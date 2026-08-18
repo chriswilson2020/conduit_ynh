@@ -1,6 +1,16 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      // Resolve the workspace package to its SOURCE, not its build output.
+      // packages/shared/dist is gitignored, so remote.sh's rsync --delete removes it
+      // from the server and every test run would otherwise need a build first. tsc -b
+      // still typechecks the real dist entrypoints, so the built artefact is covered.
+      "@conduit/shared": fileURLToPath(new URL("./packages/shared/src/index.ts", import.meta.url)),
+    },
+  },
   test: {
     include: ["packages/*/src/**/*.test.ts"],
     environment: "node",
