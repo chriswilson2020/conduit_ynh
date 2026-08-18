@@ -46,11 +46,14 @@ export async function buildApp({ config, db, webRoot }: BuildAppOptions): Promis
 
   app.addHook("onRequest", async (request) => {
     // routeOptions.url is the matched route's registered pattern (e.g. "/api/health"),
-    // populated because onRequest runs after routing — not request.url, which is the
-    // raw path. It is undefined for a request that matched no route, so those still
-    // resolve identity here same as before; harmless, since the 404 handler never
-    // reads request.user.
-    if (UNAUTHENTICATED_ROUTES.has(request.routeOptions.url ?? "")) return;
+    // populated because onRequest runs after routing -- not request.url, which is the
+    // raw path. It is undefined when no route matched. Those requests are served by
+    // the not-found handler -- either the SPA shell or a JSON 404 -- and neither reads
+    // request.user. Resolving identity here would write to the database on a cache
+    // miss (see createUserResolver), so a deep link would 500 during a database
+    // outage instead of serving the static shell that exists to report the outage.
+    const matched = request.routeOptions.url;
+    if (matched === undefined || UNAUTHENTICATED_ROUTES.has(matched)) return;
     const identity = identityFromHeaders(request.headers, config.devUser);
     request.user = identity === null ? null : await users.resolve(identity);
   });
