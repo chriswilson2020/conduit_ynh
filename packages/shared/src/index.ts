@@ -207,7 +207,9 @@ export type UpdateDealInput = z.infer<typeof updateDealInputSchema>;
  * afterDealId the neighbour immediately following it (higher position). This is
  * NOT "insert before this id" -- the field names describe the neighbours'
  * placement relative to the moved item, and Task 3's service and the web client
- * must both read them this way. */
+ * must both read them this way. When BOTH are omitted, the deal is appended at
+ * the tail of the target stage (mirrors createDeal's append semantics) --
+ * NOT inserted at the front. */
 export const moveDealInputSchema = z.object({
   stageId: z.uuid(),
   beforeDealId: z.uuid().optional(),

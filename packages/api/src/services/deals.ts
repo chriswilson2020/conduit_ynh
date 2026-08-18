@@ -258,29 +258,73 @@ export async function moveDeal(db: Database, actorId: string, dealId: string, op
       afterPos = after.position;
     }
 
-    // Tighten the upper bound to whatever CURRENTLY occupies the gap
-    // immediately above beforePos, rather than trusting afterDealId's stored
-    // position as the final word. midpoint() is a pure function of its two
-    // inputs: two concurrent moveDeal calls naming the IDENTICAL
-    // (beforeDealId, afterDealId) pair -- the realistic "two users drop into
-    // the same visual gap" race -- would otherwise both compute the exact
-    // same string and tie, even serialised one after the other by
-    // lockSiblingGroup, because before/after's own rows never moved. This
-    // extra read (still inside the same lock) is what actually breaks the
-    // tie: the loser of the lock race runs second, so its query for "what's
-    // the closest thing to beforePos now" sees the winner's freshly
-    // committed row sitting in the gap and narrows against THAT instead,
-    // landing just below it. A third, fourth, etc. concurrent caller into
-    // the same gap keeps narrowing the same way, one step further down each
-    // time -- the same self-correcting shape createDeal/createStage get from
-    // re-reading the live tail under lock, adapted to a bounded gap instead
-    // of an open-ended append.
-    const gapConditions = [eq(deals.stageId, opts.stageId), ne(deals.id, dealId)];
-    if (beforePos !== null) gapConditions.push(gt(deals.position, beforePos));
-    if (afterPos !== null) gapConditions.push(lt(deals.position, afterPos));
-    const [tightest] = await tx.select({ position: deals.position }).from(deals)
-      .where(and(...gapConditions)).orderBy(deals.position).limit(1);
-    if (tightest !== undefined) afterPos = tightest.position;
+    // Stale-pair guard: if both neighbours were given but are no longer
+    // adjacent (someone reordered between them, or the caller's before/after
+    // are simply the wrong way round), beforePos >= afterPos and midpoint()
+    // below would throw its own plain Error -- an opaque 500, not a domain
+    // error the client can react to. Surface it the same way every other
+    // stale-board case in this function does.
+    if (beforePos !== null && afterPos !== null && beforePos >= afterPos) {
+      throw new ConflictError("deal", dealId);
+    }
+
+    // Narrow the requested gap to whatever CURRENTLY occupies it, rather than
+    // trusting the named neighbours' stored positions as the final word.
+    // midpoint() is a pure function of its two inputs: two concurrent
+    // moveDeal calls naming the IDENTICAL neighbour pair -- the realistic
+    // "two users drop into the same visual gap" race -- would otherwise both
+    // compute the exact same string and tie, even serialised one after the
+    // other by lockSiblingGroup, because the named neighbours' own rows never
+    // moved. This extra read (still inside the same lock) is what actually
+    // breaks the tie: the loser of the lock race runs second, so its query
+    // sees the winner's freshly committed row sitting in the gap and narrows
+    // against THAT instead -- the same self-correcting shape createDeal/
+    // createStage get from re-reading the live tail under lock, adapted to a
+    // bounded gap instead of an open-ended append.
+    //
+    // Which side narrows depends on which bound anchors the gap, and getting
+    // this backwards is exactly the bug a review caught here: ordering ASC
+    // unconditionally is correct when beforePos anchors the gap (the nearest
+    // occupant ABOVE beforePos is always the tightest new upper bound,
+    // whatever afterDealId's stored position says) -- but for a front insert
+    // (beforeDealId omitted), the only anchor is afterPos, and ASC with no
+    // lower bound would pick the stage's global topmost row instead of the
+    // nearest occupant, leaping over every card a concurrent user prepended
+    // and landing the moved card above all of them. That direction must
+    // order DESC and narrow beforePos, not afterPos.
+    if (beforePos === null && afterPos === null) {
+      // No neighbours at all: append at the tail of the stage, mirroring
+      // createDeal's append semantics (see moveDealInputSchema's JSDoc in
+      // @conduit/shared) -- not "insert unbounded," which without this
+      // branch would fall into the front-insert case below with afterPos
+      // also null and land at the very front instead.
+      const [tail] = await tx.select({ position: deals.position }).from(deals)
+        .where(and(eq(deals.stageId, opts.stageId), ne(deals.id, dealId)))
+        .orderBy(desc(deals.position)).limit(1);
+      beforePos = tail?.position ?? null;
+    } else if (beforePos === null) {
+      // Front insert: afterPos is the only anchor. The preceding branch
+      // already ruled out both being null, so afterPos is non-null here --
+      // TS can't chain that across the two branches' conditions (they narrow
+      // different variables), hence the explicit guard, kept purely to
+      // satisfy the type checker and document the runtime invariant.
+      if (afterPos === null) throw new Error("moveDeal: unreachable -- both bounds null is handled above");
+      const anchor = afterPos;
+      const [tightest] = await tx.select({ position: deals.position }).from(deals)
+        .where(and(eq(deals.stageId, opts.stageId), ne(deals.id, dealId), lt(deals.position, anchor)))
+        .orderBy(desc(deals.position)).limit(1);
+      if (tightest !== undefined) beforePos = tightest.position;
+    } else {
+      // beforePos anchors the gap (afterDealId given too, or omitted for an
+      // "append after X" move). The nearest CURRENT occupant above it
+      // narrows the upper bound (ASC/limit 1).
+      const anchor: string = beforePos;
+      const gapConditions = [eq(deals.stageId, opts.stageId), ne(deals.id, dealId), gt(deals.position, anchor)];
+      if (afterPos !== null) gapConditions.push(lt(deals.position, afterPos));
+      const [tightest] = await tx.select({ position: deals.position }).from(deals)
+        .where(and(...gapConditions)).orderBy(deals.position).limit(1);
+      if (tightest !== undefined) afterPos = tightest.position;
+    }
 
     const position = midpoint(beforePos, afterPos);
 

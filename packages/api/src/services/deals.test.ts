@@ -255,6 +255,45 @@ describe("moveDeal", () => {
     expect(moved.position < b.position).toBe(true);
   });
 
+  it("front insert with only afterDealId lands immediately before it, not above earlier rows (regression)", async () => {
+    const { pipeline, stages } = await makePipelineWithStages(["Lead"]);
+    const x1 = await makeDeal(pipeline.id, stages[0]!.id, { title: "X1" });
+    const x2 = await makeDeal(pipeline.id, stages[0]!.id, { title: "X2" });
+    const afterDeal = await makeDeal(pipeline.id, stages[0]!.id, { title: "AfterDeal" });
+    const mover = await makeDeal(pipeline.id, stages[0]!.id, { title: "Mover" });
+    // afterDealId only (beforeDealId omitted) means "land immediately before
+    // afterDeal" -- NOT "land at the very front of the stage." A buggy
+    // unconditional ASC tighten (no lower bound) would pick the stage's
+    // global topmost row (x1) as the new upper bound and land the mover
+    // above x1 and x2 both, jumping past rows the caller never named.
+    const moved = await moveDeal(handle.db, actorId, mover.id, { stageId: stages[0]!.id, afterDealId: afterDeal.id });
+    expect(moved.position > x1.position).toBe(true);
+    expect(moved.position > x2.position).toBe(true);
+    expect(moved.position < afterDeal.position).toBe(true);
+  });
+
+  it("moveDeal with no neighbours appends at the tail of the stage, matching createDeal", async () => {
+    const { pipeline, stages } = await makePipelineWithStages(["Lead", "Won"]);
+    const a = await makeDeal(pipeline.id, stages[1]!.id, { title: "A" });
+    const b = await makeDeal(pipeline.id, stages[1]!.id, { title: "B" });
+    const moving = await makeDeal(pipeline.id, stages[0]!.id, { title: "Moving" });
+    const moved = await moveDeal(handle.db, actorId, moving.id, { stageId: stages[1]!.id });
+    expect(moved.position > a.position).toBe(true);
+    expect(moved.position > b.position).toBe(true);
+  });
+
+  it("throws ConflictError when the given before/after neighbours are no longer adjacent (stale pair)", async () => {
+    const { pipeline, stages } = await makePipelineWithStages(["Lead"]);
+    const a = await makeDeal(pipeline.id, stages[0]!.id, { title: "A" });
+    const b = await makeDeal(pipeline.id, stages[0]!.id, { title: "B" });
+    const moving = await makeDeal(pipeline.id, stages[0]!.id, { title: "Moving" });
+    // a.position < b.position; passing them reversed simulates a stale pair
+    // where the caller's neighbours are no longer adjacent in that order.
+    await expect(
+      moveDeal(handle.db, actorId, moving.id, { stageId: stages[0]!.id, beforeDealId: b.id, afterDealId: a.id }),
+    ).rejects.toBeInstanceOf(ConflictError);
+  });
+
   it("throws ConflictError when a neighbour no longer belongs to the target stage (stale board)", async () => {
     const { pipeline, stages } = await makePipelineWithStages(["Lead", "Won"]);
     const stray = await makeDeal(pipeline.id, stages[0]!.id, { title: "Stray" });
