@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
+import { GlobalSearch } from "./search";
 
 // activeProps.className replaces (rather than merges with) the base className
 // on the wire, so each string below is complete on its own -- not a base plus
@@ -24,8 +25,9 @@ export function Shell({ children }: { children: ReactNode }) {
       </aside>
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex items-center gap-4 border-b border-slate-200 bg-white px-6 py-3">
-          {/* Global search lands here in Task 10 (right rail + search UI). */}
-          <div data-testid="search-slot" className="max-w-md flex-1" />
+          <div className="max-w-md flex-1">
+            <GlobalSearch />
+          </div>
         </header>
         <main className="flex-1 overflow-auto px-6 py-6">{children}</main>
       </div>

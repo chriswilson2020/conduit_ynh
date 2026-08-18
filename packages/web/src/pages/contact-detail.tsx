@@ -11,6 +11,7 @@ import {
 } from "../queries";
 import { FieldCard, type FieldCardField } from "../components/field-card";
 import { OwnerSelect } from "../components/owner-select";
+import { Rail } from "../components/rail/rail";
 import { Button } from "../components/ui/button";
 
 function splitList(value: string): string[] {
@@ -139,8 +140,8 @@ export function ContactDetailPage() {
   const fullName = `${contact.firstName} ${contact.lastName ?? ""}`.trim();
 
   return (
-    <div className="flex gap-6">
-      <div className="min-w-0 flex-1">
+    <div className="flex flex-col gap-6 lg:flex-row">
+      <div className="min-w-0 lg:w-2/3">
         {bannerError && (
           <div
             role="alert"
@@ -201,7 +202,9 @@ export function ContactDetailPage() {
           </div>
         </div>
       </div>
-      <aside data-testid="rail-placeholder" className="w-72 shrink-0" />
+      <aside className="min-w-0 lg:w-1/3">
+        <Rail contactId={contact.id} />
+      </aside>
     </div>
   );
 }
