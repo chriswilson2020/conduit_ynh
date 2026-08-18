@@ -35,7 +35,8 @@ CREATE TABLE "events" (
 	"company_id" uuid,
 	"contact_id" uuid,
 	"payload" jsonb DEFAULT '{}'::jsonb NOT NULL,
-	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "events_verb_valid" CHECK (verb IN ('created','updated','archived','unarchived','note_added','file_attached'))
 );
 --> statement-breakpoint
 CREATE TABLE "files" (

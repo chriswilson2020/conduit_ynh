@@ -28,6 +28,10 @@ export type ErrorResponse = z.infer<typeof errorResponseSchema>;
 const nullableString = z.string().min(1).nullable();
 const timestamps = { createdAt: z.iso.datetime(), updatedAt: z.iso.datetime() };
 
+// The companies/contacts tables carry a `custom` jsonb column that is deliberately
+// absent from these schemas: custom fields are deferred (Phase 1 spec). Zod strips
+// unknown keys, so the column stays invisible to the API until a later phase adds
+// it here as a typed field.
 export const companySchema = z.object({
   id: z.uuid(), name: z.string().min(1),
   domain: nullableString, website: nullableString, phone: nullableString,

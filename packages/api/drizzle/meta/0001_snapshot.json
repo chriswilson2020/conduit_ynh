@@ -1,5 +1,5 @@
 {
-  "id": "d887a16b-3055-423d-bcbe-c76392d271a1",
+  "id": "d8f6327d-5cd4-4729-80a4-f73822bfbd5d",
   "prevId": "46d7c582-eac6-4574-8482-a59582c22b07",
   "version": "7",
   "dialect": "postgresql",
@@ -320,7 +320,12 @@
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "events_verb_valid": {
+          "name": "events_verb_valid",
+          "value": "verb IN ('created','updated','archived','unarchived','note_added','file_attached')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.files": {

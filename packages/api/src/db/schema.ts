@@ -29,6 +29,9 @@ export const contacts = pgTable("contacts", {
   id: uuid("id").primaryKey().defaultRandom(),
   firstName: text("first_name").notNull(), lastName: text("last_name"),
   companyId: uuid("company_id").references(() => companies.id),
+  // Email format is validated by the Zod input schemas (createContactInputSchema),
+  // not by this column. Any future direct-write path (import, seed) must go through
+  // those schemas to keep this guarantee.
   emails: text("emails").array().notNull().default([]),
   phones: text("phones").array().notNull().default([]),
   jobTitle: text("job_title"),
@@ -71,5 +74,5 @@ export const events = pgTable("events", {
   contactId: uuid("contact_id").references(() => contacts.id),
   payload: jsonb("payload").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [check("events_verb_valid", sql`verb IN ('created','updated','archived','unarchived','note_added','file_attached')`)]);
 export type EventRow = typeof events.$inferSelect;
