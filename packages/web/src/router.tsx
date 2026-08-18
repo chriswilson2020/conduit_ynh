@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Outlet, createRootRoute, createRoute, createRouter } from "@tanstack/react-router";
+import { Link, Outlet, createRootRoute, createRoute, createRouter } from "@tanstack/react-router";
 import { App } from "./App";
 import { basePath } from "./api";
 import { Shell } from "./components/shell";
@@ -58,6 +58,34 @@ const contactDetailRoute = createRoute({
   component: () => <div data-testid="page-contact-detail">Contact</div>,
 });
 
+// Rendered by the router itself (not a route) whenever the URL matches no
+// route in the tree -- a stale bookmark, a mistyped path, or (today) any deep
+// link outside "/", since Task 9 has not yet added real companies/contacts
+// detail routes for every id. It renders as the root route's Outlet content,
+// i.e. inside Shell, so the sidebar/header stay usable and the user is never
+// dropped on a bare, nav-less page.
+function NotFoundComponent() {
+  return (
+    <div className="flex min-h-[60vh] items-center justify-center">
+      <div
+        data-testid="not-found"
+        className="max-w-sm rounded-lg border border-slate-200 bg-white p-8 text-center shadow-sm"
+      >
+        <h1 className="text-lg font-semibold text-slate-900">Page not found</h1>
+        <p className="mt-1 text-sm text-slate-500">
+          The page you are looking for does not exist.
+        </p>
+        <Link
+          to="/"
+          className="mt-4 inline-block text-sm font-medium text-slate-900 underline hover:text-slate-700"
+        >
+          Back to dashboard
+        </Link>
+      </div>
+    </div>
+  );
+}
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   companiesRoute,
@@ -74,6 +102,7 @@ const routeTree = rootRoute.addChildren([
 export const router = createRouter({
   routeTree,
   basepath: basePath() === "/" ? undefined : basePath(),
+  defaultNotFoundComponent: NotFoundComponent,
 });
 
 declare module "@tanstack/react-router" {
