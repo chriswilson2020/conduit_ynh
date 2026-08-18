@@ -58,6 +58,8 @@ export function Files({ companyId, contactId }: FilesProps) {
   function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     setDragActive(false);
+    // Single attachment per drop, matching the file-picker: only the first
+    // dropped file is uploaded, the rest are silently ignored.
     const file = event.dataTransfer.files?.[0];
     if (file) upload(file);
   }
@@ -101,7 +103,7 @@ export function Files({ companyId, contactId }: FilesProps) {
             </a>
             <div className="mt-1 flex items-center justify-between gap-2 text-xs text-slate-400">
               <span>
-                {humanSize(file.sizeBytes)} \u00B7 {userMap.get(file.uploaderUserId) ?? "\u2014"}
+                {humanSize(file.sizeBytes)} {"\u00B7"} {userMap.get(file.uploaderUserId) ?? "\u2014"}
               </span>
               <span>{new Date(file.createdAt).toLocaleString()}</span>
             </div>
