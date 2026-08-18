@@ -353,9 +353,9 @@ export const meResponseSchema = z.object({ user: userSchema });
 export type MeResponse = z.infer<typeof meResponseSchema>;
 
 export const healthResponseSchema = z.object({
-  status: z.literal("ok"),
+  status: z.enum(["ok", "degraded"]),
   version: z.string().min(1),
-  database: z.literal("connected"),
+  database: z.enum(["connected", "disconnected"]),
 });
 export type HealthResponse = z.infer<typeof healthResponseSchema>;
 
@@ -1447,9 +1447,13 @@ export interface BuildAppOptions {
 export async function buildApp({ config, db }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     logger: config.nodeEnv === "test" ? false : { level: "info" },
-    // The app binds to loopback and is only reachable through YunoHost's nginx,
-    // which is the boundary that makes the identity headers trustworthy.
-    trustProxy: true,
+    // 1, not true: the app binds to loopback and is reachable through exactly one
+    // hop, YunoHost's nginx. trustProxy: 1 trusts only that single nearest hop's
+    // X-Forwarded-* headers. trustProxy: true would trust an unbounded chain,
+    // including any entry a client prepends itself if nginx ever appends to
+    // X-Forwarded-For (e.g. via $proxy_add_x_forwarded_for) rather than overwriting
+    // it -- letting a client forge the address anything downstream treats as req.ip.
+    trustProxy: 1,
   });
 
   app.decorateRequest("user", null);
@@ -1463,8 +1467,22 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
     request.user = identity === null ? null : await users.resolve(identity);
   });
 
-  app.get("/api/health", async () => {
-    await db.execute(sql`SELECT 1`);
+  app.get("/api/health", async (request, reply) => {
+    try {
+      await db.execute(sql`SELECT 1`);
+    } catch (error) {
+      // A health endpoint has to stay readable when the thing it reports on is
+      // broken. 503 so uptime monitoring treats it as down, but with the app's own
+      // response shape rather than the driver's error text, which could leak
+      // connection details. The underlying error still has to reach the journal,
+      // so it's logged here even though it no longer reaches the client.
+      request.log.error({ err: error }, "health check: database unreachable");
+      return reply.code(503).send({
+        status: "degraded",
+        version: config.version,
+        database: "disconnected",
+      });
+    }
     return { status: "ok", version: config.version, database: "connected" };
   });
 
@@ -1490,6 +1508,12 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
 ```
 
 The SPA fallback deliberately is not here yet — Task 10 replaces this not-found handler once there are assets to serve.
+
+Test the degraded path by stubbing `db.execute` to throw, asserting 503 with `status: "degraded"` and
+`database: "disconnected"`, and asserting the driver's error text appears **nowhere** in the response
+body — that leak is the point of the try/catch. Also pin, via the raw `last_seen_at` value, that two
+identical `/api/me` requests produce only one write, which proves the resolver's cache survives
+across requests rather than being rebuilt per request.
 
 - [ ] **Step 4: Run the tests**
 
