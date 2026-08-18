@@ -2188,7 +2188,18 @@ Expected: `Conduit 0.1.0-dev listening on 127.0.0.1:3000`.
 curl -s localhost:3000/api/health && echo && curl -s localhost:3000/api/me && echo && curl -s localhost:3000/ | grep -o '__CONDUIT_BASE__="[^"]*"'
 ```
 
-Expected: a health JSON body, a user JSON body naming `chris`, and `__CONDUIT_BASE__="/"`. Then stop the server with Ctrl-C and confirm it exits cleanly.
+Expected: a health JSON body, a user JSON body naming `chris`, and `__CONDUIT_BASE__ = "/"`. Note the
+template emits it spaced, so a grep for the unspaced form finds nothing even when the substitution
+worked.
+
+Run the server with `nohup` redirecting to a log rather than in the foreground over SSH, and confirm
+with `pgrep -f` afterwards that nothing is left running.
+
+Worth proving here rather than trusting: that dropping `users` and the `drizzle` schema then booting
+recreates them (Task 16's upgrade path depends on migrations running at boot, not in the script);
+that SIGTERM logs the shutdown line and exits 0; that `CONDUIT_DEV_USER` with `NODE_ENV=production`
+exits non-zero with the guard's message; and that an unreachable database at boot exits non-zero with
+`ECONNREFUSED` legible near the top of the output.
 
 - [ ] **Step 4: Commit**
 
