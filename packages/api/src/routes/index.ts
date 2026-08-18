@@ -8,6 +8,7 @@ import { registerFileRoutes } from "./files.js";
 import { registerEventRoutes } from "./events.js";
 import { registerUserRoutes } from "./users.js";
 import { registerSearchRoutes } from "./search.js";
+import { registerStreamRoutes } from "./stream.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -44,4 +45,5 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerEventRoutes(app, deps);
   registerUserRoutes(app, deps);
   registerSearchRoutes(app, deps);
+  registerStreamRoutes(app, deps);
 }

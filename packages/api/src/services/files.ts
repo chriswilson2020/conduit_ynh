@@ -3,6 +3,7 @@ import type { FileMeta } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { companies, contacts, events, files, type FileRow } from "../db/schema.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
+import { publish } from "./sse.js";
 
 export function toFileMeta(row: FileRow): FileMeta {
   return {
@@ -51,7 +52,7 @@ async function assertFileTargetActive(db: Database, input: AttachFileInput): Pro
 
 export async function attachFile(db: Database, actorId: string, meta: AttachFileInput): Promise<FileMeta> {
   await assertFileTargetActive(db, meta);
-  return db.transaction(async (tx) => {
+  const file = await db.transaction(async (tx) => {
     const [row] = await tx.insert(files).values({
       originalName: meta.originalName, mime: meta.mime, sizeBytes: meta.sizeBytes, sha256: meta.sha256,
       uploaderUserId: actorId, companyId: meta.companyId ?? null, contactId: meta.contactId ?? null,
@@ -64,6 +65,8 @@ export async function attachFile(db: Database, actorId: string, meta: AttachFile
     });
     return toFileMeta(row);
   });
+  publish({ keys: [["files"], ["events"]] });
+  return file;
 }
 
 export interface ListFilesOptions { companyId?: string; contactId?: string; }

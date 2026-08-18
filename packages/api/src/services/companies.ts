@@ -4,6 +4,12 @@ import type { Database } from "../db/client.js";
 import { companies, events, type CompanyRow } from "../db/schema.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
 import { decodeCursor, encodeCursor, escapeLike } from "./pagination.js";
+import { publish } from "./sse.js";
+
+/** Invalidation keys every company mutator publishes after its transaction commits. */
+function publishCompanyHint(id: string): void {
+  publish({ keys: [["companies"], ["company", id], ["events"], ["search"]] });
+}
 
 function toCompany(row: CompanyRow): Company {
   return {
@@ -15,12 +21,14 @@ function toCompany(row: CompanyRow): Company {
 }
 
 export async function createCompany(db: Database, actorId: string, input: CreateCompanyInput): Promise<Company> {
-  return db.transaction(async (tx) => {
+  const company = await db.transaction(async (tx) => {
     const [row] = await tx.insert(companies).values({ ...input }).returning();
     if (row === undefined) throw new Error("insert returned no row");
     await tx.insert(events).values({ verb: "created", actorUserId: actorId, companyId: row.id, payload: {} });
     return toCompany(row);
   });
+  publishCompanyHint(company.id);
+  return company;
 }
 
 async function mustGet(db: Database, id: string): Promise<CompanyRow> {
@@ -43,7 +51,7 @@ export async function updateCompany(db: Database, actorId: string, id: string, p
     .filter((k) => patch[k] !== undefined && patch[k] !== existing[k]);
   if (changed.length === 0) return toCompany(existing);
 
-  return db.transaction(async (tx) => {
+  const company = await db.transaction(async (tx) => {
     // archived_at IS NULL in the WHERE makes the guard atomic: a concurrent
     // archive between the mustGet read above and this UPDATE yields zero rows
     // here instead of silently mutating an archived record.
@@ -57,11 +65,16 @@ export async function updateCompany(db: Database, actorId: string, id: string, p
     await tx.insert(events).values({ verb: "updated", actorUserId: actorId, companyId: id, payload: { changed } });
     return toCompany(row);
   });
+  publishCompanyHint(company.id);
+  return company;
 }
 
 async function setArchived(db: Database, actorId: string, id: string, archived: boolean): Promise<Company> {
   await mustGet(db, id);
-  return db.transaction(async (tx) => {
+  // wrote is false on the recheck-and-return-as-is branch below (state already
+  // matched what was requested, so nothing changed) -- that branch must not
+  // publish, same as any other no-op short-circuit in this file.
+  const { company, wrote } = await db.transaction(async (tx) => {
     // The WHERE guard makes archive/unarchive idempotent and race-safe: archiving
     // requires the row currently unarchived, unarchiving requires it currently
     // archived. Zero rows back means the state already matched what was requested
@@ -76,13 +89,15 @@ async function setArchived(db: Database, actorId: string, id: string, archived: 
     if (row === undefined) {
       const [recheck] = await tx.select().from(companies).where(eq(companies.id, id));
       if (recheck === undefined) throw new NotFoundError("company", id);
-      return toCompany(recheck);
+      return { company: toCompany(recheck), wrote: false };
     }
     await tx.insert(events).values({
       verb: archived ? "archived" : "unarchived", actorUserId: actorId, companyId: id, payload: {},
     });
-    return toCompany(row);
+    return { company: toCompany(row), wrote: true };
   });
+  if (wrote) publishCompanyHint(company.id);
+  return company;
 }
 export const archiveCompany = (db: Database, a: string, id: string) => setArchived(db, a, id, true);
 export const unarchiveCompany = (db: Database, a: string, id: string) => setArchived(db, a, id, false);

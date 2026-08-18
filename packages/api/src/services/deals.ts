@@ -10,6 +10,13 @@ import {
 } from "../db/schema.js";
 import { NotFoundError, ArchivedError, ConflictError } from "./errors.js";
 import { lockSiblingGroup } from "./pipelines.js";
+import { publish } from "./sse.js";
+
+/** Invalidation keys every deal mutator (create/update/archive/move/win/lose/reopen)
+ * publishes after its transaction commits. */
+function publishDealHint(pipelineId: string, id: string): void {
+  publish({ keys: [["deals", pipelineId], ["deal", id], ["funnel", pipelineId], ["events"], ["search"]] });
+}
 
 function toDeal(row: DealRow): Deal {
   return {
@@ -97,7 +104,7 @@ export async function createDeal(
   if (input.companyId != null) await assertCompanyExists(db, input.companyId);
   if (input.contactId != null) await assertContactExists(db, input.contactId);
 
-  return db.transaction(async (tx) => {
+  const deal = await db.transaction(async (tx) => {
     // Siblings = all deals currently in this stage, regardless of status or
     // archived state, same as pipelines.ts's createPipeline/createStage
     // consider every sibling row (not just unarchived ones) when computing
@@ -130,6 +137,8 @@ export async function createDeal(
     });
     return toDeal(row);
   });
+  publishDealHint(deal.pipelineId, deal.id);
+  return deal;
 }
 
 // pipelineId/stageId/position/status are not accepted here. At the type
@@ -161,7 +170,7 @@ export async function updateDeal(db: Database, actorId: string, id: string, patc
   const changed = PATCHABLE_FIELDS.filter((k) => patch[k] !== undefined && fieldChanged(patch[k], existing[k]));
   if (changed.length === 0) return toDeal(existing);
 
-  return db.transaction(async (tx) => {
+  const deal = await db.transaction(async (tx) => {
     // archived_at IS NULL in the WHERE makes the guard atomic: a concurrent
     // archive between the mustGetDeal read above and this UPDATE yields zero
     // rows here instead of silently mutating an archived record.
@@ -182,11 +191,16 @@ export async function updateDeal(db: Database, actorId: string, id: string, patc
     });
     return toDeal(row);
   });
+  publishDealHint(deal.pipelineId, deal.id);
+  return deal;
 }
 
 async function setArchived(db: Database, actorId: string, id: string, archived: boolean): Promise<Deal> {
   await mustGetDeal(db, id);
-  return db.transaction(async (tx) => {
+  // wrote is false on the recheck-and-return-as-is branch below (state already
+  // matched what was requested, so nothing changed) -- that branch must not
+  // publish, same as any other no-op short-circuit in this file.
+  const { deal, wrote } = await db.transaction(async (tx) => {
     // The WHERE guard makes archive/unarchive idempotent and race-safe: archiving
     // requires the row currently unarchived, unarchiving requires it currently
     // archived. Zero rows back means the state already matched what was requested
@@ -201,14 +215,16 @@ async function setArchived(db: Database, actorId: string, id: string, archived: 
     if (row === undefined) {
       const [recheck] = await tx.select().from(deals).where(eq(deals.id, id));
       if (recheck === undefined) throw new NotFoundError("deal", id);
-      return toDeal(recheck);
+      return { deal: toDeal(recheck), wrote: false };
     }
     await tx.insert(events).values({
       verb: archived ? "archived" : "unarchived", actorUserId: actorId,
       companyId: row.companyId, dealId: id, payload: {},
     });
-    return toDeal(row);
+    return { deal: toDeal(row), wrote: true };
   });
+  if (wrote) publishDealHint(deal.pipelineId, deal.id);
+  return deal;
 }
 export const archiveDeal = (db: Database, a: string, id: string) => setArchived(db, a, id, true);
 export const unarchiveDeal = (db: Database, a: string, id: string) => setArchived(db, a, id, false);
@@ -221,7 +237,7 @@ export const unarchiveDeal = (db: Database, a: string, id: string) => setArchive
 // (someone else moved things concurrently) -- ConflictError, not a silent
 // misplace.
 export async function moveDeal(db: Database, actorId: string, dealId: string, opts: MoveDealInput): Promise<Deal> {
-  return db.transaction(async (tx) => {
+  const deal = await db.transaction(async (tx) => {
     // Lock the TARGET stage's deal group before any read whose result feeds
     // the position computed below (same lockSiblingGroup discipline as
     // createDeal). Locking the target rather than the source stage is what
@@ -347,6 +363,8 @@ export async function moveDeal(db: Database, actorId: string, dealId: string, op
     });
     return toDeal(row);
   });
+  publishDealHint(deal.pipelineId, deal.id);
+  return deal;
 }
 
 // Single hardened state-machine guard shared by winDeal/loseDeal/reopenDeal:
@@ -362,7 +380,7 @@ async function setStatus(
   db: Database, actorId: string, id: string,
   target: DealStatus, fromStatuses: DealStatus[], lostReason: string | null,
 ): Promise<Deal> {
-  return db.transaction(async (tx) => {
+  const deal = await db.transaction(async (tx) => {
     const [row] = await tx.update(deals).set({
       status: target,
       // closed_at iff status != open; lost_reason only when status = lost --
@@ -391,6 +409,8 @@ async function setStatus(
     await tx.insert(events).values({ verb, actorUserId: actorId, companyId: row.companyId, dealId: id, payload });
     return toDeal(row);
   });
+  publishDealHint(deal.pipelineId, deal.id);
+  return deal;
 }
 
 export const winDeal = (db: Database, actorId: string, id: string): Promise<Deal> =>

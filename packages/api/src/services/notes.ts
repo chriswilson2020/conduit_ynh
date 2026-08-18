@@ -3,6 +3,7 @@ import type { CreateNoteInput, Note } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { companies, contacts, events, notes, type NoteRow } from "../db/schema.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
+import { publish } from "./sse.js";
 
 function toNote(row: NoteRow): Note {
   return {
@@ -46,7 +47,7 @@ async function assertNoteTargetActive(db: Database, input: CreateNoteInput): Pro
 
 export async function createNote(db: Database, actorId: string, input: CreateNoteInput): Promise<Note> {
   await assertNoteTargetActive(db, input);
-  return db.transaction(async (tx) => {
+  const note = await db.transaction(async (tx) => {
     const [row] = await tx.insert(notes).values({
       body: input.body, authorUserId: actorId,
       companyId: input.companyId ?? null, contactId: input.contactId ?? null,
@@ -63,6 +64,8 @@ export async function createNote(db: Database, actorId: string, input: CreateNot
     });
     return toNote(row);
   });
+  publish({ keys: [["notes"], ["events"], ["search"]] });
+  return note;
 }
 
 export interface ListNotesOptions { companyId?: string; contactId?: string; }

@@ -4,6 +4,12 @@ import type { Database } from "../db/client.js";
 import { contacts, companies, events, type ContactRow } from "../db/schema.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
 import { decodeCursor, encodeCursor, escapeLike } from "./pagination.js";
+import { publish } from "./sse.js";
+
+/** Invalidation keys every contact mutator publishes after its transaction commits. */
+function publishContactHint(id: string): void {
+  publish({ keys: [["contacts"], ["contact", id], ["events"], ["search"]] });
+}
 
 function toContact(row: ContactRow): Contact {
   return {
@@ -32,12 +38,14 @@ async function assertCompanyExists(db: Database, companyId: string): Promise<voi
 
 export async function createContact(db: Database, actorId: string, input: CreateContactInput): Promise<Contact> {
   if (input.companyId != null) await assertCompanyExists(db, input.companyId);
-  return db.transaction(async (tx) => {
+  const contact = await db.transaction(async (tx) => {
     const [row] = await tx.insert(contacts).values({ ...input }).returning();
     if (row === undefined) throw new Error("insert returned no row");
     await tx.insert(events).values({ verb: "created", actorUserId: actorId, contactId: row.id, payload: {} });
     return toContact(row);
   });
+  publishContactHint(contact.id);
+  return contact;
 }
 
 async function mustGet(db: Database, id: string): Promise<ContactRow> {
@@ -71,7 +79,7 @@ export async function updateContact(db: Database, actorId: string, id: string, p
     .filter((k) => patch[k] !== undefined && fieldChanged(patch[k], existing[k]));
   if (changed.length === 0) return toContact(existing);
 
-  return db.transaction(async (tx) => {
+  const contact = await db.transaction(async (tx) => {
     // archived_at IS NULL in the WHERE makes the guard atomic: a concurrent
     // archive between the mustGet read above and this UPDATE yields zero rows
     // here instead of silently mutating an archived record.
@@ -85,11 +93,16 @@ export async function updateContact(db: Database, actorId: string, id: string, p
     await tx.insert(events).values({ verb: "updated", actorUserId: actorId, contactId: id, payload: { changed } });
     return toContact(row);
   });
+  publishContactHint(contact.id);
+  return contact;
 }
 
 async function setArchived(db: Database, actorId: string, id: string, archived: boolean): Promise<Contact> {
   await mustGet(db, id);
-  return db.transaction(async (tx) => {
+  // wrote is false on the recheck-and-return-as-is branch below (state already
+  // matched what was requested, so nothing changed) -- that branch must not
+  // publish, same as any other no-op short-circuit in this file.
+  const { contact, wrote } = await db.transaction(async (tx) => {
     // The WHERE guard makes archive/unarchive idempotent and race-safe: archiving
     // requires the row currently unarchived, unarchiving requires it currently
     // archived. Zero rows back means the state already matched what was requested
@@ -104,13 +117,15 @@ async function setArchived(db: Database, actorId: string, id: string, archived: 
     if (row === undefined) {
       const [recheck] = await tx.select().from(contacts).where(eq(contacts.id, id));
       if (recheck === undefined) throw new NotFoundError("contact", id);
-      return toContact(recheck);
+      return { contact: toContact(recheck), wrote: false };
     }
     await tx.insert(events).values({
       verb: archived ? "archived" : "unarchived", actorUserId: actorId, contactId: id, payload: {},
     });
-    return toContact(row);
+    return { contact: toContact(row), wrote: true };
   });
+  if (wrote) publishContactHint(contact.id);
+  return contact;
 }
 export const archiveContact = (db: Database, a: string, id: string) => setArchived(db, a, id, true);
 export const unarchiveContact = (db: Database, a: string, id: string) => setArchived(db, a, id, false);

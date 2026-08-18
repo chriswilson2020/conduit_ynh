@@ -7,6 +7,15 @@ import type {
 import type { Database } from "../db/client.js";
 import { companies, pipelines, stages, events, type PipelineRow, type StageRow } from "../db/schema.js";
 import { NotFoundError, ArchivedError, ConflictError } from "./errors.js";
+import { publish } from "./sse.js";
+
+/** Invalidation keys every pipeline/stage mutator publishes after its transaction
+ * commits. Stages have no list/detail cache of their own -- they ride along inside
+ * the pipeline-detail response -- so a stage change publishes the same two keys as
+ * a pipeline change, keyed on the OWNING pipeline's id. */
+function publishPipelineHint(pipelineId: string): void {
+  publish({ keys: [["pipelines"], ["pipeline", pipelineId], ["events"]] });
+}
 
 function toPipeline(row: PipelineRow): Pipeline {
   return {
@@ -108,7 +117,7 @@ export async function createPipeline(db: Database, actorId: string, input: Creat
   if (input.scope === "company") await assertCompanyExists(db, input.companyId!);
   const companyId = input.scope === "company" ? input.companyId! : null;
 
-  return db.transaction(async (tx) => {
+  const pipeline = await db.transaction(async (tx) => {
     // Siblings = same scope + same company (global pipelines never compete
     // for position with company-scoped ones, and two different companies'
     // pipelines never compete with each other).
@@ -124,6 +133,8 @@ export async function createPipeline(db: Database, actorId: string, input: Creat
     await maybeEmitPipelineEvent(tx, actorId, row, "created", {});
     return toPipeline(row);
   });
+  publishPipelineHint(pipeline.id);
+  return pipeline;
 }
 
 export async function updatePipeline(db: Database, actorId: string, id: string, patch: UpdatePipelineInput): Promise<Pipeline> {
@@ -136,7 +147,7 @@ export async function updatePipeline(db: Database, actorId: string, id: string, 
     .filter((k) => patch[k] !== undefined && fieldChanged(patch[k], existing[k]));
   if (changed.length === 0) return toPipeline(existing);
 
-  return db.transaction(async (tx) => {
+  const pipeline = await db.transaction(async (tx) => {
     // archived_at IS NULL in the WHERE makes the guard atomic: a concurrent
     // archive between the mustGetPipeline read above and this UPDATE yields
     // zero rows here instead of silently mutating an archived record.
@@ -150,11 +161,16 @@ export async function updatePipeline(db: Database, actorId: string, id: string, 
     await maybeEmitPipelineEvent(tx, actorId, row, "updated", { changed });
     return toPipeline(row);
   });
+  publishPipelineHint(pipeline.id);
+  return pipeline;
 }
 
 async function setArchived(db: Database, actorId: string, id: string, archived: boolean): Promise<Pipeline> {
   await mustGetPipeline(db, id);
-  return db.transaction(async (tx) => {
+  // wrote is false on the recheck-and-return-as-is branch below (state already
+  // matched what was requested, so nothing changed) -- that branch must not
+  // publish, same as any other no-op short-circuit in this file.
+  const { pipeline, wrote } = await db.transaction(async (tx) => {
     // The WHERE guard makes archive/unarchive idempotent and race-safe: archiving
     // requires the row currently unarchived, unarchiving requires it currently
     // archived. Zero rows back means the state already matched what was requested
@@ -169,11 +185,13 @@ async function setArchived(db: Database, actorId: string, id: string, archived: 
     if (row === undefined) {
       const [recheck] = await tx.select().from(pipelines).where(eq(pipelines.id, id));
       if (recheck === undefined) throw new NotFoundError("pipeline", id);
-      return toPipeline(recheck);
+      return { pipeline: toPipeline(recheck), wrote: false };
     }
     await maybeEmitPipelineEvent(tx, actorId, row, archived ? "archived" : "unarchived", {});
-    return toPipeline(row);
+    return { pipeline: toPipeline(row), wrote: true };
   });
+  if (wrote) publishPipelineHint(pipeline.id);
+  return pipeline;
 }
 export const archivePipeline = (db: Database, a: string, id: string) => setArchived(db, a, id, true);
 export const unarchivePipeline = (db: Database, a: string, id: string) => setArchived(db, a, id, false);
@@ -210,7 +228,7 @@ export async function createStage(db: Database, actorId: string, pipelineId: str
   const pipeline = await mustGetPipeline(db, pipelineId);
   if (pipeline.archivedAt !== null) throw new ArchivedError("pipeline", pipelineId);
 
-  return db.transaction(async (tx) => {
+  const stage = await db.transaction(async (tx) => {
     await lockSiblingGroup(tx, `stages:${pipelineId}`);
 
     const [lastSibling] = await tx.select({ position: stages.position }).from(stages)
@@ -234,6 +252,8 @@ export async function createStage(db: Database, actorId: string, pipelineId: str
     await maybeEmitPipelineEvent(tx, actorId, pipeline, "updated", { changed: ["stages"], stageId: row.id, stageName: row.name });
     return toStage(row);
   });
+  publishPipelineHint(pipelineId);
+  return stage;
 }
 
 export async function updateStage(db: Database, actorId: string, id: string, patch: UpdateStageInput): Promise<Stage> {
@@ -248,13 +268,15 @@ export async function updateStage(db: Database, actorId: string, id: string, pat
     .filter((k) => patch[k] !== undefined && fieldChanged(patch[k], existing[k]));
   if (changed.length === 0) return toStage(existing);
 
-  return db.transaction(async (tx) => {
+  const stage = await db.transaction(async (tx) => {
     const [row] = await tx.update(stages).set({ ...patch, updatedAt: new Date() })
       .where(eq(stages.id, id)).returning();
     if (row === undefined) throw new NotFoundError("stage", id);
     await maybeEmitPipelineEvent(tx, actorId, pipeline, "updated", { changed, stageId: id });
     return toStage(row);
   });
+  publishPipelineHint(pipeline.id);
+  return stage;
 }
 
 /** beforeStageId/afterStageId name the neighbours the moved stage ends up
@@ -273,7 +295,7 @@ export interface ReorderStageInput { beforeStageId?: string; afterStageId?: stri
 // view is stale (someone else reordered concurrently) -- ConflictError, not a
 // silent misplace.
 export async function reorderStage(db: Database, actorId: string, stageId: string, opts: ReorderStageInput): Promise<Stage> {
-  return db.transaction(async (tx) => {
+  const { stage: result, pipelineId } = await db.transaction(async (tx) => {
     const [stage] = await tx.select().from(stages).where(eq(stages.id, stageId));
     if (stage === undefined) throw new NotFoundError("stage", stageId);
 
@@ -308,6 +330,8 @@ export async function reorderStage(db: Database, actorId: string, stageId: strin
     if (row === undefined) throw new NotFoundError("stage", stageId);
 
     await maybeEmitPipelineEvent(tx, actorId, pipeline, "updated", { changed: ["position"], stageId });
-    return toStage(row);
+    return { stage: toStage(row), pipelineId: pipeline.id };
   });
+  publishPipelineHint(pipelineId);
+  return result;
 }
