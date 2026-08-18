@@ -297,3 +297,36 @@ available via `[resources.apt] packages = "postgresql"` plus `[resources.databas
 
 ---
 
+
+---
+
+## Phase 0 verification
+
+Run on 18 August 2026 against a real YunoHost 12.1.40.1 server (Debian 12.15, PostgreSQL 15.19,
+Node 24.19.0), domain `conduit.listerdale.de`, app installed at `/conduit`.
+
+| Check | Result |
+|---|---|
+| `yunohost app install` | Completed in 15.7s |
+| Service running | `active`, listening on `127.0.0.1:11812` |
+| Health endpoint | `{"status":"ok","version":"0.1.0","database":"connected"}` |
+| SSO redirect for unauthenticated request | `302` to the YunoHost portal |
+| **SSO login end to end** | A real browser login created the `users` row from the `Ynh-User` headers |
+| SPA base path substitution | `__CONDUIT_BASE__ = "/conduit"` |
+| `.env` rendering | `APP_VERSION=0.1.0`, non-empty |
+| Backup archive contents | 39MB; contains `db.sql` (3582 bytes) with the schema, the drizzle migrations table, and the real user row |
+| **Backup, remove, restore** | Restored with the *same* UUID `cf3f68a8-f747-47f2-a358-1862373281c6` and `created_at` to the microsecond, proving the data came from the archive rather than a recreated schema |
+| Upgrade 0.1.0 to 0.1.1 | Version reported `0.1.1`, user row and `created_at` unchanged |
+| Second instance at `/conduit2` | Installed as `conduit__2` with its own port and its own database; both instances healthy, both behind SSO, base paths `/conduit` and `/conduit2` |
+
+Two defects were caught only because the packaging was built and exercised rather than assumed:
+
+- `server.ts` defaulted `webRoot` one directory too high. Every unit test passed because tests pass
+  `webRoot` explicitly; it failed only when the packaged tarball ran standalone.
+- `scripts/_common.sh` was sourced before YunoHost's helpers, so `ynh_read_manifest` did not exist
+  and `app_version` rendered empty into `.env`. It fails silently, showing a blank version rather
+  than an install error.
+
+**Not yet verified:** installing from the GitHub release asset. The repository is private, so the
+asset returns 404 to unauthenticated fetches and verification served the tarball over loopback
+instead. Making the repository public is the only change required.
