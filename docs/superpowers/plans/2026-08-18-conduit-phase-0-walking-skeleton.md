@@ -2551,8 +2551,8 @@ app_version="$(ynh_read_manifest 'version' | cut -d'~' -f1)"
 ```bash
 #!/bin/bash
 
-source _common.sh
 source /usr/share/yunohost/helpers
+source _common.sh
 
 #=================================================
 # DOWNLOAD, CHECK AND UNPACK SOURCE
@@ -2619,8 +2619,8 @@ The `.env` template needs `$app_version`, `$db_user`, `$db_pwd`, `$db_name`, `$p
 ```bash
 #!/bin/bash
 
-source _common.sh
 source /usr/share/yunohost/helpers
+source _common.sh
 
 #=================================================
 # REMOVE SYSTEM CONFIGURATION
@@ -2675,8 +2675,8 @@ This is the task Phase 0 exists for. A CRM whose backup silently omits the datab
 #!/bin/bash
 
 # Keep this path: backup and restore run from a different working directory.
-source ../settings/scripts/_common.sh
 source /usr/share/yunohost/helpers
+source ../settings/scripts/_common.sh
 
 ynh_print_info "Declaring files to be backed up..."
 
@@ -2697,8 +2697,8 @@ ynh_print_info "Backup script completed for $app. (YunoHost will now copy those 
 ```bash
 #!/bin/bash
 
-source ../settings/scripts/_common.sh
 source /usr/share/yunohost/helpers
+source ../settings/scripts/_common.sh
 
 #=================================================
 # RESTORE THE APP MAIN DIR
@@ -2758,8 +2758,8 @@ ynh_script_progression "Restoration completed for $app"
 ```bash
 #!/bin/bash
 
-source _common.sh
 source /usr/share/yunohost/helpers
+source _common.sh
 
 #=================================================
 # STOP SYSTEMD SERVICE
