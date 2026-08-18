@@ -1,0 +1,213 @@
+import { useState } from "react";
+import { Link, useParams } from "@tanstack/react-router";
+import type { UpdateContactInput } from "@conduit/shared";
+import {
+  useArchiveContact,
+  useCompany,
+  useContact,
+  useUnarchiveContact,
+  useUpdateContact,
+} from "../queries";
+import { FieldCard, type FieldCardField } from "../components/field-card";
+import { OwnerSelect } from "../components/owner-select";
+import { Button } from "../components/ui/button";
+
+// See the matching comment in company-detail.tsx: getJson throws a plain
+// Error with no status code, so a 404 is only recognisable by message shape.
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof Error && /failed with 404$/.test(error.message);
+}
+
+function splitList(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item !== "");
+}
+
+function buildContactPatch(name: string, value: string): UpdateContactInput {
+  const trimmed = value.trim();
+  switch (name) {
+    case "firstName":
+      return { firstName: trimmed };
+    case "lastName":
+      return { lastName: trimmed === "" ? null : trimmed };
+    case "jobTitle":
+      return { jobTitle: trimmed === "" ? null : trimmed };
+    case "emails":
+      return { emails: splitList(value) };
+    case "phones":
+      return { phones: splitList(value) };
+    default:
+      return {};
+  }
+}
+
+export function ContactDetailPage() {
+  const { contactId } = useParams({ from: "/contacts/$contactId" });
+  const { data: contact, isLoading, error } = useContact(contactId);
+  const { data: linkedCompany } = useCompany(contact?.companyId ?? "");
+  const updateContact = useUpdateContact();
+  const archiveContact = useArchiveContact();
+  const unarchiveContact = useUnarchiveContact();
+
+  const [bannerError, setBannerError] = useState<string | null>(null);
+  const [savingField, setSavingField] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<string, string>>>({});
+
+  function handleSave(name: string, value: string) {
+    if (!contact) return;
+    setSavingField(name);
+    setFieldErrors((prev) => ({ ...prev, [name]: undefined }));
+    updateContact.mutate(
+      { id: contact.id, patch: buildContactPatch(name, value) },
+      {
+        onSuccess: () => setSavingField(null),
+        onError: (err: unknown) => {
+          setSavingField(null);
+          const message = err instanceof Error ? err.message : String(err);
+          // Invalid email format is the one error the spec calls out to show
+          // inline, right under the emails field, rather than in the banner;
+          // everything else (including a 409 while editing emails) goes to
+          // the shared top banner.
+          if (name === "emails" && message !== "archived") {
+            setFieldErrors((prev) => ({ ...prev, emails: message }));
+          } else {
+            setBannerError(message === "archived" ? "This contact is archived. Unarchive it to make changes." : message);
+          }
+        },
+      },
+    );
+  }
+
+  function handleOwnerChange(userId: string | null) {
+    if (!contact) return;
+    updateContact.mutate(
+      { id: contact.id, patch: { ownerUserId: userId } },
+      {
+        onError: (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          setBannerError(message === "archived" ? "This contact is archived. Unarchive it to make changes." : message);
+        },
+      },
+    );
+  }
+
+  function handleArchive() {
+    if (!contact) return;
+    const label = `${contact.firstName} ${contact.lastName ?? ""}`.trim();
+    if (!window.confirm(`Archive ${label}?`)) return;
+    archiveContact.mutate(contact.id, {
+      onError: (err: unknown) => setBannerError(err instanceof Error ? err.message : String(err)),
+    });
+  }
+
+  function handleUnarchive() {
+    if (!contact) return;
+    unarchiveContact.mutate(contact.id, {
+      onError: (err: unknown) => setBannerError(err instanceof Error ? err.message : String(err)),
+    });
+  }
+
+  if (isLoading) return <p>Loading...</p>;
+
+  if (error) {
+    if (isNotFoundError(error)) {
+      return (
+        <div
+          data-testid="not-found"
+          className="max-w-sm rounded-lg border border-slate-200 bg-white p-8 text-center shadow-sm"
+        >
+          <h1 className="text-lg font-semibold text-slate-900">Contact not found</h1>
+          <Link to="/contacts" className="mt-4 inline-block text-sm font-medium text-slate-900 underline">
+            Back to contacts
+          </Link>
+        </div>
+      );
+    }
+    return (
+      <p role="alert" className="text-sm text-red-600">
+        Could not load contact: {error.message}
+      </p>
+    );
+  }
+
+  if (!contact) return null;
+
+  const fields: FieldCardField[] = [
+    { name: "firstName", label: "First name", value: contact.firstName, editable: true },
+    { name: "lastName", label: "Last name", value: contact.lastName, editable: true },
+    { name: "jobTitle", label: "Job title", value: contact.jobTitle, editable: true },
+    { name: "emails", label: "Emails", value: contact.emails.join(", "), editable: true },
+    { name: "phones", label: "Phones", value: contact.phones.join(", "), editable: true },
+  ];
+  const archived = contact.archivedAt !== null;
+  const fullName = `${contact.firstName} ${contact.lastName ?? ""}`.trim();
+
+  return (
+    <div className="flex gap-6">
+      <div className="min-w-0 flex-1">
+        {bannerError && (
+          <div
+            role="alert"
+            className="mb-4 flex items-center justify-between rounded-md border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700"
+          >
+            <span>{bannerError}</span>
+            <button
+              type="button"
+              onClick={() => setBannerError(null)}
+              className="ml-4 shrink-0 text-red-500 hover:text-red-700"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        <div className="mb-4 flex items-center justify-between">
+          <h1 className="text-xl font-semibold text-slate-900">{fullName}</h1>
+          {!archived && (
+            <Button variant="danger" onClick={handleArchive}>
+              Archive
+            </Button>
+          )}
+        </div>
+
+        <FieldCard
+          fields={fields}
+          onSave={handleSave}
+          archived={archived}
+          onUnarchive={handleUnarchive}
+          savingField={savingField}
+          errors={fieldErrors}
+        />
+
+        <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
+          <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Company</span>
+          <div data-testid="field-companyId" className="flex-1 text-sm text-slate-900">
+            {contact.companyId === null ? (
+              <span>{"\u2014"}</span>
+            ) : linkedCompany ? (
+              <Link
+                to="/companies/$companyId"
+                params={{ companyId: linkedCompany.id }}
+                className="text-slate-900 underline hover:text-slate-700"
+              >
+                {linkedCompany.name}
+              </Link>
+            ) : (
+              <span>{"\u2026"}</span>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
+          <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Owner</span>
+          <div data-testid="field-ownerUserId" className="max-w-xs flex-1">
+            <OwnerSelect value={contact.ownerUserId} onChange={handleOwnerChange} disabled={archived} />
+          </div>
+        </div>
+      </div>
+      <aside data-testid="rail-placeholder" className="w-72 shrink-0" />
+    </div>
+  );
+}

@@ -3,6 +3,10 @@ import { Link, Outlet, createRootRoute, createRoute, createRouter } from "@tanst
 import { App } from "./App";
 import { basePath } from "./api";
 import { Shell } from "./components/shell";
+import { CompaniesPage } from "./pages/companies";
+import { CompanyDetailPage } from "./pages/company-detail";
+import { ContactsPage } from "./pages/contacts";
+import { ContactDetailPage } from "./pages/contact-detail";
 
 // A short staleTime keeps list/detail views from refetching on every focus
 // change while still picking up another tab's edits within a few seconds; a
@@ -32,38 +36,38 @@ const indexRoute = createRoute({
   component: App,
 });
 
-// Placeholder page components: Task 9 (companies + contacts pages) replaces
-// these with the real list/detail views.
 const companiesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/companies",
-  component: () => <div data-testid="page-companies">Companies</div>,
+  component: CompaniesPage,
 });
 
 const companyDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/companies/$companyId",
-  component: () => <div data-testid="page-company-detail">Company</div>,
+  component: CompanyDetailPage,
 });
 
 const contactsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/contacts",
-  component: () => <div data-testid="page-contacts">Contacts</div>,
+  component: ContactsPage,
 });
 
 const contactDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/contacts/$contactId",
-  component: () => <div data-testid="page-contact-detail">Contact</div>,
+  component: ContactDetailPage,
 });
 
 // Rendered by the router itself (not a route) whenever the URL matches no
-// route in the tree -- a stale bookmark, a mistyped path, or (today) any deep
-// link outside "/", since Task 9 has not yet added real companies/contacts
-// detail routes for every id. It renders as the root route's Outlet content,
-// i.e. inside Shell, so the sidebar/header stay usable and the user is never
-// dropped on a bare, nav-less page.
+// route in the tree -- a stale bookmark or a mistyped path. It renders as the
+// root route's Outlet content, i.e. inside Shell, so the sidebar/header stay
+// usable and the user is never dropped on a bare, nav-less page. A company or
+// contact id that IS shaped like a route match but doesn't exist in the
+// database is a different case, handled inside CompanyDetailPage /
+// ContactDetailPage themselves (their query 404s, so they render their own
+// not-found card rather than falling through to this one).
 function NotFoundComponent() {
   return (
     <div className="flex min-h-[60vh] items-center justify-center">
