@@ -1,5 +1,8 @@
-import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, beforeAll, afterAll } from "vitest";
 import { eq } from "drizzle-orm";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { healthResponseSchema, meResponseSchema, errorResponseSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "./test/db.js";
 import { users } from "./db/schema.js";
@@ -232,6 +235,55 @@ describe("unknown API routes", () => {
     expect(response.statusCode).toBe(404);
     const body = errorResponseSchema.parse(response.json());
     expect(body.error).toBe("not_found");
+    await app.close();
+  });
+});
+
+describe("error handler installation order", () => {
+  let webRoot: string;
+
+  beforeAll(async () => {
+    // registerSpa (called when webRoot is set) does its own `await
+    // app.register(fastifyStatic, ...)` -- the same shape of call that made this
+    // ordering hazard reachable in the first place. index.html's content does not
+    // matter for this test; the SPA branch just needs to exist and be reachable.
+    webRoot = await mkdtemp(path.join(os.tmpdir(), "conduit-app-webroot-"));
+    await writeFile(path.join(webRoot, "index.html"), "<!doctype html><html><body></body></html>");
+  });
+
+  afterAll(async () => {
+    await rm(webRoot, { recursive: true, force: true });
+  });
+
+  // Regression for a real information-disclosure bug: with webRoot set (so
+  // registerSpa's awaited app.register() runs) and a database failure during the
+  // auth onRequest hook, the response used to be Fastify's own default error
+  // handler -- carrying the raw driver error, which for a real Postgres failure
+  // includes the parameterised SQL and its bound values -- rather than this app's
+  // sanitized { error: "internal_error" } body. Fixed by installing
+  // app.setErrorHandler before any app.register() call in buildApp (see the
+  // comment there). This test fails without that fix: moving setErrorHandler back
+  // below the register calls reproduces the leak and turns this red again.
+  it("returns the sanitized 5xx body, not raw driver text, when webRoot is set and identity resolution fails", async () => {
+    const secretDriverMessage = "connection refused: fake db down for a probe test";
+    const failingDb = {
+      insert: () => {
+        throw new Error(secretDriverMessage);
+      },
+    } as unknown as Database;
+
+    const app = await buildApp({ config, db: failingDb, webRoot });
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/me",
+      headers: authHeaders,
+    });
+
+    expect(response.statusCode).toBeGreaterThanOrEqual(500);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("internal_error");
+    expect(response.body).not.toContain(secretDriverMessage);
+    expect(response.body).not.toContain("connection refused");
     await app.close();
   });
 });

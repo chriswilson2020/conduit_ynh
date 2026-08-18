@@ -22,9 +22,14 @@ export interface BuildAppOptions {
   dataDir?: string;
   /** Directory holding the built SPA. When omitted, only the API is served. */
   webRoot?: string;
+  /** Test-only override for the multipart upload size cap. See registerCrmRoutes's
+   * CrmRouteDeps for why this exists; never set outside a test. */
+  multipartFileSizeLimit?: number;
 }
 
-export async function buildApp({ config, db, dataDir = "./data", webRoot }: BuildAppOptions): Promise<FastifyInstance> {
+export async function buildApp(
+  { config, db, dataDir = "./data", webRoot, multipartFileSizeLimit }: BuildAppOptions,
+): Promise<FastifyInstance> {
   const app = Fastify({
     logger: config.nodeEnv === "test" ? false : { level: "info" },
     // 1, not true: the app binds to loopback and is reachable through exactly one
@@ -34,6 +39,35 @@ export async function buildApp({ config, db, dataDir = "./data", webRoot }: Buil
     // X-Forwarded-For (e.g. via $proxy_add_x_forwarded_for) rather than overwriting
     // it -- letting a client forge the address anything downstream treats as req.ip.
     trustProxy: 1,
+  });
+
+  // Installed FIRST, before any app.register()/addHook()/route call below --
+  // deliberately, not just conventionally. Fastify's boot sequencer (avvio) runs
+  // an awaited `app.register(plugin)` eagerly, immediately, rather than queuing it
+  // behind everything else the way a bare (unawaited) register call or a plain
+  // route/hook registration is queued. Several things below this point do await a
+  // register call (registerCrmRoutes's multipart plugin, registerSpa's static
+  // plugin) -- if setErrorHandler were installed after those, on a request that
+  // fails BEFORE reaching a route handler (e.g. this file's onRequest auth hook
+  // throwing when the database is down), Fastify would fall back to its own
+  // default error handler instead of this one, because the eager register call
+  // had already moved the boot process past the point where a later
+  // setErrorHandler takes effect for requests that were already in flight -- and
+  // Fastify's default handler sends the thrown error's own .message verbatim,
+  // which for a driver error can be the failing SQL and its bound parameters.
+  // Installing it before any register call closes that hole for every
+  // registration below, present and future, in one place. (Caught in review by
+  // the combination of a database failure in the onRequest hook and webRoot set,
+  // which is what makes registerSpa's awaited register() reach this path -- see
+  // the regression test in app.test.ts.)
+  app.setErrorHandler((error: FastifyError, request, reply) => {
+    request.log.error({ err: error }, "unhandled error");
+    const statusCode = error.statusCode ?? 500;
+    return reply.code(statusCode).send(
+      statusCode < 500
+        ? { error: "request_error", message: error.message }
+        : { error: "internal_error" },
+    );
   });
 
   app.decorateRequest("user", null);
@@ -91,7 +125,7 @@ export async function buildApp({ config, db, dataDir = "./data", webRoot }: Buil
     return { user: request.user };
   });
 
-  await registerCrmRoutes(app, { db, dataDir });
+  await registerCrmRoutes(app, { db, dataDir, multipartFileSizeLimit });
 
   if (webRoot === undefined) {
     app.setNotFoundHandler(async (request, reply) => {
@@ -103,22 +137,6 @@ export async function buildApp({ config, db, dataDir = "./data", webRoot }: Buil
   } else {
     await registerSpa(app, { webRoot, basePath: config.basePath });
   }
-
-  // Catches anything thrown rather than explicitly replied to — e.g. a database
-  // failure during /api/me's own onRequest resolve, or any future route that
-  // doesn't wrap its own errors. Without this, Fastify's default handler sends the
-  // thrown error's own message to the client, which for a driver error can be
-  // connection details. 4xx errors (validation, etc.) keep their message, since
-  // those are meant to be shown; 5xx never echoes the underlying error text.
-  app.setErrorHandler((error: FastifyError, request, reply) => {
-    request.log.error({ err: error }, "unhandled error");
-    const statusCode = error.statusCode ?? 500;
-    return reply.code(statusCode).send(
-      statusCode < 500
-        ? { error: "request_error", message: error.message }
-        : { error: "internal_error" },
-    );
-  });
 
   return app;
 }

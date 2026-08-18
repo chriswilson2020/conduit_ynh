@@ -6,6 +6,10 @@ import { requireUser, mapDomainError, parseOrReject, idParamSchema } from "./hel
 import { saveBlob, openBlob } from "../services/blobs.js";
 import { attachFile, listFiles, getFile } from "../services/files.js";
 
+// company_id/contact_id are optional filters here, not the required XOR
+// notes.ts enforces on its list: unlike a note, "list files" has a sensible
+// unfiltered meaning (no filter applied), so an absent filter is a no-op, not a
+// client error.
 const listQuerySchema = z.object({
   company_id: z.uuid().optional(),
   contact_id: z.uuid().optional(),

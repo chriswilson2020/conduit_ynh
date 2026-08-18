@@ -2,12 +2,15 @@ import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { z } from "zod";
 import {
   companySchema, contactSchema, noteSchema, fileMetaSchema, eventSchema,
   errorResponseSchema, listResponseSchema, searchResultsSchema,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
-import { buildApp } from "../app.js";
+import { buildApp, type BuildAppOptions } from "../app.js";
+import { listFiles } from "../services/files.js";
+import { listEvents } from "../services/timeline.js";
 import type { Config } from "../config.js";
 
 const handle = openTestDatabase();
@@ -41,8 +44,8 @@ afterAll(async () => {
   await handle.close();
 });
 
-async function app() {
-  return buildApp({ config, db: handle.db, dataDir });
+async function app(overrides: Partial<Omit<BuildAppOptions, "config" | "db" | "dataDir">> = {}) {
+  return buildApp({ config, db: handle.db, dataDir, ...overrides });
 }
 
 describe("companies routes", () => {
@@ -222,6 +225,41 @@ describe("notes routes", () => {
     expect(body.error).toBe("validation");
     await a.close();
   });
+
+  // See notes.ts's listQuerySchema comment: unlike files/events, GET /api/notes
+  // requires exactly one of company_id/contact_id -- there is no "everything"
+  // notes list.
+  it("GET requires exactly one of company_id or contact_id", async () => {
+    const a = await app();
+    const company = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    const contact = await a.inject({
+      method: "POST", url: "/api/contacts", headers: authHeaders, payload: { firstName: "Ada" },
+    });
+    const companyId = company.json().id as string;
+    const contactId = contact.json().id as string;
+
+    const neither = await a.inject({ method: "GET", url: "/api/notes", headers: authHeaders });
+    expect(neither.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(neither.json()).error).toBe("validation");
+
+    const both = await a.inject({
+      method: "GET", url: `/api/notes?company_id=${companyId}&contact_id=${contactId}`, headers: authHeaders,
+    });
+    expect(both.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(both.json()).error).toBe("validation");
+
+    await a.inject({
+      method: "POST", url: "/api/notes", headers: authHeaders, payload: { body: "hi", companyId },
+    });
+    const one = await a.inject({
+      method: "GET", url: `/api/notes?company_id=${companyId}`, headers: authHeaders,
+    });
+    expect(one.statusCode).toBe(200);
+    expect(z.array(noteSchema).parse(one.json())).toHaveLength(1);
+    await a.close();
+  });
 });
 
 /** Hand-build a multipart/form-data body. Fields must precede the file part -- see
@@ -293,6 +331,81 @@ describe("files routes", () => {
     expect(response.statusCode).toBe(404);
     const body = errorResponseSchema.parse(response.json());
     expect(body.error).toBe("not_found");
+    await a.close();
+  });
+
+  // multipartFileSizeLimit is a test-only override (see BuildAppOptions/CrmRouteDeps)
+  // so this can exercise the 413/truncated path with a few KB instead of 50MB.
+  it("returns 413 without creating a file row or event when the upload exceeds the size limit", async () => {
+    const a = await app({ multipartFileSizeLimit: 16 });
+    const company = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    const companyId = company.json().id as string;
+
+    const { body, boundary } = buildMultipart(
+      { companyId },
+      { name: "big.txt", content: "x".repeat(4096), mime: "text/plain" },
+    );
+    const response = await a.inject({
+      method: "POST", url: "/api/files",
+      headers: { ...authHeaders, "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload: body,
+    });
+    expect(response.statusCode).toBe(413);
+    const parsed = errorResponseSchema.parse(response.json());
+    expect(parsed.error).toBe("too_large");
+
+    expect(await listFiles(handle.db, { companyId })).toHaveLength(0);
+    const events = await listEvents(handle.db, { companyId });
+    expect(events.items.some((e) => e.verb === "file_attached")).toBe(false);
+    await a.close();
+  });
+
+  // A hostile filename must not be able to inject a header or break out of the
+  // quoted-string in the download response's Content-Disposition, even though the
+  // originalName is stored (and echoed back from POST/GET) verbatim -- sanitizing
+  // only happens where it becomes a raw header value. Sent via RFC 5987's
+  // filename*=charset''percent-encoded-value form (real CR/LF/quote bytes would
+  // break the multipart header line itself; percent-encoding is how a client gets
+  // those characters into a filename in the first place).
+  it("sanitizes a hostile filename's CR/LF/quote in Content-Disposition while preserving it in storage", async () => {
+    const a = await app();
+    const company = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    const companyId = company.json().id as string;
+
+    const hostileFilename = 'evil\r\nX-Injected: 1".txt';
+    const boundary = "----conduitHostileBoundary1234567890";
+    const body =
+      `--${boundary}\r\nContent-Disposition: form-data; name="companyId"\r\n\r\n${companyId}\r\n` +
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename*=UTF-8''${encodeURIComponent(hostileFilename)}\r\n` +
+      `Content-Type: text/plain\r\n\r\npayload\r\n` +
+      `--${boundary}--\r\n`;
+
+    const upload = await a.inject({
+      method: "POST", url: "/api/files",
+      headers: { ...authHeaders, "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload: body,
+    });
+    expect(upload.statusCode).toBe(201);
+    const meta = fileMetaSchema.parse(upload.json());
+    expect(meta.originalName).toBe(hostileFilename);
+
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${meta.id}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    const disposition = download.headers["content-disposition"];
+    expect(typeof disposition).toBe("string");
+    // The header legitimately contains two structural double-quotes (the
+    // filename="..." delimiters), so the assertion checks the decoded value
+    // between them rather than banning `"` from the whole header. No CR/LF
+    // anywhere, and exactly those two structural quotes -- none embedded.
+    expect(disposition).not.toMatch(/[\r\n]/);
+    expect((disposition as string).match(/"/g)).toHaveLength(2);
+    expect(disposition).toBe(`attachment; filename="${hostileFilename.replace(/[\r\n"]/g, "")}"`);
     await a.close();
   });
 });

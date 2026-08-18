@@ -15,6 +15,9 @@ export interface CrmRouteDeps {
   db: Database;
   /** Directory holding uploaded file blobs (see services/blobs.ts). */
   dataDir: string;
+  /** Test-only override for the multipart file-size cap, so a 413-path test can
+   * upload a few KB instead of 50MB. Defaults to 50MB in production. */
+  multipartFileSizeLimit?: number;
 }
 
 /**
@@ -22,23 +25,14 @@ export interface CrmRouteDeps {
  * Registered after /api/health and /api/me and before the not-found/SPA branch,
  * so it inherits the same onRequest auth hook without having to repeat it.
  *
- * The multipart plugin is registered WITHOUT awaiting app.register()'s own
- * promise, deliberately. Awaiting it here would make avvio (Fastify's boot
- * sequencer) load that plugin eagerly, out of the normal queued order, ahead of
- * anything the caller (app.ts) still queues afterward -- e.g. its setErrorHandler
- * call, registered later, would end up appended after avvio already began (or
- * finished) a boot pass and stop being treated as the top-level handler,
- * silently falling back to Fastify's default error responses for routes that
- * never explicitly reply themselves (like the onRequest auth hook's own
- * failures). This function still returns a Promise (per its signature) for a
- * consistent call site in app.ts, but nothing inside it needs to be awaited:
- * Fastify guarantees every queued registration -- awaited or not -- finishes
- * before any route handler runs.
+ * Awaiting app.register() here is safe (and the orthodox way to do it) only
+ * because app.ts installs setErrorHandler before calling this function -- see
+ * the comment on that call in app.ts for why the ordering matters.
  */
 export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps): Promise<void> {
-  void app.register(multipart, {
+  await app.register(multipart, {
     limits: {
-      fileSize: 50 * 1024 * 1024,
+      fileSize: deps.multipartFileSizeLimit ?? 50 * 1024 * 1024,
       files: 1,
     },
   });

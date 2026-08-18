@@ -4,6 +4,8 @@ import type { CrmRouteDeps } from "./index.js";
 import { requireUser, parseOrReject, validateCursor } from "./helpers.js";
 import { listEvents } from "../services/timeline.js";
 
+// Same choice as files.ts: company_id/contact_id are optional filters, not the
+// required XOR notes.ts enforces -- an unfiltered timeline is a valid request.
 const listQuerySchema = z.object({
   company_id: z.uuid().optional(),
   contact_id: z.uuid().optional(),

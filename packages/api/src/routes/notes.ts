@@ -5,6 +5,10 @@ import type { CrmRouteDeps } from "./index.js";
 import { requireUser, mapDomainError, parseOrReject } from "./helpers.js";
 import { createNote, listNotes } from "../services/notes.js";
 
+// Unlike files.ts/events.ts (an unfiltered call there is a valid "everything"
+// list), notes has no such list: a note only exists attached to a company or
+// contact, so a request naming neither (or both) is a client error, not an
+// empty-filter no-op.
 const listQuerySchema = z
   .object({ company_id: z.uuid().optional(), contact_id: z.uuid().optional() })
   .refine((v) => (v.company_id !== undefined) !== (v.contact_id !== undefined), {
