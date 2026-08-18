@@ -60,5 +60,9 @@ export async function search(db: Database, q: string): Promise<SearchResults> {
     companies: companyRows,
     contacts: contactRows,
     notes: noteRows.map((n) => ({ id: n.id, companyId: n.companyId, contactId: n.contactId, snippet: snippet(n.body, q) })),
+    // Stubbed empty pending the deals table existing as a queryable service
+    // (Phase 2 plan Task 5 wires the real title-ILIKE query here). The shared
+    // schema already requires this group so the response shape is final now.
+    deals: [],
   };
 }

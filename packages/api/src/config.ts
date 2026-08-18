@@ -8,6 +8,9 @@ const envSchema = z.object({
   APP_VERSION: z.string().default("0.0.0-dev"),
   CONDUIT_DEV_USER: z.string().min(1).optional(),
   DATA_DIR: z.string().min(1).default("./data"),
+  DEFAULT_CURRENCY: z.string()
+    .regex(/^[A-Z]{3}$/, "DEFAULT_CURRENCY must be 3 uppercase letters")
+    .default("EUR"),
 });
 
 export interface Config {
@@ -20,6 +23,8 @@ export interface Config {
   /** Username to assume when no SSOwat header is present. Never set in production. */
   devUser: string | null;
   dataDir: string;
+  /** Applied by the deals service when a caller creates a deal without a currency. */
+  defaultCurrency: string;
 }
 
 export function parseConfig(env: Record<string, string | undefined>): Config {
@@ -52,5 +57,6 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     version: value.APP_VERSION,
     devUser: value.CONDUIT_DEV_USER ?? null,
     dataDir: value.DATA_DIR,
+    defaultCurrency: value.DEFAULT_CURRENCY,
   };
 }

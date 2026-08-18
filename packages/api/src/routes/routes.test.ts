@@ -23,6 +23,7 @@ const config: Config = {
   version: "0.1.0-test",
   devUser: null,
   dataDir: "./data",
+  defaultCurrency: "EUR",
 };
 
 const authHeaders = {
@@ -461,7 +462,7 @@ describe("search route", () => {
     const response = await a.inject({ method: "GET", url: "/api/search?q=%20%20", headers: authHeaders });
     expect(response.statusCode).toBe(200);
     const body = searchResultsSchema.parse(response.json());
-    expect(body).toEqual({ companies: [], contacts: [], notes: [] });
+    expect(body).toEqual({ companies: [], contacts: [], notes: [], deals: [] });
     await a.close();
   });
 });

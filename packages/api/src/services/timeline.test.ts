@@ -68,7 +68,10 @@ describe("timeline service", () => {
   // survive a real insert into events, exercising the DB CHECK itself -- while an
   // invented verb is rejected by that same CHECK.
   it("keeps eventVerbSchema and the events.verb DB CHECK in sync", async () => {
-    const verbs = ["created", "updated", "archived", "unarchived", "note_added", "file_attached"];
+    const verbs = [
+      "created", "updated", "archived", "unarchived", "note_added", "file_attached",
+      "stage_changed", "won", "lost", "reopened",
+    ];
     expect(verbs).toHaveLength(eventVerbSchema.options.length);
     for (const verb of verbs) expect(eventVerbSchema.parse(verb)).toBe(verb);
 

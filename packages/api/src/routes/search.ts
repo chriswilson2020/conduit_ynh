@@ -15,7 +15,7 @@ export function registerSearchRoutes(app: FastifyInstance, { db }: CrmRouteDeps)
     // touching the database, rather than running three ILIKE '%%' scans that would
     // match everything up to LIMIT_PER_TYPE.
     const q = query.q?.trim() ?? "";
-    if (q === "") return { companies: [], contacts: [], notes: [] };
+    if (q === "") return { companies: [], contacts: [], notes: [], deals: [] };
     return search(db, q);
   });
 }

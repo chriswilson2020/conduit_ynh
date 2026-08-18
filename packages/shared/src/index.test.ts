@@ -8,7 +8,18 @@ import {
   contactSchema,
   createNoteInputSchema,
   usersResponseSchema,
+  createPipelineInputSchema,
+  dealSchema,
+  createDealInputSchema,
+  moveDealInputSchema,
+  funnelRowSchema,
+  sseHintSchema,
+  eventVerbSchema,
+  searchResultsSchema,
 } from "./index.js";
+
+const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+const uuid2 = "8f14e45f-ceea-467e-adc3-b1cc985ff1c9";
 
 describe("userSchema", () => {
   it("accepts a complete user", () => {
@@ -174,5 +185,127 @@ describe("createNoteInputSchema", () => {
         companyId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
         contactId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
       }),
+    ).toThrow());
+});
+
+describe("createPipelineInputSchema", () => {
+  it("accepts a global pipeline with no companyId", () => {
+    const input = { name: "Sales", scope: "global" as const };
+    expect(createPipelineInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("accepts a company-scoped pipeline with a companyId", () => {
+    const input = { name: "Acme deals", scope: "company" as const, companyId: uuid1 };
+    expect(createPipelineInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects scope company with no companyId", () =>
+    expect(() =>
+      createPipelineInputSchema.parse({ name: "Acme deals", scope: "company" }),
+    ).toThrow());
+
+  it("rejects scope global with a companyId present", () =>
+    expect(() =>
+      createPipelineInputSchema.parse({ name: "Sales", scope: "global", companyId: uuid1 }),
+    ).toThrow());
+
+  it("rejects an unknown scope value", () =>
+    expect(() =>
+      createPipelineInputSchema.parse({ name: "Sales", scope: "project", companyId: uuid1 }),
+    ).toThrow());
+});
+
+describe("dealSchema currency", () => {
+  const base = {
+    id: uuid1, title: "Big deal", pipelineId: uuid1, stageId: uuid1, position: "a0",
+    valueCents: null, currency: "EUR", expectedCloseDate: null, status: "open" as const,
+    lostReason: null, closedAt: null, ownerUserId: null, companyId: null, contactId: null,
+    archivedAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+  it("accepts a 3 uppercase letter currency code", () =>
+    expect(dealSchema.parse(base)).toEqual(base));
+
+  it("rejects a lowercase currency code", () =>
+    expect(() => dealSchema.parse({ ...base, currency: "eur" })).toThrow());
+
+  it("rejects a currency code that is not 3 letters", () =>
+    expect(() => dealSchema.parse({ ...base, currency: "EURO" })).toThrow());
+
+  it("rejects a numeric currency code", () =>
+    expect(() => dealSchema.parse({ ...base, currency: "123" })).toThrow());
+});
+
+describe("createDealInputSchema currency", () => {
+  it("accepts an omitted currency, since the service applies the configured default", () => {
+    expect(() =>
+      createDealInputSchema.parse({ title: "Deal", pipelineId: uuid1, stageId: uuid1 }),
+    ).not.toThrow();
+  });
+
+  it("rejects a malformed currency when one is provided", () =>
+    expect(() =>
+      createDealInputSchema.parse({ title: "Deal", pipelineId: uuid1, stageId: uuid1, currency: "e" }),
+    ).toThrow());
+});
+
+describe("moveDealInputSchema", () => {
+  it("accepts a stageId with no neighbour ids, meaning drop at the top of an empty or leading spot", () => {
+    const input = { stageId: uuid1 };
+    expect(moveDealInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("accepts a stageId with both neighbour ids", () => {
+    const input = { stageId: uuid1, beforeDealId: uuid2, afterDealId: uuid2 };
+    expect(moveDealInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects a missing stageId", () =>
+    expect(() => moveDealInputSchema.parse({ beforeDealId: uuid2 })).toThrow());
+
+  it("rejects a non-uuid stageId", () =>
+    expect(() => moveDealInputSchema.parse({ stageId: "not-a-uuid" })).toThrow());
+});
+
+describe("funnelRowSchema", () => {
+  it("accepts a funnel row", () => {
+    const row = { stageId: uuid1, count: 3, valueCents: 150000 };
+    expect(funnelRowSchema.parse(row)).toEqual(row);
+  });
+
+  it("rejects a negative count", () =>
+    expect(() => funnelRowSchema.parse({ stageId: uuid1, count: -1, valueCents: 0 })).toThrow());
+});
+
+describe("sseHintSchema", () => {
+  it("accepts a hint carrying multiple query keys", () => {
+    const hint = { keys: [["deals", uuid1], ["funnel", uuid1], ["events"]] };
+    expect(sseHintSchema.parse(hint)).toEqual(hint);
+  });
+
+  it("accepts an empty keys array", () => {
+    expect(sseHintSchema.parse({ keys: [] })).toEqual({ keys: [] });
+  });
+});
+
+describe("eventVerbSchema", () => {
+  it("accepts the Phase 2 verbs", () => {
+    for (const verb of ["stage_changed", "won", "lost", "reopened"]) {
+      expect(eventVerbSchema.parse(verb)).toBe(verb);
+    }
+  });
+
+  it("rejects an unknown verb", () =>
+    expect(() => eventVerbSchema.parse("deleted")).toThrow());
+});
+
+describe("searchResultsSchema deals group", () => {
+  it("accepts a deals group of id/title pairs", () => {
+    const body = { companies: [], contacts: [], notes: [], deals: [{ id: uuid1, title: "Big deal" }] };
+    expect(searchResultsSchema.parse(body)).toEqual(body);
+  });
+
+  it("requires the deals group to be present", () =>
+    expect(() =>
+      searchResultsSchema.parse({ companies: [], contacts: [], notes: [] }),
     ).toThrow());
 });

@@ -19,6 +19,8 @@ const config: Config = {
   basePath: "/",
   version: "0.1.0-test",
   devUser: null,
+  dataDir: "./data",
+  defaultCurrency: "EUR",
 };
 
 const authHeaders = {

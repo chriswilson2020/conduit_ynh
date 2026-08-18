@@ -20,6 +20,8 @@ const baseConfig: Config = {
   basePath: "/",
   version: "0.1.0-test",
   devUser: "devuser",
+  dataDir: "./data",
+  defaultCurrency: "EUR",
 };
 
 // A Database pointed at an address nothing listens on, with a short connect

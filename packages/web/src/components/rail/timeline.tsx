@@ -17,6 +17,13 @@ const VERB_BADGE: Record<Event["verb"], string> = {
   unarchived: "R",
   note_added: "N",
   file_attached: "F",
+  // Phase 2 (pipelines/deals) verbs. The badges/summaries below are placeholders
+  // pending Task 7 (deal detail + rail), which is where these events start being
+  // emitted and where a dealId link/summary treatment gets designed properly.
+  stage_changed: "S",
+  won: "W",
+  lost: "L",
+  reopened: "O",
 };
 
 /**

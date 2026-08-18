@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export { midpoint } from "./fractional.js";
+
 export const userSchema = z.object({
   id: z.uuid(),
   username: z.string().min(1),
@@ -90,8 +92,14 @@ export const fileMetaSchema = z.object({
 });
 export type FileMeta = z.infer<typeof fileMetaSchema>;
 
+// Phase 2 (pipelines/deals) adds four more verbs. eventSchema itself stays as
+// it was in Phase 1 -- Task 1 only widens the DB CHECK and this enum, so
+// direct-write paths (migrations, future services) can start emitting the new
+// verbs immediately. eventSchema gains a nullable dealId once the routes that
+// actually read/write it exist (see the Phase 2 plan's later tasks).
 export const eventVerbSchema = z.enum([
   "created", "updated", "archived", "unarchived", "note_added", "file_attached",
+  "stage_changed", "won", "lost", "reopened",
 ]);
 export const eventSchema = z.object({
   id: z.uuid(), verb: eventVerbSchema, actorUserId: z.uuid(),
@@ -99,6 +107,103 @@ export const eventSchema = z.object({
   payload: z.record(z.string(), z.unknown()), createdAt: z.iso.datetime(),
 });
 export type Event = z.infer<typeof eventSchema>;
+
+// --- Pipelines, stages, deals (Phase 2) ---------------------------------
+
+export const pipelineScopeSchema = z.enum(["global", "company"]);
+export type PipelineScope = z.infer<typeof pipelineScopeSchema>;
+
+export const pipelineSchema = z.object({
+  id: z.uuid(), name: z.string().min(1),
+  scope: pipelineScopeSchema, companyId: z.uuid().nullable(),
+  position: z.string().min(1),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type Pipeline = z.infer<typeof pipelineSchema>;
+
+// company_id pairs with scope exactly as the pipelines_scope_company_paired DB
+// CHECK requires: present iff scope is "company", absent iff scope is "global".
+const scopeCompanyPaired = (v: { scope: PipelineScope; companyId?: string }) =>
+  (v.scope === "company") === (v.companyId !== undefined);
+
+export const createPipelineInputSchema = z
+  .object({ name: z.string().min(1), scope: pipelineScopeSchema, companyId: z.uuid().optional() })
+  .refine(scopeCompanyPaired, { message: "companyId is required exactly when scope is company" });
+export type CreatePipelineInput = z.infer<typeof createPipelineInputSchema>;
+
+// Scope and companyId are immutable after creation (the pipeline's owner never
+// changes), so only the name is patchable here.
+export const updatePipelineInputSchema = z.object({ name: z.string().min(1).optional() });
+export type UpdatePipelineInput = z.infer<typeof updatePipelineInputSchema>;
+
+export const stageSchema = z.object({
+  id: z.uuid(), pipelineId: z.uuid(), name: z.string().min(1), position: z.string().min(1),
+  probability: z.number().int().min(0).max(100).nullable(),
+  rotDays: z.number().int().positive().nullable(), ...timestamps,
+});
+export type Stage = z.infer<typeof stageSchema>;
+
+export const createStageInputSchema = z.object({
+  name: z.string().min(1),
+  probability: z.number().int().min(0).max(100).nullable().optional(),
+  rotDays: z.number().int().positive().nullable().optional(),
+});
+export type CreateStageInput = z.infer<typeof createStageInputSchema>;
+export const updateStageInputSchema = createStageInputSchema.partial();
+export type UpdateStageInput = z.infer<typeof updateStageInputSchema>;
+
+export const dealStatusSchema = z.enum(["open", "won", "lost"]);
+export type DealStatus = z.infer<typeof dealStatusSchema>;
+
+const currencyCodeSchema = z.string().regex(/^[A-Z]{3}$/, "currency must be 3 uppercase letters");
+
+export const dealSchema = z.object({
+  id: z.uuid(), title: z.string().min(1),
+  pipelineId: z.uuid(), stageId: z.uuid(), position: z.string().min(1),
+  valueCents: z.number().int().nullable(),
+  currency: currencyCodeSchema,
+  expectedCloseDate: z.iso.date().nullable(),
+  status: dealStatusSchema,
+  lostReason: nullableString,
+  closedAt: z.iso.datetime().nullable(),
+  ownerUserId: z.uuid().nullable(),
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type Deal = z.infer<typeof dealSchema>;
+
+export const createDealInputSchema = z.object({
+  title: z.string().min(1),
+  pipelineId: z.uuid(), stageId: z.uuid(),
+  valueCents: z.number().int().nullable().optional(),
+  currency: currencyCodeSchema.optional(),
+  expectedCloseDate: z.iso.date().nullable().optional(),
+  ownerUserId: z.uuid().nullable().optional(),
+  companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
+});
+export type CreateDealInput = z.infer<typeof createDealInputSchema>;
+
+// pipelineId/stageId are excluded: a deal's pipeline never changes and its
+// stage only ever changes through moveDealInputSchema below (moveDeal derives
+// the new position from neighbour ids, which a generic field patch cannot do).
+export const updateDealInputSchema = createDealInputSchema
+  .omit({ pipelineId: true, stageId: true }).partial();
+export type UpdateDealInput = z.infer<typeof updateDealInputSchema>;
+
+export const moveDealInputSchema = z.object({
+  stageId: z.uuid(),
+  beforeDealId: z.uuid().optional(),
+  afterDealId: z.uuid().optional(),
+});
+export type MoveDealInput = z.infer<typeof moveDealInputSchema>;
+
+export const funnelRowSchema = z.object({
+  stageId: z.uuid(), count: z.number().int().nonnegative(), valueCents: z.number().int().nonnegative(),
+});
+export type FunnelRow = z.infer<typeof funnelRowSchema>;
+
+export const sseHintSchema = z.object({ keys: z.array(z.array(z.string())) });
+export type SseHint = z.infer<typeof sseHintSchema>;
 
 export function listResponseSchema<T extends z.ZodType>(item: T) {
   return z.object({ items: z.array(item), nextCursor: z.string().nullable() });
@@ -125,5 +230,6 @@ export const searchResultsSchema = z.object({
     id: z.uuid(), companyId: z.uuid().nullable(), contactId: z.uuid().nullable(),
     snippet: z.string(),
   })),
+  deals: z.array(z.object({ id: z.uuid(), title: z.string() })),
 });
 export type SearchResults = z.infer<typeof searchResultsSchema>;

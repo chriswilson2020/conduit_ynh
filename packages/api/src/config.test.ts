@@ -63,4 +63,20 @@ describe("parseConfig", () => {
       "/var/lib/conduit/data",
     );
   });
+
+  it("defaults DEFAULT_CURRENCY to EUR when unset", () => {
+    expect(parseConfig(valid).defaultCurrency).toBe("EUR");
+  });
+
+  it("carries through an explicit DEFAULT_CURRENCY", () => {
+    expect(parseConfig({ ...valid, DEFAULT_CURRENCY: "USD" }).defaultCurrency).toBe("USD");
+  });
+
+  it("rejects a lowercase DEFAULT_CURRENCY", () => {
+    expect(() => parseConfig({ ...valid, DEFAULT_CURRENCY: "usd" })).toThrow(/DEFAULT_CURRENCY/);
+  });
+
+  it("rejects a DEFAULT_CURRENCY that is not 3 letters", () => {
+    expect(() => parseConfig({ ...valid, DEFAULT_CURRENCY: "EURO" })).toThrow(/DEFAULT_CURRENCY/);
+  });
 });
