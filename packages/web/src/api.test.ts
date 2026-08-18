@@ -1,5 +1,5 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { basePath, apiUrl } from "./api";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { basePath, apiUrl, fetchHealth } from "./api";
 
 // vitest.config.ts runs this suite under environment: "node", so there is no
 // global `window`. api.ts only reads `window.__CONDUIT_BASE__` inside function
@@ -47,5 +47,50 @@ describe("apiUrl", () => {
   it("prefixes with the base path plus /api at a subpath install", () => {
     setBase("/conduit");
     expect(apiUrl("/me")).toBe("/conduit/api/me");
+  });
+});
+
+// GET /api/health returns 200 with { status: "ok", database: "connected" } when
+// healthy, or 503 with { status: "degraded", database: "disconnected" } when the
+// database is down. Both are complete, parseable answers to "what is the health
+// status" -- fetchHealth must resolve with the body in both cases, not just 200,
+// or the App component loses the informative "disconnected" detail in favour of
+// a generic "unavailable" whenever the health check itself is what is failing.
+describe("fetchHealth", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function stubFetch(response: { ok: boolean; status: number; body: unknown }) {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: response.ok,
+      status: response.status,
+      json: () => Promise.resolve(response.body),
+    }) as unknown as typeof fetch;
+  }
+
+  it("resolves with the body when the API reports healthy (200)", async () => {
+    setBase(undefined);
+    const body = { status: "ok", version: "0.1.0", database: "connected" };
+    stubFetch({ ok: true, status: 200, body });
+
+    await expect(fetchHealth()).resolves.toEqual(body);
+  });
+
+  it("resolves with the degraded body when the API reports degraded (503), rather than throwing", async () => {
+    setBase(undefined);
+    const body = { status: "degraded", version: "0.1.0", database: "disconnected" };
+    stubFetch({ ok: false, status: 503, body });
+
+    await expect(fetchHealth()).resolves.toEqual(body);
+  });
+
+  it("rejects on a genuinely unexpected status", async () => {
+    setBase(undefined);
+    stubFetch({ ok: false, status: 500, body: {} });
+
+    await expect(fetchHealth()).rejects.toThrow("GET /health failed with 500");
   });
 });

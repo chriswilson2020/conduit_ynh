@@ -27,4 +27,21 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 export const fetchMe = () => getJson<MeResponse>("/me");
-export const fetchHealth = () => getJson<HealthResponse>("/health");
+
+/**
+ * GET /api/health. Unlike other endpoints, a 503 here is not a failure to
+ * report on health, it IS the health report: the API returns 200 with
+ * `{ status: "ok", database: "connected" }` or 503 with
+ * `{ status: "degraded", database: "disconnected" }`, and both are valid,
+ * parseable HealthResponse bodies. Treating 503 as a thrown error would
+ * discard "database: disconnected" (informative) in favour of a generic
+ * "unavailable" (uninformative), so both statuses are parsed here. Only a
+ * genuinely unexpected status or a network failure should reject.
+ */
+export async function fetchHealth(): Promise<HealthResponse> {
+  const response = await fetch(apiUrl("/health"), { headers: { Accept: "application/json" } });
+  if (!response.ok && response.status !== 503) {
+    throw new Error(`GET /health failed with ${response.status}`);
+  }
+  return (await response.json()) as HealthResponse;
+}
