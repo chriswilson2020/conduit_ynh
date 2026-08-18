@@ -1,0 +1,94 @@
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { openTestDatabase } from "./test/db.js";
+import { buildApp } from "./app.js";
+import type { Config } from "./config.js";
+
+const handle = openTestDatabase();
+let webRoot: string;
+
+const baseConfig: Config = {
+  nodeEnv: "test",
+  port: 0,
+  databaseUrl: "unused-in-tests",
+  basePath: "/",
+  version: "0.1.0-test",
+  devUser: "devuser",
+};
+
+beforeAll(async () => {
+  webRoot = await mkdtemp(path.join(tmpdir(), "conduit-web-"));
+  await writeFile(
+    path.join(webRoot, "index.html"),
+    '<!doctype html><html><head><script>window.__CONDUIT_BASE__="__BASE_PATH__";</script></head><body><div id="root"></div></body></html>',
+  );
+  await mkdir(path.join(webRoot, "assets"));
+  await writeFile(path.join(webRoot, "assets", "app.js"), "console.log('bundle');");
+});
+
+afterAll(async () => {
+  await rm(webRoot, { recursive: true, force: true });
+  await handle.close();
+});
+
+describe("SPA serving", () => {
+  it("serves index.html at the root with the base path substituted", async () => {
+    const app = await buildApp({
+      config: { ...baseConfig, basePath: "/conduit" },
+      db: handle.db,
+      webRoot,
+    });
+    const response = await app.inject({ method: "GET", url: "/" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/html");
+    expect(response.body).toContain('window.__CONDUIT_BASE__="/conduit"');
+    expect(response.body).not.toContain("__BASE_PATH__");
+    await app.close();
+  });
+
+  it("substitutes / when mounted at the domain root", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/" });
+
+    expect(response.body).toContain('window.__CONDUIT_BASE__="/"');
+    await app.close();
+  });
+
+  it("serves index.html for an unknown client route so deep links work", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/deals/123" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/html");
+    await app.close();
+  });
+
+  it("serves static assets untouched", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/assets/app.js" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("console.log");
+    await app.close();
+  });
+
+  it("still returns JSON 404 for unknown API routes", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/api/nope" });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ error: "not_found" });
+    await app.close();
+  });
+
+  it("returns JSON 404 for unknown routes when no webRoot is configured", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db });
+    const response = await app.inject({ method: "GET", url: "/deals/123" });
+
+    expect(response.statusCode).toBe(404);
+    await app.close();
+  });
+});

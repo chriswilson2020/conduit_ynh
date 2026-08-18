@@ -5,6 +5,7 @@ import type { Config } from "./config.js";
 import type { Database } from "./db/client.js";
 import { identityFromHeaders } from "./auth.js";
 import { createUserResolver } from "./users.js";
+import { registerSpa } from "./spa.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -15,9 +16,11 @@ declare module "fastify" {
 export interface BuildAppOptions {
   config: Config;
   db: Database;
+  /** Directory holding the built SPA. When omitted, only the API is served. */
+  webRoot?: string;
 }
 
-export async function buildApp({ config, db }: BuildAppOptions): Promise<FastifyInstance> {
+export async function buildApp({ config, db, webRoot }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     logger: config.nodeEnv === "test" ? false : { level: "info" },
     // 1, not true: the app binds to loopback and is reachable through exactly one
@@ -81,12 +84,16 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
     return { user: request.user };
   });
 
-  app.setNotFoundHandler(async (request, reply) => {
-    return reply.code(404).send({
-      error: "not_found",
-      message: `No route for ${request.method} ${request.url}`,
+  if (webRoot === undefined) {
+    app.setNotFoundHandler(async (request, reply) => {
+      return reply.code(404).send({
+        error: "not_found",
+        message: `No route for ${request.method} ${request.url}`,
+      });
     });
-  });
+  } else {
+    await registerSpa(app, { webRoot, basePath: config.basePath });
+  }
 
   // Catches anything thrown rather than explicitly replied to — e.g. a database
   // failure during /api/me's own onRequest resolve, or any future route that
