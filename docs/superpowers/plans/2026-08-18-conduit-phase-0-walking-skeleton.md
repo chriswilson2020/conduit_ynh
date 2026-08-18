@@ -1462,7 +1462,18 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
   // Without it every request would write a row — see createUserResolver.
   const users = createUserResolver(db);
 
+  // Routes that must work without identity resolution. /api/health has to stay
+  // answerable when the database is down, and resolving a user writes to it —
+  // which would throw here, before the route's own error handling could report
+  // degraded.
+  const UNAUTHENTICATED_ROUTES = new Set(["/api/health"]);
+
   app.addHook("onRequest", async (request) => {
+    // routeOptions.url is the matched route's registered pattern, populated because
+    // onRequest runs after routing. It is undefined for a request that matched no
+    // route; those still resolve identity, which is harmless since the 404 handler
+    // never reads request.user.
+    if (UNAUTHENTICATED_ROUTES.has(request.routeOptions.url ?? "")) return;
     const identity = identityFromHeaders(request.headers, config.devUser);
     request.user = identity === null ? null : await users.resolve(identity);
   });
@@ -1503,9 +1514,36 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
     });
   });
 
+  // Without this, an unhandled error returns Fastify's default body, which echoes
+  // the raw message — including driver text such as connection strings.
+  app.setErrorHandler((error: FastifyError, request, reply) => {
+    request.log.error({ err: error }, "unhandled error");
+    const statusCode = error.statusCode ?? 500;
+    return reply.code(statusCode).send(
+      statusCode < 500
+        ? { error: "request_error", message: error.message }
+        : { error: "internal_error" },
+    );
+  });
+
   return app;
 }
 ```
+
+`FastifyError` must be imported and the parameter annotated explicitly — Fastify 5's
+`setErrorHandler` defaults its error type to `unknown`, which fails `tsc -b`.
+
+**Skipping identity resolution for `/api/health` is load-bearing, not tidiness.** The `onRequest`
+hook runs before every route, and resolving a user performs a database write on a cache miss. With
+the database down and identity headers present — the normal case in production, since SSOwat attaches
+them to every logged-in request — that write throws inside the hook, before the health route's own
+try/catch can report degraded. The endpoint then returns Fastify's default 500 with the driver
+message, which is exactly what the degraded-health handling exists to prevent.
+
+Test that specific path: `/api/health` **with** auth headers while both the query and insert paths
+throw. A test that omits the headers passes while the bug is live. And assert error responses with
+`errorResponseSchema.parse()` rather than `toMatchObject` — validating happy paths but only loosely
+asserting error paths is what let this through the first time.
 
 The SPA fallback deliberately is not here yet — Task 10 replaces this not-found handler once there are assets to serve.
 
