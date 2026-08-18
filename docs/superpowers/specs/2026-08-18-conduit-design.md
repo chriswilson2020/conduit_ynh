@@ -76,24 +76,48 @@ reason for choosing a single-language stack, so the boundary must be real from d
 
 ### Authentication
 
-SSOwat authenticates in front of the app and injects the username as a request header
-(`auth_header = true` on the permissions resource). The app:
+SSOwat authenticates in front of the app. YunoHost's nginx `proxy_params_with_auth` include
+injects the authenticated identity on every proxied request:
 
-1. Trusts that header **only** when the connection is from loopback — Fastify's `trustProxy` set to
-   loopback only. Getting this wrong makes the app trivially impersonatable, so it needs a test that
-   asserts a spoofed header from a non-loopback address is rejected.
-2. Looks up or creates a `users` row from the LDAP username on first login.
-3. Issues its own signed session cookie so the SPA and API don't re-parse headers per request.
+| Header | Contents |
+|---|---|
+| `Ynh-User` | LDAP username |
+| `Ynh-User-Email` | Primary email address |
+| `Ynh-User-Fullname` | Display name |
 
-The exact header name must be confirmed against the live server in Phase 0 rather than assumed.
-A dev-only local login path (enabled by an env flag, hard-failing in production) lets the app run
-off-YunoHost during development.
+(`REMOTE_USER` and `X-Forwarded-User` carry the same username as aliases.) SSOwat overwrites these
+headers before proxying, so a client cannot set them itself.
+
+Because every request already arrives authenticated, **the app issues no session cookie of its own**.
+It reads `Ynh-User` per request and resolves it to a `users` row, creating the row on first sight
+from the email and fullname headers. A small in-memory cache keeps that to one query per user per
+process lifetime. This removes cookie signing, session storage, expiry, and logout from the app
+entirely.
+
+The security boundary is that **the app binds to `127.0.0.1` only**, so nothing can reach it without
+passing through nginx and SSOwat. This is the standard YunoHost trust model, and it is worth stating
+its limit plainly: another process already running on the same host could connect to the loopback
+port and set `Ynh-User` freely. Defending against that would require a shared secret that other
+local users could read from the world-readable nginx conf anyway, so it buys nothing real. If the
+app ever needs to defend against hostile local processes, that is a change of threat model, not a
+tweak.
+
+A dev-only fake-user env var (`CONDUIT_DEV_USER`) stands in for the header when running off-YunoHost.
+It hard-fails at boot when `NODE_ENV=production`.
 
 ### Subpath support
 
-YunoHost installs at either `domain.tld` or `domain.tld/conduit`. The SPA base path and API prefix
-are templated from `$path` at install time. This must work from Phase 0 — retrofitting base-path
-handling into a finished SPA is painful and touches every route, asset URL, and fetch call.
+YunoHost installs at either `domain.tld` or `domain.tld/conduit`. nginx's `proxy_pass` strips the
+prefix, so the API never sees it and needs no route prefix — but the browser does, so SPA asset URLs
+and the client router both do.
+
+Rather than rebuild the SPA per install path, the SPA is built once with Vite `base: './'` (assets
+resolve relative to `index.html`, valid at any depth) and the server rewrites a `__BASE_PATH__`
+placeholder in `index.html` as it serves it. The router reads the injected value as its basename.
+One build works at any path, and there is no Vite build on the server.
+
+This must work from Phase 0 — retrofitting base-path handling into a finished SPA is painful and
+touches every route, asset URL, and fetch call.
 
 ---
 
@@ -204,10 +228,14 @@ The deliverable is a YunoHost app that does almost nothing, correctly.
 Phase 4 sends mail), `install_dir`, `data_dir`, `ports`, `nodejs` (version 24), `database`
 (`type = "postgresql"`), and `permissions` with `main.url = "/"` and `auth_header = true`.
 
-Releases ship **prebuilt** artifacts — the server does not run `npm install` or a Vite build.
-`resources.sources` points at a GitHub release tarball containing compiled API JS, built SPA assets,
-and pruned production `node_modules`. Building on a 4GB VPS during `yunohost app upgrade` is slow
-and can OOM alongside other apps.
+Releases ship **prebuilt** artifacts: `resources.sources` points at a GitHub release tarball holding
+compiled API JavaScript, built SPA assets, and a `package.json`/`package-lock.json` pair covering
+runtime dependencies only. No TypeScript compile and no Vite build happen on the server — those are
+the slow, memory-hungry steps that can OOM a VPS mid-upgrade.
+
+The install script does run `npm ci --omit=dev` to fetch runtime dependencies. Shipping
+`node_modules` inside the tarball instead would be more hermetic, but it bloats the release and
+fights npm's workspace hoisting for little gain at this scale.
 
 **Scripts** — `install`, `remove`, `upgrade`, `backup`, `restore`, `_common.sh`. `backup` must cover
 the install dir, the data dir, the Postgres dump, the systemd unit, and the nginx conf. `restore`
@@ -256,12 +284,14 @@ rather than assume it.
 
 ## Open items to resolve during Phase 0
 
-- Confirm the exact SSOwat header name and format on the live server; the design assumes a username
-  header but does not depend on which one.
-- Confirm PostgreSQL is available as a `resources.database` type on Chris's YunoHost version, and
-  fall back to installing `postgresql` via `resources.apt` plus manual provisioning if not.
 - Decide whether releases are built by GitHub Actions or locally; CI is preferable but requires the
   repo to be pushed to a forge.
+- Confirm on the live server that `Ynh-User` arrives populated for the chosen permission group.
+  The header set is confirmed from YunoHost's nginx conf, but only a real login proves the wiring.
+
+Resolved during planning: the SSOwat header names (see Authentication above), and that PostgreSQL is
+available via `[resources.apt] packages = "postgresql"` plus `[resources.database] type =
+"postgresql"`, which is the pattern real Node apps such as `hedgedoc_ynh` use.
 
 ---
 
