@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyError, type FastifyInstance } from "fastify";
 import { sql } from "drizzle-orm";
 import type { User } from "@conduit/shared";
 import type { Config } from "./config.js";
@@ -35,7 +35,19 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
   // Without it every request would write a row — see createUserResolver.
   const users = createUserResolver(db);
 
+  // Routes that must work without identity resolution. /api/health has to stay
+  // answerable when the database is down, and resolving a user writes to it on a
+  // cache miss (see createUserResolver) — that write would throw here, inside the
+  // hook, before the route's own try/catch around its read-only probe ever runs.
+  const UNAUTHENTICATED_ROUTES = new Set(["/api/health"]);
+
   app.addHook("onRequest", async (request) => {
+    // routeOptions.url is the matched route's registered pattern (e.g. "/api/health"),
+    // populated because onRequest runs after routing — not request.url, which is the
+    // raw path. It is undefined for a request that matched no route, so those still
+    // resolve identity here same as before; harmless, since the 404 handler never
+    // reads request.user.
+    if (UNAUTHENTICATED_ROUTES.has(request.routeOptions.url ?? "")) return;
     const identity = identityFromHeaders(request.headers, config.devUser);
     request.user = identity === null ? null : await users.resolve(identity);
   });
@@ -74,6 +86,22 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
       error: "not_found",
       message: `No route for ${request.method} ${request.url}`,
     });
+  });
+
+  // Catches anything thrown rather than explicitly replied to — e.g. a database
+  // failure during /api/me's own onRequest resolve, or any future route that
+  // doesn't wrap its own errors. Without this, Fastify's default handler sends the
+  // thrown error's own message to the client, which for a driver error can be
+  // connection details. 4xx errors (validation, etc.) keep their message, since
+  // those are meant to be shown; 5xx never echoes the underlying error text.
+  app.setErrorHandler((error: FastifyError, request, reply) => {
+    request.log.error({ err: error }, "unhandled error");
+    const statusCode = error.statusCode ?? 500;
+    return reply.code(statusCode).send(
+      statusCode < 500
+        ? { error: "request_error", message: error.message }
+        : { error: "internal_error" },
+    );
   });
 
   return app;

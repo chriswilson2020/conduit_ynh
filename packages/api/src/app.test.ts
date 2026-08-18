@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import { eq } from "drizzle-orm";
-import { healthResponseSchema, meResponseSchema } from "@conduit/shared";
+import { healthResponseSchema, meResponseSchema, errorResponseSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "./test/db.js";
 import { users } from "./db/schema.js";
 import { buildApp } from "./app.js";
@@ -69,6 +69,42 @@ describe("GET /api/health", () => {
     expect(response.body).not.toContain("connection refused");
     await app.close();
   });
+
+  // Regression: the onRequest hook used to resolve identity for every route,
+  // including /api/health. With auth headers present, that resolution performs an
+  // upsert on a cache miss (see createUserResolver) -- and when the database is
+  // down, that write throws *inside the hook*, before this route's own try/catch
+  // ever runs, producing Fastify's default 500 with the raw driver message. The
+  // previous "degraded" test above sent no auth headers, so identityFromHeaders
+  // returned null and resolve() was never reached -- it could not have caught this.
+  // This test sends auth headers and makes both the health probe and the insert
+  // path fail, matching the request SSOwat actually sends for a logged-in user.
+  it("reports degraded rather than 500 when authenticated and the database is down", async () => {
+    const secretDriverMessage = "connection refused: fake db down for a probe test";
+    const failingDb = {
+      execute: async () => {
+        throw new Error(secretDriverMessage);
+      },
+      insert: () => {
+        throw new Error(secretDriverMessage);
+      },
+    } as unknown as Database;
+
+    const app = await buildApp({ config, db: failingDb });
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/health",
+      headers: authHeaders,
+    });
+
+    expect(response.statusCode).toBe(503);
+    const body = healthResponseSchema.parse(response.json());
+    expect(body.status).toBe("degraded");
+    expect(body.database).toBe("disconnected");
+    expect(response.body).not.toContain(secretDriverMessage);
+    expect(response.body).not.toContain("connection refused");
+    await app.close();
+  });
 });
 
 describe("GET /api/me", () => {
@@ -92,7 +128,36 @@ describe("GET /api/me", () => {
     const response = await app.inject({ method: "GET", url: "/api/me" });
 
     expect(response.statusCode).toBe(401);
-    expect(response.json()).toMatchObject({ error: "unauthenticated" });
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("unauthenticated");
+    await app.close();
+  });
+
+  // The onRequest hook resolves identity for /api/me (unlike /api/health), so a
+  // database failure there surfaces as a thrown error inside the hook rather than
+  // through the route's own logic. That error must reach setErrorHandler and come
+  // back as the app's own error shape -- never the driver's raw message, which for
+  // a real connection failure could include connection details.
+  it("returns a 5xx without leaking driver text when resolving the user fails", async () => {
+    const secretDriverMessage = "connection refused: fake db down for a probe test";
+    const failingDb = {
+      insert: () => {
+        throw new Error(secretDriverMessage);
+      },
+    } as unknown as Database;
+
+    const app = await buildApp({ config, db: failingDb });
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/me",
+      headers: authHeaders,
+    });
+
+    expect(response.statusCode).toBeGreaterThanOrEqual(500);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("internal_error");
+    expect(response.body).not.toContain(secretDriverMessage);
+    expect(response.body).not.toContain("connection refused");
     await app.close();
   });
 
@@ -153,7 +218,8 @@ describe("GET /api/me", () => {
     });
 
     expect(response.statusCode).toBe(401);
-    expect(response.json()).toMatchObject({ error: "unauthenticated" });
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("unauthenticated");
     await app.close();
   });
 });
@@ -164,7 +230,8 @@ describe("unknown API routes", () => {
     const response = await app.inject({ method: "GET", url: "/api/does-not-exist" });
 
     expect(response.statusCode).toBe(404);
-    expect(response.json()).toMatchObject({ error: "not_found" });
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("not_found");
     await app.close();
   });
 });
