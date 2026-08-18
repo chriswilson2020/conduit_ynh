@@ -1,4 +1,4 @@
-import { and, desc, eq, isNull, isNotNull } from "drizzle-orm";
+import { and, desc, eq, isNull, isNotNull, sql } from "drizzle-orm";
 import { midpoint } from "@conduit/shared";
 import type {
   Pipeline, PipelineScope, PipelineWithStages, CreatePipelineInput, UpdatePipelineInput,
@@ -52,6 +52,24 @@ async function mustGetStage(db: Database, id: string): Promise<StageRow> {
   return row;
 }
 
+// Serialises sibling-position writes: under READ COMMITTED, two concurrent
+// inserts/moves into the same sibling group would otherwise both read the
+// same tail (or neighbour) positions and compute identical midpoint()
+// results, leaving `ORDER BY position` to tie-break nondeterministically.
+// A partial unique index can't fix this either -- global pipelines share a
+// NULL company_id, which Postgres treats as distinct in every unique index,
+// so it would never catch a collision there. pg_advisory_xact_lock is
+// transaction-scoped (auto-released at commit/rollback) and keyed on the
+// sibling group, so unrelated groups (a different pipeline's stages, a
+// different company's pipelines) never contend with each other.
+// hashtextextended folds the group-key string into the bigint key the
+// advisory-lock functions require. Call this first, before any read whose
+// result feeds into the position this transaction computes -- Task 3's
+// moveDeal (a pipeline's deals-within-a-stage) reuses the same pattern.
+async function lockSiblingGroup(tx: Database, groupKey: string): Promise<void> {
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${groupKey}, 0))`);
+}
+
 // Structural comparison, copied from contacts.ts's fieldChanged: arrays/objects
 // compare by order-sensitive JSON value, scalars by !==. Neither pipeline nor
 // stage patches currently carry an array/object field (name / probability /
@@ -91,6 +109,8 @@ export async function createPipeline(db: Database, actorId: string, input: Creat
     // Siblings = same scope + same company (global pipelines never compete
     // for position with company-scoped ones, and two different companies'
     // pipelines never compete with each other).
+    await lockSiblingGroup(tx, `pipelines:${input.scope}:${companyId ?? "global"}`);
+
     const [lastSibling] = await tx.select({ position: pipelines.position }).from(pipelines)
       .where(and(eq(pipelines.scope, input.scope), companyId === null ? isNull(pipelines.companyId) : eq(pipelines.companyId, companyId)))
       .orderBy(desc(pipelines.position)).limit(1);
@@ -188,6 +208,8 @@ export async function createStage(db: Database, actorId: string, pipelineId: str
   if (pipeline.archivedAt !== null) throw new ArchivedError("pipeline", pipelineId);
 
   return db.transaction(async (tx) => {
+    await lockSiblingGroup(tx, `stages:${pipelineId}`);
+
     const [lastSibling] = await tx.select({ position: stages.position }).from(stages)
       .where(eq(stages.pipelineId, pipelineId)).orderBy(desc(stages.position)).limit(1);
     const position = midpoint(lastSibling?.position ?? null, null);
@@ -202,15 +224,22 @@ export async function createStage(db: Database, actorId: string, pipelineId: str
     // See maybeEmitPipelineEvent's comment: same company-only rule, but stages
     // have no row of their own on any timeline (events has no stage_id column),
     // so this always records against the pipeline's company, folded into the
-    // generic "updated" verb with the stage id carried in the payload rather
-    // than a dedicated stage_* verb.
-    await maybeEmitPipelineEvent(tx, actorId, pipeline, "updated", { changed: ["stage_added"], stageId: row.id });
+    // generic "updated" verb with the stage id (and name, for a nicer future
+    // timeline summary) carried in the payload rather than a dedicated
+    // stage_* verb. "stages" (not "stage_added") in `changed` reads as
+    // "updated stages" in a plain changed-fields rendering.
+    await maybeEmitPipelineEvent(tx, actorId, pipeline, "updated", { changed: ["stages"], stageId: row.id, stageName: row.name });
     return toStage(row);
   });
 }
 
 export async function updateStage(db: Database, actorId: string, id: string, patch: UpdateStageInput): Promise<Stage> {
   const existing = await mustGetStage(db, id);
+  // Resolved up front, not just for the event: an archived pipeline must
+  // reject stage edits the same way createStage does (same relaxed,
+  // read-then-check race as createStage's comment -- accepted at this scale).
+  const pipeline = await mustGetPipeline(db, existing.pipelineId);
+  if (pipeline.archivedAt !== null) throw new ArchivedError("pipeline", pipeline.id);
 
   const changed = (Object.keys(patch) as (keyof UpdateStageInput)[])
     .filter((k) => patch[k] !== undefined && fieldChanged(patch[k], existing[k]));
@@ -220,17 +249,17 @@ export async function updateStage(db: Database, actorId: string, id: string, pat
     const [row] = await tx.update(stages).set({ ...patch, updatedAt: new Date() })
       .where(eq(stages.id, id)).returning();
     if (row === undefined) throw new NotFoundError("stage", id);
-
-    // row.pipelineId is immutable (stages never move between pipelines), so
-    // this read is always fresh with respect to which pipeline owns the stage.
-    const [pipeline] = await tx.select().from(pipelines).where(eq(pipelines.id, row.pipelineId));
-    if (pipeline !== undefined) {
-      await maybeEmitPipelineEvent(tx, actorId, pipeline, "updated", { changed, stageId: id });
-    }
+    await maybeEmitPipelineEvent(tx, actorId, pipeline, "updated", { changed, stageId: id });
     return toStage(row);
   });
 }
 
+/** beforeStageId/afterStageId name the neighbours the moved stage ends up
+ * BETWEEN: beforeStageId is the neighbour immediately preceding it (lower
+ * position), afterStageId the one immediately following it (higher
+ * position). This is NOT "insert before this id" -- mirrors
+ * moveDealInputSchema's JSDoc in @conduit/shared, which Task 3's moveDeal and
+ * the web client must read the same way. */
 export interface ReorderStageInput { beforeStageId?: string; afterStageId?: string; }
 
 // The dry run for Task 3's moveDeal: re-read the two neighbour rows by id
@@ -244,6 +273,16 @@ export async function reorderStage(db: Database, actorId: string, stageId: strin
   return db.transaction(async (tx) => {
     const [stage] = await tx.select().from(stages).where(eq(stages.id, stageId));
     if (stage === undefined) throw new NotFoundError("stage", stageId);
+
+    // Same sibling group createStage locks (this transaction reads and writes
+    // stage positions within the same pipeline), so a concurrent createStage
+    // or reorderStage on this pipeline serialises against this one instead of
+    // both computing a midpoint from the same stale neighbour snapshot.
+    await lockSiblingGroup(tx, `stages:${stage.pipelineId}`);
+
+    const [pipeline] = await tx.select().from(pipelines).where(eq(pipelines.id, stage.pipelineId));
+    if (pipeline === undefined) throw new NotFoundError("pipeline", stage.pipelineId);
+    if (pipeline.archivedAt !== null) throw new ArchivedError("pipeline", pipeline.id);
 
     let beforePos: string | null = null;
     if (opts.beforeStageId != null) {
@@ -265,10 +304,7 @@ export async function reorderStage(db: Database, actorId: string, stageId: strin
       .where(eq(stages.id, stageId)).returning();
     if (row === undefined) throw new NotFoundError("stage", stageId);
 
-    const [pipeline] = await tx.select().from(pipelines).where(eq(pipelines.id, stage.pipelineId));
-    if (pipeline !== undefined) {
-      await maybeEmitPipelineEvent(tx, actorId, pipeline, "updated", { changed: ["position"], stageId });
-    }
+    await maybeEmitPipelineEvent(tx, actorId, pipeline, "updated", { changed: ["position"], stageId });
     return toStage(row);
   });
 }

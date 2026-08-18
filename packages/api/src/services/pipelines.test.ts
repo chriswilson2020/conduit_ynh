@@ -71,6 +71,16 @@ describe("pipelines service: create", () => {
     expect(b.position < c.position).toBe(true);
   });
 
+  it("8 concurrent createPipeline calls in the same scope produce 8 distinct, strictly ordered positions", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, i) => createPipeline(handle.db, actorId, { name: `P${i}`, scope: "global" })),
+    );
+    const positions = results.map((p) => p.position);
+    expect(new Set(positions).size).toBe(8);
+    const sorted = [...positions].sort();
+    for (let i = 1; i < sorted.length; i++) expect(sorted[i]! > sorted[i - 1]!).toBe(true);
+  });
+
   it("scopes position sequences separately: global and per-company pipelines don't interleave", async () => {
     const companyX = await makeCompany("X");
     const companyY = await makeCompany("Y");
@@ -212,6 +222,27 @@ describe("stages service", () => {
     expect(s2.position < s3.position).toBe(true);
   });
 
+  it("8 concurrent createStage calls on the same pipeline produce 8 distinct, strictly ordered positions", async () => {
+    const p = await createPipeline(handle.db, actorId, { name: "Sales", scope: "global" });
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, i) => createStage(handle.db, actorId, p.id, { name: `Stage ${i}` })),
+    );
+    const positions = results.map((s) => s.position);
+    expect(new Set(positions).size).toBe(8);
+    const sorted = [...positions].sort();
+    // Strictly ordered under plain string comparison, with no duplicates --
+    // the advisory lock in lockSiblingGroup is what prevents two concurrent
+    // callers from reading the same tail and computing the same midpoint.
+    for (let i = 1; i < sorted.length; i++) expect(sorted[i]! > sorted[i - 1]!).toBe(true);
+  });
+
+  it("rejects stage rename on an archived pipeline", async () => {
+    const p = await createPipeline(handle.db, actorId, { name: "Sales", scope: "global" });
+    const s = await createStage(handle.db, actorId, p.id, { name: "Lead" });
+    await archivePipeline(handle.db, actorId, p.id);
+    await expect(updateStage(handle.db, actorId, s.id, { name: "X" })).rejects.toBeInstanceOf(ArchivedError);
+  });
+
   it("stage mutations on a company-scoped pipeline emit events; global pipelines emit none", async () => {
     const company = await makeCompany();
     const globalP = await createPipeline(handle.db, actorId, { name: "G", scope: "global" });
@@ -308,5 +339,14 @@ describe("reorderStage", () => {
   it("throws NotFoundError for an unknown stage id", async () => {
     await expect(reorderStage(handle.db, actorId, "3f2504e0-4f89-41d3-9a0c-0305e82c3301", {}))
       .rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("rejects reordering a stage whose pipeline is archived", async () => {
+    const p = await createPipeline(handle.db, actorId, { name: "Sales", scope: "global" });
+    const s1 = await createStage(handle.db, actorId, p.id, { name: "A" });
+    const s2 = await createStage(handle.db, actorId, p.id, { name: "B" });
+    await archivePipeline(handle.db, actorId, p.id);
+    await expect(reorderStage(handle.db, actorId, s1.id, { afterStageId: s2.id }))
+      .rejects.toBeInstanceOf(ArchivedError);
   });
 });

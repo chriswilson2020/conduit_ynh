@@ -202,6 +202,12 @@ export const updateDealInputSchema = createDealInputSchema
   .omit({ pipelineId: true, stageId: true }).partial();
 export type UpdateDealInput = z.infer<typeof updateDealInputSchema>;
 
+/** beforeDealId/afterDealId name the neighbours the moved deal ends up BETWEEN:
+ * beforeDealId is the neighbour immediately preceding it (lower position),
+ * afterDealId the neighbour immediately following it (higher position). This is
+ * NOT "insert before this id" -- the field names describe the neighbours'
+ * placement relative to the moved item, and Task 3's service and the web client
+ * must both read them this way. */
 export const moveDealInputSchema = z.object({
   stageId: z.uuid(),
   beforeDealId: z.uuid().optional(),
