@@ -51,4 +51,43 @@ describe("identityFromHeaders", () => {
   it("ignores an array-valued header rather than trusting the first entry", () => {
     expect(identityFromHeaders({ "ynh-user": ["chris", "attacker"] }, null)).toBeNull();
   });
+
+  it("rejects a ynh-user value containing an embedded newline", () => {
+    expect(identityFromHeaders({ "ynh-user": "chris\nX-Injected: 1" }, null)).toBeNull();
+  });
+
+  it("rejects a ynh-user value containing a tab character", () => {
+    expect(identityFromHeaders({ "ynh-user": "chris\tattacker" }, null)).toBeNull();
+  });
+
+  it("rejects a control character in ynh-user-email while a valid ynh-user still resolves", () => {
+    expect(
+      identityFromHeaders({ "ynh-user": "chris", "ynh-user-email": "chris@example.com\n" }, null),
+    ).toEqual({ username: "chris", email: null, fullName: null });
+  });
+
+  it("keeps ordinary internal spaces and hyphens in a full name", () => {
+    expect(
+      identityFromHeaders({ "ynh-user": "chris", "ynh-user-fullname": "Chris Wilson" }, null),
+    ).toEqual({ username: "chris", email: null, fullName: "Chris Wilson" });
+
+    expect(
+      identityFromHeaders(
+        { "ynh-user": "amob", "ynh-user-fullname": "Anne-Marie O'Brien" },
+        null,
+      ),
+    ).toEqual({ username: "amob", email: null, fullName: "Anne-Marie O'Brien" });
+  });
+
+  it("does not fall back to the dev user when ynh-user is present but malformed (control character)", () => {
+    expect(identityFromHeaders({ "ynh-user": "chris\nX-Injected: 1" }, "devuser")).toBeNull();
+  });
+
+  it("does not fall back to the dev user when ynh-user is present but empty/whitespace-only", () => {
+    expect(identityFromHeaders({ "ynh-user": "   " }, "devuser")).toBeNull();
+  });
+
+  it("does not fall back to the dev user when ynh-user is present but array-valued", () => {
+    expect(identityFromHeaders({ "ynh-user": ["chris", "attacker"] }, "devuser")).toBeNull();
+  });
 });
