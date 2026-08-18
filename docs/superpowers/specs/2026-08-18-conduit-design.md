@@ -90,8 +90,10 @@ headers before proxying, so a client cannot set them itself.
 
 Because every request already arrives authenticated, **the app issues no session cookie of its own**.
 It reads `Ynh-User` per request and resolves it to a `users` row, creating the row on first sight
-from the email and fullname headers. A small in-memory cache keeps that to one query per user per
-process lifetime. This removes cookie signing, session storage, expiry, and logout from the app
+from the email and fullname headers. A short-lived in-memory cache (one minute) keeps that to one
+query per user per minute rather than one per request — without it every request would write a row,
+since resolution also stamps `last_seen_at`. The TTL is deliberately not process-lifetime: a
+permanent cache would never notice an LDAP display-name or email change until a restart. This removes cookie signing, session storage, expiry, and logout from the app
 entirely.
 
 The security boundary is that **the app binds to `127.0.0.1` only**, so nothing can reach it without

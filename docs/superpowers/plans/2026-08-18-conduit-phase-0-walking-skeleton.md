@@ -1016,6 +1016,76 @@ export async function resolveUser(db: Database, identity: Identity): Promise<Use
 
 The upsert is deliberate. A find-then-insert would let two simultaneous first requests from the same user both miss and both insert, and one would blow up on the unique constraint.
 
+Then add the caching layer in the same file. Without it, every authenticated request writes a row —
+the upsert always updates `lastSeenAt` — so the table read on every request also takes a write on
+every request:
+
+```typescript
+/** How long a resolved user stays cached before we re-check LDAP's cached attributes. */
+const DEFAULT_TTL_MS = 60_000;
+
+interface CacheEntry {
+  user: User;
+  expiresAt: number;
+}
+
+export interface UserResolver {
+  resolve(identity: Identity): Promise<User>;
+  /** Number of entries currently cached. Exposed for tests. */
+  size(): number;
+  clear(): void;
+}
+
+/**
+ * Wrap resolveUser in a short-lived per-username cache.
+ *
+ * The TTL is deliberately short rather than process-lifetime. A permanent cache
+ * would never pick up an LDAP display-name or email change until a restart, and
+ * would let lastSeenAt go stale forever. A minute bounds both the write rate and
+ * how long stale attributes can linger.
+ *
+ * Eviction is lazy, on read, rather than a background timer. The map is bounded by
+ * the number of distinct usernames seen, itself bounded by the number of YunoHost
+ * accounts on the instance.
+ */
+export function createUserResolver(db: Database, ttlMs: number = DEFAULT_TTL_MS): UserResolver {
+  const cache = new Map<string, CacheEntry>();
+
+  return {
+    async resolve(identity: Identity): Promise<User> {
+      const cached = cache.get(identity.username);
+      const now = Date.now();
+      if (
+        cached !== undefined &&
+        cached.expiresAt > now &&
+        cached.user.email === identity.email &&
+        cached.user.fullName === identity.fullName
+      ) {
+        return cached.user;
+      }
+
+      const user = await resolveUser(db, identity);
+      cache.set(identity.username, { user, expiresAt: now + ttlMs });
+      return user;
+    },
+    size: () => cache.size,
+    clear: () => cache.clear(),
+  };
+}
+```
+
+Comparing the cached `email`/`fullName` against the incoming identity matters: keying on username
+alone would make an LDAP rename invisible for the whole TTL.
+
+Cover the resolver in `packages/api/src/user-resolver.test.ts`: a cache hit performs no write
+(assert `lastSeenAt` did not advance, read from the raw row), a changed `fullName` or `email`
+re-resolves within the TTL, expiry re-resolves (inject a tiny `ttlMs` such as 20ms and await a short
+delay rather than using fake timers), distinct usernames cache independently, and `clear()` empties it.
+
+Also add two tests to `users.test.ts` asserting `lastSeenAt` advances on a second sighting and
+`createdAt` is not reset — `set` deliberately omits `createdAt`, and nothing else would catch a
+regression that added it.
+
 - [ ] **Step 4: Run the tests**
 
 ```bash
@@ -1300,7 +1370,7 @@ import type { User } from "@conduit/shared";
 import type { Config } from "./config.js";
 import type { Database } from "./db/client.js";
 import { identityFromHeaders } from "./auth.js";
-import { resolveUser } from "./users.js";
+import { createUserResolver } from "./users.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -1323,9 +1393,13 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
 
   app.decorateRequest("user", null);
 
+  // One resolver per app instance, so its cache lives as long as the process.
+  // Without it every request would write a row — see createUserResolver.
+  const users = createUserResolver(db);
+
   app.addHook("onRequest", async (request) => {
     const identity = identityFromHeaders(request.headers, config.devUser);
-    request.user = identity === null ? null : await resolveUser(db, identity);
+    request.user = identity === null ? null : await users.resolve(identity);
   });
 
   app.get("/api/health", async () => {
