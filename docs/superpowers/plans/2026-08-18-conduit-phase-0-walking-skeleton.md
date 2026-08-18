@@ -29,8 +29,21 @@ keeps the developer's laptop clean.
 | Databases | `conduit_dev`, `conduit_test`, both owned by role `chris` |
 | Privileges | the deploy user needs sudo; see the separate server-setup notes |
 
-PostgreSQL listens on `127.0.0.1:5432` only, and `chris` connects over the local socket with peer
-auth — so `postgres://localhost/conduit_test` needs no password anywhere.
+**Connecting to PostgreSQL in dev and test needs care.** The server's `pg_hba.conf` grants `peer`
+auth on the Unix socket but `scram-sha-256` over TCP, and role `chris` has no password. postgres.js
+cannot express a socket path inside a `postgres://` URL — a `?host=` query parameter fails with
+`Invalid URL`. Verified empirically, exactly one form works:
+
+```bash
+PGHOST=/run/postgresql DATABASE_URL=postgres:///conduit_test
+```
+
+The empty host in the URL makes postgres.js defer to `PGHOST`, which points at the socket directory.
+A plain `postgres://localhost/conduit_test` fails with `password authentication failed`.
+
+**Production is unaffected.** YunoHost's `[resources.database]` provisions a role *with* a generated
+password, so the `.env` template's TCP string (`postgres://$db_user:$db_pwd@127.0.0.1:5432/$db_name`)
+authenticates normally. Only dev and test use the socket.
 
 **Editing workflow:** files are edited and committed in the Mac working copy, then pushed to the
 server with rsync. The server copy is a mirror and is never committed to, so git history lives in
@@ -606,7 +619,7 @@ export default defineConfig({
   out: "./drizzle",
   dialect: "postgresql",
   dbCredentials: {
-    url: process.env.DATABASE_URL ?? "postgres://localhost/conduit_dev",
+    url: process.env.DATABASE_URL ?? "postgres:///conduit_dev",
   },
 });
 ```
@@ -668,18 +681,31 @@ export async function runMigrations(db: Database): Promise<void> {
 
 - [ ] **Step 6: Verify migrations apply against the real test database**
 
-```bash
-DATABASE_URL="postgres://localhost/conduit_test" node --experimental-strip-types -e '
-import { createDatabase, runMigrations } from "./packages/api/src/db/client.ts";
-const h = createDatabase(process.env.DATABASE_URL);
-await runMigrations(h.db);
-console.log("migrations applied");
-await h.close();
-'
-psql conduit_test -c '\d users'
+Do not use a `node -e` one-liner: `-e` scripts default to CommonJS and relative TypeScript imports
+from an eval string are unreliable. Write a throwaway script instead, run it, then delete it.
+
+Create `packages/api/src/db/verify-migrations.ts`:
+
+```typescript
+import { createDatabase, runMigrations } from "./client.js";
+
+const url = process.env.DATABASE_URL ?? "postgres:///conduit_test";
+const handle = createDatabase(url, 1);
+await runMigrations(handle.db);
+console.log("migrations applied to", url);
+await handle.close();
 ```
 
-Expected: `migrations applied`, then a table description listing all six columns.
+```bash
+./scripts/remote.sh 'PGHOST=/run/postgresql DATABASE_URL=postgres:///conduit_test node packages/api/src/db/verify-migrations.ts'
+./scripts/remote.sh 'psql conduit_test -c "\d users"'
+```
+
+Expected: `migrations applied to ...`, then a table description listing all six columns plus the
+unique constraint and the `users_username_idx` index. Node 24 strips TypeScript types natively, so
+no flag is needed.
+
+**Delete `verify-migrations.ts` before committing** — it is a verification aid, not a deliverable.
 
 - [ ] **Step 7: Commit**
 
@@ -705,7 +731,7 @@ Create `packages/api/src/test/global-setup.ts`:
 import { createDatabase, runMigrations } from "../db/client.js";
 
 export const TEST_DATABASE_URL =
-  process.env.TEST_DATABASE_URL ?? "postgres://localhost/conduit_test";
+  process.env.TEST_DATABASE_URL ?? "postgres:///conduit_test";
 
 export default async function setup(): Promise<void> {
   const handle = createDatabase(TEST_DATABASE_URL, 1);
@@ -713,8 +739,10 @@ export default async function setup(): Promise<void> {
     await runMigrations(handle.db);
   } catch (cause) {
     throw new Error(
-      `Could not migrate the test database at ${TEST_DATABASE_URL}. ` +
-        `Is PostgreSQL running (systemctl status postgresql) and does conduit_test exist (sudo -u postgres createdb -O chris conduit_test)?`,
+      `Could not migrate the test database at ${TEST_DATABASE_URL} (PGHOST=${process.env.PGHOST ?? "unset"}). ` +
+        `Is PostgreSQL running (systemctl status postgresql), does conduit_test exist ` +
+        `(sudo -u postgres createdb -O chris conduit_test), and is PGHOST set to /run/postgresql? ` +
+        `A "password authentication failed" error means the connection went over TCP instead of the socket.`,
       { cause },
     );
   } finally {
@@ -746,12 +774,14 @@ export async function truncateAll(handle: DatabaseHandle): Promise<void> {
 
 When later phases add tables, extend the `TRUNCATE` list here — it is the single place that needs to know.
 
-- [ ] **Step 3: Wire the global setup into Vitest**
+- [ ] **Step 3: Wire the global setup and PGHOST into Vitest**
 
-Now that the file exists, add it to `vitest.config.ts`, inside the `test` block:
+Add both to `vitest.config.ts`, inside the `test` block. `PGHOST` is what lets the empty-host
+`postgres:///conduit_test` URL reach the Unix socket instead of failing over TCP:
 
 ```typescript
     globalSetup: ["./packages/api/src/test/global-setup.ts"],
+    env: { PGHOST: process.env.PGHOST ?? "/run/postgresql" },
 ```
 
 - [ ] **Step 4: Verify Vitest starts and global setup runs**
@@ -1808,13 +1838,10 @@ The log line "listening on" is what the install script waits for via `ynh_system
 - [ ] **Step 2: Build and run against the dev database**
 
 ```bash
-npm run build
-DATABASE_URL="postgres://localhost/conduit_dev" \
-  PORT=3000 \
-  APP_VERSION=0.1.0-dev \
-  CONDUIT_DEV_USER=chris \
-  WEB_ROOT="$PWD/packages/web/dist" \
-  node packages/api/dist/server.js
+./scripts/remote.sh 'npm run build'
+ssh $CONDUIT_REMOTE 'cd conduit && PGHOST=/run/postgresql DATABASE_URL="postgres:///conduit_dev" \
+  PORT=3000 APP_VERSION=0.1.0-dev CONDUIT_DEV_USER=chris \
+  WEB_ROOT="$PWD/packages/web/dist" node packages/api/dist/server.js'
 ```
 
 Expected: `Conduit 0.1.0-dev listening on 127.0.0.1:3000`.
@@ -1931,7 +1958,7 @@ Expected: `release/conduit-0.1.0.tar.gz` plus a printed sha256.
 - [ ] **Step 4: Verify the tarball actually runs**
 
 ```bash
-cd release && rm -rf verify && mkdir verify && tar xzf conduit-0.1.0.tar.gz -C verify && cd verify/conduit && npm ci --omit=dev >/dev/null 2>&1 && DATABASE_URL="postgres://localhost/conduit_dev" PORT=3001 APP_VERSION=0.1.0 CONDUIT_DEV_USER=chris NODE_ENV=development WEB_ROOT="$PWD/web" node server/server.js &
+cd release && rm -rf verify && mkdir verify && tar xzf conduit-0.1.0.tar.gz -C verify && cd verify/conduit && npm ci --omit=dev >/dev/null 2>&1 && PGHOST=/run/postgresql DATABASE_URL="postgres:///conduit_dev" PORT=3001 APP_VERSION=0.1.0 CONDUIT_DEV_USER=chris NODE_ENV=development WEB_ROOT="$PWD/web" node server/server.js &
 sleep 4 && curl -s localhost:3001/api/health && echo && kill %1
 ```
 
@@ -2578,7 +2605,8 @@ export default defineConfig({
     env: {
       NODE_ENV: "development",
       PORT: "3100",
-      DATABASE_URL: process.env.TEST_DATABASE_URL ?? "postgres://localhost/conduit_test",
+      PGHOST: process.env.PGHOST ?? "/run/postgresql",
+      DATABASE_URL: process.env.TEST_DATABASE_URL ?? "postgres:///conduit_test",
       APP_VERSION: "0.1.0-e2e",
       CONDUIT_DEV_USER: "e2euser",
       BASE_PATH: "/",
