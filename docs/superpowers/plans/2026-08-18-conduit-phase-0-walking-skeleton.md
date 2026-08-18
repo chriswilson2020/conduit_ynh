@@ -1470,10 +1470,14 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
 
   app.addHook("onRequest", async (request) => {
     // routeOptions.url is the matched route's registered pattern, populated because
-    // onRequest runs after routing. It is undefined for a request that matched no
-    // route; those still resolve identity, which is harmless since the 404 handler
-    // never reads request.user.
-    if (UNAUTHENTICATED_ROUTES.has(request.routeOptions.url ?? "")) return;
+    // onRequest runs after routing -- not request.url, which is the raw path. It is
+    // undefined when no route matched. Those requests are served by the not-found
+    // handler -- either the SPA shell or a JSON 404 -- and neither reads request.user.
+    // Resolving identity here would write to the database on a cache miss, so a deep
+    // link would 500 during an outage instead of serving the static shell that exists
+    // to report the outage.
+    const matched = request.routeOptions.url;
+    if (matched === undefined || UNAUTHENTICATED_ROUTES.has(matched)) return;
     const identity = identityFromHeaders(request.headers, config.devUser);
     request.user = identity === null ? null : await users.resolve(identity);
   });
@@ -2038,7 +2042,19 @@ export async function registerSpa(app: FastifyInstance, options: SpaOptions): Pr
 }
 ```
 
-index.html is read per request rather than cached. It is a few kilobytes off the page cache, and caching it would mean a stale page after every upgrade.
+index.html is read per request rather than cached. It is a few kilobytes off the page cache, and
+caching it would mean a stale page after every upgrade.
+
+**The SPA shell must be servable with the database down.** Task 8's `onRequest` hook skips identity
+resolution for unmatched routes precisely so this works — without that skip, a deep link with SSOwat
+headers present (the production norm) performs a database write before the not-found handler runs,
+and returns a bare JSON 500 instead of the shell whose error state exists to report the outage.
+
+Test it with a genuinely unreachable database (`postgres://user:pass@127.0.0.1:1/nonexistent` with a
+short `connect_timeout`), not a stub: a deep link with a `ynh-user` header returns 200 and serves
+index.html, the same with the dev-user fallback returns 200, and `/api/nope` still returns JSON 404
+rather than 500. Confirm separately that `/api/me` with the database down still returns 5xx and is
+not silently downgraded to 401 — losing that distinction would be worse than the bug being fixed.
 
 - [ ] **Step 4: Modify `packages/api/src/app.ts`**
 
