@@ -99,9 +99,11 @@ const routeTree = rootRoute.addChildren([
 // undefined there avoids the router treating "/" as a one-segment basepath
 // literally. Only a real subpath install (e.g. "/conduit") needs to be passed
 // through.
+const mountedBasePath = basePath();
+
 export const router = createRouter({
   routeTree,
-  basepath: basePath() === "/" ? undefined : basePath(),
+  basepath: mountedBasePath === "/" ? undefined : mountedBasePath,
   defaultNotFoundComponent: NotFoundComponent,
 });
 

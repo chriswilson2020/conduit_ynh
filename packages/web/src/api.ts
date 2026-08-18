@@ -58,6 +58,29 @@ async function sendJson<T>(method: "POST" | "PATCH", path: string, body?: unknow
 export const postJson = <T>(path: string, body?: unknown) => sendJson<T>("POST", path, body);
 export const patchJson = <T>(path: string, body?: unknown) => sendJson<T>("PATCH", path, body);
 
+/**
+ * POST a multipart/form-data body (file uploads). Deliberately does not set
+ * Content-Type: fetch/the browser derives it from the FormData, including the
+ * multipart boundary -- setting it manually would omit that boundary and the
+ * server would fail to parse the body. Error-shape unwrapping mirrors sendJson.
+ */
+export async function postForm(path: string, form: FormData): Promise<unknown> {
+  const response = await fetch(apiUrl(path), {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    body: form,
+  });
+  if (!response.ok) {
+    const raw: unknown = await response.json().catch(() => undefined);
+    const parsed = errorResponseSchema.safeParse(raw);
+    const message = parsed.success
+      ? (parsed.data.message ?? parsed.data.error)
+      : `POST ${path} failed with ${response.status}`;
+    throw new Error(message);
+  }
+  return await response.json();
+}
+
 export const fetchMe = () => getJson<MeResponse>("/me");
 
 /**
