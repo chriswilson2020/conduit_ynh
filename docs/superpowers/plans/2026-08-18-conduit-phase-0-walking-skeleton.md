@@ -154,10 +154,15 @@ undefined-access bugs.
 is absent on purpose — Vite typechecks it separately, and it uses `bundler` resolution rather than
 `NodeNext`.
 
+Only `shared` is referenced here. A reference to a project that does not exist yet breaks more than
+`tsc -b`: Vitest resolves every entry in `references` when it walks up for the applicable tsconfig,
+so a dangling `./packages/api` entry fails the whole test run with `Tsconfig not found`. Task 3 adds
+the `api` reference at the point the package exists.
+
 ```json
 {
   "files": [],
-  "references": [{ "path": "./packages/shared" }, { "path": "./packages/api" }]
+  "references": [{ "path": "./packages/shared" }]
 }
 ```
 
@@ -477,7 +482,19 @@ Expected: FAIL — cannot resolve `./config.js`.
 }
 ```
 
-- [ ] **Step 5: Write the implementation**
+- [ ] **Step 5: Add the api project reference to the root `tsconfig.json`**
+
+Task 1 deliberately left this out while `packages/api` did not exist. Now that it does, add it —
+otherwise `npm run typecheck` silently never typechecks the API package.
+
+```json
+{
+  "files": [],
+  "references": [{ "path": "./packages/shared" }, { "path": "./packages/api" }]
+}
+```
+
+- [ ] **Step 6: Write the implementation**
 
 Create `packages/api/src/config.ts`:
 
@@ -531,15 +548,15 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
 }
 ```
 
-- [ ] **Step 6: Run the tests**
+- [ ] **Step 7: Run the tests and the typecheck**
 
 ```bash
-npm install && npx vitest run packages/api/src/config
+./scripts/remote.sh 'npm install && npx vitest run packages/api/src/config && npm run typecheck'
 ```
 
-Expected: 8 passed.
+Expected: 8 tests passed, and `tsc -b` clean now that both referenced projects exist.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add -A
