@@ -89,6 +89,25 @@ describe("search service", () => {
     expect(result.notes.map((n) => n.id)).not.toContain(note.id);
   });
 
+  it("slices the snippet on code points, never orphaning half of a surrogate pair", async () => {
+    // A homogeneous run of emoji (all 2 UTF-16 units wide) can never trigger a
+    // mid-pair cut at the +/-60 boundary on its own -- the offset arithmetic stays
+    // even no matter how the run is sized or prefixed. Mixing in a single 1-unit
+    // ASCII character partway through the run breaks that parity, so the naive
+    // UTF-16-code-unit slice this replaces really did land inside a surrogate
+    // pair for this exact shape (verified against the pre-fix implementation).
+    const lonePairPattern = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+    const company = await createCompany(handle.db, actorId, { name: "Emoji Co" });
+    const pad = `${"\u{1F600}".repeat(5)}a${"\u{1F600}".repeat(25)}`;
+    const body = `${pad}findme${pad}`;
+    const note = await createNote(handle.db, actorId, { body, companyId: company.id });
+
+    const result = await search(handle.db, "findme");
+    const found = result.notes.find((n) => n.id === note.id);
+    expect(found).toBeDefined();
+    expect(lonePairPattern.test(found?.snippet ?? "")).toBe(false);
+  });
+
   it("excludes a note whose parent contact is archived", async () => {
     const contact = await createContact(handle.db, actorId, { firstName: "Marlowe", lastName: "Finch" });
     const note = await createNote(handle.db, actorId, { body: "marlowe finch follow-up notes", contactId: contact.id });

@@ -7,11 +7,21 @@ import { escapeLike } from "./pagination.js";
 const LIMIT_PER_TYPE = 8;
 
 function snippet(body: string, q: string): string {
-  const at = body.toLowerCase().indexOf(q.toLowerCase());
-  if (at < 0) return body.slice(0, 120);
-  const start = Math.max(0, at - 60);
-  const end = Math.min(body.length, at + q.length + 60);
-  return `${start > 0 ? "..." : ""}${body.slice(start, end)}${end < body.length ? "..." : ""}`;
+  const points = Array.from(body);
+  const lowerBody = body.toLowerCase();
+  const at = lowerBody.indexOf(q.toLowerCase());
+  // ILIKE (locale-aware, in Postgres) and toLowerCase (Unicode default folding)
+  // can disagree (Turkish dotless I, ligatures). When they do, indexOf misses and
+  // we fall back to a plain prefix -- a real excerpt of the matched note, just
+  // without the match centred. Graceful, not exact.
+  if (at < 0) return points.slice(0, 120).join("");
+  // Convert the code-unit match offset to a code-point offset so the +/-60 window
+  // slices between characters, never through a surrogate pair.
+  const pointAt = Array.from(body.slice(0, at)).length;
+  const qPoints = Array.from(q).length;
+  const start = Math.max(0, pointAt - 60);
+  const end = Math.min(points.length, pointAt + qPoints + 60);
+  return `${start > 0 ? "..." : ""}${points.slice(start, end).join("")}${end < points.length ? "..." : ""}`;
 }
 
 export async function search(db: Database, q: string): Promise<SearchResults> {
@@ -32,6 +42,11 @@ export async function search(db: Database, q: string): Promise<SearchResults> {
     // though the note row itself has no archivedAt of its own -- this is the fix
     // for the spec gap in the original draft, which filtered notes.body only and
     // let notes on archived companies/contacts leak through.
+    //
+    // Every ILIKE here (this query and the two above) is an unindexed sequential
+    // scan -- fine at Phase 1 scale with LIMIT 8, but revisit with a pg_trgm GIN
+    // index on notes.body (and the other searched columns) if search slows as
+    // data grows.
     db.select({ id: notes.id, companyId: notes.companyId, contactId: notes.contactId, body: notes.body })
       .from(notes)
       .leftJoin(companies, eq(notes.companyId, companies.id))
