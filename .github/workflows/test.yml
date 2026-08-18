@@ -7,6 +7,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     services:
       postgres:
@@ -46,6 +47,7 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     services:
       postgres:
@@ -76,8 +78,14 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      # Browser binary only. NOT --with-deps: that shells out to apt-get, which
+      # hung indefinitely here when a package tried to prompt. ubuntu-latest already
+      # ships Chromium's shared libraries, so the download alone is enough. If a
+      # future runner image drops them, add a separate step running
+      # `sudo DEBIAN_FRONTEND=noninteractive npx playwright install-deps chromium`
+      # rather than folding it back into this one, so an apt failure stays visible.
       - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
       - name: Build workspaces
         run: npm run build
       - name: Run Playwright smoke tests
