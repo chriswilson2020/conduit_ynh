@@ -4,6 +4,9 @@ import {
   meResponseSchema,
   healthResponseSchema,
   errorResponseSchema,
+  companySchema,
+  contactSchema,
+  createNoteInputSchema,
 } from "./index.js";
 
 describe("userSchema", () => {
@@ -122,4 +125,41 @@ describe("errorResponseSchema", () => {
     const body = { error: "not_found" };
     expect(errorResponseSchema.parse(body)).toEqual(body);
   });
+});
+
+describe("companySchema", () => {
+  const base = {
+    id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", name: "Acme", domain: null, website: null,
+    phone: null, address: null, industry: null, ownerUserId: null, archivedAt: null,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+  it("accepts a company", () => expect(companySchema.parse(base)).toEqual(base));
+  it("rejects an empty name", () =>
+    expect(() => companySchema.parse({ ...base, name: "" })).toThrow());
+});
+
+describe("contactSchema", () => {
+  it("requires emails to be valid", () => {
+    expect(() =>
+      contactSchema.parse({
+        id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", firstName: "Ann", lastName: null,
+        companyId: null, emails: ["not-an-email"], phones: [], jobTitle: null,
+        ownerUserId: null, archivedAt: null,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      }),
+    ).toThrow();
+  });
+});
+
+describe("createNoteInputSchema", () => {
+  it("rejects a note with no entity", () =>
+    expect(() => createNoteInputSchema.parse({ body: "hi" })).toThrow());
+  it("rejects a note with two entities", () =>
+    expect(() =>
+      createNoteInputSchema.parse({
+        body: "hi",
+        companyId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+        contactId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+      }),
+    ).toThrow());
 });

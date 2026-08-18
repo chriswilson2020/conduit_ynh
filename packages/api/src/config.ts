@@ -7,6 +7,7 @@ const envSchema = z.object({
   BASE_PATH: z.string().startsWith("/").default("/"),
   APP_VERSION: z.string().default("0.0.0-dev"),
   CONDUIT_DEV_USER: z.string().min(1).optional(),
+  DATA_DIR: z.string().min(1).default("./data"),
 });
 
 export interface Config {
@@ -18,6 +19,7 @@ export interface Config {
   version: string;
   /** Username to assume when no SSOwat header is present. Never set in production. */
   devUser: string | null;
+  dataDir: string;
 }
 
 export function parseConfig(env: Record<string, string | undefined>): Config {
@@ -49,5 +51,6 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     basePath: value.BASE_PATH === "/" ? "/" : value.BASE_PATH.replace(/\/+$/, "") || "/",
     version: value.APP_VERSION,
     devUser: value.CONDUIT_DEV_USER ?? null,
+    dataDir: value.DATA_DIR,
   };
 }

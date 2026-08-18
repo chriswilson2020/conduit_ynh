@@ -53,4 +53,14 @@ describe("parseConfig", () => {
       /CONDUIT_DEV_USER/,
     );
   });
+
+  it("defaults DATA_DIR to ./data when unset", () => {
+    expect(parseConfig(valid).dataDir).toBe("./data");
+  });
+
+  it("carries through an explicit DATA_DIR", () => {
+    expect(parseConfig({ ...valid, DATA_DIR: "/var/lib/conduit/data" }).dataDir).toBe(
+      "/var/lib/conduit/data",
+    );
+  });
 });
