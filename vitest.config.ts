@@ -6,5 +6,7 @@ export default defineConfig({
     environment: "node",
     pool: "forks",
     poolOptions: { forks: { singleFork: true } },
+    globalSetup: ["./packages/api/src/test/global-setup.ts"],
+    env: { PGHOST: process.env.PGHOST ?? "/run/postgresql" },
   },
 });
