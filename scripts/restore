@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# helpers must be sourced before _common.sh: _common.sh calls ynh_read_manifest,
+# which is only defined once the real YunoHost helpers are loaded. Sourcing
+# _common.sh first leaves app_version silently empty.
+source /usr/share/yunohost/helpers
+source ../settings/scripts/_common.sh
+
+ynh_script_progression "Restoring the app main directory..."
+
+ynh_restore "$install_dir"
+chown -R "$app:www-data" "$install_dir"
+chmod 400 "$install_dir/.env"
+chown "$app:$app" "$install_dir/.env"
+
+ynh_script_progression "Restoring the data directory..."
+
+ynh_restore "$data_dir"
+chown -R "$app:$app" "$data_dir"
+chmod 750 "$data_dir"
+
+ynh_script_progression "Restoring the PostgreSQL database..."
+
+ynh_psql_db_shell < ./db.sql
+
+ynh_script_progression "Restoring system configurations related to $app..."
+
+ynh_restore "/etc/nginx/conf.d/$domain.d/$app.conf"
+ynh_restore "/etc/systemd/system/$app.service"
+systemctl daemon-reload
+systemctl enable "$app.service" --quiet
+
+yunohost service add "$app" --description="Conduit CRM"
+
+ynh_script_progression "Starting $app's systemd service..."
+
+ynh_systemctl --service="$app" --action="start" --log_path="systemd" \
+    --wait_until="listening on 127.0.0.1"
+
+ynh_systemctl --service=nginx --action=reload
+
+ynh_script_progression "Restoration completed for $app"

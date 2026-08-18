@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Keep this path: backup and restore run from a different working directory.
+# helpers must be sourced before _common.sh: _common.sh calls ynh_read_manifest,
+# which is only defined once the real YunoHost helpers are loaded. Sourcing
+# _common.sh first leaves app_version silently empty.
+source /usr/share/yunohost/helpers
+source ../settings/scripts/_common.sh
+
+ynh_print_info "Declaring files to be backed up..."
+
+ynh_backup "$install_dir"
+ynh_backup "$data_dir"
+
+ynh_backup "/etc/nginx/conf.d/$domain.d/$app.conf"
+ynh_backup "/etc/systemd/system/$app.service"
+
+ynh_print_info "Backing up the PostgreSQL database..."
+ynh_psql_dump_db > db.sql
+
+ynh_print_info "Backup script completed for $app. (YunoHost will now copy those files to the archive)"

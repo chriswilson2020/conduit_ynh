@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# helpers must be sourced before _common.sh: _common.sh calls ynh_read_manifest,
+# which is only defined once the real YunoHost helpers are loaded. Sourcing
+# _common.sh first leaves app_version silently empty.
+source /usr/share/yunohost/helpers
+source _common.sh
+
+ynh_script_progression "Removing system configurations related to $app..."
+
+if ynh_hide_warnings yunohost service status "$app" >/dev/null; then
+    yunohost service remove "$app"
+fi
+
+ynh_config_remove_systemd
+ynh_config_remove_nginx
+
+ynh_script_progression "Removal of $app completed"
