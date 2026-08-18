@@ -23,12 +23,13 @@ function toNote(row: NoteRow): Note {
 // delete, this needs to move inside the transaction to close the race instead of
 // silently going stale.
 //
-// The archived check is a softer guarantee: unlike a contact's companyId link
-// (where an archived company is a valid target), a note's target must be
-// unarchived at creation time. Reading that flag outside the transaction leaves a
-// narrow TOCTOU window -- the target could be archived between this check and the
-// insert below -- which is accepted here at the same tolerance the rest of this
-// phase uses for pre-transaction reads.
+// The archived check is a different, weaker guarantee than the existence check
+// above: archived-at is a mutable flag, not a monotonic fact, so this read can go
+// stale. Worst case: the target is archived microseconds after this SELECT and
+// before the insert below, leaving a stray note on a now-archived record. That is
+// accepted as low-stakes at this scale (a single misplaced note, not data
+// corruption); a `SELECT ... FOR SHARE` here would close the window if it ever
+// stops being acceptable.
 async function assertNoteTargetActive(db: Database, input: CreateNoteInput): Promise<void> {
   if (input.companyId != null) {
     const [row] = await db.select({ archivedAt: companies.archivedAt })
@@ -51,10 +52,14 @@ export async function createNote(db: Database, actorId: string, input: CreateNot
       companyId: input.companyId ?? null, contactId: input.contactId ?? null,
     }).returning();
     if (row === undefined) throw new Error("insert returned no row");
+    // Array.from splits on Unicode code points, not UTF-16 code units, so a
+    // surrogate-pair character (e.g. most emoji) straddling index 120 stays intact
+    // instead of tearing into a lone surrogate that Postgres would store as U+FFFD.
+    const preview = Array.from(input.body).slice(0, 120).join("");
     await tx.insert(events).values({
       verb: "note_added", actorUserId: actorId,
       companyId: row.companyId, contactId: row.contactId,
-      payload: { noteId: row.id, preview: input.body.slice(0, 120) },
+      payload: { noteId: row.id, preview },
     });
     return toNote(row);
   });
@@ -62,6 +67,9 @@ export async function createNote(db: Database, actorId: string, input: CreateNot
 
 export interface ListNotesOptions { companyId?: string; contactId?: string; }
 
+// Unbounded on purpose: Phase 1 assumes a single record's notes stay small enough
+// to return in one page. Revisit with keyset pagination (and an index on
+// companyId/contactId) if that assumption stops holding.
 export async function listNotes(db: Database, opts: ListNotesOptions): Promise<Note[]> {
   const where = [];
   if (opts.companyId) where.push(eq(notes.companyId, opts.companyId));

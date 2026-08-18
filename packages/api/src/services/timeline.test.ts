@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { eventVerbSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
+import { events } from "../db/schema.js";
 import { listEvents } from "./timeline.js";
 import { createCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
@@ -56,5 +58,29 @@ describe("timeline service", () => {
     expect(result.items).toHaveLength(2);
     expect(result.items.every((e) => e.contactId === p.id)).toBe(true);
     expect(result.items.some((e) => e.companyId !== null)).toBe(false);
+  });
+
+  // schema.ts's events.verb CHECK and shared's eventVerbSchema live in different
+  // packages with nothing tying them together; either can drift without the other
+  // noticing. This pins both to one hardcoded list: every verb here must (a) parse
+  // through eventVerbSchema, (b) account for the schema's entire option list (so an
+  // addition to one side that's missed on the other fails this test), and (c)
+  // survive a real insert into events, exercising the DB CHECK itself -- while an
+  // invented verb is rejected by that same CHECK.
+  it("keeps eventVerbSchema and the events.verb DB CHECK in sync", async () => {
+    const verbs = ["created", "updated", "archived", "unarchived", "note_added", "file_attached"];
+    expect(verbs).toHaveLength(eventVerbSchema.options.length);
+    for (const verb of verbs) expect(eventVerbSchema.parse(verb)).toBe(verb);
+
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    for (const verb of verbs) {
+      await handle.db.insert(events).values({ verb, actorUserId: actorId, companyId: c.id, payload: {} });
+    }
+
+    await expect(handle.db.insert(events).values({
+      verb: "exploded", actorUserId: actorId, companyId: c.id, payload: {},
+    })).rejects.toMatchObject({
+      cause: { message: expect.stringMatching(/events_verb_valid|check/i) },
+    });
   });
 });
