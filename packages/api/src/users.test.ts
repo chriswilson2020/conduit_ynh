@@ -76,4 +76,34 @@ describe("resolveUser", () => {
     expect(() => new Date(user.createdAt).toISOString()).not.toThrow();
     expect(user.createdAt).toBe(new Date(user.createdAt).toISOString());
   });
+
+  it("advances lastSeenAt on a second sighting", async () => {
+    await resolveUser(handle.db, chris);
+    const [before] = await handle.db.select().from(users).where(eq(users.username, "chris"));
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await resolveUser(handle.db, chris);
+    const [after] = await handle.db.select().from(users).where(eq(users.username, "chris"));
+
+    expect(before?.lastSeenAt).toBeDefined();
+    expect(after?.lastSeenAt).toBeDefined();
+    expect(after!.lastSeenAt.getTime()).toBeGreaterThan(before!.lastSeenAt.getTime());
+  });
+
+  it("does not reset createdAt on a second sighting", async () => {
+    await resolveUser(handle.db, chris);
+    const [before] = await handle.db.select().from(users).where(eq(users.username, "chris"));
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await resolveUser(handle.db, {
+      username: "chris",
+      email: "c.j.wilson@example.com",
+      fullName: "Christopher Wilson",
+    });
+    const [after] = await handle.db.select().from(users).where(eq(users.username, "chris"));
+
+    expect(before?.createdAt).toBeDefined();
+    expect(after?.createdAt).toBeDefined();
+    expect(after!.createdAt.getTime()).toBe(before!.createdAt.getTime());
+  });
 });
