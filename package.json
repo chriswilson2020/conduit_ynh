@@ -9,10 +9,12 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "playwright test",
     "dev:api": "npm run dev -w @conduit/api",
     "dev:web": "npm run dev -w @conduit/web"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0",
     "vitest": "^4.1.10"

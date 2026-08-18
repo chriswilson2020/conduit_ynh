@@ -1,0 +1,27 @@
+import { defineConfig } from "@playwright/test";
+
+// The server under test is built, then started fresh for the whole test run (see
+// webServer below). DATABASE_URL matches the shape vitest's CI job already uses:
+// a full TCP connection string in CI (TEST_DATABASE_URL, set by the workflow to
+// point at the postgres service container) with a local socket fallback for anyone
+// running this on a machine that has PostgreSQL listening on its default socket.
+export default defineConfig({
+  testDir: "./e2e",
+  fullyParallel: true,
+  reporter: process.env.CI ? [["html", { open: "never" }], ["list"]] : "list",
+  use: { baseURL: "http://127.0.0.1:3100" },
+  webServer: {
+    command: "node packages/api/dist/server.js",
+    url: "http://127.0.0.1:3100/api/health",
+    reuseExistingServer: false,
+    env: {
+      NODE_ENV: "development",
+      PORT: "3100",
+      DATABASE_URL: process.env.TEST_DATABASE_URL ?? "postgres:///conduit_test",
+      APP_VERSION: "0.1.0-e2e",
+      CONDUIT_DEV_USER: "e2euser",
+      BASE_PATH: "/",
+      WEB_ROOT: "packages/web/dist",
+    },
+  },
+});

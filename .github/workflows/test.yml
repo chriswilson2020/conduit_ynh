@@ -43,3 +43,49 @@ jobs:
         run: npm run typecheck
       - name: Run tests
         run: npx vitest run
+
+  e2e:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: conduit
+          POSTGRES_PASSWORD: conduit
+          POSTGRES_DB: conduit_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Same shape as the `test` job's TEST_DATABASE_URL above: a full TCP
+      # connection string for the postgres service container. playwright.config.ts's
+      # webServer passes this through to the server it boots as DATABASE_URL.
+      TEST_DATABASE_URL: postgres://conduit:conduit@localhost:5432/conduit_test
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Build workspaces
+        run: npm run build
+      - name: Run Playwright smoke tests
+        run: npx playwright test
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
