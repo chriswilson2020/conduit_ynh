@@ -5,16 +5,25 @@ import { resolveUser } from "../users.js";
 import { createCompany, archiveCompany } from "./companies.js";
 import { createContact, archiveContact } from "./contacts.js";
 import { createNote } from "./notes.js";
+import { createPipeline, createStage } from "./pipelines.js";
+import { createDeal, archiveDeal, winDeal } from "./deals.js";
 import { search } from "./search.js";
 
 const handle = openTestDatabase();
 let actorId: string;
+const DEFAULT_CURRENCY = "EUR";
 
 beforeEach(async () => {
   await truncateAll(handle);
   actorId = (await resolveUser(handle.db, { username: "chris", email: null, fullName: null })).id;
 });
 afterAll(async () => { await handle.close(); });
+
+async function makeDeal(title: string) {
+  const pipeline = await createPipeline(handle.db, actorId, { name: "Sales", scope: "global" });
+  const stage = await createStage(handle.db, actorId, pipeline.id, { name: "Lead" });
+  return createDeal(handle.db, actorId, { title, pipelineId: pipeline.id, stageId: stage.id }, DEFAULT_CURRENCY);
+}
 
 describe("search service", () => {
   it("returns grouped, schema-valid results across companies, contacts, and notes", async () => {
@@ -27,9 +36,35 @@ describe("search service", () => {
     expect(result.companies.map((c) => c.id)).toContain(company.id);
     expect(result.contacts.map((c) => c.id)).toContain(contact.id);
     expect(result.notes.map((n) => n.id)).toContain(note.id);
-    // deals is stubbed empty until the Phase 2 plan's Task 5 wires the real
-    // title-ILIKE query -- this pins the key's presence in the shape now.
     expect(result.deals).toEqual([]);
+  });
+
+  it("finds a deal by a title fragment", async () => {
+    const deal = await makeDeal("Zylexo renewal");
+
+    const result = await search(handle.db, "Zylexo");
+    expect(result.deals.map((d) => d.id)).toContain(deal.id);
+    expect(result.deals.find((d) => d.id === deal.id)?.title).toBe("Zylexo renewal");
+  });
+
+  it("excludes an archived deal from the deals group", async () => {
+    const deal = await makeDeal("Vortixel contract");
+    await archiveDeal(handle.db, actorId, deal.id);
+
+    const result = await search(handle.db, "Vortixel");
+    expect(result.deals.map((d) => d.id)).not.toContain(deal.id);
+  });
+
+  // Closing a deal must not make it unfindable -- a won deal is exactly the
+  // kind of record someone looks up by name later (checking terms, pulling up
+  // the contract). Only archiving hides a deal from search, the same rule
+  // every other group in this file follows.
+  it("still finds a WON deal by title -- closing is not archiving", async () => {
+    const deal = await makeDeal("Wexfordbay expansion");
+    await winDeal(handle.db, actorId, deal.id);
+
+    const result = await search(handle.db, "Wexfordbay");
+    expect(result.deals.map((d) => d.id)).toContain(deal.id);
   });
 
   it("excludes an archived company from the companies group", async () => {

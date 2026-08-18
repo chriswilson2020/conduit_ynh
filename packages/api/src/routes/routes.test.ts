@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   companySchema, contactSchema, noteSchema, fileMetaSchema, eventSchema,
   errorResponseSchema, listResponseSchema, searchResultsSchema,
+  pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
@@ -445,6 +446,275 @@ describe("users route", () => {
   });
 });
 
+/** POST /api/pipelines and return the parsed body. */
+async function makePipeline(a: Awaited<ReturnType<typeof app>>, payload: Record<string, unknown> = { name: "Sales", scope: "global" }) {
+  const response = await a.inject({ method: "POST", url: "/api/pipelines", headers: authHeaders, payload });
+  return pipelineSchema.parse(response.json());
+}
+/** POST /api/pipelines/:id/stages and return the parsed body. */
+async function makeStage(a: Awaited<ReturnType<typeof app>>, pipelineId: string, name: string) {
+  const response = await a.inject({
+    method: "POST", url: `/api/pipelines/${pipelineId}/stages`, headers: authHeaders, payload: { name },
+  });
+  return stageSchema.parse(response.json());
+}
+/** POST /api/deals and return the parsed body. */
+async function makeDeal(
+  a: Awaited<ReturnType<typeof app>>, pipelineId: string, stageId: string, extra: Record<string, unknown> = {},
+) {
+  const response = await a.inject({
+    method: "POST", url: "/api/deals", headers: authHeaders,
+    payload: { title: "Big Co deal", pipelineId, stageId, ...extra },
+  });
+  return dealSchema.parse(response.json());
+}
+
+describe("pipelines routes", () => {
+  it("runs the pipeline CRUD happy path: create, composite get, patch, archive, unarchive", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    expect(pipeline.scope).toBe("global");
+
+    const got = await a.inject({ method: "GET", url: `/api/pipelines/${pipeline.id}`, headers: authHeaders });
+    expect(got.statusCode).toBe(200);
+    const composite = pipelineWithStagesSchema.parse(got.json());
+    expect(composite.pipeline.id).toBe(pipeline.id);
+    expect(composite.stages).toEqual([]);
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/pipelines/${pipeline.id}`, headers: authHeaders, payload: { name: "Renamed" },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(pipelineSchema.parse(patched.json()).name).toBe("Renamed");
+
+    const archived = await a.inject({ method: "POST", url: `/api/pipelines/${pipeline.id}/archive`, headers: authHeaders });
+    expect(archived.statusCode).toBe(200);
+    expect(pipelineSchema.parse(archived.json()).archivedAt).not.toBeNull();
+
+    const unarchived = await a.inject({ method: "POST", url: `/api/pipelines/${pipeline.id}/unarchive`, headers: authHeaders });
+    expect(unarchived.statusCode).toBe(200);
+    expect(pipelineSchema.parse(unarchived.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  it("lists pipelines filtered by scope, company_id, and archived", async () => {
+    const a = await app();
+    const company = await a.inject({ method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" } });
+    const companyId = company.json().id as string;
+    await makePipeline(a, { name: "Global", scope: "global" });
+    const scoped = await makePipeline(a, { name: "Scoped", scope: "company", companyId });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/pipelines?scope=company&company_id=${companyId}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = z.array(pipelineSchema).parse(response.json());
+    expect(body.map((p) => p.id)).toEqual([scoped.id]);
+    await a.close();
+  });
+
+  it("creates and renames a stage, then reorders it to the front", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const first = await makeStage(a, pipeline.id, "Lead");
+    const second = await makeStage(a, pipeline.id, "Qualified");
+
+    const renamed = await a.inject({
+      method: "PATCH", url: `/api/pipelines/${pipeline.id}/stages/${second.id}`, headers: authHeaders,
+      payload: { name: "Qualifying" },
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(stageSchema.parse(renamed.json()).name).toBe("Qualifying");
+
+    // Reorder second stage to sit BEFORE first (front of the pipeline): no
+    // beforeStageId (nothing precedes it), afterStageId names the stage it
+    // now sits immediately ahead of.
+    const front = await a.inject({
+      method: "POST", url: `/api/pipelines/${pipeline.id}/stages/${second.id}/reorder`, headers: authHeaders,
+      payload: { afterStageId: first.id },
+    });
+    expect(front.statusCode).toBe(200);
+
+    const composite = pipelineWithStagesSchema.parse(
+      (await a.inject({ method: "GET", url: `/api/pipelines/${pipeline.id}`, headers: authHeaders })).json(),
+    );
+    expect(composite.stages.map((s) => s.id)).toEqual([second.id, first.id]);
+    await a.close();
+  });
+
+  it("returns a 409 conflict body when a reorder names a neighbour from a different pipeline", async () => {
+    const a = await app();
+    const pipelineA = await makePipeline(a, { name: "A", scope: "global" });
+    const pipelineB = await makePipeline(a, { name: "B", scope: "global" });
+    const stageA = await makeStage(a, pipelineA.id, "Lead");
+    const stageB = await makeStage(a, pipelineB.id, "Lead");
+
+    const response = await a.inject({
+      method: "POST", url: `/api/pipelines/${pipelineA.id}/stages/${stageA.id}/reorder`, headers: authHeaders,
+      payload: { afterStageId: stageB.id },
+    });
+    expect(response.statusCode).toBe(409);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("conflict");
+    await a.close();
+  });
+});
+
+describe("deals routes", () => {
+  it("requires pipeline_id on the list route", async () => {
+    const a = await app();
+    const response = await a.inject({ method: "GET", url: "/api/deals", headers: authHeaders });
+    expect(response.statusCode).toBe(400);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("validation");
+    await a.close();
+  });
+
+  it("applies config.defaultCurrency when a deal is created without one", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const stage = await makeStage(a, pipeline.id, "Lead");
+    const deal = await makeDeal(a, pipeline.id, stage.id);
+    expect(deal.currency).toBe("EUR");
+    await a.close();
+  });
+
+  it("respects an explicit currency over the configured default", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const stage = await makeStage(a, pipeline.id, "Lead");
+    const deal = await makeDeal(a, pipeline.id, stage.id, { currency: "USD" });
+    expect(deal.currency).toBe("USD");
+    await a.close();
+  });
+
+  it("moves a deal into another stage", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const lead = await makeStage(a, pipeline.id, "Lead");
+    const qualified = await makeStage(a, pipeline.id, "Qualified");
+    const deal = await makeDeal(a, pipeline.id, lead.id);
+
+    const response = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/move`, headers: authHeaders,
+      payload: { stageId: qualified.id },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(dealSchema.parse(response.json()).stageId).toBe(qualified.id);
+    await a.close();
+  });
+
+  it("returns a 409 conflict body when moving next to a neighbour no longer in that stage", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const lead = await makeStage(a, pipeline.id, "Lead");
+    const qualified = await makeStage(a, pipeline.id, "Qualified");
+    const staleNeighbour = await makeDeal(a, pipeline.id, qualified.id);
+    // Move the neighbour elsewhere so its stage membership is now stale.
+    await a.inject({
+      method: "POST", url: `/api/deals/${staleNeighbour.id}/move`, headers: authHeaders,
+      payload: { stageId: lead.id },
+    });
+    const deal = await makeDeal(a, pipeline.id, lead.id);
+
+    const response = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/move`, headers: authHeaders,
+      payload: { stageId: qualified.id, beforeDealId: staleNeighbour.id },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  it("returns a 409 conflict body when moving a won deal", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const lead = await makeStage(a, pipeline.id, "Lead");
+    const qualified = await makeStage(a, pipeline.id, "Qualified");
+    const deal = await makeDeal(a, pipeline.id, lead.id);
+    await a.inject({ method: "POST", url: `/api/deals/${deal.id}/win`, headers: authHeaders });
+
+    const response = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/move`, headers: authHeaders,
+      payload: { stageId: qualified.id },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  it("runs win, reopen, and lose happy paths, each stamping status and closedAt", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const lead = await makeStage(a, pipeline.id, "Lead");
+    const dealA = await makeDeal(a, pipeline.id, lead.id);
+    const dealB = await makeDeal(a, pipeline.id, lead.id);
+
+    const won = await a.inject({ method: "POST", url: `/api/deals/${dealA.id}/win`, headers: authHeaders });
+    expect(won.statusCode).toBe(200);
+    const wonBody = dealSchema.parse(won.json());
+    expect(wonBody.status).toBe("won");
+    expect(wonBody.closedAt).not.toBeNull();
+
+    const reopened = await a.inject({ method: "POST", url: `/api/deals/${dealA.id}/reopen`, headers: authHeaders });
+    expect(reopened.statusCode).toBe(200);
+    const reopenedBody = dealSchema.parse(reopened.json());
+    expect(reopenedBody.status).toBe("open");
+    expect(reopenedBody.closedAt).toBeNull();
+
+    const lost = await a.inject({
+      method: "POST", url: `/api/deals/${dealB.id}/lose`, headers: authHeaders, payload: { reason: "budget cut" },
+    });
+    expect(lost.statusCode).toBe(200);
+    const lostBody = dealSchema.parse(lost.json());
+    expect(lostBody.status).toBe("lost");
+    expect(lostBody.lostReason).toBe("budget cut");
+    await a.close();
+  });
+
+  it("returns a 409 conflict body for an illegal transition (winning an already-won deal)", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const lead = await makeStage(a, pipeline.id, "Lead");
+    const deal = await makeDeal(a, pipeline.id, lead.id);
+    await a.inject({ method: "POST", url: `/api/deals/${deal.id}/win`, headers: authHeaders });
+
+    const response = await a.inject({ method: "POST", url: `/api/deals/${deal.id}/win`, headers: authHeaders });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  it("returns 400 when losing a deal without a reason", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const lead = await makeStage(a, pipeline.id, "Lead");
+    const deal = await makeDeal(a, pipeline.id, lead.id);
+
+    const response = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/lose`, headers: authHeaders, payload: {},
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  it("returns the funnel shape for a pipeline with one open deal", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const lead = await makeStage(a, pipeline.id, "Lead");
+    await makeDeal(a, pipeline.id, lead.id, { valueCents: 5000 });
+
+    const response = await a.inject({ method: "GET", url: `/api/pipelines/${pipeline.id}/funnel`, headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = z.array(funnelRowSchema).parse(response.json());
+    const row = body.find((r) => r.stageId === lead.id);
+    expect(row?.count).toBe(1);
+    expect(row?.valueCents).toBe(5000);
+    await a.close();
+  });
+});
+
 describe("search route", () => {
   it("returns grouped results that parse against the shared schema", async () => {
     const a = await app();
@@ -463,6 +733,20 @@ describe("search route", () => {
     expect(response.statusCode).toBe(200);
     const body = searchResultsSchema.parse(response.json());
     expect(body).toEqual({ companies: [], contacts: [], notes: [], deals: [] });
+    await a.close();
+  });
+
+  it("returns a deals group that still contains a won deal by title", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const stage = await makeStage(a, pipeline.id, "Lead");
+    const deal = await makeDeal(a, pipeline.id, stage.id, { title: "Quixotic Holdings renewal" });
+    await a.inject({ method: "POST", url: `/api/deals/${deal.id}/win`, headers: authHeaders });
+
+    const response = await a.inject({ method: "GET", url: "/api/search?q=Quixotic", headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = searchResultsSchema.parse(response.json());
+    expect(body.deals.map((d) => d.id)).toContain(deal.id);
     await a.close();
   });
 });

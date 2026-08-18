@@ -1,7 +1,7 @@
 import { and, eq, ilike, isNull, or, sql } from "drizzle-orm";
 import type { SearchResults } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { companies, contacts, notes } from "../db/schema.js";
+import { companies, contacts, notes, deals } from "../db/schema.js";
 import { escapeLike } from "./pagination.js";
 
 const LIMIT_PER_TYPE = 8;
@@ -26,7 +26,7 @@ function snippet(body: string, q: string): string {
 
 export async function search(db: Database, q: string): Promise<SearchResults> {
   const p = `%${escapeLike(q)}%`;
-  const [companyRows, contactRows, noteRows] = await Promise.all([
+  const [companyRows, contactRows, noteRows, dealRows] = await Promise.all([
     db.select({ id: companies.id, name: companies.name }).from(companies)
       .where(and(isNull(companies.archivedAt), ilike(companies.name, p))).limit(LIMIT_PER_TYPE),
     db.select({
@@ -55,14 +55,19 @@ export async function search(db: Database, q: string): Promise<SearchResults> {
         ilike(notes.body, p),
         sql`COALESCE(${companies.archivedAt}, ${contacts.archivedAt}) IS NULL`,
       )).limit(LIMIT_PER_TYPE),
+    // archivedAt excluded like every other group, but status is deliberately
+    // NOT filtered: a won or lost deal must stay findable by title -- closing
+    // a deal shouldn't make it vanish from search, and salespeople routinely
+    // look up a closed deal by name (checking terms, reopening a lost one).
+    // Only archiving (an explicit, separate lifecycle action) hides a deal
+    // from search, the same rule every other group in this file follows.
+    db.select({ id: deals.id, title: deals.title }).from(deals)
+      .where(and(isNull(deals.archivedAt), ilike(deals.title, p))).limit(LIMIT_PER_TYPE),
   ]);
   return {
     companies: companyRows,
     contacts: contactRows,
     notes: noteRows.map((n) => ({ id: n.id, companyId: n.companyId, contactId: n.contactId, snippet: snippet(n.body, q) })),
-    // Stubbed empty pending the deals table existing as a queryable service
-    // (Phase 2 plan Task 5 wires the real title-ILIKE query here). The shared
-    // schema already requires this group so the response shape is final now.
-    deals: [],
+    deals: dealRows,
   };
 }

@@ -125,7 +125,7 @@ export async function buildApp(
     return { user: request.user };
   });
 
-  await registerCrmRoutes(app, { db, dataDir, multipartFileSizeLimit });
+  await registerCrmRoutes(app, { db, dataDir, multipartFileSizeLimit, defaultCurrency: config.defaultCurrency });
 
   if (webRoot === undefined) {
     app.setNotFoundHandler(async (request, reply) => {

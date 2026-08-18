@@ -1,7 +1,7 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { User } from "@conduit/shared";
-import { NotFoundError, ArchivedError } from "../services/errors.js";
+import { NotFoundError, ArchivedError, ConflictError } from "../services/errors.js";
 import { decodeCursor } from "../services/pagination.js";
 
 /**
@@ -31,10 +31,18 @@ export function requireUser(request: FastifyRequest, reply: FastifyReply): User 
 }
 
 /**
- * Maps the two domain error types every service can throw into their HTTP shape.
+ * Maps the three domain error types every service can throw into their HTTP shape.
  * Anything else is re-thrown so it reaches app.ts's setErrorHandler, which is the
  * single place that decides what a 5xx body looks like (and never echoes the
  * underlying error text) -- this function must not swallow or reshape those.
+ *
+ * ArchivedError and ConflictError both map to HTTP 409, but with distinct
+ * bodies -- `{ error: "archived" }` vs `{ error: "conflict" }` -- that the
+ * client branches on by `code`, not just status. Archived means the row's
+ * lifecycle flag blocks the mutation outright (no retry will help without an
+ * unarchive first); conflict means the caller's view of some OTHER row's
+ * current state (a stage/pipeline neighbour, a deal's status) went stale --
+ * the client should refetch and can retry the same action once it has.
  */
 export function mapDomainError(reply: FastifyReply, error: unknown): void {
   if (error instanceof NotFoundError) {
@@ -43,6 +51,10 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
   }
   if (error instanceof ArchivedError) {
     void reply.code(409).send({ error: "archived", message: error.message });
+    return;
+  }
+  if (error instanceof ConflictError) {
+    void reply.code(409).send({ error: "conflict", message: error.message });
     return;
   }
   throw error;

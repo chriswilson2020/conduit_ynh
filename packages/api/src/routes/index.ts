@@ -9,6 +9,8 @@ import { registerEventRoutes } from "./events.js";
 import { registerUserRoutes } from "./users.js";
 import { registerSearchRoutes } from "./search.js";
 import { registerStreamRoutes } from "./stream.js";
+import { registerPipelineRoutes } from "./pipelines.js";
+import { registerDealRoutes } from "./deals.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -19,6 +21,9 @@ export interface CrmRouteDeps {
   /** Test-only override for the multipart file-size cap, so a 413-path test can
    * upload a few KB instead of 50MB. Defaults to 50MB in production. */
   multipartFileSizeLimit?: number;
+  /** Applied by deals.ts's POST /api/deals when the caller omits a currency --
+   * threaded straight from config.defaultCurrency (see config.ts). */
+  defaultCurrency: string;
 }
 
 /**
@@ -46,4 +51,6 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerUserRoutes(app, deps);
   registerSearchRoutes(app, deps);
   registerStreamRoutes(app, deps);
+  registerPipelineRoutes(app, deps);
+  registerDealRoutes(app, deps);
 }
