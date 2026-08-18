@@ -15,7 +15,11 @@ async function main(): Promise<void> {
   const app = await buildApp({
     config,
     db,
-    webRoot: process.env.WEB_ROOT ?? path.join(here, "..", "..", "web"),
+    // server.js is staged one level under the release root (<root>/server/server.js),
+    // and the built SPA sits alongside it at <root>/web -- one ".." back up to
+    // <root>, then into web. (Compare db/client.ts's migrationsFolder(), which needs
+    // two: server/db/client.js is nested one level deeper than server/server.js.)
+    webRoot: process.env.WEB_ROOT ?? path.join(here, "..", "web"),
   });
 
   // Loopback only. nginx is the sole ingress, and that is what makes the
