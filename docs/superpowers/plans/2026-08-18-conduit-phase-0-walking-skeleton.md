@@ -1189,16 +1189,28 @@ Create `packages/api/src/auth.ts`:
 import type { IncomingHttpHeaders } from "node:http";
 import type { Identity } from "./users.js";
 
-// Reject C0 (\x00-\x1f) and DEL (\x7f) control characters anywhere in the value,
-// not just at the ends. Node's HTTP parser already refuses bare CR/LF, so this is
-// defence in depth: the identity here becomes a database key and is rendered in the
-// UI, and it should not depend on a guarantee made a layer below.
-const CONTROL_CHARACTERS = /[\x00-\x1f\x7f]/;
+// Reject characters with no legitimate place in an identity string:
+//   \p{Cc}            all control characters - C0, C1 (including NEL U+0085) and DEL
+//   \u200B            zero-width space, which trim() does not strip, so it would yield
+//                     a key visually identical to another but distinct in the database
+//   \u202A-\u202E     bidi embeddings and overrides
+//   \u2066-\u2069     bidi isolates
+//                     Both can visually reorder a rendered name, and fullName is
+//                     displayed in the UI.
+//
+// Deliberately NOT rejecting the rest of \p{Cf}: ZWNJ (U+200C) and ZWJ (U+200D) are
+// required for correct rendering of Persian, Hindi and other scripts, and in emoji
+// sequences. Rejecting them would refuse legitimate names.
+//
+// Node's HTTP parser already refuses bare CR/LF, so this is defence in depth: the
+// identity here becomes a database key and is rendered in the UI, and it should not
+// depend on a guarantee made a layer below.
+const FORBIDDEN_CHARACTERS = /[\p{Cc}\u200B\u202A-\u202E\u2066-\u2069]/u;
 
-/** Reject anything that is not a single non-empty header value free of control characters. */
+/** Reject anything that is not a single non-empty header value free of forbidden characters. */
 function single(value: IncomingHttpHeaders[string]): string | null {
   if (typeof value !== "string") return null;
-  if (CONTROL_CHARACTERS.test(value)) return null;
+  if (FORBIDDEN_CHARACTERS.test(value)) return null;
   const trimmed = value.trim();
   return trimmed === "" ? null : trimmed;
 }
@@ -1239,22 +1251,36 @@ export function identityFromHeaders(
 
 Two deliberate choices here, both worth tests that pin them:
 
-**Control characters are rejected before trimming.** A value that is only a tab is malformed, not
+**Forbidden characters are rejected before trimming.** A value that is only a tab is malformed, not
 absent. This is defence in depth rather than a live vulnerability — Node's parser already refuses
 bare CR/LF — but this function is an auth boundary whose output becomes a database key, and it
 should not rest on a guarantee made a layer below.
+
+**Write the character class and its tests using `\u` escapes only, never literal glyphs.** Invisible
+characters do not survive being copied through chat, diffs or terminals intact — this bit the plan
+twice during implementation. A reliable check is to write the file with Python's `encoding="ascii"`,
+which throws if any literal non-ASCII byte is present, and to scan the committed file for bytes
+above 127.
 
 **A malformed `ynh-user` fails closed rather than falling through to the dev user.** A present-but-
 garbage header means something upstream tried to assert an identity and produced nonsense. Treating
 that identically to "no auth layer at all" would erase the distinction between local development and
 a broken or hostile proxy.
 
-Add tests beyond the seven above for: an embedded newline and a tab in `ynh-user` both returning
-null; a control character in `ynh-user-email` leaving `email: null` while a valid username still
-resolves; and — importantly — that ordinary names with spaces (`"Chris Wilson"`) and hyphens and
-apostrophes (`"Anne-Marie O'Brien"`) still pass, which is what catches an over-broad character class.
-Also pin that empty, whitespace-only, array-valued and control-character usernames all return null
-even when a dev user is configured.
+Add tests beyond the seven above for: an embedded newline, a tab, NEL (`\u0085`) and zero-width space
+(`\u200B`) in `ynh-user` all returning null; a right-to-left override (`\u202E`) in
+`ynh-user-fullname` leaving `fullName: null` while a valid username still resolves; and that empty,
+whitespace-only, array-valued and forbidden-character usernames all return null even when a dev user
+is configured.
+
+Two tests exist specifically to stop the class being widened carelessly later, and both assert with
+`toBe` that the character survives unchanged:
+
+- a Persian name containing ZWNJ (`"\u0645\u06CC\u200C\u0631\u0648\u062F"`) still passes
+- an emoji sequence joined with ZWJ (`"\u{1F468}\u200D\u{1F4BB}"`) still passes
+
+Plus ordinary names with spaces (`"Chris Wilson"`) and with hyphens and apostrophes
+(`"Anne-Marie O'Brien"`) — as separate `it` blocks, so a failure in one does not hide the other.
 
 - [ ] **Step 4: Run the tests**
 
