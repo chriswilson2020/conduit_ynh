@@ -1581,7 +1581,7 @@ git commit -m "feat(api): add fastify app with health, me and auth hook"
 ## Task 9: React SPA
 
 **Files:**
-- Create: `packages/web/package.json`, `packages/web/tsconfig.json`, `packages/web/vite.config.ts`, `packages/web/index.html`, `packages/web/src/main.tsx`, `packages/web/src/App.tsx`, `packages/web/src/api.ts`
+- Create: `packages/web/package.json`, `packages/web/tsconfig.json`, `packages/web/vite.config.ts`, `packages/web/index.html`, `packages/web/src/main.tsx`, `packages/web/src/App.tsx`, `packages/web/src/api.ts`, `packages/web/src/api.test.ts`
 
 - [ ] **Step 1: Write `packages/web/package.json`**
 
@@ -1688,7 +1688,7 @@ export function basePath(): string {
   return injected;
 }
 
-function apiUrl(path: string): string {
+export function apiUrl(path: string): string {
   const base = basePath();
   return base === "/" ? `/api${path}` : `${base}/api${path}`;
 }
@@ -1705,7 +1705,15 @@ export const fetchMe = () => getJson<MeResponse>("/me");
 export const fetchHealth = () => getJson<HealthResponse>("/health");
 ```
 
-The `startsWith("__")` check catches the un-substituted placeholder during `vite dev`, where no server rewrite happens.
+The `startsWith("__")` check catches the un-substituted placeholder during `vite dev`, where no
+server rewrite happens. `apiUrl` is exported so it can be unit tested — the whole subpath story rests
+on these two pure functions.
+
+Cover them in `packages/web/src/api.test.ts`: undefined, empty and un-substituted
+`window.__CONDUIT_BASE__` all yield `/`; `"/conduit"` yields `/conduit`; `apiUrl("/me")` gives
+`/api/me` at root and `/conduit/api/me` at a subpath. Stub `globalThis.window` per test rather than
+adding jsdom — the root Vitest environment is `node`, and `api.ts` only reads `window` inside function
+bodies, never at module load.
 
 - [ ] **Step 6: Write `packages/web/src/App.tsx`**
 
@@ -1782,10 +1790,16 @@ createRoot(container).render(
 - [ ] **Step 8: Install and build**
 
 ```bash
-npm install && npm run build -w @conduit/web
+./scripts/remote.sh 'npm install && npm run build'
 ```
 
 Expected: `packages/web/dist/index.html` plus hashed assets under `packages/web/dist/assets/`.
+
+Use the **root** build, not `npm run build -w @conduit/web`. npm topologically sorts workspaces, so
+the root build compiles `@conduit/shared` first; targeting the web workspace directly skips it and
+fails with `Cannot find module '@conduit/shared'`, because `packages/web`'s build runs a plain
+`tsc --noEmit` rather than `tsc -b`, and so does not build referenced projects. `packages/shared/dist`
+is gitignored, so it never survives an rsync either.
 
 - [ ] **Step 9: Verify the build uses relative asset paths**
 
