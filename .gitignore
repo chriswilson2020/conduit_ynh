@@ -8,3 +8,7 @@ build/
 coverage/
 playwright-report/
 test-results/
+packages/*/dist/
+*.tsbuildinfo
+release/
+.vitest/
