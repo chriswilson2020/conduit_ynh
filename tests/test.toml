@@ -1,0 +1,27 @@
+test_format = 1.0
+
+[default]
+
+    exclude = ["install.private"]
+
+    # No test_upgrade_from block yet.
+    #
+    # The plan for this file assumed that by the time v0.1.0 was published, HEAD's
+    # manifest version would already have moved on to something newer, so restoring
+    # this block with name = "0.1.0~ynh1" would test a real upgrade: install the
+    # published 0.1.0~ynh1, then upgrade to whatever came after it.
+    #
+    # That has not happened. manifest.toml has never been bumped -- it has been
+    # "0.1.0~ynh1" for its entire history (see `git log -p -- manifest.toml`), and
+    # the one published release (tag v0.1.0) is that same version. Restoring
+    #
+    #   [default.test_upgrade_from.previous]
+    #   name = "0.1.0~ynh1"
+    #
+    # now would tell package_check to install 0.1.0~ynh1 and then "upgrade" to
+    # 0.1.0~ynh1 -- identical code on both sides, so it exercises nothing an install
+    # test doesn't already cover.
+    #
+    # Add this block back, with name = "0.1.0~ynh1", the first time version in
+    # manifest.toml is bumped past that. At that point 0.1.0~ynh1 becomes a genuine
+    # prior release to upgrade from.
