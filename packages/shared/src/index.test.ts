@@ -9,6 +9,7 @@ import {
   createNoteInputSchema,
   usersResponseSchema,
   createPipelineInputSchema,
+  pipelineWithStagesSchema,
   dealSchema,
   createDealInputSchema,
   moveDealInputSchema,
@@ -212,6 +213,33 @@ describe("createPipelineInputSchema", () => {
   it("rejects an unknown scope value", () =>
     expect(() =>
       createPipelineInputSchema.parse({ name: "Sales", scope: "project", companyId: uuid1 }),
+    ).toThrow());
+});
+
+describe("pipelineWithStagesSchema", () => {
+  const now = new Date().toISOString();
+  const pipeline = {
+    id: uuid1, name: "Sales", scope: "global" as const, companyId: null, position: "a0",
+    archivedAt: null, createdAt: now, updatedAt: now,
+  };
+  const stage = {
+    id: uuid2, pipelineId: uuid1, name: "Lead", position: "a0",
+    probability: null, rotDays: null, createdAt: now, updatedAt: now,
+  };
+
+  it("accepts a pipeline with an ordered list of stages", () => {
+    const value = { pipeline, stages: [stage] };
+    expect(pipelineWithStagesSchema.parse(value)).toEqual(value);
+  });
+
+  it("accepts a pipeline with zero stages", () => {
+    const value = { pipeline, stages: [] };
+    expect(pipelineWithStagesSchema.parse(value)).toEqual(value);
+  });
+
+  it("rejects a malformed stage in the array", () =>
+    expect(() =>
+      pipelineWithStagesSchema.parse({ pipeline, stages: [{ ...stage, probability: 200 }] }),
     ).toThrow());
 });
 

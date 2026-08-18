@@ -143,6 +143,18 @@ export const stageSchema = z.object({
 });
 export type Stage = z.infer<typeof stageSchema>;
 
+// Composite response for "get one pipeline": its stages, already ordered by
+// position, bundled alongside it. Only pipelineSchema/stageSchema existed when
+// the pipelines service (Phase 2) needed a getPipeline return shape, so this
+// wraps rather than flattens them -- { pipeline, stages }, not a spread -- to
+// keep the two independently-versioned resources from colliding on field
+// names (both have id/name/createdAt/updatedAt) if either ever grows one.
+export const pipelineWithStagesSchema = z.object({
+  pipeline: pipelineSchema,
+  stages: z.array(stageSchema),
+});
+export type PipelineWithStages = z.infer<typeof pipelineWithStagesSchema>;
+
 export const createStageInputSchema = z.object({
   name: z.string().min(1),
   probability: z.number().int().min(0).max(100).nullable().optional(),
