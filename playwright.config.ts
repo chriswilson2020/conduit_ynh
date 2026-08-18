@@ -18,6 +18,12 @@ export default defineConfig({
       NODE_ENV: "development",
       PORT: "3100",
       DATABASE_URL: process.env.TEST_DATABASE_URL ?? "postgres:///conduit_test",
+      // Same fallback global-setup.ts documents for vitest: a bare "postgres:///db"
+      // URL with no ambient PGHOST connects over TCP to localhost, which requires a
+      // password this role does not have. Without this, `webServer` fails to boot
+      // with "password authentication failed" on any shell that does not already
+      // export PGHOST (e.g. remote.sh's non-interactive ssh invocation).
+      PGHOST: process.env.PGHOST ?? "/run/postgresql",
       APP_VERSION: "0.1.0-e2e",
       CONDUIT_DEV_USER: "e2euser",
       BASE_PATH: "/",

@@ -1,4 +1,5 @@
 import type { MeResponse, HealthResponse } from "@conduit/shared";
+import { errorResponseSchema } from "@conduit/shared";
 
 declare global {
   interface Window {
@@ -18,13 +19,44 @@ export function apiUrl(path: string): string {
   return base === "/" ? `/api${path}` : `${base}/api${path}`;
 }
 
-async function getJson<T>(path: string): Promise<T> {
+export async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(apiUrl(path), { headers: { Accept: "application/json" } });
   if (!response.ok) {
     throw new Error(`GET ${path} failed with ${response.status}`);
   }
   return (await response.json()) as T;
 }
+
+/**
+ * Shared POST/PATCH body sender. On a non-2xx response, the body is checked
+ * against the app's uniform error shape (`{ error, message? }`, see
+ * errorResponseSchema) and, when it matches, the thrown error carries the
+ * server's `message` (falling back to `error`) instead of a generic
+ * "<method> <path> failed with <status>" -- callers surfacing this in the UI
+ * get "company acme is archived", not "PATCH /companies/... failed with 409".
+ */
+async function sendJson<T>(method: "POST" | "PATCH", path: string, body?: unknown): Promise<T> {
+  const response = await fetch(apiUrl(path), {
+    method,
+    headers: {
+      Accept: "application/json",
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const raw: unknown = await response.json().catch(() => undefined);
+    const parsed = errorResponseSchema.safeParse(raw);
+    const message = parsed.success
+      ? (parsed.data.message ?? parsed.data.error)
+      : `${method} ${path} failed with ${response.status}`;
+    throw new Error(message);
+  }
+  return (await response.json()) as T;
+}
+
+export const postJson = <T>(path: string, body?: unknown) => sendJson<T>("POST", path, body);
+export const patchJson = <T>(path: string, body?: unknown) => sendJson<T>("PATCH", path, body);
 
 export const fetchMe = () => getJson<MeResponse>("/me");
 

@@ -104,6 +104,17 @@ export function listResponseSchema<T extends z.ZodType>(item: T) {
   return z.object({ items: z.array(item), nextCursor: z.string().nullable() });
 }
 
+// Mirrors the columns GET /api/users actually selects (see routes/users.ts):
+// a plain listing for populating an owner picker, not the full userSchema (no
+// email/createdAt).
+export const userSummarySchema = z.object({
+  id: z.uuid(), username: z.string().min(1), fullName: z.string().min(1).nullable(),
+});
+export type UserSummary = z.infer<typeof userSummarySchema>;
+
+export const usersResponseSchema = z.object({ users: z.array(userSummarySchema) });
+export type UsersResponse = z.infer<typeof usersResponseSchema>;
+
 export const searchResultsSchema = z.object({
   companies: z.array(z.object({ id: z.uuid(), name: z.string() })),
   contacts: z.array(z.object({

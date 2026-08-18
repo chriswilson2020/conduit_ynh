@@ -7,6 +7,7 @@ import {
   companySchema,
   contactSchema,
   createNoteInputSchema,
+  usersResponseSchema,
 } from "./index.js";
 
 describe("userSchema", () => {
@@ -148,6 +149,18 @@ describe("contactSchema", () => {
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       }),
     ).toThrow();
+  });
+});
+
+describe("usersResponseSchema", () => {
+  it("accepts a list of user summaries, including a null fullName", () => {
+    const body = {
+      users: [
+        { id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", username: "chris", fullName: "Chris Wilson" },
+        { id: "8f14e45f-ceea-467e-adc3-b1cc985ff1c9", username: "e2euser", fullName: null },
+      ],
+    };
+    expect(usersResponseSchema.parse(body)).toEqual(body);
   });
 });
 

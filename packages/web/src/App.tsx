@@ -40,13 +40,16 @@ export function App() {
       );
   }, []);
 
-  if (meState.kind === "loading") return <main><p>Loading...</p></main>;
+  // No wrapping <main> here: this component is rendered inside the router's
+  // Shell, which already provides the page's <main> landmark (nesting two
+  // <main> elements would be invalid HTML).
+  if (meState.kind === "loading") return <p>Loading...</p>;
   if (meState.kind === "error") {
     return (
-      <main>
+      <div>
         <h1>Conduit</h1>
         <p role="alert">Could not reach the API: {meState.message}</p>
-      </main>
+      </div>
     );
   }
 
@@ -55,7 +58,7 @@ export function App() {
   const database = healthState.kind === "ready" ? healthState.health.database : "unavailable";
 
   return (
-    <main>
+    <div>
       <h1>Conduit</h1>
       <p data-testid="greeting">
         Logged in as {user.fullName ?? user.username} ({user.username})
@@ -68,6 +71,6 @@ export function App() {
         <dt>Base path</dt>
         <dd data-testid="base-path">{basePath()}</dd>
       </dl>
-    </main>
+    </div>
   );
 }
