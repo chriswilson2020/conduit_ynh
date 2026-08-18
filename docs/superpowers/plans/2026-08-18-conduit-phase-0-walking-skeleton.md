@@ -1189,9 +1189,16 @@ Create `packages/api/src/auth.ts`:
 import type { IncomingHttpHeaders } from "node:http";
 import type { Identity } from "./users.js";
 
-/** Reject anything that is not a single non-empty header value. */
+// Reject C0 (\x00-\x1f) and DEL (\x7f) control characters anywhere in the value,
+// not just at the ends. Node's HTTP parser already refuses bare CR/LF, so this is
+// defence in depth: the identity here becomes a database key and is rendered in the
+// UI, and it should not depend on a guarantee made a layer below.
+const CONTROL_CHARACTERS = /[\x00-\x1f\x7f]/;
+
+/** Reject anything that is not a single non-empty header value free of control characters. */
 function single(value: IncomingHttpHeaders[string]): string | null {
   if (typeof value !== "string") return null;
+  if (CONTROL_CHARACTERS.test(value)) return null;
   const trimmed = value.trim();
   return trimmed === "" ? null : trimmed;
 }
@@ -1201,17 +1208,26 @@ function single(value: IncomingHttpHeaders[string]): string | null {
  * proxy_params_with_auth include. SSOwat overwrites these before proxying, so a
  * client cannot supply them itself — provided the app is only reachable via nginx,
  * which is why the server binds to loopback.
+ *
+ * The dev-user fallback only applies when the ynh-user header key is entirely
+ * absent (no SSOwat in front of the app at all). If the key is present but fails
+ * validation — empty, whitespace-only, array-valued, or containing a control
+ * character — that is a malformed identity header, not a missing one, and is
+ * rejected outright rather than silently downgrading to the configured dev user.
  */
 export function identityFromHeaders(
   headers: IncomingHttpHeaders,
   devUser: string | null,
 ): Identity | null {
-  const username = single(headers["ynh-user"]);
+  const rawUsername = headers["ynh-user"];
 
-  if (username === null) {
+  if (rawUsername === undefined) {
     if (devUser === null) return null;
     return { username: devUser, email: null, fullName: devUser };
   }
+
+  const username = single(rawUsername);
+  if (username === null) return null;
 
   return {
     username,
@@ -1220,6 +1236,25 @@ export function identityFromHeaders(
   };
 }
 ```
+
+Two deliberate choices here, both worth tests that pin them:
+
+**Control characters are rejected before trimming.** A value that is only a tab is malformed, not
+absent. This is defence in depth rather than a live vulnerability — Node's parser already refuses
+bare CR/LF — but this function is an auth boundary whose output becomes a database key, and it
+should not rest on a guarantee made a layer below.
+
+**A malformed `ynh-user` fails closed rather than falling through to the dev user.** A present-but-
+garbage header means something upstream tried to assert an identity and produced nonsense. Treating
+that identically to "no auth layer at all" would erase the distinction between local development and
+a broken or hostile proxy.
+
+Add tests beyond the seven above for: an embedded newline and a tab in `ynh-user` both returning
+null; a control character in `ynh-user-email` leaving `email: null` while a valid username still
+resolves; and — importantly — that ordinary names with spaces (`"Chris Wilson"`) and hyphens and
+apostrophes (`"Anne-Marie O'Brien"`) still pass, which is what catches an over-broad character class.
+Also pin that empty, whitespace-only, array-valued and control-character usernames all return null
+even when a dev user is configured.
 
 - [ ] **Step 4: Run the tests**
 
