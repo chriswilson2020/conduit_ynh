@@ -6,9 +6,42 @@
 
 **Architecture:** An npm-workspaces monorepo with three packages (`shared`, `api`, `web`). A Fastify server binds to loopback, reads the SSOwat-injected `Ynh-User` header on every request, resolves it to a PostgreSQL `users` row via Drizzle, serves the JSON API under `/api/*`, and serves the built React SPA for every other path with a `__BASE_PATH__` placeholder rewritten at serve time. YunoHost packaging v2 wraps all of it.
 
-**Tech Stack:** Node 24, TypeScript 5 (ESM/NodeNext), Fastify 5, Drizzle ORM 0.45 + postgres.js 3, PostgreSQL 17, React 19, Vite 8, Vitest 4, Playwright, YunoHost packaging format 2 / helpers 2.1.
+**Tech Stack:** Node 24, TypeScript 5 (ESM/NodeNext), Fastify 5, Drizzle ORM 0.45 + postgres.js 3, PostgreSQL 15, React 19, Vite 8, Vitest 4, Playwright, YunoHost packaging format 2 / helpers 2.1.
 
 **Why this phase exists:** Backup/restore and SSO are the two things YunoHost packages most often get wrong. Discovering that in month six means rework. This phase deliberately ships no features.
+
+---
+
+## Development environment
+
+**All development happens on the YunoHost server, not on a Mac.** The server is the deployment
+target, so developing there removes a whole class of "worked locally, broke on Debian" problems and
+keeps the developer's laptop clean.
+
+| | |
+|---|---|
+| Host | `$CONDUIT_REMOTE` (`conduit.listerdale.de`) |
+| Working copy | `/home/chris/conduit` |
+| OS | Debian 12.15 Bookworm, x86_64, 3.7GB RAM, 2 vCPU |
+| YunoHost | 12.1.40.1 (manifest requires `>= 12.1.17`) |
+| Node | 24.19.0, npm 11.17.0 (NodeSource) |
+| PostgreSQL | 15.19 (Debian 12's version — **not** 17) |
+| Databases | `conduit_dev`, `conduit_test`, both owned by role `chris` |
+| Privileges | the deploy user needs sudo; see the separate server-setup notes |
+
+PostgreSQL listens on `127.0.0.1:5432` only, and `chris` connects over the local socket with peer
+auth — so `postgres://localhost/conduit_test` needs no password anywhere.
+
+**Editing workflow:** files are edited and committed in the Mac working copy, then pushed to the
+server with rsync. The server copy is a mirror and is never committed to, so git history lives in
+exactly one place and the two cannot diverge.
+
+```bash
+rsync -az --delete --exclude node_modules --exclude release ./ $CONDUIT_REMOTE:/home/chris/conduit/
+```
+
+Every `npm`, `psql`, `yunohost` and Playwright command in this plan runs **on the server**, over SSH
+from the repo root at `/home/chris/conduit`.
 
 ---
 
@@ -47,34 +80,26 @@
 
 ---
 
-## Task 1: Workspace scaffold and local PostgreSQL
+## Task 1: Workspace scaffold
 
 **Files:**
-- Create: `package.json`, `tsconfig.base.json`, `vitest.config.ts`, `.nvmrc`
+- Create: `package.json`, `tsconfig.base.json`, `tsconfig.json`, `vitest.config.ts`, `.nvmrc`
 - Modify: `.gitignore`
 
-- [ ] **Step 1: Install and start PostgreSQL 17**
+The environment is already provisioned (see Development environment above), so this task is purely
+repository scaffolding. Nothing is installed on the developer's machine.
 
-YunoHost 13 runs PostgreSQL 17, so develop against the same major version.
-
-```bash
-brew install postgresql@17 && brew services start postgresql@17
-```
-
-- [ ] **Step 2: Put psql on PATH and create the databases**
-
-`postgresql@17` is keg-only, so it is not on PATH by default.
+- [ ] **Step 1: Confirm the environment is what the plan assumes**
 
 ```bash
-export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
-createdb conduit_dev && createdb conduit_test && psql -l | grep conduit
+ssh $CONDUIT_REMOTE 'node --version; npm --version; psql --version; psql -d conduit_test -tAc "SELECT current_user, current_database()"'
 ```
 
-Expected: both `conduit_dev` and `conduit_test` listed.
+Expected: `v24.19.0`, `11.17.0`, `psql (PostgreSQL) 15.19`, and `chris|conduit_test`. If the psql
+line errors, the databases are missing — recreate with
+`sudo -u postgres createdb -O chris conduit_test`.
 
-Add the `export PATH=...` line to your shell profile, or every later task will fail to find `psql`.
-
-- [ ] **Step 3: Write the root `package.json`**
+- [ ] **Step 2: Write the root `package.json`**
 
 ```json
 {
@@ -99,7 +124,7 @@ Add the `export PATH=...` line to your shell profile, or every later task will f
 }
 ```
 
-- [ ] **Step 4: Write `tsconfig.base.json`**
+- [ ] **Step 3: Write `tsconfig.base.json`**
 
 ```json
 {
@@ -120,7 +145,21 @@ Add the `export PATH=...` line to your shell profile, or every later task will f
 }
 ```
 
-`noUncheckedIndexedAccess` is on deliberately. It is mildly annoying and it catches a whole class of undefined-access bugs.
+`noUncheckedIndexedAccess` is on deliberately. It is mildly annoying and it catches a whole class of
+undefined-access bugs.
+
+- [ ] **Step 4: Write the root `tsconfig.json`**
+
+`npm run typecheck` runs `tsc -b`, which needs a root project listing the buildable packages. `web`
+is absent on purpose — Vite typechecks it separately, and it uses `bundler` resolution rather than
+`NodeNext`.
+
+```json
+{
+  "files": [],
+  "references": [{ "path": "./packages/shared" }, { "path": "./packages/api" }]
+}
+```
 
 - [ ] **Step 5: Write `vitest.config.ts`**
 
@@ -137,39 +176,30 @@ export default defineConfig({
 });
 ```
 
-`singleFork` is required: the database-backed tests share one test database and would race each other otherwise. Task 5 adds the `globalSetup` entry, once the file it points at exists.
+`singleFork` is required: the database-backed tests share one test database and would race each
+other otherwise. Task 5 adds the `globalSetup` entry, once the file it points at exists.
 
-- [ ] **Step 6: Write the root `tsconfig.json`**
-
-`npm run typecheck` runs `tsc -b`, which needs a root project listing the buildable packages. `web` is absent on purpose — Vite typechecks it separately, and it uses `bundler` resolution rather than `NodeNext`.
-
-```json
-{
-  "files": [],
-  "references": [{ "path": "./packages/shared" }, { "path": "./packages/api" }]
-}
-```
-
-- [ ] **Step 7: Write `.nvmrc` and extend `.gitignore`**
+- [ ] **Step 6: Write `.nvmrc` and extend `.gitignore`**
 
 ```bash
 echo "24" > .nvmrc
 printf '%s\n' 'packages/*/dist/' '*.tsbuildinfo' 'release/' '.vitest/' >> .gitignore
 ```
 
-- [ ] **Step 8: Install and verify**
+- [ ] **Step 7: Sync to the server and install**
 
 ```bash
-npm install && npx tsc --version && node --version
+rsync -az --delete --exclude node_modules --exclude release ./ $CONDUIT_REMOTE:/home/chris/conduit/
+ssh $CONDUIT_REMOTE 'cd conduit && npm install && npx tsc --version'
 ```
 
-Expected: TypeScript 5.9+, Node v24.x.
+Expected: npm completes, TypeScript reports 5.9 or later.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add -A
-git commit -m "chore: scaffold npm workspace and local postgres setup"
+git commit -m "chore: scaffold npm workspace"
 ```
 
 ---
@@ -667,7 +697,7 @@ export default async function setup(): Promise<void> {
   } catch (cause) {
     throw new Error(
       `Could not migrate the test database at ${TEST_DATABASE_URL}. ` +
-        `Is PostgreSQL running (brew services start postgresql@17) and does conduit_test exist (createdb conduit_test)?`,
+        `Is PostgreSQL running (systemctl status postgresql) and does conduit_test exist (sudo -u postgres createdb -O chris conduit_test)?`,
       { cause },
     );
   } finally {
@@ -2226,7 +2256,7 @@ The install dir, data dir, database, system user and port are all declared resou
 
 ```bash
 chmod +x scripts/install scripts/remove
-brew install shellcheck 2>/dev/null || true
+command -v shellcheck >/dev/null || sudo apt-get install -y -qq shellcheck
 shellcheck -e SC1091,SC2154 scripts/install scripts/remove scripts/_common.sh
 ```
 
@@ -2509,8 +2539,12 @@ git commit -m "ci: add package_check config and release workflow"
 - [ ] **Step 1: Install Playwright**
 
 ```bash
-npm install -D @playwright/test && npx playwright install chromium
+npm install -D @playwright/test && sudo npx playwright install --with-deps chromium
 ```
+
+`--with-deps` is required on headless Debian — it apt-installs the shared libraries Chromium needs,
+which are absent on a server install. Without it the browser downloads fine and then fails to launch
+with a missing-library error that reads like a Playwright bug rather than a missing package.
 
 - [ ] **Step 2: Write `playwright.config.ts`**
 
