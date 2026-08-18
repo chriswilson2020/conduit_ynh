@@ -20,7 +20,7 @@ keeps the developer's laptop clean.
 
 | | |
 |---|---|
-| Host | `$CONDUIT_REMOTE` (`conduit.listerdale.de`) |
+| Host | set via `CONDUIT_REMOTE`, or an untracked `.conduit-remote` file |
 | Working copy | `/home/chris/conduit` |
 | OS | Debian 12.15 Bookworm, x86_64, 3.7GB RAM, 2 vCPU |
 | YunoHost | 12.1.40.1 (manifest requires `>= 12.1.17`) |

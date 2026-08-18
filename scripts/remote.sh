@@ -14,9 +14,15 @@
 # the resulting lockfiles are pulled back here to be committed.
 set -euo pipefail
 
-REMOTE="${CONDUIT_REMOTE:-$CONDUIT_REMOTE}"
-REMOTE_DIR="${CONDUIT_REMOTE_DIR:-/home/chris/conduit}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The deployment target is deliberately not baked into the repo. Set CONDUIT_REMOTE,
+# or put "user@host" in an untracked .conduit-remote file at the repo root.
+if [ -z "${CONDUIT_REMOTE:-}" ] && [ -f "$ROOT/.conduit-remote" ]; then
+    CONDUIT_REMOTE="$(tr -d '[:space:]' < "$ROOT/.conduit-remote")"
+fi
+REMOTE="${CONDUIT_REMOTE:?set CONDUIT_REMOTE, or write user@host into .conduit-remote}"
+REMOTE_DIR="${CONDUIT_REMOTE_DIR:-/home/chris/conduit}"
 
 # *.tsbuildinfo is deliberately NOT excluded. Excluding it left stale incremental
 # build state on the server that rsync would never clean, producing phantom
