@@ -30,6 +30,10 @@ describe("parseConfig", () => {
     expect(parseConfig({ ...valid, BASE_PATH: "/" }).basePath).toBe("/");
   });
 
+  it("normalises an all-slashes BASE_PATH to /", () => {
+    expect(parseConfig({ ...valid, BASE_PATH: "//" }).basePath).toBe("/");
+  });
+
   it("rejects a missing DATABASE_URL", () => {
     const { DATABASE_URL, ...withoutDb } = valid;
     expect(() => parseConfig(withoutDb)).toThrow(/DATABASE_URL/);
