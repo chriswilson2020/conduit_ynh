@@ -5,6 +5,7 @@ import { openTestDatabase, truncateAll } from "./test/db.js";
 import { users } from "./db/schema.js";
 import { buildApp } from "./app.js";
 import type { Config } from "./config.js";
+import type { Database } from "./db/client.js";
 
 const handle = openTestDatabase();
 
@@ -38,8 +39,34 @@ describe("GET /api/health", () => {
 
     expect(response.statusCode).toBe(200);
     const body = healthResponseSchema.parse(response.json());
+    expect(body.status).toBe("ok");
     expect(body.version).toBe("0.1.0-test");
     expect(body.database).toBe("connected");
+    await app.close();
+  });
+
+  // Fix 1: a driver failure must not fall through to Fastify's default error
+  // handler, which would return a differently-shaped 500 carrying the raw driver
+  // message. Stub db.execute to reject the way a lost connection would, and check
+  // both the response shape and that the underlying error text never reaches the
+  // client -- that leak is exactly what this endpoint must not repeat.
+  it("reports degraded with a disconnected database when the probe query fails", async () => {
+    const secretDriverMessage = "connection refused: fake db down for a probe test";
+    const failingDb = {
+      execute: async () => {
+        throw new Error(secretDriverMessage);
+      },
+    } as unknown as Database;
+
+    const app = await buildApp({ config, db: failingDb });
+    const response = await app.inject({ method: "GET", url: "/api/health" });
+
+    expect(response.statusCode).toBe(503);
+    const body = healthResponseSchema.parse(response.json());
+    expect(body.status).toBe("degraded");
+    expect(body.database).toBe("disconnected");
+    expect(response.body).not.toContain(secretDriverMessage);
+    expect(response.body).not.toContain("connection refused");
     await app.close();
   });
 });

@@ -86,12 +86,27 @@ describe("healthResponseSchema", () => {
     expect(healthResponseSchema.parse(body)).toEqual(body);
   });
 
-  it("rejects a non-ok status", () => {
+  it("accepts a degraded response reporting a disconnected database", () => {
+    const body = { status: "degraded", version: "0.1.0", database: "disconnected" };
+    expect(healthResponseSchema.parse(body)).toEqual(body);
+  });
+
+  it("rejects a status outside ok/degraded", () => {
     expect(() =>
       healthResponseSchema.parse({
-        status: "degraded",
+        status: "unknown",
         version: "0.1.0",
         database: "connected",
+      }),
+    ).toThrow();
+  });
+
+  it("rejects a database value outside connected/disconnected", () => {
+    expect(() =>
+      healthResponseSchema.parse({
+        status: "ok",
+        version: "0.1.0",
+        database: "unknown",
       }),
     ).toThrow();
   });

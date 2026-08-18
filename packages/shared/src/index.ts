@@ -13,9 +13,9 @@ export const meResponseSchema = z.object({ user: userSchema });
 export type MeResponse = z.infer<typeof meResponseSchema>;
 
 export const healthResponseSchema = z.object({
-  status: z.literal("ok"),
+  status: z.enum(["ok", "degraded"]),
   version: z.string().min(1),
-  database: z.literal("connected"),
+  database: z.enum(["connected", "disconnected"]),
 });
 export type HealthResponse = z.infer<typeof healthResponseSchema>;
 

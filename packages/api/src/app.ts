@@ -20,9 +20,13 @@ export interface BuildAppOptions {
 export async function buildApp({ config, db }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     logger: config.nodeEnv === "test" ? false : { level: "info" },
-    // The app binds to loopback and is only reachable through YunoHost's nginx,
-    // which is the boundary that makes the identity headers trustworthy.
-    trustProxy: true,
+    // 1, not true: the app binds to loopback and is reachable through exactly one
+    // hop, YunoHost's nginx. trustProxy: 1 trusts only that single nearest hop's
+    // X-Forwarded-* headers. trustProxy: true would trust an unbounded chain,
+    // including any entry a client prepends itself if nginx ever appends to
+    // X-Forwarded-For (e.g. via $proxy_add_x_forwarded_for) rather than overwriting
+    // it -- letting a client forge the address anything downstream treats as req.ip.
+    trustProxy: 1,
   });
 
   app.decorateRequest("user", null);
@@ -36,8 +40,22 @@ export async function buildApp({ config, db }: BuildAppOptions): Promise<Fastify
     request.user = identity === null ? null : await users.resolve(identity);
   });
 
-  app.get("/api/health", async () => {
-    await db.execute(sql`SELECT 1`);
+  app.get("/api/health", async (request, reply) => {
+    try {
+      await db.execute(sql`SELECT 1`);
+    } catch (error) {
+      // A health endpoint has to stay readable when the thing it reports on is
+      // broken. 503 so uptime monitoring treats it as down, but with the app's own
+      // response shape rather than the driver's error text, which could leak
+      // connection details. The underlying error still has to reach the journal,
+      // so it's logged here even though it no longer reaches the client.
+      request.log.error({ err: error }, "health check: database unreachable");
+      return reply.code(503).send({
+        status: "degraded",
+        version: config.version,
+        database: "disconnected",
+      });
+    }
     return { status: "ok", version: config.version, database: "connected" };
   });
 
