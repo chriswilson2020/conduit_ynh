@@ -18,8 +18,12 @@ REMOTE="${CONDUIT_REMOTE:-$CONDUIT_REMOTE}"
 REMOTE_DIR="${CONDUIT_REMOTE_DIR:-/home/chris/conduit}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# *.tsbuildinfo is deliberately NOT excluded. Excluding it left stale incremental
+# build state on the server that rsync would never clean, producing phantom
+# "Cannot find module '@conduit/shared'" errors from tsc -b. Letting --delete remove
+# them costs a full rebuild each sync, which is a few seconds at this size.
 rsync -az --delete \
-    --exclude node_modules --exclude release --exclude .git --exclude '*.tsbuildinfo' \
+    --exclude node_modules --exclude release --exclude .git \
     "$ROOT/" "$REMOTE:$REMOTE_DIR/"
 
 if [ "$#" -eq 0 ]; then
