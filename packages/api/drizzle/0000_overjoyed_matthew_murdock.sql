@@ -7,5 +7,3 @@ CREATE TABLE "users" (
 	"last_seen_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "users_username_unique" UNIQUE("username")
 );
---> statement-breakpoint
-CREATE INDEX "users_username_idx" ON "users" USING btree ("username");

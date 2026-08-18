@@ -1,5 +1,5 @@
 {
-  "id": "a54e9897-7d5e-4626-ae2e-4ae16b383e06",
+  "id": "46d7c582-eac6-4574-8482-a59582c22b07",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -48,23 +48,7 @@
           "default": "now()"
         }
       },
-      "indexes": {
-        "users_username_idx": {
-          "name": "users_username_idx",
-          "columns": [
-            {
-              "expression": "username",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
+      "indexes": {},
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
