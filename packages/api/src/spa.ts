@@ -25,9 +25,13 @@ export async function registerSpa(app: FastifyInstance, options: SpaOptions): Pr
 
   const indexPath = path.join(path.resolve(options.webRoot), "index.html");
 
+  // <base href> always carries a trailing slash so relative asset URLs resolve
+  // against the mount point. basePath itself never has one ("/" stays "/").
+  const baseHref = options.basePath === "/" ? "/" : `${options.basePath}/`;
+
   const sendIndex = async (): Promise<string> => {
     const html = await readFile(indexPath, "utf8");
-    return html.replaceAll("__BASE_PATH__", options.basePath);
+    return html.replaceAll("__BASE_HREF__", baseHref).replaceAll("__BASE_PATH__", options.basePath);
   };
 
   app.setNotFoundHandler(async (request, reply) => {

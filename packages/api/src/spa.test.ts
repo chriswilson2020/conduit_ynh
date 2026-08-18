@@ -38,7 +38,7 @@ beforeAll(async () => {
   webRoot = await mkdtemp(path.join(tmpdir(), "conduit-web-"));
   await writeFile(
     path.join(webRoot, "index.html"),
-    '<!doctype html><html><head><script>window.__CONDUIT_BASE__="__BASE_PATH__";</script></head><body><div id="root"></div></body></html>',
+    '<!doctype html><html><head><base href="__BASE_HREF__" /><script>window.__CONDUIT_BASE__="__BASE_PATH__";</script></head><body><div id="root"></div></body></html>',
   );
   await mkdir(path.join(webRoot, "assets"));
   await writeFile(path.join(webRoot, "assets", "app.js"), "console.log('bundle');");
@@ -70,6 +70,30 @@ describe("SPA serving", () => {
     const response = await app.inject({ method: "GET", url: "/" });
 
     expect(response.body).toContain('window.__CONDUIT_BASE__="/"');
+    await app.close();
+  });
+
+  it("sets a base href with a trailing slash so deep-link assets resolve", async () => {
+    // Vite emits relative asset URLs. Without a <base href>, a browser at
+    // /deals/123 resolves ./assets/app.js to /deals/assets/app.js and 404s, so
+    // the page loads but the script never does and nothing renders.
+    const app = await buildApp({
+      config: { ...baseConfig, basePath: "/conduit" },
+      db: handle.db,
+      webRoot,
+    });
+    const response = await app.inject({ method: "GET", url: "/deals/123" });
+
+    expect(response.body).toContain('<base href="/conduit/"');
+    expect(response.body).not.toContain("__BASE_HREF__");
+    await app.close();
+  });
+
+  it("sets base href to / when mounted at the domain root", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/deals/123" });
+
+    expect(response.body).toContain('<base href="/"');
     await app.close();
   });
 

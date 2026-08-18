@@ -2,6 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!-- Substituted per request by the server, always with a trailing slash. Vite
+         emits relative asset URLs (base: "./") so one build works at any install
+         path, but at a deep link like /deals/123 the browser would otherwise
+         resolve them against /deals/ and 404. This anchors them to the mount. -->
+    <base href="__BASE_HREF__" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Conduit</title>
     <script>
