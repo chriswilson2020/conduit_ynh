@@ -1,5 +1,5 @@
 {
-  "id": "b3000e4a-edec-4e0e-9a39-c2cf965ab35e",
+  "id": "bbdfb9d7-ec6c-4a32-8260-0ec7016ec32c",
   "prevId": "d8f6327d-5cd4-4729-80a4-f73822bfbd5d",
   "version": "7",
   "dialect": "postgresql",
@@ -256,7 +256,7 @@
         },
         "position": {
           "name": "position",
-          "type": "text",
+          "type": "text COLLATE \"C\"",
           "primaryKey": false,
           "notNull": true
         },
@@ -828,7 +828,7 @@
         },
         "position": {
           "name": "position",
-          "type": "text",
+          "type": "text COLLATE \"C\"",
           "primaryKey": false,
           "notNull": true
         },
@@ -909,7 +909,7 @@
         },
         "position": {
           "name": "position",
-          "type": "text",
+          "type": "text COLLATE \"C\"",
           "primaryKey": false,
           "notNull": true
         },

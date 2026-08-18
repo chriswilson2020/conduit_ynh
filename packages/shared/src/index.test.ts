@@ -233,6 +233,14 @@ describe("dealSchema currency", () => {
 
   it("rejects a numeric currency code", () =>
     expect(() => dealSchema.parse({ ...base, currency: "123" })).toThrow());
+
+  it("accepts a valueCents within the safe integer range", () =>
+    expect(dealSchema.parse({ ...base, valueCents: 123456 }).valueCents).toBe(123456));
+
+  it("rejects a valueCents beyond Number.MAX_SAFE_INTEGER", () =>
+    expect(() =>
+      dealSchema.parse({ ...base, valueCents: Number.MAX_SAFE_INTEGER + 2 }),
+    ).toThrow());
 });
 
 describe("createDealInputSchema currency", () => {

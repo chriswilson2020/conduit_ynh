@@ -27,6 +27,9 @@ describe("search service", () => {
     expect(result.companies.map((c) => c.id)).toContain(company.id);
     expect(result.contacts.map((c) => c.id)).toContain(contact.id);
     expect(result.notes.map((n) => n.id)).toContain(note.id);
+    // deals is stubbed empty until the Phase 2 plan's Task 5 wires the real
+    // title-ILIKE query -- this pins the key's presence in the shape now.
+    expect(result.deals).toEqual([]);
   });
 
   it("excludes an archived company from the companies group", async () => {

@@ -160,7 +160,7 @@ const currencyCodeSchema = z.string().regex(/^[A-Z]{3}$/, "currency must be 3 up
 export const dealSchema = z.object({
   id: z.uuid(), title: z.string().min(1),
   pipelineId: z.uuid(), stageId: z.uuid(), position: z.string().min(1),
-  valueCents: z.number().int().nullable(),
+  valueCents: z.number().int().safe().nullable(),
   currency: currencyCodeSchema,
   expectedCloseDate: z.iso.date().nullable(),
   status: dealStatusSchema,
@@ -175,7 +175,7 @@ export type Deal = z.infer<typeof dealSchema>;
 export const createDealInputSchema = z.object({
   title: z.string().min(1),
   pipelineId: z.uuid(), stageId: z.uuid(),
-  valueCents: z.number().int().nullable().optional(),
+  valueCents: z.number().int().safe().nullable().optional(),
   currency: currencyCodeSchema.optional(),
   expectedCloseDate: z.iso.date().nullable().optional(),
   ownerUserId: z.uuid().nullable().optional(),

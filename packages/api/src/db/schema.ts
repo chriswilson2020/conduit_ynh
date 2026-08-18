@@ -1,5 +1,20 @@
-import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, check } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, check, customType } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
+
+/**
+ * Position strings from @conduit/shared's midpoint() must sort byte-wise, the
+ * same order as JS string comparison (and the ordering fractional.ts's
+ * integer-part encoding itself depends on: 'Z' < 'a' etc.). The database's
+ * default en_US.UTF-8 collation interleaves letter case ('Z' sorts after
+ * 'z', not before it) and would silently disagree with both the client and
+ * the fractional-index encoding, so the collation is pinned at the column --
+ * where no query author can forget it -- rather than trusted to every
+ * `ORDER BY position` call site. drizzle-orm's built-in text() has no
+ * collate option, hence this customType.
+ */
+const positionText = customType<{ data: string }>({
+  dataType() { return 'text COLLATE "C"'; },
+});
 
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -53,7 +68,7 @@ export const pipelines = pgTable("pipelines", {
   // Fractional index (see packages/shared/src/fractional.ts) ordering sibling
   // pipelines against each other, same scheme as stages.position and
   // deals.position below.
-  position: text("position").notNull(),
+  position: positionText("position").notNull(),
   archivedAt: timestamp("archived_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -70,7 +85,7 @@ export const stages = pgTable("stages", {
   id: uuid("id").primaryKey().defaultRandom(),
   pipelineId: uuid("pipeline_id").notNull().references(() => pipelines.id),
   name: text("name").notNull(),
-  position: text("position").notNull(),
+  position: positionText("position").notNull(),
   probability: integer("probability"),
   rotDays: integer("rot_days"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -86,7 +101,7 @@ export const deals = pgTable("deals", {
   pipelineId: uuid("pipeline_id").notNull().references(() => pipelines.id),
   stageId: uuid("stage_id").notNull().references(() => stages.id),
   // Fractional index ordering the deal among its stage siblings.
-  position: text("position").notNull(),
+  position: positionText("position").notNull(),
   valueCents: bigint("value_cents", { mode: "number" }),
   // No SQL-level DEFAULT: the app-level default (config.defaultCurrency, see
   // config.ts's DEFAULT_CURRENCY) is applied by the deals service when a
