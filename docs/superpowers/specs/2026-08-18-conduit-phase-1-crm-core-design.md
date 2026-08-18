@@ -27,8 +27,8 @@ All additive; drizzle migrations `0001+`, applied on boot (mechanism proven in P
   `emails` text[] NOT NULL default `{}`, `phones` text[] NOT NULL default `{}`, `job_title`,
   `owner_user_id`, `custom`, `archived_at`, timestamps.
 - `notes` — `body` text NOT NULL (plain text), `author_user_id` FK users NOT NULL,
-  `company_id` NULL, `contact_id` NULL, `created_at`. At least one entity FK must be set
-  (CHECK constraint). Deal/project FKs are added by the phases that create those tables.
+  `company_id` NULL, `contact_id` NULL, `created_at`. Exactly one entity FK must be set
+  (CHECK constraint), matching the API contract. Deal/project FKs are added by the phases that create those tables.
 - `files` — `original_name`, `mime`, `size_bytes`, `sha256` (blob path under `$data_dir/files/`),
   `uploader_user_id`, `company_id` NULL, `contact_id` NULL, `created_at`. Same CHECK.
 - `events` — append-only timeline/audit: `verb` text (`created` | `updated` | `archived` |
