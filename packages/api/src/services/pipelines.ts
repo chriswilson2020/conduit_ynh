@@ -64,9 +64,12 @@ async function mustGetStage(db: Database, id: string): Promise<StageRow> {
 // different company's pipelines) never contend with each other.
 // hashtextextended folds the group-key string into the bigint key the
 // advisory-lock functions require. Call this first, before any read whose
-// result feeds into the position this transaction computes -- Task 3's
-// moveDeal (a pipeline's deals-within-a-stage) reuses the same pattern.
-async function lockSiblingGroup(tx: Database, groupKey: string): Promise<void> {
+// result feeds into the position this transaction computes -- deals.ts's
+// createDeal and moveDeal (a stage's deals) reuse this same helper, keyed
+// `stages:deals:${stageId}` -- distinct from this file's own
+// `stages:${pipelineId}` stage-reorder keys, so the two families of sibling
+// groups never contend with each other.
+export async function lockSiblingGroup(tx: Database, groupKey: string): Promise<void> {
   await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${groupKey}, 0))`);
 }
 
