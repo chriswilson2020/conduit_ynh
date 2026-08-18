@@ -32,12 +32,28 @@ async function mustGet(db: Database, id: string): Promise<CompanyRow> {
 export async function updateCompany(db: Database, actorId: string, id: string, patch: UpdateCompanyInput): Promise<Company> {
   const existing = await mustGet(db, id);
   if (existing.archivedAt !== null) throw new ArchivedError("company", id);
-  const changed = Object.keys(patch);
+
+  // Record only fields that actually change, so the timeline never lies and a
+  // same-value or empty patch is a true no-op (no row write, no event).
+  // Scalar equality only: a later copy of this file with an array/object field
+  // (e.g. contacts' emails/phones) needs order-sensitive JSON equality here
+  // instead of !==, or a same-value patch with reordered array elements will be
+  // misreported as unchanged.
+  const changed = (Object.keys(patch) as (keyof UpdateCompanyInput)[])
+    .filter((k) => patch[k] !== undefined && patch[k] !== existing[k]);
+  if (changed.length === 0) return toCompany(existing);
+
   return db.transaction(async (tx) => {
+    // archived_at IS NULL in the WHERE makes the guard atomic: a concurrent
+    // archive between the mustGet read above and this UPDATE yields zero rows
+    // here instead of silently mutating an archived record.
     const [row] = await tx.update(companies)
       .set({ ...patch, updatedAt: new Date() })
-      .where(eq(companies.id, id)).returning();
-    if (row === undefined) throw new NotFoundError("company", id);
+      .where(and(eq(companies.id, id), isNull(companies.archivedAt))).returning();
+    if (row === undefined) {
+      const [recheck] = await tx.select().from(companies).where(eq(companies.id, id));
+      throw recheck === undefined ? new NotFoundError("company", id) : new ArchivedError("company", id);
+    }
     await tx.insert(events).values({ verb: "updated", actorUserId: actorId, companyId: id, payload: { changed } });
     return toCompany(row);
   });
@@ -46,10 +62,22 @@ export async function updateCompany(db: Database, actorId: string, id: string, p
 async function setArchived(db: Database, actorId: string, id: string, archived: boolean): Promise<Company> {
   await mustGet(db, id);
   return db.transaction(async (tx) => {
+    // The WHERE guard makes archive/unarchive idempotent and race-safe: archiving
+    // requires the row currently unarchived, unarchiving requires it currently
+    // archived. Zero rows back means the state already matched what was requested
+    // (either a concurrent call got there first, or this call is a no-op repeat),
+    // so re-select and return the current row instead of emitting a duplicate event.
     const [row] = await tx.update(companies)
       .set({ archivedAt: archived ? new Date() : null, updatedAt: new Date() })
-      .where(eq(companies.id, id)).returning();
-    if (row === undefined) throw new NotFoundError("company", id);
+      .where(and(
+        eq(companies.id, id),
+        archived ? isNull(companies.archivedAt) : isNotNull(companies.archivedAt),
+      )).returning();
+    if (row === undefined) {
+      const [recheck] = await tx.select().from(companies).where(eq(companies.id, id));
+      if (recheck === undefined) throw new NotFoundError("company", id);
+      return toCompany(recheck);
+    }
     await tx.insert(events).values({
       verb: archived ? "archived" : "unarchived", actorUserId: actorId, companyId: id, payload: {},
     });
@@ -72,6 +100,10 @@ export async function listCompanies(db: Database, opts: ListOptions): Promise<{ 
   if (opts.q) where.push(ilike(companies.name, `%${escapeLike(opts.q)}%`));
   const cur = opts.cursor ? decodeCursor(opts.cursor) : null;
   if (cur) {
+    // Non-null assertion: `or` only returns undefined when given zero conditions.
+    // Both branches here are always present, so this is safe as written, but it
+    // stops being safe if a future edit makes either branch conditional. Do not
+    // extend this call with an optional/conditional argument without rechecking.
     where.push(or(
       lt(companies.createdAt, new Date(cur.createdAt)),
       and(eq(companies.createdAt, new Date(cur.createdAt)), lt(companies.id, cur.id)),

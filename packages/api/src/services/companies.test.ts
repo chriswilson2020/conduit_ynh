@@ -58,6 +58,38 @@ describe("companies service", () => {
     expect((await listCompanies(handle.db, {})).items).toHaveLength(1);
   });
 
+  it("a same-value patch is a no-op: no updated event, updatedAt unchanged", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    const result = await updateCompany(handle.db, actorId, c.id, { name: "Acme" });
+    expect(result.updatedAt).toBe(c.updatedAt);
+    const evs = await handle.db.select().from(events).where(eq(events.companyId, c.id));
+    expect(evs.filter((e) => e.verb === "updated")).toHaveLength(0);
+  });
+
+  it("an empty patch is a no-op and returns the company", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    const result = await updateCompany(handle.db, actorId, c.id, {});
+    expect(result).toEqual(c);
+    const evs = await handle.db.select().from(events).where(eq(events.companyId, c.id));
+    expect(evs.filter((e) => e.verb === "updated")).toHaveLength(0);
+  });
+
+  it("excludes unchanged fields from the changed list when a patch mixes both", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme", industry: "biotech" });
+    await updateCompany(handle.db, actorId, c.id, { name: "Acme", industry: "fintech" });
+    const evs = await handle.db.select().from(events).where(eq(events.companyId, c.id));
+    const upd = evs.find((e) => e.verb === "updated");
+    expect(upd?.payload).toEqual({ changed: ["industry"] });
+  });
+
+  it("archiving an already-archived company is idempotent: no duplicate event", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    await archiveCompany(handle.db, actorId, c.id);
+    await archiveCompany(handle.db, actorId, c.id);
+    const evs = await handle.db.select().from(events).where(eq(events.companyId, c.id));
+    expect(evs.filter((e) => e.verb === "archived")).toHaveLength(1);
+  });
+
   it("throws NotFoundError for an unknown id", async () => {
     await expect(updateCompany(handle.db, actorId, "3f2504e0-4f89-41d3-9a0c-0305e82c3301", { name: "X" }))
       .rejects.toBeInstanceOf(NotFoundError);
