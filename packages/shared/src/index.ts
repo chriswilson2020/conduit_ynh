@@ -70,40 +70,48 @@ export type CreateContactInput = z.infer<typeof createContactInputSchema>;
 export const updateContactInputSchema = createContactInputSchema.partial();
 export type UpdateContactInput = z.infer<typeof updateContactInputSchema>;
 
-const exactlyOneEntity = (v: { companyId?: string | null; contactId?: string | null }) =>
-  [v.companyId, v.contactId].filter((x) => x != null).length === 1;
+// Widened in Phase 2 (Task 7) from company/contact to company/contact/deal: a
+// note or file can now be attached to a deal instead, mirroring the
+// notes_exactly_one_entity / files_exactly_one_entity DB CHECKs (see
+// schema.ts), which already gained a deal_id column back in P2.1.
+const exactlyOneEntity = (v: { companyId?: string | null; contactId?: string | null; dealId?: string | null }) =>
+  [v.companyId, v.contactId, v.dealId].filter((x) => x != null).length === 1;
 
 export const createNoteInputSchema = z
-  .object({ body: z.string().min(1), companyId: z.uuid().optional(), contactId: z.uuid().optional() })
-  .refine(exactlyOneEntity, { message: "exactly one of companyId or contactId is required" });
+  .object({
+    body: z.string().min(1),
+    companyId: z.uuid().optional(), contactId: z.uuid().optional(), dealId: z.uuid().optional(),
+  })
+  .refine(exactlyOneEntity, { message: "exactly one of companyId, contactId or dealId is required" });
 export type CreateNoteInput = z.infer<typeof createNoteInputSchema>;
 
 export const noteSchema = z.object({
   id: z.uuid(), body: z.string().min(1), authorUserId: z.uuid(),
-  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), createdAt: z.iso.datetime(),
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
+  createdAt: z.iso.datetime(),
 });
 export type Note = z.infer<typeof noteSchema>;
 
 export const fileMetaSchema = z.object({
   id: z.uuid(), originalName: z.string().min(1), mime: z.string().min(1),
   sizeBytes: z.number().int().nonnegative(), sha256: z.string().length(64),
-  uploaderUserId: z.uuid(), companyId: z.uuid().nullable(), contactId: z.uuid().nullable(),
+  uploaderUserId: z.uuid(),
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
   createdAt: z.iso.datetime(),
 });
 export type FileMeta = z.infer<typeof fileMetaSchema>;
 
-// Phase 2 (pipelines/deals) adds four more verbs. eventSchema itself stays as
-// it was in Phase 1 -- Task 1 only widens the DB CHECK and this enum, so
-// direct-write paths (migrations, future services) can start emitting the new
-// verbs immediately. eventSchema gains a nullable dealId once the routes that
-// actually read/write it exist (see the Phase 2 plan's later tasks).
+// Phase 2 (pipelines/deals) adds four more verbs, and (Task 7) a nullable
+// dealId: a deal event carries both dealId and companyId (when the deal has
+// one) so it surfaces on both the deal's own timeline and its company's --
+// see services/deals.ts's publishDealHint/toDeal-adjacent comments.
 export const eventVerbSchema = z.enum([
   "created", "updated", "archived", "unarchived", "note_added", "file_attached",
   "stage_changed", "won", "lost", "reopened",
 ]);
 export const eventSchema = z.object({
   id: z.uuid(), verb: eventVerbSchema, actorUserId: z.uuid(),
-  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(),
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
   payload: z.record(z.string(), z.unknown()), createdAt: z.iso.datetime(),
 });
 export type Event = z.infer<typeof eventSchema>;

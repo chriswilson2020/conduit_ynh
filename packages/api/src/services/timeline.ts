@@ -7,13 +7,15 @@ import { decodeCursor, encodeCursor } from "./pagination.js";
 function toEvent(row: EventRow): Event {
   return {
     id: row.id, verb: row.verb as Event["verb"], actorUserId: row.actorUserId,
-    companyId: row.companyId, contactId: row.contactId,
+    companyId: row.companyId, contactId: row.contactId, dealId: row.dealId,
     payload: row.payload as Record<string, unknown>,
     createdAt: row.createdAt.toISOString(),
   };
 }
 
-export interface ListEventsOptions { companyId?: string; contactId?: string; cursor?: string; limit?: number; }
+export interface ListEventsOptions {
+  companyId?: string; contactId?: string; dealId?: string; cursor?: string; limit?: number;
+}
 
 export async function listEvents(
   db: Database, opts: ListEventsOptions,
@@ -22,6 +24,7 @@ export async function listEvents(
   const where = [];
   if (opts.companyId) where.push(eq(events.companyId, opts.companyId));
   if (opts.contactId) where.push(eq(events.contactId, opts.contactId));
+  if (opts.dealId) where.push(eq(events.dealId, opts.dealId));
   const cur = opts.cursor ? decodeCursor(opts.cursor) : null;
   if (cur) {
     // Non-null assertion: `or` only returns undefined when given zero conditions.

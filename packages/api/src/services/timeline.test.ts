@@ -7,6 +7,8 @@ import { listEvents } from "./timeline.js";
 import { createCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
 import { createNote } from "./notes.js";
+import { createDeal } from "./deals.js";
+import { createPipeline, createStage } from "./pipelines.js";
 
 const handle = openTestDatabase();
 let actorId: string;
@@ -58,6 +60,24 @@ describe("timeline service", () => {
     expect(result.items).toHaveLength(2);
     expect(result.items.every((e) => e.contactId === p.id)).toBe(true);
     expect(result.items.some((e) => e.companyId !== null)).toBe(false);
+  });
+
+  it("filtering by dealId returns a deal's own events, including the company-scoped created event", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    const pipeline = await createPipeline(handle.db, actorId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, actorId, pipeline.id, { name: "Lead" });
+    const deal = await createDeal(
+      handle.db, actorId, { title: "Big Co deal", pipelineId: pipeline.id, stageId: stage.id, companyId: c.id }, "EUR",
+    );
+    await createNote(handle.db, actorId, { body: "on the deal", dealId: deal.id });
+
+    const result = await listEvents(handle.db, { dealId: deal.id });
+    expect(result.items).toHaveLength(2);
+    expect(result.items.every((e) => e.dealId === deal.id)).toBe(true);
+    // "created" (from createDeal) also carries the deal's companyId; the
+    // note_added event above does too, via createNote's dealCompanyId
+    // fallback -- both surface on the company's timeline as well.
+    expect(result.items.every((e) => e.companyId === c.id)).toBe(true);
   });
 
   // schema.ts's events.verb CHECK and shared's eventVerbSchema live in different

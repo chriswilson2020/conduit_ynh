@@ -187,6 +187,18 @@ describe("createNoteInputSchema", () => {
         contactId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
       }),
     ).toThrow());
+  it("accepts a note attached to a deal", () => {
+    const input = { body: "hi", dealId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301" };
+    expect(createNoteInputSchema.parse(input)).toEqual(input);
+  });
+  it("rejects a note with a deal plus another entity", () =>
+    expect(() =>
+      createNoteInputSchema.parse({
+        body: "hi",
+        dealId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+        companyId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+      }),
+    ).toThrow());
 });
 
 describe("createPipelineInputSchema", () => {

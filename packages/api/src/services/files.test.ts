@@ -1,12 +1,22 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import { eq } from "drizzle-orm";
+import type { Database } from "../db/client.js";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { events, files } from "../db/schema.js";
 import { attachFile, listFiles, getFile } from "./files.js";
 import { createCompany, archiveCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
+import { createDeal, archiveDeal, winDeal } from "./deals.js";
+import { createPipeline, createStage } from "./pipelines.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
+
+/** Mirrors notes.test.ts's makeDeal helper. */
+async function makeDeal(db: Database, actorId: string, companyId?: string) {
+  const pipeline = await createPipeline(db, actorId, { name: "Sales", scope: "global" });
+  const stage = await createStage(db, actorId, pipeline.id, { name: "Lead" });
+  return createDeal(db, actorId, { title: "Big Co deal", pipelineId: pipeline.id, stageId: stage.id, companyId }, "EUR");
+}
 
 const handle = openTestDatabase();
 let actorId: string;
@@ -67,6 +77,39 @@ describe("files service", () => {
       originalName: "x.txt", mime: "text/plain", sizeBytes: 1, sha256: sha,
       contactId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
     })).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("attaches a file to a deal and stamps the event with the deal's companyId", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    const deal = await makeDeal(handle.db, actorId, c.id);
+    const file = await attachFile(handle.db, actorId, {
+      originalName: "contract.pdf", mime: "application/pdf", sizeBytes: 99, sha256: sha, dealId: deal.id,
+    });
+    expect(file.dealId).toBe(deal.id);
+    expect(file.companyId).toBeNull();
+
+    const evs = await handle.db.select().from(events).where(eq(events.dealId, deal.id));
+    const added = evs.filter((e) => e.verb === "file_attached");
+    expect(added).toHaveLength(1);
+    expect(added[0]?.companyId).toBe(c.id);
+    expect(added[0]?.dealId).toBe(deal.id);
+  });
+
+  it("a won or lost deal is still a valid file target", async () => {
+    const deal = await makeDeal(handle.db, actorId);
+    await winDeal(handle.db, actorId, deal.id);
+    const file = await attachFile(handle.db, actorId, {
+      originalName: "signed.pdf", mime: "application/pdf", sizeBytes: 1, sha256: sha, dealId: deal.id,
+    });
+    expect(file.dealId).toBe(deal.id);
+  });
+
+  it("refuses attaching to an archived deal", async () => {
+    const deal = await makeDeal(handle.db, actorId);
+    await archiveDeal(handle.db, actorId, deal.id);
+    await expect(attachFile(handle.db, actorId, {
+      originalName: "x.txt", mime: "text/plain", sizeBytes: 1, sha256: sha, dealId: deal.id,
+    })).rejects.toBeInstanceOf(ArchivedError);
   });
 
   // drizzle-postgres wraps the underlying pg error in a DrizzleQueryError whose own

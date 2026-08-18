@@ -229,9 +229,9 @@ describe("notes routes", () => {
   });
 
   // See notes.ts's listQuerySchema comment: unlike files/events, GET /api/notes
-  // requires exactly one of company_id/contact_id -- there is no "everything"
-  // notes list.
-  it("GET requires exactly one of company_id or contact_id", async () => {
+  // requires exactly one of company_id/contact_id/deal_id -- there is no
+  // "everything" notes list.
+  it("GET requires exactly one of company_id, contact_id or deal_id", async () => {
     const a = await app();
     const company = await a.inject({
       method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
@@ -260,6 +260,33 @@ describe("notes routes", () => {
     });
     expect(one.statusCode).toBe(200);
     expect(z.array(noteSchema).parse(one.json())).toHaveLength(1);
+    await a.close();
+  });
+
+  it("creates a note on a deal and filters GET by deal_id", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const stage = await makeStage(a, pipeline.id, "Lead");
+    const deal = await makeDeal(a, pipeline.id, stage.id);
+
+    const response = await a.inject({
+      method: "POST", url: "/api/notes", headers: authHeaders,
+      payload: { body: "checking in", dealId: deal.id },
+    });
+    expect(response.statusCode).toBe(201);
+    const body = noteSchema.parse(response.json());
+    expect(body.dealId).toBe(deal.id);
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/notes?deal_id=${deal.id}`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(noteSchema).parse(listed.json()).map((n) => n.id)).toEqual([body.id]);
+
+    const both = await a.inject({
+      method: "GET", url: `/api/notes?deal_id=${deal.id}&company_id=${pipeline.id}`, headers: authHeaders,
+    });
+    expect(both.statusCode).toBe(400);
     await a.close();
   });
 });
@@ -322,6 +349,33 @@ describe("files routes", () => {
     expect(response.statusCode).toBe(400);
     const parsed = errorResponseSchema.parse(response.json());
     expect(parsed.error).toBe("validation");
+    await a.close();
+  });
+
+  it("uploads a file to a deal and filters GET by deal_id", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const stage = await makeStage(a, pipeline.id, "Lead");
+    const deal = await makeDeal(a, pipeline.id, stage.id);
+
+    const { body, boundary } = buildMultipart(
+      { dealId: deal.id },
+      { name: "contract.pdf", content: "pdf bytes", mime: "application/pdf" },
+    );
+    const upload = await a.inject({
+      method: "POST", url: "/api/files",
+      headers: { ...authHeaders, "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload: body,
+    });
+    expect(upload.statusCode).toBe(201);
+    const meta = fileMetaSchema.parse(upload.json());
+    expect(meta.dealId).toBe(deal.id);
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/files?deal_id=${deal.id}`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(fileMetaSchema).parse(listed.json()).map((f) => f.id)).toEqual([meta.id]);
     await a.close();
   });
 
@@ -431,6 +485,23 @@ describe("events routes", () => {
     expect(body.items[1]?.verb).toBe("created");
     await a.close();
   });
+
+  it("filters by deal_id", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const stage = await makeStage(a, pipeline.id, "Lead");
+    const deal = await makeDeal(a, pipeline.id, stage.id);
+
+    const response = await a.inject({
+      method: "GET", url: `/api/events?deal_id=${deal.id}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = listResponseSchema(eventSchema).parse(response.json());
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0]?.verb).toBe("created");
+    expect(body.items[0]?.dealId).toBe(deal.id);
+    await a.close();
+  });
 });
 
 describe("users route", () => {
@@ -494,6 +565,18 @@ describe("pipelines routes", () => {
     const unarchived = await a.inject({ method: "POST", url: `/api/pipelines/${pipeline.id}/unarchive`, headers: authHeaders });
     expect(unarchived.statusCode).toBe(200);
     expect(pipelineSchema.parse(unarchived.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  // Flagged as a gap by the P2.5 review: GET /api/pipelines/:id's 404 branch
+  // (routes/pipelines.ts) had no test exercising it directly.
+  it("returns 404 for an unknown pipeline id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: "/api/pipelines/3f2504e0-4f89-41d3-9a0c-0305e82c3301", headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
     await a.close();
   });
 
@@ -696,6 +779,41 @@ describe("deals routes", () => {
     });
     expect(response.statusCode).toBe(400);
     expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  // Flagged as a gap by the P2.5 review: GET /api/deals/:id's 404 branch
+  // (routes/deals.ts) had no test exercising it directly.
+  it("returns 404 for an unknown deal id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: "/api/deals/3f2504e0-4f89-41d3-9a0c-0305e82c3301", headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  // Flagged as a gap by the P2.5 review: POST /api/deals/:id/archive and
+  // .../unarchive had no route-level happy-path test (only the underlying
+  // service was covered).
+  it("runs the deal archive/unarchive happy path", async () => {
+    const a = await app();
+    const pipeline = await makePipeline(a);
+    const stage = await makeStage(a, pipeline.id, "Lead");
+    const deal = await makeDeal(a, pipeline.id, stage.id);
+
+    const archived = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/archive`, headers: authHeaders,
+    });
+    expect(archived.statusCode).toBe(200);
+    expect(dealSchema.parse(archived.json()).archivedAt).not.toBeNull();
+
+    const unarchived = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/unarchive`, headers: authHeaders,
+    });
+    expect(unarchived.statusCode).toBe(200);
+    expect(dealSchema.parse(unarchived.json()).archivedAt).toBeNull();
     await a.close();
   });
 

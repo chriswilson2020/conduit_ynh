@@ -1,12 +1,24 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import { eq } from "drizzle-orm";
+import type { Database } from "../db/client.js";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { events, notes } from "../db/schema.js";
 import { createNote, listNotes } from "./notes.js";
 import { createCompany, archiveCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
+import { createDeal, archiveDeal, winDeal } from "./deals.js";
+import { createPipeline, createStage } from "./pipelines.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
+
+/** Creates a global pipeline, one stage, and one deal in it (optionally
+ * company-scoped) -- mirrors the routes.test.ts makeDeal helper but calls the
+ * services directly, since these are service-level tests. */
+async function makeDeal(db: Database, actorId: string, companyId?: string) {
+  const pipeline = await createPipeline(db, actorId, { name: "Sales", scope: "global" });
+  const stage = await createStage(db, actorId, pipeline.id, { name: "Lead" });
+  return createDeal(db, actorId, { title: "Big Co deal", pipelineId: pipeline.id, stageId: stage.id, companyId }, "EUR");
+}
 
 const handle = openTestDatabase();
 let actorId: string;
@@ -59,6 +71,44 @@ describe("notes service", () => {
   it("refuses a note on a missing contact", async () => {
     await expect(createNote(handle.db, actorId, {
       body: "hi", contactId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    })).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("adds a note to a deal and stamps the event with the deal's companyId", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    const deal = await makeDeal(handle.db, actorId, c.id);
+    const note = await createNote(handle.db, actorId, { body: "checking in", dealId: deal.id });
+    expect(note.dealId).toBe(deal.id);
+    expect(note.companyId).toBeNull();
+    expect(note.contactId).toBeNull();
+
+    const evs = await handle.db.select().from(events).where(eq(events.dealId, deal.id));
+    const added = evs.filter((e) => e.verb === "note_added");
+    expect(added).toHaveLength(1);
+    // The note row itself carries only dealId (per the exactly-one CHECK), but
+    // the event is also stamped with the deal's own companyId so it surfaces
+    // on the company's timeline too -- see createNote's doc comment.
+    expect(added[0]?.companyId).toBe(c.id);
+    expect(added[0]?.dealId).toBe(deal.id);
+  });
+
+  it("a won or lost deal is still a valid note target", async () => {
+    const deal = await makeDeal(handle.db, actorId);
+    await winDeal(handle.db, actorId, deal.id);
+    const note = await createNote(handle.db, actorId, { body: "signed!", dealId: deal.id });
+    expect(note.dealId).toBe(deal.id);
+  });
+
+  it("refuses a note on an archived deal", async () => {
+    const deal = await makeDeal(handle.db, actorId);
+    await archiveDeal(handle.db, actorId, deal.id);
+    await expect(createNote(handle.db, actorId, { body: "hi", dealId: deal.id }))
+      .rejects.toBeInstanceOf(ArchivedError);
+  });
+
+  it("refuses a note on a missing deal", async () => {
+    await expect(createNote(handle.db, actorId, {
+      body: "hi", dealId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
     })).rejects.toBeInstanceOf(NotFoundError);
   });
 
