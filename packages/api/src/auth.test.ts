@@ -66,16 +66,15 @@ describe("identityFromHeaders", () => {
     ).toEqual({ username: "chris", email: null, fullName: null });
   });
 
-  it("keeps ordinary internal spaces and hyphens in a full name", () => {
+  it("keeps ordinary internal spaces in a full name", () => {
     expect(
       identityFromHeaders({ "ynh-user": "chris", "ynh-user-fullname": "Chris Wilson" }, null),
     ).toEqual({ username: "chris", email: null, fullName: "Chris Wilson" });
+  });
 
+  it("keeps ordinary hyphens and apostrophes in a full name", () => {
     expect(
-      identityFromHeaders(
-        { "ynh-user": "amob", "ynh-user-fullname": "Anne-Marie O'Brien" },
-        null,
-      ),
+      identityFromHeaders({ "ynh-user": "amob", "ynh-user-fullname": "Anne-Marie O'Brien" }, null),
     ).toEqual({ username: "amob", email: null, fullName: "Anne-Marie O'Brien" });
   });
 
@@ -87,7 +86,40 @@ describe("identityFromHeaders", () => {
     expect(identityFromHeaders({ "ynh-user": "   " }, "devuser")).toBeNull();
   });
 
+  it("does not fall back to the dev user when ynh-user is literally empty", () => {
+    expect(identityFromHeaders({ "ynh-user": "" }, "devuser")).toBeNull();
+  });
+
   it("does not fall back to the dev user when ynh-user is present but array-valued", () => {
     expect(identityFromHeaders({ "ynh-user": ["chris", "attacker"] }, "devuser")).toBeNull();
+  });
+
+  it("rejects a ynh-user value containing NEL (a C1 control character)", () => {
+    expect(identityFromHeaders({ "ynh-user": "chris\u0085" }, null)).toBeNull();
+  });
+
+  it("rejects a ynh-user value containing a zero-width space, which trim() would not strip", () => {
+    expect(identityFromHeaders({ "ynh-user": "chris\u200B" }, null)).toBeNull();
+  });
+
+  it("rejects an RTL override in ynh-user-fullname while a valid ynh-user still resolves", () => {
+    expect(
+      identityFromHeaders(
+        { "ynh-user": "chris", "ynh-user-fullname": "\u202EWilson" },
+        null,
+      ),
+    ).toEqual({ username: "chris", email: null, fullName: null });
+  });
+
+  it("preserves a Persian full name containing ZWNJ, which is required for correct rendering", () => {
+    const fullname = "\u0645\u06CC\u200C\u0631\u0648\u062F";
+    const result = identityFromHeaders({ "ynh-user": "u1", "ynh-user-fullname": fullname }, null);
+    expect(result?.fullName).toBe(fullname);
+  });
+
+  it("preserves an emoji sequence joined with ZWJ", () => {
+    const fullname = "\u{1F468}\u200D\u{1F4BB}";
+    const result = identityFromHeaders({ "ynh-user": "u2", "ynh-user-fullname": fullname }, null);
+    expect(result?.fullName).toBe(fullname);
   });
 });
