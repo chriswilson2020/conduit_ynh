@@ -589,23 +589,23 @@ git commit -m "feat(api): add validated environment config with production dev-u
 Create `packages/api/src/db/schema.ts`:
 
 ```typescript
-import { pgTable, uuid, text, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp } from "drizzle-orm/pg-core";
 
-export const users = pgTable(
-  "users",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    username: text("username").notNull().unique(),
-    email: text("email"),
-    fullName: text("full_name"),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
-  },
-  (table) => [index("users_username_idx").on(table.username)],
-);
+export const users = pgTable("users", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  username: text("username").notNull().unique(),
+  email: text("email"),
+  fullName: text("full_name"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export type UserRow = typeof users.$inferSelect;
 ```
+
+There is deliberately **no explicit index on `username`**. `.unique()` already makes PostgreSQL
+create a unique btree index to enforce the constraint, so adding one duplicates it — paying double
+write cost on the busiest column in the table for no query benefit.
 
 `username` is the join key to YunoHost LDAP and must be unique. Everything else is a cache of LDAP data that may change.
 
@@ -638,7 +638,7 @@ Expected: creates `packages/api/drizzle/0000_<random_name>.sql` containing `CREA
 cat packages/api/drizzle/0000_*.sql
 ```
 
-Expected: a `CREATE TABLE "users"` with `id`, `username`, `email`, `full_name`, `created_at`, `last_seen_at`, a unique constraint on `username`, and a `users_username_idx` index. If any column is missing, fix `schema.ts` and regenerate rather than hand-editing the SQL.
+Expected: a `CREATE TABLE "users"` with `id`, `username`, `email`, `full_name`, `created_at` and `last_seen_at`, plus `CONSTRAINT "users_username_unique" UNIQUE("username")` — and **no** separate `CREATE INDEX`. If anything differs, fix `schema.ts` and regenerate rather than hand-editing the SQL.
 
 - [ ] **Step 5: Write the database client**
 
@@ -660,9 +660,14 @@ export interface DatabaseHandle {
 }
 
 export function createDatabase(databaseUrl: string, maxConnections = 10): DatabaseHandle {
-  const sql = postgres(databaseUrl, { max: maxConnections, onnotice: () => {} });
+  // No onnotice override: postgres.js's default logs notices to stdout, which reaches
+  // journald under systemd. This is a self-hosted app an operator debugs from the
+  // journal, so notices (e.g. from migrations) should stay visible, not be discarded.
+  const sql = postgres(databaseUrl, { max: maxConnections });
   return {
     db: drizzle(sql, { schema }),
+    // Graceful shutdown with a deadline: let in-flight queries finish, but never hang
+    // the process waiting on a connection that won't close.
     close: () => sql.end({ timeout: 5 }),
   };
 }
@@ -672,6 +677,10 @@ export function migrationsFolder(): string {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "drizzle");
 }
 
+// drizzle applies all pending migrations in a single transaction, so a failure during
+// boot rolls back cleanly and the next boot attempt can safely retry. Known limitation:
+// there is no advisory lock around this, so two processes migrating the same database
+// concurrently (e.g. two instances starting at once) could race each other.
 export async function runMigrations(db: Database): Promise<void> {
   await migrate(db, { migrationsFolder: migrationsFolder() });
 }
