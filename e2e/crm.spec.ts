@@ -162,7 +162,9 @@ test.describe.serial("CRM journey", () => {
     // Detail page still loads, read-only, with the archived badge.
     await page.goto(`/companies/${companyId}`);
     await expect(page.getByTestId("archived-badge")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Archive" })).not.toBeVisible();
+    // exact: true -- "Archive" is otherwise a substring match of "Unarchive",
+    // which IS visible at this point.
+    await expect(page.getByRole("button", { name: "Archive", exact: true })).not.toBeVisible();
 
     // Unarchive restores it to the default list.
     await page.getByRole("button", { name: "Unarchive" }).click();
