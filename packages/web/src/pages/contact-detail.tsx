@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import type { UpdateContactInput } from "@conduit/shared";
+import { ApiError } from "../api";
 import {
   useArchiveContact,
   useCompany,
@@ -11,12 +12,6 @@ import {
 import { FieldCard, type FieldCardField } from "../components/field-card";
 import { OwnerSelect } from "../components/owner-select";
 import { Button } from "../components/ui/button";
-
-// See the matching comment in company-detail.tsx: getJson throws a plain
-// Error with no status code, so a 404 is only recognisable by message shape.
-function isNotFoundError(error: unknown): boolean {
-  return error instanceof Error && /failed with 404$/.test(error.message);
-}
 
 function splitList(value: string): string[] {
   return value
@@ -55,6 +50,18 @@ export function ContactDetailPage() {
   const [savingField, setSavingField] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<string, string>>>({});
 
+  // ApiError.code is the server's machine-readable `error` field: branching
+  // on it (rather than the human-readable message, which for "archived"
+  // always includes the interpolated contact id) is what lets this reword
+  // that 409 into an actionable hint.
+  function reportError(err: unknown) {
+    if (err instanceof ApiError && err.code === "archived") {
+      setBannerError("This contact is archived. Unarchive it to make changes.");
+      return;
+    }
+    setBannerError(err instanceof Error ? err.message : String(err));
+  }
+
   function handleSave(name: string, value: string) {
     if (!contact) return;
     setSavingField(name);
@@ -65,16 +72,15 @@ export function ContactDetailPage() {
         onSuccess: () => setSavingField(null),
         onError: (err: unknown) => {
           setSavingField(null);
-          const message = err instanceof Error ? err.message : String(err);
-          // Invalid email format is the one error the spec calls out to show
-          // inline, right under the emails field, rather than in the banner;
-          // everything else (including a 409 while editing emails) goes to
-          // the shared top banner.
-          if (name === "emails" && message !== "archived") {
-            setFieldErrors((prev) => ({ ...prev, emails: message }));
-          } else {
-            setBannerError(message === "archived" ? "This contact is archived. Unarchive it to make changes." : message);
+          // Invalid email format (code "validation") is the one error the
+          // spec calls out to show inline, right under the emails field,
+          // rather than in the banner; everything else (including a 409
+          // while editing emails) goes to the shared top banner.
+          if (name === "emails" && err instanceof ApiError && err.code === "validation") {
+            setFieldErrors((prev) => ({ ...prev, emails: err.message }));
+            return;
           }
+          reportError(err);
         },
       },
     );
@@ -82,37 +88,25 @@ export function ContactDetailPage() {
 
   function handleOwnerChange(userId: string | null) {
     if (!contact) return;
-    updateContact.mutate(
-      { id: contact.id, patch: { ownerUserId: userId } },
-      {
-        onError: (err: unknown) => {
-          const message = err instanceof Error ? err.message : String(err);
-          setBannerError(message === "archived" ? "This contact is archived. Unarchive it to make changes." : message);
-        },
-      },
-    );
+    updateContact.mutate({ id: contact.id, patch: { ownerUserId: userId } }, { onError: reportError });
   }
 
   function handleArchive() {
     if (!contact) return;
     const label = `${contact.firstName} ${contact.lastName ?? ""}`.trim();
     if (!window.confirm(`Archive ${label}?`)) return;
-    archiveContact.mutate(contact.id, {
-      onError: (err: unknown) => setBannerError(err instanceof Error ? err.message : String(err)),
-    });
+    archiveContact.mutate(contact.id, { onError: reportError });
   }
 
   function handleUnarchive() {
     if (!contact) return;
-    unarchiveContact.mutate(contact.id, {
-      onError: (err: unknown) => setBannerError(err instanceof Error ? err.message : String(err)),
-    });
+    unarchiveContact.mutate(contact.id, { onError: reportError });
   }
 
   if (isLoading) return <p>Loading...</p>;
 
   if (error) {
-    if (isNotFoundError(error)) {
+    if (error instanceof ApiError && error.status === 404) {
       return (
         <div
           data-testid="not-found"

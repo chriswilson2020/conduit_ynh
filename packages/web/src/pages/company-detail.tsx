@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { FormEvent } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import type { UpdateCompanyInput } from "@conduit/shared";
+import { ApiError } from "../api";
 import {
   useArchiveCompany,
   useCompany,
@@ -15,13 +16,6 @@ import { OwnerSelect } from "../components/owner-select";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
-
-// getJson (src/api.ts) throws a plain Error with no structured status code, so
-// a 404 can only be recognised by matching its "... failed with 404" message.
-// Fragile, but there is nowhere else to get the status from with today's api.ts.
-function isNotFoundError(error: unknown): boolean {
-  return error instanceof Error && /failed with 404$/.test(error.message);
-}
 
 function buildCompanyPatch(name: string, value: string): UpdateCompanyInput {
   const trimmed = value.trim();
@@ -55,9 +49,16 @@ export function CompanyDetailPage() {
   const [savingField, setSavingField] = useState<string | null>(null);
   const [newContactOpen, setNewContactOpen] = useState(false);
 
-  function reportError(err: unknown, archivedHint: string) {
-    const message = err instanceof Error ? err.message : String(err);
-    setBannerError(message === "archived" ? archivedHint : message);
+  // ApiError.code is the server's machine-readable `error` field: branching on
+  // it (rather than the human-readable message, which always includes the
+  // interpolated company id) is what lets this reword the 409 a PATCH gets
+  // back for an archived record into an actionable hint.
+  function reportError(err: unknown) {
+    if (err instanceof ApiError && err.code === "archived") {
+      setBannerError("This company is archived. Unarchive it to make changes.");
+      return;
+    }
+    setBannerError(err instanceof Error ? err.message : String(err));
   }
 
   function handleSave(name: string, value: string) {
@@ -69,7 +70,7 @@ export function CompanyDetailPage() {
         onSuccess: () => setSavingField(null),
         onError: (err) => {
           setSavingField(null);
-          reportError(err, "This company is archived. Unarchive it to make changes.");
+          reportError(err);
         },
       },
     );
@@ -77,27 +78,24 @@ export function CompanyDetailPage() {
 
   function handleOwnerChange(userId: string | null) {
     if (!company) return;
-    updateCompany.mutate(
-      { id: company.id, patch: { ownerUserId: userId } },
-      { onError: (err) => reportError(err, "This company is archived. Unarchive it to make changes.") },
-    );
+    updateCompany.mutate({ id: company.id, patch: { ownerUserId: userId } }, { onError: reportError });
   }
 
   function handleArchive() {
     if (!company) return;
     if (!window.confirm(`Archive ${company.name}?`)) return;
-    archiveCompany.mutate(company.id, { onError: (err) => reportError(err, "") });
+    archiveCompany.mutate(company.id, { onError: reportError });
   }
 
   function handleUnarchive() {
     if (!company) return;
-    unarchiveCompany.mutate(company.id, { onError: (err) => reportError(err, "") });
+    unarchiveCompany.mutate(company.id, { onError: reportError });
   }
 
   if (isLoading) return <p>Loading...</p>;
 
   if (error) {
-    if (isNotFoundError(error)) {
+    if (error instanceof ApiError && error.status === 404) {
       return (
         <div
           data-testid="not-found"

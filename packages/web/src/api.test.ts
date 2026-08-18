@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { basePath, apiUrl, fetchHealth } from "./api";
+import { basePath, apiUrl, fetchHealth, getJson, patchJson, ApiError } from "./api";
 
 // vitest.config.ts runs this suite under environment: "node", so there is no
 // global `window`. api.ts only reads `window.__CONDUIT_BASE__` inside function
@@ -92,5 +92,83 @@ describe("fetchHealth", () => {
     stubFetch({ ok: false, status: 500, body: {} });
 
     await expect(fetchHealth()).rejects.toThrow("GET /health failed with 500");
+  });
+});
+
+// This pins the contract company-detail.tsx / contact-detail.tsx rely on:
+// a non-2xx response must reject with an ApiError carrying the real HTTP
+// status and the server's machine-readable `error` field as `code`, not just
+// a display string. Before ApiError existed, those pages compared the thrown
+// Error's *message* against the literal string "archived" -- which never
+// matched, because the API always sends a message like "company <id> is
+// archived" (see packages/api/src/routes/helpers.ts), never the bare code.
+// Branching on `code`/`status` instead of parsing `message` is what makes
+// this actually work, and is safe even if the message text changes later.
+describe("ApiError", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function stubFetch(response: { ok: boolean; status: number; body?: unknown; unparseable?: boolean }) {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: response.ok,
+      status: response.status,
+      json: () =>
+        response.unparseable === true
+          ? Promise.reject(new Error("Unexpected end of JSON input"))
+          : Promise.resolve(response.body),
+    }) as unknown as typeof fetch;
+  }
+
+  it("rejects a 409 archived response with status/code/message all set from the body", async () => {
+    setBase(undefined);
+    stubFetch({
+      ok: false,
+      status: 409,
+      body: { error: "archived", message: "company a1 is archived" },
+    });
+
+    const rejection = patchJson("/companies/a1", { domain: "x.example" });
+    await expect(rejection).rejects.toBeInstanceOf(ApiError);
+    await rejection.catch((err: unknown) => {
+      const apiError = err as ApiError;
+      expect(apiError.status).toBe(409);
+      expect(apiError.code).toBe("archived");
+      expect(apiError.message).toBe("company a1 is archived");
+    });
+  });
+
+  it("rejects a 404 response with status 404 and code not_found", async () => {
+    setBase(undefined);
+    stubFetch({
+      ok: false,
+      status: 404,
+      body: { error: "not_found", message: "company a1 not found" },
+    });
+
+    const rejection = getJson("/companies/a1");
+    await expect(rejection).rejects.toBeInstanceOf(ApiError);
+    await rejection.catch((err: unknown) => {
+      const apiError = err as ApiError;
+      expect(apiError.status).toBe(404);
+      expect(apiError.code).toBe("not_found");
+      expect(apiError.message).toBe("company a1 not found");
+    });
+  });
+
+  it("falls back to code 'unknown' and a generic message for an unparseable error body", async () => {
+    setBase(undefined);
+    stubFetch({ ok: false, status: 500, unparseable: true });
+
+    const rejection = patchJson("/companies/a1", { domain: "x.example" });
+    await expect(rejection).rejects.toBeInstanceOf(ApiError);
+    await rejection.catch((err: unknown) => {
+      const apiError = err as ApiError;
+      expect(apiError.status).toBe(500);
+      expect(apiError.code).toBe("unknown");
+      expect(apiError.message).toBe("PATCH /companies/a1 failed with 500");
+    });
   });
 });

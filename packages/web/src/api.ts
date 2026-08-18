@@ -19,21 +19,54 @@ export function apiUrl(path: string): string {
   return base === "/" ? `/api${path}` : `${base}/api${path}`;
 }
 
+/**
+ * Thrown for any non-2xx response carrying the app's uniform error shape
+ * (`{ error, message? }`, see errorResponseSchema). `status` is the HTTP
+ * status code; `code` is the machine-readable `error` field ("archived",
+ * "not_found", "validation", ...). Callers must branch on `status`/`code`,
+ * never on `message` text -- that string is for display only and is free to
+ * change (it already includes interpolated ids, e.g. "company <id> is
+ * archived", so it can never be compared for equality against a constant).
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string,
+  ) {
+    super(message);
+  }
+}
+
 export async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(apiUrl(path), { headers: { Accept: "application/json" } });
   if (!response.ok) {
-    throw new Error(`GET ${path} failed with ${response.status}`);
+    throw await toApiError(response, `GET ${path} failed with ${response.status}`);
   }
   return (await response.json()) as T;
 }
 
 /**
- * Shared POST/PATCH body sender. On a non-2xx response, the body is checked
- * against the app's uniform error shape (`{ error, message? }`, see
- * errorResponseSchema) and, when it matches, the thrown error carries the
- * server's `message` (falling back to `error`) instead of a generic
- * "<method> <path> failed with <status>" -- callers surfacing this in the UI
- * get "company acme is archived", not "PATCH /companies/... failed with 409".
+ * Builds the ApiError for a non-2xx response, parsing its body against the
+ * app's uniform error shape when possible. `fallbackMessage` covers a body
+ * that doesn't parse (empty, non-JSON, or shaped differently) -- code
+ * "unknown" in that case, since there is no machine-readable error field to
+ * report.
+ */
+async function toApiError(response: Response, fallbackMessage: string): Promise<ApiError> {
+  const raw: unknown = await response.json().catch(() => undefined);
+  const parsed = errorResponseSchema.safeParse(raw);
+  if (parsed.success) {
+    return new ApiError(parsed.data.message ?? parsed.data.error, response.status, parsed.data.error);
+  }
+  return new ApiError(fallbackMessage, response.status, "unknown");
+}
+
+/**
+ * Shared POST/PATCH body sender. On a non-2xx response, throws an ApiError
+ * built from the response -- see toApiError -- so callers get a message like
+ * "company acme is archived" (not "PATCH /companies/... failed with 409")
+ * plus a status/code they can branch on without parsing that message.
  */
 async function sendJson<T>(method: "POST" | "PATCH", path: string, body?: unknown): Promise<T> {
   const response = await fetch(apiUrl(path), {
@@ -45,12 +78,7 @@ async function sendJson<T>(method: "POST" | "PATCH", path: string, body?: unknow
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) {
-    const raw: unknown = await response.json().catch(() => undefined);
-    const parsed = errorResponseSchema.safeParse(raw);
-    const message = parsed.success
-      ? (parsed.data.message ?? parsed.data.error)
-      : `${method} ${path} failed with ${response.status}`;
-    throw new Error(message);
+    throw await toApiError(response, `${method} ${path} failed with ${response.status}`);
   }
   return (await response.json()) as T;
 }
@@ -62,7 +90,7 @@ export const patchJson = <T>(path: string, body?: unknown) => sendJson<T>("PATCH
  * POST a multipart/form-data body (file uploads). Deliberately does not set
  * Content-Type: fetch/the browser derives it from the FormData, including the
  * multipart boundary -- setting it manually would omit that boundary and the
- * server would fail to parse the body. Error-shape unwrapping mirrors sendJson.
+ * server would fail to parse the body. Error handling mirrors sendJson.
  */
 export async function postForm(path: string, form: FormData): Promise<unknown> {
   const response = await fetch(apiUrl(path), {
@@ -71,12 +99,7 @@ export async function postForm(path: string, form: FormData): Promise<unknown> {
     body: form,
   });
   if (!response.ok) {
-    const raw: unknown = await response.json().catch(() => undefined);
-    const parsed = errorResponseSchema.safeParse(raw);
-    const message = parsed.success
-      ? (parsed.data.message ?? parsed.data.error)
-      : `POST ${path} failed with ${response.status}`;
-    throw new Error(message);
+    throw await toApiError(response, `POST ${path} failed with ${response.status}`);
   }
   return await response.json();
 }
