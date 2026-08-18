@@ -6,6 +6,7 @@ import type { Database } from "./db/client.js";
 import { identityFromHeaders } from "./auth.js";
 import { createUserResolver } from "./users.js";
 import { registerSpa } from "./spa.js";
+import { registerCrmRoutes } from "./routes/index.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -16,11 +17,14 @@ declare module "fastify" {
 export interface BuildAppOptions {
   config: Config;
   db: Database;
+  /** Directory holding uploaded file blobs (see services/blobs.ts). Defaults to
+   * "./data" for tests that never touch the files routes and so do not care. */
+  dataDir?: string;
   /** Directory holding the built SPA. When omitted, only the API is served. */
   webRoot?: string;
 }
 
-export async function buildApp({ config, db, webRoot }: BuildAppOptions): Promise<FastifyInstance> {
+export async function buildApp({ config, db, dataDir = "./data", webRoot }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     logger: config.nodeEnv === "test" ? false : { level: "info" },
     // 1, not true: the app binds to loopback and is reachable through exactly one
@@ -86,6 +90,8 @@ export async function buildApp({ config, db, webRoot }: BuildAppOptions): Promis
     }
     return { user: request.user };
   });
+
+  await registerCrmRoutes(app, { db, dataDir });
 
   if (webRoot === undefined) {
     app.setNotFoundHandler(async (request, reply) => {

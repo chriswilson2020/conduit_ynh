@@ -15,6 +15,7 @@ async function main(): Promise<void> {
   const app = await buildApp({
     config,
     db,
+    dataDir: config.dataDir,
     // server.js is staged one level under the release root (<root>/server/server.js),
     // and the built SPA sits alongside it at <root>/web -- one ".." back up to
     // <root>, then into web. (Compare db/client.ts's migrationsFolder(), which needs
