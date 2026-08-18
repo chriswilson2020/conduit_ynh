@@ -21,6 +21,9 @@ export function Shell({ children }: { children: ReactNode }) {
           <Link to="/contacts" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
             Contacts
           </Link>
+          <Link to="/pipelines" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+            Pipelines
+          </Link>
         </nav>
       </aside>
       <div className="flex min-w-0 flex-1 flex-col">

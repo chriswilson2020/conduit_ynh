@@ -3,10 +3,12 @@ import { Link, Outlet, createRootRoute, createRoute, createRouter } from "@tanst
 import { App } from "./App";
 import { basePath } from "./api";
 import { Shell } from "./components/shell";
+import { BoardPage } from "./pages/board";
 import { CompaniesPage } from "./pages/companies";
 import { CompanyDetailPage } from "./pages/company-detail";
 import { ContactsPage } from "./pages/contacts";
 import { ContactDetailPage } from "./pages/contact-detail";
+import { PipelinesPage } from "./pages/pipelines";
 
 // A short staleTime keeps list/detail views from refetching on every focus
 // change while still picking up another tab's edits within a few seconds; a
@@ -60,6 +62,18 @@ const contactDetailRoute = createRoute({
   component: ContactDetailPage,
 });
 
+const pipelinesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/pipelines",
+  component: PipelinesPage,
+});
+
+const boardRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/pipelines/$pipelineId",
+  component: BoardPage,
+});
+
 // Rendered by the router itself (not a route) whenever the URL matches no
 // route in the tree -- a stale bookmark or a mistyped path. It renders as the
 // root route's Outlet content, i.e. inside Shell, so the sidebar/header stay
@@ -96,6 +110,8 @@ const routeTree = rootRoute.addChildren([
   companyDetailRoute,
   contactsRoute,
   contactDetailRoute,
+  pipelinesRoute,
+  boardRoute,
 ]);
 
 // basePath() returns "/" both at a root install and during `vite dev` (see its

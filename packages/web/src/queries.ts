@@ -2,27 +2,46 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   companySchema,
   contactSchema,
+  dealSchema,
   eventSchema,
   fileMetaSchema,
+  funnelRowSchema,
   listResponseSchema,
+  midpoint,
   noteSchema,
+  pipelineSchema,
+  pipelineWithStagesSchema,
   searchResultsSchema,
+  stageSchema,
   usersResponseSchema,
   type Company,
   type Contact,
   type CreateCompanyInput,
   type CreateContactInput,
+  type CreateDealInput,
   type CreateNoteInput,
+  type CreatePipelineInput,
+  type CreateStageInput,
+  type Deal,
+  type Pipeline,
+  type PipelineScope,
+  type Stage,
   type UpdateCompanyInput,
   type UpdateContactInput,
+  type UpdateDealInput,
+  type UpdatePipelineInput,
+  type UpdateStageInput,
 } from "@conduit/shared";
-import { getJson, patchJson, postForm, postJson } from "./api";
+import { ApiError, getJson, patchJson, postForm, postJson } from "./api";
 
 const companyListSchema = listResponseSchema(companySchema);
 const contactListSchema = listResponseSchema(contactSchema);
 const eventListSchema = listResponseSchema(eventSchema);
 const noteListSchema = noteSchema.array();
 const fileListSchema = fileMetaSchema.array();
+const pipelineListSchema = pipelineSchema.array();
+const dealListSchema = dealSchema.array();
+const funnelListSchema = funnelRowSchema.array();
 
 /** Builds a `?a=1&b=2` query string, dropping keys whose value is undefined. */
 function toQueryString(params: Record<string, string | number | boolean | undefined>): string {
@@ -300,6 +319,302 @@ export function useUploadFile() {
       void queryClient.invalidateQueries({ queryKey: ["files"] });
       void queryClient.invalidateQueries({ queryKey: ["events"] });
     },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines + stages
+// ---------------------------------------------------------------------------
+
+export interface PipelineListParams {
+  scope?: PipelineScope;
+  companyId?: string;
+  archived?: boolean;
+}
+
+// Unpaginated, mirroring listPipelines server-side (see its doc comment in
+// services/pipelines.ts) -- a plain array, not { items, nextCursor }.
+export function usePipelines(params: PipelineListParams = {}) {
+  return useQuery({
+    queryKey: ["pipelines", params],
+    queryFn: async () => {
+      const qs = toQueryString({ scope: params.scope, company_id: params.companyId, archived: params.archived });
+      return parseWith(pipelineListSchema, await getJson<unknown>(`/pipelines${qs}`), "pipelines list");
+    },
+  });
+}
+
+// Composite { pipeline, stages } response -- see pipelineWithStagesSchema's
+// doc comment in @conduit/shared for why getPipeline returns the bundle.
+export function usePipeline(id: string) {
+  return useQuery({
+    queryKey: ["pipeline", id],
+    queryFn: async () =>
+      parseWith(pipelineWithStagesSchema, await getJson<unknown>(`/pipelines/${id}`), "pipeline"),
+    enabled: id !== "",
+  });
+}
+
+// Mirrors useInvalidateCompany's doc comment: publishPipelineHint in
+// services/pipelines.ts publishes ["pipelines"], ["pipeline", id], ["events"]
+// after every pipeline/stage mutation, so this invalidates the same set for
+// mutations issued from this tab (the SSE client, wired in a later task,
+// covers the ones issued elsewhere).
+function useInvalidatePipeline() {
+  const queryClient = useQueryClient();
+  return (id?: string) => {
+    void queryClient.invalidateQueries({ queryKey: ["pipelines"] });
+    void queryClient.invalidateQueries({ queryKey: ["events"] });
+    if (id !== undefined) void queryClient.invalidateQueries({ queryKey: ["pipeline", id] });
+  };
+}
+
+export function useCreatePipeline() {
+  const invalidate = useInvalidatePipeline();
+  return useMutation({
+    mutationFn: async (input: CreatePipelineInput) =>
+      parseWith(pipelineSchema, await postJson<unknown>("/pipelines", input), "pipeline"),
+    onSuccess: (pipeline: Pipeline) => invalidate(pipeline.id),
+  });
+}
+
+export function useUpdatePipeline() {
+  const invalidate = useInvalidatePipeline();
+  return useMutation({
+    mutationFn: async ({ id, patch }: { id: string; patch: UpdatePipelineInput }) =>
+      parseWith(pipelineSchema, await patchJson<unknown>(`/pipelines/${id}`, patch), "pipeline"),
+    onSuccess: (pipeline: Pipeline) => invalidate(pipeline.id),
+  });
+}
+
+export function useArchivePipeline() {
+  const invalidate = useInvalidatePipeline();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(pipelineSchema, await postJson<unknown>(`/pipelines/${id}/archive`), "pipeline"),
+    onSuccess: (pipeline: Pipeline) => invalidate(pipeline.id),
+  });
+}
+
+// Stages have no cache of their own -- they ride along inside the
+// pipeline-detail response (pipelineWithStagesSchema) -- so every stage
+// mutation below invalidates the owning ["pipeline", pipelineId] (which
+// refetches the bundle, stages included) via the same helper pipeline
+// mutations use.
+export function useCreateStage() {
+  const invalidate = useInvalidatePipeline();
+  return useMutation({
+    mutationFn: async ({ pipelineId, input }: { pipelineId: string; input: CreateStageInput }) =>
+      parseWith(stageSchema, await postJson<unknown>(`/pipelines/${pipelineId}/stages`, input), "stage"),
+    onSuccess: (_stage: Stage, { pipelineId }) => invalidate(pipelineId),
+  });
+}
+
+export function useUpdateStage() {
+  const invalidate = useInvalidatePipeline();
+  return useMutation({
+    mutationFn: async (
+      { pipelineId, stageId, patch }: { pipelineId: string; stageId: string; patch: UpdateStageInput },
+    ) =>
+      parseWith(
+        stageSchema,
+        await patchJson<unknown>(`/pipelines/${pipelineId}/stages/${stageId}`, patch),
+        "stage",
+      ),
+    onSuccess: (_stage: Stage, { pipelineId }) => invalidate(pipelineId),
+  });
+}
+
+export interface ReorderStageParams {
+  pipelineId: string;
+  stageId: string;
+  beforeStageId?: string;
+  afterStageId?: string;
+}
+
+export function useReorderStage() {
+  const invalidate = useInvalidatePipeline();
+  return useMutation({
+    mutationFn: async ({ pipelineId, stageId, beforeStageId, afterStageId }: ReorderStageParams) =>
+      parseWith(
+        stageSchema,
+        await postJson<unknown>(`/pipelines/${pipelineId}/stages/${stageId}/reorder`, {
+          beforeStageId, afterStageId,
+        }),
+        "stage",
+      ),
+    onSuccess: (_stage: Stage, { pipelineId }) => invalidate(pipelineId),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Deals
+// ---------------------------------------------------------------------------
+
+// pipeline_id is required server-side (see listDeals's doc comment in
+// services/deals.ts): a kanban board always renders exactly one pipeline's
+// columns, so this hook takes the id directly rather than a params object.
+export function useDeals(pipelineId: string) {
+  return useQuery({
+    queryKey: ["deals", pipelineId],
+    queryFn: async () => {
+      const qs = toQueryString({ pipeline_id: pipelineId });
+      return parseWith(dealListSchema, await getJson<unknown>(`/deals${qs}`), "deals list");
+    },
+    enabled: pipelineId !== "",
+  });
+}
+
+// Mirrors publishDealHint in services/deals.ts: every deal mutation
+// publishes ["deals", pipelineId], ["deal", id], ["funnel", pipelineId],
+// ["events"], ["search"] after commit -- see useInvalidateCompany's doc
+// comment for why ["search"] is invalidated eagerly rather than left to
+// expire on its own (a deal title change or an archive must stop/change
+// matching a search hit immediately).
+function useInvalidateDeal() {
+  const queryClient = useQueryClient();
+  return (pipelineId: string, id: string) => {
+    void queryClient.invalidateQueries({ queryKey: ["deals", pipelineId] });
+    void queryClient.invalidateQueries({ queryKey: ["deal", id] });
+    void queryClient.invalidateQueries({ queryKey: ["funnel", pipelineId] });
+    void queryClient.invalidateQueries({ queryKey: ["events"] });
+    void queryClient.invalidateQueries({ queryKey: ["search"] });
+  };
+}
+
+export function useCreateDeal() {
+  const invalidate = useInvalidateDeal();
+  return useMutation({
+    mutationFn: async (input: CreateDealInput) =>
+      parseWith(dealSchema, await postJson<unknown>("/deals", input), "deal"),
+    onSuccess: (deal: Deal) => invalidate(deal.pipelineId, deal.id),
+  });
+}
+
+export function useUpdateDeal() {
+  const invalidate = useInvalidateDeal();
+  return useMutation({
+    mutationFn: async ({ id, patch }: { id: string; patch: UpdateDealInput }) =>
+      parseWith(dealSchema, await patchJson<unknown>(`/deals/${id}`, patch), "deal"),
+    onSuccess: (deal: Deal) => invalidate(deal.pipelineId, deal.id),
+  });
+}
+
+export interface MoveDealParams {
+  id: string;
+  pipelineId: string;
+  stageId: string;
+  beforeDealId?: string;
+  afterDealId?: string;
+}
+
+interface MoveDealContext {
+  queryKey: readonly [string, string];
+  previous: Deal[] | undefined;
+}
+
+/**
+ * Optimistic move: onMutate snapshots the ["deals", pipelineId] cache,
+ * reassigns the dragged deal's stageId, and computes a plausible new
+ * position with the same midpoint() the server uses -- so the card lands in
+ * roughly the right slot before the network round-trip returns, instead of
+ * snapping back to its old spot for a beat. That local position is only ever
+ * a guess: onSuccess invalidates the same key set every other deal mutation
+ * does (see useInvalidateDeal), which refetches the server's authoritative
+ * order (moveDeal's neighbour-narrowing in services/deals.ts can land the
+ * deal somewhere slightly different than this guess when the drop gap wasn't
+ * empty). onError rolls back to the snapshot; a 409 specifically ("conflict"
+ * -- the board's view of the target gap was stale, per moveDealInputSchema's
+ * JSDoc) ALSO invalidates ["deals", pipelineId] on top of the rollback, since
+ * the pre-drag snapshot itself may now be stale too and only a refetch gets
+ * the client back to truth.
+ */
+export function useMoveDeal() {
+  const queryClient = useQueryClient();
+  const invalidate = useInvalidateDeal();
+  return useMutation<Deal, unknown, MoveDealParams, MoveDealContext>({
+    mutationFn: async ({ id, stageId, beforeDealId, afterDealId }: MoveDealParams) =>
+      parseWith(
+        dealSchema,
+        await postJson<unknown>(`/deals/${id}/move`, { stageId, beforeDealId, afterDealId }),
+        "deal",
+      ),
+    onMutate: async (params) => {
+      const queryKey = ["deals", params.pipelineId] as const;
+      await queryClient.cancelQueries({ queryKey });
+      const previous = queryClient.getQueryData<Deal[]>(queryKey);
+      if (previous !== undefined) {
+        const positionOf = (id?: string) => (id === undefined ? null : previous.find((d) => d.id === id)?.position ?? null);
+        const beforePos = positionOf(params.beforeDealId);
+        const afterPos = positionOf(params.afterDealId);
+        let position: string;
+        try {
+          if (beforePos !== null || afterPos !== null) {
+            position = midpoint(beforePos, afterPos);
+          } else {
+            // Neither neighbour named: append at the tail of the target
+            // stage, mirroring moveDealInputSchema's "both omitted" append
+            // semantics.
+            const tail = previous
+              .filter((d) => d.stageId === params.stageId && d.id !== params.id)
+              .reduce<string | null>((max, d) => (max === null || d.position > max ? d.position : max), null);
+            position = midpoint(tail, null);
+          }
+        } catch {
+          // A stale/invalid neighbour pair locally (e.g. the board's cached
+          // copy of the two named neighbours is no longer adjacent) --
+          // keep the deal's current position rather than crash the drag;
+          // the server's response (or the rollback below) corrects it.
+          position = previous.find((d) => d.id === params.id)?.position ?? "";
+        }
+        queryClient.setQueryData<Deal[]>(
+          queryKey,
+          previous.map((deal) => (deal.id === params.id ? { ...deal, stageId: params.stageId, position } : deal)),
+        );
+      }
+      return { queryKey, previous };
+    },
+    onError: (error, params, context) => {
+      if (context !== undefined) queryClient.setQueryData(context.queryKey, context.previous);
+      if (error instanceof ApiError && error.status === 409) {
+        void queryClient.invalidateQueries({ queryKey: ["deals", params.pipelineId] });
+      }
+    },
+    onSuccess: (deal: Deal, params) => invalidate(params.pipelineId, deal.id),
+  });
+}
+
+export function useWinDeal() {
+  const invalidate = useInvalidateDeal();
+  return useMutation({
+    mutationFn: async (id: string) => parseWith(dealSchema, await postJson<unknown>(`/deals/${id}/win`), "deal"),
+    onSuccess: (deal: Deal) => invalidate(deal.pipelineId, deal.id),
+  });
+}
+
+export function useLoseDeal() {
+  const invalidate = useInvalidateDeal();
+  return useMutation({
+    mutationFn: async ({ id, reason }: { id: string; reason: string }) =>
+      parseWith(dealSchema, await postJson<unknown>(`/deals/${id}/lose`, { reason }), "deal"),
+    onSuccess: (deal: Deal) => invalidate(deal.pipelineId, deal.id),
+  });
+}
+
+export function useReopenDeal() {
+  const invalidate = useInvalidateDeal();
+  return useMutation({
+    mutationFn: async (id: string) => parseWith(dealSchema, await postJson<unknown>(`/deals/${id}/reopen`), "deal"),
+    onSuccess: (deal: Deal) => invalidate(deal.pipelineId, deal.id),
+  });
+}
+
+export function useFunnel(pipelineId: string) {
+  return useQuery({
+    queryKey: ["funnel", pipelineId],
+    queryFn: async () =>
+      parseWith(funnelListSchema, await getJson<unknown>(`/pipelines/${pipelineId}/funnel`), "funnel"),
+    enabled: pipelineId !== "",
   });
 }
 
