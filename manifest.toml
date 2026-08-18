@@ -6,7 +6,7 @@ id = "conduit"
 name = "Conduit"
 description.en = "Self-hosted CRM with pipelines, projects, Gantt charts and an integrated inbox"
 
-version = "0.1.0~ynh1"
+version = "0.1.2~ynh1"
 
 maintainers = ["chriswilson2020"]
 
@@ -41,8 +41,8 @@ ram.runtime = "400M"
 [resources]
 
     [resources.sources.main]
-    url = "https://github.com/chriswilson2020/conduit_ynh/releases/download/v0.1.0/conduit-0.1.0.tar.gz"
-    sha256 = "212eb79bacdcc36ef2d149ddbb532942c3b03112aa87ca5892b095ea1349ae0c"
+    url = "https://github.com/chriswilson2020/conduit_ynh/releases/download/v0.1.2/conduit-0.1.2.tar.gz"
+    sha256 = "f048588cba905d05169f18d55c5a708877e2961ee59f8d29b99a7ad924fdf623"
     autoupdate.strategy = "latest_github_release"
 
     [resources.system_user]
