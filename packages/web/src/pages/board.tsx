@@ -4,7 +4,9 @@ import {
   DndContext, DragOverlay, KeyboardSensor, PointerSensor, closestCenter, useDroppable, useSensor, useSensors,
 } from "@dnd-kit/core";
 import type { DragEndEvent, DragStartEvent } from "@dnd-kit/core";
-import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import {
+  SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Link, useParams } from "@tanstack/react-router";
 import type { Deal, Stage } from "@conduit/shared";
@@ -84,23 +86,67 @@ export function BoardPage() {
     if (activeData === undefined || activeData.type !== "card" || overData === undefined) return;
 
     const targetStageId = overData.stageId;
-    const targetIds = (grouped.get(targetStageId) ?? [])
-      .map((deal) => deal.id)
-      .filter((id) => id !== active.id);
+    const activeDealId = String(active.id);
+    const overId = String(over.id);
 
-    // Neighbours in the TARGET column, per moveDealInputSchema's JSDoc:
-    // dropping on a card places the moved deal directly above it (so that
-    // card becomes afterDealId); dropping on the column itself (empty space
-    // or the empty-column placeholder) appends at the tail.
-    let insertAt = targetIds.length;
-    if (overData.type === "card") {
-      const idx = targetIds.indexOf(String(over.id));
-      if (idx !== -1) insertAt = idx;
+    let beforeDealId: string | undefined;
+    let afterDealId: string | undefined;
+
+    if (activeData.stageId === targetStageId) {
+      // Same-column reorder. Neighbours must be read off the same
+      // reordering the user SAW, not derived from over's index in
+      // isolation: dnd-kit's own drop preview follows
+      // arrayMove(activeIndex, overIndex), which places a downward-dragged
+      // card AFTER the card it's dropped on and an upward-dragged card
+      // BEFORE it. Deriving insertAt from over's index alone (the previous
+      // version of this code) reproduces only the upward case -- column
+      // [A,B,C,D], dragging A onto C previews [B,C,A,D] (A lands after C),
+      // but indexing on over's position in the active-filtered array yields
+      // beforeDealId=B/afterDealId=C, landing A one slot early, before C
+      // instead of after it. Running the SAME arrayMove the preview uses
+      // and reading A's neighbours off the result keeps this in sync with
+      // what was on screen for both directions.
+      const ids = (grouped.get(targetStageId) ?? []).map((deal) => deal.id);
+      const fromIndex = ids.indexOf(activeDealId);
+      const toIndex = overData.type === "card" ? ids.indexOf(overId) : ids.length - 1;
+      if (fromIndex === -1 || toIndex === -1) return;
+
+      const reordered = arrayMove(ids, fromIndex, toIndex);
+      const at = reordered.indexOf(activeDealId);
+      beforeDealId = at > 0 ? reordered[at - 1] : undefined;
+      afterDealId = at < reordered.length - 1 ? reordered[at + 1] : undefined;
+
+      // Drop-in-place is a no-op: skip the network call entirely when the
+      // computed neighbours match the ones the deal already had before the
+      // drag started (e.g. picked up and released without changing slot).
+      const originalBefore = fromIndex > 0 ? ids[fromIndex - 1] : undefined;
+      const originalAfter = fromIndex < ids.length - 1 ? ids[fromIndex + 1] : undefined;
+      if (beforeDealId === originalBefore && afterDealId === originalAfter) return;
+    } else {
+      // Cross-column: the active deal isn't in the target column's list yet,
+      // so there is no "prior slot" for arrayMove to reorder from -- dnd-kit
+      // treats a foreign card entering another column's sortable list as a
+      // plain insert at the hovered card's index (displacing it and
+      // everything after it down by one), which is exactly what its own
+      // drop preview shows for this case. That's a genuinely different rule
+      // from the same-column branch above (which continues PAST the hovered
+      // card when dragging downward) -- both match what dnd-kit itself
+      // renders, they just differ because one starts from "already in the
+      // list" and the other from "not in the list yet". Dropping on the
+      // column itself (blank space, or the empty-column placeholder)
+      // appends at the tail, mirroring moveDealInputSchema's append
+      // semantics for "both neighbours omitted".
+      const targetIds = (grouped.get(targetStageId) ?? []).map((deal) => deal.id);
+      let insertAt = targetIds.length;
+      if (overData.type === "card") {
+        const idx = targetIds.indexOf(overId);
+        if (idx !== -1) insertAt = idx;
+      }
+      beforeDealId = insertAt > 0 ? targetIds[insertAt - 1] : undefined;
+      afterDealId = insertAt < targetIds.length ? targetIds[insertAt] : undefined;
     }
-    const beforeDealId = insertAt > 0 ? targetIds[insertAt - 1] : undefined;
-    const afterDealId = insertAt < targetIds.length ? targetIds[insertAt] : undefined;
 
-    moveDeal.mutate({ id: String(active.id), pipelineId, stageId: targetStageId, beforeDealId, afterDealId });
+    moveDeal.mutate({ id: activeDealId, pipelineId, stageId: targetStageId, beforeDealId, afterDealId });
   }
 
   if (isLoading) return <p>Loading...</p>;
@@ -149,8 +195,13 @@ export function BoardPage() {
         {columns}
         <DragOverlay>
           {activeDeal ? (
-            <div className="rounded-md border border-slate-300 bg-white px-3 py-2 shadow-lg">
-              <span className="text-sm font-medium text-slate-900">{activeDeal.title}</span>
+            <div className="flex flex-col gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 shadow-lg">
+              <DealCardContent
+                deal={activeDeal}
+                companyName={activeDeal.companyId ? companyMap.get(activeDeal.companyId) : undefined}
+                ownerInitial={activeDeal.ownerUserId ? userInitials.get(activeDeal.ownerUserId) : undefined}
+                rotten={false}
+              />
             </div>
           ) : null}
         </DragOverlay>
@@ -188,8 +239,18 @@ function Column({
   // same way a card in it would be.
   const sortableItems = dealIds.length > 0 ? dealIds : [stage.id];
   const valueSum = deals.reduce((sum, deal) => sum + (deal.valueCents ?? 0), 0);
-  const currency = deals[0]?.currency ?? "EUR";
-  const formattedSum = new Intl.NumberFormat(undefined, { style: "currency", currency }).format(valueSum / 100);
+  const currencies = new Set(deals.map((deal) => deal.currency));
+  // A single Conduit instance has one DEFAULT_CURRENCY (see the Phase 2
+  // design's currency decision), so a mixed-currency column is unreachable
+  // through this board's own "New deal" dialog today -- but updateDeal's
+  // currency field is directly PATCHable via the API regardless, and a
+  // future per-deal currency picker would make it reachable through the UI
+  // too. Summing raw cents across currencies would silently misreport the
+  // total (100 EUR + 100 USD is not "200"), so this falls back to a literal
+  // "mixed" label instead of a wrong number.
+  const formattedSum = currencies.size > 1
+    ? "mixed"
+    : new Intl.NumberFormat(undefined, { style: "currency", currency: deals[0]?.currency ?? "EUR" }).format(valueSum / 100);
 
   return (
     <div data-testid={`column-${stage.id}`} className="flex w-72 shrink-0 flex-col gap-2 rounded-lg bg-slate-100 p-2">
@@ -248,9 +309,7 @@ function DealCard({
 
   const daysSinceUpdate = Math.floor((Date.now() - new Date(deal.updatedAt).getTime()) / MS_PER_DAY);
   const rotten = stage.rotDays != null && daysSinceUpdate > stage.rotDays;
-  const formattedValue = deal.valueCents != null
-    ? new Intl.NumberFormat(undefined, { style: "currency", currency: deal.currency }).format(deal.valueCents / 100)
-    : null;
+  const rotTitle = `No activity for ${daysSinceUpdate} days (stage rots after ${stage.rotDays} days)`;
 
   return (
     <div
@@ -261,14 +320,37 @@ function DealCard({
       {...attributes}
       {...listeners}
     >
+      <DealCardContent deal={deal} companyName={companyName} ownerInitial={ownerInitial} rotten={rotten} rotTitle={rotTitle} />
+    </div>
+  );
+}
+
+// Shared between the resting card above and the DragOverlay ghost rendered
+// while dragging, so the overlay -- which has no stage/rot context of its
+// own -- still shows the same value + company line as the card it's
+// standing in for, not just the bare title.
+function DealCardContent({
+  deal,
+  companyName,
+  ownerInitial,
+  rotten,
+  rotTitle,
+}: {
+  deal: Deal;
+  companyName?: string;
+  ownerInitial?: string;
+  rotten: boolean;
+  rotTitle?: string;
+}) {
+  const formattedValue = deal.valueCents != null
+    ? new Intl.NumberFormat(undefined, { style: "currency", currency: deal.currency }).format(deal.valueCents / 100)
+    : null;
+
+  return (
+    <>
       <div className="flex items-start justify-between gap-2">
         <span className="text-sm font-medium text-slate-900">{deal.title}</span>
-        {rotten && (
-          <span
-            title={`No activity for ${daysSinceUpdate} days (stage rots after ${stage.rotDays})`}
-            className="mt-1 h-2 w-2 shrink-0 rounded-full bg-red-500"
-          />
-        )}
+        {rotten && <span title={rotTitle} className="mt-1 h-2 w-2 shrink-0 rounded-full bg-red-500" />}
       </div>
       {formattedValue && <span className="text-xs text-slate-600">{formattedValue}</span>}
       <div className="flex items-center justify-between">
@@ -279,7 +361,7 @@ function DealCard({
           </span>
         )}
       </div>
-    </div>
+    </>
   );
 }
 
