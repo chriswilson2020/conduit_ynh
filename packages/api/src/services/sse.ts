@@ -14,6 +14,11 @@ const subscribers = new Set<Subscriber>();
  * this function's -- see each service's mutators) -- a hint for a rolled-back write
  * would make clients refetch data that never changed, or worse, cache the absence of
  * data that then appears.
+ *
+ * This drop-on-throw is a last-resort backstop for a genuinely buggy subscriber, not
+ * the primary defence against a dead connection: the one real subscriber (stream.ts's
+ * route handler) is expected to catch its own write failures and close/unsubscribe
+ * itself (see that file) rather than let a stale-socket write reach here at all.
  */
 export function publish(hint: SseHint): void {
   for (const fn of subscribers) {

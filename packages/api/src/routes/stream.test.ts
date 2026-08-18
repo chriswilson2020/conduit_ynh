@@ -5,7 +5,7 @@ import path from "node:path";
 import { sseHintSchema, companySchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { buildApp } from "../app.js";
-import { publish } from "../services/sse.js";
+import { publish, subscriberCount } from "../services/sse.js";
 import type { Config } from "../config.js";
 
 const handle = openTestDatabase();
@@ -79,6 +79,23 @@ function frameReader(body: ReadableStream<Uint8Array>) {
   };
 }
 
+/**
+ * subscriberCount() only reflects cleanup once the server has actually
+ * processed the client's disconnect (an async 'close'/'error' event, not
+ * something that happens synchronously when the test calls abort()) -- so
+ * this polls with a bounded budget rather than asserting immediately, which
+ * would be racing the very event this test exists to pin.
+ */
+async function waitForSubscriberCount(expected: number, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (subscriberCount() !== expected) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`subscriberCount() never reached ${expected}, stuck at ${subscriberCount()}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 describe("stream route", () => {
   it("requires auth: 401 with the uniform shape, no connection opened", async () => {
     const { url, close } = await listen();
@@ -123,6 +140,11 @@ describe("stream route", () => {
     } finally {
       controller.abort();
       await close();
+      // Pins the cleanup wiring in stream.ts: the 'close' handler must actually
+      // call unsubscribe(), or this subscriber would sit in the hub's Set
+      // forever, growing by one per dropped connection and getting every future
+      // publish() call written into a socket nobody is reading from anymore.
+      await waitForSubscriberCount(0);
     }
   });
 
@@ -151,6 +173,7 @@ describe("stream route", () => {
     } finally {
       controller.abort();
       await close();
+      await waitForSubscriberCount(0);
     }
   });
 });
