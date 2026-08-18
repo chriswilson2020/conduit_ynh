@@ -114,10 +114,13 @@ describe("contacts service", () => {
     const acme = await createCompany(handle.db, actorId, { name: "Acme" });
     const globex = await createCompany(handle.db, actorId, { name: "Globex" });
     const c1 = await createContact(handle.db, actorId, { firstName: "Ada", companyId: acme.id });
-    await createContact(handle.db, actorId, { firstName: "Grace", companyId: globex.id });
-    const result = await listContacts(handle.db, { companyId: acme.id });
-    expect(result.items).toHaveLength(1);
-    expect(result.items[0]?.id).toBe(c1.id);
+    const c2 = await createContact(handle.db, actorId, { firstName: "Grace", companyId: globex.id });
+    const acmeResult = await listContacts(handle.db, { companyId: acme.id });
+    expect(acmeResult.items).toHaveLength(1);
+    expect(acmeResult.items[0]?.id).toBe(c1.id);
+    const globexResult = await listContacts(handle.db, { companyId: globex.id });
+    expect(globexResult.items).toHaveLength(1);
+    expect(globexResult.items[0]?.id).toBe(c2.id);
   });
 
   it("q matches an email fragment", async () => {

@@ -19,6 +19,12 @@ function toContact(row: ContactRow): Contact {
 // every other unknown-id path already produces. An archived company is a valid
 // link target on purpose: archiving hides a company from default listings, it
 // does not sever contacts already (or newly) pointed at it.
+//
+// Reading via `db` outside the transaction (rather than `tx` inside it) is safe
+// only because company existence is monotonic here: companies are archive-only,
+// never hard-deleted, and an archived company still counts as existing. If a
+// later phase adds hard delete, this check needs to move inside the transaction
+// to close the race instead of silently going stale.
 async function assertCompanyExists(db: Database, companyId: string): Promise<void> {
   const [row] = await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId));
   if (row === undefined) throw new NotFoundError("company", companyId);
@@ -40,16 +46,18 @@ async function mustGet(db: Database, id: string): Promise<ContactRow> {
   return row;
 }
 
-// emails/phones are arrays: two arrays with identical elements are never === in JS,
-// so the companies template's plain !== comparison would misreport every same-value
-// array patch as a change. Order-sensitive JSON equality treats a same-order
-// same-value patch as a no-op but still flags a same-elements-reordered patch as a
-// real change, since array order is observable data here (display order).
-const ARRAY_KEYS = new Set<keyof UpdateContactInput>(["emails", "phones"]);
-
-function fieldChanged(key: keyof UpdateContactInput, patchValue: unknown, existingValue: unknown): boolean {
-  if (ARRAY_KEYS.has(key)) return JSON.stringify(patchValue) !== JSON.stringify(existingValue);
-  return patchValue !== existingValue;
+// Arrays and plain objects compare by order-sensitive JSON value; scalars by !==.
+// Structural detection rather than a field-name whitelist, so a future field
+// (e.g. the deferred `custom` jsonb) cannot silently fall back to reference
+// inequality and misreport every same-value patch as a change. `null` must stay
+// scalar-compared -- `typeof null === "object"` -- hence the `!== null` guards.
+// emails/phones default to `[]` and are never null, but nullable scalar fields
+// (lastName, jobTitle, companyId, ownerUserId) pass through this same helper.
+function fieldChanged(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) || Array.isArray(b) || (typeof a === "object" && a !== null) || (typeof b === "object" && b !== null)) {
+    return JSON.stringify(a) !== JSON.stringify(b);
+  }
+  return a !== b;
 }
 
 export async function updateContact(db: Database, actorId: string, id: string, patch: UpdateContactInput): Promise<Contact> {
@@ -60,7 +68,7 @@ export async function updateContact(db: Database, actorId: string, id: string, p
   // Record only fields that actually change, so the timeline never lies and a
   // same-value or empty patch is a true no-op (no row write, no event).
   const changed = (Object.keys(patch) as (keyof UpdateContactInput)[])
-    .filter((k) => patch[k] !== undefined && fieldChanged(k, patch[k], existing[k]));
+    .filter((k) => patch[k] !== undefined && fieldChanged(patch[k], existing[k]));
   if (changed.length === 0) return toContact(existing);
 
   return db.transaction(async (tx) => {
