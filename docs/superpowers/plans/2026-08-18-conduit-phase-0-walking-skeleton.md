@@ -1702,18 +1702,41 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 export const fetchMe = () => getJson<MeResponse>("/me");
-export const fetchHealth = () => getJson<HealthResponse>("/health");
+
+/**
+ * GET /api/health. Unlike other endpoints, a 503 here is not a failure to
+ * report on health, it IS the health report: the API returns 200 with
+ * `{ status: "ok", database: "connected" }` or 503 with
+ * `{ status: "degraded", database: "disconnected" }`, and both are valid,
+ * parseable HealthResponse bodies. Treating 503 as a thrown error would
+ * discard "database: disconnected" (informative) in favour of a generic
+ * "unavailable" (uninformative), so both statuses are parsed here. Only a
+ * genuinely unexpected status or a network failure should reject.
+ */
+export async function fetchHealth(): Promise<HealthResponse> {
+  const response = await fetch(apiUrl("/health"), { headers: { Accept: "application/json" } });
+  if (!response.ok && response.status !== 503) {
+    throw new Error(`GET /health failed with ${response.status}`);
+  }
+  return (await response.json()) as HealthResponse;
+}
 ```
 
 The `startsWith("__")` check catches the un-substituted placeholder during `vite dev`, where no
 server rewrite happens. `apiUrl` is exported so it can be unit tested — the whole subpath story rests
 on these two pure functions.
 
-Cover them in `packages/web/src/api.test.ts`: undefined, empty and un-substituted
+`fetchHealth` deliberately does not share `getJson`'s "any non-2xx throws" rule. A 503 carrying
+`{ status: "degraded", database: "disconnected" }` is a complete, useful answer to the health
+question, not a failure — treating it as one would show "health check unavailable" when we could show
+"disconnected".
+
+Cover these in `packages/web/src/api.test.ts`: undefined, empty and un-substituted
 `window.__CONDUIT_BASE__` all yield `/`; `"/conduit"` yields `/conduit`; `apiUrl("/me")` gives
-`/api/me` at root and `/conduit/api/me` at a subpath. Stub `globalThis.window` per test rather than
-adding jsdom — the root Vitest environment is `node`, and `api.ts` only reads `window` inside function
-bodies, never at module load.
+`/api/me` at root and `/conduit/api/me` at a subpath; and `fetchHealth` resolves on both 200 and 503
+while still rejecting an unexpected status. Stub `globalThis.window` and `globalThis.fetch` per test
+rather than adding jsdom — the root Vitest environment is `node`, and `api.ts` only touches `window`
+inside function bodies.
 
 - [ ] **Step 6: Write `packages/web/src/App.tsx`**
 
@@ -1722,33 +1745,58 @@ import { useEffect, useState } from "react";
 import type { MeResponse, HealthResponse } from "@conduit/shared";
 import { fetchMe, fetchHealth, basePath } from "./api";
 
-type State =
+// Identity and health are fetched independently, not with Promise.all. The
+// user resolver caches a resolved identity for up to 60 seconds, so during a
+// transient database blip /api/me can still succeed from cache while
+// /api/health correctly reports degraded. Identity is required for the page
+// to be useful; health is supplementary and must not block it.
+type MeState =
   | { kind: "loading" }
   | { kind: "error"; message: string }
-  | { kind: "ready"; me: MeResponse; health: HealthResponse };
+  | { kind: "ready"; me: MeResponse };
+
+type HealthState =
+  | { kind: "loading" }
+  | { kind: "unavailable"; message: string }
+  | { kind: "ready"; health: HealthResponse };
 
 export function App() {
-  const [state, setState] = useState<State>({ kind: "loading" });
+  const [meState, setMeState] = useState<MeState>({ kind: "loading" });
+  const [healthState, setHealthState] = useState<HealthState>({ kind: "loading" });
 
   useEffect(() => {
-    Promise.all([fetchMe(), fetchHealth()])
-      .then(([me, health]) => setState({ kind: "ready", me, health }))
+    fetchMe()
+      .then((me) => setMeState({ kind: "ready", me }))
       .catch((error: unknown) =>
-        setState({ kind: "error", message: error instanceof Error ? error.message : String(error) }),
+        setMeState({ kind: "error", message: error instanceof Error ? error.message : String(error) }),
       );
   }, []);
 
-  if (state.kind === "loading") return <main><p>Loading…</p></main>;
-  if (state.kind === "error") {
+  useEffect(() => {
+    fetchHealth()
+      .then((health) => setHealthState({ kind: "ready", health }))
+      .catch((error: unknown) =>
+        setHealthState({
+          kind: "unavailable",
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+  }, []);
+
+  if (meState.kind === "loading") return <main><p>Loading...</p></main>;
+  if (meState.kind === "error") {
     return (
       <main>
         <h1>Conduit</h1>
-        <p role="alert">Could not reach the API: {state.message}</p>
+        <p role="alert">Could not reach the API: {meState.message}</p>
       </main>
     );
   }
 
-  const { user } = state.me;
+  const { user } = meState.me;
+  const version = healthState.kind === "ready" ? healthState.health.version : "unavailable";
+  const database = healthState.kind === "ready" ? healthState.health.database : "unavailable";
+
   return (
     <main>
       <h1>Conduit</h1>
@@ -1757,9 +1805,9 @@ export function App() {
       </p>
       <dl>
         <dt>Version</dt>
-        <dd data-testid="version">{state.health.version}</dd>
+        <dd data-testid="version">{version}</dd>
         <dt>Database</dt>
-        <dd data-testid="database">{state.health.database}</dd>
+        <dd data-testid="database">{database}</dd>
         <dt>Base path</dt>
         <dd data-testid="base-path">{basePath()}</dd>
       </dl>
@@ -1768,7 +1816,14 @@ export function App() {
 }
 ```
 
-The `data-testid` attributes are what the Playwright test in Task 15 asserts on.
+**Do not use `Promise.all` here.** Identity and health must be fetched independently. The user
+resolver caches a resolved identity for up to a minute, while `/api/health` re-probes the database on
+every call — so during a transient blip `/api/me` succeeds from cache while health correctly reports
+degraded, and combining them would discard a working identity view, which is the page's whole job.
+
+All four `data-testid` attributes must be present whenever identity resolves, rendering `unavailable`
+rather than disappearing if health failed. Task 18 asserts on them, and a missing element gives a far
+worse failure message than one reading `unavailable`.
 
 - [ ] **Step 7: Write `packages/web/src/main.tsx`**
 
