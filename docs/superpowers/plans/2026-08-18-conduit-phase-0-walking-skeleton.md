@@ -188,14 +188,18 @@ export default defineConfig({
   test: {
     include: ["packages/*/src/**/*.test.ts"],
     environment: "node",
-    pool: "forks",
-    poolOptions: { forks: { singleFork: true } },
+    // Test files run one at a time. The database-backed tests share a single
+    // PostgreSQL database and truncate it between cases, so running two files
+    // concurrently would have them deleting each other's rows.
+    fileParallelism: false,
   },
 });
 ```
 
-`singleFork` is required: the database-backed tests share one test database and would race each
-other otherwise. Task 5 adds the `globalSetup` entry, once the file it points at exists.
+Serialising the files is required: the database-backed tests share one database and would race each
+other otherwise. Use `fileParallelism: false`, **not** `poolOptions: { forks: { singleFork: true } }`
+— Vitest 4 removed `test.poolOptions` and warns `DEPRECATED: all previous poolOptions are now
+top-level options`. Task 5 adds the `globalSetup` entry, once the file it points at exists.
 
 - [ ] **Step 6: Write `.nvmrc` and extend `.gitignore`**
 
@@ -739,6 +743,12 @@ Create `packages/api/src/test/global-setup.ts`:
 ```typescript
 import { createDatabase, runMigrations } from "../db/client.js";
 
+// vitest.config.ts sets `test.env.PGHOST` as a default, but that only reaches the
+// pool worker processes. globalSetup runs in Vitest's main process, which never sees
+// it — so without this line, `vitest run` in a shell with no ambient PGHOST fails
+// here before any test file loads, with a misleading auth error.
+process.env.PGHOST ??= "/run/postgresql";
+
 export const TEST_DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? "postgres:///conduit_test";
 
@@ -790,8 +800,14 @@ Add both to `vitest.config.ts`, inside the `test` block. `PGHOST` is what lets t
 
 ```typescript
     globalSetup: ["./packages/api/src/test/global-setup.ts"],
+    // Only reaches pool workers, not globalSetup — which runs in the main
+    // process and sets its own PGHOST fallback. See test/global-setup.ts.
     env: { PGHOST: process.env.PGHOST ?? "/run/postgresql" },
 ```
+
+`test.env` is merged into the environment of spawned pool workers only, never into the main Vitest
+process — which is where `globalSetup` runs. That is why Step 1 sets its own fallback; this entry
+covers the per-test connections opened inside workers.
 
 - [ ] **Step 4: Verify Vitest starts and global setup runs**
 
