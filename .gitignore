@@ -3,6 +3,8 @@ dist/
 build/
 .env
 .env.local
+# YunoHost packaging template, not a real secrets file (placeholders only).
+!/conf/.env
 *.log
 .DS_Store
 coverage/

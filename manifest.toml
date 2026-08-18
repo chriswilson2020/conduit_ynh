@@ -1,0 +1,68 @@
+#:schema https://raw.githubusercontent.com/YunoHost/apps/main/schemas/manifest.v2.schema.json
+
+packaging_format = 2
+
+id = "conduit"
+name = "Conduit"
+description.en = "Self-hosted CRM with pipelines, projects, Gantt charts and an integrated inbox"
+
+version = "0.1.0~ynh1"
+
+maintainers = ["chriswilson2020"]
+
+[upstream]
+license = "AGPL-3.0-or-later"
+code = "https://github.com/chriswilson2020/conduit_ynh"
+
+[integration]
+yunohost = ">= 12.1.17"
+helpers_version = "2.1"
+architectures = ["amd64", "arm64"]
+multi_instance = true
+ldap = "not_relevant"
+sso = true
+disk = "500M"
+ram.build = "50M"
+ram.runtime = "400M"
+
+[install]
+
+    [install.domain]
+    type = "domain"
+
+    [install.path]
+    type = "path"
+    default = "/conduit"
+
+    [install.init_main_permission]
+    type = "group"
+    default = "all_users"
+
+[resources]
+
+    [resources.sources.main]
+    url = "https://github.com/chriswilson2020/conduit_ynh/releases/download/v0.1.0/conduit-0.1.0.tar.gz"
+    sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+    autoupdate.strategy = "latest_github_release"
+
+    [resources.system_user]
+    allow_email = true
+
+    [resources.install_dir]
+
+    [resources.data_dir]
+
+    [resources.ports]
+
+    [resources.permissions]
+    main.url = "/"
+    main.auth_header = true
+
+    [resources.apt]
+    packages = "postgresql"
+
+    [resources.database]
+    type = "postgresql"
+
+    [resources.nodejs]
+    version = "24"
