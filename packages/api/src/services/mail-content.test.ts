@@ -320,4 +320,36 @@ describe("extractAddresses", () => {
     const result = extractAddresses(parsed);
     expect(result.from).toEqual([{ address: "alice@example.com", name: "Alice" }]);
   });
+
+  it("flattens an RFC 5322 named group (e.g. mailing-list-style Cc) into its member addresses", async () => {
+    const grouped = [
+      "From: Alice <alice@example.com>",
+      "To: Bob <bob@example.com>",
+      "Cc: Team: bob@example.com, Carol <carol@example.com>;",
+      "Subject: Hi",
+      "Date: Mon, 19 Aug 2026 10:00:00 +0000",
+      "",
+      "Body text.",
+    ].join("\r\n");
+    const parsed = await simpleParser(grouped);
+    const result = extractAddresses(parsed);
+    expect(result.cc).toEqual([
+      { address: "bob@example.com", name: null },
+      { address: "carol@example.com", name: "Carol" },
+    ]);
+  });
+
+  it("returns [] for an empty group (undisclosed-recipients:;) rather than a phantom entry", async () => {
+    const undisclosed = [
+      "From: Alice <alice@example.com>",
+      "To: undisclosed-recipients:;",
+      "Subject: Hi",
+      "Date: Mon, 19 Aug 2026 10:00:00 +0000",
+      "",
+      "Body text.",
+    ].join("\r\n");
+    const parsed = await simpleParser(undisclosed);
+    const result = extractAddresses(parsed);
+    expect(result.to).toEqual([]);
+  });
 });

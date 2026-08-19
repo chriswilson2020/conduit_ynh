@@ -3,13 +3,16 @@ import sanitizeHtml from "sanitize-html";
 import type { AddressObject } from "mailparser";
 import type { MailAddress } from "@conduit/shared";
 
-// Structural/text tags plus the table family and img/a, per the spec's
-// sanitizer profile. Deliberately NOT the sanitize-html defaults list --
-// script/style/iframe/object/embed/form/input are excluded simply by never
-// appearing here (sanitize-html's default disallowedTagsMode "discard"
-// drops a disallowed tag but keeps its allowed text/children; script and
-// style are additionally in the library's default nonTextTags list, so
-// their inner text is discarded too, not just the tag).
+// This is sanitize-html's own default allowedTags list plus img (which the
+// library omits by default). script/style/iframe/object/embed/form/input
+// are excluded simply because they were never in that default list --
+// spelled out explicitly here, rather than derived from
+// sanitizeHtml.defaults.allowedTags at runtime, so a future library upgrade
+// can't silently change this sanitizer profile out from under us.
+// sanitize-html's default disallowedTagsMode "discard" drops a disallowed
+// tag but keeps its allowed text/children; script and style are
+// additionally in the library's default nonTextTags list, so their inner
+// text is discarded too, not just the tag.
 const ALLOWED_TAGS = [
   "address", "article", "aside", "footer", "header",
   "h1", "h2", "h3", "h4", "h5", "h6", "hgroup",
@@ -24,7 +27,7 @@ const ALLOWED_TAGS = [
   "img",
 ];
 
-const ATTACHMENT_INLINE_ROUTE = (attachmentId: string) => `/api/mail/attachments/${attachmentId}/inline`;
+const ATTACHMENT_INLINE_ROUTE = (attachmentId: string) => `/api/mail/attachments/${encodeURIComponent(attachmentId)}/inline`;
 
 export interface SanitizeMailHtmlOptions {
   /** Content-ID (without angle brackets) -> mail_attachments.id. */
