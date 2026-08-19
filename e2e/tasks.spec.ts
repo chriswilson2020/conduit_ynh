@@ -368,6 +368,27 @@ test.describe.serial("Tasks/Gantt journey", () => {
     await expect(page.getByTestId(`gantt-group-${projectId}`)).toContainText(projectName);
     await expect(page.getByTestId(`gantt-bar-${designId}`)).toBeVisible();
     await expect(page.getByTestId(`gantt-bar-${buildId}`)).toBeVisible();
+
+    // Fix 2 (hotfix v0.4.2): the global view is reachable via a compact
+    // button scoped to this project group, not just the per-project page.
+    const groupCompactButton = page.getByTestId(`compact-button-${projectId}`);
+    await expect(groupCompactButton).toBeVisible();
+    page.once("dialog", (dialog) => void dialog.accept());
+    await groupCompactButton.click();
+
+    // By this point in the journey, Design/Build already sit with zero
+    // slack: the earlier "Remove slack pulls Build back..." test already
+    // pulled Build snug against Design's due date, and nothing since has
+    // reintroduced slack or added a dated no-predecessor task below the
+    // project's floor. A no-op sweep is therefore the expected outcome
+    // here, and "Nothing to compact" is JUST AS VALID a result as an actual
+    // "N tasks compacted" note -- this step is asserting the button is
+    // reachable and wired to the same flash/note mechanism, not re-asserting
+    // Fix 1's pull semantics (already covered by scheduling.test.ts). The
+    // note element (data-testid="cascade-note") is always present in the
+    // DOM (empty text when idle), so asserting its TEXT -- not just
+    // visibility -- is what actually proves the click landed.
+    await expect(page.getByTestId("cascade-note")).toContainText(/task.*compacted|Nothing to compact/);
   });
 
   test("finds Ship via global search and opens its drawer", async () => {

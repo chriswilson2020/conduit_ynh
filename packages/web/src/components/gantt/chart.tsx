@@ -4,7 +4,7 @@ import {
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { clsx } from "clsx";
 import { Link } from "@tanstack/react-router";
-import type { GanttTask, TaskDependency } from "@conduit/shared";
+import type { GanttTask, ShiftResult, TaskDependency } from "@conduit/shared";
 import { useAddDependency, useCompactSchedule, useGantt, useShiftTask } from "../../queries";
 import type { GanttTarget } from "../../queries";
 import { Button } from "../ui/button";
@@ -173,12 +173,69 @@ function buildRowTop(rows: ChartRow[]): { rowTop: Map<string, number>; bodyHeigh
   return { rowTop, bodyHeight: y };
 }
 
+/**
+ * The global chart's per-group "Remove slack" (Fix 2, hotfix v0.4.2) -- one
+ * of these per project group header row, each owning its OWN
+ * useCompactSchedule(projectId) mutation instance (a hook can't be called
+ * conditionally/in a loop inside GanttChart itself for a group count that
+ * varies with the data, so this is a real component, not an inline helper).
+ * The confirm text, mutate call, and success/empty/error handling exactly
+ * mirror the per-project page's own handleCompact in GanttChart below --
+ * only the noun ("this group's project") differs -- but the FLASH (amber
+ * ring on moved bars) and the cascade-note text are the chart's single
+ * shared mechanism, reached via the onCompacted/onEmpty/onError callbacks
+ * passed down from GanttChart, so a group compact reads identically to the
+ * per-project button's own sweep from the user's point of view.
+ */
+const GanttGroupCompactButton = memo(function GanttGroupCompactButton({
+  projectId, onCompacted, onEmpty, onError,
+}: {
+  projectId: string;
+  onCompacted: (result: ShiftResult) => void;
+  onEmpty: () => void;
+  onError: (err: unknown) => void;
+}) {
+  const compactSchedule = useCompactSchedule(projectId);
+  const handleClick = useCallback(() => {
+    if (!window.confirm("Pull every task to its earliest position? Done and in-progress tasks stay put.")) return;
+    compactSchedule.mutate(undefined, {
+      onSuccess: (result) => {
+        if (result.moved.length > 0) onCompacted(result);
+        else onEmpty();
+      },
+      onError,
+    });
+  }, [compactSchedule, onCompacted, onEmpty, onError]);
+
+  return (
+    <button
+      type="button"
+      data-testid={`compact-button-${projectId}`}
+      onClick={handleClick}
+      disabled={compactSchedule.isPending}
+      className="ml-auto shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[10px] font-medium text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      Remove slack
+    </button>
+  );
+});
+
 // No per-drag props at all (just `rows`, which only changes when the
 // server-authoritative task LIST changes) -- bails out of every drag-frame
 // re-render, mirroring gantt-lab's Sidebar. Defined at module scope, not
 // inside GanttChart, so its identity (and therefore its memoisation) is
-// stable across GanttChart's own re-renders.
-const Sidebar = memo(function Sidebar({ rows, taskCount }: { rows: ChartRow[]; taskCount: number }) {
+// stable across GanttChart's own re-renders. The onGroupCompact* callbacks
+// are themselves stable (useCallback in GanttChart), so passing them down
+// doesn't defeat this memoisation.
+const Sidebar = memo(function Sidebar({
+  rows, taskCount, onGroupCompacted, onGroupCompactEmpty, onGroupCompactError,
+}: {
+  rows: ChartRow[];
+  taskCount: number;
+  onGroupCompacted: (result: ShiftResult) => void;
+  onGroupCompactEmpty: () => void;
+  onGroupCompactError: (err: unknown) => void;
+}) {
   return (
     <div className="sticky left-0 z-20 border-r border-slate-200 bg-white" style={{ width: SIDEBAR_WIDTH, flexShrink: 0 }}>
       <div
@@ -196,6 +253,22 @@ const Sidebar = memo(function Sidebar({ rows, taskCount }: { rows: ChartRow[]; t
         >
           <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: row.projectColor }} />
           <span className="truncate">{row.projectName}</span>
+          {/* Only real projects get a compact button -- the standalone group
+              (projectId null, "No project") has no project row to sweep:
+              compactSchedule (services/scheduling.ts) takes a single
+              project id and dependency edges never cross projects
+              (addDependency enforces same-project-or-both-standalone), so
+              there is no well-defined "compact" over a pool of unrelated
+              standalone tasks, same reasoning as the per-project page's own
+              isGlobal gate below. */}
+          {row.projectId !== null && (
+            <GanttGroupCompactButton
+              projectId={row.projectId}
+              onCompacted={onGroupCompacted}
+              onEmpty={onGroupCompactEmpty}
+              onError={onGroupCompactError}
+            />
+          )}
         </div>
       ) : (
         <div
@@ -258,9 +331,12 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
   const shiftTask = useShiftTask();
   const addDependency = useAddDependency();
   // Called unconditionally (hooks can't be conditional) with "" on the
-  // global chart, where the compact button never renders and this mutation
-  // is therefore never actually fired -- see the button's own render-gate
-  // below for why "Remove slack" has no meaning across multiple projects.
+  // global chart, where THIS SPECIFIC button never renders and this mutation
+  // is therefore never actually fired -- see its own render-gate below for
+  // why one "Remove slack" button has no single meaning across multiple
+  // projects. The global chart's own per-group compact buttons (Fix 2,
+  // hotfix v0.4.2) are separate GanttGroupCompactButton instances, each with
+  // its own useCompactSchedule(realProjectId) -- see Sidebar, below.
   const compactSchedule = useCompactSchedule(isGlobal ? "" : target.projectId);
 
   const [zoom, setZoom] = useState<Zoom>("day");
@@ -361,7 +437,7 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
   // onSuccess does above/below, just with the "compacted" noun and no single
   // dragged task to exclude from the flash set.
   const handleCompact = useCallback(() => {
-    if (!window.confirm("Pull every dependent task to its earliest start? Done and in-progress tasks stay put.")) return;
+    if (!window.confirm("Pull every task to its earliest position? Done and in-progress tasks stay put.")) return;
     compactSchedule.mutate(undefined, {
       onSuccess: (result) => {
         if (result.moved.length > 0) triggerFlash(result.moved.map((m) => m.id), "compacted");
@@ -370,6 +446,21 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
       onError: (err) => setBannerError(err instanceof Error ? err.message : String(err)),
     });
   }, [compactSchedule, triggerFlash]);
+
+  // Fix 2 (hotfix v0.4.2) -- global view reachability: each project group
+  // header's own GanttGroupCompactButton owns its own useCompactSchedule
+  // mutation (see that component's doc comment for why), but funnels its
+  // outcome through these SAME shared handlers the per-project button above
+  // uses, so a group sweep flashes the same amber ring / shows the same
+  // cascade-note text as any other compact, regardless of which button fired
+  // it.
+  const handleGroupCompacted = useCallback((result: ShiftResult) => {
+    triggerFlash(result.moved.map((m) => m.id), "compacted");
+  }, [triggerFlash]);
+  const handleGroupCompactEmpty = useCallback(() => triggerFlash([], "empty"), [triggerFlash]);
+  const handleGroupCompactError = useCallback((err: unknown) => {
+    setBannerError(err instanceof Error ? err.message : String(err));
+  }, []);
 
   useEffect(() => () => {
     if (flashTimeoutRef.current !== null) window.clearTimeout(flashTimeoutRef.current);
@@ -777,11 +868,14 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
             <Button variant={zoom === "day" ? "default" : "outline"} onClick={() => setZoom("day")}>Day</Button>
             <Button variant={zoom === "week" ? "default" : "outline"} onClick={() => setZoom("week")}>Week</Button>
           </div>
-          {/* Per-project only -- compactSchedule (services/scheduling.ts) sweeps
-              ONE project's whole dependency graph at once, and dependency edges
-              never cross projects (addDependency enforces same-project-or-both-
-              standalone) -- there is no well-defined "compact" over the global
-              chart's multiple unrelated projects, and no route for it either. */}
+          {/* Per-project page only, here -- compactSchedule (services/
+              scheduling.ts) sweeps ONE project's whole dependency graph at a
+              time, so there is no single button that means anything on the
+              global chart's multiple unrelated projects. Fix 2 (hotfix
+              v0.4.2) makes the global view reachable a different way: each
+              project group header in Sidebar gets its OWN "Remove slack"
+              button (GanttGroupCompactButton, below), scoped to that one
+              group's projectId -- not this button rendering globally. */}
           {!isGlobal && (
             <Button
               data-testid="compact-button"
@@ -811,7 +905,13 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
 
       <div className="relative overflow-auto rounded-md border border-slate-200" style={{ maxHeight: GRID_MAX_HEIGHT }}>
         <div className="flex" style={{ width: SIDEBAR_WIDTH + chartWidth }}>
-          <Sidebar rows={rows} taskCount={taskRows.length} />
+          <Sidebar
+            rows={rows}
+            taskCount={taskRows.length}
+            onGroupCompacted={handleGroupCompacted}
+            onGroupCompactEmpty={handleGroupCompactEmpty}
+            onGroupCompactError={handleGroupCompactError}
+          />
           <div className="relative" style={{ width: chartWidth, flexShrink: 0 }}>
             <GanttTimescale zoom={zoom} pxPerDay={pxPerDay} rangeStartMs={rangeStartMs} totalDays={totalDays} chartWidth={chartWidth} />
             <div ref={bodyRef} className="relative" style={{ width: chartWidth, height: bodyHeight }}>
