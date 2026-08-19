@@ -51,6 +51,22 @@ export const MONTH_ABBR = [
 // this file is a calendar day, not an instant, so all conversions stay in
 // UTC-midnight space throughout (never a local-timezone Date) to avoid a
 // day-boundary bug for any user not on UTC.
+//
+// This is a DIFFERENT epoch convention from the server's (services/
+// scheduling.ts parses the same "YYYY-MM-DD" strings at UTC NOON, deliberately,
+// as defence in depth against a future caller feeding its epoch-day value to
+// something timezone-sensitive). The two conventions are safe to coexist
+// because every quantity that crosses the client/server boundary is always a
+// formatted "YYYY-MM-DD" STRING (isoToDayIndex/dayIndexToIso's inputs and
+// outputs) or a DIFFERENCE of same-convention instants (a day count) -- never
+// a raw epoch-ms value. A fixed 12-hour offset applied identically to both
+// ends of a subtraction cancels out, so "day 5 minus day 2 = 3 days" comes
+// out the same whether both were parsed at midnight or both at noon. What
+// would NOT be safe: taking a raw epoch-ms number computed by one side (this
+// file's rangeStartMs, or the server's epochDay * MS_PER_DAY) and handing it
+// to a function on the other side expecting its own convention -- always
+// re-derive from the "YYYY-MM-DD" string instead of passing a bare epoch
+// value across that boundary.
 export function isoToDayIndex(iso: string, rangeStartMs: number): number {
   return Math.round((Date.parse(iso) - rangeStartMs) / DAY_MS);
 }
@@ -123,4 +139,92 @@ export function applyOffsetDays(
   if (mode === "resize-start") return { startDay: originStartDay + deltaDays, dueDay: originDueDay };
   if (mode === "resize-end") return { startDay: originStartDay, dueDay: originDueDay + deltaDays };
   return { startDay: originStartDay + deltaDays, dueDay: originDueDay + deltaDays };
+}
+
+// --- keyboard nudge accumulation (P3.9 quality review, fix 1) -------------
+//
+// G0's keyboard path committed a shiftTask mutation on EVERY keypress. Five
+// fast ArrowRight presses fired five concurrent, uncoordinated optimistic
+// mutations (TanStack Query does not serialise mutations sharing a query
+// key), each snapshotting the gantt cache for its own rollback independently
+// -- so a slow/reordered response could clobber a sibling's optimistic
+// patch, and the final committed date was whichever response happened to
+// land last, non-deterministically landing the task anywhere from +1 to +5
+// days. The fix: each keypress now only RENDERS (updates a local pixel
+// offset via chart.tsx's dragVisual, same mechanism a pointer drag already
+// uses) -- only the position that survives ~200ms of no further keypresses
+// actually COMMITS, as a single shiftTask call carrying the final absolute
+// date pair. In short: "each keypress commits" becomes "each keypress
+// renders, the settled position commits."
+//
+// accumulateNudge is the pure piece of that: given the current accumulator
+// (or null, if nothing is accumulating) and one keypress's worth of
+// intent, it returns the new accumulator to render PLUS, if the keypress
+// targets a different task or a different resize/move mode than whatever
+// was accumulating, the STALE accumulator that must be flushed (committed
+// immediately, not left to its own debounce timer) before the new one takes
+// over -- switching what you're nudging is a clear signal the previous
+// gesture is done. All the actual side effects (scheduling/cancelling the
+// debounce timer, calling shiftTask, updating dragVisual) stay in chart.tsx;
+// this function only computes state transitions, which is what makes it
+// unit-testable without a DOM or a query client.
+export interface NudgeState {
+  taskId: string;
+  mode: DragMode;
+  originStartDay: number;
+  originDueDay: number;
+  /** Pixels-per-day and the range's epoch anchor at the moment this
+   * accumulation STARTED -- captured once, not re-read at commit time,
+   * so a zoom change or (in principle) a range recompute mid-accumulation
+   * can't retroactively change what a already-rendered offset commits to. */
+  pxPerDay: number;
+  rangeStartMs: number;
+  /** Cumulative delta from originStartDay/originDueDay, already clamped
+   * against them (clampOffsetDays's bounds are fixed by the origin, which
+   * never changes for the life of one accumulator, so re-clamping the
+   * running total on every keypress is equivalent to clamping once at the
+   * end). */
+  offsetDays: number;
+}
+
+export interface NudgeKeyAction {
+  taskId: string;
+  mode: DragMode;
+  originStartDay: number;
+  originDueDay: number;
+  pxPerDay: number;
+  rangeStartMs: number;
+  deltaDays: number;
+}
+
+export interface NudgeAccumulateResult {
+  /** The accumulator that was displaced by this keypress, if any -- the
+   * caller must commit it immediately (not wait for its debounce timer,
+   * which the caller should also cancel). Null when this keypress extended
+   * the SAME accumulation that was already running. */
+  toFlush: NudgeState | null;
+  next: NudgeState;
+}
+
+export function accumulateNudge(state: NudgeState | null, action: NudgeKeyAction): NudgeAccumulateResult {
+  const continuing = state !== null && state.taskId === action.taskId && state.mode === action.mode;
+  if (continuing) {
+    // Reuse the STATE's origin/pxPerDay/rangeStartMs, not the action's --
+    // they should be identical (no commit has landed mid-accumulation to
+    // change the task's real dates), but anchoring to the accumulator's own
+    // fixed baseline rather than trusting each new call is what makes this
+    // safe even if a caller ever passed a stale action.
+    const offsetDays = clampOffsetDays(state.mode, state.originStartDay, state.originDueDay, state.offsetDays + action.deltaDays);
+    return { toFlush: null, next: { ...state, offsetDays } };
+  }
+  const offsetDays = clampOffsetDays(action.mode, action.originStartDay, action.originDueDay, action.deltaDays);
+  return {
+    toFlush: state,
+    next: {
+      taskId: action.taskId, mode: action.mode,
+      originStartDay: action.originStartDay, originDueDay: action.originDueDay,
+      pxPerDay: action.pxPerDay, rangeStartMs: action.rangeStartMs,
+      offsetDays,
+    },
+  };
 }

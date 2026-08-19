@@ -39,8 +39,12 @@ function buildHeaderCells(zoom: Zoom, pxPerDay: number, rangeStartMs: number, to
     const startDayIdx = w * 7;
     const date = dayIndexToDate(startDayIdx, rangeStartMs);
     const label = `${MONTH_ABBR[date.getUTCMonth()] ?? ""} ${date.getUTCDate()}`;
+    // totalDays is rarely a multiple of 7, so the LAST week column would
+    // otherwise run past chartWidth (totalDays * pxPerDay) -- clip it to
+    // however many days of that final, partial week actually exist.
+    const daysInCell = Math.min(7, totalDays - startDayIdx);
     cells.push({
-      key: `w${w}`, left: startDayIdx * pxPerDay, width: 7 * pxPerDay, label,
+      key: `w${w}`, left: startDayIdx * pxPerDay, width: daysInCell * pxPerDay, label,
       isMonthStart: date.getUTCDate() <= 7,
     });
   }
