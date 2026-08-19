@@ -16,6 +16,8 @@ import {
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
+import { Funnel } from "../components/funnel";
+import { parseDecimal } from "../lib";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -61,6 +63,11 @@ export function BoardPage() {
     }
     return map;
   }, [openDeals]);
+
+  // Board stays the default view (matches every existing board.spec.ts
+  // Playwright assertion, which locates cards/columns without first
+  // switching views) -- Funnel is opt-in per page load, not persisted.
+  const [view, setView] = useState<"board" | "funnel">("board");
 
   const [activeId, setActiveId] = useState<string | null>(null);
   const activeDeal = activeId !== null ? (openDeals.find((deal) => deal.id === activeId) ?? null) : null;
@@ -218,27 +225,40 @@ export function BoardPage() {
         </div>
       )}
 
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCenter}
-        onDragStart={handleDragStart}
-        onDragCancel={handleDragCancel}
-        onDragEnd={handleDragEnd}
-      >
-        {columns}
-        <DragOverlay>
-          {activeDeal ? (
-            <div className="flex flex-col gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 shadow-lg">
-              <DealCardContent
-                deal={activeDeal}
-                companyName={activeDeal.companyId ? companyMap.get(activeDeal.companyId) : undefined}
-                ownerInitial={activeDeal.ownerUserId ? userInitials.get(activeDeal.ownerUserId) : undefined}
-                rotten={false}
-              />
-            </div>
-          ) : null}
-        </DragOverlay>
-      </DndContext>
+      <div data-testid="view-toggle" className="flex gap-2">
+        <Button variant={view === "board" ? "default" : "outline"} onClick={() => setView("board")}>
+          Board
+        </Button>
+        <Button variant={view === "funnel" ? "default" : "outline"} onClick={() => setView("funnel")}>
+          Funnel
+        </Button>
+      </div>
+
+      {view === "funnel" ? (
+        <Funnel pipelineId={pipelineId} />
+      ) : (
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragStart={handleDragStart}
+          onDragCancel={handleDragCancel}
+          onDragEnd={handleDragEnd}
+        >
+          {columns}
+          <DragOverlay>
+            {activeDeal ? (
+              <div className="flex flex-col gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 shadow-lg">
+                <DealCardContent
+                  deal={activeDeal}
+                  companyName={activeDeal.companyId ? companyMap.get(activeDeal.companyId) : undefined}
+                  ownerInitial={activeDeal.ownerUserId ? userInitials.get(activeDeal.ownerUserId) : undefined}
+                  rotten={false}
+                />
+              </div>
+            ) : null}
+          </DragOverlay>
+        </DndContext>
+      )}
     </div>
   );
 }
@@ -571,8 +591,11 @@ function NewDealDialog({
     event.preventDefault();
     const trimmed = title.trim();
     if (trimmed === "") return;
-    const trimmedValue = value.trim();
-    const valueCents = trimmedValue === "" ? undefined : Math.round(Number(trimmedValue) * 100);
+    // parseDecimal (src/lib.ts) tolerates a comma decimal separator ("12,50")
+    // on top of the dot form the type="number" input already accepts, and
+    // returns null (rather than NaN) for an empty/garbage draft.
+    const parsedValue = parseDecimal(value);
+    const valueCents = parsedValue === null ? undefined : Math.round(parsedValue * 100);
     createDeal.mutate({ title: trimmed, pipelineId, stageId, valueCents }, { onSuccess: () => onClose() });
   }
 

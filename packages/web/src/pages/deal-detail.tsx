@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import type { UpdateDealInput } from "@conduit/shared";
 import { ApiError } from "../api";
+import { parseDecimal } from "../lib";
 import {
   useArchiveDeal,
   useCompany,
@@ -29,13 +30,15 @@ function buildDealPatch(name: string, value: string): UpdateDealInput {
       return { title: trimmed };
     case "value": {
       // Mirrors board.tsx's NewDealDialog: the input is a plain decimal
-      // amount ("1234.56"), converted to integer cents on save. An empty
-      // draft clears the value; the API's own valueCents schema
+      // amount ("1234.56"), converted to integer cents on save, via the
+      // shared parseDecimal (src/lib.ts) so a comma decimal separator
+      // ("1234,56") is accepted too. An empty or unparseable draft clears
+      // the value; the API's own valueCents schema
       // (z.number().int().safe().nullable()) is the actual guard against a
       // malformed amount slipping through -- this only does the unit
       // conversion, not full validation.
-      if (trimmed === "") return { valueCents: null };
-      return { valueCents: Math.round(Number(trimmed) * 100) };
+      const parsed = parseDecimal(trimmed);
+      return { valueCents: parsed === null ? null : Math.round(parsed * 100) };
     }
     default:
       return {};
