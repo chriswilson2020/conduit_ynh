@@ -8,6 +8,12 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: true,
+  // TEMPORARY DEBUG (re-test): CI's 2-worker default runs crm.spec.ts and
+  // pipeline.spec.ts concurrently on shared CPU; testing whether serializing
+  // removes enough scheduling jitter to close the keyboard-drag race, now
+  // that the other real bugs are fixed (an earlier single test of this
+  // predated those fixes and isn't conclusive on its own).
+  workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI ? [["html", { open: "never" }], ["list"]] : "list",
   use: { baseURL: "http://127.0.0.1:3100" },
   webServer: {
