@@ -155,23 +155,32 @@ export async function shiftTask(
     // successor's new start is its predecessor's due date, strictly later
     // than the successor's start before the shift, since the shift only
     // fires when start < due) -- shifts are monotonically non-decreasing
-    // across the whole call, never reversed. Each task's final position is
-    // bounded above by (and converges to) the maximum date its predecessors
-    // settle at, which is itself bounded by the dragged task's new dates plus
-    // the total duration of the longest predecessor chain reaching it -- a
-    // finite number fixed by the graph's structure, not by how many times
-    // this loop iterates. The dependency graph is finite (a fixed number of
-    // rows) and, by addDependency's insert-time cycle rejection under this
-    // SAME lock, acyclic -- so it has a finite longest path. Each pass
-    // advances the walk exactly one edge further along that longest path (a
-    // task enters `moved` only when reached via an edge from an
-    // already-moved predecessor), so the number of passes is bounded by the
-    // graph's longest path length, which is itself bounded by its node
-    // count. A pass that reaches no new or newly-violated successor adds
-    // nothing to the next frontier, and the loop ends. The 500-pass guard
-    // below is therefore a backstop against a cycle that should be
-    // impossible by construction, not a bound this algorithm is expected to
-    // approach in real use (see the guard's own comment).
+    // across the whole call, never reversed, and a task revised on a LATER
+    // pass (diamond convergence) only ever moves further right, never back.
+    // Each task's `to` position lives in a finite state space bounded above
+    // by the dragged task's new dates plus the total duration along the
+    // longest predecessor chain reaching it -- a fixed number determined by
+    // the graph's structure, not by how many passes this loop takes. The
+    // dependency graph is finite (a fixed number of rows) and, by
+    // addDependency's insert-time cycle rejection under this SAME lock,
+    // acyclic. Critically, EVERY revision -- first touch or a later
+    // diamond-driven increase -- unconditionally re-enters `nextFrontier`,
+    // so any successor whose position just changed is guaranteed to have its
+    // own successors re-examined against the new value. Combined with the
+    // bounded state space, that means the total number of (task, violation)
+    // pairs strictly decreases pass over pass: a pass that finds nothing left
+    // to violate adds nothing to the next frontier, and the loop ends. This
+    // is airtight for termination, but it is NOT a tight bound on pass
+    // count: an adversarial within-pass edge ordering can revise a task
+    // upward on one pass and only propagate that revision to its successors
+    // on the NEXT pass, one reconciliation pass later than the graph's
+    // longest-path length alone would suggest. In practice pass count tracks
+    // the longest path length, occasionally +1 under unlucky edge ordering
+    // (see the cross-pass re-convergence test below) -- never anywhere near
+    // 500. The 500-pass guard is therefore a backstop against a cycle that
+    // should be impossible by construction, not a bound estimate this
+    // algorithm is expected to approach in real use (see the guard's own
+    // comment).
     let frontier = [taskId];
     let pass = 0;
     while (frontier.length > 0) {
@@ -330,6 +339,17 @@ export async function ganttPayload(db: Database, opts: GanttPayloadOptions): Pro
       // is its PARENT's position (via the self-join); a root task's group
       // key is its own position. Same-group rows (a root and its children)
       // land contiguous, ordered by that shared key.
+      //
+      // The self-join is unfiltered by the WHERE above (no dated/archived
+      // check on parentTasks), so a dated, unarchived child whose parent is
+      // itself excluded from this payload (undated, or archived) still finds
+      // its row via the join and sorts by that invisible parent's position.
+      // This is intentional graceful degradation, not a bug: the child has
+      // nowhere better to sort (its own group has no visible root to anchor
+      // on), and reusing the excluded parent's position at least keeps it
+      // near where its sibling group would have rendered, instead of the
+      // COALESCE falling through to the child's own position and scattering
+      // it away from any siblings it does have.
       sql`COALESCE(${parentTasks.position}, ${tasks.position})`,
       // Within a group, the root itself (parentTaskId IS NULL, false/0)
       // sorts before its children (true/1) at the same group key.

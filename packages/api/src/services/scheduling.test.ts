@@ -210,7 +210,7 @@ describe("shiftTask: SSE invalidation hints", () => {
 });
 
 describe("shiftTask vs addDependency: concurrent, same project", () => {
-  it("both succeed, and the final state is consistent: either no violation remains, or the dependency landed after the shift", async () => {
+  it("both succeed, and no interleaving leaves an inconsistent state", async () => {
     const project = await makeProject();
     const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
     const c = await createTask(handle.db, actorId, { title: "C", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-03" });
@@ -224,23 +224,81 @@ describe("shiftTask vs addDependency: concurrent, same project", () => {
 
     const finalA = await getTask(handle.db, a.id);
     const finalC = await getTask(handle.db, c.id);
-    const noViolationRemains = finalC!.startDate! >= finalA!.dueDate!;
+    const [depRow] = await handle.db.select().from(taskDependencies)
+      .where(and(eq(taskDependencies.predecessorId, a.id), eq(taskDependencies.successorId, c.id)));
+    expect(depRow).toBeDefined(); // the edge is committed either way -- both calls won
 
-    if (!noViolationRemains) {
-      const [depRow] = await handle.db.select().from(taskDependencies)
-        .where(and(eq(taskDependencies.predecessorId, a.id), eq(taskDependencies.successorId, c.id)));
-      const [shiftedEvent] = await handle.db.select().from(events)
-        .where(and(eq(events.taskId, a.id), eq(events.verb, "shifted")));
-      // A violation may only remain committed if the dependency was added
-      // AFTER the shift already ran -- shiftTask only cascades along edges
-      // that existed when it acquired the lock, and addDependency itself
-      // never touches dates, so a same-project shift that ran first and won
-      // is a legal, if stale, outcome; a future shift on either task would
-      // resolve it.
-      expect(depRow!.createdAt.getTime()).toBeGreaterThanOrEqual(shiftedEvent!.createdAt.getTime());
+    // Serialisation ORDER between the two racing transactions is NOT
+    // observable from committed timestamps: Postgres's now() pins to
+    // transaction BEGIN, which is decorrelated from advisory-lock
+    // acquisition order, and addDependency's own pre-transaction reads
+    // (mustGetTask on predecessor/successor, done via `db` before its
+    // transaction even opens) bias BEGIN time further still. Order is
+    // therefore deliberately NOT asserted here, by timestamp or otherwise --
+    // only that no interleaving produces a THIRD, inconsistent state is
+    // checked. There are exactly two legal outcomes, distinguished by
+    // whether C's row actually moved (its own committed dates, not a clock):
+    //   1. The edge existed when shiftTask's cascade ran: C was pulled along
+    //      and its final dates now satisfy the FS constraint against A's
+    //      final due date.
+    //   2. The edge did not exist yet: C is untouched, exactly as it was
+    //      before the race -- a legal, if stale, state under push-only
+    //      scheduling, which never retroactively enforces a constraint the
+    //      moment an edge lands, only when something is actually dragged (a
+    //      future shift on either task would resolve it then).
+    // What must never happen -- and what a bug in the shared-lock
+    // serialisation would produce -- is a third state: C partially or
+    // incorrectly shifted while still violating the constraint.
+    const cWasCascaded = finalC!.startDate !== "2026-01-01" || finalC!.dueDate !== "2026-01-03";
+    if (cWasCascaded) {
+      expect(finalC!.startDate! >= finalA!.dueDate!).toBe(true);
     } else {
-      expect(noViolationRemains).toBe(true);
+      expect(finalC!.startDate).toBe("2026-01-01");
+      expect(finalC!.dueDate).toBe("2026-01-03");
     }
+  });
+});
+
+describe("shiftTask: cross-pass re-convergence", () => {
+  it("a task revised upward on a LATER pass re-propagates the revision to its own successors", async () => {
+    // A -> B -> E (short path, 2 hops) and A -> C -> D -> E (long path, 3
+    // hops) both reach E; C carries a long duration so the long path pushes
+    // E further right than the short path does. E is first touched via the
+    // short path (whichever of B/D's edges into E is processed first) and
+    // must be revised upward once the long path's larger requirement is
+    // seen -- and that revision must re-propagate to E's own successor X,
+    // which the short-path-only value would have under-shifted.
+    const a = await createTask(handle.db, actorId, { title: "A", startDate: "2026-01-01", dueDate: "2026-01-03" });
+    const b = await createTask(handle.db, actorId, { title: "B", startDate: "2026-01-04", dueDate: "2026-01-06" });
+    const c = await createTask(handle.db, actorId, { title: "C", startDate: "2026-01-04", dueDate: "2026-01-13" });
+    const d = await createTask(handle.db, actorId, { title: "D", startDate: "2026-01-14", dueDate: "2026-01-15" });
+    const e = await createTask(handle.db, actorId, { title: "E", startDate: "2026-01-07", dueDate: "2026-01-08" });
+    const x = await createTask(handle.db, actorId, { title: "X", startDate: "2026-01-09", dueDate: "2026-01-10" });
+    await addDependency(handle.db, actorId, a.id, b.id);
+    await addDependency(handle.db, actorId, a.id, c.id);
+    await addDependency(handle.db, actorId, c.id, d.id);
+    await addDependency(handle.db, actorId, b.id, e.id);
+    await addDependency(handle.db, actorId, d.id, e.id);
+    await addDependency(handle.db, actorId, e.id, x.id);
+
+    const result = await shiftTask(handle.db, actorId, a.id, { startDate: "2026-01-10", dueDate: "2026-01-12" });
+
+    // Hand-traced (see the termination-argument comment in scheduling.ts):
+    // short path pushes E to (01-14, 01-15); the long path (via C's 9-day
+    // duration and D) requires E at (01-22, 01-23) -- E must land there, not
+    // the short-path value, regardless of which edge into E is processed
+    // first.
+    const eMoved = result.moved.find((m) => m.id === e.id)!;
+    expect(eMoved).toEqual({ id: e.id, startDate: "2026-01-22", dueDate: "2026-01-23", cascadedFrom: a.id });
+
+    const eEvents = await handle.db.select().from(events).where(and(eq(events.taskId, e.id), eq(events.verb, "shifted")));
+    expect(eEvents).toHaveLength(1); // exactly one event, however many times E was revised in-memory
+
+    // X must reflect E's FINAL (long-path) due date, not whatever stale
+    // value X might have first computed against E's short-path tentative
+    // position -- proving the revision re-propagated downstream.
+    const xMoved = result.moved.find((m) => m.id === x.id)!;
+    expect(xMoved).toEqual({ id: x.id, startDate: "2026-01-23", dueDate: "2026-01-24", cascadedFrom: a.id });
   });
 });
 
@@ -296,5 +354,24 @@ describe("ganttPayload", () => {
     const pairs = payload.dependencies.map((d) => `${d.predecessorId}:${d.successorId}`);
     expect(pairs).not.toContain(`${a.id}:${undated.id}`);
     expect(pairs).toContain(`${c.id}:${d.id}`);
+  });
+
+  it("a dated child of an excluded (archived) parent still sorts via the invisible parent's position, without crashing", async () => {
+    // The self-join to parentTasks is unfiltered by the dated/archived WHERE
+    // above, so it reaches a parent row that is itself excluded from the
+    // result set -- graceful degradation, not a bug (see the ORDER BY
+    // comment in scheduling.ts): the child still needs SOME position to sort
+    // by, and the excluded parent's is the best available anchor.
+    const project = await makeProject();
+    const parent = await createTask(handle.db, actorId, { title: "Parent", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-02" });
+    const child = await createTask(handle.db, actorId, {
+      title: "Child", projectId: project.id, parentTaskId: parent.id, startDate: "2026-01-03", dueDate: "2026-01-04",
+    });
+    await archiveTask(handle.db, actorId, parent.id);
+
+    const payload = await ganttPayload(handle.db, { projectId: project.id });
+    const ids = payload.tasks.map((t) => t.id);
+    expect(ids).not.toContain(parent.id);
+    expect(ids).toContain(child.id);
   });
 });
