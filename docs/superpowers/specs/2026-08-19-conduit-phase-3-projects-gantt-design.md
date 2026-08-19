@@ -11,7 +11,7 @@ Decisions taken with Chris in the Phase 3 brainstorm:
 
 | Decision | Choice |
 |---|---|
-| Gantt component | Two-day throwaway prototype first; Chris gets a try-it-in-browser verdict before any build-vs-buy money question. Everything downstream assumes custom; a failed gate re-plans only the Gantt tasks around a commercial component. |
+| Gantt component | **GATE CLOSED — build custom.** The G0 prototype passed all four criteria (drag/resize tracking at 200 rows + 150 live arrows, zoom legibility, keyboard plan) and Chris confirmed hands-on that dragging feels right. No commercial component; the auto-shift cascade was never in G0's scope and lands with the real Gantt (Tasks 5 + 9). |
 | Gantt scope | Per-project Gantt AND a global Gantt (all dated tasks across projects and standalone CRM tasks, grouped by project) |
 | Drag behaviour | **Auto-shift dependents**: push-only cascade, server-authoritative (details below) |
 | Project pipelines | Yes — pipelines gain the `project` scope, completing the original three-scope design |
