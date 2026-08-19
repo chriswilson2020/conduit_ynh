@@ -290,6 +290,40 @@ describe("notes routes", () => {
     expect(both.statusCode).toBe(400);
     await a.close();
   });
+
+  it("creates a note on a project and filters GET by project_id", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+
+    const response = await a.inject({
+      method: "POST", url: "/api/notes", headers: authHeaders,
+      payload: { body: "kickoff notes", projectId: project.id },
+    });
+    expect(response.statusCode).toBe(201);
+    const body = noteSchema.parse(response.json());
+    expect(body.projectId).toBe(project.id);
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/notes?project_id=${project.id}`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(noteSchema).parse(listed.json()).map((n) => n.id)).toEqual([body.id]);
+    await a.close();
+  });
+
+  it("returns a 409 conflict body creating a note on an archived project", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    await a.inject({ method: "POST", url: `/api/projects/${project.id}/archive`, headers: authHeaders });
+
+    const response = await a.inject({
+      method: "POST", url: "/api/notes", headers: authHeaders,
+      payload: { body: "too late", projectId: project.id },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("archived");
+    await a.close();
+  });
 });
 
 /** Hand-build a multipart/form-data body. Fields must precede the file part -- see
@@ -377,6 +411,50 @@ describe("files routes", () => {
     });
     expect(listed.statusCode).toBe(200);
     expect(z.array(fileMetaSchema).parse(listed.json()).map((f) => f.id)).toEqual([meta.id]);
+    await a.close();
+  });
+
+  it("uploads a file to a project and filters GET by project_id", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+
+    const { body, boundary } = buildMultipart(
+      { projectId: project.id },
+      { name: "spec.pdf", content: "spec bytes", mime: "application/pdf" },
+    );
+    const upload = await a.inject({
+      method: "POST", url: "/api/files",
+      headers: { ...authHeaders, "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload: body,
+    });
+    expect(upload.statusCode).toBe(201);
+    const meta = fileMetaSchema.parse(upload.json());
+    expect(meta.projectId).toBe(project.id);
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/files?project_id=${project.id}`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(fileMetaSchema).parse(listed.json()).map((f) => f.id)).toEqual([meta.id]);
+    await a.close();
+  });
+
+  it("returns a 409 conflict body uploading a file to an archived project", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    await a.inject({ method: "POST", url: `/api/projects/${project.id}/archive`, headers: authHeaders });
+
+    const { body, boundary } = buildMultipart(
+      { projectId: project.id },
+      { name: "late.txt", content: "x", mime: "text/plain" },
+    );
+    const response = await a.inject({
+      method: "POST", url: "/api/files",
+      headers: { ...authHeaders, "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload: body,
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("archived");
     await a.close();
   });
 
@@ -501,6 +579,22 @@ describe("events routes", () => {
     expect(body.items).toHaveLength(1);
     expect(body.items[0]?.verb).toBe("created");
     expect(body.items[0]?.dealId).toBe(deal.id);
+    await a.close();
+  });
+
+  it("filters by task_id", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const taskA = await makeTask(a, { projectId: project.id });
+    await makeTask(a, { projectId: project.id });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/events?task_id=${taskA.id}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = listResponseSchema(eventSchema).parse(response.json());
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0]?.taskId).toBe(taskA.id);
     await a.close();
   });
 });

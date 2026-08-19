@@ -1,7 +1,7 @@
 import { and, desc, eq } from "drizzle-orm";
 import type { FileMeta } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { companies, contacts, deals, events, files, type FileRow } from "../db/schema.js";
+import { companies, contacts, deals, projects, events, files, type FileRow } from "../db/schema.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
 import { publish } from "./sse.js";
 
@@ -9,14 +9,14 @@ export function toFileMeta(row: FileRow): FileMeta {
   return {
     id: row.id, originalName: row.originalName, mime: row.mime, sizeBytes: row.sizeBytes,
     sha256: row.sha256, uploaderUserId: row.uploaderUserId,
-    companyId: row.companyId, contactId: row.contactId, dealId: row.dealId,
+    companyId: row.companyId, contactId: row.contactId, dealId: row.dealId, projectId: row.projectId,
     createdAt: row.createdAt.toISOString(),
   };
 }
 
 export interface AttachFileInput {
   originalName: string; mime: string; sizeBytes: number; sha256: string;
-  companyId?: string; contactId?: string; dealId?: string;
+  companyId?: string; contactId?: string; dealId?: string; projectId?: string;
 }
 
 // Exactly-one-entity is the caller's job: the route layer enforces it via
@@ -39,11 +39,13 @@ export interface AttachFileInput {
 // corruption); a `SELECT ... FOR SHARE` here would close the window if it ever stops
 // being acceptable.
 //
-// Mirrors assertNoteTargetActive in notes.ts: a deal's status (open/won/lost)
-// is deliberately not checked, only its archivedAt -- a closed deal still
-// gets attachments (e.g. a signed contract on a just-won deal). Returns the
-// deal's own companyId (or null) for the deal branch so attachFile below can
-// stamp it on the file_attached event, same reasoning as notes.ts.
+// Mirrors assertNoteTargetActive in notes.ts: a deal's (or project's) status
+// (open/won/lost, or active/completed) is deliberately not checked, only its
+// archivedAt -- a closed deal still gets attachments (e.g. a signed contract
+// on a just-won deal), and a completed project still gets attachments too.
+// Returns the deal's or project's own companyId (or null) for those branches
+// so attachFile below can stamp it on the file_attached event, same
+// reasoning as notes.ts.
 async function assertFileTargetActive(db: Database, input: AttachFileInput): Promise<string | null> {
   if (input.companyId != null) {
     const [row] = await db.select({ archivedAt: companies.archivedAt })
@@ -63,23 +65,33 @@ async function assertFileTargetActive(db: Database, input: AttachFileInput): Pro
     if (row === undefined) throw new NotFoundError("deal", input.dealId);
     if (row.archivedAt !== null) throw new ArchivedError("deal", input.dealId);
     return row.companyId;
+  } else if (input.projectId != null) {
+    const [row] = await db.select({ archivedAt: projects.archivedAt, companyId: projects.companyId })
+      .from(projects).where(eq(projects.id, input.projectId));
+    if (row === undefined) throw new NotFoundError("project", input.projectId);
+    if (row.archivedAt !== null) throw new ArchivedError("project", input.projectId);
+    return row.companyId;
   }
   return null;
 }
 
 export async function attachFile(db: Database, actorId: string, meta: AttachFileInput): Promise<FileMeta> {
-  const dealCompanyId = await assertFileTargetActive(db, meta);
+  // Named generically (not dealCompanyId) now that it covers both the deal
+  // and project target branches -- see notes.ts's identical linkedCompanyId.
+  const linkedCompanyId = await assertFileTargetActive(db, meta);
   const file = await db.transaction(async (tx) => {
     const [row] = await tx.insert(files).values({
       originalName: meta.originalName, mime: meta.mime, sizeBytes: meta.sizeBytes, sha256: meta.sha256,
       uploaderUserId: actorId,
       companyId: meta.companyId ?? null, contactId: meta.contactId ?? null, dealId: meta.dealId ?? null,
+      projectId: meta.projectId ?? null,
     }).returning();
     if (row === undefined) throw new Error("insert returned no row");
     await tx.insert(events).values({
       verb: "file_attached", actorUserId: actorId,
       // See createNote's identical companyId fallback in notes.ts for why.
-      companyId: row.companyId ?? dealCompanyId, contactId: row.contactId, dealId: row.dealId,
+      companyId: row.companyId ?? linkedCompanyId, contactId: row.contactId, dealId: row.dealId,
+      projectId: row.projectId,
       payload: { fileId: row.id, originalName: row.originalName },
     });
     return toFileMeta(row);
@@ -88,16 +100,17 @@ export async function attachFile(db: Database, actorId: string, meta: AttachFile
   return file;
 }
 
-export interface ListFilesOptions { companyId?: string; contactId?: string; dealId?: string; }
+export interface ListFilesOptions { companyId?: string; contactId?: string; dealId?: string; projectId?: string; }
 
 // Unbounded on purpose: Phase 1 assumes a single record's files stay small enough to
 // return in one page. Revisit with keyset pagination (and an index on
-// companyId/contactId/dealId) if that assumption stops holding.
+// companyId/contactId/dealId/projectId) if that assumption stops holding.
 export async function listFiles(db: Database, opts: ListFilesOptions): Promise<FileMeta[]> {
   const where = [];
   if (opts.companyId) where.push(eq(files.companyId, opts.companyId));
   if (opts.contactId) where.push(eq(files.contactId, opts.contactId));
   if (opts.dealId) where.push(eq(files.dealId, opts.dealId));
+  if (opts.projectId) where.push(eq(files.projectId, opts.projectId));
   const rows = await db.select().from(files).where(and(...where))
     .orderBy(desc(files.createdAt), desc(files.id));
   return rows.map(toFileMeta);

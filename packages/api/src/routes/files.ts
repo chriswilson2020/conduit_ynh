@@ -6,16 +6,17 @@ import { requireUser, mapDomainError, parseOrReject, idParamSchema } from "./hel
 import { saveBlob, openBlob } from "../services/blobs.js";
 import { attachFile, listFiles, getFile } from "../services/files.js";
 
-// company_id/contact_id/deal_id are optional filters here, not the required
-// exactly-one notes.ts enforces on its list: unlike a note, "list files" has a
-// sensible unfiltered meaning (no filter applied), so an absent filter is a
-// no-op, not a client error. A caller in practice only ever sends one (the
-// entity whose files it's rendering), but nothing here stops more than one
-// from being ANDed together.
+// company_id/contact_id/deal_id/project_id are optional filters here, not the
+// required exactly-one notes.ts enforces on its list: unlike a note, "list
+// files" has a sensible unfiltered meaning (no filter applied), so an absent
+// filter is a no-op, not a client error. A caller in practice only ever
+// sends one (the entity whose files it's rendering), but nothing here stops
+// more than one from being ANDed together.
 const listQuerySchema = z.object({
   company_id: z.uuid().optional(),
   contact_id: z.uuid().optional(),
   deal_id: z.uuid().optional(),
+  project_id: z.uuid().optional(),
 });
 
 const uuidSchema = z.uuid();
@@ -48,23 +49,25 @@ export function registerFileRoutes(app: FastifyInstance, { db, dataDir }: CrmRou
     // Fields declared before the file part in the multipart body are already
     // parsed by the time request.file() resolves (fastify-multipart is a
     // streaming parser); fields declared after it would not be. Callers MUST send
-    // companyId/contactId/dealId before the file field for this to see them.
+    // companyId/contactId/dealId/projectId before the file field for this to see them.
     const rawCompanyId = fieldValue(part.fields.companyId);
     const rawContactId = fieldValue(part.fields.contactId);
     const rawDealId = fieldValue(part.fields.dealId);
+    const rawProjectId = fieldValue(part.fields.projectId);
     const companyId = rawCompanyId !== undefined && uuidSchema.safeParse(rawCompanyId).success ? rawCompanyId : undefined;
     const contactId = rawContactId !== undefined && uuidSchema.safeParse(rawContactId).success ? rawContactId : undefined;
     const dealId = rawDealId !== undefined && uuidSchema.safeParse(rawDealId).success ? rawDealId : undefined;
-    // Exactly one of the three raw fields must be present AND resolve to a
+    const projectId = rawProjectId !== undefined && uuidSchema.safeParse(rawProjectId).success ? rawProjectId : undefined;
+    // Exactly one of the four raw fields must be present AND resolve to a
     // valid uuid: rawCount !== 1 catches zero or more-than-one field sent;
     // resolvedCount !== 1 catches the one-field-sent-but-malformed-uuid case
     // rawCount alone would miss.
-    const rawCount = [rawCompanyId, rawContactId, rawDealId].filter((v) => v !== undefined).length;
-    const resolvedCount = [companyId, contactId, dealId].filter((v) => v !== undefined).length;
+    const rawCount = [rawCompanyId, rawContactId, rawDealId, rawProjectId].filter((v) => v !== undefined).length;
+    const resolvedCount = [companyId, contactId, dealId, projectId].filter((v) => v !== undefined).length;
     if (rawCount !== 1 || resolvedCount !== 1) {
       part.file.resume();
       return reply.code(400).send({
-        error: "validation", message: "exactly one of companyId, contactId or dealId is required",
+        error: "validation", message: "exactly one of companyId, contactId, dealId or projectId is required",
       });
     }
 
@@ -81,7 +84,7 @@ export function registerFileRoutes(app: FastifyInstance, { db, dataDir }: CrmRou
 
     try {
       const file = await attachFile(db, user.id, {
-        originalName: part.filename, mime: part.mimetype, sizeBytes, sha256, companyId, contactId, dealId,
+        originalName: part.filename, mime: part.mimetype, sizeBytes, sha256, companyId, contactId, dealId, projectId,
       });
       return reply.code(201).send(file);
     } catch (error) {
@@ -93,7 +96,9 @@ export function registerFileRoutes(app: FastifyInstance, { db, dataDir }: CrmRou
     if (requireUser(request, reply) === null) return;
     const query = parseOrReject(listQuerySchema, request.query, reply);
     if (query === undefined) return;
-    return listFiles(db, { companyId: query.company_id, contactId: query.contact_id, dealId: query.deal_id });
+    return listFiles(db, {
+      companyId: query.company_id, contactId: query.contact_id, dealId: query.deal_id, projectId: query.project_id,
+    });
   });
 
   app.get("/api/files/:id/download", async (request, reply) => {

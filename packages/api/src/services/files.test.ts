@@ -9,6 +9,7 @@ import { createCompany, archiveCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
 import { createDeal, archiveDeal, winDeal } from "./deals.js";
 import { createPipeline, createStage } from "./pipelines.js";
+import { createProject, archiveProject } from "./projects.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
 
 /** Mirrors notes.test.ts's makeDeal helper. */
@@ -116,6 +117,40 @@ describe("files service", () => {
   // .message is just "Failed query: ...";  the constraint-violation text (and thus the
   // constraint name) lives on .cause, so assertions match against that instead of the
   // top-level message.
+  it("attaches a file to a project and stamps the event with the project's companyId", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    const project = await createProject(handle.db, actorId, { name: "Launch", companyId: c.id });
+    const file = await attachFile(handle.db, actorId, {
+      originalName: "spec.pdf", mime: "application/pdf", sizeBytes: 10, sha256: sha, projectId: project.id,
+    });
+    expect(file.projectId).toBe(project.id);
+    expect(file.companyId).toBeNull();
+
+    const evs = await handle.db.select().from(events).where(eq(events.projectId, project.id));
+    const added = evs.filter((e) => e.verb === "file_attached");
+    expect(added).toHaveLength(1);
+    expect(added[0]?.companyId).toBe(c.id);
+    expect(added[0]?.projectId).toBe(project.id);
+  });
+
+  it("refuses attaching to an archived project", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Launch" });
+    await archiveProject(handle.db, actorId, project.id);
+    await expect(attachFile(handle.db, actorId, {
+      originalName: "x.txt", mime: "text/plain", sizeBytes: 1, sha256: sha, projectId: project.id,
+    })).rejects.toBeInstanceOf(ArchivedError);
+  });
+
+  it("listFiles filters by projectId", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Launch" });
+    const file = await attachFile(handle.db, actorId, {
+      originalName: "on-launch.txt", mime: "text/plain", sizeBytes: 1, sha256: sha, projectId: project.id,
+    });
+
+    const result = await listFiles(handle.db, { projectId: project.id });
+    expect(result.map((f) => f.id)).toEqual([file.id]);
+  });
+
   it("the DB CHECK rejects a hand-inserted file with both FKs set", async () => {
     const c = await createCompany(handle.db, actorId, { name: "Acme" });
     const p = await createContact(handle.db, actorId, { firstName: "Ada" });

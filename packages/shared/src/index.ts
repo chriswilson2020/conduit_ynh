@@ -70,24 +70,28 @@ export type CreateContactInput = z.infer<typeof createContactInputSchema>;
 export const updateContactInputSchema = createContactInputSchema.partial();
 export type UpdateContactInput = z.infer<typeof updateContactInputSchema>;
 
-// Widened in Phase 2 (Task 7) from company/contact to company/contact/deal: a
-// note or file can now be attached to a deal instead, mirroring the
-// notes_exactly_one_entity / files_exactly_one_entity DB CHECKs (see
-// schema.ts), which already gained a deal_id column back in P2.1.
-const exactlyOneEntity = (v: { companyId?: string | null; contactId?: string | null; dealId?: string | null }) =>
-  [v.companyId, v.contactId, v.dealId].filter((x) => x != null).length === 1;
+// Widened in Phase 2 (Task 7) from company/contact to company/contact/deal, and
+// again in Phase 3 (Task 6) to include project: a note or file can now be
+// attached to a project instead, mirroring the notes_exactly_one_entity /
+// files_exactly_one_entity DB CHECKs (see schema.ts), which already gained a
+// project_id column in the 0003 migration.
+const exactlyOneEntity = (
+  v: { companyId?: string | null; contactId?: string | null; dealId?: string | null; projectId?: string | null },
+) => [v.companyId, v.contactId, v.dealId, v.projectId].filter((x) => x != null).length === 1;
 
 export const createNoteInputSchema = z
   .object({
     body: z.string().min(1),
     companyId: z.uuid().optional(), contactId: z.uuid().optional(), dealId: z.uuid().optional(),
+    projectId: z.uuid().optional(),
   })
-  .refine(exactlyOneEntity, { message: "exactly one of companyId, contactId or dealId is required" });
+  .refine(exactlyOneEntity, { message: "exactly one of companyId, contactId, dealId or projectId is required" });
 export type CreateNoteInput = z.infer<typeof createNoteInputSchema>;
 
 export const noteSchema = z.object({
   id: z.uuid(), body: z.string().min(1), authorUserId: z.uuid(),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
+  projectId: z.uuid().nullable(),
   createdAt: z.iso.datetime(),
 });
 export type Note = z.infer<typeof noteSchema>;
@@ -97,6 +101,7 @@ export const fileMetaSchema = z.object({
   sizeBytes: z.number().int().nonnegative(), sha256: z.string().length(64),
   uploaderUserId: z.uuid(),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
+  projectId: z.uuid().nullable(),
   createdAt: z.iso.datetime(),
 });
 export type FileMeta = z.infer<typeof fileMetaSchema>;

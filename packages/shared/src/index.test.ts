@@ -212,6 +212,18 @@ describe("createNoteInputSchema", () => {
         companyId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
       }),
     ).toThrow());
+  it("accepts a note attached to a project", () => {
+    const input = { body: "hi", projectId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301" };
+    expect(createNoteInputSchema.parse(input)).toEqual(input);
+  });
+  it("rejects a note with a project plus another entity", () =>
+    expect(() =>
+      createNoteInputSchema.parse({
+        body: "hi",
+        projectId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+        dealId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+      }),
+    ).toThrow());
 });
 
 describe("createPipelineInputSchema", () => {

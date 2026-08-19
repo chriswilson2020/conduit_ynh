@@ -9,6 +9,7 @@ import { createCompany, archiveCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
 import { createDeal, archiveDeal, winDeal } from "./deals.js";
 import { createPipeline, createStage } from "./pipelines.js";
+import { createProject, updateProject, archiveProject } from "./projects.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
 
 /** Creates a global pipeline, one stage, and one deal in it (optionally
@@ -110,6 +111,57 @@ describe("notes service", () => {
     await expect(createNote(handle.db, actorId, {
       body: "hi", dealId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
     })).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("adds a note to a project and stamps the event with the project's companyId", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    const project = await createProject(handle.db, actorId, { name: "Launch", companyId: c.id });
+    const note = await createNote(handle.db, actorId, { body: "kickoff went well", projectId: project.id });
+    expect(note.projectId).toBe(project.id);
+    expect(note.companyId).toBeNull();
+    expect(note.contactId).toBeNull();
+    expect(note.dealId).toBeNull();
+
+    const evs = await handle.db.select().from(events).where(eq(events.projectId, project.id));
+    const added = evs.filter((e) => e.verb === "note_added");
+    expect(added).toHaveLength(1);
+    // The note row itself carries only projectId (per the exactly-one CHECK),
+    // but the event is also stamped with the project's own companyId so it
+    // surfaces on the company's timeline too -- see createNote's doc comment.
+    expect(added[0]?.companyId).toBe(c.id);
+    expect(added[0]?.projectId).toBe(project.id);
+  });
+
+  it("a completed project is still a valid note target", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Launch" });
+    // updateProject flips status freely (no transition matrix) -- see
+    // projects.ts's updateProject doc comment.
+    await updateProject(handle.db, actorId, project.id, { status: "completed" });
+    const note = await createNote(handle.db, actorId, { body: "wrapped up", projectId: project.id });
+    expect(note.projectId).toBe(project.id);
+  });
+
+  it("refuses a note on an archived project", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Launch" });
+    await archiveProject(handle.db, actorId, project.id);
+    await expect(createNote(handle.db, actorId, { body: "hi", projectId: project.id }))
+      .rejects.toBeInstanceOf(ArchivedError);
+  });
+
+  it("refuses a note on a missing project", async () => {
+    await expect(createNote(handle.db, actorId, {
+      body: "hi", projectId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    })).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("listNotes filters by projectId", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Launch" });
+    const other = await createProject(handle.db, actorId, { name: "Other" });
+    const note = await createNote(handle.db, actorId, { body: "on launch", projectId: project.id });
+    await createNote(handle.db, actorId, { body: "on other", projectId: other.id });
+
+    const result = await listNotes(handle.db, { projectId: project.id });
+    expect(result.map((n) => n.id)).toEqual([note.id]);
   });
 
   // drizzle-postgres wraps the underlying pg error in a DrizzleQueryError whose

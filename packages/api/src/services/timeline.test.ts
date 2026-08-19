@@ -9,6 +9,8 @@ import { createContact } from "./contacts.js";
 import { createNote } from "./notes.js";
 import { createDeal } from "./deals.js";
 import { createPipeline, createStage } from "./pipelines.js";
+import { createProject } from "./projects.js";
+import { createTask } from "./tasks.js";
 
 const handle = openTestDatabase();
 let actorId: string;
@@ -78,6 +80,28 @@ describe("timeline service", () => {
     // note_added event above does too, via createNote's dealCompanyId
     // fallback -- both surface on the company's timeline as well.
     expect(result.items.every((e) => e.companyId === c.id)).toBe(true);
+  });
+
+  it("filtering by projectId returns a project's own events, including a note dual-stamped with its companyId", async () => {
+    const c = await createCompany(handle.db, actorId, { name: "Acme" });
+    const project = await createProject(handle.db, actorId, { name: "Launch", companyId: c.id });
+    await createNote(handle.db, actorId, { body: "kickoff", projectId: project.id });
+
+    const result = await listEvents(handle.db, { projectId: project.id });
+    expect(result.items).toHaveLength(2); // "created" + "note_added"
+    expect(result.items.every((e) => e.projectId === project.id)).toBe(true);
+    expect(result.items.every((e) => e.companyId === c.id)).toBe(true);
+  });
+
+  it("filtering by taskId returns only that task's own events -- the task drawer's rail", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Launch" });
+    const taskA = await createTask(handle.db, actorId, { title: "A", projectId: project.id });
+    const taskB = await createTask(handle.db, actorId, { title: "B", projectId: project.id });
+
+    const result = await listEvents(handle.db, { taskId: taskA.id });
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.taskId).toBe(taskA.id);
+    expect(result.items.some((e) => e.taskId === taskB.id)).toBe(false);
   });
 
   // schema.ts's events.verb CHECK and shared's eventVerbSchema live in different

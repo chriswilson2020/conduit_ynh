@@ -15,7 +15,8 @@ function toEvent(row: EventRow): Event {
 }
 
 export interface ListEventsOptions {
-  companyId?: string; contactId?: string; dealId?: string; cursor?: string; limit?: number;
+  companyId?: string; contactId?: string; dealId?: string; taskId?: string; projectId?: string;
+  cursor?: string; limit?: number;
 }
 
 export async function listEvents(
@@ -26,6 +27,8 @@ export async function listEvents(
   if (opts.companyId) where.push(eq(events.companyId, opts.companyId));
   if (opts.contactId) where.push(eq(events.contactId, opts.contactId));
   if (opts.dealId) where.push(eq(events.dealId, opts.dealId));
+  if (opts.taskId) where.push(eq(events.taskId, opts.taskId));
+  if (opts.projectId) where.push(eq(events.projectId, opts.projectId));
   const cur = opts.cursor ? decodeCursor(opts.cursor) : null;
   if (cur) {
     // Non-null assertion: `or` only returns undefined when given zero conditions.
