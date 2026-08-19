@@ -1,8 +1,8 @@
 import { useMemo, useRef, useState } from "react";
 import type { FormEvent, RefObject } from "react";
 import {
-  DndContext, DragOverlay, KeyboardSensor, PointerSensor, closestCenter, rectIntersection, useDroppable,
-  useSensor, useSensors,
+  DndContext, DragOverlay, KeyboardSensor, MeasuringStrategy, PointerSensor, closestCenter, rectIntersection,
+  useDroppable, useSensor, useSensors,
 } from "@dnd-kit/core";
 import type { CollisionDetection, DragEndEvent, DragStartEvent } from "@dnd-kit/core";
 import {
@@ -68,6 +68,30 @@ const boardCollisionDetection: CollisionDetection = (args) => {
   const intersections = rectIntersection(withoutActive);
   return intersections.length > 0 ? intersections : closestCenter(withoutActive);
 };
+
+/**
+ * dnd-kit's default droppable measuring strategy (MeasuringStrategy.
+ * WhileDragging, MeasuringFrequency.Optimized) only (re)measures droppable
+ * rects in response to a `useEffect` that fires after `dragging` flips to
+ * true -- an async, paint-gated pass, not something that completes inside
+ * the same synchronous keydown handling that lifts the item. A real user's
+ * "pick up, THEN arrow, THEN drop" is spread across enough wall-clock time
+ * for that effect to have long since flushed; Playwright's scripted
+ * `Space, ArrowRight, Space` (no delay between presses, exactly what
+ * e2e/pipeline.spec.ts's keyboard-drag steps do) can complete all three
+ * key events before that effect ever runs. With no measured rects yet for
+ * anything but the origin card's own column, sortableKeyboardCoordinates'
+ * candidate scan (which explicitly skips any droppable it has no rect for)
+ * finds nothing in the pressed direction and the ArrowRight becomes a
+ * silent no-op -- the immediately-following Space then drops the card right
+ * back into whatever `over` already was: its own origin column. Forcing
+ * MeasuringStrategy.Always removes the "wait for dragging to start" gate
+ * entirely, so droppable rects are always current, not just eventually
+ * current. The board is small (a handful of stages/deals, per the design's
+ * own "bounded by what a team can usefully keep on one view" cap), so the
+ * extra continuous measuring this trades in for is not a real cost here.
+ */
+const boardMeasuring = { droppable: { strategy: MeasuringStrategy.Always } };
 
 export function BoardPage() {
   const { pipelineId } = useParams({ from: "/pipelines/$pipelineId" });
@@ -283,6 +307,7 @@ export function BoardPage() {
         <DndContext
           sensors={sensors}
           collisionDetection={boardCollisionDetection}
+          measuring={boardMeasuring}
           onDragStart={handleDragStart}
           onDragCancel={handleDragCancel}
           onDragEnd={handleDragEnd}
