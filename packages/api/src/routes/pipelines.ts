@@ -13,10 +13,17 @@ import {
 import { funnel } from "../services/deals.js";
 
 // archived is the same tri-state wire flag companies.ts's listQuerySchema
-// documents: "true"/"false"/absent, not a free-form boolean coercion.
+// documents: "true"/"false"/absent, not a free-form boolean coercion. scope/
+// project_id widened alongside company_id (Phase 3 P3.7): listPipelines and
+// createPipelineInputSchema already supported the "project" scope from P3.6
+// onward -- this list route's own query schema had been left stale at the
+// original global/company pair, which would 400 a project-detail page's
+// usePipelines({ projectId }) call before it ever reached the (already
+// correct) service layer.
 const listQuerySchema = z.object({
-  scope: z.enum(["global", "company"]).optional(),
+  scope: z.enum(["global", "company", "project"]).optional(),
   company_id: z.uuid().optional(),
+  project_id: z.uuid().optional(),
   archived: z.enum(["true", "false"]).optional().transform((v) => v === "true"),
 });
 
@@ -32,7 +39,9 @@ export function registerPipelineRoutes(app: FastifyInstance, { db }: CrmRouteDep
     if (requireUser(request, reply) === null) return;
     const query = parseOrReject(listQuerySchema, request.query, reply);
     if (query === undefined) return;
-    return listPipelines(db, { scope: query.scope, companyId: query.company_id, archived: query.archived });
+    return listPipelines(db, {
+      scope: query.scope, companyId: query.company_id, projectId: query.project_id, archived: query.archived,
+    });
   });
 
   app.post("/api/pipelines", async (request, reply) => {

@@ -7,11 +7,12 @@ export interface NotesProps {
   companyId?: string;
   contactId?: string;
   dealId?: string;
+  projectId?: string;
 }
 
-export function Notes({ companyId, contactId, dealId }: NotesProps) {
+export function Notes({ companyId, contactId, dealId, projectId }: NotesProps) {
   const [draft, setDraft] = useState("");
-  const { data: notes = [] } = useNotes({ companyId, contactId, dealId });
+  const { data: notes = [] } = useNotes({ companyId, contactId, dealId, projectId });
   const { data: users = [] } = useUsers();
   const createNote = useCreateNote();
   const userMap = useMemo(() => new Map(users.map((user) => [user.id, user.username])), [users]);
@@ -25,7 +26,7 @@ export function Notes({ companyId, contactId, dealId }: NotesProps) {
   function handleAdd() {
     const body = draft.trim();
     if (body === "") return;
-    createNote.mutate({ body, companyId, contactId, dealId }, { onSuccess: () => setDraft("") });
+    createNote.mutate({ body, companyId, contactId, dealId, projectId }, { onSuccess: () => setDraft("") });
   }
 
   return (

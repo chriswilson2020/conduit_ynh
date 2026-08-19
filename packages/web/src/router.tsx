@@ -11,6 +11,10 @@ import { ContactDetailPage } from "./pages/contact-detail";
 import { DealDetailPage } from "./pages/deal-detail";
 import { GanttLabPage } from "./pages/gantt-lab";
 import { PipelinesPage } from "./pages/pipelines";
+import { ProjectsPage } from "./pages/projects";
+import { ProjectDetailPage } from "./pages/project-detail";
+import { ProjectGanttPlaceholderPage } from "./pages/project-gantt-placeholder";
+import { TaskBoardPage } from "./pages/task-board";
 
 // A short staleTime keeps list/detail views from refetching on every focus
 // change while still picking up another tab's edits within a few seconds; a
@@ -82,6 +86,33 @@ const dealDetailRoute = createRoute({
   component: DealDetailPage,
 });
 
+const projectsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/projects",
+  component: ProjectsPage,
+});
+
+const projectDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/projects/$projectId",
+  component: ProjectDetailPage,
+});
+
+const taskBoardRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/projects/$projectId/board",
+  component: TaskBoardPage,
+});
+
+// Placeholder until Task 9 (see project-gantt-placeholder.tsx's own doc
+// comment) -- registered now so project-detail.tsx's "Gantt" link is honest
+// rather than a 404.
+const projectGanttRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/projects/$projectId/gantt",
+  component: ProjectGanttPlaceholderPage,
+});
+
 // G0 prototype gate (Phase 3 plan, Task 1): registered normally so it's a
 // real route, but deliberately linked from no nav -- throwaway, synthetic
 // data only, deleted by Task 9 once the real Gantt ships either way.
@@ -131,6 +162,10 @@ const routeTree = rootRoute.addChildren([
   boardRoute,
   dealDetailRoute,
   ganttLabRoute,
+  projectsRoute,
+  projectDetailRoute,
+  taskBoardRoute,
+  projectGanttRoute,
 ]);
 
 // basePath() returns "/" both at a root install and during `vite dev` (see its

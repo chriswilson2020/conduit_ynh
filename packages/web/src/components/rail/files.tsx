@@ -8,6 +8,7 @@ export interface FilesProps {
   companyId?: string;
   contactId?: string;
   dealId?: string;
+  projectId?: string;
 }
 
 function humanSize(bytes: number): string {
@@ -31,8 +32,8 @@ function uploadErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export function Files({ companyId, contactId, dealId }: FilesProps) {
-  const { data: files = [] } = useFiles({ companyId, contactId, dealId });
+export function Files({ companyId, contactId, dealId, projectId }: FilesProps) {
+  const { data: files = [] } = useFiles({ companyId, contactId, dealId, projectId });
   const { data: users = [] } = useUsers();
   const uploadFile = useUploadFile();
   const [error, setError] = useState<string | null>(null);
@@ -48,7 +49,7 @@ export function Files({ companyId, contactId, dealId }: FilesProps) {
     if (uploadFile.isPending) return;
     setError(null);
     uploadFile.mutate(
-      { file, companyId, contactId, dealId },
+      { file, companyId, contactId, dealId, projectId },
       { onError: (err) => setError(uploadErrorMessage(err)) },
     );
   }

@@ -87,6 +87,19 @@ export const postJson = <T>(path: string, body?: unknown) => sendJson<T>("POST",
 export const patchJson = <T>(path: string, body?: unknown) => sendJson<T>("PATCH", path, body);
 
 /**
+ * DELETE with no request or response body (e.g. removing a task dependency
+ * edge -- the route returns a bare 204). Error handling mirrors sendJson;
+ * a successful response is simply discarded rather than parsed as JSON,
+ * since a 204 has no body to parse.
+ */
+export async function deleteRequest(path: string): Promise<void> {
+  const response = await fetch(apiUrl(path), { method: "DELETE", headers: { Accept: "application/json" } });
+  if (!response.ok) {
+    throw await toApiError(response, `DELETE ${path} failed with ${response.status}`);
+  }
+}
+
+/**
  * POST a multipart/form-data body (file uploads). Deliberately does not set
  * Content-Type: fetch/the browser derives it from the FormData, including the
  * multipart boundary -- setting it manually would omit that boundary and the

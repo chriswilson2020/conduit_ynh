@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { basePath, apiUrl, fetchHealth, getJson, patchJson, ApiError } from "./api";
+import { basePath, apiUrl, deleteRequest, fetchHealth, getJson, patchJson, ApiError } from "./api";
 
 // vitest.config.ts runs this suite under environment: "node", so there is no
 // global `window`. api.ts only reads `window.__CONDUIT_BASE__` inside function
@@ -169,6 +169,39 @@ describe("ApiError", () => {
       expect(apiError.status).toBe(500);
       expect(apiError.code).toBe("unknown");
       expect(apiError.message).toBe("PATCH /companies/a1 failed with 500");
+    });
+  });
+});
+
+// deleteRequest backs useRemoveDependency (queries.ts): the route it targets
+// (DELETE /api/tasks/:id/dependencies/:predecessorId) returns a bare 204 with
+// no body, so unlike sendJson's callers this has nothing to parse on success.
+describe("deleteRequest", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("resolves with no value on a 2xx response", async () => {
+    setBase(undefined);
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, status: 204, json: () => Promise.resolve(undefined) }) as unknown as typeof fetch;
+
+    await expect(deleteRequest("/tasks/t1/dependencies/t0")).resolves.toBeUndefined();
+  });
+
+  it("rejects with an ApiError built from the response body on a non-2xx response", async () => {
+    setBase(undefined);
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false, status: 404, json: () => Promise.resolve({ error: "not_found", message: "task t1 not found" }),
+    }) as unknown as typeof fetch;
+
+    const rejection = deleteRequest("/tasks/t1/dependencies/t0");
+    await expect(rejection).rejects.toBeInstanceOf(ApiError);
+    await rejection.catch((err: unknown) => {
+      const apiError = err as ApiError;
+      expect(apiError.status).toBe(404);
+      expect(apiError.code).toBe("not_found");
     });
   });
 });

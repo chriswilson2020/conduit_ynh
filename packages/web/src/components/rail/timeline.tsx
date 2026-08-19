@@ -7,6 +7,8 @@ export interface TimelineProps {
   companyId?: string;
   contactId?: string;
   dealId?: string;
+  projectId?: string;
+  taskId?: string;
 }
 
 // Single-letter badges rather than pictographic icons: ASCII, unambiguous per
@@ -96,10 +98,10 @@ function summarize(event: Event): string {
  * fresh mount (new companyId/contactId, since this remounts per detail page)
  * starts clean.
  */
-export function Timeline({ companyId, contactId, dealId }: TimelineProps) {
+export function Timeline({ companyId, contactId, dealId, projectId, taskId }: TimelineProps) {
   const [cursor, setCursor] = useState<string | undefined>(undefined);
   const [rows, setRows] = useState<Event[]>([]);
-  const { data, isLoading } = useEvents({ companyId, contactId, dealId, cursor });
+  const { data, isLoading } = useEvents({ companyId, contactId, dealId, projectId, taskId, cursor });
   const { data: users = [] } = useUsers();
   const userMap = useMemo(() => new Map(users.map((user) => [user.id, user.username])), [users]);
 

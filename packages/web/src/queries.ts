@@ -6,13 +6,18 @@ import {
   eventSchema,
   fileMetaSchema,
   funnelRowSchema,
+  ganttPayloadSchema,
   listResponseSchema,
   midpoint,
   noteSchema,
   pipelineSchema,
   pipelineWithStagesSchema,
+  projectSchema,
   searchResultsSchema,
+  shiftResultSchema,
   stageSchema,
+  taskDependencySchema,
+  taskSchema,
   usersResponseSchema,
   type Company,
   type Contact,
@@ -21,18 +26,28 @@ import {
   type CreateDealInput,
   type CreateNoteInput,
   type CreatePipelineInput,
+  type CreateProjectInput,
   type CreateStageInput,
+  type CreateTaskInput,
   type Deal,
+  type GanttPayload,
   type Pipeline,
   type PipelineScope,
+  type Project,
+  type ProjectStatus,
+  type ShiftResult,
   type Stage,
+  type Task,
+  type TaskStatus,
   type UpdateCompanyInput,
   type UpdateContactInput,
   type UpdateDealInput,
   type UpdatePipelineInput,
+  type UpdateProjectInput,
   type UpdateStageInput,
+  type UpdateTaskInput,
 } from "@conduit/shared";
-import { ApiError, getJson, patchJson, postForm, postJson } from "./api";
+import { ApiError, deleteRequest, getJson, patchJson, postForm, postJson } from "./api";
 
 const companyListSchema = listResponseSchema(companySchema);
 const contactListSchema = listResponseSchema(contactSchema);
@@ -42,6 +57,8 @@ const fileListSchema = fileMetaSchema.array();
 const pipelineListSchema = pipelineSchema.array();
 const dealListSchema = dealSchema.array();
 const funnelListSchema = funnelRowSchema.array();
+const projectListSchema = projectSchema.array();
+const taskListSchema = taskSchema.array();
 
 /** Builds a `?a=1&b=2` query string, dropping keys whose value is undefined. */
 function toQueryString(params: Record<string, string | number | boolean | undefined>): string {
@@ -244,10 +261,14 @@ export function useUnarchiveContact() {
 // Notes
 // ---------------------------------------------------------------------------
 
+// projectId (Phase 3 P3.6) is a fourth optional entity filter alongside the
+// original three, mirroring the notes/files/events routes' own widened
+// company_id/contact_id/deal_id/project_id query params.
 export interface EntityFilterParams {
   companyId?: string;
   contactId?: string;
   dealId?: string;
+  projectId?: string;
 }
 
 export function useNotes(params: EntityFilterParams) {
@@ -255,11 +276,12 @@ export function useNotes(params: EntityFilterParams) {
     queryKey: ["notes", params],
     queryFn: async () => {
       const qs = toQueryString({
-        company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId,
+        company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId, project_id: params.projectId,
       });
       return parseWith(noteListSchema, await getJson<unknown>(`/notes${qs}`), "notes list");
     },
-    enabled: params.companyId !== undefined || params.contactId !== undefined || params.dealId !== undefined,
+    enabled: params.companyId !== undefined || params.contactId !== undefined || params.dealId !== undefined
+      || params.projectId !== undefined,
   });
 }
 
@@ -289,11 +311,12 @@ export function useFiles(params: EntityFilterParams) {
     queryKey: ["files", params],
     queryFn: async () => {
       const qs = toQueryString({
-        company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId,
+        company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId, project_id: params.projectId,
       });
       return parseWith(fileListSchema, await getJson<unknown>(`/files${qs}`), "files list");
     },
-    enabled: params.companyId !== undefined || params.contactId !== undefined || params.dealId !== undefined,
+    enabled: params.companyId !== undefined || params.contactId !== undefined || params.dealId !== undefined
+      || params.projectId !== undefined,
   });
 }
 
@@ -302,12 +325,13 @@ export interface UploadFileInput {
   companyId?: string;
   contactId?: string;
   dealId?: string;
+  projectId?: string;
 }
 
 export function useUploadFile() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ file, companyId, contactId, dealId }: UploadFileInput) => {
+    mutationFn: async ({ file, companyId, contactId, dealId, projectId }: UploadFileInput) => {
       const form = new FormData();
       // The entity id field(s) must be appended before the file field: the API
       // (packages/api/src/routes/files.ts) streams the multipart body and only
@@ -315,6 +339,7 @@ export function useUploadFile() {
       if (companyId !== undefined) form.append("companyId", companyId);
       if (contactId !== undefined) form.append("contactId", contactId);
       if (dealId !== undefined) form.append("dealId", dealId);
+      if (projectId !== undefined) form.append("projectId", projectId);
       form.append("file", file);
       return parseWith(fileMetaSchema, await postForm("/files", form), "file");
     },
@@ -336,6 +361,9 @@ export function useUploadFile() {
 export interface PipelineListParams {
   scope?: PipelineScope;
   companyId?: string;
+  // Phase 3 P3.7: project-scoped pipelines (project-detail.tsx's own
+  // Pipelines section, mirroring company-detail.tsx's).
+  projectId?: string;
   archived?: boolean;
 }
 
@@ -345,7 +373,9 @@ export function usePipelines(params: PipelineListParams = {}) {
   return useQuery({
     queryKey: ["pipelines", params],
     queryFn: async () => {
-      const qs = toQueryString({ scope: params.scope, company_id: params.companyId, archived: params.archived });
+      const qs = toQueryString({
+        scope: params.scope, company_id: params.companyId, project_id: params.projectId, archived: params.archived,
+      });
       return parseWith(pipelineListSchema, await getJson<unknown>(`/pipelines${qs}`), "pipelines list");
     },
   });
@@ -655,10 +685,407 @@ export function useFunnel(pipelineId: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Projects (Phase 3)
+// ---------------------------------------------------------------------------
+
+export interface ProjectListParams {
+  companyId?: string;
+  status?: ProjectStatus;
+  archived?: boolean;
+}
+
+// Unpaginated, mirroring listProjects server-side (see its doc comment in
+// services/projects.ts) -- a plain array, not { items, nextCursor }, same
+// shape usePipelines already uses for the same reason.
+export function useProjects(params: ProjectListParams = {}) {
+  return useQuery({
+    queryKey: ["projects", params],
+    queryFn: async () => {
+      const qs = toQueryString({ company_id: params.companyId, status: params.status, archived: params.archived });
+      return parseWith(projectListSchema, await getJson<unknown>(`/projects${qs}`), "projects list");
+    },
+  });
+}
+
+export function useProject(id: string) {
+  return useQuery({
+    queryKey: ["project", id],
+    queryFn: async () => parseWith(projectSchema, await getJson<unknown>(`/projects/${id}`), "project"),
+    enabled: id !== "",
+  });
+}
+
+// Mirrors publishProjectHint in services/projects.ts: every project mutation
+// publishes ["projects"], ["project", id], ["events"], ["search"] after
+// commit -- see useInvalidateCompany's doc comment for why ["search"] is
+// invalidated eagerly rather than left to expire on its own.
+function useInvalidateProject() {
+  const queryClient = useQueryClient();
+  return (id?: string) => {
+    void queryClient.invalidateQueries({ queryKey: ["projects"] });
+    void queryClient.invalidateQueries({ queryKey: ["events"] });
+    void queryClient.invalidateQueries({ queryKey: ["search"] });
+    if (id !== undefined) void queryClient.invalidateQueries({ queryKey: ["project", id] });
+  };
+}
+
+export function useCreateProject() {
+  const invalidate = useInvalidateProject();
+  return useMutation({
+    mutationFn: async (input: CreateProjectInput) =>
+      parseWith(projectSchema, await postJson<unknown>("/projects", input), "project"),
+    onSuccess: (project: Project) => invalidate(project.id),
+  });
+}
+
+export function useUpdateProject() {
+  const invalidate = useInvalidateProject();
+  return useMutation({
+    mutationFn: async ({ id, patch }: { id: string; patch: UpdateProjectInput }) =>
+      parseWith(projectSchema, await patchJson<unknown>(`/projects/${id}`, patch), "project"),
+    onSuccess: (project: Project) => invalidate(project.id),
+  });
+}
+
+export function useArchiveProject() {
+  const invalidate = useInvalidateProject();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(projectSchema, await postJson<unknown>(`/projects/${id}/archive`), "project"),
+    onSuccess: (project: Project) => invalidate(project.id),
+  });
+}
+
+export function useUnarchiveProject() {
+  const invalidate = useInvalidateProject();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(projectSchema, await postJson<unknown>(`/projects/${id}/unarchive`), "project"),
+    onSuccess: (project: Project) => invalidate(project.id),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tasks (Phase 3)
+// ---------------------------------------------------------------------------
+
+export interface TaskListParams {
+  projectId?: string;
+  standalone?: boolean;
+  assigneeId?: string;
+  status?: TaskStatus;
+  dated?: boolean;
+  archived?: boolean;
+}
+
+/**
+ * Unpaginated, mirroring listTasks server-side. The query key's second
+ * segment mirrors publishTaskHint's own invalidation key shape
+ * (services/tasks.ts: `["tasks", task.projectId ?? "standalone"]`) so a task
+ * mutation's project-scoped invalidation prefix-matches every useTasks call
+ * scoped to that same project (the task board's own useTasks({ projectId })
+ * call, in particular) regardless of which extra filters (status/dated/
+ * archived) it also applies. A caller that names neither projectId nor
+ * standalone -- there is none in this phase; My Tasks uses useMyTasks below
+ * instead, which keys off ["my-tasks", assigneeId] to match the server's own
+ * per-assignee publish hint directly -- falls back to a literal "all"
+ * segment so the key stays well-formed rather than colliding with either
+ * scoped shape.
+ */
+export function useTasks(params: TaskListParams = {}) {
+  const scope = params.projectId ?? (params.standalone === true ? "standalone" : "all");
+  return useQuery({
+    queryKey: ["tasks", scope, params],
+    queryFn: async () => {
+      const qs = toQueryString({
+        project_id: params.projectId, standalone: params.standalone, assignee_id: params.assigneeId,
+        status: params.status, dated: params.dated, archived: params.archived,
+      });
+      return parseWith(taskListSchema, await getJson<unknown>(`/tasks${qs}`), "tasks list");
+    },
+  });
+}
+
+/**
+ * Mirrors publishTaskHint in services/tasks.ts: every task mutation
+ * publishes ["tasks", scope], ["gantt"], ["events"], ["search"], plus
+ * ["my-tasks", assigneeId] for every assignee actually touched (the task's
+ * current one, and -- via extraAssigneeIds -- its pre-patch one on a
+ * reassignment, so both the old and new My Tasks lists refresh).
+ */
+function useInvalidateTask() {
+  const queryClient = useQueryClient();
+  return (task: Task, extraAssigneeIds: (string | null)[] = []) => {
+    const scope = task.projectId ?? "standalone";
+    void queryClient.invalidateQueries({ queryKey: ["tasks", scope] });
+    void queryClient.invalidateQueries({ queryKey: ["gantt"] });
+    void queryClient.invalidateQueries({ queryKey: ["events"] });
+    void queryClient.invalidateQueries({ queryKey: ["search"] });
+    const assignees = new Set<string>();
+    if (task.assigneeUserId !== null) assignees.add(task.assigneeUserId);
+    for (const a of extraAssigneeIds) if (a !== null) assignees.add(a);
+    for (const a of assignees) void queryClient.invalidateQueries({ queryKey: ["my-tasks", a] });
+  };
+}
+
+export function useCreateTask() {
+  const invalidate = useInvalidateTask();
+  return useMutation({
+    mutationFn: async (input: CreateTaskInput) =>
+      parseWith(taskSchema, await postJson<unknown>("/tasks", input), "task"),
+    onSuccess: (task: Task) => invalidate(task),
+  });
+}
+
+export function useUpdateTask() {
+  const invalidate = useInvalidateTask();
+  return useMutation({
+    // previousAssigneeUserId is optional: passed by a caller that already
+    // holds the pre-patch task (e.g. the task drawer, Task 8) so a
+    // reassignment invalidates both the old and new My Tasks lists,
+    // mirroring the server's own extraAssigneeIds parameter. A caller
+    // without it handy still self-heals within the query's own staleTime.
+    mutationFn: async (
+      { id, patch }: { id: string; patch: UpdateTaskInput; previousAssigneeUserId?: string | null },
+    ) => parseWith(taskSchema, await patchJson<unknown>(`/tasks/${id}`, patch), "task"),
+    onSuccess: (task: Task, { previousAssigneeUserId }) =>
+      invalidate(task, previousAssigneeUserId !== undefined ? [previousAssigneeUserId] : []),
+  });
+}
+
+export function useSetTaskStatus() {
+  const invalidate = useInvalidateTask();
+  return useMutation({
+    mutationFn: async ({ id, status }: { id: string; status: TaskStatus }) =>
+      parseWith(taskSchema, await postJson<unknown>(`/tasks/${id}/status`, { status }), "task"),
+    onSuccess: (task: Task) => invalidate(task),
+  });
+}
+
+export interface BoardMoveTaskParams {
+  id: string;
+  projectId: string | null;
+  status: TaskStatus;
+  beforeTaskId?: string;
+  afterTaskId?: string;
+}
+
+interface BoardMoveTaskContext {
+  queryKey: readonly [string, string, TaskListParams];
+  previous: Task[] | undefined;
+}
+
+/**
+ * Optimistic board move, mirroring useMoveDeal's shape exactly (see its own
+ * doc comment for the full reasoning): onMutate snapshots the scoped
+ * useTasks({ projectId }) cache entry, reassigns the dragged task's status
+ * and a plausible new position via the same midpoint() the server uses, and
+ * rolls back on error -- a 409 additionally invalidates the scoped key so a
+ * stale local view of the target column's gap gets corrected from the
+ * server rather than just reverted.
+ */
+export function useBoardMoveTask() {
+  const queryClient = useQueryClient();
+  const invalidate = useInvalidateTask();
+  return useMutation<Task, unknown, BoardMoveTaskParams, BoardMoveTaskContext>({
+    mutationFn: async ({ id, status, beforeTaskId, afterTaskId }: BoardMoveTaskParams) =>
+      parseWith(
+        taskSchema,
+        await postJson<unknown>(`/tasks/${id}/board-move`, { status, beforeTaskId, afterTaskId }),
+        "task",
+      ),
+    onMutate: async (params) => {
+      const scope = params.projectId ?? "standalone";
+      // Matches exactly the params shape task-board.tsx's useTasks({ projectId })
+      // call produces (projectId, everything else undefined) -- TanStack's
+      // default key hashing treats undefined-valued keys as absent, so this
+      // hashes identically to that call's own queryKey.
+      const filterParams: TaskListParams = { projectId: params.projectId ?? undefined };
+      const queryKey = ["tasks", scope, filterParams] as const;
+      await queryClient.cancelQueries({ queryKey });
+      const previous = queryClient.getQueryData<Task[]>(queryKey);
+      if (previous !== undefined) {
+        const positionOf = (id?: string) => (id === undefined ? null : previous.find((t) => t.id === id)?.position ?? null);
+        const beforePos = positionOf(params.beforeTaskId);
+        const afterPos = positionOf(params.afterTaskId);
+        let position: string;
+        try {
+          if (beforePos !== null || afterPos !== null) {
+            position = midpoint(beforePos, afterPos);
+          } else {
+            // Neither neighbour named: append at the tail of the target
+            // status column, mirroring createTask's append semantics.
+            const tail = previous
+              .filter((t) => t.status === params.status && t.id !== params.id)
+              .reduce<string | null>((max, t) => (max === null || t.position > max ? t.position : max), null);
+            position = midpoint(tail, null);
+          }
+        } catch {
+          // A stale/invalid neighbour pair locally -- keep the task's
+          // current position rather than crash the drag; the server's
+          // response (or the rollback below) corrects it.
+          position = previous.find((t) => t.id === params.id)?.position ?? "";
+        }
+        queryClient.setQueryData<Task[]>(
+          queryKey,
+          previous.map((t) => (t.id === params.id ? { ...t, status: params.status, position } : t)),
+        );
+      }
+      return { queryKey, previous };
+    },
+    onError: (error, _params, context) => {
+      if (context !== undefined) queryClient.setQueryData(context.queryKey, context.previous);
+      if (error instanceof ApiError && error.status === 409 && context !== undefined) {
+        void queryClient.invalidateQueries({ queryKey: context.queryKey });
+      }
+    },
+    onSuccess: (task: Task) => invalidate(task),
+  });
+}
+
+/**
+ * Dependency mutations only know the two task ids involved, not either
+ * task's current project/assignee -- the precise scoped invalidation
+ * useInvalidateTask computes from a whole Task isn't available here, so
+ * this falls back to broad ["tasks"]/["gantt"] prefixes (a strict superset
+ * of the server's own successor-scoped publish hint in
+ * services/tasks.ts's addDependency/removeDependency). Correctness over
+ * precision for a low-frequency mutation.
+ */
+function invalidateAfterDependencyChange(queryClient: ReturnType<typeof useQueryClient>): void {
+  void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+  void queryClient.invalidateQueries({ queryKey: ["gantt"] });
+  void queryClient.invalidateQueries({ queryKey: ["events"] });
+  void queryClient.invalidateQueries({ queryKey: ["search"] });
+}
+
+export function useAddDependency() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    // :id in the route names the successor -- see services/tasks.ts's
+    // addDependency doc comment for why the dependency direction is
+    // predecessor -> successor.
+    mutationFn: async ({ predecessorId, successorId }: { predecessorId: string; successorId: string }) =>
+      parseWith(
+        taskDependencySchema,
+        await postJson<unknown>(`/tasks/${successorId}/dependencies`, { predecessorId }),
+        "task dependency",
+      ),
+    onSuccess: () => invalidateAfterDependencyChange(queryClient),
+  });
+}
+
+export function useRemoveDependency() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ predecessorId, successorId }: { predecessorId: string; successorId: string }) => {
+      await deleteRequest(`/tasks/${successorId}/dependencies/${predecessorId}`);
+    },
+    onSuccess: () => invalidateAfterDependencyChange(queryClient),
+  });
+}
+
+export interface ShiftTaskParams {
+  id: string;
+  startDate: string;
+  dueDate: string;
+}
+
+/**
+ * Optimistic dates on the dragged task only -- the server decides which
+ * successors actually cascade, and Task 9's Gantt is expected to read the
+ * moved list off this mutation's own `data` (the raw ShiftResult response,
+ * kept around by useMutation automatically) for its post-commit cascade
+ * flash, rather than anything written to a query cache here; see
+ * shiftResultSchema's own doc comment in @conduit/shared for why
+ * cascadedFrom needs the whole response, not a per-task cache patch.
+ *
+ * Patches every currently-cached ["gantt", ...] query that contains this
+ * task, rather than one specific key the way useMoveDeal/useBoardMoveTask
+ * target a single list -- Task 9's per-project and global Gantt pages are
+ * the first and only callers, and there is no way to know in advance which
+ * of the two shapes (or both) is mounted. onError rolls every patched query
+ * back to its own snapshot.
+ */
+export function useShiftTask() {
+  const queryClient = useQueryClient();
+  return useMutation<ShiftResult, unknown, ShiftTaskParams, Map<readonly unknown[], GanttPayload>>({
+    mutationFn: async ({ id, startDate, dueDate }: ShiftTaskParams) =>
+      parseWith(shiftResultSchema, await postJson<unknown>(`/tasks/${id}/shift`, { startDate, dueDate }), "shift result"),
+    onMutate: async (params) => {
+      await queryClient.cancelQueries({ queryKey: ["gantt"] });
+      const snapshots = new Map<readonly unknown[], GanttPayload>();
+      const queries = queryClient.getQueriesData<GanttPayload>({ queryKey: ["gantt"] });
+      for (const [key, data] of queries) {
+        if (data === undefined) continue;
+        snapshots.set(key, data);
+        if (!data.tasks.some((t) => t.id === params.id)) continue;
+        queryClient.setQueryData<GanttPayload>(key, {
+          ...data,
+          tasks: data.tasks.map((t) => (t.id === params.id ? { ...t, startDate: params.startDate, dueDate: params.dueDate } : t)),
+        });
+      }
+      return snapshots;
+    },
+    onError: (_error, _params, snapshots) => {
+      if (snapshots === undefined) return;
+      for (const [key, data] of snapshots) queryClient.setQueryData(key, data);
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["gantt"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+      void queryClient.invalidateQueries({ queryKey: ["search"] });
+      // my-tasks keys are deliberately not invalidated here: this hook has
+      // no Task/assignee list handy (only the ShiftResult's moved ids), and
+      // scheduling.ts's shiftTask already scopes its own my-tasks SSE hints
+      // to the assignees actually touched -- a same-tab caller sees the
+      // moved dates immediately via the optimistic patch above regardless.
+    },
+  });
+}
+
+export type GanttTarget = { projectId: string } | { global: true };
+
+export function useGantt(target: GanttTarget) {
+  const key = "projectId" in target ? target.projectId : "global";
+  return useQuery({
+    queryKey: ["gantt", key],
+    queryFn: async () => {
+      const path = "projectId" in target ? `/projects/${target.projectId}/gantt` : "/gantt";
+      return parseWith(ganttPayloadSchema, await getJson<unknown>(path), "gantt payload");
+    },
+    enabled: "projectId" in target ? target.projectId !== "" : true,
+  });
+}
+
+// My Tasks (Task 8) keys off ["my-tasks", assigneeId] directly rather than
+// through useTasks' ["tasks", scope, params] shape, so it matches the
+// server's own per-assignee publish hint (publishTaskHint's extraAssigneeIds
+// loop in services/tasks.ts) exactly -- an assigned task can live in any
+// project (or none), so there is no single ["tasks", scope] prefix that
+// would cover every task this needs to show.
+export function useMyTasks(assigneeId: string) {
+  return useQuery({
+    queryKey: ["my-tasks", assigneeId],
+    queryFn: async () => {
+      const qs = toQueryString({ assignee_id: assigneeId });
+      return parseWith(taskListSchema, await getJson<unknown>(`/tasks${qs}`), "tasks list");
+    },
+    enabled: assigneeId !== "",
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Events (timeline)
 // ---------------------------------------------------------------------------
 
+// taskId (Phase 3 P3.6) lets the task drawer's own timeline (Task 8) filter
+// down to one task's events, mirroring the project_id filter EntityFilterParams
+// already carries -- events.ts's route accepts both alongside the original
+// three.
 export interface EventListParams extends EntityFilterParams {
+  taskId?: string;
   cursor?: string;
   limit?: number;
 }
@@ -669,6 +1096,7 @@ export function useEvents(params: EventListParams = {}) {
     queryFn: async () => {
       const qs = toQueryString({
         company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId,
+        task_id: params.taskId, project_id: params.projectId,
         cursor: params.cursor, limit: params.limit,
       });
       return parseWith(eventListSchema, await getJson<unknown>(`/events${qs}`), "events list");
