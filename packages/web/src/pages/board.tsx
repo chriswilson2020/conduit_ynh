@@ -91,7 +91,7 @@ const boardCollisionDetection: CollisionDetection = (args) => {
  * own "bounded by what a team can usefully keep on one view" cap), so the
  * extra continuous measuring this trades in for is not a real cost here.
  */
-const boardMeasuring = { droppable: { strategy: MeasuringStrategy.Always } };
+const boardMeasuring = { droppable: { strategy: MeasuringStrategy.BeforeDragging } };
 
 export function BoardPage() {
   const { pipelineId } = useParams({ from: "/pipelines/$pipelineId" });
