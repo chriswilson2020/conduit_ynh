@@ -91,6 +91,7 @@ describe("timeline service", () => {
     const verbs = [
       "created", "updated", "archived", "unarchived", "note_added", "file_attached",
       "stage_changed", "won", "lost", "reopened",
+      "shifted", "completed", "dependency_added", "dependency_removed",
     ];
     expect(verbs).toHaveLength(eventVerbSchema.options.length);
     for (const verb of verbs) expect(eventVerbSchema.parse(verb)).toBe(verb);

@@ -37,6 +37,7 @@ describe("search service", () => {
     expect(result.contacts.map((c) => c.id)).toContain(contact.id);
     expect(result.notes.map((n) => n.id)).toContain(note.id);
     expect(result.deals).toEqual([]);
+    expect(result.tasks).toEqual([]);
   });
 
   it("finds a deal by a title fragment", async () => {

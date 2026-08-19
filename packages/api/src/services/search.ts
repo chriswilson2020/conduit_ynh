@@ -69,5 +69,11 @@ export async function search(db: Database, q: string): Promise<SearchResults> {
     contacts: contactRows,
     notes: noteRows.map((n) => ({ id: n.id, companyId: n.companyId, contactId: n.contactId, snippet: snippet(n.body, q) })),
     deals: dealRows,
+    // Stubbed empty pending the tasks table existing as a queryable service
+    // (Phase 3 plan Task 6 wires the real title-ILIKE query here, archived
+    // excluded, done included). The shared schema already requires this group
+    // so the response shape is final now -- mirrors this file's own deals stub
+    // from Phase 2's P2.1.
+    tasks: [],
   };
 }

@@ -850,7 +850,7 @@ describe("search route", () => {
     const response = await a.inject({ method: "GET", url: "/api/search?q=%20%20", headers: authHeaders });
     expect(response.statusCode).toBe(200);
     const body = searchResultsSchema.parse(response.json());
-    expect(body).toEqual({ companies: [], contacts: [], notes: [], deals: [] });
+    expect(body).toEqual({ companies: [], contacts: [], notes: [], deals: [], tasks: [] });
     await a.close();
   });
 

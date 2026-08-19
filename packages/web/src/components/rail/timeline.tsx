@@ -22,6 +22,15 @@ const VERB_BADGE: Record<Event["verb"], string> = {
   won: "W",
   lost: "L",
   reopened: "O",
+  // Placeholder letters, just enough to keep this map exhaustively typed
+  // against the widened eventVerbSchema (Phase 3 Task 2) -- Task 8 gives
+  // these (and summarize() below) real task-event treatment once the tasks
+  // service actually emits them. Mirrors P2.1's own stub-now/wire-later
+  // approach (see search.ts's tasks: [] stub).
+  shifted: "H",
+  completed: "D",
+  dependency_added: "P",
+  dependency_removed: "M",
 };
 
 /**

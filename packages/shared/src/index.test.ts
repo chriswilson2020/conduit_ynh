@@ -17,6 +17,17 @@ import {
   sseHintSchema,
   eventVerbSchema,
   searchResultsSchema,
+  projectSchema,
+  createProjectInputSchema,
+  updateProjectInputSchema,
+  taskSchema,
+  createTaskInputSchema,
+  updateTaskInputSchema,
+  taskDependencySchema,
+  createTaskDependencyInputSchema,
+  shiftTaskInputSchema,
+  shiftResultSchema,
+  ganttPayloadSchema,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -348,12 +359,237 @@ describe("eventVerbSchema", () => {
 
 describe("searchResultsSchema deals group", () => {
   it("accepts a deals group of id/title pairs", () => {
-    const body = { companies: [], contacts: [], notes: [], deals: [{ id: uuid1, title: "Big deal" }] };
+    const body = {
+      companies: [], contacts: [], notes: [], deals: [{ id: uuid1, title: "Big deal" }], tasks: [],
+    };
     expect(searchResultsSchema.parse(body)).toEqual(body);
   });
 
   it("requires the deals group to be present", () =>
     expect(() =>
-      searchResultsSchema.parse({ companies: [], contacts: [], notes: [] }),
+      searchResultsSchema.parse({ companies: [], contacts: [], notes: [], tasks: [] }),
     ).toThrow());
+});
+
+describe("searchResultsSchema tasks group", () => {
+  it("accepts a tasks group of id/title/projectId triples, including a standalone task", () => {
+    const body = {
+      companies: [], contacts: [], notes: [], deals: [],
+      tasks: [
+        { id: uuid1, title: "Call back", projectId: uuid2 },
+        { id: uuid2, title: "Standalone follow-up", projectId: null },
+      ],
+    };
+    expect(searchResultsSchema.parse(body)).toEqual(body);
+  });
+
+  it("requires the tasks group to be present", () =>
+    expect(() =>
+      searchResultsSchema.parse({ companies: [], contacts: [], notes: [], deals: [] }),
+    ).toThrow());
+});
+
+describe("projectSchema color format", () => {
+  const base = {
+    id: uuid1, name: "Website relaunch", companyId: null, dealId: null, ownerUserId: null,
+    status: "active" as const, startDate: null, dueDate: null, color: null,
+    archivedAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+
+  it("accepts a null color", () => expect(projectSchema.parse(base)).toEqual(base));
+
+  it("accepts a well-formed 6-digit hex color", () => {
+    const value = { ...base, color: "#1a2b3c" };
+    expect(projectSchema.parse(value)).toEqual(value);
+  });
+
+  it("rejects a 3-digit hex shorthand", () =>
+    expect(() => projectSchema.parse({ ...base, color: "#abc" })).toThrow());
+
+  it("rejects a color missing the leading #", () =>
+    expect(() => projectSchema.parse({ ...base, color: "1a2b3c" })).toThrow());
+
+  it("rejects a color with a non-hex digit", () =>
+    expect(() => projectSchema.parse({ ...base, color: "#1a2b3g" })).toThrow());
+});
+
+describe("createProjectInputSchema / updateProjectInputSchema", () => {
+  it("accepts a minimal project with just a name", () => {
+    const input = { name: "Q4 rollout" };
+    expect(createProjectInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects an empty name", () =>
+    expect(() => createProjectInputSchema.parse({ name: "" })).toThrow());
+
+  it("rejects a malformed color on create", () =>
+    expect(() => createProjectInputSchema.parse({ name: "Q4 rollout", color: "not-a-color" })).toThrow());
+
+  it("accepts a fully-empty partial update", () =>
+    expect(updateProjectInputSchema.parse({})).toEqual({}));
+
+  it("rejects a malformed color on update", () =>
+    expect(() => updateProjectInputSchema.parse({ color: "red" })).toThrow());
+});
+
+describe("taskSchema / createTaskInputSchema date pairing", () => {
+  const base = {
+    id: uuid1, title: "Draft proposal", description: null, type: "task" as const,
+    status: "todo" as const, assigneeUserId: null, startDate: null, dueDate: null,
+    completedAt: null, progressPct: null, parentTaskId: null, position: "a0",
+    companyId: null, contactId: null, dealId: null, projectId: null,
+    archivedAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+
+  it("accepts a fully-populated task", () => {
+    const value = { ...base, startDate: "2026-09-01", dueDate: "2026-09-05", progressPct: 40 };
+    expect(taskSchema.parse(value)).toEqual(value);
+  });
+
+  it("accepts undated (both null) via createTaskInputSchema", () => {
+    const input = { title: "Draft proposal" };
+    expect(createTaskInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("accepts a matched start/due pair on create", () => {
+    const input = { title: "Draft proposal", startDate: "2026-09-01", dueDate: "2026-09-05" };
+    expect(createTaskInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("accepts a same-day start/due pair (start == due) on create", () => {
+    const input = { title: "One-day task", startDate: "2026-09-01", dueDate: "2026-09-01" };
+    expect(createTaskInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects a startDate with no dueDate on create", () =>
+    expect(() =>
+      createTaskInputSchema.parse({ title: "Draft proposal", startDate: "2026-09-01" }),
+    ).toThrow());
+
+  it("rejects a dueDate with no startDate on create", () =>
+    expect(() =>
+      createTaskInputSchema.parse({ title: "Draft proposal", dueDate: "2026-09-05" }),
+    ).toThrow());
+
+  it("rejects startDate after dueDate on create", () =>
+    expect(() =>
+      createTaskInputSchema.parse({
+        title: "Draft proposal", startDate: "2026-09-05", dueDate: "2026-09-01",
+      }),
+    ).toThrow());
+
+  it("accepts an update that touches neither date", () => {
+    const input = { title: "Renamed" };
+    expect(updateTaskInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("accepts an update that clears both dates to null", () => {
+    const input = { startDate: null, dueDate: null };
+    expect(updateTaskInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("accepts an update that moves both dates together", () => {
+    const input = { startDate: "2026-10-01", dueDate: "2026-10-03" };
+    expect(updateTaskInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects an update that touches only startDate", () =>
+    expect(() => updateTaskInputSchema.parse({ startDate: "2026-10-01" })).toThrow());
+
+  it("rejects an update that touches only dueDate", () =>
+    expect(() => updateTaskInputSchema.parse({ dueDate: "2026-10-01" })).toThrow());
+
+  it("rejects an update with startDate after dueDate", () =>
+    expect(() =>
+      updateTaskInputSchema.parse({ startDate: "2026-10-05", dueDate: "2026-10-01" }),
+    ).toThrow());
+
+  it("rejects a progressPct above 100", () =>
+    expect(() => createTaskInputSchema.parse({ title: "x", progressPct: 101 })).toThrow());
+
+  it("rejects a negative progressPct", () =>
+    expect(() => createTaskInputSchema.parse({ title: "x", progressPct: -1 })).toThrow());
+});
+
+describe("taskDependencySchema / createTaskDependencyInputSchema", () => {
+  it("accepts a finish-to-start dependency", () => {
+    const value = { id: uuid1, predecessorId: uuid1, successorId: uuid2, type: "FS" as const, createdAt: new Date().toISOString() };
+    expect(taskDependencySchema.parse(value)).toEqual(value);
+  });
+
+  it("rejects a dependency type other than FS", () =>
+    expect(() =>
+      taskDependencySchema.parse({
+        id: uuid1, predecessorId: uuid1, successorId: uuid2, type: "SS", createdAt: new Date().toISOString(),
+      }),
+    ).toThrow());
+
+  it("accepts a create-dependency input naming just the predecessor", () => {
+    const input = { predecessorId: uuid1 };
+    expect(createTaskDependencyInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects a create-dependency input with a non-uuid predecessorId", () =>
+    expect(() => createTaskDependencyInputSchema.parse({ predecessorId: "not-a-uuid" })).toThrow());
+});
+
+describe("shiftTaskInputSchema", () => {
+  it("accepts startDate before dueDate", () => {
+    const input = { startDate: "2026-09-01", dueDate: "2026-09-05" };
+    expect(shiftTaskInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("accepts startDate equal to dueDate", () => {
+    const input = { startDate: "2026-09-01", dueDate: "2026-09-01" };
+    expect(shiftTaskInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects startDate after dueDate", () =>
+    expect(() =>
+      shiftTaskInputSchema.parse({ startDate: "2026-09-05", dueDate: "2026-09-01" }),
+    ).toThrow());
+
+  it("rejects a missing dueDate, since a shift always sets both dates", () =>
+    expect(() => shiftTaskInputSchema.parse({ startDate: "2026-09-01" })).toThrow());
+});
+
+describe("shiftResultSchema", () => {
+  it("accepts a dragged task (cascadedFrom null) plus a cascaded one", () => {
+    const value = {
+      moved: [
+        { id: uuid1, startDate: "2026-09-01", dueDate: "2026-09-05", cascadedFrom: null },
+        { id: uuid2, startDate: "2026-09-06", dueDate: "2026-09-08", cascadedFrom: uuid1 },
+      ],
+    };
+    expect(shiftResultSchema.parse(value)).toEqual(value);
+  });
+
+  it("accepts an empty moved list", () =>
+    expect(shiftResultSchema.parse({ moved: [] })).toEqual({ moved: [] }));
+});
+
+describe("ganttPayloadSchema", () => {
+  const now = new Date().toISOString();
+  const projectTask = {
+    id: uuid1, title: "Design phase", description: null, type: "task" as const, status: "todo" as const,
+    assigneeUserId: null, startDate: "2026-09-01", dueDate: "2026-09-05",
+    completedAt: null, progressPct: null, parentTaskId: null, position: "a0",
+    companyId: null, contactId: null, dealId: null, projectId: uuid1,
+    archivedAt: null, createdAt: now, updatedAt: now,
+    projectName: "Website relaunch", projectColor: "#1a2b3c",
+  };
+  const standaloneTask = {
+    ...projectTask, id: uuid2, projectId: null, projectName: null, projectColor: null,
+  };
+
+  it("accepts a payload mixing a project-grouped task and a standalone task, plus a dependency", () => {
+    const value = {
+      tasks: [projectTask, standaloneTask],
+      dependencies: [{ id: uuid1, predecessorId: uuid1, successorId: uuid2, type: "FS" as const, createdAt: now }],
+    };
+    expect(ganttPayloadSchema.parse(value)).toEqual(value);
+  });
+
+  it("accepts an empty payload", () =>
+    expect(ganttPayloadSchema.parse({ tasks: [], dependencies: [] })).toEqual({ tasks: [], dependencies: [] }));
 });

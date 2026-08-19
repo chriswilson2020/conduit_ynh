@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, check, customType } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, check, unique, customType } from "drizzle-orm/pg-core";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
 /**
@@ -65,6 +66,12 @@ export const pipelines = pgTable("pipelines", {
   name: text("name").notNull(),
   scope: text("scope").notNull(),
   companyId: uuid("company_id").references(() => companies.id),
+  // Phase 3's third scope value. Forward reference (projects is defined further
+  // down, after deals -- projects.dealId -> deals, deals.pipelineId -> pipelines,
+  // pipelines.projectId -> projects is a genuine three-way cycle among these
+  // tables), hence the explicit AnyPgColumn return type: TypeScript can't infer
+  // a circular reference's column type on its own.
+  projectId: uuid("project_id").references((): AnyPgColumn => projects.id),
   // Fractional index (see packages/shared/src/fractional.ts) ordering sibling
   // pipelines against each other, same scheme as stages.position and
   // deals.position below.
@@ -73,11 +80,16 @@ export const pipelines = pgTable("pipelines", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
-  check("pipelines_scope_valid", sql`scope IN ('global','company')`),
-  // "project" is a Phase 3 scope value (needs the projects table) -- deliberately
-  // not in the valid-scope CHECK above yet. See the Phase 2 design spec's
-  // overnight-call note.
-  check("pipelines_scope_company_paired", sql`(scope = 'company') = (company_id IS NOT NULL)`),
+  check("pipelines_scope_valid", sql`scope IN ('global','company','project')`),
+  // Widened from Phase 2's two-way (scope = 'company') = (company_id IS NOT
+  // NULL) pairing to a three-way exclusivity now that 'project' is a real
+  // scope: exactly one of company_id/project_id is set for its matching
+  // scope, and neither is set for 'global'.
+  check("pipelines_scope_paired", sql`(
+    (scope = 'global' AND company_id IS NULL AND project_id IS NULL) OR
+    (scope = 'company' AND company_id IS NOT NULL AND project_id IS NULL) OR
+    (scope = 'project' AND project_id IS NOT NULL AND company_id IS NULL)
+  )`),
 ]);
 export type PipelineRow = typeof pipelines.$inferSelect;
 
@@ -130,10 +142,97 @@ export const deals = pgTable("deals", {
 ]);
 export type DealRow = typeof deals.$inferSelect;
 
-// notes/files: exactly one of the three possible parents. deal_id joins
-// company_id/contact_id here rather than replacing them, since a note/file can
-// be attached to a deal instead of a company or contact.
-const exactlyOne = sql`num_nonnulls(company_id, contact_id, deal_id) = 1`;
+// --- Projects, tasks, task dependencies (Phase 3) -----------------------
+
+export const projects = pgTable("projects", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  companyId: uuid("company_id").references(() => companies.id),
+  // The deal a project originated from, if any -- optional and one-directional
+  // (a deal does not point back at "its" project; a company/deal can spawn
+  // more than one project over time).
+  dealId: uuid("deal_id").references(() => deals.id),
+  ownerUserId: uuid("owner_user_id").references(() => users.id),
+  status: text("status").notNull().default("active"),
+  startDate: date("start_date"),
+  dueDate: date("due_date"),
+  // Hex colour used for Gantt bars/badges; validated at the column so a bad
+  // value can never enter via a direct-write path (see the contacts.emails
+  // comment above for the same "Zod schemas are the primary gate, the CHECK
+  // is the backstop" reasoning).
+  color: text("color"),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  check("projects_status_valid", sql`status IN ('active','completed')`),
+  check("projects_color_format", sql`color IS NULL OR color ~ '^#[0-9a-fA-F]{6}$'`),
+]);
+export type ProjectRow = typeof projects.$inferSelect;
+
+export const tasks = pgTable("tasks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  title: text("title").notNull(),
+  description: text("description"),
+  type: text("type").notNull().default("task"),
+  status: text("status").notNull().default("todo"),
+  assigneeUserId: uuid("assignee_user_id").references(() => users.id),
+  startDate: date("start_date"),
+  dueDate: date("due_date"),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  progressPct: integer("progress_pct"),
+  // One level of subtask grouping only -- the service rejects a parent that
+  // itself already has a parent. Self-reference needs the explicit
+  // AnyPgColumn return type (TypeScript can't infer a self-referential
+  // column type), same trick as pipelines.projectId above.
+  parentTaskId: uuid("parent_task_id").references((): AnyPgColumn => tasks.id),
+  // Fractional index; sibling group = same parent within the same project, or
+  // the standalone (no project) pool. See stages/deals.position above for the
+  // same scheme.
+  position: positionText("position").notNull(),
+  companyId: uuid("company_id").references(() => companies.id),
+  contactId: uuid("contact_id").references(() => contacts.id),
+  dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  check("tasks_type_valid", sql`type IN ('task','call','meeting','email','deadline')`),
+  check("tasks_status_valid", sql`status IN ('todo','in_progress','blocked','done')`),
+  // Both null (undated), or both set with start <= due -- a task can't have
+  // only one of the pair (the Gantt needs a span, not a single anchor).
+  check(
+    "tasks_dates_paired",
+    sql`(start_date IS NULL AND due_date IS NULL) OR (start_date IS NOT NULL AND due_date IS NOT NULL AND start_date <= due_date)`,
+  ),
+  check("tasks_completed_at_paired", sql`(completed_at IS NOT NULL) = (status = 'done')`),
+  check("tasks_progress_range", sql`progress_pct IS NULL OR (progress_pct >= 0 AND progress_pct <= 100)`),
+]);
+export type TaskRow = typeof tasks.$inferSelect;
+
+export const taskDependencies = pgTable("task_dependencies", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  predecessorId: uuid("predecessor_id").notNull().references(() => tasks.id),
+  successorId: uuid("successor_id").notNull().references(() => tasks.id),
+  // Column exists so SS/FF/SF become a CHECK widening later, not a migration --
+  // only 'FS' (finish-to-start) is supported in Phase 3.
+  type: text("type").notNull().default("FS"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  check("task_dependencies_type_valid", sql`type IN ('FS')`),
+  check("task_dependencies_no_self_ref", sql`predecessor_id <> successor_id`),
+  unique("task_dependencies_pred_succ_unique").on(t.predecessorId, t.successorId),
+]);
+export type TaskDependencyRow = typeof taskDependencies.$inferSelect;
+
+// notes/files: exactly one of the four possible parents. project_id joins
+// company_id/contact_id/deal_id here rather than replacing them, since a
+// note/file can be attached to a project instead. Tasks are deliberately NOT
+// a fifth option here -- tasks are first-class work items in Phase 3, not
+// attachment targets; commentary on work goes on the project or the linked
+// CRM record.
+const exactlyOne = sql`num_nonnulls(company_id, contact_id, deal_id, project_id) = 1`;
 
 export const notes = pgTable("notes", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -142,6 +241,7 @@ export const notes = pgTable("notes", {
   companyId: uuid("company_id").references(() => companies.id),
   contactId: uuid("contact_id").references(() => contacts.id),
   dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [check("notes_exactly_one_entity", exactlyOne)]);
 export type NoteRow = typeof notes.$inferSelect;
@@ -154,6 +254,7 @@ export const files = pgTable("files", {
   companyId: uuid("company_id").references(() => companies.id),
   contactId: uuid("contact_id").references(() => contacts.id),
   dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [check("files_exactly_one_entity", exactlyOne)]);
 export type FileRow = typeof files.$inferSelect;
@@ -167,9 +268,15 @@ export const events = pgTable("events", {
   // No exactly-one CHECK on events (unlike notes/files): a deal event carries
   // both dealId AND companyId when the deal has a company, so both timelines
   // show it (Phase 2 plan, deals service task) -- zero, one, two, or three of
-  // these can legitimately be set.
+  // these can legitimately be set. Phase 3 extends the same reasoning to
+  // taskId/projectId (a task event on a project-linked task carries both).
   dealId: uuid("deal_id").references(() => deals.id),
+  taskId: uuid("task_id").references(() => tasks.id),
+  projectId: uuid("project_id").references(() => projects.id),
   payload: jsonb("payload").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [check("events_verb_valid", sql`verb IN ('created','updated','archived','unarchived','note_added','file_attached','stage_changed','won','lost','reopened')`)]);
+}, (t) => [check(
+  "events_verb_valid",
+  sql`verb IN ('created','updated','archived','unarchived','note_added','file_attached','stage_changed','won','lost','reopened','shifted','completed','dependency_added','dependency_removed')`,
+)]);
 export type EventRow = typeof events.$inferSelect;

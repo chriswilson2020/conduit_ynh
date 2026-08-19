@@ -104,10 +104,17 @@ export type FileMeta = z.infer<typeof fileMetaSchema>;
 // Phase 2 (pipelines/deals) adds four more verbs, and (Task 7) a nullable
 // dealId: a deal event carries both dealId and companyId (when the deal has
 // one) so it surfaces on both the deal's own timeline and its company's --
-// see services/deals.ts's publishDealHint/toDeal-adjacent comments.
+// see services/deals.ts's publishDealHint/toDeal-adjacent comments. Phase 3
+// adds shifted/completed/dependency_added/dependency_removed -- task
+// reopening reuses the existing "reopened" verb rather than adding a
+// task-specific one. Same deferral as Phase 2's own P2.1: this task only
+// widens the DB CHECK (see schema.ts) and this enum; eventSchema gains
+// nullable taskId/projectId once the routes that actually read/write them
+// exist (Task 6).
 export const eventVerbSchema = z.enum([
   "created", "updated", "archived", "unarchived", "note_added", "file_attached",
   "stage_changed", "won", "lost", "reopened",
+  "shifted", "completed", "dependency_added", "dependency_removed",
 ]);
 export const eventSchema = z.object({
   id: z.uuid(), verb: eventVerbSchema, actorUserId: z.uuid(),
@@ -118,6 +125,11 @@ export type Event = z.infer<typeof eventSchema>;
 
 // --- Pipelines, stages, deals (Phase 2) ---------------------------------
 
+// 'project' is now a DB-valid scope (pipelines_scope_valid, schema.ts) now
+// that the projects table exists, but is deliberately not added here yet --
+// same deferral as eventSchema's taskId/projectId above: this schema (and
+// createPipelineInputSchema's pairing refine below) widens once the route
+// that actually creates project-scoped pipelines exists.
 export const pipelineScopeSchema = z.enum(["global", "company"]);
 export type PipelineScope = z.infer<typeof pipelineScopeSchema>;
 
@@ -230,6 +242,154 @@ export const funnelRowSchema = z.object({
 });
 export type FunnelRow = z.infer<typeof funnelRowSchema>;
 
+// --- Projects, tasks, task dependencies (Phase 3) -----------------------
+
+export const projectStatusSchema = z.enum(["active", "completed"]);
+export type ProjectStatus = z.infer<typeof projectStatusSchema>;
+
+const hexColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/, "color must be a 6-digit hex code (e.g. #1a2b3c)");
+
+export const projectSchema = z.object({
+  id: z.uuid(), name: z.string().min(1),
+  companyId: z.uuid().nullable(), dealId: z.uuid().nullable(), ownerUserId: z.uuid().nullable(),
+  status: projectStatusSchema,
+  startDate: z.iso.date().nullable(), dueDate: z.iso.date().nullable(),
+  color: hexColorSchema.nullable(),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type Project = z.infer<typeof projectSchema>;
+
+// status is deliberately absent here (defaults 'active' at creation, same as
+// deals always opening "open") -- no immovable fields to strip for update, so
+// updateProjectInputSchema is a plain .partial() with nothing omitted.
+export const createProjectInputSchema = z.object({
+  name: z.string().min(1),
+  companyId: z.uuid().nullable().optional(), dealId: z.uuid().nullable().optional(),
+  ownerUserId: z.uuid().nullable().optional(),
+  startDate: z.iso.date().nullable().optional(), dueDate: z.iso.date().nullable().optional(),
+  color: hexColorSchema.nullable().optional(),
+});
+export type CreateProjectInput = z.infer<typeof createProjectInputSchema>;
+export const updateProjectInputSchema = createProjectInputSchema.partial();
+export type UpdateProjectInput = z.infer<typeof updateProjectInputSchema>;
+
+export const taskTypeSchema = z.enum(["task", "call", "meeting", "email", "deadline"]);
+export type TaskType = z.infer<typeof taskTypeSchema>;
+export const taskStatusSchema = z.enum(["todo", "in_progress", "blocked", "done"]);
+export type TaskStatus = z.infer<typeof taskStatusSchema>;
+
+export const taskSchema = z.object({
+  id: z.uuid(), title: z.string().min(1), description: nullableString,
+  type: taskTypeSchema, status: taskStatusSchema,
+  assigneeUserId: z.uuid().nullable(),
+  startDate: z.iso.date().nullable(), dueDate: z.iso.date().nullable(),
+  completedAt: z.iso.datetime().nullable(),
+  progressPct: z.number().int().min(0).max(100).nullable(),
+  parentTaskId: z.uuid().nullable(), position: z.string().min(1),
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
+  projectId: z.uuid().nullable(),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type Task = z.infer<typeof taskSchema>;
+
+/**
+ * Mirrors the tasks_dates_paired DB CHECK: both null/omitted, or both present
+ * with startDate <= dueDate. Shared between create (an absent key just means
+ * "no dates yet") and update (an absent key means "leave this pair alone" --
+ * partial-update semantics, so it can only ever see one snapshot, never the
+ * row's persisted counterpart). A partial update may therefore only touch
+ * startDate/dueDate together, never just one -- a lone value can't be
+ * validated against a value this schema can't see.
+ */
+function taskDatesPaired(v: { startDate?: string | null; dueDate?: string | null }): boolean {
+  // Checked directly on v.startDate/v.dueDate (not via intermediate booleans)
+  // so TS actually narrows their type for the startDate <= dueDate comparison
+  // below -- narrowing doesn't propagate through a derived boolean variable.
+  if (v.startDate === undefined && v.dueDate === undefined) return true;
+  if (v.startDate === undefined || v.dueDate === undefined) return false;
+  if (v.startDate === null && v.dueDate === null) return true;
+  if (v.startDate !== null && v.dueDate !== null) return v.startDate <= v.dueDate;
+  return false;
+}
+
+const taskInputShape = z.object({
+  title: z.string().min(1),
+  description: nullableString.optional(),
+  type: taskTypeSchema.optional(),
+  assigneeUserId: z.uuid().nullable().optional(),
+  startDate: z.iso.date().nullable().optional(),
+  dueDate: z.iso.date().nullable().optional(),
+  progressPct: z.number().int().min(0).max(100).nullable().optional(),
+  parentTaskId: z.uuid().nullable().optional(),
+  companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
+  dealId: z.uuid().nullable().optional(), projectId: z.uuid().nullable().optional(),
+});
+
+// status/position/completedAt excluded from both: status changes go through
+// the dedicated setTaskStatus action (which stamps completedAt itself),
+// position through moveTaskOnBoard -- mirrors deals' pipelineId/stageId/
+// position exclusion from createDealInputSchema/updateDealInputSchema.
+export const createTaskInputSchema = taskInputShape.refine(taskDatesPaired, {
+  message: "startDate and dueDate must both be set (with startDate <= dueDate) or both omitted",
+});
+export type CreateTaskInput = z.infer<typeof createTaskInputSchema>;
+
+export const updateTaskInputSchema = taskInputShape.partial().refine(taskDatesPaired, {
+  message: "startDate and dueDate must both be provided together (with startDate <= dueDate), or neither",
+});
+export type UpdateTaskInput = z.infer<typeof updateTaskInputSchema>;
+
+// Column exists so SS/FF/SF become a CHECK (and enum) widening later, not a
+// migration -- only 'FS' is valid in Phase 3.
+export const taskDependencyTypeSchema = z.enum(["FS"]);
+export type TaskDependencyType = z.infer<typeof taskDependencyTypeSchema>;
+
+export const taskDependencySchema = z.object({
+  id: z.uuid(), predecessorId: z.uuid(), successorId: z.uuid(),
+  type: taskDependencyTypeSchema, createdAt: z.iso.datetime(),
+});
+export type TaskDependency = z.infer<typeof taskDependencySchema>;
+
+// The successor is named by the route (POST /api/tasks/:id/dependencies,
+// :id = successorId), so the body only needs the predecessor.
+export const createTaskDependencyInputSchema = z.object({ predecessorId: z.uuid() });
+export type CreateTaskDependencyInput = z.infer<typeof createTaskDependencyInputSchema>;
+
+// A shift always sets both dates (see scheduling.ts's shiftTask): a resize
+// changes one independently and a move shifts both by the same delta, but
+// either way the caller computes the resulting pair client-side and sends it
+// whole -- the service never needs to infer "which end moved."
+export const shiftTaskInputSchema = z
+  .object({ startDate: z.iso.date(), dueDate: z.iso.date() })
+  .refine((v) => v.startDate <= v.dueDate, { message: "startDate must be on or before dueDate" });
+export type ShiftTaskInput = z.infer<typeof shiftTaskInputSchema>;
+
+export const shiftResultSchema = z.object({
+  moved: z.array(z.object({
+    id: z.uuid(), startDate: z.iso.date(), dueDate: z.iso.date(),
+    // null for the dragged task itself; the id of the predecessor whose
+    // violation pushed this task for every other entry.
+    cascadedFrom: z.uuid().nullable(),
+  })),
+});
+export type ShiftResult = z.infer<typeof shiftResultSchema>;
+
+// Extends taskSchema with the project's name/color so the chart can group and
+// colour bars without a second round trip -- both null for a standalone task
+// (no projectId). Used for both the per-project and global Gantt (Task 5's
+// ganttPayload).
+export const ganttTaskSchema = taskSchema.extend({
+  projectName: z.string().min(1).nullable(),
+  projectColor: hexColorSchema.nullable(),
+});
+export type GanttTask = z.infer<typeof ganttTaskSchema>;
+
+export const ganttPayloadSchema = z.object({
+  tasks: z.array(ganttTaskSchema),
+  dependencies: z.array(taskDependencySchema),
+});
+export type GanttPayload = z.infer<typeof ganttPayloadSchema>;
+
 export const sseHintSchema = z.object({ keys: z.array(z.array(z.string())) });
 export type SseHint = z.infer<typeof sseHintSchema>;
 
@@ -259,5 +419,10 @@ export const searchResultsSchema = z.object({
     snippet: z.string(),
   })),
   deals: z.array(z.object({ id: z.uuid(), title: z.string() })),
+  // Stubbed empty pending the tasks table being queryable by the search
+  // service (Phase 3 plan Task 6 wires the real title-ILIKE query here,
+  // archived excluded, done included). The shared schema already requires
+  // this group so the response shape is final now -- mirrors P2.1's deals stub.
+  tasks: z.array(z.object({ id: z.uuid(), title: z.string(), projectId: z.uuid().nullable() })),
 });
 export type SearchResults = z.infer<typeof searchResultsSchema>;
