@@ -150,6 +150,11 @@ const boardKeyboardCoordinateGetter: KeyboardCoordinateGetter = (event, args) =>
   });
   let closestId = getFirstCollision(collisions, "id");
   if (closestId === over?.id && collisions.length > 1) closestId = collisions[1]?.id ?? null;
+  // eslint-disable-next-line no-console
+  console.log(
+    `[dbg coordGetter] code=${event.code} activeContainerId=${activeContainerId}`,
+    `filtered=${filteredContainers.length} closestId=${closestId} currentOver=${over?.id ?? null}`,
+  );
   if (closestId == null) return undefined;
 
   const newDroppable = droppableContainers.get(closestId);
@@ -270,6 +275,8 @@ export function BoardPage() {
     lastOverRef.current = event.over === null
       ? null
       : { id: String(event.over.id), data: event.over.data.current as DndData | undefined };
+    // eslint-disable-next-line no-console
+    console.log(`[dbg onDragOver] over=${event.over?.id ?? null}`);
   }
 
   // dnd-kit calls onDragCancel instead of onDragEnd when a drag is aborted
@@ -302,6 +309,11 @@ export function BoardPage() {
       ? null
       : { id: String(event.over.id), data: event.over.data.current as DndData | undefined });
     lastOverRef.current = null;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[dbg onDragEnd-top] active=${String(active.id)} over=${over?.id ?? null}`,
+      `viaLastOverRef=${viaLastOverRef} eventOverId=${eventOverId}`,
+    );
     if (over === null || active.id === over.id) return;
     const activeData = active.data.current as DndData | undefined;
     const overData = over.data;
