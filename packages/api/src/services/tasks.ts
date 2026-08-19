@@ -554,8 +554,12 @@ export async function addDependency(
 ): Promise<TaskDependency> {
   const predecessor = await mustGetTask(db, predecessorId);
   const successor = await mustGetTask(db, successorId);
-  if (predecessorId === successorId) throw new ConflictError("task", predecessorId);
-  if (predecessor.projectId !== successor.projectId) throw new ConflictError("task", successorId);
+  if (predecessorId === successorId) {
+    throw new ConflictError("task", predecessorId, "a task cannot depend on itself");
+  }
+  if (predecessor.projectId !== successor.projectId) {
+    throw new ConflictError("task", successorId, "tasks must belong to the same project to depend on each other");
+  }
 
   const dep = await db.transaction(async (tx) => {
     // Serialises check+insert per dependency graph: without this, two
@@ -598,7 +602,11 @@ export async function addDependency(
         .from(taskDependencies).where(inArray(taskDependencies.predecessorId, frontier));
       const next: string[] = [];
       for (const r of rows) {
-        if (r.successorId === predecessorId) throw new ConflictError("task", predecessorId);
+        if (r.successorId === predecessorId) {
+          throw new ConflictError(
+            "task", predecessorId, `adding this dependency would create a cycle (predecessor ${predecessorId})`,
+          );
+        }
         if (!visited.has(r.successorId)) {
           visited.add(r.successorId);
           next.push(r.successorId);
@@ -620,7 +628,7 @@ export async function addDependency(
       // (no further statements attempted on this transaction), so drizzle's
       // transaction wrapper rolls back cleanly even though the connection is
       // now in Postgres's aborted-transaction state.
-      if (isUniqueViolation(err)) throw new ConflictError("task", successorId);
+      if (isUniqueViolation(err)) throw new ConflictError("task", successorId, "this dependency already exists");
       throw err;
     }
 

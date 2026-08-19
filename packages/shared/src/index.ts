@@ -467,10 +467,9 @@ export const searchResultsSchema = z.object({
     snippet: z.string(),
   })),
   deals: z.array(z.object({ id: z.uuid(), title: z.string() })),
-  // Stubbed empty pending the tasks table being queryable by the search
-  // service (Phase 3 plan Task 6 wires the real title-ILIKE query here,
-  // archived excluded, done included). The shared schema already requires
-  // this group so the response shape is final now -- mirrors P2.1's deals stub.
+  // Title ILIKE, archived excluded, done included -- see services/search.ts's
+  // tasks-group query for why a done task still matters (finding finished
+  // work by name is a feature, mirroring the deals group's won-deal rule).
   tasks: z.array(z.object({ id: z.uuid(), title: z.string(), projectId: z.uuid().nullable() })),
 });
 export type SearchResults = z.infer<typeof searchResultsSchema>;

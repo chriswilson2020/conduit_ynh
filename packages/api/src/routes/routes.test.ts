@@ -1178,7 +1178,53 @@ describe("tasks routes", () => {
       payload: { predecessorId: taskB.id },
     });
     expect(cyclic.statusCode).toBe(409);
-    expect(errorResponseSchema.parse(cyclic.json()).error).toBe("conflict");
+    const cyclicBody = errorResponseSchema.parse(cyclic.json());
+    expect(cyclicBody.error).toBe("conflict");
+    expect(cyclicBody.message).toContain("cycle");
+    await a.close();
+  });
+
+  // Each addDependency rejection reason gets its own message now (P3.6
+  // review): the UI branches on more than just the 409 status/error code, so
+  // this pins the distinguishing substring for every one of the four cases,
+  // not just the generic ConflictError code assertion.
+  it("gives each dependency-add rejection its own distinguishing 409 message", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const taskA = await makeTask(a, { title: "A", projectId: project.id });
+    const taskB = await makeTask(a, { title: "B", projectId: project.id });
+    const standalone = await makeTask(a, { title: "Standalone" });
+
+    const selfRef = await a.inject({
+      method: "POST", url: `/api/tasks/${taskA.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskA.id },
+    });
+    expect(selfRef.statusCode).toBe(409);
+    const selfRefBody = errorResponseSchema.parse(selfRef.json());
+    expect(selfRefBody.error).toBe("conflict");
+    expect(selfRefBody.message).toContain("cannot depend on itself");
+
+    const crossProject = await a.inject({
+      method: "POST", url: `/api/tasks/${taskA.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: standalone.id },
+    });
+    expect(crossProject.statusCode).toBe(409);
+    const crossProjectBody = errorResponseSchema.parse(crossProject.json());
+    expect(crossProjectBody.error).toBe("conflict");
+    expect(crossProjectBody.message).toContain("must belong to the same project");
+
+    await a.inject({
+      method: "POST", url: `/api/tasks/${taskB.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskA.id },
+    });
+    const duplicate = await a.inject({
+      method: "POST", url: `/api/tasks/${taskB.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskA.id },
+    });
+    expect(duplicate.statusCode).toBe(409);
+    const duplicateBody = errorResponseSchema.parse(duplicate.json());
+    expect(duplicateBody.error).toBe("conflict");
+    expect(duplicateBody.message).toContain("already exists");
     await a.close();
   });
 
