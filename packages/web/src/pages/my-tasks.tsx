@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { Task } from "@conduit/shared";
 import { useMe, useMyTasks, useProjects, useSetTaskStatus } from "../queries";
@@ -68,23 +68,39 @@ export function MyTasksPage() {
   const { data: projects = [] } = useProjects();
   const setTaskStatus = useSetTaskStatus();
 
+  const [bannerError, setBannerError] = useState<string | null>(null);
+
   const projectNameById = useMemo(() => new Map(projects.map((p) => [p.id, p.name])), [projects]);
   const groups = useMemo(() => groupTasks(tasks, todayLocalIso()), [tasks]);
 
+  // replace: true -- same reasoning as task-board.tsx's openTask/closeTask:
+  // this stays on /my-tasks and only flips the ?task= param, so a pushed
+  // history entry per open/close would make Back reopen/reclose the drawer
+  // instead of leaving the page.
   function openTask(id: string) {
-    void navigate({ to: "/my-tasks", search: (prev) => ({ ...prev, task: id }) });
+    void navigate({ to: "/my-tasks", search: (prev) => ({ ...prev, task: id }), replace: true });
   }
   function closeTask() {
-    void navigate({ to: "/my-tasks", search: (prev) => ({ ...prev, task: undefined }) });
+    void navigate({ to: "/my-tasks", search: (prev) => ({ ...prev, task: undefined }), replace: true });
   }
 
   // Checking marks a task done; unchecking reopens it to "todo" -- My Tasks
   // has no record of whatever status a task held before it was completed
   // (setTaskStatus's own completedAt pairing means that state isn't even
   // preserved server-side), so "todo" is the least-surprising landing spot,
-  // same as a fresh task's own default status.
+  // same as a fresh task's own default status. onError mirrors the task
+  // drawer's reportError: without it, a failed mutation just reverts the
+  // checkbox (TanStack Query re-rendering from the un-mutated cache) with no
+  // indication anything went wrong.
   function toggleDone(task: Task, checked: boolean) {
-    setTaskStatus.mutate({ id: task.id, status: checked ? "done" : "todo" });
+    setTaskStatus.mutate(
+      { id: task.id, status: checked ? "done" : "todo" },
+      {
+        onError: (err) => {
+          setBannerError(err instanceof Error ? err.message : String(err));
+        },
+      },
+    );
   }
 
   if (isLoading) return <p>Loading...</p>;
@@ -92,6 +108,17 @@ export function MyTasksPage() {
   return (
     <div data-testid="my-tasks" className="flex flex-col gap-6">
       <h1 className="text-xl font-semibold text-slate-900">My Tasks</h1>
+      {bannerError && (
+        <div
+          role="alert"
+          className="flex items-center justify-between rounded-md border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700"
+        >
+          <span>{bannerError}</span>
+          <button type="button" onClick={() => setBannerError(null)} className="ml-4 shrink-0 text-red-500 hover:text-red-700">
+            Dismiss
+          </button>
+        </div>
+      )}
       {groups.map((group) =>
         group.key === "done" ? (
           <DoneGroup

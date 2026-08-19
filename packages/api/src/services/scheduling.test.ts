@@ -195,7 +195,12 @@ describe("shiftTask: SSE invalidation hints", () => {
     const hints: string[][][] = [];
     const unsub = subscribe((hint) => hints.push(hint.keys));
     try {
-      await shiftTask(handle.db, actorId, a.id, { startDate: "2026-01-08", dueDate: "2026-01-12" });
+      const result = await shiftTask(handle.db, actorId, a.id, { startDate: "2026-01-08", dueDate: "2026-01-12" });
+      // The drag cascaded onto B too (its startDate no longer clears A's new
+      // dueDate) -- both ids must actually be in the result for the
+      // per-task-key assertion below to mean anything.
+      expect(result.moved.map((m) => m.id).sort()).toEqual([a.id, b.id].sort());
+
       const flat = (hints[hints.length - 1] ?? []).map((k) => k.join(":"));
       expect(flat).toContain(`tasks:${project.id}`);
       expect(flat).toContain("gantt");
@@ -203,6 +208,11 @@ describe("shiftTask: SSE invalidation hints", () => {
       expect(flat).toContain(`my-tasks:${actorId}`);
       expect(flat).toContain(`my-tasks:${other}`);
       expect(flat).not.toContain("search");
+      // A ["task", id] per moved task -- mirrors publishTaskHint's own key
+      // (tasks.ts), so a task drawer open on a cascaded task (not just the
+      // dragged one) also picks up its shifted dates live.
+      expect(flat).toContain(`task:${a.id}`);
+      expect(flat).toContain(`task:${b.id}`);
     } finally {
       unsub();
     }

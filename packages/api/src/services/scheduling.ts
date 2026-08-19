@@ -301,6 +301,15 @@ export async function shiftTask(
   publish({
     keys: [
       ["tasks", projectId ?? "standalone"], ["gantt"], ["events"],
+      // One ["task", id] per moved task (the dragged task plus every
+      // cascaded successor) -- mirrors publishTaskHint's own ["task", id]
+      // entry in tasks.ts, so a task drawer open on any task this cascade
+      // touches (not just the one actually dragged) picks up its new dates
+      // live instead of only refreshing on next visit. Bounded by the
+      // cascade's own size (a real dependency graph is tiny, same bound
+      // addDependency's cycle BFS already assumes), and the SSE client
+      // coalesces a burst of keys from one publish into one refetch each.
+      ...result.moved.map((m) => ["task", m.id]),
       ...assigneeIds.map((a) => ["my-tasks", a]),
     ],
   });

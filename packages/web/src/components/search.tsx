@@ -111,7 +111,12 @@ export function GlobalSearch() {
       // A project task opens straight into its board's drawer; a standalone
       // task (no projectId) has no board to land on, so it opens via My
       // Tasks instead -- both routes read the same `?task=<id>` deep-link
-      // param (Task 8's task-board.tsx / my-tasks.tsx).
+      // param (Task 8's task-board.tsx / my-tasks.tsx). Deliberately a plain
+      // push (no `replace`), unlike those two pages' own openTask/closeTask:
+      // this navigation lands on a DIFFERENT route than wherever search was
+      // invoked from, so it's a real navigation Back should undo -- only a
+      // same-route ?task= toggle (the drawer opening/closing without
+      // otherwise leaving the page) gets replace: true.
       if (entry.projectId !== null) {
         void navigate({ to: "/projects/$projectId/board", params: { projectId: entry.projectId }, search: { task: entry.id } });
       } else {

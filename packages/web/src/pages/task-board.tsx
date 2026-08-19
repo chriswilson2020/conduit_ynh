@@ -43,11 +43,21 @@ export function TaskBoardPage() {
   const { data: users = [] } = useUsers();
   const boardMoveTask = useBoardMoveTask();
 
+  // replace: true -- these two stay on THIS route and only flip the ?task=
+  // param, so pushing a history entry per open/close would mean Back doesn't
+  // leave the board, it just reopens/recloses the drawer. Contrast with
+  // search.tsx's task-result navigation, which lands on a DIFFERENT route
+  // (this board, or My Tasks) and deliberately stays a push -- that one's a
+  // real navigation a user expects Back to undo.
   function openTask(id: string) {
-    void navigate({ to: "/projects/$projectId/board", params: { projectId }, search: (prev) => ({ ...prev, task: id }) });
+    void navigate({
+      to: "/projects/$projectId/board", params: { projectId }, search: (prev) => ({ ...prev, task: id }), replace: true,
+    });
   }
   function closeTask() {
-    void navigate({ to: "/projects/$projectId/board", params: { projectId }, search: (prev) => ({ ...prev, task: undefined }) });
+    void navigate({
+      to: "/projects/$projectId/board", params: { projectId }, search: (prev) => ({ ...prev, task: undefined }), replace: true,
+    });
   }
 
   const userInitials = useMemo(
