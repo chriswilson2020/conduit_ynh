@@ -253,8 +253,12 @@ With their likely landing, agreed in the brainstorm:
 
 - **Folders beyond INBOX + Sent** — expected first real-usage gap (sieve-filed mail will not
   sync). v0.5.x point release once the inbox has seen real use.
-- **OAuth/XOAUTH2 providers (Gmail, O365)** — v0.5.x, the day someone actually connects one;
-  self-contained as a new auth mode on `mail_accounts`.
+- **External providers** (revised 19 Aug after discussion with Chris) — still YAGNI-gated on a
+  real mailbox needing connection, but split by vendor: **Microsoft 365 goes straight to the
+  Graph API** (delta-query sync + `sendMail`; a second sync driver behind a `provider`
+  discriminator on `mail_accounts` — its own small phase, not a point release) because
+  Microsoft is retiring SMTP AUTH and IMAP is the legacy door there; **Gmail stays
+  IMAP+XOAUTH2** (Google keeps IMAP healthy; that path is a v0.5.x-sized auth mode).
 - **Subject-fallback threading** — only if broken threads are observed in practice (senders
   that strip References); v0.5.x fix on evidence.
 - **Merging mail into the events timeline** — Phase 6 (Polish); the Mail tab covers the need
