@@ -296,6 +296,9 @@ export interface SyntheticMessageIdInput {
   /** mailparser's raw header lines ({key: lowercased name, line: the whole
    * unparsed line}); the Date entry is what dateMaterial hashes. */
   headerLines?: ReadonlyArray<{ key: string; line: string }> | undefined;
+  /** mailparser's parsed attachments; only their count, filenames and sizes
+   * are hashed (see attachmentMaterial), never their bytes. */
+  attachments?: ReadonlyArray<{ filename?: string | undefined; size?: number | undefined }> | undefined;
 }
 
 // Length-prefixed rather than separator-joined: a fixed separator (even an
@@ -338,20 +341,42 @@ function dateMaterial(parsed: SyntheticMessageIdInput): string {
 }
 
 /**
+ * Attachment fingerprint folded into the hash: the count, then each
+ * attachment's filename and byte size, in order. Without it, two messages
+ * identical in from/date/subject/body but differing only in what is
+ * attached (the "here is the invoice" / "here is the corrected invoice"
+ * pair, or the same body sent twice with different files) collapse to one
+ * synthetic id and the second is silently swallowed by the duplicate
+ * guard. The BYTES are deliberately not hashed -- filename plus size is
+ * enough to separate real messages, and hashing multi-megabyte payloads on
+ * every ingest is not.
+ */
+function attachmentMaterial(parsed: SyntheticMessageIdInput): string {
+  const attachments = parsed.attachments ?? [];
+  const parts = [String(attachments.length)];
+  for (const attachment of attachments) {
+    parts.push(attachment.filename ?? "", String(attachment.size ?? 0));
+  }
+  return parts.map(lengthPrefixed).join("");
+}
+
+/**
  * A stable id for messages that arrive with no RFC 5322 Message-ID (some
  * senders omit it). Hashes from_addr + the date material (see dateMaterial)
- * + subject + the first 1k chars of body_text, each length-prefixed (see
- * lengthPrefixed) so the fields can never be re-split a different way and
- * collide. Pure function of the parsed fields, so re-ingesting the same raw
- * message (a UIDVALIDITY refetch) reproduces the same id and UNIQUE
- * (account_id, message_id) converges instead of duplicating.
+ * + subject + the first 1k chars of body_text + the attachment fingerprint
+ * (see attachmentMaterial), each length-prefixed (see lengthPrefixed) so the
+ * fields can never be re-split a different way and collide. Pure function of
+ * the parsed fields, so re-ingesting the same raw message (a UIDVALIDITY
+ * refetch) reproduces the same id and UNIQUE (account_id, message_id)
+ * converges instead of duplicating.
  */
 export function syntheticMessageId(parsed: SyntheticMessageIdInput): string {
   const fromAddr = (parsed.from?.value[0]?.address ?? "").toLowerCase();
   const sentAt = dateMaterial(parsed);
   const subject = parsed.subject ?? "";
   const bodyText = (parsed.text ?? "").slice(0, 1000);
-  const material = [fromAddr, sentAt, subject, bodyText].map(lengthPrefixed).join("");
+  const material = [fromAddr, sentAt, subject, bodyText].map(lengthPrefixed).join("")
+    + attachmentMaterial(parsed);
   return `sha256:${createHash("sha256").update(material, "utf8").digest("hex")}`;
 }
 

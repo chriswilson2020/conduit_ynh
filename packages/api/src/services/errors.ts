@@ -62,3 +62,43 @@ export class MailCredentialDecryptError extends Error {
 // assertable instead of a generic Error. Not mapped by mapDomainError: it is
 // not expected to ever reach a route handler.
 export class IncompleteTestConnectionSettingsError extends Error {}
+
+// Every failure escaping mail-ingest.ts's ingestMessage, wrapped with the
+// context the sync loop needs to act on it: which account, which folder,
+// which UID. Task 5's poison-message contract depends on this -- a message
+// that fails twice has its UID skipped and a truncated note written to
+// last_error, so one unparseable or oversized message can never wedge a
+// mailbox behind a cursor that will not advance. The original failure stays
+// reachable on `cause` (a NotFoundError for an unknown account, a driver
+// error, a parse failure) for callers that want to branch on it.
+//
+// `reason` is truncated because it lands in mail_accounts.last_error, which
+// is rendered in the settings UI: a driver error quoting a megabyte of
+// offending SQL parameters must not become a megabyte row.
+export class MailIngestError extends Error {
+  readonly accountId: string;
+  readonly folder: string;
+  readonly uid: number | null;
+  /** The underlying failure's message, truncated to MAX_REASON_LENGTH. */
+  readonly reason: string;
+
+  static readonly MAX_REASON_LENGTH = 200;
+
+  constructor(
+    context: { accountId: string; folder: string; uid: number | null },
+    reason: string,
+    options?: { cause?: unknown },
+  ) {
+    const truncated = reason.length > MailIngestError.MAX_REASON_LENGTH
+      ? `${reason.slice(0, MailIngestError.MAX_REASON_LENGTH)}...`
+      : reason;
+    super(
+      `mail ingest failed for account ${context.accountId} ${context.folder}/${context.uid ?? "no-uid"}: ${truncated}`,
+      options,
+    );
+    this.accountId = context.accountId;
+    this.folder = context.folder;
+    this.uid = context.uid;
+    this.reason = truncated;
+  }
+}

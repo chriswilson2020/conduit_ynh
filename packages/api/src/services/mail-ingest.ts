@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { simpleParser, type Attachment, type ParsedMail } from "mailparser";
@@ -8,7 +8,7 @@ import {
   type MailMessageRow,
 } from "../db/schema.js";
 import { saveBlob } from "./blobs.js";
-import { NotFoundError } from "./errors.js";
+import { MailIngestError, NotFoundError } from "./errors.js";
 import {
   extractAddresses, htmlToText, makeSnippet, normalizeSubject, sanitizeMailHtml, syntheticMessageId,
 } from "./mail-content.js";
@@ -35,15 +35,25 @@ import { publish } from "./sse.js";
  * serialises its own account in-process); this is the one place mail needs
  * one.
  *
- * A single constant group, deliberately: mail volume is low (a busy
- * mailbox is a few messages a second at worst, and each transaction here
- * is a handful of indexed statements), so global serialisation costs
- * nothing worth optimising, whereas a finer-grained key would have to be
- * derived from the very thread identity this section is still resolving --
- * exactly the thing that is not known yet. Reuses lockSiblingGroup's
+ * A single constant group, deliberately: a finer-grained key would have to
+ * be derived from the very thread identity this section is still resolving
+ * -- exactly the thing that is not known yet. Reuses lockSiblingGroup's
  * pg_advisory_xact_lock + hashtextextended mechanism (pipelines.ts) rather
  * than inventing a second advisory-lock convention; the key namespace is
  * disjoint from the "stages:..." sibling groups it was written for.
+ *
+ * What the lock actually spans, so the cost is not misread as trivial: two
+ * or three indexed SELECTs (duplicate guard, ancestor lookup, contact
+ * match), one blob write per attachment (filesystem I/O, unbounded in
+ * count until MAX_ATTACHMENTS), a full sanitize-html parse of the body,
+ * and the inserts/updates. Attachment I/O and sanitizing are the slow
+ * parts, and at mail volumes -- a busy mailbox is a few messages a second
+ * -- serialising them globally is still the right trade for getting one
+ * conversation into one thread. If that ever stops being true, the fix is
+ * to hoist parsing, blob writes and sanitizing ABOVE the transaction and
+ * lock only from thread resolution onward; the property to preserve when
+ * doing so is that the duplicate guard still runs before any blob is
+ * written, so a refetch does not rewrite every attachment in the mailbox.
  *
  * Exported because ingest is not the only writer that resolves or creates
  * threads: mail-send (Task 6) inserts outbound messages and can start a
@@ -87,6 +97,14 @@ const messageColumns = {
 /** A mail_messages row minus the generated `search` column (see messageColumns). */
 export type IngestedMessage = Omit<MailMessageRow, "search">;
 
+/** The four thread link columns, as mail-send's compose dialog supplies them. */
+export interface IngestMessageLinks {
+  companyId?: string | null;
+  contactId?: string | null;
+  dealId?: string | null;
+  projectId?: string | null;
+}
+
 export interface IngestMessageInput {
   accountId: string;
   /** IMAP folder this sighting came from (INBOX, the account's sent_folder, ...). */
@@ -96,6 +114,24 @@ export interface IngestMessageInput {
   raw: Buffer | string;
   /** IMAP flags as fetched, e.g. ["\\Seen", "\\Answered"]. */
   flags: string[];
+  /**
+   * Thread this message onto an existing thread instead of resolving one
+   * from its headers -- mail-send (Task 6) replying into a known thread,
+   * where the CRM's own thread identity beats whatever the outgoing
+   * References chain would resolve to. Validated to exist; short-circuits
+   * thread resolution entirely.
+   */
+  threadId?: string;
+  /**
+   * Record links to stamp on a thread this call CREATES (mail-send's
+   * compose dialog opened from a contact/company/deal/project page).
+   * Ignored when the message joins an existing thread -- that thread's
+   * links are already whatever auto-linking or a human made them, and a
+   * compose seed must not rewrite them. A contactId here also suppresses
+   * auto-linking, by the same "already linked, leave it alone" rule that
+   * protects manual links.
+   */
+  links?: IngestMessageLinks;
 }
 
 export interface IngestResult {
@@ -103,6 +139,65 @@ export interface IngestResult {
   created: boolean;
   message: IngestedMessage;
   threadId: string;
+}
+
+// --- Caps on attacker-controlled fields ------------------------------------
+//
+// Everything ingest stores comes off the wire, so every stored field needs a
+// bound; without them a single crafted message is a stored-data bomb. Two
+// hard limits sit behind these numbers. mail_messages.search is a generated
+// tsvector over subject + body_text + from_addr + from_name, and Postgres
+// refuses a tsvector over 1MB -- the INSERT itself fails, so an uncapped
+// body wedges the message permanently (measured: ~850KB of subject+body is
+// already enough). And message_id is indexed by a btree, whose per-row limit
+// is about 2704 bytes -- a 3000-byte Message-ID makes the INSERT fail on the
+// index, not the column. The caps below sum to roughly 262KB of tsvector
+// input, comfortably clear of both.
+//
+// Truncation is deterministic (a pure function of the bytes), so a refetch
+// of the same message produces the same stored values and the duplicate
+// guard still converges.
+const MAX_BODY_TEXT_BYTES = 256 * 1024;
+const MAX_SUBJECT_BYTES = 4 * 1024;
+// RFC 5322's line-length limit: no legitimate display name or address is
+// longer, and both feed the tsvector.
+const MAX_HEADER_FIELD_BYTES = 998;
+// Past this a Message-ID is hashed rather than truncated -- see
+// normalizeMessageId. Same 998-byte reasoning; the btree limit is the hard
+// constraint underneath it.
+const MAX_MESSAGE_ID_BYTES = 998;
+// Bound on both the stored to/cc address arrays and the participant list
+// auto-linking scans. A 1MiB To: header parses into ~100k addresses: as a
+// jsonb column that is a permanent multi-megabyte row per message, and as a
+// participant list it is 100k bind parameters (past the driver's 65535
+// ceiling) plus a scan that runs inside the global ingest lock. No real
+// message addresses 200 people directly.
+const MAX_PARTICIPANTS = 200;
+// Attachments are streamed to blob storage and never rewritten, so an
+// unbounded message is unbounded disk. 50MB matches the deliberate-upload
+// limit in routes/index.ts; 50 attachments is far past any real message.
+// Both are skip-and-continue, not reject: the MESSAGE still ingests (its
+// text is the part the CRM cares about), minus the offending parts.
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const MAX_ATTACHMENTS = 50;
+// Guard before simpleParser, which is where pathological input actually
+// hurts: a 1MiB To: header took over 8 minutes to parse (measured), all of
+// it inside the sync loop. Anything this large is not mail worth having, and
+// Task 5's poison-message contract handles the resulting MailIngestError by
+// skipping the UID after a retry.
+const MAX_RAW_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Truncate to a UTF-8 byte budget without splitting a character. The
+ * TextDecoder is given the slice in streaming mode precisely so a partial
+ * trailing sequence is HELD BACK rather than replaced with U+FFFD -- which
+ * would otherwise corrupt the last character and, worse, do it differently
+ * depending on where the byte boundary fell.
+ */
+function capUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const slice = Buffer.from(value, "utf8").subarray(0, maxBytes);
+  return new TextDecoder("utf-8").decode(slice, { stream: true });
 }
 
 /** RFC 5322 ids arrive wrapped in angle brackets; everything here stores and
@@ -121,17 +216,40 @@ function normalizeId(value: string | undefined): string | null {
   return bare.length > 0 ? bare : null;
 }
 
+/**
+ * A Message-ID as stored and compared. One past MAX_MESSAGE_ID_BYTES is
+ * replaced by a hash of the WHOLE id rather than truncated: truncation maps
+ * every long id sharing a prefix onto one stored value, silently merging
+ * distinct messages into one row and one thread -- exactly the failure
+ * threading exists to avoid. A hash keeps them apart, and being a pure
+ * function of the full id it still reproduces the same value on every
+ * refetch. The "sha256:" shape matches syntheticMessageId's on purpose:
+ * both mean "this id is derived, not the literal header".
+ *
+ * Applied to in_reply_to and every References entry too, not just the
+ * message's own id -- an ancestor stored under its hashed id is only
+ * findable if the walk hashes the same way.
+ */
+function normalizeMessageId(value: string | undefined): string | null {
+  const id = normalizeId(value);
+  if (id === null) return null;
+  if (Buffer.byteLength(id, "utf8") <= MAX_MESSAGE_ID_BYTES) return id;
+  return `sha256:${createHash("sha256").update(id, "utf8").digest("hex")}`;
+}
+
 // Hard cap on how much of a References header is kept, in the same spirit
 // as normalizeSubject's 1000-char cap: this is attacker-controlled input.
 // Uncapped, every id becomes a bind parameter in resolveThreadId's ancestor
 // lookup and a member of its dedupe scan (which is quadratic in the list
 // length), so one crafted message could stall the event loop and its folder
 // cursor with it -- and under Task 5's sync loop a message that always
-// stalls or throws flips the whole account to status=error. Measured
-// against mailparser 3.7: a 40k-id header (1MB) is delivered in full, while
-// one around 1.5MB is dropped entirely, so tens of thousands of ids is the
-// realistic worst case reaching this function -- under the driver's 65535
-// parameter ceiling, but nowhere near a query worth issuing.
+// stalls or throws flips the whole account to status=error.
+//
+// Measured against mailparser 3.9.15: a header is dropped entirely at
+// exactly 1 MiB, and below that the id COUNT is bounded only by those bytes
+// -- 100,000 short ids were delivered in one header. So the parser is no
+// protection here: a short-id header can carry well past the driver's 65535
+// bind-parameter ceiling, and this cap is what makes the lookup safe.
 //
 // The LAST 50 are kept because the walk is right-to-left: the nearest
 // ancestors, the only ones threading actually consults, live at the end. A
@@ -140,14 +258,15 @@ function normalizeId(value: string | undefined): string | null {
 const MAX_REFERENCES = 50;
 
 /** mailparser gives `references` as a string for a single id and an array for
- * several; normalise to a bare-id array, order preserved (oldest first), and
- * capped to the newest MAX_REFERENCES entries. */
+ * several; normalise to a bare-id array (oversized ids hashed, see
+ * normalizeMessageId), order preserved (oldest first), capped to the newest
+ * MAX_REFERENCES entries. */
 function normalizeReferences(value: string | string[] | undefined): string[] {
   if (value === undefined) return [];
   const list = Array.isArray(value) ? value : [value];
   const out: string[] = [];
   for (const entry of list) {
-    const id = normalizeId(entry);
+    const id = normalizeMessageId(entry);
     if (id !== null) out.push(id);
   }
   return out.slice(-MAX_REFERENCES);
@@ -186,10 +305,30 @@ interface PreparedAttachment {
  * matches this codebase's archive-not-delete posture, and the alternative
  * risks deleting a blob another row legitimately shares.
  */
-async function prepareAttachments(dataDir: string, parsed: ParsedMail): Promise<PreparedAttachment[]> {
+async function prepareAttachments(
+  dataDir: string, parsed: ParsedMail, context: { accountId: string; folder: string; uid: number | null },
+): Promise<PreparedAttachment[]> {
   const prepared: PreparedAttachment[] = [];
   for (const attachment of parsed.attachments) {
     const content: Buffer = attachment.content;
+    // Both guards SKIP the part and keep ingesting the message: the body
+    // text is what the CRM is really after, and dropping a whole
+    // conversation because one part is absurd is the worse failure. Logged
+    // (not silent) so an operator can see why a chip is missing.
+    if (prepared.length >= MAX_ATTACHMENTS) {
+      console.warn(
+        "mail-ingest: attachment limit reached, skipping the rest",
+        { ...context, limit: MAX_ATTACHMENTS, filename: attachmentFilename(attachment) },
+      );
+      break;
+    }
+    if (content.length > MAX_ATTACHMENT_BYTES) {
+      console.warn(
+        "mail-ingest: attachment exceeds the size limit, skipping it",
+        { ...context, limit: MAX_ATTACHMENT_BYTES, bytes: content.length, filename: attachmentFilename(attachment) },
+      );
+      continue;
+    }
     // Readable.from does NOT iterate a Buffer byte by byte (documented
     // special case), so this streams the payload as a single chunk.
     const { sha256, sizeBytes } = await saveBlob(dataDir, Readable.from(content));
@@ -356,10 +495,55 @@ async function autoLinkThread(tx: Database, threadId: string, participants: stri
  * callers (Task 5's AccountSync, which holds a possibly-stale account row
  * in memory for the lifetime of its loop) from feeding in an address the
  * user has since changed.
+ *
+ * This is the ONLY writer of mail_messages/mail_threads/mail_attachments,
+ * by design -- mail-send (Task 6) does not grow its own insert path, it
+ * calls this function after SMTP and the IMAP APPEND have succeeded, with
+ * folder = the account's sent_folder, the raw MIME it just sent, flags
+ * ["\\Seen"], `threadId` when replying and `links` when the compose dialog
+ * seeded a record. Everything that makes the row correct (direction,
+ * threading, dedupe against the Sent-folder sighting that arrives later,
+ * auto-linking, the SSE hint) then happens in exactly one place. None of
+ * the internals are exported to support that: a second writer reproducing
+ * half of this is how the invariants rot.
+ *
+ * Every failure escapes as MailIngestError, carrying account/folder/uid and
+ * the original on `cause` (see errors.ts) -- Task 5's poison-message
+ * contract is written against that type.
  */
 export async function ingestMessage(
   db: Database, dataDir: string, input: IngestMessageInput,
 ): Promise<IngestResult> {
+  try {
+    return await ingestParsedMessage(db, dataDir, input);
+  } catch (error) {
+    // One typed error out of this function, carrying the coordinates Task
+    // 5's poison-message contract needs (account, folder, uid). The
+    // original is preserved on `cause` -- nothing here decides that a
+    // failure is fatal, it only makes it actionable.
+    if (error instanceof MailIngestError) throw error;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new MailIngestError(
+      { accountId: input.accountId, folder: input.folder, uid: input.uid },
+      reason,
+      { cause: error },
+    );
+  }
+}
+
+async function ingestParsedMessage(
+  db: Database, dataDir: string, input: IngestMessageInput,
+): Promise<IngestResult> {
+  const context = { accountId: input.accountId, folder: input.folder, uid: input.uid };
+  // Size guard BEFORE simpleParser, which is where pathological input
+  // actually bites: a 1MiB To: header measured over 8 minutes of parsing,
+  // all of it blocking the sync loop. Task 5 treats the resulting
+  // MailIngestError as a poison message and skips the UID.
+  const rawBytes = typeof input.raw === "string" ? Buffer.byteLength(input.raw, "utf8") : input.raw.length;
+  if (rawBytes > MAX_RAW_BYTES) {
+    throw new MailIngestError(context, `raw message of ${rawBytes} bytes exceeds the ${MAX_RAW_BYTES}-byte limit`);
+  }
+
   // Parsed BEFORE the transaction opens: parsing touches no database state
   // and can be slow for a large multipart message, and every millisecond
   // inside the transaction is a millisecond the global ingest lock is held
@@ -373,8 +557,8 @@ export async function ingestMessage(
   const parsed = await simpleParser(input.raw, { skipImageLinks: true });
 
   const addresses = extractAddresses(parsed);
-  const messageId = normalizeId(parsed.messageId) ?? syntheticMessageId(parsed);
-  const inReplyTo = normalizeId(parsed.inReplyTo);
+  const messageId = normalizeMessageId(parsed.messageId) ?? syntheticMessageId(parsed);
+  const inReplyTo = normalizeMessageId(parsed.inReplyTo);
   const references = normalizeReferences(parsed.references);
   const seen = hasSeenFlag(input.flags);
   const rawSubject = parsed.subject ?? "";
@@ -386,26 +570,35 @@ export async function ingestMessage(
   const sentAt = parsed.date ?? new Date();
 
   const result = await db.transaction(async (tx) => {
-    // Taken as the transaction's first statement -- ahead of the duplicate
-    // guard, not merely around thread-resolution+insert -- so the guard's
-    // SELECT and this transaction's INSERT are atomic with respect to
-    // every other ingest too. That way a same-account double sighting
-    // (which AccountSync's in-process serialisation should already
-    // prevent) still takes the clean duplicate path instead of colliding
-    // on the UNIQUE constraint. The cost is that a whole-folder refetch
-    // serialises against other accounts' ingests, which at mail volumes is
-    // nothing next to getting one conversation into one thread.
-    await lockSiblingGroup(tx, INGEST_LOCK_KEY);
-
-    const [account] = await tx.select({ id: mailAccounts.id, email: mailAccounts.email })
-      .from(mailAccounts).where(eq(mailAccounts.id, input.accountId));
+    // Read BEFORE the lock: an unknown account is the one failure that
+    // needs no serialisation at all, and making it wait behind every other
+    // account's ingest just to be told the row is gone is pure contention.
+    const [account] = await tx.select({
+      id: mailAccounts.id, email: mailAccounts.email, sentFolder: mailAccounts.sentFolder,
+    }).from(mailAccounts).where(eq(mailAccounts.id, input.accountId));
     if (account === undefined) throw new NotFoundError("mail account", input.accountId);
+
+    // Taken ahead of the duplicate guard, not merely around
+    // thread-resolution+insert -- so the guard's SELECT and this
+    // transaction's INSERT are atomic with respect to every other ingest
+    // too. That way a same-account double sighting (which AccountSync's
+    // in-process serialisation should already prevent) still takes the
+    // clean duplicate path instead of colliding on the UNIQUE constraint.
+    // The cost is that a whole-folder refetch serialises against other
+    // accounts' ingests, which at mail volumes is nothing next to getting
+    // one conversation into one thread.
+    await lockSiblingGroup(tx, INGEST_LOCK_KEY);
 
     // --- Duplicate guard -------------------------------------------------
     // A refetch (UIDVALIDITY reset) or a second-folder sighting must update
     // only where the message was last seen and whether it is read -- never
     // duplicate the row, re-thread it, re-store its attachments or re-run
     // auto-linking. Everything below this block is new-message-only work.
+    // folder/imap_uid therefore mean "where this message was last seen",
+    // not "every folder it is in": a message copied across folders makes
+    // them churn as each folder's pass sees it. That is by design, and
+    // bounded -- each folder is walked once per pass by Task 5's cursors,
+    // so the churn is per-pass, not a loop.
     const [existing] = await tx.select(messageColumns).from(mailMessages)
       .where(and(eq(mailMessages.accountId, input.accountId), eq(mailMessages.messageId, messageId)));
     if (existing !== undefined) {
@@ -421,20 +614,38 @@ export async function ingestMessage(
     }
 
     // --- Thread resolution ----------------------------------------------
-    let threadId = await resolveThreadId(tx, messageId, references, inReplyTo);
+    // An explicit threadId (mail-send replying) wins over the header walk:
+    // the CRM already knows which conversation this belongs to. Validated
+    // rather than trusted -- a stale thread id would otherwise violate the
+    // FK at insert time with a far less useful error.
+    let threadId: string | null;
+    if (input.threadId !== undefined) {
+      const [thread] = await tx.select({ id: mailThreads.id })
+        .from(mailThreads).where(eq(mailThreads.id, input.threadId));
+      if (thread === undefined) throw new NotFoundError("mail thread", input.threadId);
+      threadId = thread.id;
+    } else {
+      threadId = await resolveThreadId(tx, messageId, references, inReplyTo);
+    }
     if (threadId === null) {
       const [thread] = await tx.insert(mailThreads).values({
         // Normalized once, from the first message of the thread (spec):
         // later "Re:" replies never rewrite it.
         subject: normalizeSubject(rawSubject),
         lastMessageAt: sentAt,
+        // Compose-dialog seeds, applied only here -- on a thread this call
+        // creates. Joining an existing thread never rewrites its links.
+        companyId: input.links?.companyId ?? null,
+        contactId: input.links?.contactId ?? null,
+        dealId: input.links?.dealId ?? null,
+        projectId: input.links?.projectId ?? null,
       }).returning({ id: mailThreads.id });
       if (thread === undefined) throw new Error("mail thread insert returned no row");
       threadId = thread.id;
     }
 
     // --- Attachments, then HTML ------------------------------------------
-    const attachments = await prepareAttachments(dataDir, parsed);
+    const attachments = await prepareAttachments(dataDir, parsed, context);
     const cidMap: Record<string, string> = {};
     for (const attachment of attachments) {
       if (attachment.contentId !== null) cidMap[attachment.contentId] = attachment.id;
@@ -445,19 +656,30 @@ export async function ingestMessage(
     // text/html message, or the html half of a multipart/alternative. It
     // does NOT when the body is an html part inside a multipart/related or
     // multipart/mixed, i.e. every html mail carrying an inline image or an
-    // attachment (probed against mailparser 3.7), and there `text` is
+    // attachment (probed against mailparser 3.9.15), and there `text` is
     // undefined. This fallback covers that very common shape, deriving the
     // text from the already-SANITIZED html (htmlToText's documented
     // precondition -- it does no safety filtering of its own) so body_text,
     // and therefore the search tsvector and the snippet, stay useful
     // instead of empty.
-    const bodyText = parsed.text ?? (bodyHtml !== null ? htmlToText(bodyHtml) : "");
+    //
+    // Blank counts as absent, not just undefined: the standard newsletter
+    // shape is a multipart/alternative whose text/plain half is empty or a
+    // stub of whitespace, and treating that as real text would leave the
+    // message unsearchable with an empty snippet.
+    const parsedText = parsed.text;
+    const hasParsedText = parsedText !== undefined && parsedText.trim().length > 0;
+    const derivedText = hasParsedText
+      ? parsedText
+      : (bodyHtml !== null ? htmlToText(bodyHtml) : (parsedText ?? ""));
+    const bodyText = capUtf8(derivedText, MAX_BODY_TEXT_BYTES);
 
     // --- Message ---------------------------------------------------------
-    const fromAddr = addresses.from[0]?.address ?? "";
+    const fromAddr = capUtf8(addresses.from[0]?.address ?? "", MAX_HEADER_FIELD_BYTES);
     const direction = fromAddr.length > 0 && fromAddr === account.email.toLowerCase()
       ? "outbound"
       : "inbound";
+    const fromName = addresses.from[0]?.name ?? null;
     const newMessageId = randomUUID();
     const [inserted] = await tx.insert(mailMessages).values({
       id: newMessageId,
@@ -467,14 +689,22 @@ export async function ingestMessage(
       inReplyTo,
       referencesIds: references,
       fromAddr,
-      fromName: addresses.from[0]?.name ?? null,
-      toAddrs: addresses.to,
-      ccAddrs: addresses.cc,
-      // Spec: bcc_addrs is populated for outbound only. An inbound
-      // message's own Bcc header (when a sender leaves one in) names
-      // recipients this mailbox was never meant to learn about.
-      bccAddrs: direction === "outbound" ? addresses.bcc : [],
-      subject: rawSubject,
+      fromName: fromName === null ? null : capUtf8(fromName, MAX_HEADER_FIELD_BYTES),
+      // Recipient lists are capped like every other stored header field: a
+      // 1MiB To: header parses into ~100k addresses, which as jsonb is a
+      // permanent multi-megabyte row nothing in the UI can render anyway.
+      toAddrs: addresses.to.slice(0, MAX_PARTICIPANTS),
+      ccAddrs: addresses.cc.slice(0, MAX_PARTICIPANTS),
+      // Spec: bcc_addrs is populated for outbound only -- and this narrows
+      // that further to outbound mail found in the account's OWN sent
+      // folder. `direction` is a pure From-header comparison (spec), so
+      // anyone can spoof your address into your INBOX; without the folder
+      // check that forgery would smuggle its Bcc list into storage and out
+      // through the thread view as if the CRM's user had sent it.
+      bccAddrs: direction === "outbound" && input.folder === account.sentFolder
+        ? addresses.bcc.slice(0, MAX_PARTICIPANTS)
+        : [],
+      subject: capUtf8(rawSubject, MAX_SUBJECT_BYTES),
       bodyText,
       bodyHtml,
       snippet: makeSnippet(bodyText),
@@ -502,8 +732,10 @@ export async function ingestMessage(
       // ingest's attachments/thread bump/links to a row it did not create
       // (which would double-count the thread and duplicate attachments).
       // The next sync pass re-ingests and takes the duplicate path
-      // cleanly. Unreachable between two ingests, by the lock.
-      throw new Error(`mail ingest raced another writer for message ${messageId}`);
+      // cleanly. Unreachable between two ingests, by the lock. The id is
+      // truncated because this message ends up in last_error via
+      // MailIngestError, and a Message-ID can be up to MAX_MESSAGE_ID_BYTES.
+      throw new Error(`mail ingest raced another writer for message ${messageId.slice(0, 80)}`);
     }
 
     if (attachments.length > 0) {
@@ -536,9 +768,20 @@ export async function ingestMessage(
     }).where(eq(mailThreads.id, threadId));
 
     // --- Auto-link --------------------------------------------------------
+    // Set-based dedupe, not includes(): the array scan is quadratic in the
+    // recipient count, and a 1MiB To: header (~100k addresses) measured
+    // 973ms of pure event-loop stall -- inside the GLOBAL ingest lock, so
+    // every other account's sync waits on it. Capped as well, because even
+    // a deduped list becomes one bind parameter per address in the contact
+    // lookup and 65535 is the driver's ceiling. Order is preserved (from,
+    // then to, then cc), which is what decides the winning match.
     const participants: string[] = [];
+    const seenParticipants = new Set<string>();
     for (const address of [...addresses.from, ...addresses.to, ...addresses.cc]) {
-      if (!participants.includes(address.address)) participants.push(address.address);
+      if (participants.length >= MAX_PARTICIPANTS) break;
+      if (seenParticipants.has(address.address)) continue;
+      seenParticipants.add(address.address);
+      participants.push(address.address);
     }
     await autoLinkThread(tx, threadId, participants);
 

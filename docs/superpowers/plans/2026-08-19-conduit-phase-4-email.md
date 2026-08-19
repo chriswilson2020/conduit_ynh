@@ -111,6 +111,9 @@ export interface ImapClient {
 - Errors anywhere: `status='error'` + `last_error`, backoff `min(60s * 2^attempt, 32min)` (timer injectable), successful pass resets `status='active'`, `last_synced_at`, attempt=0. Every status flip publishes `[["mail-accounts"]]` (drives the settings error badge).
 - `markSeen(folder, uids)` and `appendSent(raw)` queue onto the same serial loop (exposed for routes/send).
 - `stop()` — abort idle, disconnect, resolve.
+- **Poison-message contract (ruling, Task 4 quality review):** every `ingestMessage` call is individually try/caught — ingest raises one typed `MailIngestError` carrying accountId/folder/uid plus a ≤200-char reason (services/errors.ts), so the loop has what it needs without unwrapping driver errors. First failure for a UID: retry it once within the same pass. Second failure: **advance the cursor past that UID** and record the truncated reason in `last_error`, leaving `status='active'` — one unparseable, oversized or otherwise hostile message must never wedge a mailbox behind a cursor that will not move. Nothing is deleted: the message stays on the server and a later manual refetch (cursor reset) can retry it. This is the one error class that does NOT flip the account to `error` + backoff.
+- **Fetching:** pull each message's raw body lazily, one at a time inside the per-message loop — never materialise a batch of 50 raw buffers (50 × up to 25MB is a heap spike no server needs). Guard `raw` size before handing it to ingest as well: ingest itself rejects anything over 25MB (a 1MiB `To:` header measured >8min inside `simpleParser`), which surfaces as a `MailIngestError` and is therefore handled by the poison contract above.
+- **SSE coalescing** is a batch-boundary decision, not a per-message one: ingest publishes its own `[["mail-threads"], ["mail-thread", id], ["mail-unread"]]` hint per new message, so a 50-message backfill batch fires 150 key hints. If that proves noisy in the web layer, coalesce at the end of each batch (one hint per pass) rather than suppressing ingest's — ingest has no idea whether it is inside a batch.
 
 `SyncManager` — `start(db)` loads non-archived accounts → AccountSync each (clientFactory injectable); `accountChanged(id)` create/restart/teardown after CRUD; `syncNow(id)`; `get(id)` for send/markSeen access; NOT started under NODE_ENV=test. Wire `start` into server.ts after listen; `accountChanged` into mail-accounts service. Tests (~16, fake ImapClient + fake timers): backfill honours backfill_days & resumes mid-batch after injected crash; cursor advance; UIDVALIDITY reset converges without dupes; flag reconcile flips seen; idle wake triggers pass; backoff doubles & caps & resets; error → status flip; stop is clean; markSeen writes flags through; manager teardown on archive.
 
@@ -131,10 +134,17 @@ export interface ImapClient {
 //    "smtp_failed", NOTHING stored.
 // 4. syncManager.get(accountId)?.appendSent(rfc822) -- try/catch, log.warn on
 //    failure, proceed (spec: send succeeded, DB record must land).
-// 5. Reuse ingest primitives to insert the outbound row (direction outbound,
-//    seen true, folder = sent_folder, imap_uid null, thread = input.threadId
-//    or new thread with input.links applied). Same transaction as thread bump.
-// 6. SSE. Return the message row.
+// 5. Call ingestMessage(db, dataDir, {accountId, folder: account.sent_folder,
+//    uid: null, raw: <the MIME just sent>, flags: ["\\Seen"], threadId?,
+//    links?}) -- the WHOLE row, not "ingest primitives": ingest stays the
+//    single writer of mail_messages/mail_threads/mail_attachments (ruling,
+//    Task 4 quality review), so direction, threading, the thread bump,
+//    auto-linking, the advisory lock and the SSE hint all happen once, in
+//    one place. threadId short-circuits thread resolution on a reply; links
+//    apply only when a new thread is created. It also makes the later
+//    Sent-folder sighting of the same message dedupe onto this row via
+//    UNIQUE (account_id, message_id) instead of duplicating it.
+// 6. Return the message row (ingest published the SSE hint).
 ```
 
 Tests (~12): ordering matrix (SMTP fail → no row; APPEND fail → row + warn), reply headers chain, new-thread links applied, owner check (404 on foreign account), sanitization applied, text alt generated, attachment streaming, archived/error account rejected (409).

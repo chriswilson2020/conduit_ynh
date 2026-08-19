@@ -4,7 +4,11 @@ import { TEST_DATABASE_URL } from "./global-setup.js";
 
 // max: 2, not 1 — a single test occasionally issues two queries concurrently (e.g. a
 // query racing a truncate in a differently-scoped connection), and with max: 1 the
-// second would queue behind the first instead of running. Isolation between test
+// second would queue behind the first instead of running. Second reason, since Phase
+// 4: mail-ingest.test.ts's concurrency case needs two transactions genuinely open at
+// once to exercise the global ingest advisory lock — at max: 1 the second would wait
+// for a connection rather than for the lock, and the test would pass without proving
+// anything. Isolation between test
 // files does not come from connection limits, though: it relies on `fileParallelism:
 // false` in vitest.config.ts, which keeps files from truncating the shared database
 // out from under each other. If that ever gets flipped on for speed, this stops being

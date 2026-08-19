@@ -443,6 +443,29 @@ describe("syntheticMessageId", () => {
     expect(syntheticMessageId(longA)).toBe(syntheticMessageId(longB));
   });
 
+  it("changes when the message differs only by its attachments", () => {
+    // Same sender, date, subject and body, different file: without the
+    // attachment fingerprint these collapse to one synthetic id and the
+    // second message is silently swallowed by ingest's duplicate guard.
+    const invoice = { ...base, attachments: [{ filename: "invoice.pdf", size: 1024 }] };
+    const corrected = { ...base, attachments: [{ filename: "invoice-corrected.pdf", size: 1024 }] };
+    expect(syntheticMessageId(invoice)).not.toBe(syntheticMessageId(corrected));
+    expect(syntheticMessageId(invoice)).not.toBe(syntheticMessageId(base));
+  });
+
+  it("changes when an attachment's size differs but its name does not", () => {
+    const small = { ...base, attachments: [{ filename: "report.pdf", size: 1024 }] };
+    const large = { ...base, attachments: [{ filename: "report.pdf", size: 2048 }] };
+    expect(syntheticMessageId(small)).not.toBe(syntheticMessageId(large));
+  });
+
+  it("is stable across a refetch of the same attachments", () => {
+    const attachments = [{ filename: "a.pdf", size: 10 }, { filename: "b.png", size: 20 }];
+    const first = { ...base, attachments };
+    const refetched = { ...base, attachments: [{ filename: "a.pdf", size: 10 }, { filename: "b.png", size: 20 }] };
+    expect(syntheticMessageId(first)).toBe(syntheticMessageId(refetched));
+  });
+
   it("length-prefixes fields so a separator-shaped substring inside one field cannot forge a boundary collision", () => {
     const a = { ...base, subject: "A::B", text: "C" };
     const b = { ...base, subject: "A", text: "B::C" };
