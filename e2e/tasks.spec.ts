@@ -237,28 +237,34 @@ test.describe.serial("Tasks/Gantt journey", () => {
   });
 
   test("drags Build to Done on the board", async () => {
-    await page.goto(`/projects/${projectId}/board`);
     // Only Design was dragged earlier (todo -> in_progress); Build has sat
     // in To do since its creation, so this needs three column hops: todo(0)
     // -> in_progress(1) -> blocked(2) -> done(3). Three SEPARATE lift/arrow/
-    // drop gestures, not one lift with three arrows -- every keyboard drag
-    // proven to work elsewhere in this codebase (pipeline.spec.ts, and this
-    // file's own Design drag) is a single arrow press per gesture; stacking
-    // three arrows inside one gesture consistently landed the card short of
-    // done (confirmed by 3/3 identical CI failures, not the timing flakiness
-    // keyboardDragCard's own comment addresses -- a real dnd-kit behaviour
-    // difference, not this codebase's bug to fix here).
+    // drop gestures (not one lift with three arrows -- CI run 32270842284
+    // showed stacking three arrows inside one gesture consistently lands the
+    // card short of done), each preceded by its own page.goto: every other
+    // keyboard drag in this codebase (pipeline.spec.ts, this file's own
+    // Design drag) navigates fresh immediately before dragging, and CI run
+    // 32271110864 showed the second of three BACK-TO-BACK gestures (no
+    // navigation between them) re-dropping onto its OWN starting column --
+    // the DndContext's dnd-kit measurements not yet settled from the
+    // previous gesture's just-landed mutation. A fresh navigation before
+    // each hop gives every gesture the same settled-DOM starting condition
+    // the passing single-hop drags already rely on.
     const todo = boardColumn("todo");
     const inProgress = boardColumn("in_progress");
     const blocked = boardColumn("blocked");
     const done = boardColumn("done");
 
+    await page.goto(`/projects/${projectId}/board`);
     await keyboardDragCard(todo.getByTestId(`card-${buildId}`), ["ArrowRight"]);
     await expect(inProgress.getByTestId(`card-${buildId}`)).toBeVisible();
 
+    await page.goto(`/projects/${projectId}/board`);
     await keyboardDragCard(inProgress.getByTestId(`card-${buildId}`), ["ArrowRight"]);
     await expect(blocked.getByTestId(`card-${buildId}`)).toBeVisible();
 
+    await page.goto(`/projects/${projectId}/board`);
     await keyboardDragCard(blocked.getByTestId(`card-${buildId}`), ["ArrowRight"]);
     await expect(done.getByTestId(`card-${buildId}`)).toBeVisible();
     await expect(todo.getByTestId(`card-${buildId}`)).not.toBeVisible();
