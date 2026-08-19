@@ -1,5 +1,5 @@
 {
-  "id": "00795149-6678-4d60-865b-79797aa7d374",
+  "id": "2e41d18e-929d-49c3-847f-aee01be9cb9a",
   "prevId": "bdde31d2-49f1-4c90-b56a-54b3083327b9",
   "version": "7",
   "dialect": "postgresql",
@@ -1263,9 +1263,13 @@
         },
         "search": {
           "name": "search",
-          "type": "tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(subject,'') || ' ' || coalesce(body_text,'') || ' ' || coalesce(from_addr,'') || ' ' || coalesce(from_name,''))) STORED",
+          "type": "tsvector",
           "primaryKey": false,
-          "notNull": true
+          "notNull": true,
+          "generated": {
+            "as": "to_tsvector('english', coalesce(subject,'') || ' ' || coalesce(body_text,'') || ' ' || coalesce(from_addr,'') || ' ' || coalesce(from_name,''))",
+            "type": "stored"
+          }
         },
         "created_at": {
           "name": "created_at",

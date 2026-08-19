@@ -18,26 +18,27 @@ const positionText = customType<{ data: string }>({
 });
 
 /**
- * mail_messages.search: a STORED generated column, not a value the app ever
- * writes. drizzle-orm has no built-in tsvector column type, so -- exactly
- * like positionText's collation pin above -- the full Postgres type
- * expression is smuggled through as this customType's dataType() (drizzle
- * inserts it into the CREATE TABLE column list verbatim). Unlike
- * positionText, drizzle-kit's generator is NOT trusted to round-trip this
- * text correctly: confirmed by running it -- `db:generate` wrapped this
- * entire type expression in a spurious pair of double quotes, as though it
- * were a single identifier, which is not valid SQL for a GENERATED ALWAYS AS
- * column. The migration SQL this produces is therefore hand-corrected after
- * `db:generate` rather than taken as-is -- see drizzle/0004_*.sql, whose GIN
- * index is hand-written for the same reason (drizzle-kit has no notion of a
- * GIN index over a generated column either).
+ * mail_messages.search: drizzle-orm has no built-in tsvector column type, so
+ * -- like positionText's collation pin above -- this customType supplies
+ * just the bare type name. The GENERATED ALWAYS AS (...) STORED clause is
+ * NOT part of the type string (an earlier version of this code smuggled the
+ * whole clause through here, which produced two real bugs: drizzle-kit's
+ * generator wrapped the entire string in a spurious pair of double quotes as
+ * though it were a single identifier -- confirmed by running it, not
+ * assumed -- and, worse, drizzle-orm had no way to know the column was
+ * generated, so its inferred insert type demanded a value for `search` on
+ * every insert while Postgres rejects any insert that supplies one for an
+ * actual generated column: no valid insert could satisfy both). The
+ * generated-ness instead comes from drizzle's own `.generatedAlwaysAs()`
+ * below, which both `db:generate` and drizzle-orm's insert-type inference
+ * understand correctly. `db:generate`'s own output for this column already
+ * matches Postgres's GENERATED ALWAYS AS (...) STORED syntax exactly, with
+ * no hand-editing needed; only the GIN index still has to be hand-written
+ * (drizzle-kit has no notion of an index over a generated column) -- see
+ * drizzle/0004_*.sql.
  */
 const searchVector = customType<{ data: string }>({
-  dataType() {
-    return "tsvector GENERATED ALWAYS AS (to_tsvector('english', " +
-      "coalesce(subject,'') || ' ' || coalesce(body_text,'') || ' ' || " +
-      "coalesce(from_addr,'') || ' ' || coalesce(from_name,''))) STORED";
-  },
+  dataType() { return "tsvector"; },
 });
 
 export const users = pgTable("users", {
@@ -422,9 +423,12 @@ export const mailMessages = pgTable("mail_messages", {
   seen: boolean("seen").notNull().default(false),
   direction: text("direction").notNull(),
   // GENERATED ALWAYS AS (...) STORED -- see searchVector's customType
-  // comment above. Never written by the app; Postgres computes it on every
-  // insert/update of the four source columns.
-  search: searchVector("search").notNull(),
+  // comment above. Never written by the app (drizzle's insert type
+  // correctly excludes it, since .generatedAlwaysAs() marks it generated);
+  // Postgres computes it on every insert/update of the four source columns.
+  search: searchVector("search").notNull().generatedAlwaysAs(
+    sql`to_tsvector('english', coalesce(subject,'') || ' ' || coalesce(body_text,'') || ' ' || coalesce(from_addr,'') || ' ' || coalesce(from_name,''))`,
+  ),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [

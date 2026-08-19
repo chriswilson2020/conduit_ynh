@@ -78,7 +78,7 @@ CREATE TABLE "mail_messages" (
 	"imap_uid" bigint,
 	"seen" boolean DEFAULT false NOT NULL,
 	"direction" text NOT NULL,
-	"search" tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(subject,'') || ' ' || coalesce(body_text,'') || ' ' || coalesce(from_addr,'') || ' ' || coalesce(from_name,''))) STORED NOT NULL,
+	"search" "tsvector" GENERATED ALWAYS AS (to_tsvector('english', coalesce(subject,'') || ' ' || coalesce(body_text,'') || ' ' || coalesce(from_addr,'') || ' ' || coalesce(from_name,''))) STORED NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "mail_messages_account_message_unique" UNIQUE("account_id","message_id"),

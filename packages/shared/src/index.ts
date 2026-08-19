@@ -515,7 +515,10 @@ export type MailAccountUpdateInput = z.infer<typeof mailAccountUpdateInputSchema
 // POST /api/mail/accounts/test dry-runs IMAP+SMTP logins with either the
 // submitted credentials (composing a not-yet-saved account) or, when only
 // accountId is given, the stored ones -- every other field is therefore
-// optional here even though mailAccountCreateInputSchema requires them.
+// optional here even though mailAccountCreateInputSchema requires them. The
+// refine below only guards the coarse "gave us nothing to test" case
+// (accountId XOR a fresh connection attempt to start from); the route does
+// the fine-grained enforcement (e.g. imapHost present without imapSecurity).
 export const mailAccountTestInputSchema = z.object({
   accountId: z.uuid().optional(),
   imapHost: z.string().min(1).optional(), imapPort: z.number().int().positive().optional(),
@@ -525,6 +528,8 @@ export const mailAccountTestInputSchema = z.object({
   username: z.string().min(1).optional(),
   password: z.string().min(1).optional(),
   smtpPassword: z.string().min(1).optional(),
+}).refine((v) => v.accountId !== undefined || v.imapHost !== undefined, {
+  message: "either accountId or imapHost is required",
 });
 export type MailAccountTestInput = z.infer<typeof mailAccountTestInputSchema>;
 
@@ -544,8 +549,18 @@ export type MailDirection = z.infer<typeof mailDirectionSchema>;
 // shape (spec: "array of {address, name}") -- name is optional/nullable
 // because a raw address header ("bob@example.com" with no display name) is
 // completely ordinary.
+//
+// address is deliberately z.string().min(1), NOT z.email(): this is the
+// READ side, describing addresses that arrived over IMAP from the real
+// world -- root@localhost, SRS-rewritten bounce addresses with embedded '='
+// (bounces+SRS=abc@lists.example.org), quoted local parts, and other RFC
+// 5321 forms zod v4's z.email() rejects outright. A thread whose parseWith
+// throws on one address is a thread that never renders, so this schema must
+// accept whatever mailparser handed the ingest pipeline. The COMPOSE side
+// (sendMailInputSchema below) is different -- human-typed input -- and uses
+// its own stricter schema with z.email().
 export const mailAddressSchema = z.object({
-  address: z.email(), name: z.string().min(1).nullable().optional(),
+  address: z.string().min(1), name: z.string().min(1).nullable().optional(),
 });
 export type MailAddress = z.infer<typeof mailAddressSchema>;
 
@@ -553,7 +568,9 @@ export const mailMessageSchema = z.object({
   id: z.uuid(), accountId: z.uuid(), threadId: z.uuid(),
   messageId: z.string().min(1), inReplyTo: z.string().min(1).nullable(),
   referencesIds: z.array(z.string().min(1)),
-  fromAddr: z.email(), fromName: nullableString,
+  // Same reasoning as mailAddressSchema.address above -- real From headers
+  // include forms z.email() rejects.
+  fromAddr: z.string().min(1), fromName: nullableString,
   toAddrs: z.array(mailAddressSchema), ccAddrs: z.array(mailAddressSchema), bccAddrs: z.array(mailAddressSchema),
   // subject/bodyText/snippet default to '' at the DB (inbound mail can lack
   // a subject entirely), so no .min(1) here -- unlike mailAddressSchema's
@@ -567,9 +584,14 @@ export const mailMessageSchema = z.object({
 });
 export type MailMessage = z.infer<typeof mailMessageSchema>;
 
+// blobPath deliberately excluded -- mirrors fileMetaSchema above, which
+// never exposes its own storage internals to a client either; downloads go
+// through the authenticated GET /api/mail/attachments/:id route, which
+// resolves the path server-side. The DB column (schema.ts's mailAttachments
+// .blobPath) is unaffected -- only this client-facing shape changes.
 export const mailAttachmentSchema = z.object({
   id: z.uuid(), messageId: z.uuid(), filename: z.string().min(1), mime: z.string().min(1),
-  sizeBytes: z.number().int().nonnegative(), blobPath: z.string().min(1),
+  sizeBytes: z.number().int().nonnegative(),
   contentId: nullableString, isInline: z.boolean(), createdAt: z.iso.datetime(),
 });
 export type MailAttachment = z.infer<typeof mailAttachmentSchema>;
@@ -603,6 +625,14 @@ export const threadLinksInputSchema = z.object({
 });
 export type ThreadLinksInput = z.infer<typeof threadLinksInputSchema>;
 
+// Compose-side counterpart to mailAddressSchema: human-typed (or picked from
+// a contact-address autocomplete) rather than parsed off the wire, so it can
+// afford to hold the line at z.email() -- unlike inbound mail, a compose
+// recipient the user typed wrong should be rejected before it reaches SMTP.
+const composeAddressSchema = z.object({
+  address: z.email(), name: z.string().min(1).nullable().optional(),
+});
+
 // Compose and reply share one shape (spec, Send path): threadId is present
 // only when replying, absent when composing fresh. links pre-links a
 // brand-new thread the way the compose dialog does when opened from a
@@ -611,9 +641,9 @@ export type ThreadLinksInput = z.infer<typeof threadLinksInputSchema>;
 export const sendMailInputSchema = z.object({
   accountId: z.uuid(),
   threadId: z.uuid().optional(),
-  to: z.array(mailAddressSchema).min(1),
-  cc: z.array(mailAddressSchema).optional().default([]),
-  bcc: z.array(mailAddressSchema).optional().default([]),
+  to: z.array(composeAddressSchema).min(1),
+  cc: z.array(composeAddressSchema).optional().default([]),
+  bcc: z.array(composeAddressSchema).optional().default([]),
   subject: z.string(),
   bodyHtml: z.string().min(1),
   attachmentIds: z.array(z.uuid()).optional().default([]),

@@ -1,15 +1,23 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import { eq, sql } from "drizzle-orm";
+import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
+import { TEST_DATABASE_URL } from "../test/global-setup.js";
 import { resolveUser } from "../users.js";
 import { createCompany } from "../services/companies.js";
 import { createContact } from "../services/contacts.js";
 import { createPipeline, createStage } from "../services/pipelines.js";
 import { createDeal } from "../services/deals.js";
 import { createProject } from "../services/projects.js";
+import { createDatabase, migrationsFolder } from "./client.js";
 import {
-  companies, mailAccounts, mailFolderState, mailThreads, mailMessages, mailAttachments, emailTemplates,
+  users, companies, contacts, pipelines, stages, deals, projects,
+  mailAccounts, mailFolderState, mailThreads, mailMessages, mailAttachments, emailTemplates,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -33,12 +41,16 @@ function accountValues(overrides: Partial<typeof mailAccounts.$inferInsert> = {}
 }
 
 describe("mail schema (0004)", () => {
-  // "0002-style" migration test: companies/contacts/deals/projects are
-  // created through the same pre-existing (Phase 0-3) service layer this
-  // migration leaves untouched, then mail_threads links to all four --
-  // proving 0004 is genuinely additive: the old tables need no changes at
-  // all for the new FKs to resolve against real rows created the old way.
-  it("links a mail_thread to pre-existing company/contact/deal/project rows created through the Phase 0-3 services", async () => {
+  // NOT an upgrade-with-data test -- this runs against handle.db, which
+  // global-setup.ts has already migrated all the way through 0004 before any
+  // test file executes, so it never observes a genuinely pre-0004 database.
+  // What it verifies: mail_threads' FKs resolve correctly against rows
+  // created through the ordinary (unmodified) Phase 0-3 service layer, i.e.
+  // post-migration linkage, not upgrade survival. The actual upgrade-with-
+  // data scenario (apply 0004 on top of an already-populated pre-0004
+  // database) is covered separately below, in a scratch database created
+  // and dropped just for that test.
+  it("links a mail_thread to company/contact/deal/project rows created through the Phase 0-3 services", async () => {
     const company = await createCompany(handle.db, userId, { name: "Acme" });
     const contact = await createContact(handle.db, userId, { firstName: "Bob", companyId: company.id });
     const pipeline = await createPipeline(handle.db, userId, { name: "Sales", scope: "global" });
@@ -71,11 +83,91 @@ describe("mail schema (0004)", () => {
     expect(message?.threadId).toBe(thread!.id);
     expect(attachment?.messageId).toBe(message!.id);
 
-    // The pre-existing company row itself is untouched -- still readable
-    // exactly as the old (pre-0004) schema would have returned it.
+    // The company row itself is unaffected by anything mail-related.
     const [rereadCompany] = await handle.db.select().from(companies).where(eq(companies.id, company.id));
     expect(rereadCompany).toMatchObject({ id: company.id, name: "Acme" });
   });
+
+  // The genuine "0002-style" upgrade test: a real database migrated only
+  // through 0003 (built from a trimmed copy of the real 0000-0003 migration
+  // files, mirroring a848ce1's "0000+0001 with real rows, then 0002 on top"
+  // precedent), populated with pre-existing data while still in that old
+  // state, THEN migrated forward with 0004 -- proving the migration itself
+  // (not just the resulting schema) applies cleanly on top of a populated
+  // database and leaves that data intact. Runs against its own scratch
+  // database (created and dropped here), never touching the shared
+  // conduit_test database other sessions rely on.
+  it("applies migration 0004 on top of a real database already migrated only through 0003 and already carrying data", async () => {
+    const dbName = `conduit_test_upgrade_${randomUUID().replace(/-/g, "")}`;
+    const realFolder = migrationsFolder();
+    const journal = JSON.parse(
+      readFileSync(path.join(realFolder, "meta", "_journal.json"), "utf8"),
+    ) as { entries: { idx: number; tag: string }[] };
+    const pre0004Entries = journal.entries.filter((e) => e.idx <= 3);
+    const tmpFolder = mkdtempSync(path.join(tmpdir(), "conduit-pre0004-"));
+    mkdirSync(path.join(tmpFolder, "meta"));
+    for (const entry of pre0004Entries) {
+      copyFileSync(path.join(realFolder, `${entry.tag}.sql`), path.join(tmpFolder, `${entry.tag}.sql`));
+    }
+    writeFileSync(
+      path.join(tmpFolder, "meta", "_journal.json"),
+      JSON.stringify({ ...journal, entries: pre0004Entries }),
+    );
+
+    await handle.db.execute(sql.raw(`CREATE DATABASE "${dbName}"`));
+    const scratchUrl = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${dbName}`);
+    const scratch = createDatabase(scratchUrl, 1);
+    try {
+      // Old state: only 0000-0003 applied.
+      await migrate(scratch.db, { migrationsFolder: tmpFolder });
+
+      // Real pre-existing data, inserted while the database is genuinely at
+      // 0003 -- companies/contacts/pipelines/stages/deals/projects/users are
+      // byte-identical between 0003 and 0004 (0004 touches none of them), so
+      // the real schema.ts table objects describe this "old" shape exactly.
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const [company] = await scratch.db.insert(companies).values({ name: "Acme" }).returning();
+      const [contact] = await scratch.db.insert(contacts)
+        .values({ firstName: "Bob", companyId: company!.id }).returning();
+      const [pipeline] = await scratch.db.insert(pipelines)
+        .values({ name: "Sales", scope: "global", position: "a0" }).returning();
+      const [stage] = await scratch.db.insert(stages)
+        .values({ pipelineId: pipeline!.id, name: "New", position: "a0" }).returning();
+      const [deal] = await scratch.db.insert(deals).values({
+        title: "Big Deal", pipelineId: pipeline!.id, stageId: stage!.id, position: "a0", currency: "EUR",
+      }).returning();
+      const [project] = await scratch.db.insert(projects).values({ name: "Rollout" }).returning();
+
+      // Upgrade: apply the real, full migrations folder. 0004 is the only
+      // pending migration (0000-0003 are already recorded as applied).
+      await migrate(scratch.db, { migrationsFolder: realFolder });
+
+      // The pre-existing data survived the upgrade untouched.
+      const [rereadCompany] = await scratch.db.select().from(companies).where(eq(companies.id, company!.id));
+      expect(rereadCompany).toMatchObject({ id: company!.id, name: "Acme" });
+
+      // And 0004's new tables/FKs work against that pre-existing (pre-
+      // migration) data, not just data inserted after the upgrade.
+      const [account] = await scratch.db.insert(mailAccounts).values({
+        userId: user!.id, label: "Work", email: "chris@example.com",
+        imapHost: "localhost", imapPort: 993, imapSecurity: "tls",
+        smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls",
+        username: "chris", credentialsCiphertext: "v1:iv:tag:data",
+      }).returning();
+      const [thread] = await scratch.db.insert(mailThreads).values({
+        subject: "Re: Big Deal", lastMessageAt: new Date(),
+        companyId: company!.id, contactId: contact!.id, dealId: deal!.id, projectId: project!.id,
+      }).returning();
+      expect(account?.userId).toBe(user!.id);
+      expect(thread).toMatchObject({
+        companyId: company!.id, contactId: contact!.id, dealId: deal!.id, projectId: project!.id,
+      });
+    } finally {
+      await scratch.close();
+      await handle.db.execute(sql.raw(`DROP DATABASE IF EXISTS "${dbName}"`));
+      rmSync(tmpFolder, { recursive: true, force: true });
+    }
+  }, 30000);
 
   it("applies every column default when a row supplies only the required fields", async () => {
     const [account] = await handle.db.insert(mailAccounts).values(accountValues()).returning();

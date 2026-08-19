@@ -773,6 +773,9 @@ describe("mailAccountTestInputSchema", () => {
     };
     expect(mailAccountTestInputSchema.parse(input)).toEqual(input);
   });
+
+  it("rejects an empty body -- neither accountId nor a connection to test", () =>
+    expect(() => mailAccountTestInputSchema.parse({})).toThrow());
 });
 
 describe("mailThreadSchema", () => {
@@ -818,15 +821,47 @@ describe("mailMessageSchema", () => {
 
   it("rejects a direction outside inbound/outbound", () =>
     expect(() => mailMessageSchema.parse({ ...message, direction: "sideways" })).toThrow());
+
+  // The whole reason fromAddr/toAddrs[].address are z.string().min(1) and
+  // NOT z.email(): real inbound mail carries address forms zod v4's email
+  // validator rejects outright. A thread whose parseWith throws on one of
+  // these must never happen -- that would kill the entire thread list, not
+  // just hide one message.
+  it("accepts real-world address forms z.email() would reject: root@localhost and an SRS bounce address", () => {
+    const rootLocal = { ...message, fromAddr: "root@localhost" };
+    expect(mailMessageSchema.parse(rootLocal).fromAddr).toBe("root@localhost");
+
+    const srsBounce = {
+      ...message,
+      fromAddr: "bounces+SRS=abc@lists.example.org",
+      toAddrs: [{ address: "bounces+SRS=abc@lists.example.org" }],
+    };
+    expect(mailMessageSchema.parse(srsBounce).fromAddr).toBe("bounces+SRS=abc@lists.example.org");
+    expect(mailMessageSchema.parse(srsBounce).toAddrs).toEqual([
+      { address: "bounces+SRS=abc@lists.example.org" },
+    ]);
+  });
 });
 
 describe("mailAttachmentSchema", () => {
   it("accepts a complete attachment", () => {
     const attachment = {
       id: uuid1, messageId: uuid2, filename: "invoice.pdf", mime: "application/pdf",
-      sizeBytes: 12345, blobPath: "ab/cd/hash", contentId: null, isInline: false, createdAt: now,
+      sizeBytes: 12345, contentId: null, isInline: false, createdAt: now,
     };
     expect(mailAttachmentSchema.parse(attachment)).toEqual(attachment);
+  });
+
+  // Client-facing shape must not leak storage internals (mirrors
+  // fileMetaSchema, which never exposes one either) -- a stray blobPath key
+  // on the input is silently stripped by zod, not surfaced.
+  it("strips a blobPath key rather than exposing it", () => {
+    const withBlobPath = {
+      id: uuid1, messageId: uuid2, filename: "invoice.pdf", mime: "application/pdf",
+      sizeBytes: 12345, blobPath: "ab/cd/hash", contentId: null, isInline: false, createdAt: now,
+    };
+    const parsed = mailAttachmentSchema.parse(withBlobPath);
+    expect(parsed).not.toHaveProperty("blobPath");
   });
 });
 
@@ -879,6 +914,14 @@ describe("sendMailInputSchema", () => {
 
   it("rejects an empty to[] (a send always has at least one recipient)", () =>
     expect(() => sendMailInputSchema.parse({ ...base, to: [] })).toThrow());
+
+  // Unlike mailMessageSchema's read-side fromAddr/toAddrs (real inbound mail,
+  // never validated as z.email()), this is human-typed compose input -- a
+  // garbage address here is a typo that should be rejected before it ever
+  // reaches SMTP, not silently accepted the way the read side must accept
+  // whatever the wire actually contained.
+  it("rejects a garbage (non-email) address in to[]", () =>
+    expect(() => sendMailInputSchema.parse({ ...base, to: [{ address: "not-an-email" }] })).toThrow());
 });
 
 describe("emailTemplateSchema and createEmailTemplateInputSchema", () => {
