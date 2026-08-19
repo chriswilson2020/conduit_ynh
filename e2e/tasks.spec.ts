@@ -221,18 +221,22 @@ test.describe.serial("Tasks/Gantt journey", () => {
 
   test("drags Build to Done on the board", async () => {
     await page.goto(`/projects/${projectId}/board`);
-    const inProgress = boardColumn("in_progress");
+    // Only Design was dragged earlier (todo -> in_progress); Build has sat
+    // in To do since its creation, so this is a three-column hop: todo(0)
+    // -> in_progress(1) -> blocked(2) -> done(3).
+    const todo = boardColumn("todo");
     const done = boardColumn("done");
-    const buildCard = inProgress.getByTestId(`card-${buildId}`);
+    const buildCard = todo.getByTestId(`card-${buildId}`);
 
     await buildCard.focus();
     await page.keyboard.press("Space");
     await page.keyboard.press("ArrowRight");
     await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowRight");
     await page.keyboard.press("Space");
 
     await expect(done.getByTestId(`card-${buildId}`)).toBeVisible();
-    await expect(inProgress.getByTestId(`card-${buildId}`)).not.toBeVisible();
+    await expect(todo.getByTestId(`card-${buildId}`)).not.toBeVisible();
   });
 
   test("assigns Ship to the dev user and finds it in My Tasks", async () => {
