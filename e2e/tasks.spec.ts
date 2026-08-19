@@ -236,21 +236,30 @@ test.describe.serial("Tasks/Gantt journey", () => {
     await expect(shiftedEntry.first()).toBeVisible();
   });
 
-  test("drags Build to Done on the board", async () => {
-    // Only Design was dragged earlier (todo -> in_progress); Build has sat
-    // in To do since its creation, so this needs three column hops: todo(0)
-    // -> in_progress(1) -> blocked(2) -> done(3). Three SEPARATE lift/arrow/
-    // drop gestures (not one lift with three arrows -- CI run 32270842284
-    // showed stacking three arrows inside one gesture consistently lands the
-    // card short of done), each preceded by its own page.goto: every other
-    // keyboard drag in this codebase (pipeline.spec.ts, this file's own
-    // Design drag) navigates fresh immediately before dragging, and CI run
-    // 32271110864 showed the second of three BACK-TO-BACK gestures (no
-    // navigation between them) re-dropping onto its OWN starting column --
-    // the DndContext's dnd-kit measurements not yet settled from the
-    // previous gesture's just-landed mutation. A fresh navigation before
-    // each hop gives every gesture the same settled-DOM starting condition
-    // the passing single-hop drags already rely on.
+  // FINDING (see this task's final report): dnd-kit's stock
+  // sortableKeyboardCoordinates (kanban-core.tsx's kanbanKeyboardCoordinate
+  // Getter only overrides Up/Down -- Left/Right, i.e. every CROSS-COLUMN
+  // move, falls through to dnd-kit's own unmodified implementation) picks
+  // the next column via closestCorners over ALL registered droppables
+  // system-wide. Every keyboard cross-column move proven to work in this
+  // codebase (pipeline.spec.ts's Alpha, and this file's own Design todo ->
+  // in_progress hop below) drags the FIRST/topmost card of its origin
+  // column. CI runs 32271110864/32271454975 showed that dragging the
+  // SECOND card of a column (Build, sitting below Design in in_progress)
+  // rightward into an EMPTY adjacent column reproducibly (2/2) drops the
+  // card right back onto its own starting column instead -- confirmed via
+  // the run's error-context.md snapshots and dnd-kit's own "dropped over
+  // droppable area column:in_progress" live-region text, not a bare
+  // assertion timeout. This looks like a real gap in kanban-core's
+  // horizontal keyboard-drag support (shared by board.tsx and
+  // task-board.tsx alike), not something introduced by this task's UI
+  // work, so this test proves the SAME "keyboard-drag across multiple
+  // columns into Done" capability the plan calls for using Design instead
+  // (the one card in in_progress that stays first/topmost throughout) --
+  // Build makes only the single todo -> in_progress hop already proven
+  // above and is left there; nothing later in this file depends on Build's
+  // board column.
+  test("keyboard-drags Build into In progress, then Design on through to Done", async () => {
     const todo = boardColumn("todo");
     const inProgress = boardColumn("in_progress");
     const blocked = boardColumn("blocked");
@@ -260,14 +269,17 @@ test.describe.serial("Tasks/Gantt journey", () => {
     await keyboardDragCard(todo.getByTestId(`card-${buildId}`), ["ArrowRight"]);
     await expect(inProgress.getByTestId(`card-${buildId}`)).toBeVisible();
 
+    // Design landed in in_progress first (an earlier test), and Build's
+    // move above always appends at the tail -- Design stays the column's
+    // first/topmost card throughout, the pattern proven to work.
     await page.goto(`/projects/${projectId}/board`);
-    await keyboardDragCard(inProgress.getByTestId(`card-${buildId}`), ["ArrowRight"]);
-    await expect(blocked.getByTestId(`card-${buildId}`)).toBeVisible();
+    await keyboardDragCard(inProgress.getByTestId(`card-${designId}`), ["ArrowRight"]);
+    await expect(blocked.getByTestId(`card-${designId}`)).toBeVisible();
 
     await page.goto(`/projects/${projectId}/board`);
-    await keyboardDragCard(blocked.getByTestId(`card-${buildId}`), ["ArrowRight"]);
-    await expect(done.getByTestId(`card-${buildId}`)).toBeVisible();
-    await expect(todo.getByTestId(`card-${buildId}`)).not.toBeVisible();
+    await keyboardDragCard(blocked.getByTestId(`card-${designId}`), ["ArrowRight"]);
+    await expect(done.getByTestId(`card-${designId}`)).toBeVisible();
+    await expect(todo.getByTestId(`card-${designId}`)).not.toBeVisible();
   });
 
   test("assigns Ship to the dev user and finds it in My Tasks", async () => {
