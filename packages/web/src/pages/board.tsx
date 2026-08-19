@@ -78,18 +78,15 @@ const boardCollisionDetection: CollisionDetection = (args) => {
  * "pick up, THEN arrow, THEN drop" is spread across enough wall-clock time
  * for that effect to have long since flushed; Playwright's scripted
  * `Space, ArrowRight, Space` (no delay between presses, exactly what
- * e2e/pipeline.spec.ts's keyboard-drag steps do) can complete all three
- * key events before that effect ever runs. With no measured rects yet for
- * anything but the origin card's own column, sortableKeyboardCoordinates'
- * candidate scan (which explicitly skips any droppable it has no rect for)
- * finds nothing in the pressed direction and the ArrowRight becomes a
- * silent no-op -- the immediately-following Space then drops the card right
- * back into whatever `over` already was: its own origin column. Forcing
- * MeasuringStrategy.Always removes the "wait for dragging to start" gate
- * entirely, so droppable rects are always current, not just eventually
- * current. The board is small (a handful of stages/deals, per the design's
- * own "bounded by what a team can usefully keep on one view" cap), so the
- * extra continuous measuring this trades in for is not a real cost here.
+ * e2e/pipeline.spec.ts's keyboard-drag steps do) can complete all three key
+ * events before that effect ever runs, leaving no measured rects for
+ * anything but the origin card's own column. BeforeDragging instead
+ * measures continuously while AT REST (so by the time any drag starts,
+ * rects are already current -- no "wait for dragging to start" gate to
+ * lose the race against) and freezes them for the duration of the drag
+ * itself, which is cheaper than Always (no per-arrow-press remeasuring)
+ * and correct here because nothing on this board actually moves or
+ * resizes mid-drag (no onDragOver-driven reflow -- see handleDragEnd).
  */
 const boardMeasuring = { droppable: { strategy: MeasuringStrategy.BeforeDragging } };
 
