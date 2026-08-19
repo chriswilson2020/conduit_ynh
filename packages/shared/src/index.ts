@@ -407,8 +407,11 @@ export type ShiftTaskInput = z.infer<typeof shiftTaskInputSchema>;
 export const shiftResultSchema = z.object({
   moved: z.array(z.object({
     id: z.uuid(), startDate: z.iso.date(), dueDate: z.iso.date(),
-    // null for the dragged task itself; the id of the predecessor whose
-    // violation pushed this task for every other entry.
+    // null for the dragged task itself; for every other (cascaded) entry,
+    // the id of the DRAGGED task -- not the immediate predecessor that
+    // happened to trip the violation. See scheduling.ts's shiftTask: the UI
+    // flashes "moved because you dragged X", one consistent reason across
+    // the whole cascade, not a different one per hop down the chain.
     cascadedFrom: z.uuid().nullable(),
   })),
 });

@@ -109,7 +109,13 @@ async function assertParentValid(db: Database, parentTaskId: string, projectId: 
 // itself carries no direct company link. Reused by every event this file
 // emits, not just `created` -- an update/status-change/dependency event on a
 // project-linked-but-not-company-linked task should surface the same way.
-async function resolveEventCompanyId(tx: Database, row: TaskRow): Promise<string | null> {
+//
+// Exported so scheduling.ts's shiftTask can dual-stamp its `shifted` events
+// the same way, instead of duplicating this lookup -- shiftTask's moved
+// tasks (the dragged one and every cascaded successor) need exactly the same
+// direct-or-via-project company resolution as every other mutation in this
+// file.
+export async function resolveEventCompanyId(tx: Database, row: TaskRow): Promise<string | null> {
   if (row.companyId !== null) return row.companyId;
   if (row.projectId === null) return null;
   const [proj] = await tx.select({ companyId: projects.companyId }).from(projects).where(eq(projects.id, row.projectId));
