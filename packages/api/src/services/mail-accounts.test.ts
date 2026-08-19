@@ -11,7 +11,7 @@ import { resolveUser } from "../users.js";
 import { mailAccounts } from "../db/schema.js";
 import { encryptCredentials } from "./mail-crypto.js";
 import {
-  createAccount, updateAccount, archiveAccount, getOwnAccount, getAccountCredentials,
+  createAccount, updateAccount, archiveAccount, unarchiveAccount, getOwnAccount, getAccountCredentials,
   listAccounts, testConnection, type TestConnectionDeps,
 } from "./mail-accounts.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
@@ -66,6 +66,14 @@ async function corruptCiphertext(id: string): Promise<void> {
   const wrongKeyCiphertext = encryptCredentials(randomBytes(32), { imapPassword: "x", smtpPassword: "x" });
   await handle.db.update(mailAccounts).set({ credentialsCiphertext: wrongKeyCiphertext }).where(eq(mailAccounts.id, id));
 }
+// A ciphertext that is not even structurally v1 (wrong segment count) --
+// decryptCredentials throws a plain Error for this, NOT MailCredentialDecryptError
+// (see mail-crypto.ts) -- used to prove testConnection's decrypt catch is
+// broad enough to cover this shape too, not just the two typed errors.
+async function garbleCiphertext(id: string): Promise<void> {
+  await handle.db.update(mailAccounts).set({ credentialsCiphertext: "not-even-v1-shaped" })
+    .where(eq(mailAccounts.id, id));
+}
 
 describe("createAccount", () => {
   it("creates an account with status active and no credential fields on the returned shape", async () => {
@@ -110,6 +118,12 @@ describe("createAccount", () => {
       unsub();
     }
   });
+
+  it("sanitizes signatureHtml on write: a script tag is stripped", async () => {
+    const account = await make({ signatureHtml: "<p>Regards</p><script>alert(1)</script>" });
+    expect(account.signatureHtml).not.toContain("<script>");
+    expect(account.signatureHtml).toContain("Regards");
+  });
 });
 
 describe("updateAccount", () => {
@@ -128,24 +142,79 @@ describe("updateAccount", () => {
     expect(creds).toEqual({ imapPassword: "keep-me", smtpPassword: "keep-me-too" });
   });
 
-  it("changing only the imap password re-encrypts, leaving the stored smtp password untouched", async () => {
-    const account = await make({ password: "imap-old", smtpPassword: "smtp-unchanged" });
-    await updateAccount(handle.db, actorId, account.id, { password: "imap-new" }, keyPath);
+  // RULING: a lone `password` means BOTH protocols (matches createAccount's
+  // and testConnection's "SMTP differs" default) -- the settings form only
+  // ever submits smtpPassword alongside password when its toggle is on.
+  it("a lone password updates BOTH the imap and smtp password", async () => {
+    const account = await make({ password: "imap-old", smtpPassword: "smtp-old" });
+    await updateAccount(handle.db, actorId, account.id, { password: "both-new" }, keyPath);
     const creds = await getAccountCredentials(handle.db, account.id, keyPath);
-    expect(creds).toEqual({ imapPassword: "imap-new", smtpPassword: "smtp-unchanged" });
+    expect(creds).toEqual({ imapPassword: "both-new", smtpPassword: "both-new" });
   });
 
-  it("changing only the smtp password re-encrypts, leaving the stored imap password untouched", async () => {
+  it("password + smtpPassword together: smtpPassword wins for smtp, password sets imap", async () => {
+    const account = await make({ password: "imap-old", smtpPassword: "smtp-old" });
+    await updateAccount(handle.db, actorId, account.id, { password: "imap-new", smtpPassword: "smtp-new" }, keyPath);
+    const creds = await getAccountCredentials(handle.db, account.id, keyPath);
+    expect(creds).toEqual({ imapPassword: "imap-new", smtpPassword: "smtp-new" });
+  });
+
+  it("a lone smtpPassword changes only smtp, carrying the stored imap password forward", async () => {
     const account = await make({ password: "imap-unchanged", smtpPassword: "smtp-old" });
     await updateAccount(handle.db, actorId, account.id, { smtpPassword: "smtp-new" }, keyPath);
     const creds = await getAccountCredentials(handle.db, account.id, keyPath);
     expect(creds).toEqual({ imapPassword: "imap-unchanged", smtpPassword: "smtp-new" });
   });
 
-  it("resets an errored account to active and clears last_error when a connection field changes", async () => {
+  it("a full password submission succeeds even against an undecryptable stored ciphertext (key-rotation recovery)", async () => {
+    const account = await make();
+    await corruptCiphertext(account.id);
+    // password alone is fully self-determining (both halves), so this must
+    // never need to decrypt the broken stored blob -- the whole point of the
+    // lazy-decrypt design is that a lost/rotated mail.key becomes fixable by
+    // submitting a fresh password instead of a permanent dead end.
+    await updateAccount(handle.db, actorId, account.id, { password: "recovered" }, keyPath);
+    const creds = await getAccountCredentials(handle.db, account.id, keyPath);
+    expect(creds).toEqual({ imapPassword: "recovered", smtpPassword: "recovered" });
+  });
+
+  it("sanitizes signatureHtml on write: a script tag is stripped", async () => {
+    const account = await make();
+    const updated = await updateAccount(
+      handle.db, actorId, account.id, { signatureHtml: "<p>Regards</p><script>alert(1)</script>" }, keyPath,
+    );
+    expect(updated.signatureHtml).not.toContain("<script>");
+    expect(updated.signatureHtml).toContain("Regards");
+  });
+
+  it("resets an errored account to active and clears last_error when a connection field (imapHost) changes", async () => {
     const account = await make();
     await forceError(account.id);
     const updated = await updateAccount(handle.db, actorId, account.id, { imapHost: "imap.example.com" }, keyPath);
+    expect(updated.status).toBe("active");
+    expect(updated.lastError).toBeNull();
+  });
+
+  it("resets an errored account when smtpHost changes", async () => {
+    const account = await make();
+    await forceError(account.id);
+    const updated = await updateAccount(handle.db, actorId, account.id, { smtpHost: "smtp.example.com" }, keyPath);
+    expect(updated.status).toBe("active");
+    expect(updated.lastError).toBeNull();
+  });
+
+  it("resets an errored account when imapSecurity changes", async () => {
+    const account = await make();
+    await forceError(account.id);
+    const updated = await updateAccount(handle.db, actorId, account.id, { imapSecurity: "starttls" }, keyPath);
+    expect(updated.status).toBe("active");
+    expect(updated.lastError).toBeNull();
+  });
+
+  it("resets an errored account when only the password changes (wantsPasswordChange counts as a connection change)", async () => {
+    const account = await make();
+    await forceError(account.id);
+    const updated = await updateAccount(handle.db, actorId, account.id, { password: "new-password" }, keyPath);
     expect(updated.status).toBe("active");
     expect(updated.lastError).toBeNull();
   });
@@ -156,6 +225,35 @@ describe("updateAccount", () => {
     const updated = await updateAccount(handle.db, actorId, account.id, { label: "Renamed only" }, keyPath);
     expect(updated.status).toBe("error");
     expect(updated.lastError).toBe("boom");
+  });
+
+  it("does NOT reset an errored account when only backfillDays changes", async () => {
+    const account = await make();
+    await forceError(account.id);
+    const updated = await updateAccount(handle.db, actorId, account.id, { backfillDays: 30 }, keyPath);
+    expect(updated.status).toBe("error");
+    expect(updated.lastError).toBe("boom");
+  });
+
+  it("does NOT reset an errored account when only signatureHtml changes", async () => {
+    const account = await make();
+    await forceError(account.id);
+    const updated = await updateAccount(handle.db, actorId, account.id, { signatureHtml: "<p>New sig</p>" }, keyPath);
+    expect(updated.status).toBe("error");
+    expect(updated.lastError).toBe("boom");
+  });
+
+  it("publishes the mail-accounts SSE key", async () => {
+    const account = await make();
+    const hints: string[][][] = [];
+    const unsub = subscribe((hint) => hints.push(hint.keys));
+    try {
+      await updateAccount(handle.db, actorId, account.id, { label: "Renamed" }, keyPath);
+      const flat = hints.flat().map((k) => k.join(":"));
+      expect(flat).toContain("mail-accounts");
+    } finally {
+      unsub();
+    }
   });
 
   it("a same-value patch is a no-op: updatedAt unchanged", async () => {
@@ -212,6 +310,46 @@ describe("archiveAccount", () => {
   });
 });
 
+describe("unarchiveAccount", () => {
+  it("clears archivedAt and is idempotent", async () => {
+    const account = await make();
+    await archiveAccount(handle.db, actorId, account.id);
+    const unarchived = await unarchiveAccount(handle.db, actorId, account.id);
+    expect(unarchived.archivedAt).toBeNull();
+    const unarchivedAgain = await unarchiveAccount(handle.db, actorId, account.id);
+    expect(unarchivedAgain.archivedAt).toBeNull();
+  });
+
+  it("does not heal status/last_error -- unarchiving alone does not fix a broken connection", async () => {
+    const account = await make();
+    await forceError(account.id);
+    await archiveAccount(handle.db, actorId, account.id);
+    const unarchived = await unarchiveAccount(handle.db, actorId, account.id);
+    expect(unarchived.status).toBe("error");
+    expect(unarchived.lastError).toBe("boom");
+  });
+
+  it("throws NotFoundError for another user's account", async () => {
+    const account = await make({}, otherActorId);
+    await archiveAccount(handle.db, otherActorId, account.id);
+    await expect(unarchiveAccount(handle.db, actorId, account.id)).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("publishes the mail-accounts SSE key", async () => {
+    const account = await make();
+    await archiveAccount(handle.db, actorId, account.id);
+    const hints: string[][][] = [];
+    const unsub = subscribe((hint) => hints.push(hint.keys));
+    try {
+      await unarchiveAccount(handle.db, actorId, account.id);
+      const flat = hints.flat().map((k) => k.join(":"));
+      expect(flat).toContain("mail-accounts");
+    } finally {
+      unsub();
+    }
+  });
+});
+
 describe("getOwnAccount", () => {
   it("returns the account with no credential fields", async () => {
     const account = await make();
@@ -252,7 +390,12 @@ describe("listAccounts", () => {
     expect(mailAccountSummarySchema.safeParse(others[0]).success).toBe(true);
   });
 
-  it("excludes an archived other-user account from others, but keeps an archived own account in own", async () => {
+  // RULING: archived accounts are NOT filtered out of either collection.
+  // `own` so Settings can show the user their own archived account; `others`
+  // because a summary leaks nothing beyond an active one, and Task 10 still
+  // needs to label threads sent through a now-archived account of someone
+  // else's (the spec keeps an archived account's messages).
+  it("keeps an archived own account in own, and an archived other-user account in others", async () => {
     const mine = await make({ label: "Mine" });
     await archiveAccount(handle.db, actorId, mine.id);
     const theirs = await make({ label: "Theirs", email: "alex@example.com" }, otherActorId);
@@ -261,7 +404,7 @@ describe("listAccounts", () => {
     const { own, others } = await listAccounts(handle.db, actorId);
     expect(own.map((a) => a.id)).toContain(mine.id);
     expect(own.find((a) => a.id === mine.id)?.archivedAt).not.toBeNull();
-    expect(others.map((a) => a.id)).not.toContain(theirs.id);
+    expect(others.map((a) => a.id)).toContain(theirs.id);
   });
 });
 
@@ -321,6 +464,20 @@ describe("testConnection", () => {
   it("with accountId and no submitted password: an unreadable stored ciphertext surfaces per-protocol, not a thrown error", async () => {
     const account = await make();
     await corruptCiphertext(account.id);
+    const result = await testConnection(handle.db, actorId, { accountId: account.id }, keyPath, okDeps());
+    expect(result).toEqual({
+      imap: { ok: false, error: "credentials unreadable" },
+      smtp: { ok: false, error: "credentials unreadable" },
+    });
+  });
+
+  // Widened-catch case: a ciphertext that is not even structurally v1 throws
+  // a plain Error from decryptCredentials (not MailCredentialDecryptError) --
+  // this must surface the same way as any other decrypt failure, not as a
+  // thrown 500. See garbleCiphertext's own comment.
+  it("with accountId and no submitted password: a structurally-invalid stored ciphertext also surfaces per-protocol", async () => {
+    const account = await make();
+    await garbleCiphertext(account.id);
     const result = await testConnection(handle.db, actorId, { accountId: account.id }, keyPath, okDeps());
     expect(result).toEqual({
       imap: { ok: false, error: "credentials unreadable" },

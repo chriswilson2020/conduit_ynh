@@ -33,7 +33,7 @@ export function requireUser(request: FastifyRequest, reply: FastifyReply): User 
 }
 
 /**
- * Maps the three domain error types every service can throw into their HTTP shape.
+ * Maps the five domain error types every service can throw into their HTTP shape.
  * Anything else is re-thrown so it reaches app.ts's setErrorHandler, which is the
  * single place that decides what a 5xx body looks like (and never echoes the
  * underlying error text) -- this function must not swallow or reshape those.
@@ -67,12 +67,21 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
   // request itself was fine. Route-level exercise of these two branches
   // lands with routes/mail.ts in Task 7; this only wires the mapping so that
   // task's routes get it for free.
+  //
+  // Static message text, deliberately NOT error.message: MailKeyMissingError's
+  // message embeds the server's filesystem path (mail.key's location), which
+  // must never reach an authenticated client -- app.ts's own 5xx handler
+  // already holds this line for every other unhandled error, and there is no
+  // reason a domain-mapped 503 should be laxer about it. The real message
+  // (with the path) stays on the Error object for server-side logs.
   if (error instanceof MailKeyMissingError) {
-    void reply.code(503).send({ error: "mail_key_missing", message: error.message });
+    void reply.code(503).send({ error: "mail_key_missing", message: "mail key unavailable" });
     return;
   }
   if (error instanceof MailCredentialDecryptError) {
-    void reply.code(503).send({ error: "mail_credentials_unreadable", message: error.message });
+    void reply.code(503).send({
+      error: "mail_credentials_unreadable", message: "stored mail credentials could not be decrypted",
+    });
     return;
   }
   throw error;

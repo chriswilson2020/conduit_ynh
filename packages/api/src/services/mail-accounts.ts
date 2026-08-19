@@ -1,12 +1,13 @@
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, isNotNull } from "drizzle-orm";
 import type {
   MailAccount, MailAccountCreateInput, MailAccountUpdateInput, MailAccountTestInput,
   MailAccountSummary, MailSecurity, MailAccountStatus,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { mailAccounts, type MailAccountRow } from "../db/schema.js";
-import { NotFoundError, ArchivedError, MailKeyMissingError, MailCredentialDecryptError } from "./errors.js";
+import { NotFoundError, ArchivedError } from "./errors.js";
 import { encryptCredentialsAt, decryptCredentialsAt, type MailCredentials } from "./mail-crypto.js";
+import { sanitizeMailHtml } from "./mail-content.js";
 import { publish } from "./sse.js";
 
 /** Invalidation key every mail-account mutator publishes after its write commits.
@@ -69,7 +70,12 @@ export async function createAccount(
     // rather than coerced back into the default.
     ...(input.sentFolder !== undefined ? { sentFolder: input.sentFolder } : {}),
     ...(input.backfillDays !== undefined ? { backfillDays: input.backfillDays } : {}),
-    signatureHtml: input.signatureHtml ?? null,
+    // Signatures render directly in the main document, no iframe/CSP
+    // isolation (spec) -- this service is the only write path for
+    // signature_html, so it is the one place that must run the shared
+    // sanitizer profile (mail-content.ts's sanitizeMailHtml, no cidMap: a
+    // signature has no attachments to rewrite cid: references against).
+    signatureHtml: input.signatureHtml != null ? sanitizeMailHtml(input.signatureHtml) : null,
     status: "active",
   }).returning();
   if (row === undefined) throw new Error("insert returned no row");
@@ -97,6 +103,16 @@ const CONNECTION_FIELDS = [
   "imapHost", "imapPort", "imapSecurity", "smtpHost", "smtpPort", "smtpSecurity", "username",
 ] as const satisfies readonly (keyof MailAccountUpdateInput)[];
 
+/**
+ * Password-field convention (matches createAccount and testConnection's
+ * "SMTP differs" default): a lone `password` sets BOTH the imap and smtp
+ * password, unless `smtpPassword` is also submitted, in which case that
+ * wins for smtp. A lone `smtpPassword` changes ONLY smtp, carrying the
+ * stored imap password forward unchanged. The settings form (Task 9)
+ * submits `password` alone when its "SMTP differs" toggle is off, and both
+ * fields when it is on -- so this mirrors the form's own two states exactly
+ * rather than introducing a third.
+ */
 export async function updateAccount(
   db: Database, actorId: string, id: string, patch: UpdateAccountInput, mailKeyPath: string,
 ): Promise<MailAccount> {
@@ -117,21 +133,6 @@ export async function updateAccount(
 
   if (changedKeys.length === 0 && !wantsPasswordChange) return toMailAccount(existing);
 
-  let credentialsCiphertext: string | undefined;
-  if (wantsPasswordChange) {
-    // The ciphertext holds BOTH imap+smtp passwords as one JSON blob (GCM is
-    // atomic over the whole payload -- there is no way to update just one
-    // field in place), so changing only one of the two still requires
-    // decrypting the current pair to carry the untouched one forward
-    // unchanged into the new ciphertext.
-    const current = decryptCredentialsAt(mailKeyPath, existing.credentialsCiphertext);
-    const next: MailCredentials = {
-      imapPassword: password !== undefined && password !== "" ? password : current.imapPassword,
-      smtpPassword: smtpPassword !== undefined && smtpPassword !== "" ? smtpPassword : current.smtpPassword,
-    };
-    credentialsCiphertext = encryptCredentialsAt(mailKeyPath, next);
-  }
-
   // A stale last_error must not survive a fix, but an unrelated edit (e.g.
   // relabelling the account) must not fake-heal a genuinely still-broken
   // connection either -- so the reset is gated on whether something that
@@ -140,13 +141,56 @@ export async function updateAccount(
     || wantsPasswordChange;
   const shouldResetStatus = existing.status === "error" && connectionFieldChanged;
 
-  const [row] = await db.update(mailAccounts).set({
-    ...rest,
-    updatedAt: new Date(),
-    ...(credentialsCiphertext !== undefined ? { credentialsCiphertext } : {}),
-    ...(shouldResetStatus ? { status: "active" as const, lastError: null } : {}),
-  }).where(eq(mailAccounts.id, id)).returning();
-  if (row === undefined) throw new NotFoundError("mail account", id);
+  // SELECT (for the decrypt-and-carry-forward branch below) -> decrypt ->
+  // UPDATE is a read-modify-write on the same row: two concurrent updates
+  // that both only touch smtpPassword would otherwise both decrypt the same
+  // pre-transaction snapshot and the loser's imap half silently reverts to
+  // stale data. Wrapping in a transaction and re-reading fresh (see the
+  // smtpPassword-alone branch below) closes that window; companies.ts's
+  // updateCompany is the precedent for wrapping the mutating half of an
+  // update in a transaction while the initial ownership/archived check
+  // above stays outside it.
+  const row = await db.transaction(async (tx) => {
+    let credentialsCiphertext: string | undefined;
+    if (password !== undefined && password !== "") {
+      // Fully determined by the submission -- covers both protocols (smtp
+      // too, unless overridden below) -- so this branch never reads the
+      // stored ciphertext at all. That is what makes a key-rotated (no
+      // longer decryptable) account recoverable: submit a fresh password
+      // and the broken stored blob is simply overwritten, never decrypted.
+      credentialsCiphertext = encryptCredentialsAt(mailKeyPath, {
+        imapPassword: password,
+        smtpPassword: smtpPassword !== undefined && smtpPassword !== "" ? smtpPassword : password,
+      });
+    } else if (smtpPassword !== undefined && smtpPassword !== "") {
+      // smtpPassword alone: only smtp changes, so the stored imap half must
+      // be carried forward -- the one remaining case that still needs to
+      // decrypt. Re-read inside the transaction (not the `existing` read
+      // from before it started) so a concurrent password change landing in
+      // between is not silently clobbered by encrypting a stale imap half.
+      const [fresh] = await tx.select().from(mailAccounts).where(eq(mailAccounts.id, id));
+      if (fresh === undefined) throw new NotFoundError("mail account", id);
+      const current = decryptCredentialsAt(mailKeyPath, fresh.credentialsCiphertext);
+      credentialsCiphertext = encryptCredentialsAt(mailKeyPath, {
+        imapPassword: current.imapPassword,
+        smtpPassword,
+      });
+    }
+
+    const [updated] = await tx.update(mailAccounts).set({
+      ...rest,
+      // Same write-path sanitization as createAccount -- see its comment.
+      // Only overrides rest.signatureHtml when it is a non-null string; an
+      // explicit null (clearing the signature) or an absent key both pass
+      // through the spread above unchanged.
+      ...(rest.signatureHtml != null ? { signatureHtml: sanitizeMailHtml(rest.signatureHtml) } : {}),
+      updatedAt: new Date(),
+      ...(credentialsCiphertext !== undefined ? { credentialsCiphertext } : {}),
+      ...(shouldResetStatus ? { status: "active" as const, lastError: null } : {}),
+    }).where(eq(mailAccounts.id, id)).returning();
+    if (updated === undefined) throw new NotFoundError("mail account", id);
+    return updated;
+  });
   // Task 5 wires accountChanged here (restart the AccountSync so it picks up
   // new settings/credentials, or clears its backoff after the status reset).
   publishAccountsHint();
@@ -158,8 +202,10 @@ export async function updateAccount(
  * conditional update as companies.ts's setArchived: a concurrent archive
  * between mustGetOwned and this UPDATE yields zero rows, in which case the
  * current (already-archived) state is re-read and returned rather than
- * treated as an error. There is no unarchive counterpart for mail accounts
- * (unlike companies/deals) -- the spec's route list only ever lists archive. */
+ * treated as an error. unarchiveAccount below is the mirror -- re-adding
+ * the same mailbox as a brand-new account row instead would re-ingest every
+ * message under a new account_id and duplicate every thread it touches, so
+ * archiving needs a real way back rather than being terminal. */
 export async function archiveAccount(db: Database, actorId: string, id: string): Promise<MailAccount> {
   const existing = await mustGetOwned(db, actorId, id);
   if (existing.archivedAt !== null) return toMailAccount(existing);
@@ -174,6 +220,30 @@ export async function archiveAccount(db: Database, actorId: string, id: string):
     return toMailAccount(recheck);
   }
   // Task 5 wires accountChanged here (tear down this account's AccountSync).
+  publishAccountsHint();
+  return toMailAccount(row);
+}
+
+/** Mirror of archiveAccount: clears archived_at, same owner check, same
+ * idempotent/race-safe WHERE-guarded pattern. Deliberately does NOT touch
+ * status/last_error -- an account archived while erroring un-archives still
+ * erroring, which is correct (nothing about unarchiving fixed the
+ * connection); the ArchivedError guard on updateAccount/testConnection is
+ * what actually re-enables editing/testing it. */
+export async function unarchiveAccount(db: Database, actorId: string, id: string): Promise<MailAccount> {
+  const existing = await mustGetOwned(db, actorId, id);
+  if (existing.archivedAt === null) return toMailAccount(existing);
+
+  const [row] = await db.update(mailAccounts)
+    .set({ archivedAt: null, updatedAt: new Date() })
+    .where(and(eq(mailAccounts.id, id), isNotNull(mailAccounts.archivedAt)))
+    .returning();
+  if (row === undefined) {
+    const [recheck] = await db.select().from(mailAccounts).where(eq(mailAccounts.id, id));
+    if (recheck === undefined) throw new NotFoundError("mail account", id);
+    return toMailAccount(recheck);
+  }
+  // Task 5 wires accountChanged here (start a new AccountSync for this account again).
   publishAccountsHint();
   return toMailAccount(row);
 }
@@ -215,19 +285,20 @@ export interface MailAccountList {
  * own) and can trivially concatenate. A flat discriminated-union list would
  * make BOTH call sites re-filter/narrow on every read for no benefit.
  *
- * `others` excludes archived accounts (an inactive filter option for an
- * account you cannot manage is just noise) but `own` does NOT filter
- * archived accounts out -- the settings page is exactly where a user needs
- * to see an account they archived, e.g. to confirm it took effect. This
- * asymmetry is intentional, not an oversight.
+ * Neither collection filters archived accounts out. `own` needs them so the
+ * settings page can show an account the user archived (e.g. to confirm it
+ * took effect). `others` needs them too, for a different reason: a
+ * summary leaks nothing (id/label/email only, same as an active one), and
+ * the spec keeps an archived account's messages -- Task 10 still has to
+ * label threads sent through a now-archived account of someone else's, so
+ * dropping it from `others` would leave those threads unable to name their
+ * own account.
  */
 export async function listAccounts(db: Database, actorId: string): Promise<MailAccountList> {
   const rows = await db.select().from(mailAccounts)
     .orderBy(desc(mailAccounts.createdAt), desc(mailAccounts.id));
   const own = rows.filter((r) => r.userId === actorId).map(toMailAccount);
-  const others = rows
-    .filter((r) => r.userId !== actorId && r.archivedAt === null)
-    .map(toSummary);
+  const others = rows.filter((r) => r.userId !== actorId).map(toSummary);
   return { own, others };
 }
 
@@ -272,10 +343,10 @@ async function runVerify(verify: () => Promise<void>): Promise<ProtocolResult> {
  *   *replacement* password after mail.key was lost/rotated (the exact
  *   scenario where decrypting the OLD ciphertext would fail) still works:
  *   a fully-overridden test never touches the broken ciphertext at all. When
- *   decryption IS attempted and fails (MailKeyMissingError or
- *   MailCredentialDecryptError), that surfaces as a normal per-protocol
- *   `{ok: false, error: "credentials unreadable"}` result for BOTH
- *   protocols -- never a thrown 503 -- because a user testing a broken
+ *   decryption IS attempted and fails, for ANY reason (missing key, wrong
+ *   key, or a structurally-invalid ciphertext), that surfaces as a normal
+ *   per-protocol `{ok: false, error: "credentials unreadable"}` result for
+ *   BOTH protocols -- never a thrown 503 -- because a user testing a broken
  *   account needs the answer, not an error page.
  * - Without accountId: submitted fields are used directly. Fine-grained
  *   "all required fields present" enforcement is the route's job (Task 7,
@@ -299,14 +370,18 @@ export async function testConnection(
         const creds = decryptCredentialsAt(mailKeyPath, account.credentialsCiphertext);
         storedImapPassword = creds.imapPassword;
         storedSmtpPassword = creds.smtpPassword;
-      } catch (err) {
-        if (err instanceof MailKeyMissingError || err instanceof MailCredentialDecryptError) {
-          return {
-            imap: { ok: false, error: CREDENTIALS_UNREADABLE },
-            smtp: { ok: false, error: CREDENTIALS_UNREADABLE },
-          };
-        }
-        throw err;
+      } catch {
+        // Deliberately broad: catches MailKeyMissingError, MailCredentialDecryptError,
+        // AND the plain Error decryptCredentials throws for a ciphertext that
+        // is not even structurally v1 (see mail-crypto.ts) -- every failure
+        // mode ends up meaning the same thing to a caller here, "cannot read
+        // the stored credentials." This is a test endpoint: someone pressing
+        // "Test connection" on a broken account needs an answer, never an
+        // unhandled 500.
+        return {
+          imap: { ok: false, error: CREDENTIALS_UNREADABLE },
+          smtp: { ok: false, error: CREDENTIALS_UNREADABLE },
+        };
       }
     }
   }

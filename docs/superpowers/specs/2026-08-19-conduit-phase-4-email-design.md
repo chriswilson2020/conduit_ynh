@@ -158,8 +158,9 @@ context; unresolved placeholders are left visible for the user to fill.
 All under the existing auth. "Own account" = `mail_accounts.user_id` is the current user.
 
 - `GET/POST /api/mail/accounts`; `PATCH /api/mail/accounts/:id`;
-  `POST /api/mail/accounts/:id/archive` — own accounts only in every mutating direction; the
-  list returns other users' accounts as id+label+email (for filter UI), never settings. `POST /api/mail/accounts/test` dry-runs IMAP and SMTP logins with the
+  `POST /api/mail/accounts/:id/archive`; `POST /api/mail/accounts/:id/unarchive` — own accounts
+  only in every mutating direction; the list returns other users' accounts as id+label+email
+  (for filter UI), never settings. `POST /api/mail/accounts/test` dry-runs IMAP and SMTP logins with the
   submitted (or stored) credentials and returns per-protocol results.
 - `GET /api/mail/threads` — filters: `account_id`, `unread`, `unlinked`, `company_id`,
   `contact_id`, `deal_id`, `project_id`, `archived`; keyset pagination by
