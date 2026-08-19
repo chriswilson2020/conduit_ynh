@@ -66,7 +66,15 @@ const boardCollisionDetection: CollisionDetection = (args) => {
     droppableContainers: args.droppableContainers.filter((container) => container.id !== args.active.id),
   };
   const intersections = rectIntersection(withoutActive);
-  return intersections.length > 0 ? intersections : closestCenter(withoutActive);
+  const result = intersections.length > 0 ? intersections : closestCenter(withoutActive);
+  // TEMPORARY DEBUG INSTRUMENTATION -- see the keyboard-drag race
+  // investigation in commit history.
+  // eslint-disable-next-line no-console
+  console.log(
+    "[dbg collisionDetection] rects=", args.droppableRects.size,
+    "result=", JSON.stringify(result.map((c) => c.id)),
+  );
+  return result;
 };
 
 /**
@@ -155,7 +163,25 @@ export function BoardPage() {
   const suppressCardClickRef = useRef(false);
 
   const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 4 } });
-  const keyboardSensor = useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates });
+  const keyboardSensor = useSensor(KeyboardSensor, {
+    coordinateGetter: (event, args) => {
+      // TEMPORARY DEBUG INSTRUMENTATION -- see the keyboard-drag race
+      // investigation in commit history. Logs what the coordinateGetter
+      // actually sees on each arrow press: how many droppable rects are
+      // measured, what `over` currently is, and what it decides to return.
+      const rectCount = args.context.droppableRects.size;
+      const containerCount = args.context.droppableContainers.getEnabled().length;
+      const before = { over: args.context.over?.id ?? null, rectCount, containerCount };
+      const result = sortableKeyboardCoordinates(event, args);
+      // eslint-disable-next-line no-console
+      console.log(
+        "[dbg coordinateGetter]", event.code,
+        "before=", JSON.stringify(before),
+        "result=", JSON.stringify(result),
+      );
+      return result;
+    },
+  });
   const archived = pipelineData !== undefined && pipelineData.pipeline.archivedAt !== null;
   // Empty sensor list means no pointer/keyboard gesture can ever activate a
   // drag -- the simplest way to make the whole board read-only for an
