@@ -18,9 +18,11 @@ import type { Locator, Page } from "@playwright/test";
 // left no state behind, and a processed-but-not-yet-committed one converges
 // anyway because the coordinate getter resolves the TARGET's absolute
 // coordinates, not a delta: a duplicate press re-resolves to the same target
-// while the first's render is still pending. Shared by both describes below
-// (and mirrored in pipeline.spec.ts, whose board reuses the same
-// kanban-core machinery).
+// while the first's render is still pending. Used by the journey describe
+// below (and mirrored in pipeline.spec.ts, whose board reuses the same
+// kanban-core machinery); the off-screen-columns regression at the bottom
+// deliberately bypasses it -- see its comment for why announcement gating
+// alone would mask the very bug it pins.
 async function keyboardDragCard(page: Page, card: Locator, arrowKeys: string[]) {
   const announcement = page.locator('[id^="DndLiveRegion"]');
   await card.focus();
@@ -432,19 +434,61 @@ test.describe.serial("Task board keyboard drag with off-screen columns", () => {
   });
 
   test("keyboard-drags the card into the off-screen Done column", async () => {
-    await page.goto(`/projects/${projectId}/board`);
     const blocked = boardColumn("blocked");
     const done = boardColumn("done");
 
-    // The regression's premise: Done must actually start off-screen, or this
-    // degenerates into the same on-screen drag the wide journey already
-    // covers. Guards the viewport/column arithmetic above against layout
-    // drift silently widening what fits.
-    await expect(done).not.toBeInViewport();
+    // Deliberately NOT keyboardDragCard: gating every step on announcements
+    // alone would mask this very bug -- the UNFIXED sensor's smooth-scroll
+    // fallback also walks `over` onto the target (and announces) a few
+    // hundred ms later, so an announcement-gated drag eventually lands even
+    // without the fix (Codex review on PR #1). What the fix actually
+    // guarantees -- and what the old code cannot fake -- is that the target
+    // column is brought into view SYNCHRONOUSLY, inside the ArrowRight
+    // keydown itself, so the one-shot in-viewport probe right after the
+    // press below is the discriminating assertion. (An immediate
+    // un-gated drop is NOT a usable discriminator: `over` reaches
+    // onDragEnd via a React render even in the fixed code, and a scripted
+    // Space ~10ms after the arrow reliably beats that render on CI -- the
+    // drop preview needs the same render, so a real user dropping before it
+    // gets exactly the no-move they saw.) The drop itself then stays
+    // announcement-gated for the same attach-race reasons as the helper,
+    // and a swallowed keypress fails the probe, retrying the WHOLE gesture
+    // from a fresh page load -- while the actual bug fails the probe on
+    // every attempt.
+    const announcement = page.locator('[id^="DndLiveRegion"]');
+    await expect(async () => {
+      await page.goto(`/projects/${projectId}/board`);
+      // The regression's premise: Done must actually start off-screen, or
+      // this degenerates into the same on-screen drag the wide journey
+      // already covers. Guards the viewport/column arithmetic above against
+      // layout drift silently widening what fits.
+      await expect(done).not.toBeInViewport();
 
-    await keyboardDragCard(page, blocked.getByTestId(`card-${taskId}`), ["ArrowRight"]);
+      const card = blocked.getByTestId(`card-${taskId}`);
+      await card.focus();
+      await page.keyboard.press("Space");
+      await expect(announcement).toContainText("was moved over");
+      await page.keyboard.press("ArrowRight");
 
-    await expect(done.getByTestId(`card-${taskId}`)).toBeVisible();
+      // One-shot, non-retrying probe, evaluated as soon as the press
+      // resolves: the fixed coordinate getter has already scrolled Done
+      // fully into the 1000px viewport; the unfixed sensor has only just
+      // STARTED a ~400px smooth scroll (and skipped the move), so Done's
+      // right edge is still far off-screen here. A retrying assertion
+      // would wait out that animation and pass either way -- this must not.
+      const doneInView = await done.evaluate((el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.left >= 0 && rect.right <= window.innerWidth + 1;
+      });
+      expect(doneInView).toBe(true);
+
+      // Outcome checks, safe to gate now that the mechanism is pinned: the
+      // arrow's own announcement (over = Done's placeholder or column
+      // droppable), then the drop.
+      await expect(announcement).toContainText(/was moved over droppable area (column:)?done/);
+      await page.keyboard.press("Space");
+      await expect(done.getByTestId(`card-${taskId}`)).toBeVisible({ timeout: 3000 });
+    }).toPass({ timeout: 30_000 });
     await expect(blocked.getByTestId(`card-${taskId}`)).not.toBeVisible();
   });
 
