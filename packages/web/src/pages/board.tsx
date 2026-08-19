@@ -1,9 +1,10 @@
 import { useMemo, useRef, useState } from "react";
 import type { FormEvent, RefObject } from "react";
 import {
-  DndContext, DragOverlay, KeyboardSensor, PointerSensor, closestCenter, useDroppable, useSensor, useSensors,
+  DndContext, DragOverlay, KeyboardSensor, PointerSensor, closestCenter, rectIntersection, useDroppable,
+  useSensor, useSensors,
 } from "@dnd-kit/core";
-import type { DragEndEvent, DragStartEvent } from "@dnd-kit/core";
+import type { CollisionDetection, DragEndEvent, DragStartEvent } from "@dnd-kit/core";
 import {
   SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -25,6 +26,48 @@ interface CardDndData { type: "card"; stageId: string }
 interface PlaceholderDndData { type: "placeholder"; stageId: string }
 interface ColumnDndData { type: "column"; stageId: string }
 type DndData = CardDndData | PlaceholderDndData | ColumnDndData;
+
+/**
+ * Every card sits inside BOTH its own sortable droppable AND its column's
+ * wrapping useDroppable (added so pointer users can drop into blank space
+ * below the last card, appending at the tail -- see Column's comment below).
+ * That containment relationship breaks a KEYBOARD drag under the stock
+ * closestCenter algorithm two different ways (a pointer drag hits neither --
+ * the first pixel of movement already breaks any tie):
+ *
+ *   1. On lift, the active card's own collisionRect exactly equals its own
+ *      resting droppable rect -- distance zero to itself -- so `over` locks
+ *      onto the dragged card and no arrow press can ever move it anywhere.
+ *   2. Even once the active id is excluded, a column's droppable rect
+ *      spatially CONTAINS every card inside it, and closestCenter ranks
+ *      candidates by distance between RECT CENTERS -- for a compact column
+ *      the column's own center can be closer to the ghost's center than any
+ *      individual sibling card's center is, so `over` sticks on the column
+ *      and a same-column ArrowDown/ArrowUp never reaches a sibling card.
+ *
+ * rectIntersection sidesteps both by ranking candidates on overlap RATIO
+ * instead of center distance. The keyboard sensor's own coordinateGetter
+ * (sortableKeyboardCoordinates) snaps the ghost's rect to align with the
+ * target card/placeholder on every arrow press, so afterwards the ghost
+ * overlaps that one small card almost completely (ratio near 1) while only
+ * covering a tiny fraction of the much larger enclosing column (ratio near
+ * 0) -- the card wins outright without ever comparing centers. This also
+ * preserves the pointer blank-space-drop case: a point that overlaps no
+ * card at all still overlaps the column, so `over` still resolves to the
+ * column there and onDragEnd's existing tail-append branch still fires.
+ * closestCenter is kept as a fallback for the one case rectIntersection
+ * can't answer -- nothing at all under the ghost -- which should not arise
+ * on this board (every column always has either cards or its empty-column
+ * placeholder) but is defensive rather than load-bearing.
+ */
+const boardCollisionDetection: CollisionDetection = (args) => {
+  const withoutActive = {
+    ...args,
+    droppableContainers: args.droppableContainers.filter((container) => container.id !== args.active.id),
+  };
+  const intersections = rectIntersection(withoutActive);
+  return intersections.length > 0 ? intersections : closestCenter(withoutActive);
+};
 
 export function BoardPage() {
   const { pipelineId } = useParams({ from: "/pipelines/$pipelineId" });
@@ -239,7 +282,7 @@ export function BoardPage() {
       ) : (
         <DndContext
           sensors={sensors}
-          collisionDetection={closestCenter}
+          collisionDetection={boardCollisionDetection}
           onDragStart={handleDragStart}
           onDragCancel={handleDragCancel}
           onDragEnd={handleDragEnd}
