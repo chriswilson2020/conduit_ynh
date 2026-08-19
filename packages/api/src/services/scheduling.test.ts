@@ -781,3 +781,115 @@ describe("compactSchedule: Fix 2 (hotfix v0.4.3) -- never schedules a movable ta
     expect(dependentMoved.cascadedFrom).toBeNull();
   });
 });
+
+describe("compactSchedule: v0.4.4 -- an in_progress task is only frozen once it has actually started", () => {
+  it("the user's second regression: in_progress with a FUTURE start pulls back like a todo, and its dependents follow", async () => {
+    // Mirrors the live demo project exactly as reported: Design finished
+    // last week, Build is flagged in_progress but SCHEDULED weeks out --
+    // under the v0.4.3 rule Build's status alone froze it, stranding QA and
+    // Launch in the future no matter how much slack sat in between. The
+    // v0.4.4 refinement (see scheduling.ts's MOVABLE doc comment) says a
+    // future-start in_progress task is being worked on NOW, so its
+    // future-dated slot is slack: it pulls (today-clamped) like a todo.
+    const todayIso = todayDateOnly();
+    const day = (n: number) => addDays(todayIso, n);
+    const project = await makeProject({ name: "SecondRegression" });
+    const design = await createTask(handle.db, actorId, {
+      title: "Design", projectId: project.id, startDate: day(-9), dueDate: day(-5),
+    });
+    await setTaskStatus(handle.db, actorId, design.id, "done");
+    const build = await createTask(handle.db, actorId, {
+      title: "Build", projectId: project.id, startDate: day(15), dueDate: day(20),
+    });
+    await setTaskStatus(handle.db, actorId, build.id, "in_progress");
+    const content = await createTask(handle.db, actorId, {
+      title: "Content", projectId: project.id, startDate: day(0), dueDate: day(3),
+    });
+    const qa = await createTask(handle.db, actorId, {
+      title: "QA", projectId: project.id, startDate: day(20), dueDate: day(22),
+    });
+    const launch = await createTask(handle.db, actorId, {
+      title: "Launch", projectId: project.id, startDate: day(22), dueDate: day(22),
+    });
+    await addDependency(handle.db, actorId, design.id, build.id);
+    await addDependency(handle.db, actorId, build.id, qa.id);
+    await addDependency(handle.db, actorId, content.id, qa.id);
+    await addDependency(handle.db, actorId, qa.id, launch.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    // Build: movable now. Its only predecessor (Design) has a due date in
+    // the past, so the target clamps to today -- 5-day duration preserved.
+    const buildMoved = result.moved.find((m) => m.id === build.id)!;
+    expect(buildMoved.startDate).toBe(todayIso);
+    expect(buildMoved.dueDate).toBe(day(5));
+
+    // QA settles against max(Build's NEW clamped due day(5), Content's due
+    // day(3), today) = day(5) -- the September stranding is gone.
+    const qaMoved = result.moved.find((m) => m.id === qa.id)!;
+    expect(qaMoved.startDate).toBe(day(5));
+    expect(qaMoved.dueDate).toBe(day(7));
+    const launchMoved = result.moved.find((m) => m.id === launch.id)!;
+    expect(launchMoved.startDate).toBe(day(7));
+  });
+
+  it("an in_progress task whose start is today or earlier stays frozen, and still constrains its successors", async () => {
+    const todayIso = todayDateOnly();
+    const day = (n: number) => addDays(todayIso, n);
+    const project = await makeProject({ name: "StartedStaysPut" });
+    const started = await createTask(handle.db, actorId, {
+      title: "Started", projectId: project.id, startDate: day(0), dueDate: day(9),
+    });
+    await setTaskStatus(handle.db, actorId, started.id, "in_progress");
+    const dependent = await createTask(handle.db, actorId, {
+      title: "Dependent", projectId: project.id, startDate: day(30), dueDate: day(32),
+    });
+    await addDependency(handle.db, actorId, started.id, dependent.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    // start == today is the boundary case: started, therefore frozen.
+    expect(result.moved.some((m) => m.id === started.id)).toBe(false);
+    const after = await getTask(handle.db, started.id);
+    expect(after?.startDate).toBe(day(0));
+    expect(after?.dueDate).toBe(day(9));
+    const dependentMoved = result.moved.find((m) => m.id === dependent.id)!;
+    expect(dependentMoved.startDate).toBe(day(9));
+    expect(dependentMoved.dueDate).toBe(day(11));
+  });
+
+  it("a future-start in_progress task does not anchor the floor -- the earliest dated task does", async () => {
+    // No project startDate and no genuinely-started work, so the floor
+    // falls through to the earliest dated task overall. Under v0.4.3 the
+    // future-start in_progress task counted as a "reality anchor" and set
+    // the floor at day(50); now it's just another movable task, so the
+    // earliest todo (day 30) defines the floor and everything no-pred pulls
+    // toward THAT.
+    const todayIso = todayDateOnly();
+    const day = (n: number) => addDays(todayIso, n);
+    const project = await makeProject({ name: "NoFalseAnchor" });
+    const earliest = await createTask(handle.db, actorId, {
+      title: "Earliest", projectId: project.id, startDate: day(30), dueDate: day(32),
+    });
+    const inprog = await createTask(handle.db, actorId, {
+      title: "FutureInProgress", projectId: project.id, startDate: day(50), dueDate: day(54),
+    });
+    await setTaskStatus(handle.db, actorId, inprog.id, "in_progress");
+    const late = await createTask(handle.db, actorId, {
+      title: "Late", projectId: project.id, startDate: day(70), dueDate: day(72),
+    });
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    // Earliest defines the floor, stays put.
+    expect(result.moved.some((m) => m.id === earliest.id)).toBe(false);
+    // Both no-pred movables (the future-start in_progress included) pull to
+    // the day(30) floor, durations preserved.
+    const inprogMoved = result.moved.find((m) => m.id === inprog.id)!;
+    expect(inprogMoved.startDate).toBe(day(30));
+    expect(inprogMoved.dueDate).toBe(day(34));
+    const lateMoved = result.moved.find((m) => m.id === late.id)!;
+    expect(lateMoved.startDate).toBe(day(30));
+    expect(lateMoved.dueDate).toBe(day(32));
+  });
+});
