@@ -5,7 +5,8 @@ import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable"
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import type { Deal, Stage } from "@conduit/shared";
 import {
-  useCompanies, useCreateDeal, useCreateStage, useDeals, useMoveDeal, usePipeline, useUpdateStage, useUsers,
+  useArchivePipeline, useCompanies, useCreateDeal, useCreateStage, useDeals, useMoveDeal, usePipeline,
+  useUnarchivePipeline, useUpdateStage, useUsers,
 } from "../queries";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -19,6 +20,7 @@ import { parseDecimal } from "../lib";
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 export function BoardPage() {
+  const navigate = useNavigate();
   const { pipelineId } = useParams({ from: "/pipelines/$pipelineId" });
   const { data: pipelineData, isLoading } = usePipeline(pipelineId);
   const { data: dealsData } = useDeals(pipelineId);
@@ -26,6 +28,8 @@ export function BoardPage() {
   const { data: companiesData } = useCompanies({ limit: 100 });
   const { data: users = [] } = useUsers();
   const moveDeal = useMoveDeal();
+  const archivePipeline = useArchivePipeline();
+  const unarchivePipeline = useUnarchivePipeline();
 
   const companyMap = useMemo(
     () => new Map((companiesData?.items ?? []).map((company) => [company.id, company.name])),
@@ -88,6 +92,18 @@ export function BoardPage() {
 
   const { pipeline, stages } = pipelineData;
 
+  // Mirrors company-detail.tsx's handleArchive/handleUnarchive -- confirm,
+  // then mutate. Archiving navigates back to the pipelines index (Phase
+  // 3.1): there's nothing left worth looking at on a board that just went
+  // read-only, unlike unarchiving, which stays put on the now-editable board.
+  function handleArchivePipeline() {
+    if (!window.confirm(`Archive ${pipeline.name}? The board becomes read-only until it's unarchived.`)) return;
+    archivePipeline.mutate(pipelineId, { onSuccess: () => void navigate({ to: "/pipelines" }) });
+  }
+  function handleUnarchivePipeline() {
+    unarchivePipeline.mutate(pipelineId);
+  }
+
   const columns = (
     <div data-testid="board" className="flex items-start gap-4 overflow-x-auto pb-4">
       {stages.map((stage) => (
@@ -108,16 +124,26 @@ export function BoardPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div>
-        <Link to="/pipelines" className="text-xs font-medium text-slate-500 hover:text-slate-700">
-          {"\u2190"} Pipelines
-        </Link>
-        <h1 className="text-xl font-semibold text-slate-900">{pipeline.name}</h1>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <Link to="/pipelines" className="text-xs font-medium text-slate-500 hover:text-slate-700">
+            {"\u2190"} Pipelines
+          </Link>
+          <h1 className="text-xl font-semibold text-slate-900">{pipeline.name}</h1>
+        </div>
+        {!archived && (
+          <Button data-testid="archive-pipeline-button" variant="danger" onClick={handleArchivePipeline}>
+            Archive pipeline
+          </Button>
+        )}
       </div>
 
       {archived && (
-        <div role="alert" className="rounded-md border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
-          This pipeline is archived. The board is read-only.
+        <div role="alert" className="flex items-center justify-between gap-3 rounded-md border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
+          <span>This pipeline is archived. The board is read-only.</span>
+          <Button data-testid="unarchive-pipeline-button" variant="outline" onClick={handleUnarchivePipeline}>
+            Unarchive
+          </Button>
         </div>
       )}
 

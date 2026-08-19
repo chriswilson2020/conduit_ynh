@@ -16,7 +16,14 @@ const GLOBAL = "global";
 export function PipelinesPage() {
   const navigate = useNavigate();
   const [createOpen, setCreateOpen] = useState(false);
-  const { data: pipelines = [], isLoading } = usePipelines({});
+  // Archived pipelines hidden by default (usePipelines({}) -- archived
+  // undefined -- already resolves to the server's own default of "only
+  // unarchived", see listPipelines in services/pipelines.ts), toggled the
+  // same way entity-table.tsx's own "Archived" checkbox works for the other
+  // list pages -- this page is hand-rolled (no EntityTable here), so the
+  // checkbox is reproduced directly rather than pulled from that component.
+  const [archived, setArchived] = useState(false);
+  const { data: pipelines = [], isLoading } = usePipelines({ archived });
   // Same limit-100 id -> name lookup tradeoff as ContactsPage's companyMap
   // (see its doc comment): right for today's scale, worth revisiting if a
   // tenant's company count grows well past that.
@@ -50,14 +57,20 @@ export function PipelinesPage() {
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-slate-900">Pipelines</h1>
-        <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-          <DialogTrigger asChild>
-            <Button>New pipeline</Button>
-          </DialogTrigger>
-          <DialogContent>
-            <CreatePipelineDialog onClose={() => setCreateOpen(false)} />
-          </DialogContent>
-        </Dialog>
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-2 text-sm text-slate-600">
+            <input type="checkbox" checked={archived} onChange={(event) => setArchived(event.target.checked)} />
+            Archived
+          </label>
+          <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+            <DialogTrigger asChild>
+              <Button>New pipeline</Button>
+            </DialogTrigger>
+            <DialogContent>
+              <CreatePipelineDialog onClose={() => setCreateOpen(false)} />
+            </DialogContent>
+          </Dialog>
+        </div>
       </div>
 
       {isLoading && <p className="text-sm text-slate-400">Loading...</p>}

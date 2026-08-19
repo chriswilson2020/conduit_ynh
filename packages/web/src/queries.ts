@@ -435,6 +435,19 @@ export function useArchivePipeline() {
   });
 }
 
+// Mirrors useArchivePipeline above -- board.tsx's read-only banner (Phase
+// 3.1) is the first caller, restoring an archived pipeline to an editable
+// board the same way useUnarchiveCompany/useUnarchiveProject already do for
+// their own entities.
+export function useUnarchivePipeline() {
+  const invalidate = useInvalidatePipeline();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(pipelineSchema, await postJson<unknown>(`/pipelines/${id}/unarchive`), "pipeline"),
+    onSuccess: (pipeline: Pipeline) => invalidate(pipeline.id),
+  });
+}
+
 // Stages have no cache of their own -- they ride along inside the
 // pipeline-detail response (pipelineWithStagesSchema) -- so every stage
 // mutation below invalidates the owning ["pipeline", pipelineId] (which
