@@ -92,7 +92,10 @@ test.describe.serial("Tasks/Gantt journey", () => {
 
   test("creates a project and lands on its detail page", async () => {
     await page.goto("/projects");
-    await page.getByRole("button", { name: "New project" }).click();
+    // entity-table.tsx's create trigger is always labelled bare "New" (the
+    // dialog it opens is titled "New project" -- projects.tsx's
+    // NewProjectDialog -- but the trigger button itself is not).
+    await page.getByRole("button", { name: "New" }).click();
     await page.getByPlaceholder("Project name").fill(projectName);
     await page.getByRole("button", { name: "Create" }).click();
 
