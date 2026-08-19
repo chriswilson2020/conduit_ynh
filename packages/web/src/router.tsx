@@ -9,6 +9,7 @@ import { CompanyDetailPage } from "./pages/company-detail";
 import { ContactsPage } from "./pages/contacts";
 import { ContactDetailPage } from "./pages/contact-detail";
 import { DealDetailPage } from "./pages/deal-detail";
+import { GanttLabPage } from "./pages/gantt-lab";
 import { PipelinesPage } from "./pages/pipelines";
 
 // A short staleTime keeps list/detail views from refetching on every focus
@@ -81,6 +82,15 @@ const dealDetailRoute = createRoute({
   component: DealDetailPage,
 });
 
+// G0 prototype gate (Phase 3 plan, Task 1): registered normally so it's a
+// real route, but deliberately linked from no nav -- throwaway, synthetic
+// data only, deleted by Task 9 once the real Gantt ships either way.
+const ganttLabRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/gantt-lab",
+  component: GanttLabPage,
+});
+
 // Rendered by the router itself (not a route) whenever the URL matches no
 // route in the tree -- a stale bookmark or a mistyped path. It renders as the
 // root route's Outlet content, i.e. inside Shell, so the sidebar/header stay
@@ -120,6 +130,7 @@ const routeTree = rootRoute.addChildren([
   pipelinesRoute,
   boardRoute,
   dealDetailRoute,
+  ganttLabRoute,
 ]);
 
 // basePath() returns "/" both at a root install and during `vite dev` (see its
