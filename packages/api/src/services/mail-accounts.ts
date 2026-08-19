@@ -19,6 +19,56 @@ function publishAccountsHint(): void {
   publish({ keys: [["mail-accounts"]] });
 }
 
+/**
+ * Notified after every account mutation that changes whether or how this
+ * account should be syncing: create (start one), update (restart, so the new
+ * settings/credentials take effect), archive (tear down), unarchive (start
+ * again). mail-sync.ts's SyncManager registers itself here at start() and
+ * unregisters at stop().
+ *
+ * Registration runs in this direction -- the sync engine registering with the
+ * accounts service, rather than this file importing the sync engine -- for
+ * the same reason stream.ts registers with sse.ts's subscribe() instead of
+ * sse.ts importing the route: the mutating service stays independent of the
+ * consumer, mail-accounts.ts remains unit-testable with no sync engine in the
+ * picture at all, and the two modules do not form an import cycle (mail-sync
+ * has to import getAccountCredentialsAsSystem from here).
+ */
+type AccountChangedHook = (accountId: string) => void;
+let accountChangedHook: AccountChangedHook | null = null;
+
+/** Register the hook; returns an unregister function that only clears the
+ * hook if it is still the one it installed (sse.ts's subscribe() precedent),
+ * so a replaced registration cannot be torn down by a stale unregister. */
+export function setAccountChangedHook(hook: AccountChangedHook): () => void {
+  accountChangedHook = hook;
+  return () => {
+    if (accountChangedHook === hook) accountChangedHook = null;
+  };
+}
+
+/**
+ * Called after the mutation's transaction has committed, alongside the SSE
+ * hint and for the same reason: the sync engine must react to the row that is
+ * actually stored, never to one a rollback erased.
+ *
+ * Never throws. A sync-engine failure must not fail the user's CRUD request,
+ * which has already committed by this point -- the worst case is one account
+ * whose sync is out of step until the next restart, which is not worth a 500
+ * on a successful save. (The hook itself is synchronous by contract; the
+ * manager's implementation kicks off its own async reconcile and handles that
+ * promise internally.)
+ */
+function notifyAccountChanged(accountId: string): void {
+  const hook = accountChangedHook;
+  if (hook === null) return;
+  try {
+    hook(accountId);
+  } catch (error) {
+    console.error("mail-accounts: account-changed hook threw", { accountId, error });
+  }
+}
+
 function toMailAccount(row: MailAccountRow) {
   return {
     id: row.id, userId: row.userId, label: row.label, email: row.email,
@@ -105,7 +155,7 @@ export async function createAccount(
     throw err;
   }
   if (row === undefined) throw new Error("insert returned no row");
-  // Task 5 wires accountChanged here (start a new AccountSync for this account).
+  notifyAccountChanged(row.id);
   publishAccountsHint();
   return toMailAccount(row);
 }
@@ -264,9 +314,9 @@ export async function updateAccount(
     return { row: updated, wrote: true };
   });
   if (wrote) {
-    // Task 5 wires accountChanged here (restart the AccountSync so it picks
-    // up new settings/credentials, or clears its backoff after the status
-    // reset).
+    // Restarts the AccountSync, so it picks up new settings/credentials and
+    // drops any backoff it was sitting in after the status reset.
+    notifyAccountChanged(id);
     publishAccountsHint();
   }
   return toMailAccount(row);
@@ -302,7 +352,8 @@ export async function archiveAccount(db: Database, actorId: string, id: string):
     return { row: updated, wrote: true };
   });
   if (wrote) {
-    // Task 5 wires accountChanged here (tear down this account's AccountSync).
+    // Tears down this account's AccountSync (spec: archiving stops its sync).
+    notifyAccountChanged(id);
     publishAccountsHint();
   }
   return toMailAccount(row);
@@ -332,7 +383,8 @@ export async function unarchiveAccount(db: Database, actorId: string, id: string
     return { row: updated, wrote: true };
   });
   if (wrote) {
-    // Task 5 wires accountChanged here (start a new AccountSync for this account again).
+    // Starts an AccountSync for this account again.
+    notifyAccountChanged(id);
     publishAccountsHint();
   }
   return toMailAccount(row);
