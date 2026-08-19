@@ -18,9 +18,11 @@ import type { Locator, Page } from "@playwright/test";
 // left no state behind, and a processed-but-not-yet-committed one converges
 // anyway because the coordinate getter resolves the TARGET's absolute
 // coordinates, not a delta: a duplicate press re-resolves to the same target
-// while the first's render is still pending. Shared by both describes below
-// (and mirrored in pipeline.spec.ts, whose board reuses the same
-// kanban-core machinery).
+// while the first's render is still pending. Used by the journey describe
+// below (and mirrored in pipeline.spec.ts, whose board reuses the same
+// kanban-core machinery); the off-screen-columns regression at the bottom
+// deliberately bypasses it for the arrow/drop -- see its comment for why an
+// announcement-gated drop would mask the very bug it pins.
 async function keyboardDragCard(page: Page, card: Locator, arrowKeys: string[]) {
   const announcement = page.locator('[id^="DndLiveRegion"]');
   await card.focus();
@@ -432,19 +434,41 @@ test.describe.serial("Task board keyboard drag with off-screen columns", () => {
   });
 
   test("keyboard-drags the card into the off-screen Done column", async () => {
-    await page.goto(`/projects/${projectId}/board`);
     const blocked = boardColumn("blocked");
     const done = boardColumn("done");
 
-    // The regression's premise: Done must actually start off-screen, or this
-    // degenerates into the same on-screen drag the wide journey already
-    // covers. Guards the viewport/column arithmetic above against layout
-    // drift silently widening what fits.
-    await expect(done).not.toBeInViewport();
+    // Deliberately NOT keyboardDragCard for the arrow and drop: that helper
+    // waits for the arrow's "was moved over" announcement before dropping,
+    // and the UNFIXED sensor's smooth-scroll fallback also updates `over`
+    // (and announces) a few hundred ms into such a wait -- an
+    // announcement-gated drop would pass against the very bug this test
+    // pins (Codex review on PR #1). The bug's victim is precisely the fast
+    // drop, so the drop is pressed immediately after the arrow; the fixed
+    // coordinate getter commits the move inside the ArrowRight keydown
+    // itself, which is what makes that immediate drop land. Only the lift
+    // keeps its announcement sync (the listener-attach race is orthogonal
+    // to the scroll race), and the swallowed-keypress flake the helper's
+    // re-press normally absorbs is handled here by retrying the WHOLE
+    // gesture from a fresh page load instead: a swallowed key leaves an
+    // attempt a visible no-op a later attempt redoes, while the actual bug
+    // fails every attempt.
+    await expect(async () => {
+      await page.goto(`/projects/${projectId}/board`);
+      // The regression's premise: Done must actually start off-screen, or
+      // this degenerates into the same on-screen drag the wide journey
+      // already covers. Guards the viewport/column arithmetic above against
+      // layout drift silently widening what fits.
+      await expect(done).not.toBeInViewport();
 
-    await keyboardDragCard(page, blocked.getByTestId(`card-${taskId}`), ["ArrowRight"]);
+      const card = blocked.getByTestId(`card-${taskId}`);
+      await card.focus();
+      await page.keyboard.press("Space");
+      await expect(page.locator('[id^="DndLiveRegion"]')).toContainText("was moved over");
+      await page.keyboard.press("ArrowRight");
+      await page.keyboard.press("Space");
 
-    await expect(done.getByTestId(`card-${taskId}`)).toBeVisible();
+      await expect(done.getByTestId(`card-${taskId}`)).toBeVisible({ timeout: 3000 });
+    }).toPass({ timeout: 30_000 });
     await expect(blocked.getByTestId(`card-${taskId}`)).not.toBeVisible();
   });
 
