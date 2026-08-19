@@ -8,10 +8,6 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: true,
-  // TEMPORARY DEBUG -- see if CI's default 2-worker parallelism (crm.spec.ts
-  // and pipeline.spec.ts racing for the same shared CPU) is a factor in the
-  // keyboard-drag timing investigation.
-  workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI ? [["html", { open: "never" }], ["list"]] : "list",
   use: { baseURL: "http://127.0.0.1:3100" },
   webServer: {

@@ -4,7 +4,7 @@ import {
   DndContext, DragOverlay, KeyboardSensor, MeasuringStrategy, PointerSensor, closestCenter, rectIntersection,
   useDroppable, useSensor, useSensors,
 } from "@dnd-kit/core";
-import type { CollisionDetection, DragEndEvent, DragStartEvent } from "@dnd-kit/core";
+import type { CollisionDetection, DragEndEvent, DragOverEvent, DragStartEvent } from "@dnd-kit/core";
 import {
   SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -154,6 +154,25 @@ export function BoardPage() {
   // spurious click regardless of which card's onClick ends up receiving it.
   const suppressCardClickRef = useRef(false);
 
+  /**
+   * dnd-kit's onDragEnd event carries `over` read from an internal ref
+   * (sensorContext.current) that is only synced from React state via a
+   * layout effect -- and that state is itself only set by a SEPARATE,
+   * later-firing passive effect (the one that also fires onDragOver),
+   * which only runs after the render that first computed the new position
+   * has already committed. A keyboard drag's final "drop" keydown can
+   * arrive (and dnd-kit's raw, non-React keydown listener processes it
+   * synchronously) before that second render has happened, so
+   * event.over on onDragEnd can reflect an ArrowRight-old position even
+   * though onDragOver already fired with the correct one moments earlier.
+   * onDragOver's own event object, by contrast, is built fresh from local
+   * variables at the point it fires (not read back off that lagging ref),
+   * so it is never subject to this gap. Tracking its value here and
+   * preferring it in handleDragEnd sidesteps the race instead of trying to
+   * win it.
+   */
+  const lastOverRef = useRef<{ id: string; data: DndData | undefined } | null>(null);
+
   const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 4 } });
   const keyboardSensor = useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates });
   const archived = pipelineData !== undefined && pipelineData.pipeline.archivedAt !== null;
@@ -162,36 +181,19 @@ export function BoardPage() {
   // archived pipeline without branching the JSX below into two shapes.
   const sensors = useSensors(...(archived ? [] : [pointerSensor, keyboardSensor]));
 
-  // TEMPORARY DEBUG INSTRUMENTATION -- capture-phase listener on the
-  // document, independent of dnd-kit entirely, to see exactly which
-  // keydowns physically arrive and when.
-  useMemo(() => {
-    if (typeof document === "undefined") return;
-    const seen = (document as unknown as { __dbgKeyListenerInstalled?: boolean }).__dbgKeyListenerInstalled;
-    if (seen) return;
-    (document as unknown as { __dbgKeyListenerInstalled?: boolean }).__dbgKeyListenerInstalled = true;
-    document.addEventListener(
-      "keydown",
-      (e) => {
-        // eslint-disable-next-line no-console
-        console.log(`[dbg keydown] code=${e.code} t=${performance.now().toFixed(1)}`);
-      },
-      true,
-    );
-  }, []);
-
   function handleDragStart(event: DragStartEvent) {
-    // eslint-disable-next-line no-console
-    console.log(`[dbg onDragStart] id=${event.active.id} t=${performance.now().toFixed(1)}`);
     setActiveId(String(event.active.id));
     suppressCardClickRef.current = true;
+    lastOverRef.current = null;
   }
 
-  // TEMPORARY DEBUG INSTRUMENTATION -- see the keyboard-drag race
-  // investigation in commit history.
-  function handleDragOver() {
-    // eslint-disable-next-line no-console
-    console.log(`[dbg onDragOver] t=${performance.now().toFixed(1)}`);
+  // See lastOverRef's doc comment: this is the freshest signal available
+  // for "what is the drag currently over," captured as it happens rather
+  // than read back later off a ref that can still be one render behind.
+  function handleDragOver(event: DragOverEvent) {
+    lastOverRef.current = event.over === null
+      ? null
+      : { id: String(event.over.id), data: event.over.data.current as DndData | undefined };
   }
 
   // dnd-kit calls onDragCancel instead of onDragEnd when a drag is aborted
@@ -200,25 +202,31 @@ export function BoardPage() {
   // leaving the DragOverlay showing a phantom card and the next plain click
   // silently swallowed.
   function handleDragCancel() {
-    // eslint-disable-next-line no-console
-    console.log(`[dbg onDragCancel] t=${performance.now().toFixed(1)}`);
     setActiveId(null);
     suppressCardClickRef.current = false;
+    lastOverRef.current = null;
   }
 
   function handleDragEnd(event: DragEndEvent) {
-    // eslint-disable-next-line no-console
-    console.log(`[dbg onDragEnd] over=${event.over?.id ?? null} t=${performance.now().toFixed(1)}`);
     setActiveId(null);
     // See suppressCardClickRef's doc comment above for why this is a
     // macrotask reset rather than immediate: the drop gesture's native click
     // event (if any) dispatches synchronously, ahead of a setTimeout(0)
     // queued from here, so it still observes the flag as true.
     setTimeout(() => { suppressCardClickRef.current = false; }, 0);
-    const { active, over } = event;
-    if (!over || active.id === over.id) return;
+    const { active } = event;
+    // Prefer the last onDragOver-reported target over event.over -- see
+    // lastOverRef's doc comment for why event.over can still be one render
+    // behind it at drop time. Falls back to event.over for the (rarer) case
+    // where the drag was dropped without ever moving (over never changed
+    // from wherever it resolved to at lift, so onDragOver never fired).
+    const over = lastOverRef.current ?? (event.over === null
+      ? null
+      : { id: String(event.over.id), data: event.over.data.current as DndData | undefined });
+    lastOverRef.current = null;
+    if (over === null || active.id === over.id) return;
     const activeData = active.data.current as DndData | undefined;
-    const overData = over.data.current as DndData | undefined;
+    const overData = over.data;
     if (activeData === undefined || activeData.type !== "card" || overData === undefined) return;
 
     const targetStageId = overData.stageId;
