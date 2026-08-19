@@ -150,11 +150,6 @@ const boardKeyboardCoordinateGetter: KeyboardCoordinateGetter = (event, args) =>
   });
   let closestId = getFirstCollision(collisions, "id");
   if (closestId === over?.id && collisions.length > 1) closestId = collisions[1]?.id ?? null;
-  // eslint-disable-next-line no-console
-  console.log(
-    `[dbg coordGetter] code=${event.code} activeContainerId=${activeContainerId}`,
-    `filtered=${filteredContainers.length} closestId=${closestId} currentOver=${over?.id ?? null}`,
-  );
   if (closestId == null) return undefined;
 
   const newDroppable = droppableContainers.get(closestId);
@@ -275,8 +270,6 @@ export function BoardPage() {
     lastOverRef.current = event.over === null
       ? null
       : { id: String(event.over.id), data: event.over.data.current as DndData | undefined };
-    // eslint-disable-next-line no-console
-    console.log(`[dbg onDragOver] over=${event.over?.id ?? null}`);
   }
 
   // dnd-kit calls onDragCancel instead of onDragEnd when a drag is aborted
@@ -303,28 +296,14 @@ export function BoardPage() {
     // behind it at drop time. Falls back to event.over for the (rarer) case
     // where the drag was dropped without ever moving (over never changed
     // from wherever it resolved to at lift, so onDragOver never fired).
-    const viaLastOverRef = lastOverRef.current !== null;
-    const eventOverId = event.over === null ? null : String(event.over.id);
     const over = lastOverRef.current ?? (event.over === null
       ? null
       : { id: String(event.over.id), data: event.over.data.current as DndData | undefined });
     lastOverRef.current = null;
-    // eslint-disable-next-line no-console
-    console.log(
-      `[dbg onDragEnd-top] active=${String(active.id)} over=${over?.id ?? null}`,
-      `viaLastOverRef=${viaLastOverRef} eventOverId=${eventOverId}`,
-    );
     if (over === null || active.id === over.id) return;
     const activeData = active.data.current as DndData | undefined;
     const overData = over.data;
     if (activeData === undefined || activeData.type !== "card" || overData === undefined) return;
-
-    // eslint-disable-next-line no-console
-    console.log(
-      `[dbg moveDeal-input] active=${String(active.id)} activeStage=${activeData.stageId}`,
-      `overId=${over.id} overType=${overData.type} overStage=${overData.stageId}`,
-      `viaLastOverRef=${viaLastOverRef} eventOverId=${eventOverId}`,
-    );
 
     const targetStageId = overData.stageId;
     const activeDealId = String(active.id);

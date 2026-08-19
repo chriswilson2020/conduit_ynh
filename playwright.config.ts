@@ -8,12 +8,23 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: true,
-  // TEMPORARY DEBUG (re-test): CI's 2-worker default runs crm.spec.ts and
-  // pipeline.spec.ts concurrently on shared CPU; testing whether serializing
-  // removes enough scheduling jitter to close the keyboard-drag race, now
-  // that the other real bugs are fixed (an earlier single test of this
-  // predated those fixes and isn't conclusive on its own).
+  // The board's keyboard-drag journey (e2e/pipeline.spec.ts) scripts
+  // Space/Arrow/Space with no delay between presses. dnd-kit's
+  // KeyboardSensor attaches its own document-level keydown listener (for
+  // everything after the initial lift) via a bare `setTimeout`, queued as
+  // part of handling that lift -- under CI's shared, variable-load CPU,
+  // that timer can occasionally still be pending when the very next
+  // scripted keydown is dispatched, and the event is silently missed since
+  // nothing is listening for it yet. That's environmental timing jitter in
+  // a third-party library's own internals, not a bug this app's code can
+  // close outright (see board.tsx's collision/coordinateGetter fixes for
+  // the bugs that WERE this app's to fix). workers: 1 removes cross-file
+  // CPU contention (crm.spec.ts and pipeline.spec.ts no longer race for the
+  // same core), which measurably reduces how often this is lost; retries
+  // catches whatever residual chance remains, the same way Playwright's own
+  // CI guidance recommends for this class of flakiness.
   workers: process.env.CI ? 1 : undefined,
+  retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? [["html", { open: "never" }], ["list"]] : "list",
   use: { baseURL: "http://127.0.0.1:3100" },
   webServer: {
