@@ -5,7 +5,7 @@ import { resolveUser } from "../users.js";
 import { events, taskDependencies } from "../db/schema.js";
 import { createProject, archiveProject } from "./projects.js";
 import { createTask, archiveTask, addDependency, getTask, setTaskStatus } from "./tasks.js";
-import { shiftTask, ganttPayload, compactSchedule } from "./scheduling.js";
+import { shiftTask, ganttPayload, compactSchedule, todayDateOnly, addDays } from "./scheduling.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
 import { subscribe } from "./sse.js";
 
@@ -387,11 +387,21 @@ describe("ganttPayload", () => {
 });
 
 describe("compactSchedule", () => {
+  // Every date in this block (bar the two self-floor-defining, permanently
+  // clamp-immune cases noted at their own tests) is expressed relative to
+  // "today" rather than as a fixed calendar date. These tests exercise plain
+  // compaction/floor/diamond semantics, not Fix 2's today-clamp (hotfix
+  // v0.4.3, see scheduling.ts's TODAY CLAMP comment) -- so every date here is
+  // offset comfortably (60+ days) into the future from whenever the suite
+  // actually runs, which keeps the clamp from ever engaging and keeps these
+  // tests valid on any run day, not just the day they were written.
+  const day = (n: number) => addDays(todayDateOnly(), n);
+
   it("chain compacts left, each successor settling against its PREDECESSOR's already-compacted due date", async () => {
     const project = await makeProject();
-    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
-    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-14" });
-    const c = await createTask(handle.db, actorId, { title: "C", projectId: project.id, startDate: "2026-01-20", dueDate: "2026-01-24" });
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: day(60), dueDate: day(64) });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: day(69), dueDate: day(73) });
+    const c = await createTask(handle.db, actorId, { title: "C", projectId: project.id, startDate: day(79), dueDate: day(83) });
     await addDependency(handle.db, actorId, a.id, b.id);
     await addDependency(handle.db, actorId, b.id, c.id);
 
@@ -405,16 +415,22 @@ describe("compactSchedule", () => {
     expect(result.moved.some((m) => m.id === a.id)).toBe(false);
     // B: pulled to sit exactly on A's due date, 4-day duration preserved.
     const bMoved = result.moved.find((m) => m.id === b.id)!;
-    expect(bMoved).toEqual({ id: b.id, startDate: "2026-01-05", dueDate: "2026-01-09", cascadedFrom: null });
+    expect(bMoved).toEqual({ id: b.id, startDate: day(64), dueDate: day(68), cascadedFrom: null });
     // C settles against B's NEW (compacted) due date, not B's original one --
     // this is the one-topological-pass argument in action.
     const cMoved = result.moved.find((m) => m.id === c.id)!;
-    expect(cMoved).toEqual({ id: c.id, startDate: "2026-01-09", dueDate: "2026-01-13", cascadedFrom: null });
+    expect(cMoved).toEqual({ id: c.id, startDate: day(68), dueDate: day(72), cascadedFrom: null });
 
-    expect((await getTask(handle.db, a.id))?.startDate).toBe("2026-01-01");
+    expect((await getTask(handle.db, a.id))?.startDate).toBe(day(60));
   });
 
   it("a sole no-predecessor task never moves -- it defines the floor it would otherwise pull toward (Fix 1)", async () => {
+    // Self-floor-defining (the project's only dated task), so this is
+    // permanently immune to Fix 2's today-clamp regardless of how far in the
+    // past or future its own dates sit -- see this function's TODAY CLAMP
+    // doc comment: a task the pull-only rule leaves alone isn't being pulled
+    // anywhere, so there's nothing for the clamp to clamp. Deliberately kept
+    // as a fixed past-relative-to-2026-08-19 date to prove exactly that.
     const project = await makeProject();
     const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-02-10", dueDate: "2026-02-12" });
 
@@ -428,41 +444,41 @@ describe("compactSchedule", () => {
 
   it("done/in_progress tasks never move themselves, but their (unchanged) due date still constrains successors", async () => {
     const project = await makeProject();
-    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: day(60), dueDate: day(64) });
     await setTaskStatus(handle.db, actorId, a.id, "done");
-    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-15" });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: day(69), dueDate: day(74) });
     await addDependency(handle.db, actorId, a.id, b.id);
 
     const result = await compactSchedule(handle.db, actorId, project.id);
 
     expect(result.moved.some((m) => m.id === a.id)).toBe(false);
     const aAfter = await getTask(handle.db, a.id);
-    expect(aAfter?.startDate).toBe("2026-01-01");
-    expect(aAfter?.dueDate).toBe("2026-01-05");
+    expect(aAfter?.startDate).toBe(day(60));
+    expect(aAfter?.dueDate).toBe(day(64));
     // B still settles against A's due date, 5-day duration preserved.
     const bMoved = result.moved.find((m) => m.id === b.id)!;
-    expect(bMoved).toEqual({ id: b.id, startDate: "2026-01-05", dueDate: "2026-01-10", cascadedFrom: null });
+    expect(bMoved).toEqual({ id: b.id, startDate: day(64), dueDate: day(69), cascadedFrom: null });
   });
 
   it("a constraint VIOLATION (successor starts before predecessor's due) is fixed by pushing the successor right", async () => {
     const project = await makeProject();
-    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-10" });
-    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-02", dueDate: "2026-01-04" });
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: day(60), dueDate: day(69) });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: day(61), dueDate: day(63) });
     await addDependency(handle.db, actorId, a.id, b.id);
 
     const result = await compactSchedule(handle.db, actorId, project.id);
 
     const bMoved = result.moved.find((m) => m.id === b.id)!;
     // B's 2-day duration preserved, pushed to land exactly on A's due date.
-    expect(bMoved).toEqual({ id: b.id, startDate: "2026-01-10", dueDate: "2026-01-12", cascadedFrom: null });
+    expect(bMoved).toEqual({ id: b.id, startDate: day(69), dueDate: day(71), cascadedFrom: null });
   });
 
   it("diamond convergence: the converging task settles at the MAX of both compacted predecessor due dates", async () => {
     const project = await makeProject();
-    const p = await createTask(handle.db, actorId, { title: "P", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-03" });
-    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-12" });
-    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-04", dueDate: "2026-01-05" });
-    const d = await createTask(handle.db, actorId, { title: "D", projectId: project.id, startDate: "2026-01-20", dueDate: "2026-01-22" });
+    const p = await createTask(handle.db, actorId, { title: "P", projectId: project.id, startDate: day(60), dueDate: day(62) });
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: day(69), dueDate: day(71) });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: day(63), dueDate: day(64) });
+    const d = await createTask(handle.db, actorId, { title: "D", projectId: project.id, startDate: day(79), dueDate: day(81) });
     await addDependency(handle.db, actorId, p.id, a.id);
     await addDependency(handle.db, actorId, p.id, b.id);
     await addDependency(handle.db, actorId, a.id, d.id);
@@ -470,11 +486,11 @@ describe("compactSchedule", () => {
 
     const result = await compactSchedule(handle.db, actorId, project.id);
 
-    // A: pulled to P's due (01-03), 2-day duration -> 01-03..01-05.
-    // B: pulled to P's due (01-03), 1-day duration -> 01-03..01-04.
-    // D via A needs start >= 01-05; via B needs start >= 01-04 -- MAX wins.
+    // A: pulled to P's due (day 62), 2-day duration -> 62..64.
+    // B: pulled to P's due (day 62), 1-day duration -> 62..63.
+    // D via A needs start >= 64; via B needs start >= 63 -- MAX wins.
     const dMoved = result.moved.find((m) => m.id === d.id)!;
-    expect(dMoved).toEqual({ id: d.id, startDate: "2026-01-05", dueDate: "2026-01-07", cascadedFrom: null });
+    expect(dMoved).toEqual({ id: d.id, startDate: day(64), dueDate: day(66), cascadedFrom: null });
   });
 
   it("an undated task never moves itself, and its successor -- having no DATED predecessor -- pulls to the floor (Fix 1)", async () => {
@@ -487,11 +503,11 @@ describe("compactSchedule", () => {
     // the NEW semantics it now pulls LEFT to the floor like any other
     // no-dated-predecessor task. Floor here = the earliest dated task in the
     // project pre-compaction (no project startDate, nothing done/
-    // in_progress) = A's own 2026-01-01.
+    // in_progress) = A's own start.
     const project = await makeProject();
-    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: day(60), dueDate: day(64) });
     const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id }); // no dates
-    const c = await createTask(handle.db, actorId, { title: "C", projectId: project.id, startDate: "2026-01-20", dueDate: "2026-01-22" });
+    const c = await createTask(handle.db, actorId, { title: "C", projectId: project.id, startDate: day(79), dueDate: day(81) });
     await addDependency(handle.db, actorId, a.id, b.id);
     await addDependency(handle.db, actorId, b.id, c.id);
 
@@ -500,7 +516,7 @@ describe("compactSchedule", () => {
     expect(result.moved.some((m) => m.id === b.id)).toBe(false);
     // C's 2-day duration preserved, pulled to A's floor-defining start.
     const cMoved = result.moved.find((m) => m.id === c.id)!;
-    expect(cMoved).toEqual({ id: c.id, startDate: "2026-01-01", dueDate: "2026-01-03", cascadedFrom: null });
+    expect(cMoved).toEqual({ id: c.id, startDate: day(60), dueDate: day(62), cascadedFrom: null });
   });
 
   it("a task with BOTH a dated and an undated predecessor settles against the dated one only", async () => {
@@ -509,9 +525,9 @@ describe("compactSchedule", () => {
     // this is the only one where SOME (not zero, not all) entries get
     // filtered out of the same array.
     const project = await makeProject();
-    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: day(60), dueDate: day(64) });
     const u = await createTask(handle.db, actorId, { title: "U", projectId: project.id }); // no dates
-    const t = await createTask(handle.db, actorId, { title: "T", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-12" });
+    const t = await createTask(handle.db, actorId, { title: "T", projectId: project.id, startDate: day(69), dueDate: day(71) });
     await addDependency(handle.db, actorId, a.id, t.id);
     await addDependency(handle.db, actorId, u.id, t.id);
 
@@ -520,7 +536,7 @@ describe("compactSchedule", () => {
     // U contributes nothing -- T settles at A's due date alone, 2-day
     // duration preserved.
     const tMoved = result.moved.find((m) => m.id === t.id)!;
-    expect(tMoved).toEqual({ id: t.id, startDate: "2026-01-05", dueDate: "2026-01-07", cascadedFrom: null });
+    expect(tMoved).toEqual({ id: t.id, startDate: day(64), dueDate: day(66), cascadedFrom: null });
   });
 
   it("an empty project, and a project with no dependencies at all, are both a clean no-op", async () => {
@@ -528,14 +544,17 @@ describe("compactSchedule", () => {
     expect((await compactSchedule(handle.db, actorId, empty.id)).moved).toEqual([]);
 
     const lonely = await makeProject({ name: "Lonely" });
+    // Self-floor-defining, same as the "sole no-predecessor task" test above
+    // -- permanently clamp-immune, so a fixed past-relative date is fine
+    // here too.
     await createTask(handle.db, actorId, { title: "Solo", projectId: lonely.id, startDate: "2026-03-01", dueDate: "2026-03-02" });
     expect((await compactSchedule(handle.db, actorId, lonely.id)).moved).toEqual([]);
   });
 
   it("every moved task's `shifted` event carries the compacted marker and a null cascadedFrom", async () => {
     const project = await makeProject();
-    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
-    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-14" });
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: day(60), dueDate: day(64) });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: day(69), dueDate: day(73) });
     await addDependency(handle.db, actorId, a.id, b.id);
 
     await compactSchedule(handle.db, actorId, project.id);
@@ -543,8 +562,8 @@ describe("compactSchedule", () => {
     const bEvents = await handle.db.select().from(events).where(and(eq(events.taskId, b.id), eq(events.verb, "shifted")));
     expect(bEvents).toHaveLength(1);
     expect(bEvents[0]?.payload).toEqual({
-      from: { start: "2026-01-10", due: "2026-01-14" },
-      to: { start: "2026-01-05", due: "2026-01-09" },
+      from: { start: day(69), due: day(73) },
+      to: { start: day(64), due: day(68) },
       cascadedFrom: null,
       compacted: true,
     });
@@ -569,32 +588,38 @@ describe("compactSchedule: Fix 1 (hotfix v0.4.2) -- no-predecessor tasks pull to
   it("the user's regression scenario: a no-pred todo pulls to the earliest done/in_progress start, and its dependents follow", async () => {
     // Design is real, finished work; Build is real, in-progress work; both
     // are non-movable and therefore both real floor candidates -- Design's
-    // Aug 10 is earlier than Build's Aug 17, so Design defines the floor.
-    // Content has NO predecessors at all and sits weeks later (Sep 12) with
-    // nothing constraining it -- under the OLD semantics it would stay
-    // exactly there forever ("anchored"); under the new semantics it pulls
-    // LEFT to the floor, keeping its own 2-day duration. QA then settles at
-    // the max of Build's (untouched) due date and Content's NEW (pulled)
-    // due date, and Launch simply follows QA -- both exactly the existing
-    // "settle against the max of predecessors' final dates" rule, unchanged
-    // by this fix.
+    // start is earlier than Build's, so Design defines the floor. Content
+    // has NO predecessors at all and sits weeks later, with nothing
+    // constraining it -- under the OLD semantics it would stay exactly there
+    // forever ("anchored"); under Fix 1 it pulls LEFT to the floor, keeping
+    // its own 2-day duration. Design's floor and Build's due date are both
+    // deliberately placed in the PAST relative to today (Fix 2, hotfix
+    // v0.4.3): Content's pull target is therefore today, not Design's stale
+    // start -- see this describe block's own name and scheduling.ts's TODAY
+    // CLAMP comment. QA then settles at the max of Build's (untouched, still
+    // in the FUTURE) due date and Content's NEW (today-clamped) due date --
+    // Build wins -- and Launch simply follows QA. All dates are relative to
+    // "today" (not hardcoded) so this test's outcome doesn't depend on which
+    // day it happens to run.
+    const todayIso = todayDateOnly();
+    const day = (n: number) => addDays(todayIso, n);
     const project = await makeProject({ name: "Regression" });
     const design = await createTask(handle.db, actorId, {
-      title: "Design", projectId: project.id, startDate: "2026-08-10", dueDate: "2026-08-14",
+      title: "Design", projectId: project.id, startDate: day(-9), dueDate: day(-5),
     });
     await setTaskStatus(handle.db, actorId, design.id, "done");
     const build = await createTask(handle.db, actorId, {
-      title: "Build", projectId: project.id, startDate: "2026-08-17", dueDate: "2026-08-22",
+      title: "Build", projectId: project.id, startDate: day(-2), dueDate: day(3),
     });
     await setTaskStatus(handle.db, actorId, build.id, "in_progress");
     const content = await createTask(handle.db, actorId, {
-      title: "Content", projectId: project.id, startDate: "2026-09-12", dueDate: "2026-09-14",
+      title: "Content", projectId: project.id, startDate: day(24), dueDate: day(26),
     });
     const qa = await createTask(handle.db, actorId, {
-      title: "QA", projectId: project.id, startDate: "2026-09-20", dueDate: "2026-09-22",
+      title: "QA", projectId: project.id, startDate: day(32), dueDate: day(34),
     });
     const launch = await createTask(handle.db, actorId, {
-      title: "Launch", projectId: project.id, startDate: "2026-10-01", dueDate: "2026-10-03",
+      title: "Launch", projectId: project.id, startDate: day(43), dueDate: day(45),
     });
     await addDependency(handle.db, actorId, build.id, qa.id);
     await addDependency(handle.db, actorId, content.id, qa.id);
@@ -606,38 +631,55 @@ describe("compactSchedule: Fix 1 (hotfix v0.4.2) -- no-predecessor tasks pull to
     expect(result.moved.some((m) => m.id === design.id)).toBe(false);
     expect(result.moved.some((m) => m.id === build.id)).toBe(false);
 
-    // Content: floor = Design's Aug 10 (earliest dated non-movable start),
-    // 2-day duration preserved.
+    // Content: floor = Design's start (earliest dated non-movable start),
+    // but Design's start is in the past, so Fix 2 clamps the target to
+    // TODAY instead -- 2-day duration preserved.
     const contentMoved = result.moved.find((m) => m.id === content.id)!;
-    expect(contentMoved).toEqual({ id: content.id, startDate: "2026-08-10", dueDate: "2026-08-12", cascadedFrom: null });
+    expect(contentMoved.startDate).toBe(todayIso);
+    expect(contentMoved.dueDate).toBe(day(2));
+    expect(contentMoved.cascadedFrom).toBeNull();
 
-    // QA: max(Build's due 08-22, Content's NEW due 08-12) = 08-22, 2-day
-    // duration preserved.
+    // QA = max(Build's due, Content's NEW clamped due, today). Build's due
+    // is still in the future and is later than both Content's clamped due
+    // and today, so it wins -- 2-day duration preserved.
     const qaMoved = result.moved.find((m) => m.id === qa.id)!;
-    expect(qaMoved).toEqual({ id: qa.id, startDate: "2026-08-22", dueDate: "2026-08-24", cascadedFrom: null });
+    expect(qaMoved.startDate).toBe(build.dueDate);
+    expect(qaMoved.dueDate).toBe(day(5));
+    expect(qaMoved.cascadedFrom).toBeNull();
 
     // Launch: settles directly against QA's new due date, 2-day duration.
     const launchMoved = result.moved.find((m) => m.id === launch.id)!;
-    expect(launchMoved).toEqual({ id: launch.id, startDate: "2026-08-24", dueDate: "2026-08-26", cascadedFrom: null });
+    expect(launchMoved.startDate).toBe(qaMoved.dueDate);
+    expect(launchMoved.dueDate).toBe(day(7));
+    expect(launchMoved.cascadedFrom).toBeNull();
   });
 
   it("a project with an explicit startDate uses it as the floor, ahead of any task's own dates", async () => {
-    const project = await makeProject({ name: "Explicit", startDate: "2026-01-01" });
+    // Floor and task both kept comfortably in the future (relative to
+    // today) so this test exercises the floor-priority rule itself, not
+    // Fix 2's today-clamp -- that's covered separately below.
+    const day = (n: number) => addDays(todayDateOnly(), n);
+    const project = await makeProject({ name: "Explicit", startDate: day(60) });
     const a = await createTask(handle.db, actorId, {
-      title: "A", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-12",
+      title: "A", projectId: project.id, startDate: day(69), dueDate: day(71),
     });
 
     const result = await compactSchedule(handle.db, actorId, project.id);
 
     const aMoved = result.moved.find((m) => m.id === a.id)!;
-    expect(aMoved).toEqual({ id: a.id, startDate: "2026-01-01", dueDate: "2026-01-03", cascadedFrom: null });
+    expect(aMoved).toEqual({ id: a.id, startDate: day(60), dueDate: day(62), cascadedFrom: null });
   });
 
   it("a no-predecessor task already starting before the floor is left alone -- pull-only, never pushed right", async () => {
     // The floor is a compaction TARGET, not a constraint: a task that
     // already starts earlier than the floor has nothing to pull TOWARD (it's
     // already left of it), and this function never pushes a no-violation
-    // task right just to reach a target.
+    // task right just to reach a target. Both dates are fixed and in the
+    // past (relative to 2026-08-19) on purpose: this is the one case Fix 2's
+    // today-clamp does NOT reach (see scheduling.ts's TODAY CLAMP comment --
+    // a task the pull-only rule leaves alone was never being pulled
+    // anywhere, so there's nothing to clamp), and stays permanently valid
+    // however far "today" advances from here.
     const project = await makeProject({ name: "AlreadyEarly", startDate: "2026-06-01" });
     const a = await createTask(handle.db, actorId, {
       title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-03",
@@ -652,23 +694,90 @@ describe("compactSchedule: Fix 1 (hotfix v0.4.2) -- no-predecessor tasks pull to
   });
 
   it("an all-todo project (nothing done/in_progress, no project startDate) uses its own earliest dated task as the floor", async () => {
+    const day = (n: number) => addDays(todayDateOnly(), n);
     const project = await makeProject({ name: "AllTodo" });
     // Earliest -- no predecessors either, so it's the floor definer and
     // therefore doesn't move itself.
     const earliest = await createTask(handle.db, actorId, {
-      title: "Earliest", projectId: project.id, startDate: "2026-03-01", dueDate: "2026-03-02",
+      title: "Earliest", projectId: project.id, startDate: day(60), dueDate: day(61),
     });
     // A second, unrelated no-pred todo sitting later in the same project --
     // pulls LEFT to the same floor the earliest task itself defines.
     const later = await createTask(handle.db, actorId, {
-      title: "Later", projectId: project.id, startDate: "2026-05-01", dueDate: "2026-05-04",
+      title: "Later", projectId: project.id, startDate: day(150), dueDate: day(153),
     });
 
     const result = await compactSchedule(handle.db, actorId, project.id);
 
     expect(result.moved.some((m) => m.id === earliest.id)).toBe(false);
     const laterMoved = result.moved.find((m) => m.id === later.id)!;
-    // 3-day duration (05-01..05-04) preserved, pulled to the 03-01 floor.
-    expect(laterMoved).toEqual({ id: later.id, startDate: "2026-03-01", dueDate: "2026-03-04", cascadedFrom: null });
+    // 3-day duration preserved, pulled to the earliest task's floor.
+    expect(laterMoved).toEqual({ id: later.id, startDate: day(60), dueDate: day(63), cascadedFrom: null });
+  });
+});
+
+describe("compactSchedule: Fix 2 (hotfix v0.4.3) -- never schedules a movable task's start before today", () => {
+  it("a floor sitting in the past clamps the pull target to today, not the stale floor date", async () => {
+    const todayIso = todayDateOnly();
+    const day = (n: number) => addDays(todayIso, n);
+    // An explicit project startDate a month in the past -- the OLD floor
+    // rule would pull straight to it; Fix 2 clamps the target up to today
+    // instead.
+    const project = await makeProject({ name: "PastFloor", startDate: day(-30) });
+    const a = await createTask(handle.db, actorId, {
+      title: "A", projectId: project.id, startDate: day(20), dueDate: day(23),
+    });
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    const aMoved = result.moved.find((m) => m.id === a.id)!;
+    expect(aMoved.startDate).toBe(todayIso);
+    expect(aMoved.dueDate).toBe(day(3)); // 3-day duration preserved
+    expect(aMoved.cascadedFrom).toBeNull();
+  });
+
+  it("a dependent whose predecessor's due date is last week clamps to today, not that stale due date", async () => {
+    const todayIso = todayDateOnly();
+    const day = (n: number) => addDays(todayIso, n);
+    const project = await makeProject({ name: "PastPredecessor" });
+    const predecessor = await createTask(handle.db, actorId, {
+      title: "Predecessor", projectId: project.id, startDate: day(-14), dueDate: day(-7),
+    });
+    await setTaskStatus(handle.db, actorId, predecessor.id, "done");
+    const dependent = await createTask(handle.db, actorId, {
+      title: "Dependent", projectId: project.id, startDate: day(10), dueDate: day(12),
+    });
+    await addDependency(handle.db, actorId, predecessor.id, dependent.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    expect(result.moved.some((m) => m.id === predecessor.id)).toBe(false); // done, frozen as ever
+    const dependentMoved = result.moved.find((m) => m.id === dependent.id)!;
+    expect(dependentMoved.startDate).toBe(todayIso);
+    expect(dependentMoved.dueDate).toBe(day(2)); // 2-day duration preserved
+    expect(dependentMoved.cascadedFrom).toBeNull();
+  });
+
+  it("a predecessor's constraint due AFTER today is unaffected by the clamp", async () => {
+    const todayIso = todayDateOnly();
+    const day = (n: number) => addDays(todayIso, n);
+    const project = await makeProject({ name: "FutureConstraint" });
+    const predecessor = await createTask(handle.db, actorId, {
+      title: "Predecessor", projectId: project.id, startDate: day(-5), dueDate: day(10),
+    });
+    await setTaskStatus(handle.db, actorId, predecessor.id, "done");
+    const dependent = await createTask(handle.db, actorId, {
+      title: "Dependent", projectId: project.id, startDate: day(20), dueDate: day(22),
+    });
+    await addDependency(handle.db, actorId, predecessor.id, dependent.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    const dependentMoved = result.moved.find((m) => m.id === dependent.id)!;
+    // maxDue (day 10) is already after today -- max(maxDue, today) == maxDue,
+    // exactly the pre-Fix-2 behaviour.
+    expect(dependentMoved.startDate).toBe(predecessor.dueDate);
+    expect(dependentMoved.dueDate).toBe(day(12)); // 2-day duration preserved
+    expect(dependentMoved.cascadedFrom).toBeNull();
   });
 });
