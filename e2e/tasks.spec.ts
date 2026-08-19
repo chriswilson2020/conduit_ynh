@@ -323,3 +323,76 @@ test.describe.serial("Tasks/Gantt journey", () => {
     await expect(page.getByRole("heading", { name: shipTitle })).toBeVisible();
   });
 });
+
+// Regression for the off-screen-column keyboard drag (see kanban-core.tsx's
+// kanbanKeyboardCoordinateGetter): at a viewport narrow enough that the Done
+// column sits outside the board's visible area, a keyboard cross-column drag
+// must still land -- the journey above deliberately runs WIDE (1600x900, see
+// its beforeAll) so its many drag steps never depend on scrolling, which is
+// exactly why it can't catch this. 1000px leaves ~728px for the board after
+// the 224px sidebar and px-6 padding, so of the four 288px+16px-gap columns
+// only To do and In progress fit -- Blocked is clipped and Done is fully
+// off-screen, the layout CI runs 32271110864/32272013870 first failed under.
+test.describe.serial("Task board keyboard drag with off-screen columns", () => {
+  const runId = `${Date.now().toString(36)}n`;
+  const projectName = `Narrow ${runId}`;
+  const taskTitle = `Move ${runId}`;
+
+  let page: Page;
+  let projectId: string;
+  let taskId: string;
+
+  test.beforeAll(async ({ browser }) => {
+    page = await browser.newPage({ viewport: { width: 1000, height: 900 } });
+  });
+
+  test.afterAll(async () => {
+    await page.close();
+  });
+
+  test("creates a project with one task in Blocked", async () => {
+    await page.goto("/projects");
+    await page.getByRole("button", { name: "New" }).click();
+    await page.getByPlaceholder("Project name").fill(projectName);
+    await page.getByRole("button", { name: "Create" }).click();
+    await expect(page).toHaveURL(/\/projects\/[0-9a-f-]{36}$/);
+    projectId = page.url().split("/").pop() as string;
+
+    // Created directly in Blocked so the regression below needs exactly one
+    // hop: Blocked(2) -> Done(3), the drag whose TARGET is off-screen.
+    await page.goto(`/projects/${projectId}/board`);
+    const blocked = boardColumn("blocked");
+    await blocked.getByRole("button", { name: "New task" }).click();
+    await page.getByPlaceholder("Task title").fill(taskTitle);
+    await page.getByRole("button", { name: "Create" }).click();
+    const card = blocked.locator('[data-testid^="card-"]').filter({ hasText: taskTitle });
+    await expect(card).toBeVisible();
+    taskId = ((await card.getAttribute("data-testid")) as string).replace("card-", "");
+  });
+
+  test("keyboard-drags the card into the off-screen Done column", async () => {
+    await page.goto(`/projects/${projectId}/board`);
+    const blocked = boardColumn("blocked");
+    const done = boardColumn("done");
+
+    // The regression's premise: Done must actually start off-screen, or this
+    // degenerates into the same on-screen drag the wide journey already
+    // covers. Guards the viewport/column arithmetic above against layout
+    // drift silently widening what fits.
+    await expect(done).not.toBeInViewport();
+
+    const card = blocked.getByTestId(`card-${taskId}`);
+    await card.focus();
+    await page.keyboard.press("Space");
+    await page.waitForTimeout(50);
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("Space");
+
+    await expect(done.getByTestId(`card-${taskId}`)).toBeVisible();
+    await expect(blocked.getByTestId(`card-${taskId}`)).not.toBeVisible();
+  });
+
+  function boardColumn(status: string): Locator {
+    return page.getByTestId(`column-${status}`);
+  }
+});
