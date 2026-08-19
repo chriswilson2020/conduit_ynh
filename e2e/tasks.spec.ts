@@ -32,14 +32,13 @@ test.describe.serial("Tasks/Gantt journey", () => {
     // w-72 (288px) columns plus gaps need ~1200px on their own, and the
     // shell's fixed 224px sidebar plus main's px-6 padding eats another
     // ~272px -- under the default viewport, "Blocked"/"Done" sit off-screen
-    // needing a horizontal scroll to reach. CI runs 32271110864/32272013870
-    // showed a keyboard cross-column drag INTO an off-screen column
-    // reproducibly (2/2, with both the second card AND the first card
-    // tried) drops back onto its own starting column instead of reaching
-    // the target -- dnd-kit's droppable measuring evidently needs the
-    // target actually in the viewport. Widening the page once here avoids
-    // relying on any mid-test scroll timing for every column the journey's
-    // keyboard drags touch.
+    // needing a horizontal scroll to reach. Off-screen targets used to make
+    // a keyboard cross-column drag drop back onto its starting column (CI
+    // runs 32271110864/32272013870); kanban-core's coordinate getter now
+    // scrolls the target into view (see kanbanKeyboardCoordinateGetter's
+    // doc comment), with the off-screen-columns regression at the bottom of
+    // this file pinning that. The journey still runs wide so its many drag
+    // steps exercise the plain on-screen path, independent of scrolling.
     page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
   });
 

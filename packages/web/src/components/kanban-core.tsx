@@ -7,7 +7,7 @@ import {
 import type {
   CollisionDetection, DragEndEvent, DragOverEvent, DragStartEvent, DroppableContainer, KeyboardCoordinateGetter,
 } from "@dnd-kit/core";
-import { arrayMove, hasSortableData, sortableKeyboardCoordinates, useSortable } from "@dnd-kit/sortable";
+import { arrayMove, hasSortableData, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
 /**
@@ -100,39 +100,71 @@ export const kanbanCollisionDetection: CollisionDetection = (args) => {
 export const kanbanMeasuring = { droppable: { strategy: MeasuringStrategy.BeforeDragging } };
 
 /**
- * Wraps @dnd-kit/sortable's own sortableKeyboardCoordinates with one added
- * restriction: for ArrowUp/ArrowDown, only candidates in the SAME sortable
- * container (i.e. the same column) as the active card are considered.
+ * Reimplements @dnd-kit/sortable's sortableKeyboardCoordinates (MIT) for all
+ * four arrow keys, with two kanban-specific changes -- each guarding a REAL
+ * failure; the body otherwise mirrors the stock function faithfully:
  *
- * sortableKeyboardCoordinates' own Up/Down direction filter only checks
- * vertical position (collisionRect.top vs a candidate's rect.top) -- it has
- * no notion of which column a candidate belongs to. The empty-column
- * placeholder that makes an empty column reachable via ArrowLeft/ArrowRight
- * (see useKanbanColumnDroppable/KanbanEmptyPlaceholder below) is ALSO a
- * valid "sortable" candidate by that rule, and a neighbouring column's
- * placeholder can end up geometrically CLOSER by dnd-kit's own
- * closestCorners ranking than the intended same-column sibling directly
- * below/above the active card -- sending an ArrowDown/ArrowUp press into a
- * different column's empty placeholder instead of reordering within the
- * current one. Confirmed by instrumenting moveDeal's inputs during the
- * original (Phase 2) investigation: a same-column ArrowDown press resolved
- * to a DIFFERENT column's placeholder id, moving the dragged deal out of
- * its own column entirely instead of past its sibling.
+ * 1. ArrowUp/ArrowDown only consider candidates in the SAME sortable
+ *    container (i.e. the same column) as the active card. The stock Up/Down
+ *    direction filter only checks vertical position (collisionRect.top vs a
+ *    candidate's rect.top) -- it has no notion of which column a candidate
+ *    belongs to. The empty-column placeholder that makes an empty column
+ *    reachable via ArrowLeft/ArrowRight (see useKanbanColumnDroppable/
+ *    KanbanEmptyPlaceholder below) is ALSO a valid "sortable" candidate by
+ *    that rule, and a neighbouring column's placeholder can end up
+ *    geometrically CLOSER by dnd-kit's own closestCorners ranking than the
+ *    intended same-column sibling directly below/above the active card --
+ *    sending an ArrowDown/ArrowUp press into a different column's empty
+ *    placeholder instead of reordering within the current one. Confirmed by
+ *    instrumenting moveDeal's inputs during the original (Phase 2)
+ *    investigation: a same-column ArrowDown press resolved to a DIFFERENT
+ *    column's placeholder id, moving the dragged deal out of its own column
+ *    entirely instead of past its sibling.
  *
- * Reimplemented in full (rather than filtering
- * context.droppableContainers down to the active card's own container and
- * delegating to sortableKeyboardCoordinates) because that function calls
- * `.getEnabled()` on context.droppableContainers, a method on dnd-kit's own
- * DroppableContainersMap class that a plain filtered array does not have.
- * The body below otherwise mirrors sortableKeyboardCoordinates faithfully
- * (@dnd-kit/sortable, MIT); the only change is the containerId equality
- * check added to the Up/Down branch of the direction filter.
+ * 2. ArrowLeft/ArrowRight scroll the chosen target into view before
+ *    returning its coordinates. The stock getter picks the right target even
+ *    when its column sits outside the board's visible area (droppable rects
+ *    exist for off-screen nodes too), but KeyboardSensor then REFUSES the
+ *    move: when the returned coordinates fall outside a scrollable
+ *    ancestor's visible rect it never calls handleMove at all -- it fires
+ *    scrollContainer.scrollTo({ behavior: "smooth" }) and returns, betting
+ *    that the resulting async scroll events will walk `over` onto the target
+ *    by themselves. A real user pressing slowly gets away with that; a
+ *    scripted Space/Arrow/Space (or a fast typist) drops before the smooth
+ *    scroll ever lands, so the card silently falls back onto its origin
+ *    column -- reproduced 2/2 in CI runs 32271110864/32272013870 (the tasks
+ *    journey under Playwright's default 1280px viewport, where Done starts
+ *    off-screen; see e2e/tasks.spec.ts's off-screen-columns regression).
+ *    scrollIntoView here is synchronous and instant (block/inline "nearest"
+ *    makes it a no-op when the target is already visible), and the rects in
+ *    droppableRects are dnd-kit Rect instances whose left/top getters
+ *    live-compensate for ancestor scroll -- so reading them AFTER the scroll
+ *    yields the target's current viewport position, the sensor's
+ *    visible-rect check now passes, and the move commits inside this same
+ *    keydown with nothing async left to race the drop. Horizontal candidates
+ *    keep the stock geometry-only filter (no same-container restriction --
+ *    Left/Right IS the cross-column gesture, and same-column candidates all
+ *    share the active card's left edge so the strict inequality already
+ *    excludes them); by the same token the stock same-container size offset
+ *    is always zero here, so the horizontal branch returns the rect's
+ *    top-left directly.
+ *
+ * Reimplemented in full (rather than filtering context.droppableContainers
+ * down and delegating to sortableKeyboardCoordinates) because that function
+ * calls `.getEnabled()` on context.droppableContainers, a method on
+ * dnd-kit's own DroppableContainersMap class that a plain filtered array
+ * does not have.
  */
 export const kanbanKeyboardCoordinateGetter: KeyboardCoordinateGetter = (event, args) => {
   const verticalCodes: string[] = [KeyboardCode.Down, KeyboardCode.Up];
-  if (!verticalCodes.includes(event.code)) return sortableKeyboardCoordinates(event, args);
+  const horizontalCodes: string[] = [KeyboardCode.Left, KeyboardCode.Right];
+  const isVertical = verticalCodes.includes(event.code);
+  if (!isVertical && !horizontalCodes.includes(event.code)) return undefined;
+  // Mirrors the stock getter: direction keys are consumed by the drag even
+  // when no move results, never left to scroll the page natively mid-drag.
+  event.preventDefault();
 
-  const { active, context, currentCoordinates } = args;
+  const { active, context } = args;
   const { collisionRect, droppableRects, droppableContainers, over, scrollableAncestors } = context;
   if (!collisionRect) return undefined;
 
@@ -144,10 +176,15 @@ export const kanbanKeyboardCoordinateGetter: KeyboardCoordinateGetter = (event, 
   const filteredContainers: DroppableContainer[] = [];
   for (const entry of droppableContainers.getEnabled()) {
     if (!entry || entry.disabled) continue;
-    if (!hasSortableData(entry) || entry.data.current.sortable.containerId !== activeContainerId) continue;
     const rect = droppableRects.get(entry.id);
     if (!rect) continue;
-    if (event.code === KeyboardCode.Down ? collisionRect.top < rect.top : collisionRect.top > rect.top) {
+    if (isVertical) {
+      // Change 1: same-column candidates only for Up/Down.
+      if (!hasSortableData(entry) || entry.data.current.sortable.containerId !== activeContainerId) continue;
+      if (event.code === KeyboardCode.Down ? collisionRect.top < rect.top : collisionRect.top > rect.top) {
+        filteredContainers.push(entry);
+      }
+    } else if (event.code === KeyboardCode.Right ? collisionRect.left < rect.left : collisionRect.left > rect.left) {
       filteredContainers.push(entry);
     }
   }
@@ -164,6 +201,15 @@ export const kanbanKeyboardCoordinateGetter: KeyboardCoordinateGetter = (event, 
   const newRect = newDroppable ? droppableRects.get(newDroppable.id) : null;
   const newNode = newDroppable?.node.current;
   if (!newNode || !newRect || !activeContainer || !newDroppable) return undefined;
+
+  if (!isVertical) {
+    // Change 2: bring an off-screen target column into view NOW, so the
+    // sensor's visible-rect check can't veto the move -- and only read the
+    // (live, scroll-compensated) rect afterwards. No-op when already
+    // visible.
+    newNode.scrollIntoView({ block: "nearest", inline: "nearest" });
+    return { x: newRect.left, y: newRect.top };
+  }
 
   const newScrollAncestors = getScrollableAncestors(newNode);
   const hasDifferentScrollAncestors = newScrollAncestors.some((el, i) => scrollableAncestors[i] !== el);
