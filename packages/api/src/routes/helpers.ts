@@ -1,7 +1,9 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { User } from "@conduit/shared";
-import { NotFoundError, ArchivedError, ConflictError } from "../services/errors.js";
+import {
+  NotFoundError, ArchivedError, ConflictError, MailKeyMissingError, MailCredentialDecryptError,
+} from "../services/errors.js";
 import { decodeCursor } from "../services/pagination.js";
 
 /**
@@ -55,6 +57,22 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
   }
   if (error instanceof ConflictError) {
     void reply.code(409).send({ error: "conflict", message: error.message });
+    return;
+  }
+  // Both raised by mail-crypto (services/errors.ts) and both mean "mail is
+  // temporarily unavailable" rather than a request-shaped problem: a missing
+  // key file is an operator-fixable deployment gap (install/upgrade is
+  // supposed to generate it), and an unreadable ciphertext means mail.key
+  // was rotated/restored since a row was encrypted. 503, not 500 -- the
+  // request itself was fine. Route-level exercise of these two branches
+  // lands with routes/mail.ts in Task 7; this only wires the mapping so that
+  // task's routes get it for free.
+  if (error instanceof MailKeyMissingError) {
+    void reply.code(503).send({ error: "mail_key_missing", message: error.message });
+    return;
+  }
+  if (error instanceof MailCredentialDecryptError) {
+    void reply.code(503).send({ error: "mail_credentials_unreadable", message: error.message });
     return;
   }
   throw error;

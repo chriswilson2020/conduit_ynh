@@ -31,6 +31,7 @@ import {
   shiftResultSchema,
   ganttPayloadSchema,
   mailAccountSchema,
+  mailAccountSummarySchema,
   mailAccountCreateInputSchema,
   mailAccountUpdateInputSchema,
   mailAccountTestInputSchema,
@@ -726,6 +727,19 @@ describe("mailAccountSchema", () => {
     for (const key of keys) {
       expect(key.toLowerCase()).not.toMatch(/password|credential|secret/);
     }
+  });
+});
+
+describe("mailAccountSummarySchema", () => {
+  it("accepts the id/label/email shape", () => {
+    const summary = { id: uuid1, label: "Work", email: "chris@example.com" };
+    expect(mailAccountSummarySchema.parse(summary)).toEqual(summary);
+  });
+
+  // The whole point of this schema: it's the only shape another user's mail
+  // account may appear in, so it must never widen to carry settings.
+  it("has exactly id/label/email and nothing else", () => {
+    expect(Object.keys(mailAccountSummarySchema.shape).sort()).toEqual(["email", "id", "label"]);
   });
 });
 

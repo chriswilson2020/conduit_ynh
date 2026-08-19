@@ -484,6 +484,19 @@ export const mailAccountSchema = z.object({
 });
 export type MailAccount = z.infer<typeof mailAccountSchema>;
 
+// The ONLY shape another user's mail account may ever appear in (Task 3's
+// listAccounts, Phase 4 spec's routes list: "the list returns other users'
+// accounts as id+label+email (for filter UI), never settings"). Mirrors
+// userSummarySchema above -- same reasoning, a plain listing shape for
+// populating a filter/picker, not the full account. No host/port/security/
+// username/status here on purpose: those are settings, and settings belong
+// to their owner alone, same spirit as mailAccountSchema excluding
+// credentialsCiphertext.
+export const mailAccountSummarySchema = z.object({
+  id: z.uuid(), label: z.string().min(1), email: z.email(),
+});
+export type MailAccountSummary = z.infer<typeof mailAccountSummarySchema>;
+
 // userId is the actor, stamped server-side (mirrors notes' authorUserId --
 // never a caller-supplied field). One password field with an optional
 // smtpPassword override, per the "SMTP differs" toggle in the Phase 4 spec's
