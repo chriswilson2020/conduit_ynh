@@ -323,7 +323,9 @@ describe("ingestMessage: parsing and message fields", () => {
     const raw = [
       "Message-ID: <big@example.com>",
       "From: alice@example.com",
-      `X-Filler: ${"y".repeat(300 * 1024)}`,
+      // Just past the 64KB cap -- the boundary is what this exercises, not
+      // an absurd outlier that any cap would catch.
+      `X-Filler: ${"y".repeat(70 * 1024)}`,
       "Subject: padded",
       "",
       "body",
@@ -346,8 +348,8 @@ describe("ingestMessage: parsing and message fields", () => {
     // guard rejects BEFORE simpleParser. 3s leaves ample room over the
     // sub-millisecond real path while staying far below 6.1s.
     const crowd = Array.from({ length: 60000 }, (_, i) => `f${i}@exa`).join(", ");
-    // ~709KB: past the 256KB header cap, short of mailparser's 1 MiB drop.
-    expect(crowd.length).toBeGreaterThan(256 * 1024);
+    // ~709KB: 11x the 64KB header cap, short of mailparser's 1 MiB drop.
+    expect(crowd.length).toBeGreaterThan(64 * 1024);
     expect(crowd.length).toBeLessThan(1024 * 1024);
     const raw = ["Message-ID: <crowd@example.com>", "From: alice@example.com", `To: ${crowd}`, "", "hi", ""]
       .join("\r\n");
@@ -360,7 +362,7 @@ describe("ingestMessage: parsing and message fields", () => {
 
   it("leaves a message with an ordinary large header block alone", async () => {
     // ~20KB of To: header: unusual but legitimate (a big distribution
-    // list), and nowhere near the 256KB bound.
+    // list), and comfortably inside the 64KB bound.
     const recipients = Array.from({ length: 900 }, (_, i) => `person${i}@example.com`).join(", ");
     expect(recipients.length).toBeGreaterThan(20 * 1024);
     const result = await ingest({ messageId: ROOT_ID, to: recipients });
@@ -453,7 +455,10 @@ describe("ingestMessage: caps on attacker-controlled fields", () => {
     // (one bind parameter per address, plus a scan inside the global ingest
     // lock). The contact sits at the very end, past the cap, so this also
     // pins down that the cap -- not luck -- decides what auto-linking sees.
-    const crowd = Array.from({ length: 3000 }, (_, i) => `filler${i}@example.com`);
+    // 1500 addresses is ~36KB of To: header: an order of magnitude past
+    // MAX_PARTICIPANTS while still inside MAX_HEADER_BYTES, so the guard
+    // this test is not about lets the message through to be capped here.
+    const crowd = Array.from({ length: 1500 }, (_, i) => `filler${i}@example.com`);
     crowd.push("alice@example.com");
     await createContact(handle.db, actorId, { firstName: "Alice", emails: ["alice@example.com"] });
     const result = await ingest({
@@ -601,12 +606,13 @@ describe("ingestMessage: threading", () => {
   it("caps a monstrous References header and still threads on the nearest ancestor", async () => {
     // Uncapped, every id becomes a bind parameter in the ancestor lookup
     // and a member of a quadratic dedupe scan. The ids are deliberately
-    // SHORT, and the count is the most the HEADER cap allows through
-    // (~26k at ~10 bytes each in 256KB): 20k of them is a realistic worst
-    // case that still arrives fully parsed, and the References cap takes
-    // it down to 50 -- all the right-to-left walk ever consults.
+    // SHORT, so the count is bounded by the HEADER cap (~6500 at ~10 bytes
+    // each in 64KB): 5000 of them is a ~49KB header that really does reach
+    // the parser rather than being rejected by the header guard first, and
+    // the References cap takes it down to 50 -- all the right-to-left walk
+    // ever consults.
     const parent = await ingest({ messageId: PARENT_ID });
-    const bloated = Array.from({ length: 20000 }, (_, i) => `<a${i}@x>`);
+    const bloated = Array.from({ length: 5000 }, (_, i) => `<a${i}@x>`);
     bloated.push(PARENT_ID);
     const reply = await ingest({ messageId: CHILD_ID, references: bloated }, { uid: 2 });
     expect(reply.message.threadId).toBe(parent.message.threadId);

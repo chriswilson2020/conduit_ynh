@@ -168,12 +168,12 @@ const MAX_HEADER_FIELD_BYTES = 998;
 const MAX_MESSAGE_ID_BYTES = 998;
 // Bound on both the stored to/cc address arrays and the participant list
 // auto-linking scans. Under MAX_HEADER_BYTES a To: header still reaches
-// ~11k addresses (at ~22 bytes each): as a jsonb column that is a
-// permanent multi-hundred-KB row per message that no view can render, and
-// as a participant list it is 11k bind parameters plus a scan running
-// inside the global ingest lock. No real message addresses 200 people
-// directly. Deliberately independent of the header cap -- if that ever
-// moves, this stays bounded on its own terms.
+// ~2900 addresses (at ~22 bytes each): as a jsonb column that is a
+// permanent tens-of-KB row per message that no view can render, and as a
+// participant list it is 2900 bind parameters plus a scan running inside
+// the global ingest lock. No real message addresses 200 people directly.
+// Deliberately independent of the header cap -- if that ever moves, this
+// stays bounded on its own terms.
 const MAX_PARTICIPANTS = 200;
 // Attachments are streamed to blob storage and never rewritten, so an
 // unbounded message is unbounded disk. 50 attachments is far past any real
@@ -200,10 +200,15 @@ const MAX_RAW_BYTES = 25 * 1024 * 1024;
 // (a 709KB header, 2.7% of the raw cap) took 6.1s, and ~150k addresses
 // (still under 5% of the raw cap) stalled simpleParser for over 8 minutes
 // -- blocking the entire event loop, not just the sync loop, since that
-// parse never yields. 256KB is far above any real header block (a heavily
-// forwarded thread with full References and DKIM signatures is single-digit
-// KB) and keeps the worst case in the low seconds.
-const MAX_HEADER_BYTES = 256 * 1024;
+// parse never yields. 64KB is still an order of magnitude above any real
+// header block (a heavily forwarded thread with full References and DKIM
+// signatures is single-digit KB), and it is what keeps the worst case
+// SUB-SECOND: at 256KB, the cap this started at, a header packed with
+// minimal addresses measured 7.2s of blocked event loop -- under the cap
+// and therefore accepted, which is exactly the outcome the guard exists to
+// prevent. The bound has to sit where the superlinear curve is still flat,
+// not merely where real mail stops.
+const MAX_HEADER_BYTES = 64 * 1024;
 
 /**
  * Truncate to a UTF-8 byte budget without splitting a character. The
@@ -291,9 +296,9 @@ function normalizeMessageId(value: string | undefined): string | null {
 // entirely at exactly 1 MiB, and below that the id COUNT is bounded only by
 // those bytes -- 100,000 short ids were delivered in one header -- so the
 // parser is no protection here. MAX_HEADER_BYTES now bounds the header
-// block first, which brings the reachable worst case down to roughly 26k
-// short ids (256KB at ~10 bytes each): under the driver's 65535
-// bind-parameter ceiling, but still tens of thousands of parameters and a
+// block first, which brings the reachable worst case down to roughly 6500
+// short ids (64KB at ~10 bytes each): well under the driver's 65535
+// bind-parameter ceiling, but still thousands of parameters and a
 // quadratic dedupe scan per message. The two caps are deliberately
 // independent -- this one keeps the lookup at 50 ids whatever the header
 // cap becomes.
@@ -832,7 +837,7 @@ async function ingestParsedMessage(
     // recipient count, and at 40k addresses that measured 973ms of pure
     // event-loop stall -- inside the GLOBAL ingest lock, so every other
     // account's sync waits on it. (MAX_HEADER_BYTES keeps a To: header
-    // under ~11k addresses now, but a quadratic scan is not something to
+    // under ~2900 addresses now, but a quadratic scan is not something to
     // leave standing behind another cap.) Capped as well, because even a
     // deduped list becomes one bind parameter per address in the contact
     // lookup. Order is preserved (from, then to, then cc), which is what
