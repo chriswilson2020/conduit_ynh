@@ -307,17 +307,65 @@ describe("ingestMessage: parsing and message fields", () => {
     expect(ingestError.cause).toBeInstanceOf(NotFoundError);
   });
 
-  it("rejects a raw message past the size guard without parsing it", async () => {
-    // The guard exists because simpleParser is where pathological input
-    // hurts (a 1MiB To: header measured over 8 minutes); this must return
-    // promptly, which it only does by never reaching the parser.
+  it("rejects a raw message past the whole-message size guard", async () => {
+    // This cap bounds memory and disk (parse buffer, decoded parts, blob
+    // writes) -- NOT parse time, which the header cap below handles.
     const oversized = Buffer.alloc(26 * 1024 * 1024, 0x41);
     const error = await ingestMessage(handle.db, dataDir, {
       accountId, folder: "INBOX", uid: 1, raw: oversized, flags: [],
     }).then(() => undefined, (err: unknown) => err);
     expect(error).toBeInstanceOf(MailIngestError);
-    expect((error as MailIngestError).reason).toContain("exceeds");
+    expect((error as MailIngestError).reason).toContain("raw message");
     expect(await messageRows()).toHaveLength(0);
+  });
+
+  it("rejects an oversized header block", async () => {
+    const raw = [
+      "Message-ID: <big@example.com>",
+      "From: alice@example.com",
+      `X-Filler: ${"y".repeat(300 * 1024)}`,
+      "Subject: padded",
+      "",
+      "body",
+      "",
+    ].join("\r\n");
+    const error = await ingest(raw).then(() => undefined, (err: unknown) => err);
+    expect(error).toBeInstanceOf(MailIngestError);
+    expect((error as MailIngestError).reason).toContain("header block");
+    expect(await messageRows()).toHaveLength(0);
+  });
+
+  it("rejects a message whose To: header carries tens of thousands of addresses, without parsing it", async () => {
+    // The measured cost driver: mailparser's address parsing is
+    // superlinear, and 60k addresses took 6.1s of blocked event loop. The
+    // addresses are deliberately short, reproducing that measurement's
+    // ~709KB header -- under 3% of the whole-message cap (so that cap
+    // never sees it) and under mailparser's own 1 MiB header drop (so the
+    // parser would really parse it, slowly, rather than discard it). The
+    // elapsed assertion is the point of the test: it only holds if the
+    // guard rejects BEFORE simpleParser. 3s leaves ample room over the
+    // sub-millisecond real path while staying far below 6.1s.
+    const crowd = Array.from({ length: 60000 }, (_, i) => `f${i}@exa`).join(", ");
+    // ~709KB: past the 256KB header cap, short of mailparser's 1 MiB drop.
+    expect(crowd.length).toBeGreaterThan(256 * 1024);
+    expect(crowd.length).toBeLessThan(1024 * 1024);
+    const raw = ["Message-ID: <crowd@example.com>", "From: alice@example.com", `To: ${crowd}`, "", "hi", ""]
+      .join("\r\n");
+    const startedAt = Date.now();
+    const error = await ingest(raw).then(() => undefined, (err: unknown) => err);
+    expect(error).toBeInstanceOf(MailIngestError);
+    expect((error as MailIngestError).reason).toContain("header block");
+    expect(Date.now() - startedAt).toBeLessThan(3000);
+  });
+
+  it("leaves a message with an ordinary large header block alone", async () => {
+    // ~20KB of To: header: unusual but legitimate (a big distribution
+    // list), and nowhere near the 256KB bound.
+    const recipients = Array.from({ length: 900 }, (_, i) => `person${i}@example.com`).join(", ");
+    expect(recipients.length).toBeGreaterThan(20 * 1024);
+    const result = await ingest({ messageId: ROOT_ID, to: recipients });
+    expect(result.created).toBe(true);
+    expect(result.message.toAddrs).toHaveLength(200);
   });
 
   it("decodes a quoted-printable body and an encoded-word subject", async () => {
@@ -385,6 +433,19 @@ describe("ingestMessage: caps on attacker-controlled fields", () => {
       { uid: 3 });
     expect(sibling.created).toBe(true);
     expect(sibling.message.messageId).not.toBe(first.message.messageId);
+  });
+
+  it("threads a child onto a parent whose Message-ID was hashed for being oversized", async () => {
+    // The two caps have to agree: the parent is stored under a hashed id,
+    // so the child's References entry must be hashed the same way or the
+    // ancestor is unfindable and the conversation splits.
+    const longId = `<${"z".repeat(3000)}@example.com>`;
+    const parent = await ingest({ messageId: longId, subject: "Long id parent" });
+    const child = await ingest({ messageId: CHILD_ID, subject: "Re: Long id parent", references: [longId] },
+      { uid: 2 });
+    expect(child.message.threadId).toBe(parent.message.threadId);
+    expect(child.message.referencesIds).toEqual([parent.message.messageId]);
+    expect(await threads()).toHaveLength(1);
   });
 
   it("caps a monstrous recipient list, in storage and in the auto-link scan", async () => {
@@ -538,18 +599,14 @@ describe("ingestMessage: threading", () => {
   });
 
   it("caps a monstrous References header and still threads on the nearest ancestor", async () => {
-    // Attacker-controlled header: uncapped, every id becomes a bind
-    // parameter in the ancestor lookup and a member of a quadratic dedupe
-    // scan, and under Task 5's sync loop one poison message stalling there
-    // takes the folder cursor (and the account) down with it. The ids are
-    // deliberately SHORT: mailparser drops a References header at exactly
-    // 1 MiB, but below that the id count is bounded only by bytes, so 70k
-    // short ids (~740KB) sail through the parser -- past the driver's
-    // 65535 bind-parameter ceiling. The parser is no protection here; the
-    // cap is. Only the newest 50 survive, which is all the right-to-left
-    // walk ever consults.
+    // Uncapped, every id becomes a bind parameter in the ancestor lookup
+    // and a member of a quadratic dedupe scan. The ids are deliberately
+    // SHORT, and the count is the most the HEADER cap allows through
+    // (~26k at ~10 bytes each in 256KB): 20k of them is a realistic worst
+    // case that still arrives fully parsed, and the References cap takes
+    // it down to 50 -- all the right-to-left walk ever consults.
     const parent = await ingest({ messageId: PARENT_ID });
-    const bloated = Array.from({ length: 70000 }, (_, i) => `<a${i}@x>`);
+    const bloated = Array.from({ length: 20000 }, (_, i) => `<a${i}@x>`);
     bloated.push(PARENT_ID);
     const reply = await ingest({ messageId: CHILD_ID, references: bloated }, { uid: 2 });
     expect(reply.message.threadId).toBe(parent.message.threadId);

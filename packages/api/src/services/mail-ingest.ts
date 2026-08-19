@@ -167,25 +167,43 @@ const MAX_HEADER_FIELD_BYTES = 998;
 // constraint underneath it.
 const MAX_MESSAGE_ID_BYTES = 998;
 // Bound on both the stored to/cc address arrays and the participant list
-// auto-linking scans. A 1MiB To: header parses into ~100k addresses: as a
-// jsonb column that is a permanent multi-megabyte row per message, and as a
-// participant list it is 100k bind parameters (past the driver's 65535
-// ceiling) plus a scan that runs inside the global ingest lock. No real
-// message addresses 200 people directly.
+// auto-linking scans. Under MAX_HEADER_BYTES a To: header still reaches
+// ~11k addresses (at ~22 bytes each): as a jsonb column that is a
+// permanent multi-hundred-KB row per message that no view can render, and
+// as a participant list it is 11k bind parameters plus a scan running
+// inside the global ingest lock. No real message addresses 200 people
+// directly. Deliberately independent of the header cap -- if that ever
+// moves, this stays bounded on its own terms.
 const MAX_PARTICIPANTS = 200;
 // Attachments are streamed to blob storage and never rewritten, so an
-// unbounded message is unbounded disk. 50MB matches the deliberate-upload
-// limit in routes/index.ts; 50 attachments is far past any real message.
-// Both are skip-and-continue, not reject: the MESSAGE still ingests (its
-// text is the part the CRM cares about), minus the offending parts.
+// unbounded message is unbounded disk. 50 attachments is far past any real
+// message. The 50MB per-attachment bound (matching routes/index.ts's
+// deliberate-upload limit) is belt and braces rather than a live limit: a
+// message is already capped at MAX_RAW_BYTES, and base64 costs 4/3, so no
+// single attachment reaching this code can exceed ~19.6MB today. It is
+// kept because the attachment path should stay bounded on its own terms --
+// raising the raw cap, or a future non-IMAP caller, must not silently make
+// attachment size unbounded. Both are skip-and-continue, not reject: the
+// MESSAGE still ingests (its text is what the CRM is really after), minus
+// the offending parts.
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const MAX_ATTACHMENTS = 50;
-// Guard before simpleParser, which is where pathological input actually
-// hurts: a 1MiB To: header took over 8 minutes to parse (measured), all of
-// it inside the sync loop. Anything this large is not mail worth having, and
-// Task 5's poison-message contract handles the resulting MailIngestError by
-// skipping the UID after a retry.
+// Whole-message bound: what it really limits is MEMORY and DISK -- the
+// buffer handed to simpleParser, the decoded parts it materialises, and the
+// blob bytes written from them. It is not a parse-time guard; a message
+// far under it can still be pathological (see MAX_HEADER_BYTES).
 const MAX_RAW_BYTES = 25 * 1024 * 1024;
+// Header-block bound, and THIS is the parse-time guard. mailparser's
+// address parsing is superlinear in the number of addresses on a header,
+// and the header block is a rounding error against MAX_RAW_BYTES, so the
+// whole-message cap does not constrain it at all: measured, 60k addresses
+// (a 709KB header, 2.7% of the raw cap) took 6.1s, and ~150k addresses
+// (still under 5% of the raw cap) stalled simpleParser for over 8 minutes
+// -- blocking the entire event loop, not just the sync loop, since that
+// parse never yields. 256KB is far above any real header block (a heavily
+// forwarded thread with full References and DKIM signatures is single-digit
+// KB) and keeps the worst case in the low seconds.
+const MAX_HEADER_BYTES = 256 * 1024;
 
 /**
  * Truncate to a UTF-8 byte budget without splitting a character. The
@@ -198,6 +216,30 @@ function capUtf8(value: string, maxBytes: number): string {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
   const slice = Buffer.from(value, "utf8").subarray(0, maxBytes);
   return new TextDecoder("utf-8").decode(slice, { stream: true });
+}
+
+/**
+ * Byte length of the message's header block -- everything before the first
+ * blank line -- or null when it is longer than `limit`.
+ *
+ * Only the first `limit + 4` bytes are searched, so a hostile message costs
+ * one bounded scan rather than a walk over 25MB: if no blank line appears in
+ * that window, the header block is over the limit by definition. A message
+ * with no blank line at all is all headers, and passes only if the whole
+ * thing fits in the limit. Both CRLF CRLF and bare LF LF count as the
+ * terminator -- IMAP delivers CRLF, but fixtures, tests and some tools use
+ * LF, and treating an LF-terminated message as "one giant header" would
+ * reject perfectly good mail.
+ */
+function headerBlockBytes(raw: Buffer, limit: number): number | null {
+  const window = raw.subarray(0, Math.min(raw.length, limit + 4));
+  let end = -1;
+  for (const terminator of ["\r\n\r\n", "\n\n"]) {
+    const at = window.indexOf(terminator, 0, "utf8");
+    if (at >= 0 && (end === -1 || at < end)) end = at;
+  }
+  if (end >= 0) return end;
+  return raw.length <= limit ? raw.length : null;
 }
 
 /** RFC 5322 ids arrive wrapped in angle brackets; everything here stores and
@@ -245,11 +287,16 @@ function normalizeMessageId(value: string | undefined): string | null {
 // cursor with it -- and under Task 5's sync loop a message that always
 // stalls or throws flips the whole account to status=error.
 //
-// Measured against mailparser 3.9.15: a header is dropped entirely at
-// exactly 1 MiB, and below that the id COUNT is bounded only by those bytes
-// -- 100,000 short ids were delivered in one header. So the parser is no
-// protection here: a short-id header can carry well past the driver's 65535
-// bind-parameter ceiling, and this cap is what makes the lookup safe.
+// Measured against mailparser 3.9.15: the parser drops a References header
+// entirely at exactly 1 MiB, and below that the id COUNT is bounded only by
+// those bytes -- 100,000 short ids were delivered in one header -- so the
+// parser is no protection here. MAX_HEADER_BYTES now bounds the header
+// block first, which brings the reachable worst case down to roughly 26k
+// short ids (256KB at ~10 bytes each): under the driver's 65535
+// bind-parameter ceiling, but still tens of thousands of parameters and a
+// quadratic dedupe scan per message. The two caps are deliberately
+// independent -- this one keeps the lookup at 50 ids whatever the header
+// cap becomes.
 //
 // The LAST 50 are kept because the walk is right-to-left: the nearest
 // ancestors, the only ones threading actually consults, live at the end. A
@@ -535,13 +582,26 @@ async function ingestParsedMessage(
   db: Database, dataDir: string, input: IngestMessageInput,
 ): Promise<IngestResult> {
   const context = { accountId: input.accountId, folder: input.folder, uid: input.uid };
-  // Size guard BEFORE simpleParser, which is where pathological input
-  // actually bites: a 1MiB To: header measured over 8 minutes of parsing,
-  // all of it blocking the sync loop. Task 5 treats the resulting
-  // MailIngestError as a poison message and skips the UID.
+  // Two guards, before simpleParser, bounding two different costs. Task 5
+  // treats either MailIngestError as a poison message: retry once, then
+  // skip the UID rather than let one message wedge the mailbox.
+  //
+  // First, the whole message -- memory and disk (the parse buffer, the
+  // decoded parts, the blob writes).
   const rawBytes = typeof input.raw === "string" ? Buffer.byteLength(input.raw, "utf8") : input.raw.length;
   if (rawBytes > MAX_RAW_BYTES) {
     throw new MailIngestError(context, `raw message of ${rawBytes} bytes exceeds the ${MAX_RAW_BYTES}-byte limit`);
+  }
+
+  // Second, the header block -- parse TIME, which the cap above does not
+  // constrain: mailparser's address parsing is superlinear in address
+  // count, and a 709KB header (2.7% of the raw cap) already measured 6.1s
+  // while ~150k addresses stalled the event loop for over 8 minutes. This
+  // is the bound that keeps a 1MB message from being a denial of service.
+  const rawBuffer = typeof input.raw === "string" ? Buffer.from(input.raw, "utf8") : input.raw;
+  const headerBytes = headerBlockBytes(rawBuffer, MAX_HEADER_BYTES);
+  if (headerBytes === null) {
+    throw new MailIngestError(context, `header block exceeds the ${MAX_HEADER_BYTES}-byte limit`);
   }
 
   // Parsed BEFORE the transaction opens: parsing touches no database state
@@ -554,7 +614,7 @@ async function ingestParsedMessage(
   // would (a) defeat the cid -> attachment placeholder rewrite entirely
   // and (b) get dropped by the sanitizer's img scheme allowlist, silently
   // losing every inline image.
-  const parsed = await simpleParser(input.raw, { skipImageLinks: true });
+  const parsed = await simpleParser(rawBuffer, { skipImageLinks: true });
 
   const addresses = extractAddresses(parsed);
   const messageId = normalizeMessageId(parsed.messageId) ?? syntheticMessageId(parsed);
@@ -769,12 +829,14 @@ async function ingestParsedMessage(
 
     // --- Auto-link --------------------------------------------------------
     // Set-based dedupe, not includes(): the array scan is quadratic in the
-    // recipient count, and a 1MiB To: header (~100k addresses) measured
-    // 973ms of pure event-loop stall -- inside the GLOBAL ingest lock, so
-    // every other account's sync waits on it. Capped as well, because even
-    // a deduped list becomes one bind parameter per address in the contact
-    // lookup and 65535 is the driver's ceiling. Order is preserved (from,
-    // then to, then cc), which is what decides the winning match.
+    // recipient count, and at 40k addresses that measured 973ms of pure
+    // event-loop stall -- inside the GLOBAL ingest lock, so every other
+    // account's sync waits on it. (MAX_HEADER_BYTES keeps a To: header
+    // under ~11k addresses now, but a quadratic scan is not something to
+    // leave standing behind another cap.) Capped as well, because even a
+    // deduped list becomes one bind parameter per address in the contact
+    // lookup. Order is preserved (from, then to, then cc), which is what
+    // decides the winning match.
     const participants: string[] = [];
     const seenParticipants = new Set<string>();
     for (const address of [...addresses.from, ...addresses.to, ...addresses.cc]) {
