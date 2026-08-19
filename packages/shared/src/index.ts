@@ -322,8 +322,12 @@ export type Task = z.infer<typeof taskSchema>;
  * row's persisted counterpart). A partial update may therefore only touch
  * startDate/dueDate together, never just one -- a lone value can't be
  * validated against a value this schema can't see.
+ *
+ * Exported so services/tasks.ts's updateTask/createTask can re-assert the
+ * same invariant against a raw patch object -- a direct service caller (as
+ * opposed to the zod-validated route) bypasses this file's .refine() entirely.
  */
-function taskDatesPaired(v: { startDate?: string | null; dueDate?: string | null }): boolean {
+export function taskDatesPaired(v: { startDate?: string | null; dueDate?: string | null }): boolean {
   // Checked directly on v.startDate/v.dueDate (not via intermediate booleans)
   // so TS actually narrows their type for the startDate <= dueDate comparison
   // below -- narrowing doesn't propagate through a derived boolean variable.
@@ -360,6 +364,20 @@ export const updateTaskInputSchema = taskInputShape.partial().refine(taskDatesPa
   message: "startDate and dueDate must both be provided together (with startDate <= dueDate), or neither",
 });
 export type UpdateTaskInput = z.infer<typeof updateTaskInputSchema>;
+
+/** beforeTaskId/afterTaskId name the neighbours the moved task ends up BETWEEN
+ * within the target status column -- same "neighbours, not an insertion
+ * target" semantics as moveDealInputSchema above, adapted from stage to
+ * status. Both omitted appends at the tail of the target status column
+ * (mirrors createTask's append semantics). Board moves stay within the
+ * task's own project/standalone pool -- there is no cross-project move, so
+ * only status names the target column, not projectId. */
+export const moveTaskOnBoardInputSchema = z.object({
+  status: taskStatusSchema,
+  beforeTaskId: z.uuid().optional(),
+  afterTaskId: z.uuid().optional(),
+});
+export type MoveTaskOnBoardInput = z.infer<typeof moveTaskOnBoardInputSchema>;
 
 // Column exists so SS/FF/SF become a CHECK (and enum) widening later, not a
 // migration -- only 'FS' is valid in Phase 3.
