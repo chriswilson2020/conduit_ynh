@@ -21,3 +21,16 @@ export class ConflictError extends Error {
     super(message ?? `${entity} ${id} no longer matches the expected state`);
   }
 }
+
+// Raised by mail-crypto's loadMailKey when $data_dir/mail.key is absent -- an
+// operator-fixable deployment gap (install/upgrade is supposed to generate
+// it; see the Phase 4 spec's "Key handling" section), not a bug. Distinct
+// from a wrong-size key file, which throws a plain Error: a missing file is
+// the one case routes must turn into a 503 ("mail is temporarily
+// unavailable, an admin needs to look at this") rather than a 500, so it
+// gets its own type for mapDomainError-style branching in routes/mail.ts.
+export class MailKeyMissingError extends Error {
+  constructor(keyPath: string) {
+    super(`mail key not found at ${keyPath}`);
+  }
+}

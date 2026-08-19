@@ -1,3 +1,4 @@
+import path from "node:path";
 import { z } from "zod";
 
 const envSchema = z.object({
@@ -11,6 +12,11 @@ const envSchema = z.object({
   DEFAULT_CURRENCY: z.string()
     .regex(/^[A-Z]{3}$/, "DEFAULT_CURRENCY must be 3 uppercase letters")
     .default("EUR"),
+  // No zod .default() here: the default depends on DATA_DIR, which is itself
+  // configurable, so it is computed below after parsing rather than baked into
+  // the schema (same reason basePath's trailing-slash normalisation happens
+  // post-parse instead of in the schema).
+  MAIL_KEY_PATH: z.string().min(1).optional(),
 });
 
 export interface Config {
@@ -25,6 +31,8 @@ export interface Config {
   dataDir: string;
   /** Applied by the deals service when a caller creates a deal without a currency. */
   defaultCurrency: string;
+  /** 32-byte AES-256-GCM key file for mail credential encryption; see mail-crypto.ts. */
+  mailKeyPath: string;
 }
 
 export function parseConfig(env: Record<string, string | undefined>): Config {
@@ -58,5 +66,6 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     devUser: value.CONDUIT_DEV_USER ?? null,
     dataDir: value.DATA_DIR,
     defaultCurrency: value.DEFAULT_CURRENCY,
+    mailKeyPath: value.MAIL_KEY_PATH ?? path.join(value.DATA_DIR, "mail.key"),
   };
 }

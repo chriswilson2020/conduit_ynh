@@ -68,6 +68,18 @@ describe("parseConfig", () => {
     expect(parseConfig(valid).defaultCurrency).toBe("EUR");
   });
 
+  it("defaults MAIL_KEY_PATH to DATA_DIR/mail.key when unset", () => {
+    expect(parseConfig({ ...valid, DATA_DIR: "/var/lib/conduit/data" }).mailKeyPath).toBe(
+      "/var/lib/conduit/data/mail.key",
+    );
+  });
+
+  it("carries through an explicit MAIL_KEY_PATH", () => {
+    expect(parseConfig({ ...valid, MAIL_KEY_PATH: "/etc/conduit/mail.key" }).mailKeyPath).toBe(
+      "/etc/conduit/mail.key",
+    );
+  });
+
   it("carries through an explicit DEFAULT_CURRENCY", () => {
     expect(parseConfig({ ...valid, DEFAULT_CURRENCY: "USD" }).defaultCurrency).toBe("USD");
   });
