@@ -12,7 +12,7 @@ import { createProject, archiveProject } from "./projects.js";
 import {
   createTask, updateTask, archiveTask, unarchiveTask,
   setTaskStatus, moveTaskOnBoard,
-  addDependency, removeDependency,
+  addDependency, removeDependency, listDependencies,
   getTask, listTasks,
 } from "./tasks.js";
 import { NotFoundError, ArchivedError, ConflictError } from "./errors.js";
@@ -633,6 +633,34 @@ describe("task dependencies", () => {
     const evs = await handle.db.select().from(events).where(eq(events.taskId, b.id));
     expect(evs.filter((e) => e.verb === "dependency_removed")).toHaveLength(0);
   });
+
+  it("listDependencies returns only this task's predecessors (it is the successor end), oldest first", async () => {
+    const a = await makeTask({ title: "A" });
+    const b = await makeTask({ title: "B" });
+    const c = await makeTask({ title: "C" });
+    await addDependency(handle.db, actorId, a.id, c.id);
+    await addDependency(handle.db, actorId, b.id, c.id);
+    // c also feeds a fourth task -- that edge must NOT show up in c's own
+    // predecessor list, only in the fourth task's.
+    const d = await makeTask({ title: "D" });
+    await addDependency(handle.db, actorId, c.id, d.id);
+
+    expect((await listDependencies(handle.db, c.id)).map((dep) => dep.predecessorId)).toEqual([a.id, b.id]);
+    expect((await listDependencies(handle.db, d.id)).map((dep) => dep.predecessorId)).toEqual([c.id]);
+    expect(await listDependencies(handle.db, a.id)).toEqual([]);
+  });
+
+  it("listDependencies includes edges between undated tasks -- unlike ganttPayload, which drops them", async () => {
+    const a = await makeTask({ title: "A" });
+    const b = await makeTask({ title: "B" });
+    await addDependency(handle.db, actorId, a.id, b.id);
+    expect((await listDependencies(handle.db, b.id)).map((dep) => dep.predecessorId)).toEqual([a.id]);
+  });
+
+  it("listDependencies rejects an unknown task id", async () => {
+    await expect(listDependencies(handle.db, "3f2504e0-4f89-41d3-9a0c-0305e82c3301"))
+      .rejects.toBeInstanceOf(NotFoundError);
+  });
 });
 
 describe("getTask / listTasks", () => {
@@ -677,7 +705,7 @@ describe("getTask / listTasks", () => {
 });
 
 describe("SSE invalidation hints", () => {
-  it("publishes tasks/gantt/events/search keys, plus a my-tasks key when the task has an assignee", async () => {
+  it("publishes tasks/task/gantt/events/search keys, plus a my-tasks key when the task has an assignee", async () => {
     const hints: string[][][] = [];
     const unsub = subscribe((hint) => hints.push(hint.keys));
     try {
@@ -685,11 +713,29 @@ describe("SSE invalidation hints", () => {
       const keySets = hints.map((keys) => keys.map((k) => k.join(":")));
       const flat = keySets[keySets.length - 1] ?? [];
       expect(flat).toContain(`tasks:standalone`);
+      // Mirrors publishDealHint's ["deal", id] (services/deals.ts) -- see
+      // publishTaskHint's own doc comment for why the task drawer's
+      // useTask(id)/dependency-list caches key off this.
+      expect(flat).toContain(`task:${task.id}`);
       expect(flat).toContain("gantt");
       expect(flat).toContain("events");
       expect(flat).toContain("search");
       expect(flat).toContain(`my-tasks:${actorId}`);
       expect(task.assigneeUserId).toBe(actorId);
+    } finally {
+      unsub();
+    }
+  });
+
+  it("addDependency publishes the successor's task key, so the drawer's dependency list refreshes", async () => {
+    const a = await makeTask({ title: "A" });
+    const b = await makeTask({ title: "B" });
+    const hints: string[][][] = [];
+    const unsub = subscribe((hint) => hints.push(hint.keys));
+    try {
+      await addDependency(handle.db, actorId, a.id, b.id);
+      const flat = hints[hints.length - 1]?.map((k) => k.join(":")) ?? [];
+      expect(flat).toContain(`task:${b.id}`);
     } finally {
       unsub();
     }

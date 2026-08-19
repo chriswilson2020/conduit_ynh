@@ -20,9 +20,20 @@ import { publish } from "./sse.js";
  * pre-patch assignee here unconditionally; the Set dedupes the common case
  * where the assignee didn't actually change, so callers never need to check
  * first.
+ *
+ * ["task", task.id] mirrors publishDealHint's ["deal", id] (services/deals.ts):
+ * the task drawer's single-task useTask(id) query (queries.ts) keys off
+ * exactly this, and TanStack's prefix-matched invalidateQueries also reaches
+ * a deeper ["task", id, "dependencies"] cache (the drawer's predecessor
+ * list) for free -- addDependency/removeDependency below both already call
+ * this with the successor task, so a dependency edit invalidates the
+ * drawer's dependency list the same way a field edit invalidates its fields,
+ * with no separate key needed.
  */
 function publishTaskHint(task: Task, extraAssigneeIds: (string | null)[] = []): void {
-  const keys: string[][] = [["tasks", task.projectId ?? "standalone"], ["gantt"], ["events"], ["search"]];
+  const keys: string[][] = [
+    ["tasks", task.projectId ?? "standalone"], ["task", task.id], ["gantt"], ["events"], ["search"],
+  ];
   const assignees = new Set<string>();
   if (task.assigneeUserId !== null) assignees.add(task.assigneeUserId);
   for (const a of extraAssigneeIds) if (a !== null) assignees.add(a);
@@ -670,6 +681,19 @@ export async function removeDependency(db: Database, actorId: string, predecesso
 export async function getTask(db: Database, id: string): Promise<Task | null> {
   const [row] = await db.select().from(tasks).where(eq(tasks.id, id));
   return row === undefined ? null : toTask(row);
+}
+
+// Predecessors of `id` -- the edges the task drawer's dependency list needs
+// (this task is the successor end of each). mustGetTask 404s a bad task id
+// rather than silently returning an empty list, mirroring getTask's route
+// (routes/tasks.ts) 404ing a missing id instead of returning null-as-200.
+// Ordered by createdAt so the drawer's list is stable (insertion order)
+// rather than whatever order Postgres happens to return rows in.
+export async function listDependencies(db: Database, id: string): Promise<TaskDependency[]> {
+  await mustGetTask(db, id);
+  const rows = await db.select().from(taskDependencies)
+    .where(eq(taskDependencies.successorId, id)).orderBy(taskDependencies.createdAt);
+  return rows.map(toTaskDependency);
 }
 
 export interface ListTasksOptions {

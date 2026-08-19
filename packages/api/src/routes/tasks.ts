@@ -8,7 +8,7 @@ import type { CrmRouteDeps } from "./index.js";
 import { requireUser, mapDomainError, parseOrReject, idParamSchema } from "./helpers.js";
 import {
   createTask, updateTask, archiveTask, unarchiveTask, listTasks, getTask,
-  setTaskStatus, moveTaskOnBoard, addDependency, removeDependency,
+  setTaskStatus, moveTaskOnBoard, addDependency, removeDependency, listDependencies,
 } from "../services/tasks.js";
 import { shiftTask } from "../services/scheduling.js";
 
@@ -177,5 +177,21 @@ export function registerTaskRoutes(app: FastifyInstance, { db }: CrmRouteDeps): 
     if (params === undefined) return;
     await removeDependency(db, user.id, params.predecessorId, params.id);
     return reply.code(204).send();
+  });
+
+  // This task's predecessors (edges where :id is the successor) -- the task
+  // drawer's dependency list (Task 8). Unlike the Gantt payload's
+  // dependencies (services/scheduling.ts's ganttPayload), which only carries
+  // edges between two DATED tasks, this returns every predecessor
+  // regardless of either task's dates.
+  app.get("/api/tasks/:id/dependencies", async (request, reply) => {
+    if (requireUser(request, reply) === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    try {
+      return await listDependencies(db, params.id);
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
   });
 }

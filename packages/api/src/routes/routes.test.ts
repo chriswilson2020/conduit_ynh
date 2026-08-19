@@ -1283,6 +1283,35 @@ describe("tasks routes", () => {
     await a.close();
   });
 
+  it("lists a task's predecessors, and 404s for an unknown task id", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const taskA = await makeTask(a, { title: "A", projectId: project.id });
+    const taskB = await makeTask(a, { title: "B", projectId: project.id });
+    await a.inject({
+      method: "POST", url: `/api/tasks/${taskB.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskA.id },
+    });
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/tasks/${taskB.id}/dependencies`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    const deps = taskDependencySchema.array().parse(listed.json());
+    expect(deps.map((d) => d.predecessorId)).toEqual([taskA.id]);
+
+    const emptyList = await a.inject({
+      method: "GET", url: `/api/tasks/${taskA.id}/dependencies`, headers: authHeaders,
+    });
+    expect(taskDependencySchema.array().parse(emptyList.json())).toEqual([]);
+
+    const missing = await a.inject({
+      method: "GET", url: "/api/tasks/3f2504e0-4f89-41d3-9a0c-0305e82c3301/dependencies", headers: authHeaders,
+    });
+    expect(missing.statusCode).toBe(404);
+    await a.close();
+  });
+
   // The centrepiece: build a two-hop dependency chain via the API, shift the
   // head task's dates far enough right to violate both downstream tasks, and
   // assert the response's moved array (schema-parsed) shows the cascade.
