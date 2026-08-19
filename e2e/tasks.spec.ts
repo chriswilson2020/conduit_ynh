@@ -235,6 +235,36 @@ test.describe.serial("Tasks/Gantt journey", () => {
     expect(buildTitleAfter).not.toBe(`${buildTitle}: 2026-09-08 to 2026-09-12`);
   });
 
+  test("Remove slack pulls Build back to touch Design's due date once slack is reintroduced", async () => {
+    // The cascade above already lands Build with ZERO slack (shiftTask's own
+    // successor push sets a violated successor's start to exactly its
+    // predecessor's new due date, never further) -- compacting right after
+    // it would be a no-op. Reintroduce real slack first via a plain drawer
+    // edit (updateTask, no cascade involved) so there's something for the
+    // compactor to actually pull.
+    await page.goto(`/projects/${projectId}/board`);
+    await openDrawerFromCard(buildId, buildTitle);
+    await setDrawerDates("2026-09-20", "2026-09-24");
+    await closeDrawer();
+
+    await page.goto(`/projects/${projectId}/gantt`);
+    const buildBar = page.getByTestId(`gantt-bar-${buildId}`);
+    await expect(buildBar).toHaveAttribute("title", `${buildTitle}: 2026-09-20 to 2026-09-24`);
+
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.getByTestId("compact-button").click();
+
+    // Only Build moves -- Design has no predecessor and never moves.
+    await expect(page.getByTestId("cascade-note")).toContainText(/1 task compacted/);
+
+    // Design sits at 2026-09-11..09-15 (the +10-day nudge from the previous
+    // test). Build's 4-day duration is preserved, pulled back to touch
+    // Design's due date exactly -- the same tight position the earlier
+    // cascade itself landed it in, before this test's manual edit
+    // reintroduced slack.
+    await expect(buildBar).toHaveAttribute("title", `${buildTitle}: 2026-09-15 to 2026-09-19`);
+  });
+
   test("the project rail's Timeline shows a shifted entry", async () => {
     await page.goto(`/projects/${projectId}`);
     const rail = page.getByTestId("rail");

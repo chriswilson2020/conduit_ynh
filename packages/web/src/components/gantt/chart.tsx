@@ -271,9 +271,11 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
   // `kind` distinguishes an interactive-drag cascade ("N tasks shifted") from
   // a "Remove slack" sweep ("N tasks compacted") -- same flash/note mechanism
   // (the amber ring on each bar, the one-line note, the 1s auto-clear timer),
-  // just a different noun in the note text. See triggerFlash/handleCompact
-  // below.
-  const [flash, setFlash] = useState<{ ids: Set<string>; count: number; kind: "shifted" | "compacted" } | null>(null);
+  // just a different noun in the note text. "empty" is compact-only: a sweep
+  // that moved nothing still gets a brief acknowledgement ("Nothing to
+  // compact") rather than the button silently doing nothing from the user's
+  // point of view. See triggerFlash/handleCompact below.
+  const [flash, setFlash] = useState<{ ids: Set<string>; count: number; kind: "shifted" | "compacted" | "empty" } | null>(null);
   const [bannerError, setBannerError] = useState<string | null>(null);
   // Purely a rendering signal (see isCommitting below) -- inFlightTaskIdsRef
   // is the actual guard consulted synchronously by handlePointerDown/
@@ -344,7 +346,7 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
     }
   }, [taskById]);
 
-  const triggerFlash = useCallback((ids: string[], kind: "shifted" | "compacted" = "shifted") => {
+  const triggerFlash = useCallback((ids: string[], kind: "shifted" | "compacted" | "empty" = "shifted") => {
     if (flashTimeoutRef.current !== null) window.clearTimeout(flashTimeoutRef.current);
     setFlash({ ids: new Set(ids), count: ids.length, kind });
     flashTimeoutRef.current = window.setTimeout(() => {
@@ -363,6 +365,7 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
     compactSchedule.mutate(undefined, {
       onSuccess: (result) => {
         if (result.moved.length > 0) triggerFlash(result.moved.map((m) => m.id), "compacted");
+        else triggerFlash([], "empty");
       },
       onError: (err) => setBannerError(err instanceof Error ? err.message : String(err)),
     });
@@ -791,7 +794,9 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
           )}
         </div>
         <div data-testid="cascade-note" aria-live="polite" className="text-xs font-medium text-amber-700">
-          {flash ? `${flash.count} task${flash.count === 1 ? "" : "s"} ${flash.kind}` : ""}
+          {flash
+            ? (flash.kind === "empty" ? "Nothing to compact" : `${flash.count} task${flash.count === 1 ? "" : "s"} ${flash.kind}`)
+            : ""}
         </div>
       </div>
 

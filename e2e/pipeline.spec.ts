@@ -228,4 +228,34 @@ test.describe.serial("Pipeline journey", () => {
 
     await context2.close();
   });
+
+  test("archives the pipeline, hides it from the default list, and restores it via the board's Unarchive banner", async () => {
+    await page.goto(`/pipelines/${pipelineId}`);
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.getByTestId("archive-pipeline-button").click();
+
+    await expect(page).toHaveURL(/\/pipelines$/);
+
+    // Gone from the default (non-archived) list.
+    await expect(page.getByTestId(`pipeline-row-${pipelineId}`)).not.toBeVisible();
+
+    // Present once the Archived toggle is turned on.
+    await page.getByRole("checkbox", { name: "Archived" }).check();
+    await expect(page.getByTestId(`pipeline-row-${pipelineId}`)).toBeVisible();
+
+    // Board still loads, read-only, with an Unarchive affordance in the banner.
+    await page.goto(`/pipelines/${pipelineId}`);
+    await expect(page.getByRole("alert")).toContainText("archived");
+    await expect(page.getByTestId("archive-pipeline-button")).not.toBeVisible();
+    await page.getByTestId("unarchive-pipeline-button").click();
+
+    // Unarchiving stays on the board (unlike archiving, which navigates
+    // away) and restores the normal "Archive pipeline" affordance.
+    await expect(page.getByTestId("archive-pipeline-button")).toBeVisible();
+    await expect(page.getByRole("alert")).not.toBeVisible();
+
+    // Back in the default (non-archived) list on the pipelines index.
+    await page.goto("/pipelines");
+    await expect(page.getByTestId(`pipeline-row-${pipelineId}`)).toBeVisible();
+  });
 });

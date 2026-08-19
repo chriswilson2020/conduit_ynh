@@ -4,6 +4,7 @@ import { DndContext, DragOverlay } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import type { Deal, Stage } from "@conduit/shared";
+import { ApiError } from "../api";
 import {
   useArchivePipeline, useCompanies, useCreateDeal, useCreateStage, useDeals, useMoveDeal, usePipeline,
   useUnarchivePipeline, useUpdateStage, useUsers,
@@ -30,6 +31,12 @@ export function BoardPage() {
   const moveDeal = useMoveDeal();
   const archivePipeline = useArchivePipeline();
   const unarchivePipeline = useUnarchivePipeline();
+  // Mirrors company-detail.tsx's own bannerError/reportError pair -- until
+  // now, this page's only mutations (drag/stage/deal edits) either had
+  // nowhere useful to surface a failure or were already covered elsewhere;
+  // archive/unarchive are the first board.tsx mutations whose failure the
+  // user has no other way to notice (no optimistic UI to visibly snap back).
+  const [bannerError, setBannerError] = useState<string | null>(null);
 
   const companyMap = useMemo(
     () => new Map((companiesData?.items ?? []).map((company) => [company.id, company.name])),
@@ -92,16 +99,29 @@ export function BoardPage() {
 
   const { pipeline, stages } = pipelineData;
 
+  // Mirrors company-detail.tsx's own reportError: ApiError.code is the
+  // server's machine-readable `error` field, branched on so a stale-state
+  // race (someone else archived/unarchived this pipeline in another tab a
+  // moment ago) gets a specific, actionable message instead of the raw
+  // "pipeline ... is archived" text.
+  function reportError(err: unknown) {
+    if (err instanceof ApiError && err.code === "archived") {
+      setBannerError("This pipeline's archive state changed elsewhere. Reload the page.");
+      return;
+    }
+    setBannerError(err instanceof Error ? err.message : String(err));
+  }
+
   // Mirrors company-detail.tsx's handleArchive/handleUnarchive -- confirm,
   // then mutate. Archiving navigates back to the pipelines index (Phase
   // 3.1): there's nothing left worth looking at on a board that just went
   // read-only, unlike unarchiving, which stays put on the now-editable board.
   function handleArchivePipeline() {
     if (!window.confirm(`Archive ${pipeline.name}? The board becomes read-only until it's unarchived.`)) return;
-    archivePipeline.mutate(pipelineId, { onSuccess: () => void navigate({ to: "/pipelines" }) });
+    archivePipeline.mutate(pipelineId, { onSuccess: () => void navigate({ to: "/pipelines" }), onError: reportError });
   }
   function handleUnarchivePipeline() {
-    unarchivePipeline.mutate(pipelineId);
+    unarchivePipeline.mutate(pipelineId, { onError: reportError });
   }
 
   const columns = (
@@ -124,6 +144,22 @@ export function BoardPage() {
 
   return (
     <div className="flex flex-col gap-4">
+      {bannerError && (
+        <div
+          role="alert"
+          className="flex items-center justify-between rounded-md border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700"
+        >
+          <span>{bannerError}</span>
+          <button
+            type="button"
+            onClick={() => setBannerError(null)}
+            className="ml-4 shrink-0 text-red-500 hover:text-red-700"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       <div className="flex items-start justify-between gap-3">
         <div>
           <Link to="/pipelines" className="text-xs font-medium text-slate-500 hover:text-slate-700">

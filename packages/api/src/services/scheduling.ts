@@ -335,7 +335,12 @@ export async function shiftTask(
 //     role shiftTask's dragged task plays for its own cascade.
 //   * status "done"/"in_progress" -- deliberately frozen (work already
 //     started/finished doesn't get silently rescheduled), but still a real
-//     constraint for anything downstream of it.
+//     constraint for anything downstream of it. This holds even when such a
+//     task is ITSELF currently violating its own predecessors' due dates --
+//     compactSchedule never fixes a protected task's own violation, only
+//     todo/blocked ones; a done/in_progress task that started early (or
+//     whose predecessor moved later after the fact) stays exactly where it
+//     is, constraint or no constraint.
 //   * Undated -- exactly shiftTask's own null-stopper (see its cascade loop
 //     comment): an undated task can't be moved (no dates to move) and can't
 //     usefully constrain a successor either (there is nothing to compare
@@ -407,13 +412,11 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
     // that invariant, not a case expected to ever fire.
     let head = 0;
     const queue: string[] = taskIds.filter((id) => (inDegree.get(id) ?? 0) === 0);
-    const settledStart = new Map<string, string | null>();
+    // Only the DUE date is ever read back out (by a successor computing its
+    // own max) -- a settled task's start never feeds anything downstream, so
+    // there's no parallel settledStart map to maintain.
     const settledDue = new Map<string, string | null>();
-    for (const id of taskIds) {
-      const row = taskById.get(id)!;
-      settledStart.set(id, row.startDate);
-      settledDue.set(id, row.dueDate);
-    }
+    for (const id of taskIds) settledDue.set(id, taskById.get(id)!.dueDate);
 
     const moved = new Map<string, MovedEntry>();
     let processed = 0;
@@ -437,7 +440,6 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
             const duration = diffDays(row.dueDate!, row.startDate!);
             const newStart = maxDue;
             const newDue = addDays(newStart, duration);
-            settledStart.set(id, newStart);
             settledDue.set(id, newDue);
             moved.set(id, {
               id, fromStart: row.startDate, fromDue: row.dueDate,

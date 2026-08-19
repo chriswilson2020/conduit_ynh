@@ -492,6 +492,26 @@ describe("compactSchedule", () => {
     expect(cAfter?.dueDate).toBe("2026-01-22");
   });
 
+  it("a task with BOTH a dated and an undated predecessor settles against the dated one only", async () => {
+    // Exercises the mixed branch of predDueDates's null-filter -- every
+    // other test here has either all-dated or all-undated predecessors, so
+    // this is the only one where SOME (not zero, not all) entries get
+    // filtered out of the same array.
+    const project = await makeProject();
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
+    const u = await createTask(handle.db, actorId, { title: "U", projectId: project.id }); // no dates
+    const t = await createTask(handle.db, actorId, { title: "T", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-12" });
+    await addDependency(handle.db, actorId, a.id, t.id);
+    await addDependency(handle.db, actorId, u.id, t.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    // U contributes nothing -- T settles at A's due date alone, 2-day
+    // duration preserved.
+    const tMoved = result.moved.find((m) => m.id === t.id)!;
+    expect(tMoved).toEqual({ id: t.id, startDate: "2026-01-05", dueDate: "2026-01-07", cascadedFrom: null });
+  });
+
   it("an empty project, and a project with no dependencies at all, are both a clean no-op", async () => {
     const empty = await makeProject({ name: "Empty" });
     expect((await compactSchedule(handle.db, actorId, empty.id)).moved).toEqual([]);
