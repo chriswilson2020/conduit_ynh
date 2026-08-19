@@ -1,16 +1,7 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import type { FormEvent, RefObject } from "react";
-import {
-  DndContext, DragOverlay, KeyboardCode, KeyboardSensor, MeasuringStrategy, PointerSensor, closestCenter,
-  closestCorners, getFirstCollision, getScrollableAncestors, rectIntersection, useDroppable, useSensor, useSensors,
-} from "@dnd-kit/core";
-import type {
-  CollisionDetection, DragEndEvent, DragOverEvent, DragStartEvent, DroppableContainer, KeyboardCoordinateGetter,
-} from "@dnd-kit/core";
-import {
-  SortableContext, arrayMove, hasSortableData, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy,
-} from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
+import { DndContext, DragOverlay } from "@dnd-kit/core";
+import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import type { Deal, Stage } from "@conduit/shared";
 import {
@@ -20,154 +11,12 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
 import { Funnel } from "../components/funnel";
+import {
+  KanbanEmptyPlaceholder, kanbanSortableItems, useKanbanBoard, useKanbanCardSortable, useKanbanColumnDroppable,
+} from "../components/kanban-core";
 import { parseDecimal } from "../lib";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
-interface CardDndData { type: "card"; stageId: string }
-interface PlaceholderDndData { type: "placeholder"; stageId: string }
-interface ColumnDndData { type: "column"; stageId: string }
-type DndData = CardDndData | PlaceholderDndData | ColumnDndData;
-
-/**
- * Every card sits inside BOTH its own sortable droppable AND its column's
- * wrapping useDroppable (added so pointer users can drop into blank space
- * below the last card, appending at the tail -- see Column's comment below).
- * That containment relationship breaks a KEYBOARD drag under the stock
- * closestCenter algorithm two different ways (a pointer drag hits neither --
- * the first pixel of movement already breaks any tie):
- *
- *   1. On lift, the active card's own collisionRect exactly equals its own
- *      resting droppable rect -- distance zero to itself -- so `over` locks
- *      onto the dragged card and no arrow press can ever move it anywhere.
- *   2. Even once the active id is excluded, a column's droppable rect
- *      spatially CONTAINS every card inside it, and closestCenter ranks
- *      candidates by distance between RECT CENTERS -- for a compact column
- *      the column's own center can be closer to the ghost's center than any
- *      individual sibling card's center is, so `over` sticks on the column
- *      and a same-column ArrowDown/ArrowUp never reaches a sibling card.
- *
- * rectIntersection sidesteps both by ranking candidates on overlap RATIO
- * instead of center distance. The keyboard sensor's own coordinateGetter
- * (sortableKeyboardCoordinates) snaps the ghost's rect to align with the
- * target card/placeholder on every arrow press, so afterwards the ghost
- * overlaps that one small card almost completely (ratio near 1) while only
- * covering a tiny fraction of the much larger enclosing column (ratio near
- * 0) -- the card wins outright without ever comparing centers. This also
- * preserves the pointer blank-space-drop case: a point that overlaps no
- * card at all still overlaps the column, so `over` still resolves to the
- * column there and onDragEnd's existing tail-append branch still fires.
- * closestCenter is kept as a fallback for the one case rectIntersection
- * can't answer -- nothing at all under the ghost -- which should not arise
- * on this board (every column always has either cards or its empty-column
- * placeholder) but is defensive rather than load-bearing.
- */
-const boardCollisionDetection: CollisionDetection = (args) => {
-  const withoutActive = {
-    ...args,
-    droppableContainers: args.droppableContainers.filter((container) => container.id !== args.active.id),
-  };
-  const intersections = rectIntersection(withoutActive);
-  return intersections.length > 0 ? intersections : closestCenter(withoutActive);
-};
-
-/**
- * dnd-kit's default droppable measuring strategy (MeasuringStrategy.
- * WhileDragging, MeasuringFrequency.Optimized) only (re)measures droppable
- * rects in response to a `useEffect` that fires after `dragging` flips to
- * true -- an async, paint-gated pass, not something that completes inside
- * the same synchronous keydown handling that lifts the item. A real user's
- * "pick up, THEN arrow, THEN drop" is spread across enough wall-clock time
- * for that effect to have long since flushed; Playwright's scripted
- * `Space, ArrowRight, Space` (no delay between presses, exactly what
- * e2e/pipeline.spec.ts's keyboard-drag steps do) can complete all three key
- * events before that effect ever runs, leaving no measured rects for
- * anything but the origin card's own column. BeforeDragging instead
- * measures continuously while AT REST (so by the time any drag starts,
- * rects are already current -- no "wait for dragging to start" gate to
- * lose the race against) and freezes them for the duration of the drag
- * itself, which is cheaper than Always (no per-arrow-press remeasuring)
- * and correct here because nothing on this board actually moves or
- * resizes mid-drag (no onDragOver-driven reflow -- see handleDragEnd).
- */
-const boardMeasuring = { droppable: { strategy: MeasuringStrategy.BeforeDragging } };
-
-/**
- * Wraps @dnd-kit/sortable's own sortableKeyboardCoordinates with one added
- * restriction: for ArrowUp/ArrowDown, only candidates in the SAME sortable
- * container (i.e. the same column) as the active card are considered.
- *
- * sortableKeyboardCoordinates' own Up/Down direction filter only checks
- * vertical position (collisionRect.top vs a candidate's rect.top) -- it has
- * no notion of which column a candidate belongs to. The empty-column
- * placeholder that makes an empty column reachable via ArrowLeft/ArrowRight
- * (see EmptyPlaceholder below) is ALSO a valid "sortable" candidate by that
- * rule, and a neighbouring column's placeholder can end up geometrically
- * CLOSER by dnd-kit's own closestCorners ranking than the intended
- * same-column sibling directly below/above the active card -- sending an
- * ArrowDown/ArrowUp press into a different column's empty placeholder
- * instead of reordering within the current one. Confirmed by instrumenting
- * moveDeal's inputs during investigation: a same-column ArrowDown press
- * resolved to a DIFFERENT column's placeholder id, moving the dragged deal
- * out of its own column entirely instead of past its sibling.
- *
- * Reimplemented in full (rather than filtering
- * context.droppableContainers down to the active card's own container and
- * delegating to sortableKeyboardCoordinates) because that function calls
- * `.getEnabled()` on context.droppableContainers, a method on dnd-kit's own
- * DroppableContainersMap class that a plain filtered array does not have.
- * The body below otherwise mirrors sortableKeyboardCoordinates faithfully
- * (@dnd-kit/sortable, MIT); the only change is the containerId equality
- * check added to the Up/Down branch of the direction filter.
- */
-const boardKeyboardCoordinateGetter: KeyboardCoordinateGetter = (event, args) => {
-  const verticalCodes: string[] = [KeyboardCode.Down, KeyboardCode.Up];
-  if (!verticalCodes.includes(event.code)) return sortableKeyboardCoordinates(event, args);
-
-  const { active, context, currentCoordinates } = args;
-  const { collisionRect, droppableRects, droppableContainers, over, scrollableAncestors } = context;
-  if (!collisionRect) return undefined;
-
-  const activeContainer = droppableContainers.get(active);
-  const activeContainerId = activeContainer && hasSortableData(activeContainer)
-    ? activeContainer.data.current.sortable.containerId
-    : undefined;
-
-  const filteredContainers: DroppableContainer[] = [];
-  for (const entry of droppableContainers.getEnabled()) {
-    if (!entry || entry.disabled) continue;
-    if (!hasSortableData(entry) || entry.data.current.sortable.containerId !== activeContainerId) continue;
-    const rect = droppableRects.get(entry.id);
-    if (!rect) continue;
-    if (event.code === KeyboardCode.Down ? collisionRect.top < rect.top : collisionRect.top > rect.top) {
-      filteredContainers.push(entry);
-    }
-  }
-
-  const collisions = closestCorners({
-    active: { id: active } as never, collisionRect, droppableRects,
-    droppableContainers: filteredContainers, pointerCoordinates: null,
-  });
-  let closestId = getFirstCollision(collisions, "id");
-  if (closestId === over?.id && collisions.length > 1) closestId = collisions[1]?.id ?? null;
-  if (closestId == null) return undefined;
-
-  const newDroppable = droppableContainers.get(closestId);
-  const newRect = newDroppable ? droppableRects.get(newDroppable.id) : null;
-  const newNode = newDroppable?.node.current;
-  if (!newNode || !newRect || !activeContainer || !newDroppable) return undefined;
-
-  const newScrollAncestors = getScrollableAncestors(newNode);
-  const hasDifferentScrollAncestors = newScrollAncestors.some((el, i) => scrollableAncestors[i] !== el);
-  // Same-container by construction here (the filter above already enforces
-  // it), so the vertical offset always applies -- unlike
-  // sortableKeyboardCoordinates' general version, this branch never needs
-  // to handle a cross-container Up/Down case.
-  const isAfterActive = hasSortableData(activeContainer) && hasSortableData(newDroppable)
-    && activeContainer.data.current.sortable.index < newDroppable.data.current.sortable.index;
-  const offsetY = hasDifferentScrollAncestors ? 0 : (isAfterActive ? collisionRect.height - newRect.height : 0);
-  return { x: newRect.left, y: newRect.top - offsetY };
-};
 
 export function BoardPage() {
   const { pipelineId } = useParams({ from: "/pipelines/$pipelineId" });
@@ -207,167 +56,32 @@ export function BoardPage() {
     return map;
   }, [openDeals]);
 
+  // Ids-only projection of `grouped`, the shape kanban-core's drag machinery
+  // needs (it never sees a Deal, only ids) -- see useKanbanBoard's own doc
+  // comment on itemsByColumn.
+  const itemsByColumn = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const [stageId, deals] of grouped) map.set(stageId, deals.map((deal) => deal.id));
+    return map;
+  }, [grouped]);
+
   // Board stays the default view (matches every existing board.spec.ts
   // Playwright assertion, which locates cards/columns without first
   // switching views) -- Funnel is opt-in per page load, not persisted.
   const [view, setView] = useState<"board" | "funnel">("board");
 
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const activeDeal = activeId !== null ? (openDeals.find((deal) => deal.id === activeId) ?? null) : null;
-
-  // Cards navigate to the deal detail page on click (see DealCard below), but
-  // dnd-kit's own drag lifecycle must win when the user is actually dragging,
-  // not clicking. PointerSensor's activationConstraint below means a plain
-  // click (no pointer movement past 4px) never starts a drag at all -- this
-  // ref only needs to guard the OTHER direction: a real drag's mouseup can
-  // still fire a native "click" event afterward (on whichever card happens to
-  // be under the pointer at drop time, which is not necessarily the dragged
-  // card itself, since dnd-kit's live reordering can shift a different card
-  // under it). handleDragStart only ever fires once that 4px threshold is
-  // exceeded, so reaching it at all already proves a genuine drag, not a
-  // click -- setting the flag there and clearing it on a macrotask (after the
-  // synchronous click that follows the same mouseup) suppresses that
-  // spurious click regardless of which card's onClick ends up receiving it.
-  const suppressCardClickRef = useRef(false);
-
-  /**
-   * dnd-kit's onDragEnd event carries `over` read from an internal ref
-   * (sensorContext.current) that is only synced from React state via a
-   * layout effect -- and that state is itself only set by a SEPARATE,
-   * later-firing passive effect (the one that also fires onDragOver),
-   * which only runs after the render that first computed the new position
-   * has already committed. A keyboard drag's final "drop" keydown can
-   * arrive (and dnd-kit's raw, non-React keydown listener processes it
-   * synchronously) before that second render has happened, so
-   * event.over on onDragEnd can reflect an ArrowRight-old position even
-   * though onDragOver already fired with the correct one moments earlier.
-   * onDragOver's own event object, by contrast, is built fresh from local
-   * variables at the point it fires (not read back off that lagging ref),
-   * so it is never subject to this gap. Tracking its value here and
-   * preferring it in handleDragEnd sidesteps the race instead of trying to
-   * win it.
-   */
-  const lastOverRef = useRef<{ id: string; data: DndData | undefined } | null>(null);
-
-  const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 4 } });
-  const keyboardSensor = useSensor(KeyboardSensor, { coordinateGetter: boardKeyboardCoordinateGetter });
   const archived = pipelineData !== undefined && pipelineData.pipeline.archivedAt !== null;
-  // Empty sensor list means no pointer/keyboard gesture can ever activate a
-  // drag -- the simplest way to make the whole board read-only for an
-  // archived pipeline without branching the JSX below into two shapes.
-  const sensors = useSensors(...(archived ? [] : [pointerSensor, keyboardSensor]));
 
-  function handleDragStart(event: DragStartEvent) {
-    setActiveId(String(event.active.id));
-    suppressCardClickRef.current = true;
-    lastOverRef.current = null;
-  }
-
-  // See lastOverRef's doc comment: this is the freshest signal available
-  // for "what is the drag currently over," captured as it happens rather
-  // than read back later off a ref that can still be one render behind.
-  function handleDragOver(event: DragOverEvent) {
-    lastOverRef.current = event.over === null
-      ? null
-      : { id: String(event.over.id), data: event.over.data.current as DndData | undefined };
-  }
-
-  // dnd-kit calls onDragCancel instead of onDragEnd when a drag is aborted
-  // (e.g. Escape mid-drag) -- without this, both activeId and
-  // suppressCardClickRef would stay stuck from the handleDragStart above,
-  // leaving the DragOverlay showing a phantom card and the next plain click
-  // silently swallowed.
-  function handleDragCancel() {
-    setActiveId(null);
-    suppressCardClickRef.current = false;
-    lastOverRef.current = null;
-  }
-
-  function handleDragEnd(event: DragEndEvent) {
-    setActiveId(null);
-    // See suppressCardClickRef's doc comment above for why this is a
-    // macrotask reset rather than immediate: the drop gesture's native click
-    // event (if any) dispatches synchronously, ahead of a setTimeout(0)
-    // queued from here, so it still observes the flag as true.
-    setTimeout(() => { suppressCardClickRef.current = false; }, 0);
-    const { active } = event;
-    // Prefer the last onDragOver-reported target over event.over -- see
-    // lastOverRef's doc comment for why event.over can still be one render
-    // behind it at drop time. Falls back to event.over for the (rarer) case
-    // where the drag was dropped without ever moving (over never changed
-    // from wherever it resolved to at lift, so onDragOver never fired).
-    const over = lastOverRef.current ?? (event.over === null
-      ? null
-      : { id: String(event.over.id), data: event.over.data.current as DndData | undefined });
-    lastOverRef.current = null;
-    if (over === null || active.id === over.id) return;
-    const activeData = active.data.current as DndData | undefined;
-    const overData = over.data;
-    if (activeData === undefined || activeData.type !== "card" || overData === undefined) return;
-
-    const targetStageId = overData.stageId;
-    const activeDealId = String(active.id);
-    const overId = String(over.id);
-
-    let beforeDealId: string | undefined;
-    let afterDealId: string | undefined;
-
-    if (activeData.stageId === targetStageId) {
-      // Same-column reorder. Neighbours must be read off the same
-      // reordering the user SAW, not derived from over's index in
-      // isolation: dnd-kit's own drop preview follows
-      // arrayMove(activeIndex, overIndex), which places a downward-dragged
-      // card AFTER the card it's dropped on and an upward-dragged card
-      // BEFORE it. Deriving insertAt from over's index alone (the previous
-      // version of this code) reproduces only the upward case -- column
-      // [A,B,C,D], dragging A onto C previews [B,C,A,D] (A lands after C),
-      // but indexing on over's position in the active-filtered array yields
-      // beforeDealId=B/afterDealId=C, landing A one slot early, before C
-      // instead of after it. Running the SAME arrayMove the preview uses
-      // and reading A's neighbours off the result keeps this in sync with
-      // what was on screen for both directions.
-      const ids = (grouped.get(targetStageId) ?? []).map((deal) => deal.id);
-      const fromIndex = ids.indexOf(activeDealId);
-      const toIndex = overData.type === "card" ? ids.indexOf(overId) : ids.length - 1;
-      if (fromIndex === -1 || toIndex === -1) return;
-
-      const reordered = arrayMove(ids, fromIndex, toIndex);
-      const at = reordered.indexOf(activeDealId);
-      beforeDealId = at > 0 ? reordered[at - 1] : undefined;
-      afterDealId = at < reordered.length - 1 ? reordered[at + 1] : undefined;
-
-      // Drop-in-place is a no-op: skip the network call entirely when the
-      // computed neighbours match the ones the deal already had before the
-      // drag started (e.g. picked up and released without changing slot).
-      const originalBefore = fromIndex > 0 ? ids[fromIndex - 1] : undefined;
-      const originalAfter = fromIndex < ids.length - 1 ? ids[fromIndex + 1] : undefined;
-      if (beforeDealId === originalBefore && afterDealId === originalAfter) return;
-    } else {
-      // Cross-column: the active deal isn't in the target column's list yet,
-      // so there is no "prior slot" for arrayMove to reorder from -- dnd-kit
-      // treats a foreign card entering another column's sortable list as a
-      // plain insert at the hovered card's index (displacing it and
-      // everything after it down by one), which is exactly what its own
-      // drop preview shows for this case. That's a genuinely different rule
-      // from the same-column branch above (which continues PAST the hovered
-      // card when dragging downward) -- both match what dnd-kit itself
-      // renders, they just differ because one starts from "already in the
-      // list" and the other from "not in the list yet". Dropping on the
-      // column itself (blank space, or the empty-column placeholder)
-      // appends at the tail, mirroring moveDealInputSchema's append
-      // semantics for "both neighbours omitted".
-      const targetIds = (grouped.get(targetStageId) ?? []).map((deal) => deal.id);
-      let insertAt = targetIds.length;
-      if (overData.type === "card") {
-        const idx = targetIds.indexOf(overId);
-        if (idx !== -1) insertAt = idx;
-      }
-      beforeDealId = insertAt > 0 ? targetIds[insertAt - 1] : undefined;
-      afterDealId = insertAt < targetIds.length ? targetIds[insertAt] : undefined;
-    }
-
-    moveDeal.mutate({ id: activeDealId, pipelineId, stageId: targetStageId, beforeDealId, afterDealId });
-  }
+  const { activeId, suppressCardClickRef, sensors, dndProps } = useKanbanBoard({
+    itemsByColumn,
+    onMove: (params) => {
+      moveDeal.mutate({
+        id: params.id, pipelineId, stageId: params.columnId, beforeDealId: params.beforeId, afterDealId: params.afterId,
+      });
+    },
+    disabled: archived,
+  });
+  const activeDeal = activeId !== null ? (openDeals.find((deal) => deal.id === activeId) ?? null) : null;
 
   if (isLoading) return <p>Loading...</p>;
   if (!pipelineData) return null;
@@ -419,15 +133,7 @@ export function BoardPage() {
       {view === "funnel" ? (
         <Funnel pipelineId={pipelineId} />
       ) : (
-        <DndContext
-          sensors={sensors}
-          collisionDetection={boardCollisionDetection}
-          measuring={boardMeasuring}
-          onDragStart={handleDragStart}
-          onDragOver={handleDragOver}
-          onDragCancel={handleDragCancel}
-          onDragEnd={handleDragEnd}
-        >
+        <DndContext sensors={sensors} {...dndProps}>
           {columns}
           <DragOverlay>
             {activeDeal ? (
@@ -464,19 +170,9 @@ function Column({
   readOnly: boolean;
   suppressCardClickRef: RefObject<boolean>;
 }) {
-  const { setNodeRef } = useDroppable({
-    id: `column:${stage.id}`,
-    data: { type: "column", stageId: stage.id } satisfies ColumnDndData,
-    disabled: readOnly,
-  });
+  const { setNodeRef } = useKanbanColumnDroppable(stage.id, readOnly);
   const dealIds = deals.map((deal) => deal.id);
-  // An empty column has no card to register as a sortable item, so nothing
-  // for the keyboard sensor's coordinateGetter to land on (it only considers
-  // sortable-registered rects, not plain droppables) -- registering the
-  // stage's own id as the sole sortable item when empty (see
-  // EmptyPlaceholder below) keeps an empty column reachable by keyboard, the
-  // same way a card in it would be.
-  const sortableItems = dealIds.length > 0 ? dealIds : [stage.id];
+  const sortableItems = kanbanSortableItems(stage.id, dealIds);
   const valueSum = deals.reduce((sum, deal) => sum + (deal.valueCents ?? 0), 0);
   const currencies = new Set(deals.map((deal) => deal.currency));
   // A single Conduit instance has one DEFAULT_CURRENCY (see the Phase 2
@@ -507,22 +203,10 @@ function Column({
               suppressCardClickRef={suppressCardClickRef}
             />
           ))}
-          {deals.length === 0 && <EmptyPlaceholder stageId={stage.id} />}
+          {deals.length === 0 && <KanbanEmptyPlaceholder columnId={stage.id} label="No deals" />}
         </SortableContext>
       </div>
       {!readOnly && <NewDealButton pipelineId={pipelineId} stageId={stage.id} />}
-    </div>
-  );
-}
-
-function EmptyPlaceholder({ stageId }: { stageId: string }) {
-  const { setNodeRef } = useSortable({
-    id: stageId,
-    data: { type: "placeholder", stageId } satisfies PlaceholderDndData,
-  });
-  return (
-    <div ref={setNodeRef} className="rounded-md border border-dashed border-slate-300 px-2 py-4 text-center text-xs text-slate-400">
-      No deals
     </div>
   );
 }
@@ -543,21 +227,17 @@ function DealCard({
   suppressCardClickRef: RefObject<boolean>;
 }) {
   const navigate = useNavigate();
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id: deal.id,
-    data: { type: "card", stageId: deal.stageId } satisfies CardDndData,
-    disabled: readOnly,
-  });
-  const style = { transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.4 : 1 };
+  const { attributes, listeners, setNodeRef, style } = useKanbanCardSortable(deal.id, deal.stageId, readOnly);
 
   const daysSinceUpdate = Math.floor((Date.now() - new Date(deal.updatedAt).getTime()) / MS_PER_DAY);
   const rotten = stage.rotDays != null && daysSinceUpdate > stage.rotDays;
   const rotTitle = `No activity for ${daysSinceUpdate} days (stage rots after ${stage.rotDays} days)`;
 
   // Cards navigate to the deal detail page on a plain click. See
-  // suppressCardClickRef's doc comment in BoardPage for why the flag it
-  // checks is enough to tell a click apart from a drag-and-drop's trailing
-  // click, without this card needing to know whether IT was the one dragged.
+  // suppressCardClickRef's doc comment in kanban-core's useKanbanBoard for
+  // why the flag it checks is enough to tell a click apart from a
+  // drag-and-drop's trailing click, without this card needing to know
+  // whether IT was the one dragged.
   function handleClick() {
     if (suppressCardClickRef.current) return;
     void navigate({ to: "/deals/$dealId", params: { dealId: deal.id } });
