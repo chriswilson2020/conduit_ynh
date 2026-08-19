@@ -20,11 +20,24 @@ import { funnel } from "../services/deals.js";
 // original global/company pair, which would 400 a project-detail page's
 // usePipelines({ projectId }) call before it ever reached the (already
 // correct) service layer.
+//
+// The .refine below requires project_id whenever scope=project is passed --
+// deliberately NOT symmetric with scope=company, which has always been
+// listable without a company_id (returning every company-scoped pipeline
+// across every company; pre-existing behaviour, unchanged here). scope=
+// project is a brand-new combination as of this fix, with exactly one real
+// caller (project-detail.tsx's usePipelines({ projectId })) and no existing
+// use case for "every project-scoped pipeline across every project" the way
+// company's laxity accidentally allows -- so this sets the stricter, more
+// obviously-correct contract from the start rather than inheriting company's
+// looseness by copying its shape.
 const listQuerySchema = z.object({
   scope: z.enum(["global", "company", "project"]).optional(),
   company_id: z.uuid().optional(),
   project_id: z.uuid().optional(),
   archived: z.enum(["true", "false"]).optional().transform((v) => v === "true"),
+}).refine((v) => v.scope !== "project" || v.project_id !== undefined, {
+  message: "project_id is required when scope is project",
 });
 
 const stageIdParamSchema = z.object({ id: z.uuid(), stageId: z.uuid() });

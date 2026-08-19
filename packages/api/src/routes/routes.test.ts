@@ -705,6 +705,39 @@ describe("pipelines routes", () => {
     await a.close();
   });
 
+  // Regression coverage for the P3.7 web-task fix: this route's own list
+  // query schema had been left stale at scope enum(["global","company"]) with
+  // no project_id param, well after project-scoped pipelines were wired up at
+  // the service/shared-schema layer (P3.6) -- a project-detail page's
+  // usePipelines({ projectId }) call would 400 before ever reaching the
+  // (already correct) listPipelines service. Also covers the added
+  // project_id-required-when-scope=project validation (see the route's own
+  // doc comment for why that pairing is enforced here but scope=company is
+  // deliberately left unpaired, unchanged).
+  it("lists pipelines filtered by scope=project and project_id, excluding a company-scoped one, and 400s scope=project without project_id", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const company = await a.inject({ method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" } });
+    const companyId = company.json().id as string;
+    const companyScoped = await makePipeline(a, { name: "Company scoped", scope: "company", companyId });
+    const projectScoped = await makePipeline(a, { name: "Project scoped", scope: "project", projectId: project.id });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/pipelines?scope=project&project_id=${project.id}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = z.array(pipelineSchema).parse(response.json());
+    expect(body.map((p) => p.id)).toEqual([projectScoped.id]);
+    expect(body.map((p) => p.id)).not.toContain(companyScoped.id);
+
+    const missingProjectId = await a.inject({
+      method: "GET", url: "/api/pipelines?scope=project", headers: authHeaders,
+    });
+    expect(missingProjectId.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(missingProjectId.json()).error).toBe("validation");
+    await a.close();
+  });
+
   it("creates and renames a stage, then reorders it to the front", async () => {
     const a = await app();
     const pipeline = await makePipeline(a);

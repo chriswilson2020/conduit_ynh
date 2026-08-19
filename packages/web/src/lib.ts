@@ -12,3 +12,12 @@ export function parseDecimal(input: string): number | null {
   const parsed = Number(trimmed.replace(",", "."));
   return Number.isNaN(parsed) ? null : parsed;
 }
+
+/** Today as a YYYY-MM-DD string in the USER'S LOCAL calendar, not UTC.
+ * toISOString() is always UTC, which misclassifies "due today" around local
+ * midnight for any non-UTC timezone. Date-only strings in this app mean the
+ * user's calendar day, so "today" must too. */
+export function todayLocalIso(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}

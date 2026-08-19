@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components
 import {
   KanbanEmptyPlaceholder, kanbanSortableItems, useKanbanBoard, useKanbanCardSortable, useKanbanColumnDroppable,
 } from "../components/kanban-core";
+import { todayLocalIso } from "../lib";
 
 // Fixed status columns, not stages (per the design's task board: kanban
 // machinery reused with a fixed column set instead of a per-pipeline one).
@@ -22,10 +23,6 @@ const TYPE_BADGE: Record<TaskType, string> = { task: "T", call: "C", meeting: "M
 const TYPE_LABEL: Record<TaskType, string> = {
   task: "Task", call: "Call", meeting: "Meeting", email: "Email", deadline: "Deadline",
 };
-
-function todayIsoDate(): string {
-  return new Date().toISOString().slice(0, 10);
-}
 
 export function TaskBoardPage() {
   const { projectId } = useParams({ from: "/projects/$projectId/board" });
@@ -197,7 +194,7 @@ function TaskCard({
 // overlay -- which has no ownerInitial context of its own beyond what's
 // passed in -- still shows the same content as the card it's standing in for.
 function TaskCardContent({ task, ownerInitial }: { task: Task; ownerInitial?: string }) {
-  const overdue = task.dueDate !== null && task.status !== "done" && task.dueDate < todayIsoDate();
+  const overdue = task.dueDate !== null && task.status !== "done" && task.dueDate < todayLocalIso();
 
   return (
     <>
@@ -264,7 +261,12 @@ function NewTaskDialog({
           // createTask always lands a new task in the default "todo" status
           // (see services/tasks.ts) -- a column other than todo needs one
           // more call to actually preset it, mirroring the plan's "status
-          // preset" per-column dialog.
+          // preset" per-column dialog. Accepted tradeoff: this is two round
+          // trips, so a task created from e.g. the "Blocked" column can
+          // render in the "To do" column for one refetch before the status
+          // call lands -- if that flicker ever grates, the real fix is
+          // letting createTask accept an initial status server-side rather
+          // than working around it here.
           if (status !== "todo") setTaskStatus.mutate({ id: task.id, status });
           onClose();
         },
