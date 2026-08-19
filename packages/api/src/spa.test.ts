@@ -117,6 +117,54 @@ describe("SPA serving", () => {
     await app.close();
   });
 
+  // Fix 2 (hotfix v0.4.3): a release used to need a hard refresh to be seen,
+  // because the SPA shell had no cache-control of its own and browsers are
+  // free to cache a bare 200 response with no header at all.
+  it("sends Cache-Control: no-cache for the SPA shell at the root", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).toBe("no-cache");
+    await app.close();
+  });
+
+  it("sends Cache-Control: no-cache for the SPA shell on a deep link", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/deals/123" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).toBe("no-cache");
+    await app.close();
+  });
+
+  // Vite content-hashes every filename under assets/, so those files are
+  // safe to cache forever -- a new release ships new hashed filenames, it
+  // never overwrites an old one in place.
+  it("sends a long-lived immutable Cache-Control for a hash-named file under /assets/", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/assets/app.js" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).toBe("public, max-age=31536000, immutable");
+    await app.close();
+  });
+
+  // index.html itself must never get the assets/ treatment, even via the
+  // static plugin's own route for it (wildcard:false enumerates every file
+  // under webRoot at boot, including index.html -- index:false only turns
+  // off the automatic "/" -> index.html mapping, it does not remove that
+  // per-file route). A stale-forever index.html would mean releases can
+  // never be seen at all, the opposite of this fix's whole point.
+  it("never sends the immutable Cache-Control for index.html, even fetched directly via the static route", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/index.html" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).not.toContain("immutable");
+    await app.close();
+  });
+
   it("still returns JSON 404 for unknown API routes", async () => {
     const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
     const response = await app.inject({ method: "GET", url: "/api/nope" });
