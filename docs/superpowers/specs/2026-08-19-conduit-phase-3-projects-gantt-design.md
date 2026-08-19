@@ -41,11 +41,11 @@ Decisions taken with Chris in the Phase 3 brainstorm:
   transaction and rejects with ConflictError if the successor already reaches the predecessor.
 - `pipelines` — scope CHECK widens to (`global`|`company`|`project`), `project_id` FK NULL,
   pairing CHECK updated (company scope pairs company_id; project scope pairs project_id).
-- `events` — verb list widens (`shifted`, `completed`, `reopened_task`, `dependency_added`,
-  `dependency_removed`), gains `task_id` and `project_id` FKs. notes/files gain `project_id`
-  and `task_id`? No: notes/files gain **project_id only** (exactly-one CHECK widens to four);
-  tasks are not note/file targets in Phase 3 — commentary on work goes on the project or the
-  linked CRM record.
+- `events` — verb list widens (`shifted`, `completed`, `dependency_added`,
+  `dependency_removed`; task reopening reuses the existing `reopened` verb), gains `task_id`
+  and `project_id` FKs. notes/files gain **project_id only** (their exactly-one CHECK widens to
+  four); tasks are deliberately not note/file targets in Phase 3 — commentary on work goes on
+  the project or the linked CRM record.
 - users untouched.
 
 ## Auto-shift semantics (push-only cascade)
@@ -74,9 +74,9 @@ Decisions taken with Chris in the Phase 3 brainstorm:
 
 - `projects.ts` — hardened-pattern CRUD/archive; `listProjects({ companyId?, status?, archived? })`;
   completing a project does NOT auto-complete its tasks (deliberate; comment it).
-- `tasks.ts` — CRUD/archive; status transitions (any-to-any except done requires progress
-  semantics? No — statuses are freely settable; `done` stamps `completed_at`, leaving `done`
-  clears it, CHECK enforces pairing); `moveTaskOnBoard` (status + position, kanban semantics
+- `tasks.ts` — CRUD/archive; statuses are freely settable (no transition matrix — unlike
+  deals, task workflow is informal); entering `done` stamps `completed_at`, leaving `done`
+  clears it, and the CHECK enforces the pairing; `moveTaskOnBoard` (status + position, kanban semantics
   reusing the Phase 2 neighbour/lock/gap-tighten pattern); assignment; `listTasks` filters
   (projectId, assigneeId, status, dated-only); dependency add/remove with cycle check.
 - `scheduling.ts` — shiftTask as above; `ganttPayload(projectId | global)` returning tasks
