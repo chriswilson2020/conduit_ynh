@@ -62,6 +62,43 @@ test.describe.serial("Pipeline journey", () => {
     return (testid as string).replace("column-", "");
   }
 
+  // Keyboard-drags a sortable card: Space lifts, each arrow moves one slot
+  // or column, Space drops -- mirrors tasks.spec.ts's keyboardDragCard (same
+  // kanban-core machinery under both boards); see that helper's doc comment
+  // for why every step waits on dnd-kit's own aria-live announcements
+  // instead of flat waits: the bare-setTimeout listener attach documented in
+  // playwright.config.ts swallowed this file's waitless Arrow AND ending
+  // Space outright on cold CI retry workers (run 32275345192 and the run
+  // before it), leaving the drag stuck mid-air past the assertion timeout.
+  async function keyboardDragCard(card: Locator, arrowKeys: string[]) {
+    const announcement = page.locator('[id^="DndLiveRegion"]');
+    await card.focus();
+    await page.keyboard.press("Space");
+    // Both lift-time announcements ("Picked up ...", then "... was moved
+    // over ..." for the ghost's own column) must have committed before the
+    // change-detection below can trust a text change to be an arrow's own.
+    await expect(announcement).toContainText("was moved over");
+    for (const key of arrowKeys) {
+      let announced = false;
+      for (let attempt = 0; attempt < 3 && !announced; attempt += 1) {
+        const before = (await announcement.textContent()) ?? "";
+        await page.keyboard.press(key);
+        try {
+          await expect(announcement).not.toHaveText(before, { timeout: 1500 });
+          announced = true;
+        } catch {
+          // Swallowed by the listener-attach race -- press again. Safe even
+          // if the first press was processed but not yet committed: the
+          // coordinate getter resolves absolute target coordinates, so the
+          // duplicate re-resolves to the same target.
+        }
+      }
+      if (!announced) throw new Error(`dnd-kit never announced a move for ${key}`);
+    }
+    await page.keyboard.press("Space");
+    await expect(announcement).toContainText("was dropped");
+  }
+
   // Opens the column's "New deal" dialog (it portals to the document body,
   // not the column, so the form fields are filled at the page level), fills
   // it in, and waits for the resulting card to appear in the column before
@@ -122,12 +159,7 @@ test.describe.serial("Pipeline journey", () => {
     const qualified = page.getByTestId(`column-${qualifiedStageId}`);
     const alphaCard = lead.getByTestId(`card-${alphaId}`);
 
-    // dnd-kit keyboard drag: focus the sortable element itself (the card),
-    // then Space lifts, ArrowRight moves it into the next column, Space drops.
-    await alphaCard.focus();
-    await page.keyboard.press("Space");
-    await page.keyboard.press("ArrowRight");
-    await page.keyboard.press("Space");
+    await keyboardDragCard(alphaCard, ["ArrowRight"]);
 
     await expect(qualified.getByTestId(`card-${alphaId}`)).toBeVisible();
     await expect(lead.getByTestId(`card-${alphaId}`)).not.toBeVisible();
@@ -149,10 +181,7 @@ test.describe.serial("Pipeline journey", () => {
     await expect(lead.locator('[data-testid^="card-"]')).toHaveCount(3);
 
     const betaCard = lead.getByTestId(`card-${betaId}`);
-    await betaCard.focus();
-    await page.keyboard.press("Space");
-    await page.keyboard.press("ArrowDown");
-    await page.keyboard.press("Space");
+    await keyboardDragCard(betaCard, ["ArrowDown"]);
 
     // This pins the P2.6 arrayMove fix: dnd-kit's own drop preview places a
     // downward-dragged card AFTER the card it's dropped on, so Beta should
