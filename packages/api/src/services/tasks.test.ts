@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import type { UpdateTaskInput } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
-import { events } from "../db/schema.js";
+import { events, taskDependencies } from "../db/schema.js";
 import { createCompany, archiveCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
 import { createPipeline, createStage } from "./pipelines.js";
@@ -295,6 +295,38 @@ describe("tasks service: update", () => {
         .rejects.toBeInstanceOf(ConflictError);
     });
   });
+
+  describe("parent-side reparent guard", () => {
+    it("rejects changing a parent task's own project while it still has children", async () => {
+      const p1 = await makeProject({ name: "P1" });
+      const p2 = await makeProject({ name: "P2" });
+      const parent = await makeTask({ title: "Parent", projectId: p1.id });
+      await makeTask({ title: "Child", projectId: p1.id, parentTaskId: parent.id });
+      // The child is left in p1, pointing at a parent that would now be in
+      // p2 -- the exact mismatch assertParentValid rejects from the child's
+      // own side, reached here from the parent's side instead.
+      await expect(updateTask(handle.db, actorId, parent.id, { projectId: p2.id }))
+        .rejects.toBeInstanceOf(ConflictError);
+    });
+
+    it("rejects setting parentTaskId on a task that already has children (a subtask cannot itself be a parent)", async () => {
+      const hasKids = await makeTask({ title: "HasKids" });
+      await makeTask({ title: "Kid", parentTaskId: hasKids.id });
+      const wouldBeNewParent = await makeTask({ title: "NewParent" });
+      await expect(updateTask(handle.db, actorId, hasKids.id, { parentTaskId: wouldBeNewParent.id }))
+        .rejects.toBeInstanceOf(ConflictError);
+    });
+
+    it("allows the project change once the children have been detached first", async () => {
+      const p1 = await makeProject({ name: "P1" });
+      const p2 = await makeProject({ name: "P2" });
+      const parent = await makeTask({ title: "Parent", projectId: p1.id });
+      const child = await makeTask({ title: "Child", projectId: p1.id, parentTaskId: parent.id });
+      await updateTask(handle.db, actorId, child.id, { parentTaskId: null });
+      const moved = await updateTask(handle.db, actorId, parent.id, { projectId: p2.id });
+      expect(moved.projectId).toBe(p2.id);
+    });
+  });
 });
 
 describe("tasks service: archive/unarchive", () => {
@@ -502,6 +534,34 @@ describe("task dependencies", () => {
     const b = await makeTask({ title: "B" });
     await addDependency(handle.db, actorId, a.id, b.id);
     await expect(addDependency(handle.db, actorId, b.id, a.id)).rejects.toBeInstanceOf(ConflictError);
+  });
+
+  it("closes the concurrent 2-cycle race: A->B and B->A fired at once, exactly one wins, no cycle results", async () => {
+    const a = await makeTask({ title: "A" });
+    const b = await makeTask({ title: "B" });
+
+    // Without the per-graph lock in addDependency, both calls' BFS could run
+    // against the same pre-image under READ COMMITTED (neither sees the
+    // other's not-yet-committed edge), both find no cycle, and both insert --
+    // landing a live A<->B cycle despite every individual check passing.
+    const results = await Promise.allSettled([
+      addDependency(handle.db, actorId, a.id, b.id),
+      addDependency(handle.db, actorId, b.id, a.id),
+    ]);
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<unknown> => r.status === "fulfilled");
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason).toBeInstanceOf(ConflictError);
+
+    // No cycle exists after: exactly one edge persisted, and a fresh
+    // addDependency BFS from either node terminates (neither the winning
+    // pair nor its reverse can be re-added without hitting the duplicate or
+    // cycle check, both of which require the walk to actually finish).
+    const edges = await handle.db.select().from(taskDependencies);
+    expect(edges).toHaveLength(1);
+    const winner = edges[0]!;
+    expect([`${a.id}:${b.id}`, `${b.id}:${a.id}`]).toContain(`${winner.predecessorId}:${winner.successorId}`);
   });
 
   it("rejects a transitive three-node cycle: A->B->C then C->A", async () => {

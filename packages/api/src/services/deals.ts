@@ -344,9 +344,21 @@ export async function moveDeal(db: Database, actorId: string, dealId: string, op
 
     const position = midpoint(beforePos, afterPos);
 
-    const [row] = await tx.update(deals).set({ stageId: opts.stageId, position, updatedAt: new Date() })
-      .where(eq(deals.id, dealId)).returning();
-    if (row === undefined) throw new NotFoundError("deal", dealId);
+    // archived_at IS NULL in the WHERE closes a TOCTOU gap the rest of this
+    // function's guards don't cover: `deal` was read at the top of this
+    // transaction and checked archivedAt === null then, but a concurrent
+    // archiveDeal could still land between that read and this UPDATE. Without
+    // this clause the row would be silently repositioned/restaged despite
+    // being archived by the time this statement runs; with it, zero rows
+    // come back and the recheck below distinguishes NotFound from Archived --
+    // same pattern as updateCompany/updateDeal's own archived_at guard.
+    const [row] = await tx.update(deals)
+      .set({ stageId: opts.stageId, position, updatedAt: new Date() })
+      .where(and(eq(deals.id, dealId), isNull(deals.archivedAt))).returning();
+    if (row === undefined) {
+      const [recheck] = await tx.select().from(deals).where(eq(deals.id, dealId));
+      throw recheck === undefined ? new NotFoundError("deal", dealId) : new ArchivedError("deal", dealId);
+    }
 
     // fromName resolved for a nicer timeline summary without the client
     // needing a second round trip to a stage id -> name lookup. A move

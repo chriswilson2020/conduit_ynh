@@ -238,7 +238,43 @@ export async function updateTask(db: Database, actorId: string, id: string, patc
     await assertParentValid(db, nextParentTaskId, nextProjectId);
   }
 
+  // Parent-side reparent guard: assertParentValid above only protects the
+  // CHILD's own invariant (my new parent is in my project, and isn't itself
+  // a subtask). It says nothing about a task's EXISTING children when the
+  // task itself is the one being edited here. Two ways that hole bites:
+  //   1. Moving THIS task to a different project while it still has children
+  //      left behind in the old project -- exactly the same
+  //      parent/child-project mismatch assertParentValid rejects from the
+  //      child's side, just reached from the parent's side instead.
+  //   2. Setting parentTaskId on THIS task (making it a subtask) while it
+  //      still has children of its own -- Phase 3's one-level rule forbids a
+  //      task from being both a parent and a child, and that must hold no
+  //      matter which end of the relationship the request edits.
+  // Deliberately NOT cascade-reassigning the children's projectId (or
+  // detaching them) to make the patch "just work": silently moving N
+  // subtasks across projects (or orphaning them into the standalone pool) as
+  // a side effect of a one-field edit is the exact kind of surprise
+  // projects.ts's updateProject rejects for project-completion cascading
+  // onto tasks -- the caller must move or detach the subtasks explicitly
+  // first, and gets told so.
+  const projectChanging = patch.projectId !== undefined && patch.projectId !== existing.projectId;
+  const becomingChild = patch.parentTaskId !== undefined && patch.parentTaskId !== null;
+  const needsChildGuard = projectChanging || becomingChild;
+
   const task = await db.transaction(async (tx) => {
+    if (needsChildGuard) {
+      // Checked fresh inside the transaction (not against a pre-transaction
+      // snapshot) so a child inserted concurrently, between the reads above
+      // and this point, can't slip past the guard.
+      const [child] = await tx.select({ id: tasks.id }).from(tasks).where(eq(tasks.parentTaskId, id)).limit(1);
+      if (child !== undefined) {
+        throw new ConflictError(
+          "task", id,
+          `task ${id} has subtasks; move or detach them before changing its project or making it a subtask itself`,
+        );
+      }
+    }
+
     let position: string | undefined;
     if (groupChanged) {
       const groupKey = `tasks:${nextProjectId ?? "standalone"}:${nextParentTaskId ?? "root"}`;
@@ -368,15 +404,24 @@ export async function moveTaskOnBoard(
   db: Database, actorId: string, taskId: string, opts: MoveTaskOnBoardInput,
 ): Promise<Task> {
   const task = await db.transaction(async (tx) => {
-    const existing = await mustGetTask(tx, taskId);
-    if (existing.archivedAt !== null) throw new ArchivedError("task", taskId);
-
-    const projectId = existing.projectId;
     // Board moves stay within the task's own project (or standalone pool) --
     // there is no cross-project drag, only a column (status) change within
-    // it, so the lock/sibling-group key is keyed on the task's OWN
-    // (unchanging) projectId, not anything the caller sent.
-    await lockSiblingGroup(tx, `tasks:board:${projectId ?? "standalone"}:${opts.status}`);
+    // it -- so the lock/sibling-group key needs to know which project that
+    // is before anything can be locked, unlike moveDeal's target-stage lock
+    // (entirely caller-supplied, no read required first). This probe is used
+    // ONLY to build the lock key, never to decide anything: existence,
+    // archived state, and the row's own current status/completedAt all come
+    // from the authoritative mustGetTask re-read immediately below, AFTER
+    // the lock is held -- same lock-before-any-decision-feeding-read
+    // discipline deals.ts's moveDeal follows, just with one extra read up
+    // front because this lock key isn't fully caller-supplied.
+    const [probe] = await tx.select({ projectId: tasks.projectId }).from(tasks).where(eq(tasks.id, taskId));
+    if (probe === undefined) throw new NotFoundError("task", taskId);
+    await lockSiblingGroup(tx, `tasks:board:${probe.projectId ?? "standalone"}:${opts.status}`);
+
+    const existing = await mustGetTask(tx, taskId);
+    if (existing.archivedAt !== null) throw new ArchivedError("task", taskId);
+    const projectId = existing.projectId;
 
     const sameColumn = (t: TaskRow) => t.projectId === projectId && t.status === opts.status;
 
@@ -443,6 +488,11 @@ export async function moveTaskOnBoard(
     const enteringDone = statusChanged && opts.status === "done";
     const leavingDone = statusChanged && existing.status === "done" && opts.status !== "done";
 
+    // archived_at IS NULL in the WHERE closes the same TOCTOU gap
+    // updateTask/updateCompany guard against: without it, a concurrent
+    // archive landing between the mustGetTask read above and this UPDATE
+    // would silently reposition/restatus an archived task instead of the
+    // zero-row recheck below catching it.
     const [row] = await tx.update(tasks).set({
       status: opts.status,
       position,
@@ -452,8 +502,11 @@ export async function moveTaskOnBoard(
       // value).
       completedAt: enteringDone ? new Date() : leavingDone ? null : existing.completedAt,
       updatedAt: new Date(),
-    }).where(eq(tasks.id, taskId)).returning();
-    if (row === undefined) throw new NotFoundError("task", taskId);
+    }).where(and(eq(tasks.id, taskId), isNull(tasks.archivedAt))).returning();
+    if (row === undefined) {
+      const [recheck] = await tx.select().from(tasks).where(eq(tasks.id, taskId));
+      throw recheck === undefined ? new NotFoundError("task", taskId) : new ArchivedError("task", taskId);
+    }
 
     // Position-only reorders (status unchanged) emit NO event -- pure board
     // reordering is timeline noise nobody wants to see. Only a genuine
@@ -499,6 +552,23 @@ export async function addDependency(
   if (predecessor.projectId !== successor.projectId) throw new ConflictError("task", successorId);
 
   const dep = await db.transaction(async (tx) => {
+    // Serialises check+insert per dependency graph: without this, two
+    // concurrent addDependency calls forming the two edges of a 2-cycle
+    // (A->B and B->A) each run their BFS under READ COMMITTED against the
+    // pre-image of the graph (neither sees the other's not-yet-committed
+    // edge), both find no cycle, and both insert -- landing a live cycle in
+    // the committed data despite every individual check passing. That cycle
+    // is sticky downstream: scheduling.ts's shiftTask cascade would walk
+    // into it and abort at its depth guard forever, with no repair endpoint
+    // short of a manual DELETE. Locking the whole graph (keyed by project, or
+    // the standalone pool -- same group predecessor/successor already agree
+    // on) before the BFS forces the second caller to wait, re-run its BFS
+    // against the FIRST caller's now-committed edge, and correctly find the
+    // cycle. Same tool this file already uses twice (createTask/updateTask's
+    // sibling-group locks), just guarding a graph invariant instead of a
+    // position sequence.
+    await lockSiblingGroup(tx, `deps:${predecessor.projectId ?? "standalone"}`);
+
     // Reject a dependency that would create a cycle: if predecessor is
     // reachable FROM successor via EXISTING edges, adding
     // predecessor->successor on top of that closes a loop

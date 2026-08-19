@@ -13,5 +13,11 @@ export class ArchivedError extends Error {
 // point-in-time relationship). Maps to HTTP 409 at the route layer: the
 // client raced a stale board and should refetch, not blindly retry.
 export class ConflictError extends Error {
-  constructor(entity: string, id: string) { super(`${entity} ${id} no longer matches the expected state`); }
+  // message is optional: most call sites are happy with the generic templated
+  // message, but a few (e.g. tasks.ts's parent-side reparent guard) need to
+  // tell the caller specifically what to do about it, not just that the row
+  // "no longer matches the expected state".
+  constructor(entity: string, id: string, message?: string) {
+    super(message ?? `${entity} ${id} no longer matches the expected state`);
+  }
 }
