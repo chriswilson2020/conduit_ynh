@@ -316,6 +316,194 @@ export async function shiftTask(
   return result;
 }
 
+// --- compactSchedule ("Remove slack") -------------------------------------
+//
+// Phase 3.1: shiftTask's sibling. Where shiftTask reacts to ONE task moving
+// (pushing violated successors right, just enough), compactSchedule sweeps
+// an entire project at once and pins every movable task to EXACTLY the max
+// of its predecessors' due dates -- pulling slack out AND fixing violations
+// in the same pass, since both are the same operation from this function's
+// point of view (the task's new start is never a function of its OLD start
+// at all, only of its predecessors' current due dates).
+//
+// MOVABLE means: dated (both startDate and dueDate set), has at least one
+// DATED predecessor, and its status is "todo" or "blocked". Everything else
+// is an anchor -- it keeps its own dates untouched, but (if dated) still
+// contributes its due date to whichever successors settle against it:
+//   * No predecessors at all (or every predecessor is undated) -- nothing to
+//     settle against, so there's nothing to compact; same "anchors the plan"
+//     role shiftTask's dragged task plays for its own cascade.
+//   * status "done"/"in_progress" -- deliberately frozen (work already
+//     started/finished doesn't get silently rescheduled), but still a real
+//     constraint for anything downstream of it.
+//   * Undated -- exactly shiftTask's own null-stopper (see its cascade loop
+//     comment): an undated task can't be moved (no dates to move) and can't
+//     usefully constrain a successor either (there is nothing to compare
+//     against), so it's transparent -- a successor whose ONLY predecessor is
+//     undated has no dated predecessor at all, and stays put, same as if the
+//     edge didn't exist.
+export async function compactSchedule(db: Database, actorId: string, projectId: string): Promise<ShiftResult> {
+  const { result, assigneeIds } = await db.transaction(async (tx) => {
+    // Same lock, same key shiftTask/addDependency already use for this
+    // project's dependency graph (`deps:${projectId}`) -- see shiftTask's own
+    // doc comment on this lock for the full shared-contract reasoning. This
+    // function reads-then-reasons over exactly the same two pieces of state
+    // (the project's dependency edges, and every task's current dates) that
+    // shiftTask's cascade and addDependency's cycle BFS do, so it needs to be
+    // serialised against both the same way they're serialised against each
+    // other: a shiftTask cascade or an addDependency insert landing mid-sweep
+    // could otherwise see (or produce) a graph/dates snapshot this function's
+    // single topological pass never re-validates once it starts.
+    await lockSiblingGroup(tx, `deps:${projectId}`);
+
+    const [project] = await tx.select({ archivedAt: projects.archivedAt }).from(projects).where(eq(projects.id, projectId));
+    if (project === undefined) throw new NotFoundError("project", projectId);
+    if (project.archivedAt !== null) throw new ArchivedError("project", projectId);
+
+    const projectTasks = await tx.select().from(tasks).where(eq(tasks.projectId, projectId));
+    const taskIds = projectTasks.map((t) => t.id);
+    const taskById = new Map(projectTasks.map((t) => [t.id, t] as const));
+
+    // Every edge with a predecessor in this project's task set. addDependency
+    // only ever links two tasks in the SAME project (or both standalone), so
+    // an edge whose predecessor is one of this project's tasks is guaranteed
+    // to have its successor here too -- no separate successorId-in-taskIds
+    // check needed.
+    const edges = taskIds.length === 0 ? [] : await tx.select({
+      predecessorId: taskDependencies.predecessorId,
+      successorId: taskDependencies.successorId,
+    }).from(taskDependencies).where(inArray(taskDependencies.predecessorId, taskIds));
+
+    const predecessorsOf = new Map<string, string[]>();
+    const successorsOf = new Map<string, string[]>();
+    const inDegree = new Map<string, number>();
+    for (const id of taskIds) {
+      predecessorsOf.set(id, []);
+      successorsOf.set(id, []);
+      inDegree.set(id, 0);
+    }
+    for (const edge of edges) {
+      predecessorsOf.get(edge.successorId)?.push(edge.predecessorId);
+      successorsOf.get(edge.predecessorId)?.push(edge.successorId);
+      inDegree.set(edge.successorId, (inDegree.get(edge.successorId) ?? 0) + 1);
+    }
+
+    // Kahn's algorithm: a task is only READY (pushed onto the queue) once
+    // every one of its predecessors has already been settled, so by the time
+    // this loop processes a task, `settledDue` already holds each of its
+    // predecessors' FINAL (possibly-just-compacted) due date -- never a stale
+    // pre-compaction value. That is exactly what makes ONE pass sufficient
+    // here, unlike shiftTask's repeated-settle cascade: shiftTask reacts to a
+    // single external change and has to re-examine a task every time ANY of
+    // its predecessors moves again (a diamond can revise the same successor
+    // upward more than once, see its cross-pass re-convergence test), but
+    // compactSchedule computes each task's position ONCE, as a pure function
+    // of its predecessors' final values -- and topological order guarantees
+    // those are already final by the time this task is reached. A cycle
+    // would break that guarantee (no node in a cycle is ever "ready"), but
+    // addDependency's insert-time BFS rejects cycles under this same lock, so
+    // the graph reaching this point is acyclic by construction -- the
+    // `processed !== taskIds.length` check below is a defensive backstop for
+    // that invariant, not a case expected to ever fire.
+    let head = 0;
+    const queue: string[] = taskIds.filter((id) => (inDegree.get(id) ?? 0) === 0);
+    const settledStart = new Map<string, string | null>();
+    const settledDue = new Map<string, string | null>();
+    for (const id of taskIds) {
+      const row = taskById.get(id)!;
+      settledStart.set(id, row.startDate);
+      settledDue.set(id, row.dueDate);
+    }
+
+    const moved = new Map<string, MovedEntry>();
+    let processed = 0;
+    while (head < queue.length) {
+      const id = queue[head]!;
+      head++;
+      processed++;
+      const row = taskById.get(id)!;
+
+      const movable = row.startDate !== null && row.dueDate !== null && (row.status === "todo" || row.status === "blocked");
+      if (movable) {
+        // Undated predecessors contribute nothing (see this function's doc
+        // comment) -- filtered out here, not treated as an always-satisfied
+        // (or always-violating) bound.
+        const predDueDates = (predecessorsOf.get(id) ?? [])
+          .map((p) => settledDue.get(p) ?? null)
+          .filter((d): d is string => d !== null);
+        if (predDueDates.length > 0) {
+          const maxDue = predDueDates.reduce((a, b) => (a > b ? a : b));
+          if (maxDue !== row.startDate) {
+            const duration = diffDays(row.dueDate!, row.startDate!);
+            const newStart = maxDue;
+            const newDue = addDays(newStart, duration);
+            settledStart.set(id, newStart);
+            settledDue.set(id, newDue);
+            moved.set(id, {
+              id, fromStart: row.startDate, fromDue: row.dueDate,
+              toStart: newStart, toDue: newDue, cascadedFrom: null, row,
+            });
+          }
+        }
+      }
+
+      for (const succ of successorsOf.get(id) ?? []) {
+        const next = (inDegree.get(succ) ?? 0) - 1;
+        inDegree.set(succ, next);
+        if (next === 0) queue.push(succ);
+      }
+    }
+    if (processed !== taskIds.length) {
+      throw new Error("compactSchedule: dependency graph contains a cycle that slipped past addDependency's cycle guard");
+    }
+
+    const movedList = [...moved.values()];
+    for (const entry of movedList) {
+      await tx.update(tasks)
+        .set({ startDate: entry.toStart, dueDate: entry.toDue, updatedAt: new Date() })
+        .where(eq(tasks.id, entry.id));
+
+      const eventCompanyId = await resolveEventCompanyId(tx, entry.row);
+      await tx.insert(events).values({
+        verb: "shifted", actorUserId: actorId, taskId: entry.id, projectId: entry.row.projectId,
+        companyId: eventCompanyId,
+        payload: {
+          from: { start: entry.fromStart, due: entry.fromDue },
+          to: { start: entry.toStart, due: entry.toDue },
+          cascadedFrom: null,
+          // Distinguishes a compaction-driven move from an interactive drag's
+          // own `shifted` event on the timeline (see the doc comment on this
+          // function, and timeline.tsx's summarize()) -- cascadedFrom alone
+          // can't do that here since it's always null for compactSchedule.
+          compacted: true,
+        },
+      });
+    }
+
+    const assignees = new Set<string>();
+    for (const entry of movedList) if (entry.row.assigneeUserId !== null) assignees.add(entry.row.assigneeUserId);
+
+    return {
+      result: {
+        moved: movedList.map((e) => ({ id: e.id, startDate: e.toStart, dueDate: e.toDue, cascadedFrom: null })),
+      } satisfies ShiftResult,
+      assigneeIds: [...assignees],
+    };
+  });
+
+  // Same SSE key shape as shiftTask's own publish (see its comment) -- a
+  // project-wide compaction is just a bigger version of the same "some
+  // tasks' dates changed" event from every consumer's point of view.
+  publish({
+    keys: [
+      ["tasks", projectId], ["gantt"], ["events"],
+      ...result.moved.map((m) => ["task", m.id]),
+      ...assigneeIds.map((a) => ["my-tasks", a]),
+    ],
+  });
+  return result;
+}
+
 // --- ganttPayload --------------------------------------------------------
 
 export type GanttPayloadOptions = { projectId: string } | { global: true };

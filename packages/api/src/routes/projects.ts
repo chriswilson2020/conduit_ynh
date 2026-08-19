@@ -6,7 +6,7 @@ import { requireUser, mapDomainError, parseOrReject, idParamSchema } from "./hel
 import {
   createProject, updateProject, archiveProject, unarchiveProject, listProjects, getProject,
 } from "../services/projects.js";
-import { ganttPayload } from "../services/scheduling.js";
+import { ganttPayload, compactSchedule } from "../services/scheduling.js";
 
 // archived is the same tri-state wire flag companies.ts's listQuerySchema
 // documents: "true"/"false"/absent, not a free-form boolean coercion.
@@ -100,5 +100,21 @@ export function registerProjectRoutes(app: FastifyInstance, { db }: CrmRouteDeps
       return reply.code(404).send({ error: "not_found", message: `project ${params.id} not found` });
     }
     return ganttPayload(db, { projectId: params.id });
+  });
+
+  // "Remove slack" (Phase 3.1) -- scheduling.ts's compactSchedule, this
+  // project's whole dependency graph in one sweep. mapDomainError turns an
+  // unknown project into 404 and an archived one into 409, same as every
+  // other project route here.
+  app.post("/api/projects/:id/compact", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    try {
+      return await compactSchedule(db, user.id, params.id);
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
   });
 }

@@ -1069,6 +1069,45 @@ describe("projects routes", () => {
     expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
     await a.close();
   });
+
+  // "Remove slack" (Phase 3.1): POST /api/projects/:id/compact.
+  it("compacts a project's schedule and returns the moved list", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const taskA = await makeTask(a, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
+    const taskB = await makeTask(a, { title: "B", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-14" });
+    await a.inject({
+      method: "POST", url: `/api/tasks/${taskB.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskA.id },
+    });
+
+    const response = await a.inject({ method: "POST", url: `/api/projects/${project.id}/compact`, headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = shiftResultSchema.parse(response.json());
+    expect(body.moved).toEqual([{ id: taskB.id, startDate: "2026-01-05", dueDate: "2026-01-09", cascadedFrom: null }]);
+    await a.close();
+  });
+
+  it("returns 404 compacting an unknown project id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/projects/3f2504e0-4f89-41d3-9a0c-0305e82c3301/compact", headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  it("returns 409 compacting an archived project", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    await a.inject({ method: "POST", url: `/api/projects/${project.id}/archive`, headers: authHeaders });
+
+    const response = await a.inject({ method: "POST", url: `/api/projects/${project.id}/compact`, headers: authHeaders });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("archived");
+    await a.close();
+  });
 });
 
 describe("tasks routes", () => {

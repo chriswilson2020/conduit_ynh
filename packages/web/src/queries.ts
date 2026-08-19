@@ -1105,6 +1105,31 @@ export function useShiftTask() {
   });
 }
 
+/**
+ * "Remove slack" (Phase 3.1) -- POST /api/projects/:id/compact
+ * (services/scheduling.ts's compactSchedule). Invalidates the EXACT same key
+ * set useShiftTask's onSuccess does: from the client's point of view a
+ * project-wide compaction is just a bigger version of the same "some tasks'
+ * dates changed" event a single drag produces. No optimistic patch (unlike
+ * useShiftTask): a compaction can move an unbounded number of tasks in one
+ * call, so there's no single dragged task's dates to preview locally --
+ * chart.tsx's compact button waits for the real response and flashes off of
+ * its `moved` list directly, same as it already does with useShiftTask's.
+ */
+export function useCompactSchedule(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () =>
+      parseWith(shiftResultSchema, await postJson<unknown>(`/projects/${projectId}/compact`), "shift result"),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["gantt"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+      void queryClient.invalidateQueries({ queryKey: ["search"] });
+    },
+  });
+}
+
 export type GanttTarget = { projectId: string } | { global: true };
 
 export function useGantt(target: GanttTarget) {

@@ -93,13 +93,18 @@ function summarize(event: Event): string {
     // task's id for every event other than the dragged task's own (which
     // carries null) -- rendered generically as "(cascaded)" rather than
     // resolving that id to a title, mirroring dependency_added/_removed
-    // below.
+    // below. `compacted: true` (Phase 3.1's compactSchedule, scheduling.ts)
+    // is a THIRD, independent marker on the same verb -- a compaction event's
+    // own cascadedFrom is always null (compactSchedule has no "one dragged
+    // task" to trace back to), so this appends alongside "(cascaded)" rather
+    // than replacing it, even though in practice the two never co-occur.
     case "shifted": {
       const fromRange = formatDateRange(event.payload.from);
       const toRange = formatDateRange(event.payload.to);
       if (fromRange === null || toRange === null) return "shifted";
       const cascaded = typeof event.payload.cascadedFrom === "string";
-      return `shifted ${fromRange} ${"\u2192"} ${toRange}${cascaded ? " (cascaded)" : ""}`;
+      const compacted = event.payload.compacted === true;
+      return `shifted ${fromRange} ${"\u2192"} ${toRange}${cascaded ? " (cascaded)" : ""}${compacted ? " (compacted)" : ""}`;
     }
     case "completed":
       return "completed";

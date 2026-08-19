@@ -5,7 +5,7 @@ import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerE
 import { clsx } from "clsx";
 import { Link } from "@tanstack/react-router";
 import type { GanttTask, TaskDependency } from "@conduit/shared";
-import { useAddDependency, useGantt, useShiftTask } from "../../queries";
+import { useAddDependency, useCompactSchedule, useGantt, useShiftTask } from "../../queries";
 import type { GanttTarget } from "../../queries";
 import { Button } from "../ui/button";
 import { GanttBar } from "./bar";
@@ -257,13 +257,23 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
   const { data, isLoading, isError, error } = useGantt(target);
   const shiftTask = useShiftTask();
   const addDependency = useAddDependency();
+  // Called unconditionally (hooks can't be conditional) with "" on the
+  // global chart, where the compact button never renders and this mutation
+  // is therefore never actually fired -- see the button's own render-gate
+  // below for why "Remove slack" has no meaning across multiple projects.
+  const compactSchedule = useCompactSchedule(isGlobal ? "" : target.projectId);
 
   const [zoom, setZoom] = useState<Zoom>("day");
   const [dragVisual, setDragVisual] = useState<DragVisual | null>(null);
   const [pendingConnector, setPendingConnector] = useState<PendingConnector | null>(null);
   const [hoveredTargetId, setHoveredTargetIdState] = useState<string | null>(null);
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
-  const [flash, setFlash] = useState<{ ids: Set<string>; count: number } | null>(null);
+  // `kind` distinguishes an interactive-drag cascade ("N tasks shifted") from
+  // a "Remove slack" sweep ("N tasks compacted") -- same flash/note mechanism
+  // (the amber ring on each bar, the one-line note, the 1s auto-clear timer),
+  // just a different noun in the note text. See triggerFlash/handleCompact
+  // below.
+  const [flash, setFlash] = useState<{ ids: Set<string>; count: number; kind: "shifted" | "compacted" } | null>(null);
   const [bannerError, setBannerError] = useState<string | null>(null);
   // Purely a rendering signal (see isCommitting below) -- inFlightTaskIdsRef
   // is the actual guard consulted synchronously by handlePointerDown/
@@ -334,14 +344,29 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
     }
   }, [taskById]);
 
-  const triggerFlash = useCallback((ids: string[]) => {
+  const triggerFlash = useCallback((ids: string[], kind: "shifted" | "compacted" = "shifted") => {
     if (flashTimeoutRef.current !== null) window.clearTimeout(flashTimeoutRef.current);
-    setFlash({ ids: new Set(ids), count: ids.length });
+    setFlash({ ids: new Set(ids), count: ids.length, kind });
     flashTimeoutRef.current = window.setTimeout(() => {
       setFlash(null);
       flashTimeoutRef.current = null;
     }, 1000);
   }, []);
+
+  // "Remove slack" -- see queries.ts's useCompactSchedule doc comment for why
+  // this has no optimistic patch of its own; the button just waits for the
+  // real response and flashes off its `moved` list, exactly like a drag's
+  // onSuccess does above/below, just with the "compacted" noun and no single
+  // dragged task to exclude from the flash set.
+  const handleCompact = useCallback(() => {
+    if (!window.confirm("Pull every dependent task to its earliest start? Done and in-progress tasks stay put.")) return;
+    compactSchedule.mutate(undefined, {
+      onSuccess: (result) => {
+        if (result.moved.length > 0) triggerFlash(result.moved.map((m) => m.id), "compacted");
+      },
+      onError: (err) => setBannerError(err instanceof Error ? err.message : String(err)),
+    });
+  }, [compactSchedule, triggerFlash]);
 
   useEffect(() => () => {
     if (flashTimeoutRef.current !== null) window.clearTimeout(flashTimeoutRef.current);
@@ -744,12 +769,29 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
   return (
     <div data-testid="gantt" className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div data-testid="gantt-zoom" className="flex gap-2">
-          <Button variant={zoom === "day" ? "default" : "outline"} onClick={() => setZoom("day")}>Day</Button>
-          <Button variant={zoom === "week" ? "default" : "outline"} onClick={() => setZoom("week")}>Week</Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <div data-testid="gantt-zoom" className="flex gap-2">
+            <Button variant={zoom === "day" ? "default" : "outline"} onClick={() => setZoom("day")}>Day</Button>
+            <Button variant={zoom === "week" ? "default" : "outline"} onClick={() => setZoom("week")}>Week</Button>
+          </div>
+          {/* Per-project only -- compactSchedule (services/scheduling.ts) sweeps
+              ONE project's whole dependency graph at once, and dependency edges
+              never cross projects (addDependency enforces same-project-or-both-
+              standalone) -- there is no well-defined "compact" over the global
+              chart's multiple unrelated projects, and no route for it either. */}
+          {!isGlobal && (
+            <Button
+              data-testid="compact-button"
+              variant="outline"
+              onClick={handleCompact}
+              disabled={compactSchedule.isPending}
+            >
+              Remove slack
+            </Button>
+          )}
         </div>
         <div data-testid="cascade-note" aria-live="polite" className="text-xs font-medium text-amber-700">
-          {flash ? `${flash.count} task${flash.count === 1 ? "" : "s"} shifted` : ""}
+          {flash ? `${flash.count} task${flash.count === 1 ? "" : "s"} ${flash.kind}` : ""}
         </div>
       </div>
 

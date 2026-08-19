@@ -3,9 +3,9 @@ import { and, eq } from "drizzle-orm";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { events, taskDependencies } from "../db/schema.js";
-import { createProject } from "./projects.js";
-import { createTask, archiveTask, addDependency, getTask } from "./tasks.js";
-import { shiftTask, ganttPayload } from "./scheduling.js";
+import { createProject, archiveProject } from "./projects.js";
+import { createTask, archiveTask, addDependency, getTask, setTaskStatus } from "./tasks.js";
+import { shiftTask, ganttPayload, compactSchedule } from "./scheduling.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
 import { subscribe } from "./sse.js";
 
@@ -383,5 +383,153 @@ describe("ganttPayload", () => {
     const ids = payload.tasks.map((t) => t.id);
     expect(ids).not.toContain(parent.id);
     expect(ids).toContain(child.id);
+  });
+});
+
+describe("compactSchedule", () => {
+  it("chain compacts left, each successor settling against its PREDECESSOR's already-compacted due date", async () => {
+    const project = await makeProject();
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-14" });
+    const c = await createTask(handle.db, actorId, { title: "C", projectId: project.id, startDate: "2026-01-20", dueDate: "2026-01-24" });
+    await addDependency(handle.db, actorId, a.id, b.id);
+    await addDependency(handle.db, actorId, b.id, c.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    // A anchors (no predecessor) -- not in the moved list at all.
+    expect(result.moved.some((m) => m.id === a.id)).toBe(false);
+    // B: pulled to sit exactly on A's due date, 4-day duration preserved.
+    const bMoved = result.moved.find((m) => m.id === b.id)!;
+    expect(bMoved).toEqual({ id: b.id, startDate: "2026-01-05", dueDate: "2026-01-09", cascadedFrom: null });
+    // C settles against B's NEW (compacted) due date, not B's original one --
+    // this is the one-topological-pass argument in action.
+    const cMoved = result.moved.find((m) => m.id === c.id)!;
+    expect(cMoved).toEqual({ id: c.id, startDate: "2026-01-09", dueDate: "2026-01-13", cascadedFrom: null });
+
+    expect((await getTask(handle.db, a.id))?.startDate).toBe("2026-01-01");
+  });
+
+  it("a head task with no predecessors never moves, even though it anchors a chain with slack to pull", async () => {
+    const project = await makeProject();
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-02-10", dueDate: "2026-02-12" });
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    expect(result.moved).toEqual([]);
+    const after = await getTask(handle.db, a.id);
+    expect(after?.startDate).toBe("2026-02-10");
+    expect(after?.dueDate).toBe("2026-02-12");
+  });
+
+  it("done/in_progress tasks never move themselves, but their (unchanged) due date still constrains successors", async () => {
+    const project = await makeProject();
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
+    await setTaskStatus(handle.db, actorId, a.id, "done");
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-15" });
+    await addDependency(handle.db, actorId, a.id, b.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    expect(result.moved.some((m) => m.id === a.id)).toBe(false);
+    const aAfter = await getTask(handle.db, a.id);
+    expect(aAfter?.startDate).toBe("2026-01-01");
+    expect(aAfter?.dueDate).toBe("2026-01-05");
+    // B still settles against A's due date, 5-day duration preserved.
+    const bMoved = result.moved.find((m) => m.id === b.id)!;
+    expect(bMoved).toEqual({ id: b.id, startDate: "2026-01-05", dueDate: "2026-01-10", cascadedFrom: null });
+  });
+
+  it("a constraint VIOLATION (successor starts before predecessor's due) is fixed by pushing the successor right", async () => {
+    const project = await makeProject();
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-10" });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-02", dueDate: "2026-01-04" });
+    await addDependency(handle.db, actorId, a.id, b.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    const bMoved = result.moved.find((m) => m.id === b.id)!;
+    // B's 2-day duration preserved, pushed to land exactly on A's due date.
+    expect(bMoved).toEqual({ id: b.id, startDate: "2026-01-10", dueDate: "2026-01-12", cascadedFrom: null });
+  });
+
+  it("diamond convergence: the converging task settles at the MAX of both compacted predecessor due dates", async () => {
+    const project = await makeProject();
+    const p = await createTask(handle.db, actorId, { title: "P", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-03" });
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-12" });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-04", dueDate: "2026-01-05" });
+    const d = await createTask(handle.db, actorId, { title: "D", projectId: project.id, startDate: "2026-01-20", dueDate: "2026-01-22" });
+    await addDependency(handle.db, actorId, p.id, a.id);
+    await addDependency(handle.db, actorId, p.id, b.id);
+    await addDependency(handle.db, actorId, a.id, d.id);
+    await addDependency(handle.db, actorId, b.id, d.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    // A: pulled to P's due (01-03), 2-day duration -> 01-03..01-05.
+    // B: pulled to P's due (01-03), 1-day duration -> 01-03..01-04.
+    // D via A needs start >= 01-05; via B needs start >= 01-04 -- MAX wins.
+    const dMoved = result.moved.find((m) => m.id === d.id)!;
+    expect(dMoved).toEqual({ id: d.id, startDate: "2026-01-05", dueDate: "2026-01-07", cascadedFrom: null });
+  });
+
+  it("an undated task neither moves itself nor constrains its successor -- the successor stays anchored", async () => {
+    const project = await makeProject();
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id }); // no dates
+    const c = await createTask(handle.db, actorId, { title: "C", projectId: project.id, startDate: "2026-01-20", dueDate: "2026-01-22" });
+    await addDependency(handle.db, actorId, a.id, b.id);
+    await addDependency(handle.db, actorId, b.id, c.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    expect(result.moved.some((m) => m.id === b.id)).toBe(false);
+    // C's ONLY predecessor is the undated B -- C has no DATED predecessor to
+    // settle against, so it stays put, exactly as if it had none at all.
+    expect(result.moved.some((m) => m.id === c.id)).toBe(false);
+    const cAfter = await getTask(handle.db, c.id);
+    expect(cAfter?.startDate).toBe("2026-01-20");
+    expect(cAfter?.dueDate).toBe("2026-01-22");
+  });
+
+  it("an empty project, and a project with no dependencies at all, are both a clean no-op", async () => {
+    const empty = await makeProject({ name: "Empty" });
+    expect((await compactSchedule(handle.db, actorId, empty.id)).moved).toEqual([]);
+
+    const lonely = await makeProject({ name: "Lonely" });
+    await createTask(handle.db, actorId, { title: "Solo", projectId: lonely.id, startDate: "2026-03-01", dueDate: "2026-03-02" });
+    expect((await compactSchedule(handle.db, actorId, lonely.id)).moved).toEqual([]);
+  });
+
+  it("every moved task's `shifted` event carries the compacted marker and a null cascadedFrom", async () => {
+    const project = await makeProject();
+    const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
+    const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-14" });
+    await addDependency(handle.db, actorId, a.id, b.id);
+
+    await compactSchedule(handle.db, actorId, project.id);
+
+    const bEvents = await handle.db.select().from(events).where(and(eq(events.taskId, b.id), eq(events.verb, "shifted")));
+    expect(bEvents).toHaveLength(1);
+    expect(bEvents[0]?.payload).toEqual({
+      from: { start: "2026-01-10", due: "2026-01-14" },
+      to: { start: "2026-01-05", due: "2026-01-09" },
+      cascadedFrom: null,
+      compacted: true,
+    });
+    // A never moved -- no event at all for it.
+    const aEvents = await handle.db.select().from(events).where(and(eq(events.taskId, a.id), eq(events.verb, "shifted")));
+    expect(aEvents).toHaveLength(0);
+  });
+
+  it("throws NotFoundError for an unknown project id", async () => {
+    await expect(compactSchedule(handle.db, actorId, "3f2504e0-4f89-41d3-9a0c-0305e82c3301"))
+      .rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("refuses to compact an archived project", async () => {
+    const project = await makeProject();
+    await archiveProject(handle.db, actorId, project.id);
+    await expect(compactSchedule(handle.db, actorId, project.id)).rejects.toBeInstanceOf(ArchivedError);
   });
 });
