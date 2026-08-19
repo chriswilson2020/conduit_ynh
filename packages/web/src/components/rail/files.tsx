@@ -7,6 +7,7 @@ import { useFiles, useUploadFile, useUsers } from "../../queries";
 export interface FilesProps {
   companyId?: string;
   contactId?: string;
+  dealId?: string;
 }
 
 function humanSize(bytes: number): string {
@@ -30,8 +31,8 @@ function uploadErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export function Files({ companyId, contactId }: FilesProps) {
-  const { data: files = [] } = useFiles({ companyId, contactId });
+export function Files({ companyId, contactId, dealId }: FilesProps) {
+  const { data: files = [] } = useFiles({ companyId, contactId, dealId });
   const { data: users = [] } = useUsers();
   const uploadFile = useUploadFile();
   const [error, setError] = useState<string | null>(null);
@@ -46,7 +47,10 @@ export function Files({ companyId, contactId }: FilesProps) {
   function upload(file: File) {
     if (uploadFile.isPending) return;
     setError(null);
-    uploadFile.mutate({ file, companyId, contactId }, { onError: (err) => setError(uploadErrorMessage(err)) });
+    uploadFile.mutate(
+      { file, companyId, contactId, dealId },
+      { onError: (err) => setError(uploadErrorMessage(err)) },
+    );
   }
 
   function handleInputChange(event: ChangeEvent<HTMLInputElement>) {

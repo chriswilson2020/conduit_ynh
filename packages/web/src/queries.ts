@@ -247,16 +247,19 @@ export function useUnarchiveContact() {
 export interface EntityFilterParams {
   companyId?: string;
   contactId?: string;
+  dealId?: string;
 }
 
 export function useNotes(params: EntityFilterParams) {
   return useQuery({
     queryKey: ["notes", params],
     queryFn: async () => {
-      const qs = toQueryString({ company_id: params.companyId, contact_id: params.contactId });
+      const qs = toQueryString({
+        company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId,
+      });
       return parseWith(noteListSchema, await getJson<unknown>(`/notes${qs}`), "notes list");
     },
-    enabled: params.companyId !== undefined || params.contactId !== undefined,
+    enabled: params.companyId !== undefined || params.contactId !== undefined || params.dealId !== undefined,
   });
 }
 
@@ -285,10 +288,12 @@ export function useFiles(params: EntityFilterParams) {
   return useQuery({
     queryKey: ["files", params],
     queryFn: async () => {
-      const qs = toQueryString({ company_id: params.companyId, contact_id: params.contactId });
+      const qs = toQueryString({
+        company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId,
+      });
       return parseWith(fileListSchema, await getJson<unknown>(`/files${qs}`), "files list");
     },
-    enabled: params.companyId !== undefined || params.contactId !== undefined,
+    enabled: params.companyId !== undefined || params.contactId !== undefined || params.dealId !== undefined,
   });
 }
 
@@ -296,18 +301,20 @@ export interface UploadFileInput {
   file: File;
   companyId?: string;
   contactId?: string;
+  dealId?: string;
 }
 
 export function useUploadFile() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ file, companyId, contactId }: UploadFileInput) => {
+    mutationFn: async ({ file, companyId, contactId, dealId }: UploadFileInput) => {
       const form = new FormData();
       // The entity id field(s) must be appended before the file field: the API
       // (packages/api/src/routes/files.ts) streams the multipart body and only
       // sees fields that arrive ahead of the file part.
       if (companyId !== undefined) form.append("companyId", companyId);
       if (contactId !== undefined) form.append("contactId", contactId);
+      if (dealId !== undefined) form.append("dealId", dealId);
       form.append("file", file);
       return parseWith(fileMetaSchema, await postForm("/files", form), "file");
     },
@@ -482,6 +489,18 @@ function useInvalidateDeal() {
   };
 }
 
+// Single-deal detail query, mirroring useCompany/useContact -- the ["deal", id]
+// key this uses is already the one publishDealHint/useInvalidateDeal target
+// (added ahead of this hook back in P2.3/P2.6), so every deal mutation already
+// invalidates it correctly; this was just the missing reader.
+export function useDeal(id: string) {
+  return useQuery({
+    queryKey: ["deal", id],
+    queryFn: async () => parseWith(dealSchema, await getJson<unknown>(`/deals/${id}`), "deal"),
+    enabled: id !== "",
+  });
+}
+
 export function useCreateDeal() {
   const invalidate = useInvalidateDeal();
   return useMutation({
@@ -496,6 +515,23 @@ export function useUpdateDeal() {
   return useMutation({
     mutationFn: async ({ id, patch }: { id: string; patch: UpdateDealInput }) =>
       parseWith(dealSchema, await patchJson<unknown>(`/deals/${id}`, patch), "deal"),
+    onSuccess: (deal: Deal) => invalidate(deal.pipelineId, deal.id),
+  });
+}
+
+export function useArchiveDeal() {
+  const invalidate = useInvalidateDeal();
+  return useMutation({
+    mutationFn: async (id: string) => parseWith(dealSchema, await postJson<unknown>(`/deals/${id}/archive`), "deal"),
+    onSuccess: (deal: Deal) => invalidate(deal.pipelineId, deal.id),
+  });
+}
+
+export function useUnarchiveDeal() {
+  const invalidate = useInvalidateDeal();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(dealSchema, await postJson<unknown>(`/deals/${id}/unarchive`), "deal"),
     onSuccess: (deal: Deal) => invalidate(deal.pipelineId, deal.id),
   });
 }
@@ -632,7 +668,7 @@ export function useEvents(params: EventListParams = {}) {
     queryKey: ["events", params],
     queryFn: async () => {
       const qs = toQueryString({
-        company_id: params.companyId, contact_id: params.contactId,
+        company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId,
         cursor: params.cursor, limit: params.limit,
       });
       return parseWith(eventListSchema, await getJson<unknown>(`/events${qs}`), "events list");

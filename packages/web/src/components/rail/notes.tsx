@@ -6,11 +6,12 @@ import { Textarea } from "../ui/textarea";
 export interface NotesProps {
   companyId?: string;
   contactId?: string;
+  dealId?: string;
 }
 
-export function Notes({ companyId, contactId }: NotesProps) {
+export function Notes({ companyId, contactId, dealId }: NotesProps) {
   const [draft, setDraft] = useState("");
-  const { data: notes = [] } = useNotes({ companyId, contactId });
+  const { data: notes = [] } = useNotes({ companyId, contactId, dealId });
   const { data: users = [] } = useUsers();
   const createNote = useCreateNote();
   const userMap = useMemo(() => new Map(users.map((user) => [user.id, user.username])), [users]);
@@ -24,7 +25,7 @@ export function Notes({ companyId, contactId }: NotesProps) {
   function handleAdd() {
     const body = draft.trim();
     if (body === "") return;
-    createNote.mutate({ body, companyId, contactId }, { onSuccess: () => setDraft("") });
+    createNote.mutate({ body, companyId, contactId, dealId }, { onSuccess: () => setDraft("") });
   }
 
   return (

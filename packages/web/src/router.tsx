@@ -8,6 +8,7 @@ import { CompaniesPage } from "./pages/companies";
 import { CompanyDetailPage } from "./pages/company-detail";
 import { ContactsPage } from "./pages/contacts";
 import { ContactDetailPage } from "./pages/contact-detail";
+import { DealDetailPage } from "./pages/deal-detail";
 import { PipelinesPage } from "./pages/pipelines";
 
 // A short staleTime keeps list/detail views from refetching on every focus
@@ -74,6 +75,12 @@ const boardRoute = createRoute({
   component: BoardPage,
 });
 
+const dealDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/deals/$dealId",
+  component: DealDetailPage,
+});
+
 // Rendered by the router itself (not a route) whenever the URL matches no
 // route in the tree -- a stale bookmark or a mistyped path. It renders as the
 // root route's Outlet content, i.e. inside Shell, so the sidebar/header stay
@@ -112,6 +119,7 @@ const routeTree = rootRoute.addChildren([
   contactDetailRoute,
   pipelinesRoute,
   boardRoute,
+  dealDetailRoute,
 ]);
 
 // basePath() returns "/" both at a root install and during `vite dev` (see its

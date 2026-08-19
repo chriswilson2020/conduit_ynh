@@ -8,6 +8,13 @@ export interface FieldCardField {
   label: string;
   value: string | null;
   editable?: boolean;
+  /** Read-only rendering override for the field's non-editing display -- e.g. a
+   * formatted currency string ("$1,234.56") while `value` stays the raw,
+   * editable representation ("1234.56") that startEdit below seeds the input
+   * from. Falls back to `value` itself when omitted (every other page's
+   * fields), so this is purely additive for callers that don't need the
+   * split. */
+  displayValue?: string | null;
 }
 
 export interface FieldCardProps {
@@ -111,7 +118,10 @@ export function FieldCard({
                     }
                     onClick={() => startEdit(field)}
                   >
-                    {field.value === null || field.value === "" ? "\u2014" : field.value}
+                    {(() => {
+                      const shown = field.displayValue !== undefined ? field.displayValue : field.value;
+                      return shown === null || shown === "" ? "\u2014" : shown;
+                    })()}
                   </span>
                 )}
                 {error && <p className="mt-1 px-2 text-xs text-red-600">{error}</p>}

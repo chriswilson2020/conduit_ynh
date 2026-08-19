@@ -6,6 +6,7 @@ import { Button } from "../ui/button";
 export interface TimelineProps {
   companyId?: string;
   contactId?: string;
+  dealId?: string;
 }
 
 // Single-letter badges rather than pictographic icons: ASCII, unambiguous per
@@ -17,9 +18,6 @@ const VERB_BADGE: Record<Event["verb"], string> = {
   unarchived: "R",
   note_added: "N",
   file_attached: "F",
-  // Phase 2 (pipelines/deals) verbs. The badges/summaries below are placeholders
-  // pending Task 7 (deal detail + rail), which is where these events start being
-  // emitted and where a dealId link/summary treatment gets designed properly.
   stage_changed: "S",
   won: "W",
   lost: "L",
@@ -47,6 +45,37 @@ function summarize(event: Event): string {
       const name = event.payload.originalName;
       return typeof name === "string" ? name : "";
     }
+    // Payload shape written by moveDeal in services/deals.ts: { from, to,
+    // fromName, toName }. fromName/toName are used (not from/to, which are
+    // stage ids) so this never needs a second round trip to resolve a name.
+    case "stage_changed": {
+      const fromName = event.payload.fromName;
+      const toName = event.payload.toName;
+      if (typeof fromName === "string" && typeof toName === "string") {
+        return `moved from ${fromName} to ${toName}`;
+      }
+      if (typeof toName === "string") return `moved to ${toName}`;
+      return "moved stage";
+    }
+    // Payload shape written by setStatus's target === "won" branch:
+    // { valueCents, currency }. Falls back to a bare "won" when either is
+    // missing (e.g. an unpriced deal has valueCents: null).
+    case "won": {
+      const valueCents = event.payload.valueCents;
+      const currency = event.payload.currency;
+      if (typeof valueCents === "number" && typeof currency === "string") {
+        const formatted = new Intl.NumberFormat(undefined, { style: "currency", currency }).format(valueCents / 100);
+        return `won ${formatted}`;
+      }
+      return "won";
+    }
+    // Payload shape written by setStatus's target === "lost" branch: { reason }.
+    case "lost": {
+      const reason = event.payload.reason;
+      return typeof reason === "string" && reason !== "" ? `lost: ${reason}` : "lost";
+    }
+    case "reopened":
+      return "reopened";
     default:
       return event.verb;
   }
@@ -58,10 +87,10 @@ function summarize(event: Event): string {
  * fresh mount (new companyId/contactId, since this remounts per detail page)
  * starts clean.
  */
-export function Timeline({ companyId, contactId }: TimelineProps) {
+export function Timeline({ companyId, contactId, dealId }: TimelineProps) {
   const [cursor, setCursor] = useState<string | undefined>(undefined);
   const [rows, setRows] = useState<Event[]>([]);
-  const { data, isLoading } = useEvents({ companyId, contactId, cursor });
+  const { data, isLoading } = useEvents({ companyId, contactId, dealId, cursor });
   const { data: users = [] } = useUsers();
   const userMap = useMemo(() => new Map(users.map((user) => [user.id, user.username])), [users]);
 

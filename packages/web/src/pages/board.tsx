@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import type { FormEvent } from "react";
+import { useMemo, useRef, useState } from "react";
+import type { FormEvent, RefObject } from "react";
 import {
   DndContext, DragOverlay, KeyboardSensor, PointerSensor, closestCenter, useDroppable, useSensor, useSensors,
 } from "@dnd-kit/core";
@@ -8,7 +8,7 @@ import {
   SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import type { Deal, Stage } from "@conduit/shared";
 import {
   useCompanies, useCreateDeal, useCreateStage, useDeals, useMoveDeal, usePipeline, useUpdateStage, useUsers,
@@ -65,6 +65,21 @@ export function BoardPage() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const activeDeal = activeId !== null ? (openDeals.find((deal) => deal.id === activeId) ?? null) : null;
 
+  // Cards navigate to the deal detail page on click (see DealCard below), but
+  // dnd-kit's own drag lifecycle must win when the user is actually dragging,
+  // not clicking. PointerSensor's activationConstraint below means a plain
+  // click (no pointer movement past 4px) never starts a drag at all -- this
+  // ref only needs to guard the OTHER direction: a real drag's mouseup can
+  // still fire a native "click" event afterward (on whichever card happens to
+  // be under the pointer at drop time, which is not necessarily the dragged
+  // card itself, since dnd-kit's live reordering can shift a different card
+  // under it). handleDragStart only ever fires once that 4px threshold is
+  // exceeded, so reaching it at all already proves a genuine drag, not a
+  // click -- setting the flag there and clearing it on a macrotask (after the
+  // synchronous click that follows the same mouseup) suppresses that
+  // spurious click regardless of which card's onClick ends up receiving it.
+  const suppressCardClickRef = useRef(false);
+
   const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 4 } });
   const keyboardSensor = useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates });
   const archived = pipelineData !== undefined && pipelineData.pipeline.archivedAt !== null;
@@ -75,10 +90,26 @@ export function BoardPage() {
 
   function handleDragStart(event: DragStartEvent) {
     setActiveId(String(event.active.id));
+    suppressCardClickRef.current = true;
+  }
+
+  // dnd-kit calls onDragCancel instead of onDragEnd when a drag is aborted
+  // (e.g. Escape mid-drag) -- without this, both activeId and
+  // suppressCardClickRef would stay stuck from the handleDragStart above,
+  // leaving the DragOverlay showing a phantom card and the next plain click
+  // silently swallowed.
+  function handleDragCancel() {
+    setActiveId(null);
+    suppressCardClickRef.current = false;
   }
 
   function handleDragEnd(event: DragEndEvent) {
     setActiveId(null);
+    // See suppressCardClickRef's doc comment above for why this is a
+    // macrotask reset rather than immediate: the drop gesture's native click
+    // event (if any) dispatches synchronously, ahead of a setTimeout(0)
+    // queued from here, so it still observes the flag as true.
+    setTimeout(() => { suppressCardClickRef.current = false; }, 0);
     const { active, over } = event;
     if (!over || active.id === over.id) return;
     const activeData = active.data.current as DndData | undefined;
@@ -165,6 +196,7 @@ export function BoardPage() {
           userInitials={userInitials}
           pipelineId={pipelineId}
           readOnly={archived}
+          suppressCardClickRef={suppressCardClickRef}
         />
       ))}
       {!archived && <AddStageTile pipelineId={pipelineId} />}
@@ -190,6 +222,7 @@ export function BoardPage() {
         sensors={sensors}
         collisionDetection={closestCenter}
         onDragStart={handleDragStart}
+        onDragCancel={handleDragCancel}
         onDragEnd={handleDragEnd}
       >
         {columns}
@@ -217,6 +250,7 @@ function Column({
   userInitials,
   pipelineId,
   readOnly,
+  suppressCardClickRef,
 }: {
   stage: Stage;
   deals: Deal[];
@@ -224,6 +258,7 @@ function Column({
   userInitials: Map<string, string>;
   pipelineId: string;
   readOnly: boolean;
+  suppressCardClickRef: RefObject<boolean>;
 }) {
   const { setNodeRef } = useDroppable({
     id: `column:${stage.id}`,
@@ -265,6 +300,7 @@ function Column({
               companyName={deal.companyId ? companyMap.get(deal.companyId) : undefined}
               ownerInitial={deal.ownerUserId ? userInitials.get(deal.ownerUserId) : undefined}
               readOnly={readOnly}
+              suppressCardClickRef={suppressCardClickRef}
             />
           ))}
           {deals.length === 0 && <EmptyPlaceholder stageId={stage.id} />}
@@ -293,13 +329,16 @@ function DealCard({
   companyName,
   ownerInitial,
   readOnly,
+  suppressCardClickRef,
 }: {
   deal: Deal;
   stage: Stage;
   companyName?: string;
   ownerInitial?: string;
   readOnly: boolean;
+  suppressCardClickRef: RefObject<boolean>;
 }) {
+  const navigate = useNavigate();
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: deal.id,
     data: { type: "card", stageId: deal.stageId } satisfies CardDndData,
@@ -311,11 +350,21 @@ function DealCard({
   const rotten = stage.rotDays != null && daysSinceUpdate > stage.rotDays;
   const rotTitle = `No activity for ${daysSinceUpdate} days (stage rots after ${stage.rotDays} days)`;
 
+  // Cards navigate to the deal detail page on a plain click. See
+  // suppressCardClickRef's doc comment in BoardPage for why the flag it
+  // checks is enough to tell a click apart from a drag-and-drop's trailing
+  // click, without this card needing to know whether IT was the one dragged.
+  function handleClick() {
+    if (suppressCardClickRef.current) return;
+    void navigate({ to: "/deals/$dealId", params: { dealId: deal.id } });
+  }
+
   return (
     <div
       ref={setNodeRef}
       style={style}
       data-testid={`card-${deal.id}`}
+      onClick={handleClick}
       className="flex flex-col gap-1 rounded-md border border-slate-200 bg-white px-3 py-2 shadow-sm"
       {...attributes}
       {...listeners}

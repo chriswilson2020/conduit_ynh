@@ -8,6 +8,8 @@ import {
   useCompany,
   useContacts,
   useCreateContact,
+  useCreatePipeline,
+  usePipelines,
   useUnarchiveCompany,
   useUpdateCompany,
 } from "../queries";
@@ -42,6 +44,7 @@ export function CompanyDetailPage() {
   const { companyId } = useParams({ from: "/companies/$companyId" });
   const { data: company, isLoading, error } = useCompany(companyId);
   const { data: contactsData } = useContacts({ companyId });
+  const { data: pipelines = [] } = usePipelines({ companyId });
   const updateCompany = useUpdateCompany();
   const archiveCompany = useArchiveCompany();
   const unarchiveCompany = useUnarchiveCompany();
@@ -49,6 +52,7 @@ export function CompanyDetailPage() {
   const [bannerError, setBannerError] = useState<string | null>(null);
   const [savingField, setSavingField] = useState<string | null>(null);
   const [newContactOpen, setNewContactOpen] = useState(false);
+  const [newPipelineOpen, setNewPipelineOpen] = useState(false);
 
   // ApiError.code is the server's machine-readable `error` field: branching on
   // it (rather than the human-readable message, which always includes the
@@ -203,6 +207,37 @@ export function CompanyDetailPage() {
             )}
           </ul>
         </section>
+
+        <section className="mt-6">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-900">Pipelines</h2>
+            <Dialog open={newPipelineOpen} onOpenChange={setNewPipelineOpen}>
+              <DialogTrigger asChild>
+                <Button variant="outline">New pipeline</Button>
+              </DialogTrigger>
+              <DialogContent>
+                <NewPipelineDialog companyId={company.id} onClose={() => setNewPipelineOpen(false)} />
+              </DialogContent>
+            </Dialog>
+          </div>
+          <ul
+            data-testid="company-pipelines"
+            className="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white"
+          >
+            {pipelines.map((pipeline) => (
+              <li key={pipeline.id}>
+                <Link
+                  to="/pipelines/$pipelineId"
+                  params={{ pipelineId: pipeline.id }}
+                  className="block px-4 py-2 text-sm text-slate-900 hover:bg-slate-50"
+                >
+                  {pipeline.name}
+                </Link>
+              </li>
+            ))}
+            {pipelines.length === 0 && <li className="px-4 py-2 text-sm text-slate-400">No pipelines</li>}
+          </ul>
+        </section>
       </div>
       <aside className="min-w-0 lg:w-1/3">
         <Rail companyId={company.id} />
@@ -243,6 +278,49 @@ function NewContactDialog({ companyId, onClose }: { companyId: string; onClose: 
       />
       {createContact.isError && <p className="text-sm text-red-600">{createContact.error.message}</p>}
       <Button type="submit" disabled={firstName.trim() === "" || createContact.isPending}>
+        Create
+      </Button>
+    </form>
+  );
+}
+
+// Always creates a company-scoped pipeline (scope: "company") prefilled with
+// this company's id -- unlike PipelinesPage's own create dialog (which lets
+// the user pick global vs. a company), this one only ever needs to offer the
+// name field since the scope/companyId are already decided by where the
+// dialog was opened from.
+function NewPipelineDialog({ companyId, onClose }: { companyId: string; onClose: () => void }) {
+  const navigate = useNavigate();
+  const [name, setName] = useState("");
+  const createPipeline = useCreatePipeline();
+
+  function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    const trimmed = name.trim();
+    if (trimmed === "") return;
+    createPipeline.mutate(
+      { name: trimmed, scope: "company", companyId },
+      {
+        onSuccess: (pipeline) => {
+          onClose();
+          void navigate({ to: "/pipelines/$pipelineId", params: { pipelineId: pipeline.id } });
+        },
+      },
+    );
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+      <DialogTitle>New pipeline</DialogTitle>
+      <Input
+        autoFocus
+        value={name}
+        onChange={(event) => setName(event.target.value)}
+        placeholder="Pipeline name"
+        disabled={createPipeline.isPending}
+      />
+      {createPipeline.isError && <p className="text-sm text-red-600">{createPipeline.error.message}</p>}
+      <Button type="submit" disabled={name.trim() === "" || createPipeline.isPending}>
         Create
       </Button>
     </form>

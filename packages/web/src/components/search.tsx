@@ -8,12 +8,14 @@ import { Input } from "./ui/input";
 type FlatResult =
   | { kind: "company"; key: string; id: string; label: string }
   | { kind: "contact"; key: string; id: string; label: string; secondary: string | null }
-  | { kind: "note"; key: string; snippet: string; companyId: string | null; contactId: string | null };
+  | { kind: "note"; key: string; snippet: string; companyId: string | null; contactId: string | null }
+  | { kind: "deal"; key: string; id: string; label: string };
 
 const GROUP_LABEL: Record<FlatResult["kind"], string> = {
   company: "Companies",
   contact: "Contacts",
   note: "Notes",
+  deal: "Deals",
 };
 
 /**
@@ -62,7 +64,13 @@ export function GlobalSearch() {
       companyId: note.companyId,
       contactId: note.contactId,
     }));
-    return [...companies, ...contacts, ...notes];
+    const deals: FlatResult[] = data.deals.map((deal) => ({
+      kind: "deal",
+      key: `deal-${deal.id}`,
+      id: deal.id,
+      label: deal.title,
+    }));
+    return [...companies, ...contacts, ...notes, ...deals];
   }, [data]);
 
   // A fresh result set always restarts the highlight at the top -- keyed on
@@ -87,6 +95,8 @@ export function GlobalSearch() {
       void navigate({ to: "/companies/$companyId", params: { companyId: entry.id } });
     } else if (entry.kind === "contact") {
       void navigate({ to: "/contacts/$contactId", params: { contactId: entry.id } });
+    } else if (entry.kind === "deal") {
+      void navigate({ to: "/deals/$dealId", params: { dealId: entry.id } });
     } else if (entry.companyId !== null) {
       void navigate({ to: "/companies/$companyId", params: { companyId: entry.companyId } });
     } else if (entry.contactId !== null) {
