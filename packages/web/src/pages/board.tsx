@@ -1,6 +1,5 @@
 import { useMemo, useRef, useState } from "react";
 import type { FormEvent, RefObject } from "react";
-import { flushSync } from "react-dom";
 import {
   DndContext, DragOverlay, KeyboardSensor, MeasuringStrategy, PointerSensor, closestCenter, rectIntersection,
   useDroppable, useSensor, useSensors,
@@ -188,15 +187,11 @@ export function BoardPage() {
     suppressCardClickRef.current = true;
   }
 
-  // TEMPORARY DEBUG -- forces any pending React update (including dnd-kit's
-  // own internal DragMove dispatch from a keyboard arrow press) to flush
-  // synchronously as soon as `over` changes, instead of potentially still
-  // being queued when the very next keydown (e.g. an immediately-following
-  // drop) is processed by dnd-kit's raw, non-React keydown listener.
+  // TEMPORARY DEBUG INSTRUMENTATION -- see the keyboard-drag race
+  // investigation in commit history.
   function handleDragOver() {
     // eslint-disable-next-line no-console
     console.log(`[dbg onDragOver] t=${performance.now().toFixed(1)}`);
-    flushSync(() => {});
   }
 
   // dnd-kit calls onDragCancel instead of onDragEnd when a drag is aborted
