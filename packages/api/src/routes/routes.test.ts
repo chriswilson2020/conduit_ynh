@@ -13,6 +13,7 @@ import { openTestDatabase, truncateAll } from "../test/db.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
 import { listFiles } from "../services/files.js";
 import { listEvents } from "../services/timeline.js";
+import { todayDateOnly, addDays } from "../services/scheduling.js";
 import type { Config } from "../config.js";
 
 const handle = openTestDatabase();
@@ -1070,12 +1071,17 @@ describe("projects routes", () => {
     await a.close();
   });
 
-  // "Remove slack" (Phase 3.1): POST /api/projects/:id/compact.
+  // "Remove slack" (Phase 3.1): POST /api/projects/:id/compact. Dates are
+  // relative to today (not hardcoded) -- compactSchedule refuses to schedule
+  // a movable task's start before today (Fix 1, hotfix v0.4.3), so a fixed
+  // past date here would get clamped instead of landing on taskA's due date,
+  // which is the wiring this smoke test actually cares about.
   it("compacts a project's schedule and returns the moved list", async () => {
     const a = await app();
+    const day = (n: number) => addDays(todayDateOnly(), n);
     const project = await makeProject(a);
-    const taskA = await makeTask(a, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
-    const taskB = await makeTask(a, { title: "B", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-14" });
+    const taskA = await makeTask(a, { title: "A", projectId: project.id, startDate: day(60), dueDate: day(64) });
+    const taskB = await makeTask(a, { title: "B", projectId: project.id, startDate: day(69), dueDate: day(73) });
     await a.inject({
       method: "POST", url: `/api/tasks/${taskB.id}/dependencies`, headers: authHeaders,
       payload: { predecessorId: taskA.id },
@@ -1084,7 +1090,7 @@ describe("projects routes", () => {
     const response = await a.inject({ method: "POST", url: `/api/projects/${project.id}/compact`, headers: authHeaders });
     expect(response.statusCode).toBe(200);
     const body = shiftResultSchema.parse(response.json());
-    expect(body.moved).toEqual([{ id: taskB.id, startDate: "2026-01-05", dueDate: "2026-01-09", cascadedFrom: null }]);
+    expect(body.moved).toEqual([{ id: taskB.id, startDate: day(64), dueDate: day(68), cascadedFrom: null }]);
     await a.close();
   });
 

@@ -39,11 +39,28 @@ function formatDateOnly(epochDay: number): string {
   const day = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
-function addDays(s: string, days: number): string {
+// Exported alongside todayDateOnly (below) so tests can build dates relative
+// to "today" the same way this file does, instead of hardcoding calendar
+// dates that drift into the past as real time moves on.
+export function addDays(s: string, days: number): string {
   return formatDateOnly(parseDateOnly(s) + days);
 }
 function diffDays(a: string, b: string): number {
   return parseDateOnly(a) - parseDateOnly(b);
+}
+
+// Server-authoritative "today", date-only, for compactSchedule's Fix 1 clamp
+// (hotfix v0.4.3) -- see that function's doc comment. Deliberately NOT
+// per-client: the server has no reliable way to know the timezone of whoever
+// clicked "Remove slack", and date-only semantics (no time-of-day) make the
+// resulting window harmless either way -- the worst case is a task landing on
+// "today" as measured up to roughly +/-2h away from a particular user's own
+// local calendar day at the moment of the click, never more, since this reads
+// straight off the server's system clock in UTC. Exported so tests can derive
+// their expected dates from the same source this function uses, instead of
+// hardcoding a date that would only be "today" on the day this was written.
+export function todayDateOnly(): string {
+  return formatDateOnly(Math.floor(Date.now() / MS_PER_DAY));
 }
 
 // --- shared mapping helpers ------------------------------------------------
@@ -327,17 +344,26 @@ export async function shiftTask(
 // at all, only of its predecessors' current due dates).
 //
 // MOVABLE means: dated (both startDate and dueDate set), and its status is
-// "todo" or "blocked". Everything else keeps its own dates untouched, but
-// (if dated) still contributes its due date to whichever successors settle
-// against it:
-//   * status "done"/"in_progress" -- deliberately frozen (work already
-//     started/finished doesn't get silently rescheduled), but still a real
-//     constraint for anything downstream of it. This holds even when such a
-//     task is ITSELF currently violating its own predecessors' due dates --
-//     compactSchedule never fixes a protected task's own violation, only
-//     todo/blocked ones; a done/in_progress task that started early (or
-//     whose predecessor moved later after the fact) stays exactly where it
-//     is, constraint or no constraint.
+// "todo" or "blocked" -- or (refinement, hotfix v0.4.4) "in_progress" with a
+// startDate still in the FUTURE (start > todayIso, the same server-side
+// "today" the TODAY CLAMP below uses). Everything else keeps its own dates
+// untouched, but (if dated) still contributes its due date to whichever
+// successors settle against it:
+//   * status "done", or "in_progress" with start <= today -- deliberately
+//     frozen (work already started/finished doesn't get silently
+//     rescheduled), but still a real constraint for anything downstream of
+//     it. This holds even when such a task is ITSELF currently violating its
+//     own predecessors' due dates -- compactSchedule never fixes a protected
+//     task's own violation, only movable ones; a frozen task that started
+//     early (or whose predecessor moved later after the fact) stays exactly
+//     where it is, constraint or no constraint. The v0.4.4 refinement exists
+//     because the anchoring rationale -- "don't rewrite history" -- only
+//     holds for work that has actually begun on the calendar: an
+//     "in_progress" task whose scheduled start is still weeks away is being
+//     worked on NOW, so its future-dated slot is exactly the slack this
+//     function exists to remove; it gets pulled (and today-clamped) like a
+//     todo. An in_progress task with dates but start <= today, or with no
+//     dates at all, stays frozen as before.
 //   * Undated -- exactly shiftTask's own null-stopper (see its cascade loop
 //     comment): an undated task can't be moved (no dates to move) and can't
 //     usefully constrain a successor either (there is nothing to compare
@@ -355,10 +381,14 @@ export async function shiftTask(
 //   1. The project's own startDate, if set -- the plan's explicit
 //      beginning always wins.
 //   2. Otherwise, the earliest startDate among the project's dated
-//      non-movable (done/in_progress) tasks -- "reality" anchors: work
-//      that has actually started or finished is the truest baseline a plan
-//      has, so a still-open task with nothing constraining it settles
-//      against where real work began.
+//      non-movable tasks (done, or in_progress with start <= today -- the
+//      same frozen set the MOVABLE definition above carves out) --
+//      "reality" anchors: work that has actually started or finished is
+//      the truest baseline a plan has, so a still-open task with nothing
+//      constraining it settles against where real work began. A
+//      future-start in_progress task is movable (v0.4.4) and so
+//      deliberately does NOT anchor the floor -- its future slot is slack,
+//      not reality.
 //   3. Otherwise (a project of pure todo/blocked, nothing has started yet),
 //      the earliest startDate among ALL the project's dated tasks,
 //      pre-compaction -- a plan with no external anchor at all keeps its
@@ -370,6 +400,36 @@ export async function shiftTask(
 // TARGET, not a constraint, and this function never pushes a task right
 // just to reach one. done/in_progress tasks are, as ever, never subject to
 // any of this -- frozen is frozen, floor or no floor.
+//
+// TODAY CLAMP (Fix 2, hotfix v0.4.3) -- neither the floor above nor a
+// predecessor's due date is allowed to pull (or leave) a movable task's
+// START before today, `todayDateOnly()` (see that function's own comment on
+// why "today" is measured server-side, date-only). Concretely: wherever this
+// function would otherwise settle a movable task's start at some
+// `constraintOrFloorStart` (a predecessor's max due date, or the floor),
+// the actual target is `max(constraintOrFloorStart, todayIso)` instead --
+// string comparison is exact here since both sides are YYYY-MM-DD. This
+// applies uniformly to both settling paths below: the predecessor-due path
+// (even when the predecessor's due date is itself in the past -- e.g. a
+// done task that finished last month) and the no-dated-predecessor floor
+// path (even when the floor itself, project startDate or otherwise, is in
+// the past). It does NOT apply to a no-dated-predecessor task that already
+// starts before the (possibly today-clamped) floor and is therefore left
+// alone by the pull-only rule above -- that task isn't being pulled
+// anywhere by this sweep, so there is nothing for the clamp to clamp; its
+// past start is whatever a prior manual drag put there, and manual drags
+// into the past remain allowed (only compactSchedule itself refuses to
+// produce one).
+//
+// Subtlety worth confirming explicitly: a task clamped to today still
+// constrains its OWN successors by its clamped (not its original,
+// pre-clamp) due date -- this falls out for free from the existing
+// topological-pass design with no extra plumbing, because `settledDue` is
+// set to the task's FINAL post-clamp due date the same way it's always set
+// to a task's final post-settle due date, and every successor reads its
+// predecessors' due dates back out of `settledDue`, never off the original
+// `taskById` rows. A successor processed after a today-clamped predecessor
+// therefore sees exactly the clamped value, with no special-casing needed.
 export async function compactSchedule(db: Database, actorId: string, projectId: string): Promise<ShiftResult> {
   const { result, assigneeIds } = await db.transaction(async (tx) => {
     // Same lock, same key shiftTask/addDependency already use for this
@@ -393,6 +453,19 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
     const taskIds = projectTasks.map((t) => t.id);
     const taskById = new Map(projectTasks.map((t) => [t.id, t] as const));
 
+    // Fix 2 (hotfix v0.4.3) -- server-authoritative "today", computed once,
+    // before the topological loop moves anything, exactly like `floor`
+    // below (which now also reads it, so it comes first). See this
+    // function's TODAY CLAMP doc comment for the full rationale; see
+    // todayDateOnly() itself for why "today" is measured this way.
+    const todayIso = todayDateOnly();
+
+    // The v0.4.4 movable/frozen split, shared by the floor's "reality
+    // anchor" filter below and the per-task movable check in the loop --
+    // see the MOVABLE section of this function's doc comment.
+    const isFrozen = (t: typeof projectTasks[number]): boolean =>
+      t.status === "done" || (t.status === "in_progress" && (t.startDate === null || t.startDate <= todayIso));
+
     // Fix 1's floor -- see this function's doc comment for the full
     // priority-order rationale. Computed here, ONCE, from projectTasks as
     // read above (pre-compaction, before the topological loop below moves
@@ -400,7 +473,7 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
     let floor: string | null = project.startDate;
     if (floor === null) {
       const datedNonMovable = projectTasks.filter((t) =>
-        t.startDate !== null && t.dueDate !== null && (t.status === "done" || t.status === "in_progress"));
+        t.startDate !== null && t.dueDate !== null && isFrozen(t));
       const datedAny = projectTasks.filter((t) => t.startDate !== null && t.dueDate !== null);
       for (const t of (datedNonMovable.length > 0 ? datedNonMovable : datedAny)) {
         if (floor === null || t.startDate! < floor) floor = t.startDate!;
@@ -464,7 +537,7 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
       processed++;
       const row = taskById.get(id)!;
 
-      const movable = row.startDate !== null && row.dueDate !== null && (row.status === "todo" || row.status === "blocked");
+      const movable = row.startDate !== null && row.dueDate !== null && !isFrozen(row);
       if (movable) {
         // Undated predecessors contribute nothing (see this function's doc
         // comment) -- filtered out here, not treated as an always-satisfied
@@ -474,9 +547,15 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
           .filter((d): d is string => d !== null);
         if (predDueDates.length > 0) {
           const maxDue = predDueDates.reduce((a, b) => (a > b ? a : b));
-          if (maxDue !== row.startDate) {
+          // Fix 2 (hotfix v0.4.3): the target is never earlier than today,
+          // even when the predecessor's max due date itself is in the past
+          // (e.g. a done/in_progress predecessor that finished before
+          // today) -- see the TODAY CLAMP doc comment above. String compare
+          // is exact for YYYY-MM-DD.
+          const target = maxDue < todayIso ? todayIso : maxDue;
+          if (target !== row.startDate) {
             const duration = diffDays(row.dueDate!, row.startDate!);
-            const newStart = maxDue;
+            const newStart = target;
             const newDue = addDays(newStart, duration);
             settledDue.set(id, newDue);
             moved.set(id, {
@@ -484,20 +563,31 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
               toStart: newStart, toDue: newDue, cascadedFrom: null, row,
             });
           }
-        } else if (floor !== null && floor < row.startDate!) {
+        } else if (floor !== null) {
           // Fix 1: no DATED predecessor to settle against -- pull to the
-          // floor instead of staying anchored. Pull-only (see this
-          // function's doc comment): only fires when the floor is strictly
-          // EARLIER than this task's current start; a task already sitting
-          // before the floor is left alone, never pushed right to reach it.
-          const duration = diffDays(row.dueDate!, row.startDate!);
-          const newStart = floor;
-          const newDue = addDays(newStart, duration);
-          settledDue.set(id, newDue);
-          moved.set(id, {
-            id, fromStart: row.startDate, fromDue: row.dueDate,
-            toStart: newStart, toDue: newDue, cascadedFrom: null, row,
-          });
+          // floor instead of staying anchored. Fix 2 (hotfix v0.4.3): the
+          // floor itself is first clamped up to today (never down), so a
+          // floor sitting in the past -- an old project startDate, or the
+          // earliest dated task's start -- pulls a task no further left
+          // than today. Pull-only (see this function's doc comment): the
+          // move still only fires when this (possibly today-clamped) floor
+          // is strictly EARLIER than the task's current start; a task
+          // already sitting before it -- floor, today-clamped or not -- is
+          // left alone, never pushed right to reach it. That "already
+          // early" case is exactly the one the clamp does NOT reach: this
+          // sweep isn't pulling that task anywhere, so there is nothing to
+          // clamp (see the doc comment above).
+          const effectiveFloor = floor < todayIso ? todayIso : floor;
+          if (effectiveFloor < row.startDate!) {
+            const duration = diffDays(row.dueDate!, row.startDate!);
+            const newStart = effectiveFloor;
+            const newDue = addDays(newStart, duration);
+            settledDue.set(id, newDue);
+            moved.set(id, {
+              id, fromStart: row.startDate, fromDue: row.dueDate,
+              toStart: newStart, toDue: newDue, cascadedFrom: null, row,
+            });
+          }
         }
       }
 
