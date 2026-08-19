@@ -259,9 +259,8 @@ export const projectSchema = z.object({
 });
 export type Project = z.infer<typeof projectSchema>;
 
-// status is deliberately absent here (defaults 'active' at creation, same as
-// deals always opening "open") -- no immovable fields to strip for update, so
-// updateProjectInputSchema is a plain .partial() with nothing omitted.
+// status is deliberately absent here: a project always starts 'active' (same
+// as a deal always opening "open"), so create has no use for it.
 export const createProjectInputSchema = z.object({
   name: z.string().min(1),
   companyId: z.uuid().nullable().optional(), dealId: z.uuid().nullable().optional(),
@@ -270,7 +269,15 @@ export const createProjectInputSchema = z.object({
   color: hexColorSchema.nullable().optional(),
 });
 export type CreateProjectInput = z.infer<typeof createProjectInputSchema>;
-export const updateProjectInputSchema = createProjectInputSchema.partial();
+
+// Unlike a deal's status (a state machine gated behind winDeal/loseDeal/
+// reopenDeal), a project's status is freely settable through the generic
+// update path -- there is no transition matrix, so it is added here rather
+// than left out of a plain .partial() the way create's schema leaves every
+// other field. See services/projects.ts's updateProject for why completing a
+// project deliberately does not cascade to its tasks.
+export const updateProjectInputSchema = createProjectInputSchema.partial()
+  .extend({ status: projectStatusSchema.optional() });
 export type UpdateProjectInput = z.infer<typeof updateProjectInputSchema>;
 
 export const taskTypeSchema = z.enum(["task", "call", "meeting", "email", "deadline"]);

@@ -425,8 +425,25 @@ describe("createProjectInputSchema / updateProjectInputSchema", () => {
   it("rejects a malformed color on create", () =>
     expect(() => createProjectInputSchema.parse({ name: "Q4 rollout", color: "not-a-color" })).toThrow());
 
+  // status is absent from createProjectInputSchema's own shape (a project
+  // always starts "active"); zod strips unknown keys from a non-strict
+  // object, so a caller sending one on create just has it silently dropped
+  // rather than rejected.
+  it("strips a status key sent on create", () => {
+    const input = { name: "Q4 rollout", status: "completed" };
+    expect(createProjectInputSchema.parse(input)).toEqual({ name: "Q4 rollout" });
+  });
+
   it("accepts a fully-empty partial update", () =>
     expect(updateProjectInputSchema.parse({})).toEqual({}));
+
+  it("update accepts a freely-settable status, unlike a deal's gated status", () => {
+    const input = { status: "completed" as const };
+    expect(updateProjectInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects an invalid status value on update", () =>
+    expect(() => updateProjectInputSchema.parse({ status: "archived" })).toThrow());
 
   it("rejects a malformed color on update", () =>
     expect(() => updateProjectInputSchema.parse({ color: "red" })).toThrow());
