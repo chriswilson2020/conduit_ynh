@@ -11,7 +11,15 @@ import type { Database } from "./db/client.js";
 import * as schema from "./db/schema.js";
 
 const handle = openTestDatabase();
+// The directory that CONTAINS the web root. It holds a file the server must never
+// serve, which is what the traversal cases below aim at: escaping webRoot by a
+// single segment is enough to reach it, so those tests fail on a real containment
+// break rather than passing because the request 404'd for an unrelated reason.
+let sandbox: string;
 let webRoot: string;
+
+// Distinctive enough that it cannot turn up in a legitimate response by accident.
+const SECRET_CONTENTS = "conduit-outside-webroot-sentinel";
 
 const baseConfig: Config = {
   nodeEnv: "test",
@@ -37,7 +45,10 @@ function brokenDatabase(): Database {
 }
 
 beforeAll(async () => {
-  webRoot = await mkdtemp(path.join(tmpdir(), "conduit-web-"));
+  sandbox = await mkdtemp(path.join(tmpdir(), "conduit-web-"));
+  await writeFile(path.join(sandbox, "secret.txt"), SECRET_CONTENTS);
+  webRoot = path.join(sandbox, "web");
+  await mkdir(webRoot);
   await writeFile(
     path.join(webRoot, "index.html"),
     '<!doctype html><html><head><base href="__BASE_HREF__" /><script>window.__CONDUIT_BASE__="__BASE_PATH__";</script></head><body><div id="root"></div></body></html>',
@@ -47,7 +58,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await rm(webRoot, { recursive: true, force: true });
+  await rm(sandbox, { recursive: true, force: true });
   await handle.close();
 });
 
@@ -161,7 +172,11 @@ describe("SPA serving", () => {
     const response = await app.inject({ method: "GET", url: "/index.html" });
 
     expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).toBe("no-cache");
     expect(response.headers["cache-control"]).not.toContain("immutable");
+    // Proof it came from the not-found handler rather than from the static
+    // plugin: only that handler substitutes the placeholders.
+    expect(response.body).not.toContain("__BASE_HREF__");
     await app.close();
   });
 
@@ -179,6 +194,61 @@ describe("SPA serving", () => {
     const response = await app.inject({ method: "GET", url: "/deals/123" });
 
     expect(response.statusCode).toBe(404);
+    await app.close();
+  });
+});
+
+// Every path here resolves, after normalisation, to something outside webRoot --
+// either the sentinel one directory up or /etc/passwd. They mimic the shapes in
+// @fastify/static's own advisories: leading and non-leading "..", percent-encoded
+// dot segments, and percent-encoded separators (GHSA-83w8-p2f5-377r,
+// GHSA-x428-ghpx-8j92, GHSA-8pvw-jcv7-9cmj).
+const TRAVERSAL_URLS = [
+  "/../secret.txt",
+  "/./../secret.txt",
+  "//../secret.txt",
+  "/assets/../../secret.txt",
+  "/%2e%2e%2fsecret.txt",
+  "/%2E%2E%2Fsecret.txt",
+  "/assets%2f..%2f..%2fsecret.txt",
+  "/%2e%2e%2f%2e%2e%2fetc/passwd",
+  "/../../../../etc/passwd",
+];
+
+// registerSpa passes wildcard:false, so the plugin enumerates the files under
+// webRoot at boot and registers one exact route per file rather than a catch-all.
+// A traversal path therefore matches no route and falls through to the SPA
+// not-found handler. These cases pin that outcome down so a later change -- the
+// wildcard flag going back to its default, a prefix being added, or a plugin
+// upgrade that resolves paths differently -- cannot start serving files from
+// outside webRoot without failing here.
+describe("SPA static serving stays inside the web root", () => {
+  for (const url of TRAVERSAL_URLS) {
+    it(`serves nothing from outside the web root for ${url}`, async () => {
+      const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+      const response = await app.inject({ method: "GET", url });
+
+      expect(response.body).not.toContain(SECRET_CONTENTS);
+      expect(response.body).not.toContain("root:x:0:0");
+      // Either nothing matched (404) or the request fell through to the SPA
+      // shell (200). Any other status means a file was resolved and sent.
+      expect([200, 404]).toContain(response.statusCode);
+      if (response.statusCode === 200) {
+        expect(response.headers["content-type"]).toContain("text/html");
+        expect(response.body).toContain('<div id="root">');
+      }
+      await app.close();
+    });
+  }
+
+  // Control for the cases above: the sentinel is not served under its own plain
+  // name either, which is what makes finding SECRET_CONTENTS in a response proof
+  // of an escape rather than of an unrelated fixture leak.
+  it("does not serve the sibling file next to the web root by its own name", async () => {
+    const app = await buildApp({ config: baseConfig, db: handle.db, webRoot });
+    const response = await app.inject({ method: "GET", url: "/secret.txt" });
+
+    expect(response.body).not.toContain(SECRET_CONTENTS);
     await app.close();
   });
 });
