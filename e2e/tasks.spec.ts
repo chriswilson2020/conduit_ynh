@@ -55,6 +55,26 @@ test.describe.serial("Tasks/Gantt journey", () => {
     return (testid as string).replace("card-", "");
   }
 
+  // dnd-kit's own keyboard sensor (task-board.tsx reuses the exact same
+  // machinery as pipeline.spec.ts's board -- see kanban-core.tsx) attaches
+  // the listener that catches everything AFTER the lift via a bare
+  // setTimeout queued while handling the lift itself (see playwright.
+  // config.ts's own doc comment on this). A same-tick Space-then-Arrow can
+  // outrun that setTimeout under CI's shared, variable-load CPU, so this
+  // waits one tick after the lift before sending the first Arrow --
+  // pipeline.spec.ts's single-arrow drags get away without it most of the
+  // time, but this file adds more keyboard-drag steps to the same shared
+  // worker (plus the Gantt nudge test's own rapid keypresses), which upped
+  // how often CI actually lost the race; workers:1/retries:2 alone weren't
+  // enough headroom for it here.
+  async function keyboardDragCard(card: Locator, arrowKeys: string[]) {
+    await card.focus();
+    await page.keyboard.press("Space");
+    await page.waitForTimeout(50);
+    for (const key of arrowKeys) await page.keyboard.press(key);
+    await page.keyboard.press("Space");
+  }
+
   // Opens the drawer via a card click (task-board.tsx's openTask, a ?task=
   // replace-navigation) and waits for the drawer body to actually resolve
   // this task (its title heading matches) before returning.
@@ -124,10 +144,7 @@ test.describe.serial("Tasks/Gantt journey", () => {
     const inProgress = boardColumn("in_progress");
     const designCard = todo.getByTestId(`card-${designId}`);
 
-    await designCard.focus();
-    await page.keyboard.press("Space");
-    await page.keyboard.press("ArrowRight");
-    await page.keyboard.press("Space");
+    await keyboardDragCard(designCard, ["ArrowRight"]);
 
     await expect(inProgress.getByTestId(`card-${designId}`)).toBeVisible();
     await expect(todo.getByTestId(`card-${designId}`)).not.toBeVisible();
@@ -228,12 +245,7 @@ test.describe.serial("Tasks/Gantt journey", () => {
     const done = boardColumn("done");
     const buildCard = todo.getByTestId(`card-${buildId}`);
 
-    await buildCard.focus();
-    await page.keyboard.press("Space");
-    await page.keyboard.press("ArrowRight");
-    await page.keyboard.press("ArrowRight");
-    await page.keyboard.press("ArrowRight");
-    await page.keyboard.press("Space");
+    await keyboardDragCard(buildCard, ["ArrowRight", "ArrowRight", "ArrowRight"]);
 
     await expect(done.getByTestId(`card-${buildId}`)).toBeVisible();
     await expect(todo.getByTestId(`card-${buildId}`)).not.toBeVisible();
