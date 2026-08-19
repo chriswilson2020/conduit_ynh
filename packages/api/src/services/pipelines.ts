@@ -53,15 +53,16 @@ async function assertCompanyExists(db: Database, companyId: string): Promise<voi
 // Same existence-only, archived-is-valid reasoning as assertCompanyExists
 // above, applied to Phase 3's project scope -- a project, like a company, is
 // archive-only, never hard-deleted, so this read is safe outside the
-// transaction for the same monotonic-existence reason. Returns the project's
-// companyId (possibly null) so createPipeline can dual-stamp its event on the
-// project's own parent company, mirroring maybeEmitPipelineEvent's handling
-// of project-scoped mutations further down.
-async function assertProjectExists(db: Database, projectId: string): Promise<string | null> {
-  const [row] = await db.select({ id: projects.id, companyId: projects.companyId })
-    .from(projects).where(eq(projects.id, projectId));
+// transaction for the same monotonic-existence reason. This is a pre-check
+// only: it does not resolve the project's companyId for event dual-stamping.
+// That resolution deliberately lives inside the transaction, in
+// maybeEmitPipelineEvent further down, so it stays consistent under
+// concurrent reparenting (a project's companyId changing between this
+// pre-check and the transaction's commit) rather than trusting a value read
+// here and carried in.
+async function assertProjectExists(db: Database, projectId: string): Promise<void> {
+  const [row] = await db.select({ id: projects.id }).from(projects).where(eq(projects.id, projectId));
   if (row === undefined) throw new NotFoundError("project", projectId);
-  return row.companyId;
 }
 
 async function mustGetPipeline(db: Database, id: string): Promise<PipelineRow> {
