@@ -1,7 +1,7 @@
 import { and, eq, ilike, isNull, or, sql } from "drizzle-orm";
 import type { SearchResults } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { companies, contacts, notes, deals } from "../db/schema.js";
+import { companies, contacts, notes, deals, tasks } from "../db/schema.js";
 import { escapeLike } from "./pagination.js";
 
 const LIMIT_PER_TYPE = 8;
@@ -26,7 +26,7 @@ function snippet(body: string, q: string): string {
 
 export async function search(db: Database, q: string): Promise<SearchResults> {
   const p = `%${escapeLike(q)}%`;
-  const [companyRows, contactRows, noteRows, dealRows] = await Promise.all([
+  const [companyRows, contactRows, noteRows, dealRows, taskRows] = await Promise.all([
     db.select({ id: companies.id, name: companies.name }).from(companies)
       .where(and(isNull(companies.archivedAt), ilike(companies.name, p))).limit(LIMIT_PER_TYPE),
     db.select({
@@ -63,17 +63,20 @@ export async function search(db: Database, q: string): Promise<SearchResults> {
     // from search, the same rule every other group in this file follows.
     db.select({ id: deals.id, title: deals.title }).from(deals)
       .where(and(isNull(deals.archivedAt), ilike(deals.title, p))).limit(LIMIT_PER_TYPE),
+    // archivedAt excluded like every other group, but status is deliberately
+    // NOT filtered here either: a `done` task must stay findable by title --
+    // finding a piece of finished work by name (checking what was delivered,
+    // reopening it) is exactly as useful as finding a closed deal by title
+    // above, and for the same reason only archiving (an explicit, separate
+    // lifecycle action) hides a task from search.
+    db.select({ id: tasks.id, title: tasks.title, projectId: tasks.projectId }).from(tasks)
+      .where(and(isNull(tasks.archivedAt), ilike(tasks.title, p))).limit(LIMIT_PER_TYPE),
   ]);
   return {
     companies: companyRows,
     contacts: contactRows,
     notes: noteRows.map((n) => ({ id: n.id, companyId: n.companyId, contactId: n.contactId, snippet: snippet(n.body, q) })),
     deals: dealRows,
-    // Stubbed empty pending the tasks table existing as a queryable service
-    // (Phase 3 plan Task 6 wires the real title-ILIKE query here, archived
-    // excluded, done included). The shared schema already requires this group
-    // so the response shape is final now -- mirrors this file's own deals stub
-    // from Phase 2's P2.1.
-    tasks: [],
+    tasks: taskRows,
   };
 }

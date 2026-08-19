@@ -7,6 +7,8 @@ import { createContact, archiveContact } from "./contacts.js";
 import { createNote } from "./notes.js";
 import { createPipeline, createStage } from "./pipelines.js";
 import { createDeal, archiveDeal, winDeal } from "./deals.js";
+import { createTask, archiveTask, setTaskStatus } from "./tasks.js";
+import { createProject } from "./projects.js";
 import { search } from "./search.js";
 
 const handle = openTestDatabase();
@@ -145,6 +147,36 @@ describe("search service", () => {
     const found = result.notes.find((n) => n.id === note.id);
     expect(found).toBeDefined();
     expect(lonePairPattern.test(found?.snippet ?? "")).toBe(false);
+  });
+
+  it("finds a task by a title fragment", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Launch" });
+    const task = await createTask(handle.db, actorId, { title: "Zylexo onboarding call", projectId: project.id });
+
+    const result = await search(handle.db, "Zylexo");
+    expect(result.tasks.map((t) => t.id)).toContain(task.id);
+    const found = result.tasks.find((t) => t.id === task.id);
+    expect(found?.title).toBe("Zylexo onboarding call");
+    expect(found?.projectId).toBe(project.id);
+  });
+
+  // Unlike a deal's status, a done task's title must stay findable too --
+  // finding a piece of finished work by name is exactly as useful as finding
+  // a won deal above, and for the same reason.
+  it("still finds a DONE task by title -- completion is not archiving", async () => {
+    const task = await createTask(handle.db, actorId, { title: "Wexfordbay migration" });
+    await setTaskStatus(handle.db, actorId, task.id, "done");
+
+    const result = await search(handle.db, "Wexfordbay");
+    expect(result.tasks.map((t) => t.id)).toContain(task.id);
+  });
+
+  it("excludes an archived task from the tasks group", async () => {
+    const task = await createTask(handle.db, actorId, { title: "Vortixel cleanup" });
+    await archiveTask(handle.db, actorId, task.id);
+
+    const result = await search(handle.db, "Vortixel");
+    expect(result.tasks.map((t) => t.id)).not.toContain(task.id);
   });
 
   it("excludes a note whose parent contact is archived", async () => {

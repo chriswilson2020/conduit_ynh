@@ -7,6 +7,7 @@ import {
   companySchema, contactSchema, noteSchema, fileMetaSchema, eventSchema,
   errorResponseSchema, listResponseSchema, searchResultsSchema,
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
+  projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
@@ -539,6 +540,20 @@ async function makeDeal(
   });
   return dealSchema.parse(response.json());
 }
+/** POST /api/projects and return the parsed body. */
+async function makeProject(a: Awaited<ReturnType<typeof app>>, extra: Record<string, unknown> = {}) {
+  const response = await a.inject({
+    method: "POST", url: "/api/projects", headers: authHeaders, payload: { name: "Launch", ...extra },
+  });
+  return projectSchema.parse(response.json());
+}
+/** POST /api/tasks and return the parsed body. */
+async function makeTask(a: Awaited<ReturnType<typeof app>>, extra: Record<string, unknown> = {}) {
+  const response = await a.inject({
+    method: "POST", url: "/api/tasks", headers: authHeaders, payload: { title: "Do the thing", ...extra },
+  });
+  return taskSchema.parse(response.json());
+}
 
 describe("pipelines routes", () => {
   it("runs the pipeline CRUD happy path: create, composite get, patch, archive, unarchive", async () => {
@@ -833,6 +848,334 @@ describe("deals routes", () => {
   });
 });
 
+describe("projects routes", () => {
+  it("runs the project CRUD happy path: create, get, patch, archive, unarchive", async () => {
+    const a = await app();
+    const project = await makeProject(a, { name: "Q4 rollout" });
+    expect(project.status).toBe("active");
+
+    const got = await a.inject({ method: "GET", url: `/api/projects/${project.id}`, headers: authHeaders });
+    expect(got.statusCode).toBe(200);
+    expect(projectSchema.parse(got.json()).id).toBe(project.id);
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/projects/${project.id}`, headers: authHeaders, payload: { name: "Renamed" },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(projectSchema.parse(patched.json()).name).toBe("Renamed");
+
+    const archived = await a.inject({ method: "POST", url: `/api/projects/${project.id}/archive`, headers: authHeaders });
+    expect(archived.statusCode).toBe(200);
+    expect(projectSchema.parse(archived.json()).archivedAt).not.toBeNull();
+
+    const unarchived = await a.inject({ method: "POST", url: `/api/projects/${project.id}/unarchive`, headers: authHeaders });
+    expect(unarchived.statusCode).toBe(200);
+    expect(projectSchema.parse(unarchived.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  it("returns 404 for an unknown project id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: "/api/projects/3f2504e0-4f89-41d3-9a0c-0305e82c3301", headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  it("returns 409 patching an archived project", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    await a.inject({ method: "POST", url: `/api/projects/${project.id}/archive`, headers: authHeaders });
+
+    const response = await a.inject({
+      method: "PATCH", url: `/api/projects/${project.id}`, headers: authHeaders, payload: { name: "New" },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("archived");
+    await a.close();
+  });
+
+  it("lists projects filtered by company_id, status, and archived", async () => {
+    const a = await app();
+    const company = await a.inject({ method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" } });
+    const companyId = company.json().id as string;
+    const owned = await makeProject(a, { name: "Owned", companyId });
+    await makeProject(a, { name: "Standalone" });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/projects?company_id=${companyId}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = z.array(projectSchema).parse(response.json());
+    expect(body.map((p) => p.id)).toEqual([owned.id]);
+    await a.close();
+  });
+
+  it("returns both forms of the gantt payload shaped by the schema", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    await makeTask(a, { projectId: project.id, startDate: "2026-02-01", dueDate: "2026-02-05" });
+
+    const perProject = await a.inject({
+      method: "GET", url: `/api/projects/${project.id}/gantt`, headers: authHeaders,
+    });
+    expect(perProject.statusCode).toBe(200);
+    const perProjectBody = ganttPayloadSchema.parse(perProject.json());
+    expect(perProjectBody.tasks).toHaveLength(1);
+    expect(perProjectBody.tasks[0]?.projectId).toBe(project.id);
+
+    const global = await a.inject({ method: "GET", url: "/api/gantt", headers: authHeaders });
+    expect(global.statusCode).toBe(200);
+    const globalBody = ganttPayloadSchema.parse(global.json());
+    expect(globalBody.tasks.map((t) => t.id)).toContain(perProjectBody.tasks[0]?.id);
+    await a.close();
+  });
+
+  it("returns 404 for the gantt of an unknown project id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: "/api/projects/3f2504e0-4f89-41d3-9a0c-0305e82c3301/gantt", headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+});
+
+describe("tasks routes", () => {
+  it("runs the task CRUD happy path: create, get, patch, archive, unarchive", async () => {
+    const a = await app();
+    const task = await makeTask(a, { title: "Write the spec" });
+    expect(task.status).toBe("todo");
+
+    const got = await a.inject({ method: "GET", url: `/api/tasks/${task.id}`, headers: authHeaders });
+    expect(got.statusCode).toBe(200);
+    expect(taskSchema.parse(got.json()).id).toBe(task.id);
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/tasks/${task.id}`, headers: authHeaders, payload: { title: "Renamed" },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(taskSchema.parse(patched.json()).title).toBe("Renamed");
+
+    const archived = await a.inject({ method: "POST", url: `/api/tasks/${task.id}/archive`, headers: authHeaders });
+    expect(archived.statusCode).toBe(200);
+    expect(taskSchema.parse(archived.json()).archivedAt).not.toBeNull();
+
+    const unarchived = await a.inject({ method: "POST", url: `/api/tasks/${task.id}/unarchive`, headers: authHeaders });
+    expect(unarchived.statusCode).toBe(200);
+    expect(taskSchema.parse(unarchived.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  it("returns 404 for an unknown task id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: "/api/tasks/3f2504e0-4f89-41d3-9a0c-0305e82c3301", headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  it("returns 409 patching an archived task", async () => {
+    const a = await app();
+    const task = await makeTask(a);
+    await a.inject({ method: "POST", url: `/api/tasks/${task.id}/archive`, headers: authHeaders });
+
+    const response = await a.inject({
+      method: "PATCH", url: `/api/tasks/${task.id}`, headers: authHeaders, payload: { title: "New" },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("archived");
+    await a.close();
+  });
+
+  it("lists tasks filtered by project_id, standalone, assignee_id, status, dated, and archived", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const inProject = await makeTask(a, { title: "In project", projectId: project.id });
+    const standalone = await makeTask(a, { title: "Standalone" });
+
+    const byProject = await a.inject({
+      method: "GET", url: `/api/tasks?project_id=${project.id}`, headers: authHeaders,
+    });
+    expect(z.array(taskSchema).parse(byProject.json()).map((t) => t.id)).toEqual([inProject.id]);
+
+    const byStandalone = await a.inject({
+      method: "GET", url: "/api/tasks?standalone=true", headers: authHeaders,
+    });
+    expect(z.array(taskSchema).parse(byStandalone.json()).map((t) => t.id)).toContain(standalone.id);
+    await a.close();
+  });
+
+  it("sets a task's status, stamping completed_at", async () => {
+    const a = await app();
+    const task = await makeTask(a);
+
+    const response = await a.inject({
+      method: "POST", url: `/api/tasks/${task.id}/status`, headers: authHeaders, payload: { status: "done" },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = taskSchema.parse(response.json());
+    expect(body.status).toBe("done");
+    expect(body.completedAt).not.toBeNull();
+    await a.close();
+  });
+
+  it("returns 400 for an invalid status value", async () => {
+    const a = await app();
+    const task = await makeTask(a);
+    const response = await a.inject({
+      method: "POST", url: `/api/tasks/${task.id}/status`, headers: authHeaders, payload: { status: "bogus" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  it("moves a task on the board into another status column", async () => {
+    const a = await app();
+    const task = await makeTask(a);
+    const response = await a.inject({
+      method: "POST", url: `/api/tasks/${task.id}/board-move`, headers: authHeaders,
+      payload: { status: "in_progress" },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(taskSchema.parse(response.json()).status).toBe("in_progress");
+    await a.close();
+  });
+
+  it("returns 409 board-moving next to a neighbour in a different column", async () => {
+    const a = await app();
+    const taskA = await makeTask(a, { title: "A" });
+    const taskB = await makeTask(a, { title: "B" });
+    // taskB stays in todo; ask to move taskA into in_progress but name taskB
+    // (still in todo) as a same-column neighbour -- a stale/mismatched pair.
+    const response = await a.inject({
+      method: "POST", url: `/api/tasks/${taskA.id}/board-move`, headers: authHeaders,
+      payload: { status: "in_progress", beforeTaskId: taskB.id },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  it("adds a dependency, 201, and rejects a cycle with 409", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const taskA = await makeTask(a, { title: "A", projectId: project.id });
+    const taskB = await makeTask(a, { title: "B", projectId: project.id });
+
+    const added = await a.inject({
+      method: "POST", url: `/api/tasks/${taskB.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskA.id },
+    });
+    expect(added.statusCode).toBe(201);
+    const dep = taskDependencySchema.parse(added.json());
+    expect(dep.predecessorId).toBe(taskA.id);
+    expect(dep.successorId).toBe(taskB.id);
+
+    // B already depends on A; adding A->B's reverse (B->A) would close a cycle.
+    const cyclic = await a.inject({
+      method: "POST", url: `/api/tasks/${taskA.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskB.id },
+    });
+    expect(cyclic.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(cyclic.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  it("removes a dependency, and removing it again is an idempotent 204", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const taskA = await makeTask(a, { title: "A", projectId: project.id });
+    const taskB = await makeTask(a, { title: "B", projectId: project.id });
+    await a.inject({
+      method: "POST", url: `/api/tasks/${taskB.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskA.id },
+    });
+
+    const first = await a.inject({
+      method: "DELETE", url: `/api/tasks/${taskB.id}/dependencies/${taskA.id}`, headers: authHeaders,
+    });
+    expect(first.statusCode).toBe(204);
+
+    const second = await a.inject({
+      method: "DELETE", url: `/api/tasks/${taskB.id}/dependencies/${taskA.id}`, headers: authHeaders,
+    });
+    expect(second.statusCode).toBe(204);
+    await a.close();
+  });
+
+  // The centrepiece: build a two-hop dependency chain via the API, shift the
+  // head task's dates far enough right to violate both downstream tasks, and
+  // assert the response's moved array (schema-parsed) shows the cascade.
+  it("shift cascades through a dependency chain and returns every moved task", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const taskA = await makeTask(a, {
+      title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05",
+    });
+    const taskB = await makeTask(a, {
+      title: "B", projectId: project.id, startDate: "2026-01-06", dueDate: "2026-01-10",
+    });
+    const taskC = await makeTask(a, {
+      title: "C", projectId: project.id, startDate: "2026-01-11", dueDate: "2026-01-15",
+    });
+    await a.inject({
+      method: "POST", url: `/api/tasks/${taskB.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskA.id },
+    });
+    await a.inject({
+      method: "POST", url: `/api/tasks/${taskC.id}/dependencies`, headers: authHeaders,
+      payload: { predecessorId: taskB.id },
+    });
+
+    const response = await a.inject({
+      method: "POST", url: `/api/tasks/${taskA.id}/shift`, headers: authHeaders,
+      payload: { startDate: "2026-01-10", dueDate: "2026-01-14" },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = shiftResultSchema.parse(response.json());
+    expect(body.moved.length).toBeGreaterThan(1);
+    expect(body.moved.map((m) => m.id)).toEqual(expect.arrayContaining([taskA.id, taskB.id, taskC.id]));
+    const movedA = body.moved.find((m) => m.id === taskA.id);
+    expect(movedA?.cascadedFrom).toBeNull();
+    const movedC = body.moved.find((m) => m.id === taskC.id);
+    expect(movedC?.cascadedFrom).toBe(taskA.id);
+    await a.close();
+  });
+
+  it("returns 409 shifting an archived task", async () => {
+    const a = await app();
+    const task = await makeTask(a, { startDate: "2026-01-01", dueDate: "2026-01-05" });
+    await a.inject({ method: "POST", url: `/api/tasks/${task.id}/archive`, headers: authHeaders });
+
+    const response = await a.inject({
+      method: "POST", url: `/api/tasks/${task.id}/shift`, headers: authHeaders,
+      payload: { startDate: "2026-01-10", dueDate: "2026-01-14" },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("archived");
+    await a.close();
+  });
+
+  it("returns 400 shifting with dueDate before startDate", async () => {
+    const a = await app();
+    const task = await makeTask(a);
+    const response = await a.inject({
+      method: "POST", url: `/api/tasks/${task.id}/shift`, headers: authHeaders,
+      payload: { startDate: "2026-01-10", dueDate: "2026-01-05" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+});
+
 describe("search route", () => {
   it("returns grouped results that parse against the shared schema", async () => {
     const a = await app();
@@ -865,6 +1208,18 @@ describe("search route", () => {
     expect(response.statusCode).toBe(200);
     const body = searchResultsSchema.parse(response.json());
     expect(body.deals.map((d) => d.id)).toContain(deal.id);
+    await a.close();
+  });
+
+  it("returns a tasks group that still contains a DONE task by title", async () => {
+    const a = await app();
+    const task = await makeTask(a, { title: "Wexfordbay handover" });
+    await a.inject({ method: "POST", url: `/api/tasks/${task.id}/status`, headers: authHeaders, payload: { status: "done" } });
+
+    const response = await a.inject({ method: "GET", url: "/api/search?q=Wexfordbay", headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = searchResultsSchema.parse(response.json());
+    expect(body.tasks.map((t) => t.id)).toContain(task.id);
     await a.close();
   });
 });

@@ -11,6 +11,9 @@ import { registerSearchRoutes } from "./search.js";
 import { registerStreamRoutes } from "./stream.js";
 import { registerPipelineRoutes } from "./pipelines.js";
 import { registerDealRoutes } from "./deals.js";
+import { registerProjectRoutes } from "./projects.js";
+import { registerTaskRoutes } from "./tasks.js";
+import { registerGanttRoutes } from "./gantt.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -27,8 +30,10 @@ export interface CrmRouteDeps {
 }
 
 /**
- * Wires the six hardened CRM services (plus the plain user listing) into HTTP.
- * Registered after /api/health and /api/me and before the not-found/SPA branch,
+ * Wires the hardened CRM/PM services (plus the plain user listing) into HTTP:
+ * companies, contacts, notes, files, events, search, pipelines/deals (Phase
+ * 2), and projects/tasks/gantt (Phase 3). Registered after /api/health and
+ * /api/me and before the not-found/SPA branch,
  * so it inherits the same onRequest auth hook without having to repeat it.
  *
  * Awaiting app.register() here is safe (and the orthodox way to do it) only
@@ -53,4 +58,7 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerStreamRoutes(app, deps);
   registerPipelineRoutes(app, deps);
   registerDealRoutes(app, deps);
+  registerProjectRoutes(app, deps);
+  registerTaskRoutes(app, deps);
+  registerGanttRoutes(app, deps);
 }
