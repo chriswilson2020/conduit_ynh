@@ -293,6 +293,9 @@ export interface SyntheticMessageIdInput {
   date?: Date | undefined;
   subject?: string | undefined;
   text?: string | undefined;
+  /** mailparser's raw header lines ({key: lowercased name, line: the whole
+   * unparsed line}); the Date entry is what dateMaterial hashes. */
+  headerLines?: ReadonlyArray<{ key: string; line: string }> | undefined;
 }
 
 // Length-prefixed rather than separator-joined: a fixed separator (even an
@@ -308,17 +311,44 @@ function lengthPrefixed(value: string): string {
 }
 
 /**
+ * The date material hashed by syntheticMessageId: the RAW Date header text
+ * when the message carries one, and only otherwise the parsed Date object.
+ *
+ * mailparser does not leave `date` undefined for a message whose Date
+ * header is present but unparseable ("Date: not a date") -- it synthesises
+ * `new Date()`, i.e. the moment of parsing. Hashing that object would make
+ * the synthetic id different on every parse: two ingests of the same bytes
+ * would produce two rows and two threads, and every UIDVALIDITY refetch
+ * would duplicate the message again. The raw header text is the only
+ * byte-stable source, so it wins whenever it exists (which also makes a
+ * well-formed Date header hash its own text rather than a re-serialised
+ * form of it -- same determinism, one code path).
+ *
+ * First Date header only, if a malformed message somehow carries several:
+ * the same header mailparser itself would have used.
+ */
+function dateMaterial(parsed: SyntheticMessageIdInput): string {
+  const rawLine = parsed.headerLines?.find((header) => header.key === "date")?.line;
+  if (rawLine !== undefined) {
+    const separator = rawLine.indexOf(":");
+    return separator === -1 ? rawLine.trim() : rawLine.slice(separator + 1).trim();
+  }
+  // No Date header at all: the epoch sentinel, stable by construction.
+  return (parsed.date ?? new Date(0)).toISOString();
+}
+
+/**
  * A stable id for messages that arrive with no RFC 5322 Message-ID (some
- * senders omit it). Hashes from_addr + ISO sent_at + subject + the first 1k
- * chars of body_text, each length-prefixed (see lengthPrefixed) so the
- * fields can never be re-split a different way and collide. Pure function
- * of the parsed fields, so re-ingesting the same raw message (a
- * UIDVALIDITY refetch) reproduces the same id and UNIQUE (account_id,
- * message_id) converges instead of duplicating.
+ * senders omit it). Hashes from_addr + the date material (see dateMaterial)
+ * + subject + the first 1k chars of body_text, each length-prefixed (see
+ * lengthPrefixed) so the fields can never be re-split a different way and
+ * collide. Pure function of the parsed fields, so re-ingesting the same raw
+ * message (a UIDVALIDITY refetch) reproduces the same id and UNIQUE
+ * (account_id, message_id) converges instead of duplicating.
  */
 export function syntheticMessageId(parsed: SyntheticMessageIdInput): string {
   const fromAddr = (parsed.from?.value[0]?.address ?? "").toLowerCase();
-  const sentAt = (parsed.date ?? new Date(0)).toISOString();
+  const sentAt = dateMaterial(parsed);
   const subject = parsed.subject ?? "";
   const bodyText = (parsed.text ?? "").slice(0, 1000);
   const material = [fromAddr, sentAt, subject, bodyText].map(lengthPrefixed).join("");

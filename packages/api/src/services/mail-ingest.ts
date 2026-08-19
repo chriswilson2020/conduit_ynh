@@ -121,8 +121,27 @@ function normalizeId(value: string | undefined): string | null {
   return bare.length > 0 ? bare : null;
 }
 
+// Hard cap on how much of a References header is kept, in the same spirit
+// as normalizeSubject's 1000-char cap: this is attacker-controlled input.
+// Uncapped, every id becomes a bind parameter in resolveThreadId's ancestor
+// lookup and a member of its dedupe scan (which is quadratic in the list
+// length), so one crafted message could stall the event loop and its folder
+// cursor with it -- and under Task 5's sync loop a message that always
+// stalls or throws flips the whole account to status=error. Measured
+// against mailparser 3.7: a 40k-id header (1MB) is delivered in full, while
+// one around 1.5MB is dropped entirely, so tens of thousands of ids is the
+// realistic worst case reaching this function -- under the driver's 65535
+// parameter ceiling, but nowhere near a query worth issuing.
+//
+// The LAST 50 are kept because the walk is right-to-left: the nearest
+// ancestors, the only ones threading actually consults, live at the end. A
+// real chain reaching 50 deep already threads through its nearest ancestor
+// long before the far end matters.
+const MAX_REFERENCES = 50;
+
 /** mailparser gives `references` as a string for a single id and an array for
- * several; normalise to a bare-id array, order preserved (oldest first). */
+ * several; normalise to a bare-id array, order preserved (oldest first), and
+ * capped to the newest MAX_REFERENCES entries. */
 function normalizeReferences(value: string | string[] | undefined): string[] {
   if (value === undefined) return [];
   const list = Array.isArray(value) ? value : [value];
@@ -131,7 +150,7 @@ function normalizeReferences(value: string | string[] | undefined): string[] {
     const id = normalizeId(entry);
     if (id !== null) out.push(id);
   }
-  return out;
+  return out.slice(-MAX_REFERENCES);
 }
 
 /** IMAP system flags are case-insensitive (RFC 3501), so compare folded. */
@@ -421,11 +440,17 @@ export async function ingestMessage(
       if (attachment.contentId !== null) cidMap[attachment.contentId] = attachment.id;
     }
     const bodyHtml = typeof parsed.html === "string" ? sanitizeMailHtml(parsed.html, { cidMap }) : null;
-    // mailparser only produces `text` when the message actually carries a
-    // text/plain part; for HTML-only mail it is undefined. Deriving the
+    // mailparser derives `text` from the html itself (script content
+    // stripped) when the html IS the message body -- a single-part
+    // text/html message, or the html half of a multipart/alternative. It
+    // does NOT when the body is an html part inside a multipart/related or
+    // multipart/mixed, i.e. every html mail carrying an inline image or an
+    // attachment (probed against mailparser 3.7), and there `text` is
+    // undefined. This fallback covers that very common shape, deriving the
     // text from the already-SANITIZED html (htmlToText's documented
-    // precondition) keeps body_text -- and therefore the search tsvector
-    // and the snippet -- useful for those messages instead of empty.
+    // precondition -- it does no safety filtering of its own) so body_text,
+    // and therefore the search tsvector and the snippet, stay useful
+    // instead of empty.
     const bodyText = parsed.text ?? (bodyHtml !== null ? htmlToText(bodyHtml) : "");
 
     // --- Message ---------------------------------------------------------

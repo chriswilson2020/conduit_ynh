@@ -202,7 +202,11 @@ describe("ingestMessage: parsing and message fields", () => {
     expect(result.message.sentAt.getTime()).toBeLessThanOrEqual(Date.now() + 1000);
   });
 
-  it("sanitizes html, derives body_text from it when there is no text part", async () => {
+  it("sanitizes html and keeps mailparser's own text for a single-part html message", async () => {
+    // A single-part text/html body is one of the shapes mailparser derives
+    // `text` from itself (script content stripped), so body_text here is
+    // ITS output, not ingest's htmlToText fallback -- the fallback case has
+    // its own test below.
     const result = await ingest({
       messageId: ROOT_ID,
       html: "<p>Hello <b>there</b></p><script>alert(1)</script><p onclick=\"x()\">bye</p>",
@@ -212,6 +216,25 @@ describe("ingestMessage: parsing and message fields", () => {
     expect(result.message.bodyHtml).toBe("<p>Hello <b>there</b></p><p>bye</p>\n");
     expect(result.message.bodyText).toBe("Hello there\n\nbye");
     expect(result.message.snippet).toBe("Hello there bye");
+  });
+
+  it("derives body_text from the sanitized html when mailparser produces none", async () => {
+    // multipart/related (html body + an inline image) is the shape where
+    // mailparser leaves `text` undefined -- every html mail with an inline
+    // image or an attachment -- so this is ingest's own htmlToText
+    // fallback. The attachment placeholder must not leak into body_text
+    // (it would end up in the search tsvector and the snippet).
+    const result = await ingest({
+      messageId: ROOT_ID,
+      html: "<p>Hello <b>there</b></p><p><img src=\"cid:logo@example.com\"></p>",
+      attachments: [{
+        mime: "image/png", base64: "aGVsbG8gcG5n", filename: "logo.png",
+        contentId: "<logo@example.com>", disposition: "inline",
+      }],
+    });
+    expect(result.message.bodyHtml).toContain("mailattachment:");
+    expect(result.message.bodyText).toBe("Hello there");
+    expect(result.message.snippet).toBe("Hello there");
   });
 
   it("stores body_html as null for a text-only message", async () => {
@@ -341,6 +364,24 @@ describe("ingestMessage: threading", () => {
     expect((await threadById(parent.message.threadId)).messageCount).toBe(1);
   });
 
+  it("caps a monstrous References header and still threads on the nearest ancestor", async () => {
+    // Attacker-controlled header: uncapped, every id becomes a bind
+    // parameter in the ancestor lookup and a member of a quadratic dedupe
+    // scan, and under Task 5's sync loop one poison message stalling
+    // there takes the folder cursor (and the account) down with it. 40k is
+    // used deliberately: mailparser delivers a header that size in full
+    // (it drops one around 1.5MB entirely), so this is the real worst case
+    // reaching ingest. Only the newest 50 survive -- all the right-to-left
+    // walk ever consults.
+    const parent = await ingest({ messageId: PARENT_ID });
+    const bloated = Array.from({ length: 40000 }, (_, i) => `<filler${i}@example.com>`);
+    bloated.push(PARENT_ID);
+    const reply = await ingest({ messageId: CHILD_ID, references: bloated }, { uid: 2 });
+    expect(reply.message.threadId).toBe(parent.message.threadId);
+    expect(reply.message.referencesIds).toHaveLength(50);
+    expect(reply.message.referencesIds[49]).toBe("parent@example.com");
+  });
+
   it("accepts a single-value References header", async () => {
     const root = await ingest({ messageId: ROOT_ID });
     const reply = await ingest({ messageId: CHILD_ID, references: ROOT_ID }, { uid: 2 });
@@ -397,6 +438,21 @@ describe("ingestMessage: synthetic ids and duplicates", () => {
     expect(second.created).toBe(false);
     expect(second.message.id).toBe(first.message.id);
     expect(await messageRows()).toHaveLength(1);
+  });
+
+  it("gives a message with a MALFORMED Date header a stable synthetic id too", async () => {
+    // mailparser synthesises `date = new Date()` for a present-but-
+    // unparseable Date header, so a synthetic id hashed from the parsed
+    // Date object changed on every parse: one message became a fresh row
+    // and a fresh thread on every refetch. syntheticMessageId hashes the
+    // raw header text instead.
+    const raw = rawMail({ date: "not a date", subject: "Broken date", text: "hello" });
+    const first = await ingest(raw);
+    const second = await ingest(raw, { uid: 12, folder: "Archive" });
+    expect(second.created).toBe(false);
+    expect(second.message.id).toBe(first.message.id);
+    expect(await messageRows()).toHaveLength(1);
+    expect(await threads()).toHaveLength(1);
   });
 
   it("re-ingesting a message updates folder, uid and seen without re-threading or re-linking", async () => {
@@ -546,6 +602,22 @@ describe("ingestMessage: auto-linking", () => {
     await createContact(handle.db, actorId, { firstName: "Bob", emails: ["bob@example.com"] });
     const result = await ingest({ messageId: ROOT_ID, from: "alice@example.com", to: "bob@example.com" });
     expect((await threadById(result.message.threadId)).contactId).toBe(alice.id);
+  });
+
+  it("prefers a To match over a Cc match", async () => {
+    // Participant order is from -> to -> cc, and it is the ORDER that
+    // decides, not which contact the database happens to return first:
+    // Carol is created before Bob here, so a query-order-driven
+    // implementation would pick the Cc contact.
+    const carol = await createContact(handle.db, actorId, { firstName: "Carol", emails: ["carol@example.com"] });
+    const bob = await createContact(handle.db, actorId, { firstName: "Bob", emails: ["bob@example.com"] });
+    const result = await ingest({
+      messageId: ROOT_ID, from: "nobody@elsewhere.example",
+      to: "chris@example.com, bob@example.com", cc: "carol@example.com",
+    });
+    const thread = await threadById(result.message.threadId);
+    expect(thread.contactId).toBe(bob.id);
+    expect(thread.contactId).not.toBe(carol.id);
   });
 
   it("leaves the thread unlinked when no participant matches a contact", async () => {

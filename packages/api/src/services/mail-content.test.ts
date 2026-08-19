@@ -413,6 +413,30 @@ describe("syntheticMessageId", () => {
     );
   });
 
+  it("hashes the raw Date header text, not mailparser's parsed Date object", () => {
+    // The defect this closes: for a present-but-unparseable Date header
+    // ("Date: not a date") mailparser synthesises `date = new Date()` --
+    // the moment of parsing -- so hashing that object gave a different id
+    // on every parse, and one message became a new row and a new thread on
+    // every single refetch. Same raw header line + different synthesised
+    // Date objects must hash identically.
+    const headerLines = [{ key: "date", line: "Date: not a date" }];
+    const firstParse = { ...base, date: new Date("2026-08-19T10:00:00.000Z"), headerLines };
+    const secondParse = { ...base, date: new Date("2026-08-19T10:00:07.000Z"), headerLines };
+    expect(syntheticMessageId(firstParse)).toBe(syntheticMessageId(secondParse));
+  });
+
+  it("still distinguishes two messages whose raw Date headers differ", () => {
+    const monday = { ...base, headerLines: [{ key: "date", line: "Date: Mon, 17 Aug 2026 10:00:00 +0000" }] };
+    const tuesday = { ...base, headerLines: [{ key: "date", line: "Date: Tue, 18 Aug 2026 10:00:00 +0000" }] };
+    expect(syntheticMessageId(monday)).not.toBe(syntheticMessageId(tuesday));
+  });
+
+  it("falls back to the parsed date when there is no Date header line at all", () => {
+    const noDateHeader = { ...base, headerLines: [{ key: "subject", line: "Subject: Hello" }] };
+    expect(syntheticMessageId(noDateHeader)).toBe(syntheticMessageId(base));
+  });
+
   it("only hashes the first 1000 characters of the body text", () => {
     const longA = { ...base, text: "x".repeat(1000) + "AAAA" };
     const longB = { ...base, text: "x".repeat(1000) + "BBBB" };
