@@ -5,7 +5,7 @@ import type {
   Stage, CreateStageInput, UpdateStageInput,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { companies, pipelines, stages, events, type PipelineRow, type StageRow } from "../db/schema.js";
+import { companies, projects, pipelines, stages, events, type PipelineRow, type StageRow } from "../db/schema.js";
 import { NotFoundError, ArchivedError, ConflictError } from "./errors.js";
 import { publish } from "./sse.js";
 
@@ -19,7 +19,8 @@ function publishPipelineHint(pipelineId: string): void {
 
 function toPipeline(row: PipelineRow): Pipeline {
   return {
-    id: row.id, name: row.name, scope: row.scope as PipelineScope, companyId: row.companyId,
+    id: row.id, name: row.name, scope: row.scope as PipelineScope,
+    companyId: row.companyId, projectId: row.projectId,
     position: row.position,
     archivedAt: row.archivedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
@@ -47,6 +48,20 @@ function toStage(row: StageRow): Stage {
 async function assertCompanyExists(db: Database, companyId: string): Promise<void> {
   const [row] = await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId));
   if (row === undefined) throw new NotFoundError("company", companyId);
+}
+
+// Same existence-only, archived-is-valid reasoning as assertCompanyExists
+// above, applied to Phase 3's project scope -- a project, like a company, is
+// archive-only, never hard-deleted, so this read is safe outside the
+// transaction for the same monotonic-existence reason. Returns the project's
+// companyId (possibly null) so createPipeline can dual-stamp its event on the
+// project's own parent company, mirroring maybeEmitPipelineEvent's handling
+// of project-scoped mutations further down.
+async function assertProjectExists(db: Database, projectId: string): Promise<string | null> {
+  const [row] = await db.select({ id: projects.id, companyId: projects.companyId })
+    .from(projects).where(eq(projects.id, projectId));
+  if (row === undefined) throw new NotFoundError("project", projectId);
+  return row.companyId;
 }
 
 async function mustGetPipeline(db: Database, id: string): Promise<PipelineRow> {
@@ -96,39 +111,69 @@ function fieldChanged(a: unknown, b: unknown): boolean {
 }
 
 // [decision] Pipelines are timeline-relevant only through their owning
-// company: a global pipeline has no company (and no contact/deal) to attach
-// an event row to, and nothing in the product renders a "global timeline", so
-// a global-pipeline event would be permanently unreachable. Company-scoped
-// pipeline mutations DO write one, carrying company_id, so they surface on
-// that company's timeline. Every mutator below (create/update/archive/
-// unarchive, and the stage mutators further down) checks companyId and skips
-// the insert when it is null.
+// company or project: a global pipeline has neither (and no contact/deal
+// either) to attach an event row to, and nothing in the product renders a
+// "global timeline", so a global-pipeline event would be permanently
+// unreachable. Company-scoped pipeline mutations write one carrying
+// company_id; project-scoped mutations write one carrying BOTH project_id
+// and (when the project itself has a company) that company's id too --
+// mirroring deals.ts's dealId/companyId dual-stamp, so a project pipeline's
+// mutation surfaces on the project's own timeline AND its parent company's.
+// Every mutator below (create/update/archive/unarchive, and the stage
+// mutators further down) passes the pipeline row through here and this
+// function decides which column(s), if any, get an event.
+//
+// The extra SELECT for a project-scoped row's companyId is a deliberate
+// tradeoff over denormalising it onto the pipeline row: pipelines.company_id
+// is reserved for company-scoped rows by the pipelines_scope_paired CHECK, so
+// a project-scoped pipeline's own row never carries its project's company --
+// it has to be looked up. Accepted at this scale the same way updateStage's
+// extra mustGetPipeline call already is.
 async function maybeEmitPipelineEvent(
   tx: Database, actorId: string, row: PipelineRow, verb: string, payload: Record<string, unknown>,
 ): Promise<void> {
-  if (row.companyId === null) return;
-  await tx.insert(events).values({ verb, actorUserId: actorId, companyId: row.companyId, payload });
+  if (row.companyId === null && row.projectId === null) return;
+  let companyId = row.companyId;
+  if (row.projectId !== null) {
+    const [project] = await tx.select({ companyId: projects.companyId }).from(projects).where(eq(projects.id, row.projectId));
+    companyId = project?.companyId ?? null;
+  }
+  await tx.insert(events).values({ verb, actorUserId: actorId, companyId, projectId: row.projectId, payload });
 }
 
 export async function createPipeline(db: Database, actorId: string, input: CreatePipelineInput): Promise<Pipeline> {
-  // createPipelineInputSchema's scopeCompanyPaired refine already guarantees
-  // companyId is present iff scope is "company" -- this only checks that the
-  // id it names actually exists.
+  // createPipelineInputSchema's scopePaired refine already guarantees
+  // companyId is present iff scope is "company" and projectId present iff
+  // scope is "project" -- this only checks that the id it names actually
+  // exists. An archived project is a valid pipeline owner, same as an
+  // archived company (see assertProjectExists's comment).
   if (input.scope === "company") await assertCompanyExists(db, input.companyId!);
+  if (input.scope === "project") await assertProjectExists(db, input.projectId!);
   const companyId = input.scope === "company" ? input.companyId! : null;
+  const projectId = input.scope === "project" ? input.projectId! : null;
 
   const pipeline = await db.transaction(async (tx) => {
-    // Siblings = same scope + same company (global pipelines never compete
-    // for position with company-scoped ones, and two different companies'
-    // pipelines never compete with each other).
-    await lockSiblingGroup(tx, `pipelines:${input.scope}:${companyId ?? "global"}`);
+    // Siblings = same scope + same owner (global pipelines never compete for
+    // position with company- or project-scoped ones, and two different
+    // companies'/projects' pipelines never compete with each other). Group
+    // key deliberately distinct per scope: `pipelines:project:${projectId}`
+    // for project scope, matching the existing `pipelines:company:${companyId}`
+    // shape.
+    const scopeKey = input.scope === "company" ? companyId! : input.scope === "project" ? projectId! : "global";
+    await lockSiblingGroup(tx, `pipelines:${input.scope}:${scopeKey}`);
 
     const [lastSibling] = await tx.select({ position: pipelines.position }).from(pipelines)
-      .where(and(eq(pipelines.scope, input.scope), companyId === null ? isNull(pipelines.companyId) : eq(pipelines.companyId, companyId)))
+      .where(and(
+        eq(pipelines.scope, input.scope),
+        input.scope === "company" ? eq(pipelines.companyId, companyId!)
+          : input.scope === "project" ? eq(pipelines.projectId, projectId!)
+          : isNull(pipelines.companyId),
+      ))
       .orderBy(desc(pipelines.position)).limit(1);
     const position = midpoint(lastSibling?.position ?? null, null);
 
-    const [row] = await tx.insert(pipelines).values({ name: input.name, scope: input.scope, companyId, position }).returning();
+    const [row] = await tx.insert(pipelines)
+      .values({ name: input.name, scope: input.scope, companyId, projectId, position }).returning();
     if (row === undefined) throw new Error("insert returned no row");
     await maybeEmitPipelineEvent(tx, actorId, row, "created", {});
     return toPipeline(row);
@@ -203,17 +248,20 @@ export async function getPipeline(db: Database, id: string): Promise<PipelineWit
   return { pipeline: toPipeline(row), stages: stageRows.map(toStage) };
 }
 
-export interface ListPipelinesOptions { scope?: PipelineScope; companyId?: string; archived?: boolean; }
+export interface ListPipelinesOptions {
+  scope?: PipelineScope; companyId?: string; projectId?: string; archived?: boolean;
+}
 
-// No pagination: pipelines are bounded (a handful per company at most, plus a
-// small number of global ones), the same tradeoff listNotes makes for a
-// single record's notes. Unlike listCompanies/listContacts, which can grow
-// into the thousands, a runaway pipeline count would itself be an anomaly
-// worth surfacing rather than a case to paginate around.
+// No pagination: pipelines are bounded (a handful per company/project at
+// most, plus a small number of global ones), the same tradeoff listNotes
+// makes for a single record's notes. Unlike listCompanies/listContacts,
+// which can grow into the thousands, a runaway pipeline count would itself
+// be an anomaly worth surfacing rather than a case to paginate around.
 export async function listPipelines(db: Database, opts: ListPipelinesOptions): Promise<Pipeline[]> {
   const where = [opts.archived ? isNotNull(pipelines.archivedAt) : isNull(pipelines.archivedAt)];
   if (opts.scope) where.push(eq(pipelines.scope, opts.scope));
   if (opts.companyId) where.push(eq(pipelines.companyId, opts.companyId));
+  if (opts.projectId) where.push(eq(pipelines.projectId, opts.projectId));
   const rows = await db.select().from(pipelines).where(and(...where)).orderBy(pipelines.position);
   return rows.map(toPipeline);
 }

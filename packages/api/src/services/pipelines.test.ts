@@ -4,6 +4,7 @@ import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { events } from "../db/schema.js";
 import { createCompany, archiveCompany } from "./companies.js";
+import { createProject, archiveProject } from "./projects.js";
 import {
   createPipeline, updatePipeline, archivePipeline, unarchivePipeline,
   getPipeline, listPipelines,
@@ -22,6 +23,9 @@ afterAll(async () => { await handle.close(); });
 
 async function makeCompany(name = "Acme") {
   return createCompany(handle.db, actorId, { name });
+}
+async function makeProject(name = "Launch", companyId?: string) {
+  return createProject(handle.db, actorId, { name, companyId });
 }
 
 describe("pipelines service: create", () => {
@@ -100,6 +104,86 @@ describe("pipelines service: create", () => {
     expect(x1.position < x2.position).toBe(true);
     const y1Again = await listPipelines(handle.db, { companyId: companyY.id });
     expect(y1Again.map((p) => p.position)).toEqual([y1.position]);
+  });
+});
+
+describe("pipelines service: project scope", () => {
+  it("creates a project-scoped pipeline and writes a created event carrying project_id and no company_id (standalone project)", async () => {
+    const project = await makeProject();
+    const before = await handle.db.select().from(events).where(eq(events.projectId, project.id));
+    const pipeline = await createPipeline(handle.db, actorId, { name: "Launch plan", scope: "project", projectId: project.id });
+    expect(pipeline.scope).toBe("project");
+    expect(pipeline.projectId).toBe(project.id);
+    expect(pipeline.companyId).toBeNull();
+    const after = await handle.db.select().from(events).where(eq(events.projectId, project.id));
+    // makeProject's own "created" event is included in `before` already, so
+    // this asserts the increment createPipeline is responsible for.
+    expect(after.length).toBe(before.length + 1);
+    const created = after.find((e) => e.verb === "created" && e.companyId === null);
+    expect(created).toBeDefined();
+  });
+
+  it("a project-scoped pipeline on a company-linked project dual-stamps its event with both project_id and the project's company_id", async () => {
+    const company = await makeCompany();
+    const project = await makeProject("Onboarding", company.id);
+    const pipeline = await createPipeline(handle.db, actorId, { name: "Onboarding plan", scope: "project", projectId: project.id });
+    const evs = await handle.db.select().from(events).where(eq(events.projectId, project.id));
+    const created = evs.find((e) => e.verb === "created" && e.companyId === company.id);
+    expect(created).toBeDefined();
+    expect(pipeline.projectId).toBe(project.id);
+  });
+
+  it("rejects a project-scoped pipeline whose project does not exist", async () => {
+    await expect(
+      createPipeline(handle.db, actorId, { name: "X", scope: "project", projectId: "3f2504e0-4f89-41d3-9a0c-0305e82c3301" }),
+    ).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("accepts an archived project as a valid pipeline owner", async () => {
+    const project = await makeProject();
+    await archiveProject(handle.db, actorId, project.id);
+    const pipeline = await createPipeline(handle.db, actorId, { name: "Launch plan", scope: "project", projectId: project.id });
+    expect(pipeline.projectId).toBe(project.id);
+  });
+
+  it("scopes position sequences separately: project-scoped pipelines don't interleave with global or company ones", async () => {
+    const company = await makeCompany();
+    const project = await makeProject();
+    const g1 = await createPipeline(handle.db, actorId, { name: "G1", scope: "global" });
+    const c1 = await createPipeline(handle.db, actorId, { name: "C1", scope: "company", companyId: company.id });
+    // Same proof style as the global/company independence test above: the
+    // first pipeline in each independent sequence computes midpoint(null,
+    // null) against an empty sibling set, so all three land on the identical
+    // position string -- direct proof, not inference from ordering.
+    const p1 = await createPipeline(handle.db, actorId, { name: "P1", scope: "project", projectId: project.id });
+    expect(p1.position).toBe(g1.position);
+    expect(p1.position).toBe(c1.position);
+
+    // A second pipeline for the same project is appended relative to p1 only.
+    const p2 = await createPipeline(handle.db, actorId, { name: "P2", scope: "project", projectId: project.id });
+    expect(p1.position < p2.position).toBe(true);
+    const stillJustP1 = await listPipelines(handle.db, { companyId: company.id });
+    expect(stillJustP1.map((p) => p.position)).toEqual([c1.position]);
+  });
+
+  it("updating and archiving a project-scoped pipeline both emit events carrying project_id", async () => {
+    const project = await makeProject();
+    const pipeline = await createPipeline(handle.db, actorId, { name: "Old", scope: "project", projectId: project.id });
+    await updatePipeline(handle.db, actorId, pipeline.id, { name: "New" });
+    await archivePipeline(handle.db, actorId, pipeline.id);
+    const evs = await handle.db.select().from(events).where(eq(events.projectId, project.id));
+    expect(evs.some((e) => e.verb === "updated")).toBe(true);
+    expect(evs.some((e) => e.verb === "archived")).toBe(true);
+  });
+
+  it("filters listPipelines by projectId", async () => {
+    const projectA = await makeProject("A");
+    const projectB = await makeProject("B");
+    await createPipeline(handle.db, actorId, { name: "PA", scope: "project", projectId: projectA.id });
+    await createPipeline(handle.db, actorId, { name: "PB", scope: "project", projectId: projectB.id });
+
+    expect((await listPipelines(handle.db, { projectId: projectA.id })).map((p) => p.name)).toEqual(["PA"]);
+    expect((await listPipelines(handle.db, { scope: "project" })).map((p) => p.name).sort()).toEqual(["PA", "PB"]);
   });
 });
 

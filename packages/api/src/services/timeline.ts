@@ -8,6 +8,7 @@ function toEvent(row: EventRow): Event {
   return {
     id: row.id, verb: row.verb as Event["verb"], actorUserId: row.actorUserId,
     companyId: row.companyId, contactId: row.contactId, dealId: row.dealId,
+    taskId: row.taskId, projectId: row.projectId,
     payload: row.payload as Record<string, unknown>,
     createdAt: row.createdAt.toISOString(),
   };

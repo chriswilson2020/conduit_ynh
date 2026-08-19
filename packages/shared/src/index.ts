@@ -107,48 +107,63 @@ export type FileMeta = z.infer<typeof fileMetaSchema>;
 // see services/deals.ts's publishDealHint/toDeal-adjacent comments. Phase 3
 // adds shifted/completed/dependency_added/dependency_removed -- task
 // reopening reuses the existing "reopened" verb rather than adding a
-// task-specific one. Same deferral as Phase 2's own P2.1: this task only
-// widens the DB CHECK (see schema.ts) and this enum; eventSchema gains
-// nullable taskId/projectId once the routes that actually read/write them
-// exist (Task 6).
+// task-specific one.
 export const eventVerbSchema = z.enum([
   "created", "updated", "archived", "unarchived", "note_added", "file_attached",
   "stage_changed", "won", "lost", "reopened",
   "shifted", "completed", "dependency_added", "dependency_removed",
 ]);
+// taskId/projectId were deferred in P3.2 (the schema.ts columns existed but
+// nothing read/wrote them through this shape yet); Task 3 widens this now
+// that projects.ts and pipelines.ts's project scope both emit events carrying
+// one or both of them -- a project-scoped pipeline event, for instance,
+// carries taskId=null, projectId=<id>, and companyId=<the project's company,
+// when it has one>, mirroring the existing dealId/companyId dual-stamp.
 export const eventSchema = z.object({
   id: z.uuid(), verb: eventVerbSchema, actorUserId: z.uuid(),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
+  taskId: z.uuid().nullable(), projectId: z.uuid().nullable(),
   payload: z.record(z.string(), z.unknown()), createdAt: z.iso.datetime(),
 });
 export type Event = z.infer<typeof eventSchema>;
 
 // --- Pipelines, stages, deals (Phase 2) ---------------------------------
 
-// 'project' is now a DB-valid scope (pipelines_scope_valid, schema.ts) now
-// that the projects table exists, but is deliberately not added here yet --
-// same deferral as eventSchema's taskId/projectId above: this schema (and
-// createPipelineInputSchema's pairing refine below) widens once the route
-// that actually creates project-scoped pipelines exists.
-export const pipelineScopeSchema = z.enum(["global", "company"]);
+// 'project' completes the three-scope design (Phase 3 plan/spec): a pipeline
+// now belongs to exactly one of global (no owner), a company, or a project.
+// Deferred no longer -- P3.2 only widened the DB CHECK (pipelines_scope_valid,
+// schema.ts) and left this enum and the pairing refine below for the task
+// that actually wires project-scoped pipeline creation (this one).
+export const pipelineScopeSchema = z.enum(["global", "company", "project"]);
 export type PipelineScope = z.infer<typeof pipelineScopeSchema>;
 
 export const pipelineSchema = z.object({
   id: z.uuid(), name: z.string().min(1),
-  scope: pipelineScopeSchema, companyId: z.uuid().nullable(),
+  scope: pipelineScopeSchema, companyId: z.uuid().nullable(), projectId: z.uuid().nullable(),
   position: z.string().min(1),
   archivedAt: z.iso.datetime().nullable(), ...timestamps,
 });
 export type Pipeline = z.infer<typeof pipelineSchema>;
 
-// company_id pairs with scope exactly as the pipelines_scope_company_paired DB
-// CHECK requires: present iff scope is "company", absent iff scope is "global".
-const scopeCompanyPaired = (v: { scope: PipelineScope; companyId?: string }) =>
-  (v.scope === "company") === (v.companyId !== undefined);
+// Mirrors the pipelines_scope_paired DB CHECK's three-way exclusivity:
+// companyId present iff scope is "company", projectId present iff scope is
+// "project", neither present for "global". Each side of the `===` is
+// evaluated independently, so a caller can't satisfy the check by supplying
+// BOTH companyId and projectId for either scoped value -- e.g. scope
+// "company" with a projectId present fails the second clause even though the
+// first is satisfied.
+const scopePaired = (v: { scope: PipelineScope; companyId?: string; projectId?: string }) =>
+  (v.scope === "company") === (v.companyId !== undefined) &&
+  (v.scope === "project") === (v.projectId !== undefined);
 
 export const createPipelineInputSchema = z
-  .object({ name: z.string().min(1), scope: pipelineScopeSchema, companyId: z.uuid().optional() })
-  .refine(scopeCompanyPaired, { message: "companyId is required exactly when scope is company" });
+  .object({
+    name: z.string().min(1), scope: pipelineScopeSchema,
+    companyId: z.uuid().optional(), projectId: z.uuid().optional(),
+  })
+  .refine(scopePaired, {
+    message: "companyId is required exactly when scope is company, projectId exactly when scope is project",
+  });
 export type CreatePipelineInput = z.infer<typeof createPipelineInputSchema>;
 
 // Scope and companyId are immutable after creation (the pipeline's owner never

@@ -8,6 +8,7 @@ import {
   contactSchema,
   createNoteInputSchema,
   usersResponseSchema,
+  pipelineSchema,
   createPipelineInputSchema,
   pipelineWithStagesSchema,
   dealSchema,
@@ -16,6 +17,7 @@ import {
   funnelRowSchema,
   sseHintSchema,
   eventVerbSchema,
+  eventSchema,
   searchResultsSchema,
   projectSchema,
   createProjectInputSchema,
@@ -223,9 +225,19 @@ describe("createPipelineInputSchema", () => {
     expect(createPipelineInputSchema.parse(input)).toEqual(input);
   });
 
+  it("accepts a project-scoped pipeline with a projectId", () => {
+    const input = { name: "Launch plan", scope: "project" as const, projectId: uuid1 };
+    expect(createPipelineInputSchema.parse(input)).toEqual(input);
+  });
+
   it("rejects scope company with no companyId", () =>
     expect(() =>
       createPipelineInputSchema.parse({ name: "Acme deals", scope: "company" }),
+    ).toThrow());
+
+  it("rejects scope project with no projectId", () =>
+    expect(() =>
+      createPipelineInputSchema.parse({ name: "Launch plan", scope: "project" }),
     ).toThrow());
 
   it("rejects scope global with a companyId present", () =>
@@ -233,16 +245,37 @@ describe("createPipelineInputSchema", () => {
       createPipelineInputSchema.parse({ name: "Sales", scope: "global", companyId: uuid1 }),
     ).toThrow());
 
+  it("rejects scope project with a companyId instead of a projectId", () =>
+    expect(() =>
+      createPipelineInputSchema.parse({ name: "Launch plan", scope: "project", companyId: uuid1 }),
+    ).toThrow());
+
+  it("rejects scope company with a projectId present alongside companyId", () =>
+    expect(() =>
+      createPipelineInputSchema.parse({ name: "Acme deals", scope: "company", companyId: uuid1, projectId: uuid2 }),
+    ).toThrow());
+
   it("rejects an unknown scope value", () =>
     expect(() =>
-      createPipelineInputSchema.parse({ name: "Sales", scope: "project", companyId: uuid1 }),
+      createPipelineInputSchema.parse({ name: "Sales", scope: "bogus", companyId: uuid1 }),
     ).toThrow());
+});
+
+describe("pipelineSchema", () => {
+  it("round-trips a project-scoped pipeline with a null companyId", () => {
+    const now = new Date().toISOString();
+    const value = {
+      id: uuid1, name: "Launch plan", scope: "project" as const, companyId: null, projectId: uuid2,
+      position: "a0", archivedAt: null, createdAt: now, updatedAt: now,
+    };
+    expect(pipelineSchema.parse(value)).toEqual(value);
+  });
 });
 
 describe("pipelineWithStagesSchema", () => {
   const now = new Date().toISOString();
   const pipeline = {
-    id: uuid1, name: "Sales", scope: "global" as const, companyId: null, position: "a0",
+    id: uuid1, name: "Sales", scope: "global" as const, companyId: null, projectId: null, position: "a0",
     archivedAt: null, createdAt: now, updatedAt: now,
   };
   const stage = {
@@ -355,6 +388,26 @@ describe("eventVerbSchema", () => {
 
   it("rejects an unknown verb", () =>
     expect(() => eventVerbSchema.parse("deleted")).toThrow());
+});
+
+describe("eventSchema taskId/projectId", () => {
+  it("round-trips an event carrying both a taskId and a projectId", () => {
+    const value = {
+      id: uuid1, verb: "shifted" as const, actorUserId: uuid1,
+      companyId: null, contactId: null, dealId: null, taskId: uuid2, projectId: uuid1,
+      payload: {}, createdAt: new Date().toISOString(),
+    };
+    expect(eventSchema.parse(value)).toEqual(value);
+  });
+
+  it("accepts null taskId and projectId, e.g. a plain company event", () => {
+    const value = {
+      id: uuid1, verb: "created" as const, actorUserId: uuid1,
+      companyId: uuid2, contactId: null, dealId: null, taskId: null, projectId: null,
+      payload: {}, createdAt: new Date().toISOString(),
+    };
+    expect(eventSchema.parse(value)).toEqual(value);
+  });
 });
 
 describe("searchResultsSchema deals group", () => {
