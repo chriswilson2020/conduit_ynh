@@ -3,8 +3,15 @@ import { randomBytes } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { loadMailKey, encryptCredentials, decryptCredentials, type MailCredentials } from "./mail-crypto.js";
-import { MailKeyMissingError } from "./errors.js";
+import {
+  loadMailKey,
+  encryptCredentials,
+  decryptCredentials,
+  encryptCredentialsAt,
+  decryptCredentialsAt,
+  type MailCredentials,
+} from "./mail-crypto.js";
+import { MailKeyMissingError, MailCredentialDecryptError } from "./errors.js";
 
 let dir: string;
 
@@ -100,7 +107,7 @@ describe("encryptCredentials / decryptCredentials", () => {
     const dataBytes = Buffer.from(data, "base64");
     dataBytes[0] = dataBytes[0] ^ 0xff;
     const tampered = [version, iv, tag, dataBytes.toString("base64")].join(":");
-    expect(() => decryptCredentials(key, tampered)).toThrow();
+    expect(() => decryptCredentials(key, tampered)).toThrow(MailCredentialDecryptError);
   });
 
   it("throws when a byte of the auth tag is tampered with", async () => {
@@ -110,7 +117,7 @@ describe("encryptCredentials / decryptCredentials", () => {
     const tagBytes = Buffer.from(tag, "base64");
     tagBytes[0] = tagBytes[0] ^ 0xff;
     const tampered = [version, iv, tagBytes.toString("base64"), data].join(":");
-    expect(() => decryptCredentials(key, tampered)).toThrow();
+    expect(() => decryptCredentials(key, tampered)).toThrow(MailCredentialDecryptError);
   });
 
   it("throws on an unknown version prefix", async () => {
@@ -125,10 +132,71 @@ describe("encryptCredentials / decryptCredentials", () => {
     expect(() => decryptCredentials(key, "v1:onlyoneseparator")).toThrow();
   });
 
-  it("throws when decrypting with the wrong key", async () => {
+  it("throws a typed MailCredentialDecryptError (not a raw Node error) when decrypting with the wrong key", async () => {
     const key = loadMailKey(await writeKey(randomBytes(32)));
     const wrongKey = randomBytes(32);
     const ciphertext = encryptCredentials(key, creds);
-    expect(() => decryptCredentials(wrongKey, ciphertext)).toThrow();
+    expect(() => decryptCredentials(wrongKey, ciphertext)).toThrow(MailCredentialDecryptError);
+  });
+
+  it("does not leak key material into the wrong-key error message", async () => {
+    const key = loadMailKey(await writeKey(randomBytes(32)));
+    const wrongKey = randomBytes(32);
+    const ciphertext = encryptCredentials(key, creds);
+    let threw = false;
+    try {
+      decryptCredentials(wrongKey, ciphertext);
+    } catch (err) {
+      threw = true;
+      const message = (err as Error).message;
+      expect(message).not.toContain(key.toString("base64"));
+      expect(message).not.toContain(wrongKey.toString("base64"));
+      expect(message).not.toContain(key.toString("hex"));
+    }
+    expect(threw).toBe(true);
+  });
+
+  it("rejects a truncated (4-byte) auth tag before it ever reaches the cipher", async () => {
+    const key = loadMailKey(await writeKey(randomBytes(32)));
+    const ciphertext = encryptCredentials(key, creds);
+    const [version, iv, tag, data] = ciphertext.split(":");
+    const truncatedTag = Buffer.from(tag, "base64").subarray(0, 4).toString("base64");
+    const tampered = [version, iv, truncatedTag, data].join(":");
+    expect(() => decryptCredentials(key, tampered)).toThrow(MailCredentialDecryptError);
+    expect(() => decryptCredentials(key, tampered)).toThrow(/tag/i);
+  });
+
+  it("rejects a wrong-size (8-byte) IV before it ever reaches the cipher", async () => {
+    const key = loadMailKey(await writeKey(randomBytes(32)));
+    const ciphertext = encryptCredentials(key, creds);
+    const [version, , tag, data] = ciphertext.split(":");
+    const wrongIv = randomBytes(8).toString("base64");
+    const tampered = [version, wrongIv, tag, data].join(":");
+    expect(() => decryptCredentials(key, tampered)).toThrow(MailCredentialDecryptError);
+    expect(() => decryptCredentials(key, tampered)).toThrow(/IV/i);
+  });
+
+  it("rejects a decrypted payload that does not match the {imapPassword, smtpPassword} shape", async () => {
+    const key = loadMailKey(await writeKey(randomBytes(32)));
+    // encryptCredentials only serialises its argument -- it does not itself
+    // validate the shape -- so this constructs a ciphertext that decrypts
+    // and authenticates cleanly but unwraps to the wrong JSON shape.
+    const ciphertext = encryptCredentials(key, { foo: "bar" } as unknown as MailCredentials);
+    expect(() => decryptCredentials(key, ciphertext)).toThrow(MailCredentialDecryptError);
+  });
+});
+
+describe("encryptCredentialsAt / decryptCredentialsAt", () => {
+  const creds: MailCredentials = { imapPassword: "hunter2", smtpPassword: "hunter3" };
+
+  it("round-trips credentials given only a keyPath", async () => {
+    const keyPath = await writeKey(randomBytes(32));
+    const ciphertext = encryptCredentialsAt(keyPath, creds);
+    expect(decryptCredentialsAt(keyPath, ciphertext)).toEqual(creds);
+  });
+
+  it("decryptCredentialsAt throws MailKeyMissingError when the key file is absent", () => {
+    const keyPath = path.join(dir, "does-not-exist.key");
+    expect(() => decryptCredentialsAt(keyPath, "v1:a:b:c")).toThrow(MailKeyMissingError);
   });
 });

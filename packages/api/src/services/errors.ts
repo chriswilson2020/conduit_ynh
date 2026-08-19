@@ -34,3 +34,19 @@ export class MailKeyMissingError extends Error {
     super(`mail key not found at ${keyPath}`);
   }
 }
+
+// Raised by mail-crypto's decryptCredentials when the key file loaded fine
+// but the ciphertext would not decrypt/authenticate under it, or the
+// decrypted payload was not the {imapPassword, smtpPassword} shape it
+// should be -- the "restore mail.key from an old backup, or a row was
+// encrypted under a key that has since been rotated" scenario. Distinct
+// from MailKeyMissingError (no key available at all) and from the plain
+// Errors decryptCredentials throws for a ciphertext that is not even
+// structurally v1 (wrong segment count, unrecognised version prefix) --
+// those indicate a caller/format bug, not a key mismatch. Message text
+// must never include key, IV, tag, or plaintext bytes.
+export class MailCredentialDecryptError extends Error {
+  constructor(reason: string) {
+    super(`failed to decrypt mail credentials: ${reason}`);
+  }
+}

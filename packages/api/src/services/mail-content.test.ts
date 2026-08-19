@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { simpleParser } from "mailparser";
 import {
   sanitizeMailHtml,
+  resolveAttachmentUrls,
   normalizeSubject,
   makeSnippet,
   syntheticMessageId,
@@ -98,12 +99,33 @@ describe("sanitizeMailHtml", () => {
     expect(out).toContain('src="https://example.com/a.png"');
   });
 
-  it("rewrites a mapped cid image to the authenticated attachment route", () => {
+  it("keeps a relative img src as-is (scheme-less srcs bypass allowedSchemesByTag by design of sanitize-html)", () => {
+    const out = sanitizeMailHtml('<img src="/static/logo.png" alt="logo">');
+    expect(out).toContain('src="/static/logo.png"');
+  });
+
+  it("keeps a protocol-relative img src as-is (same bypass -- treated as remote-equivalent)", () => {
+    const out = sanitizeMailHtml('<img src="//example.com/x.png" alt="x">');
+    expect(out).toContain('src="//example.com/x.png"');
+  });
+
+  it("rewrites a mapped cid image to the stable placeholder scheme, never an absolute route", () => {
     const out = sanitizeMailHtml('<img src="cid:logo123@mail" alt="logo">', {
       cidMap: { "logo123@mail": "attach-1" },
     });
-    expect(out).toContain('src="/api/mail/attachments/attach-1/inline"');
+    expect(out).toContain('src="mailattachment:attach-1"');
     expect(out).not.toContain("cid:");
+    expect(out).not.toContain("/api/mail/attachments/");
+  });
+
+  it("strips surrounding <> from a cid src before the cidMap lookup", () => {
+    const out = sanitizeMailHtml('<img src="cid:<logo@x>" alt="logo">', { cidMap: { "logo@x": "attach-9" } });
+    expect(out).toContain('src="mailattachment:attach-9"');
+  });
+
+  it("percent-decodes a cid src before the cidMap lookup", () => {
+    const out = sanitizeMailHtml('<img src="cid:logo%40x" alt="logo">', { cidMap: { "logo@x": "attach-9" } });
+    expect(out).toContain('src="mailattachment:attach-9"');
   });
 
   it("drops an img tag whose cid has no entry in cidMap", () => {
@@ -129,9 +151,45 @@ describe("sanitizeMailHtml", () => {
     expect(out).not.toContain("javascript:");
   });
 
-  it("keeps an inline style attribute on allowed tags", () => {
+  it("keeps an inline style attribute (multiple safe properties) on allowed tags", () => {
     const out = sanitizeMailHtml('<p style="color:red;font-weight:bold">hi</p>');
     expect(out).toContain('style="color:red;font-weight:bold"');
+  });
+
+  it("keeps a safe color style value", () => {
+    const out = sanitizeMailHtml('<p style="color:red">hi</p>');
+    expect(out).toContain('style="color:red"');
+  });
+
+  it("strips a background:url(...) declaration (property not allowed at all)", () => {
+    const out = sanitizeMailHtml('<p style="background:url(https://evil.example/beacon.png)">hi</p>');
+    expect(out).not.toContain("url(");
+    expect(out).not.toContain("background");
+    expect(out).toBe("<p>hi</p>");
+  });
+
+  it("strips a position:fixed declaration (property not allowed at all)", () => {
+    const out = sanitizeMailHtml('<p style="position:fixed;top:0;left:0">hi</p>');
+    expect(out).not.toContain("position");
+    expect(out).not.toContain("fixed");
+    expect(out).toBe("<p>hi</p>");
+  });
+
+  it("keeps colspan on td -- structural, not just cosmetic", () => {
+    const out = sanitizeMailHtml('<table><tr><td colspan="2">x</td></tr></table>');
+    expect(out).toContain('colspan="2"');
+  });
+
+  it("keeps rowspan, align, and bgcolor on table-family tags", () => {
+    const out = sanitizeMailHtml('<table bgcolor="#eee"><tr><td rowspan="2" align="center">x</td></tr></table>');
+    expect(out).toContain('bgcolor="#eee"');
+    expect(out).toContain('rowspan="2"');
+    expect(out).toContain('align="center"');
+  });
+
+  it("keeps the legacy font tag and its color attribute", () => {
+    const out = sanitizeMailHtml('<font color="red">hi</font>');
+    expect(out).toBe('<font color="red">hi</font>');
   });
 
   it("strips a disallowed tag but keeps its allowed children/text", () => {
@@ -143,6 +201,27 @@ describe("sanitizeMailHtml", () => {
   it("leaves remote (http/https) images untouched in the markup -- blocking is render-time, not ingest-time", () => {
     const out = sanitizeMailHtml('<img src="https://tracker.example.com/pixel.gif" alt="">');
     expect(out).toContain("https://tracker.example.com/pixel.gif");
+  });
+});
+
+describe("resolveAttachmentUrls", () => {
+  it("swaps a stored placeholder for the authenticated route under a root basePath", () => {
+    const stored = '<img src="mailattachment:attach-1" alt="logo">';
+    expect(resolveAttachmentUrls(stored, "/")).toBe('<img src="/api/mail/attachments/attach-1/inline" alt="logo">');
+  });
+
+  it("prefixes the route with a non-root basePath", () => {
+    const stored = '<img src="mailattachment:attach-1" alt="logo">';
+    expect(resolveAttachmentUrls(stored, "/conduit")).toBe(
+      '<img src="/conduit/api/mail/attachments/attach-1/inline" alt="logo">',
+    );
+  });
+
+  it("resolves every placeholder occurrence, not just the first", () => {
+    const stored = '<img src="mailattachment:a1"><img src="mailattachment:a2">';
+    expect(resolveAttachmentUrls(stored, "/")).toBe(
+      '<img src="/api/mail/attachments/a1/inline"><img src="/api/mail/attachments/a2/inline">',
+    );
   });
 });
 
@@ -175,16 +254,25 @@ describe("normalizeSubject", () => {
     expect(normalizeSubject("  Hello   World  ")).toBe("Hello World");
   });
 
-  it("returns (no subject) for an empty string", () => {
-    expect(normalizeSubject("")).toBe("(no subject)");
+  it("returns an empty string for an empty input -- matches the DB default, not a display placeholder", () => {
+    expect(normalizeSubject("")).toBe("");
   });
 
-  it("returns (no subject) when only a prefix chain remains", () => {
-    expect(normalizeSubject("Re: Fwd:")).toBe("(no subject)");
+  it("returns an empty string when only a prefix chain remains", () => {
+    expect(normalizeSubject("Re: Fwd:")).toBe("");
   });
 
-  it("returns (no subject) for whitespace-only input", () => {
-    expect(normalizeSubject("   ")).toBe("(no subject)");
+  it("returns an empty string for whitespace-only input", () => {
+    expect(normalizeSubject("   ")).toBe("");
+  });
+
+  it("normalizes a pathological subject (word + 60k trailing spaces, no colon) in well under 50ms", () => {
+    const pathological = `Re${" ".repeat(60000)}`;
+    const start = Date.now();
+    const result = normalizeSubject(pathological);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(50);
+    expect(typeof result).toBe("string");
   });
 });
 
@@ -207,6 +295,17 @@ describe("makeSnippet", () => {
   it("returns the whole string unchanged in length when under 160 chars", () => {
     expect(makeSnippet("short")).toBe("short");
   });
+
+  it("slices on Unicode code points, not UTF-16 units, keeping an emoji at the boundary intact", () => {
+    // Built via fromCodePoint (not a literal or a \u escape) to keep this
+    // source file pure ASCII: U+1F600 GRINNING FACE, a surrogate pair in
+    // UTF-16 -- exactly the case where naive .slice(0, 160) could split it.
+    const emoji = String.fromCodePoint(0x1f600);
+    const text = "a".repeat(159) + emoji + " more text beyond the boundary";
+    const snippet = makeSnippet(text);
+    expect(Array.from(snippet)).toHaveLength(160);
+    expect(snippet.endsWith(emoji)).toBe(true);
+  });
 });
 
 describe("htmlToText", () => {
@@ -222,6 +321,25 @@ describe("htmlToText", () => {
     expect(htmlToText("Tom &amp; Jerry &lt;3&gt; &quot;fun&quot; &#39;times&#39;")).toBe(
       "Tom & Jerry <3> \"fun\" 'times'",
     );
+  });
+
+  it("decodes numeric entities, both decimal and hex", () => {
+    // Expected characters built via fromCharCode (not literals) to keep
+    // this source file pure ASCII: U+00E9 (e acute, decimal 233) and
+    // U+2019 (right single quotation mark, hex 2019).
+    const eAcute = String.fromCharCode(0xe9);
+    const rightSingleQuote = String.fromCharCode(0x2019);
+    expect(htmlToText("Caf&#233; &#x2019;quote&#x2019;")).toBe(
+      `Caf${eAcute} ${rightSingleQuote}quote${rightSingleQuote}`,
+    );
+  });
+
+  it("keeps a link's destination as text after stripping the tag", () => {
+    expect(htmlToText('<a href="https://example.com/">Click here</a>')).toBe("Click here <https://example.com/>");
+  });
+
+  it("separates table cells with a space rather than running them together", () => {
+    expect(htmlToText("<tr><td>A</td><td>B</td></tr>")).toBe("A B");
   });
 
   it("strips inline tags without adding a line break", () => {
@@ -283,6 +401,12 @@ describe("syntheticMessageId", () => {
     const longA = { ...base, text: "x".repeat(1000) + "AAAA" };
     const longB = { ...base, text: "x".repeat(1000) + "BBBB" };
     expect(syntheticMessageId(longA)).toBe(syntheticMessageId(longB));
+  });
+
+  it("length-prefixes fields so a separator-shaped substring inside one field cannot forge a boundary collision", () => {
+    const a = { ...base, subject: "A::B", text: "C" };
+    const b = { ...base, subject: "A", text: "B::C" };
+    expect(syntheticMessageId(a)).not.toBe(syntheticMessageId(b));
   });
 });
 

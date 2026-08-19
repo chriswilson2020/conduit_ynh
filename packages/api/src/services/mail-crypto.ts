@@ -1,10 +1,12 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { MailKeyMissingError } from "./errors.js";
+import { z } from "zod";
+import { MailKeyMissingError, MailCredentialDecryptError } from "./errors.js";
 
 const ALGORITHM = "aes-256-gcm";
 const KEY_BYTES = 32;
 const IV_BYTES = 12;
+const AUTH_TAG_BYTES = 16;
 const VERSION = "v1";
 
 /**
@@ -12,11 +14,16 @@ const VERSION = "v1";
  * "Key handling" section). imapPassword and smtpPassword are usually identical --
  * the account form offers one password field with an "SMTP differs" toggle -- but
  * both are always stored so a differing SMTP password survives independently.
+ * A zod schema (not just a TS interface) because decryptCredentials validates the
+ * decrypted JSON against it -- a ciphertext can authenticate cleanly under GCM and
+ * still not unwrap to this shape, e.g. if it were ever encrypted by something else
+ * under the same key.
  */
-export interface MailCredentials {
-  imapPassword: string;
-  smtpPassword: string;
-}
+const mailCredentialsSchema = z.object({
+  imapPassword: z.string(),
+  smtpPassword: z.string(),
+});
+export type MailCredentials = z.infer<typeof mailCredentialsSchema>;
 
 // Keyed by resolved path rather than a single module-level slot: tests use a
 // fresh temp file per case (see mail-crypto.test.ts), and keying by path means
@@ -36,6 +43,13 @@ const keyCache = new Map<string, Buffer>();
  * map to 503 rather than an unhandled 500. Any other read failure (permission
  * denied, etc.) propagates as-is -- that is an operator problem with no
  * dedicated handling.
+ *
+ * The returned Buffer is cached and shared across every caller for a given
+ * keyPath (see keyCache above) -- treat it as read-only, and note there is no
+ * invalidation: if mail.key is replaced on disk after the first successful
+ * load (key rotation, or a restore from backup with a different key), this
+ * process keeps using the OLD in-memory key until it restarts. Rotating the
+ * key is a restart-the-server operation, not a live one.
  */
 export function loadMailKey(keyPath: string): Buffer {
   const cached = keyCache.get(keyPath);
@@ -74,11 +88,15 @@ export function encryptCredentials(key: Buffer, credentials: MailCredentials): s
 }
 
 /**
- * Inverse of encryptCredentials. Throws on: an unsupported/missing version
- * prefix, a malformed segment count, or GCM auth-tag verification failure
- * (wrong key, or any tampered byte in the IV/tag/data) -- decipher.final()
- * is where GCM raises that, so this function performs no manual integrity
- * check of its own.
+ * Inverse of encryptCredentials. Throws a plain Error for a ciphertext that
+ * is not even structurally v1 (wrong segment count, unrecognised version
+ * prefix) -- that is a caller/format bug, not a key problem. Throws the
+ * typed MailCredentialDecryptError for everything downstream of that: a
+ * malformed IV/tag length, GCM authentication failure (wrong key, or any
+ * tampered byte), or a decrypted payload that is not valid JSON matching
+ * MailCredentials -- all cases where "the key you have does not work for
+ * this ciphertext" is the useful thing for a caller to know, without any
+ * key/IV/tag/plaintext material leaking into the error message.
  */
 export function decryptCredentials(key: Buffer, ciphertext: string): MailCredentials {
   const parts = ciphertext.split(":");
@@ -92,8 +110,55 @@ export function decryptCredentials(key: Buffer, ciphertext: string): MailCredent
   const iv = Buffer.from(ivB64, "base64");
   const tag = Buffer.from(tagB64, "base64");
   const data = Buffer.from(dataB64, "base64");
-  const decipher = createDecipheriv(ALGORITHM, key, iv);
-  decipher.setAuthTag(tag);
-  const plaintext = Buffer.concat([decipher.update(data), decipher.final()]);
-  return JSON.parse(plaintext.toString("utf8")) as MailCredentials;
+  // Node accepts a GCM auth tag shorter than the full 16 bytes rather than
+  // rejecting it outright (see DEP0182) -- a truncated tag verifies against
+  // far fewer bits than intended, a real integrity downgrade, not just a
+  // formatting nicety. Reject both non-standard lengths up front, before
+  // either ever reaches the cipher.
+  if (iv.length !== IV_BYTES) {
+    throw new MailCredentialDecryptError(`invalid IV length: expected ${IV_BYTES} bytes`);
+  }
+  if (tag.length !== AUTH_TAG_BYTES) {
+    throw new MailCredentialDecryptError(`invalid auth tag length: expected ${AUTH_TAG_BYTES} bytes`);
+  }
+  let plaintext: Buffer;
+  try {
+    const decipher = createDecipheriv(ALGORITHM, key, iv);
+    decipher.setAuthTag(tag);
+    plaintext = Buffer.concat([decipher.update(data), decipher.final()]);
+  } catch {
+    // Node's own error here can be more detailed than this needs to be --
+    // never forward it (or the key/iv/tag bytes) verbatim. Callers only
+    // need to know decryption failed, e.g. because mail.key was
+    // rotated/restored since this row was encrypted.
+    throw new MailCredentialDecryptError("authentication failed (wrong key or corrupted ciphertext)");
+  }
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(plaintext.toString("utf8"));
+  } catch {
+    throw new MailCredentialDecryptError("decrypted payload was not valid JSON");
+  }
+  const result = mailCredentialsSchema.safeParse(parsedJson);
+  if (!result.success) {
+    throw new MailCredentialDecryptError("decrypted payload did not match the expected credentials shape");
+  }
+  return result.data;
+}
+
+/**
+ * Thin keyPath-taking wrappers -- the spirit of blobs.ts's
+ * `saveBlob(dataDir, ...)` -- for callers holding `config.mailKeyPath`
+ * (Task 3's account service, mainly) that just want to encrypt/decrypt in
+ * one call without separately threading loadMailKey through every call
+ * site. Prefer the pure key-based functions above wherever a Buffer key is
+ * already in hand (e.g. inside a loop over several accounts) to avoid
+ * repeated Map lookups.
+ */
+export function encryptCredentialsAt(keyPath: string, credentials: MailCredentials): string {
+  return encryptCredentials(loadMailKey(keyPath), credentials);
+}
+
+export function decryptCredentialsAt(keyPath: string, ciphertext: string): MailCredentials {
+  return decryptCredentials(loadMailKey(keyPath), ciphertext);
 }
