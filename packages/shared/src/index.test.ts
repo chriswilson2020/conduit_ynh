@@ -30,6 +30,18 @@ import {
   shiftTaskInputSchema,
   shiftResultSchema,
   ganttPayloadSchema,
+  mailAccountSchema,
+  mailAccountCreateInputSchema,
+  mailAccountUpdateInputSchema,
+  mailAccountTestInputSchema,
+  mailThreadSchema,
+  mailMessageSchema,
+  mailAttachmentSchema,
+  threadListFiltersSchema,
+  threadLinksInputSchema,
+  sendMailInputSchema,
+  emailTemplateSchema,
+  createEmailTemplateInputSchema,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -674,4 +686,212 @@ describe("ganttPayloadSchema", () => {
 
   it("accepts an empty payload", () =>
     expect(ganttPayloadSchema.parse({ tasks: [], dependencies: [] })).toEqual({ tasks: [], dependencies: [] }));
+});
+
+// --- Mail (Phase 4) -------------------------------------------------------
+
+const now = new Date().toISOString();
+
+describe("mailAccountSchema", () => {
+  const account = {
+    id: uuid1, userId: uuid2, label: "Work", email: "chris@example.com",
+    imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
+    smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
+    username: "chris",
+    sentFolder: "Sent", signatureHtml: null, backfillDays: 90,
+    status: "active" as const, lastError: null, lastSyncedAt: null,
+    archivedAt: null, createdAt: now, updatedAt: now,
+  };
+
+  it("accepts a complete account", () => {
+    expect(mailAccountSchema.parse(account)).toEqual(account);
+  });
+
+  it("accepts a null backfillDays (NULL means sync everything)", () => {
+    expect(mailAccountSchema.parse({ ...account, backfillDays: null }).backfillDays).toBeNull();
+  });
+
+  it("rejects an imapSecurity value outside tls/starttls", () =>
+    expect(() => mailAccountSchema.parse({ ...account, imapSecurity: "plain" })).toThrow());
+
+  it("rejects a status outside active/error", () =>
+    expect(() => mailAccountSchema.parse({ ...account, status: "syncing" })).toThrow());
+
+  // The whole point of this schema: no key on it may look like a credential.
+  // schema.ts's mail_accounts.credentials_ciphertext (and imap/smtp passwords)
+  // must never reach this shape -- see the Phase 4 spec's Key handling section.
+  it("has no credential-shaped field in its shape", () => {
+    const keys = Object.keys(mailAccountSchema.shape);
+    expect(keys).not.toContain("credentialsCiphertext");
+    for (const key of keys) {
+      expect(key.toLowerCase()).not.toMatch(/password|credential|secret/);
+    }
+  });
+});
+
+describe("mailAccountCreateInputSchema", () => {
+  const input = {
+    label: "Work", email: "chris@example.com",
+    imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
+    smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
+    username: "chris", password: "hunter2",
+  };
+
+  it("accepts the minimal shape (single password, no smtpPassword)", () => {
+    expect(mailAccountCreateInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("accepts an smtpPassword override for the 'SMTP differs' toggle", () => {
+    const withSmtp = { ...input, smtpPassword: "different" };
+    expect(mailAccountCreateInputSchema.parse(withSmtp)).toEqual(withSmtp);
+  });
+
+  it("rejects a missing password", () =>
+    expect(() => mailAccountCreateInputSchema.parse({ ...input, password: undefined })).toThrow());
+});
+
+describe("mailAccountUpdateInputSchema", () => {
+  it("accepts a partial patch with no password fields", () => {
+    expect(mailAccountUpdateInputSchema.parse({ label: "Renamed" })).toEqual({ label: "Renamed" });
+  });
+
+  it("has no password field at all (blank-means-unchanged is a service concern)", () => {
+    expect(Object.keys(mailAccountUpdateInputSchema.shape)).not.toContain("password");
+  });
+});
+
+describe("mailAccountTestInputSchema", () => {
+  it("accepts referencing a saved account by id alone", () => {
+    expect(mailAccountTestInputSchema.parse({ accountId: uuid1 })).toEqual({ accountId: uuid1 });
+  });
+
+  it("accepts a full not-yet-saved connection (no accountId)", () => {
+    const input = {
+      imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
+      smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
+      username: "chris", password: "hunter2",
+    };
+    expect(mailAccountTestInputSchema.parse(input)).toEqual(input);
+  });
+});
+
+describe("mailThreadSchema", () => {
+  it("accepts a fully-linked thread", () => {
+    const thread = {
+      id: uuid1, subject: "Re: Proposal", lastMessageAt: now, messageCount: 3,
+      companyId: uuid2, contactId: uuid2, dealId: uuid2, projectId: uuid2,
+      archivedAt: null, createdAt: now, updatedAt: now,
+    };
+    expect(mailThreadSchema.parse(thread)).toEqual(thread);
+  });
+
+  it("accepts an unlinked thread (all four link fields null)", () => {
+    const thread = {
+      id: uuid1, subject: "Hello", lastMessageAt: now, messageCount: 1,
+      companyId: null, contactId: null, dealId: null, projectId: null,
+      archivedAt: null, createdAt: now, updatedAt: now,
+    };
+    expect(mailThreadSchema.parse(thread)).toEqual(thread);
+  });
+});
+
+describe("mailMessageSchema", () => {
+  const message = {
+    id: uuid1, accountId: uuid2, threadId: uuid2,
+    messageId: "<abc@example.com>", inReplyTo: null, referencesIds: [],
+    fromAddr: "bob@example.com", fromName: "Bob",
+    toAddrs: [{ address: "chris@example.com", name: "Chris" }],
+    ccAddrs: [], bccAddrs: [],
+    subject: "Hello", bodyText: "Hi there", bodyHtml: "<p>Hi there</p>",
+    snippet: "Hi there", sentAt: now, folder: "INBOX", imapUid: 42,
+    seen: false, direction: "inbound" as const, createdAt: now, updatedAt: now,
+  };
+
+  it("accepts a complete inbound message", () => {
+    expect(mailMessageSchema.parse(message)).toEqual(message);
+  });
+
+  it("accepts the all-empty-string defaults a bare synthetic message-id row would have", () => {
+    const bare = { ...message, subject: "", bodyText: "", bodyHtml: null, snippet: "" };
+    expect(mailMessageSchema.parse(bare)).toEqual(bare);
+  });
+
+  it("rejects a direction outside inbound/outbound", () =>
+    expect(() => mailMessageSchema.parse({ ...message, direction: "sideways" })).toThrow());
+});
+
+describe("mailAttachmentSchema", () => {
+  it("accepts a complete attachment", () => {
+    const attachment = {
+      id: uuid1, messageId: uuid2, filename: "invoice.pdf", mime: "application/pdf",
+      sizeBytes: 12345, blobPath: "ab/cd/hash", contentId: null, isInline: false, createdAt: now,
+    };
+    expect(mailAttachmentSchema.parse(attachment)).toEqual(attachment);
+  });
+});
+
+describe("threadListFiltersSchema", () => {
+  it("accepts every filter set at once", () => {
+    const filters = {
+      accountId: uuid1, unread: true, unlinked: false,
+      companyId: uuid2, contactId: uuid2, dealId: uuid2, projectId: uuid2,
+      archived: false, cursor: "abc", limit: 20,
+    };
+    expect(threadListFiltersSchema.parse(filters)).toEqual(filters);
+  });
+
+  it("accepts no filters at all (unfiltered list)", () => {
+    expect(threadListFiltersSchema.parse({})).toEqual({});
+  });
+});
+
+describe("threadLinksInputSchema", () => {
+  it("accepts each of the four link kinds", () => {
+    for (const kind of ["company", "contact", "deal", "project"] as const) {
+      expect(threadLinksInputSchema.parse({ kind, id: uuid1 })).toEqual({ kind, id: uuid1 });
+    }
+  });
+
+  it("rejects a kind outside the four record types", () =>
+    expect(() => threadLinksInputSchema.parse({ kind: "task", id: uuid1 })).toThrow());
+});
+
+describe("sendMailInputSchema", () => {
+  const base = {
+    accountId: uuid1,
+    to: [{ address: "chris@example.com" }],
+    subject: "Hello", bodyHtml: "<p>Hi</p>",
+  };
+
+  it("accepts a minimal compose (cc/bcc/attachmentIds default to empty)", () => {
+    expect(sendMailInputSchema.parse(base)).toEqual({ ...base, cc: [], bcc: [], attachmentIds: [] });
+  });
+
+  it("accepts a reply (threadId set) with links ignored/absent", () => {
+    const reply = { ...base, threadId: uuid2 };
+    expect(sendMailInputSchema.parse(reply).threadId).toBe(uuid2);
+  });
+
+  it("accepts pre-link data for a fresh compose from a record page", () => {
+    const withLinks = { ...base, links: { dealId: uuid2 } };
+    expect(sendMailInputSchema.parse(withLinks).links).toEqual({ dealId: uuid2 });
+  });
+
+  it("rejects an empty to[] (a send always has at least one recipient)", () =>
+    expect(() => sendMailInputSchema.parse({ ...base, to: [] })).toThrow());
+});
+
+describe("emailTemplateSchema and createEmailTemplateInputSchema", () => {
+  it("accepts a complete template", () => {
+    const template = {
+      id: uuid1, name: "Follow-up", subject: "Following up", bodyHtml: "<p>Hi</p>",
+      archivedAt: null, createdAt: now, updatedAt: now,
+    };
+    expect(emailTemplateSchema.parse(template)).toEqual(template);
+  });
+
+  it("accepts a create input with subject omitted (defaults to '' at the DB)", () => {
+    const input = { name: "Follow-up", bodyHtml: "<p>Hi</p>" };
+    expect(createEmailTemplateInputSchema.parse(input)).toEqual(input);
+  });
 });

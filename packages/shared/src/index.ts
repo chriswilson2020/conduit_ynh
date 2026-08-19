@@ -456,6 +456,187 @@ export type UserSummary = z.infer<typeof userSummarySchema>;
 export const usersResponseSchema = z.object({ users: z.array(userSummarySchema) });
 export type UsersResponse = z.infer<typeof usersResponseSchema>;
 
+// --- Mail (Phase 4) ------------------------------------------------------
+
+export const mailSecuritySchema = z.enum(["tls", "starttls"]);
+export type MailSecurity = z.infer<typeof mailSecuritySchema>;
+
+export const mailAccountStatusSchema = z.enum(["active", "error"]);
+export type MailAccountStatus = z.infer<typeof mailAccountStatusSchema>;
+
+// Deliberately excludes credentialsCiphertext (and any other secret) --
+// mail_accounts.credentials_ciphertext is never serialized to a client (see
+// the Phase 4 spec's "Key handling" section). This is the account shape
+// every read route returns; index.test.ts asserts by construction that no
+// key on this schema looks like a credential.
+export const mailAccountSchema = z.object({
+  id: z.uuid(), userId: z.uuid(), label: z.string().min(1), email: z.email(),
+  imapHost: z.string().min(1), imapPort: z.number().int().positive(), imapSecurity: mailSecuritySchema,
+  smtpHost: z.string().min(1), smtpPort: z.number().int().positive(), smtpSecurity: mailSecuritySchema,
+  username: z.string().min(1),
+  sentFolder: z.string().min(1),
+  signatureHtml: nullableString,
+  backfillDays: z.number().int().positive().nullable(),
+  status: mailAccountStatusSchema,
+  lastError: nullableString,
+  lastSyncedAt: z.iso.datetime().nullable(),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type MailAccount = z.infer<typeof mailAccountSchema>;
+
+// userId is the actor, stamped server-side (mirrors notes' authorUserId --
+// never a caller-supplied field). One password field with an optional
+// smtpPassword override, per the "SMTP differs" toggle in the Phase 4 spec's
+// Key handling section -- when smtpPassword is omitted, the service reuses
+// password for both protocols.
+export const mailAccountCreateInputSchema = z.object({
+  label: z.string().min(1), email: z.email(),
+  imapHost: z.string().min(1), imapPort: z.number().int().positive(), imapSecurity: mailSecuritySchema,
+  smtpHost: z.string().min(1), smtpPort: z.number().int().positive(), smtpSecurity: mailSecuritySchema,
+  username: z.string().min(1),
+  password: z.string().min(1),
+  smtpPassword: z.string().min(1).optional(),
+  sentFolder: z.string().min(1).optional(),
+  signatureHtml: nullableString.optional(),
+  backfillDays: z.number().int().positive().nullable().optional(),
+});
+export type MailAccountCreateInput = z.infer<typeof mailAccountCreateInputSchema>;
+
+// update omits password/smtpPassword on purpose here: the edit form leaves
+// password fields blank and only overwrites when non-empty (spec, Key
+// handling) -- that "blank means unchanged" behaviour is a service-layer
+// concern, not something a single static shape can express, so credential
+// updates route through mailAccountCreateInputSchema's password fields at
+// the call site instead of living on this schema.
+export const mailAccountUpdateInputSchema = mailAccountCreateInputSchema
+  .omit({ password: true, smtpPassword: true }).partial();
+export type MailAccountUpdateInput = z.infer<typeof mailAccountUpdateInputSchema>;
+
+// POST /api/mail/accounts/test dry-runs IMAP+SMTP logins with either the
+// submitted credentials (composing a not-yet-saved account) or, when only
+// accountId is given, the stored ones -- every other field is therefore
+// optional here even though mailAccountCreateInputSchema requires them.
+export const mailAccountTestInputSchema = z.object({
+  accountId: z.uuid().optional(),
+  imapHost: z.string().min(1).optional(), imapPort: z.number().int().positive().optional(),
+  imapSecurity: mailSecuritySchema.optional(),
+  smtpHost: z.string().min(1).optional(), smtpPort: z.number().int().positive().optional(),
+  smtpSecurity: mailSecuritySchema.optional(),
+  username: z.string().min(1).optional(),
+  password: z.string().min(1).optional(),
+  smtpPassword: z.string().min(1).optional(),
+});
+export type MailAccountTestInput = z.infer<typeof mailAccountTestInputSchema>;
+
+export const mailThreadSchema = z.object({
+  id: z.uuid(), subject: z.string().min(1),
+  lastMessageAt: z.iso.datetime(), messageCount: z.number().int().nonnegative(),
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
+  projectId: z.uuid().nullable(),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type MailThread = z.infer<typeof mailThreadSchema>;
+
+export const mailDirectionSchema = z.enum(["inbound", "outbound"]);
+export type MailDirection = z.infer<typeof mailDirectionSchema>;
+
+// {address, name} mirrors mail_messages.to_addrs/cc_addrs/bcc_addrs' jsonb
+// shape (spec: "array of {address, name}") -- name is optional/nullable
+// because a raw address header ("bob@example.com" with no display name) is
+// completely ordinary.
+export const mailAddressSchema = z.object({
+  address: z.email(), name: z.string().min(1).nullable().optional(),
+});
+export type MailAddress = z.infer<typeof mailAddressSchema>;
+
+export const mailMessageSchema = z.object({
+  id: z.uuid(), accountId: z.uuid(), threadId: z.uuid(),
+  messageId: z.string().min(1), inReplyTo: z.string().min(1).nullable(),
+  referencesIds: z.array(z.string().min(1)),
+  fromAddr: z.email(), fromName: nullableString,
+  toAddrs: z.array(mailAddressSchema), ccAddrs: z.array(mailAddressSchema), bccAddrs: z.array(mailAddressSchema),
+  // subject/bodyText/snippet default to '' at the DB (inbound mail can lack
+  // a subject entirely), so no .min(1) here -- unlike mailAddressSchema's
+  // name, empty string is the normal "absent" value for these, not null.
+  subject: z.string(), bodyText: z.string(), bodyHtml: z.string().nullable(),
+  snippet: z.string(),
+  sentAt: z.iso.datetime(), folder: z.string().min(1),
+  imapUid: z.number().int().nonnegative().nullable(),
+  seen: z.boolean(), direction: mailDirectionSchema,
+  ...timestamps,
+});
+export type MailMessage = z.infer<typeof mailMessageSchema>;
+
+export const mailAttachmentSchema = z.object({
+  id: z.uuid(), messageId: z.uuid(), filename: z.string().min(1), mime: z.string().min(1),
+  sizeBytes: z.number().int().nonnegative(), blobPath: z.string().min(1),
+  contentId: nullableString, isInline: z.boolean(), createdAt: z.iso.datetime(),
+});
+export type MailAttachment = z.infer<typeof mailAttachmentSchema>;
+
+// Query-side filter contract for GET /api/mail/threads (route layer maps its
+// snake_case querystring onto this camelCase shape, same division of labour
+// as e.g. tasks.ts's listQuerySchema/listTasks). unread/unlinked/archived
+// are plain booleans here, not the wire tri-state string -- that coercion is
+// the route's job, same as every other listQuerySchema in routes/*.ts.
+export const threadListFiltersSchema = z.object({
+  accountId: z.uuid().optional(),
+  unread: z.boolean().optional(),
+  unlinked: z.boolean().optional(),
+  companyId: z.uuid().optional(), contactId: z.uuid().optional(),
+  dealId: z.uuid().optional(), projectId: z.uuid().optional(),
+  archived: z.boolean().optional(),
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(100).optional(),
+});
+export type ThreadListFilters = z.infer<typeof threadListFiltersSchema>;
+
+export const mailLinkKindSchema = z.enum(["company", "contact", "deal", "project"]);
+export type MailLinkKind = z.infer<typeof mailLinkKindSchema>;
+
+// Body shape for both POST /api/mail/threads/:id/links (set) and DELETE
+// .../links/:kind (unlink uses only the path param, but kind+id together
+// describe "this one link" as a single addressable value either way).
+export const threadLinksInputSchema = z.object({
+  kind: mailLinkKindSchema,
+  id: z.uuid(),
+});
+export type ThreadLinksInput = z.infer<typeof threadLinksInputSchema>;
+
+// Compose and reply share one shape (spec, Send path): threadId is present
+// only when replying, absent when composing fresh. links pre-links a
+// brand-new thread the way the compose dialog does when opened from a
+// contact/company/deal/project page -- meaningless (and ignored) on a reply,
+// which already has a thread.
+export const sendMailInputSchema = z.object({
+  accountId: z.uuid(),
+  threadId: z.uuid().optional(),
+  to: z.array(mailAddressSchema).min(1),
+  cc: z.array(mailAddressSchema).optional().default([]),
+  bcc: z.array(mailAddressSchema).optional().default([]),
+  subject: z.string(),
+  bodyHtml: z.string().min(1),
+  attachmentIds: z.array(z.uuid()).optional().default([]),
+  links: z.object({
+    companyId: z.uuid().optional(), contactId: z.uuid().optional(),
+    dealId: z.uuid().optional(), projectId: z.uuid().optional(),
+  }).optional(),
+});
+export type SendMailInput = z.infer<typeof sendMailInputSchema>;
+
+export const emailTemplateSchema = z.object({
+  id: z.uuid(), name: z.string().min(1), subject: z.string(), bodyHtml: z.string().min(1),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type EmailTemplate = z.infer<typeof emailTemplateSchema>;
+
+export const createEmailTemplateInputSchema = z.object({
+  name: z.string().min(1), subject: z.string().optional(), bodyHtml: z.string().min(1),
+});
+export type CreateEmailTemplateInput = z.infer<typeof createEmailTemplateInputSchema>;
+export const updateEmailTemplateInputSchema = createEmailTemplateInputSchema.partial();
+export type UpdateEmailTemplateInput = z.infer<typeof updateEmailTemplateInputSchema>;
+
 export const searchResultsSchema = z.object({
   companies: z.array(z.object({ id: z.uuid(), name: z.string() })),
   contacts: z.array(z.object({

@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, check, unique, customType } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, boolean, check, unique, customType } from "drizzle-orm/pg-core";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -15,6 +15,29 @@ import { sql } from "drizzle-orm";
  */
 const positionText = customType<{ data: string }>({
   dataType() { return 'text COLLATE "C"'; },
+});
+
+/**
+ * mail_messages.search: a STORED generated column, not a value the app ever
+ * writes. drizzle-orm has no built-in tsvector column type, so -- exactly
+ * like positionText's collation pin above -- the full Postgres type
+ * expression is smuggled through as this customType's dataType() (drizzle
+ * inserts it into the CREATE TABLE column list verbatim). Unlike
+ * positionText, drizzle-kit's generator is NOT trusted to round-trip this
+ * text correctly: confirmed by running it -- `db:generate` wrapped this
+ * entire type expression in a spurious pair of double quotes, as though it
+ * were a single identifier, which is not valid SQL for a GENERATED ALWAYS AS
+ * column. The migration SQL this produces is therefore hand-corrected after
+ * `db:generate` rather than taken as-is -- see drizzle/0004_*.sql, whose GIN
+ * index is hand-written for the same reason (drizzle-kit has no notion of a
+ * GIN index over a generated column either).
+ */
+const searchVector = customType<{ data: string }>({
+  dataType() {
+    return "tsvector GENERATED ALWAYS AS (to_tsvector('english', " +
+      "coalesce(subject,'') || ' ' || coalesce(body_text,'') || ' ' || " +
+      "coalesce(from_addr,'') || ' ' || coalesce(from_name,''))) STORED";
+  },
 });
 
 export const users = pgTable("users", {
@@ -280,3 +303,159 @@ export const events = pgTable("events", {
   sql`verb IN ('created','updated','archived','unarchived','note_added','file_attached','stage_changed','won','lost','reopened','shifted','completed','dependency_added','dependency_removed')`,
 )]);
 export type EventRow = typeof events.$inferSelect;
+
+// --- Mail (Phase 4) ------------------------------------------------------
+//
+// Purely additive: no existing table changes. Indexes (the search GIN index,
+// mail_messages(thread_id), mail_threads(last_message_at), and the four
+// mail_threads FK columns) are deliberately NOT declared here via drizzle's
+// index() builder -- no table in this codebase has used it so far, and
+// keeping this migration's indexing as one hand-written block in
+// drizzle/0004_*.sql (alongside the hand-written search column) keeps all of
+// this migration's non-generatable SQL in one place instead of splitting it
+// between schema.ts and the .sql file.
+
+export const mailAccounts = pgTable("mail_accounts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id),
+  label: text("label").notNull(),
+  // The account's own address, used for direction detection (from_addr ===
+  // email, case-insensitively) and as the From header on send.
+  email: text("email").notNull(),
+  imapHost: text("imap_host").notNull(),
+  imapPort: integer("imap_port").notNull(),
+  imapSecurity: text("imap_security").notNull(),
+  smtpHost: text("smtp_host").notNull(),
+  smtpPort: integer("smtp_port").notNull(),
+  smtpSecurity: text("smtp_security").notNull(),
+  username: text("username").notNull(),
+  // AES-256-GCM, format v1:<iv>:<tag>:<data>; see the Phase 4 spec's Key
+  // handling section. Never selected into any API response.
+  credentialsCiphertext: text("credentials_ciphertext").notNull(),
+  sentFolder: text("sent_folder").notNull().default("Sent"),
+  signatureHtml: text("signature_html"),
+  // NULL = sync everything, not "sync nothing" -- see mail-sync.ts (later
+  // task)'s backfill, which treats NULL as "no lower bound."
+  backfillDays: integer("backfill_days").default(90),
+  status: text("status").notNull().default("active"),
+  lastError: text("last_error"),
+  lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  check("mail_accounts_imap_security_valid", sql`imap_security IN ('tls','starttls')`),
+  check("mail_accounts_smtp_security_valid", sql`smtp_security IN ('tls','starttls')`),
+  check("mail_accounts_status_valid", sql`status IN ('active','error')`),
+]);
+export type MailAccountRow = typeof mailAccounts.$inferSelect;
+
+// The incremental-sync cursor per (account, folder). No created_at -- unlike
+// every other mail table, this one is pure mutable cursor state with no
+// history worth keeping (see the Phase 4 spec's data model bullet for it,
+// which lists only updated_at).
+export const mailFolderState = pgTable("mail_folder_state", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  accountId: uuid("account_id").notNull().references(() => mailAccounts.id),
+  folder: text("folder").notNull(),
+  uidvalidity: bigint("uidvalidity", { mode: "number" }).notNull(),
+  lastSeenUid: bigint("last_seen_uid", { mode: "number" }).notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  unique("mail_folder_state_account_folder_unique").on(t.accountId, t.folder),
+]);
+export type MailFolderStateRow = typeof mailFolderState.$inferSelect;
+
+// Threads are global, not per-account (spec: a conversation two users are
+// both on is one thread) -- hence no accountId column here at all; accountId
+// lives on mail_messages instead. The four link columns mirror
+// notes/files/tasks' company/contact/deal/project columns, but deliberately
+// WITHOUT their exactly-one CHECK: a thread can be linked to any subset (or
+// none) of the four, set independently by auto-linking and manual links.
+export const mailThreads = pgTable("mail_threads", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  subject: text("subject").notNull(),
+  lastMessageAt: timestamp("last_message_at", { withTimezone: true }).notNull(),
+  messageCount: integer("message_count").notNull().default(0),
+  companyId: uuid("company_id").references(() => companies.id),
+  contactId: uuid("contact_id").references(() => contacts.id),
+  dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type MailThreadRow = typeof mailThreads.$inferSelect;
+
+export const mailMessages = pgTable("mail_messages", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  accountId: uuid("account_id").notNull().references(() => mailAccounts.id),
+  threadId: uuid("thread_id").notNull().references(() => mailThreads.id),
+  // RFC 5322 Message-ID, or a synthetic "sha256:<hash>" when the source
+  // message lacks one (spec). Paired with accountId in the UNIQUE below so
+  // the same message seen twice (two folders, or a UIDVALIDITY refetch)
+  // collapses to one row.
+  messageId: text("message_id").notNull(),
+  inReplyTo: text("in_reply_to"),
+  // Column name is the SQL keyword "references" (drizzle quotes every
+  // identifier it emits, same as every other column here, so this needs no
+  // special handling in the generated DDL). The TS property is renamed to
+  // referencesIds purely so call sites never have to write the awkward
+  // `messages.references` -- a plain readability choice, not a technical
+  // requirement.
+  referencesIds: text("references").array().notNull().default([]),
+  fromAddr: text("from_addr").notNull(),
+  fromName: text("from_name"),
+  toAddrs: jsonb("to_addrs").notNull(),
+  ccAddrs: jsonb("cc_addrs").notNull().default([]),
+  // Populated for outbound only (spec) -- inbound ingest never learns Bcc.
+  bccAddrs: jsonb("bcc_addrs").notNull().default([]),
+  subject: text("subject").notNull().default(""),
+  bodyText: text("body_text").notNull().default(""),
+  bodyHtml: text("body_html"),
+  snippet: text("snippet").notNull().default(""),
+  sentAt: timestamp("sent_at", { withTimezone: true }).notNull(),
+  folder: text("folder").notNull(),
+  // NULL until an APPENDed send is next reconciled against the Sent folder
+  // (spec, Send path step 5).
+  imapUid: bigint("imap_uid", { mode: "number" }),
+  seen: boolean("seen").notNull().default(false),
+  direction: text("direction").notNull(),
+  // GENERATED ALWAYS AS (...) STORED -- see searchVector's customType
+  // comment above. Never written by the app; Postgres computes it on every
+  // insert/update of the four source columns.
+  search: searchVector("search").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  check("mail_messages_direction_valid", sql`direction IN ('inbound','outbound')`),
+  unique("mail_messages_account_message_unique").on(t.accountId, t.messageId),
+]);
+export type MailMessageRow = typeof mailMessages.$inferSelect;
+
+export const mailAttachments = pgTable("mail_attachments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  messageId: uuid("message_id").notNull().references(() => mailMessages.id),
+  filename: text("filename").notNull(),
+  mime: text("mime").notNull(),
+  sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+  // Stored via the existing blobs service under $data_dir (spec).
+  blobPath: text("blob_path").notNull(),
+  contentId: text("content_id"),
+  isInline: boolean("is_inline").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type MailAttachmentRow = typeof mailAttachments.$inferSelect;
+
+// Shared across users (spec) -- no ownerUserId/authorUserId, unlike most
+// other tables in this file.
+export const emailTemplates = pgTable("email_templates", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  subject: text("subject").notNull().default(""),
+  bodyHtml: text("body_html").notNull(),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type EmailTemplateRow = typeof emailTemplates.$inferSelect;
