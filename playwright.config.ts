@@ -22,7 +22,11 @@ export default defineConfig({
   // CPU contention (crm.spec.ts and pipeline.spec.ts no longer race for the
   // same core), which measurably reduces how often this is lost; retries
   // catches whatever residual chance remains, the same way Playwright's own
-  // CI guidance recommends for this class of flakiness.
+  // CI guidance recommends for this class of flakiness. The drag helpers in
+  // pipeline.spec.ts/tasks.spec.ts additionally wait on dnd-kit's aria-live
+  // announcements after every press (re-pressing a swallowed arrow), so a
+  // lost keydown now self-heals inside the test instead of burning a retry
+  // -- see keyboardDragCard's doc comment in tasks.spec.ts.
   workers: process.env.CI ? 1 : undefined,
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? [["html", { open: "never" }], ["list"]] : "list",

@@ -1,6 +1,58 @@
 import { test, expect } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
 
+// Keyboard-drags a sortable card: Space lifts, each arrow moves one slot or
+// column, Space drops. dnd-kit's KeyboardSensor attaches the document-level
+// keydown listener that handles everything AFTER the lift via a bare
+// setTimeout queued while handling the lift itself (see playwright.config.ts
+// on this), and under CI's variable-load CPU that timer can lose not just a
+// same-tick follow-up press but one issued a flat 50ms later -- run
+// 32275345192 (and the run before it) showed an ArrowRight swallowed despite
+// that wait, and pipeline.spec.ts's waitless drags on cold retry workers
+// losing BOTH the arrow and the ending Space, leaving the drag stuck mid-air
+// past the assertion timeout. Flat waits guess; dnd-kit's own aria-live
+// region does not: every press it actually processes commits a new
+// announcement ("Picked up ...", "... was moved over ...", "... was dropped
+// over ..."). So each step here waits for its announcement, and an arrow
+// whose announcement never arrives is pressed again -- a swallowed keydown
+// left no state behind, and a processed-but-not-yet-committed one converges
+// anyway because the coordinate getter resolves the TARGET's absolute
+// coordinates, not a delta: a duplicate press re-resolves to the same target
+// while the first's render is still pending. Shared by both describes below
+// (and mirrored in pipeline.spec.ts, whose board reuses the same
+// kanban-core machinery).
+async function keyboardDragCard(page: Page, card: Locator, arrowKeys: string[]) {
+  const announcement = page.locator('[id^="DndLiveRegion"]');
+  await card.focus();
+  await page.keyboard.press("Space");
+  // The lift settles in two announcements ("Picked up ...", then "... was
+  // moved over ..." once `over` resolves to the ghost's own column). Waiting
+  // for the second means every lift-time render has committed before the
+  // first arrow, so a text CHANGE below can only be that arrow's own
+  // announcement, never a late lift one.
+  await expect(announcement).toContainText("was moved over");
+  for (const key of arrowKeys) {
+    let announced = false;
+    for (let attempt = 0; attempt < 3 && !announced; attempt += 1) {
+      const before = (await announcement.textContent()) ?? "";
+      await page.keyboard.press(key);
+      try {
+        await expect(announcement).not.toHaveText(before, { timeout: 1500 });
+        announced = true;
+      } catch {
+        // Swallowed by the listener-attach race above -- press again.
+      }
+    }
+    if (!announced) throw new Error(`dnd-kit never announced a move for ${key}`);
+  }
+  await page.keyboard.press("Space");
+  // An announced arrow proves the document listener is attached, so this
+  // Space cannot be swallowed -- but wait for the drop to commit before
+  // returning ("dropped over" when it lands on a droppable, bare "dropped"
+  // otherwise) rather than racing the caller's assertions against it.
+  await expect(announcement).toContainText("was dropped");
+}
+
 // One serial journey through Phase 3's project/task/board/drawer/Gantt
 // flows (Task 10): create a project, build a small task board, keyboard-drag
 // a card, wire up dates and a dependency via the drawer, open the Gantt and
@@ -64,26 +116,6 @@ test.describe.serial("Tasks/Gantt journey", () => {
     await expect(card).toBeVisible();
     const testid = await card.getAttribute("data-testid");
     return (testid as string).replace("card-", "");
-  }
-
-  // dnd-kit's own keyboard sensor (task-board.tsx reuses the exact same
-  // machinery as pipeline.spec.ts's board -- see kanban-core.tsx) attaches
-  // the listener that catches everything AFTER the lift via a bare
-  // setTimeout queued while handling the lift itself (see playwright.
-  // config.ts's own doc comment on this). A same-tick Space-then-Arrow can
-  // outrun that setTimeout under CI's shared, variable-load CPU, so this
-  // waits one tick after the lift before sending the first Arrow --
-  // pipeline.spec.ts's single-arrow drags get away without it most of the
-  // time, but this file adds more keyboard-drag steps to the same shared
-  // worker (plus the Gantt nudge test's own rapid keypresses), which upped
-  // how often CI actually lost the race; workers:1/retries:2 alone weren't
-  // enough headroom for it here.
-  async function keyboardDragCard(card: Locator, arrowKeys: string[]) {
-    await card.focus();
-    await page.keyboard.press("Space");
-    await page.waitForTimeout(50);
-    for (const key of arrowKeys) await page.keyboard.press(key);
-    await page.keyboard.press("Space");
   }
 
   // Opens the drawer via a card click (task-board.tsx's openTask, a ?task=
@@ -155,7 +187,7 @@ test.describe.serial("Tasks/Gantt journey", () => {
     const inProgress = boardColumn("in_progress");
     const designCard = todo.getByTestId(`card-${designId}`);
 
-    await keyboardDragCard(designCard, ["ArrowRight"]);
+    await keyboardDragCard(page, designCard, ["ArrowRight"]);
 
     await expect(inProgress.getByTestId(`card-${designId}`)).toBeVisible();
     await expect(todo.getByTestId(`card-${designId}`)).not.toBeVisible();
@@ -261,15 +293,15 @@ test.describe.serial("Tasks/Gantt journey", () => {
     const done = boardColumn("done");
 
     await page.goto(`/projects/${projectId}/board`);
-    await keyboardDragCard(todo.getByTestId(`card-${buildId}`), ["ArrowRight"]);
+    await keyboardDragCard(page, todo.getByTestId(`card-${buildId}`), ["ArrowRight"]);
     await expect(inProgress.getByTestId(`card-${buildId}`)).toBeVisible();
 
     await page.goto(`/projects/${projectId}/board`);
-    await keyboardDragCard(inProgress.getByTestId(`card-${buildId}`), ["ArrowRight"]);
+    await keyboardDragCard(page, inProgress.getByTestId(`card-${buildId}`), ["ArrowRight"]);
     await expect(blocked.getByTestId(`card-${buildId}`)).toBeVisible();
 
     await page.goto(`/projects/${projectId}/board`);
-    await keyboardDragCard(blocked.getByTestId(`card-${buildId}`), ["ArrowRight"]);
+    await keyboardDragCard(page, blocked.getByTestId(`card-${buildId}`), ["ArrowRight"]);
     await expect(done.getByTestId(`card-${buildId}`)).toBeVisible();
     await expect(todo.getByTestId(`card-${buildId}`)).not.toBeVisible();
   });
@@ -380,12 +412,7 @@ test.describe.serial("Task board keyboard drag with off-screen columns", () => {
     // drift silently widening what fits.
     await expect(done).not.toBeInViewport();
 
-    const card = blocked.getByTestId(`card-${taskId}`);
-    await card.focus();
-    await page.keyboard.press("Space");
-    await page.waitForTimeout(50);
-    await page.keyboard.press("ArrowRight");
-    await page.keyboard.press("Space");
+    await keyboardDragCard(page, blocked.getByTestId(`card-${taskId}`), ["ArrowRight"]);
 
     await expect(done.getByTestId(`card-${taskId}`)).toBeVisible();
     await expect(blocked.getByTestId(`card-${taskId}`)).not.toBeVisible();
