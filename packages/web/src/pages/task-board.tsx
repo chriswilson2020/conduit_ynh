@@ -2,12 +2,13 @@ import { useMemo, useState } from "react";
 import type { FormEvent, RefObject } from "react";
 import { DndContext, DragOverlay } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import type { Task, TaskStatus, TaskType } from "@conduit/shared";
 import { useBoardMoveTask, useCreateTask, useProject, useSetTaskStatus, useTasks, useUsers } from "../queries";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
+import { TaskDrawer } from "../components/task-drawer";
 import {
   KanbanEmptyPlaceholder, kanbanSortableItems, useKanbanBoard, useKanbanCardSortable, useKanbanColumnDroppable,
 } from "../components/kanban-core";
@@ -15,21 +16,39 @@ import { todayLocalIso } from "../lib";
 
 // Fixed status columns, not stages (per the design's task board: kanban
 // machinery reused with a fixed column set instead of a per-pipeline one).
-const STATUSES: TaskStatus[] = ["todo", "in_progress", "blocked", "done"];
-const STATUS_LABEL: Record<TaskStatus, string> = {
+// Exported: the task drawer (Task 8) and My Tasks reuse these same labels/
+// badges rather than redefining them, so a status/type's wording only ever
+// lives in one place.
+export const STATUSES: TaskStatus[] = ["todo", "in_progress", "blocked", "done"];
+export const STATUS_LABEL: Record<TaskStatus, string> = {
   todo: "To do", in_progress: "In progress", blocked: "Blocked", done: "Done",
 };
-const TYPE_BADGE: Record<TaskType, string> = { task: "T", call: "C", meeting: "M", email: "E", deadline: "D" };
-const TYPE_LABEL: Record<TaskType, string> = {
+export const TYPE_BADGE: Record<TaskType, string> = { task: "T", call: "C", meeting: "M", email: "E", deadline: "D" };
+export const TYPE_LABEL: Record<TaskType, string> = {
   task: "Task", call: "Call", meeting: "Meeting", email: "Email", deadline: "Deadline",
 };
+export const TASK_TYPES: TaskType[] = ["task", "call", "meeting", "email", "deadline"];
 
 export function TaskBoardPage() {
   const { projectId } = useParams({ from: "/projects/$projectId/board" });
+  // `?task=<id>` deep-links straight to the drawer (Task 8's plan: read on
+  // mount, open, clear on close) -- the URL is the single source of truth
+  // for which task is open, so a card click and a search-result navigation
+  // both just set this same param rather than a separate local state that
+  // could drift from it.
+  const { task: openTaskId } = useSearch({ from: "/projects/$projectId/board" });
+  const navigate = useNavigate();
   const { data: project } = useProject(projectId);
   const { data: tasks = [], isLoading } = useTasks({ projectId });
   const { data: users = [] } = useUsers();
   const boardMoveTask = useBoardMoveTask();
+
+  function openTask(id: string) {
+    void navigate({ to: "/projects/$projectId/board", params: { projectId }, search: (prev) => ({ ...prev, task: id }) });
+  }
+  function closeTask() {
+    void navigate({ to: "/projects/$projectId/board", params: { projectId }, search: (prev) => ({ ...prev, task: undefined }) });
+  }
 
   const userInitials = useMemo(
     () => new Map(users.map((user) => [user.id, (user.fullName ?? user.username).slice(0, 1).toUpperCase()])),
@@ -96,6 +115,7 @@ export function TaskBoardPage() {
               projectId={projectId}
               userInitials={userInitials}
               suppressCardClickRef={suppressCardClickRef}
+              onCardClick={openTask}
             />
           ))}
         </div>
@@ -110,6 +130,7 @@ export function TaskBoardPage() {
           ) : null}
         </DragOverlay>
       </DndContext>
+      <TaskDrawer taskId={openTaskId ?? null} onClose={closeTask} />
     </div>
   );
 }
@@ -120,12 +141,14 @@ function Column({
   projectId,
   userInitials,
   suppressCardClickRef,
+  onCardClick,
 }: {
   status: TaskStatus;
   tasks: Task[];
   projectId: string;
   userInitials: Map<string, string>;
   suppressCardClickRef: RefObject<boolean>;
+  onCardClick: (id: string) => void;
 }) {
   const { setNodeRef } = useKanbanColumnDroppable(status);
   const taskIds = tasks.map((task) => task.id);
@@ -145,6 +168,7 @@ function Column({
               task={task}
               ownerInitial={task.assigneeUserId ? userInitials.get(task.assigneeUserId) : undefined}
               suppressCardClickRef={suppressCardClickRef}
+              onClick={onCardClick}
             />
           ))}
           {tasks.length === 0 && <KanbanEmptyPlaceholder columnId={status} label="No tasks" />}
@@ -159,20 +183,23 @@ function TaskCard({
   task,
   ownerInitial,
   suppressCardClickRef,
+  onClick,
 }: {
   task: Task;
   ownerInitial?: string;
   suppressCardClickRef: RefObject<boolean>;
+  onClick: (id: string) => void;
 }) {
   const { attributes, listeners, setNodeRef, style } = useKanbanCardSortable(task.id, task.status);
 
-  // Task 8 wires the task drawer to this click; for now it is a deliberate
-  // no-op (not a broken link) per the plan -- suppressCardClickRef still has
-  // to be checked here regardless, since dnd-kit's drop gesture can still
-  // fire a trailing native click event even though nothing happens on it yet
-  // (see kanban-core's useKanbanBoard doc comment on suppressCardClickRef).
+  // Opens the task drawer (Task 8) via the ?task= query param -- see
+  // TaskBoardPage's openTask. suppressCardClickRef still has to be checked
+  // here regardless of what the click does, since dnd-kit's drop gesture can
+  // still fire a trailing native click event (see kanban-core's
+  // useKanbanBoard doc comment on suppressCardClickRef).
   function handleClick() {
     if (suppressCardClickRef.current) return;
+    onClick(task.id);
   }
 
   return (

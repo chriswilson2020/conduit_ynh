@@ -8,6 +8,7 @@ import {
   funnelRowSchema,
   ganttPayloadSchema,
   listResponseSchema,
+  meResponseSchema,
   midpoint,
   noteSchema,
   pipelineSchema,
@@ -59,6 +60,7 @@ const dealListSchema = dealSchema.array();
 const funnelListSchema = funnelRowSchema.array();
 const projectListSchema = projectSchema.array();
 const taskListSchema = taskSchema.array();
+const taskDependencyListSchema = taskDependencySchema.array();
 
 /** Builds a `?a=1&b=2` query string, dropping keys whose value is undefined. */
 function toQueryString(params: Record<string, string | number | boolean | undefined>): string {
@@ -806,18 +808,48 @@ export function useTasks(params: TaskListParams = {}) {
   });
 }
 
+// Single-task detail query for the task drawer (Task 8), mirroring
+// useDeal/useProject -- the ["task", id] key this uses is exactly what
+// publishTaskHint (services/tasks.ts) publishes on every task mutation
+// (added alongside deals'/projects' own ["deal", id]/["project", id]
+// precedent), so both this and useTaskDependencies below (a deeper key
+// under the same prefix) invalidate correctly whether the mutation landed
+// in this tab or arrived over SSE from another one.
+export function useTask(id: string) {
+  return useQuery({
+    queryKey: ["task", id],
+    queryFn: async () => parseWith(taskSchema, await getJson<unknown>(`/tasks/${id}`), "task"),
+    enabled: id !== "",
+  });
+}
+
+// This task's predecessors -- GET /api/tasks/:id/dependencies
+// (services/tasks.ts's listDependencies), scoped under ["task", id] (see
+// useTask's doc comment above) rather than a sibling top-level key, so
+// invalidating ["task", id] anywhere also refreshes this.
+export function useTaskDependencies(id: string) {
+  return useQuery({
+    queryKey: ["task", id, "dependencies"],
+    queryFn: async () =>
+      parseWith(taskDependencyListSchema, await getJson<unknown>(`/tasks/${id}/dependencies`), "task dependencies"),
+    enabled: id !== "",
+  });
+}
+
 /**
  * Mirrors publishTaskHint in services/tasks.ts: every task mutation
- * publishes ["tasks", scope], ["gantt"], ["events"], ["search"], plus
- * ["my-tasks", assigneeId] for every assignee actually touched (the task's
- * current one, and -- via extraAssigneeIds -- its pre-patch one on a
- * reassignment, so both the old and new My Tasks lists refresh).
+ * publishes ["tasks", scope], ["task", id], ["gantt"], ["events"],
+ * ["search"], plus ["my-tasks", assigneeId] for every assignee actually
+ * touched (the task's current one, and -- via extraAssigneeIds -- its
+ * pre-patch one on a reassignment, so both the old and new My Tasks lists
+ * refresh).
  */
 function useInvalidateTask() {
   const queryClient = useQueryClient();
   return (task: Task, extraAssigneeIds: (string | null)[] = []) => {
     const scope = task.projectId ?? "standalone";
     void queryClient.invalidateQueries({ queryKey: ["tasks", scope] });
+    void queryClient.invalidateQueries({ queryKey: ["task", task.id] });
     void queryClient.invalidateQueries({ queryKey: ["gantt"] });
     void queryClient.invalidateQueries({ queryKey: ["events"] });
     void queryClient.invalidateQueries({ queryKey: ["search"] });
@@ -858,6 +890,25 @@ export function useSetTaskStatus() {
   return useMutation({
     mutationFn: async ({ id, status }: { id: string; status: TaskStatus }) =>
       parseWith(taskSchema, await postJson<unknown>(`/tasks/${id}/status`, { status }), "task"),
+    onSuccess: (task: Task) => invalidate(task),
+  });
+}
+
+// Archive/unarchive, mirroring useArchiveDeal/useArchiveProject -- the task
+// drawer (Task 8) is the first caller.
+export function useArchiveTask() {
+  const invalidate = useInvalidateTask();
+  return useMutation({
+    mutationFn: async (id: string) => parseWith(taskSchema, await postJson<unknown>(`/tasks/${id}/archive`), "task"),
+    onSuccess: (task: Task) => invalidate(task),
+  });
+}
+
+export function useUnarchiveTask() {
+  const invalidate = useInvalidateTask();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(taskSchema, await postJson<unknown>(`/tasks/${id}/unarchive`), "task"),
     onSuccess: (task: Task) => invalidate(task),
   });
 }
@@ -951,9 +1002,18 @@ export function useBoardMoveTask() {
  * of the server's own successor-scoped publish hint in
  * services/tasks.ts's addDependency/removeDependency). Correctness over
  * precision for a low-frequency mutation.
+ *
+ * ["task", successorId] IS precise, though: it's exactly the key
+ * publishTaskHint's ["task", task.id] entry targets (services/tasks.ts --
+ * addDependency/removeDependency both call publishTaskHint on the successor),
+ * and TanStack's prefix match reaches the task drawer's deeper
+ * ["task", id, "dependencies"] cache (useTaskDependencies below) too, so the
+ * drawer's predecessor list refreshes from this same call with no separate
+ * key.
  */
-function invalidateAfterDependencyChange(queryClient: ReturnType<typeof useQueryClient>): void {
+function invalidateAfterDependencyChange(queryClient: ReturnType<typeof useQueryClient>, successorId: string): void {
   void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+  void queryClient.invalidateQueries({ queryKey: ["task", successorId] });
   void queryClient.invalidateQueries({ queryKey: ["gantt"] });
   void queryClient.invalidateQueries({ queryKey: ["events"] });
   void queryClient.invalidateQueries({ queryKey: ["search"] });
@@ -971,7 +1031,7 @@ export function useAddDependency() {
         await postJson<unknown>(`/tasks/${successorId}/dependencies`, { predecessorId }),
         "task dependency",
       ),
-    onSuccess: () => invalidateAfterDependencyChange(queryClient),
+    onSuccess: (_dep, { successorId }) => invalidateAfterDependencyChange(queryClient, successorId),
   });
 }
 
@@ -981,7 +1041,7 @@ export function useRemoveDependency() {
     mutationFn: async ({ predecessorId, successorId }: { predecessorId: string; successorId: string }) => {
       await deleteRequest(`/tasks/${successorId}/dependencies/${predecessorId}`);
     },
-    onSuccess: () => invalidateAfterDependencyChange(queryClient),
+    onSuccess: (_void, { successorId }) => invalidateAfterDependencyChange(queryClient, successorId),
   });
 }
 
@@ -1112,6 +1172,20 @@ export function useUsers() {
   return useQuery({
     queryKey: ["users"],
     queryFn: async () => parseWith(usersResponseSchema, await getJson<unknown>("/users"), "users list").users,
+  });
+}
+
+// A react-query-flavoured GET /api/me, alongside App.tsx's own plain
+// fetchMe()-in-a-useEffect (api.ts) -- that one exists to gate the whole
+// app's first paint on identity resolving and has no reason to route
+// through the query cache. My Tasks (Task 8) needs the current user's id as
+// a normal read inside an already-mounted page (useMyTasks(me.id)), so it
+// goes through this hook instead -- same parseWith validation every other
+// hook here gets, and free caching/staleTime like any other query.
+export function useMe() {
+  return useQuery({
+    queryKey: ["me"],
+    queryFn: async () => parseWith(meResponseSchema, await getJson<unknown>("/me"), "me").user,
   });
 }
 

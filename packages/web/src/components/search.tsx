@@ -9,22 +9,25 @@ type FlatResult =
   | { kind: "company"; key: string; id: string; label: string }
   | { kind: "contact"; key: string; id: string; label: string; secondary: string | null }
   | { kind: "note"; key: string; snippet: string; companyId: string | null; contactId: string | null }
-  | { kind: "deal"; key: string; id: string; label: string };
+  | { kind: "deal"; key: string; id: string; label: string }
+  | { kind: "task"; key: string; id: string; label: string; projectId: string | null };
 
 const GROUP_LABEL: Record<FlatResult["kind"], string> = {
   company: "Companies",
   contact: "Contacts",
   note: "Notes",
   deal: "Deals",
+  task: "Tasks",
 };
 
 /**
  * Global header search. Debounces the raw input 200ms (mirroring
  * entity-table.tsx's filter debounce) before it drives useSearch, which only
  * fires once the debounced value is non-empty (useSearch's own `enabled`
- * check -- see queries.ts). Results from the three groups are flattened into
- * one array, in Companies/Contacts/Notes order, so ArrowUp/ArrowDown can move
- * a single highlight index across all of them regardless of group.
+ * check -- see queries.ts). Results from every group are flattened into one
+ * array, in Companies/Contacts/Notes/Deals/Tasks order (searchResultsSchema's
+ * own field order), so ArrowUp/ArrowDown can move a single highlight index
+ * across all of them regardless of group.
  */
 export function GlobalSearch() {
   const navigate = useNavigate();
@@ -70,7 +73,14 @@ export function GlobalSearch() {
       id: deal.id,
       label: deal.title,
     }));
-    return [...companies, ...contacts, ...notes, ...deals];
+    const tasks: FlatResult[] = data.tasks.map((task) => ({
+      kind: "task",
+      key: `task-${task.id}`,
+      id: task.id,
+      label: task.title,
+      projectId: task.projectId,
+    }));
+    return [...companies, ...contacts, ...notes, ...deals, ...tasks];
   }, [data]);
 
   // A fresh result set always restarts the highlight at the top -- keyed on
@@ -97,6 +107,16 @@ export function GlobalSearch() {
       void navigate({ to: "/contacts/$contactId", params: { contactId: entry.id } });
     } else if (entry.kind === "deal") {
       void navigate({ to: "/deals/$dealId", params: { dealId: entry.id } });
+    } else if (entry.kind === "task") {
+      // A project task opens straight into its board's drawer; a standalone
+      // task (no projectId) has no board to land on, so it opens via My
+      // Tasks instead -- both routes read the same `?task=<id>` deep-link
+      // param (Task 8's task-board.tsx / my-tasks.tsx).
+      if (entry.projectId !== null) {
+        void navigate({ to: "/projects/$projectId/board", params: { projectId: entry.projectId }, search: { task: entry.id } });
+      } else {
+        void navigate({ to: "/my-tasks", search: { task: entry.id } });
+      }
     } else if (entry.companyId !== null) {
       void navigate({ to: "/companies/$companyId", params: { companyId: entry.companyId } });
     } else if (entry.contactId !== null) {

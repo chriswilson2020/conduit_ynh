@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
+import { clsx } from "clsx";
 import { Input } from "./ui/input";
+import { Textarea } from "./ui/textarea";
 import { Button } from "./ui/button";
 
 export interface FieldCardField {
@@ -15,6 +17,12 @@ export interface FieldCardField {
    * fields), so this is purely additive for callers that don't need the
    * split. */
   displayValue?: string | null;
+  /** Edits through a Textarea instead of a single-line Input -- the task
+   * drawer's (Task 8) description field, which unlike every other FieldCard
+   * user to date is plain multi-line text, not a short label/amount. Enter
+   * no longer commits when true (a multi-line field needs Enter for actual
+   * newlines); Escape and blur still do. */
+  multiline?: boolean;
 }
 
 export interface FieldCardProps {
@@ -66,8 +74,16 @@ export function FieldCard({
     onSave(name, draft);
   }
 
-  function handleKeyDown(event: KeyboardEvent<HTMLInputElement>, name: string) {
-    if (event.key === "Enter") {
+  // Shared by the Input and Textarea key handlers below -- Enter commits
+  // ONLY for a single-line field (multiline === false); a multiline field
+  // needs Enter free for actual newlines, so it commits on blur/Escape only,
+  // same as every field already does for Escape.
+  function handleKeyDown(
+    event: KeyboardEvent<HTMLInputElement> | KeyboardEvent<HTMLTextAreaElement>,
+    name: string,
+    multiline: boolean,
+  ) {
+    if (event.key === "Enter" && !multiline) {
       commit(name);
     } else if (event.key === "Escape") {
       setEditingField(null);
@@ -101,21 +117,33 @@ export function FieldCard({
               <dt className="w-32 shrink-0 pt-2 text-sm font-medium text-slate-500">{field.label}</dt>
               <dd data-testid={`field-${field.name}`} className="flex-1 text-sm text-slate-900">
                 {isEditing ? (
-                  <Input
-                    autoFocus
-                    value={draft}
-                    disabled={isSaving}
-                    onChange={(event) => setDraft(event.target.value)}
-                    onBlur={() => commit(field.name)}
-                    onKeyDown={(event) => handleKeyDown(event, field.name)}
-                  />
+                  field.multiline ? (
+                    <Textarea
+                      autoFocus
+                      rows={3}
+                      value={draft}
+                      disabled={isSaving}
+                      onChange={(event) => setDraft(event.target.value)}
+                      onBlur={() => commit(field.name)}
+                      onKeyDown={(event) => handleKeyDown(event, field.name, true)}
+                    />
+                  ) : (
+                    <Input
+                      autoFocus
+                      value={draft}
+                      disabled={isSaving}
+                      onChange={(event) => setDraft(event.target.value)}
+                      onBlur={() => commit(field.name)}
+                      onKeyDown={(event) => handleKeyDown(event, field.name, false)}
+                    />
+                  )
                 ) : (
                   <span
-                    className={
-                      field.editable && !archived
-                        ? "block cursor-pointer rounded px-2 py-2 hover:bg-slate-50"
-                        : "block px-2 py-2"
-                    }
+                    className={clsx(
+                      "block px-2 py-2",
+                      field.editable && !archived && "cursor-pointer rounded hover:bg-slate-50",
+                      field.multiline && "whitespace-pre-wrap",
+                    )}
                     onClick={() => startEdit(field)}
                   >
                     {(() => {

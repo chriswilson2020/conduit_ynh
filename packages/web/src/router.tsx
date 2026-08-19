@@ -10,11 +10,21 @@ import { ContactsPage } from "./pages/contacts";
 import { ContactDetailPage } from "./pages/contact-detail";
 import { DealDetailPage } from "./pages/deal-detail";
 import { GanttLabPage } from "./pages/gantt-lab";
+import { MyTasksPage } from "./pages/my-tasks";
 import { PipelinesPage } from "./pages/pipelines";
 import { ProjectsPage } from "./pages/projects";
 import { ProjectDetailPage } from "./pages/project-detail";
 import { ProjectGanttPlaceholderPage } from "./pages/project-gantt-placeholder";
 import { TaskBoardPage } from "./pages/task-board";
+
+// Shared by both routes below that open the task drawer via a `?task=<id>`
+// deep link (the task board and My Tasks, Task 8) -- a malformed/absent
+// value degrades to "no task open" rather than throwing, mirroring every
+// other loosely-typed search param convention in this app (there is no
+// stricter validation library wired in).
+function validateTaskSearch(search: Record<string, unknown>): { task?: string } {
+  return { task: typeof search.task === "string" ? search.task : undefined };
+}
 
 // A short staleTime keeps list/detail views from refetching on every focus
 // change while still picking up another tab's edits within a few seconds; a
@@ -101,7 +111,15 @@ const projectDetailRoute = createRoute({
 const taskBoardRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/projects/$projectId/board",
+  validateSearch: validateTaskSearch,
   component: TaskBoardPage,
+});
+
+const myTasksRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/my-tasks",
+  validateSearch: validateTaskSearch,
+  component: MyTasksPage,
 });
 
 // Placeholder until Task 9 (see project-gantt-placeholder.tsx's own doc
@@ -166,6 +184,7 @@ const routeTree = rootRoute.addChildren([
   projectDetailRoute,
   taskBoardRoute,
   projectGanttRoute,
+  myTasksRoute,
 ]);
 
 // basePath() returns "/" both at a root install and during `vite dev` (see its

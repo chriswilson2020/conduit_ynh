@@ -24,11 +24,12 @@ const VERB_BADGE: Record<Event["verb"], string> = {
   won: "W",
   lost: "L",
   reopened: "O",
-  // Placeholder letters, just enough to keep this map exhaustively typed
-  // against the widened eventVerbSchema (Phase 3 Task 2) -- Task 8 gives
-  // these (and summarize() below) real task-event treatment once the tasks
-  // service actually emits them. Mirrors P2.1's own stub-now/wire-later
-  // approach (see search.ts's tasks: [] stub).
+  // Task 8's real task-event badges (Phase 3 Task 2 widened eventVerbSchema
+  // with these four; P2.1 only stubbed the map exhaustively typed against
+  // it -- see search.ts's own tasks: [] stub for that same stub-now/
+  // wire-later precedent). Letters chosen to stay unique against every
+  // badge above: H (sHifted), D (completeD), P (dePendency added),
+  // M (reMoved).
   shifted: "H",
   completed: "D",
   dependency_added: "P",
@@ -87,9 +88,42 @@ function summarize(event: Event): string {
     }
     case "reopened":
       return "reopened";
+    // Payload shape written by scheduling.ts's shiftTask: { from: {start,
+    // due}, to: {start, due}, cascadedFrom }. cascadedFrom is the DRAGGED
+    // task's id for every event other than the dragged task's own (which
+    // carries null) -- rendered generically as "(cascaded)" rather than
+    // resolving that id to a title, mirroring dependency_added/_removed
+    // below.
+    case "shifted": {
+      const fromRange = formatDateRange(event.payload.from);
+      const toRange = formatDateRange(event.payload.to);
+      if (fromRange === null || toRange === null) return "shifted";
+      const cascaded = typeof event.payload.cascadedFrom === "string";
+      return `shifted ${fromRange} ${"\u2192"} ${toRange}${cascaded ? " (cascaded)" : ""}`;
+    }
+    case "completed":
+      return "completed";
+    // Payload for both: { predecessorId }, written by addDependency/
+    // removeDependency in services/tasks.ts. predecessorId is a raw uuid --
+    // rendered generically (no lookup of the predecessor's title), since a
+    // timeline event has no project/task context handy to fetch it with.
+    case "dependency_added":
+      return "added a dependency";
+    case "dependency_removed":
+      return "removed a dependency";
     default:
       return event.verb;
   }
+}
+
+/** Narrows a shifted event's `from`/`to` payload half ({start, due}, both
+ * date strings) into "start\u2013due", or null when the shape doesn't match
+ * -- see summarize()'s "shifted" case. */
+function formatDateRange(part: unknown): string | null {
+  if (typeof part !== "object" || part === null) return null;
+  const { start, due } = part as Record<string, unknown>;
+  if (typeof start !== "string" || typeof due !== "string") return null;
+  return `${start}\u2013${due}`;
 }
 
 /**
