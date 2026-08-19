@@ -34,10 +34,6 @@ test.describe.serial("Pipeline journey", () => {
 
   test.beforeAll(async ({ browser }) => {
     page = await browser.newPage();
-    // TEMPORARY DEBUG INSTRUMENTATION -- see keyboard-drag race investigation.
-    page.on("console", (msg) => {
-      if (msg.text().startsWith("[dbg")) console.log("BROWSER:", msg.text());
-    });
   });
 
   test.afterAll(async () => {
