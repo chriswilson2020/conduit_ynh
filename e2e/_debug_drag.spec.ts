@@ -1,6 +1,6 @@
 import { test } from "@playwright/test";
 
-test("debug keyboard drag - repeated ArrowRight and ArrowDown", async ({ page }) => {
+test("debug keyboard drag - exact no-delay repro", async ({ page }) => {
   await page.goto("/pipelines");
   await page.getByRole("button", { name: "New pipeline" }).click();
   await page.getByPlaceholder("Pipeline name").fill("Debug " + Date.now());
@@ -34,40 +34,19 @@ test("debug keyboard drag - repeated ArrowRight and ArrowDown", async ({ page })
   await createDeal("Alpha");
   await createDeal("Beta");
 
-  const alphaCard = lead.locator('[data-testid^="card-"]').filter({ hasText: "Alpha" });
-  const alphaTestId = (await alphaCard.getAttribute("data-testid")) as string;
-  console.log(`ALPHA=${alphaTestId}`);
-
-  await alphaCard.focus();
-  await page.keyboard.press("Space");
-  await page.waitForTimeout(100);
-  console.log("after Space (lift):", await page.getByRole("status").last().textContent());
-
-  for (let i = 0; i < 3; i++) {
+  // Exactly the real journey's sequence: no waits between presses at all.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const card = lead.locator('[data-testid^="card-"]').filter({ hasText: `Alpha-${attempt}` }).first();
+    await createDeal(`Alpha-${attempt}`);
+    await card.focus();
+    await page.keyboard.press("Space");
     await page.keyboard.press("ArrowRight");
-    await page.waitForTimeout(150);
-    console.log(`after ArrowRight #${i + 1}:`, await page.getByRole("status").last().textContent());
+    await page.keyboard.press("Space");
+    await page.waitForTimeout(50);
+    const status = await page.getByRole("status").last().textContent();
+    const inLead = await lead.locator('[data-testid^="card-"]').filter({ hasText: `Alpha-${attempt}` }).count();
+    const inQualified = await qualified.locator('[data-testid^="card-"]').filter({ hasText: `Alpha-${attempt}` }).count();
+    const inWon = await won.locator('[data-testid^="card-"]').filter({ hasText: `Alpha-${attempt}` }).count();
+    console.log(`attempt ${attempt}: status="${status}" inLead=${inLead} inQualified=${inQualified} inWon=${inWon}`);
   }
-  for (let i = 0; i < 2; i++) {
-    await page.keyboard.press("ArrowLeft");
-    await page.waitForTimeout(150);
-    console.log(`after ArrowLeft #${i + 1}:`, await page.getByRole("status").last().textContent());
-  }
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(100);
-
-  // Now test same-column ArrowDown with 3 cards.
-  await createDeal("Gamma");
-  await createDeal("Delta");
-  const betaCard = lead.locator('[data-testid^="card-"]').filter({ hasText: "Beta" });
-  await betaCard.focus();
-  await page.keyboard.press("Space");
-  await page.waitForTimeout(100);
-  console.log("same-col after Space (lift):", await page.getByRole("status").last().textContent());
-  for (let i = 0; i < 2; i++) {
-    await page.keyboard.press("ArrowDown");
-    await page.waitForTimeout(150);
-    console.log(`same-col after ArrowDown #${i + 1}:`, await page.getByRole("status").last().textContent());
-  }
-  await page.keyboard.press("Escape");
 });
