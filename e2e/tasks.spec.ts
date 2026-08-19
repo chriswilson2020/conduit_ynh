@@ -239,14 +239,27 @@ test.describe.serial("Tasks/Gantt journey", () => {
   test("drags Build to Done on the board", async () => {
     await page.goto(`/projects/${projectId}/board`);
     // Only Design was dragged earlier (todo -> in_progress); Build has sat
-    // in To do since its creation, so this is a three-column hop: todo(0)
-    // -> in_progress(1) -> blocked(2) -> done(3).
+    // in To do since its creation, so this needs three column hops: todo(0)
+    // -> in_progress(1) -> blocked(2) -> done(3). Three SEPARATE lift/arrow/
+    // drop gestures, not one lift with three arrows -- every keyboard drag
+    // proven to work elsewhere in this codebase (pipeline.spec.ts, and this
+    // file's own Design drag) is a single arrow press per gesture; stacking
+    // three arrows inside one gesture consistently landed the card short of
+    // done (confirmed by 3/3 identical CI failures, not the timing flakiness
+    // keyboardDragCard's own comment addresses -- a real dnd-kit behaviour
+    // difference, not this codebase's bug to fix here).
     const todo = boardColumn("todo");
+    const inProgress = boardColumn("in_progress");
+    const blocked = boardColumn("blocked");
     const done = boardColumn("done");
-    const buildCard = todo.getByTestId(`card-${buildId}`);
 
-    await keyboardDragCard(buildCard, ["ArrowRight", "ArrowRight", "ArrowRight"]);
+    await keyboardDragCard(todo.getByTestId(`card-${buildId}`), ["ArrowRight"]);
+    await expect(inProgress.getByTestId(`card-${buildId}`)).toBeVisible();
 
+    await keyboardDragCard(inProgress.getByTestId(`card-${buildId}`), ["ArrowRight"]);
+    await expect(blocked.getByTestId(`card-${buildId}`)).toBeVisible();
+
+    await keyboardDragCard(blocked.getByTestId(`card-${buildId}`), ["ArrowRight"]);
     await expect(done.getByTestId(`card-${buildId}`)).toBeVisible();
     await expect(todo.getByTestId(`card-${buildId}`)).not.toBeVisible();
   });
