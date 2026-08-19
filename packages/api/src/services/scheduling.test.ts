@@ -397,7 +397,11 @@ describe("compactSchedule", () => {
 
     const result = await compactSchedule(handle.db, actorId, project.id);
 
-    // A anchors (no predecessor) -- not in the moved list at all.
+    // A has no predecessors, so (Fix 1, hotfix v0.4.2) it's subject to the
+    // floor-pull rule -- but it stays put anyway, because with no project
+    // startDate and nothing done/in_progress, A is itself the earliest dated
+    // task in the project, i.e. A DEFINES the floor it would otherwise pull
+    // toward. Not in the moved list at all.
     expect(result.moved.some((m) => m.id === a.id)).toBe(false);
     // B: pulled to sit exactly on A's due date, 4-day duration preserved.
     const bMoved = result.moved.find((m) => m.id === b.id)!;
@@ -410,7 +414,7 @@ describe("compactSchedule", () => {
     expect((await getTask(handle.db, a.id))?.startDate).toBe("2026-01-01");
   });
 
-  it("a head task with no predecessors never moves, even though it anchors a chain with slack to pull", async () => {
+  it("a sole no-predecessor task never moves -- it defines the floor it would otherwise pull toward (Fix 1)", async () => {
     const project = await makeProject();
     const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-02-10", dueDate: "2026-02-12" });
 
@@ -473,7 +477,17 @@ describe("compactSchedule", () => {
     expect(dMoved).toEqual({ id: d.id, startDate: "2026-01-05", dueDate: "2026-01-07", cascadedFrom: null });
   });
 
-  it("an undated task neither moves itself nor constrains its successor -- the successor stays anchored", async () => {
+  it("an undated task never moves itself, and its successor -- having no DATED predecessor -- pulls to the floor (Fix 1)", async () => {
+    // CHANGED by Fix 1 (hotfix v0.4.2): C's only predecessor is the undated
+    // B, so C has no DATED predecessor to settle against -- exactly the same
+    // "nothing to settle against" category a truly pred-less task falls
+    // into (see this function's own doc comment, which has always grouped
+    // "no predecessors at all" and "every predecessor undated" together).
+    // Under the OLD semantics that meant C stayed anchored forever; under
+    // the NEW semantics it now pulls LEFT to the floor like any other
+    // no-dated-predecessor task. Floor here = the earliest dated task in the
+    // project pre-compaction (no project startDate, nothing done/
+    // in_progress) = A's own 2026-01-01.
     const project = await makeProject();
     const a = await createTask(handle.db, actorId, { title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-05" });
     const b = await createTask(handle.db, actorId, { title: "B", projectId: project.id }); // no dates
@@ -484,12 +498,9 @@ describe("compactSchedule", () => {
     const result = await compactSchedule(handle.db, actorId, project.id);
 
     expect(result.moved.some((m) => m.id === b.id)).toBe(false);
-    // C's ONLY predecessor is the undated B -- C has no DATED predecessor to
-    // settle against, so it stays put, exactly as if it had none at all.
-    expect(result.moved.some((m) => m.id === c.id)).toBe(false);
-    const cAfter = await getTask(handle.db, c.id);
-    expect(cAfter?.startDate).toBe("2026-01-20");
-    expect(cAfter?.dueDate).toBe("2026-01-22");
+    // C's 2-day duration preserved, pulled to A's floor-defining start.
+    const cMoved = result.moved.find((m) => m.id === c.id)!;
+    expect(cMoved).toEqual({ id: c.id, startDate: "2026-01-01", dueDate: "2026-01-03", cascadedFrom: null });
   });
 
   it("a task with BOTH a dated and an undated predecessor settles against the dated one only", async () => {
@@ -551,5 +562,113 @@ describe("compactSchedule", () => {
     const project = await makeProject();
     await archiveProject(handle.db, actorId, project.id);
     await expect(compactSchedule(handle.db, actorId, project.id)).rejects.toBeInstanceOf(ArchivedError);
+  });
+});
+
+describe("compactSchedule: Fix 1 (hotfix v0.4.2) -- no-predecessor tasks pull to a floor", () => {
+  it("the user's regression scenario: a no-pred todo pulls to the earliest done/in_progress start, and its dependents follow", async () => {
+    // Design is real, finished work; Build is real, in-progress work; both
+    // are non-movable and therefore both real floor candidates -- Design's
+    // Aug 10 is earlier than Build's Aug 17, so Design defines the floor.
+    // Content has NO predecessors at all and sits weeks later (Sep 12) with
+    // nothing constraining it -- under the OLD semantics it would stay
+    // exactly there forever ("anchored"); under the new semantics it pulls
+    // LEFT to the floor, keeping its own 2-day duration. QA then settles at
+    // the max of Build's (untouched) due date and Content's NEW (pulled)
+    // due date, and Launch simply follows QA -- both exactly the existing
+    // "settle against the max of predecessors' final dates" rule, unchanged
+    // by this fix.
+    const project = await makeProject({ name: "Regression" });
+    const design = await createTask(handle.db, actorId, {
+      title: "Design", projectId: project.id, startDate: "2026-08-10", dueDate: "2026-08-14",
+    });
+    await setTaskStatus(handle.db, actorId, design.id, "done");
+    const build = await createTask(handle.db, actorId, {
+      title: "Build", projectId: project.id, startDate: "2026-08-17", dueDate: "2026-08-22",
+    });
+    await setTaskStatus(handle.db, actorId, build.id, "in_progress");
+    const content = await createTask(handle.db, actorId, {
+      title: "Content", projectId: project.id, startDate: "2026-09-12", dueDate: "2026-09-14",
+    });
+    const qa = await createTask(handle.db, actorId, {
+      title: "QA", projectId: project.id, startDate: "2026-09-20", dueDate: "2026-09-22",
+    });
+    const launch = await createTask(handle.db, actorId, {
+      title: "Launch", projectId: project.id, startDate: "2026-10-01", dueDate: "2026-10-03",
+    });
+    await addDependency(handle.db, actorId, build.id, qa.id);
+    await addDependency(handle.db, actorId, content.id, qa.id);
+    await addDependency(handle.db, actorId, qa.id, launch.id);
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    // Design/Build never move -- done/in_progress, as always.
+    expect(result.moved.some((m) => m.id === design.id)).toBe(false);
+    expect(result.moved.some((m) => m.id === build.id)).toBe(false);
+
+    // Content: floor = Design's Aug 10 (earliest dated non-movable start),
+    // 2-day duration preserved.
+    const contentMoved = result.moved.find((m) => m.id === content.id)!;
+    expect(contentMoved).toEqual({ id: content.id, startDate: "2026-08-10", dueDate: "2026-08-12", cascadedFrom: null });
+
+    // QA: max(Build's due 08-22, Content's NEW due 08-12) = 08-22, 2-day
+    // duration preserved.
+    const qaMoved = result.moved.find((m) => m.id === qa.id)!;
+    expect(qaMoved).toEqual({ id: qa.id, startDate: "2026-08-22", dueDate: "2026-08-24", cascadedFrom: null });
+
+    // Launch: settles directly against QA's new due date, 2-day duration.
+    const launchMoved = result.moved.find((m) => m.id === launch.id)!;
+    expect(launchMoved).toEqual({ id: launch.id, startDate: "2026-08-24", dueDate: "2026-08-26", cascadedFrom: null });
+  });
+
+  it("a project with an explicit startDate uses it as the floor, ahead of any task's own dates", async () => {
+    const project = await makeProject({ name: "Explicit", startDate: "2026-01-01" });
+    const a = await createTask(handle.db, actorId, {
+      title: "A", projectId: project.id, startDate: "2026-01-10", dueDate: "2026-01-12",
+    });
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    const aMoved = result.moved.find((m) => m.id === a.id)!;
+    expect(aMoved).toEqual({ id: a.id, startDate: "2026-01-01", dueDate: "2026-01-03", cascadedFrom: null });
+  });
+
+  it("a no-predecessor task already starting before the floor is left alone -- pull-only, never pushed right", async () => {
+    // The floor is a compaction TARGET, not a constraint: a task that
+    // already starts earlier than the floor has nothing to pull TOWARD (it's
+    // already left of it), and this function never pushes a no-violation
+    // task right just to reach a target.
+    const project = await makeProject({ name: "AlreadyEarly", startDate: "2026-06-01" });
+    const a = await createTask(handle.db, actorId, {
+      title: "A", projectId: project.id, startDate: "2026-01-01", dueDate: "2026-01-03",
+    });
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    expect(result.moved).toEqual([]);
+    const after = await getTask(handle.db, a.id);
+    expect(after?.startDate).toBe("2026-01-01");
+    expect(after?.dueDate).toBe("2026-01-03");
+  });
+
+  it("an all-todo project (nothing done/in_progress, no project startDate) uses its own earliest dated task as the floor", async () => {
+    const project = await makeProject({ name: "AllTodo" });
+    // Earliest -- no predecessors either, so it's the floor definer and
+    // therefore doesn't move itself.
+    const earliest = await createTask(handle.db, actorId, {
+      title: "Earliest", projectId: project.id, startDate: "2026-03-01", dueDate: "2026-03-02",
+    });
+    // A second, unrelated no-pred todo sitting later in the same project --
+    // pulls LEFT to the same floor the earliest task itself defines.
+    const later = await createTask(handle.db, actorId, {
+      title: "Later", projectId: project.id, startDate: "2026-05-01", dueDate: "2026-05-04",
+    });
+
+    const result = await compactSchedule(handle.db, actorId, project.id);
+
+    expect(result.moved.some((m) => m.id === earliest.id)).toBe(false);
+    const laterMoved = result.moved.find((m) => m.id === later.id)!;
+    // 3-day duration (05-01..05-04) preserved, pulled to the 03-01 floor.
+    expect(laterMoved).toEqual({ id: later.id, startDate: "2026-03-01", dueDate: "2026-03-04", cascadedFrom: null });
   });
 });

@@ -326,13 +326,10 @@ export async function shiftTask(
 // point of view (the task's new start is never a function of its OLD start
 // at all, only of its predecessors' current due dates).
 //
-// MOVABLE means: dated (both startDate and dueDate set), has at least one
-// DATED predecessor, and its status is "todo" or "blocked". Everything else
-// is an anchor -- it keeps its own dates untouched, but (if dated) still
-// contributes its due date to whichever successors settle against it:
-//   * No predecessors at all (or every predecessor is undated) -- nothing to
-//     settle against, so there's nothing to compact; same "anchors the plan"
-//     role shiftTask's dragged task plays for its own cascade.
+// MOVABLE means: dated (both startDate and dueDate set), and its status is
+// "todo" or "blocked". Everything else keeps its own dates untouched, but
+// (if dated) still contributes its due date to whichever successors settle
+// against it:
 //   * status "done"/"in_progress" -- deliberately frozen (work already
 //     started/finished doesn't get silently rescheduled), but still a real
 //     constraint for anything downstream of it. This holds even when such a
@@ -345,8 +342,34 @@ export async function shiftTask(
 //     comment): an undated task can't be moved (no dates to move) and can't
 //     usefully constrain a successor either (there is nothing to compare
 //     against), so it's transparent -- a successor whose ONLY predecessor is
-//     undated has no dated predecessor at all, and stays put, same as if the
-//     edge didn't exist.
+//     undated has no dated predecessor at all, and is handled by the FLOOR
+//     rule below, same as a successor with no predecessor edge at all.
+//
+// FLOOR RULE (Fix 1, hotfix v0.4.2) -- a movable task with NO dated
+// predecessor (no predecessor edges at all, or every predecessor is
+// undated: the same "nothing to settle against" category above) no longer
+// stays anchored forever. It PULLS LEFT to a floor, computed ONCE, from
+// pre-compaction data, before any task in this sweep moves -- so every
+// no-dated-predecessor task in the project pulls toward the exact same
+// reference point regardless of processing order. In priority order:
+//   1. The project's own startDate, if set -- the plan's explicit
+//      beginning always wins.
+//   2. Otherwise, the earliest startDate among the project's dated
+//      non-movable (done/in_progress) tasks -- "reality" anchors: work
+//      that has actually started or finished is the truest baseline a plan
+//      has, so a still-open task with nothing constraining it settles
+//      against where real work began.
+//   3. Otherwise (a project of pure todo/blocked, nothing has started yet),
+//      the earliest startDate among ALL the project's dated tasks,
+//      pre-compaction -- a plan with no external anchor at all keeps its
+//      own earliest start as its baseline, so compacting doesn't drift the
+//      whole plan's start date around depending on which task happens to
+//      have no predecessors.
+// This is PULL-ONLY: a no-dated-predecessor task that already starts before
+// the floor is left exactly where it is -- the floor is a compaction
+// TARGET, not a constraint, and this function never pushes a task right
+// just to reach one. done/in_progress tasks are, as ever, never subject to
+// any of this -- frozen is frozen, floor or no floor.
 export async function compactSchedule(db: Database, actorId: string, projectId: string): Promise<ShiftResult> {
   const { result, assigneeIds } = await db.transaction(async (tx) => {
     // Same lock, same key shiftTask/addDependency already use for this
@@ -361,13 +384,28 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
     // single topological pass never re-validates once it starts.
     await lockSiblingGroup(tx, `deps:${projectId}`);
 
-    const [project] = await tx.select({ archivedAt: projects.archivedAt }).from(projects).where(eq(projects.id, projectId));
+    const [project] = await tx.select({ archivedAt: projects.archivedAt, startDate: projects.startDate })
+      .from(projects).where(eq(projects.id, projectId));
     if (project === undefined) throw new NotFoundError("project", projectId);
     if (project.archivedAt !== null) throw new ArchivedError("project", projectId);
 
     const projectTasks = await tx.select().from(tasks).where(eq(tasks.projectId, projectId));
     const taskIds = projectTasks.map((t) => t.id);
     const taskById = new Map(projectTasks.map((t) => [t.id, t] as const));
+
+    // Fix 1's floor -- see this function's doc comment for the full
+    // priority-order rationale. Computed here, ONCE, from projectTasks as
+    // read above (pre-compaction, before the topological loop below moves
+    // anything).
+    let floor: string | null = project.startDate;
+    if (floor === null) {
+      const datedNonMovable = projectTasks.filter((t) =>
+        t.startDate !== null && t.dueDate !== null && (t.status === "done" || t.status === "in_progress"));
+      const datedAny = projectTasks.filter((t) => t.startDate !== null && t.dueDate !== null);
+      for (const t of (datedNonMovable.length > 0 ? datedNonMovable : datedAny)) {
+        if (floor === null || t.startDate! < floor) floor = t.startDate!;
+      }
+    }
 
     // Every edge with a predecessor in this project's task set. addDependency
     // only ever links two tasks in the SAME project (or both standalone), so
@@ -446,6 +484,20 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
               toStart: newStart, toDue: newDue, cascadedFrom: null, row,
             });
           }
+        } else if (floor !== null && floor < row.startDate!) {
+          // Fix 1: no DATED predecessor to settle against -- pull to the
+          // floor instead of staying anchored. Pull-only (see this
+          // function's doc comment): only fires when the floor is strictly
+          // EARLIER than this task's current start; a task already sitting
+          // before the floor is left alone, never pushed right to reach it.
+          const duration = diffDays(row.dueDate!, row.startDate!);
+          const newStart = floor;
+          const newDue = addDays(newStart, duration);
+          settledDue.set(id, newDue);
+          moved.set(id, {
+            id, fromStart: row.startDate, fromDue: row.dueDate,
+            toStart: newStart, toDue: newDue, cascadedFrom: null, row,
+          });
         }
       }
 
