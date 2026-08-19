@@ -36,6 +36,9 @@ export function Shell({ children }: { children: ReactNode }) {
           <Link to="/my-tasks" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
             My Tasks
           </Link>
+          <Link to="/gantt" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+            Gantt
+          </Link>
         </nav>
       </aside>
       <div className="flex min-w-0 flex-1 flex-col">

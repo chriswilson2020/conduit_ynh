@@ -9,12 +9,11 @@ import { CompanyDetailPage } from "./pages/company-detail";
 import { ContactsPage } from "./pages/contacts";
 import { ContactDetailPage } from "./pages/contact-detail";
 import { DealDetailPage } from "./pages/deal-detail";
-import { GanttLabPage } from "./pages/gantt-lab";
+import { GlobalGanttPage, ProjectGanttPage } from "./pages/gantt";
 import { MyTasksPage } from "./pages/my-tasks";
 import { PipelinesPage } from "./pages/pipelines";
 import { ProjectsPage } from "./pages/projects";
 import { ProjectDetailPage } from "./pages/project-detail";
-import { ProjectGanttPlaceholderPage } from "./pages/project-gantt-placeholder";
 import { TaskBoardPage } from "./pages/task-board";
 
 // Shared by both routes below that open the task drawer via a `?task=<id>`
@@ -122,22 +121,22 @@ const myTasksRoute = createRoute({
   component: MyTasksPage,
 });
 
-// Placeholder until Task 9 (see project-gantt-placeholder.tsx's own doc
-// comment) -- registered now so project-detail.tsx's "Gantt" link is honest
-// rather than a 404.
+// The real Gantt (Task 9), replacing G0's throwaway gantt-lab route (now
+// deleted) and project-gantt-placeholder.tsx (also deleted). Per-project and
+// global both open the task drawer via the same `?task=<id>` deep-link
+// convention as the task board / My Tasks.
 const projectGanttRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/projects/$projectId/gantt",
-  component: ProjectGanttPlaceholderPage,
+  validateSearch: validateTaskSearch,
+  component: ProjectGanttPage,
 });
 
-// G0 prototype gate (Phase 3 plan, Task 1): registered normally so it's a
-// real route, but deliberately linked from no nav -- throwaway, synthetic
-// data only, deleted by Task 9 once the real Gantt ships either way.
-const ganttLabRoute = createRoute({
+const globalGanttRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: "/gantt-lab",
-  component: GanttLabPage,
+  path: "/gantt",
+  validateSearch: validateTaskSearch,
+  component: GlobalGanttPage,
 });
 
 // Rendered by the router itself (not a route) whenever the URL matches no
@@ -179,11 +178,11 @@ const routeTree = rootRoute.addChildren([
   pipelinesRoute,
   boardRoute,
   dealDetailRoute,
-  ganttLabRoute,
   projectsRoute,
   projectDetailRoute,
   taskBoardRoute,
   projectGanttRoute,
+  globalGanttRoute,
   myTasksRoute,
 ]);
 
