@@ -1,12 +1,14 @@
 import { useMemo, useRef, useState } from "react";
 import type { FormEvent, RefObject } from "react";
 import {
-  DndContext, DragOverlay, KeyboardSensor, MeasuringStrategy, PointerSensor, closestCenter, rectIntersection,
-  useDroppable, useSensor, useSensors,
+  DndContext, DragOverlay, KeyboardCode, KeyboardSensor, MeasuringStrategy, PointerSensor, closestCenter,
+  closestCorners, getFirstCollision, getScrollableAncestors, rectIntersection, useDroppable, useSensor, useSensors,
 } from "@dnd-kit/core";
-import type { CollisionDetection, DragEndEvent, DragOverEvent, DragStartEvent } from "@dnd-kit/core";
+import type {
+  CollisionDetection, DragEndEvent, DragOverEvent, DragStartEvent, DroppableContainer, KeyboardCoordinateGetter,
+} from "@dnd-kit/core";
 import {
-  SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy,
+  SortableContext, arrayMove, hasSortableData, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
@@ -90,6 +92,83 @@ const boardCollisionDetection: CollisionDetection = (args) => {
  */
 const boardMeasuring = { droppable: { strategy: MeasuringStrategy.BeforeDragging } };
 
+/**
+ * Wraps @dnd-kit/sortable's own sortableKeyboardCoordinates with one added
+ * restriction: for ArrowUp/ArrowDown, only candidates in the SAME sortable
+ * container (i.e. the same column) as the active card are considered.
+ *
+ * sortableKeyboardCoordinates' own Up/Down direction filter only checks
+ * vertical position (collisionRect.top vs a candidate's rect.top) -- it has
+ * no notion of which column a candidate belongs to. The empty-column
+ * placeholder that makes an empty column reachable via ArrowLeft/ArrowRight
+ * (see EmptyPlaceholder below) is ALSO a valid "sortable" candidate by that
+ * rule, and a neighbouring column's placeholder can end up geometrically
+ * CLOSER by dnd-kit's own closestCorners ranking than the intended
+ * same-column sibling directly below/above the active card -- sending an
+ * ArrowDown/ArrowUp press into a different column's empty placeholder
+ * instead of reordering within the current one. Confirmed by instrumenting
+ * moveDeal's inputs during investigation: a same-column ArrowDown press
+ * resolved to a DIFFERENT column's placeholder id, moving the dragged deal
+ * out of its own column entirely instead of past its sibling.
+ *
+ * Reimplemented in full (rather than filtering
+ * context.droppableContainers down to the active card's own container and
+ * delegating to sortableKeyboardCoordinates) because that function calls
+ * `.getEnabled()` on context.droppableContainers, a method on dnd-kit's own
+ * DroppableContainersMap class that a plain filtered array does not have.
+ * The body below otherwise mirrors sortableKeyboardCoordinates faithfully
+ * (@dnd-kit/sortable, MIT); the only change is the containerId equality
+ * check added to the Up/Down branch of the direction filter.
+ */
+const boardKeyboardCoordinateGetter: KeyboardCoordinateGetter = (event, args) => {
+  const verticalCodes: string[] = [KeyboardCode.Down, KeyboardCode.Up];
+  if (!verticalCodes.includes(event.code)) return sortableKeyboardCoordinates(event, args);
+
+  const { active, context, currentCoordinates } = args;
+  const { collisionRect, droppableRects, droppableContainers, over, scrollableAncestors } = context;
+  if (!collisionRect) return undefined;
+
+  const activeContainer = droppableContainers.get(active);
+  const activeContainerId = activeContainer && hasSortableData(activeContainer)
+    ? activeContainer.data.current.sortable.containerId
+    : undefined;
+
+  const filteredContainers: DroppableContainer[] = [];
+  for (const entry of droppableContainers.getEnabled()) {
+    if (!entry || entry.disabled) continue;
+    if (!hasSortableData(entry) || entry.data.current.sortable.containerId !== activeContainerId) continue;
+    const rect = droppableRects.get(entry.id);
+    if (!rect) continue;
+    if (event.code === KeyboardCode.Down ? collisionRect.top < rect.top : collisionRect.top > rect.top) {
+      filteredContainers.push(entry);
+    }
+  }
+
+  const collisions = closestCorners({
+    active: { id: active } as never, collisionRect, droppableRects,
+    droppableContainers: filteredContainers, pointerCoordinates: null,
+  });
+  let closestId = getFirstCollision(collisions, "id");
+  if (closestId === over?.id && collisions.length > 1) closestId = collisions[1]?.id ?? null;
+  if (closestId == null) return undefined;
+
+  const newDroppable = droppableContainers.get(closestId);
+  const newRect = newDroppable ? droppableRects.get(newDroppable.id) : null;
+  const newNode = newDroppable?.node.current;
+  if (!newNode || !newRect || !activeContainer || !newDroppable) return undefined;
+
+  const newScrollAncestors = getScrollableAncestors(newNode);
+  const hasDifferentScrollAncestors = newScrollAncestors.some((el, i) => scrollableAncestors[i] !== el);
+  // Same-container by construction here (the filter above already enforces
+  // it), so the vertical offset always applies -- unlike
+  // sortableKeyboardCoordinates' general version, this branch never needs
+  // to handle a cross-container Up/Down case.
+  const isAfterActive = hasSortableData(activeContainer) && hasSortableData(newDroppable)
+    && activeContainer.data.current.sortable.index < newDroppable.data.current.sortable.index;
+  const offsetY = hasDifferentScrollAncestors ? 0 : (isAfterActive ? collisionRect.height - newRect.height : 0);
+  return { x: newRect.left, y: newRect.top - offsetY };
+};
+
 export function BoardPage() {
   const { pipelineId } = useParams({ from: "/pipelines/$pipelineId" });
   const { data: pipelineData, isLoading } = usePipeline(pipelineId);
@@ -171,7 +250,7 @@ export function BoardPage() {
   const lastOverRef = useRef<{ id: string; data: DndData | undefined } | null>(null);
 
   const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 4 } });
-  const keyboardSensor = useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates });
+  const keyboardSensor = useSensor(KeyboardSensor, { coordinateGetter: boardKeyboardCoordinateGetter });
   const archived = pipelineData !== undefined && pipelineData.pipeline.archivedAt !== null;
   // Empty sensor list means no pointer/keyboard gesture can ever activate a
   // drag -- the simplest way to make the whole board read-only for an
