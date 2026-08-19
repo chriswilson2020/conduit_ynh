@@ -33,7 +33,7 @@ Identical to Phase 2's plan: `./scripts/remote.sh` for every command; NodeNext `
 
 ### Task 1 (G0): Gantt prototype gate — FIRST, and the verdict goes to Chris
 
-**Files:** Create `packages/web/src/pages/gantt-lab.tsx` (+ route in router.tsx behind `import.meta.env.DEV || window.__CONDUIT_BASE__` — no: register it always but link it nowhere; it is throwaway and removed in Task 9). No API changes; synthetic data generated in the component.
+**Files:** Create `packages/web/src/pages/gantt-lab.tsx` (+ route in router.tsx — registered normally but linked from nowhere; it is throwaway, carries only synthetic data, and Task 9 deletes it). No API changes.
 
 Build, in deliberately rough form:
 - A CSS grid: left column task names (200 synthetic tasks, 8 groups), timeline columns = days for 6 months (~180 cols), `grid-auto-columns: minmax(24px, 1fr)` at day zoom, week zoom = 26 cols.
