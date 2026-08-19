@@ -257,25 +257,32 @@ describe("mail schema (0004)", () => {
     expect(mailAccountStatusSchema.options).toEqual(["active", "error"]);
     expect(mailDirectionSchema.options).toEqual(["inbound", "outbound"]);
 
+    // Distinct emails per row: mail_accounts_user_email_active_unique (this
+    // migration's duplicate-mailbox partial unique index) would otherwise
+    // reject every row after the first for this same user -- unrelated to
+    // what this test is actually checking (the CHECK constraints), so it is
+    // sidestepped rather than tested here.
     for (const imapSecurity of mailSecuritySchema.options) {
-      await handle.db.insert(mailAccounts).values(accountValues({ imapSecurity, label: imapSecurity }));
+      await handle.db.insert(mailAccounts)
+        .values(accountValues({ imapSecurity, label: imapSecurity, email: `${imapSecurity}@example.com` }));
     }
     await expect(
-      handle.db.insert(mailAccounts).values(accountValues({ imapSecurity: "plaintext" })),
+      handle.db.insert(mailAccounts).values(accountValues({ imapSecurity: "plaintext", email: "plaintext@example.com" })),
     ).rejects.toMatchObject({
       cause: { message: expect.stringMatching(/mail_accounts_imap_security_valid|check/i) },
     });
 
     for (const status of mailAccountStatusSchema.options) {
-      await handle.db.insert(mailAccounts).values(accountValues({ status, label: status }));
+      await handle.db.insert(mailAccounts).values(accountValues({ status, label: status, email: `${status}@example.com` }));
     }
     await expect(
-      handle.db.insert(mailAccounts).values(accountValues({ status: "syncing" })),
+      handle.db.insert(mailAccounts).values(accountValues({ status: "syncing", email: "syncing@example.com" })),
     ).rejects.toMatchObject({
       cause: { message: expect.stringMatching(/mail_accounts_status_valid|check/i) },
     });
 
-    const [account] = await handle.db.insert(mailAccounts).values(accountValues()).returning();
+    const [account] = await handle.db.insert(mailAccounts)
+      .values(accountValues({ email: "final@example.com" })).returning();
     const [thread] = await handle.db.insert(mailThreads).values({
       subject: "Hello", lastMessageAt: new Date(),
     }).returning();
@@ -339,10 +346,10 @@ describe("mail schema (0004)", () => {
     expect(indexes.length).toBeGreaterThan(0);
   });
 
-  it("has every hand-written index: the four mail_threads FKs, mail_messages(thread_id/message_id), mail_attachments(message_id)", async () => {
+  it("has every hand-written index: the four mail_threads FKs, mail_messages(thread_id/message_id), mail_attachments(message_id), mail_accounts' duplicate-mailbox unique index", async () => {
     const rows = await handle.db.execute<{ tablename: string; indexname: string; indexdef: string }>(
       sql`SELECT tablename, indexname, indexdef FROM pg_indexes
-          WHERE tablename IN ('mail_threads','mail_messages','mail_attachments')`,
+          WHERE tablename IN ('mail_threads','mail_messages','mail_attachments','mail_accounts')`,
     );
     const names = rows.map((r) => r.indexname);
     for (const expected of [
@@ -351,6 +358,7 @@ describe("mail schema (0004)", () => {
       "mail_threads_last_message_at_idx",
       "mail_messages_thread_id_idx", "mail_messages_message_id_idx",
       "mail_attachments_message_id_idx",
+      "mail_accounts_user_email_active_unique",
     ]) {
       expect(names).toContain(expected);
     }
@@ -360,6 +368,40 @@ describe("mail schema (0004)", () => {
     // scan rather than a sort.
     const lastMessageAtIndex = rows.find((r) => r.indexname === "mail_threads_last_message_at_idx");
     expect(lastMessageAtIndex?.indexdef).toMatch(/last_message_at DESC, id DESC/i);
+
+    // Genuinely UNIQUE, genuinely partial, genuinely case-insensitive --
+    // confirms the DDL, not just its presence in pg_indexes.
+    const dupIndex = rows.find((r) => r.indexname === "mail_accounts_user_email_active_unique");
+    expect(dupIndex?.indexdef).toMatch(/UNIQUE/i);
+    expect(dupIndex?.indexdef).toMatch(/lower\(email\)/i);
+    expect(dupIndex?.indexdef).toMatch(/WHERE.*archived_at IS NULL/i);
+  });
+
+  // DB-level proof the constraint actually behaves as intended -- the
+  // service-level ConflictError mapping (mail-accounts.ts) is tested
+  // separately in mail-accounts.test.ts; this is the raw constraint itself.
+  it("mail_accounts' duplicate-mailbox unique index rejects a second active row for the same (user, email), but allows an archived duplicate or a different user", async () => {
+    const [first] = await handle.db.insert(mailAccounts).values(accountValues()).returning();
+    expect(first).toBeDefined();
+
+    // Same user, same email (even different case), both active -> rejected.
+    await expect(
+      handle.db.insert(mailAccounts).values(accountValues({ email: "CHRIS@example.com", label: "Duplicate" })),
+    ).rejects.toMatchObject({ cause: { code: "23505" } });
+
+    // Archiving the first frees the address up for a fresh active row.
+    await handle.db.update(mailAccounts).set({ archivedAt: new Date() })
+      .where(eq(mailAccounts.id, first!.id));
+    const [second] = await handle.db.insert(mailAccounts)
+      .values(accountValues({ label: "Re-added" })).returning();
+    expect(second).toBeDefined();
+
+    // A different user with the same email is unaffected -- per-user
+    // accounts, shared visibility (spec), not a global uniqueness rule.
+    const otherUserId = (await resolveUser(handle.db, { username: "alex", email: null, fullName: null })).id;
+    const [thirdUser] = await handle.db.insert(mailAccounts)
+      .values(accountValues({ userId: otherUserId, label: "Alex's copy" })).returning();
+    expect(thirdUser).toBeDefined();
   });
 
   it("stores to_addrs/cc_addrs/bcc_addrs as structured jsonb, not stringified JSON", async () => {

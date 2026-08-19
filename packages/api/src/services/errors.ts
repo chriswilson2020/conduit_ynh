@@ -50,3 +50,15 @@ export class MailCredentialDecryptError extends Error {
     super(`failed to decrypt mail credentials: ${reason}`);
   }
 }
+
+// Raised by mail-accounts.ts's testConnection when accountId is absent and
+// the submitted fields do not fully determine a connection to test. Not a
+// reachable route error in practice: mailAccountTestInputSchema's
+// superRefine (packages/shared) already requires the full connection field
+// set whenever accountId is absent, so any request that passed schema
+// validation cannot trigger this. Kept as a typed class rather than a bare
+// Error purely so a caller that bypasses the schema -- a direct service
+// call, e.g. from a future internal caller or a test -- gets something
+// assertable instead of a generic Error. Not mapped by mapDomainError: it is
+// not expected to ever reach a route handler.
+export class IncompleteTestConnectionSettingsError extends Error {}

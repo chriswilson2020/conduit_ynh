@@ -298,10 +298,13 @@ export type EventRow = typeof events.$inferSelect;
 // --- Mail (Phase 4) ------------------------------------------------------
 //
 // Purely additive: no existing table changes. Indexes (the search GIN index,
-// mail_messages(thread_id), mail_threads(last_message_at), and the four
-// mail_threads FK columns) are deliberately NOT declared here via drizzle's
-// index() builder -- no table in this codebase has used it so far, and
-// keeping this migration's indexing as one hand-written block in
+// mail_messages(thread_id), mail_messages(message_id),
+// mail_attachments(message_id), mail_threads(last_message_at), the four
+// mail_threads FK columns, and mail_accounts' partial unique index on
+// (user_id, lower(email)) WHERE archived_at IS NULL -- duplicate-mailbox
+// prevention, quality-review ruling) are deliberately NOT declared here via
+// drizzle's index() builder -- no table in this codebase has used it so
+// far, and keeping this migration's indexing as one hand-written block in
 // drizzle/0004_*.sql (alongside the hand-written search column) keeps all of
 // this migration's non-generatable SQL in one place instead of splitting it
 // between schema.ts and the .sql file.

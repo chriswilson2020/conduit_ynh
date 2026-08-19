@@ -144,4 +144,18 @@ CREATE INDEX "mail_threads_last_message_at_idx" ON "mail_threads" USING btree ("
 CREATE INDEX "mail_threads_company_id_idx" ON "mail_threads" USING btree ("company_id");--> statement-breakpoint
 CREATE INDEX "mail_threads_contact_id_idx" ON "mail_threads" USING btree ("contact_id");--> statement-breakpoint
 CREATE INDEX "mail_threads_deal_id_idx" ON "mail_threads" USING btree ("deal_id");--> statement-breakpoint
-CREATE INDEX "mail_threads_project_id_idx" ON "mail_threads" USING btree ("project_id");
+CREATE INDEX "mail_threads_project_id_idx" ON "mail_threads" USING btree ("project_id");--> statement-breakpoint
+-- Duplicate-mailbox prevention (quality-review ruling, Task 3): a user
+-- adding the same mailbox twice would sync every message a second time
+-- under a new account_id, duplicating every thread it touches. Partial
+-- (WHERE archived_at IS NULL) and per-user, not global: re-adding a
+-- previously-archived copy of the same address is allowed (the archived row
+-- stays out of the way), and two DIFFERENT users legitimately sharing one
+-- mailbox address is allowed too (per-user accounts, shared visibility --
+-- spec). lower(email) matches direction detection's own case-insensitive
+-- comparison (schema.ts's mail_accounts.email comment). drizzle has no
+-- functional-index / partial-index builder, so -- like every other index in
+-- this hand-written block -- this exists in the database only; mail-
+-- accounts.ts's createAccount/updateAccount catch its 23505 violation and
+-- remap it to a ConflictError.
+CREATE UNIQUE INDEX "mail_accounts_user_email_active_unique" ON "mail_accounts" USING btree ("user_id", lower("email")) WHERE "archived_at" IS NULL;

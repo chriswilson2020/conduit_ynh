@@ -59,28 +59,39 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
     void reply.code(409).send({ error: "conflict", message: error.message });
     return;
   }
-  // Both raised by mail-crypto (services/errors.ts) and both mean "mail is
-  // temporarily unavailable" rather than a request-shaped problem: a missing
-  // key file is an operator-fixable deployment gap (install/upgrade is
-  // supposed to generate it), and an unreadable ciphertext means mail.key
-  // was rotated/restored since a row was encrypted. 503, not 500 -- the
-  // request itself was fine. Route-level exercise of these two branches
-  // lands with routes/mail.ts in Task 7; this only wires the mapping so that
-  // task's routes get it for free.
+  // Both raised by mail-crypto (services/errors.ts). Static message text in
+  // both branches, deliberately NOT error.message: MailKeyMissingError's
+  // message embeds the server's filesystem path (mail.key's location),
+  // which must never reach an authenticated client -- app.ts's own 5xx
+  // handler already holds this line for every other unhandled error, and
+  // there is no reason a domain-mapped error should be laxer about it. The
+  // real message (with the path) stays on the Error object for server-side
+  // logs. Route-level exercise of these two branches lands with
+  // routes/mail.ts in Task 7; this only wires the mapping so that task's
+  // routes get it for free.
   //
-  // Static message text, deliberately NOT error.message: MailKeyMissingError's
-  // message embeds the server's filesystem path (mail.key's location), which
-  // must never reach an authenticated client -- app.ts's own 5xx handler
-  // already holds this line for every other unhandled error, and there is no
-  // reason a domain-mapped 503 should be laxer about it. The real message
-  // (with the path) stays on the Error object for server-side logs.
+  // MailKeyMissingError stays 503: mail.key is either present or absent
+  // server-wide, not a property of any one account, so this is a genuine
+  // "mail is temporarily unavailable, an admin needs to look at this"
+  // condition -- retrying later (once an operator runs the install/upgrade
+  // step that generates the key) is the correct client behaviour, which is
+  // exactly what 503 signals.
   if (error instanceof MailKeyMissingError) {
     void reply.code(503).send({ error: "mail_key_missing", message: "mail key unavailable" });
     return;
   }
+  // MailCredentialDecryptError maps to 409, NOT 503: 503 implies "retry
+  // later and it'll work", but a row whose stored ciphertext no longer
+  // decrypts under the current mail.key (rotated/restored key, or a
+  // genuinely corrupted row) will never start decrypting again on its own --
+  // recovery requires the caller to submit a fresh password (updateAccount's
+  // password-present branch never reads the broken ciphertext at all, so it
+  // always succeeds regardless). 409 with an actionable message steers the
+  // client toward that fix instead of a bare retry.
   if (error instanceof MailCredentialDecryptError) {
-    void reply.code(503).send({
-      error: "mail_credentials_unreadable", message: "stored mail credentials could not be decrypted",
+    void reply.code(409).send({
+      error: "mail_credentials_unreadable",
+      message: "stored mail credentials could not be decrypted; submit a new password to re-establish them",
     });
     return;
   }

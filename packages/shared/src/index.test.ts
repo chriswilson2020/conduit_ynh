@@ -34,7 +34,10 @@ import {
   mailAccountSummarySchema,
   mailAccountCreateInputSchema,
   mailAccountUpdateInputSchema,
+  mailAccountUpdatePasswordFieldsSchema,
   mailAccountTestInputSchema,
+  mailAccountTestResultSchema,
+  mailAccountListSchema,
   mailThreadSchema,
   mailMessageSchema,
   mailAttachmentSchema,
@@ -774,6 +777,21 @@ describe("mailAccountUpdateInputSchema", () => {
   });
 });
 
+describe("mailAccountUpdatePasswordFieldsSchema", () => {
+  it("permits an empty string on both fields -- blank means keep the stored value", () => {
+    const blank = { password: "", smtpPassword: "" };
+    expect(mailAccountUpdatePasswordFieldsSchema.parse(blank)).toEqual(blank);
+  });
+
+  it("permits a bare non-empty password with smtpPassword omitted", () => {
+    expect(mailAccountUpdatePasswordFieldsSchema.parse({ password: "new" })).toEqual({ password: "new" });
+  });
+
+  it("permits an entirely empty body (both fields absent)", () => {
+    expect(mailAccountUpdatePasswordFieldsSchema.parse({})).toEqual({});
+  });
+});
+
 describe("mailAccountTestInputSchema", () => {
   it("accepts referencing a saved account by id alone", () => {
     expect(mailAccountTestInputSchema.parse({ accountId: uuid1 })).toEqual({ accountId: uuid1 });
@@ -788,8 +806,87 @@ describe("mailAccountTestInputSchema", () => {
     expect(mailAccountTestInputSchema.parse(input)).toEqual(input);
   });
 
+  it("accepts a full not-yet-saved connection with no smtpPassword override", () => {
+    const input = {
+      imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
+      smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
+      username: "chris", password: "hunter2", smtpPassword: "different",
+    };
+    expect(mailAccountTestInputSchema.parse(input)).toEqual(input);
+  });
+
   it("rejects an empty body -- neither accountId nor a connection to test", () =>
     expect(() => mailAccountTestInputSchema.parse({})).toThrow());
+
+  // The superRefine's whole point: without accountId, a request missing even
+  // ONE connection field must fail validation before it ever reaches the
+  // service, which is what makes mail-accounts.ts's testConnection defensive
+  // "incomplete settings" throw unreachable from routes/mail.ts (Task 7).
+  it("rejects a not-yet-saved connection missing just imapSecurity, on the imapSecurity path", () => {
+    const input = {
+      imapHost: "localhost", imapPort: 993,
+      smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
+      username: "chris", password: "hunter2",
+    };
+    const result = mailAccountTestInputSchema.safeParse(input);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((i) => i.path.join(".") === "imapSecurity")).toBe(true);
+    }
+  });
+
+  it("rejects a not-yet-saved connection missing password", () => {
+    const input = {
+      imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
+      smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
+      username: "chris",
+    };
+    const result = mailAccountTestInputSchema.safeParse(input);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((i) => i.path.join(".") === "password")).toBe(true);
+    }
+  });
+
+  it("does not require smtpPassword on a not-yet-saved connection (defaults to password)", () => {
+    const input = {
+      imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
+      smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
+      username: "chris", password: "hunter2",
+    };
+    expect(mailAccountTestInputSchema.safeParse(input).success).toBe(true);
+  });
+
+  it("does not require any connection field when accountId is given, even alongside a partial override", () => {
+    expect(mailAccountTestInputSchema.safeParse({ accountId: uuid1, imapHost: "override-only" }).success).toBe(true);
+  });
+});
+
+describe("mailAccountTestResultSchema", () => {
+  it("accepts a per-protocol ok/error result", () => {
+    const result = { imap: { ok: true }, smtp: { ok: false, error: "bad login" } };
+    expect(mailAccountTestResultSchema.parse(result)).toEqual(result);
+  });
+});
+
+describe("mailAccountListSchema", () => {
+  it("accepts {own, others} with own accounts full and others as summaries", () => {
+    const account = {
+      id: uuid1, userId: uuid2, label: "Work", email: "chris@example.com",
+      imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
+      smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
+      username: "chris",
+      sentFolder: "Sent", signatureHtml: null, backfillDays: 90,
+      status: "active" as const, lastError: null, lastSyncedAt: null,
+      archivedAt: null, createdAt: now, updatedAt: now,
+    };
+    const list = { own: [account], others: [{ id: uuid2, label: "Theirs", email: "alex@example.com" }] };
+    expect(mailAccountListSchema.parse(list)).toEqual(list);
+  });
+
+  it("accepts an empty list", () => {
+    expect(mailAccountListSchema.parse({ own: [], others: [] })).toEqual({ own: [], others: [] });
+  });
 });
 
 describe("mailThreadSchema", () => {

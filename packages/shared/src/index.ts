@@ -525,13 +525,25 @@ export const mailAccountUpdateInputSchema = mailAccountCreateInputSchema
   .omit({ password: true, smtpPassword: true }).partial();
 export type MailAccountUpdateInput = z.infer<typeof mailAccountUpdateInputSchema>;
 
+// The update-path counterpart to mailAccountCreateInputSchema's password/
+// smtpPassword: unlike create's `.min(1)` (a password is mandatory when
+// first saving an account), "" is a valid, MEANINGFUL value here -- blank
+// means "keep the currently stored password" (mail-accounts.ts's
+// updateAccount), not an invalid one. This is the schema a PATCH body's
+// password fields validate through (Task 7); reusing
+// mailAccountCreateInputSchema's stricter `.min(1)` fields for updates would
+// reject the blank-means-unchanged submission the edit form relies on
+// before it ever reached the service.
+export const mailAccountUpdatePasswordFieldsSchema = z.object({
+  password: z.string().optional(),
+  smtpPassword: z.string().optional(),
+});
+export type MailAccountUpdatePasswordFields = z.infer<typeof mailAccountUpdatePasswordFieldsSchema>;
+
 // POST /api/mail/accounts/test dry-runs IMAP+SMTP logins with either the
 // submitted credentials (composing a not-yet-saved account) or, when only
 // accountId is given, the stored ones -- every other field is therefore
-// optional here even though mailAccountCreateInputSchema requires them. The
-// refine below only guards the coarse "gave us nothing to test" case
-// (accountId XOR a fresh connection attempt to start from); the route does
-// the fine-grained enforcement (e.g. imapHost present without imapSecurity).
+// optional here even though mailAccountCreateInputSchema requires them.
 export const mailAccountTestInputSchema = z.object({
   accountId: z.uuid().optional(),
   imapHost: z.string().min(1).optional(), imapPort: z.number().int().positive().optional(),
@@ -541,10 +553,47 @@ export const mailAccountTestInputSchema = z.object({
   username: z.string().min(1).optional(),
   password: z.string().min(1).optional(),
   smtpPassword: z.string().min(1).optional(),
-}).refine((v) => v.accountId !== undefined || v.imapHost !== undefined, {
-  message: "either accountId or imapHost is required",
+}).superRefine((v, ctx) => {
+  if (v.accountId !== undefined) return; // the stored account supplies every field; anything else here only overrides it.
+  // No accountId: this is a fresh, not-yet-saved connection attempt, so the
+  // submission must be self-sufficient. smtpPassword stays optional even
+  // here -- mail-accounts.ts's testConnection defaults it to `password`,
+  // same "SMTP differs" convention as mailAccountCreateInputSchema. Reported
+  // as field-level issues (not one coarse message) so routes/mail.ts (Task
+  // 7) can surface exactly which one is missing, and so this schema makes
+  // the service's own defensive "incomplete settings" branch unreachable
+  // from any request that passed validation.
+  const required = [
+    ["imapHost", v.imapHost], ["imapPort", v.imapPort], ["imapSecurity", v.imapSecurity],
+    ["smtpHost", v.smtpHost], ["smtpPort", v.smtpPort], ["smtpSecurity", v.smtpSecurity],
+    ["username", v.username], ["password", v.password],
+  ] as const;
+  for (const [field, value] of required) {
+    if (value === undefined) {
+      ctx.addIssue({ code: "custom", path: [field], message: `${field} is required when accountId is not given` });
+    }
+  }
 });
 export type MailAccountTestInput = z.infer<typeof mailAccountTestInputSchema>;
+
+const mailTestProtocolResultSchema = z.object({ ok: z.boolean(), error: z.string().optional() });
+// POST /api/mail/accounts/test's response shape (Task 3's testConnection
+// return value; Task 7 wires the route). Field-optional `error` mirrors
+// mail-accounts.ts's ProtocolResult -- present only on failure, and its text
+// must never contain a password or ciphertext (mail-accounts.ts's own
+// contract).
+export const mailAccountTestResultSchema = z.object({
+  imap: mailTestProtocolResultSchema, smtp: mailTestProtocolResultSchema,
+});
+export type MailAccountTestResult = z.infer<typeof mailAccountTestResultSchema>;
+
+// GET /api/mail/accounts' response shape (Task 3's listAccounts; Task 7
+// wires the route). See listAccounts' own doc comment in mail-accounts.ts
+// for why the shape is {own, others} rather than one discriminated list.
+export const mailAccountListSchema = z.object({
+  own: z.array(mailAccountSchema), others: z.array(mailAccountSummarySchema),
+});
+export type MailAccountList = z.infer<typeof mailAccountListSchema>;
 
 export const mailThreadSchema = z.object({
   id: z.uuid(),

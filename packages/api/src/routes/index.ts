@@ -27,6 +27,10 @@ export interface CrmRouteDeps {
   /** Applied by deals.ts's POST /api/deals when the caller omits a currency --
    * threaded straight from config.defaultCurrency (see config.ts). */
   defaultCurrency: string;
+  /** Threaded straight from config.mailKeyPath (see config.ts) for
+   * routes/mail.ts (Task 7) to pass into mail-accounts.ts's service calls.
+   * Seam only -- unused until that route file exists. */
+  mailKeyPath: string;
 }
 
 /**
