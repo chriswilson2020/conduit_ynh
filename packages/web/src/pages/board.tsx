@@ -162,7 +162,27 @@ export function BoardPage() {
   // archived pipeline without branching the JSX below into two shapes.
   const sensors = useSensors(...(archived ? [] : [pointerSensor, keyboardSensor]));
 
+  // TEMPORARY DEBUG INSTRUMENTATION -- capture-phase listener on the
+  // document, independent of dnd-kit entirely, to see exactly which
+  // keydowns physically arrive and when.
+  useMemo(() => {
+    if (typeof document === "undefined") return;
+    const seen = (document as unknown as { __dbgKeyListenerInstalled?: boolean }).__dbgKeyListenerInstalled;
+    if (seen) return;
+    (document as unknown as { __dbgKeyListenerInstalled?: boolean }).__dbgKeyListenerInstalled = true;
+    document.addEventListener(
+      "keydown",
+      (e) => {
+        // eslint-disable-next-line no-console
+        console.log(`[dbg keydown] code=${e.code} t=${performance.now().toFixed(1)}`);
+      },
+      true,
+    );
+  }, []);
+
   function handleDragStart(event: DragStartEvent) {
+    // eslint-disable-next-line no-console
+    console.log(`[dbg onDragStart] id=${event.active.id} t=${performance.now().toFixed(1)}`);
     setActiveId(String(event.active.id));
     suppressCardClickRef.current = true;
   }
@@ -173,11 +193,15 @@ export function BoardPage() {
   // leaving the DragOverlay showing a phantom card and the next plain click
   // silently swallowed.
   function handleDragCancel() {
+    // eslint-disable-next-line no-console
+    console.log(`[dbg onDragCancel] t=${performance.now().toFixed(1)}`);
     setActiveId(null);
     suppressCardClickRef.current = false;
   }
 
   function handleDragEnd(event: DragEndEvent) {
+    // eslint-disable-next-line no-console
+    console.log(`[dbg onDragEnd] over=${event.over?.id ?? null} t=${performance.now().toFixed(1)}`);
     setActiveId(null);
     // See suppressCardClickRef's doc comment above for why this is a
     // macrotask reset rather than immediate: the drop gesture's native click
