@@ -103,21 +103,34 @@ describe("mail schema (0004)", () => {
     const journal = JSON.parse(
       readFileSync(path.join(realFolder, "meta", "_journal.json"), "utf8"),
     ) as { entries: { idx: number; tag: string }[] };
-    const pre0004Entries = journal.entries.filter((e) => e.idx <= 3);
+    // Derived, not hardcoded to idx <= 3: locates 0004 by tag and takes
+    // everything strictly before it, so a future 0005 (added after 0004
+    // ships and this migration stops being hand-editable) doesn't silently
+    // change what "pre-0004" means here.
+    const migration0004 = journal.entries.find((e) => e.tag.startsWith("0004_"));
+    if (migration0004 === undefined) throw new Error("could not find a 0004 migration in the journal");
+    const pre0004Entries = journal.entries.filter((e) => e.idx < migration0004.idx);
     const tmpFolder = mkdtempSync(path.join(tmpdir(), "conduit-pre0004-"));
-    mkdirSync(path.join(tmpFolder, "meta"));
-    for (const entry of pre0004Entries) {
-      copyFileSync(path.join(realFolder, `${entry.tag}.sql`), path.join(tmpFolder, `${entry.tag}.sql`));
-    }
-    writeFileSync(
-      path.join(tmpFolder, "meta", "_journal.json"),
-      JSON.stringify({ ...journal, entries: pre0004Entries }),
-    );
 
-    await handle.db.execute(sql.raw(`CREATE DATABASE "${dbName}"`));
-    const scratchUrl = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${dbName}`);
-    const scratch = createDatabase(scratchUrl, 1);
+    // CREATE DATABASE and every subsequent step live inside the try so the
+    // finally below always runs cleanup, including on a failure between
+    // creating the database and finishing the migration/insert sequence
+    // (rather than leaking a scratch database that partially succeeded).
+    let scratch: ReturnType<typeof createDatabase> | undefined;
     try {
+      mkdirSync(path.join(tmpFolder, "meta"));
+      for (const entry of pre0004Entries) {
+        copyFileSync(path.join(realFolder, `${entry.tag}.sql`), path.join(tmpFolder, `${entry.tag}.sql`));
+      }
+      writeFileSync(
+        path.join(tmpFolder, "meta", "_journal.json"),
+        JSON.stringify({ ...journal, entries: pre0004Entries }),
+      );
+
+      await handle.db.execute(sql.raw(`CREATE DATABASE "${dbName}"`));
+      const scratchUrl = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${dbName}`);
+      scratch = createDatabase(scratchUrl, 1);
+
       // Old state: only 0000-0003 applied.
       await migrate(scratch.db, { migrationsFolder: tmpFolder });
 
@@ -163,8 +176,13 @@ describe("mail schema (0004)", () => {
         companyId: company!.id, contactId: contact!.id, dealId: deal!.id, projectId: project!.id,
       });
     } finally {
-      await scratch.close();
-      await handle.db.execute(sql.raw(`DROP DATABASE IF EXISTS "${dbName}"`));
+      await scratch?.close();
+      // WITH (FORCE) (PG 15+, confirmed on the dev server): disconnects any
+      // straggling connection to the scratch database itself rather than
+      // failing the drop -- belt-and-braces alongside the explicit close()
+      // above, since a lingering connection would otherwise leak the
+      // database this test just created.
+      await handle.db.execute(sql.raw(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`));
       rmSync(tmpFolder, { recursive: true, force: true });
     }
   }, 30000);
@@ -321,18 +339,27 @@ describe("mail schema (0004)", () => {
     expect(indexes.length).toBeGreaterThan(0);
   });
 
-  it("has the four hand-written mail_threads indexes plus mail_messages(thread_id) and mail_threads(last_message_at)", async () => {
-    const rows = await handle.db.execute<{ tablename: string; indexname: string }>(
-      sql`SELECT tablename, indexname FROM pg_indexes WHERE tablename IN ('mail_threads','mail_messages')`,
+  it("has every hand-written index: the four mail_threads FKs, mail_messages(thread_id/message_id), mail_attachments(message_id)", async () => {
+    const rows = await handle.db.execute<{ tablename: string; indexname: string; indexdef: string }>(
+      sql`SELECT tablename, indexname, indexdef FROM pg_indexes
+          WHERE tablename IN ('mail_threads','mail_messages','mail_attachments')`,
     );
     const names = rows.map((r) => r.indexname);
     for (const expected of [
       "mail_threads_company_id_idx", "mail_threads_contact_id_idx",
       "mail_threads_deal_id_idx", "mail_threads_project_id_idx",
-      "mail_threads_last_message_at_idx", "mail_messages_thread_id_idx",
+      "mail_threads_last_message_at_idx",
+      "mail_messages_thread_id_idx", "mail_messages_message_id_idx",
+      "mail_attachments_message_id_idx",
     ]) {
       expect(names).toContain(expected);
     }
+
+    // Composite and DESC on both columns -- matches GET /api/mail/threads'
+    // keyset pagination direction exactly, so that query is a single index
+    // scan rather than a sort.
+    const lastMessageAtIndex = rows.find((r) => r.indexname === "mail_threads_last_message_at_idx");
+    expect(lastMessageAtIndex?.indexdef).toMatch(/last_message_at DESC, id DESC/i);
   });
 
   it("stores to_addrs/cc_addrs/bcc_addrs as structured jsonb, not stringified JSON", async () => {

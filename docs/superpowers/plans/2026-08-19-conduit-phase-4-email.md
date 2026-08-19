@@ -14,6 +14,8 @@
 
 Identical to Phase 3's plan: `./scripts/remote.sh` for every command (the worktree lacks the untracked `.conduit-remote` — copy it from the main checkout before the first run); NodeNext `.js` extensions in api, none in web; ASCII-only sources with `\u` escapes, byte-scan before commit (email fixtures included — encode any non-ASCII test content as escapes); ApiError code/status branching; testids for structure, roles for controls; Playwright ONLY in CI (iterate via push + `gh run view --log-failed`). Suite at start: 603 unit + 31 e2e, green. Hardened service pattern per `services/deals.ts`/`tasks.ts` (atomic guards, publish-after-commit SSE hints). Mail needs no advisory locks — each AccountSync serialises its own account in-process and never two writers race one folder cursor.
 
+0004's indexes (the search GIN index, mail_messages(thread_id)/(message_id), mail_attachments(message_id), mail_threads(last_message_at DESC, id DESC), and the four mail_threads FK columns) are hand-written directly into `drizzle/0004_*.sql` — they exist in the database but have no representation in `schema.ts` or the drizzle-kit snapshot. Two consequences for every later task: never introduce `drizzle-kit push` to this project (it diffs schema.ts against the live database and would DROP every one of these indexes, having no record of them); and declaring any one of them later via drizzle's `index()` builder requires first deleting its hand-written `CREATE INDEX` statement, or a future `db:generate` will try to create a duplicate.
+
 ## File structure
 
 | Path | Responsibility |

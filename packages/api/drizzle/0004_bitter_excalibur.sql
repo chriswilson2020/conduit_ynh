@@ -108,19 +108,35 @@ ALTER TABLE "mail_threads" ADD CONSTRAINT "mail_threads_company_id_companies_id_
 ALTER TABLE "mail_threads" ADD CONSTRAINT "mail_threads_contact_id_contacts_id_fk" FOREIGN KEY ("contact_id") REFERENCES "public"."contacts"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "mail_threads" ADD CONSTRAINT "mail_threads_deal_id_deals_id_fk" FOREIGN KEY ("deal_id") REFERENCES "public"."deals"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "mail_threads" ADD CONSTRAINT "mail_threads_project_id_projects_id_fk" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
--- Hand-written: drizzle-kit has no notion of a GIN index over a generated
--- tsvector column (see schema.ts's searchVector customType comment), so this
--- is not declared via drizzle's index() builder at all -- it exists only
--- here, alongside the other indexes this migration needs. Full-text search
--- (websearch_to_tsquery against this column) is a later task; this index is
--- laid down now so that task never needs its own migration.
+-- Hand-written block: none of the indexes below exist in schema.ts or the
+-- drizzle-kit snapshot (drizzle's index() builder is unused throughout this
+-- migration -- see schema.ts's searchVector customType comment for why the
+-- GIN index specifically can't be declared that way). They exist in the
+-- database only. Consequences: `drizzle-kit push` must never be introduced
+-- to this project (it diffs against the live DB and would DROP every index
+-- here, having no schema.ts record of them); and declaring any one of them
+-- later via index() requires first removing its hand-written CREATE INDEX
+-- here, or drizzle-kit will try to create a duplicate.
+--
+-- Full-text search (websearch_to_tsquery against mail_messages.search) is a
+-- later task; this GIN index is laid down now so that task never needs its
+-- own migration.
 CREATE INDEX "mail_messages_search_idx" ON "mail_messages" USING gin ("search");--> statement-breakpoint
 -- Thread's message list is always "WHERE thread_id = ... ORDER BY sent_at";
 -- this is the index that query needs.
 CREATE INDEX "mail_messages_thread_id_idx" ON "mail_messages" USING btree ("thread_id");--> statement-breakpoint
--- GET /api/mail/threads' default ordering (keyset pagination on
--- (last_message_at, id), per the Phase 4 spec's routes section).
-CREATE INDEX "mail_threads_last_message_at_idx" ON "mail_threads" USING btree ("last_message_at");--> statement-breakpoint
+-- Threading (mail-threading.ts, a later task) looks up an existing message
+-- by message_id alone when walking a new message's references/in_reply_to
+-- chain -- the hottest write-path query in the sync engine. Without this,
+-- that's a sequential scan on every ingested message.
+CREATE INDEX "mail_messages_message_id_idx" ON "mail_messages" USING btree ("message_id");--> statement-breakpoint
+-- Every thread-open loads its messages' attachments.
+CREATE INDEX "mail_attachments_message_id_idx" ON "mail_attachments" USING btree ("message_id");--> statement-breakpoint
+-- GET /api/mail/threads' default ordering: keyset pagination on
+-- (last_message_at, id) DESC (per the Phase 4 spec's routes section) --
+-- composite and matching the pagination direction, so the keyset query is a
+-- single index scan rather than a sort.
+CREATE INDEX "mail_threads_last_message_at_idx" ON "mail_threads" USING btree ("last_message_at" DESC, "id" DESC);--> statement-breakpoint
 -- The four thread FKs: each is a filter GET /api/mail/threads supports
 -- (company_id/contact_id/deal_id/project_id) and each record page's Mail
 -- tab ("threads linked to this company/contact/deal/project") queries by

@@ -20,22 +20,12 @@ const positionText = customType<{ data: string }>({
 /**
  * mail_messages.search: drizzle-orm has no built-in tsvector column type, so
  * -- like positionText's collation pin above -- this customType supplies
- * just the bare type name. The GENERATED ALWAYS AS (...) STORED clause is
- * NOT part of the type string (an earlier version of this code smuggled the
- * whole clause through here, which produced two real bugs: drizzle-kit's
- * generator wrapped the entire string in a spurious pair of double quotes as
- * though it were a single identifier -- confirmed by running it, not
- * assumed -- and, worse, drizzle-orm had no way to know the column was
- * generated, so its inferred insert type demanded a value for `search` on
- * every insert while Postgres rejects any insert that supplies one for an
- * actual generated column: no valid insert could satisfy both). The
- * generated-ness instead comes from drizzle's own `.generatedAlwaysAs()`
- * below, which both `db:generate` and drizzle-orm's insert-type inference
- * understand correctly. `db:generate`'s own output for this column already
- * matches Postgres's GENERATED ALWAYS AS (...) STORED syntax exactly, with
- * no hand-editing needed; only the GIN index still has to be hand-written
- * (drizzle-kit has no notion of an index over a generated column) -- see
- * drizzle/0004_*.sql.
+ * just the bare type name. Generation comes from `.generatedAlwaysAs()`
+ * below instead of being folded into the type string, which is what keeps
+ * `search` out of the inferred insert type (a generated column can never be
+ * written by the app). The GIN index still has to be hand-written in
+ * drizzle/0004_*.sql -- drizzle-kit has no notion of an index over a
+ * generated column.
  */
 const searchVector = customType<{ data: string }>({
   dataType() { return "tsvector"; },
@@ -388,6 +378,15 @@ export const mailThreads = pgTable("mail_threads", {
 });
 export type MailThreadRow = typeof mailThreads.$inferSelect;
 
+/**
+ * jsonb shape of mail_messages.to_addrs/cc_addrs/bcc_addrs -- mirrors
+ * @conduit/shared's mailAddressSchema by hand (different packages, nothing
+ * ties the two together automatically). Type-only: `.$type<>()` doesn't
+ * validate anything at runtime, it just stops the column's rows showing up
+ * as `unknown` at every call site that reads them.
+ */
+type MailAddressJson = { address: string; name?: string | null };
+
 export const mailMessages = pgTable("mail_messages", {
   id: uuid("id").primaryKey().defaultRandom(),
   accountId: uuid("account_id").notNull().references(() => mailAccounts.id),
@@ -407,10 +406,10 @@ export const mailMessages = pgTable("mail_messages", {
   referencesIds: text("references").array().notNull().default([]),
   fromAddr: text("from_addr").notNull(),
   fromName: text("from_name"),
-  toAddrs: jsonb("to_addrs").notNull(),
-  ccAddrs: jsonb("cc_addrs").notNull().default([]),
+  toAddrs: jsonb("to_addrs").notNull().$type<MailAddressJson[]>(),
+  ccAddrs: jsonb("cc_addrs").notNull().default([]).$type<MailAddressJson[]>(),
   // Populated for outbound only (spec) -- inbound ingest never learns Bcc.
-  bccAddrs: jsonb("bcc_addrs").notNull().default([]),
+  bccAddrs: jsonb("bcc_addrs").notNull().default([]).$type<MailAddressJson[]>(),
   subject: text("subject").notNull().default(""),
   bodyText: text("body_text").notNull().default(""),
   bodyHtml: text("body_html"),

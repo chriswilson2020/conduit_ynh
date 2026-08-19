@@ -852,16 +852,13 @@ describe("mailAttachmentSchema", () => {
     expect(mailAttachmentSchema.parse(attachment)).toEqual(attachment);
   });
 
-  // Client-facing shape must not leak storage internals (mirrors
-  // fileMetaSchema, which never exposes one either) -- a stray blobPath key
-  // on the input is silently stripped by zod, not surfaced.
-  it("strips a blobPath key rather than exposing it", () => {
-    const withBlobPath = {
-      id: uuid1, messageId: uuid2, filename: "invoice.pdf", mime: "application/pdf",
-      sizeBytes: 12345, blobPath: "ab/cd/hash", contentId: null, isInline: false, createdAt: now,
-    };
-    const parsed = mailAttachmentSchema.parse(withBlobPath);
-    expect(parsed).not.toHaveProperty("blobPath");
+  // Client-facing shape must not leak storage internals -- mirrors
+  // fileMetaSchema, which never exposes one either. Same idiom as
+  // mailAccountSchema's credential-shape assertion above: checked on the
+  // shape itself, not just on one parsed value, so the guarantee holds
+  // regardless of what any particular input happens to include.
+  it("has no blobPath field in its shape", () => {
+    expect(Object.keys(mailAttachmentSchema.shape)).not.toContain("blobPath");
   });
 });
 

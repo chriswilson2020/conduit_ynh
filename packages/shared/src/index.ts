@@ -534,7 +534,13 @@ export const mailAccountTestInputSchema = z.object({
 export type MailAccountTestInput = z.infer<typeof mailAccountTestInputSchema>;
 
 export const mailThreadSchema = z.object({
-  id: z.uuid(), subject: z.string().min(1),
+  id: z.uuid(),
+  // No .min(1): a thread's subject derives from its first message's
+  // subject, which can itself be '' (mail_messages.subject defaults to ''
+  // for inbound mail lacking one) -- same reasoning as mailMessageSchema's
+  // subject below. One thread with an empty subject must not throw on
+  // parseWith and take the whole thread list down with it.
+  subject: z.string(),
   lastMessageAt: z.iso.datetime(), messageCount: z.number().int().nonnegative(),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
   projectId: z.uuid().nullable(),
@@ -646,6 +652,10 @@ export const sendMailInputSchema = z.object({
   bcc: z.array(composeAddressSchema).optional().default([]),
   subject: z.string(),
   bodyHtml: z.string().min(1),
+  // files.id, not mail_attachments.id -- attachments are uploaded first
+  // through the existing multipart flow (spec, Send path) and referenced
+  // here by that upload's id; mail_attachments rows only exist for messages
+  // already ingested, which an in-progress compose is not.
   attachmentIds: z.array(z.uuid()).optional().default([]),
   links: z.object({
     companyId: z.uuid().optional(), contactId: z.uuid().optional(),
