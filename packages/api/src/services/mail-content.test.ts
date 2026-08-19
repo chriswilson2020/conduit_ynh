@@ -151,6 +151,22 @@ describe("sanitizeMailHtml", () => {
     expect(out).not.toContain("javascript:");
   });
 
+  it("drops an inbound img that already carries the mailattachment: scheme", () => {
+    // Only the cid -> cidMap rewrite may emit this scheme. A message
+    // arriving with it in an img src is naming an attachment id it has no
+    // relationship to (any thread, any user), which serve-time resolution
+    // would happily turn into a real URL.
+    const out = sanitizeMailHtml('<p>a</p><img src="mailattachment:11111111-1111-1111-1111-111111111111" alt="x">');
+    expect(out).toBe("<p>a</p>");
+  });
+
+  it("drops an inbound mailattachment: img whatever its casing or leading space", () => {
+    const out = sanitizeMailHtml('<img src="  MailAttachment:11111111-1111-1111-1111-111111111111">', {
+      cidMap: { "logo@x": "attach-1" },
+    });
+    expect(out).toBe("");
+  });
+
   it("keeps an inline style attribute (multiple safe properties) on allowed tags", () => {
     const out = sanitizeMailHtml('<p style="color:red;font-weight:bold">hi</p>');
     expect(out).toContain('style="color:red;font-weight:bold"');

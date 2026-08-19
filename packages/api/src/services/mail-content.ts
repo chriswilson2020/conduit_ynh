@@ -91,6 +91,12 @@ function attachmentPlaceholder(attachmentId: string): string {
 
 const ATTACHMENT_PLACEHOLDER_RE = /mailattachment:([A-Za-z0-9._~-]+)/g;
 
+// Matches an img src that already carries the placeholder scheme on the way
+// IN (see transformImg): leading whitespace tolerated the same way
+// extractCid tolerates it, since sanitize-html hands over the raw attribute
+// value.
+const PLACEHOLDER_SRC_RE = new RegExp(`^\\s*${ATTACHMENT_PLACEHOLDER_SCHEME}:`, "i");
+
 /**
  * Swap stored `mailattachment:` placeholders (see sanitizeMailHtml's cid
  * rewrite) for the authenticated download route, at serve time. `apiBase`
@@ -162,6 +168,17 @@ function transformImg(cidMap: Record<string, string> | undefined) {
           return { tagName, attribs: { ...attribs, src: attachmentPlaceholder(attachmentId) } };
         }
         const { src: _unmappedCid, ...rest } = attribs;
+        return { tagName, attribs: rest };
+      }
+      // The cid rewrite above is the ONLY writer of the placeholder
+      // scheme. Inbound HTML arriving with it already in an img src is
+      // hostile (or at best confused): allowedSchemesByTag lists the
+      // scheme, so it would otherwise survive sanitization and resolve at
+      // serve time to whatever attachment id it names -- someone else's
+      // attachment, on someone else's thread. Dropped like an unmapped
+      // cid.
+      if (PLACEHOLDER_SRC_RE.test(src)) {
+        const { src: _forgedPlaceholder, ...rest } = attribs;
         return { tagName, attribs: rest };
       }
     }
