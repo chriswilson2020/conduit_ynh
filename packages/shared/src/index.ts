@@ -840,8 +840,39 @@ export type MailThreadDetail = z.infer<typeof mailThreadDetailSchema>;
 // GET /api/mail/unread-count -- distinct non-archived threads holding at
 // least one unseen message. A count of THREADS, not messages: it drives the
 // inbox nav badge, which counts conversations the way the thread list does.
+// Messages sitting in their account's trash_folder do NOT count (Phase 4.1
+// Task 4): trashing an unread message must not leave the badge counting it
+// forever, and nothing ever re-sights an unsynced Trash to clear the flag.
+// An ARCHIVED folder's unread messages DO count -- filing something is not
+// reading it (api: mail-threads.ts's unreadThreadCount).
 export const mailUnreadCountSchema = z.object({ count: z.number().int().nonnegative() });
 export type MailUnreadCount = z.infer<typeof mailUnreadCountSchema>;
+
+// GET /api/mail/unread-count?byFolder=1 -- the folder sidebar's badges
+// (Phase 4.1 Task 4), one grouped query rather than one request per folder.
+//
+// Two things this shape deliberately does NOT do, both documented at the
+// query (api: mail-threads.ts's unreadCountsByFolder):
+//
+// - it does NOT apply the trash exclusion above. Each count belongs to its
+//   own folder row, so the Trash row's badge is the honest count of unread
+//   mail in Trash; excluding it would make that row permanently read 0
+//   while the messages under it are visibly unread.
+// - it carries NO accountId, per the spec's shape. Folder names are
+//   therefore counted across accounts: two accounts' INBOXes produce ONE
+//   `INBOX` row holding both. Fine for the single-account case (Chris's,
+//   and the reason the shape is this one); a multi-account sidebar that
+//   wants per-account badges needs an account-scoped variant of this
+//   endpoint, which v0.6.0 does not have.
+export const mailUnreadFolderCountSchema = z.object({
+  folder: z.string().min(1), count: z.number().int().nonnegative(),
+});
+export type MailUnreadFolderCount = z.infer<typeof mailUnreadFolderCountSchema>;
+
+export const mailUnreadFolderCountsSchema = z.object({
+  folders: z.array(mailUnreadFolderCountSchema),
+});
+export type MailUnreadFolderCounts = z.infer<typeof mailUnreadFolderCountsSchema>;
 
 // Query-side filter contract for GET /api/mail/threads (route layer maps its
 // snake_case querystring onto this camelCase shape, same division of labour
@@ -895,6 +926,14 @@ export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
 // small enough that one request's per-account IMAP MOVE queueing stays
 // bounded; `.min(1)` because a bulk action against zero threads is not a
 // request, it's a bug in whatever sent it.
+//
+// 200 is the OUTER bound, and only `hide` reaches it. trash/archive wait on
+// a real mail server -- each queued MOVE runs on its account's serial sync
+// loop -- so the route applies a tighter per-action cap of 50 to those two
+// and rejects a larger request with the uniform 400 (api: routes/mail.ts's
+// bulk endpoint, Task 4 ruling). The tighter bound lives there rather than
+// here because it is a property of the ACTION, not of the body shape, and
+// this schema is also what the whole-thread single-id callers parse through.
 export const bulkThreadActionInputSchema = z.object({
   threadIds: z.array(z.uuid()).min(1).max(200),
   folder: folderNameSchema.optional(),

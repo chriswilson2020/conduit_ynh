@@ -9,13 +9,16 @@ import {
   contactSchema, dealSchema, errorResponseSchema, listResponseSchema, pipelineSchema, stageSchema,
   mailAccountSchema, mailAccountListSchema, mailAccountTestResultSchema, mailThreadSchema,
   mailThreadListItemSchema, mailThreadDetailSchema, mailMessageSchema, mailUnreadCountSchema,
+  mailUnreadFolderCountsSchema, mailAccountFolderSchema, bulkThreadResultSchema,
   emailTemplateSchema, searchResultsSchema,
   type MailAccountCreateInput, type MailAccountSyncStats, type SendMailInput,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { buildApp } from "../app.js";
 import type { Config } from "../config.js";
-import { mailAccounts, mailAttachments, mailMessages, mailThreads } from "../db/schema.js";
+import {
+  mailAccountFolders, mailAccounts, mailAttachments, mailMessages, mailThreads,
+} from "../db/schema.js";
 import { saveBlob } from "../services/blobs.js";
 import type { SendMailMessage, SendMailTransport } from "../services/mail-send.js";
 import type { MailRouteSyncManager } from "./mail.js";
@@ -27,6 +30,11 @@ let dataDir: string;
 let keyPath: string;
 let transport: FakeTransport;
 let syncs: Map<string, FakeAccountSync>;
+/** Account ids the routes asked for a pass (the folder picker's enable path).
+ * syncNow is fire-and-forget by contract, so recording the ASK is the whole
+ * assertion -- nothing here waits for a pass that a real engine may not run
+ * for minutes. */
+let syncNowCalls: string[];
 /** Swapped for `() => null` by the tests that need the no-sync-engine shape. */
 let manager: MailRouteSyncManager;
 
@@ -38,7 +46,11 @@ beforeEach(async () => {
   await writeFile(keyPath, randomBytes(32));
   transport = new FakeTransport();
   syncs = new Map();
-  manager = { get: (id) => syncs.get(id) };
+  syncNowCalls = [];
+  manager = {
+    get: (id) => syncs.get(id),
+    syncNow: (id) => { syncNowCalls.push(id); return Promise.resolve(); },
+  };
 });
 afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
@@ -80,7 +92,11 @@ class FakeTransport implements SendMailTransport {
 class FakeAccountSync {
   readonly appended: Buffer[] = [];
   readonly markSeenCalls: { folder: string; uids: number[] }[] = [];
+  readonly moveCalls: { folder: string; uids: number[]; targetFolder: string }[] = [];
   markSeenFailure: Error | null = null;
+  /** Set to make the queued MOVE reject, the way a server refusal reaches the
+   * move service (which then compensates and fails those threads). */
+  moveFailure: Error | null = null;
   stats: MailAccountSyncStats = {
     passes: 3, failures: 1, ingested: 12, poisonSkips: 0, idleWakes: 2, attempt: 0, stopped: false,
   };
@@ -93,6 +109,11 @@ class FakeAccountSync {
   markSeen(folder: string, uids: readonly number[]): Promise<void> {
     this.markSeenCalls.push({ folder, uids: [...uids] });
     return this.markSeenFailure === null ? Promise.resolve() : Promise.reject(this.markSeenFailure);
+  }
+
+  moveMessages(folder: string, uids: readonly number[], targetFolder: string): Promise<void> {
+    this.moveCalls.push({ folder, uids: [...uids], targetFolder });
+    return this.moveFailure === null ? Promise.resolve() : Promise.reject(this.moveFailure);
   }
 }
 
@@ -217,6 +238,39 @@ async function seedAttachment(
   }).returning();
   if (row === undefined) throw new Error("seedAttachment: no row");
   return { id: row.id, body };
+}
+
+/** One discovered folder row, as a sync pass's LIST would have written it
+ * (services/mail-folders.ts's discoverFolders). Seeded directly here: these
+ * routes are about what the picker does with the rows, not about discovery. */
+async function seedFolder(
+  accountId: string,
+  folder: string,
+  opts: {
+    specialUse?: "archive" | "drafts" | "junk" | "sent" | "trash";
+    syncEnabled?: boolean;
+    selectable?: boolean;
+    lastDiscoveredAt?: Date;
+  } = {},
+): Promise<string> {
+  const [row] = await handle.db.insert(mailAccountFolders).values({
+    accountId, folder,
+    specialUse: opts.specialUse ?? null,
+    syncEnabled: opts.syncEnabled ?? true,
+    selectable: opts.selectable ?? true,
+    lastDiscoveredAt: opts.lastDiscoveredAt ?? new Date("2026-08-20T09:00:00Z"),
+  }).returning();
+  if (row === undefined) throw new Error("seedFolder: no row");
+  return row.id;
+}
+
+/** Point an account at the move targets a discovery pass would have resolved
+ * for it. Written straight to the row, since the routes under test are the
+ * bulk ones, not the Settings PATCH that also writes these. */
+async function setMoveTargets(
+  accountId: string, targets: { trashFolder?: string | null; archiveFolder?: string | null },
+): Promise<void> {
+  await handle.db.update(mailAccounts).set(targets).where(eq(mailAccounts.id, accountId));
 }
 
 async function makeContact(a: App, overrides: Record<string, unknown> = {}) {
@@ -406,6 +460,193 @@ describe("mail account routes", () => {
 
 // --- Threads: list ----------------------------------------------------------
 
+// --- Folders ----------------------------------------------------------------
+
+describe("mail folder routes", () => {
+  it("lists an account's folders with route-computed locked flags and the discovery fields", async () => {
+    const a = await app();
+    const account = await makeAccount(a, { sentFolder: "Sent Items" });
+    await seedFolder(account.id, "INBOX");
+    await seedFolder(account.id, "Sent Items", { specialUse: "sent" });
+    await seedFolder(account.id, "Trash", { specialUse: "trash", syncEnabled: false });
+    await seedFolder(account.id, "Shared", { selectable: false });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/accounts/${account.id}/folders`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    const folders = mailAccountFolderSchema.array().parse(response.json());
+    // Name-ordered, every row present -- including the unselectable one, which
+    // the picker greys out rather than hides.
+    expect(folders.map((f) => f.folder)).toEqual(["INBOX", "Sent Items", "Shared", "Trash"]);
+    // locked: INBOX and the account's CURRENT sent folder, computed here and
+    // never a column (repointing sent_folder moves the lock with it).
+    expect(folders.filter((f) => f.locked).map((f) => f.folder)).toEqual(["INBOX", "Sent Items"]);
+    expect(folders.find((f) => f.folder === "Trash")).toMatchObject({
+      specialUse: "trash", syncEnabled: false, selectable: true,
+    });
+    await a.close();
+  });
+
+  it("404s another user's account and an unknown id on both folder routes", async () => {
+    const a = await app();
+    const theirs = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    await seedFolder(theirs.id, "Projects");
+
+    // Whose mailbox holds which folders is a setting, not shared CRM content:
+    // a foreign account 404s exactly like a nonexistent one.
+    for (const id of [theirs.id, UNKNOWN_ID]) {
+      const listed = await a.inject({
+        method: "GET", url: `/api/mail/accounts/${id}/folders`, headers: authHeaders,
+      });
+      expect(listed.statusCode).toBe(404);
+      const patched = await a.inject({
+        method: "PATCH", url: `/api/mail/accounts/${id}/folders`, headers: authHeaders,
+        payload: { folder: "Projects", syncEnabled: false },
+      });
+      expect(patched.statusCode).toBe(404);
+    }
+    // The stranger's row is untouched.
+    const [row] = await handle.db.select().from(mailAccountFolders)
+      .where(eq(mailAccountFolders.accountId, theirs.id));
+    expect(row?.syncEnabled).toBe(true);
+    await a.close();
+  });
+
+  it("switches a folder off without asking for a sync pass", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    await seedFolder(account.id, "Projects");
+
+    const response = await a.inject({
+      method: "PATCH", url: `/api/mail/accounts/${account.id}/folders`, headers: authHeaders,
+      payload: { folder: "Projects", syncEnabled: false },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(mailAccountFolderSchema.parse(response.json())).toMatchObject({
+      folder: "Projects", syncEnabled: false, locked: false,
+    });
+    // Nothing to fetch, so nothing is asked for.
+    expect(syncNowCalls).toEqual([]);
+    await a.close();
+  });
+
+  it("asks for a sync pass when a folder is switched on, and not on a same-value patch", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    await seedFolder(account.id, "Junk", { specialUse: "junk", syncEnabled: false });
+
+    const enabled = await a.inject({
+      method: "PATCH", url: `/api/mail/accounts/${account.id}/folders`, headers: authHeaders,
+      // The folder name is trimmed by the shared schema before it ever reaches
+      // the service, so a padded submission still finds the row.
+      payload: { folder: " Junk ", syncEnabled: true },
+    });
+    expect(enabled.statusCode).toBe(200);
+    expect(mailAccountFolderSchema.parse(enabled.json()).syncEnabled).toBe(true);
+    expect(syncNowCalls).toEqual([account.id]);
+
+    // Idempotent re-submission: no write, and no second pass requested.
+    const again = await a.inject({
+      method: "PATCH", url: `/api/mail/accounts/${account.id}/folders`, headers: authHeaders,
+      payload: { folder: "Junk", syncEnabled: true },
+    });
+    expect(again.statusCode).toBe(200);
+    expect(syncNowCalls).toEqual([account.id]);
+    await a.close();
+  });
+
+  it("409s a locked folder, 409s an unselectable one, and 404s an unknown name", async () => {
+    const a = await app();
+    const account = await makeAccount(a, { sentFolder: "Sent" });
+    await seedFolder(account.id, "INBOX");
+    await seedFolder(account.id, "Sent", { specialUse: "sent" });
+    await seedFolder(account.id, "Shared", { selectable: false });
+
+    async function patch(payload: Record<string, unknown>) {
+      return a.inject({
+        method: "PATCH", url: `/api/mail/accounts/${account.id}/folders`, headers: authHeaders, payload,
+      });
+    }
+
+    // INBOX and the sent folder are always walked, so the switch is not real.
+    const inbox = await patch({ folder: "INBOX", syncEnabled: false });
+    expect(inbox.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(inbox.json())).toMatchObject({
+      error: "conflict",
+      message: 'folder "INBOX" is always synced (INBOX and the account\'s Sent folder)'
+        + " and cannot be switched off",
+    });
+    expect((await patch({ folder: "Sent", syncEnabled: true })).statusCode).toBe(409);
+
+    // A \Noselect node holds no messages: enabling it would promise a sync
+    // that can never happen.
+    const shared = await patch({ folder: "Shared", syncEnabled: true });
+    expect(shared.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(shared.json()).message)
+      .toBe('folder "Shared" holds no messages on the server (\\Noselect) and cannot be synced');
+
+    const unknown = await patch({ folder: "Nope", syncEnabled: true });
+    expect(unknown.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(unknown.json()).error).toBe("not_found");
+
+    // Blank and missing bodies are the uniform 400, not a 404.
+    expect((await patch({ folder: "   ", syncEnabled: true })).statusCode).toBe(400);
+    expect((await patch({ folder: "Shared" })).statusCode).toBe(400);
+    expect(syncNowCalls).toEqual([]);
+    await a.close();
+  });
+
+  it("saves the folder toggle even when the sync engine is absent or throwing", async () => {
+    const a = await app({ syncManager: () => null });
+    const account = await makeAccount(a);
+    await seedFolder(account.id, "Junk", { specialUse: "junk", syncEnabled: false });
+
+    // The DATABASE write is this route's contract; asking for a pass is best
+    // effort, exactly like the read route's `\Seen` write-back.
+    const response = await a.inject({
+      method: "PATCH", url: `/api/mail/accounts/${account.id}/folders`, headers: authHeaders,
+      payload: { folder: "Junk", syncEnabled: true },
+    });
+    expect(response.statusCode).toBe(200);
+    const [row] = await handle.db.select().from(mailAccountFolders)
+      .where(eq(mailAccountFolders.accountId, account.id));
+    expect(row?.syncEnabled).toBe(true);
+    await a.close();
+
+    const throwing = await app({
+      syncManager: () => ({
+        get: (id) => syncs.get(id),
+        syncNow: () => { throw new Error("engine exploded"); },
+      }),
+    });
+    const second = await makeAccount(throwing, { label: "Side", email: "side@example.com" });
+    await seedFolder(second.id, "Junk", { specialUse: "junk", syncEnabled: false });
+    const survived = await throwing.inject({
+      method: "PATCH", url: `/api/mail/accounts/${second.id}/folders`, headers: authHeaders,
+      payload: { folder: "Junk", syncEnabled: true },
+    });
+    expect(survived.statusCode).toBe(200);
+    await throwing.close();
+  });
+
+  it("accepts the trash and archive overrides on the account PATCH, trimmed", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const response = await a.inject({
+      method: "PATCH", url: `/api/mail/accounts/${account.id}`, headers: authHeaders,
+      payload: { trashFolder: " Deleted Items ", archiveFolder: " Archive " },
+    });
+    expect(response.statusCode).toBe(200);
+    // An IMAP mailbox name is compared byte for byte by the move service, so
+    // the padded submission must not become a second mailbox.
+    expect(mailAccountSchema.parse(response.json())).toMatchObject({
+      trashFolder: "Deleted Items", archiveFolder: "Archive",
+    });
+    await a.close();
+  });
+});
+
 describe("mail thread list route", () => {
   it("lists non-archived threads newest-first with their derived row fields", async () => {
     const a = await app();
@@ -590,6 +831,71 @@ describe("mail thread list route", () => {
     expect(await subjects("archived=true")).toEqual(["Filed"]);
     // ANDed, not ORed: an unread thread on the OTHER account matches neither.
     expect(await subjects(`unread=true&account_id=${second.id}`)).toEqual([]);
+    await a.close();
+  });
+
+  it("filters by folder, and follows a message that moved between folders", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const inbox = await seedThread({ subject: "Inbox thread", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const inboxMessage = await seedMessage(inbox, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), folder: "INBOX",
+    });
+    const filed = await seedThread({ subject: "Filed thread", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(filed, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), folder: "Projects" });
+
+    async function subjects(query: string): Promise<string[]> {
+      const response = await a.inject({ method: "GET", url: `/api/mail/threads?${query}`, headers: authHeaders });
+      expect(response.statusCode).toBe(200);
+      return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items.map((t) => t.subject);
+    }
+
+    expect(await subjects("folder=INBOX")).toEqual(["Inbox thread"]);
+    expect(await subjects("folder=Projects")).toEqual(["Filed thread"]);
+    // Membership is derived from the MESSAGES, so an archive move (folder
+    // rewritten, uid dropped -- services/mail-move.ts) changes which view the
+    // thread appears in, with no thread-level column involved.
+    await handle.db.update(mailMessages).set({ folder: "Archive", imapUid: null })
+      .where(eq(mailMessages.id, inboxMessage));
+    expect(await subjects("folder=INBOX")).toEqual([]);
+    expect(await subjects("folder=Archive")).toEqual(["Inbox thread"]);
+    // Byte-for-byte, the same rule UNIQUE (account_id, folder) follows.
+    expect(await subjects("folder=archive")).toEqual([]);
+    // Padding is trimmed rather than becoming a second folder name.
+    expect(await subjects("folder=%20Archive%20")).toEqual(["Inbox thread"]);
+    // A blank filter is invalid input, not "no filter".
+    const blank = await a.inject({ method: "GET", url: "/api/mail/threads?folder=%20", headers: authHeaders });
+    expect(blank.statusCode).toBe(400);
+    await a.close();
+  });
+
+  it("combines account_id and folder into ONE EXISTS, excluding a thread whose halves are on different accounts", async () => {
+    const a = await app();
+    const first = await makeAccount(a);
+    const second = await makeAccount(a, { label: "Side", email: "side@example.com" });
+
+    // The trap two separate EXISTS clauses fall into: this thread has an
+    // INBOX message on account A and a Projects message on account B, so each
+    // clause passes independently while NO message is in Projects on A.
+    const split = await seedThread({ subject: "Split", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(split, first.id, { sentAt: new Date("2026-08-02T09:00:00Z"), folder: "INBOX" });
+    await seedMessage(split, second.id, { sentAt: new Date("2026-08-02T10:00:00Z"), folder: "Projects" });
+    // ...and a thread that really is in Projects on account A.
+    const genuine = await seedThread({ subject: "Genuine", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(genuine, first.id, { sentAt: new Date("2026-08-01T10:00:00Z"), folder: "Projects" });
+
+    async function subjects(query: string): Promise<string[]> {
+      const response = await a.inject({ method: "GET", url: `/api/mail/threads?${query}`, headers: authHeaders });
+      expect(response.statusCode).toBe(200);
+      return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items.map((t) => t.subject);
+    }
+
+    expect(await subjects(`account_id=${first.id}&folder=Projects`)).toEqual(["Genuine"]);
+    expect(await subjects(`account_id=${second.id}&folder=Projects`)).toEqual(["Split"]);
+    // Each filter alone still matches the split thread -- which is exactly why
+    // they cannot be two independent subqueries.
+    expect(await subjects("folder=Projects")).toEqual(["Split", "Genuine"]);
+    expect(await subjects(`account_id=${first.id}`)).toEqual(["Split", "Genuine"]);
     await a.close();
   });
 });
@@ -868,6 +1174,369 @@ describe("mail thread link and archive routes", () => {
     const response = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
     expect(response.statusCode).toBe(200);
     expect(mailUnreadCountSchema.parse(response.json()).count).toBe(1);
+    await a.close();
+  });
+
+  it("drops a trashed unread thread from the badge and the list's unread flag, but keeps an archived one", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    await setMoveTargets(account.id, { trashFolder: " Trash ", archiveFolder: "Archive" });
+
+    const trashed = await seedThread({ subject: "Trashed", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(trashed, account.id, {
+      sentAt: new Date("2026-08-03T10:00:00Z"), folder: "Trash", seen: false, imapUid: null,
+    });
+    const archived = await seedThread({ subject: "Archived", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(archived, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), folder: "Archive", seen: false,
+    });
+
+    // Trashing never touches `seen` (services/mail-move.ts), and nothing ever
+    // re-sights an unsynced Trash to clear it -- so the COUNTING is what
+    // carves it out, here and in the list's unread flag alike. The stored
+    // " Trash " is compared trimmed, the way the move service reads it.
+    const badge = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(mailUnreadCountSchema.parse(badge.json()).count).toBe(1);
+
+    const list = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
+    const items = listResponseSchema(mailThreadListItemSchema).parse(list.json()).items;
+    // Filing a message is not reading it: the Archive row keeps its dot.
+    expect(items.map((t) => [t.subject, t.unread])).toEqual([["Trashed", false], ["Archived", true]]);
+    await a.close();
+  });
+
+  it("counts only the trash of the account the message belongs to", async () => {
+    const a = await app();
+    const first = await makeAccount(a);
+    const second = await makeAccount(a, { label: "Side", email: "side@example.com" });
+    await setMoveTargets(first.id, { trashFolder: "Bin" });
+    await setMoveTargets(second.id, { trashFolder: "Trash" });
+
+    // One account's Trash is another's ordinary folder: this message sits in
+    // "Bin" on the account whose trash is "Trash", so it still counts.
+    const thread = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(thread, second.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), folder: "Bin", seen: false,
+    });
+    const response = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(mailUnreadCountSchema.parse(response.json()).count).toBe(1);
+
+    // An account with no classified trash folder excludes nothing at all.
+    await setMoveTargets(second.id, { trashFolder: null });
+    const unresolved = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(mailUnreadCountSchema.parse(unresolved.json()).count).toBe(1);
+    expect(first.id).not.toBe(second.id);
+    await a.close();
+  });
+
+  it("reports per-folder counts with ?byFolder=1, Trash row included", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    await setMoveTargets(account.id, { trashFolder: "Trash" });
+
+    const inbox = await seedThread({ lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(inbox, account.id, { sentAt: new Date("2026-08-03T10:00:00Z"), seen: false });
+    // Two unread messages in one thread count once: a conversation is one
+    // thing to deal with, the same way the badge counts it.
+    await seedMessage(inbox, account.id, { sentAt: new Date("2026-08-03T11:00:00Z"), seen: false, imapUid: 11 });
+    const trashed = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(trashed, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), folder: "Trash", seen: false, imapUid: null,
+    });
+    const read = await seedThread({ lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(read, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), folder: "Projects", seen: true });
+
+    const response = await a.inject({
+      method: "GET", url: "/api/mail/unread-count?byFolder=1", headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    // The per-folder variant deliberately does NOT apply the badge's trash
+    // exclusion: each count belongs to its own row, and a Trash row reading 0
+    // above visibly unread mail would be a lie. A folder with nothing unread
+    // simply has no row.
+    expect(mailUnreadFolderCountsSchema.parse(response.json())).toEqual({
+      folders: [{ folder: "INBOX", count: 1 }, { folder: "Trash", count: 1 }],
+    });
+
+    // ...and the plain badge, for the same data, leaves the trashed one out.
+    const badge = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(mailUnreadCountSchema.parse(badge.json()).count).toBe(1);
+
+    // One spelling of the flag, and anything else is the uniform 400 rather
+    // than a silent fall-back to the plain count.
+    const wrong = await a.inject({
+      method: "GET", url: "/api/mail/unread-count?byFolder=true", headers: authHeaders,
+    });
+    expect(wrong.statusCode).toBe(400);
+    await a.close();
+  });
+});
+
+// --- Bulk actions -----------------------------------------------------------
+
+describe("mail bulk thread action route", () => {
+  /** An account with a live fake sync and both move targets resolved -- the
+   * ordinary state after a discovery pass. */
+  async function readyAccount(a: App, overrides: Partial<MailAccountCreateInput> = {}) {
+    const account = await makeAccount(a, overrides);
+    await setMoveTargets(account.id, { trashFolder: "Trash", archiveFolder: "Archive" });
+    const sync = new FakeAccountSync();
+    syncs.set(account.id, sync);
+    return { account, sync };
+  }
+
+  async function bulk(a: App, payload: Record<string, unknown>) {
+    return a.inject({ method: "POST", url: "/api/mail/threads/bulk", headers: authHeaders, payload });
+  }
+
+  async function messageRow(id: string) {
+    const [row] = await handle.db.select().from(mailMessages).where(eq(mailMessages.id, id));
+    return row;
+  }
+
+  it("archives the selected threads' messages in the view folder, queueing one MOVE per source folder", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    const first = await seedThread({ subject: "One", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const inboxOne = await seedMessage(first, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 41 });
+    // Same thread, different folder: folder-scoped selection acts only on the
+    // view the user was looking at.
+    const elsewhere = await seedMessage(first, account.id, {
+      sentAt: new Date("2026-08-02T09:00:00Z"), folder: "Projects", imapUid: 42,
+    });
+    const second = await seedThread({ subject: "Two", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    const inboxTwo = await seedMessage(second, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), imapUid: 43 });
+
+    const response = await bulk(a, { threadIds: [first, second], folder: "INBOX", action: "archive" });
+    expect(response.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(response.json())).toEqual({
+      results: [{ threadId: first, ok: true }, { threadId: second, ok: true }],
+    });
+
+    // Optimistic DB write: folder rewritten, uid dropped (the old number names
+    // a message in the OLD mailbox), and the queued MOVE carries both uids in
+    // one call for the one (account, source folder) group.
+    expect(await messageRow(inboxOne)).toMatchObject({ folder: "Archive", imapUid: null });
+    expect(await messageRow(inboxTwo)).toMatchObject({ folder: "Archive", imapUid: null });
+    expect(await messageRow(elsewhere)).toMatchObject({ folder: "Projects", imapUid: 42 });
+    expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [41, 43], targetFolder: "Archive" }]);
+    await a.close();
+  });
+
+  it("trashes to the account's trash folder, and hides CRM-side without touching a mailbox", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    const trashed = await seedThread({ subject: "Bin me", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const trashedMessage = await seedMessage(trashed, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 51,
+    });
+    const hidden = await seedThread({ subject: "Hide me", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    const hiddenMessage = await seedMessage(hidden, account.id, {
+      sentAt: new Date("2026-08-01T10:00:00Z"), imapUid: 52,
+    });
+
+    expect((await bulk(a, { threadIds: [trashed], folder: "INBOX", action: "trash" })).statusCode).toBe(200);
+    expect(await messageRow(trashedMessage)).toMatchObject({ folder: "Trash", imapUid: null });
+    // Nothing is expunged: the row survives in Trash, and the server's own
+    // retention owns actual destruction.
+    expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [51], targetFolder: "Trash" }]);
+
+    // "Hide in CRM" is the pre-4.1 thread archive in bulk: a CRM column, no
+    // IMAP work at all, and `folder` is ignored entirely.
+    const hide = await bulk(a, { threadIds: [hidden], action: "hide" });
+    expect(hide.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(hide.json()).results).toEqual([{ threadId: hidden, ok: true }]);
+    const [row] = await handle.db.select().from(mailThreads).where(eq(mailThreads.id, hidden));
+    expect(row?.archivedAt).not.toBeNull();
+    expect(await messageRow(hiddenMessage)).toMatchObject({ folder: "INBOX", imapUid: 52 });
+    expect(sync.moveCalls).toHaveLength(1);
+    await a.close();
+  });
+
+  it("moves every folder's messages when no folder is given (the single-thread buttons' mode)", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    const thread = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const inbox = await seedMessage(thread, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 61 });
+    const projects = await seedMessage(thread, account.id, {
+      sentAt: new Date("2026-08-02T09:00:00Z"), folder: "Projects", imapUid: 62,
+    });
+    // Archiving a conversation must never empty Sent.
+    const sent = await seedMessage(thread, account.id, {
+      sentAt: new Date("2026-08-02T08:00:00Z"), folder: "Sent", imapUid: 63,
+    });
+
+    const response = await bulk(a, { threadIds: [thread], action: "archive" });
+    expect(response.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(response.json()).results).toEqual([{ threadId: thread, ok: true }]);
+    expect(await messageRow(inbox)).toMatchObject({ folder: "Archive" });
+    expect(await messageRow(projects)).toMatchObject({ folder: "Archive" });
+    expect(await messageRow(sent)).toMatchObject({ folder: "Sent", imapUid: 63 });
+    // One queued call per SOURCE folder -- the mailbox the server has to SELECT.
+    expect(sync.moveCalls).toEqual([
+      { folder: "INBOX", uids: [61], targetFolder: "Archive" },
+      { folder: "Projects", uids: [62], targetFolder: "Archive" },
+    ]);
+    await a.close();
+  });
+
+  it("caps trash and archive at 50 threads while hide keeps the shared schema's 200", async () => {
+    const a = await app();
+    const ids = Array.from({ length: 51 }, () => randomUUID());
+
+    for (const action of ["trash", "archive"] as const) {
+      const response = await bulk(a, { threadIds: ids, folder: "INBOX", action });
+      expect(response.statusCode).toBe(400);
+      expect(errorResponseSchema.parse(response.json())).toEqual({
+        error: "validation",
+        message: `${action} accepts at most 50 threads per request (received 51)`,
+      });
+    }
+
+    // hide waits on nothing but the database, so it keeps the outer bound.
+    // (Every id here is unknown, which is a per-thread failure, not a 400.)
+    const hide = await bulk(a, { threadIds: ids, action: "hide" });
+    expect(hide.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(hide.json()).results).toHaveLength(51);
+
+    // The shared cap still holds above it, for every action.
+    const tooMany = await bulk(a, {
+      threadIds: Array.from({ length: 201 }, () => randomUUID()), action: "hide",
+    });
+    expect(tooMany.statusCode).toBe(400);
+    await a.close();
+  });
+
+  it("returns one 200 body carrying successes, skips and per-thread failures side by side", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    // A second account with no sync loop: it refuses, and only for threads
+    // whose messages it was actually going to move.
+    const stalled = await makeAccount(a, { label: "Stalled", email: "stalled@example.com" });
+    await setMoveTargets(stalled.id, { trashFolder: "Trash", archiveFolder: "Archive" });
+
+    const moved = await seedThread({ subject: "Moves", lastMessageAt: new Date("2026-08-04T10:00:00Z") });
+    await seedMessage(moved, account.id, { sentAt: new Date("2026-08-04T10:00:00Z"), imapUid: 71 });
+    const refused = await seedThread({ subject: "Refused", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(refused, stalled.id, { sentAt: new Date("2026-08-03T10:00:00Z"), imapUid: 72 });
+    // Already in the target folder: nothing to do, and a no-op is a success.
+    const already = await seedThread({ subject: "Already", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(already, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), folder: "Archive", imapUid: 73,
+    });
+    // Awaiting reconciliation: no uid to name it to the server, so it is
+    // skipped rather than failed, and it self-heals after the next pass.
+    const pending = await seedThread({ subject: "Pending", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(pending, account.id, {
+      sentAt: new Date("2026-08-01T10:00:00Z"), imapUid: null,
+    });
+
+    const response = await bulk(a, {
+      threadIds: [moved, refused, already, pending, UNKNOWN_ID], folder: "INBOX", action: "archive",
+    });
+    expect(response.statusCode).toBe(200);
+    // Per-thread results, in REQUEST order, and the error strings are the
+    // stable user-facing ones the bulk bar surfaces (Task 5).
+    expect(bulkThreadResultSchema.parse(response.json()).results).toEqual([
+      { threadId: moved, ok: true },
+      { threadId: refused, ok: false, error: 'mail sync is not running for account "Stalled"' },
+      { threadId: already, ok: true, skipped: true },
+      { threadId: pending, ok: true, skipped: true },
+      { threadId: UNKNOWN_ID, ok: false, error: `mail thread ${UNKNOWN_ID} not found` },
+    ]);
+    // The healthy account still did its work: one refusal does not stop the rest.
+    expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [71], targetFolder: "Archive" }]);
+    await a.close();
+  });
+
+  it("fails the thread with the server's own message when the queued MOVE is refused, and puts the row back", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    sync.moveFailure = new Error("NO [TRYCREATE] Mailbox does not exist");
+    const thread = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const message = await seedMessage(thread, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 81,
+    });
+
+    const response = await bulk(a, { threadIds: [thread], folder: "INBOX", action: "archive" });
+    expect(response.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(response.json()).results).toEqual([
+      { threadId: thread, ok: false, error: "NO [TRYCREATE] Mailbox does not exist" },
+    ]);
+    // The CRM must never claim a move the server refused: the compensating
+    // revert restores the row's own folder and uid.
+    expect(await messageRow(message)).toMatchObject({ folder: "INBOX", imapUid: 81 });
+    await a.close();
+  });
+
+  it("refuses every account's threads when the deployment has no sync engine at all", async () => {
+    const a = await app({ syncManager: () => null });
+    const account = await makeAccount(a);
+    await setMoveTargets(account.id, { trashFolder: "Trash", archiveFolder: "Archive" });
+    const thread = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const message = await seedMessage(thread, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 91 });
+
+    // Unlike the Sent-folder APPEND, a missing loop is a refusal rather than a
+    // skipped best-effort step: moving the rows with nothing to carry the MOVE
+    // out would leave the CRM showing a folder the message never reached.
+    const response = await bulk(a, { threadIds: [thread], folder: "INBOX", action: "trash" });
+    expect(response.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(response.json()).results).toEqual([
+      { threadId: thread, ok: false, error: 'mail sync is not running for account "Work"' },
+    ]);
+    expect(await messageRow(message)).toMatchObject({ folder: "INBOX", imapUid: 91 });
+
+    // hide needs no mail server, so it still works on the same deployment.
+    const hide = await bulk(a, { threadIds: [thread], action: "hide" });
+    expect(bulkThreadResultSchema.parse(hide.json()).results).toEqual([{ threadId: thread, ok: true }]);
+    await a.close();
+  });
+
+  it("reports an unresolved move target as that account's own failure", async () => {
+    const a = await app();
+    const { account } = await readyAccount(a);
+    // NULL means "nothing has classified one yet", which is the spec's
+    // "detect for me" state -- not a folder to guess at.
+    await setMoveTargets(account.id, { trashFolder: null });
+    const thread = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(thread, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 101 });
+
+    const response = await bulk(a, { threadIds: [thread], folder: "INBOX", action: "trash" });
+    expect(bulkThreadResultSchema.parse(response.json()).results).toEqual([{
+      threadId: thread, ok: false,
+      error: 'account "Work" has no Trash folder yet'
+        + " -- set one in Settings, or wait for a sync pass to detect it",
+    }]);
+    // ...and Archive, whose target IS resolved, still works for the same thread.
+    const archived = await bulk(a, { threadIds: [thread], folder: "INBOX", action: "archive" });
+    expect(bulkThreadResultSchema.parse(archived.json()).results).toEqual([{ threadId: thread, ok: true }]);
+    await a.close();
+  });
+
+  it("400s an empty selection, an unknown action and a blank folder", async () => {
+    const a = await app();
+    const thread = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    for (const payload of [
+      { threadIds: [], folder: "INBOX", action: "archive" },
+      { threadIds: [thread], action: "delete" },
+      { threadIds: [thread], folder: "  ", action: "archive" },
+      { threadIds: ["not-a-uuid"], action: "hide" },
+      { folder: "INBOX", action: "archive" },
+    ]) {
+      const response = await bulk(a, payload);
+      expect(response.statusCode).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    }
+    await a.close();
+  });
+
+  it("requires authentication", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/threads/bulk",
+      payload: { threadIds: [UNKNOWN_ID], action: "hide" },
+    });
+    expect(response.statusCode).toBe(401);
     await a.close();
   });
 });

@@ -194,7 +194,9 @@ SSE: the existing key-hint mechanism (`services/sse.ts`), not named events. Inge
 thread mutation (read/links/archive) publish `[["mail-threads"], ["mail-thread", id],
 ["mail-unread"]]`; account create/update/archive/unarchive and every sync status flip publish
 `[["mail-accounts"]]` (drives the settings error badge); template create/update/archive/unarchive
-publish `[["email-templates"]]`.
+publish `[["email-templates"]]`. (Phase 4.1 adds one more family to this list:
+`[["mail-folders", accountId]]`, published by the folder toggle and by a discovery pass that
+creates or reclassifies a folder — see that phase's spec.)
 
 ## Frontend (`packages/web`)
 

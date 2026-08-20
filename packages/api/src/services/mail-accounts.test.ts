@@ -192,6 +192,35 @@ describe("updateAccount", () => {
     expect(cleared).toMatchObject({ trashFolder: null, archiveFolder: "Archive" });
   });
 
+  it("trims trashFolder/archiveFolder, and reads a resubmitted padded value as no change", async () => {
+    const account = await make();
+    // An IMAP mailbox name is compared byte for byte by the move service, so
+    // " Archive " must not be stored as a second mailbox (Task 4).
+    const set = await updateAccount(
+      handle.db, actorId, account.id, { trashFolder: " Deleted Items ", archiveFolder: " Archive " }, keyPath,
+    );
+    expect(set).toMatchObject({ trashFolder: "Deleted Items", archiveFolder: "Archive" });
+
+    // Normalised BEFORE the same-value diff, like sentFolder and the
+    // signature: otherwise a resubmitted padded value reads as an edit and
+    // fires an unearned SSE hint.
+    const resubmitted = await updateAccount(
+      handle.db, actorId, account.id, { archiveFolder: "  Archive  " }, keyPath,
+    );
+    expect(resubmitted.updatedAt).toBe(set.updatedAt);
+  });
+
+  it("drops a whitespace-only override rather than storing an unselectable folder name", async () => {
+    const account = await make();
+    await updateAccount(handle.db, actorId, account.id, { trashFolder: "Trash" }, keyPath);
+    // "" is rejected by the shared schema; " " reaches the service, and
+    // storing it would leave a target no server can select -- so it is
+    // dropped, exactly as a blank sent_folder is. Clearing an override is
+    // what an explicit null is for.
+    const blanked = await updateAccount(handle.db, actorId, account.id, { trashFolder: "   " }, keyPath);
+    expect(blanked.trashFolder).toBe("Trash");
+  });
+
   it("absent/empty password fields keep the stored credentials", async () => {
     const account = await make({ password: "keep-me", smtpPassword: "keep-me-too" });
     await updateAccount(handle.db, actorId, account.id, { label: "Renamed", password: "", smtpPassword: undefined }, keyPath);
@@ -840,6 +869,13 @@ describe("account-changed hook", () => {
       // engine is told it can keep its connection and just re-read the row.
       calls.length = 0;
       await updateAccount(handle.db, actorId, account.id, { label: "Renamed" }, keyPath);
+      expect(calls).toEqual([{ accountId: account.id, connectionChanged: false }]);
+
+      // Nor do the move targets: where trashed or archived mail goes is not
+      // part of a connection, so the live sync is woken to re-read the row,
+      // never dropped and re-LOGINed (Task 4).
+      calls.length = 0;
+      await updateAccount(handle.db, actorId, account.id, { trashFolder: "Deleted Items" }, keyPath);
       expect(calls).toEqual([{ accountId: account.id, connectionChanged: false }]);
 
       calls.length = 0;

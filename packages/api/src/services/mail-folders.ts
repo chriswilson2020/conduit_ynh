@@ -1,7 +1,8 @@
-import { and, eq, isNull, or, sql } from "drizzle-orm";
-import type { SpecialUse } from "@conduit/shared";
+import { and, asc, eq, isNull, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
+import type { FolderPatchInput, MailAccountFolder, SpecialUse } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { mailAccountFolders, mailAccounts, type MailAccountFolderRow } from "../db/schema.js";
+import { ConflictError, NotFoundError } from "./errors.js";
 import type { ImapFolderListing } from "./mail-imap.js";
 import { publish } from "./sse.js";
 
@@ -69,6 +70,28 @@ export const INBOX = "INBOX";
  */
 export function folderKey(folder: string): string {
   return folder.toUpperCase() === INBOX ? INBOX : folder;
+}
+
+/**
+ * folderKey, in SQL, for the queries that have to apply the same rule to a
+ * COLUMN rather than to a value it already fetched.
+ *
+ * Written here, beside the TypeScript one, so the two cannot drift: the rule is
+ * still "INBOX case-folded, everything else verbatim", and a query that
+ * case-folded everything would silently merge "Archive" and "archive" exactly
+ * as the value-side version would.
+ *
+ * The one caller today is the unread exclusion in mail-threads.ts, comparing
+ * each message's `folder` against its account's `trash_folder`. Note what using
+ * it costs: an expression is not an indexable column, so a predicate built from
+ * it cannot use mail_messages' folder indexes. That is fine where it is used --
+ * the unread queries are driven by the partial unseen index and this only
+ * filters what that already found -- and it would NOT be fine in the thread
+ * list's folder filter, which is why that one compares the column directly
+ * (see listThreads).
+ */
+export function folderKeySql(expression: SQLWrapper): SQL {
+  return sql`(case when upper(${expression}) = ${INBOX} then ${INBOX} else ${expression} end)`;
 }
 
 // --- Classification ---------------------------------------------------------
@@ -531,4 +554,183 @@ async function fillMoveTargets(
   // reasoning, and the same shape, as AccountSync.writeAccountState.
   publish({ keys: [["mail-accounts"]] });
   return { trashFolder: row.trashFolder, archiveFolder: row.archiveFolder };
+}
+
+// --- The picker (Phase 4.1 Task 4) -------------------------------------------
+
+/**
+ * The SSE hint family for ONE account's folder set: `[["mail-folders", id]]`.
+ *
+ * Per account rather than global, unlike `[["mail-accounts"]]`: the sidebar and
+ * the Settings picker render one account's folders at a time, and a discovery
+ * pass on a busy second mailbox has no business invalidating the first's list.
+ *
+ * Published by exactly two writers, and this function is why they agree on the
+ * key: the toggle below, and the sync engine when a pass DISCOVERS something
+ * (mail-sync.ts's runPass -- a folder created or reclassified). Note which
+ * writer is absent: fillMoveTargets above publishes `[["mail-accounts"]]`,
+ * because trash_folder/archive_folder live on the ACCOUNT row, not on a folder.
+ */
+export function publishFoldersHint(accountId: string): void {
+  publish({ keys: [["mail-folders", accountId]] });
+}
+
+/**
+ * The account's id and the two fields the picker's rules are built from.
+ *
+ * A narrow read of its own rather than mail-accounts.ts's mustGetOwned, which
+ * selects the whole row (credentials ciphertext included) for paths that need
+ * it. What it copies deliberately is that function's OWNERSHIP RULE: the same
+ * NotFoundError for "no such account" and "someone else's account", so a
+ * foreign id cannot be told apart from a nonexistent one -- an account's folder
+ * list is as much a private setting as its host and port.
+ *
+ * `sentFolder` is trimmed on read, the same way mail-sync.ts's loadAccount
+ * trims it: a stored " Sent " must lock the same row as "Sent".
+ */
+async function mustGetOwnedAccount(
+  db: Database, actorId: string, accountId: string,
+): Promise<{ id: string; sentFolder: string }> {
+  const [row] = await db.select({
+    id: mailAccounts.id, userId: mailAccounts.userId, sentFolder: mailAccounts.sentFolder,
+  }).from(mailAccounts).where(eq(mailAccounts.id, accountId));
+  if (row === undefined || row.userId !== actorId) throw new NotFoundError("mail account", accountId);
+  return { id: row.id, sentFolder: row.sentFolder.trim() };
+}
+
+/**
+ * Is this folder one the walk syncs regardless of the picker?
+ *
+ * INBOX and the account's Sent folder are always walked (foldersOf's locked-on
+ * rule -- the send path and direction detection depend on them), so a toggle on
+ * either would be a switch that does nothing. `locked` is computed HERE, from
+ * the account's CURRENT sent_folder, and is deliberately not a column: pointing
+ * sent_folder at a different mailbox in Settings moves the lock with it, and a
+ * stored flag would have to be rewritten on every such edit to stay true.
+ *
+ * Compared on folderKey, so "inbox" and "INBOX" are one mailbox (RFC 3501) while
+ * "Sent" and "sent" stay two.
+ */
+function isLocked(folder: string, sentFolder: string): boolean {
+  const key = folderKey(folder);
+  return key === INBOX || key === folderKey(sentFolder);
+}
+
+function toAccountFolder(row: MailAccountFolderRow, sentFolder: string): MailAccountFolder {
+  return {
+    id: row.id, accountId: row.accountId, folder: row.folder,
+    specialUse: row.specialUse as SpecialUse | null,
+    syncEnabled: row.syncEnabled, selectable: row.selectable,
+    locked: isLocked(row.folder, sentFolder),
+    lastDiscoveredAt: row.lastDiscoveredAt.toISOString(),
+    createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * Every folder ever discovered on `accountId`, for the Settings picker and the
+ * inbox sidebar (GET /api/mail/accounts/:id/folders).
+ *
+ * EVERY row, including ones that have gone stale: a folder that vanished from
+ * the server keeps its row (this module's header explains why), and the CRM may
+ * still hold messages filed under it. Hiding it here would hide those messages'
+ * folder from the only UI that can filter by it. `lastDiscoveredAt` is on the
+ * wire precisely so the client can grey a stale row rather than lose it.
+ *
+ * Ordered by name so the picker is stable across refetches; the sidebar does its
+ * own ordering (INBOX first, and so on) in Task 5, which is a presentation
+ * decision, not a storage one.
+ */
+export async function listAccountFolders(
+  db: Database, actorId: string, accountId: string,
+): Promise<MailAccountFolder[]> {
+  const account = await mustGetOwnedAccount(db, actorId, accountId);
+  const rows = await db.select().from(mailAccountFolders)
+    .where(eq(mailAccountFolders.accountId, accountId))
+    .orderBy(asc(mailAccountFolders.folder));
+  return rows.map((row) => toAccountFolder(row, account.sentFolder));
+}
+
+export interface FolderPatchResult {
+  folder: MailAccountFolder;
+  /**
+   * True only when this call actually turned a folder ON -- what the route
+   * uses to decide whether to ask for a sync pass. False for a switch-off and
+   * false for a same-value PATCH, because neither has anything for a pass to
+   * fetch that the ordinary poll interval would not.
+   */
+  enabled: boolean;
+}
+
+/**
+ * Toggle one folder's `sync_enabled` (PATCH /api/mail/accounts/:id/folders).
+ *
+ * Identified by NAME within the account, matching the shared schema's choice
+ * (folderPatchInputSchema) -- and matched BYTE FOR BYTE against the stored
+ * name, which is also how UNIQUE (account_id, folder) matches it. The picker
+ * renders straight from listAccountFolders above, so the name it sends back is
+ * the one this table holds; a hand-written request that spells INBOX
+ * differently gets the 404 rather than a fuzzy match, which is the safer answer
+ * for a mutation that decides what the CRM ingests.
+ *
+ * Two refusals, both 409 at the route:
+ *
+ * - LOCKED (INBOX and the account's Sent folder). Refused in BOTH directions,
+ *   including "enable" on a folder that is already effectively on: the row is
+ *   not user-controlled at all, and silently accepting a no-op PATCH would
+ *   leave the picker believing it owns a switch it does not.
+ * - UNSELECTABLE (`\Noselect` -- a hierarchy node holding no messages). The
+ *   walk skips these whatever the flag says, so enabling one promises a sync
+ *   that will never happen. Refused in both directions for the same reason as
+ *   above: the switch is not real.
+ *
+ * An ARCHIVED account is deliberately NOT refused. Its folder rows survive
+ * (archive-not-delete), curating them while the account is put away is a
+ * reasonable thing to do, and the `enabled` path costs nothing there: syncNow's
+ * reconcile finds the row archived and creates no loop.
+ */
+export async function setFolderSyncEnabled(
+  db: Database, actorId: string, accountId: string, input: FolderPatchInput,
+): Promise<FolderPatchResult> {
+  const account = await mustGetOwnedAccount(db, actorId, accountId);
+  const [existing] = await db.select().from(mailAccountFolders).where(and(
+    eq(mailAccountFolders.accountId, accountId),
+    eq(mailAccountFolders.folder, input.folder),
+  ));
+  if (existing === undefined) throw new NotFoundError("mail folder", input.folder);
+  if (isLocked(existing.folder, account.sentFolder)) {
+    throw new ConflictError(
+      "mail folder", input.folder,
+      `folder "${input.folder}" is always synced (INBOX and the account's Sent folder)`
+        + " and cannot be switched off",
+    );
+  }
+  if (!existing.selectable) {
+    throw new ConflictError(
+      "mail folder", input.folder,
+      `folder "${input.folder}" holds no messages on the server (\\Noselect) and cannot be synced`,
+    );
+  }
+  // Same-value PATCH is a true no-op: no write, no hint, no pass -- the house
+  // rule every other update follows (see mail-accounts.ts's updateAccount).
+  if (existing.syncEnabled === input.syncEnabled) {
+    return { folder: toAccountFolder(existing, account.sentFolder), enabled: false };
+  }
+
+  const [updated] = await db.update(mailAccountFolders)
+    .set({ syncEnabled: input.syncEnabled, updatedAt: new Date() })
+    .where(eq(mailAccountFolders.id, existing.id))
+    .returning();
+  // Unreachable short of the row being deleted underneath us, which nothing
+  // does (rows are never deleted -- see this module's header). Defensive rather
+  // than asserted: a 404 beats a TypeError.
+  if (updated === undefined) throw new NotFoundError("mail folder", input.folder);
+
+  // After the write, never before: a hint for a change that did not land makes
+  // every client refetch the state it already had.
+  publishFoldersHint(accountId);
+  return {
+    folder: toAccountFolder(updated, account.sentFolder),
+    enabled: input.syncEnabled,
+  };
 }

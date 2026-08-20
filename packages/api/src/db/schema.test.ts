@@ -377,7 +377,7 @@ describe("mail schema (0004)", () => {
     expect(indexes.length).toBeGreaterThan(0);
   });
 
-  it("has every hand-written index: the four mail_threads FKs, mail_messages(thread_id/message_id/account+folder+uid/unseen-thread), mail_attachments(message_id), mail_accounts' duplicate-mailbox unique index", async () => {
+  it("has every hand-written index: the four mail_threads FKs, mail_messages(thread_id/message_id/account+folder+uid/unseen-thread/folder+thread), mail_attachments(message_id), mail_accounts' duplicate-mailbox unique index", async () => {
     const rows = await handle.db.execute<{ tablename: string; indexname: string; indexdef: string }>(
       sql`SELECT tablename, indexname, indexdef FROM pg_indexes
           WHERE tablename IN ('mail_threads','mail_messages','mail_attachments','mail_accounts')`,
@@ -390,6 +390,7 @@ describe("mail schema (0004)", () => {
       "mail_messages_thread_id_idx", "mail_messages_message_id_idx",
       "mail_messages_account_folder_uid_idx",
       "mail_messages_unseen_thread_idx",
+      "mail_messages_folder_thread_idx",
       "mail_attachments_message_id_idx",
       "mail_accounts_user_email_active_unique",
     ]) {
@@ -407,6 +408,14 @@ describe("mail schema (0004)", () => {
     // re-walk's UID clear, which carries no imap_uid term at all.
     const uidIndex = rows.find((r) => r.indexname === "mail_messages_account_folder_uid_idx");
     expect(uidIndex?.indexdef).toMatch(/\(account_id, folder, imap_uid\)/i);
+
+    // Column order again, and the reason this index exists at all (0005): the
+    // thread list's folder filter binds FOLDER ALONE, so the index above
+    // cannot serve it -- its leading account_id is missing from the predicate
+    // and it carries no thread_id for the EXISTS correlation. Reversing these
+    // two columns would leave the same gap.
+    const folderThreadIndex = rows.find((r) => r.indexname === "mail_messages_folder_thread_idx");
+    expect(folderThreadIndex?.indexdef).toMatch(/\(folder, thread_id\)/i);
 
     // Composite and DESC on both columns -- matches GET /api/mail/threads'
     // keyset pagination direction exactly, so that query is a single index
@@ -535,6 +544,16 @@ describe("mail folder schema (0005)", () => {
         .values(folderValues(account!.id, { folder: "Archive", specialUse: "archive" }))
         .returning();
       expect(folderRow).toMatchObject({ accountId: account!.id, folder: "Archive", specialUse: "archive" });
+
+      // 0005's hand-written index arrived with it, ON A DATABASE THIS TEST
+      // MIGRATED FROM THE FILES. That is the assertion the shared test
+      // database cannot make: its copy of the index was applied by hand (the
+      // migration was edited in place before release), so it would be there
+      // even if the .sql file had lost the statement.
+      const indexes = await scratch.db.execute<{ indexname: string }>(
+        sql`SELECT indexname FROM pg_indexes WHERE tablename = 'mail_messages'`,
+      );
+      expect(indexes.map((row) => row.indexname)).toContain("mail_messages_folder_thread_idx");
     });
   }, 30000);
 

@@ -1,11 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { and, asc, eq } from "drizzle-orm";
-import type { SseHint } from "@conduit/shared";
+import { mailAccountFolderSchema, type SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { mailAccountFolders, mailAccounts } from "../db/schema.js";
+import { ConflictError, NotFoundError } from "./errors.js";
 import type { ImapFolderListing } from "./mail-imap.js";
-import { classifyFolder, dedupeListings, discoverFolders, lastPathSegment } from "./mail-folders.js";
+import {
+  classifyFolder, dedupeListings, discoverFolders, lastPathSegment,
+  listAccountFolders, setFolderSyncEnabled,
+} from "./mail-folders.js";
 import { subscribe } from "./sse.js";
 
 const handle = openTestDatabase();
@@ -72,6 +76,10 @@ async function accountOf(accountId: string) {
 
 const PASS_ONE = new Date("2026-08-20T09:00:00.000Z");
 const PASS_TWO = new Date("2026-08-20T10:00:00.000Z");
+
+/** A well-formed uuid that is nobody's account -- the "no such row" half of
+ * the ownership tests, whose other half is a real row someone else owns. */
+const UNKNOWN_ID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
 
 // --- Classification ---------------------------------------------------------
 
@@ -579,5 +587,172 @@ describe("discoverFolders", () => {
       listing("Archive/2026", { specialUse: "archive" }),
     ], PASS_ONE);
     expect(await accountOf(accountId)).toMatchObject({ archiveFolder: "Archive/2026" });
+  });
+});
+
+// --- The picker (Task 4) -----------------------------------------------------
+
+describe("listAccountFolders", () => {
+  it("returns every discovered folder, name-ordered, with locked computed for INBOX and the sent folder", async () => {
+    const accountId = await makeAccount({ sentFolder: "Sent Items" });
+    await discoverFolders(handle.db, accountId, [
+      listing("Projects"),
+      listing("INBOX"),
+      listing("Sent Items", { specialUse: "sent" }),
+      listing("Trash", { specialUse: "trash" }),
+    ], PASS_ONE);
+
+    const folders = await listAccountFolders(handle.db, userId, accountId);
+    expect(folders.map((f) => f.folder)).toEqual(["INBOX", "Projects", "Sent Items", "Trash"]);
+    // locked is derived here, never a column: the walk always includes these
+    // two whatever sync_enabled says.
+    expect(folders.map((f) => [f.folder, f.locked])).toEqual([
+      ["INBOX", true], ["Projects", false], ["Sent Items", true], ["Trash", false],
+    ]);
+    // Every row parses as the wire contract the picker consumes.
+    for (const folder of folders) expect(() => mailAccountFolderSchema.parse(folder)).not.toThrow();
+    // Trash defaulted off at discovery; the rest on.
+    expect(folders.map((f) => [f.folder, f.syncEnabled])).toEqual([
+      ["INBOX", true], ["Projects", true], ["Sent Items", true], ["Trash", false],
+    ]);
+  });
+
+  it("locks a differently-cased INBOX row, and does not lock a differently-cased sent folder", async () => {
+    // RFC 3501 makes INBOX the one case-insensitive mailbox name; "sent" and
+    // "Sent" really are two different mailboxes on a real server.
+    const accountId = await makeAccount({ sentFolder: "Sent" });
+    await discoverFolders(handle.db, accountId, [listing("inbox"), listing("sent")], PASS_ONE);
+    const folders = await listAccountFolders(handle.db, userId, accountId);
+    expect(folders.map((f) => [f.folder, f.locked])).toEqual([["inbox", true], ["sent", false]]);
+  });
+
+  it("keeps a stale or unselectable row in the list rather than hiding it", async () => {
+    const accountId = await makeAccount();
+    await discoverFolders(handle.db, accountId, [
+      listing("INBOX"), listing("Gone"), listing("Shared", { selectable: false }),
+    ], PASS_ONE);
+    // "Gone" vanishes from the server: its row survives with
+    // last_discovered_at standing still, and the CRM may still hold messages
+    // filed under it.
+    await discoverFolders(handle.db, accountId, [
+      listing("INBOX"), listing("Shared", { selectable: false }),
+    ], PASS_TWO);
+
+    const folders = await listAccountFolders(handle.db, userId, accountId);
+    expect(folders.map((f) => f.folder)).toEqual(["Gone", "INBOX", "Shared"]);
+    expect(folders.find((f) => f.folder === "Gone")?.lastDiscoveredAt).toBe(PASS_ONE.toISOString());
+    expect(folders.find((f) => f.folder === "Shared")?.selectable).toBe(false);
+  });
+
+  it("404s another user's account and an unknown one alike", async () => {
+    const accountId = await makeAccount();
+    await discoverFolders(handle.db, accountId, [listing("INBOX")], PASS_ONE);
+    const stranger = (await resolveUser(handle.db, { username: "dana", email: null, fullName: null })).id;
+    // Same error for both, so a foreign id cannot be told apart from a
+    // nonexistent one: whose folders exist is not something to disclose.
+    await expect(listAccountFolders(handle.db, stranger, accountId)).rejects.toBeInstanceOf(NotFoundError);
+    await expect(listAccountFolders(handle.db, userId, UNKNOWN_ID)).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("returns nothing for an account no pass has listed yet", async () => {
+    const accountId = await makeAccount();
+    expect(await listAccountFolders(handle.db, userId, accountId)).toEqual([]);
+  });
+});
+
+describe("setFolderSyncEnabled", () => {
+  async function seedPicker(): Promise<string> {
+    const accountId = await makeAccount({ sentFolder: "Sent" });
+    await discoverFolders(handle.db, accountId, [
+      listing("INBOX"), listing("Sent", { specialUse: "sent" }),
+      listing("Projects"), listing("Junk", { specialUse: "junk" }),
+      listing("Shared", { selectable: false }),
+    ], PASS_ONE);
+    hints = [];
+    return accountId;
+  }
+
+  function folderHints(): SseHint[] {
+    return hints.filter((hint) => hint.keys.some((key) => key[0] === "mail-folders"));
+  }
+
+  it("switches a folder off, publishes the account's folder hint, and reports nothing to sync", async () => {
+    const accountId = await seedPicker();
+    const result = await setFolderSyncEnabled(handle.db, userId, accountId, {
+      folder: "Projects", syncEnabled: false,
+    });
+    expect(result.folder).toMatchObject({ folder: "Projects", syncEnabled: false, locked: false });
+    // Switching OFF asks for no pass: there is nothing to fetch.
+    expect(result.enabled).toBe(false);
+    expect((await rowOf(accountId, "Projects"))!.syncEnabled).toBe(false);
+    expect(folderHints()).toEqual([{ keys: [["mail-folders", accountId]] }]);
+  });
+
+  it("switches a folder on and reports that a pass is wanted", async () => {
+    const accountId = await seedPicker();
+    const result = await setFolderSyncEnabled(handle.db, userId, accountId, {
+      folder: "Junk", syncEnabled: true,
+    });
+    expect(result.folder).toMatchObject({ folder: "Junk", syncEnabled: true });
+    expect(result.enabled).toBe(true);
+    expect(folderHints()).toHaveLength(1);
+  });
+
+  it("treats a same-value patch as a no-op: no write, no hint, no pass", async () => {
+    const accountId = await seedPicker();
+    const before = await rowOf(accountId, "Projects");
+    const result = await setFolderSyncEnabled(handle.db, userId, accountId, {
+      folder: "Projects", syncEnabled: true,
+    });
+    expect(result.enabled).toBe(false);
+    expect((await rowOf(accountId, "Projects"))!.updatedAt.getTime()).toBe(before!.updatedAt.getTime());
+    expect(folderHints()).toEqual([]);
+  });
+
+  it("refuses a locked folder in both directions", async () => {
+    const accountId = await seedPicker();
+    // INBOX and the account's sent folder are walked regardless of the flag,
+    // so a switch on either would be a control that does nothing.
+    await expect(setFolderSyncEnabled(handle.db, userId, accountId, { folder: "INBOX", syncEnabled: false }))
+      .rejects.toBeInstanceOf(ConflictError);
+    await expect(setFolderSyncEnabled(handle.db, userId, accountId, { folder: "Sent", syncEnabled: true }))
+      .rejects.toBeInstanceOf(ConflictError);
+    expect(folderHints()).toEqual([]);
+  });
+
+  it("refuses an unselectable folder", async () => {
+    const accountId = await seedPicker();
+    await expect(setFolderSyncEnabled(handle.db, userId, accountId, { folder: "Shared", syncEnabled: true }))
+      .rejects.toBeInstanceOf(ConflictError);
+    expect((await rowOf(accountId, "Shared"))!.syncEnabled).toBe(true);
+  });
+
+  it("404s an unknown folder name, including one that differs only in case", async () => {
+    const accountId = await seedPicker();
+    await expect(setFolderSyncEnabled(handle.db, userId, accountId, { folder: "Nope", syncEnabled: true }))
+      .rejects.toBeInstanceOf(NotFoundError);
+    // Matched byte for byte, exactly as UNIQUE (account_id, folder) matches it.
+    await expect(setFolderSyncEnabled(handle.db, userId, accountId, { folder: "projects", syncEnabled: false }))
+      .rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("404s another user's account without touching the row", async () => {
+    const accountId = await seedPicker();
+    const stranger = (await resolveUser(handle.db, { username: "dana", email: null, fullName: null })).id;
+    await expect(setFolderSyncEnabled(handle.db, stranger, accountId, { folder: "Projects", syncEnabled: false }))
+      .rejects.toBeInstanceOf(NotFoundError);
+    expect((await rowOf(accountId, "Projects"))!.syncEnabled).toBe(true);
+  });
+
+  it("allows a folder toggle on an archived account, whose sync reconcile then ignores it", async () => {
+    const accountId = await seedPicker();
+    await handle.db.update(mailAccounts).set({ archivedAt: new Date() })
+      .where(eq(mailAccounts.id, accountId));
+    // Curating an archived account's folders is reasonable, and costs nothing:
+    // syncNow's reconcile finds the row archived and creates no loop.
+    const result = await setFolderSyncEnabled(handle.db, userId, accountId, {
+      folder: "Junk", syncEnabled: true,
+    });
+    expect(result).toMatchObject({ enabled: true });
   });
 });

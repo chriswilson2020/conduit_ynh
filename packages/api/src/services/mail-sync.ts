@@ -12,7 +12,7 @@ import {
   type IngestMessageFn, type SyncClock, type SyncLogger,
 } from "./mail-imap.js";
 import { getAccountCredentialsAsSystem, setAccountChangedHook } from "./mail-accounts.js";
-import { INBOX, discoverFolders, folderKey } from "./mail-folders.js";
+import { INBOX, discoverFolders, folderKey, publishFoldersHint } from "./mail-folders.js";
 import { ingestMessage } from "./mail-ingest.js";
 import { publish } from "./sse.js";
 
@@ -715,6 +715,29 @@ export class AccountSync {
     if (summary.created.length > 0 || summary.reclassified.length > 0
       || summary.trashFolder !== null || summary.archiveFolder !== null) {
       this.logger.info({ accountId: this.accountId, ...summary }, "mail-sync: folders discovered");
+    }
+    // A folder appeared or changed role, so every client showing this
+    // account's folder list -- the sidebar and the Settings picker -- is now
+    // holding a stale one (Phase 4.1 Task 4's hint family; the key is minted by
+    // mail-folders.ts so its two publishers cannot disagree about it).
+    //
+    // Gated on created/reclassified alone. A pass that merely re-sighted the
+    // same folders changed nothing a client renders, and this runs on EVERY
+    // pass of every account -- a hint here without the gate would be a refetch
+    // storm on a poll interval. The two target columns are not in the gate
+    // either: they live on the account row, and fillMoveTargets publishes
+    // `[["mail-accounts"]]` for them itself.
+    //
+    // After discovery's writes, never before: discoverFolders' upsert and its
+    // account update have both returned by this line, so a client that
+    // refetches on this hint reads the rows the pass just wrote. (Publishing
+    // before them is the mistake this is spelled out to prevent -- same rule as
+    // writeAccountState's publish-after-commit.) The folder WALK below has not
+    // run yet, deliberately: the picker's list is discovery's output, and
+    // waiting for a long backfill before telling anyone a folder exists would
+    // leave the sidebar wrong for minutes.
+    if (summary.created.length > 0 || summary.reclassified.length > 0) {
+      publishFoldersHint(this.accountId);
     }
     for (const folder of foldersOf(account, folders)) {
       if (this.stopped) return;

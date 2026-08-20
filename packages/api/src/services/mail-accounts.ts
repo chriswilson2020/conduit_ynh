@@ -109,6 +109,38 @@ function normalizeSentFolder(value: string | undefined): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/**
+ * trash_folder/archive_folder, normalised at the WRITE -- normalizeSentFolder's
+ * rule applied to the two Phase 4.1 move targets (Task 4, once the Settings
+ * folder picker started submitting them).
+ *
+ * Same reason as sent_folder's: an IMAP mailbox name is compared byte for byte
+ * downstream, so a stored " Archive " is a different mailbox from "Archive"
+ * everywhere it is used -- and here that means services/mail-move.ts, which
+ * reads these columns as the MOVE target. It already trims on read as a
+ * backstop for rows written before this; trimming at the write is what keeps
+ * the stored value and the picker's own display of it in agreement.
+ *
+ * THREE INPUTS, THREE ANSWERS:
+ * - `undefined` (field absent from the PATCH): unchanged, like every other
+ *   optional field.
+ * - `null`: a real, intended value -- "detect this for me", which the next
+ *   discovery pass fills back in (mail-folders.ts's fillMoveTargets). Passed
+ *   through untouched.
+ * - a string: trimmed. Whitespace-only trims to nothing and is REJECTED as an
+ *   override -- dropped from the patch, exactly as normalizeSentFolder drops a
+ *   blank sent_folder. Unlike sent_folder there is no column default to fall
+ *   back to, so writing "" would store a mailbox name no server can select and
+ *   turn every bulk move on that account into a server-side failure. The empty
+ *   string never gets this far anyway (the shared schema's nullableString
+ *   rejects it outright); this covers " ".
+ */
+function normalizeFolderOverride(value: string | null | undefined): string | null | undefined {
+  if (value === undefined || value === null) return value;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function toMailAccount(row: MailAccountRow) {
   return {
     id: row.id, userId: row.userId, label: row.label, email: row.email,
@@ -276,19 +308,29 @@ export async function updateAccount(
   // (and then overwrite) the "Sent" already in the column. A whitespace-only
   // submission normalises to undefined, i.e. drops out of the patch entirely
   // -- see normalizeSentFolder.
-  // trashFolder/archiveFolder deliberately get NO equivalent normalisation
-  // here yet -- the shared schema's nullableString already rejects a blank
-  // submission outright (mailAccountUpdateInputSchema's own comment), so
-  // there is no "" to normalise away, and unlike sentFolder there is no
-  // stored default a whitespace-only value should fall back to. Real-value
-  // trimming (" Archive " -> "Archive") is Task 4 work, once the folder
-  // picker actually submits these.
+  // trashFolder/archiveFolder are trimmed here for exactly the same reason,
+  // and in the same place, so the same-value diff below compares like with
+  // like: a resubmitted " Archive " must read as unchanged against the stored
+  // "Archive", not as an edit that then overwrites it with the padded form.
+  // See normalizeFolderOverride for the three-way undefined/null/string rule.
+  //
+  // Neither column is in CONNECTION_FIELDS, and that is the right answer, not
+  // an omission: changing where trashed or archived mail goes changes nothing
+  // a connection is built from, so the AccountSync is WOKEN rather than
+  // restarted (see notifyAccountChanged's call below). The running loop reads
+  // the account row on its next pass, and mail-move.ts re-reads these two
+  // columns at move time precisely because a pass can fill them underneath it.
   const withSentFolder = rest.sentFolder !== undefined
     ? { ...rest, sentFolder: normalizeSentFolder(rest.sentFolder) }
     : rest;
-  const normalizedRest = withSentFolder.signatureHtml != null
-    ? { ...withSentFolder, signatureHtml: sanitizeMailHtml(withSentFolder.signatureHtml) }
-    : withSentFolder;
+  const withFolderOverrides = {
+    ...withSentFolder,
+    ...(rest.trashFolder !== undefined ? { trashFolder: normalizeFolderOverride(rest.trashFolder) } : {}),
+    ...(rest.archiveFolder !== undefined ? { archiveFolder: normalizeFolderOverride(rest.archiveFolder) } : {}),
+  };
+  const normalizedRest = withFolderOverrides.signatureHtml != null
+    ? { ...withFolderOverrides, signatureHtml: sanitizeMailHtml(withFolderOverrides.signatureHtml) }
+    : withFolderOverrides;
   const passwordProvided = password !== undefined && password !== "";
   const smtpPasswordProvided = smtpPassword !== undefined && smtpPassword !== "";
   const freshCredentialsCiphertext = passwordProvided

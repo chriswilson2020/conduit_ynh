@@ -35,11 +35,18 @@ Decisions taken with Chris in the 4.1 brainstorm:
 - `mail_folder_state` unchanged (it is already keyed by (account, folder) and generalises
   as-is). `sent_folder` on mail_accounts unchanged (APPEND target; discovery marks it
   special_use=sent when they agree).
-- No new indexes expected beyond UNIQUE. The existing (account_id, folder, imap_uid) index is
-  expected, unverified, to help the folder-scoped thread-list filter — it carries no
-  `thread_id`, so the filter's actual query shape (join or EXISTS back to `mail_threads`) is
-  what Task 4 must EXPLAIN against seeded data before this claim stands (house rule:
-  hand-written indexes carry a named query, and state only what was measured).
+- ~~No new indexes expected beyond UNIQUE.~~ **MEASURED, and the expectation was wrong.**
+  Task 4 EXPLAINed the folder filter at 20,000 threads / 85,000 messages (2 accounts, 5
+  folders). The existing (account_id, folder, imap_uid) index cannot serve a folder-only
+  filter — its leading column is absent from the predicate and it carries no `thread_id` —
+  so the planner probed `mail_messages(thread_id)` once per candidate thread. Fine for a
+  folder whose mail is recent (INBOX: 0.3ms), but the honest worst case is a folder holding
+  only OLD threads, where the keyset walk passes nearly every thread before it fills a page:
+  **70.8ms and 123,003 shared buffer hits**. One hand-written index in 0005,
+  `mail_messages (folder, thread_id)`, takes that case to **6.6ms / 290 buffers** and turns
+  the ordinary cases' probes index-only (INBOX 357 → 26 buffers; a small folder 2,954 → 26;
+  an empty folder 5.3ms → 0.08ms). 1.6MB against a 32MB table. The index carries its named
+  query and the measurements in the migration, per the house rule.
 
 ## Folder discovery & classification
 
@@ -114,9 +121,17 @@ search, and the "Hide in CRM" state remains orthogonal.
 ## Bulk API (`routes/mail.ts` additions)
 
 - `GET /api/mail/accounts/:id/folders` — the picker's list (name, special_use, sync_enabled,
-  selectable, locked flags for INBOX/sent).
-- `PATCH /api/mail/accounts/:id/folders` — toggle sync_enabled (owner-only; INBOX/sent
-  locked; enabling triggers `syncNow`).
+  selectable, locked flags for INBOX/sent). Owner-only, and a foreign account 404s exactly
+  like a nonexistent one. `locked` is computed per request from the account's CURRENT
+  sent_folder, never stored. Stale rows (a folder that vanished from LIST) and `\Noselect`
+  rows are both RETURNED — the CRM may still hold messages filed under them, and
+  `last_discovered_at`/`selectable` are on the wire so the picker can grey them out.
+- `PATCH /api/mail/accounts/:id/folders` — toggle sync_enabled (owner-only; enabling
+  triggers `syncNow`, fire-and-forget). Two 409s, both refused in BOTH directions because
+  the switch is not real either way: a LOCKED folder (INBOX and the account's sent folder,
+  always walked) and an UNSELECTABLE one (`\Noselect` holds no messages to sync). An
+  unknown folder name is a 404, matched byte for byte as UNIQUE (account_id, folder) does.
+  A same-value patch is a no-op: no write, no hint, no pass.
 - `POST /api/mail/threads/bulk` — `{ threadIds[], folder?, action: "trash"|"archive"|"hide" }`.
   `folder` is now OPTIONAL, carrying the move service's two modes above: present = the view
   the selection was made in (list multi-select, folder-scoped); absent = whole-thread (the
@@ -128,10 +143,32 @@ search, and the "Hide in CRM" state remains orthogonal.
   the target, or owned by an archived account); `error` is present iff `ok` is false. An
   account in backoff, with an unresolvable target folder, or with no running sync loop while
   not archived fails ITS threads with a message — but only for messages the action was
-  actually going to move; others proceed. Cap threadIds at 200 per request.
+  actually going to move; others proceed. Cap threadIds at 200 per request — the OUTER bound,
+  reachable only by `hide`. **trash/archive are capped at 50 by the route** (400 otherwise):
+  those two wait on a real mail server, since each queued MOVE runs on its account's serial
+  sync loop, so the bound on the request is a bound on the SIZE of that wait rather than on
+  its duration (a timeout would produce exactly the "claimed a move the server refused" state
+  the compensation exists to prevent). Consequence the endpoint documents: **a proxy 504 does
+  not mean the action failed** — the work continues on the loop, the SSE hints still fire, and
+  the client must REFETCH rather than retry (a blind retry trashes whatever is now in the
+  source folder).
 - Thread list gains a `folder` filter (threads with >= 1 message in that folder); the
   unread-count endpoint gains an optional per-folder variant for sidebar badges (one grouped
-  query, not N).
+  query, not N), shaped `{folders: [{folder, count}]}` — no accountId, so two accounts'
+  INBOXes are one row.
+- **Unread counting excludes each account's trash_folder** (both the badge and the thread
+  list's per-row unread flag). A move never touches `seen`, and nothing re-sights an unsynced
+  Trash, so a trashed unread message would otherwise count forever. Archive-folder unread
+  still counts — filing is not reading. The `?byFolder=1` variant does NOT apply the
+  exclusion: each count belongs to its own folder row, and a Trash row reading 0 above
+  visibly unread mail would be a lie.
+- SSE: one new key family, `[["mail-folders", accountId]]`, for the sidebar and the picker.
+  Published by the folder toggle above (after its write) and by the sync engine when a
+  discovery pass CREATES or RECLASSIFIES a folder (after discovery's DB work, before the
+  walk — a new folder should reach the sidebar without waiting for its first backfill). Not
+  published by a pass that merely re-sighted the same folders, which is every pass on a
+  settled mailbox. `trash_folder`/`archive_folder` resolution keeps publishing
+  `[["mail-accounts"]]` instead: those live on the account row.
 
 ## Frontend
 

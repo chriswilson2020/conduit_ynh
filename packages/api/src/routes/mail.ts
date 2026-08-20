@@ -4,6 +4,7 @@ import {
   mailAccountCreateInputSchema, mailAccountUpdateInputSchema, mailAccountUpdatePasswordFieldsSchema,
   mailAccountTestInputSchema, mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
   createEmailTemplateInputSchema, updateEmailTemplateInputSchema,
+  bulkThreadActionInputSchema, folderPatchInputSchema,
   type MailAccountSyncStats,
 } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
@@ -20,8 +21,11 @@ import {
 } from "../services/mail-accounts.js";
 import {
   listThreads, getThreadDetail, markThreadRead, setThreadLink, clearThreadLink,
-  archiveThread, unarchiveThread, unreadThreadCount, getAttachmentBlob, toMessage,
+  archiveThread, unarchiveThread, unreadThreadCount, unreadCountsByFolder,
+  getAttachmentBlob, toMessage,
 } from "../services/mail-threads.js";
+import { listAccountFolders, setFolderSyncEnabled } from "../services/mail-folders.js";
+import { moveThreads } from "../services/mail-move.js";
 import {
   listTemplates, createTemplate, updateTemplate, archiveTemplate, unarchiveTemplate,
 } from "../services/mail-templates.js";
@@ -41,8 +45,25 @@ export interface MailRouteSyncManager extends SendMailSyncManager {
     /** Best-effort `\Seen` write-back; rejects immediately while the account
      * is in backoff (mail-sync.ts's SyncUnavailableError). */
     markSeen(folder: string, uids: readonly number[]): Promise<void>;
+    /**
+     * Queued IMAP MOVE (Phase 4.1). Widened onto this slice so one getter also
+     * satisfies mail-move.ts's MoveSyncManager -- the bulk route hands this
+     * value straight to that service rather than carrying a second manager.
+     *
+     * UNLIKE the two above, this one is not best-effort: the move service
+     * treats a MISSING sync as a per-account refusal, because moving the
+     * database rows with nothing to carry the MOVE out would leave the CRM
+     * claiming a move that never happened (see accountStateOf).
+     */
+    moveMessages(folder: string, uids: readonly number[], targetFolder: string): Promise<void>;
     readonly stats: MailAccountSyncStats;
   } | undefined;
+  /**
+   * Ask for a pass now. RESOLVES WHEN THE PASS IS REQUESTED, not when it
+   * finishes (mail-sync.ts's syncNow), so callers treat it as
+   * fire-and-forget and let the SSE hints report what came of it.
+   */
+  syncNow(accountId: string): Promise<void>;
 }
 
 // unread/unlinked/archived are the same tri-state wire flag companies.ts's
@@ -59,8 +80,24 @@ const threadListQuerySchema = z.object({
   deal_id: z.uuid().optional(),
   project_id: z.uuid().optional(),
   archived: z.enum(["true", "false"]).optional().transform((v) => v === "true"),
+  // The folder view (Phase 4.1): threads with at least one message in this
+  // folder. Trimmed and non-blank, mirroring the shared folderNameSchema every
+  // other folder-carrying field parses through -- an IMAP mailbox name is
+  // compared byte for byte downstream, so " Archive " and "Archive" must not
+  // become two different views. A blank folder is invalid input, not "no
+  // filter": the sidebar always sends a real name or omits the parameter.
+  folder: z.string().trim().min(1).optional(),
   cursor: z.string().min(1).optional(),
   limit: z.coerce.number().int().positive().max(100).optional(),
+});
+
+// GET /api/mail/unread-count's only parameter. `byFolder=1` and nothing else:
+// a flag with one spelling cannot be got subtly wrong the way the tri-state
+// "true"/"false" strings above can, and anything else 400s rather than being
+// read as "no, plain count please" -- a client asking for a shape this route
+// does not have should hear about it.
+const unreadCountQuerySchema = z.object({
+  byFolder: z.literal("1").optional(),
 });
 
 const templateListQuerySchema = z.object({
@@ -93,6 +130,17 @@ const linkKindParamSchema = z.object({ id: z.uuid(), kind: mailLinkKindSchema })
  * top-level navigation.
  */
 const INLINE_RENDERABLE_MIME = /^image\/(png|jpeg|jpg|gif|webp|bmp|avif|x-icon|vnd\.microsoft\.icon)$/i;
+
+/**
+ * Threads per bulk request for `trash`/`archive` -- the two actions that talk
+ * to a mail server. `hide` keeps the shared schema's 200, since it writes one
+ * CRM column per thread and waits for nothing.
+ *
+ * 50 is a full page of multi-select (the list pages at 50) and no more, so the
+ * longest a single request can hold a connection open is 50 threads' worth of
+ * queued MOVEs behind whatever that account's serial loop is already doing.
+ */
+const MOVE_ACTION_THREAD_CAP = 50;
 
 export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): void {
   // syncManager is the GETTER, captured here and called inside each handler:
@@ -191,6 +239,86 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     }
   });
 
+  // --- Folders -------------------------------------------------------------
+
+  /**
+   * The account's discovered folders, for the Settings picker and the inbox
+   * sidebar (Phase 4.1).
+   *
+   * Owner-only, exactly like the account routes above and unlike every THREAD
+   * route: which mailboxes someone's mail server holds is a setting, not
+   * shared CRM content. A foreign id 404s the same way a nonexistent one does
+   * (mail-folders.ts's mustGetOwnedAccount).
+   *
+   * `locked` on each row is computed by the service from the account's CURRENT
+   * sent_folder and is not a column -- see isLocked for why storing it would
+   * go stale the moment someone repoints sent_folder.
+   */
+  app.get("/api/mail/accounts/:id/folders", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    try {
+      return await listAccountFolders(db, user.id, params.id);
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
+  });
+
+  /**
+   * Toggle one folder's sync_enabled.
+   *
+   * The two refusals both arrive as ConflictError and leave as 409s: a LOCKED
+   * folder (INBOX and the account's Sent folder, always walked regardless of
+   * the flag) and an UNSELECTABLE one (`\Noselect`, which holds no messages to
+   * sync). An unknown folder name is a 404. See setFolderSyncEnabled for why
+   * each is refused in both directions rather than accepted as a no-op.
+   *
+   * ENABLING ASKS FOR A PASS, and does not wait for one: syncNow resolves when
+   * the pass is REQUESTED, the loop may be mid-backfill, and the client learns
+   * the outcome from the SSE hints the pass publishes. A rejection is logged
+   * and swallowed for the same reason the `\Seen` write-back's is -- the
+   * database write is this route's contract, and a sync engine having a bad
+   * day must not turn a saved preference into a 500.
+   *
+   * Switching a folder OFF asks for nothing: there is no work to do, and the
+   * next ordinary pass simply stops walking it.
+   */
+  app.patch("/api/mail/accounts/:id/folders", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(folderPatchInputSchema, request.body, reply);
+    if (input === undefined) return;
+    let result;
+    try {
+      result = await setFolderSyncEnabled(db, user.id, params.id, input);
+    } catch (error) {
+      mapDomainError(reply, error);
+      return;
+    }
+    if (result.enabled) {
+      const manager = syncManager();
+      const onFailure = (error: unknown): void => {
+        request.log.warn(
+          { err: error, accountId: params.id, folder: input.folder },
+          "mail: could not request a sync pass after enabling a folder",
+        );
+      };
+      try {
+        void manager?.syncNow(params.id).catch(onFailure);
+      } catch (error) {
+        // Belt and braces, as on the read route: syncNow is documented to
+        // reject rather than throw, and a fake that throws must not take the
+        // request with it.
+        onFailure(error);
+      }
+    }
+    return result.folder;
+  });
+
   // POST, not GET, despite reading nothing: the body carries credentials for
   // an account that may not exist yet, and credentials do not belong in a
   // query string (or in an access log).
@@ -220,7 +348,8 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
       accountId: query.account_id, unread: query.unread, unlinked: query.unlinked,
       companyId: query.company_id, contactId: query.contact_id,
       dealId: query.deal_id, projectId: query.project_id,
-      archived: query.archived, cursor: query.cursor, limit: query.limit,
+      archived: query.archived, folder: query.folder,
+      cursor: query.cursor, limit: query.limit,
     });
   });
 
@@ -332,9 +461,82 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     }
   });
 
+  /**
+   * The nav badge's count, or -- with `?byFolder=1` -- the sidebar's per-folder
+   * counts in ONE grouped query (Phase 4.1).
+   *
+   * The two answers differ in more than shape, and mail-threads.ts documents
+   * why at each query: the plain count EXCLUDES messages in their account's
+   * Trash (nothing ever re-sights an unsynced Trash to clear the flag, so they
+   * would inflate the badge forever), while the per-folder counts do not --
+   * each count belongs to its own folder row, and a Trash row reading 0 above a
+   * list of visibly unread mail is a lie.
+   */
   app.get("/api/mail/unread-count", async (request, reply) => {
     if (requireUser(request, reply) === null) return;
+    const query = parseOrReject(unreadCountQuerySchema, request.query, reply);
+    if (query === undefined) return;
+    if (query.byFolder === "1") return { folders: await unreadCountsByFolder(db) };
     return { count: await unreadThreadCount(db) };
+  });
+
+  /**
+   * The bulk thread actions: Trash and Archive MOVE messages on the IMAP
+   * server, "Hide in CRM" sets the pre-4.1 CRM-side thread archive
+   * (services/mail-move.ts owns all three).
+   *
+   * AUTH-ONLY, not owner-scoped, like every other thread route: mail is
+   * shared-visibility in this CRM, and the IMAP write still happens through
+   * each message's own account's sync loop under that account's credentials.
+   * The user id is audit context for the service's log line.
+   *
+   * ALWAYS 200 WHEN THE REQUEST ITSELF WAS VALID. Per-thread failures ride
+   * INSIDE the body (`{threadId, ok, skipped?, error?}` per requested id, in
+   * request order) rather than becoming a status code, because a bulk action
+   * routinely half-succeeds -- one account in backoff, another fine -- and a
+   * 4xx/5xx would throw away the answer for every thread that worked.
+   *
+   * A 504 FROM A PROXY DOES NOT MEAN THE ACTION FAILED. Each queued MOVE runs
+   * on its account's serial sync loop, so this request waits for the mail
+   * server, and an account halfway through a first backfill can make that wait
+   * minutes (see moveThreads' own note). If the answer is lost in transit the
+   * work still lands, the SSE hints still fire, and the client should REFETCH
+   * rather than retry blindly -- a blind retry would trash or archive a second
+   * time, which for `trash` means moving whatever is now in the source folder.
+   * The cap below is the bound on that exposure.
+   */
+  app.post("/api/mail/threads/bulk", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const input = parseOrReject(bulkThreadActionInputSchema, request.body, reply);
+    if (input === undefined) return;
+    // The shared schema's 200 is the outer bound and only `hide` may reach it:
+    // hiding is a CRM-side column write per thread, while trash/archive each
+    // wait on a real mail server. Capping the two MOVE actions lower is the
+    // ruling's answer to that wait -- bound the SIZE of the request rather than
+    // its duration, since a timeout would produce exactly the "claimed a move
+    // the server refused" state the move service's compensation exists to
+    // prevent. Enforced here rather than in the schema because it is a property
+    // of the ACTION, not of the body shape.
+    if (input.action !== "hide" && input.threadIds.length > MOVE_ACTION_THREAD_CAP) {
+      return reply.code(400).send({
+        error: "validation",
+        message: `${input.action} accepts at most ${MOVE_ACTION_THREAD_CAP} threads per request`
+          + ` (received ${input.threadIds.length})`,
+      });
+    }
+    try {
+      return await moveThreads(db, user.id, input, {
+        // Resolved per request, never captured: the manager does not exist
+        // when routes are registered (see CrmRouteDeps.syncManager). null is
+        // an ordinary answer here and the service knows what to do with it --
+        // every account refuses, and each refusal is reported per thread.
+        syncManager: syncManager(),
+        logger: request.log,
+      });
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
   });
 
   // --- Send ----------------------------------------------------------------

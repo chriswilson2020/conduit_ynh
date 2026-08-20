@@ -522,6 +522,11 @@ function accountHints(): SseHint[] {
   return hints.filter((hint) => hint.keys.some((key) => key[0] === "mail-accounts"));
 }
 
+/** The per-account folder-set family (Phase 4.1): `[["mail-folders", id]]`. */
+function folderHints(): SseHint[] {
+  return hints.filter((hint) => hint.keys.some((key) => key[0] === "mail-folders"));
+}
+
 // --- Backfill and cursors ---------------------------------------------------
 
 describe("AccountSync: backfill and cursor", () => {
@@ -834,6 +839,40 @@ describe("AccountSync: folder discovery", () => {
     await waitFor(() => sync.stats.passes >= 2, "the pass that sees it");
 
     expect((await folderRows(accountId)).map((row) => row.folder)).toEqual(["Clients", "INBOX", "Sent"]);
+  });
+
+  it("publishes the account's folder hint when a pass creates or reclassifies a folder, and not otherwise", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    // The first pass creates INBOX and Sent, so it publishes.
+    expect(folderHints()).toEqual([{ keys: [["mail-folders", accountId]] }]);
+
+    // A settled mailbox re-sights the same folders and publishes NOTHING --
+    // this runs on every pass of every account, so an ungated hint would be a
+    // refetch storm on the poll interval.
+    hints = [];
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 2, "a settled pass");
+    expect(folderHints()).toEqual([]);
+
+    // A folder appears: the sidebar and the picker are now stale.
+    client.listed = [...client.listed, { folder: "Clients", selectable: true, delimiter: "/" }];
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 3, "the pass that sees it");
+    expect(folderHints()).toEqual([{ keys: [["mail-folders", accountId]] }]);
+
+    // And a RECLASSIFICATION counts too: the picker renders the role.
+    hints = [];
+    client.listed = client.listed.map((entry) => entry.folder === "Clients"
+      ? { ...entry, specialUse: "archive" as const } : entry);
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 4, "the pass that reclassifies it");
+    expect(folderHints()).toEqual([{ keys: [["mail-folders", accountId]] }]);
+
+    await sync.stop();
   });
 
   it("treats a LIST failure as a pass-level failure, not a poison skip", async () => {

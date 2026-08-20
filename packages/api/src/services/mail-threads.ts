@@ -1,15 +1,18 @@
-import { and, asc, desc, eq, inArray, isNull, isNotNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, isNotNull, lt, or, sql, type SQL } from "drizzle-orm";
 import type {
   MailAddress, MailAttachment, MailDealSuggestion, MailDirection, MailLinkKind, MailMessage,
-  MailMessageWithAttachments, MailThread, MailThreadDetail, MailThreadListItem, ThreadListFilters,
+  MailMessageWithAttachments, MailThread, MailThreadDetail, MailThreadListItem,
+  MailUnreadFolderCount, ThreadListFilters,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
   companies, contacts, deals, projects,
-  mailAttachments, mailMessages, mailThreads, type MailMessageRow, type MailThreadRow,
+  mailAccounts, mailAttachments, mailMessages, mailThreads,
+  type MailMessageRow, type MailThreadRow,
 } from "../db/schema.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
 import { resolveAttachmentUrls } from "./mail-content.js";
+import { folderKeySql } from "./mail-folders.js";
 import { decodeLastMessageAtCursor, encodeCursor } from "./pagination.js";
 import { publish } from "./sse.js";
 
@@ -97,6 +100,34 @@ const MAX_LIMIT = 100;
  * expensive either -- the bound is on rows fetched, not only rows returned. */
 const MAX_SENDERS = 5;
 
+/**
+ * "This message is not sitting in its OWN account's Trash folder" -- the
+ * predicate both unread computations apply (Phase 4.1 Task 4's coordinator
+ * ruling), and the reason every query using it joins mail_accounts.
+ *
+ * WHY THE COUNTING CARRIES THIS RATHER THAN THE MOVE. Trashing a message never
+ * touches `seen` (services/mail-move.ts is explicit about not writing it: a
+ * trashed unread message is still unread, it is just in the Trash). Nothing
+ * afterwards ever re-sights it either -- Trash is not sync-enabled by default,
+ * so no pass reconciles its flags again -- so an unread message dropped in the
+ * Trash would go on counting towards the inbox badge forever, with no way for
+ * a user to clear it. Excluding it here is the fix that leaves the flag honest.
+ *
+ * ARCHIVE IS DELIBERATELY NOT EXCLUDED. Filing a message is not reading it, and
+ * an archive folder IS synced by default, so its flags stay live and the count
+ * stays correct. Only Trash gets the carve-out, and only for the account that
+ * message belongs to -- one account's "Trash" is another's ordinary folder.
+ *
+ * `trash_folder` NULL means nothing has classified one yet (see the column's
+ * own comment), so nothing is excluded for that account. The comparison is
+ * folderKey's -- INBOX case-folded, everything else verbatim -- over the
+ * TRIMMED column, mirroring how mail-move.ts reads the same column: a stored
+ * " Trash " must not read as a second mailbox.
+ */
+function notInAccountTrash(): SQL {
+  return sql`(${mailAccounts.trashFolder} IS NULL OR ${folderKeySql(mailMessages.folder)} <> ${folderKeySql(sql`btrim(${mailAccounts.trashFolder})`)})`;
+}
+
 /** Aggregates computed per page of threads, not denormalised onto
  * mail_threads: every one of them changes on ingest, and a second writer on
  * the thread row would be one more thing for ingest's transaction to get
@@ -125,15 +156,29 @@ async function loadAggregates(db: Database, threadIds: string[]): Promise<Map<st
   if (threadIds.length === 0) return byThread;
 
   // 1. One grouped row per thread for the two set-wide facts.
+  //
+  //    The join to mail_accounts serves the unread flag alone (see
+  //    notInAccountTrash): a message in its account's Trash must not light the
+  //    unread dot on a row whose conversation the user has thrown away. It is
+  //    the same rule the badge applies, written in the same place, so the list
+  //    and the badge cannot disagree about which messages count.
+  //
+  //    `accountIds` is deliberately NOT filtered by it. That field says which
+  //    mailboxes a thread is visible in, for the account chips, and a thread
+  //    whose only message on one account now sits in that account's Trash is
+  //    still a thread that account has -- the chip is about provenance, not
+  //    about unread.
   const grouped = await db.select({
     threadId: mailMessages.threadId,
-    unread: sql<boolean>`bool_or(NOT ${mailMessages.seen})`,
+    unread: sql<boolean>`bool_or(NOT ${mailMessages.seen} AND ${notInAccountTrash()})`,
     // ORDER BY inside the aggregate: array_agg has no defined output order
     // without one, so the account chips on a multi-account thread row would
     // otherwise be stable only by accident of the plan. By contract, not by
     // luck.
     accountIds: sql<string[]>`array_agg(DISTINCT ${mailMessages.accountId} ORDER BY ${mailMessages.accountId})`,
-  }).from(mailMessages).where(inArray(mailMessages.threadId, threadIds))
+  }).from(mailMessages)
+    .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
+    .where(inArray(mailMessages.threadId, threadIds))
     .groupBy(mailMessages.threadId);
 
   // 2. The newest message per thread, for its snippet alone. DISTINCT ON
@@ -223,12 +268,39 @@ export async function listThreads(
       isNull(mailThreads.dealId), isNull(mailThreads.projectId),
     )!);
   }
-  // Both of these are properties of a thread's MESSAGES, so they are EXISTS
-  // subqueries rather than columns: a thread is "in" an account when any of
-  // its messages was seen through that account's mailbox, and unread when any
-  // one message is unseen.
-  if (opts.accountId) {
-    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${mailMessages.accountId} = ${opts.accountId})`);
+  // All three of these are properties of a thread's MESSAGES, so they are
+  // EXISTS subqueries rather than columns: a thread is "in" an account when any
+  // of its messages was seen through that account's mailbox, "in" a folder when
+  // any of its messages sits there, and unread when any one message is unseen.
+  //
+  // ACCOUNT AND FOLDER SHARE ONE SUBQUERY, and that is a correctness property
+  // rather than an optimisation. Two separate EXISTS clauses each pass
+  // INDEPENDENTLY, so a thread whose INBOX message is on account A and whose
+  // matching-folder message is on account B satisfies both while having no
+  // message that is in that folder ON THAT ACCOUNT -- the thread would appear
+  // in a folder view of a mailbox it is not in. One subquery testing both
+  // columns on the SAME ROW is what the folder sidebar actually means.
+  //
+  // The folder name is compared to the column DIRECTLY (not through
+  // folderKeySql): the client sends back a name this API gave it, from the
+  // folders endpoint, and an expression here would put the comparison out of
+  // reach of mail_messages(folder, thread_id) -- the index that makes this
+  // filter an index-only probe (drizzle/0005). The cost of the strictness is
+  // that a hand-written "inbox" filter matches nothing on a server storing
+  // "INBOX", which is the same byte-for-byte rule UNIQUE (account_id, folder)
+  // and the walk already follow.
+  //
+  // What this filter deliberately does NOT do is hide threads whose only
+  // messages belong to an ARCHIVED account. Those rows survive (archive-not-
+  // delete) and still carry a folder, so they still match -- excluding them
+  // would need an anti-join on every list query for a state that is rare and
+  // reversible, and the bulk actions already report such threads as `skipped`
+  // rather than pretending they moved (services/mail-move.ts).
+  if (opts.accountId !== undefined || opts.folder !== undefined) {
+    const terms: SQL[] = [sql`${mailMessages.threadId} = ${mailThreads.id}`];
+    if (opts.accountId !== undefined) terms.push(sql`${mailMessages.accountId} = ${opts.accountId}`);
+    if (opts.folder !== undefined) terms.push(sql`${mailMessages.folder} = ${opts.folder}`);
+    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} WHERE ${sql.join(terms, sql` AND `)})`);
   }
   if (opts.unread) {
     where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${mailMessages.seen} = false)`);
@@ -557,16 +629,51 @@ export async function getAttachmentBlob(
 // --- Unread count ----------------------------------------------------------
 
 /**
- * Distinct non-archived threads holding at least one unseen message -- the
- * inbox nav badge. Counted over threads rather than messages for the same
- * reason the list is thread-shaped: a ten-message unread conversation is one
- * thing to deal with, not ten.
+ * Distinct non-archived threads holding at least one unseen message that is
+ * not in its account's Trash -- the inbox nav badge. Counted over threads
+ * rather than messages for the same reason the list is thread-shaped: a
+ * ten-message unread conversation is one thing to deal with, not ten.
+ *
+ * The Trash carve-out is notInAccountTrash's, and the join to mail_accounts is
+ * there for it alone. Archive-folder mail still counts.
  */
 export async function unreadThreadCount(db: Database): Promise<number> {
   const [row] = await db.select({
     count: sql<number>`count(DISTINCT ${mailMessages.threadId})::int`,
   }).from(mailMessages)
     .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
-    .where(and(isNull(mailThreads.archivedAt), eq(mailMessages.seen, false)));
+    .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
+    .where(and(isNull(mailThreads.archivedAt), eq(mailMessages.seen, false), notInAccountTrash()));
   return row?.count ?? 0;
+}
+
+/**
+ * The same count, split per folder -- the sidebar's per-folder badges
+ * (GET /api/mail/unread-count?byFolder=1).
+ *
+ * ONE GROUPED QUERY, not one per folder: a mailbox with thirty sieve-filed
+ * folders would otherwise cost thirty round trips every time the sidebar
+ * refetched, which SSE makes a frequent event.
+ *
+ * NO TRASH EXCLUSION HERE, deliberately, and this is the one place the two
+ * unread computations differ. The badge above answers "how much is waiting for
+ * me?", where mail in the Trash is not waiting for anything. A sidebar row
+ * answers "how much unread is IN THIS FOLDER?", and applying the carve-out
+ * would make the Trash row read 0 while the messages listed under it visibly
+ * are not. Each count belongs to its own row.
+ *
+ * Folders are counted by NAME across accounts, per the response shape the spec
+ * fixes ({folder, count}, no accountId): two accounts' INBOXes are one row
+ * here. See mailUnreadFolderCountsSchema in packages/shared for what that means
+ * for a multi-account sidebar.
+ */
+export async function unreadCountsByFolder(db: Database): Promise<MailUnreadFolderCount[]> {
+  return db.select({
+    folder: mailMessages.folder,
+    count: sql<number>`count(DISTINCT ${mailMessages.threadId})::int`,
+  }).from(mailMessages)
+    .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
+    .where(and(isNull(mailThreads.archivedAt), eq(mailMessages.seen, false)))
+    .groupBy(mailMessages.folder)
+    .orderBy(asc(mailMessages.folder));
 }
