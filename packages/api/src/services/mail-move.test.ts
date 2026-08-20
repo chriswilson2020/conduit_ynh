@@ -364,6 +364,79 @@ describe("moveThreads: per account", () => {
     expect((await messageRows(good))[0]).toMatchObject({ folder: "Archive", imapUid: null });
   });
 
+  it("does not fail a thread when the refusing account had nothing in scope anyway", async () => {
+    // The refusal is a statement about messages this action WOULD have moved.
+    // Account B cannot move -- but its only message in this thread sits
+    // outside the view folder, so the user's INBOX archive has nothing to do
+    // with it, and failing the thread would be a report about a mailbox they
+    // were not acting on.
+    const good = await makeAccount();
+    const stuck = await makeAccount({ label: "Personal", archiveFolder: null });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId: good, folder: "INBOX", imapUid: 151 });
+    await makeMessage({ threadId, accountId: stuck, folder: "Clients", imapUid: 152 });
+    const manager = new FakeManager();
+    const sync = manager.for(good);
+    manager.for(stuck);
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true }]);
+    expect(sync.calls).toEqual([{ folder: "INBOX", uids: [151], targetFolder: "Archive" }]);
+    expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
+      .toEqual([["Archive", null], ["Clients", 152]]);
+  });
+
+  it("never fails a thread for an ARCHIVED account's rows, so it stays archivable forever", async () => {
+    // Archiving a mail account keeps its messages (archive-not-delete) but
+    // tears its sync loop down for good. Reporting those rows as a failure
+    // would make every thread carrying one permanently un-archivable from any
+    // view, for a reason no user could act on.
+    const live = await makeAccount();
+    const gone = await makeAccount({ label: "Old" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId: live, folder: "INBOX", imapUid: 161 });
+    await makeMessage({ threadId, accountId: gone, folder: "INBOX", imapUid: 162 });
+    await handle.db.update(mailAccounts)
+      .set({ archivedAt: new Date("2026-08-01T00:00:00.000Z") }).where(eq(mailAccounts.id, gone));
+    // The manager knows nothing about it, exactly as SyncManager does not
+    // after tearing an archived account's loop down.
+    const manager = new FakeManager();
+    const sync = manager.for(live);
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true }]);
+    expect(sync.calls).toEqual([{ folder: "INBOX", uids: [161], targetFolder: "Archive" }]);
+    // The archived account's row keeps its folder and UID: excluded, not moved
+    // and not reverted.
+    expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
+      .toEqual([["Archive", null], ["INBOX", 162]]);
+  });
+
+  it("skips a thread whose whole in-scope set sits on an archived account", async () => {
+    const gone = await makeAccount({ label: "Old" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId: gone, folder: "INBOX", imapUid: 171 });
+    await handle.db.update(mailAccounts)
+      .set({ archivedAt: new Date("2026-08-01T00:00:00.000Z") }).where(eq(mailAccounts.id, gone));
+    const manager = new FakeManager();
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+    );
+
+    // Same shape as a thread awaiting reconciliation: nothing eligible, so a
+    // successful no-op rather than an error the user cannot clear.
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true }]);
+    expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 171 });
+    expect(threadHints()).toHaveLength(0);
+  });
+
   it("fails an account with no running sync loop, and writes nothing for it", async () => {
     const accountId = await makeAccount({ label: "Personal" });
     const threadId = await makeThread();

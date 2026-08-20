@@ -82,9 +82,15 @@ below):
      and record Mail tabs): every one of the thread's messages EXCEPT those already in the
      target folder (nothing to do) and those in the account's sent folder (archiving a
      conversation must never empty Sent).
-   If the resulting set is empty (every eligible message across the thread awaited
-   reconciliation), the move is a no-op for this thread: reported as `{ ok: true, skipped:
-   true }`, not a failure.
+   If the resulting set is empty, the move is a no-op for this thread: reported as
+   `{ ok: true, skipped: true }`, not a failure. Three things empty it: every in-scope
+   message awaited reconciliation; every one was already in the target folder; or every one
+   belongs to an ARCHIVED mail account, whose rows survive (archive-not-delete) but whose
+   sync loop is torn down for good — permanently unmovable, so they are excluded like a NULL
+   uid rather than failed, which would leave such a thread un-archivable from every view
+   forever. A per-account refusal (below) applies only to messages that SURVIVE these
+   filters: an account that cannot move must not fail a thread whose messages of its own
+   were never in scope.
 2. Optimistic DB update inside one transaction: `folder` = target, `imap_uid` = NULL,
    `updated_at` bumped; SSE hints published after commit.
 3. Queue the IMAP MOVE (grouped per account/folder, chunked per the existing UID_CHUNK).
@@ -116,10 +122,12 @@ search, and the "Hide in CRM" state remains orthogonal.
   conversation view/record-tab single-thread buttons). `hide` (the existing CRM archive
   applied in bulk) ignores `folder` entirely either way. Server groups by account, applies
   the move service, returns per-thread results `{ threadId, ok, skipped?, error? }` —
-  `skipped: true` (always paired with `ok: true`) means nothing moved because every eligible
-  message awaited reconciliation; `error` is present iff `ok` is false. An account in backoff
-  or with an unresolvable target folder fails ITS threads with a message; others proceed.
-  Cap threadIds at 200 per request.
+  `skipped: true` (always paired with `ok: true`) means the thread's eligible set came out
+  empty, for any of the three reasons in step 1 above (awaiting reconciliation, already in
+  the target, or owned by an archived account); `error` is present iff `ok` is false. An
+  account in backoff, with an unresolvable target folder, or with no running sync loop while
+  not archived fails ITS threads with a message — but only for messages the action was
+  actually going to move; others proceed. Cap threadIds at 200 per request.
 - Thread list gains a `folder` filter (threads with >= 1 message in that folder); the
   unread-count endpoint gains an optional per-folder variant for sidebar badges (one grouped
   query, not N).

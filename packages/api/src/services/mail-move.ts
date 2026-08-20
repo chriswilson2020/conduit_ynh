@@ -184,56 +184,97 @@ class Outcomes {
  * which of its folders is Sent (the whole-thread carve-out), and the sync loop
  * that will do the actual MOVE. */
 interface AccountContext {
-  /** Trimmed, for the whole-thread mode's Sent carve-out. */
-  sentFolder: string;
   targetFolder: string;
   sync: MoveSyncAccount;
 }
 
 /**
- * One account's move context, or the sentence explaining why it has none.
+ * What an account's OWN folders mean for the eligibility filters -- needed for
+ * every account, including the ones that cannot move anything, because whether
+ * a message is IN SCOPE is decided before (and independently of) whether its
+ * account can carry the move out.
+ */
+interface AccountScope {
+  /** Trimmed, for the whole-thread mode's Sent carve-out. */
+  sentFolder: string;
+  /** null when nothing has ever classified one for this action. */
+  targetFolder: string | null;
+}
+
+/**
+ * What one account can contribute to this move.
+ *
+ * - `ready`: a resolved target and a running loop.
+ * - `refused`: it cannot move anything, and any IN-SCOPE message of its own
+ *   fails that message's thread with `error`.
+ * - `unmovable`: an ARCHIVED account, whose rows are excluded outright.
+ */
+type AccountState =
+  | { kind: "ready"; scope: AccountScope; context: AccountContext }
+  | { kind: "refused"; scope: AccountScope; error: string }
+  | { kind: "unmovable"; scope: AccountScope };
+
+/**
+ * One account's state for this action.
  *
  * TARGET RESOLUTION IS A COLUMN READ, not a search. mail-folders.ts already
  * did the work at discovery: it prefers a LISTING-classified folder over a
  * name-matched one, skips unselectable mailboxes, and fills
  * trash_folder/archive_folder only while they are NULL, so a user's override
  * always wins. NULL therefore means "nothing has ever classified one" -- the
- * spec's "detect for me" state, not "I want no target" -- and that is the one
- * case that fails, with a sentence a user can act on.
+ * spec's "detect for me" state, not "I want no target" -- and it is one of the
+ * two refusals, with a sentence a user can act on.
  *
  * Trimmed on read, mirroring normalizeSentFolder: an IMAP mailbox name is
  * compared byte for byte downstream, so a stored " Archive " must not become a
  * second mailbox. (Task 4 adds the write-side trim when the Settings form
  * starts submitting these columns; until then this is the only guard.)
  *
- * A MISSING SYNC LOOP IS A FAILURE, not a skipped best-effort step -- the one
- * place this service deliberately differs from mail-send's APPEND. Moving the
- * DB rows with no loop to carry the MOVE out would leave the CRM showing
- * messages in a folder they never reached, and nothing would ever correct it:
- * the source folder's cursor is already past them, and the target folder's
- * pass has nothing to re-sight. So an account whose sync is not running fails
- * its threads and changes nothing.
+ * A MISSING SYNC LOOP IS THE OTHER REFUSAL, not a skipped best-effort step --
+ * the one place this service deliberately differs from mail-send's APPEND.
+ * Moving the DB rows with no loop to carry the MOVE out would leave the CRM
+ * showing messages in a folder they never reached, and nothing would ever
+ * correct it: the source folder's cursor is already past them, and the target
+ * folder's pass has nothing to re-sight.
+ *
+ * AN ARCHIVED ACCOUNT IS CHECKED FIRST, and is NOT a refusal. SyncManager
+ * tears its loop down and will never build another (mail-sync.ts's
+ * applyAccountChange), so "no loop" is permanent rather than a state a user
+ * can fix -- while its message rows survive, because archiving an account
+ * keeps its mail (archive-not-delete). Reported as a failure, those rows would
+ * make every thread carrying one PERMANENTLY un-archivable from any view: the
+ * bulk action would fail forever, for a reason nothing can act on. So they are
+ * treated exactly like a NULL uid -- excluded from the eligible set, never
+ * failed -- and a thread whose whole in-scope set is such rows reports the
+ * ordinary `{ ok: true, skipped: true }` no-op.
  */
-function resolveAccount(
-  account: { id: string; label: string; sentFolder: string; trashFolder: string | null; archiveFolder: string | null },
+function accountStateOf(
+  account: {
+    id: string; label: string; archivedAt: Date | null; sentFolder: string;
+    trashFolder: string | null; archiveFolder: string | null;
+  },
   action: "trash" | "archive",
   syncManager: MoveSyncManager | null,
-): { ok: true; context: AccountContext } | { ok: false; error: string } {
+): AccountState {
   const raw = action === "trash" ? account.trashFolder : account.archiveFolder;
-  const targetFolder = (raw ?? "").trim();
+  const trimmed = (raw ?? "").trim();
+  const targetFolder = trimmed.length === 0 ? null : trimmed;
+  const scope: AccountScope = { sentFolder: account.sentFolder.trim(), targetFolder };
+  if (account.archivedAt !== null) return { kind: "unmovable", scope };
   const role = action === "trash" ? "Trash" : "Archive";
-  if (targetFolder.length === 0) {
+  if (targetFolder === null) {
     return {
-      ok: false,
+      kind: "refused",
+      scope,
       error: `account "${account.label}" has no ${role} folder yet`
         + " -- set one in Settings, or wait for a sync pass to detect it",
     };
   }
   const sync = syncManager?.get(account.id);
   if (sync === undefined) {
-    return { ok: false, error: `mail sync is not running for account "${account.label}"` };
+    return { kind: "refused", scope, error: `mail sync is not running for account "${account.label}"` };
   }
-  return { ok: true, context: { sentFolder: account.sentFolder.trim(), targetFolder, sync } };
+  return { kind: "ready", scope, context: { targetFolder, sync } };
 }
 
 // --- The service -----------------------------------------------------------
@@ -254,11 +295,16 @@ function resolveAccount(
  *   the target folder and those in the account's Sent folder. Archiving a
  *   conversation must never empty Sent.
  *
- * Either way a message awaiting reconciliation (`imap_uid` NULL -- a just-sent
- * message the Sent pass has not re-sighted) is left alone: there is no UID to
- * name it by. A thread with nothing eligible is reported `{ ok: true, skipped:
- * true }`, a successful no-op rather than a failure, and self-heals the moment
- * the user asks again after the next pass.
+ * Three kinds of message are dropped from the eligible set in either mode, and
+ * a thread left with none is reported `{ ok: true, skipped: true }` -- a
+ * successful no-op, never a failure:
+ *
+ * - AWAITING RECONCILIATION (`imap_uid` NULL -- a just-sent message the Sent
+ *   pass has not re-sighted): there is no UID to name it to the server. Rare,
+ *   and it self-heals the moment the user asks again after the next pass.
+ * - ALREADY IN THE TARGET FOLDER: nothing to do.
+ * - OWNED BY AN ARCHIVED ACCOUNT: permanently unmovable, and deliberately not
+ *   a failure -- see accountStateOf.
  *
  * THE RETURNED PROMISE WAITS FOR THE SERVER. Each queued MOVE runs on its
  * account's serial sync loop, so a bulk action against an account halfway
@@ -340,9 +386,11 @@ async function hideThreads(db: Database, threadIds: readonly string[], outcomes:
 }
 
 /**
- * The messages this action will move, with every thread that will NOT
- * contribute one already recorded on `outcomes` (unknown thread, unresolvable
- * account, no sync loop).
+ * The messages this action will move, with the threads that cannot move
+ * already recorded on `outcomes`: an unknown thread id, and any thread with an
+ * IN-SCOPE message on an account that refused (see the ordering note in the
+ * row loop -- a refusal follows the eligibility filters, it never precedes
+ * them).
  *
  * Three reads, in this order: the requested threads (to tell "no such thread"
  * apart from "nothing to move"), their messages, and the accounts those
@@ -378,45 +426,64 @@ async function collectCandidates(
 
   const accountIds = [...new Set(messages.map((row) => row.accountId))];
   const accountRows = await db.select({
-    id: mailAccounts.id, label: mailAccounts.label, sentFolder: mailAccounts.sentFolder,
+    id: mailAccounts.id, label: mailAccounts.label, archivedAt: mailAccounts.archivedAt,
+    sentFolder: mailAccounts.sentFolder,
     trashFolder: mailAccounts.trashFolder, archiveFolder: mailAccounts.archiveFolder,
   }).from(mailAccounts).where(inArray(mailAccounts.id, accountIds));
 
-  const refusals = new Map<string, string>();
+  const states = new Map<string, AccountState>();
   for (const account of accountRows) {
-    const resolved = resolveAccount(account, action, syncManager);
-    if (resolved.ok) contexts.set(account.id, resolved.context);
-    else refusals.set(account.id, resolved.error);
+    const state = accountStateOf(account, action, syncManager);
+    states.set(account.id, state);
+    if (state.kind === "ready") contexts.set(account.id, state.context);
   }
 
   const candidates: Candidate[] = [];
   for (const row of messages) {
-    const refusal = refusals.get(row.accountId);
-    if (refusal !== undefined) {
-      // An account that cannot move fails ITS threads with the reason, and
-      // every other account in the same request carries on (spec).
-      outcomes.fail(row.threadId, refusal);
-      continue;
-    }
-    const context = contexts.get(row.accountId);
-    if (context === undefined) continue;
+    const state = states.get(row.accountId);
+    if (state === undefined) continue;
+    // An archived account's rows are permanently unmovable, so they are
+    // dropped here beside the NULL uids rather than failing anything -- see
+    // accountStateOf for why reporting them would make a thread carrying one
+    // un-archivable forever.
+    if (state.kind === "unmovable") continue;
     // No UID, no way to name the message to the server. Rare and
     // self-healing: the next pass over its folder fills the UID in.
     if (row.imapUid === null) continue;
+
+    // EVERY ELIGIBILITY FILTER RUNS BEFORE THE REFUSAL BELOW, and the order is
+    // the correctness property, not tidiness. A refusal is a statement about
+    // messages this action would actually have moved: an account that cannot
+    // move must not fail a thread whose messages of its own were never in
+    // scope in the first place (outside the view folder, awaiting
+    // reconciliation, or carved out of the whole-thread set). Judging the
+    // account before its rows made every such thread fail for a mailbox the
+    // user was not acting on.
+    //
     // Already there. In whole-thread mode this is the spec's explicit
     // exclusion; in folder-scoped mode it can only fire when the user acts
     // from the target folder's OWN view (archiving from the Archive view),
     // where "nothing to do" is just as true -- and where moving a message into
-    // the mailbox it is already in would churn its UID for nothing.
-    if (sameFolder(row.folder, context.targetFolder)) continue;
+    // the mailbox it is already in would churn its UID for nothing. A refused
+    // account may have no target at all, in which case there is no folder for
+    // a message to be "already in".
+    const { sentFolder, targetFolder } = state.scope;
+    if (targetFolder !== null && sameFolder(row.folder, targetFolder)) continue;
     if (viewFolder === undefined) {
       // Whole-thread: everything except Sent. Archiving a conversation must
       // never empty the Sent folder.
-      if (sameFolder(row.folder, context.sentFolder)) continue;
+      if (sameFolder(row.folder, sentFolder)) continue;
     } else if (!sameFolder(row.folder, viewFolder)) {
       // Folder-scoped: only the view the selection was made in. Note there is
       // no Sent carve-out here -- a user looking AT the Sent folder and
       // trashing a message means it.
+      continue;
+    }
+
+    if (state.kind === "refused") {
+      // In scope, and this account cannot move it: THIS is what fails the
+      // thread. Every other account in the same request carries on (spec).
+      outcomes.fail(row.threadId, state.error);
       continue;
     }
     candidates.push({

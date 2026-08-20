@@ -328,12 +328,24 @@ export interface ImapClient {
    *
    * ONE CAVEAT THIS CONTRACT CANNOT FIX, worth knowing rather than
    * discovering: on a server that does NOT advertise RFC 6851 MOVE, imapflow
-   * emulates it as COPY + \Deleted + EXPUNGE and issues the delete WITHOUT
-   * checking whether the copy succeeded (lib/commands/move.js). On such a
-   * server a refused copy can still expunge the source messages -- the single
-   * place the CRM's "we never expunge" promise rests on the server advertising
-   * MOVE. Dovecot, the deployment target and CI's server, does; Task 6's
-   * integration suite is where that stops being a claim.
+   * emulates it as COPY + \Deleted + EXPUNGE (lib/commands/move.js), and that
+   * emulation is dangerous in two independent ways.
+   *
+   * - It issues the delete WITHOUT checking whether the COPY succeeded, so a
+   *   refused copy can still destroy the source messages.
+   * - The delete's EXPUNGE is scoped to the given UIDs only when the server
+   *   ALSO has UIDPLUS (`UID EXPUNGE`). Without it, imapflow falls back to a
+   *   PLAIN `EXPUNGE` (lib/commands/expunge.js), which by RFC 3501 removes
+   *   EVERY message flagged \Deleted in that mailbox -- including messages
+   *   some other client flagged and has not yet expunged, which this CRM
+   *   never touched and knows nothing about.
+   *
+   * So the CRM's "we never expunge" promise rests on the server advertising
+   * MOVE, and the blast radius of it not doing so rests on UIDPLUS. Dovecot,
+   * the deployment target and CI's server, advertises both; Task 6's
+   * integration suite is where that stops being a claim. Any future adapter
+   * for a server without MOVE must implement the copy-then-delete itself
+   * rather than inherit this one.
    */
   move(folder: string, uids: number[], targetFolder: string): Promise<void>;
   /**

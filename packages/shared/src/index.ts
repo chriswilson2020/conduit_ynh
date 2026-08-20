@@ -909,9 +909,13 @@ export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
 // `error` is present IFF `ok` is false (mirroring
 // mailAccountTestResultSchema's per-protocol shape above), and
 // `skipped: true` can only accompany `ok: true` -- a skip is the move
-// service finding nothing eligible to move (every message in this thread's
-// relevant folder view was awaiting reconciliation, NULL imap_uid), which
-// is a successful no-op, not a failure.
+// service finding nothing eligible to move in this thread's relevant scope,
+// which is a successful no-op, not a failure. Three things produce it
+// (spec, Move write-back step 1): every in-scope message was awaiting
+// reconciliation (NULL imap_uid), every one was already in the target
+// folder, or every one belongs to an ARCHIVED mail account -- whose rows
+// survive but can never be moved again, and are therefore excluded rather
+// than failed, so such a thread does not become un-archivable forever.
 const bulkThreadResultItemSchema = z.object({
   threadId: z.uuid(),
   ok: z.boolean(),
