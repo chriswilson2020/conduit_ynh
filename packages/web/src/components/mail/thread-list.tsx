@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { clsx } from "clsx";
 import type { MailThreadListItem } from "@conduit/shared";
 import { relativeTime } from "../../lib";
@@ -35,7 +36,9 @@ export interface ThreadListProps {
   selectedId?: string | null;
   /** Page size; the route's own default is used when omitted. */
   limit?: number;
-  emptyLabel?: string;
+  /** A node, not just a string: the inbox's empty state links at Settings
+   * when there is no mail account to have received anything yet. */
+  emptyLabel?: ReactNode;
 }
 
 const DEFAULT_LIMIT = 25;

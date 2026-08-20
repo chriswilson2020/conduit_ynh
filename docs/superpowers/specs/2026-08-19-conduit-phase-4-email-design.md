@@ -192,8 +192,9 @@ SSE events: `mail.message` (new message: thread id, account id, snippet), `mail.
   unread dot, account chip, link chips) with the filter bar, and the conversation view.
   Unread badge on the nav item, kept live via SSE. Empty state points at Settings → Mail.
 - **Conversation view**: messages oldest-first, all but the latest collapsed. HTML bodies
-  render in an iframe via `srcdoc` with `sandbox="allow-same-origin"` — scripts stay blocked
-  (no `allow-scripts`, ever) — and a restrictive CSP meta tag: remote images blocked by default
+  render in an iframe via `srcdoc` with
+  `sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"` — scripts stay
+  blocked (no `allow-scripts`, ever) — and a restrictive CSP meta tag: remote images blocked by default
   with a per-thread "Load remote images" button; text-only messages render as preformatted text.
   **Why `allow-same-origin` rather than an empty sandbox** (coordinator ruling, 20 Aug): an
   empty sandbox gives the frame an opaque origin, so SameSite cookies are not attached to its
@@ -203,7 +204,22 @@ SSE events: `mail.message` (new message: thread id, account id, snippet), `mail.
   changes. With scripts blocked, ingest-time sanitization stripping `script`/`style` `url()`/
   forms, and the CSP meta still governing `img-src`, `allow-same-origin` is the accepted risk.
   The consequence for the API is that `GET /api/mail/attachments/:id/inline` is an ordinary
-  authenticated same-origin route, not a signed one. Attachment list with
+  authenticated same-origin route, not a signed one.
+  **Why the two popup flags** (coordinator ruling, 20 Aug, amending the above): a link in a
+  message opens in a new tab, the way it does in every mail client. Without `allow-popups` the
+  sanitizer's own `target="_blank"` is inert and links do nothing at all — a broken app, not a
+  security posture — and `allow-popups-to-escape-sandbox` is what makes the opened tab an
+  ordinary one rather than one inheriting these flags. What the pair costs is already covered
+  three times over: the ingest sanitizer stamps `rel="noopener noreferrer"` on every anchor
+  (that transform is now load-bearing, not belt-and-braces), the escape flag keeps the new tab
+  out of this frame's sandbox, and the frame's `no-referrer` meta covers the referrer. There is
+  no CSP interaction — the flags live on the attribute, and the policy must never gain a
+  `sandbox` directive, which would re-impose them and break links again — and nothing about the
+  cookie story that motivated `allow-same-origin` changes. Accepted consequence: the sanitizer's
+  scheme allowlist only constrains hrefs that carry a scheme, so inbound mail can link the
+  user's own CRM and have it open in a new tab. That is a GET-only, user-initiated nuisance, and
+  the same permissiveness is what lets legitimate same-origin links to CRM records work.
+  Never granted: `allow-scripts`, `allow-forms`, `allow-top-navigation`, `allow-modals`. Attachment list with
   download. Link panel: chips for the four records with unlink, an entity picker to link
   manually, and the deal-suggestion one-click row. Reply / Reply-all / Forward.
 - **Composer**: TipTap (already a design-doc dependency; first actual use), To/Cc/Bcc with
@@ -231,7 +247,10 @@ SSE events: `mail.message` (new message: thread id, account id, snippet), `mail.
 - Credentials AES-256-GCM at rest, key outside the DB, never serialized to clients.
 - All HTML (inbound bodies, signatures, templates, compose payloads) sanitized server-side
   with one shared sanitizer profile; `cid:` URLs rewritten to authenticated routes at ingest.
-- Sandboxed-iframe rendering; remote content blocked until explicitly loaded per thread.
+- Sandboxed-iframe rendering (`allow-same-origin` plus the two popup flags — never
+  `allow-scripts`/`allow-forms`/`allow-top-navigation`/`allow-modals`; see the Frontend section
+  for both rulings and for why the sanitizer's `rel="noopener noreferrer"` anchor transform is
+  load-bearing); remote content blocked until explicitly loaded per thread.
 - Send restricted to the account owner; attachment downloads authenticated; account settings
   readable only by the owner.
 - Users may point the sync at arbitrary hosts (inherent to an IMAP client); connections use

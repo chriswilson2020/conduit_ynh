@@ -222,6 +222,14 @@ export function sanitizeMailHtml(html: string, options: SanitizeMailHtmlOptions 
     // the img-src edge-case tests below.
     allowedSchemesByTag: { img: ["http", "https", ATTACHMENT_PLACEHOLDER_SCHEME] },
     transformTags: {
+      // LOAD-BEARING since the popup ruling (coordinator, 20 Aug): the
+      // conversation's iframe sandbox now grants allow-popups and
+      // allow-popups-to-escape-sandbox (web: MESSAGE_FRAME_SANDBOX), so
+      // `target="_blank"` actually opens a tab -- and `rel="noopener
+      // noreferrer"` is what keeps that tab from reaching back through
+      // window.opener or leaking a referrer. It was belt-and-braces while the
+      // sandbox blocked popups outright; it is now the mechanism. Do not relax
+      // it without revisiting that ruling.
       a: sanitizeHtml.simpleTransform("a", { rel: "noopener noreferrer", target: "_blank" }, true),
       img: transformImg(options.cidMap),
     },

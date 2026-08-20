@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate, useSearch } from "@tanstack/react-router";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { useMailAccounts } from "../queries";
 import { Composer } from "../components/mail/composer";
 import { Conversation } from "../components/mail/conversation";
@@ -28,7 +28,7 @@ export function InboxPage() {
   const { thread: selectedId } = useSearch({ from: "/mail" });
   const { data: accounts } = useMailAccounts();
 
-  const [accountId, setAccountId] = useState(ALL_ACCOUNTS);
+  const [accountChoice, setAccountChoice] = useState(ALL_ACCOUNTS);
   const [unread, setUnread] = useState(false);
   const [unlinked, setUnlinked] = useState(false);
   const [archived, setArchived] = useState(false);
@@ -43,6 +43,21 @@ export function InboxPage() {
       .map((account) => ({ id: account.id, label: account.label, email: account.email })),
     ...(accounts?.others ?? []),
   ];
+
+  // The picked account, but only while it is still one of the options: an
+  // account archived in another tab (or by another user) drops out of the list
+  // above, and a filter that survived that would be an invisible one -- an
+  // empty inbox with nothing on screen to explain it. Derived rather than
+  // reset from an effect, so there is never a render (or a fetch) using the
+  // stranded id. The picker itself renders this value, so the trigger cannot
+  // show a label that no longer exists either.
+  const accountId = filterAccounts.some((account) => account.id === accountChoice)
+    ? accountChoice : ALL_ACCOUNTS;
+
+  // Assumed true until the accounts actually arrive: "add a mail account"
+  // must not flash on screen while the list is still loading.
+  const noActiveAccount = accounts !== undefined
+    && !accounts.own.some((account) => account.archivedAt === null);
 
   // undefined rather than false for the three flags: an absent filter is not
   // the same query as an explicitly-false one, and keeping them out of the
@@ -73,7 +88,7 @@ export function InboxPage() {
           <div className="flex flex-wrap items-center gap-2">
             {filterAccounts.length > 1 && (
               <div className="w-48">
-                <Select value={accountId} onValueChange={setAccountId}>
+                <Select value={accountId} onValueChange={setAccountChoice}>
                   <SelectTrigger ariaLabel="Account" testId="filter-account">
                     <SelectValue />
                   </SelectTrigger>
@@ -95,7 +110,19 @@ export function InboxPage() {
             filters={filters}
             onSelect={select}
             selectedId={selectedId ?? null}
-            emptyLabel={archived ? "No archived conversations" : "No conversations"}
+            // An inbox with no mail account is not an empty inbox, it is an
+            // unconfigured one (spec: "Empty state points at Settings ->
+            // Mail"), and that reading beats the archived/unfiltered wording:
+            // with no account there is nothing to have archived either.
+            emptyLabel={noActiveAccount ? (
+              <span data-testid="inbox-no-account">
+                No mail account yet.{" "}
+                <Link to="/settings/mail" className="font-medium text-slate-900 underline hover:text-slate-700">
+                  Add one in Settings {"\u2192"} Mail
+                </Link>{" "}
+                to start syncing your inbox.
+              </span>
+            ) : archived ? "No archived conversations" : "No conversations"}
           />
         </div>
 

@@ -502,26 +502,39 @@ function normalizeAddress(value: string): string {
  * minus the addresses of THIS INSTALLATION'S OWN mail accounts and minus
  * anyone already in `to`.
  *
- * Dropping our own addresses is the correctness-critical half. Every account
- * address is excluded, not just the one the message arrived through: a thread
- * can be visible in two of the user's mailboxes at once (that is exactly what
- * mailThreadListItemSchema's `accountIds` array is for), and a reply-all that
- * cc'd the user's other mailbox would send them a copy of their own reply --
- * and, worse, feed it straight back into the CRM as an inbound message on the
- * same thread. The comparison is case-insensitive and trimmed because the
- * local part's case is preserved by every mail server on earth and matched by
- * none of them, and because header addresses arrive with whatever whitespace
- * the sender's client left on them.
+ * THE OWN-ADDRESS EXCLUSION APPLIES TO THE REPLY-ALL EXTRAS, NOT TO THE
+ * PRIMARY RECIPIENT. It exists to stop a reply-all cc'ing a mailbox this CRM
+ * itself syncs: that would mail the user a copy of their own reply and, worse,
+ * feed it back in as an inbound message on the same thread. It must never
+ * decide WHO THE REPLY IS TO. A colleague whose mailbox is also synced here is
+ * a perfectly ordinary correspondent, and filtering them out of `to` left
+ * internal mail with no recipient at all and a disabled Send button. The one
+ * place it still applies to `to` is our OWN outbound message's original To --
+ * replying to a conversation we started must not address ourselves -- and even
+ * there, an empty result falls back to the sender rather than handing back
+ * nothing.
+ *
+ * The comparison is case-insensitive and trimmed because the local part's case
+ * is preserved by every mail server on earth and matched by none of them, and
+ * because header addresses arrive with whatever whitespace the sender's client
+ * left on them.
  */
 export function replyRecipients(
   message: ReplySource,
   options: { all: boolean; ownAddresses: readonly string[] },
 ): ReplyRecipients {
   const own = new Set(options.ownAddresses.map(normalizeAddress));
+  const sender: ComposerRecipient = { address: message.fromAddr, name: message.fromName ?? null };
   const primary: ComposerRecipient[] = message.direction === "inbound"
-    ? [{ address: message.fromAddr, name: message.fromName ?? null }]
-    : message.toAddrs.map((address) => ({ address: address.address, name: address.name ?? null }));
-  const to = dedupeRecipients(primary.filter((entry) => !own.has(normalizeAddress(entry.address))));
+    ? [sender]
+    : message.toAddrs
+      .map((address) => ({ address: address.address, name: address.name ?? null }))
+      .filter((entry) => !own.has(normalizeAddress(entry.address)));
+  // Safety net: a reply with nobody in To is a dead end for the user (the
+  // composer's Send is disabled on an empty To), so the sender stands in --
+  // even when the sender is us, which is the honest answer for a note we sent
+  // to ourselves and something the user can edit.
+  const to = dedupeRecipients(primary.length > 0 ? primary : [sender]);
   if (!options.all) return { to, cc: [] };
 
   const taken = new Set(to.map((entry) => normalizeAddress(entry.address)));
@@ -611,6 +624,40 @@ export function forwardBody(
 // ---------------------------------------------------------------------------
 
 /**
+ * The `sandbox` attribute for a message body's iframe. A constant, not a
+ * literal in the component, so the flags have one place to be read, reviewed
+ * and tested.
+ *
+ * `allow-same-origin` (coordinator ruling, 20 Aug): an EMPTY sandbox gives the
+ * frame an opaque origin, so SameSite cookies are not attached to its
+ * subresource loads and the SSOwat proxy in front of this app bounces the
+ * cookieless inline-image requests to its login page -- inline `cid:` images
+ * would simply never render. Signed attachment URLs would avoid that but need
+ * SSOwat `skipped_uris` packaging changes.
+ *
+ * `allow-popups` + `allow-popups-to-escape-sandbox` (coordinator ruling,
+ * 20 Aug, amending the above): a link in a message opens in a new tab, the way
+ * it does in every mail client. Without the pair the sanitizer's own
+ * `target="_blank"` is inert and links do nothing at all, which reads as a
+ * broken app rather than as a security posture. The `-to-escape-sandbox` half
+ * is what makes the opened tab an ORDINARY tab instead of one that inherits
+ * these flags -- inheriting them would hand a hostile message a same-origin,
+ * unsandboxed-by-CSP document to work with.
+ *
+ * The opened tab cannot reach back through `window.opener`, because the
+ * ingest-time sanitizer stamps `rel="noopener noreferrer"` on every anchor
+ * (api: mail-content.ts's transformTags) -- with the popup flags on, that
+ * transform is load-bearing rather than belt-and-braces.
+ *
+ * WHAT IS DELIBERATELY ABSENT, and must never be added:
+ * `allow-scripts` (the whole basis for granting the frame this app's origin),
+ * `allow-forms` (a message could POST to the app as the user),
+ * `allow-top-navigation` (a message could navigate the CRM out from under
+ * them), `allow-modals` (a message could hold the tab with a dialog).
+ */
+export const MESSAGE_FRAME_SANDBOX = "allow-same-origin allow-popups allow-popups-to-escape-sandbox";
+
+/**
  * The Content-Security-Policy injected into a message body's iframe.
  *
  * Default state: nothing loads except images from this app's own origin (the
@@ -624,12 +671,15 @@ export function forwardBody(
  * and it stays off until a human asks, because a remote image in a mail is a
  * read receipt for the sender.
  *
- * This function must never emit anything resembling `allow-scripts` -- the
- * sandbox attribute is `allow-same-origin` alone (see MessageFrame, and the
- * coordinator's 20 Aug ruling recorded in the plan): scripts stay blocked by
- * the sandbox AND by this policy, which is what makes it acceptable to give
- * the frame the app's own origin so that cookie-authenticated inline images
- * load through the SSOwat proxy.
+ * This function must never emit anything resembling `allow-scripts`. Scripts
+ * are blocked twice over -- by MESSAGE_FRAME_SANDBOX above, which grants no
+ * `allow-scripts`, and by this policy's `default-src 'none'` -- and that
+ * doubling is what makes it acceptable to give the frame the app's own origin
+ * so cookie-authenticated inline images load through the SSOwat proxy.
+ *
+ * Note also what this policy does NOT emit: a `sandbox` directive. A CSP
+ * `sandbox` re-imposes sandboxing from inside the document and would drop the
+ * popup flags the attribute grants, breaking message links again.
  */
 export function messageFrameCsp(origin: string, options: { remoteImages: boolean }): string {
   const img = ["data:", "'self'", ...(origin === "" ? [] : [origin])];

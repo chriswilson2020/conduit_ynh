@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { messageFrameCsp, messageFrameSrcdoc } from "./mail-lib";
+import { MESSAGE_FRAME_SANDBOX, messageFrameCsp, messageFrameSrcdoc } from "./mail-lib";
 
 export interface MessageFrameProps {
   /** The message's body_html, as the API served it: already sanitized at
@@ -13,15 +13,14 @@ export interface MessageFrameProps {
 /**
  * One message body, isolated in an iframe.
  *
- * THE SANDBOX IS `allow-same-origin`, AND NOTHING ELSE. Never add
- * `allow-scripts` (coordinator ruling, 20 Aug; the plan and the spec's
- * Frontend section both carry the reasoning): an EMPTY sandbox would give the
- * frame an opaque origin, its subresource loads would carry no SameSite
- * cookies, and SSOwat would bounce the cookieless inline-image requests to its
- * login page -- so inline images would never render. Same-origin plus no
- * scripts plus the injected CSP (mail-lib's messageFrameCsp) is the accepted
- * trade, and it is why GET /api/mail/attachments/:id/inline is an ordinary
- * authenticated route rather than a signed one.
+ * THE SANDBOX IS mail-lib's MESSAGE_FRAME_SANDBOX -- same-origin plus the two
+ * popup flags, and NEVER `allow-scripts` (coordinator rulings, 20 Aug; that
+ * constant's doc comment, the plan and the spec's Frontend section carry the
+ * full reasoning). Same-origin is what makes cookie-authenticated inline
+ * images load through SSOwat, and is why GET /api/mail/attachments/:id/inline
+ * is an ordinary authenticated route rather than a signed one; no scripts plus
+ * the injected CSP (mail-lib's messageFrameCsp) is what makes granting the
+ * frame this app's origin acceptable.
  *
  * SIZING IS FIXED, deliberately. Auto-sizing an iframe to its content needs a
  * script INSIDE the frame to measure and post the height out, and there are no
@@ -29,11 +28,13 @@ export interface MessageFrameProps {
  * longer than that scrolls within it, rather than a measurement that cannot
  * exist. (The plan says the same thing: "no in-frame measurement".)
  *
- * LINKS INSIDE A MESSAGE ARE INERT in this release, as a consequence of the
- * same sandbox: the sanitizer gives every link target="_blank", and a sandbox
- * without allow-popups blocks that navigation. Opening mail links is a
- * separate decision (allow-popups widens what a hostile message can do), not
- * something to slip in under a rendering component.
+ * LINKS INSIDE A MESSAGE OPEN IN A NEW TAB, like any mail client's: the
+ * sanitizer gives every anchor `target="_blank"` and `rel="noopener
+ * noreferrer"`, and the sandbox's popup pair is what lets that target actually
+ * fire, in an ordinary tab rather than a sandboxed one. Nothing about the
+ * links is trusted -- the destination is whatever the message said -- but that
+ * is equally true of a link in any inbox, and a link that silently does
+ * nothing reads as a broken app.
  */
 export function MessageFrame({ html, remoteImages, testId }: MessageFrameProps) {
   const srcDoc = useMemo(() => {
@@ -48,7 +49,7 @@ export function MessageFrame({ html, remoteImages, testId }: MessageFrameProps) 
     <iframe
       data-testid={testId}
       title="Message body"
-      sandbox="allow-same-origin"
+      sandbox={MESSAGE_FRAME_SANDBOX}
       referrerPolicy="no-referrer"
       srcDoc={srcDoc}
       className="h-[32rem] max-h-[32rem] w-full rounded border border-slate-200 bg-white"

@@ -26,6 +26,7 @@ import {
   forwardBody,
   forwardSubject,
   mergeThreadPage,
+  MESSAGE_FRAME_SANDBOX,
   messageFrameCsp,
   messageFrameSrcdoc,
   NO_SUBJECT_LABEL,
@@ -544,6 +545,38 @@ describe("replyRecipients", () => {
     const { to } = replyRecipients(message, { all: false, ownAddresses: [] });
     expect(to).toEqual([{ address: "alice@example.com", name: "Alice" }]);
   });
+
+  // The exclusion decides who is CC'd, never who the reply is TO. A colleague
+  // whose mailbox this CRM also syncs is an ordinary correspondent, and
+  // filtering them out of To left internal mail unaddressed (and Send
+  // disabled).
+  it("replies to a sender whose own mailbox this installation syncs", () => {
+    const internal = {
+      ...message,
+      fromAddr: "colleague@corp.example", fromName: "Colleague",
+      toAddrs: [{ address: "me@corp.example", name: "Me" }],
+      ccAddrs: [],
+    };
+    const own = ["me@corp.example", "colleague@corp.example"];
+    expect(replyRecipients(internal, { all: false, ownAddresses: own }).to)
+      .toEqual([{ address: "colleague@corp.example", name: "Colleague" }]);
+    const all = replyRecipients(internal, { all: true, ownAddresses: own });
+    expect(all.to).toEqual([{ address: "colleague@corp.example", name: "Colleague" }]);
+    // ...and the extras are still filtered: our own mailbox is not cc'd.
+    expect(all.cc).toEqual([]);
+  });
+
+  it("falls back to the sender when our own message went only to ourselves", () => {
+    const noteToSelf = {
+      ...message,
+      direction: "outbound" as const,
+      fromAddr: "me@corp.example", fromName: "Me",
+      toAddrs: [{ address: "me@corp.example", name: "Me" }],
+      ccAddrs: [],
+    };
+    expect(replyRecipients(noteToSelf, { all: false, ownAddresses: own }).to)
+      .toEqual([{ address: "me@corp.example", name: "Me" }]);
+  });
 });
 
 describe("replySubject / forwardSubject", () => {
@@ -617,14 +650,41 @@ describe("messageFrameCsp", () => {
       .toBe("default-src 'none'; img-src data: 'self'; style-src 'unsafe-inline'");
   });
 
-  // The sandbox is allow-same-origin and nothing else (plan, 20 Aug ruling):
-  // no policy this builder emits may ever loosen script execution.
+  // Scripts are blocked by the sandbox (which grants no allow-scripts) AND by
+  // this policy; no policy this builder emits may ever loosen that.
   it("never emits a script source of any kind", () => {
     for (const remoteImages of [true, false]) {
       const csp = messageFrameCsp("https://crm.example", { remoteImages });
       expect(csp).toContain("default-src 'none'");
       expect(csp).not.toMatch(/allow-scripts|script-src|unsafe-eval/);
     }
+  });
+
+  // A CSP `sandbox` directive would re-impose sandboxing from inside the
+  // document and drop the popup flags the ATTRIBUTE grants, breaking every
+  // link in every message (see MESSAGE_FRAME_SANDBOX).
+  it("never emits a sandbox directive", () => {
+    for (const remoteImages of [true, false]) {
+      expect(messageFrameCsp("https://crm.example", { remoteImages })).not.toContain("sandbox");
+    }
+  });
+});
+
+describe("MESSAGE_FRAME_SANDBOX", () => {
+  it("grants same origin and both popup flags", () => {
+    expect(MESSAGE_FRAME_SANDBOX).toContain("allow-same-origin");
+    expect(MESSAGE_FRAME_SANDBOX).toContain("allow-popups");
+    expect(MESSAGE_FRAME_SANDBOX).toContain("allow-popups-to-escape-sandbox");
+  });
+
+  // The four that would turn a rendered message into an actor on this app's
+  // own origin: run code, submit a form as the user, navigate the CRM out from
+  // under them, or hold the tab with a dialog.
+  it("never grants scripts, forms, top navigation or modals", () => {
+    expect(MESSAGE_FRAME_SANDBOX).not.toMatch(/allow-scripts/);
+    expect(MESSAGE_FRAME_SANDBOX).not.toMatch(/allow-forms/);
+    expect(MESSAGE_FRAME_SANDBOX).not.toMatch(/allow-top-navigation/);
+    expect(MESSAGE_FRAME_SANDBOX).not.toMatch(/allow-modals/);
   });
 });
 

@@ -401,10 +401,11 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
 
   // What a message body's rewritten cid: images point at (see
   // mail-content.ts's resolveAttachmentUrls). An ordinary authenticated
-  // same-origin route: the conversation iframe renders with
-  // sandbox="allow-same-origin" and no allow-scripts, so subresource loads
-  // carry the session cookie and reach this route through the SSOwat proxy
-  // the way any other request does.
+  // same-origin route: the conversation iframe's sandbox grants
+  // allow-same-origin (and the two popup flags, but never allow-scripts --
+  // see the web package's MESSAGE_FRAME_SANDBOX), so subresource loads carry
+  // the session cookie and reach this route through the SSOwat proxy the way
+  // any other request does.
   app.get("/api/mail/attachments/:id/inline", async (request, reply) => {
     if (requireUser(request, reply) === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
