@@ -1,0 +1,155 @@
+# Conduit Phase 4.1 — IMAP folders and bulk mail actions
+
+## Context
+
+Phase 4 shipped as v0.5.0: the CRM inbox syncs INBOX + Sent per account, read-mostly (the only
+write-back is the `\Seen` flag). Chris's first real-use requests, the same day: see his IMAP
+folders (sieve-filed mail is currently invisible), and select multiple conversations to delete
+or archive. Delete/archive means the CRM starts MOVING messages on the server — a deliberate
+capability step beyond v0.5.0's read-mostly posture. Ships as v0.6.0.
+
+Decisions taken with Chris in the 4.1 brainstorm:
+
+| Decision | Choice |
+|---|---|
+| Folder scope | **All folders except Junk/Trash by default, with a per-account picker.** Discovery via IMAP LIST; a Settings checklist can include/exclude any folder (Junk/Trash opt-in). |
+| Delete | **IMAP MOVE to the account's Trash folder.** Real mail-client semantics; the server's retention owns actual destruction. The CRM never expunges, and the message row persists (`folder` becomes the Trash name) — archive-not-delete holds: the CRM destroys nothing. |
+| Archive | **IMAP MOVE to the account's Archive folder.** Sticks across every mail client. The v0.5.0 CRM-side thread archive remains as a separate, purely-CRM state, renamed **"Hide in CRM"** in the UI so the two cannot be confused. |
+| Selection | **Thread-level multi-select in the list** (checkboxes + shift-click). Actions apply to the selected threads' messages IN THE CURRENT FOLDER VIEW only. Per-message selection inside a conversation is deferred. |
+
+## Data model (migration 0005, additive)
+
+- `mail_account_folders` — id, `account_id` FK NOT NULL, `folder` text NOT NULL (the exact
+  IMAP mailbox name, UTF-7 already decoded by imapflow), `special_use` text NULL CHECK
+  (`archive`|`drafts`|`junk`|`sent`|`trash`) (from SPECIAL-USE attributes, name-heuristic
+  fallback), `sync_enabled` boolean NOT NULL (default set at discovery: false for
+  junk/trash, true otherwise), `selectable` boolean NOT NULL default true (`\Noselect`
+  folders are listed but never synced), `last_discovered_at` timestamptz NOT NULL,
+  timestamps; UNIQUE (account_id, folder). Rows are never deleted: a folder that vanishes
+  from LIST keeps its row (and its messages keep their history) but is marked by
+  `last_discovered_at` going stale and is dropped from the sync walk and the UI.
+- `mail_accounts` — gains `trash_folder` text NULL and `archive_folder` text NULL
+  (resolved automatically from special_use at discovery when NULL; user-overridable in
+  Settings; a bulk action against an account whose target folder cannot be resolved fails
+  that account's threads with an explanatory per-thread error rather than guessing).
+- `mail_folder_state` unchanged (it is already keyed by (account, folder) and generalises
+  as-is). `sent_folder` on mail_accounts unchanged (APPEND target; discovery marks it
+  special_use=sent when they agree).
+- No new indexes expected beyond UNIQUE; the existing (account_id, folder, imap_uid) index
+  serves the folder-scoped reads. Confirm with EXPLAIN during implementation (house rule:
+  hand-written indexes carry a named query).
+
+## Folder discovery & classification
+
+Each AccountSync pass begins with LIST (imapflow `list()`, which surfaces SPECIAL-USE
+attributes where the server supports RFC 6154 — Dovecot does). Upsert into
+`mail_account_folders`; new folders get the default `sync_enabled` per classification.
+Classification precedence: SPECIAL-USE attribute; else case-insensitive name heuristics
+(`trash|deleted`, `junk|spam`, `archive`, `drafts`, `sent`) on the last path segment; else
+none. `trash_folder`/`archive_folder` on the account are filled from classification when
+NULL. Discovery is cheap (one LIST per pass) and is what keeps the picker current.
+
+## Sync walk generalisation
+
+`foldersOf(account)` changes from the INBOX+sent pair to: all `sync_enabled AND selectable`
+folders from `mail_account_folders` (INBOX and the sent folder are always walked regardless
+of the flag — the send path and direction detection depend on them; the picker shows them
+locked on). IDLE remains INBOX-only. Cursor/UIDVALIDITY/flag-reconcile semantics are
+unchanged per folder. Backfill windows apply per folder on first sync (a folder enabled
+later backfills from its enablement per `backfill_days`, same as a new account).
+Cross-folder duplicate sightings already collapse via UNIQUE (account_id, message_id) with
+`folder`/`imap_uid` reflecting the latest sighting — unchanged, and it is what makes MOVE
+convergence free (below).
+
+## Move write-back (`services/mail-move.ts` + sync-engine addition)
+
+`ImapClient` gains `move(folder, uids, targetFolder)` (imapflow `messageMove`; throw on
+falsy return per the established falsy-return discipline). `AccountSync` exposes
+`moveMessages(folder, uids, targetFolder)` queued on the existing serial loop — same
+contract as `markSeen`: runs between passes, fast-rejects with `SyncUnavailableError`
+during backoff, never overlaps a pass.
+
+Move service semantics, per thread, per account:
+1. Collect the thread's messages whose `folder` equals the CURRENT VIEW's folder (the
+   selection-granularity ruling) and whose `imap_uid` is NOT NULL (rows awaiting
+   reconciliation are skipped and reported per-thread — rare, self-heals next pass).
+2. Optimistic DB update inside one transaction: `folder` = target, `imap_uid` = NULL,
+   `updated_at` bumped; SSE hints published after commit.
+3. Queue the IMAP MOVE (grouped per account/folder, chunked per the existing UID_CHUNK).
+   MOVE failure is caught and logged and the DB rows are REVERTED by a compensating update
+   (same transaction shape) with the failure surfaced in the bulk result — the CRM view
+   must never claim a move the server refused. (Failure after partial chunk success leaves
+   the succeeded chunk moved — the next pass's re-sighting converges either way; the
+   compensation applies only to unsent chunks. Comment this honestly.)
+4. The next pass of the target folder re-sights the messages, and the (account_id,
+   message_id) upsert restores `imap_uid` — the Phase 4 reconciliation machinery, unchanged.
+   If the target folder is not sync-enabled (Trash by default), the rows simply keep
+   `folder` = Trash with NULL uid: visible under a Trash filter, never updated again, never
+   deleted.
+
+Threads are not archived CRM-side by a server move: thread visibility in folder views is
+derived from message folders. A thread whose messages have ALL left synced folders
+naturally drops out of every folder view; it remains reachable via record Mail tabs,
+search, and the "Hide in CRM" state remains orthogonal.
+
+## Bulk API (`routes/mail.ts` additions)
+
+- `GET /api/mail/accounts/:id/folders` — the picker's list (name, special_use, sync_enabled,
+  selectable, locked flags for INBOX/sent).
+- `PATCH /api/mail/accounts/:id/folders` — toggle sync_enabled (owner-only; INBOX/sent
+  locked; enabling triggers `syncNow`).
+- `POST /api/mail/threads/bulk` — `{ threadIds[], folder, action: "trash"|"archive"|"hide" }`
+  (folder = the view the selection was made in; `hide` is the existing CRM archive applied
+  in bulk). Server groups by account, applies the move service, returns per-thread results
+  `{ threadId, ok, error? }` — an account in backoff or with an unresolvable target folder
+  fails ITS threads with a message; others proceed. Cap threadIds at 200 per request.
+- Thread list gains a `folder` filter (threads with >= 1 message in that folder); the
+  unread-count endpoint gains an optional per-folder variant for sidebar badges (one grouped
+  query, not N).
+
+## Frontend
+
+- **Folder sidebar** on the inbox (per-account sections when multiple accounts; folder rows
+  with unread badges; INBOX default view; Trash/Junk appear when sync-enabled OR when the
+  CRM holds rows in them — moves create such rows even for unsynced Trash). Folder
+  choice feeds the thread-list `folder` filter and is part of the accumulation filter key.
+- **Multi-select**: checkbox per row (visible on hover/when any selected), shift-click
+  ranges, select-all-on-page; a bulk-action bar (Archive / Trash / Hide in CRM) with
+  per-thread failure toasts from the bulk result. Selection clears on filter/folder change.
+- **Settings → Mail accounts**: per-account folder checklist (from the folders endpoint;
+  INBOX/sent locked on; Junk/Trash default off), and editable Trash/Archive folder
+  overrides with the auto-detected values as placeholders.
+- **Conversation view**: single-thread Archive/Trash buttons using the same bulk endpoint
+  (one thread); the existing CRM archive control renamed "Hide in CRM" everywhere.
+- Message rows moved to Trash render with a subtle "in Trash" chip in conversations.
+
+## Testing
+
+- Unit: folder classification matrix (SPECIAL-USE, name heuristics, precedence, Noselect);
+  discovery upsert/staleness; walk generalisation (enabled/locked/selectable); move service
+  (optimistic update, compensation on failure, NULL-uid skip, chunking, per-account
+  grouping); bulk route (authz, partial failure shape, cap); folder filter + per-folder
+  unread counts; sidebar/selection pure logic (range selection, filter-key integration) in
+  mail-lib with tests.
+- Fake ImapClient gains list/move; the state-machine tests cover a move racing a pass
+  (serialisation makes it sequential — assert it) and re-sighting convergence after a move.
+- CI integration (the Task 8 suite): real LIST with SPECIAL-USE against Dovecot; real
+  messageMove + re-sighting; move to a nonexistent folder → readable error.
+- e2e: extend the mail journey — enable an extra folder via the picker, see its seeded
+  message appear under the folder filter, multi-select two threads, Archive them, assert
+  they land in the Archive folder via a direct IMAP check and vanish from the INBOX view.
+- Suite baseline at start: 1262 unit + 26 integration + 42 e2e, green.
+
+## Rollout
+
+Single release: bump to v0.6.0 -> CI gate -> ff-merge -> tag -> manifest sha -> Chris runs
+the one sudo yunohost upgrade command. Live verification against Chris's real mailbox: his
+sieve-filed folders appear after the upgrade's first pass; archive two threads from the CRM
+and see them move in his other mail client; trash one and find it in Trash there.
+
+## Out of scope (deferred, not rejected)
+
+Per-message selection inside conversations; moving mail INTO arbitrary folders (only
+Trash/Archive targets in v0.6.0); folder creation/rename/delete; drafts sync; cross-account
+bulk selections spanning different folder names are supported only via the per-account
+grouping (no unified "All mail" bulk view yet); Junk training (spam reporting).
