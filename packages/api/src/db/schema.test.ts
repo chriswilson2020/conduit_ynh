@@ -154,8 +154,9 @@ describe("mail schema (0004)", () => {
       }).returning();
       const [project] = await scratch.db.insert(projects).values({ name: "Rollout" }).returning();
 
-      // Upgrade: apply the real, full migrations folder. 0004 is the only
-      // pending migration (0000-0003 are already recorded as applied).
+      // Upgrade: apply the real, full migrations folder. With 0005 now in
+      // the journal too, this applies both 0004 and 0005 in one go (0000-
+      // 0003 are already recorded as applied).
       await migrate(scratch.db, { migrationsFolder: realFolder });
 
       // The pre-existing data survived the upgrade untouched.

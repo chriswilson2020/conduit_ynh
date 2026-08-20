@@ -384,9 +384,9 @@ export const mailAccountFolders = pgTable("mail_account_folders", {
   // first sight DEPENDS on the row's own classification (false for
   // junk/trash, true otherwise -- spec) rather than being one fixed value,
   // so it can only be an app-level default computed by the discovery service
-  // (Task 2) at insert time. Same reasoning as mail_accounts.currency-style
-  // fields elsewhere in this file (see deals.currency's comment above) --
-  // config the app decides, not a constant baked into the DDL.
+  // (Task 2) at insert time. Same reasoning as deals.currency-style fields
+  // elsewhere in this file (see deals.currency's comment above) -- config
+  // the app decides, not a constant baked into the DDL.
   syncEnabled: boolean("sync_enabled").notNull(),
   // \Noselect folders (a pure hierarchy separator, no messages of its own)
   // are still listed -- for the picker and for classification -- but never
