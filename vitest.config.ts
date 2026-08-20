@@ -5,9 +5,13 @@ export default defineConfig({
   resolve: {
     alias: {
       // Resolve the workspace package to its SOURCE, not its build output.
-      // packages/shared/dist is gitignored, so remote.sh's rsync --delete removes it
-      // from the server and every test run would otherwise need a build first. tsc -b
-      // still typechecks the real dist entrypoints, so the built artefact is covered.
+      // remote.sh excludes dist from its rsync (a locally-built dist can be stale
+      // relative to what's being synced -- see that script's header comment), so
+      // packages/shared/dist exists on the server only once its own `npm run build`
+      // has produced it, and never as a side effect of a sync. Resolving to source
+      // here means a test run never depends on that having happened. tsc -b still
+      // typechecks the real dist entrypoints, so the built artefact is covered by
+      // typecheck even though vitest itself never touches it.
       "@conduit/shared": fileURLToPath(new URL("./packages/shared/src/index.ts", import.meta.url)),
     },
   },
