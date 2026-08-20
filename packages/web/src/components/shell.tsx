@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Link } from "@tanstack/react-router";
+import { Link, useRouterState } from "@tanstack/react-router";
 import { GlobalSearch } from "./search";
 import { useSseInvalidation } from "./sse";
 
@@ -15,6 +15,13 @@ export function Shell({ children }: { children: ReactNode }) {
   // RootComponent), not per-page: one EventSource per browser tab, live for
   // as long as the app is open, not re-opened on every navigation.
   useSseInvalidation();
+
+  // The Settings entry links at one of its two tabs but must stay highlighted
+  // on both, and activeProps only knows about the link's own target -- so its
+  // active state is computed from the path instead. `includes` rather than
+  // `startsWith`: at a subpath install the pathname is prefixed with the
+  // app's base (see api.ts's basePath).
+  const inSettings = useRouterState({ select: (state) => state.location.pathname.includes("/settings") });
 
   return (
     <div data-testid="shell" className="flex min-h-screen bg-slate-50">
@@ -38,6 +45,9 @@ export function Shell({ children }: { children: ReactNode }) {
           </Link>
           <Link to="/gantt" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
             Gantt
+          </Link>
+          <Link to="/settings/mail" className={inSettings ? activeNavLinkClass : navLinkClass}>
+            Settings
           </Link>
         </nav>
       </aside>

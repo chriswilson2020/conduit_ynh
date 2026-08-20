@@ -100,6 +100,22 @@ export async function deleteRequest(path: string): Promise<void> {
 }
 
 /**
+ * DELETE that answers with a body, rather than the bare 204 deleteRequest
+ * above covers: clearing a mail thread's link
+ * (DELETE /api/mail/threads/:id/links/:kind) returns the UPDATED thread, the
+ * same shape its POST counterpart does, so the caller can invalidate off the
+ * response instead of refetching to find out what changed. Error handling
+ * mirrors sendJson.
+ */
+export async function deleteJson<T>(path: string): Promise<T> {
+  const response = await fetch(apiUrl(path), { method: "DELETE", headers: { Accept: "application/json" } });
+  if (!response.ok) {
+    throw await toApiError(response, `DELETE ${path} failed with ${response.status}`);
+  }
+  return (await response.json()) as T;
+}
+
+/**
  * POST a multipart/form-data body (file uploads). Deliberately does not set
  * Content-Type: fetch/the browser derives it from the FormData, including the
  * multipart boundary -- setting it manually would omit that boundary and the

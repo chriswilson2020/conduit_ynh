@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseDecimal, todayLocalIso } from "./lib";
+import { parseDecimal, relativeTime, todayLocalIso } from "./lib";
 
 describe("parseDecimal", () => {
   it("parses a plain dot-decimal amount", () => {
@@ -25,6 +25,42 @@ describe("parseDecimal", () => {
 // every caller (task-board.tsx today, My Tasks/the Gantt's today line later)
 // relies on: a plain YYYY-MM-DD string that round-trips through a date-only
 // comparison/parse.
+// The injected `now` is what makes these deterministic -- see relativeTime's
+// own doc comment for why the clock is a parameter rather than read inside.
+describe("relativeTime", () => {
+  const now = new Date("2026-08-20T12:00:00.000Z");
+
+  it("reads a fresh timestamp as 'just now'", () => {
+    expect(relativeTime("2026-08-20T11:59:30.000Z", now)).toBe("just now");
+  });
+
+  it("counts whole minutes", () => {
+    expect(relativeTime("2026-08-20T11:45:00.000Z", now)).toBe("15m ago");
+  });
+
+  it("counts whole hours", () => {
+    expect(relativeTime("2026-08-20T09:00:00.000Z", now)).toBe("3h ago");
+  });
+
+  it("counts whole days up to a week", () => {
+    expect(relativeTime("2026-08-18T12:00:00.000Z", now)).toBe("2d ago");
+  });
+
+  it("falls back to a date beyond a week", () => {
+    // The exact rendering is locale-dependent; what this pins is that it is
+    // no longer a relative label.
+    expect(relativeTime("2026-06-01T12:00:00.000Z", now)).not.toMatch(/ago$/);
+  });
+
+  it("treats a future timestamp as 'just now' rather than a negative age", () => {
+    expect(relativeTime("2026-08-20T12:05:00.000Z", now)).toBe("just now");
+  });
+
+  it("returns the placeholder for an unparseable value", () => {
+    expect(relativeTime("not a date", now)).toBe(String.fromCharCode(0x2014));
+  });
+});
+
 describe("todayLocalIso", () => {
   it("returns a zero-padded YYYY-MM-DD string", () => {
     expect(todayLocalIso()).toMatch(/^\d{4}-\d{2}-\d{2}$/);

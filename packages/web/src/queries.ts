@@ -3,11 +3,20 @@ import {
   companySchema,
   contactSchema,
   dealSchema,
+  emailTemplateSchema,
   eventSchema,
   fileMetaSchema,
   funnelRowSchema,
   ganttPayloadSchema,
   listResponseSchema,
+  mailAccountListSchema,
+  mailAccountSchema,
+  mailAccountTestResultSchema,
+  mailMessageSchema,
+  mailThreadDetailSchema,
+  mailThreadListItemSchema,
+  mailThreadSchema,
+  mailUnreadCountSchema,
   meResponseSchema,
   midpoint,
   noteSchema,
@@ -25,6 +34,7 @@ import {
   type CreateCompanyInput,
   type CreateContactInput,
   type CreateDealInput,
+  type CreateEmailTemplateInput,
   type CreateNoteInput,
   type CreatePipelineInput,
   type CreateProjectInput,
@@ -32,10 +42,18 @@ import {
   type CreateTaskInput,
   type Deal,
   type GanttPayload,
+  type MailAccountCreateInput,
+  type MailAccountTestInput,
+  type MailAccountUpdateInput,
+  type MailAccountUpdatePasswordFields,
+  type MailLinkKind,
+  type MailMessage,
+  type MailThread,
   type Pipeline,
   type PipelineScope,
   type Project,
   type ProjectStatus,
+  type SendMailInput,
   type ShiftResult,
   type Stage,
   type Task,
@@ -43,12 +61,13 @@ import {
   type UpdateCompanyInput,
   type UpdateContactInput,
   type UpdateDealInput,
+  type UpdateEmailTemplateInput,
   type UpdatePipelineInput,
   type UpdateProjectInput,
   type UpdateStageInput,
   type UpdateTaskInput,
 } from "@conduit/shared";
-import { ApiError, deleteRequest, getJson, patchJson, postForm, postJson } from "./api";
+import { ApiError, deleteJson, deleteRequest, getJson, patchJson, postForm, postJson } from "./api";
 
 const companyListSchema = listResponseSchema(companySchema);
 const contactListSchema = listResponseSchema(contactSchema);
@@ -61,6 +80,8 @@ const funnelListSchema = funnelRowSchema.array();
 const projectListSchema = projectSchema.array();
 const taskListSchema = taskSchema.array();
 const taskDependencyListSchema = taskDependencySchema.array();
+const mailThreadListSchema = listResponseSchema(mailThreadListItemSchema);
+const emailTemplateListSchema = emailTemplateSchema.array();
 
 /** Builds a `?a=1&b=2` query string, dropping keys whose value is undefined. */
 function toQueryString(params: Record<string, string | number | boolean | undefined>): string {
@@ -1237,5 +1258,326 @@ export function useSearch(q: string) {
     queryFn: async () =>
       parseWith(searchResultsSchema, await getJson<unknown>(`/search?q=${encodeURIComponent(q)}`), "search results"),
     enabled: q.trim() !== "",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Mail (Phase 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every query key below is EXACTLY the key the API's own mail SSE hints
+ * publish -- ["mail-accounts"] (services/mail-accounts.ts, and mail-sync.ts's
+ * status flips), ["mail-threads"]/["mail-thread", id]/["mail-unread"]
+ * (services/mail-threads.ts's publishThreadHint and mail-ingest.ts's ingest
+ * hint), ["email-templates"] (services/mail-templates.ts) -- so components/
+ * sse.tsx's invalidation works on them unchanged, with no mail-specific case.
+ *
+ * ["search"] is the one key the mail hints deliberately do NOT carry: an
+ * ingest or a thread archive does not invalidate the global search cache
+ * server-side, exactly as in Phases 1-3, where each MUTATION HOOK lists
+ * ["search"] among its own invalidations (see useInvalidateCompany's doc
+ * comment for why it is invalidated eagerly rather than left to expire). The
+ * mail mutation hooks below follow that same division of labour.
+ */
+
+export interface MailAccountsOptions {
+  /**
+   * Polling interval, in ms, for the mounting component only.
+   *
+   * FRESHNESS CONTRACT (routes/mail.ts's GET /api/mail/accounts doc comment):
+   * `syncStats` on each own account is a set of in-process counters read at
+   * fetch time, and nothing publishes a hint when they move -- the
+   * ["mail-accounts"] hint fires on account mutations and status flips, a
+   * much rarer event. The Settings mail page owns freshness for its own view
+   * by passing an interval here; every OTHER consumer must treat this hook as
+   * an SSE-invalidated cache of the account ROWS and leave this unset.
+   */
+  refetchInterval?: number;
+}
+
+export function useMailAccounts(options: MailAccountsOptions = {}) {
+  return useQuery({
+    // Deliberately NOT keyed on the options above: a polling consumer and a
+    // non-polling one must share one cache entry (and one SSE key), the same
+    // way two useCompanies({}) callers do -- refetchInterval is an observer
+    // setting, not part of the query's identity.
+    queryKey: ["mail-accounts"],
+    queryFn: async () =>
+      parseWith(mailAccountListSchema, await getJson<unknown>("/mail/accounts"), "mail accounts"),
+    refetchInterval: options.refetchInterval,
+  });
+}
+
+// Mirrors useInvalidateCompany: ["mail-accounts"] is the list every account
+// mutation changes, and ["search"] rides along per the house convention
+// documented at the top of this section.
+function useInvalidateMailAccount() {
+  const queryClient = useQueryClient();
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: ["mail-accounts"] });
+    void queryClient.invalidateQueries({ queryKey: ["search"] });
+  };
+}
+
+export function useCreateMailAccount() {
+  const invalidate = useInvalidateMailAccount();
+  return useMutation({
+    mutationFn: async (input: MailAccountCreateInput) =>
+      parseWith(mailAccountSchema, await postJson<unknown>("/mail/accounts", input), "mail account"),
+    onSuccess: () => invalidate(),
+  });
+}
+
+/**
+ * PATCH body: settings, password fields, or both -- exactly the merge
+ * routes/mail.ts's accountPatchSchema performs. The password halves are
+ * optional and "" means KEEP THE STORED ONE (mailAccountUpdatePasswordFields
+ * Schema in @conduit/shared, and mail-accounts.ts's updateAccount); a lone
+ * `password` sets both protocols, `password`+`smtpPassword` sets them
+ * separately, which is the settings form's "SMTP differs" toggle off/on.
+ */
+export type MailAccountPatch = MailAccountUpdateInput & MailAccountUpdatePasswordFields;
+
+export function useUpdateMailAccount() {
+  const invalidate = useInvalidateMailAccount();
+  return useMutation({
+    mutationFn: async ({ id, patch }: { id: string; patch: MailAccountPatch }) =>
+      parseWith(mailAccountSchema, await patchJson<unknown>(`/mail/accounts/${id}`, patch), "mail account"),
+    onSuccess: () => invalidate(),
+  });
+}
+
+export function useArchiveMailAccount() {
+  const invalidate = useInvalidateMailAccount();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(mailAccountSchema, await postJson<unknown>(`/mail/accounts/${id}/archive`), "mail account"),
+    onSuccess: () => invalidate(),
+  });
+}
+
+export function useUnarchiveMailAccount() {
+  const invalidate = useInvalidateMailAccount();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(mailAccountSchema, await postJson<unknown>(`/mail/accounts/${id}/unarchive`), "mail account"),
+    onSuccess: () => invalidate(),
+  });
+}
+
+/**
+ * Dry-run IMAP+SMTP login. The ONLY mail mutation hook here that invalidates
+ * nothing -- mail-accounts.ts's testConnection persists no row and publishes
+ * no hint (it does not even flip `status`), so there is nothing for a cache
+ * to have gone stale about. Takes either a stored account (`{ accountId }`,
+ * optionally with field overrides) or a complete, not-yet-saved set of
+ * settings; blank password fields must be OMITTED rather than sent as "" --
+ * mailAccountTestInputSchema holds them to `.min(1)`, and an omitted password
+ * on an `accountId` test is what makes it use the stored credentials.
+ */
+export function useTestMailAccount() {
+  return useMutation({
+    mutationFn: async (input: MailAccountTestInput) =>
+      parseWith(
+        mailAccountTestResultSchema,
+        await postJson<unknown>("/mail/accounts/test", input),
+        "mail account test result",
+      ),
+  });
+}
+
+export interface MailThreadListParams {
+  accountId?: string;
+  unread?: boolean;
+  unlinked?: boolean;
+  companyId?: string;
+  contactId?: string;
+  dealId?: string;
+  projectId?: string;
+  archived?: boolean;
+  cursor?: string;
+  limit?: number;
+}
+
+// Keyset-paginated { items, nextCursor } by (last_message_at, id), like every
+// other list route behind listResponseSchema -- NOT the plain array
+// usePipelines/useProjects return.
+export function useMailThreads(params: MailThreadListParams = {}) {
+  return useQuery({
+    queryKey: ["mail-threads", params],
+    queryFn: async () => {
+      const qs = toQueryString({
+        account_id: params.accountId, unread: params.unread, unlinked: params.unlinked,
+        company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId,
+        project_id: params.projectId, archived: params.archived,
+        cursor: params.cursor, limit: params.limit,
+      });
+      return parseWith(mailThreadListSchema, await getJson<unknown>(`/mail/threads${qs}`), "mail threads list");
+    },
+  });
+}
+
+// Composite { thread, messages, dealSuggestions } response -- see
+// mailThreadDetailSchema in @conduit/shared for why the bundle is one fetch.
+export function useMailThread(id: string) {
+  return useQuery({
+    queryKey: ["mail-thread", id],
+    queryFn: async () =>
+      parseWith(mailThreadDetailSchema, await getJson<unknown>(`/mail/threads/${id}`), "mail thread"),
+    enabled: id !== "",
+  });
+}
+
+// The three keys services/mail-threads.ts's publishThreadHint publishes on
+// every thread mutation, plus ["search"] (see this section's header comment).
+function useInvalidateMailThread() {
+  const queryClient = useQueryClient();
+  return (threadId: string) => {
+    void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
+    void queryClient.invalidateQueries({ queryKey: ["mail-thread", threadId] });
+    void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
+    void queryClient.invalidateQueries({ queryKey: ["search"] });
+  };
+}
+
+export function useMarkThreadRead() {
+  const invalidate = useInvalidateMailThread();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(mailThreadSchema, await postJson<unknown>(`/mail/threads/${id}/read`), "mail thread"),
+    onSuccess: (thread: MailThread) => invalidate(thread.id),
+  });
+}
+
+export function useSetThreadLink() {
+  const invalidate = useInvalidateMailThread();
+  return useMutation({
+    mutationFn: async ({ threadId, kind, id }: { threadId: string; kind: MailLinkKind; id: string }) =>
+      parseWith(
+        mailThreadSchema,
+        await postJson<unknown>(`/mail/threads/${threadId}/links`, { kind, id }),
+        "mail thread",
+      ),
+    onSuccess: (thread: MailThread) => invalidate(thread.id),
+  });
+}
+
+export function useClearThreadLink() {
+  const invalidate = useInvalidateMailThread();
+  return useMutation({
+    mutationFn: async ({ threadId, kind }: { threadId: string; kind: MailLinkKind }) =>
+      parseWith(
+        mailThreadSchema,
+        await deleteJson<unknown>(`/mail/threads/${threadId}/links/${kind}`),
+        "mail thread",
+      ),
+    onSuccess: (thread: MailThread) => invalidate(thread.id),
+  });
+}
+
+export function useArchiveThread() {
+  const invalidate = useInvalidateMailThread();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(mailThreadSchema, await postJson<unknown>(`/mail/threads/${id}/archive`), "mail thread"),
+    onSuccess: (thread: MailThread) => invalidate(thread.id),
+  });
+}
+
+export function useUnarchiveThread() {
+  const invalidate = useInvalidateMailThread();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(mailThreadSchema, await postJson<unknown>(`/mail/threads/${id}/unarchive`), "mail thread"),
+    onSuccess: (thread: MailThread) => invalidate(thread.id),
+  });
+}
+
+/**
+ * Compose and reply (POST /api/mail/send, 201 with the stored outbound
+ * message). A send lands a new message -- and, when composing fresh, a new
+ * thread -- so it invalidates the same key family a thread mutation does,
+ * keyed on the message's own threadId. An SMTP refusal arrives as an
+ * ApiError with status 502 / code "smtp_failed" and nothing is stored, so the
+ * composer still holds the draft and can retry it as-is.
+ */
+export function useSendMail() {
+  const invalidate = useInvalidateMailThread();
+  return useMutation({
+    mutationFn: async (input: SendMailInput) =>
+      parseWith(mailMessageSchema, await postJson<unknown>("/mail/send", input), "sent mail message"),
+    onSuccess: (message: MailMessage) => invalidate(message.threadId),
+  });
+}
+
+// Unpaginated plain array (services/mail-templates.ts's listTemplates orders
+// by name), same shape usePipelines/useProjects use.
+export function useMailTemplates(params: { archived?: boolean } = {}) {
+  return useQuery({
+    queryKey: ["email-templates", params],
+    queryFn: async () => {
+      const qs = toQueryString({ archived: params.archived });
+      return parseWith(emailTemplateListSchema, await getJson<unknown>(`/mail/templates${qs}`), "email templates");
+    },
+  });
+}
+
+// Templates are SHARED (no owner column) and their SSE hint is the bare
+// ["email-templates"] key, which prefix-matches every ["email-templates",
+// params] list above.
+function useInvalidateMailTemplate() {
+  const queryClient = useQueryClient();
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: ["email-templates"] });
+    void queryClient.invalidateQueries({ queryKey: ["search"] });
+  };
+}
+
+export function useCreateMailTemplate() {
+  const invalidate = useInvalidateMailTemplate();
+  return useMutation({
+    mutationFn: async (input: CreateEmailTemplateInput) =>
+      parseWith(emailTemplateSchema, await postJson<unknown>("/mail/templates", input), "email template"),
+    onSuccess: () => invalidate(),
+  });
+}
+
+export function useUpdateMailTemplate() {
+  const invalidate = useInvalidateMailTemplate();
+  return useMutation({
+    mutationFn: async ({ id, patch }: { id: string; patch: UpdateEmailTemplateInput }) =>
+      parseWith(emailTemplateSchema, await patchJson<unknown>(`/mail/templates/${id}`, patch), "email template"),
+    onSuccess: () => invalidate(),
+  });
+}
+
+export function useArchiveMailTemplate() {
+  const invalidate = useInvalidateMailTemplate();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(emailTemplateSchema, await postJson<unknown>(`/mail/templates/${id}/archive`), "email template"),
+    onSuccess: () => invalidate(),
+  });
+}
+
+export function useUnarchiveMailTemplate() {
+  const invalidate = useInvalidateMailTemplate();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(emailTemplateSchema, await postJson<unknown>(`/mail/templates/${id}/unarchive`), "email template"),
+    onSuccess: () => invalidate(),
+  });
+}
+
+// Distinct non-archived threads holding an unseen message -- the inbox nav
+// badge (Task 10). ["mail-unread"] is published by ingest AND by every thread
+// mutation, so the badge follows both a new arrival and a mark-read without
+// polling.
+export function useUnreadMailCount() {
+  return useQuery({
+    queryKey: ["mail-unread"],
+    queryFn: async () =>
+      parseWith(mailUnreadCountSchema, await getJson<unknown>("/mail/unread-count"), "mail unread count").count,
   });
 }

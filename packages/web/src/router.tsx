@@ -14,6 +14,8 @@ import { MyTasksPage } from "./pages/my-tasks";
 import { PipelinesPage } from "./pages/pipelines";
 import { ProjectsPage } from "./pages/projects";
 import { ProjectDetailPage } from "./pages/project-detail";
+import { SettingsMailPage } from "./pages/settings-mail";
+import { SettingsTemplatesPage } from "./pages/settings-templates";
 import { TaskBoardPage } from "./pages/task-board";
 
 // Shared by both routes below that open the task drawer via a `?task=<id>`
@@ -139,6 +141,23 @@ const globalGanttRoute = createRoute({
   component: GlobalGanttPage,
 });
 
+// Settings (Phase 4) is the app's first non-record area: two sibling routes
+// under /settings, each rendering its own page inside the shared
+// SettingsLayout frame (components/settings-layout.tsx). The tabs there are
+// router Links rather than a Tabs component precisely because these are real
+// routes -- see that file's doc comment.
+const settingsMailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/mail",
+  component: SettingsMailPage,
+});
+
+const settingsTemplatesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/templates",
+  component: SettingsTemplatesPage,
+});
+
 // Rendered by the router itself (not a route) whenever the URL matches no
 // route in the tree -- a stale bookmark or a mistyped path. It renders as the
 // root route's Outlet content, i.e. inside Shell, so the sidebar/header stay
@@ -184,6 +203,8 @@ const routeTree = rootRoute.addChildren([
   projectGanttRoute,
   globalGanttRoute,
   myTasksRoute,
+  settingsMailRoute,
+  settingsTemplatesRoute,
 ]);
 
 // basePath() returns "/" both at a root install and during `vite dev` (see its
