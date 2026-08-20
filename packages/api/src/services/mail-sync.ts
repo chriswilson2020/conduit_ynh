@@ -1075,10 +1075,14 @@ export class AccountSync {
       // Servers without IDLE degrade to poll-only, silently (spec). Logged
       // ONCE, at info: this is a property of the server, not an incident.
       // The client is still dropped this once, because the same rejection is
-      // also what a dead socket looks like and a reconnect is the only way
-      // to tell the two apart -- the latch clears on the next successful
-      // connect, so a genuinely transient failure costs one poll interval of
-      // IDLE rather than disabling it forever.
+      // also what a dead socket looks like. The latch clears ONLY on recovery
+      // from a pass-level failure or a manager restart -- never on the
+      // reconnect this drop causes, since clearing there would reinstate the
+      // log-and-reconnect cycle the latch exists to remove. The cost of a
+      // false positive (a transient rejection on a server that does support
+      // IDLE) is therefore polling instead of push for the life of this
+      // AccountSync. Task 6's adapter should make this a fact rather than a
+      // heuristic by reporting "server lacks IDLE" from the capability list.
       this.idleUnsupported = true;
       this.logger.info(
         { accountId: this.accountId, err: errorText(idleError) },
