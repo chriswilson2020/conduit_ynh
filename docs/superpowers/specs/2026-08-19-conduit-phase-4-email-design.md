@@ -2,7 +2,7 @@
 
 ## Context
 
-Phases 0-3.1 are live (v0.4.1): CRM core, scoped pipelines/deals, projects/tasks and the custom
+Phases 0-3.1 are live (v0.4.4 at release time): CRM core, scoped pipelines/deals, projects/tasks and the custom
 Gantt with push-only cascade. Phase 4 delivers the email half of the original vision: an IMAP sync
 worker, a threaded CRM inbox auto-linked to contacts and deals, compose/reply via SMTP, templates
 and signatures. Ships as v0.5.0.
@@ -73,6 +73,9 @@ mail-account routes, not a crash. Ciphertext format: `v1:<iv-base64>:<tag-base64
 where data is the JSON `{imapPassword, smtpPassword}` (usually identical; the form offers one
 password field with an "SMTP differs" toggle). Credentials are never returned by any API
 response; the edit form leaves password fields blank and only overwrites when non-empty.
+Losing mail.key strands every stored IMAP/SMTP credential permanently (users re-enter passwords;
+nothing else is lost). Key rotation or restore-with-a-different-key requires a server restart
+(the key is memoised per path).
 
 ## Sync engine (`services/mail-sync.ts`)
 
@@ -97,8 +100,9 @@ operation at a time — the in-process analogue of the Phase 2/3 advisory-lock c
   script/style/iframe/form/event handlers; keep structure and inline styles) → store
   attachments via the blobs service, rewriting `cid:` URLs in the sanitized HTML to the
   authenticated attachment route → thread (below) → auto-link (below) → insert → bump thread
-  `last_message_at`/`message_count` → SSE `mail.message` event. `direction` is `outbound` when
-  `from_addr` equals the account's `email` (case-insensitive), else `inbound`.
+  `last_message_at`/`message_count` → SSE key-hint `[["mail-threads"], ["mail-thread", threadId],
+  ["mail-unread"]]`. `direction` is `outbound` when `from_addr` equals the account's `email`
+  (case-insensitive), else `inbound`.
 - **Errors**: per-account exponential backoff (1min → 32min cap), sets `status='error'` +
   `last_error`; any successful pass resets to `active`. All entry points are exception-guarded;
   a failing account can never take the server down. Reconnects on connection drop.
@@ -107,9 +111,10 @@ The manager exposes `syncNow(accountId)` for the account-created path and tests,
 disabled under `NODE_ENV=test` unless explicitly started (unit tests drive `AccountSync` with a
 fake client).
 
-**ImapClient interface**: `AccountSync` talks to a thin interface (connect, listNew, fetchFlags,
-fetchMessage, append, idle) with two implementations — `ImapflowClient` (real) and an in-memory
-fake for unit tests. This is a seam for testing, not an abstraction layer to grow.
+**ImapClient interface**: `AccountSync` talks to a thin interface (connect, disconnect, status,
+fetchNewer, fetchRaw, fetchFlags, append, addFlags, idle) with two implementations —
+`ImapflowClient` (real) and an in-memory fake for unit tests. This is a seam for testing, not an
+abstraction layer to grow.
 
 ## Threading & auto-linking (`services/mail-threading.ts`)
 
@@ -180,11 +185,16 @@ All under the existing auth. "Own account" = `mail_accounts.user_id` is the curr
   the app's own origin by linking to it.
 - `GET/POST/PATCH/archive/unarchive /api/mail/templates` — shared CRUD, archive-not-delete
   (and therefore, like accounts, an unarchive to undo it).
+- `GET /api/mail/unread-count` — `{count}` of distinct non-archived threads with an unseen
+  message; backs the nav item's unread badge.
 - Global search: the existing search endpoint gains a `mail` section querying the tsvector
   (`websearch_to_tsquery`), returning thread-grouped hits.
 
-SSE events: `mail.message` (new message: thread id, account id, snippet), `mail.thread`
-(links/read/archive changed), `mail.account` (status change — drives the settings error badge).
+SSE: the existing key-hint mechanism (`services/sse.ts`), not named events. Ingest and every
+thread mutation (read/links/archive) publish `[["mail-threads"], ["mail-thread", id],
+["mail-unread"]]`; account create/update/archive/unarchive and every sync status flip publish
+`[["mail-accounts"]]` (drives the settings error badge); template create/update/archive/unarchive
+publish `[["email-templates"]]`.
 
 ## Frontend (`packages/web`)
 
@@ -266,9 +276,10 @@ SSE events: `mail.message` (new message: thread id, account id, snippet), `mail.
   `AccountSync` state machine against the fake ImapClient (backfill resume, cursor advance,
   UIDVALIDITY reset, flag reconcile, backoff), routes/authz (owner-only account access and
   send), template substitution. All fixtures ASCII-only with `\u` escapes.
-- **CI integration**: a Dovecot container in the GitHub Actions job; integration tests drive
-  `ImapflowClient` against it (login, fetch, IDLE wake, APPEND) — the only place the real
-  client is exercised.
+- **CI integration**: two Dovecot instances (STARTTLS and non-STARTTLS) plus Mailpit in the
+  GitHub Actions job; integration tests drive `ImapflowClient` against them (login, fetch, IDLE
+  wake, APPEND, STARTTLS enforcement, TLS verification, SMTP send) — the only place the real
+  client is exercised. 26 integration cases.
 - **e2e (Playwright, CI only)**: seed Dovecot with a small mailbox → add account through the
   UI (Dovecot preset) → sync → thread list and conversation render → mark read → link a deal
   suggestion → reply (SMTP captured by Mailpit) → sent message appears in thread. Existing e2e
@@ -280,7 +291,7 @@ Single release: bump to v0.5.0 → CI gate → ff-merge → tag → CI builds th
 manifest sha update on main → Chris runs the one sudo yunohost upgrade command. Before the
 first implementation branch is cut, PR #1 (keyboard-drag fix, `claude/sad-carson-38358f`) must
 be merged or explicitly deferred — its e2e/playwright.config.ts changes are the only collision
-surface with this phase.
+surface with this phase. **Resolved:** merged 19 Aug via PRs #1/#2.
 
 ## Out of scope (deferred, not rejected)
 
@@ -302,3 +313,29 @@ With their likely landing, agreed in the brainstorm:
   missed.
 - **Team/shared mailboxes (info@)** — needs its own ownership/ACL brainstorm when a concrete
   shared mailbox exists; no slot assigned.
+
+### Known limitations (v0.5.0)
+
+Accepted for the initial release rather than deferred to a later phase — small enough that a
+point release, not a phase, is the right size for each:
+
+- **Thread detail returns every message uncapped.** `GET /api/mail/threads/:id` has no limit,
+  and each message carries its full sanitized body; a very large mailing-list thread is a
+  response no browser tab survives opening. v0.5.x fix: a server-side cap (newest N messages)
+  plus a `truncated` flag the conversation renders as a "load earlier messages" control — it
+  needs a schema field, so it did not fit as a patch.
+- **Forward does not re-attach attachments.** `POST /api/files` links a file to exactly one
+  record, so re-attaching on forward would copy each blob onto the forward's own record rather
+  than reference the original rows — a real feature with a real storage cost, deferred rather
+  than half-done.
+- **Compose without a record link cannot attach files.** The same one-record-per-file constraint
+  means the composer disables its attach control when opened with no company/contact/deal/project
+  link in context (e.g. a bare reply whose thread carries no links yet).
+- **Deals' contact/company have no UI picker.** `deals.contact_id`/`company_id` are reachable
+  only through `PATCH /api/deals/:id` today — the board's New deal dialog takes just a title and
+  value, and a deal's contact is read-only everywhere it is shown. A per-deal picker would close
+  this; worth a line in a later phase's backlog, not a v0.5.0 change.
+- **Accumulated inbox pages beyond the first are not live-refreshed.** Only the current page of
+  the thread list is a live query; after "load more," an SSE invalidation refreshes that page
+  while earlier pages keep the rows they were fetched with until the list resets (a filter
+  change or remount).

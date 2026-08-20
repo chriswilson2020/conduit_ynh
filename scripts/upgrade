@@ -29,12 +29,21 @@ ynh_script_progression "Ensuring $app's mail credential key exists..."
 # without one. See scripts/install for what the file is and why no MAIL_KEY_PATH
 # accompanies it.
 #
-# The [ -f ] guard is doing more than making the upgrade re-runnable. Every
-# stored IMAP/SMTP password is sealed under this exact key, and mail-crypto.ts
-# cannot distinguish a rotated key from a tampered ciphertext -- so overwriting
-# it would silently strand every configured mail account, with each one failing
-# to decrypt at its next sync. Restoring a lost key is an operator's job (it is
-# in the data_dir backup); an upgrade must never quietly mint a new one.
+# The [ -f ] guard exists so an upgrade never OVERWRITES a key that is
+# already in place. Every stored IMAP/SMTP password is sealed under this
+# exact key, and mail-crypto.ts cannot distinguish a rotated key from a
+# tampered ciphertext -- so overwriting a key still in use would silently
+# strand every configured mail account, with each one failing to decrypt at
+# its next sync.
+#
+# Minting a key when one is absent is deliberate, not a gap in that
+# guarantee: it covers a fresh data_dir (nothing to strand) and a key that
+# was already lost before this upgrade ran. In the lost-key case, the
+# stored credentials were already unrecoverable -- nothing here makes that
+# worse -- so the operator's job is to have each user re-enter their mail
+# password once, not to restore the key (that is still the right move if a
+# backup with the matching key exists). Either way, any ciphertext this new
+# key cannot open surfaces to the caller as a typed 409, not a crash.
 if [ ! -f "$data_dir/mail.key" ]; then
     openssl rand -out "$data_dir/mail.key" 32
     chmod 600 "$data_dir/mail.key"

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseConfig } from "./config.js";
@@ -10,6 +11,26 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 async function main(): Promise<void> {
   const config = parseConfig(process.env);
+
+  // The key is read lazily (mail-crypto.ts's loadMailKey), only when a
+  // mail-account route actually needs to encrypt/decrypt credentials, and a
+  // missing file must never stop the CRM from serving -- it degrades to a
+  // 503 on mail-account routes (see the Phase 4 spec's "Key handling"
+  // section). This is the one place that promise becomes visible at boot,
+  // logged once, so an operator sees it in the startup log rather than
+  // discovering it the first time someone opens Settings -> Mail.
+  //
+  // No dedicated unit test: main() below runs unconditionally on import
+  // (nothing guards it behind an entry-point check), so a test importing
+  // this module would attempt a real database connection rather than
+  // exercising just this line. Making that seam-testable is a server.ts
+  // restructuring, out of scope for this check.
+  if (!existsSync(config.mailKeyPath)) {
+    console.warn(
+      `mail.key not found at ${config.mailKeyPath}; mail-account routes will return 503 until it exists -- the install/upgrade scripts provision it`,
+    );
+  }
+
   const { db, close } = createDatabase(config.databaseUrl);
 
   await runMigrations(db);
