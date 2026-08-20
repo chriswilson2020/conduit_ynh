@@ -171,9 +171,15 @@ All under the existing auth. "Own account" = `mail_accounts.user_id` is the curr
 - `POST /api/mail/threads/:id/links` / `DELETE .../links/:kind` — set/clear the four FKs.
 - `POST /api/mail/threads/:id/archive` (+ unarchive) — CRM-side only.
 - `POST /api/mail/send` — compose and reply (threadId optional), as in Send path.
-- `GET /api/mail/attachments/:id` — authenticated download; inline variant used by `cid:`
-  rewrites.
-- `GET/POST/PATCH/archive /api/mail/templates` — shared CRUD, archive-not-delete.
+- `GET /api/mail/attachments/:id` — authenticated download (`Content-Disposition: attachment`);
+  `GET /api/mail/attachments/:id/inline` is the variant a rewritten `cid:` src points at, and
+  serves ONLY rows ingest marked `is_inline`. Both are ordinary authenticated same-origin
+  routes (see the Frontend section's sandbox ruling) and send `X-Content-Type-Options: nosniff`;
+  the inline route additionally declines to declare a non-image content type, falling back to
+  an octet-stream download, so a hostile inbound `text/html` attachment cannot be rendered on
+  the app's own origin by linking to it.
+- `GET/POST/PATCH/archive/unarchive /api/mail/templates` — shared CRUD, archive-not-delete
+  (and therefore, like accounts, an unarchive to undo it).
 - Global search: the existing search endpoint gains a `mail` section querying the tsvector
   (`websearch_to_tsquery`), returning thread-grouped hits.
 
@@ -186,9 +192,18 @@ SSE events: `mail.message` (new message: thread id, account id, snippet), `mail.
   unread dot, account chip, link chips) with the filter bar, and the conversation view.
   Unread badge on the nav item, kept live via SSE. Empty state points at Settings → Mail.
 - **Conversation view**: messages oldest-first, all but the latest collapsed. HTML bodies
-  render in an iframe via `srcdoc` with an empty `sandbox` attribute (no `allow-scripts`, no
-  `allow-same-origin`) and a restrictive CSP meta tag: remote images blocked by default with a
-  per-thread "Load remote images" button; text-only messages render as preformatted text. Attachment list with
+  render in an iframe via `srcdoc` with `sandbox="allow-same-origin"` — scripts stay blocked
+  (no `allow-scripts`, ever) — and a restrictive CSP meta tag: remote images blocked by default
+  with a per-thread "Load remote images" button; text-only messages render as preformatted text.
+  **Why `allow-same-origin` rather than an empty sandbox** (coordinator ruling, 20 Aug): an
+  empty sandbox gives the frame an opaque origin, so SameSite cookies are not attached to its
+  subresource loads, and the YunoHost SSOwat proxy in front of the app would bounce those
+  cookieless inline-image requests to its login page — inline `cid:` images would simply never
+  render. Signed attachment URLs would avoid that but require SSOwat `skipped_uris` packaging
+  changes. With scripts blocked, ingest-time sanitization stripping `script`/`style` `url()`/
+  forms, and the CSP meta still governing `img-src`, `allow-same-origin` is the accepted risk.
+  The consequence for the API is that `GET /api/mail/attachments/:id/inline` is an ordinary
+  authenticated same-origin route, not a signed one. Attachment list with
   download. Link panel: chips for the four records with unlink, an entity picker to link
   manually, and the deal-suggestion one-click row. Reply / Reply-all / Forward.
 - **Composer**: TipTap (already a design-doc dependency; first actual use), To/Cc/Bcc with

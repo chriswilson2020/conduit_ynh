@@ -604,11 +604,47 @@ export const mailAccountTestResultSchema = z.object({
 });
 export type MailAccountTestResult = z.infer<typeof mailAccountTestResultSchema>;
 
+// Live counters from the in-process sync engine (api:
+// services/mail-sync.ts's AccountSyncStats), mirrored here by hand because
+// packages/web cannot import from packages/api. Purely observational -- the
+// durable facts about an account's health (status, lastError, lastSyncedAt)
+// live on the account row itself; these say how the CURRENT process's loop
+// has been getting on since it started, and reset on every restart.
+export const mailAccountSyncStatsSchema = z.object({
+  passes: z.number().int().nonnegative(),
+  failures: z.number().int().nonnegative(),
+  ingested: z.number().int().nonnegative(),
+  poisonSkips: z.number().int().nonnegative(),
+  idleWakes: z.number().int().nonnegative(),
+  /** Consecutive failures; non-zero means the account is in backoff. */
+  attempt: z.number().int().nonnegative(),
+  stopped: z.boolean(),
+});
+export type MailAccountSyncStats = z.infer<typeof mailAccountSyncStatsSchema>;
+
+// An own account plus whatever the sync engine can say about it right now.
+// syncStats is optional AND nullable, and deliberately not defaulted: null
+// is the honest answer for an account with no live sync (archived, never
+// started, or a deployment with sync disabled -- NODE_ENV=test included),
+// while absent lets every caller that only cares about the account row
+// itself (every service, every fixture) keep using the plain account shape.
+// The extension direction matters: mailAccountSchema stays the source of
+// truth for what an account IS, and this adds the one derived field the
+// settings page needs on top, rather than a second hand-written account
+// shape that could drift from it.
+export const mailAccountWithSyncStatsSchema = mailAccountSchema.extend({
+  syncStats: mailAccountSyncStatsSchema.nullable().optional(),
+});
+export type MailAccountWithSyncStats = z.infer<typeof mailAccountWithSyncStatsSchema>;
+
 // GET /api/mail/accounts' response shape (Task 3's listAccounts; Task 7
 // wires the route). See listAccounts' own doc comment in mail-accounts.ts
 // for why the shape is {own, others} rather than one discriminated list.
+// Only `own` carries sync stats: another user's sync health is as much a
+// setting as their host and port, and `others` exists purely to label a
+// filter dropdown.
 export const mailAccountListSchema = z.object({
-  own: z.array(mailAccountSchema), others: z.array(mailAccountSummarySchema),
+  own: z.array(mailAccountWithSyncStatsSchema), others: z.array(mailAccountSummarySchema),
 });
 export type MailAccountList = z.infer<typeof mailAccountListSchema>;
 
@@ -680,6 +716,59 @@ export const mailAttachmentSchema = z.object({
   contentId: nullableString, isInline: z.boolean(), createdAt: z.iso.datetime(),
 });
 export type MailAttachment = z.infer<typeof mailAttachmentSchema>;
+
+// One row of GET /api/mail/threads. The four extra fields are everything the
+// thread-list row renders that is NOT on the thread itself (unread dot,
+// participants summary, snippet, account chip) -- derived per page from the
+// thread's messages rather than denormalised onto mail_threads, because
+// every one of them changes on ingest and none is worth a second writer.
+//
+// participants is capped server-side: a mailing-list thread has hundreds of
+// distinct From addresses and a list row shows three.
+export const mailThreadListItemSchema = mailThreadSchema.extend({
+  /** At least one message in the thread is unseen. */
+  unread: z.boolean(),
+  /** The most recent message's snippet (already placeholder-free). */
+  snippet: z.string(),
+  /** Distinct From addresses, most recent first, capped. */
+  participants: z.array(mailAddressSchema),
+  /** Every account whose mailbox this thread is visible in. */
+  accountIds: z.array(z.uuid()),
+});
+export type MailThreadListItem = z.infer<typeof mailThreadListItemSchema>;
+
+// A thread-detail message carries its attachments inline: the conversation
+// view renders chips under each body, and a second round trip per message
+// would be one request per message on a long thread.
+export const mailMessageWithAttachmentsSchema = mailMessageSchema.extend({
+  attachments: z.array(mailAttachmentSchema),
+});
+export type MailMessageWithAttachments = z.infer<typeof mailMessageWithAttachmentsSchema>;
+
+// Open deals of the thread's linked contact/company that the thread is not
+// already linked to -- the one-click "link this deal" row in the link panel.
+// {id, title} mirrors searchResultsSchema's deals group: enough to render a
+// row and act on it, and nothing else.
+export const mailDealSuggestionSchema = z.object({ id: z.uuid(), title: z.string().min(1) });
+export type MailDealSuggestion = z.infer<typeof mailDealSuggestionSchema>;
+
+// GET /api/mail/threads/:id. Messages are oldest-first (the conversation
+// renders in that order) and every body_html has already had its stored
+// `mailattachment:` placeholders resolved to real attachment routes -- the
+// stored form never leaves the API (see api: mail-content.ts's
+// resolveAttachmentUrls).
+export const mailThreadDetailSchema = z.object({
+  thread: mailThreadSchema,
+  messages: z.array(mailMessageWithAttachmentsSchema),
+  dealSuggestions: z.array(mailDealSuggestionSchema),
+});
+export type MailThreadDetail = z.infer<typeof mailThreadDetailSchema>;
+
+// GET /api/mail/unread-count -- distinct non-archived threads holding at
+// least one unseen message. A count of THREADS, not messages: it drives the
+// inbox nav badge, which counts conversations the way the thread list does.
+export const mailUnreadCountSchema = z.object({ count: z.number().int().nonnegative() });
+export type MailUnreadCount = z.infer<typeof mailUnreadCountSchema>;
 
 // Query-side filter contract for GET /api/mail/threads (route layer maps its
 // snake_case querystring onto this camelCase shape, same division of labour
@@ -771,5 +860,18 @@ export const searchResultsSchema = z.object({
   // tasks-group query for why a done task still matters (finding finished
   // work by name is a feature, mirroring the deals group's won-deal rule).
   tasks: z.array(z.object({ id: z.uuid(), title: z.string(), projectId: z.uuid().nullable() })),
+  // The one group that is full-text rather than ILIKE: mail_messages carries
+  // a generated tsvector (schema.ts), so this group is
+  // websearch_to_tsquery + ts_rank rather than a substring scan. Grouped by
+  // THREAD, not message -- a hit means "this conversation matches", and the
+  // id a client navigates to is the thread's. subject/snippet come from the
+  // best-ranked message in that thread, so the excerpt shown is the one that
+  // actually matched, not the newest message's.
+  mail: z.array(z.object({
+    threadId: z.uuid(),
+    // Message subject, not thread subject: both can legitimately be "".
+    subject: z.string(),
+    snippet: z.string(),
+  })),
 });
 export type SearchResults = z.infer<typeof searchResultsSchema>;

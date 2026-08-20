@@ -8,7 +8,8 @@ import { createUserResolver } from "./users.js";
 import { registerSpa } from "./spa.js";
 import { registerCrmRoutes } from "./routes/index.js";
 import { createSmtpTransportFactory } from "./services/mail-imapflow.js";
-import type { SendMailSyncManager, SendMailTransportFactory } from "./services/mail-send.js";
+import type { SendMailTransportFactory } from "./services/mail-send.js";
+import type { MailRouteSyncManager } from "./routes/mail.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -28,9 +29,9 @@ export interface BuildAppOptions {
    * CrmRouteDeps for why this exists; never set outside a test. */
   multipartFileSizeLimit?: number;
   /**
-   * The mail seams routes/mail.ts (Task 7) needs but this function cannot
-   * build for itself: the sync manager does not exist until after the server
-   * is listening (hence a getter, not a value), and how an SMTP connection is
+   * The mail seams routes/mail.ts needs but this function cannot build for
+   * itself: the sync manager does not exist until after the server is
+   * listening (hence a getter, not a value), and how an SMTP connection is
    * configured is the composition root's decision, not this file's.
    *
    * Optional so that the many tests which build an app but never send mail
@@ -39,7 +40,7 @@ export interface BuildAppOptions {
    * same expression server.ts uses, never a different source of truth.
    */
   mail?: {
-    syncManager: () => SendMailSyncManager | null;
+    syncManager: () => MailRouteSyncManager | null;
     transportFactory: SendMailTransportFactory;
   };
 }
@@ -144,7 +145,8 @@ export async function buildApp(
 
   await registerCrmRoutes(app, {
     db, dataDir, multipartFileSizeLimit,
-    defaultCurrency: config.defaultCurrency, mailKeyPath: config.mailKeyPath,
+    defaultCurrency: config.defaultCurrency,
+    basePath: config.basePath, mailKeyPath: config.mailKeyPath,
     syncManager: mail?.syncManager ?? (() => null),
     transportFactory: mail?.transportFactory
       ?? createSmtpTransportFactory({ rejectUnauthorized: config.mailTlsRejectUnauthorized }),

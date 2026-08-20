@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { randomUUID } from "node:crypto";
 import { searchResultsSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
+import { mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
 import { resolveUser } from "../users.js";
 import { createCompany, archiveCompany } from "./companies.js";
 import { createContact, archiveContact } from "./contacts.js";
@@ -186,5 +188,98 @@ describe("search service", () => {
 
     const result = await search(handle.db, "marlowe finch");
     expect(result.notes.map((n) => n.id)).not.toContain(note.id);
+  });
+});
+
+// The one full-text group, so it is exercised on the properties the others
+// cannot have: thread grouping, rank ordering, and a query string a human
+// typed rather than one a parser would accept.
+describe("search service: mail group", () => {
+  // Rows are inserted directly rather than through ingest: this group is a
+  // query, and driving mailparser to reach it would only make the fixture
+  // harder to read. credentials_ciphertext is never decrypted on this path.
+  async function makeMailAccount(): Promise<string> {
+    const [row] = await handle.db.insert(mailAccounts).values({
+      userId: actorId, label: "Work", email: `chris+${randomUUID()}@example.com`,
+      imapHost: "localhost", imapPort: 993, imapSecurity: "tls",
+      smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls",
+      username: "chris", credentialsCiphertext: "v1:unused-in-search-tests",
+    }).returning();
+    if (row === undefined) throw new Error("makeMailAccount: no row");
+    return row.id;
+  }
+
+  async function makeMailThread(subject: string, archived = false): Promise<string> {
+    const [row] = await handle.db.insert(mailThreads).values({
+      subject, lastMessageAt: new Date("2026-08-02T10:00:00Z"), messageCount: 1,
+      archivedAt: archived ? new Date() : null,
+    }).returning();
+    if (row === undefined) throw new Error("makeMailThread: no row");
+    return row.id;
+  }
+
+  async function makeMailMessage(
+    threadId: string, accountId: string, message: { subject: string; bodyText: string; snippet: string },
+  ): Promise<void> {
+    await handle.db.insert(mailMessages).values({
+      accountId, threadId, messageId: `<${randomUUID()}@example.com>`,
+      referencesIds: [], fromAddr: "alice@example.com", fromName: "Alice",
+      toAddrs: [{ address: "chris@example.com" }],
+      subject: message.subject, bodyText: message.bodyText, snippet: message.snippet,
+      sentAt: new Date("2026-08-02T10:00:00Z"), folder: "INBOX", seen: true, direction: "inbound",
+    });
+  }
+
+  it("returns one hit per thread even when several of its messages match", async () => {
+    const accountId = await makeMailAccount();
+    const threadId = await makeMailThread("Quokkaline rollout");
+    for (const n of [1, 2, 3]) {
+      await makeMailMessage(threadId, accountId, {
+        subject: `Quokkaline ${n}`, bodyText: "quokkaline planning", snippet: `snippet ${n}`,
+      });
+    }
+
+    const result = await search(handle.db, "quokkaline");
+    expect(() => searchResultsSchema.parse(result)).not.toThrow();
+    expect(result.mail.filter((hit) => hit.threadId === threadId)).toHaveLength(1);
+  });
+
+  it("caps the mail group at five threads", async () => {
+    const accountId = await makeMailAccount();
+    for (let i = 0; i < 7; i += 1) {
+      const threadId = await makeMailThread(`Bramblewick ${i}`);
+      await makeMailMessage(threadId, accountId, {
+        subject: `Bramblewick ${i}`, bodyText: "bramblewick update", snippet: `snippet ${i}`,
+      });
+    }
+    const result = await search(handle.db, "bramblewick");
+    expect(result.mail).toHaveLength(5);
+  });
+
+  it("excludes archived threads", async () => {
+    const accountId = await makeMailAccount();
+    const live = await makeMailThread("Fenwold live");
+    await makeMailMessage(live, accountId, { subject: "Fenwold", bodyText: "fenwold notes", snippet: "live" });
+    const filed = await makeMailThread("Fenwold filed", true);
+    await makeMailMessage(filed, accountId, { subject: "Fenwold", bodyText: "fenwold notes", snippet: "filed" });
+
+    const result = await search(handle.db, "fenwold");
+    expect(result.mail.map((hit) => hit.threadId)).toEqual([live]);
+  });
+
+  // websearch_to_tsquery, not to_tsquery: a human types punctuation and
+  // stray operators, and to_tsquery would raise a syntax error on both.
+  it("survives punctuation and bare boolean operators in the query", async () => {
+    const accountId = await makeMailAccount();
+    const threadId = await makeMailThread("Grimsdale");
+    await makeMailMessage(threadId, accountId, {
+      subject: "Grimsdale", bodyText: "the grimsdale contract", snippet: "hit",
+    });
+
+    for (const q of ["grimsdale!!", "grimsdale & | contract", '"grimsdale contract"', "grimsdale -unrelated"]) {
+      const result = await search(handle.db, q);
+      expect(() => searchResultsSchema.parse(result)).not.toThrow();
+    }
+    expect((await search(handle.db, "grimsdale!!")).mail.map((hit) => hit.threadId)).toEqual([threadId]);
   });
 });

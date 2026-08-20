@@ -38,7 +38,11 @@ import {
   mailAccountTestInputSchema,
   mailAccountTestResultSchema,
   mailAccountListSchema,
+  mailAccountWithSyncStatsSchema,
   mailThreadSchema,
+  mailThreadListItemSchema,
+  mailThreadDetailSchema,
+  mailUnreadCountSchema,
   mailMessageSchema,
   mailAttachmentSchema,
   threadListFiltersSchema,
@@ -441,21 +445,21 @@ describe("eventSchema taskId/projectId", () => {
 describe("searchResultsSchema deals group", () => {
   it("accepts a deals group of id/title pairs", () => {
     const body = {
-      companies: [], contacts: [], notes: [], deals: [{ id: uuid1, title: "Big deal" }], tasks: [],
+      companies: [], contacts: [], notes: [], deals: [{ id: uuid1, title: "Big deal" }], tasks: [], mail: [],
     };
     expect(searchResultsSchema.parse(body)).toEqual(body);
   });
 
   it("requires the deals group to be present", () =>
     expect(() =>
-      searchResultsSchema.parse({ companies: [], contacts: [], notes: [], tasks: [] }),
+      searchResultsSchema.parse({ companies: [], contacts: [], notes: [], tasks: [], mail: [] }),
     ).toThrow());
 });
 
 describe("searchResultsSchema tasks group", () => {
   it("accepts a tasks group of id/title/projectId triples, including a standalone task", () => {
     const body = {
-      companies: [], contacts: [], notes: [], deals: [],
+      companies: [], contacts: [], notes: [], deals: [], mail: [],
       tasks: [
         { id: uuid1, title: "Call back", projectId: uuid2 },
         { id: uuid2, title: "Standalone follow-up", projectId: null },
@@ -466,8 +470,34 @@ describe("searchResultsSchema tasks group", () => {
 
   it("requires the tasks group to be present", () =>
     expect(() =>
-      searchResultsSchema.parse({ companies: [], contacts: [], notes: [], deals: [] }),
+      searchResultsSchema.parse({ companies: [], contacts: [], notes: [], deals: [], mail: [] }),
     ).toThrow());
+});
+
+describe("searchResultsSchema mail group", () => {
+  it("accepts thread-grouped hits, including an empty subject and snippet", () => {
+    const body = {
+      companies: [], contacts: [], notes: [], deals: [], tasks: [],
+      mail: [
+        { threadId: uuid1, subject: "Invoice 2026-08", snippet: "...the invoice is attached..." },
+        // Both can legitimately be "" -- mail_messages defaults them for
+        // inbound mail that carries neither.
+        { threadId: uuid2, subject: "", snippet: "" },
+      ],
+    };
+    expect(searchResultsSchema.parse(body)).toEqual(body);
+  });
+
+  it("requires the mail group to be present", () =>
+    expect(() =>
+      searchResultsSchema.parse({ companies: [], contacts: [], notes: [], deals: [], tasks: [] }),
+    ).toThrow());
+
+  it("rejects a hit keyed by message id rather than thread id", () =>
+    expect(() => searchResultsSchema.parse({
+      companies: [], contacts: [], notes: [], deals: [], tasks: [],
+      mail: [{ messageId: uuid1, subject: "Invoice", snippet: "..." }],
+    })).toThrow());
 });
 
 describe("projectSchema color format", () => {
@@ -970,6 +1000,97 @@ describe("mailAttachmentSchema", () => {
   // regardless of what any particular input happens to include.
   it("has no blobPath field in its shape", () => {
     expect(Object.keys(mailAttachmentSchema.shape)).not.toContain("blobPath");
+  });
+});
+
+describe("mailAccountWithSyncStatsSchema", () => {
+  const account = {
+    id: uuid1, userId: uuid2, label: "Work", email: "chris@example.com",
+    imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
+    smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
+    username: "chris", sentFolder: "Sent", signatureHtml: null, backfillDays: 90,
+    status: "active" as const, lastError: null, lastSyncedAt: null,
+    archivedAt: null, createdAt: now, updatedAt: now,
+  };
+  const stats = {
+    passes: 4, failures: 1, ingested: 30, poisonSkips: 0, idleWakes: 3, attempt: 0, stopped: false,
+  };
+
+  it("accepts an account carrying live sync stats", () => {
+    const value = { ...account, syncStats: stats };
+    expect(mailAccountWithSyncStatsSchema.parse(value)).toEqual(value);
+  });
+
+  // null is the honest answer for an account with no live sync; absent keeps
+  // every plain-account fixture and service return value valid as-is.
+  it("accepts syncStats null and syncStats absent alike", () => {
+    expect(mailAccountWithSyncStatsSchema.parse({ ...account, syncStats: null }).syncStats).toBeNull();
+    expect(mailAccountWithSyncStatsSchema.parse(account).syncStats).toBeUndefined();
+  });
+
+  it("still has no credential-shaped field in its shape", () => {
+    for (const key of Object.keys(mailAccountWithSyncStatsSchema.shape)) {
+      expect(key.toLowerCase()).not.toMatch(/password|credential|secret/);
+    }
+  });
+});
+
+describe("mailThreadListItemSchema", () => {
+  const row = {
+    id: uuid1, subject: "Re: Proposal", lastMessageAt: now, messageCount: 3,
+    companyId: null, contactId: uuid2, dealId: null, projectId: null,
+    archivedAt: null, createdAt: now, updatedAt: now,
+    unread: true, snippet: "Thanks for sending this over",
+    participants: [{ address: "bob@example.com", name: "Bob" }, { address: "root@localhost" }],
+    accountIds: [uuid2],
+  };
+
+  it("accepts a full list row", () => expect(mailThreadListItemSchema.parse(row)).toEqual(row));
+
+  it("requires the derived row fields the thread itself does not carry", () => {
+    for (const field of ["unread", "snippet", "participants", "accountIds"]) {
+      const { [field]: _dropped, ...rest } = row as Record<string, unknown>;
+      expect(() => mailThreadListItemSchema.parse(rest)).toThrow();
+    }
+  });
+});
+
+describe("mailThreadDetailSchema", () => {
+  it("accepts a thread with messages, their attachments, and deal suggestions", () => {
+    const detail = {
+      thread: {
+        id: uuid1, subject: "Re: Proposal", lastMessageAt: now, messageCount: 1,
+        companyId: null, contactId: uuid2, dealId: null, projectId: null,
+        archivedAt: null, createdAt: now, updatedAt: now,
+      },
+      messages: [{
+        id: uuid2, accountId: uuid1, threadId: uuid1,
+        messageId: "<abc@example.com>", inReplyTo: null, referencesIds: [],
+        fromAddr: "bob@example.com", fromName: "Bob",
+        toAddrs: [{ address: "chris@example.com" }], ccAddrs: [], bccAddrs: [],
+        subject: "Hello", bodyText: "Hi", bodyHtml: "<p>Hi</p>", snippet: "Hi",
+        sentAt: now, folder: "INBOX", imapUid: 42, seen: true, direction: "inbound" as const,
+        createdAt: now, updatedAt: now,
+        attachments: [{
+          id: uuid1, messageId: uuid2, filename: "invoice.pdf", mime: "application/pdf",
+          sizeBytes: 10, contentId: null, isInline: false, createdAt: now,
+        }],
+      }],
+      dealSuggestions: [{ id: uuid2, title: "Renewal" }],
+    };
+    expect(mailThreadDetailSchema.parse(detail)).toEqual(detail);
+  });
+});
+
+describe("mailUnreadCountSchema", () => {
+  it("accepts zero and a positive count", () => {
+    expect(mailUnreadCountSchema.parse({ count: 0 }).count).toBe(0);
+    expect(mailUnreadCountSchema.parse({ count: 7 }).count).toBe(7);
+  });
+
+  it("rejects a negative or fractional count", () => {
+    expect(() => mailUnreadCountSchema.parse({ count: -1 })).toThrow();
+    expect(() => mailUnreadCountSchema.parse({ count: 1.5 })).toThrow();
   });
 });
 

@@ -1,0 +1,1044 @@
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { eq } from "drizzle-orm";
+import {
+  contactSchema, dealSchema, errorResponseSchema, listResponseSchema, pipelineSchema, stageSchema,
+  mailAccountSchema, mailAccountListSchema, mailAccountTestResultSchema, mailThreadSchema,
+  mailThreadListItemSchema, mailThreadDetailSchema, mailMessageSchema, mailUnreadCountSchema,
+  emailTemplateSchema, searchResultsSchema,
+  type MailAccountCreateInput, type MailAccountSyncStats, type SendMailInput,
+} from "@conduit/shared";
+import { openTestDatabase, truncateAll } from "../test/db.js";
+import { buildApp } from "../app.js";
+import type { Config } from "../config.js";
+import { mailAccounts, mailAttachments, mailMessages, mailThreads } from "../db/schema.js";
+import { saveBlob } from "../services/blobs.js";
+import type { SendMailMessage, SendMailTransport } from "../services/mail-send.js";
+import type { MailRouteSyncManager } from "./mail.js";
+
+const handle = openTestDatabase();
+
+let dir: string;
+let dataDir: string;
+let keyPath: string;
+let transport: FakeTransport;
+let syncs: Map<string, FakeAccountSync>;
+/** Swapped for `() => null` by the tests that need the no-sync-engine shape. */
+let manager: MailRouteSyncManager;
+
+beforeEach(async () => {
+  await truncateAll(handle);
+  dir = await mkdtemp(path.join(os.tmpdir(), "conduit-mail-routes-"));
+  dataDir = path.join(dir, "data");
+  keyPath = path.join(dir, "mail.key");
+  await writeFile(keyPath, randomBytes(32));
+  transport = new FakeTransport();
+  syncs = new Map();
+  manager = { get: (id) => syncs.get(id) };
+});
+afterEach(async () => {
+  await rm(dir, { recursive: true, force: true });
+});
+afterAll(async () => { await handle.close(); });
+
+const authHeaders = {
+  "ynh-user": "chris",
+  "ynh-user-email": "chris@example.com",
+  "ynh-user-fullname": "Chris Wilson",
+};
+// A second identity, for the foreign-account 404s. Resolved by the same
+// onRequest hook as the first, so no explicit user seeding is needed.
+const otherHeaders = {
+  "ynh-user": "dana",
+  "ynh-user-email": "dana@example.com",
+  "ynh-user-fullname": "Dana Rae",
+};
+
+const UNKNOWN_ID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+
+// --- Fakes -----------------------------------------------------------------
+
+class FakeTransport implements SendMailTransport {
+  readonly sent: SendMailMessage[] = [];
+  failure: Error | null = null;
+
+  factory = (): SendMailTransport => this;
+
+  sendMail(message: SendMailMessage): Promise<unknown> {
+    if (this.failure !== null) return Promise.reject(this.failure);
+    this.sent.push(message);
+    return Promise.resolve({ accepted: message.envelope.to });
+  }
+}
+
+/** Stands in for one account's AccountSync. Records what the routes asked of
+ * it, and can reject the way a real one in backoff does. */
+class FakeAccountSync {
+  readonly appended: Buffer[] = [];
+  readonly markSeenCalls: { folder: string; uids: number[] }[] = [];
+  markSeenFailure: Error | null = null;
+  stats: MailAccountSyncStats = {
+    passes: 3, failures: 1, ingested: 12, poisonSkips: 0, idleWakes: 2, attempt: 0, stopped: false,
+  };
+
+  appendSent(raw: Buffer | string): Promise<void> {
+    this.appended.push(Buffer.isBuffer(raw) ? raw : Buffer.from(raw, "utf8"));
+    return Promise.resolve();
+  }
+
+  markSeen(folder: string, uids: readonly number[]): Promise<void> {
+    this.markSeenCalls.push({ folder, uids: [...uids] });
+    return this.markSeenFailure === null ? Promise.resolve() : Promise.reject(this.markSeenFailure);
+  }
+}
+
+// --- App -------------------------------------------------------------------
+
+function config(basePath = "/"): Config {
+  return {
+    nodeEnv: "test", port: 0, databaseUrl: "unused-in-tests", basePath,
+    version: "0.1.0-test", devUser: null, dataDir, defaultCurrency: "EUR",
+    mailKeyPath: keyPath, mailTlsRejectUnauthorized: true,
+  };
+}
+
+interface AppOptions {
+  basePath?: string;
+  /** Defaults to the fake manager; pass `() => null` for the no-engine case. */
+  syncManager?: () => MailRouteSyncManager | null;
+}
+
+async function app(options: AppOptions = {}) {
+  return buildApp({
+    config: config(options.basePath),
+    db: handle.db,
+    dataDir,
+    mail: {
+      syncManager: options.syncManager ?? (() => manager),
+      transportFactory: transport.factory,
+    },
+  });
+}
+
+type App = Awaited<ReturnType<typeof app>>;
+
+// --- Fixtures ---------------------------------------------------------------
+
+const baseAccountInput: MailAccountCreateInput = {
+  label: "Work", email: "chris@example.com",
+  imapHost: "mail.example.com", imapPort: 993, imapSecurity: "tls",
+  smtpHost: "mail.example.com", smtpPort: 587, smtpSecurity: "starttls",
+  username: "chris", password: "imap-secret",
+};
+
+async function makeAccount(
+  a: App, overrides: Partial<MailAccountCreateInput> = {}, headers = authHeaders,
+) {
+  const response = await a.inject({
+    method: "POST", url: "/api/mail/accounts", headers, payload: { ...baseAccountInput, ...overrides },
+  });
+  expect(response.statusCode).toBe(201);
+  return mailAccountSchema.parse(response.json());
+}
+
+interface ThreadSeed {
+  subject?: string;
+  lastMessageAt: Date;
+  companyId?: string; contactId?: string; dealId?: string; projectId?: string;
+  archived?: boolean;
+}
+
+async function seedThread(seed: ThreadSeed): Promise<string> {
+  const [row] = await handle.db.insert(mailThreads).values({
+    subject: seed.subject ?? "Quarterly review",
+    lastMessageAt: seed.lastMessageAt,
+    messageCount: 1,
+    companyId: seed.companyId ?? null, contactId: seed.contactId ?? null,
+    dealId: seed.dealId ?? null, projectId: seed.projectId ?? null,
+    archivedAt: seed.archived === true ? new Date() : null,
+  }).returning();
+  if (row === undefined) throw new Error("seedThread: no row");
+  return row.id;
+}
+
+interface MessageSeed {
+  fromAddr?: string;
+  fromName?: string | null;
+  subject?: string;
+  bodyText?: string;
+  bodyHtml?: string | null;
+  snippet?: string;
+  sentAt: Date;
+  folder?: string;
+  imapUid?: number | null;
+  seen?: boolean;
+}
+
+async function seedMessage(threadId: string, accountId: string, seed: MessageSeed): Promise<string> {
+  const [row] = await handle.db.insert(mailMessages).values({
+    accountId, threadId,
+    messageId: `<${randomUUID()}@example.com>`,
+    inReplyTo: null, referencesIds: [],
+    fromAddr: seed.fromAddr ?? "alice@example.com",
+    fromName: seed.fromName ?? "Alice",
+    toAddrs: [{ address: "chris@example.com", name: "Chris" }], ccAddrs: [], bccAddrs: [],
+    subject: seed.subject ?? "Quarterly review",
+    bodyText: seed.bodyText ?? "Body text",
+    bodyHtml: seed.bodyHtml === undefined ? "<p>Body text</p>" : seed.bodyHtml,
+    snippet: seed.snippet ?? "Body text",
+    sentAt: seed.sentAt,
+    folder: seed.folder ?? "INBOX",
+    imapUid: seed.imapUid === undefined ? 10 : seed.imapUid,
+    seen: seed.seen ?? true,
+    direction: "inbound",
+  }).returning();
+  if (row === undefined) throw new Error("seedMessage: no row");
+  return row.id;
+}
+
+/** Write real bytes into the blob store and register them as an attachment of
+ * `messageId`, so the download/inline routes have something to stream. */
+async function seedAttachment(
+  messageId: string, opts: { filename?: string; mime?: string; isInline?: boolean; body?: string } = {},
+): Promise<{ id: string; body: string }> {
+  const body = opts.body ?? "attachment-bytes";
+  const { sha256, sizeBytes } = await saveBlob(dataDir, Readable.from(Buffer.from(body, "utf8")));
+  const [row] = await handle.db.insert(mailAttachments).values({
+    messageId,
+    filename: opts.filename ?? "invoice.pdf",
+    mime: opts.mime ?? "application/pdf",
+    sizeBytes, blobPath: sha256,
+    contentId: opts.isInline === true ? "logo@example.com" : null,
+    isInline: opts.isInline ?? false,
+  }).returning();
+  if (row === undefined) throw new Error("seedAttachment: no row");
+  return { id: row.id, body };
+}
+
+async function makeContact(a: App, overrides: Record<string, unknown> = {}) {
+  const response = await a.inject({
+    method: "POST", url: "/api/contacts", headers: authHeaders,
+    payload: { firstName: "Alice", lastName: "Anderson", emails: ["alice@example.com"], ...overrides },
+  });
+  return contactSchema.parse(response.json());
+}
+
+async function makeDeal(a: App, extra: Record<string, unknown> = {}) {
+  const pipelineResponse = await a.inject({
+    method: "POST", url: "/api/pipelines", headers: authHeaders, payload: { name: `Sales ${randomUUID()}`, scope: "global" },
+  });
+  const pipeline = pipelineSchema.parse(pipelineResponse.json());
+  const stageResponse = await a.inject({
+    method: "POST", url: `/api/pipelines/${pipeline.id}/stages`, headers: authHeaders, payload: { name: "Lead" },
+  });
+  const stage = stageSchema.parse(stageResponse.json());
+  const dealResponse = await a.inject({
+    method: "POST", url: "/api/deals", headers: authHeaders,
+    payload: { title: "Renewal", pipelineId: pipeline.id, stageId: stage.id, ...extra },
+  });
+  return dealSchema.parse(dealResponse.json());
+}
+
+/** Every account-returning response must be free of anything credential
+ * shaped -- the whole point of mailAccountSchema (see its own note in
+ * packages/shared). Asserted on the raw JSON, not the parsed value, because
+ * zod strips unknown keys and would hide exactly the leak this is looking for. */
+function expectNoCredentials(payload: unknown): void {
+  const json = JSON.stringify(payload);
+  expect(json).not.toMatch(/password|credential|ciphertext|secret/i);
+}
+
+// --- Accounts ---------------------------------------------------------------
+
+describe("mail account routes", () => {
+  it("creates an account, returns 201 with a contract-shaped body, and leaks no credential", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/accounts", headers: authHeaders, payload: baseAccountInput,
+    });
+    expect(response.statusCode).toBe(201);
+    const body = mailAccountSchema.parse(response.json());
+    expect(body.label).toBe("Work");
+    expect(body.status).toBe("active");
+    expectNoCredentials(response.json());
+    await a.close();
+  });
+
+  it("rejects an invalid create body with the uniform 400", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/accounts", headers: authHeaders,
+      payload: { ...baseAccountInput, email: "not-an-address" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  it("409s on a second active account for the same mailbox", async () => {
+    const a = await app();
+    await makeAccount(a);
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/accounts", headers: authHeaders, payload: baseAccountInput,
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  it("lists own accounts in full with live sync stats, others as summaries, and no credentials", async () => {
+    const a = await app();
+    const own = await makeAccount(a);
+    await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    const sync = new FakeAccountSync();
+    syncs.set(own.id, sync);
+
+    const response = await a.inject({ method: "GET", url: "/api/mail/accounts", headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = mailAccountListSchema.parse(response.json());
+    expect(body.own.map((account) => account.id)).toEqual([own.id]);
+    expect(body.own[0]?.syncStats).toEqual(sync.stats);
+    expect(body.others.map((account) => account.email)).toEqual(["dana@example.com"]);
+    // Others carry id/label/email and nothing else -- no host, port or status.
+    expect(Object.keys(response.json().others[0] as object).sort()).toEqual(["email", "id", "label"]);
+    expectNoCredentials(response.json());
+    await a.close();
+  });
+
+  it("reports syncStats null for an account with no live sync engine", async () => {
+    const a = await app({ syncManager: () => null });
+    await makeAccount(a);
+    const response = await a.inject({ method: "GET", url: "/api/mail/accounts", headers: authHeaders });
+    const body = mailAccountListSchema.parse(response.json());
+    expect(body.own[0]?.syncStats).toBeNull();
+    await a.close();
+  });
+
+  it("patches an own account and 404s on another user's", async () => {
+    const a = await app();
+    const own = await makeAccount(a);
+    const theirs = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/mail/accounts/${own.id}`, headers: authHeaders,
+      // A blank password means "keep the stored one" on the update path.
+      payload: { label: "Work mail", password: "" },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(mailAccountSchema.parse(patched.json()).label).toBe("Work mail");
+    expectNoCredentials(patched.json());
+
+    const foreign = await a.inject({
+      method: "PATCH", url: `/api/mail/accounts/${theirs.id}`, headers: authHeaders, payload: { label: "Mine now" },
+    });
+    expect(foreign.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(foreign.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  it("archives and unarchives an own account, and 404s both on another user's", async () => {
+    const a = await app();
+    const own = await makeAccount(a);
+    const theirs = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+
+    const archived = await a.inject({ method: "POST", url: `/api/mail/accounts/${own.id}/archive`, headers: authHeaders });
+    expect(archived.statusCode).toBe(200);
+    expect(mailAccountSchema.parse(archived.json()).archivedAt).not.toBeNull();
+    expectNoCredentials(archived.json());
+
+    const restored = await a.inject({ method: "POST", url: `/api/mail/accounts/${own.id}/unarchive`, headers: authHeaders });
+    expect(restored.statusCode).toBe(200);
+    expect(mailAccountSchema.parse(restored.json()).archivedAt).toBeNull();
+
+    for (const action of ["archive", "unarchive"]) {
+      const foreign = await a.inject({
+        method: "POST", url: `/api/mail/accounts/${theirs.id}/${action}`, headers: authHeaders,
+      });
+      expect(foreign.statusCode).toBe(404);
+    }
+    await a.close();
+  });
+
+  it("rejects a test-connection body that names neither an account nor a full connection", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/accounts/test", headers: authHeaders, payload: { imapHost: "mail.example.com" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  it("404s a test-connection against another user's account", async () => {
+    const a = await app();
+    const theirs = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/accounts/test", headers: authHeaders, payload: { accountId: theirs.id },
+    });
+    expect(response.statusCode).toBe(404);
+    await a.close();
+  });
+
+  it("runs a real test-connection through the adapter deps and reports both protocols failing", async () => {
+    const a = await app();
+    // Port 1 refuses instantly on every platform, so this exercises the wiring
+    // to mail-imapflow's defaultTestConnectionDeps without a network wait.
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/accounts/test", headers: authHeaders,
+      payload: {
+        imapHost: "127.0.0.1", imapPort: 1, imapSecurity: "tls",
+        smtpHost: "127.0.0.1", smtpPort: 1, smtpSecurity: "starttls",
+        username: "chris", password: "hunter2",
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = mailAccountTestResultSchema.parse(response.json());
+    expect(body.imap.ok).toBe(false);
+    expect(body.smtp.ok).toBe(false);
+    expectNoCredentials(response.json());
+    await a.close();
+  });
+});
+
+// --- Threads: list ----------------------------------------------------------
+
+describe("mail thread list route", () => {
+  it("lists non-archived threads newest-first with their derived row fields", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const older = await seedThread({ subject: "Older", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    const newer = await seedThread({ subject: "Newer", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const archived = await seedThread({ subject: "Gone", lastMessageAt: new Date("2026-08-03T10:00:00Z"), archived: true });
+    await seedMessage(older, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: true, snippet: "Older body" });
+    await seedMessage(newer, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, snippet: "Newer body", fromAddr: "bob@example.com", fromName: "Bob",
+    });
+    await seedMessage(archived, account.id, { sentAt: new Date("2026-08-03T10:00:00Z") });
+
+    const response = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
+    expect(body.items.map((t) => t.subject)).toEqual(["Newer", "Older"]);
+    expect(body.items[0]?.unread).toBe(true);
+    expect(body.items[0]?.snippet).toBe("Newer body");
+    expect(body.items[0]?.participants.map((p) => p.address)).toEqual(["bob@example.com"]);
+    expect(body.items[0]?.accountIds).toEqual([account.id]);
+    expect(body.items[1]?.unread).toBe(false);
+    expect(body.nextCursor).toBeNull();
+    await a.close();
+  });
+
+  it("pages through the keyset by (last_message_at, id) without repeats or gaps", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      const sentAt = new Date(Date.UTC(2026, 7, 1 + i, 10));
+      const threadId = await seedThread({ subject: `Thread ${i}`, lastMessageAt: sentAt });
+      await seedMessage(threadId, account.id, { sentAt });
+      ids.push(threadId);
+    }
+    const expected = [...ids].reverse();
+
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 5; page += 1) {
+      const url: string = `/api/mail/threads?limit=2${cursor === null ? "" : `&cursor=${encodeURIComponent(cursor)}`}`;
+      const response = await a.inject({ method: "GET", url, headers: authHeaders });
+      const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
+      seen.push(...body.items.map((t) => t.id));
+      cursor = body.nextCursor;
+      if (cursor === null) break;
+    }
+    expect(cursor).toBeNull();
+    expect(seen).toEqual(expected);
+    await a.close();
+  });
+
+  it("400s on a garbage cursor and on a cursor minted for a different ordering", async () => {
+    const a = await app();
+    const garbage = await a.inject({
+      method: "GET", url: "/api/mail/threads?cursor=not-valid-base64url-json", headers: authHeaders,
+    });
+    expect(garbage.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(garbage.json()).message).toBe("invalid cursor");
+
+    // A created_at cursor is structurally valid base64url JSON, but names a
+    // column this list does not order by -- it must not be accepted.
+    const createdAtCursor = Buffer.from(
+      JSON.stringify({ createdAt: "2026-08-01T10:00:00.000Z", id: UNKNOWN_ID }), "utf8",
+    ).toString("base64url");
+    const wrongOrdering = await a.inject({
+      method: "GET", url: `/api/mail/threads?cursor=${encodeURIComponent(createdAtCursor)}`, headers: authHeaders,
+    });
+    expect(wrongOrdering.statusCode).toBe(400);
+    await a.close();
+  });
+
+  it("filters by account, unread, archived and the four record links, ANDed together", async () => {
+    const a = await app();
+    const first = await makeAccount(a);
+    const second = await makeAccount(a, { label: "Side", email: "side@example.com" });
+    const contact = await makeContact(a);
+
+    const linked = await seedThread({
+      subject: "Linked", lastMessageAt: new Date("2026-08-02T10:00:00Z"), contactId: contact.id,
+    });
+    await seedMessage(linked, first.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
+    const loose = await seedThread({ subject: "Loose", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(loose, second.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: true });
+    const archived = await seedThread({ subject: "Filed", lastMessageAt: new Date("2026-08-03T10:00:00Z"), archived: true });
+    await seedMessage(archived, first.id, { sentAt: new Date("2026-08-03T10:00:00Z") });
+
+    async function subjects(query: string): Promise<string[]> {
+      const response = await a.inject({ method: "GET", url: `/api/mail/threads?${query}`, headers: authHeaders });
+      expect(response.statusCode).toBe(200);
+      return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items.map((t) => t.subject);
+    }
+
+    expect(await subjects(`account_id=${first.id}`)).toEqual(["Linked"]);
+    expect(await subjects(`account_id=${second.id}`)).toEqual(["Loose"]);
+    expect(await subjects("unread=true")).toEqual(["Linked"]);
+    expect(await subjects("unlinked=true")).toEqual(["Loose"]);
+    expect(await subjects(`contact_id=${contact.id}`)).toEqual(["Linked"]);
+    expect(await subjects("archived=true")).toEqual(["Filed"]);
+    // ANDed, not ORed: an unread thread on the OTHER account matches neither.
+    expect(await subjects(`unread=true&account_id=${second.id}`)).toEqual([]);
+    await a.close();
+  });
+});
+
+// --- Threads: detail --------------------------------------------------------
+
+describe("mail thread detail route", () => {
+  it("returns the thread with messages oldest-first and their attachments", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const second = await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), subject: "Re: hello" });
+    const first = await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), subject: "hello" });
+    const attachment = await seedAttachment(second, { filename: "invoice.pdf" });
+
+    const response = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = mailThreadDetailSchema.parse(response.json());
+    expect(body.messages.map((m) => m.id)).toEqual([first, second]);
+    expect(body.messages[1]?.attachments.map((f) => f.id)).toEqual([attachment.id]);
+    expect(body.messages[0]?.attachments).toEqual([]);
+    // The tsvector column must never ride along on a message.
+    expect(response.json()).not.toHaveProperty("messages.0.search");
+    expect(JSON.stringify(response.json())).not.toContain("blobPath");
+    await a.close();
+  });
+
+  it("resolves stored attachment placeholders against the deployment's basePath", async () => {
+    const rootApp = await app({ basePath: "/" });
+    const account = await makeAccount(rootApp);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const messageId = await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), bodyHtml: null });
+    const inline = await seedAttachment(messageId, { filename: "logo.png", mime: "image/png", isInline: true });
+    await handle.db.update(mailMessages)
+      .set({ bodyHtml: `<p><img src="mailattachment:${inline.id}"></p>` })
+      .where(eq(mailMessages.id, messageId));
+
+    const atRoot = await rootApp.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    const rootBody = mailThreadDetailSchema.parse(atRoot.json());
+    expect(rootBody.messages[0]?.bodyHtml).toContain(`/api/mail/attachments/${inline.id}/inline`);
+    expect(rootBody.messages[0]?.bodyHtml).not.toContain("mailattachment:");
+    await rootApp.close();
+
+    const subApp = await app({ basePath: "/conduit" });
+    const atSubPath = await subApp.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    const subBody = mailThreadDetailSchema.parse(atSubPath.json());
+    expect(subBody.messages[0]?.bodyHtml).toContain(`/conduit/api/mail/attachments/${inline.id}/inline`);
+    await subApp.close();
+  });
+
+  it("suggests the linked contact's open deals, newest first, and none once a deal is linked", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const contact = await makeContact(a);
+    const open = await makeDeal(a, { title: "Open renewal", contactId: contact.id });
+    const won = await makeDeal(a, { title: "Won already", contactId: contact.id });
+    await a.inject({ method: "POST", url: `/api/deals/${won.id}/win`, headers: authHeaders });
+
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z"), contactId: contact.id });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const withSuggestions = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    const body = mailThreadDetailSchema.parse(withSuggestions.json());
+    expect(body.dealSuggestions.map((d) => d.id)).toEqual([open.id]);
+
+    await a.inject({
+      method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
+      payload: { kind: "deal", id: open.id },
+    });
+    const linked = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    expect(mailThreadDetailSchema.parse(linked.json()).dealSuggestions).toEqual([]);
+    await a.close();
+  });
+
+  it("404s an unknown thread id", async () => {
+    const a = await app();
+    const response = await a.inject({ method: "GET", url: `/api/mail/threads/${UNKNOWN_ID}`, headers: authHeaders });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+});
+
+// --- Threads: read ----------------------------------------------------------
+
+describe("mail thread read route", () => {
+  it("marks every message seen, drops the unread count, and queues one write-back per account/folder", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: false, imapUid: 11 });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, imapUid: 12 });
+    // Sent-folder message with no UID yet: nothing to name on the server.
+    await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T11:00:00Z"), seen: false, imapUid: null, folder: "Sent",
+    });
+    const sync = new FakeAccountSync();
+    syncs.set(account.id, sync);
+
+    const before = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(mailUnreadCountSchema.parse(before.json()).count).toBe(1);
+
+    const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(response.json()).id).toBe(threadId);
+
+    const after = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(mailUnreadCountSchema.parse(after.json()).count).toBe(0);
+    expect(sync.markSeenCalls).toEqual([{ folder: "INBOX", uids: [11, 12] }]);
+    await a.close();
+  });
+
+  it("still succeeds when one account's sync is in backoff and the other is not", async () => {
+    const a = await app();
+    const healthy = await makeAccount(a);
+    const broken = await makeAccount(a, { label: "Broken", email: "broken@example.com" });
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, healthy.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: false, imapUid: 21 });
+    await seedMessage(threadId, broken.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, imapUid: 22 });
+
+    const healthySync = new FakeAccountSync();
+    const brokenSync = new FakeAccountSync();
+    brokenSync.markSeenFailure = new Error("mail sync for account is in backoff after a failed pass");
+    syncs.set(healthy.id, healthySync);
+    syncs.set(broken.id, brokenSync);
+
+    const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    expect(healthySync.markSeenCalls).toEqual([{ folder: "INBOX", uids: [21] }]);
+    expect(brokenSync.markSeenCalls).toEqual([{ folder: "INBOX", uids: [22] }]);
+    // The database write is the contract, and it happened for both accounts.
+    const rows = await handle.db.select({ seen: mailMessages.seen }).from(mailMessages)
+      .where(eq(mailMessages.threadId, threadId));
+    expect(rows.every((row) => row.seen)).toBe(true);
+    await a.close();
+  });
+
+  it("succeeds with no sync engine at all", async () => {
+    const a = await app({ syncManager: () => null });
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, imapUid: 31 });
+
+    const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("404s an unknown thread", async () => {
+    const a = await app();
+    const response = await a.inject({ method: "POST", url: `/api/mail/threads/${UNKNOWN_ID}/read`, headers: authHeaders });
+    expect(response.statusCode).toBe(404);
+    await a.close();
+  });
+});
+
+// --- Threads: links and archive ---------------------------------------------
+
+describe("mail thread link and archive routes", () => {
+  it("sets and clears each of the four links", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const contact = await makeContact(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const linked = await a.inject({
+      method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
+      payload: { kind: "contact", id: contact.id },
+    });
+    expect(linked.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(linked.json()).contactId).toBe(contact.id);
+
+    const cleared = await a.inject({
+      method: "DELETE", url: `/api/mail/threads/${threadId}/links/contact`, headers: authHeaders,
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(cleared.json()).contactId).toBeNull();
+    // Idempotent: clearing an already-empty link is not an error.
+    const again = await a.inject({
+      method: "DELETE", url: `/api/mail/threads/${threadId}/links/contact`, headers: authHeaders,
+    });
+    expect(again.statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("404s an unknown link target, 400s an unknown link kind, and 409s an archived target", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const missing = await a.inject({
+      method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
+      payload: { kind: "contact", id: UNKNOWN_ID },
+    });
+    expect(missing.statusCode).toBe(404);
+
+    const badKind = await a.inject({
+      method: "DELETE", url: `/api/mail/threads/${threadId}/links/task`, headers: authHeaders,
+    });
+    expect(badKind.statusCode).toBe(400);
+
+    const contact = await makeContact(a);
+    await a.inject({ method: "POST", url: `/api/contacts/${contact.id}/archive`, headers: authHeaders });
+    const archivedTarget = await a.inject({
+      method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
+      payload: { kind: "contact", id: contact.id },
+    });
+    expect(archivedTarget.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(archivedTarget.json()).error).toBe("archived");
+    await a.close();
+  });
+
+  it("archives and unarchives a thread CRM-side, and refuses link changes while archived", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const contact = await makeContact(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const archived = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
+    expect(archived.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(archived.json()).archivedAt).not.toBeNull();
+
+    const whileArchived = await a.inject({
+      method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
+      payload: { kind: "contact", id: contact.id },
+    });
+    expect(whileArchived.statusCode).toBe(409);
+
+    const restored = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
+    expect(restored.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(restored.json()).archivedAt).toBeNull();
+
+    const unknown = await a.inject({ method: "POST", url: `/api/mail/threads/${UNKNOWN_ID}/archive`, headers: authHeaders });
+    expect(unknown.statusCode).toBe(404);
+    await a.close();
+  });
+
+  it("counts unread threads, not unread messages, and ignores archived threads", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const busy = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(busy, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: false });
+    await seedMessage(busy, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
+    const filed = await seedThread({ lastMessageAt: new Date("2026-08-03T10:00:00Z"), archived: true });
+    await seedMessage(filed, account.id, { sentAt: new Date("2026-08-03T10:00:00Z"), seen: false });
+
+    const response = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    expect(mailUnreadCountSchema.parse(response.json()).count).toBe(1);
+    await a.close();
+  });
+});
+
+// --- Send -------------------------------------------------------------------
+
+describe("mail send route", () => {
+  function sendPayload(accountId: string, overrides: Partial<SendMailInput> = {}) {
+    return {
+      accountId,
+      to: [{ address: "alice@example.com", name: "Alice" }],
+      subject: "Hello Alice",
+      bodyHtml: "<p>Hi Alice</p>",
+      ...overrides,
+    };
+  }
+
+  it("sends, stores the message and returns 201 with a contract-shaped body", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const sync = new FakeAccountSync();
+    syncs.set(account.id, sync);
+
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/send", headers: authHeaders, payload: sendPayload(account.id),
+    });
+    expect(response.statusCode).toBe(201);
+    const body = mailMessageSchema.parse(response.json());
+    expect(body.direction).toBe("outbound");
+    expect(body.subject).toBe("Hello Alice");
+    expect(transport.sent).toHaveLength(1);
+    expect(sync.appended).toHaveLength(1);
+    await a.close();
+  });
+
+  it("maps an SMTP refusal to 502 smtp_failed with a reason and stores nothing", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    transport.failure = new Error("auth: Invalid login");
+
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/send", headers: authHeaders, payload: sendPayload(account.id),
+    });
+    expect(response.statusCode).toBe(502);
+    const body = response.json() as { error: string; reason?: string };
+    expect(body.error).toBe("smtp_failed");
+    expect(body.reason).toContain("auth:");
+    const stored = await handle.db.select().from(mailMessages);
+    expect(stored).toHaveLength(0);
+    await a.close();
+  });
+
+  it("400s a send with no recipients and 404s a send from another user's account", async () => {
+    const a = await app();
+    const theirs = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    const mine = await makeAccount(a);
+
+    const noRecipients = await a.inject({
+      method: "POST", url: "/api/mail/send", headers: authHeaders, payload: sendPayload(mine.id, { to: [] }),
+    });
+    expect(noRecipients.statusCode).toBe(400);
+
+    const foreign = await a.inject({
+      method: "POST", url: "/api/mail/send", headers: authHeaders, payload: sendPayload(theirs.id),
+    });
+    expect(foreign.statusCode).toBe(404);
+    await a.close();
+  });
+
+  it("409s a send from an account whose last sync failed", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    await handle.db.update(mailAccounts).set({ status: "error", lastError: "auth: Invalid login" })
+      .where(eq(mailAccounts.id, account.id));
+
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/send", headers: authHeaders, payload: sendPayload(account.id),
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+    await a.close();
+  });
+});
+
+// --- Attachments ------------------------------------------------------------
+
+describe("mail attachment routes", () => {
+  async function seedOne(a: App, opts: Parameters<typeof seedAttachment>[1] = {}) {
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const messageId = await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    return seedAttachment(messageId, opts);
+  }
+
+  it("downloads with the stored mime, an attachment disposition and nosniff", async () => {
+    const a = await app();
+    const attachment = await seedOne(a, { filename: "invoice.pdf", mime: "application/pdf" });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toBe("application/pdf");
+    expect(response.headers["content-disposition"]).toBe('attachment; filename="invoice.pdf"');
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+    expect(response.body).toBe(attachment.body);
+    await a.close();
+  });
+
+  it("serves an inline image inline, with nosniff", async () => {
+    const a = await app();
+    const attachment = await seedOne(a, { filename: "logo.png", mime: "image/png", isInline: true });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}/inline`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toBe("image/png");
+    expect(response.headers["content-disposition"]).toBe('inline; filename="logo.png"');
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+    await a.close();
+  });
+
+  it("404s the inline route for an attachment that is not inline", async () => {
+    const a = await app();
+    const attachment = await seedOne(a, { filename: "invoice.pdf", mime: "application/pdf", isInline: false });
+
+    const inline = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}/inline`, headers: authHeaders,
+    });
+    expect(inline.statusCode).toBe(404);
+    // The same attachment downloads perfectly well.
+    const download = await a.inject({ method: "GET", url: `/api/mail/attachments/${attachment.id}`, headers: authHeaders });
+    expect(download.statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("refuses to render a non-image inline attachment in place, serving it as a download instead", async () => {
+    const a = await app();
+    const attachment = await seedOne(a, { filename: "payload.html", mime: "text/html", isInline: true });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}/inline`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toBe("application/octet-stream");
+    expect(response.headers["content-disposition"]).toBe('attachment; filename="payload.html"');
+    await a.close();
+  });
+
+  it("404s an unknown attachment id on both routes", async () => {
+    const a = await app();
+    for (const url of [`/api/mail/attachments/${UNKNOWN_ID}`, `/api/mail/attachments/${UNKNOWN_ID}/inline`]) {
+      const response = await a.inject({ method: "GET", url, headers: authHeaders });
+      expect(response.statusCode).toBe(404);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    }
+    await a.close();
+  });
+});
+
+// --- Templates --------------------------------------------------------------
+
+describe("mail template routes", () => {
+  it("runs the template CRUD happy path and sanitizes the body on write", async () => {
+    const a = await app();
+    const created = await a.inject({
+      method: "POST", url: "/api/mail/templates", headers: authHeaders,
+      payload: { name: "Intro", subject: "Hello", bodyHtml: "<p>Hi</p><script>alert(1)</script>" },
+    });
+    expect(created.statusCode).toBe(201);
+    const template = emailTemplateSchema.parse(created.json());
+    expect(template.bodyHtml).not.toContain("script");
+
+    const listed = await a.inject({ method: "GET", url: "/api/mail/templates", headers: authHeaders });
+    expect(listed.statusCode).toBe(200);
+    expect(emailTemplateSchema.array().parse(listed.json()).map((t) => t.id)).toEqual([template.id]);
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/mail/templates/${template.id}`, headers: authHeaders,
+      payload: { name: "Intro v2" },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(emailTemplateSchema.parse(patched.json()).name).toBe("Intro v2");
+
+    const archived = await a.inject({
+      method: "POST", url: `/api/mail/templates/${template.id}/archive`, headers: authHeaders,
+    });
+    expect(archived.statusCode).toBe(200);
+    const afterArchive = await a.inject({ method: "GET", url: "/api/mail/templates", headers: authHeaders });
+    expect(emailTemplateSchema.array().parse(afterArchive.json())).toHaveLength(0);
+
+    const restored = await a.inject({
+      method: "POST", url: `/api/mail/templates/${template.id}/unarchive`, headers: authHeaders,
+    });
+    expect(restored.statusCode).toBe(200);
+    expect(emailTemplateSchema.parse(restored.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  it("is shared: one user sees and can edit another user's template", async () => {
+    const a = await app();
+    const created = await a.inject({
+      method: "POST", url: "/api/mail/templates", headers: authHeaders,
+      payload: { name: "House style", bodyHtml: "<p>Hi</p>" },
+    });
+    const template = emailTemplateSchema.parse(created.json());
+
+    const theirView = await a.inject({ method: "GET", url: "/api/mail/templates", headers: otherHeaders });
+    expect(emailTemplateSchema.array().parse(theirView.json()).map((t) => t.id)).toEqual([template.id]);
+
+    const theirEdit = await a.inject({
+      method: "PATCH", url: `/api/mail/templates/${template.id}`, headers: otherHeaders, payload: { name: "Ours" },
+    });
+    expect(theirEdit.statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("400s an invalid body, 404s an unknown id, and 409s a body that sanitizes to nothing", async () => {
+    const a = await app();
+    const invalid = await a.inject({
+      method: "POST", url: "/api/mail/templates", headers: authHeaders, payload: { name: "", bodyHtml: "<p>Hi</p>" },
+    });
+    expect(invalid.statusCode).toBe(400);
+
+    const unknown = await a.inject({
+      method: "PATCH", url: `/api/mail/templates/${UNKNOWN_ID}`, headers: authHeaders, payload: { name: "x" },
+    });
+    expect(unknown.statusCode).toBe(404);
+
+    const emptied = await a.inject({
+      method: "POST", url: "/api/mail/templates", headers: authHeaders,
+      payload: { name: "Hostile", bodyHtml: "<script>alert(1)</script>" },
+    });
+    expect(emptied.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(emptied.json()).error).toBe("conflict");
+    await a.close();
+  });
+});
+
+// --- Search -----------------------------------------------------------------
+
+describe("search route: mail group", () => {
+  it("returns one best-ranked hit per thread, rank ordered, excluding archived threads", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+
+    const strong = await seedThread({ subject: "Invoice", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(strong, account.id, {
+      sentAt: new Date("2026-08-01T10:00:00Z"), subject: "Invoice invoice invoice",
+      bodyText: "invoice invoice invoice invoice", snippet: "best hit",
+    });
+    await seedMessage(strong, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), subject: "Re: Invoice",
+      bodyText: "thanks", snippet: "weaker hit",
+    });
+    const weak = await seedThread({ subject: "Passing mention", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(weak, account.id, {
+      sentAt: new Date("2026-08-03T10:00:00Z"), subject: "Lunch",
+      bodyText: "we can talk about the invoice at lunch some time", snippet: "weak hit",
+    });
+    const filed = await seedThread({ subject: "Filed", lastMessageAt: new Date("2026-08-04T10:00:00Z"), archived: true });
+    await seedMessage(filed, account.id, {
+      sentAt: new Date("2026-08-04T10:00:00Z"), subject: "Invoice", bodyText: "invoice", snippet: "archived hit",
+    });
+
+    const response = await a.inject({ method: "GET", url: "/api/search?q=invoice", headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = searchResultsSchema.parse(response.json());
+    // One row per thread, strongest first, archived thread absent.
+    expect(body.mail.map((hit) => hit.threadId)).toEqual([strong, weak]);
+    expect(body.mail[0]?.snippet).toBe("best hit");
+    await a.close();
+  });
+
+  it("returns an empty mail group for a whitespace-only query without touching the database", async () => {
+    const a = await app();
+    const response = await a.inject({ method: "GET", url: "/api/search?q=%20", headers: authHeaders });
+    expect(searchResultsSchema.parse(response.json()).mail).toEqual([]);
+    await a.close();
+  });
+});

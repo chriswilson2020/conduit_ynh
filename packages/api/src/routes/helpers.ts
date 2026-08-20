@@ -135,10 +135,20 @@ export function parseOrReject<T>(schema: z.ZodType<T>, data: unknown, reply: Fas
  * one (which is what the service layer does on its own -- it has no way to tell
  * "no cursor" from "garbage cursor" apart, so this check has to live here).
  * Returns true when there is nothing to reject (cursor absent or valid).
+ *
+ * `decode` names the ordering the cursor must belong to, defaulting to the
+ * created_at keyset every Phase 1-3 list uses. A route paginating by some
+ * other column (mail threads, by last_message_at) passes that column's
+ * decoder, so a cursor minted for a different ordering is rejected here
+ * rather than paging from a timestamp that means something else.
  */
-export function validateCursor(cursor: string | undefined, reply: FastifyReply): boolean {
+export function validateCursor(
+  cursor: string | undefined,
+  reply: FastifyReply,
+  decode: (raw: string) => object | null = decodeCursor,
+): boolean {
   if (cursor === undefined) return true;
-  if (decodeCursor(cursor) !== null) return true;
+  if (decode(cursor) !== null) return true;
   void reply.code(400).send({ error: "validation", message: "invalid cursor" });
   return false;
 }

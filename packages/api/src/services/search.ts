@@ -1,10 +1,60 @@
-import { and, eq, ilike, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, ilike, isNull, or, sql } from "drizzle-orm";
 import type { SearchResults } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { companies, contacts, notes, deals, tasks } from "../db/schema.js";
+import { companies, contacts, notes, deals, tasks, mailMessages, mailThreads } from "../db/schema.js";
 import { escapeLike } from "./pagination.js";
 
 const LIMIT_PER_TYPE = 8;
+// Deliberately tighter than LIMIT_PER_TYPE: mail hits are thread-grouped, so
+// five is five conversations (each of which may have matched on several of
+// its messages), and the Phase 4 spec/plan fix the number at 5.
+const LIMIT_MAIL = 5;
+
+/**
+ * The mail group: the only full-text group here, because mail_messages is
+ * the only table with a tsvector (schema.ts's generated `search` column).
+ *
+ * Thread-grouped, not message-grouped: a user searching for "invoice" wants
+ * the conversation, and five hits from one noisy thread would crowd out four
+ * other threads. DISTINCT ON (thread_id) with the inner ORDER BY on
+ * ts_rank picks the best-ranked message per thread; the outer query then
+ * re-sorts those winners by rank so the strongest conversation is first
+ * (DISTINCT ON forces its own leading sort key, which is why this needs two
+ * levels rather than one).
+ *
+ * websearch_to_tsquery, not to_tsquery: it takes whatever a human types --
+ * bare words, "quoted phrases", or/-negation -- and never throws on
+ * punctuation the way to_tsquery does. Archived threads are excluded like
+ * every other group here; message-level `seen`/direction are not filtered,
+ * because finding something you already read (or sent) is the normal case.
+ *
+ * subject/snippet are read as explicit columns; the tsvector itself is only
+ * ever an expression in WHERE/ORDER BY and never selected -- it is a large
+ * derived blob no client has any use for.
+ */
+async function searchMail(db: Database, q: string): Promise<SearchResults["mail"]> {
+  const tsQuery = sql`websearch_to_tsquery('english', ${q})`;
+  const rank = sql<number>`ts_rank(${mailMessages.search}, ${tsQuery})`;
+  const best = db
+    .selectDistinctOn([mailMessages.threadId], {
+      threadId: mailMessages.threadId,
+      subject: mailMessages.subject,
+      snippet: mailMessages.snippet,
+      rank: rank.as("search_rank"),
+    })
+    .from(mailMessages)
+    .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
+    .where(and(isNull(mailThreads.archivedAt), sql`${mailMessages.search} @@ ${tsQuery}`))
+    // sent_at breaks a rank tie toward the newest message, so a thread whose
+    // messages all rank identically shows its latest one.
+    .orderBy(mailMessages.threadId, desc(rank), desc(mailMessages.sentAt))
+    .as("best_per_thread");
+
+  const rows = await db
+    .select({ threadId: best.threadId, subject: best.subject, snippet: best.snippet })
+    .from(best).orderBy(desc(best.rank)).limit(LIMIT_MAIL);
+  return rows;
+}
 
 function snippet(body: string, q: string): string {
   const points = Array.from(body);
@@ -26,7 +76,7 @@ function snippet(body: string, q: string): string {
 
 export async function search(db: Database, q: string): Promise<SearchResults> {
   const p = `%${escapeLike(q)}%`;
-  const [companyRows, contactRows, noteRows, dealRows, taskRows] = await Promise.all([
+  const [companyRows, contactRows, noteRows, dealRows, taskRows, mailRows] = await Promise.all([
     db.select({ id: companies.id, name: companies.name }).from(companies)
       .where(and(isNull(companies.archivedAt), ilike(companies.name, p))).limit(LIMIT_PER_TYPE),
     db.select({
@@ -71,6 +121,7 @@ export async function search(db: Database, q: string): Promise<SearchResults> {
     // lifecycle action) hides a task from search.
     db.select({ id: tasks.id, title: tasks.title, projectId: tasks.projectId }).from(tasks)
       .where(and(isNull(tasks.archivedAt), ilike(tasks.title, p))).limit(LIMIT_PER_TYPE),
+    searchMail(db, q),
   ]);
   return {
     companies: companyRows,
@@ -78,5 +129,6 @@ export async function search(db: Database, q: string): Promise<SearchResults> {
     notes: noteRows.map((n) => ({ id: n.id, companyId: n.companyId, contactId: n.contactId, snippet: snippet(n.body, q) })),
     deals: dealRows,
     tasks: taskRows,
+    mail: mailRows,
   };
 }

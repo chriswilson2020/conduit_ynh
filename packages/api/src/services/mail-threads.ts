@@ -1,0 +1,504 @@
+import { and, asc, desc, eq, inArray, isNull, isNotNull, lt, or, sql } from "drizzle-orm";
+import type {
+  MailAddress, MailAttachment, MailDealSuggestion, MailDirection, MailLinkKind, MailMessage,
+  MailMessageWithAttachments, MailThread, MailThreadDetail, MailThreadListItem, ThreadListFilters,
+} from "@conduit/shared";
+import type { Database } from "../db/client.js";
+import {
+  companies, contacts, deals, projects,
+  mailAttachments, mailMessages, mailThreads, type MailMessageRow, type MailThreadRow,
+} from "../db/schema.js";
+import { NotFoundError, ArchivedError } from "./errors.js";
+import { resolveAttachmentUrls } from "./mail-content.js";
+import { decodeLastMessageAtCursor, encodeCursor } from "./pagination.js";
+import { publish } from "./sse.js";
+
+/**
+ * Threads are SHARED, exactly like companies/contacts/deals: every
+ * authenticated user sees every thread (Phase 4 spec, "a conversation two
+ * users are both on is one thread" -- there is no per-user visibility column
+ * on mail_threads to scope by). Owner checks in this file would therefore be
+ * theatre; the only owner-scoped mail surfaces are ACCOUNTS (settings and
+ * credentials) and SEND (whose From address is someone's identity), both of
+ * which live in mail-accounts.ts / mail-send.ts.
+ */
+
+/** Every mail-thread mutation invalidates the same three key families: the
+ * list, this one thread's detail, and the unread badge. Mirrors the hint
+ * mail-ingest.ts publishes when a new message lands, so a client only has to
+ * know one set of keys. */
+function publishThreadHint(threadId: string): void {
+  publish({ keys: [["mail-threads"], ["mail-thread", threadId], ["mail-unread"]] });
+}
+
+function toThread(row: MailThreadRow): MailThread {
+  return {
+    id: row.id, subject: row.subject,
+    lastMessageAt: row.lastMessageAt.toISOString(), messageCount: row.messageCount,
+    companyId: row.companyId, contactId: row.contactId, dealId: row.dealId, projectId: row.projectId,
+    archivedAt: row.archivedAt?.toISOString() ?? null,
+    createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * Explicit column list, never `select()`: mail_messages carries the generated
+ * `search` tsvector, a large derived blob no client has any use for and one
+ * that would otherwise ride along on every message of every thread. The same
+ * reason mail-accounts.ts narrows its `others` select -- what a query does not
+ * fetch cannot leak or bloat.
+ */
+const MESSAGE_COLUMNS = {
+  id: mailMessages.id, accountId: mailMessages.accountId, threadId: mailMessages.threadId,
+  messageId: mailMessages.messageId, inReplyTo: mailMessages.inReplyTo,
+  referencesIds: mailMessages.referencesIds,
+  fromAddr: mailMessages.fromAddr, fromName: mailMessages.fromName,
+  toAddrs: mailMessages.toAddrs, ccAddrs: mailMessages.ccAddrs, bccAddrs: mailMessages.bccAddrs,
+  subject: mailMessages.subject, bodyText: mailMessages.bodyText, bodyHtml: mailMessages.bodyHtml,
+  snippet: mailMessages.snippet, sentAt: mailMessages.sentAt, folder: mailMessages.folder,
+  imapUid: mailMessages.imapUid, seen: mailMessages.seen, direction: mailMessages.direction,
+  createdAt: mailMessages.createdAt, updatedAt: mailMessages.updatedAt,
+} as const;
+
+/**
+ * `apiBase` is config.basePath, threaded from the route layer. body_html is
+ * stored with `mailattachment:<id>` placeholders and NEVER served in that
+ * form (mail-content.ts's resolveAttachmentUrls doc comment): resolving
+ * happens on every read and is never written back, which is what keeps
+ * stored HTML portable across a `yunohost app change_url`.
+ */
+export function toMessage(row: Omit<MailMessageRow, "search">, apiBase: string): MailMessage {
+  return {
+    id: row.id, accountId: row.accountId, threadId: row.threadId,
+    messageId: row.messageId, inReplyTo: row.inReplyTo, referencesIds: row.referencesIds,
+    fromAddr: row.fromAddr, fromName: row.fromName,
+    toAddrs: row.toAddrs, ccAddrs: row.ccAddrs, bccAddrs: row.bccAddrs,
+    subject: row.subject, bodyText: row.bodyText,
+    bodyHtml: row.bodyHtml === null ? null : resolveAttachmentUrls(row.bodyHtml, apiBase),
+    snippet: row.snippet,
+    sentAt: row.sentAt.toISOString(), folder: row.folder, imapUid: row.imapUid,
+    seen: row.seen, direction: row.direction as MailDirection,
+    createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+// --- List ------------------------------------------------------------------
+
+/** The shared filter contract IS the options type -- no third hand-written
+ * shape to drift from the wire (packages/shared's threadListFiltersSchema)
+ * and from the route's querystring mapping. */
+export type ListThreadsOptions = ThreadListFilters;
+
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+/** A mailing-list thread has hundreds of distinct senders and a list row has
+ * space for a couple of names. Capped here rather than in the client so the
+ * response stays a bounded size whatever the data does. */
+const MAX_PARTICIPANTS = 5;
+
+/** Aggregates computed per page of threads, not denormalised onto
+ * mail_threads: every one of them changes on ingest, and a second writer on
+ * the thread row would be one more thing for ingest's transaction to get
+ * right. */
+interface ThreadAggregates {
+  unread: boolean;
+  snippet: string;
+  participants: MailAddress[];
+  accountIds: string[];
+}
+
+async function loadAggregates(db: Database, threadIds: string[]): Promise<Map<string, ThreadAggregates>> {
+  const byThread = new Map<string, ThreadAggregates>();
+  if (threadIds.length === 0) return byThread;
+
+  // One grouped row per thread for the two set-wide facts.
+  const grouped = await db.select({
+    threadId: mailMessages.threadId,
+    unread: sql<boolean>`bool_or(NOT ${mailMessages.seen})`,
+    accountIds: sql<string[]>`array_agg(DISTINCT ${mailMessages.accountId})`,
+  }).from(mailMessages).where(inArray(mailMessages.threadId, threadIds))
+    .groupBy(mailMessages.threadId);
+
+  // One row per (thread, distinct sender), each being that sender's most
+  // recent message in the thread. Two facts fall out of the same query: the
+  // participants list, and the thread's latest message -- the newest row here
+  // IS the thread's newest message, because the newest message is by
+  // definition its own sender's newest.
+  const lowerFrom = sql`lower(${mailMessages.fromAddr})`;
+  const senders = await db.selectDistinctOn([mailMessages.threadId, lowerFrom], {
+    threadId: mailMessages.threadId,
+    fromAddr: mailMessages.fromAddr,
+    fromName: mailMessages.fromName,
+    snippet: mailMessages.snippet,
+    sentAt: mailMessages.sentAt,
+  }).from(mailMessages).where(inArray(mailMessages.threadId, threadIds))
+    .orderBy(mailMessages.threadId, lowerFrom, desc(mailMessages.sentAt), desc(mailMessages.id));
+
+  const sendersByThread = new Map<string, typeof senders>();
+  for (const row of senders) {
+    const list = sendersByThread.get(row.threadId);
+    if (list === undefined) sendersByThread.set(row.threadId, [row]);
+    else list.push(row);
+  }
+
+  for (const row of grouped) {
+    const rows = [...(sendersByThread.get(row.threadId) ?? [])]
+      .sort((a, b) => b.sentAt.getTime() - a.sentAt.getTime());
+    byThread.set(row.threadId, {
+      unread: row.unread,
+      snippet: rows[0]?.snippet ?? "",
+      participants: rows.slice(0, MAX_PARTICIPANTS)
+        .map((r) => ({ address: r.fromAddr, name: r.fromName })),
+      accountIds: row.accountIds,
+    });
+  }
+  return byThread;
+}
+
+/**
+ * The inbox list. Keyset paginated by (last_message_at, id) descending --
+ * mail_threads' own index order (see the hand-written indexes in
+ * drizzle/0004) -- rather than by created_at like every Phase 1-3 list: a
+ * thread's position in the inbox is decided by its newest message, and
+ * created_at is when the CRM first saw the conversation, which for a
+ * backfilled mailbox is "all at once."
+ *
+ * Filters AND together. `archived` is the usual two-state flag (archived-only
+ * when true, non-archived otherwise); `unread` and `unlinked` are toggles, so
+ * false means "do not filter", not "only read"/"only linked" -- the inbox has
+ * no use for either inverse, and a toggle that filters when off would be a
+ * surprising thing for a checkbox to do.
+ */
+export async function listThreads(
+  db: Database, opts: ListThreadsOptions = {},
+): Promise<{ items: MailThreadListItem[]; nextCursor: string | null }> {
+  const limit = Math.min(opts.limit ?? DEFAULT_LIMIT, MAX_LIMIT);
+  const where = [opts.archived ? isNotNull(mailThreads.archivedAt) : isNull(mailThreads.archivedAt)];
+  if (opts.companyId) where.push(eq(mailThreads.companyId, opts.companyId));
+  if (opts.contactId) where.push(eq(mailThreads.contactId, opts.contactId));
+  if (opts.dealId) where.push(eq(mailThreads.dealId, opts.dealId));
+  if (opts.projectId) where.push(eq(mailThreads.projectId, opts.projectId));
+  // "Nothing has claimed this conversation yet" -- the triage filter. All
+  // four columns null, not just the contact one: a thread auto-linked to a
+  // company but no contact has still been claimed.
+  if (opts.unlinked) {
+    where.push(and(
+      isNull(mailThreads.companyId), isNull(mailThreads.contactId),
+      isNull(mailThreads.dealId), isNull(mailThreads.projectId),
+    )!);
+  }
+  // Both of these are properties of a thread's MESSAGES, so they are EXISTS
+  // subqueries rather than columns: a thread is "in" an account when any of
+  // its messages was seen through that account's mailbox, and unread when any
+  // one message is unseen.
+  if (opts.accountId) {
+    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${mailMessages.accountId} = ${opts.accountId})`);
+  }
+  if (opts.unread) {
+    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${mailMessages.seen} = false)`);
+  }
+  const cur = opts.cursor ? decodeLastMessageAtCursor(opts.cursor) : null;
+  if (cur) {
+    // Non-null assertion: `or` only returns undefined for zero conditions;
+    // both branches here are unconditional. Same note as timeline.ts's --
+    // do not make either branch optional without rechecking.
+    where.push(or(
+      lt(mailThreads.lastMessageAt, new Date(cur.lastMessageAt)),
+      and(eq(mailThreads.lastMessageAt, new Date(cur.lastMessageAt)), lt(mailThreads.id, cur.id)),
+    )!);
+  }
+
+  const rows = await db.select().from(mailThreads).where(and(...where))
+    .orderBy(desc(mailThreads.lastMessageAt), desc(mailThreads.id)).limit(limit + 1);
+  const page = rows.slice(0, limit);
+  const aggregates = await loadAggregates(db, page.map((row) => row.id));
+  const last = page[page.length - 1];
+  return {
+    items: page.map((row) => {
+      const extra = aggregates.get(row.id);
+      return {
+        ...toThread(row),
+        // A thread with no messages cannot exist (ingest creates both in one
+        // transaction), but the map lookup is still optional-shaped rather
+        // than asserted: an empty inbox row is a rendering nuisance, a thrown
+        // TypeError is an outage.
+        unread: extra?.unread ?? false,
+        snippet: extra?.snippet ?? "",
+        participants: extra?.participants ?? [],
+        accountIds: extra?.accountIds ?? [],
+      } satisfies MailThreadListItem;
+    }),
+    nextCursor: rows.length > limit && last !== undefined
+      ? encodeCursor({ lastMessageAt: last.lastMessageAt.toISOString(), id: last.id }) : null,
+  };
+}
+
+// --- Detail ----------------------------------------------------------------
+
+async function mustGetThread(db: Database, id: string): Promise<MailThreadRow> {
+  const [row] = await db.select().from(mailThreads).where(eq(mailThreads.id, id));
+  if (row === undefined) throw new NotFoundError("mail thread", id);
+  return row;
+}
+
+const MAX_DEAL_SUGGESTIONS = 5;
+
+/**
+ * Open deals belonging to whoever this thread is already linked to -- the
+ * link panel's one-click row ("this conversation is with Alice; her renewal
+ * deal is open, link it?").
+ *
+ * Only OPEN deals, unlike the search service's deals group: a suggestion is a
+ * prompt to act, and nobody wants to be prompted to file a conversation
+ * against a deal that closed last year. A thread already linked to a deal
+ * gets no suggestions at all -- the link panel shows the link instead -- and
+ * a thread linked to nobody gets none either, since there would be nothing to
+ * derive them from.
+ */
+async function loadDealSuggestions(db: Database, thread: MailThreadRow): Promise<MailDealSuggestion[]> {
+  if (thread.dealId !== null) return [];
+  const owners = [];
+  if (thread.contactId !== null) owners.push(eq(deals.contactId, thread.contactId));
+  if (thread.companyId !== null) owners.push(eq(deals.companyId, thread.companyId));
+  if (owners.length === 0) return [];
+  return db.select({ id: deals.id, title: deals.title }).from(deals)
+    .where(and(isNull(deals.archivedAt), eq(deals.status, "open"), or(...owners)!))
+    .orderBy(desc(deals.createdAt), desc(deals.id)).limit(MAX_DEAL_SUGGESTIONS);
+}
+
+export async function getThreadDetail(db: Database, id: string, apiBase: string): Promise<MailThreadDetail> {
+  const thread = await mustGetThread(db, id);
+  const messageRows = await db.select(MESSAGE_COLUMNS).from(mailMessages)
+    .where(eq(mailMessages.threadId, id))
+    // Oldest first: the conversation view renders in reading order, with only
+    // the newest message expanded.
+    .orderBy(asc(mailMessages.sentAt), asc(mailMessages.id));
+
+  const messageIds = messageRows.map((row) => row.id);
+  const attachmentRows = messageIds.length === 0 ? [] : await db.select({
+    id: mailAttachments.id, messageId: mailAttachments.messageId,
+    filename: mailAttachments.filename, mime: mailAttachments.mime,
+    sizeBytes: mailAttachments.sizeBytes, contentId: mailAttachments.contentId,
+    isInline: mailAttachments.isInline, createdAt: mailAttachments.createdAt,
+    // blobPath deliberately absent -- see mailAttachmentSchema's own note.
+  }).from(mailAttachments).where(inArray(mailAttachments.messageId, messageIds))
+    .orderBy(asc(mailAttachments.createdAt), asc(mailAttachments.id));
+
+  const byMessage = new Map<string, MailAttachment[]>();
+  for (const row of attachmentRows) {
+    const attachment: MailAttachment = {
+      id: row.id, messageId: row.messageId, filename: row.filename, mime: row.mime,
+      sizeBytes: row.sizeBytes, contentId: row.contentId, isInline: row.isInline,
+      createdAt: row.createdAt.toISOString(),
+    };
+    const list = byMessage.get(row.messageId);
+    if (list === undefined) byMessage.set(row.messageId, [attachment]);
+    else list.push(attachment);
+  }
+
+  const messages: MailMessageWithAttachments[] = messageRows.map((row) => ({
+    ...toMessage(row, apiBase),
+    attachments: byMessage.get(row.id) ?? [],
+  }));
+
+  return { thread: toThread(thread), messages, dealSuggestions: await loadDealSuggestions(db, thread) };
+}
+
+// --- Read ------------------------------------------------------------------
+
+/** One `\Seen` write-back: a folder's worth of UIDs on one account. */
+export interface SeenWriteBack {
+  accountId: string;
+  folder: string;
+  uids: number[];
+}
+
+/**
+ * Mark every message in the thread seen, in the DATABASE. The IMAP side is
+ * the caller's job: this returns the write-back groups rather than talking to
+ * the sync engine itself, which keeps this module free of the sync engine
+ * entirely and puts the best-effort decision (see routes/mail.ts) in one
+ * visible place.
+ *
+ * Messages whose imap_uid is NULL are skipped in the groups: a message this
+ * server APPENDed but has not yet re-sighted in the Sent folder has no UID to
+ * name, and the flag will be right the moment the next pass ingests it.
+ */
+export async function markThreadRead(
+  db: Database, id: string,
+): Promise<{ thread: MailThread; writeBacks: SeenWriteBack[] }> {
+  const thread = await mustGetThread(db, id);
+  const changed = await db.update(mailMessages).set({ seen: true, updatedAt: new Date() })
+    .where(and(eq(mailMessages.threadId, id), eq(mailMessages.seen, false)))
+    .returning({
+      accountId: mailMessages.accountId, folder: mailMessages.folder, imapUid: mailMessages.imapUid,
+    });
+
+  const groups = new Map<string, SeenWriteBack>();
+  for (const row of changed) {
+    if (row.imapUid === null) continue;
+    const key = `${row.accountId} ${row.folder}`;
+    const group = groups.get(key);
+    if (group === undefined) groups.set(key, { accountId: row.accountId, folder: row.folder, uids: [row.imapUid] });
+    else group.uids.push(row.imapUid);
+  }
+
+  // Nothing changed means the thread was already read: no hint, matching
+  // every other no-op short-circuit in the codebase (a hint for a write that
+  // did not happen makes every client refetch for nothing).
+  if (changed.length > 0) publishThreadHint(id);
+  return { thread: toThread(thread), writeBacks: [...groups.values()] };
+}
+
+// --- Links -----------------------------------------------------------------
+
+/** The four link kinds, as they are named on mail_threads. The wire kind and
+ * the column deliberately differ ("company" vs companyId), so this is the one
+ * place the two vocabularies meet. */
+const LINK_FIELDS = {
+  company: "companyId", contact: "contactId", deal: "dealId", project: "projectId",
+} as const satisfies Record<MailLinkKind, "companyId" | "contactId" | "dealId" | "projectId">;
+
+/**
+ * The manual link target must exist and must not be archived -- the same rule
+ * ingest's auto-linker follows (it skips archived contacts) and the same one
+ * notes/files apply to their own targets. Filing a live conversation against
+ * a record someone has archived is almost always a mistake, and the archive
+ * is the signal that says so.
+ */
+async function assertLinkTargetActive(db: Database, kind: MailLinkKind, id: string): Promise<void> {
+  const table = { company: companies, contact: contacts, deal: deals, project: projects }[kind];
+  const [row] = await db.select({ archivedAt: table.archivedAt }).from(table).where(eq(table.id, id));
+  if (row === undefined) throw new NotFoundError(kind, id);
+  if (row.archivedAt !== null) throw new ArchivedError(kind, id);
+}
+
+async function writeLink(db: Database, threadId: string, kind: MailLinkKind, value: string | null): Promise<MailThread> {
+  const patch: Partial<typeof mailThreads.$inferInsert> = { updatedAt: new Date() };
+  patch[LINK_FIELDS[kind]] = value;
+  const [row] = await db.update(mailThreads).set(patch)
+    .where(and(eq(mailThreads.id, threadId), isNull(mailThreads.archivedAt)))
+    .returning();
+  // archived_at IS NULL in the WHERE keeps the guard atomic against a
+  // concurrent archive; the read in setThreadLink/clearThreadLink is what
+  // produces the friendly error, this is what makes it true.
+  if (row === undefined) throw new ArchivedError("mail thread", threadId);
+  publishThreadHint(threadId);
+  return toThread(row);
+}
+
+export async function setThreadLink(
+  db: Database, threadId: string, kind: MailLinkKind, targetId: string,
+): Promise<MailThread> {
+  const thread = await mustGetThread(db, threadId);
+  if (thread.archivedAt !== null) throw new ArchivedError("mail thread", threadId);
+  await assertLinkTargetActive(db, kind, targetId);
+  return writeLink(db, threadId, kind, targetId);
+}
+
+/** Idempotent: clearing a link that is already null still succeeds and still
+ * returns the thread, the same way archive/unarchive treat a no-op. */
+export async function clearThreadLink(db: Database, threadId: string, kind: MailLinkKind): Promise<MailThread> {
+  const thread = await mustGetThread(db, threadId);
+  if (thread.archivedAt !== null) throw new ArchivedError("mail thread", threadId);
+  return writeLink(db, threadId, kind, null);
+}
+
+// --- Archive ---------------------------------------------------------------
+
+/**
+ * CRM-side only, exactly as the spec says: this sets mail_threads.archived_at
+ * and touches no mailbox. Nothing is moved, expunged or flagged on the IMAP
+ * server -- "archived" here means "out of the CRM inbox", and the user's own
+ * mail client is left entirely alone.
+ */
+async function setArchived(db: Database, id: string, archived: boolean): Promise<MailThread> {
+  const [row] = await db.update(mailThreads)
+    .set({ archivedAt: archived ? new Date() : null, updatedAt: new Date() })
+    .where(and(
+      eq(mailThreads.id, id),
+      archived ? isNull(mailThreads.archivedAt) : isNotNull(mailThreads.archivedAt),
+    )).returning();
+  if (row !== undefined) {
+    publishThreadHint(id);
+    return toThread(row);
+  }
+  const existing = await mustGetThread(db, id);
+  return toThread(existing);
+}
+
+export function archiveThread(db: Database, id: string): Promise<MailThread> {
+  return setArchived(db, id, true);
+}
+export function unarchiveThread(db: Database, id: string): Promise<MailThread> {
+  return setArchived(db, id, false);
+}
+
+// --- Attachments -----------------------------------------------------------
+
+/** What an attachment download route needs: the client-facing metadata plus
+ * the blob digest it has to open (mailAttachmentSchema deliberately has no
+ * blobPath, so this is a separate, server-only shape). */
+export interface MailAttachmentBlob {
+  id: string;
+  filename: string;
+  mime: string;
+  sizeBytes: number;
+  /** blobs.ts's sha256 content address (see mail-ingest.ts, which writes it). */
+  blobPath: string;
+  isInline: boolean;
+}
+
+/**
+ * Look up one attachment for serving.
+ *
+ * The join to mail_messages/mail_threads is the AUTHORIZATION check, such as
+ * it is. Attachment ids are attacker-influenced: an inbound message can carry
+ * `<img src="cid:...">` for any Content-ID it likes, and while
+ * sanitizeMailHtml refuses to emit a `mailattachment:` placeholder it did not
+ * mint itself, a hand-written request to this route can still name any uuid.
+ * Because mail visibility is SHARED -- every authenticated user sees every
+ * thread -- "does a message and thread exist for this attachment" is the whole
+ * of the authorization question, and the 404 below is the answer. The FKs make
+ * the join redundant in a healthy database, which is exactly why it is written
+ * out: it states the rule rather than relying on a constraint elsewhere.
+ *
+ * `inlineOnly` is the second half of the guard, for the route that serves
+ * bytes for rendering rather than saving: it serves only rows ingest itself
+ * marked `is_inline` (a real cid: part of a multipart/related body), never an
+ * ordinary file attachment someone points an <img> at.
+ */
+export async function getAttachmentBlob(
+  db: Database, id: string, opts: { inlineOnly: boolean },
+): Promise<MailAttachmentBlob> {
+  const [row] = await db.select({
+    id: mailAttachments.id, filename: mailAttachments.filename, mime: mailAttachments.mime,
+    sizeBytes: mailAttachments.sizeBytes, blobPath: mailAttachments.blobPath,
+    isInline: mailAttachments.isInline,
+  }).from(mailAttachments)
+    .innerJoin(mailMessages, eq(mailMessages.id, mailAttachments.messageId))
+    .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
+    .where(eq(mailAttachments.id, id));
+  if (row === undefined) throw new NotFoundError("mail attachment", id);
+  // Same 404, not a 403: whether an existing attachment happens to be inline
+  // is not something this route needs to disclose.
+  if (opts.inlineOnly && !row.isInline) throw new NotFoundError("mail attachment", id);
+  return row;
+}
+
+// --- Unread count ----------------------------------------------------------
+
+/**
+ * Distinct non-archived threads holding at least one unseen message -- the
+ * inbox nav badge. Counted over threads rather than messages for the same
+ * reason the list is thread-shaped: a ten-message unread conversation is one
+ * thing to deal with, not ten.
+ */
+export async function unreadThreadCount(db: Database): Promise<number> {
+  const [row] = await db.select({
+    count: sql<number>`count(DISTINCT ${mailMessages.threadId})::int`,
+  }).from(mailMessages)
+    .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
+    .where(and(isNull(mailThreads.archivedAt), eq(mailMessages.seen, false)));
+  return row?.count ?? 0;
+}

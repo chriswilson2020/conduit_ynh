@@ -1,7 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import multipart from "@fastify/multipart";
 import type { Database } from "../db/client.js";
-import type { SendMailSyncManager, SendMailTransportFactory } from "../services/mail-send.js";
+import type { SendMailTransportFactory } from "../services/mail-send.js";
+import type { MailRouteSyncManager } from "./mail.js";
 import { registerCompanyRoutes } from "./companies.js";
 import { registerContactRoutes } from "./contacts.js";
 import { registerNoteRoutes } from "./notes.js";
@@ -15,6 +16,7 @@ import { registerDealRoutes } from "./deals.js";
 import { registerProjectRoutes } from "./projects.js";
 import { registerTaskRoutes } from "./tasks.js";
 import { registerGanttRoutes } from "./gantt.js";
+import { registerMailRoutes } from "./mail.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -28,9 +30,17 @@ export interface CrmRouteDeps {
   /** Applied by deals.ts's POST /api/deals when the caller omits a currency --
    * threaded straight from config.defaultCurrency (see config.ts). */
   defaultCurrency: string;
+  /**
+   * Public path this app is mounted at, without a trailing slash ("/" for a
+   * root deployment) -- config.basePath, threaded straight through.
+   * routes/mail.ts resolves stored `mailattachment:` placeholders against it
+   * on every body-serving response (see mail-content.ts's
+   * resolveAttachmentUrls), which is what keeps stored HTML portable across a
+   * `yunohost app change_url`.
+   */
+  basePath: string;
   /** Threaded straight from config.mailKeyPath (see config.ts) for
-   * routes/mail.ts (Task 7) to pass into mail-accounts.ts's service calls.
-   * Seam only -- unused until that route file exists. */
+   * routes/mail.ts to pass into mail-accounts.ts's service calls. */
   mailKeyPath: string;
   /**
    * The live sync engine, fetched at REQUEST time rather than captured at
@@ -40,11 +50,11 @@ export interface CrmRouteDeps {
    *
    * Returning null is an ordinary, supported answer, not a failure: sync is
    * off under NODE_ENV=test and in any deployment without an adapter, and
-   * both consumers (mail-send's Sent-folder APPEND, Task 7's `\Seen`
-   * write-back) treat "no manager" and "no sync for this account" the same
-   * best-effort way.
+   * all three consumers (mail-send's Sent-folder APPEND, the thread-read
+   * route's `\Seen` write-back, the accounts list's sync stats) treat "no
+   * manager" and "no sync for this account" the same best-effort way.
    */
-  syncManager: () => SendMailSyncManager | null;
+  syncManager: () => MailRouteSyncManager | null;
   /**
    * Builds an SMTP transport for one send. Supplied by the composition root
    * (server.ts) from parsed config, so nothing under routes/ or services/
@@ -57,8 +67,8 @@ export interface CrmRouteDeps {
 /**
  * Wires the hardened CRM/PM services (plus the plain user listing) into HTTP:
  * companies, contacts, notes, files, events, search, pipelines/deals (Phase
- * 2), and projects/tasks/gantt (Phase 3). Registered after /api/health and
- * /api/me and before the not-found/SPA branch,
+ * 2), projects/tasks/gantt (Phase 3), and mail (Phase 4). Registered after
+ * /api/health and /api/me and before the not-found/SPA branch,
  * so it inherits the same onRequest auth hook without having to repeat it.
  *
  * Awaiting app.register() here is safe (and the orthodox way to do it) only
@@ -86,4 +96,5 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerProjectRoutes(app, deps);
   registerTaskRoutes(app, deps);
   registerGanttRoutes(app, deps);
+  registerMailRoutes(app, deps);
 }
