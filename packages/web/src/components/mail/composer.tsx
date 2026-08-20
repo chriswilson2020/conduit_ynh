@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, KeyboardEvent } from "react";
 import type { FileMeta, SendMailInput } from "@conduit/shared";
-import { ApiError } from "../../api";
 import {
   useContacts,
   useMailAccounts,
@@ -11,13 +10,16 @@ import {
   useUploadFile,
 } from "../../queries";
 import {
+  attachmentTarget,
+  composeErrorMessage,
   dedupeRecipients,
   htmlIsBlank,
   parseRecipientInput,
-  sendFailureMessage,
+  resolveRecipients,
   signatureBlock,
   substitutePlaceholders,
   templateSubject,
+  type ComposerLinks,
   type ComposerRecipient,
   type TemplateContext,
 } from "./composer-lib";
@@ -46,9 +48,11 @@ export interface ComposerSeed {
   /**
    * Record links applied to a NEW thread (ignored server-side on a reply,
    * which already has one). Also decides which record an attachment upload is
-   * filed against -- see attachmentTarget below.
+   * filed against -- see composer-lib's attachmentTarget, and note that a
+   * seed with no links at all disables the attach control entirely, so a
+   * reply opened from a conversation should pass the THREAD's links.
    */
-  links?: { companyId?: string; contactId?: string; dealId?: string; projectId?: string };
+  links?: ComposerLinks;
   /**
    * Names for template placeholders. Supplied by the opener (a record page
    * knows its own contact/company) rather than fetched here from
@@ -86,34 +90,6 @@ export function Composer({ open, onOpenChange, seed }: ComposerProps) {
   );
 }
 
-/**
- * Which record an attachment is filed against. POST /api/files requires
- * EXACTLY ONE of companyId/contactId/dealId/projectId, so a compose with no
- * record link at all has nowhere to put an upload -- the attach control is
- * disabled in that case rather than failing at 400. Most specific link first:
- * an attachment on a deal thread belongs on the deal, not on its company.
- */
-type AttachmentTarget = { companyId?: string; contactId?: string; dealId?: string; projectId?: string };
-
-function attachmentTarget(links: ComposerSeed["links"]): AttachmentTarget | null {
-  if (links === undefined) return null;
-  if (links.dealId !== undefined) return { dealId: links.dealId };
-  if (links.projectId !== undefined) return { projectId: links.projectId };
-  if (links.contactId !== undefined) return { contactId: links.contactId };
-  if (links.companyId !== undefined) return { companyId: links.companyId };
-  return null;
-}
-
-function composeErrorMessage(error: unknown): string {
-  if (error instanceof ApiError) {
-    // 502 smtp_failed: nothing was stored, and the reason (auth:/connection:
-    // classified, or the server's own words) rides in the message -- see
-    // sendFailureMessage.
-    return error.code === "smtp_failed" ? sendFailureMessage(error.message) : error.message;
-  }
-  return error instanceof Error ? error.message : String(error);
-}
-
 function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => void }) {
   const { data: accounts } = useMailAccounts();
   const { data: templates = [] } = useMailTemplates();
@@ -126,6 +102,13 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
   const [to, setTo] = useState<ComposerRecipient[]>([...(seed?.to ?? [])]);
   const [cc, setCc] = useState<ComposerRecipient[]>([...(seed?.cc ?? [])]);
   const [bcc, setBcc] = useState<ComposerRecipient[]>([]);
+  // The three in-progress drafts live HERE, not inside each RecipientField:
+  // handleSubmit has to be able to read what is still sitting in an input at
+  // the instant Send is pressed (see resolveRecipients' doc comment for the
+  // bug that costs otherwise).
+  const [toDraft, setToDraft] = useState("");
+  const [ccDraft, setCcDraft] = useState("");
+  const [bccDraft, setBccDraft] = useState("");
   const [showCcBcc, setShowCcBcc] = useState((seed?.cc ?? []).length > 0);
   const [subject, setSubject] = useState(seed?.subject ?? "");
   const [bodyHtml, setBodyHtml] = useState(seed?.bodyHtml ?? "");
@@ -200,7 +183,24 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
       setLocalError("Choose an account to send from.");
       return;
     }
-    if (to.length === 0) {
+    // Committed chips PLUS whatever is still typed, resolved synchronously
+    // here -- a recipient the user typed but never separated must be sent,
+    // not silently dropped, and one that is not an address must be reported.
+    const resolvedTo = resolveRecipients(to, toDraft);
+    const resolvedCc = resolveRecipients(cc, ccDraft);
+    const resolvedBcc = resolveRecipients(bcc, bccDraft);
+    setTo(resolvedTo.recipients);
+    setCc(resolvedCc.recipients);
+    setBcc(resolvedBcc.recipients);
+    const invalid = [...resolvedTo.invalid, ...resolvedCc.invalid, ...resolvedBcc.invalid];
+    if (invalid.length > 0) {
+      setLocalError(`Not an email address: ${invalid.join(", ")}`);
+      return;
+    }
+    setToDraft("");
+    setCcDraft("");
+    setBccDraft("");
+    if (resolvedTo.recipients.length === 0) {
       setLocalError("Add at least one recipient.");
       return;
     }
@@ -212,9 +212,9 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
     const input: SendMailInput = {
       accountId,
       threadId: seed?.threadId,
-      to: dedupeRecipients(to),
-      cc: dedupeRecipients(cc),
-      bcc: dedupeRecipients(bcc),
+      to: resolvedTo.recipients,
+      cc: resolvedCc.recipients,
+      bcc: resolvedBcc.recipients,
       subject,
       bodyHtml,
       attachmentIds: attachments.map((file) => file.id),
@@ -254,6 +254,8 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
         testId="composer-to"
         recipients={to}
         onChange={setTo}
+        draft={toDraft}
+        onDraftChange={setToDraft}
         onInvalid={setLocalError}
       />
 
@@ -264,6 +266,8 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
             testId="composer-cc"
             recipients={cc}
             onChange={setCc}
+            draft={ccDraft}
+            onDraftChange={setCcDraft}
             onInvalid={setLocalError}
           />
           <RecipientField
@@ -271,6 +275,8 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
             testId="composer-bcc"
             recipients={bcc}
             onChange={setBcc}
+            draft={bccDraft}
+            onDraftChange={setBccDraft}
             onInvalid={setLocalError}
           />
         </>
@@ -361,7 +367,9 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
         <Button
           type="submit"
           data-testid="composer-send"
-          disabled={send.isPending || accountId === null || to.length === 0}
+          // A typed-but-uncommitted recipient counts: handleSubmit resolves
+          // the draft before it decides there is nobody to send to.
+          disabled={send.isPending || accountId === null || (to.length === 0 && toDraft.trim() === "")}
         >
           {send.isPending ? "Sending..." : "Send"}
         </Button>
@@ -383,15 +391,19 @@ function RecipientField({
   testId,
   recipients,
   onChange,
+  draft,
+  onDraftChange,
   onInvalid,
 }: {
   label: string;
   testId: string;
   recipients: ComposerRecipient[];
   onChange: (next: ComposerRecipient[]) => void;
+  /** Owned by the composer, not this field -- see its useState comment. */
+  draft: string;
+  onDraftChange: (next: string) => void;
   onInvalid: (message: string | null) => void;
 }) {
-  const [draft, setDraft] = useState("");
   const [debounced, setDebounced] = useState("");
   const [open, setOpen] = useState(false);
 
@@ -420,7 +432,7 @@ function RecipientField({
 
   function commit(recipient: ComposerRecipient) {
     onChange(dedupeRecipients([...recipients, recipient]));
-    setDraft("");
+    onDraftChange("");
     setOpen(false);
   }
 
@@ -429,24 +441,23 @@ function RecipientField({
     if (parsed.tokens.length > 0) onChange(dedupeRecipients([...recipients, ...parsed.tokens]));
     if (parsed.invalid.length > 0) onInvalid(`Not an email address: ${parsed.invalid.join(", ")}`);
     else if (parsed.tokens.length > 0) onInvalid(null);
-    setDraft(parsed.remainder);
+    onDraftChange(parsed.remainder);
     setOpen(parsed.remainder.trim() !== "");
   }
 
-  function commitDraft(): boolean {
-    if (draft.trim() === "") return false;
-    // Reuses the same parser by appending the separator the user did not
-    // type, so Enter/Tab/blur and "type a comma" cannot diverge.
-    const parsed = parseRecipientInput(`${draft},`);
-    if (parsed.tokens.length === 0) {
-      onInvalid(`Not an email address: ${draft.trim()}`);
-      return false;
+  // Enter/Tab/blur all land here. Same resolver the submit path uses, so the
+  // two can never disagree about what a half-typed line means.
+  function commitDraft(): void {
+    if (draft.trim() === "") return;
+    const resolved = resolveRecipients(recipients, draft);
+    if (resolved.invalid.length > 0) {
+      onInvalid(`Not an email address: ${resolved.invalid.join(", ")}`);
+      return;
     }
-    onChange(dedupeRecipients([...recipients, ...parsed.tokens]));
+    onChange(resolved.recipients);
     onInvalid(null);
-    setDraft("");
+    onDraftChange("");
     setOpen(false);
-    return true;
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
@@ -498,13 +509,11 @@ function RecipientField({
             onKeyDown={handleKeyDown}
             onFocus={() => setOpen(draft.trim() !== "")}
             onBlur={() => {
-              // A click on a suggestion blurs the input first, so the
-              // dropdown cannot be closed synchronously here or the click
-              // would land on nothing.
-              setTimeout(() => {
-                commitDraft();
-                setOpen(false);
-              }, 150);
+              // Synchronous, no timer: the suggestion buttons below swallow
+              // their own mousedown, so clicking one never blurs this input
+              // and there is no race left to defer around.
+              commitDraft();
+              setOpen(false);
             }}
           />
         </div>
@@ -516,6 +525,10 @@ function RecipientField({
                   type="button"
                   data-testid="composer-suggestion"
                   className="block w-full px-3 py-2 text-left text-sm hover:bg-slate-50"
+                  // Keeps focus in the input: without this the mousedown
+                  // blurs it, the dropdown unmounts, and the click lands on
+                  // nothing.
+                  onMouseDown={(event) => event.preventDefault()}
                   onClick={() => commit(suggestion)}
                 >
                   <span className="block text-slate-900">{suggestion.name ?? suggestion.address}</span>

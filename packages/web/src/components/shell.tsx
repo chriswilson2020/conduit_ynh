@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Link, useRouterState } from "@tanstack/react-router";
+import { basePath } from "../api";
 import { GlobalSearch } from "./search";
 import { useSseInvalidation } from "./sse";
 
@@ -18,10 +19,12 @@ export function Shell({ children }: { children: ReactNode }) {
 
   // The Settings entry links at one of its two tabs but must stay highlighted
   // on both, and activeProps only knows about the link's own target -- so its
-  // active state is computed from the path instead. `includes` rather than
-  // `startsWith`: at a subpath install the pathname is prefixed with the
-  // app's base (see api.ts's basePath).
-  const inSettings = useRouterState({ select: (state) => state.location.pathname.includes("/settings") });
+  // active state is computed from the path instead. The router's
+  // location.pathname is the browser's, base and all (it decodes the raw
+  // history path and never strips the basepath), so the prefix is built from
+  // basePath() rather than assuming a root install.
+  const settingsPrefix = basePath() === "/" ? "/settings" : `${basePath()}/settings`;
+  const inSettings = useRouterState({ select: (state) => state.location.pathname.startsWith(settingsPrefix) });
 
   return (
     <div data-testid="shell" className="flex min-h-screen bg-slate-50">

@@ -1,9 +1,6 @@
 import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
-import type {
-  MailAccountCreateInput, MailAccountTestInput, MailAccountTestResult, MailAccountWithSyncStats,
-  MailSecurity,
-} from "@conduit/shared";
+import type { MailAccountTestResult, MailAccountWithSyncStats, MailSecurity } from "@conduit/shared";
 import { relativeTime } from "../lib";
 import {
   useArchiveMailAccount,
@@ -13,9 +10,17 @@ import {
   useTestMailAccount,
   useUnarchiveMailAccount,
   useUpdateMailAccount,
-  type MailAccountPatch,
 } from "../queries";
 import { friendlyMailError, htmlIsBlank } from "../components/mail/composer-lib";
+import {
+  buildCreateInput,
+  buildTestInput,
+  buildUpdatePatch,
+  dovecotPreset,
+  initialFormState,
+  validateForm,
+  type AccountFormState,
+} from "./settings-mail-lib";
 import { RichTextEditor } from "../components/mail/rich-text";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
@@ -36,11 +41,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
  * rows and polls nothing.
  */
 const ACCOUNT_POLL_MS = 10_000;
-
-const LOCAL_DOVECOT = {
-  imapHost: "localhost", imapPort: "993", imapSecurity: "tls" as MailSecurity,
-  smtpHost: "localhost", smtpPort: "587", smtpSecurity: "starttls" as MailSecurity,
-};
 
 export function SettingsMailPage() {
   const { data, isLoading, error } = useMailAccounts({ refetchInterval: ACCOUNT_POLL_MS });
@@ -307,93 +307,6 @@ function SignatureEditor({ account }: { account: MailAccountWithSyncStats }) {
   );
 }
 
-interface AccountFormState {
-  label: string;
-  email: string;
-  imapHost: string;
-  imapPort: string;
-  imapSecurity: MailSecurity;
-  smtpHost: string;
-  smtpPort: string;
-  smtpSecurity: MailSecurity;
-  username: string;
-  /**
-   * The form's two password states, and there is no third one (see
-   * mail-accounts.ts's updateAccount doc comment): off submits `password`
-   * alone, which the server applies to BOTH protocols; on submits `password`
-   * and `smtpPassword` together.
-   */
-  smtpDiffers: boolean;
-  password: string;
-  smtpPassword: string;
-  sentFolder: string;
-  /** "30" | "90" | "all", or an existing account's own stored value. */
-  backfill: string;
-}
-
-function initialFormState(account?: MailAccountWithSyncStats): AccountFormState {
-  if (account === undefined) {
-    return {
-      label: "", email: "",
-      imapHost: "", imapPort: "993", imapSecurity: "tls",
-      smtpHost: "", smtpPort: "587", smtpSecurity: "starttls",
-      username: "", smtpDiffers: false, password: "", smtpPassword: "",
-      sentFolder: "Sent", backfill: "90",
-    };
-  }
-  return {
-    label: account.label, email: account.email,
-    imapHost: account.imapHost, imapPort: String(account.imapPort), imapSecurity: account.imapSecurity,
-    smtpHost: account.smtpHost, smtpPort: String(account.smtpPort), smtpSecurity: account.smtpSecurity,
-    username: account.username,
-    // Password fields always start blank on an edit: blank means "keep the
-    // stored password", and a stored credential is never sent to a client to
-    // pre-fill them with in the first place.
-    smtpDiffers: false, password: "", smtpPassword: "",
-    sentFolder: account.sentFolder,
-    backfill: account.backfillDays === null ? "all" : String(account.backfillDays),
-  };
-}
-
-function isPort(value: string): boolean {
-  return /^\d+$/.test(value) && Number(value) > 0 && Number(value) <= 65535;
-}
-
-/** The one field-level validation gate, shared by Save and Test connection --
- * a test with half a form is as useless as a save with one. */
-function validateForm(state: AccountFormState, isEdit: boolean): string | null {
-  if (state.label.trim() === "") return "A label is required.";
-  if (state.email.trim() === "") return "An email address is required.";
-  if (state.imapHost.trim() === "" || state.smtpHost.trim() === "") return "IMAP and SMTP hosts are required.";
-  if (!isPort(state.imapPort) || !isPort(state.smtpPort)) return "Ports must be whole numbers between 1 and 65535.";
-  if (state.username.trim() === "") return "A username is required.";
-  if (!isEdit && state.password === "") return "A password is required.";
-  if (state.smtpDiffers && (state.password === "") !== (state.smtpPassword === "")) {
-    return isEdit
-      ? "With separate SMTP credentials, fill in both password fields, or leave both blank to keep the stored ones."
-      : "Enter both the IMAP and the SMTP password.";
-  }
-  return null;
-}
-
-/** The non-credential half of the submission, identical for create and
- * update -- the server no-ops fields whose value has not changed. */
-function settingsFields(state: AccountFormState) {
-  return {
-    label: state.label.trim(),
-    email: state.email.trim(),
-    imapHost: state.imapHost.trim(),
-    imapPort: Number(state.imapPort),
-    imapSecurity: state.imapSecurity,
-    smtpHost: state.smtpHost.trim(),
-    smtpPort: Number(state.smtpPort),
-    smtpSecurity: state.smtpSecurity,
-    username: state.username.trim(),
-    sentFolder: state.sentFolder.trim() === "" ? "Sent" : state.sentFolder.trim(),
-    backfillDays: state.backfill === "all" ? null : Number(state.backfill),
-  };
-}
-
 function AccountForm({
   account,
   onClose,
@@ -414,13 +327,7 @@ function AccountForm({
   }
 
   function applyDovecotPreset() {
-    setState((current) => ({
-      ...current,
-      ...LOCAL_DOVECOT,
-      // The account's own mailbox login on a YunoHost box is the LDAP
-      // username -- the same identity this session is authenticated as.
-      username: me?.username ?? current.username,
-    }));
+    setState((current) => dovecotPreset(current, me?.username));
   }
 
   function handleTest() {
@@ -430,18 +337,7 @@ function AccountForm({
       return;
     }
     setLocalError(null);
-    const overrides = {
-      imapHost: state.imapHost.trim(), imapPort: Number(state.imapPort), imapSecurity: state.imapSecurity,
-      smtpHost: state.smtpHost.trim(), smtpPort: Number(state.smtpPort), smtpSecurity: state.smtpSecurity,
-      username: state.username.trim(),
-      // Blank password fields are OMITTED, never sent as "":
-      // mailAccountTestInputSchema holds them to .min(1), and on a stored
-      // account an absent password is exactly what makes the test use the
-      // saved credentials.
-      ...(state.password !== "" ? { password: state.password } : {}),
-      ...(state.smtpDiffers && state.smtpPassword !== "" ? { smtpPassword: state.smtpPassword } : {}),
-    } satisfies MailAccountTestInput;
-    test.mutate(account !== undefined ? { accountId: account.id, ...overrides } : overrides);
+    test.mutate(buildTestInput(state, account?.id));
   }
 
   function handleSubmit(event: FormEvent) {
@@ -453,20 +349,10 @@ function AccountForm({
     }
     setLocalError(null);
     if (account === undefined) {
-      const input: MailAccountCreateInput = {
-        ...settingsFields(state),
-        password: state.password,
-        ...(state.smtpDiffers ? { smtpPassword: state.smtpPassword } : {}),
-      };
-      create.mutate(input, { onSuccess: onClose });
+      create.mutate(buildCreateInput(state), { onSuccess: onClose });
       return;
     }
-    const patch: MailAccountPatch = {
-      ...settingsFields(state),
-      ...(state.password !== "" ? { password: state.password } : {}),
-      ...(state.smtpDiffers && state.smtpPassword !== "" ? { smtpPassword: state.smtpPassword } : {}),
-    };
-    update.mutate({ id: account.id, patch }, { onSuccess: onClose });
+    update.mutate({ id: account.id, patch: buildUpdatePatch(state) }, { onSuccess: onClose });
   }
 
   const pending = create.isPending || update.isPending;

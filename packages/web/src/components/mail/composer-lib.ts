@@ -1,4 +1,5 @@
 import { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
+import { ApiError } from "../../api";
 
 /**
  * The composer's (and the mail settings page's) pure parts, kept out of the
@@ -129,6 +130,41 @@ export function parseRecipientInput(raw: string): ParsedRecipientInput {
   return { tokens, invalid, remainder };
 }
 
+export interface ResolvedRecipients {
+  /** Committed chips plus whatever was still being typed, de-duplicated. */
+  recipients: ComposerRecipient[];
+  /** Fragments of the pending draft that are not addresses. */
+  invalid: string[];
+}
+
+/**
+ * The submission-time view of one recipient line: the chips the user has
+ * already committed PLUS whatever is still sitting in the input.
+ *
+ * This exists because of a real bug it fixes. A recipient field commits its
+ * draft on blur, and a click on Send fires mousedown -> blur -> click: if the
+ * commit is deferred at all (it used to run behind a timer, so a click on a
+ * suggestion would not be swallowed by the dropdown closing), the submit
+ * handler reads the committed array BEFORE the draft lands, and a message
+ * addressed to one chipped and one typed recipient goes out to the first one
+ * only, silently. The submit path therefore never trusts the committed array
+ * on its own -- it resolves it against the live draft here, and a draft that
+ * is not an address surfaces as a validation error rather than disappearing.
+ *
+ * The draft is parsed by appending the separator the user did not type, so
+ * this and "type a comma" cannot diverge in what they accept.
+ */
+export function resolveRecipients(
+  committed: readonly ComposerRecipient[], draft: string,
+): ResolvedRecipients {
+  if (draft.trim() === "") return { recipients: dedupeRecipients(committed), invalid: [] };
+  const parsed = parseRecipientInput(`${draft},`);
+  return {
+    recipients: dedupeRecipients([...committed, ...parsed.tokens]),
+    invalid: parsed.invalid,
+  };
+}
+
 /** Case-insensitive address de-duplication, preserving first-seen order and
  * the name that came with the first sighting. */
 export function dedupeRecipients(recipients: readonly ComposerRecipient[]): ComposerRecipient[] {
@@ -214,4 +250,46 @@ export function htmlIsBlank(html: string): boolean {
  */
 export function signatureBlock(signatureHtml: string): string {
   return `<p></p>${signatureHtml}`;
+}
+
+/** The four record links a composed thread can carry (sendMailInputSchema's
+ * own `links` shape). */
+export interface ComposerLinks {
+  companyId?: string;
+  contactId?: string;
+  dealId?: string;
+  projectId?: string;
+}
+
+export type AttachmentTarget = ComposerLinks;
+
+/**
+ * Which record an attachment upload is filed against. POST /api/files
+ * requires EXACTLY ONE of companyId/contactId/dealId/projectId, so a compose
+ * with no record link at all has nowhere to put an upload -- null here is
+ * what disables the attach control instead of letting the upload 400.
+ *
+ * Most specific link first (deal, project, contact, company): an attachment
+ * on a deal thread belongs on the deal, not on the company behind it.
+ */
+export function attachmentTarget(links: ComposerLinks | undefined): AttachmentTarget | null {
+  if (links === undefined) return null;
+  if (links.dealId !== undefined) return { dealId: links.dealId };
+  if (links.projectId !== undefined) return { projectId: links.projectId };
+  if (links.contactId !== undefined) return { contactId: links.contactId };
+  if (links.companyId !== undefined) return { companyId: links.companyId };
+  return null;
+}
+
+/**
+ * Display text for anything the composer can fail with. Branches on
+ * ApiError.code, never on message text (see src/api.ts): the one code worth
+ * special handling is the send path's 502 `smtp_failed`, whose message
+ * carries the adapter's classified reason -- see sendFailureMessage.
+ */
+export function composeErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    return error.code === "smtp_failed" ? sendFailureMessage(error.message) : error.message;
+  }
+  return error instanceof Error ? error.message : String(error);
 }

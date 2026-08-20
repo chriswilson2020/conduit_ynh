@@ -215,9 +215,53 @@ Two contracts Task 7 hands over (quality review, 20 Aug):
 - **`syncStats` freshness is this page's job.** `GET /api/mail/accounts` returns each own account's live sync counters as of that fetch, and nothing keeps them current — they are in-process counters, not rows, so no write publishes a hint when they move (`[["mail-accounts"]]` fires on account mutations and status flips, a much rarer event). The Settings mail page therefore owns freshness for its own view via a `refetchInterval`; every other consumer treats `useMailAccounts` as an SSE-invalidated cache of the account ROWS and must not depend on stats being current. Anything else needing a live counter needs its own endpoint, not a shorter assumption about this one.
 - **Mail mutation hooks must invalidate `["search"]` themselves.** The mail SSE hints (`mail-threads`/`mail-thread`/`mail-unread`/`mail-accounts`/`email-templates`) deliberately do not carry a search key, so an ingest or a thread archive does not invalidate the global search cache on its own — the same division of labour every Phase 1-3 hook already follows (each mutation hook lists `["search"]` among its own invalidations). Follow it here rather than widening the server-side hints.
 
+As built (Task 9, 20 Aug) — seven deviations from the paragraph above:
+
+- **`parseWith`, not casts.** Every fetcher in queries.ts validates its response through `parseWith`
+  (only api.ts casts), and the mail hooks follow that, so contract drift fails loudly.
+- **api.ts gained `deleteJson`.** `DELETE /api/mail/threads/:id/links/:kind` answers with the updated
+  thread; the existing `deleteRequest` is for bare 204s and discards the body.
+- **`useTestMailAccount` invalidates nothing** — the one deliberate exception to the "every mail
+  mutation also invalidates `["search"]`" rule: `testConnection` writes no row, publishes no hint and
+  does not even flip `status`, so there is no cache for it to have staled.
+- **Hook names** settled as `useUnreadMailCount`, `useSetThreadLink`/`useClearThreadLink` (singular,
+  matching the service's own `setThreadLink`/`clearThreadLink`), and templates as `useMailTemplates` +
+  `useCreate`/`useUpdate`/`useArchive`/`useUnarchiveMailTemplate`.
+- **StarterKit v3 bundles the Link extension**, so components/mail/rich-text.tsx registers
+  `StarterKit.configure({ link: false })` alongside its own configured `Link` rather than both copies.
+- **Signature append is once per account SELECTION**, at the end of the body, never matched-and-replaced:
+  TipTap normalises the markup on the way in, so there is nothing reliable left to match a previously
+  inserted block against.
+- **The Settings nav highlight is computed**, not `activeProps`: one entry has to stay lit across both
+  tabs, so shell.tsx tests the basePath-prefixed pathname via `useRouterState`. There is no bare
+  `/settings` route — the nav links straight at `/settings/mail`.
+
+Pure logic lives in two tested libs rather than inside the components: `components/mail/composer-lib.ts`
+(recipient parsing and submit-time resolution, template substitution, the prefix→message mapping,
+attachment target, error mapping) and `pages/settings-mail-lib.ts` (form state, validation, and the
+four password-convention submission shapes).
+
 ### Task 10: Web — inbox, conversation, record Mail tabs
 
 `/mail` route + nav item "Inbox" with unread badge (useUnreadCount). Two-pane: `thread-list.tsx` (virtualised not needed — keyset "load more" per house pattern; row: unread dot, participants summary, subject, snippet, relative time, account chip, link chips) + filter bar (account select, unread toggle, unlinked toggle, archived toggle); `conversation.tsx`: header (subject, link-panel), messages oldest-first collapsed except last (`message-<id>` testid, click expands), each body in `message-frame.tsx` — iframe `srcdoc` with `sandbox="allow-same-origin"` (scripts still blocked: never add `allow-scripts`) and an injected CSP meta tag: default state `default-src 'none'; img-src data: <app-origin>; style-src 'unsafe-inline'` (inline `cid:` attachments are app-origin, so they always render); the per-thread "Load remote images" button re-renders frames with `img-src` widened by `https: http:`. **`allow-same-origin`, not an empty sandbox** (coordinator ruling, 20 Aug; spec's Frontend bullet carries the same text): an empty sandbox gives the frame an opaque origin, SameSite cookies are therefore not sent with its subresource loads, and SSOwat bounces the cookieless inline-image requests to its login page — inline images would never render. Signed URLs would fix that but need SSOwat `skipped_uris` packaging changes. Scripts blocked + ingest-time sanitization + the CSP meta governing `img-src` make this the accepted risk, and it is why `GET /api/mail/attachments/:id/inline` (Task 7) is an ordinary authenticated same-origin route rather than a signed one. Frame sizing: fixed `max-h-[32rem] overflow-auto` (the sandbox blocks scripts, so no in-frame measurement — do not attempt auto-resize). Text-only messages render `<pre className="whitespace-pre-wrap">` directly, no iframe. Attachment chips (download links). `link-panel.tsx`: four link chips with unlink x, entity-picker popovers (existing search endpoints), deal-suggestion row (one-click link). Reply/Reply-all/Forward buttons seed the composer (forward inlines quoted body + reattaches). Record Mail tabs: contact/company/deal/project detail pages get a Mail tab (existing tab pattern from company-detail) rendering thread-list with the record filter + a Compose button seeded with the record's addresses/links. Testids: `inbox`, `thread-row-<id>`, `conversation`, `message-<id>`, `link-panel`, `deal-suggestion-<id>`, `load-remote-images`.
+
+
+Task 9 hands over (as built, 20 Aug):
+
+- **Attachments need a record link.** `POST /api/files` requires exactly one of
+  companyId/contactId/dealId/projectId, so the composer disables its attach control when the seed
+  carries no links at all (target order: deal → project → contact → company). Opening the composer from
+  a conversation MUST therefore pass the THREAD's links, or Attach is silently unavailable on replies.
+  Accepted for v0.5.0 (coordinator, 20 Aug) rather than widening the files route.
+- **`useMailThreads` returns `{ items, nextCursor }`** and the cursor is part of the query key, so each
+  page is its own cache entry. Task 10 accumulates pages itself behind a "load more" button — this is
+  deliberately NOT an infinite query, matching the house keyset pattern.
+- **Global search already has a mail group server-side.** `searchResultsSchema.mail`
+  (threadId/subject/snippet) is populated, but components/search.tsx still flattens only the original
+  five groups. Task 10 adds the mail group's render and its navigation once `/mail` exists.
+- **`useMailAccounts()` must stay option-less everywhere except Settings.** Its `refetchInterval` option
+  exists solely for the settings page's `syncStats` freshness contract; every other consumer treats the
+  hook as an SSE-invalidated cache of the account rows.
 
 ### Task 11: Playwright journey
 
@@ -225,4 +269,4 @@ Two contracts Task 7 hands over (quality review, 20 Aug):
 
 ### Task 12: Packaging + release 0.5.0
 
-`scripts/install`: after data_dir setup — `openssl rand -out "$data_dir/mail.key" 32`, `chmod 600`, `chown $app:$app` (match the existing file-provisioning idiom in the script). `scripts/upgrade`: same, guarded by `[ -f ]`. `scripts/backup`/`restore`: mail.key rides the existing data_dir coverage — VERIFY that data_dir is fully included (it is for files); add an explicit line only if the scripts enumerate paths. Config: `MAIL_KEY_PATH` env in the systemd service/config template pointing at `$data_dir/mail.key`. Also in this task (Chris's decision, 19 Aug): merge branch `fix/fastify-static-advisories` (commit 901f205, @fastify/static v8 -> v10 security migration, verified against v0.4.3) into the phase branch before the version bump — regenerate the lockfile on the server after the merge, re-run the full suite, mention the migration in the release notes, and drop the `conduit_test_secfix` database on the dev server. Then Phase 2 Task 10 release mechanics verbatim (bump all versions to 0.5.0, CI gate, ff-merge to main, tag v0.5.0, Release workflow builds the asset, manifest sha update on main, branch cleanup, hand Chris the one sudo upgrade command). Live verification checklist: add real account (Chris's local Dovecot via preset), watch sync populate, link a deal, send a reply from the CRM and see it in his normal mail client's Sent.
+`scripts/install`: after data_dir setup — `openssl rand -out "$data_dir/mail.key" 32`, `chmod 600`, `chown $app:$app` (match the existing file-provisioning idiom in the script). `scripts/upgrade`: same, guarded by `[ -f ]`. `scripts/backup`/`restore`: mail.key rides the existing data_dir coverage — VERIFY that data_dir is fully included (it is for files); add an explicit line only if the scripts enumerate paths. Config: `MAIL_KEY_PATH` env in the systemd service/config template pointing at `$data_dir/mail.key`. Also in this task (Chris's decision, 19 Aug): merge branch `fix/fastify-static-advisories` (commit 901f205, @fastify/static v8 -> v10 security migration, verified against v0.4.3) into the phase branch before the version bump — regenerate the lockfile on the server after the merge, re-run the full suite, mention the migration in the release notes, and drop the `conduit_test_secfix` database on the dev server. Then Phase 2 Task 10 release mechanics verbatim (bump all versions to 0.5.0, CI gate, ff-merge to main, tag v0.5.0, Release workflow builds the asset, manifest sha update on main, branch cleanup, hand Chris the one sudo upgrade command). Live verification checklist: add real account (Chris's local Dovecot via preset), watch sync populate, link a deal, send a reply from the CRM and see it in his normal mail client's Sent. Plus one dev-only check that CI cannot make: run `npm run dev:web` (StrictMode is on in dev, while the CI e2e serves the production build where React never double-invokes an effect), open the composer and confirm the selected account's signature is appended exactly once — the specific risk is the `signedFor` ref surviving a simulated remount while TipTap rebuilds its editor, which would either skip or double the append.

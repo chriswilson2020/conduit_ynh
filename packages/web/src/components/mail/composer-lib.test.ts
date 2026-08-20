@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
+import { ApiError } from "../../api";
 import {
+  attachmentTarget,
+  composeErrorMessage,
   dedupeRecipients,
   friendlyMailError,
   htmlIsBlank,
@@ -9,6 +12,7 @@ import {
   MAIL_CONNECTION_MESSAGE,
   parseAddressToken,
   parseRecipientInput,
+  resolveRecipients,
   sendFailureMessage,
   signatureBlock,
   substitutePlaceholders,
@@ -139,6 +143,107 @@ describe("parseRecipientInput", () => {
     const result = parseRecipientInput("alice@example.com,,");
     expect(result.tokens).toHaveLength(1);
     expect(result.invalid).toEqual([]);
+  });
+});
+
+// The submit path's own view of a recipient line. The bug these pin: a
+// message addressed to one chipped and one still-typed recipient used to go
+// out to the first one only, because the draft was committed behind a timer
+// that had not fired when Send read the committed array.
+describe("resolveRecipients", () => {
+  it("sends a chipped AND a typed-but-uncommitted recipient", () => {
+    expect(resolveRecipients([{ address: "alice@example.com" }], "bob@example.com").recipients)
+      .toEqual([{ address: "alice@example.com" }, { address: "bob@example.com" }]);
+  });
+
+  it("sends a typed-only recipient with no chips at all", () => {
+    const resolved = resolveRecipients([], "bob@example.com");
+    expect(resolved.recipients).toEqual([{ address: "bob@example.com" }]);
+    expect(resolved.invalid).toEqual([]);
+  });
+
+  it("tolerates a draft the user already ended with a separator", () => {
+    expect(resolveRecipients([], "bob@example.com,").recipients).toEqual([{ address: "bob@example.com" }]);
+  });
+
+  it("parses a display name in the pending draft", () => {
+    expect(resolveRecipients([], "Bob Jones <bob@example.com>").recipients)
+      .toEqual([{ address: "bob@example.com", name: "Bob Jones" }]);
+  });
+
+  it("reports an unusable pending fragment instead of dropping it silently", () => {
+    const resolved = resolveRecipients([{ address: "alice@example.com" }], "nonsense");
+    expect(resolved.invalid).toEqual(["nonsense"]);
+    // The committed chips survive: the caller turns `invalid` into a
+    // validation error rather than sending a partially-addressed message.
+    expect(resolved.recipients).toEqual([{ address: "alice@example.com" }]);
+  });
+
+  it("leaves the committed list alone when nothing is being typed", () => {
+    const resolved = resolveRecipients([{ address: "alice@example.com" }], "   ");
+    expect(resolved.recipients).toEqual([{ address: "alice@example.com" }]);
+    expect(resolved.invalid).toEqual([]);
+  });
+
+  it("does not duplicate a typed address that is already chipped", () => {
+    expect(resolveRecipients([{ address: "alice@example.com" }], "ALICE@example.com").recipients)
+      .toEqual([{ address: "alice@example.com" }]);
+  });
+});
+
+describe("attachmentTarget", () => {
+  it("prefers the deal over everything else", () => {
+    expect(attachmentTarget({ dealId: "d", projectId: "p", contactId: "c", companyId: "co" }))
+      .toEqual({ dealId: "d" });
+  });
+
+  it("falls back to the project", () => {
+    expect(attachmentTarget({ projectId: "p", contactId: "c", companyId: "co" })).toEqual({ projectId: "p" });
+  });
+
+  it("falls back to the contact", () => {
+    expect(attachmentTarget({ contactId: "c", companyId: "co" })).toEqual({ contactId: "c" });
+  });
+
+  it("falls back to the company", () => {
+    expect(attachmentTarget({ companyId: "co" })).toEqual({ companyId: "co" });
+  });
+
+  // POST /api/files needs exactly one record id, so "no links" means the
+  // attach control is disabled rather than an upload that 400s.
+  it("returns null for an empty links object", () => {
+    expect(attachmentTarget({})).toBeNull();
+  });
+
+  it("returns null when there are no links at all", () => {
+    expect(attachmentTarget(undefined)).toBeNull();
+  });
+});
+
+describe("composeErrorMessage", () => {
+  it("maps a 502 smtp_failed reason to the classified message", () => {
+    const error = new ApiError(
+      `sending the message failed: ${MAIL_AUTH_ERROR_PREFIX} Invalid login`, 502, "smtp_failed",
+    );
+    expect(composeErrorMessage(error)).toBe(MAIL_AUTH_MESSAGE);
+  });
+
+  it("shows an unclassified smtp_failed reason as the server worded it", () => {
+    const error = new ApiError("sending the message failed: 550 relay denied", 502, "smtp_failed");
+    expect(composeErrorMessage(error)).toBe("sending the message failed: 550 relay denied");
+  });
+
+  it("passes any other ApiError through by its message", () => {
+    expect(composeErrorMessage(new ApiError("mail account xyz is archived", 409, "archived")))
+      .toBe("mail account xyz is archived");
+  });
+
+  it("handles a plain Error", () => {
+    expect(composeErrorMessage(new Error("network down"))).toBe("network down");
+  });
+
+  it("handles something that is not an Error at all", () => {
+    expect(composeErrorMessage("boom")).toBe("boom");
   });
 });
 
