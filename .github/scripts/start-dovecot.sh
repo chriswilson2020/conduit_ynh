@@ -111,6 +111,10 @@ namespace inbox {
   mailbox Big {
     auto = create
   }
+  # Written to by nothing, so an empty SEARCH stays provable all run.
+  mailbox Empty {
+    auto = create
+  }
 }
 
 protocol imap {

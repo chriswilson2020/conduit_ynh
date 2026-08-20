@@ -92,7 +92,7 @@ jobs:
       - name: Ensure the integration mailboxes exist
         run: >-
           docker exec conduit-dovecot doveadm mailbox create
-          -u "$MAIL_IT_USERNAME" Sent Walk Drop Flags Dates Big || true
+          -u "$MAIL_IT_USERNAME" Sent Walk Drop Flags Dates Big Empty || true
       - name: Typecheck
         run: npm run typecheck
       - name: Run tests
@@ -206,7 +206,7 @@ jobs:
       - name: Ensure the integration mailboxes exist
         run: >-
           docker exec conduit-dovecot doveadm mailbox create
-          -u "$MAIL_IT_USERNAME" Sent Walk Drop Flags Dates Big || true
+          -u "$MAIL_IT_USERNAME" Sent Walk Drop Flags Dates Big Empty || true
       - name: Build workspaces
         run: npm run build
       - name: Run Playwright smoke tests

@@ -299,12 +299,14 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
     });
 
     it("reports a readable error when the target folder is gone", async () => {
-      // What a user who renamed their Sent folder actually hits, and the
-      // reason APPEND's falsy return has to become a throw: a `false` read as
-      // success would report a send as filed when nothing was stored.
+      // What a user who renamed their Sent folder actually hits. imapflow
+      // rejects this with the message "Command failed" and nothing else --
+      // the sentence saying why is on the error's `response`, and this
+      // message is what mail_accounts.last_error stores verbatim. That is a
+      // defect this case found; normalizeMailError now folds the reply in.
       await expect(client.append(
         `Sent-renamed-${runId}`, rfc822({ subject: `${runId} missing folder` }), ["\\Seen"],
-      )).rejects.toThrow(/refused|exist/i);
+      )).rejects.toThrow(/refused|exist|TRYCREATE/i);
     });
 
     it("carries a 25MB message and a 60KB header line through APPEND and fetchRaw", async () => {
@@ -333,51 +335,77 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
   describe("date filtering", () => {
     let client: ImapflowClient;
     let base = 0;
-    let seeded: number[] = [];
+    let older = 0;
+    let newer = 0;
+    /** Recorded between the two appends, three seconds clear of each. */
+    let boundary = new Date();
 
     beforeAll(async () => {
       client = await connectClient();
       base = await highestUid(client, "Dates");
       // A Date: header from six months ago. The server stamps its own
-      // INTERNALDATE at APPEND time -- which is what SEARCH SINCE reads -- so
-      // this message is recent to the server and ancient to its own header.
-      // That is exactly what imported mail looks like, and why the backfill
-      // window is not the window a user would predict from the headers.
+      // INTERNALDATE at APPEND time -- which is what the arrival filter reads
+      // -- so this message is recent to the server and ancient to its own
+      // header. That is exactly what imported mail looks like, and why the
+      // backfill window is not the window a user would predict from headers.
       await client.append("Dates", rfc822({
         subject: `${runId} imported`, date: new Date(Date.now() - 180 * DAY_MS),
       }), []);
+      // Three seconds either side of the boundary. The filter turns out to be
+      // second-granular against this server (see the case below), so the gap
+      // has to be wide enough to survive a loaded runner's jitter.
+      await delay(3_000);
+      boundary = new Date();
+      await delay(3_000);
       await client.append("Dates", rfc822({ subject: `${runId} fresh` }), []);
-      const listed = await client.fetchNewer("Dates", { sinceUid: base, limit: 10, sinceDate: null });
-      seeded = listed.map((message) => message.uid);
-      expect(seeded).toHaveLength(2);
-    });
 
-    it("filters on INTERNALDATE, not on the Date: header", async () => {
+      const listed = await client.fetchNewer("Dates", { sinceUid: base, limit: 10, sinceDate: null });
+      expect(listed).toHaveLength(2);
+      older = listed[0]?.uid ?? 0;
+      newer = listed[1]?.uid ?? 0;
+    }, 60_000);
+
+    it("filters on arrival, not on the Date: header", async () => {
       const recent = await client.fetchNewer("Dates", {
         sinceUid: base, limit: 10, sinceDate: new Date(Date.now() - 7 * DAY_MS),
       });
       // The six-month-old header does not exclude it: a seven-day backfill
       // window still ingests it, because it ARRIVED today.
-      expect(recent.map((message) => message.uid)).toEqual(seeded);
+      expect(recent.map((message) => message.uid)).toEqual([older, newer]);
     });
 
-    it("treats SEARCH SINCE as whole days, so today's mail is inside today's window", async () => {
-      // Date-granular, not timestamp-granular (RFC 3501): SINCE <today>
-      // matches mail that arrived earlier today, which a naive
-      // "INTERNALDATE >= now" reading would exclude. Asserted as SETS,
-      // because the timestamps themselves are the server's to choose.
-      const today = await client.fetchFlags("Dates", new Date());
-      expect(today.map((message) => message.uid)).toEqual(expect.arrayContaining(seeded));
-
-      const future = await client.fetchFlags("Dates", new Date(Date.now() + 2 * DAY_MS));
-      expect(future).toHaveLength(0);
+    it("resolves the window to the second, because SINCE is sent as WITHIN YOUNGER", async () => {
+      // The surprise this suite exists to find. imapflow does not send
+      // `SEARCH SINCE <date>` when the server advertises RFC 5032 WITHIN --
+      // Dovecot does -- it sends `SEARCH YOUNGER <seconds ago>` instead,
+      // computed from `now` as the command is compiled. So the window is
+      // SECOND-granular here, not the whole-day granularity SINCE would give:
+      // a message that arrived earlier the same day is EXCLUDED by a boundary
+      // after it, which is what this asserts.
+      //
+      // Asserted as SETS rather than timestamps: which messages come back is
+      // the contract, and the clocks are the server's business.
+      //
+      // Harmless for this app, and worth knowing anyway. The window's start
+      // stays fixed as `now` advances (the seconds-ago value grows with it),
+      // so a long backfill does not slide its own lower bound. And a
+      // sinceDate at or after `now` clamps to `YOUNGER 0`, which Dovecot
+      // rejects as BAD -- unreachable from the app, whose backfillDays is
+      // always a positive number of days, and the reason this case puts its
+      // boundary in the past rather than in the future.
+      const afterBoundary = (await client.fetchFlags("Dates", boundary)).map((m) => m.uid);
+      expect(afterBoundary).toContain(newer);
+      expect(afterBoundary).not.toContain(older);
     });
 
-    it("returns nothing for a backfill window that starts in the future", async () => {
-      const none = await client.fetchNewer("Dates", {
-        sinceUid: base, limit: 10, sinceDate: new Date(Date.now() + 2 * DAY_MS),
-      });
-      expect(none).toEqual([]);
+    it("returns an empty set, not a failure, for a folder with nothing in it", async () => {
+      // The other half of RETURN-VALUE DISCIPLINE. A falsy SEARCH return has
+      // to become a throw; an EMPTY one must not -- a throw here would fail
+      // every pass over a quiet folder, and a brand-new account's Sent folder
+      // is exactly that on its first sync.
+      await expect(client.fetchFlags("Empty", yesterday())).resolves.toEqual([]);
+      await expect(client.fetchNewer("Empty", { sinceUid: 0, limit: 10, sinceDate: null }))
+        .resolves.toEqual([]);
     });
   });
 

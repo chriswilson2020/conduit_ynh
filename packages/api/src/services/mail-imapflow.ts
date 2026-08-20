@@ -124,6 +124,29 @@ function isTlsFailure(error: unknown): boolean {
 }
 
 /**
+ * The server's own reply text, for the errors where imapflow keeps it out of
+ * the message.
+ *
+ * A command the server answered NO or BAD to rejects with the message
+ * "Command failed" and nothing else: the sentence saying WHY -- "Mailbox
+ * doesn't exist: Sent", "Permission denied" -- is put on `response`, and the
+ * response code on `serverResponseCode`. That matters because an adapter
+ * error's message is stored verbatim in mail_accounts.last_error and returned
+ * verbatim by the test-connection endpoint (mail-imap.ts, ERROR
+ * CLASSIFICATION), and "Command failed" is a dead end for the user and for
+ * the next reader of the log alike. Found by the integration suite's
+ * APPEND-to-a-renamed-Sent-folder case -- the shape a user actually hits.
+ *
+ * This cannot leak a credential: it is the server's reply to a command, and
+ * neither imapflow nor this adapter puts a password in one.
+ */
+function serverResponseText(error: unknown): string | null {
+  if (typeof error !== "object" || error === null) return null;
+  const { response } = error as { response?: unknown };
+  return typeof response === "string" && response.length > 0 ? response : null;
+}
+
+/**
  * Give a library error a message the rest of the app can branch on, per
  * mail-imap.ts's ERROR CLASSIFICATION contract: `auth:` for a rejected login,
  * `connection:` for anything socket/DNS/TLS-shaped, and the original message
@@ -131,24 +154,33 @@ function isTlsFailure(error: unknown): boolean {
  * does not exist -- guessing a class for those would be worse than saying
  * nothing).
  *
- * The original error is kept on `cause`, and the returned message never adds
- * anything that was not already in it -- in particular no password, which the
- * caller holds but this function is never given.
+ * The original error is kept on `cause`, and the returned message adds
+ * nothing the library did not already have -- the prefix, and the server's
+ * own reply where imapflow parked it on a property instead of in the message.
+ * In particular no password, which the caller holds but this function is
+ * never given.
  *
  * Idempotent: an already-prefixed message is returned as-is, so an error that
  * passes through two layers (adapter -> mail-send) is not double-tagged.
  */
 export function normalizeMailError(error: unknown): Error {
-  const message = error instanceof Error ? error.message : String(error);
-  if (message.startsWith(MAIL_AUTH_ERROR_PREFIX) || message.startsWith(MAIL_CONNECTION_ERROR_PREFIX)) {
-    return error instanceof Error ? error : new Error(message);
+  const raw = error instanceof Error ? error.message : String(error);
+  if (raw.startsWith(MAIL_AUTH_ERROR_PREFIX) || raw.startsWith(MAIL_CONNECTION_ERROR_PREFIX)) {
+    return error instanceof Error ? error : new Error(raw);
   }
+  const detail = serverResponseText(error);
+  const message = detail === null || raw.includes(detail) ? raw : `${raw}: ${detail}`;
   const code = errorCode(error);
   const isConnectionFailure = (code !== null && CONNECTION_ERROR_CODES.has(code)) || isTlsFailure(error);
   const prefix = isAuthFailure(error)
     ? MAIL_AUTH_ERROR_PREFIX
     : (isConnectionFailure ? MAIL_CONNECTION_ERROR_PREFIX : null);
-  if (prefix === null) return error instanceof Error ? error : new Error(message);
+  if (prefix === null) {
+    // Identity (and the stack) is preserved when there was nothing to add:
+    // the caller may already be holding this exact error.
+    if (message === raw) return error instanceof Error ? error : new Error(raw);
+    return new Error(message, { cause: error });
+  }
   return new Error(`${prefix} ${message}`, { cause: error });
 }
 
@@ -521,6 +553,24 @@ export class ImapflowClient implements ImapClient {
     });
   }
 
+  /**
+   * NOT necessarily a literal `SEARCH SINCE`, and the difference is worth
+   * knowing (established by the integration suite, which asserts it against
+   * Dovecot). imapflow rewrites `since` to RFC 5032's `YOUNGER <seconds ago>`
+   * whenever the server advertises WITHIN -- Dovecot does -- computing the
+   * interval from `now` as it compiles the command. Two consequences:
+   *
+   * - The filter is SECOND-granular here, not the whole-day granularity RFC
+   *   3501's SINCE gives. Strictly better for this caller (the reconcile
+   *   window is a lower bound), but a reader reasoning from "SINCE" would
+   *   predict the wrong message set for a boundary inside today.
+   * - A `sinceDate` at or after `now` clamps to `YOUNGER 0`, which servers
+   *   reject as BAD. Unreachable from this app -- every caller's window is
+   *   days wide and always in the past -- but it is why nothing here should
+   *   ever be handed "now" as a lower bound.
+   *
+   * The same rewrite applies to fetchNewer's `sinceDate`.
+   */
   async fetchFlags(folder: string, sinceDate: Date): Promise<ImapMessageDescriptor[]> {
     return await this.withMailbox(folder, async () => {
       const found = await this.run<number[] | false | undefined>(
@@ -541,10 +591,17 @@ export class ImapflowClient implements ImapClient {
     // would SELECT the Sent folder on the connection the loop is using for
     // INBOX for no reason. No INTERNALDATE either -- the server stamps its
     // own arrival time (contract).
-    const result = await this.run<AppendResponseObject | false>(
+    //
+    // BOTH falsy shapes, not just the `false` the .d.ts promises: the runtime
+    // returns UNDEFINED when the connection is not in a state it will APPEND
+    // from, and reading that as success would report a sent message as filed
+    // in Sent with nothing stored anywhere. (A server that REFUSES the append
+    // -- a renamed Sent folder, say -- throws instead, and arrives at the
+    // caller through normalizeMailError carrying the server's own text.)
+    const result = await this.run<AppendResponseObject | false | undefined>(
       () => this.client.append(folder, raw, flags),
     );
-    if (result === false) throw new Error(`APPEND to ${folder} was refused`);
+    if (!result) throw new Error(`APPEND to ${folder} was refused`);
   }
 
   async addFlags(folder: string, uids: number[], flags: string[]): Promise<void> {

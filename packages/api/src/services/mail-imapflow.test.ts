@@ -140,6 +140,37 @@ describe("normalizeMailError", () => {
     expect(normalizeMailError(error).message).toBe("connection: Server does not support STARTTLS");
   });
 
+  it("recovers the server's own text from a bare Command failed", () => {
+    // What imapflow rejects a NO/BAD with: the message says nothing, and the
+    // sentence explaining it is parked on `response`. Since this message is
+    // what lands in mail_accounts.last_error and in the test-connection
+    // result, "Command failed" on its own is a dead end -- so the reply is
+    // folded in. (Found by the integration suite's APPEND to a renamed Sent
+    // folder.)
+    const error = Object.assign(new Error("Command failed"), {
+      response: "A5 NO [TRYCREATE] Mailbox doesn't exist: Sent",
+      serverResponseCode: "TRYCREATE",
+    });
+    expect(normalizeMailError(error).message)
+      .toBe("Command failed: A5 NO [TRYCREATE] Mailbox doesn't exist: Sent");
+    expect(normalizeMailError(error).cause).toBe(error);
+  });
+
+  it("does not repeat a server reply the message already carries", () => {
+    const error = Object.assign(new Error("Mailbox doesn't exist"), {
+      response: "Mailbox doesn't exist",
+    });
+    expect(normalizeMailError(error)).toBe(error);
+  });
+
+  it("still classifies a connection failure that also carries a server reply", () => {
+    const error = Object.assign(new Error("Command failed"), {
+      code: "EConnectionClosed", response: "connection closed mid-command",
+    });
+    expect(normalizeMailError(error).message)
+      .toBe("connection: Command failed: connection closed mid-command");
+  });
+
   it("leaves an unclassifiable error exactly as it was", () => {
     // A server rejecting a SELECT is neither a credential nor a connection
     // problem, and inventing a class for it would mislead the settings UI.
