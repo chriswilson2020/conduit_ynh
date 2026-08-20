@@ -3,6 +3,7 @@ import type { KeyboardEvent } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { clsx } from "clsx";
 import { useSearch } from "../queries";
+import { subjectLabel } from "./mail/mail-lib";
 import { Input } from "./ui/input";
 
 type FlatResult =
@@ -10,7 +11,8 @@ type FlatResult =
   | { kind: "contact"; key: string; id: string; label: string; secondary: string | null }
   | { kind: "note"; key: string; snippet: string; companyId: string | null; contactId: string | null }
   | { kind: "deal"; key: string; id: string; label: string }
-  | { kind: "task"; key: string; id: string; label: string; projectId: string | null };
+  | { kind: "task"; key: string; id: string; label: string; projectId: string | null }
+  | { kind: "mail"; key: string; threadId: string; label: string; secondary: string };
 
 const GROUP_LABEL: Record<FlatResult["kind"], string> = {
   company: "Companies",
@@ -18,6 +20,7 @@ const GROUP_LABEL: Record<FlatResult["kind"], string> = {
   note: "Notes",
   deal: "Deals",
   task: "Tasks",
+  mail: "Mail",
 };
 
 /**
@@ -25,9 +28,9 @@ const GROUP_LABEL: Record<FlatResult["kind"], string> = {
  * entity-table.tsx's filter debounce) before it drives useSearch, which only
  * fires once the debounced value is non-empty (useSearch's own `enabled`
  * check -- see queries.ts). Results from every group are flattened into one
- * array, in Companies/Contacts/Notes/Deals/Tasks order (searchResultsSchema's
- * own field order), so ArrowUp/ArrowDown can move a single highlight index
- * across all of them regardless of group.
+ * array, in Companies/Contacts/Notes/Deals/Tasks/Mail order
+ * (searchResultsSchema's own field order), so ArrowUp/ArrowDown can move a
+ * single highlight index across all of them regardless of group.
  */
 export function GlobalSearch() {
   const navigate = useNavigate();
@@ -80,7 +83,19 @@ export function GlobalSearch() {
       label: task.title,
       projectId: task.projectId,
     }));
-    return [...companies, ...contacts, ...notes, ...deals, ...tasks];
+    // Grouped by THREAD server-side, with the subject and snippet of the
+    // best-ranked message in it (searchResultsSchema.mail) -- so the row shows
+    // the excerpt that actually matched, and the id navigated to is the
+    // thread's. The subject can legitimately be empty, hence the shared
+    // placeholder rather than a blank row.
+    const mail: FlatResult[] = data.mail.map((hit) => ({
+      kind: "mail",
+      key: `mail-${hit.threadId}`,
+      threadId: hit.threadId,
+      label: subjectLabel(hit.subject),
+      secondary: hit.snippet,
+    }));
+    return [...companies, ...contacts, ...notes, ...deals, ...tasks, ...mail];
   }, [data]);
 
   // A fresh result set always restarts the highlight at the top -- keyed on
@@ -107,6 +122,11 @@ export function GlobalSearch() {
       void navigate({ to: "/contacts/$contactId", params: { contactId: entry.id } });
     } else if (entry.kind === "deal") {
       void navigate({ to: "/deals/$dealId", params: { dealId: entry.id } });
+    } else if (entry.kind === "mail") {
+      // The inbox reads `?thread=` and preselects (and scrolls to) that
+      // conversation -- a plain push, like the task deep links above: this
+      // lands on a different route than wherever search was invoked from.
+      void navigate({ to: "/mail", search: { thread: entry.threadId } });
     } else if (entry.kind === "task") {
       // A project task opens straight into its board's drawer; a standalone
       // task (no projectId) has no board to land on, so it opens via My
@@ -204,8 +224,8 @@ export function GlobalSearch() {
                       ) : (
                         <>
                           <span className="block text-slate-900">{entry.label}</span>
-                          {entry.kind === "contact" && entry.secondary && (
-                            <span className="block text-xs text-slate-400">{entry.secondary}</span>
+                          {(entry.kind === "contact" || entry.kind === "mail") && entry.secondary && (
+                            <span className="block truncate text-xs text-slate-400">{entry.secondary}</span>
                           )}
                         </>
                       )}
