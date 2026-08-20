@@ -463,7 +463,7 @@ describe("mail account routes", () => {
 // --- Folders ----------------------------------------------------------------
 
 describe("mail folder routes", () => {
-  it("lists an account's folders with route-computed locked flags and the discovery fields", async () => {
+  it("lists an account's folders with service-computed locked flags and the discovery fields", async () => {
     const a = await app();
     const account = await makeAccount(a, { sentFolder: "Sent Items" });
     await seedFolder(account.id, "INBOX");
@@ -636,6 +636,24 @@ describe("mail folder routes", () => {
     });
     expect(survived.statusCode).toBe(200);
     await throwing.close();
+  });
+
+  it("requires authentication on both folder routes", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    await seedFolder(account.id, "Projects");
+    const listed = await a.inject({ method: "GET", url: `/api/mail/accounts/${account.id}/folders` });
+    expect(listed.statusCode).toBe(401);
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/mail/accounts/${account.id}/folders`,
+      payload: { folder: "Projects", syncEnabled: false },
+    });
+    expect(patched.statusCode).toBe(401);
+    // The unauthenticated PATCH wrote nothing.
+    const [row] = await handle.db.select().from(mailAccountFolders)
+      .where(eq(mailAccountFolders.accountId, account.id));
+    expect(row?.syncEnabled).toBe(true);
+    await a.close();
   });
 
   it("accepts the trash and archive overrides on the account PATCH, trimmed", async () => {
@@ -1211,10 +1229,9 @@ describe("mail thread link and archive routes", () => {
     // Filing a message is not reading it: the Archive row keeps its dot.
     expect(items.map((t) => [t.subject, t.unread])).toEqual([["Trashed", false], ["Archived", true]]);
 
-    // ...and the unread FILTER agrees with both of them. It is the third
-    // unread computation, and all three carve out Trash: without it this
-    // response returned the trashed thread while the same body said
-    // `unread: false` about it.
+    // ...and the UNSCOPED unread filter agrees with both of them. All three
+    // unscoped computations carve Trash out: without it this response returned
+    // the trashed thread while the same body said `unread: false` about it.
     const filtered = await a.inject({
       method: "GET", url: "/api/mail/threads?unread=true", headers: authHeaders,
     });
@@ -1231,6 +1248,88 @@ describe("mail thread link and archive routes", () => {
     });
     expect(listResponseSchema(mailThreadListItemSchema).parse(withInbox.json())
       .items.map((t) => t.subject)).toEqual(["Trashed", "Archived"]);
+    await a.close();
+  });
+
+  it("scopes unread to the folder view: the Trash view's dots match the Trash badge", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    await setMoveTargets(account.id, { trashFolder: "Trash" });
+
+    // One thread with unread mail IN the Trash and nothing unread elsewhere,
+    // one with unread mail in Projects, one read everywhere.
+    const trashed = await seedThread({ subject: "Trashed", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(trashed, account.id, {
+      sentAt: new Date("2026-08-03T10:00:00Z"), folder: "Trash", seen: false, imapUid: null,
+    });
+    const filed = await seedThread({ subject: "Filed", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(filed, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), folder: "Projects", seen: false,
+    });
+    // ...and this one is unseen in INBOX but READ in Projects, which is what
+    // separates "unseen in this folder" from "unseen somewhere".
+    const split = await seedThread({ subject: "Split", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(split, account.id, {
+      sentAt: new Date("2026-08-01T10:00:00Z"), folder: "INBOX", seen: false,
+    });
+    await seedMessage(split, account.id, {
+      sentAt: new Date("2026-08-01T09:00:00Z"), folder: "Projects", seen: true, imapUid: 21,
+    });
+
+    async function rows(query: string): Promise<[string, boolean][]> {
+      const response = await a.inject({ method: "GET", url: `/api/mail/threads?${query}`, headers: authHeaders });
+      expect(response.statusCode).toBe(200);
+      return listResponseSchema(mailThreadListItemSchema).parse(response.json())
+        .items.map((t) => [t.subject, t.unread]);
+    }
+
+    // A FOLDER VIEW asks "what is unseen IN THIS FOLDER?", so the Trash view
+    // shows its own unread mail instead of claiming everything in it is read
+    // under a sidebar badge that says the opposite.
+    expect(await rows("folder=Trash")).toEqual([["Trashed", true]]);
+    const badges = await a.inject({
+      method: "GET", url: "/api/mail/unread-count?byFolder=1", headers: authHeaders,
+    });
+    expect(mailUnreadFolderCountsSchema.parse(badges.json()).folders).toEqual([
+      { folder: "INBOX", count: 1 }, { folder: "Projects", count: 1 }, { folder: "Trash", count: 1 },
+    ]);
+    // The Projects view: "Filed" is unseen there, "Split" is not (its unseen
+    // message is in INBOX), even though "Split" is unread in the global sense.
+    expect(await rows("folder=Projects")).toEqual([["Filed", true], ["Split", false]]);
+    // ...and the folder-scoped unread FILTER selects exactly the folder's own
+    // badge population, which is the property the sidebar depends on.
+    expect(await rows("folder=Projects&unread=true")).toEqual([["Filed", true]]);
+    expect(await rows("folder=Trash&unread=true")).toEqual([["Trashed", true]]);
+    expect(await rows("folder=INBOX&unread=true")).toEqual([["Split", true]]);
+    // Unscoped, the global rule still applies: Trash is carved out, the rest
+    // counts wherever it sits.
+    expect(await rows("unread=true")).toEqual([["Filed", true], ["Split", true]]);
+    await a.close();
+  });
+
+  it("scopes the folder view's unread flag to the account when the view names one", async () => {
+    const a = await app();
+    const first = await makeAccount(a);
+    const second = await makeAccount(a, { label: "Side", email: "side@example.com" });
+    // One thread, an INBOX message on each account: read on the first, unseen
+    // on the second. Looking at the FIRST account's INBOX, nothing is unseen.
+    const thread = await seedThread({ subject: "Shared", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(thread, first.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: true });
+    await seedMessage(thread, second.id, { sentAt: new Date("2026-08-02T09:00:00Z"), seen: false });
+
+    async function rows(query: string): Promise<[string, boolean][]> {
+      const response = await a.inject({ method: "GET", url: `/api/mail/threads?${query}`, headers: authHeaders });
+      return listResponseSchema(mailThreadListItemSchema).parse(response.json())
+        .items.map((t) => [t.subject, t.unread]);
+    }
+
+    expect(await rows(`folder=INBOX&account_id=${first.id}`)).toEqual([["Shared", false]]);
+    expect(await rows(`folder=INBOX&account_id=${second.id}`)).toEqual([["Shared", true]]);
+    expect(await rows(`folder=INBOX&account_id=${first.id}&unread=true`)).toEqual([]);
+    expect(await rows(`folder=INBOX&account_id=${second.id}&unread=true`)).toEqual([["Shared", true]]);
+    // An account filter with NO folder is not a folder view: the flag stays
+    // the global one, exactly as it was before folders existed.
+    expect(await rows(`account_id=${first.id}`)).toEqual([["Shared", true]]);
     await a.close();
   });
 
@@ -1461,7 +1560,8 @@ describe("mail bulk thread action route", () => {
     await seedMessage(moved, account.id, { sentAt: new Date("2026-08-04T10:00:00Z"), imapUid: 71 });
     const refused = await seedThread({ subject: "Refused", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
     await seedMessage(refused, stalled.id, { sentAt: new Date("2026-08-03T10:00:00Z"), imapUid: 72 });
-    // Already in the target folder: nothing to do, and a no-op is a success.
+    // Its only message is already in the target folder, so the INBOX view has
+    // nothing of this thread to act on: a no-op, and a success.
     const already = await seedThread({ subject: "Already", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
     await seedMessage(already, account.id, {
       sentAt: new Date("2026-08-02T10:00:00Z"), folder: "Archive", imapUid: 73,
@@ -1477,17 +1577,34 @@ describe("mail bulk thread action route", () => {
       threadIds: [moved, refused, already, pending, UNKNOWN_ID], folder: "INBOX", action: "archive",
     });
     expect(response.statusCode).toBe(200);
-    // Per-thread results, in REQUEST order, and the error strings are the
-    // stable user-facing ones the bulk bar surfaces (Task 5).
+    // Per-thread results, in REQUEST order. Each carries BOTH halves: the
+    // stable `reason` code Task 5 branches on, and the free-text `error` it
+    // displays. The whole mixed body parses through the shared schema, whose
+    // superRefine is what ties the two to `ok`/`skipped`.
     expect(bulkThreadResultSchema.parse(response.json()).results).toEqual([
       { threadId: moved, ok: true },
-      { threadId: refused, ok: false, error: 'mail sync is not running for account "Stalled"' },
-      { threadId: already, ok: true, skipped: true },
-      { threadId: pending, ok: true, skipped: true },
-      { threadId: UNKNOWN_ID, ok: false, error: `mail thread ${UNKNOWN_ID} not found` },
+      {
+        threadId: refused, ok: false, reason: "no_sync",
+        error: 'mail sync is not running for account "Stalled"',
+      },
+      { threadId: already, ok: true, skipped: true, reason: "already_in_target" },
+      { threadId: pending, ok: true, skipped: true, reason: "awaiting_reconciliation" },
+      {
+        threadId: UNKNOWN_ID, ok: false, reason: "not_found",
+        error: `mail thread ${UNKNOWN_ID} not found`,
+      },
     ]);
     // The healthy account still did its work: one refusal does not stop the rest.
     expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [71], targetFolder: "Archive" }]);
+
+    // And archiving FROM the Archive view is the literal already_in_target
+    // case: the message is in scope this time, and it is already where it was
+    // going, so nothing is queued for it.
+    const fromTarget = await bulk(a, { threadIds: [already], folder: "Archive", action: "archive" });
+    expect(bulkThreadResultSchema.parse(fromTarget.json()).results).toEqual([
+      { threadId: already, ok: true, skipped: true, reason: "already_in_target" },
+    ]);
+    expect(sync.moveCalls).toHaveLength(1);
     await a.close();
   });
 
@@ -1503,7 +1620,10 @@ describe("mail bulk thread action route", () => {
     const response = await bulk(a, { threadIds: [thread], folder: "INBOX", action: "archive" });
     expect(response.statusCode).toBe(200);
     expect(bulkThreadResultSchema.parse(response.json()).results).toEqual([
-      { threadId: thread, ok: false, error: "NO [TRYCREATE] Mailbox does not exist" },
+      {
+        threadId: thread, ok: false, reason: "server_refused",
+        error: "NO [TRYCREATE] Mailbox does not exist",
+      },
     ]);
     // The CRM must never claim a move the server refused: the compensating
     // revert restores the row's own folder and uid.
@@ -1524,7 +1644,10 @@ describe("mail bulk thread action route", () => {
     const response = await bulk(a, { threadIds: [thread], folder: "INBOX", action: "trash" });
     expect(response.statusCode).toBe(200);
     expect(bulkThreadResultSchema.parse(response.json()).results).toEqual([
-      { threadId: thread, ok: false, error: 'mail sync is not running for account "Work"' },
+      {
+        threadId: thread, ok: false, reason: "no_sync",
+        error: 'mail sync is not running for account "Work"',
+      },
     ]);
     expect(await messageRow(message)).toMatchObject({ folder: "INBOX", imapUid: 91 });
 
@@ -1545,7 +1668,7 @@ describe("mail bulk thread action route", () => {
 
     const response = await bulk(a, { threadIds: [thread], folder: "INBOX", action: "trash" });
     expect(bulkThreadResultSchema.parse(response.json()).results).toEqual([{
-      threadId: thread, ok: false,
+      threadId: thread, ok: false, reason: "no_target",
       error: 'account "Work" has no Trash folder yet'
         + " -- set one in Settings, or wait for a sync pass to detect it",
     }]);

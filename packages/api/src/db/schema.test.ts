@@ -402,6 +402,17 @@ describe("mail schema (0004)", () => {
     // rather than the unread badge's index.
     const unseenIndex = rows.find((r) => r.indexname === "mail_messages_unseen_thread_idx");
     expect(unseenIndex?.indexdef).toMatch(/WHERE.*seen = false/i);
+    // ...and it carries the two payload columns 0005 added (INCLUDE, not key
+    // columns -- neither is ever a search term here). Without them Task 4's
+    // Trash carve-out reads `folder` and `account_id` from the HEAP, which
+    // costs the badge the index-only scan this index exists to give it: 298
+    // buffers became 2,257 in the measurement recorded in the migration. The
+    // assertion is on INCLUDE specifically, because an index that merely
+    // exists would pass a name check while quietly costing that scan.
+    expect(unseenIndex?.indexdef).toMatch(/INCLUDE \(folder, account_id\)/i);
+    // Exactly one index of that name: 0005 replaces 0004's rather than adding
+    // a second, so a stale duplicate would show up here.
+    expect(names.filter((n) => n === "mail_messages_unseen_thread_idx")).toHaveLength(1);
 
     // Column ORDER is the point of this one, not just its existence: the
     // leading (account_id, folder) prefix is what serves the UIDVALIDITY
@@ -550,10 +561,17 @@ describe("mail folder schema (0005)", () => {
       // database cannot make: its copy of the index was applied by hand (the
       // migration was edited in place before release), so it would be there
       // even if the .sql file had lost the statement.
-      const indexes = await scratch.db.execute<{ indexname: string }>(
-        sql`SELECT indexname FROM pg_indexes WHERE tablename = 'mail_messages'`,
+      const indexes = await scratch.db.execute<{ indexname: string; indexdef: string }>(
+        sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'mail_messages'`,
       );
       expect(indexes.map((row) => row.indexname)).toContain("mail_messages_folder_thread_idx");
+      // And 0005's REPLACEMENT of 0004's unseen index landed as a replacement:
+      // one index of that name, carrying the INCLUDE columns. A drop-and-
+      // recreate is the one shape of migration that can leave two objects (or
+      // none) if the statements are ever reordered.
+      const unseen = indexes.filter((row) => row.indexname === "mail_messages_unseen_thread_idx");
+      expect(unseen).toHaveLength(1);
+      expect(unseen[0]?.indexdef).toMatch(/INCLUDE \(folder, account_id\)/i);
     });
   }, 30000);
 

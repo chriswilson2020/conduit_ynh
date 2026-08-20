@@ -274,7 +274,10 @@ describe("moveThreads: the two modes", () => {
     const missed = await moveThreads(
       handle.db, actorId, { threadIds: [threadId], folder: "clients", action: "archive" }, deps(manager),
     );
-    expect(missed.results).toEqual([{ threadId, ok: true, skipped: true }]);
+    // The fallback skip reason: "nothing this action was going to move". The
+    // enum has no value for "every message was outside the view folder", and
+    // already_in_target is the closest thing it can say (see Outcomes.skip).
+    expect(missed.results).toEqual([{ threadId, ok: true, skipped: true, reason: "already_in_target" }]);
     expect(sync.calls).toHaveLength(1);
     expect((await messageRows(threadId))[1]).toMatchObject({ folder: "Clients", imapUid: 192 });
   });
@@ -359,8 +362,11 @@ describe("moveThreads: nothing to move", () => {
     );
 
     // A successful no-op, not a failure: it self-heals the moment the next
-    // pass fills the UID in and the user asks again.
-    expect(result.results).toEqual([{ threadId, ok: true, skipped: true }]);
+    // pass fills the UID in and the user asks again -- which is what the
+    // reason code tells a client, so it can say so rather than guessing.
+    expect(result.results).toEqual([
+      { threadId, ok: true, skipped: true, reason: "awaiting_reconciliation" },
+    ]);
     expect(sync.calls).toEqual([]);
     expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: null });
     expect(threadHints()).toHaveLength(0);
@@ -377,7 +383,7 @@ describe("moveThreads: nothing to move", () => {
       handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
-    expect(result.results).toEqual([{ threadId, ok: true, skipped: true }]);
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "already_in_target" }]);
     expect((await messageRows(threadId))[0]).toMatchObject({ folder: "Clients", imapUid: 51 });
   });
 
@@ -394,7 +400,10 @@ describe("moveThreads: nothing to move", () => {
     );
 
     expect(result.results).toEqual([
-      { threadId: missing, ok: false, error: "mail thread 00000000-0000-4000-8000-000000000000 not found" },
+      {
+        threadId: missing, ok: false, reason: "not_found",
+        error: "mail thread 00000000-0000-4000-8000-000000000000 not found",
+      },
       { threadId, ok: true },
     ]);
     expect(sync.calls).toHaveLength(1);
@@ -538,8 +547,12 @@ describe("moveThreads: per account", () => {
     );
 
     // Same shape as a thread awaiting reconciliation: nothing eligible, so a
-    // successful no-op rather than an error the user cannot clear.
-    expect(result.results).toEqual([{ threadId, ok: true, skipped: true }]);
+    // successful no-op rather than an error the user cannot clear -- but its
+    // OWN reason code, because this one is fixed in Settings (unarchive the
+    // account) rather than by waiting, and only the code can say which.
+    expect(result.results).toEqual([
+      { threadId, ok: true, skipped: true, reason: "archived_account" },
+    ]);
     expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 171 });
     expect(threadHints()).toHaveLength(0);
   });
@@ -657,7 +670,9 @@ describe("moveThreads: compensation", () => {
 
     // The CRM must never claim a move the server refused: the row goes back
     // exactly as it was, UID included.
-    expect(result.results).toEqual([{ threadId, ok: false, error: "MOVE from INBOX to Archive was refused" }]);
+    expect(result.results).toEqual([
+      { threadId, ok: false, reason: "server_refused", error: "MOVE from INBOX to Archive was refused" },
+    ]);
     expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 121 });
     // Two hints: the optimistic move, then the revert -- clients holding the
     // optimistic view have to be told it came back.
@@ -793,7 +808,7 @@ describe("moveThreads: compensation", () => {
     );
 
     expect(result.results).toEqual([
-      { threadId, ok: false, error: "MOVE from Clients to Archive was refused" },
+      { threadId, ok: false, reason: "server_refused", error: "MOVE from Clients to Archive was refused" },
     ]);
     expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
       .toEqual([["Archive", null], ["Clients", 132]]);

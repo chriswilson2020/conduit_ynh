@@ -54,6 +54,16 @@ Decisions taken with Chris in the 4.1 brainstorm:
   index-only (52.5ms / 110,443 → 36.3ms / 53,211 — about 1.5x time, 2x buffers). The index
   is justified either way (nothing measured slower), but the headline number is not what
   every folder gets. Named query and measurements live in the migration, per the house rule.
+- **0005 also REPLACES 0004's unseen partial index**, adding `INCLUDE (folder, account_id)`
+  (0004 shipped and is immutable, so the replacement lives here; the name is unchanged, so
+  there is exactly one index and 0004's comment still describes it). Task 4's Trash carve-out
+  made the badge read `folder` and `account_id`, which the old index did not carry — costing
+  it the index-only scan it exists for. Measured at 85,000 messages / 8,000 unread: badge
+  before the carve-out 9.98ms / 298 buffers, Heap Fetches 0; badge WITH the carve-out on the
+  old index **25.4ms / 2,257 buffers**, bitmap heap scan over 1,962 heap blocks; with INCLUDE
+  **19.3ms / 311 buffers, Heap Fetches 0** again. The per-folder counts gain it too (12.4ms /
+  310, Heap Fetches 0 — `folder` is their GROUP BY key). INCLUDE rather than key columns
+  because neither is ever a search term here. Cost: 264kB → 504kB.
 
 ## Folder discovery & classification
 
@@ -144,10 +154,21 @@ search, and the "Hide in CRM" state remains orthogonal.
   the selection was made in (list multi-select, folder-scoped); absent = whole-thread (the
   conversation view/record-tab single-thread buttons). `hide` (the existing CRM archive
   applied in bulk) ignores `folder` entirely either way. Server groups by account, applies
-  the move service, returns per-thread results `{ threadId, ok, skipped?, error? }` —
+  the move service, returns per-thread results `{ threadId, ok, skipped?, error?, reason? }` —
   `skipped: true` (always paired with `ok: true`) means the thread's eligible set came out
   empty, for any of the three reasons in step 1 above (awaiting reconciliation, already in
-  the target, or owned by an archived account); `error` is present iff `ok` is false. An
+  the target, or owned by an archived account); `error` is present iff `ok` is false.
+  **`reason` is the machine-readable half, and the one a client branches on** — `error` stays
+  free text for display and no UI may parse it (the house rule for every error shape).
+  Failures carry `no_sync | no_target | not_found | server_refused`; skips carry
+  `archived_account | awaiting_reconciliation | already_in_target`, in that precedence when
+  one thread hits several (the first two mean a message could not be moved, the last that the
+  goal already holds). It is present exactly when there is something to explain — a failure
+  or a skip — and its half of the enum must match which; the shared schema enforces both.
+  `already_in_target` doubles as the fallback for a no-op the enum does not name (every
+  message outside the view folder, or a whole-thread action on Sent-only mail): telling those
+  apart would need a fourth value. The free-text `error` is capped on the way out, since a
+  mail server's refusal text is arbitrary and one response can carry 50 of them. An
   account in backoff, with an unresolvable target folder, or with no running sync loop while
   not archived fails ITS threads with a message — but only for messages the action was
   actually going to move; others proceed. Cap threadIds at 200 per request — the OUTER bound,
@@ -163,12 +184,24 @@ search, and the "Hide in CRM" state remains orthogonal.
   unread-count endpoint gains an optional per-folder variant for sidebar badges (one grouped
   query, not N), shaped `{folders: [{folder, count}]}` — no accountId, so two accounts'
   INBOXes are one row.
-- **Unread counting excludes each account's trash_folder** (both the badge and the thread
-  list's per-row unread flag). A move never touches `seen`, and nothing re-sights an unsynced
-  Trash, so a trashed unread message would otherwise count forever. Archive-folder unread
-  still counts — filing is not reading. The `?byFolder=1` variant does NOT apply the
-  exclusion: each count belongs to its own folder row, and a Trash row reading 0 above
-  visibly unread mail would be a lie.
+- **"Unread" scopes to the view** (coordinator ruling, Task 4 quality review). Two scopes,
+  and every unread computation belongs to exactly one:
+  - **Unscoped** — the nav badge, the default list's per-row `unread` flag, and `?unread=true`
+    with no folder — means "unread anywhere", and **excludes each account's trash_folder**.
+    A move never touches `seen`, and nothing re-sights an unsynced Trash, so a trashed unread
+    message would otherwise count forever. Archive-folder unread still counts: filing is not
+    reading.
+  - **Folder-scoped** — `?folder=F`'s per-row flag, `?folder=F&unread=true`, and each
+    `?byFolder=1` count — means "unseen IN F", with `seen = false` folded into the SAME
+    predicate as the folder term, and takes **no trash carve-out at all**. That is what
+    resolves the Trash self-contradiction (a Trash view whose rows all claim to be read,
+    under a sidebar badge counting them as unread): scoped to the view, the rows and the
+    badge answer the same question and agree. Anywhere else the carve-out would be
+    redundant — a trashed message is not in F.
+  - When the view also names an account, the folder-scoped predicate carries it too, for the
+    same reason the folder filter itself is one combined EXISTS: "unseen in INBOX" while
+    looking at account A must not light up because account B's INBOX has something. An
+    account filter ALONE is not a view in this sense and leaves the flag unscoped.
 - SSE: one new key family, `[["mail-folders", accountId]]`, for the sidebar and the picker.
   Published by the folder toggle above (after its write) and by the sync engine when a
   discovery pass CREATES or RECLASSIFIES a folder (after discovery's DB work, before the

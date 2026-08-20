@@ -583,7 +583,10 @@ export function publishFoldersHint(accountId: string): void {
  * it. What it copies deliberately is that function's OWNERSHIP RULE: the same
  * NotFoundError for "no such account" and "someone else's account", so a
  * foreign id cannot be told apart from a nonexistent one -- an account's folder
- * list is as much a private setting as its host and port.
+ * list is part of its settings, like its host and port. (Folder NAMES are not
+ * themselves secret in a shared-visibility CRM -- they ride on message rows and
+ * folder filters. It is the configuration surface and the mailbox's shape that
+ * stay with their owner.)
  *
  * `sentFolder` is trimmed on read, the same way mail-sync.ts's loadAccount
  * trims it: a stored " Sent " must lock the same row as "Sent".

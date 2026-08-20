@@ -246,9 +246,15 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * sidebar (Phase 4.1).
    *
    * Owner-only, exactly like the account routes above and unlike every THREAD
-   * route: which mailboxes someone's mail server holds is a setting, not
-   * shared CRM content. A foreign id 404s the same way a nonexistent one does
-   * (mail-folders.ts's mustGetOwnedAccount).
+   * route -- these rows are part of an account's SETTINGS (what it syncs, what
+   * its server's mailbox topology looks like), and settings belong to their
+   * owner. Not a secrecy claim about the names themselves: mail is
+   * shared-visibility here, so any authenticated user can already see a folder
+   * name on a message row or in a folder filter. What owner-scoping protects
+   * is the picker's configuration surface and the shape of someone else's
+   * mailbox, including folders that hold no CRM mail at all. A foreign id 404s
+   * the same way a nonexistent one does (mail-folders.ts's
+   * mustGetOwnedAccount), so the two cannot be told apart.
    *
    * `locked` on each row is computed by the service from the account's CURRENT
    * sent_folder and is not a column -- see isLocked for why storing it would
@@ -499,11 +505,15 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * A 504 FROM A PROXY DOES NOT MEAN THE ACTION FAILED. Each queued MOVE runs
    * on its account's serial sync loop, so this request waits for the mail
    * server, and an account halfway through a first backfill can make that wait
-   * minutes (see moveThreads' own note). If the answer is lost in transit the
-   * work still lands, the SSE hints still fire, and the client should REFETCH
-   * rather than retry blindly -- a blind retry would trash or archive a second
-   * time, which for `trash` means moving whatever is now in the source folder.
-   * The cap below is the bound on that exposure.
+   * minutes (see moveThreads' own note). The deployed ceiling is concrete:
+   * conf/nginx.conf sets `proxy_read_timeout 300`, so five minutes is where
+   * this app's own reverse proxy gives up on the response -- while the loop
+   * carries on regardless, because nothing about a client disconnecting
+   * cancels queued work. If the answer is lost that way the work still lands,
+   * the SSE hints still fire, and the client should REFETCH rather than retry
+   * blindly -- a blind retry would trash or archive a second time, which for
+   * `trash` means moving whatever is now in the source folder. The cap below
+   * is the bound on how much work one request can queue behind that ceiling.
    */
   app.post("/api/mail/threads/bulk", async (request, reply) => {
     const user = requireUser(request, reply);

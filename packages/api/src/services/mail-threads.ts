@@ -101,14 +101,56 @@ const MAX_LIMIT = 100;
 const MAX_SENDERS = 5;
 
 /**
- * "This message is not sitting in its OWN account's Trash folder" -- the
- * predicate ALL THREE unread computations apply (Phase 4.1 Task 4's
- * coordinator ruling), and the reason every query using it joins
- * mail_accounts. The three: the nav badge (unreadThreadCount), each list row's
- * `unread` flag (loadAggregates), and the list's `unread=true` FILTER
- * (listThreads). They must agree -- two of the three carving Trash out while
- * the filter did not is a contradiction a user reaches in one click, and it is
- * exactly the bug the third site was added to fix.
+ * WHAT "UNREAD" MEANS, IN TWO SCOPES (Phase 4.1 Task 4's coordinator ruling).
+ * Read this before touching any of the four sites below; they only make sense
+ * together.
+ *
+ * UNSCOPED contexts answer "how much mail is waiting for me ANYWHERE?" -- the
+ * nav badge (unreadThreadCount), the default list's per-row `unread` flag, and
+ * `?unread=true` with no folder. Those apply notInAccountTrash below: a move
+ * never touches `seen`, and nothing re-sights an unsynced Trash to clear it, so
+ * a trashed unread message would otherwise sit in the badge forever with no way
+ * for a user to clear it. Archive-folder mail still counts -- filing is not
+ * reading, and an archive folder IS synced, so its flags stay live.
+ *
+ * FOLDER-SCOPED contexts answer a narrower question -- "what is unseen IN THIS
+ * VIEW?" -- and take NO Trash carve-out at all: `?folder=F`'s per-row flag,
+ * `?folder=F&unread=true`, and each `?byFolder=1` sidebar count. Two reasons,
+ * and the first is the one that made the ruling necessary:
+ *
+ * - IT RESOLVES THE TRASH SELF-CONTRADICTION. Carving Trash out of a view whose
+ *   folder IS the Trash makes that view claim everything in it is read, under a
+ *   sidebar badge counting those same messages as unread. Scoped to the view,
+ *   the Trash folder honestly shows its own unread mail, and the badge and the
+ *   rows agree because they are answering the same question.
+ * - IT IS REDUNDANT ANYWHERE ELSE. When F is not the trash folder, a message in
+ *   the trash is not in F, so the carve-out could not remove anything.
+ *
+ * The mechanism, in every folder-scoped site, is the same: `seen = false` is
+ * folded into the SAME predicate as the folder term, so what is tested is
+ * "unseen AND in F", never "unseen somewhere AND in F somewhere".
+ *
+ * ---------------------------------------------------------------------------
+ *
+ * This predicate is the unscoped half: "this message is not sitting in its OWN
+ * account's Trash folder", and the reason every query using it joins
+ * mail_accounts. One account's Trash is another's ordinary folder, so the
+ * comparison is per message against ITS account's column.
+ *
+ * `trash_folder` NULL means nothing has classified one yet (see the column's
+ * own comment), so nothing is excluded for that account. The comparison is
+ * folderKey's -- INBOX case-folded, everything else verbatim -- over the
+ * trimmed column, mirroring how mail-move.ts reads it: a stored " Trash " must
+ * not read as a second mailbox.
+ *
+ * btrim carries its whitespace set EXPLICITLY rather than relying on the
+ * default (which is the space character alone) -- the set is JavaScript
+ * `String.prototype.trim`'s ASCII range, so the two agree on every folder name
+ * anyone can type. The one remaining gap, stated rather than papered over: JS
+ * also strips U+00A0 and the other Unicode space separators, and this does not,
+ * so a folder name padded with a non-breaking space would be trimmed by the
+ * service-side write path and not by this comparison. Nothing produces such a
+ * name today (discovery stores what the server listed).
  *
  * WHY THE COUNTING CARRIES THIS RATHER THAN THE MOVE. Trashing a message never
  * touches `seen` (services/mail-move.ts is explicit about not writing it: a
@@ -130,7 +172,49 @@ const MAX_SENDERS = 5;
  * " Trash " must not read as a second mailbox.
  */
 function notInAccountTrash(): SQL {
-  return sql`(${mailAccounts.trashFolder} IS NULL OR ${folderKeySql(mailMessages.folder)} <> ${folderKeySql(sql`btrim(${mailAccounts.trashFolder})`)})`;
+  return sql`(${mailAccounts.trashFolder} IS NULL OR ${folderKeySql(mailMessages.folder)} <> ${folderKeySql(trimmedTrashFolder())})`;
+}
+
+/** The account's trash folder, trimmed on JS's terms -- see notInAccountTrash
+ * for why the whitespace set is spelled out. Written `\\t` and friends because
+ * a JS template literal would turn a bare `\t` into a real tab byte, which is
+ * both a different SQL literal and a non-ASCII-source hazard. */
+function trimmedTrashFolder(): SQL {
+  return sql`btrim(${mailAccounts.trashFolder}, E' \\t\\n\\r\\f\\v')`;
+}
+
+/**
+ * The VIEW a list request is showing, as far as "unread" is concerned: the
+ * folder filter it carries, and the account filter alongside it.
+ *
+ * `folder` is what makes the scope folder-scoped. `accountId` narrows it
+ * further when both are present, for the same reason the folder filter itself
+ * is one combined EXISTS: with two accounts open in one CRM, "unseen in INBOX"
+ * while looking at account A must not light up because account B's INBOX has
+ * something. An account filter ALONE does not make a view in this sense -- it
+ * carries no folder, so the flag stays the global one, exactly as it was before
+ * Phase 4.1.
+ */
+interface UnreadScope {
+  folder?: string | undefined;
+  accountId?: string | undefined;
+}
+
+/**
+ * What counts as unread FOR THIS VIEW, as a predicate over one mail_messages
+ * row (the `seen = false` half is applied by each caller, so this composes into
+ * an aggregate filter and into an EXISTS alike).
+ *
+ * The whole of the two-scope ruling in one function, so no caller can implement
+ * half of it: a folder view tests membership of that folder (and account, when
+ * the view names one) and takes no Trash carve-out; an unscoped view takes the
+ * carve-out. See notInAccountTrash's header.
+ */
+function unreadPredicate(view: UnreadScope): SQL {
+  if (view.folder === undefined) return notInAccountTrash();
+  const terms: SQL[] = [sql`${mailMessages.folder} = ${view.folder}`];
+  if (view.accountId !== undefined) terms.push(sql`${mailMessages.accountId} = ${view.accountId}`);
+  return sql`(${sql.join(terms, sql` AND `)})`;
 }
 
 /** Aggregates computed per page of threads, not denormalised onto
@@ -156,26 +240,29 @@ interface ThreadAggregates {
  * mailing-list thread. The fix is to ask each question at its own
  * granularity.
  */
-async function loadAggregates(db: Database, threadIds: string[]): Promise<Map<string, ThreadAggregates>> {
+async function loadAggregates(
+  db: Database, threadIds: string[], view: UnreadScope,
+): Promise<Map<string, ThreadAggregates>> {
   const byThread = new Map<string, ThreadAggregates>();
   if (threadIds.length === 0) return byThread;
 
   // 1. One grouped row per thread for the two set-wide facts.
   //
-  //    The join to mail_accounts serves the unread flag alone (see
-  //    notInAccountTrash): a message in its account's Trash must not light the
-  //    unread dot on a row whose conversation the user has thrown away. It is
-  //    the same rule the badge applies, written in the same place, so the list
-  //    and the badge cannot disagree about which messages count.
+  //    The unread flag answers whichever question the LIST is asking -- see
+  //    the two scopes on notInAccountTrash. In a folder view it is "unseen in
+  //    THIS folder" (so the Trash view's dots match the Trash badge, instead of
+  //    every row claiming to be read under a badge that says otherwise); with
+  //    no folder it is "unseen anywhere except a Trash", which is the badge's
+  //    own question and the reason for the join to mail_accounts.
   //
-  //    `accountIds` is deliberately NOT filtered by it. That field says which
+  //    `accountIds` is deliberately NOT scoped by either. That field says which
   //    mailboxes a thread is visible in, for the account chips, and a thread
   //    whose only message on one account now sits in that account's Trash is
   //    still a thread that account has -- the chip is about provenance, not
   //    about unread.
   const grouped = await db.select({
     threadId: mailMessages.threadId,
-    unread: sql<boolean>`bool_or(NOT ${mailMessages.seen} AND ${notInAccountTrash()})`,
+    unread: sql<boolean>`bool_or(NOT ${mailMessages.seen} AND ${unreadPredicate(view)})`,
     // ORDER BY inside the aggregate: array_agg has no defined output order
     // without one, so the account chips on a multi-account thread row would
     // otherwise be stable only by accident of the plan. By contract, not by
@@ -301,23 +388,31 @@ export async function listThreads(
   // would need an anti-join on every list query for a state that is rare and
   // reversible, and the bulk actions already report such threads as `skipped`
   // rather than pretending they moved (services/mail-move.ts).
+  //
+  // WHEN THE VIEW NAMES A FOLDER, `unread=true` JOINS THIS SUBQUERY rather than
+  // getting one of its own -- the two-scope ruling (see notInAccountTrash).
+  // "Unread in Projects" has to mean one message that is BOTH unseen AND in
+  // Projects; a second, independent EXISTS would match a thread with an unseen
+  // message in INBOX and a read one in Projects, which is the same
+  // each-clause-passes-separately trap as the cross-account case above.
+  const scoped = opts.folder !== undefined;
   if (opts.accountId !== undefined || opts.folder !== undefined) {
     const terms: SQL[] = [sql`${mailMessages.threadId} = ${mailThreads.id}`];
     if (opts.accountId !== undefined) terms.push(sql`${mailMessages.accountId} = ${opts.accountId}`);
     if (opts.folder !== undefined) terms.push(sql`${mailMessages.folder} = ${opts.folder}`);
+    if (opts.unread && scoped) terms.push(sql`${mailMessages.seen} = false`);
     where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} WHERE ${sql.join(terms, sql` AND `)})`);
   }
-  // THE THIRD UNREAD COMPUTATION, and it applies the same Trash carve-out as
-  // the other two (notInAccountTrash). All three have to agree or the UI
-  // contradicts itself in a way a user can reach in one click: without the
-  // carve-out here, a thread whose only unseen message sits in Trash came back
-  // from ?unread=true carrying `unread: false` -- an unread filter returning a
-  // row the same response then says is read.
+  // The UNSCOPED unread filter -- no folder, so the question is the badge's,
+  // and the answer has to be the badge's too. It carries the Trash carve-out
+  // for that reason: without it, a thread whose only unseen message sits in
+  // Trash came back from `?unread=true` carrying `unread: false`, an unread
+  // filter returning a row the same response calls read.
   //
-  // The join lives INSIDE the subquery, which is why this cannot just borrow
-  // the outer query's FROM: the outer list selects from mail_threads alone, and
-  // an account is a property of each MESSAGE, not of the thread.
-  if (opts.unread) {
+  // The join lives INSIDE the subquery, which is why this cannot borrow the
+  // outer query's FROM: the outer list selects from mail_threads alone, and an
+  // account is a property of each MESSAGE, not of the thread.
+  if (opts.unread && !scoped) {
     where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} JOIN ${mailAccounts} ON ${mailAccounts.id} = ${mailMessages.accountId} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${mailMessages.seen} = false AND ${notInAccountTrash()})`);
   }
   const cur = opts.cursor ? decodeLastMessageAtCursor(opts.cursor) : null;
@@ -334,7 +429,11 @@ export async function listThreads(
   const rows = await db.select().from(mailThreads).where(and(...where))
     .orderBy(desc(mailThreads.lastMessageAt), desc(mailThreads.id)).limit(limit + 1);
   const page = rows.slice(0, limit);
-  const aggregates = await loadAggregates(db, page.map((row) => row.id));
+  // The page's rows are described in the same scope the filters selected them
+  // in, so a row's unread dot answers the question its own view asked.
+  const aggregates = await loadAggregates(
+    db, page.map((row) => row.id), { folder: opts.folder, accountId: opts.accountId },
+  );
   const last = page[page.length - 1];
   return {
     items: page.map((row) => {
@@ -670,12 +769,22 @@ export async function unreadThreadCount(db: Database): Promise<number> {
  * folders would otherwise cost thirty round trips every time the sidebar
  * refetched, which SSE makes a frequent event.
  *
- * NO TRASH EXCLUSION HERE, deliberately, and this is the one place the two
- * unread computations differ. The badge above answers "how much is waiting for
- * me?", where mail in the Trash is not waiting for anything. A sidebar row
- * answers "how much unread is IN THIS FOLDER?", and applying the carve-out
- * would make the Trash row read 0 while the messages listed under it visibly
- * are not. Each count belongs to its own row.
+ * NO TRASH EXCLUSION HERE: this is the folder-scoped half of the two-scope
+ * ruling (notInAccountTrash's header), and it needs no carve-out for the same
+ * two reasons the folder-scoped list flag does not. Each row already IS a
+ * folder, so `seen = false` and the folder are tested on the same message by
+ * construction; the Trash row honestly counts its own unread mail instead of
+ * reading 0 above rows the list shows as unread; and for any other folder the
+ * carve-out could not remove anything, since a trashed message is not in it.
+ * The badge above answers the other question -- "how much is waiting for me,
+ * anywhere?" -- where mail in the Trash is not waiting for anything.
+ *
+ * A row therefore appears for any folder holding unread mail, INCLUDING ones
+ * the picker has switched off, ones that have vanished from the server, and
+ * ones belonging to another user's account (the counts are not owner-scoped,
+ * matching the shared-visibility thread list). The sidebar joins these to the
+ * folders endpoint by name and renders what it recognises -- see the plan's
+ * Task 5 note.
  *
  * Folders are counted by NAME across accounts, per the response shape the spec
  * fixes ({folder, count}, no accountId): two accounts' INBOXes are one row

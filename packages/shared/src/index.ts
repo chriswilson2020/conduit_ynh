@@ -680,10 +680,12 @@ export type MailAccountList = z.infer<typeof mailAccountListSchema>;
 // (api: db/schema.ts) field for field -- see that table's comments for what
 // each carries and why syncEnabled/lastDiscoveredAt have no DB-level
 // default -- EXCEPT `locked`, which has no DB column at all: it is computed
-// by the route (true for INBOX and the account's current sent_folder, the
-// two folders foldersOf always walks regardless of sync_enabled -- spec)
-// so the picker can grey them out without the client re-deriving that rule
-// itself.
+// per request by the SERVICE that reads the rows (mail-folders.ts's
+// listAccountFolders, not the route -- the same derivation guards the PATCH,
+// and one copy of the rule is what keeps the read and the write agreeing).
+// True for INBOX and the account's current sent_folder, the two folders
+// foldersOf always walks regardless of sync_enabled (spec), so the picker can
+// grey them out without the client re-deriving that rule itself.
 export const mailAccountFolderSchema = z.object({
   id: z.uuid(), accountId: z.uuid(), folder: z.string().min(1),
   specialUse: specialUseSchema.nullable(),
@@ -956,11 +958,57 @@ export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
 // survive but cannot be moved while the account stays archived (unarchiving
 // in Settings restores its sync loop), and are therefore excluded rather
 // than failed: from the mail view the failure would be unactionable.
+// WHY a thread failed, as a code rather than a sentence. `error` stays for
+// display -- it carries the account label, or the server's own refusal text --
+// but a client must never branch on English (the house rule api.ts states for
+// every error shape): a UI that groups failures, offers "open Settings" for
+// the fixable ones, or counts skips needs something stable, and these are it.
+//
+// Every value maps to one decision in services/mail-move.ts:
+// - no_sync: the account has no running sync loop (and is not archived).
+//   Not best-effort-skippable -- moving the rows with nothing to carry the
+//   MOVE out would leave the CRM claiming a move that never happened.
+// - no_target: trash_folder/archive_folder is NULL for that account, the
+//   spec's "detect this for me" state. Fixable in Settings, or by waiting for
+//   a discovery pass.
+// - not_found: no such thread id.
+// - server_refused: the queued IMAP MOVE was rejected; the optimistic rows
+//   have been put back. `error` carries the server's text.
+export const bulkThreadFailureReasonSchema = z.enum([
+  "no_sync", "no_target", "not_found", "server_refused",
+]);
+export type BulkThreadFailureReason = z.infer<typeof bulkThreadFailureReasonSchema>;
+
+// WHY a thread was a no-op -- the spec's three empty-eligible-set causes
+// (Move write-back, step 1), in the precedence mail-move.ts applies when a
+// thread hits more than one:
+// - archived_account: its messages belong to an archived mail account, whose
+//   sync loop is torn down. Persistent, and fixable only in Settings, so it
+//   outranks the other two.
+// - awaiting_reconciliation: NULL imap_uid -- a just-sent message the Sent
+//   pass has not re-sighted. Transient; asking again after the next pass
+//   works.
+// - already_in_target: everything in scope is already in the target folder.
+//   The intended end state already holds.
+export const bulkThreadSkipReasonSchema = z.enum([
+  "archived_account", "awaiting_reconciliation", "already_in_target",
+]);
+export type BulkThreadSkipReason = z.infer<typeof bulkThreadSkipReasonSchema>;
+
+export const bulkThreadResultReasonSchema = z.enum([
+  ...bulkThreadFailureReasonSchema.options, ...bulkThreadSkipReasonSchema.options,
+]);
+export type BulkThreadResultReason = z.infer<typeof bulkThreadResultReasonSchema>;
+
+const FAILURE_REASONS = new Set<string>(bulkThreadFailureReasonSchema.options);
+const SKIP_REASONS = new Set<string>(bulkThreadSkipReasonSchema.options);
+
 const bulkThreadResultItemSchema = z.object({
   threadId: z.uuid(),
   ok: z.boolean(),
   skipped: z.boolean().optional(),
   error: z.string().optional(),
+  reason: bulkThreadResultReasonSchema.optional(),
 }).superRefine((v, ctx) => {
   if (v.ok && v.error !== undefined) {
     ctx.addIssue({ code: "custom", path: ["error"], message: "error must be absent when ok is true" });
@@ -970,6 +1018,26 @@ const bulkThreadResultItemSchema = z.object({
   }
   if (v.skipped === true && !v.ok) {
     ctx.addIssue({ code: "custom", path: ["skipped"], message: "skipped can only be true when ok is true" });
+  }
+  // A plain success is the one outcome with nothing to explain, so `reason` is
+  // present exactly when there IS something -- a failure or a skip -- and its
+  // half of the enum has to match which of the two it is. Enforced here rather
+  // than left to convention, because a client switching on `reason` to decide
+  // what to show would otherwise have to re-derive the flags it belongs to.
+  const explained = !v.ok || v.skipped === true;
+  if (explained && v.reason === undefined) {
+    ctx.addIssue({ code: "custom", path: ["reason"], message: "reason is required when ok is false or skipped is true" });
+  }
+  if (!explained && v.reason !== undefined) {
+    ctx.addIssue({ code: "custom", path: ["reason"], message: "reason must be absent on a plain success" });
+  }
+  if (v.reason !== undefined) {
+    if (!v.ok && !FAILURE_REASONS.has(v.reason)) {
+      ctx.addIssue({ code: "custom", path: ["reason"], message: "a failure must carry a failure reason" });
+    }
+    if (v.skipped === true && !SKIP_REASONS.has(v.reason)) {
+      ctx.addIssue({ code: "custom", path: ["reason"], message: "a skip must carry a skip reason" });
+    }
   }
 });
 export const bulkThreadResultSchema = z.object({

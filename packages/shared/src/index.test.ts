@@ -57,6 +57,8 @@ import {
   bulkThreadActionKindSchema,
   bulkThreadActionInputSchema,
   bulkThreadResultSchema,
+  bulkThreadFailureReasonSchema,
+  bulkThreadSkipReasonSchema,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -1250,11 +1252,52 @@ describe("bulkThreadResultSchema", () => {
         { threadId: uuid1, ok: true },
         // skipped: nothing moved because every eligible message awaited
         // reconciliation (NULL imap_uid) -- a successful no-op, not a failure.
-        { threadId: uuid2, ok: true, skipped: true },
-        { threadId: randomUUID(), ok: false, error: "account in backoff" },
+        // Both non-plain outcomes carry a `reason` code, which is what a
+        // client branches on; `error` is free text for display only.
+        { threadId: uuid2, ok: true, skipped: true, reason: "awaiting_reconciliation" },
+        { threadId: randomUUID(), ok: false, error: "account in backoff", reason: "no_sync" },
       ],
     };
     expect(bulkThreadResultSchema.parse(result)).toEqual(result);
+  });
+
+  it("requires a reason on a failure and on a skip, and refuses one on a plain success", () => {
+    // A plain success is the one outcome with nothing to explain.
+    expect(() =>
+      bulkThreadResultSchema.parse({ results: [{ threadId: uuid1, ok: true, reason: "already_in_target" }] }),
+    ).toThrow();
+    expect(() =>
+      bulkThreadResultSchema.parse({ results: [{ threadId: uuid1, ok: true, skipped: true }] }),
+    ).toThrow();
+    expect(() =>
+      bulkThreadResultSchema.parse({ results: [{ threadId: uuid1, ok: false, error: "boom" }] }),
+    ).toThrow();
+  });
+
+  it("keeps the two halves of the reason enum on their own side of ok/skipped", () => {
+    // A failure cannot claim a skip's reason...
+    expect(() => bulkThreadResultSchema.parse({
+      results: [{ threadId: uuid1, ok: false, error: "boom", reason: "already_in_target" }],
+    })).toThrow();
+    // ...nor a skip a failure's.
+    expect(() => bulkThreadResultSchema.parse({
+      results: [{ threadId: uuid1, ok: true, skipped: true, reason: "server_refused" }],
+    })).toThrow();
+    // And nothing outside the enum at all.
+    expect(() => bulkThreadResultSchema.parse({
+      results: [{ threadId: uuid1, ok: false, error: "boom", reason: "because" }],
+    })).toThrow();
+  });
+
+  it("names every failure and skip reason the move service can produce", () => {
+    // Pinned so a rename cannot quietly land without the client that
+    // branches on these being updated with it.
+    expect(bulkThreadFailureReasonSchema.options)
+      .toEqual(["no_sync", "no_target", "not_found", "server_refused"]);
+    // In precedence order: the first two mean a message could not be moved,
+    // the last that the goal already holds (api: mail-move.ts's noteSkip).
+    expect(bulkThreadSkipReasonSchema.options)
+      .toEqual(["archived_account", "awaiting_reconciliation", "already_in_target"]);
   });
 
   it("rejects error present alongside ok: true", () =>
@@ -1269,7 +1312,9 @@ describe("bulkThreadResultSchema", () => {
 
   it("rejects skipped: true paired with ok: false (a skip is never a failure)", () =>
     expect(() =>
-      bulkThreadResultSchema.parse({ results: [{ threadId: uuid1, ok: false, skipped: true, error: "x" }] }),
+      bulkThreadResultSchema.parse({
+        results: [{ threadId: uuid1, ok: false, skipped: true, error: "x", reason: "no_sync" }],
+      }),
     ).toThrow());
 });
 

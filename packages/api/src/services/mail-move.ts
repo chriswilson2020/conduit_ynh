@@ -1,5 +1,7 @@
-import { and, inArray, isNotNull, sql } from "drizzle-orm";
-import type { BulkThreadActionInput, BulkThreadResult } from "@conduit/shared";
+import { inArray, sql } from "drizzle-orm";
+import type {
+  BulkThreadActionInput, BulkThreadFailureReason, BulkThreadResult, BulkThreadSkipReason,
+} from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
 import { NotFoundError } from "./errors.js";
@@ -148,17 +150,31 @@ const MAX_LOGGED_IDS = 500;
  * How much of a caught error's text a log line may carry, mirroring
  * mail-sync.ts's MAX_LAST_ERROR_CHARS (and its `truncate`) for `last_error`.
  *
- * The one place it matters here is revertMove's failure, where the error comes
- * from the DATABASE rather than from a mail server: a drizzle error quotes the
- * failing statement AND every bind parameter, and this module's statements
- * carry three parameters per row for a chunk of up to UID_CHUNK rows -- ~1500
- * of them at full size. Untruncated, one revert failure writes a megabyte of
- * uuids into the journal, burying the message ids that are the whole point of
- * the line.
+ * Two places it matters. revertMove's failure, where the error comes from the
+ * DATABASE rather than a mail server: a drizzle error quotes the failing
+ * statement AND every bind parameter, and this module's statements carry three
+ * parameters per row for a chunk of up to UID_CHUNK rows -- ~1500 of them at
+ * full size. Untruncated, one revert failure writes a megabyte of uuids into
+ * the journal, burying the message ids that are the whole point of the line.
+ *
+ * And the per-thread `error` on the WIRE (Outcomes.fail), which a browser
+ * renders in a toast: a mail server's refusal text is arbitrary, a bulk
+ * response can carry 50 of them, and neither the response nor the toast is a
+ * place to discover that. The machine-readable half of that answer is `reason`,
+ * which is never truncated because it is an enum.
  */
 const MAX_LOGGED_ERROR_CHARS = 500;
 
 type ResultItem = BulkThreadResult["results"][number];
+
+/** Precedence when one thread hits several skip causes -- lower wins. Written
+ * as a table rather than an if-chain so the order is one readable fact; see
+ * Outcomes.noteSkip for why it runs this way round. */
+const SKIP_REASON_RANK: Record<BulkThreadSkipReason, number> = {
+  archived_account: 0,
+  awaiting_reconciliation: 1,
+  already_in_target: 2,
+};
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -226,17 +242,55 @@ interface MoveGroup {
  */
 class Outcomes {
   private readonly byThread = new Map<string, ResultItem>();
+  /**
+   * Why each thread's eligible set came out empty, recorded as the rows are
+   * filtered and read only if the thread ends up with nothing to move.
+   *
+   * Kept apart from `byThread` because the two are decided at different times:
+   * a skip is only KNOWN to be a skip once every one of the thread's messages
+   * has been looked at, so collection notes the causes as it goes and `skip`
+   * resolves them at the end.
+   */
+  private readonly skipReasons = new Map<string, BulkThreadSkipReason>();
 
-  fail(threadId: string, error: string): void {
+  fail(threadId: string, error: string, reason: BulkThreadFailureReason): void {
     const existing = this.byThread.get(threadId);
     if (existing !== undefined && existing.ok === false) return;
-    this.byThread.set(threadId, { threadId, ok: false, error });
+    // Capped on the way OUT, not at the throw site: this string reaches a
+    // browser and a toast, and the one source that can be unbounded is a mail
+    // server's own refusal text (see MAX_LOGGED_ERROR_CHARS).
+    this.byThread.set(threadId, {
+      threadId, ok: false, error: truncate(error, MAX_LOGGED_ERROR_CHARS), reason,
+    });
+  }
+
+  /**
+   * Note why one of this thread's messages was dropped from the eligible set.
+   * The strongest reason seen wins, in the enum's own order (archived_account,
+   * then awaiting_reconciliation, then already_in_target): the first two mean a
+   * message is somewhere the CRM could not move it FROM, while the last means
+   * the goal already holds, so reporting an unfinished cause ahead of a
+   * finished one is the honest ordering when a thread has both.
+   */
+  noteSkip(threadId: string, reason: BulkThreadSkipReason): void {
+    const existing = this.skipReasons.get(threadId);
+    if (existing !== undefined && SKIP_REASON_RANK[existing] <= SKIP_REASON_RANK[reason]) return;
+    this.skipReasons.set(threadId, reason);
   }
 
   /** A successful no-op: nothing was eligible to move (spec's `skipped`). */
   skip(threadId: string): void {
     if (this.byThread.has(threadId)) return;
-    this.byThread.set(threadId, { threadId, ok: true, skipped: true });
+    this.byThread.set(threadId, {
+      threadId, ok: true, skipped: true,
+      // The fallback covers the causes the enum does not name: in
+      // folder-scoped mode every message was outside the view folder, and in
+      // whole-thread mode the thread was nothing but Sent mail. Both mean
+      // "nothing this action was going to move", which is what
+      // already_in_target tells a user -- but they are not literally that, and
+      // a UI that needs to tell them apart needs a fourth value here.
+      reason: this.skipReasons.get(threadId) ?? "already_in_target",
+    });
   }
 
   succeed(threadId: string): void {
@@ -276,8 +330,9 @@ class Outcomes {
   list(threadIds: readonly string[]): ResultItem[] {
     return threadIds.map((threadId) => this.byThread.get(threadId)
       // Unreachable: every id is classified below. A defensive answer beats a
-      // response that silently drops a row the client asked about.
-      ?? { threadId, ok: false, error: "no result was produced for this thread" });
+      // response that silently drops a row the client asked about -- and it
+      // still has to satisfy the contract, hence a reason.
+      ?? { threadId, ok: false, error: "no result was produced for this thread", reason: "not_found" });
   }
 }
 
@@ -306,7 +361,7 @@ interface AccountScope {
  */
 type AccountState =
   | { kind: "ready"; scope: AccountScope; targetFolder: string; sync: MoveSyncAccount }
-  | { kind: "refused"; scope: AccountScope; error: string }
+  | { kind: "refused"; scope: AccountScope; error: string; reason: BulkThreadFailureReason }
   | { kind: "unmovable"; scope: AccountScope };
 
 /**
@@ -364,11 +419,16 @@ function accountStateOf(
       scope,
       error: `account "${account.label}" has no ${role} folder yet`
         + " -- set one in Settings, or wait for a sync pass to detect it",
+      reason: "no_target",
     };
   }
   const sync = syncManager?.get(account.id);
   if (sync === undefined) {
-    return { kind: "refused", scope, error: `mail sync is not running for account "${account.label}"` };
+    return {
+      kind: "refused", scope,
+      error: `mail sync is not running for account "${account.label}"`,
+      reason: "no_sync",
+    };
   }
   return { kind: "ready", scope, targetFolder, sync };
 }
@@ -443,7 +503,10 @@ export async function moveThreads(
     if (candidates.length > 0) {
       await applyOptimisticMove(db, candidates);
       const failures = await queueMoves(db, candidates, logger);
-      for (const [threadId, error] of failures) outcomes.fail(threadId, error);
+      // Every failure out of the queue is the same kind: the mail server said
+      // no (or the queue refused while the account was in backoff), and the
+      // rows have been put back.
+      for (const [threadId, error] of failures) outcomes.fail(threadId, error, "server_refused");
       for (const row of candidates) outcomes.succeed(row.threadId);
     }
     // Whatever is still unclassified had nothing eligible to move -- every
@@ -477,7 +540,10 @@ export async function moveThreads(
  *
  * Sequential, and one failure does not stop the rest: an unknown id fails ITS
  * thread and the others still hide, which is the partial-failure shape the
- * bulk contract promises.
+ * bulk contract promises. AN UNKNOWN ID IS THE ONLY per-thread failure this
+ * path has, so it is the only one caught: anything else (the database went
+ * away mid-batch) is not a fact about one thread, has no honest `reason` code
+ * to carry, and is re-thrown to become the 500 it is.
  *
  * ONE SSE HINT FOR THE BATCH, not one per thread: archiveThread's own hint is
  * suppressed and this publishes a single frame carrying every hidden thread's
@@ -497,7 +563,8 @@ async function hideThreads(db: Database, threadIds: readonly string[], outcomes:
       outcomes.succeed(threadId);
       hidden.add(threadId);
     } catch (error) {
-      outcomes.fail(threadId, errorText(error));
+      if (!(error instanceof NotFoundError)) throw error;
+      outcomes.fail(threadId, error.message, "not_found");
     }
   }
   if (hidden.size > 0) publishMoveHints(hidden);
@@ -531,22 +598,23 @@ async function collectCandidates(
   const known = new Set((await db.select({ id: mailThreads.id }).from(mailThreads)
     .where(inArray(mailThreads.id, [...threadIds]))).map((row) => row.id));
   for (const threadId of threadIds) {
-    if (!known.has(threadId)) outcomes.fail(threadId, new NotFoundError("mail thread", threadId).message);
+    if (!known.has(threadId)) {
+      outcomes.fail(threadId, new NotFoundError("mail thread", threadId).message, "not_found");
+    }
   }
   if (known.size === 0) return { candidates: [], refusedAccounts: 0 };
 
+  // Rows awaiting reconciliation (NULL imap_uid) are FETCHED and dropped in the
+  // loop below, not filtered out in SQL. They used to be filtered here, on the
+  // grounds that nothing observable changed -- but something does now: a thread
+  // whose whole in-scope set was awaiting reconciliation has to report
+  // `awaiting_reconciliation` rather than the fallback skip reason, and a row
+  // the query never returned cannot say so. The extra rows are few (a NULL uid
+  // lasts until the next pass of the Sent folder).
   const messages = await db.select({
     id: mailMessages.id, threadId: mailMessages.threadId, accountId: mailMessages.accountId,
     folder: mailMessages.folder, imapUid: mailMessages.imapUid,
-  }).from(mailMessages).where(and(
-    inArray(mailMessages.threadId, [...known]),
-    // Rows awaiting reconciliation can never be moved (no UID to name them
-    // by), so they are dropped in SQL rather than carried into the loop below.
-    // Nothing observable changes -- a thread left with nothing eligible still
-    // reports `skipped` either way -- it is simply fewer rows to fetch on a
-    // long conversation.
-    isNotNull(mailMessages.imapUid),
-  ));
+  }).from(mailMessages).where(inArray(mailMessages.threadId, [...known]));
   if (messages.length === 0) return { candidates: [], refusedAccounts: 0 };
 
   const accountIds = [...new Set(messages.map((row) => row.accountId))];
@@ -565,34 +633,17 @@ async function collectCandidates(
   for (const row of messages) {
     const state = states.get(row.accountId);
     if (state === undefined) continue;
-    // An archived account's rows cannot move while it stays archived, so they
-    // are dropped here beside the NULL uids rather than failing anything --
-    // see accountStateOf for why a failure whose only remedy is in Settings is
-    // the wrong answer to give the mail view.
-    if (state.kind === "unmovable") continue;
-    // Narrowing only: the WHERE above already excluded these rows. Kept
-    // because the column is nullable, so its type stays `number | null`
-    // however the query filtered it.
-    if (row.imapUid === null) continue;
-
-    // EVERY ELIGIBILITY FILTER RUNS BEFORE THE REFUSAL BELOW, and the order is
-    // the correctness property, not tidiness. A refusal is a statement about
-    // messages this action would actually have moved: an account that cannot
-    // move must not fail a thread whose messages of its own were never in
-    // scope in the first place (outside the view folder, awaiting
-    // reconciliation, or carved out of the whole-thread set). Judging the
-    // account before its rows made every such thread fail for a mailbox the
-    // user was not acting on.
-    //
-    // Already there. In whole-thread mode this is the spec's explicit
-    // exclusion; in folder-scoped mode it can only fire when the user acts
-    // from the target folder's OWN view (archiving from the Archive view),
-    // where "nothing to do" is just as true -- and where moving a message into
-    // the mailbox it is already in would churn its UID for nothing. A refused
-    // account may have no target at all, in which case there is no folder for
-    // a message to be "already in".
     const { sentFolder, targetFolder } = state.scope;
-    if (targetFolder !== null && sameFolder(row.folder, targetFolder)) continue;
+
+    // WHAT IS IN SCOPE IS DECIDED FIRST, and everything below depends on that
+    // order. A row this action was never going to touch must produce NOTHING:
+    // not a refusal (an account that cannot move must not fail a thread whose
+    // messages of its own were out of scope -- judging the account before its
+    // rows made every such thread fail for a mailbox the user was not acting
+    // on), and not a skip REASON either (a NULL-uid message sitting in some
+    // other folder is not why a thread selected in THIS view had nothing to
+    // move, and reporting it as such tells the user to wait for a pass that
+    // will change nothing).
     if (viewFolder === undefined) {
       // Whole-thread: everything except Sent. Archiving a conversation must
       // never empty the Sent folder.
@@ -604,10 +655,42 @@ async function collectCandidates(
       continue;
     }
 
+    // From here the row IS in scope, so every way of dropping it is something
+    // this thread may end up reporting -- as a skip reason if the thread ends
+    // with nothing to move, or as the refusal at the bottom.
+    //
+    // Already there. In whole-thread mode this is the spec's explicit
+    // exclusion; in folder-scoped mode it can only fire when the user acts
+    // from the target folder's OWN view (archiving from the Archive view),
+    // where "nothing to do" is just as true -- and where moving a message into
+    // the mailbox it is already in would churn its UID for nothing. A refused
+    // account may have no target at all, in which case there is no folder for
+    // a message to be "already in". It is tested FIRST of the three, because a
+    // message that is already where it was going needs no uid and no live sync
+    // to be finished with.
+    if (targetFolder !== null && sameFolder(row.folder, targetFolder)) {
+      outcomes.noteSkip(row.threadId, "already_in_target");
+      continue;
+    }
+    // An archived account's rows cannot move while it stays archived, so they
+    // are dropped here beside the NULL uids rather than failing anything --
+    // see accountStateOf for why a failure whose only remedy is in Settings is
+    // the wrong answer to give the mail view.
+    if (state.kind === "unmovable") {
+      outcomes.noteSkip(row.threadId, "archived_account");
+      continue;
+    }
+    // No UID, no way to name this message to the server. Self-heals: the next
+    // pass of its folder re-sights it and the upsert restores the uid.
+    if (row.imapUid === null) {
+      outcomes.noteSkip(row.threadId, "awaiting_reconciliation");
+      continue;
+    }
+
     if (state.kind === "refused") {
       // In scope, and this account cannot move it: THIS is what fails the
       // thread. Every other account in the same request carries on (spec).
-      outcomes.fail(row.threadId, state.error);
+      outcomes.fail(row.threadId, state.error, state.reason);
       refused.add(row.accountId);
       continue;
     }

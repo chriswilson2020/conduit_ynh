@@ -57,4 +57,37 @@ ALTER TABLE "mail_account_folders" ADD CONSTRAINT "mail_account_folders_account_
 -- Column order: folder leads because it is the only column the folder-only
 -- filter binds, and thread_id follows so the correlation is answered from the
 -- index alone. 1.6MB at 85k messages, against a 35MB table.
-CREATE INDEX "mail_messages_folder_thread_idx" ON "mail_messages" USING btree ("folder","thread_id");
+CREATE INDEX "mail_messages_folder_thread_idx" ON "mail_messages" USING btree ("folder","thread_id");--> statement-breakpoint
+-- Same block, same rules: 0004's unseen partial index is REPLACED here rather
+-- than edited there (0004 shipped in v0.5.0 and is immutable). The name is
+-- deliberately unchanged, so this migration leaves exactly one index of that
+-- name and 0004's own comment still describes the right object.
+--
+-- NAMED QUERIES: the unread badge and the sidebar's per-folder counts
+-- (services/mail-threads.ts's unreadThreadCount / unreadCountsByFolder) --
+--   SELECT count(DISTINCT m.thread_id) FROM mail_messages m
+--     JOIN mail_threads t ON t.id = m.thread_id
+--     JOIN mail_accounts a ON a.id = m.account_id      -- badge only
+--    WHERE t.archived_at IS NULL AND m.seen = false
+--      AND <m.folder is not a's trash folder>          -- badge only
+--
+-- WHY: Task 4's Trash carve-out made the badge read `folder` and `account_id`,
+-- which 0004's index does not carry. That cost it the index-only scan it was
+-- built for -- the plan fell back to a bitmap heap scan and went and fetched
+-- ~2,000 heap blocks to read two columns. MEASURED at 85,000 messages with
+-- 8,000 unread (top-level Aggregate node):
+--
+--   * badge, pre-4.1 (no carve-out), 0004 index: 9.98ms / 298 buffers,
+--     Index Only Scan, Heap Fetches: 0;
+--   * badge, WITH the carve-out, 0004 index: 25.4ms / 2,257 buffers, Bitmap
+--     Heap Scan, 1,962 heap blocks -- the regression this replaces;
+--   * badge, WITH the carve-out, this index: 19.3ms / 311 buffers, Index Only
+--     Scan, Heap Fetches: 0 again.
+--
+-- The per-folder counts get it too (12.4ms / 310, Heap Fetches: 0): `folder`
+-- is the GROUP BY key, and it now comes from the index rather than the heap.
+-- INCLUDE rather than more key columns because neither column is ever a search
+-- term here -- they are payload, and keeping them out of the key leaves the
+-- index ordered by thread_id alone. Cost: 264kB -> 504kB at 8k unread rows.
+DROP INDEX "mail_messages_unseen_thread_idx";--> statement-breakpoint
+CREATE INDEX "mail_messages_unseen_thread_idx" ON "mail_messages" USING btree ("thread_id") INCLUDE ("folder","account_id") WHERE seen = false;

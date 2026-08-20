@@ -1273,6 +1273,25 @@ export function useSearch(q: string) {
  * hint), ["email-templates"] (services/mail-templates.ts) -- so components/
  * sse.tsx's invalidation works on them unchanged, with no mail-specific case.
  *
+ * Phase 4.1 adds one more published family, registered here so the next hook
+ * to need it uses the key the server already sends rather than inventing one:
+ *
+ * - ["mail-folders", accountId] -- one account's discovered folder set
+ *   (api: services/mail-folders.ts's publishFoldersHint). Published by the
+ *   Settings folder toggle and by any sync pass whose discovery CREATES or
+ *   RECLASSIFIES a folder. Per account, not global: a busy second mailbox has
+ *   no business invalidating the first account's picker. No hook uses it yet
+ *   -- the folder picker and sidebar are Task 5.
+ *
+ * And one key that is NOT a published family, noted here for the same reason:
+ *
+ * - ["mail-unread", "by-folder"] -- where the sidebar's per-folder counts
+ *   (GET /api/mail/unread-count?byFolder=1) belong. Nesting it UNDER
+ *   ["mail-unread"] is the whole point: the server publishes the parent, and
+ *   TanStack Query's prefix matching invalidates both the badge and the
+ *   per-folder counts from that one hint, so the sidebar stays live without
+ *   the API needing a second key for the same fact.
+ *
  * ["search"] is the one key the mail hints deliberately do NOT carry: an
  * ingest or a thread archive does not invalidate the global search cache
  * server-side, exactly as in Phases 1-3, where each MUTATION HOOK lists
