@@ -38,7 +38,9 @@ import {
  * here empties a folder. Instead every case records the folder's highest UID
  * first and asserts only about what it appended above that, and every subject
  * carries a per-run id. Dovecot's storage persists for the whole job, and
- * these tests are correct anyway.
+ * these tests are correct anyway. That isolation is SEQUENTIAL, though: two
+ * cases sharing a folder concurrently would each read a highestUid the other
+ * is about to invalidate, so `it.concurrent` must not be used in this file.
  */
 
 const RUN = Boolean(process.env.MAIL_IT);
@@ -115,6 +117,14 @@ function rfc822({ subject, body = "Integration body.", date = new Date(), extraH
 // Every client this file opens, so nothing is left holding a socket when the
 // run ends. disconnect() is safe twice (it swallows), so a case that has
 // already closed one need not remove it.
+//
+// Note that clients are released in afterAll, not per case: every new
+// describe block therefore ADDS to the set of connections held open for the
+// rest of the file. That is affordable only because the fixture raises
+// `mail_max_userip_connections` to 100 (start-dovecot.sh) -- against
+// Dovecot's default of 10 this file would start failing to log in partway
+// through, which is what to check first if a newly added block reports an
+// authentication or connection error the cases before it do not.
 const opened: ImapflowClient[] = [];
 
 async function connectClient(

@@ -218,8 +218,13 @@ jobs:
           name: playwright-report
           path: playwright-report/
           retention-days: 7
+      # Same dump the unit job takes, and for the same reason: when the
+      # journey's sync finds nothing, "which folders exist, and did the
+      # seeding APPEND land in one of them" is the first question, and the
+      # containers are gone by the time anyone reads this.
       - name: Mail server logs
         if: failure()
         run: |
           docker logs conduit-dovecot || true
           docker logs conduit-dovecot-nostarttls || true
+          docker exec conduit-dovecot doveadm mailbox list -u "$MAIL_IT_USERNAME" || true

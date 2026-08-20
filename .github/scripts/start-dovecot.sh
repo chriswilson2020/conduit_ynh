@@ -21,7 +21,13 @@
 # the clear with the password.
 set -euo pipefail
 
-IMAGE="dovecot/dovecot:2.3-latest"
+# PINNED, like Mailpit's tag in the workflow. "2.3-latest" is a moving tag,
+# and the configuration below is 2.3 syntax: Dovecot 2.4 renamed enough of it
+# (`mail_location`, the `namespace`/`service` blocks) that the container would
+# exit at boot the day that tag moved on. 2.3.21.1 is what 2.3-latest resolves
+# to today (both are sha256:547d28f9a893c93a1d2f6dc164880cd7bfa74009106dfa46b36a6a2ee636d921),
+# so this is the same image, named so it stays the same image.
+IMAGE="dovecot/dovecot:2.3.21.1"
 TMP="${RUNNER_TEMP:-/tmp}"
 MAIN="$TMP/conduit-dovecot"
 PLAIN="$TMP/conduit-dovecot-nostarttls"
