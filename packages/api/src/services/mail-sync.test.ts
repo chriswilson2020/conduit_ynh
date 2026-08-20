@@ -198,12 +198,10 @@ class FakeImapClient implements ImapClient {
     this.idleResolve = null;
   }
 
-  async status(folder: string): Promise<{ uidvalidity: number; uidnext: number }> {
+  async status(folder: string): Promise<{ uidvalidity: number }> {
     return this.track({ op: "status", folder }, () => {
       if (this.statusError !== null) throw this.statusError;
-      const target = this.folder(folder);
-      const uids = [...target.messages.keys()];
-      return { uidvalidity: target.uidvalidity, uidnext: Math.max(0, ...uids) + 1 };
+      return { uidvalidity: this.folder(folder).uidvalidity };
     });
   }
 
@@ -526,6 +524,57 @@ describe("AccountSync: backfill and cursor", () => {
     const cursor = await cursorFor(accountId, "INBOX");
     expect(cursor?.uidvalidity).toBe(77);
     expect(cursor?.lastSeenUid).toBe(3);
+  });
+
+  it("clears stored UIDs on a UIDVALIDITY re-walk, so a renumbered mailbox cannot cross-apply flags", async () => {
+    // The re-walk is WINDOWED (backfill_days), so it only re-sights recent
+    // messages -- anything older would otherwise keep a UID from the dead
+    // namespace, and reconcileFlags matches on (account, folder, imap_uid).
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+    const inbox = client.folder("INBOX");
+    inbox.add(1, rawMail({ messageId: "old@example.com" }), {
+      internalDate: new Date("2000-01-01T00:00:00.000Z"),
+    });
+    inbox.add(2, rawMail({ messageId: "recent@example.com" }), {
+      internalDate: new Date("2026-08-18T00:00:00.000Z"),
+    });
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    expect((await messageRows()).map((row) => [row.messageId, row.imapUid, row.seen]))
+      .toEqual([["old@example.com", 1, false], ["recent@example.com", 2, false]]);
+
+    // The window shrinks...
+    await handle.db.update(mailAccounts)
+      .set({ backfillDays: 30 }).where(eq(mailAccounts.id, accountId));
+    // ...and the mailbox is renumbered, with recent@ landing on the very UID
+    // old@ is still stored under. That collision is the whole defect.
+    inbox.messages.clear();
+    inbox.uidvalidity = 99;
+    inbox.add(1, rawMail({ messageId: "recent@example.com" }), {
+      internalDate: new Date("2026-08-18T00:00:00.000Z"), flags: ["\\Seen"],
+    });
+    inbox.add(5, rawMail({ messageId: "old@example.com" }), {
+      internalDate: new Date("2000-01-01T00:00:00.000Z"),
+    });
+
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 2, "the re-walk");
+
+    const rows = await messageRows();
+    const old = rows.find((row) => row.messageId === "old@example.com");
+    const recent = rows.find((row) => row.messageId === "recent@example.com");
+    // Outside the window, so never re-sighted: its read state is untouched
+    // by the message that now holds the number it used to have, because its
+    // stale UID was cleared and is no longer matchable. (Asserted in this
+    // order deliberately -- the read state IS the harm; the null UID is the
+    // mechanism. Without the clear, both of these fail.)
+    expect(old?.seen).toBe(false);
+    expect(old?.imapUid).toBeNull();
+    // Inside the window: refreshed by the re-walk, flags and all.
+    expect(recent?.imapUid).toBe(1);
+    expect(recent?.seen).toBe(true);
   });
 
   it("syncs the Sent folder alongside INBOX, keeping a cursor for each", async () => {
@@ -960,6 +1009,73 @@ describe("AccountSync: queued work", () => {
     client.setFlagsError = null;
     sync.wake();
     await waitFor(() => sync.stats.passes >= 2, "the pass after the failed task");
+  });
+
+  it("drains queued work without running a pass, and still passes on the next poll", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client, clock } = makeSync(accountId);
+    client.folder("INBOX").add(1, rawMail({ messageId: "m1@example.com" }));
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    await waitFor(() => client.idleEntries >= 1, "the loop to park on IDLE");
+    const fetches = client.opsOf("fetchNewer").length;
+    const statuses = client.opsOf("status").length;
+
+    await sync.markSeen("INBOX", [1]);
+
+    // The flag write ran; NOTHING else did. Task 7 calls this once per thread
+    // the user opens, and a full status/fetch/reconcile round per click would
+    // be pure waste.
+    expect(client.opsOf("setFlags")).toHaveLength(1);
+    expect(client.opsOf("fetchNewer")).toHaveLength(fetches);
+    expect(client.opsOf("status")).toHaveLength(statuses);
+    expect(client.opsOf("fetchFlags")).toHaveLength(2);
+    expect(sync.stats.passes).toBe(1);
+
+    // And the loop went straight back to waiting, so a real trigger still
+    // produces a real pass.
+    await waitFor(() => clock.pendingCount() > 0, "the loop to park again");
+    clock.fire();
+    await waitFor(() => sync.stats.passes >= 2, "the polled pass");
+    expect(client.opsOf("fetchNewer").length).toBeGreaterThan(fetches);
+  });
+
+  it("does not let queued work pull a backoff retry forward", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client, clock } = makeSync(accountId);
+    client.statusError = new Error("NO [SERVERBUG]");
+
+    sync.start();
+    await waitFor(() => sync.stats.failures >= 1, "the first failure");
+    await waitFor(() => clock.pendingCount() > 0, "the backoff wait");
+
+    // A mark-read landing mid-backoff runs, but must not count as the retry:
+    // a user clicking around must not accelerate a broken account's
+    // reconnect attempts.
+    await sync.markSeen("INBOX", [1]);
+    expect(client.opsOf("setFlags")).toHaveLength(1);
+    expect(sync.stats.failures).toBe(1);
+    await waitFor(() => clock.pendingCount() > 0, "the fresh backoff wait");
+    expect(sync.stats.passes).toBe(0);
+  });
+
+  it("trims a stored sent folder once, so the walk and the APPEND agree", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    await handle.db.update(mailAccounts)
+      .set({ sentFolder: "  Sent  " }).where(eq(mailAccounts.id, accountId));
+    const { sync, client } = makeSync(accountId);
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    await sync.appendSent(rawMail({ messageId: "sent@example.com", from: "chris@example.com" }));
+
+    // Untrimmed, the pass would walk `Sent` while the APPEND went to
+    // `"  Sent  "` -- two different mailboxes to an IMAP server.
+    expect(client.opsOf("status").map((call) => call.folder)).toEqual(["INBOX", "Sent"]);
+    expect(client.opsOf("append")[0]?.folder).toBe("Sent");
+    expect([...client.folders.keys()]).not.toContain("  Sent  ");
+    expect((await cursorRows(accountId)).map((row) => row.folder)).toEqual(["INBOX", "Sent"]);
   });
 
   it("markSeen with no uids does nothing at all", async () => {

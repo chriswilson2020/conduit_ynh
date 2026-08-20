@@ -78,9 +78,12 @@ const SEEN_FLAG = "\\Seen";
 
 // --- The IMAP seam ---------------------------------------------------------
 
+/** Deliberately just UIDVALIDITY. UIDNEXT would be the obvious companion,
+ * but nothing here reads it -- the cursor is driven by what fetchNewer
+ * actually returns, not by a predicted upper bound -- and every field in
+ * this interface is one the real adapter has to implement. */
 export interface ImapFolderStatus {
   uidvalidity: number;
-  uidnext: number;
 }
 
 /** One message as the server lists it: enough to decide what to ingest and
@@ -135,6 +138,7 @@ export interface ImapClient {
   /** Rejects on failure -> pass-level error -> backoff. */
   connect(): Promise<void>;
   disconnect(): Promise<void>;
+  /** UIDVALIDITY for the folder; a change means the cursor is worthless. */
   status(folder: string): Promise<ImapFolderStatus>;
   /** Ascending by UID. Bodies are NOT included -- see fetchRaw. */
   fetchNewer(folder: string, options: FetchNewerOptions): Promise<ImapMessageDescriptor[]>;
@@ -344,10 +348,15 @@ export class AccountSync {
   private loopPromise: Promise<void> | null = null;
   private stopped = false;
   private tornDown = false;
-  /** A pass was requested (syncNow, or work was queued) while the loop was
-   * busy or waiting. Latched so the request cannot be lost in the gap
-   * between a pass finishing and the next wait starting. */
-  private pendingWake = false;
+  /**
+   * A pass is owed. Latched (rather than acted on directly) so a request
+   * arriving while the loop is mid-pass cannot be lost in the gap between
+   * that pass finishing and the next wait starting; consumed by the loop
+   * when it actually starts the pass, so one request buys exactly one pass.
+   *
+   * True initially: start() runs a pass immediately.
+   */
+  private passDue = true;
   private attempt = 0;
   /** Poison skips recorded during the CURRENT pass; written to last_error
    * when the pass completes. */
@@ -384,7 +393,12 @@ export class AccountSync {
 
   /** Run a pass as soon as the loop is free, cutting any wait short. */
   wake(): void {
-    this.pendingWake = true;
+    this.passDue = true;
+    this.interrupt();
+  }
+
+  /** End whatever wait the loop is in, without claiming a pass is due. */
+  private interrupt(): void {
     this.waitController?.abort();
   }
 
@@ -419,6 +433,11 @@ export class AccountSync {
    */
   appendSent(raw: Buffer | string): Promise<void> {
     return this.enqueue("appendSent", async (client, account) => {
+      // Already trimmed by loadAccount; empty means the stored value was
+      // nothing but whitespace, and there is no mailbox to append to.
+      if (account.sentFolder.length === 0) {
+        throw new Error(`mail account ${account.id} has no sent folder configured`);
+      }
       await client.append(account.sentFolder, raw, [SEEN_FLAG]);
     });
   }
@@ -440,20 +459,31 @@ export class AccountSync {
 
   private async runLoop(): Promise<void> {
     try {
+      // Carried across iterations because an iteration can be queue-only:
+      // whether the LAST pass succeeded is what decides between an IDLE wait
+      // and a backoff, and a markSeen in between must not lose that.
+      let passSucceeded = true;
       while (!this.stopped) {
         await this.drainQueue();
         if (this.stopped) break;
-        const outcome = await this.runPassGuarded();
-        if (this.stopped) break;
-        if (outcome === "teardown") {
-          this.stopped = true;
-          break;
+        // A pass runs only when one is DUE -- start, an IDLE wake, the poll
+        // timer, an elapsed backoff, or an explicit syncNow. Queued work
+        // wakes the loop but never marks a pass due (see enqueue).
+        if (this.passDue) {
+          this.passDue = false;
+          const outcome = await this.runPassGuarded();
+          if (this.stopped) break;
+          if (outcome === "teardown") {
+            this.stopped = true;
+            break;
+          }
+          passSucceeded = outcome === "ok";
         }
-        await this.waitBeforeNextPass(outcome === "ok");
+        await this.waitForWork(passSucceeded);
       }
     } catch (error) {
       // Unreachable by design -- drainQueue, runPassGuarded and
-      // waitBeforeNextPass all swallow their own failures. If it ever fires,
+      // waitForWork all swallow their own failures. If it ever fires,
       // this account stops syncing (loudly) and the rest of the server, and
       // every other account, carries on.
       this.logger.error(
@@ -498,7 +528,12 @@ export class AccountSync {
     if (this.stopped) return Promise.reject(new SyncStoppedError(this.accountId));
     return new Promise<void>((resolve, reject) => {
       this.queue.push({ label, run, resolve, reject });
-      this.wake();
+      // interrupt, NOT wake: the loop should come back and run this task
+      // now, but queued work must not drag a whole pass along behind it.
+      // Task 7 calls markSeen once per thread the user opens, and a
+      // status/fetchNewer/fetchFlags round over both folders per click would
+      // be pure waste -- passes belong to IDLE, the poll timer and syncNow.
+      this.interrupt();
     });
   }
 
@@ -619,7 +654,12 @@ export class AccountSync {
       .where(eq(mailAccounts.id, this.accountId));
     if (row === undefined) throw new NotFoundError("mail account", this.accountId);
     if (row.archivedAt !== null) throw new ArchivedError("mail account", this.accountId);
-    return row;
+    // The one choke point for sent_folder normalisation: every consumer in
+    // this file reads the account through here, so a stored " Sent " cannot
+    // have the pass walk `Sent` while an APPEND goes to `" Sent "` -- two
+    // different mailboxes as far as an IMAP server is concerned. Normalising
+    // at each use site instead is exactly how those two drift apart.
+    return { ...row, sentFolder: row.sentFolder.trim() };
   }
 
   /** One connection per AccountSync, kept between passes because IDLE needs
@@ -768,9 +808,30 @@ export class AccountSync {
         { accountId, folder, was: row.uidvalidity, now: uidvalidity },
         "mail-sync: UIDVALIDITY changed, re-walking the folder",
       );
-      await this.db.update(mailFolderState)
-        .set({ uidvalidity, lastSeenUid: 0, updatedAt: this.clock.now() })
-        .where(eq(mailFolderState.id, row.id));
+      await this.db.transaction(async (tx) => {
+        // Every UID the server previously issued is meaningless now --
+        // INCLUDING the ones already stored on our own rows, which is the
+        // part that bites. The re-walk only re-sights messages inside the
+        // backfill window, so anything older keeps a UID from the dead
+        // namespace; reconcileFlags below (and Task 7's \Seen write-back)
+        // match on (account, folder, imap_uid), so on a renumbered mailbox a
+        // recent message's flags would be applied to an old message's row
+        // that happens to still hold that number. Clearing them first makes
+        // every stale UID unmatchable -- imap_uid is nullable precisely
+        // because a row need not correspond to anything on the server -- and
+        // the rows the re-walk does re-sight get their fresh UID from
+        // ingest's duplicate-guard UPDATE.
+        //
+        // Ordered before the cursor reset, and in one transaction with it,
+        // so a crash between the two leaves the mismatch still detectable
+        // and the whole step simply repeats.
+        await tx.update(mailMessages)
+          .set({ imapUid: null, updatedAt: this.clock.now() })
+          .where(and(eq(mailMessages.accountId, accountId), eq(mailMessages.folder, folder)));
+        await tx.update(mailFolderState)
+          .set({ uidvalidity, lastSeenUid: 0, updatedAt: this.clock.now() })
+          .where(eq(mailFolderState.id, row.id));
+      });
       return 0;
     }
     return row.lastSeenUid;
@@ -943,19 +1004,37 @@ export class AccountSync {
     return Math.min(BASE_BACKOFF_MS * 2 ** Math.max(0, this.attempt - 1), MAX_BACKOFF_MS);
   }
 
-  private async waitBeforeNextPass(passSucceeded: boolean): Promise<void> {
+  /**
+   * Park until there is something to do. Which of the two waits is used
+   * depends on the last pass: IDLE (capped at the poll interval) after a
+   * good one, backoff after a bad one.
+   *
+   * A wait that ELAPSES means the next pass is due. A wait that was aborted
+   * does not: `wake()` marks its own pass due, and a queued task
+   * deliberately marks none. `signal.aborted` is what tells the two apart,
+   * which is why it is read before any cleanup abort of our own.
+   */
+  private async waitForWork(passSucceeded: boolean): Promise<void> {
     try {
-      // A wake, or queued work, that arrived DURING the pass means the next
-      // pass is already due; waiting first would delay it by a whole
-      // interval (and delay queued work behind it).
-      if (this.wakeRequested()) return;
+      // Something arrived DURING the pass: don't wait first, or a queued
+      // task (or a syncNow) would sit behind a whole poll interval.
+      if (this.passDue || this.queue.length > 0) return;
       const controller = new AbortController();
       // Assigned before the stopped re-check, so a stop() landing anywhere
       // from here on aborts this controller rather than missing it.
       this.waitController = controller;
       if (this.stopped) return;
-      if (passSucceeded) await this.waitForNewMail(controller);
-      else await this.clock.wait(this.backoffMs(), controller.signal);
+      if (passSucceeded) {
+        if (await this.waitForNewMail(controller)) this.passDue = true;
+      } else {
+        await this.clock.wait(this.backoffMs(), controller.signal);
+        // Aborted means something cut the backoff short. A queued task is
+        // the one thing that can do that without owing a pass, and when it
+        // does, the retry is NOT pulled forward -- the loop drains the queue
+        // and comes back here for a fresh backoff. A user's mark-read must
+        // not be able to accelerate a broken account's reconnect attempts.
+        if (!controller.signal.aborted) this.passDue = true;
+      }
     } catch (error) {
       // clock.wait never rejects and waitForNewMail handles its own; this is
       // a backstop so a wait can never break the loop.
@@ -965,31 +1044,22 @@ export class AccountSync {
       );
     } finally {
       this.waitController = null;
-      // However the wait ended, the pass that follows it serves every wake
-      // outstanding right now -- including the one that cut this wait short
-      // by aborting it. Leaving the latch set would buy that request a
-      // SECOND, immediate pass it never asked for; a wake arriving later,
-      // while the coming pass is running, sets the latch again and is served
-      // by the pass after that.
-      this.pendingWake = false;
     }
   }
 
-  private wakeRequested(): boolean {
-    return this.pendingWake || this.queue.length > 0;
-  }
-
   /**
-   * IDLE on INBOX, capped at the poll interval. Both endings mean the same
-   * thing to the loop -- run another pass -- which is why nothing here
-   * inspects which one won beyond a counter.
+   * IDLE on INBOX, capped at the poll interval. New mail, the adapter's own
+   * IDLE window closing, and the cap elapsing all mean the same thing -- run
+   * another pass -- and all three return true. An external abort (stop, or a
+   * queued task cutting in) returns false, so the caller knows no pass was
+   * earned.
    */
-  private async waitForNewMail(controller: AbortController): Promise<void> {
+  private async waitForNewMail(controller: AbortController): Promise<boolean> {
     const client = this.client;
     const capped = this.clock.wait(this.pollIntervalMs, controller.signal);
     if (client === null) {
       await capped;
-      return;
+      return !controller.signal.aborted;
     }
 
     let idleError: unknown;
@@ -1019,17 +1089,27 @@ export class AccountSync {
       await this.dropClient();
       await capped;
     }
-    // Release whichever of the two is still pending, and make sure neither
-    // outlives this call (a stray timer is what makes a test suite hang).
+    // Read BEFORE the cleanup abort below, which would otherwise make every
+    // wait look externally aborted.
+    const elapsed = !controller.signal.aborted;
+    // Release whichever of the two is still pending. `capped` is awaited so
+    // no timer outlives this call (a stray timer is what makes a test suite
+    // hang); `idling` deliberately is NOT -- shutdown must not be able to
+    // block on a future adapter that ignores, or is slow to honour, the
+    // abort signal. It carries both handlers, so a late settlement of any
+    // kind is already absorbed. (Task 6's adapter should still honour abort
+    // promptly -- it is what makes a shutdown fast rather than merely safe.)
     controller.abort();
-    await Promise.all([idling, capped]);
+    await capped;
+    return elapsed;
   }
 }
 
 /** INBOX plus the account's Sent folder, deduplicated. INBOX is
- * case-insensitive per RFC 3501; every other folder name is not. */
+ * case-insensitive per RFC 3501; every other folder name is not. The value
+ * arrives already trimmed -- see loadAccount. */
 function foldersOf(account: MailAccountRow): string[] {
-  const sent = account.sentFolder.trim();
+  const sent = account.sentFolder;
   if (sent.length === 0 || sent.toUpperCase() === INBOX) return [INBOX];
   return [INBOX, sent];
 }
