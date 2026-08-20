@@ -35,7 +35,7 @@ import type { IngestMessageInput, IngestResult } from "./mail-ingest.js";
  *
  * CANCELLATION AND SHUTDOWN
  * - NOTHING except `idle()` is cancellable. There is no AbortSignal on
- *   connect/status/fetch/append/addFlags, by design -- adding one would put
+ *   connect/status/fetch/append/addFlags/move, by design -- adding one would put
  *   a cancellation path through every imapflow call for no benefit the loop
  *   can use. The consequence is load-bearing: the ONLY bound on how long a
  *   shutdown waits for a wedged network operation is the adapter's own
@@ -68,7 +68,9 @@ import type { IngestMessageInput, IngestResult } from "./mail-ingest.js";
  *   silently end the walk. `list()` is held to the same rule for the same
  *   reason: an empty listing is indistinguishable from "this account has no
  *   folders", which discovery would write down as a mailbox where nothing
- *   was found (see `list` below).
+ *   was found (see `list` below). `messageMove` is the sharpest case of all
+ *   -- it reports a REFUSED move (a missing destination mailbox, say) as
+ *   `false` rather than by throwing -- see `move` below.
  * - `status()` must convert imapflow's `uidValidity` from BigInt to Number.
  *   mail_folder_state.uidvalidity is a bigint column in `mode: "number"`, and
  *   a BigInt reaching the comparison would make every pass see a mismatch and
@@ -290,6 +292,50 @@ export interface ImapClient {
    * clients rely on. The only caller writes back `\Seen`.
    */
   addFlags(folder: string, uids: number[], flags: string[]): Promise<void>;
+  /**
+   * MOVE `uids` out of `folder` and into `targetFolder` (Phase 4.1's bulk
+   * Trash/Archive). Both are mailbox names exactly as `list()` reported them,
+   * already decoded, like every other folder argument here.
+   *
+   * An empty `uids` is a no-op, as with addFlags: a caller chunking a group
+   * that turned out to be empty must not have to special-case it.
+   *
+   * A FALSY RETURN IS A FAILURE, and nowhere in this file is that rule doing
+   * more work. imapflow's `messageMove` resolves with a CopyResponseObject on
+   * success, but its MOVE handler CATCHES every command error -- a NO or BAD,
+   * which is exactly what a server answers for a destination mailbox that does
+   * not exist -- logs it to imapflow's own logger (this adapter disables that
+   * one) and RETURNS FALSE (lib/commands/move.js in 1.7.1). It also returns
+   * `undefined` when its preconditions fail (no mailbox selected, an empty
+   * range, an empty destination), and `messageMove` itself returns false when
+   * the range resolves to nothing (lib/imap-flow.js). So a REFUSED MOVE DOES
+   * NOT THROW: an adapter that passed the falsy value on would report a move
+   * the server rejected as done, and mail-move.ts would leave the CRM claiming
+   * a message sits in a folder it never reached -- the one thing the move
+   * service's compensating revert exists to prevent. Turn every falsy shape
+   * into a thrown error naming both folders.
+   *
+   * COPYUID IS DELIBERATELY DISCARDED. A UIDPLUS server reports the
+   * destination UIDs (`uidMap`) and its UIDVALIDITY; none of it is used. The
+   * move service NULLs `imap_uid` and lets the target folder's next pass
+   * re-sight the message, which restores the UID through ingest's (account_id,
+   * message_id) upsert -- the Phase 4 reconciliation machinery, unchanged.
+   * Recording COPYUID instead would mean storing the destination's UIDVALIDITY
+   * beside it for the number to mean anything, would be absent entirely on a
+   * server without UIDPLUS, and would still have to agree with whatever the
+   * re-sighting later wrote. One path that always works beats two that have to
+   * agree.
+   *
+   * ONE CAVEAT THIS CONTRACT CANNOT FIX, worth knowing rather than
+   * discovering: on a server that does NOT advertise RFC 6851 MOVE, imapflow
+   * emulates it as COPY + \Deleted + EXPUNGE and issues the delete WITHOUT
+   * checking whether the copy succeeded (lib/commands/move.js). On such a
+   * server a refused copy can still expunge the source messages -- the single
+   * place the CRM's "we never expunge" promise rests on the server advertising
+   * MOVE. Dovecot, the deployment target and CI's server, does; Task 6's
+   * integration suite is where that stops being a claim.
+   */
+  move(folder: string, uids: number[], targetFolder: string): Promise<void>;
   /**
    * Blocks until the server reports new mail, or `signal` aborts.
    *

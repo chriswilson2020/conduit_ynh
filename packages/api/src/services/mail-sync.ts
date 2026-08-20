@@ -1,7 +1,10 @@
 import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 import type { MailSecurity } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { mailAccounts, mailFolderState, mailMessages, type MailAccountRow } from "../db/schema.js";
+import {
+  mailAccounts, mailFolderState, mailMessages,
+  type MailAccountFolderRow, type MailAccountRow,
+} from "../db/schema.js";
 import { ArchivedError, MailIngestError, NotFoundError } from "./errors.js";
 import {
   consoleSyncLogger, systemClock as systemSyncClock,
@@ -70,9 +73,17 @@ const MAX_BACKOFF_MS = 32 * 60_000;
  */
 const POISON_RETRIES = 1;
 
-/** UIDs per addFlags/UPDATE statement, so a mailbox-wide operation cannot
- * become one statement with tens of thousands of bind parameters. */
-const UID_CHUNK = 500;
+/**
+ * UIDs per addFlags/move/UPDATE statement, so a mailbox-wide operation cannot
+ * become one statement with tens of thousands of bind parameters.
+ *
+ * Exported for services/mail-move.ts, which partitions its queued moves on
+ * exactly this size. Sharing the constant is the point: the service has to
+ * know what one queued call covers in order to revert exactly the rows a
+ * failure applies to, and a second constant that happened to differ would make
+ * its compensation wrong in a way nothing would report.
+ */
+export const UID_CHUNK = 500;
 
 /** mail_accounts.last_error is rendered verbatim in the settings UI, so a
  * driver error quoting a megabyte of SQL parameters must not become a
@@ -111,7 +122,10 @@ function truncate(value: string, max: number): string {
   return value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
-function chunked<T>(items: readonly T[], size: number): T[][] {
+/** Split `items` into runs of at most `size`. Exported alongside UID_CHUNK for
+ * the one caller (mail-move.ts) that has to partition exactly as this engine
+ * does. */
+export function chunked<T>(items: readonly T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
   return out;
@@ -383,6 +397,43 @@ export class AccountSync {
     });
   }
 
+  /**
+   * Queue an IMAP MOVE of `uids` from `folder` to `targetFolder` onto the loop
+   * (services/mail-move.ts -- Phase 4.1's bulk Trash/Archive). Resolves once
+   * the server has accepted every chunk.
+   *
+   * Same queue, same contract and the same reasons as markSeen: it runs
+   * BETWEEN passes on this account's one serial loop, so a move can never
+   * overlap a walk of the folder it is moving out of; it fast-rejects with
+   * SyncUnavailableError while the account is in backoff (see whyUnavailable);
+   * and it REJECTS on failure, so the returned promise must always be handled.
+   * Here that is not hygiene but correctness: the move service's compensating
+   * revert IS the handler, and a floating rejection would leave the CRM
+   * showing a move the server refused.
+   *
+   * Chunked by UID_CHUNK like markSeen, so one bulk action cannot become a
+   * single command carrying thousands of UIDs. The move service chunks too,
+   * and deliberately: it needs to know WHICH uids a given failure covers so it
+   * can put exactly those rows back, and a rejection from a loop that chunked
+   * internally cannot tell it. This chunking is the floor for any other
+   * caller, not a duplicate of the service's.
+   *
+   * PARTIAL FAILURE IS REAL: with more than one chunk, an early one can be
+   * accepted and a later one rejected, leaving those messages moved on the
+   * server while this promise rejects. Nothing here can un-MOVE a message --
+   * the caller's compensation and the target folder's next re-sighting are
+   * what converge (see mail-move.ts).
+   */
+  moveMessages(folder: string, uids: readonly number[], targetFolder: string): Promise<void> {
+    if (uids.length === 0) return Promise.resolve();
+    const list = [...uids];
+    return this.enqueue("moveMessages", async (client) => {
+      for (const batch of chunked(list, UID_CHUNK)) {
+        await client.move(folder, batch, targetFolder);
+      }
+    });
+  }
+
   /** Abort the current wait, let the loop unwind, disconnect. Idempotent,
    * and safe to call before start(). */
   async stop(): Promise<void> {
@@ -635,6 +686,12 @@ export class AccountSync {
     // `account` is deliberately not re-read afterwards even though discovery
     // can fill trash_folder/archive_folder on it: nothing the walk below reads
     // comes from those columns, and the next pass loads the row again anyway.
+    // The one account column the walk DOES read is sent_folder (foldersOf
+    // locks it on), and discovery cannot touch it -- fillMoveTargets writes
+    // trash_folder/archive_folder and nothing else -- so the value loaded at
+    // the top of this pass is still the current one. The caller that must
+    // re-read is the MOVE path (services/mail-move.ts), because the two
+    // columns it depends on are exactly the two a pass can fill underneath it.
     //
     // The stop check matches the walk's: a shutdown that arrives while the
     // connection was being made should not spend a LIST and an upsert on its
@@ -642,7 +699,11 @@ export class AccountSync {
     if (this.stopped) return;
     const listed = await client.list();
     if (this.stopped) return;
-    const { summary } = await discoverFolders(this.db, account.id, listed, this.clock.now());
+    // `folders` is THIS pass's live set (mail-folders.ts's FolderDiscovery),
+    // and the walk drives off it rather than off a query of
+    // mail_account_folders -- see foldersOf for why that difference is the
+    // whole safety property.
+    const { folders, summary } = await discoverFolders(this.db, account.id, listed, this.clock.now());
     this.passFolders = summary.listed;
     // Rare by construction -- a settled mailbox creates nothing and
     // reclassifies nothing, so this stays silent instead of firing once per
@@ -653,7 +714,7 @@ export class AccountSync {
       || summary.trashFolder !== null || summary.archiveFolder !== null) {
       this.logger.info({ accountId: this.accountId, ...summary }, "mail-sync: folders discovered");
     }
-    for (const folder of foldersOf(account)) {
+    for (const folder of foldersOf(account, folders)) {
       if (this.stopped) return;
       await this.syncFolder(client, account, folder);
     }
@@ -1153,13 +1214,62 @@ export class AccountSync {
   }
 }
 
-/** INBOX plus the account's Sent folder, deduplicated. INBOX is
- * case-insensitive per RFC 3501; every other folder name is not. The value
- * arrives already trimmed -- see loadAccount. */
-function foldersOf(account: MailAccountRow): string[] {
-  const sent = account.sentFolder;
-  if (sent.length === 0 || sent.toUpperCase() === INBOX) return [INBOX];
-  return [INBOX, sent];
+/**
+ * The folders THIS pass walks (Phase 4.1): INBOX and the account's Sent folder
+ * always, plus every folder this pass's own LIST reported as `sync_enabled`
+ * AND `selectable`.
+ *
+ * `discovered` is discoverFolders' return -- the rows for THIS pass's listing
+ * -- and taking it as an argument instead of re-querying mail_account_folders
+ * is the entire safety property. The table keeps a row for every folder ever
+ * seen (rows are never deleted; staleness is read off `last_discovered_at`),
+ * so a re-query would hand the walk a mailbox the server no longer has. That
+ * SELECT fails, which is a pass-level failure, which backs the account off --
+ * on every pass, forever, for a folder the user deleted months ago. A folder
+ * absent from this pass's LIST is absent from `discovered`, so it is skipped
+ * BY CONSTRUCTION rather than by a check that could be forgotten.
+ *
+ * INBOX AND SENT ARE LOCKED ON whatever the picker says (spec): the send path
+ * APPENDs to Sent and direction detection depends on both, so switching off
+ * the two folders the rest of the mail feature is built on is not a choice on
+ * offer. Seeding them first is ALSO the fallback for a pass whose discovery
+ * produced nothing usable -- an empty LIST, or a first pass that failed before
+ * it could record anything -- because the result is then exactly the Phase 4
+ * pair, INBOX + sent, and the walk behaves as it did before folders existed.
+ *
+ * Their locked-on-ness is unconditional: not filtered by `selectable`, and not
+ * conditional on this LIST still reporting them. Accepted, and the honest
+ * reading of "always walked" -- an account whose configured sent_folder is
+ * missing from the server fails its pass and says so in `last_error`, which is
+ * the same answer mail-send's APPEND to that folder already gives. The
+ * misconfiguration is real; papering over it would only move the surprise.
+ *
+ * DEDUPE: INBOX is the one mailbox name IMAP defines as case-insensitive (RFC
+ * 3501), so a sent_folder of "inbox" is the SAME folder and is not walked
+ * twice; every other name is compared byte for byte, because on a real server
+ * "Archive" and "archive" are two different mailboxes. `sentFolder` arrives
+ * already trimmed (see loadAccount) and discovery stores names exactly as the
+ * server listed them, so nothing here re-normalises anything.
+ */
+function foldersOf(account: MailAccountRow, discovered: readonly MailAccountFolderRow[]): string[] {
+  const walked: string[] = [INBOX];
+  const seen = new Set<string>([INBOX]);
+  const add = (folder: string): void => {
+    if (folder.length === 0) return;
+    const key = folder.toUpperCase() === INBOX ? INBOX : folder;
+    if (seen.has(key)) return;
+    seen.add(key);
+    walked.push(folder);
+  };
+  add(account.sentFolder);
+  for (const row of discovered) {
+    // `selectable` is not a second opinion about sync_enabled: a \Noselect
+    // mailbox is a hierarchy node that holds no messages and cannot be
+    // SELECTed at all, so walking one is a guaranteed pass failure.
+    if (!row.syncEnabled || !row.selectable) continue;
+    add(row.folder);
+  }
+  return walked;
 }
 
 // --- SyncManager -----------------------------------------------------------

@@ -439,6 +439,16 @@ describe("ImapflowClient", () => {
     await expect(client.addFlags("INBOX", [], ["\\Seen"])).resolves.toBeUndefined();
     await client.disconnect();
   });
+
+  it("move with no uids does nothing at all", async () => {
+    // Same guard as addFlags, and for the same reason: the move service
+    // chunks per (account, folder) and must not have to special-case a group
+    // that came out empty. Reaching the server here would throw -- there is
+    // no connection.
+    const client = new ImapflowClient(settings, { rejectUnauthorized: true });
+    await expect(client.move("INBOX", [], "Archive")).resolves.toBeUndefined();
+    await client.disconnect();
+  });
 });
 
 describe("createImapClientFactory", () => {

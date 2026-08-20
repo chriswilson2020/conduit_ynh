@@ -1,6 +1,7 @@
 import {
   ImapFlow,
-  type AppendResponseObject, type FetchMessageObject, type ImapFlowOptions, type StatusObject,
+  type AppendResponseObject, type CopyResponseObject, type FetchMessageObject,
+  type ImapFlowOptions, type StatusObject,
 } from "imapflow";
 import nodemailer from "nodemailer";
 import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
@@ -731,6 +732,45 @@ export class ImapflowClient implements ImapClient {
       // account's other mail clients rely on (contract).
       const ok = await this.client.messageFlagsAdd(uids, flags, { uid: true });
       if (!ok) throw new Error(`could not add flags in ${folder}`);
+    });
+  }
+
+  /**
+   * MOVE, with `folder` selected and `targetFolder` named by the command --
+   * so only the SOURCE is locked, exactly as addFlags locks only the folder
+   * it is writing to.
+   *
+   * The falsy guard is the whole method (mail-imap.ts's `move` carries the
+   * reasoning): imapflow reports a REFUSED move -- a destination mailbox that
+   * does not exist being the case a user actually hits -- by returning `false`
+   * from a caught command error, not by throwing. Reading that as success
+   * would tell mail-move.ts the server had accepted the move, and its
+   * compensating revert would never run.
+   *
+   * The message names both folders because it is the one the user sees: it
+   * travels back through the bulk result as that thread's per-thread error.
+   * imapflow's own catch swallows the server's text (it goes to the library's
+   * disabled logger), so there is nothing more specific to add here -- which
+   * is precisely why the two names have to be in it.
+   *
+   * The explicit type argument widens the result to the shapes the RUNTIME can
+   * produce: the .d.ts promises `CopyResponseObject | false`, while
+   * lib/commands/move.js also returns `undefined` when its preconditions are
+   * not met. Same reasoning as status() and list().
+   */
+  async move(folder: string, uids: number[], targetFolder: string): Promise<void> {
+    if (uids.length === 0) return;
+    await this.withMailbox(folder, async () => {
+      const moved = await this.run<CopyResponseObject | false | undefined>(
+        // `{ uid: true }` is not optional: without it imapflow reads the
+        // numbers as SEQUENCE numbers, which name entirely different messages
+        // -- the CRM stores UIDs and nothing else.
+        () => this.client.messageMove(uids, targetFolder, { uid: true }),
+      );
+      // The COPYUID mapping `moved` carries on a UIDPLUS server is discarded
+      // deliberately (contract): the target folder's next pass re-sights these
+      // messages and ingest's duplicate guard restores their UIDs.
+      if (!moved) throw new Error(`MOVE from ${folder} to ${targetFolder} was refused`);
     });
   }
 

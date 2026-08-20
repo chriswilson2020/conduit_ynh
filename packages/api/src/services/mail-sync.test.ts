@@ -12,6 +12,7 @@ import { mailAccountFolders, mailAccounts, mailFolderState, mailMessages, mailTh
 import { MailIngestError, NotFoundError } from "./errors.js";
 import { archiveAccount, createAccount, updateAccount } from "./mail-accounts.js";
 import { ingestMessage } from "./mail-ingest.js";
+import { moveThreads } from "./mail-move.js";
 import {
   AccountSync, SyncManager, SyncStoppedError, SyncUnavailableError, startSyncManager,
   type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
@@ -139,6 +140,7 @@ class FakeImapClient implements ImapClient {
   readonly folders = new Map<string, FakeFolder>();
   readonly calls: FakeCall[] = [];
   readonly fetchNewerOptions: FetchNewerOptions[] = [];
+  readonly fetchNewerFolders: string[] = [];
   readonly settings: ImapConnectionSettings;
   /**
    * What LIST reports, mutable per test.
@@ -169,6 +171,7 @@ class FakeImapClient implements ImapClient {
   listError: Error | null = null;
   statusError: Error | null = null;
   addFlagsError: Error | null = null;
+  moveError: Error | null = null;
   idleError: Error | null = null;
   idleEntries = 0;
   /** uid -> how many more times fetchRaw should throw for it. */
@@ -256,6 +259,10 @@ class FakeImapClient implements ImapClient {
         throw new Error(`Command failed: Mailbox doesn't exist: ${folder}`);
       }
       this.fetchNewerOptions.push(options);
+      // Parallel to fetchNewerOptions, so a test can say which FOLDER a
+      // window belonged to instead of inferring it from call order -- which
+      // stopped being reliable once a pass could walk more than two folders.
+      this.fetchNewerFolders.push(folder);
       const target = this.folder(folder);
       return [...target.messages.entries()]
         .filter(([uid]) => uid > options.sinceUid)
@@ -308,6 +315,40 @@ class FakeImapClient implements ImapClient {
         const message = target.messages.get(uid);
         if (message === undefined) continue;
         for (const flag of flags) if (!message.flags.includes(flag)) message.flags.push(flag);
+      }
+    });
+  }
+
+  /**
+   * MOVE, as a server does it: the source loses the messages and the target
+   * gains them under NEW uids. The renumbering is the point rather than
+   * bookkeeping -- a UID names a message IN A MAILBOX, which is exactly why
+   * the move service nulls its stored one and waits for the re-sighting to
+   * fill in whatever the target folder ended up calling it.
+   */
+  async move(folder: string, uids: number[], targetFolder: string): Promise<void> {
+    await this.track({ op: "move", folder, uids: [...uids] }, () => {
+      if (this.moveError !== null) throw this.moveError;
+      // BOTH ends are checked. A real server refuses a MOVE naming a missing
+      // source (its SELECT fails) or a missing destination (NO [TRYCREATE]) --
+      // and the missing-destination case is the one the bulk action's
+      // per-thread error message exists for.
+      for (const name of [folder, targetFolder]) {
+        if (this.missingFolders.has(name)) {
+          throw new Error(`Command failed: Mailbox doesn't exist: ${name}`);
+        }
+      }
+      const source = this.folder(folder);
+      const target = this.folder(targetFolder);
+      let nextUid = Math.max(0, ...target.messages.keys()) + 1;
+      for (const uid of uids) {
+        const message = source.messages.get(uid);
+        // A uid the source no longer holds is skipped rather than failing the
+        // command: the CRM's stored uid can be one message behind the server.
+        if (message === undefined) continue;
+        source.messages.delete(uid);
+        target.messages.set(nextUid, message);
+        nextUid += 1;
       }
     });
   }
@@ -691,6 +732,11 @@ describe("AccountSync: backfill and cursor", () => {
   it("does not walk the sent folder twice when it is a differently-cased INBOX", async () => {
     const accountId = await makeAccount({ backfillDays: null, sentFolder: "inbox" });
     const { sync, client } = makeSync(accountId);
+    // A mailbox with nothing but INBOX in it, so the only folder the walk
+    // could name twice is the one under test. (The fake's default listing
+    // carries a Sent folder, which the generalised walk would rightly sync as
+    // a discovered, sync-enabled folder -- a different claim from this one.)
+    client.listed = [{ folder: "INBOX", selectable: true, delimiter: "/" }];
     client.folder("INBOX").add(1, rawMail({ messageId: "one@example.com" }));
 
     sync.start();
@@ -841,6 +887,133 @@ describe("AccountSync: folder discovery", () => {
     await waitFor(() => sync.stats.passes >= 1, "the first pass");
 
     expect(await accountRow(accountId)).toMatchObject({ trashFolder: "Trash", archiveFolder: "Archive" });
+  });
+});
+
+// --- The generalised walk ---------------------------------------------------
+
+describe("AccountSync: the generalised walk", () => {
+  /** INBOX, Sent (the locked pair), an ordinary folder, a Junk that defaults
+   * off, and a \Noselect hierarchy node. */
+  const mixedListing: ImapFolderListing[] = [
+    { folder: "INBOX", selectable: true, delimiter: "/" },
+    { folder: "Sent", specialUse: "sent", selectable: true, delimiter: "/" },
+    { folder: "Clients", selectable: true, delimiter: "/" },
+    { folder: "Junk", specialUse: "junk", selectable: true, delimiter: "/" },
+    { folder: "Lists", selectable: false, delimiter: "/" },
+  ];
+
+  function walkedFolders(client: FakeImapClient): string[] {
+    return client.opsOf("status").map((call) => call.folder ?? "");
+  }
+
+  it("walks every sync-enabled selectable folder this pass listed, and nothing else", async () => {
+    const accountId = await makeAccount({ backfillDays: null, sentFolder: "Sent" });
+    const { sync, client } = makeSync(accountId);
+    client.listed = mixedListing;
+    client.folder("INBOX").add(1, rawMail({ messageId: "in@example.com" }));
+    client.folder("Clients").add(1, rawMail({ messageId: "client@example.com" }));
+    client.folder("Junk").add(1, rawMail({ messageId: "spam@example.com" }));
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+
+    // Clients joins the walk because discovery defaulted it on; Junk does not
+    // (junk/trash default off, spec); Lists does not because a \Noselect
+    // mailbox cannot be SELECTed at all, whatever its sync_enabled says.
+    expect(walkedFolders(client)).toEqual(["INBOX", "Sent", "Clients"]);
+    expect((await messageRows()).map((row) => row.messageId).sort())
+      .toEqual(["client@example.com", "in@example.com"]);
+    expect((await cursorRows(accountId)).map((row) => row.folder)).toEqual(["Clients", "INBOX", "Sent"]);
+  });
+
+  it("always walks INBOX and the sent folder, however the picker is set", async () => {
+    const accountId = await makeAccount({ backfillDays: null, sentFolder: "Sent" });
+    const { sync, client } = makeSync(accountId);
+    client.listed = mixedListing;
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+
+    // The picker switching everything off, including the two rows Task 4's
+    // route renders as locked.
+    await handle.db.update(mailAccountFolders).set({ syncEnabled: false })
+      .where(eq(mailAccountFolders.accountId, accountId));
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 2, "the pass after the toggles");
+
+    // The send path APPENDs to Sent and direction detection depends on both,
+    // so these two are not a choice on offer.
+    const second = walkedFolders(client).slice(3);
+    expect(second).toEqual(["INBOX", "Sent"]);
+  });
+
+  it("does not walk a folder whose row survives but which LIST no longer reports", async () => {
+    const accountId = await makeAccount({ backfillDays: null, sentFolder: "Sent" });
+    const { sync, client } = makeSync(accountId);
+    client.listed = [...mixedListing];
+    client.folder("Clients").add(1, rawMail({ messageId: "client@example.com" }));
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    expect(walkedFolders(client)).toContain("Clients");
+
+    // The user deletes (or renames) the folder on the server. Its row stays --
+    // rows are never deleted, staleness is read off last_discovered_at -- so
+    // this is exactly the mismatch a walk driven off a TABLE QUERY would fall
+    // into: SELECTing a mailbox the server does not have is a pass-level
+    // failure, on every pass, forever.
+    client.listed = mixedListing.filter((entry) => entry.folder !== "Clients");
+    client.missingFolders.add("Clients");
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 2, "the pass after it vanished");
+
+    expect(walkedFolders(client).slice(3)).toEqual(["INBOX", "Sent"]);
+    expect(sync.stats.failures).toBe(0);
+    expect((await accountRow(accountId)).status).toBe("active");
+    // The row (and the message ingested under it) survives untouched.
+    const rows = await handle.db.select().from(mailAccountFolders)
+      .where(eq(mailAccountFolders.accountId, accountId)).orderBy(asc(mailAccountFolders.folder));
+    expect(rows.map((row) => row.folder)).toContain("Clients");
+    expect((await messageRows()).map((row) => row.folder)).toEqual(["Clients"]);
+  });
+
+  it("backfills a folder enabled mid-life from its own first sync, inside the window", async () => {
+    // The engine's existing first-sync semantics -- cursor absent means the
+    // backfill window applies -- now hold PER FOLDER, so a folder switched on
+    // months into an account's life backfills exactly as a new account does.
+    const accountId = await makeAccount({ backfillDays: 30, sentFolder: "Sent" });
+    const { sync, client } = makeSync(accountId);
+    client.listed = mixedListing;
+    client.folder("INBOX").add(1, rawMail({ messageId: "in@example.com" }));
+    client.folder("Junk").add(1, rawMail({ messageId: "old@example.com" }), {
+      internalDate: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    client.folder("Junk").add(2, rawMail({ messageId: "recent@example.com" }), {
+      internalDate: new Date("2026-08-18T00:00:00.000Z"),
+    });
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    expect(walkedFolders(client)).not.toContain("Junk");
+    const before = client.fetchNewerFolders.length;
+
+    // The user opts Junk in from the picker.
+    await handle.db.update(mailAccountFolders).set({ syncEnabled: true })
+      .where(and(eq(mailAccountFolders.accountId, accountId), eq(mailAccountFolders.folder, "Junk")));
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 2, "the pass that picks it up");
+
+    const junkWindows = client.fetchNewerFolders
+      .map((folder, index) => ({ folder, options: client.fetchNewerOptions[index] }))
+      .filter((entry, index) => index >= before && entry.folder === "Junk");
+    // A fresh cursor (no row yet) and the account's backfill window measured
+    // from now -- not from the account's creation, and not unbounded.
+    expect(junkWindows[0]?.options?.sinceUid).toBe(0);
+    expect(junkWindows[0]?.options?.sinceDate?.toISOString()).toBe("2026-07-20T12:00:00.000Z");
+    expect((await messageRows()).map((row) => row.messageId).sort())
+      .toEqual(["in@example.com", "recent@example.com"]);
+    expect((await cursorFor(accountId, "Junk"))?.lastSeenUid).toBe(2);
   });
 });
 
@@ -1454,6 +1627,130 @@ describe("AccountSync: queued work", () => {
     await waitFor(() => sync.stats.passes >= 1, "the first pass");
     await sync.markSeen("INBOX", []);
     expect(client.opsOf("addFlags")).toHaveLength(0);
+  });
+});
+
+// --- Queued moves -----------------------------------------------------------
+
+describe("AccountSync: queued moves", () => {
+  const withArchive: ImapFolderListing[] = [
+    { folder: "INBOX", selectable: true, delimiter: "/" },
+    { folder: "Sent", specialUse: "sent", selectable: true, delimiter: "/" },
+    { folder: "Archive", specialUse: "archive", selectable: true, delimiter: "/" },
+  ];
+
+  it("runs a queued move between passes, never alongside one", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+    const inbox = client.folder("INBOX");
+    for (let uid = 1; uid <= 3; uid += 1) inbox.add(uid, rawMail({ messageId: `m${uid}@example.com` }));
+
+    // Hold the pass open mid-fetch, then race a move against it.
+    let release = (): void => {};
+    client.gate = new Promise<void>((resolve) => { release = resolve; });
+
+    sync.start();
+    await waitFor(() => client.opsOf("fetchRaw").length >= 1, "the pass to reach a fetch");
+    const queued = sync.moveMessages("INBOX", [1, 2], "Archive");
+    expect(client.opsOf("move")).toHaveLength(0);
+
+    client.gate = null;
+    release();
+    await queued;
+
+    // The whole point of the one serial loop: a move can never overlap the
+    // walk of the folder it is moving messages OUT of.
+    expect(client.maxInFlight).toBe(1);
+    const moveIndex = client.calls.findIndex((call) => call.op === "move");
+    const lastFetchIndex = client.calls.map((call) => call.op).lastIndexOf("fetchRaw");
+    expect(moveIndex).toBeGreaterThan(lastFetchIndex);
+    expect(client.opsOf("move")[0]).toMatchObject({ folder: "INBOX", uids: [1, 2] });
+    expect([...client.folder("Archive").messages.keys()]).toEqual([1, 2]);
+    expect([...inbox.messages.keys()]).toEqual([3]);
+  });
+
+  it("chunks one move into UID_CHUNK-sized commands", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    const uids = Array.from({ length: 600 }, (_, index) => index + 1);
+    await sync.moveMessages("INBOX", uids, "Archive");
+
+    // One mailbox-wide action must never become a single command carrying
+    // thousands of UIDs.
+    const moves = client.opsOf("move");
+    expect(moves.map((call) => call.uids?.length)).toEqual([500, 100]);
+    expect(moves[0]?.uids?.[0]).toBe(1);
+    expect(moves[1]?.uids?.[99]).toBe(600);
+  });
+
+  it("refuses a move during a backoff, immediately and with the reason", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client, clock } = makeSync(accountId);
+    client.statusError = new Error("NO [SERVERBUG] mailbox unavailable");
+
+    sync.start();
+    await waitFor(() => sync.stats.failures >= 1, "the first failure");
+    await waitFor(() => clock.pendingCount() > 0, "the backoff wait");
+    const connects = client.connectCalls;
+
+    // The bulk action's per-thread error for an account in backoff comes from
+    // exactly this rejection -- immediately, with the stored reason, and
+    // without a connect attempt the backoff exists to prevent.
+    const error = await sync.moveMessages("INBOX", [1], "Archive")
+      .then(() => undefined, (err: unknown) => err);
+    expect(error).toBeInstanceOf(SyncUnavailableError);
+    expect((error as SyncUnavailableError).lastError).toContain("SERVERBUG");
+    expect(client.connectCalls).toBe(connects);
+    expect(client.opsOf("move")).toHaveLength(0);
+  });
+
+  it("moveMessages with no uids does nothing at all", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    await sync.moveMessages("INBOX", [], "Archive");
+    expect(client.opsOf("move")).toHaveLength(0);
+  });
+
+  it("converges after a real move: the target folder's next pass restores the UID, on one row", async () => {
+    // End to end through the REAL ingest: the move service writes the
+    // optimistic row, the engine moves the message, and the Phase 4
+    // reconciliation machinery -- UNIQUE (account_id, message_id) -- is what
+    // makes the re-sighting an UPDATE rather than a second row.
+    const accountId = await makeAccount({ backfillDays: null, sentFolder: "Sent" });
+    const { sync, client } = makeSync(accountId);
+    client.listed = withArchive;
+    client.folder("INBOX").add(1, rawMail({ messageId: "one@example.com" }));
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    const [stored] = await messageRows();
+    expect(stored).toMatchObject({ folder: "INBOX", imapUid: 1 });
+
+    const result = await moveThreads(
+      handle.db, actorId,
+      { threadIds: [stored?.threadId ?? ""], folder: "INBOX", action: "archive" },
+      { syncManager: { get: () => sync }, logger: silentLogger },
+    );
+    expect(result.results).toEqual([{ threadId: stored?.threadId, ok: true }]);
+
+    // Optimistic and correct: the message really has left INBOX, and its UID
+    // is NULL because the old number names nothing in the new mailbox.
+    expect([...client.folder("INBOX").messages.keys()]).toEqual([]);
+    expect([...client.folder("Archive").messages.keys()]).toEqual([1]);
+    expect((await messageRows())[0]).toMatchObject({ folder: "Archive", imapUid: null });
+
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 2, "the pass that re-sights it");
+
+    const after = await messageRows();
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ folder: "Archive", imapUid: 1, threadId: stored?.threadId });
+    expect(await handle.db.select().from(mailThreads)).toHaveLength(1);
   });
 });
 
