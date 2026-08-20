@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  bulkThreadResultSchema,
   companySchema,
   contactSchema,
   dealSchema,
@@ -9,6 +10,7 @@ import {
   funnelRowSchema,
   ganttPayloadSchema,
   listResponseSchema,
+  mailAccountFolderSchema,
   mailAccountListSchema,
   mailAccountSchema,
   mailAccountTestResultSchema,
@@ -17,6 +19,7 @@ import {
   mailThreadListItemSchema,
   mailThreadSchema,
   mailUnreadCountSchema,
+  mailUnreadFolderCountsSchema,
   meResponseSchema,
   midpoint,
   noteSchema,
@@ -29,6 +32,7 @@ import {
   taskDependencySchema,
   taskSchema,
   usersResponseSchema,
+  type BulkThreadActionInput,
   type Company,
   type Contact,
   type CreateCompanyInput,
@@ -41,8 +45,10 @@ import {
   type CreateStageInput,
   type CreateTaskInput,
   type Deal,
+  type FolderPatchInput,
   type GanttPayload,
   type MailAccountCreateInput,
+  type MailAccountFolder,
   type MailAccountTestInput,
   type MailAccountUpdateInput,
   type MailAccountUpdatePasswordFields,
@@ -81,6 +87,7 @@ const projectListSchema = projectSchema.array();
 const taskListSchema = taskSchema.array();
 const taskDependencyListSchema = taskDependencySchema.array();
 const mailThreadListSchema = listResponseSchema(mailThreadListItemSchema);
+const mailAccountFolderListSchema = mailAccountFolderSchema.array();
 const emailTemplateListSchema = emailTemplateSchema.array();
 
 /** Builds a `?a=1&b=2` query string, dropping keys whose value is undefined. */
@@ -1280,8 +1287,8 @@ export function useSearch(q: string) {
  *   (api: services/mail-folders.ts's publishFoldersHint). Published by the
  *   Settings folder toggle and by any sync pass whose discovery CREATES or
  *   RECLASSIFIES a folder. Per account, not global: a busy second mailbox has
- *   no business invalidating the first account's picker. No hook uses it yet
- *   -- the folder picker and sidebar are Task 5.
+ *   no business invalidating the first account's picker. Read by
+ *   useMailFolders below (the sidebar and the Settings picker).
  *
  * And one key that is NOT a published family, noted here for the same reason:
  *
@@ -1290,7 +1297,8 @@ export function useSearch(q: string) {
  *   ["mail-unread"] is the whole point: the server publishes the parent, and
  *   TanStack Query's prefix matching invalidates both the badge and the
  *   per-folder counts from that one hint, so the sidebar stays live without
- *   the API needing a second key for the same fact.
+ *   the API needing a second key for the same fact. Read by
+ *   useUnreadMailCountsByFolder below.
  *
  * ["search"] is the one key the mail hints deliberately do NOT carry: an
  * ingest or a thread archive does not invalidate the global search cache
@@ -1406,6 +1414,56 @@ export function useTestMailAccount() {
   });
 }
 
+/**
+ * One account's discovered folders (Phase 4.1) -- the Settings picker and the
+ * inbox sidebar.
+ *
+ * Keyed EXACTLY as the server publishes it: `[["mail-folders", accountId]]`
+ * (api: services/mail-folders.ts's publishFoldersHint), fired by the folder
+ * PATCH and by any discovery pass that creates or reclassifies a folder. Per
+ * account, so a busy second mailbox does not invalidate the first one's picker.
+ *
+ * Owner-only server-side: another user's account 404s exactly like a
+ * nonexistent one, so this is only ever called with an id from `own`.
+ */
+export function useMailFolders(accountId: string) {
+  return useQuery({
+    queryKey: ["mail-folders", accountId],
+    queryFn: async () =>
+      parseWith(
+        mailAccountFolderListSchema,
+        await getJson<unknown>(`/mail/accounts/${accountId}/folders`),
+        "mail folders",
+      ),
+    enabled: accountId !== "",
+  });
+}
+
+/**
+ * Toggle one folder's sync_enabled (PATCH .../folders, by folder NAME).
+ *
+ * Invalidates this account's folders plus the thread/unread families: enabling
+ * a folder changes what the sidebar offers AND, once its first pass lands, what
+ * the list holds. The server asks its own sync loop for a pass (fire and
+ * forget) and publishes the folder hint after the write, so the two paths agree.
+ */
+export function useSetFolderSync() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ accountId, input }: { accountId: string; input: FolderPatchInput }) =>
+      parseWith(
+        mailAccountFolderSchema,
+        await patchJson<unknown>(`/mail/accounts/${accountId}/folders`, input),
+        "mail folder",
+      ),
+    onSuccess: (_folder: MailAccountFolder, { accountId }) => {
+      void queryClient.invalidateQueries({ queryKey: ["mail-folders", accountId] });
+      void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
+      void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
+    },
+  });
+}
+
 export interface MailThreadListParams {
   accountId?: string;
   unread?: boolean;
@@ -1415,6 +1473,10 @@ export interface MailThreadListParams {
   dealId?: string;
   projectId?: string;
   archived?: boolean;
+  /** The folder view (Phase 4.1): threads with at least one message in this
+   * folder. Sent BYTE-EXACT as the folders endpoint listed it -- an IMAP
+   * mailbox name is matched as bytes all the way down. */
+  folder?: string;
   cursor?: string;
   limit?: number;
 }
@@ -1430,6 +1492,9 @@ export function useMailThreads(params: MailThreadListParams = {}) {
         account_id: params.accountId, unread: params.unread, unlinked: params.unlinked,
         company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId,
         project_id: params.projectId, archived: params.archived,
+        // `folder`, not `folder_id` or a snake_case variant: it is a NAME, and
+        // the route's own query schema spells it exactly this way.
+        folder: params.folder,
         cursor: params.cursor, limit: params.limit,
       });
       return parseWith(mailThreadListSchema, await getJson<unknown>(`/mail/threads${qs}`), "mail threads list");
@@ -1598,5 +1663,72 @@ export function useUnreadMailCount() {
     queryKey: ["mail-unread"],
     queryFn: async () =>
       parseWith(mailUnreadCountSchema, await getJson<unknown>("/mail/unread-count"), "mail unread count").count,
+  });
+}
+
+/**
+ * The folder sidebar's badges: one grouped query, not one request per folder.
+ *
+ * Keyed UNDER ["mail-unread"] so the server's own bare ["mail-unread"] hint --
+ * published by ingest and by every thread mutation -- invalidates these counts
+ * by prefix along with the nav badge. There is no separate server key for this,
+ * and there does not need to be (see this section's header comment).
+ *
+ * The two answers are NOT the same number sliced differently, and neither is
+ * derived from the other here: the nav badge is "unread anywhere, excluding
+ * each account's Trash", while every row of this one is "unseen IN that folder"
+ * with no Trash carve-out at all -- so a Trash row's badge honestly counts the
+ * unread mail in Trash (the two-scope ruling, spec's Bulk API section). Render
+ * what the API returns; do not re-derive either from the other.
+ */
+export function useUnreadMailCountsByFolder() {
+  return useQuery({
+    queryKey: ["mail-unread", "by-folder"],
+    queryFn: async () =>
+      parseWith(
+        mailUnreadFolderCountsSchema,
+        await getJson<unknown>("/mail/unread-count?byFolder=1"),
+        "mail unread counts by folder",
+      ).folders,
+  });
+}
+
+/**
+ * The bulk thread actions (Phase 4.1): Trash and Archive MOVE messages on the
+ * IMAP server, "Hide in CRM" sets the CRM-side thread archive.
+ *
+ * `folder` carries the move service's two modes and the caller decides which:
+ * PRESENT means folder-scoped (a multi-select made in a folder view acts only
+ * on the messages in THAT folder), ABSENT means whole-thread (the conversation
+ * view's single-thread buttons). See bulk-bar.tsx for the ruling on the
+ * unfiltered list.
+ *
+ * ALWAYS 200 when the request was valid: per-thread failures ride inside the
+ * body, so a caller must read `results` rather than trusting the absence of a
+ * throw. And a THROW is not the same as a failure either -- a proxy 504 means
+ * the answer was lost while the queued moves carry on (the route says so in as
+ * many words), which is why the invalidation below hangs off onSettled: after
+ * this call the client's view of the mail is unknown either way, and the fix is
+ * to refetch, never to retry.
+ */
+export function useBulkThreadAction() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: BulkThreadActionInput) =>
+      parseWith(
+        bulkThreadResultSchema,
+        await postJson<unknown>("/mail/threads/bulk", input),
+        "bulk thread action result",
+      ),
+    onSettled: (_result, _error, input) => {
+      void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
+      void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
+      void queryClient.invalidateQueries({ queryKey: ["search"] });
+      // Each touched thread's own detail entry: the conversation on screen may
+      // be one of them, and its messages' folders have just changed.
+      for (const threadId of input.threadIds) {
+        void queryClient.invalidateQueries({ queryKey: ["mail-thread", threadId] });
+      }
+    },
   });
 }

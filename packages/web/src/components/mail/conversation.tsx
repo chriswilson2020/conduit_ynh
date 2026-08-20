@@ -1,10 +1,13 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { clsx } from "clsx";
-import type { MailAttachment, MailMessageWithAttachments } from "@conduit/shared";
+import type {
+  BulkThreadActionKind, MailAttachment, MailMessageWithAttachments,
+} from "@conduit/shared";
 import { apiUrl } from "../../api";
 import { humanSize, relativeTime } from "../../lib";
 import {
   useArchiveThread,
+  useBulkThreadAction,
   useCompany,
   useContact,
   useMailAccounts,
@@ -17,13 +20,17 @@ import { LinkPanel } from "./link-panel";
 import { MessageFrame } from "./message-frame";
 import {
   addressLabel,
+  bulkErrorMessage,
   composeErrorMessage,
   forwardBody,
   forwardSubject,
+  messageIsInTrash,
   replyRecipients,
   replySource,
   replySubject,
   subjectLabel,
+  summarizeBulkResult,
+  type BulkActionSummary,
   type ComposerLinks,
 } from "./mail-lib";
 import { Button } from "../ui/button";
@@ -47,6 +54,9 @@ export function Conversation({ threadId }: ConversationProps) {
   const archive = useArchiveThread();
   const unarchive = useUnarchiveThread();
   const { data: accounts } = useMailAccounts();
+  const move = useBulkThreadAction();
+  const [moveSummary, setMoveSummary] = useState<BulkActionSummary | null>(null);
+  const [moveFailure, setMoveFailure] = useState<string | null>(null);
 
   // null = "the user has not touched the accordion yet", which means the
   // default below applies -- the latest message open, everything else closed.
@@ -114,6 +124,38 @@ export function Conversation({ threadId }: ConversationProps) {
     ],
     [accounts],
   );
+
+  // Each own account's Trash folder, for the per-message "in Trash" chip.
+  // Only OWN accounts: trash_folder is a setting, and another user's account
+  // reaches this client as id/label/email alone -- a missing chip there, never
+  // a wrong one (see messageIsInTrash).
+  const trashByAccount = useMemo(() => {
+    const map = new Map<string, string | null>();
+    for (const account of accounts?.own ?? []) map.set(account.id, account.trashFolder);
+    return map;
+  }, [accounts]);
+
+  /**
+   * The single-thread server moves: Archive and Trash, through the same bulk
+   * endpoint with ONE id and NO folder.
+   *
+   * No folder means WHOLE-THREAD mode (the spec's second mode, which exists for
+   * exactly this surface): every message of the conversation except those
+   * already in the target and those in the account's Sent folder, because
+   * archiving a conversation must never empty Sent. That is a different
+   * question from the list's multi-select, which is scoped to the folder view
+   * the selection was made in.
+   */
+  function runMove(action: BulkThreadActionKind) {
+    setMoveSummary(null);
+    setMoveFailure(null);
+    move.mutate({ threadIds: [threadId], action }, {
+      onSuccess: (result) => setMoveSummary(summarizeBulkResult(action, result.results)),
+      // A 504 means the answer was lost, not that the move failed -- the hook
+      // has already refetched (see useBulkThreadAction).
+      onError: (moveError) => setMoveFailure(bulkErrorMessage(moveError)),
+    });
+  }
 
   const links: ComposerLinks | undefined = thread === undefined ? undefined : {
     ...(thread.companyId === null ? {} : { companyId: thread.companyId }),
@@ -193,7 +235,7 @@ export function Conversation({ threadId }: ConversationProps) {
         <h2 className="min-w-0 break-words text-lg font-semibold text-slate-900">
           {subjectLabel(thread.subject)}
         </h2>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
           {!remoteImages && (
             <Button
               variant="outline"
@@ -203,6 +245,28 @@ export function Conversation({ threadId }: ConversationProps) {
               Load remote images
             </Button>
           )}
+          {/* The two SERVER moves. "Archive" here files the mail in the
+              account's Archive folder over IMAP, so it sticks in every mail
+              client -- unlike the CRM-side state next to it. */}
+          <Button
+            variant="outline"
+            data-testid="conversation-archive"
+            disabled={move.isPending}
+            onClick={() => runMove("archive")}
+          >
+            Archive
+          </Button>
+          <Button
+            variant="outline"
+            data-testid="conversation-trash"
+            disabled={move.isPending}
+            onClick={() => runMove("trash")}
+          >
+            Trash
+          </Button>
+          {/* The CRM-only state, renamed "Hide in CRM" now that Archive above
+              means something else entirely. The testids predate the rename and
+              stay put: they are addresses, not labels. */}
           {archived ? (
             <Button
               variant="outline"
@@ -210,7 +274,7 @@ export function Conversation({ threadId }: ConversationProps) {
               disabled={unarchive.isPending}
               onClick={() => unarchive.mutate(thread.id)}
             >
-              Unarchive
+              Unhide
             </Button>
           ) : (
             <Button
@@ -219,11 +283,25 @@ export function Conversation({ threadId }: ConversationProps) {
               disabled={archive.isPending}
               onClick={() => archive.mutate(thread.id)}
             >
-              Archive
+              Hide in CRM
             </Button>
           )}
         </div>
       </div>
+
+      {(moveSummary !== null || moveFailure !== null) && (
+        <div data-testid="conversation-move-result" role="status" aria-live="polite" className="flex flex-col gap-1">
+          {moveFailure !== null && <p className="text-sm text-red-600">{moveFailure}</p>}
+          {moveSummary !== null && (
+            <>
+              <p className="text-sm text-slate-600">{moveSummary.headline}</p>
+              {moveSummary.notes.map((note) => (
+                <p key={note} className="text-xs text-slate-500">{note}</p>
+              ))}
+            </>
+          )}
+        </div>
+      )}
 
       <LinkPanel thread={thread} dealSuggestions={data.dealSuggestions} />
 
@@ -251,6 +329,7 @@ export function Conversation({ threadId }: ConversationProps) {
             expanded={expandedIds.has(message.id)}
             onToggle={toggle}
             remoteImages={remoteImages}
+            inTrash={messageIsInTrash(message, trashByAccount)}
           />
         ))}
       </ol>
@@ -274,13 +353,16 @@ export function Conversation({ threadId }: ConversationProps) {
  * one row (or, for remoteImages, deliberately for all of them).
  */
 const Message = memo(function Message({
-  message, expanded, onToggle, remoteImages,
+  message, expanded, onToggle, remoteImages, inTrash,
 }: {
   message: MailMessageWithAttachments;
   expanded: boolean;
   /** Takes the id, so the parent can hand every row ONE stable callback. */
   onToggle: (messageId: string) => void;
   remoteImages: boolean;
+  /** This message sits in its account's Trash folder (Phase 4.1) -- a plain
+   * boolean, so the memo above still bails out. */
+  inTrash: boolean;
 }) {
   const outbound = message.direction === "outbound";
   const from = message.fromName != null && message.fromName !== ""
@@ -302,6 +384,16 @@ const Message = memo(function Message({
       >
         <span className="flex items-baseline gap-2">
           <span className="min-w-0 flex-1 truncate text-sm font-medium text-slate-900">{from}</span>
+          {/* The CRM never expunges: a trashed message keeps its row, and this
+              chip is how the conversation says where it now lives. */}
+          {inTrash && (
+            <span
+              data-testid="trash-chip"
+              className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-500"
+            >
+              in Trash
+            </span>
+          )}
           {outbound && <span className="shrink-0 text-[11px] uppercase text-slate-400">Sent</span>}
           <span className="shrink-0 text-xs text-slate-400" title={new Date(message.sentAt).toLocaleString()}>
             {relativeTime(message.sentAt)}

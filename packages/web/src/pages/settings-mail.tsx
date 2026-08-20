@@ -1,17 +1,20 @@
 import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
+import { clsx } from "clsx";
 import type { MailAccountTestResult, MailAccountWithSyncStats, MailSecurity } from "@conduit/shared";
 import { relativeTime } from "../lib";
 import {
   useArchiveMailAccount,
   useCreateMailAccount,
   useMailAccounts,
+  useMailFolders,
   useMe,
+  useSetFolderSync,
   useTestMailAccount,
   useUnarchiveMailAccount,
   useUpdateMailAccount,
 } from "../queries";
-import { friendlyMailError, htmlIsBlank } from "../components/mail/mail-lib";
+import { friendlyMailError, htmlIsBlank, newestDiscovery } from "../components/mail/mail-lib";
 import {
   buildCreateInput,
   buildTestInput,
@@ -147,6 +150,7 @@ function AccountCard({
   const archive = useArchiveMailAccount();
   const unarchive = useUnarchiveMailAccount();
   const [showSignature, setShowSignature] = useState(false);
+  const [showFolders, setShowFolders] = useState(false);
   const isArchived = account.archivedAt !== null;
 
   return (
@@ -202,6 +206,13 @@ function AccountCard({
                 Signature
               </Button>
               <Button
+                variant="outline"
+                data-testid={`folders-toggle-${account.id}`}
+                onClick={() => setShowFolders((current) => !current)}
+              >
+                Folders
+              </Button>
+              <Button
                 variant="danger"
                 disabled={archive.isPending}
                 onClick={() => {
@@ -237,6 +248,11 @@ function AccountCard({
       {test.data !== undefined && <TestResult result={test.data} />}
 
       {showSignature && !isArchived && <SignatureEditor account={account} />}
+      {/* Folders stay editable on an ARCHIVED account too: its rows survive
+          (archive-not-delete), curating them while the mailbox is put away is
+          reasonable, and the API refuses none of it -- enabling one simply
+          finds no sync loop to ask for a pass. */}
+      {showFolders && <FolderPicker account={account} />}
     </section>
   );
 }
@@ -299,6 +315,172 @@ function SignatureEditor({ account }: { account: MailAccountWithSyncStats }) {
           })}
         >
           {update.isPending ? "Saving..." : "Save signature"}
+        </Button>
+        {update.isError && <p role="alert" className="text-sm text-red-600">{update.error.message}</p>}
+        {update.isSuccess && <p className="text-xs text-slate-400">Saved</p>}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The per-account folder picker (Phase 4.1): which discovered folders the CRM
+ * syncs, plus the Trash/Archive targets its move actions file mail into.
+ *
+ * The list is the folders endpoint's, unfiltered -- including `\Noselect`
+ * hierarchy nodes and folders that have vanished from the server, both of which
+ * are shown greyed rather than hidden, because the CRM may still hold messages
+ * filed under a name the server no longer offers and this is the only screen
+ * that says so.
+ */
+function FolderPicker({ account }: { account: MailAccountWithSyncStats }) {
+  const { data: folders, isLoading, error } = useMailFolders(account.id);
+  const setSync = useSetFolderSync();
+
+  const newest = newestDiscovery(folders ?? []);
+  const detected = (use: "trash" | "archive") =>
+    (folders ?? []).find((folder) => folder.specialUse === use)?.folder;
+
+  return (
+    <div className="mt-3 flex flex-col gap-2 border-t border-slate-100 pt-3">
+      <span className="text-xs font-semibold uppercase text-slate-500">Folders</span>
+      <p className="text-xs text-slate-400">
+        Everything ticked here is synced into the CRM. Junk and Trash start switched off.
+        A folder keeps whatever you set even if the server later reclassifies it {"\u2014"}
+        the default is only chosen the first time a folder is seen, so this list is the way back.
+      </p>
+
+      {isLoading && <p className="text-sm text-slate-400">Loading...</p>}
+      {error && (
+        <p role="alert" className="text-sm text-red-600">
+          Could not load folders: {error.message}
+        </p>
+      )}
+      {setSync.isError && (
+        <p role="alert" className="text-sm text-red-600">{setSync.error.message}</p>
+      )}
+
+      <ul className="flex flex-col gap-1">
+        {(folders ?? []).map((folder) => {
+          // Locked (INBOX and the account's Sent folder) and `\Noselect` rows
+          // are both refused by the API in BOTH directions -- the switch is not
+          // real either way -- so the checkbox is disabled and says why rather
+          // than sending a request that comes back 409.
+          const why = folder.locked
+            ? "Always synced: the CRM needs INBOX and Sent for sending and direction"
+            : !folder.selectable
+              ? "This folder holds no messages (\\Noselect)"
+              : undefined;
+          const stale = folder.lastDiscoveredAt < newest;
+          return (
+            <li key={folder.id}>
+              <label
+                className={clsx(
+                  "flex items-center gap-2 text-sm",
+                  why === undefined ? "text-slate-700" : "text-slate-400",
+                )}
+                title={why}
+              >
+                <input
+                  type="checkbox"
+                  data-testid={`folder-picker-${folder.folder}`}
+                  checked={folder.syncEnabled}
+                  disabled={why !== undefined || setSync.isPending}
+                  onChange={(event) => setSync.mutate({
+                    accountId: account.id,
+                    // BY NAME, byte for byte as the endpoint listed it: that is
+                    // how UNIQUE (account_id, folder) matches it server-side.
+                    input: { folder: folder.folder, syncEnabled: event.target.checked },
+                  })}
+                  className="h-4 w-4"
+                />
+                <span className={clsx("truncate", stale && "italic")}>{folder.folder}</span>
+                {folder.specialUse !== null && (
+                  <span className="shrink-0 text-[11px] uppercase text-slate-400">{folder.specialUse}</span>
+                )}
+                {stale && (
+                  <span className="shrink-0 text-[11px] text-slate-400" title="Not seen in the last sync">
+                    not seen in the last sync
+                  </span>
+                )}
+              </label>
+            </li>
+          );
+        })}
+      </ul>
+
+      <MoveTargets
+        account={account}
+        detectedTrash={detected("trash")}
+        detectedArchive={detected("archive")}
+      />
+    </div>
+  );
+}
+
+/**
+ * Where Trash and Archive put mail for this account.
+ *
+ * BLANK MEANS "DETECT THIS FOR ME": the column goes back to NULL and the next
+ * discovery pass refills it from the server's SPECIAL-USE attributes (api:
+ * mail-folders.ts's fillMoveTargets, which only ever writes into a NULL). The
+ * placeholder therefore shows what discovery has ALREADY classified, when it
+ * has classified anything -- so an empty field is never a mystery. A bulk
+ * action against an account with neither a stored nor a detected target fails
+ * that account's threads with `no_target` rather than guessing.
+ */
+function MoveTargets({
+  account, detectedTrash, detectedArchive,
+}: {
+  account: MailAccountWithSyncStats;
+  detectedTrash: string | undefined;
+  detectedArchive: string | undefined;
+}) {
+  const update = useUpdateMailAccount();
+  const [trash, setTrash] = useState(account.trashFolder ?? "");
+  const [archiveTo, setArchiveTo] = useState(account.archiveFolder ?? "");
+
+  const placeholder = (detectedValue: string | undefined) =>
+    (detectedValue === undefined ? "Detect for me" : `Detect for me (${detectedValue})`);
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-t border-slate-100 pt-2">
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Trash folder" testId="trash-folder">
+          <Input
+            value={trash}
+            onChange={(event) => setTrash(event.target.value)}
+            placeholder={placeholder(detectedTrash)}
+            data-testid={`trash-folder-${account.id}`}
+          />
+        </Field>
+        <Field label="Archive folder" testId="archive-folder">
+          <Input
+            value={archiveTo}
+            onChange={(event) => setArchiveTo(event.target.value)}
+            placeholder={placeholder(detectedArchive)}
+            data-testid={`archive-folder-${account.id}`}
+          />
+        </Field>
+      </div>
+      <div className="flex items-center gap-3">
+        <Button
+          data-testid={`save-move-targets-${account.id}`}
+          disabled={update.isPending}
+          onClick={() => update.mutate({
+            id: account.id,
+            // null, not "": the shared schema rejects a blank string outright,
+            // and null is the meaningful "not resolved yet" value the next
+            // discovery pass refills. Trimming is the service's job (mirroring
+            // normalizeSentFolder), but a whitespace-only field is a blank one
+            // here, not a folder called "   ".
+            patch: {
+              trashFolder: trash.trim() === "" ? null : trash.trim(),
+              archiveFolder: archiveTo.trim() === "" ? null : archiveTo.trim(),
+            },
+          })}
+        >
+          {update.isPending ? "Saving..." : "Save folders"}
         </Button>
         {update.isError && <p role="alert" className="text-sm text-red-600">{update.error.message}</p>}
         {update.isSuccess && <p className="text-xs text-slate-400">Saved</p>}

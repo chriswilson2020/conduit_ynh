@@ -1,4 +1,7 @@
-import type { MailAddress, MailThreadListItem } from "@conduit/shared";
+import type {
+  BulkThreadActionKind, BulkThreadResult, MailAddress, MailThreadListItem,
+  MailUnreadFolderCount, SpecialUse,
+} from "@conduit/shared";
 import { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
 import { ApiError } from "../../api";
 
@@ -774,4 +777,447 @@ export function messageFrameSrcdoc(bodyHtml: string, csp: string): string {
     bodyHtml,
     "</body></html>",
   ].join("");
+}
+
+// ---------------------------------------------------------------------------
+// Thread selection (Phase 4.1 multi-select)
+// ---------------------------------------------------------------------------
+
+/**
+ * Which rows of the thread list are ticked, and which filter set they were
+ * ticked under.
+ *
+ * The `key` is the SAME filter identity ThreadPages uses (threadFilterKey), and
+ * it is here for the same reason: "the selection clears when the filter or the
+ * folder changes" is a property of this record rather than an effect somebody
+ * has to remember to write. Every function below runs the incoming state
+ * through selectionForKey first, so a selection made in the INBOX view can
+ * never be acted on from the Archive view -- not even for the one render
+ * between a filter changing and an effect firing, because there is no such
+ * render.
+ *
+ * `anchor` is the row a shift-click ranges FROM: the last row ticked by an
+ * ordinary click. It survives a shift-click (see extendThreadSelection) so that
+ * widening and narrowing a range works the way every mail client's does.
+ */
+export interface ThreadSelection {
+  key: string;
+  ids: ReadonlySet<string>;
+  anchor: string | null;
+}
+
+/**
+ * The most rows one "select all" may tick.
+ *
+ * Pinned to the route's own per-request cap for `trash`/`archive` (50 --
+ * routes/mail.ts's MOVE_ACTION_THREAD_CAP), so the obvious gesture cannot build
+ * a selection the server would answer with a 400. It is deliberately not the
+ * page size: the list ACCUMULATES pages, so "everything visible" grows past one
+ * page as soon as "load more" is pressed, and a cap that tracked the page size
+ * would quietly stop matching what the button ticks. `hide` could take 200, but
+ * one number is easier to hold than a per-action select-all.
+ */
+export const SELECT_ALL_CAP = 50;
+
+/** Per-action request caps, mirroring the API: the shared schema's 200 outer
+ * bound, which only `hide` may reach, and the route's tighter 50 for the two
+ * actions that wait on a real mail server. */
+const BULK_ACTION_CAPS: Record<BulkThreadActionKind, number> = {
+  trash: 50, archive: 50, hide: 200,
+};
+
+export function emptySelection(key: string): ThreadSelection {
+  return { key, ids: new Set(), anchor: null };
+}
+
+/**
+ * The selection as it applies to `key` -- itself when it was made under that
+ * key, an empty one otherwise. The whole clear-on-filter-change rule, in the
+ * same shape cursorForKey gives the paging one.
+ */
+export function selectionForKey(state: ThreadSelection, key: string): ThreadSelection {
+  return state.key === key ? state : emptySelection(key);
+}
+
+/** Tick or untick one row, and make it the anchor for the next shift-click.
+ * The anchor moves even on an UNTICK: it marks where the pointer last was,
+ * which is what the next range should start from. */
+export function toggleThreadSelected(
+  state: ThreadSelection, key: string, threadId: string,
+): ThreadSelection {
+  const base = selectionForKey(state, key);
+  const ids = new Set(base.ids);
+  if (ids.has(threadId)) ids.delete(threadId);
+  else ids.add(threadId);
+  return { key, ids, anchor: threadId };
+}
+
+/**
+ * Shift-click: tick every row between the anchor and `threadId` in the VISIBLE
+ * row order (`order` is what the list is currently rendering, accumulated pages
+ * included -- the only order a user could have meant).
+ *
+ * A range only ever ADDS. Untick is what a plain click is for, and a range that
+ * toggled would flip rows the user can see are already ticked.
+ *
+ * With no anchor, or when either end is no longer in the list (a refetch can
+ * drop a row out from under a selection), this degrades to a plain toggle
+ * rather than guessing at a range that no longer exists.
+ */
+export function extendThreadSelection(
+  state: ThreadSelection, key: string, threadId: string, order: readonly string[],
+): ThreadSelection {
+  const base = selectionForKey(state, key);
+  const from = base.anchor === null ? -1 : order.indexOf(base.anchor);
+  const to = order.indexOf(threadId);
+  if (from < 0 || to < 0) return toggleThreadSelected(base, key, threadId);
+  const lo = Math.min(from, to);
+  const hi = Math.max(from, to);
+  const ids = new Set(base.ids);
+  for (let index = lo; index <= hi; index += 1) {
+    const id = order[index];
+    if (id !== undefined) ids.add(id);
+  }
+  // The anchor STAYS: a second shift-click re-ranges from the same origin,
+  // which is how a user narrows a range they overshot.
+  return { key, ids, anchor: base.anchor };
+}
+
+/**
+ * The header checkbox: tick every visible row (up to SELECT_ALL_CAP), or -- when
+ * they are all ticked already -- clear the selection outright.
+ *
+ * Clearing empties EVERYTHING, including any row that has since scrolled out of
+ * the list; the button reads "none selected" afterwards and that must be true.
+ */
+export function toggleAllOnPage(
+  state: ThreadSelection, key: string, order: readonly string[],
+): ThreadSelection {
+  const base = selectionForKey(state, key);
+  const page = order.slice(0, SELECT_ALL_CAP);
+  if (page.length > 0 && page.every((id) => base.ids.has(id))) return emptySelection(key);
+  const ids = new Set(base.ids);
+  for (const id of page) ids.add(id);
+  return { key, ids, anchor: base.anchor };
+}
+
+/** Whether the header checkbox should read as ticked: every row it would tick
+ * is ticked already. */
+export function allOnPageSelected(
+  state: ThreadSelection, key: string, order: readonly string[],
+): boolean {
+  const base = selectionForKey(state, key);
+  const page = order.slice(0, SELECT_ALL_CAP);
+  return page.length > 0 && page.every((id) => base.ids.has(id));
+}
+
+/**
+ * The selected ids, in visible row order, and ONLY the ones still visible.
+ *
+ * The filter is not tidiness: a refetch can drop a thread out of the list (it
+ * was moved, hidden, or simply fell off the page) while its id sits in the
+ * selection, and sending an id for a row nobody can see any more would act on
+ * mail the user is not looking at.
+ */
+export function selectedThreadIds(
+  state: ThreadSelection, key: string, order: readonly string[],
+): string[] {
+  const base = selectionForKey(state, key);
+  return order.filter((id) => base.ids.has(id));
+}
+
+/**
+ * Why a bulk action cannot be sent as selected, or null when it can.
+ *
+ * Mirrors the server's caps rather than trusting them to hold: the route
+ * answers an over-cap request with a 400, and a disabled button with a reason
+ * beats a red error after the click.
+ */
+export function bulkActionBlocked(action: BulkThreadActionKind, count: number): string | null {
+  const cap = BULK_ACTION_CAPS[action];
+  if (count <= cap) return null;
+  return `Select ${cap} conversations or fewer for this action (${count} selected).`;
+}
+
+// ---------------------------------------------------------------------------
+// Folder sidebar shaping
+// ---------------------------------------------------------------------------
+
+/**
+ * The fields the sidebar reads off one row of GET /api/mail/accounts/:id/folders
+ * (MailAccountFolder). Structural rather than the schema type itself, so a test
+ * can state a case in six fields -- the same reason ReplySource exists.
+ */
+export interface SidebarFolderInput {
+  folder: string;
+  specialUse: SpecialUse | null;
+  syncEnabled: boolean;
+  selectable: boolean;
+  locked: boolean;
+  lastDiscoveredAt: string;
+}
+
+export interface SidebarFolderRow {
+  /** The IMAP name, BYTE-EXACT as the server listed it -- this string is what
+   * goes into the thread-list filter, so it must never be display-cased. */
+  folder: string;
+  /** That folder's own unread count, straight from the API. */
+  unread: number;
+  specialUse: SpecialUse | null;
+  /** Not re-sighted by the account's most recent discovery pass. */
+  stale: boolean;
+}
+
+/**
+ * Presentation order: INBOX, then Sent/Drafts/Archive, then everything
+ * unclassified alphabetically, then Junk and Trash at the bottom -- the order
+ * every mail client has trained people to expect. Ordering is a presentation
+ * decision, which is why the API sorts by name and this does not.
+ */
+const SPECIAL_ORDER: Record<SpecialUse, number> = {
+  sent: 1, drafts: 2, archive: 3, junk: 5, trash: 6,
+};
+const ORDINARY_RANK = 4;
+
+/** RFC 3501's one case-insensitive mailbox name, and the only one. */
+const INBOX_NAME = "INBOX";
+
+/**
+ * The moment of this account's most recent discovery pass, as the ISO string
+ * the API serves -- compared lexically, which for a fixed-format UTC timestamp
+ * is the same ordering as by time.
+ *
+ * Staleness with no threshold to guess at: a pass re-stamps
+ * `last_discovered_at` on every folder it sighted, with ONE moment for the
+ * whole pass (api: mail-folders.ts's discoverFolders binds `now` for every
+ * row), so a row behind this is exactly a row the last pass did not see -- a
+ * folder deleted or renamed on the server. With one row, or with a set that has
+ * never been re-discovered, nothing is behind and nothing is stale.
+ */
+export function newestDiscovery(folders: readonly { lastDiscoveredAt: string }[]): string {
+  return folders.reduce<string>(
+    (max, row) => (row.lastDiscoveredAt > max ? row.lastDiscoveredAt : max), "",
+  );
+}
+
+function folderRank(row: SidebarFolderRow): number {
+  if (row.folder.toUpperCase() === INBOX_NAME) return 0;
+  return row.specialUse === null ? ORDINARY_RANK : SPECIAL_ORDER[row.specialUse];
+}
+
+/**
+ * The sidebar's rows for ONE account: its folders joined to the per-folder
+ * unread counts BY NAME.
+ *
+ * THE JOIN DIRECTION IS THE CONTRACT (Task 4's handover). `counts` is a plain
+ * group-by over unread mail with no accountId on it, so it can carry folders
+ * this account has switched off, folders that have VANISHED from the server,
+ * and folders belonging to somebody else's account entirely -- mail is
+ * shared-visibility here and the counts are not owner-scoped. Iterating the
+ * FOLDERS and looking counts up is what makes an unmatched count row a
+ * non-event rather than a phantom sidebar entry. The same shape means two
+ * accounts' INBOXes share one count row; single-account installs (this
+ * release's target) are unaffected, and a per-account badge would need an
+ * account-scoped variant of the endpoint that v0.6.0 does not have.
+ *
+ * NO CLIENT-SIDE RE-DERIVATION of unread. Each count is already scoped to its
+ * own folder server-side (the two-scope ruling), so a folder's badge and the
+ * rows under it answer the same question -- including Trash, whose badge is the
+ * honest count of unread mail in Trash while the nav badge excludes it.
+ *
+ * What is rendered: every SELECTABLE folder that is either synced, or is the
+ * account's own Trash target, or still holds unread mail.
+ * - `\Noselect` rows hold no messages by definition and are never rows here.
+ * - A switched-off folder is out because switching it off is how a user curates
+ *   this list.
+ * - The account's Trash stays IN even when unsynced, because this CRM's own
+ *   Trash action files rows there and they must stay reachable. It is matched
+ *   byte for byte, like every other folder comparison in this app.
+ * - A folder still holding unread mail stays in whatever its flag says, so no
+ *   unread conversation can become unreachable by a toggle.
+ * A folder that is switched off, holds no unread mail and is not the Trash
+ * target is therefore invisible here even if the CRM holds READ messages in it;
+ * answering that exactly would need a per-folder message count the API does not
+ * serve, and the picker is one click away.
+ */
+export function buildFolderRows(
+  folders: readonly SidebarFolderInput[],
+  counts: readonly MailUnreadFolderCount[],
+  options: { trashFolder: string | null },
+): SidebarFolderRow[] {
+  const unreadByFolder = new Map(counts.map((count) => [count.folder, count.count]));
+  const newest = newestDiscovery(folders);
+  const rows: SidebarFolderRow[] = [];
+  for (const folder of folders) {
+    if (!folder.selectable) continue;
+    const unread = unreadByFolder.get(folder.folder) ?? 0;
+    const stale = folder.lastDiscoveredAt < newest;
+    const isTrashTarget = options.trashFolder !== null && folder.folder === options.trashFolder;
+    if (stale && unread === 0) continue;
+    if (!folder.syncEnabled && !isTrashTarget && unread === 0) continue;
+    rows.push({ folder: folder.folder, unread, specialUse: folder.specialUse, stale });
+  }
+  return rows.sort((a, b) => {
+    const byRank = folderRank(a) - folderRank(b);
+    return byRank === 0 ? a.folder.localeCompare(b.folder) : byRank;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Bulk action results
+// ---------------------------------------------------------------------------
+
+type BulkResultItem = BulkThreadResult["results"][number];
+
+export interface BulkActionSummary {
+  /** Threads the action actually applied to. */
+  moved: number;
+  /** Successful no-ops (the server's `skipped: true`). */
+  skipped: number;
+  failed: number;
+  /** One line naming all three outcomes. */
+  headline: string;
+  /** One sentence per reason worth explaining, most actionable first. */
+  notes: string[];
+  /** At least one note is fixed in Settings -> Mail, so the caller can link. */
+  settingsLink: boolean;
+}
+
+/** How each action reads in a past-tense summary. */
+function actionVerb(action: BulkThreadActionKind): string {
+  if (action === "hide") return "hidden";
+  return action === "trash" ? "moved to Trash" : "archived";
+}
+
+/** The folder an action targets, for the no_target note. */
+function actionTarget(action: BulkThreadActionKind): string {
+  return action === "trash" ? "Trash" : "Archive";
+}
+
+/** At most this many distinct server refusal strings are shown, each trimmed to
+ * MAX_REFUSAL_CHARS: the API already caps its free text, and one response can
+ * carry fifty different sentences from a mail server having a bad day. */
+const MAX_REFUSALS_SHOWN = 3;
+const MAX_REFUSAL_CHARS = 120;
+
+function truncate(text: string): string {
+  const trimmed = text.trim();
+  return trimmed.length <= MAX_REFUSAL_CHARS ? trimmed : `${trimmed.slice(0, MAX_REFUSAL_CHARS)}\u2026`;
+}
+
+/**
+ * What to tell the user about one bulk response.
+ *
+ * EVERY BRANCH IS ON THE `reason` CODE, never on the free-text `error` -- the
+ * house rule for every error shape in this app (api.ts's ApiError doc comment),
+ * and the reason the API grew the code in the first place. `error` is display
+ * text and appears in exactly one note, `server_refused`'s, where the mail
+ * server's own words are the only thing that could explain the refusal.
+ *
+ * `already_in_target` and `out_of_scope` are deliberately QUIET: both mean the
+ * user asked for something that was already true of those threads (the goal
+ * holds / the action never applied there), neither is fixable or worth a
+ * sentence, and both are still COUNTED so the headline stays honest. That
+ * honesty is the point of the headline's shape: "Nothing archived, 2 skipped."
+ * must not be mistakable for "2 archived."
+ */
+export function summarizeBulkResult(
+  action: BulkThreadActionKind, results: readonly BulkResultItem[],
+): BulkActionSummary {
+  let moved = 0;
+  let skipped = 0;
+  let failed = 0;
+  const byReason = new Map<string, number>();
+  const refusals: string[] = [];
+  for (const result of results) {
+    if (!result.ok) failed += 1;
+    else if (result.skipped === true) skipped += 1;
+    else moved += 1;
+    if (result.reason === undefined) continue;
+    byReason.set(result.reason, (byReason.get(result.reason) ?? 0) + 1);
+    if (result.reason === "server_refused" && result.error !== undefined
+      && !refusals.includes(result.error)) refusals.push(result.error);
+  }
+
+  const verb = actionVerb(action);
+  const parts = [moved > 0 ? `${moved} ${verb}` : `Nothing ${verb}`];
+  if (skipped > 0) parts.push(`${skipped} skipped`);
+  if (failed > 0) parts.push(`${failed} failed`);
+
+  const notes: string[] = [];
+  const count = (reason: string) => byReason.get(reason) ?? 0;
+  // Failures first: they are the outcomes a user may need to act on.
+  if (count("no_sync") > 0) {
+    notes.push(`${count("no_sync")} could not be moved: that mail account is reconnecting`
+      + " \u2014 try again shortly.");
+  }
+  if (count("no_target") > 0) {
+    notes.push(`${count("no_target")} could not be moved: no ${actionTarget(action)} folder is set`
+      + " for that account yet.");
+  }
+  if (count("not_found") > 0) {
+    notes.push(`${count("not_found")} no longer exist \u2014 the list has been refreshed.`);
+  }
+  if (count("server_refused") > 0) {
+    const shown = refusals.slice(0, MAX_REFUSALS_SHOWN).map(truncate).join("; ");
+    notes.push(`${count("server_refused")} were refused by the mail server: ${shown}`);
+  }
+  if (count("awaiting_reconciliation") > 0) {
+    notes.push(`${count("awaiting_reconciliation")} will complete after the next sync pass.`);
+  }
+  if (count("archived_account") > 0) {
+    notes.push(`${count("archived_account")} belong to an archived mail account`
+      + " \u2014 unarchive it in Settings to move its mail.");
+  }
+
+  return {
+    moved, skipped, failed,
+    headline: `${parts.join(", ")}.`,
+    notes,
+    settingsLink: count("no_target") > 0 || count("archived_account") > 0,
+  };
+}
+
+/**
+ * What a bulk call that never returned a body means.
+ *
+ * A 504 IS NOT A FAILURE (routes/mail.ts's bulk endpoint says so in as many
+ * words): each queued MOVE runs on its account's serial sync loop, the deployed
+ * nginx gives up on the RESPONSE after 300s, and the work carries on regardless
+ * -- so the honest thing to show is that the outcome is unknown, and the honest
+ * thing to do is refetch rather than retry (a blind retry would trash whatever
+ * is now in the source folder). A network-level failure lands here too: the
+ * request may well have been delivered, and nothing about the exception says
+ * otherwise. Anything else -- a 400 over the cap, a 401 -- is a real refusal
+ * and shows its own message.
+ */
+export const BULK_TIMEOUT_MESSAGE = "The request timed out \u2014 the changes may still have applied."
+  + " The list has been refreshed.";
+
+export function bulkErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    return error.status === 504 || error.status === 502 || error.status === 408
+      ? BULK_TIMEOUT_MESSAGE : error.message;
+  }
+  return BULK_TIMEOUT_MESSAGE;
+}
+
+/**
+ * Is this message sitting in its own account's Trash folder -- the "in Trash"
+ * chip in a conversation?
+ *
+ * Byte-exact, and per ACCOUNT: `Trash` on one account and `Trash` on another
+ * are the same string but not the same mailbox, and only the owning account's
+ * trash_folder decides. The map is built from the accounts the client can see
+ * settings for, so a message on ANOTHER USER's account is never chipped: their
+ * trash_folder is a setting this client is not served (mailAccountSummarySchema
+ * carries id/label/email and nothing else). That is a missing chip, not a wrong
+ * one.
+ */
+export function messageIsInTrash(
+  message: { accountId: string; folder: string },
+  trashByAccount: ReadonlyMap<string, string | null>,
+): boolean {
+  const trash = trashByAccount.get(message.accountId);
+  return trash != null && trash === message.folder;
 }

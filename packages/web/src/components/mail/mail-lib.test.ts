@@ -1,8 +1,25 @@
 import { describe, it, expect } from "vitest";
-import type { MailThreadListItem } from "@conduit/shared";
+import type {
+  BulkThreadFailureReason, BulkThreadSkipReason, MailThreadListItem,
+} from "@conduit/shared";
 import { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
 import { ApiError } from "../../api";
 import {
+  buildFolderRows,
+  bulkActionBlocked,
+  bulkErrorMessage,
+  BULK_TIMEOUT_MESSAGE,
+  emptySelection,
+  extendThreadSelection,
+  messageIsInTrash,
+  newestDiscovery,
+  selectedThreadIds,
+  selectionForKey,
+  SELECT_ALL_CAP,
+  summarizeBulkResult,
+  toggleAllOnPage,
+  toggleThreadSelected,
+  type SidebarFolderInput,
   attachmentTarget,
   composeErrorMessage,
   dedupeRecipients,
@@ -790,5 +807,310 @@ describe("messageFrameSrcdoc", () => {
   it("does not escape the body", () => {
     expect(messageFrameSrcdoc('<p class="x">Hi &amp; bye</p>', "default-src 'none'"))
       .toContain('<body><p class="x">Hi &amp; bye</p></body>');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4.1: selection model, folder sidebar shaping, bulk result summaries
+// ---------------------------------------------------------------------------
+
+describe("thread selection", () => {
+  const KEY = '[["folder","INBOX"]]';
+  const OTHER = '[["folder","Archive"]]';
+  const rows = ["a", "b", "c", "d", "e"];
+
+  it("starts empty and toggles one row at a time", () => {
+    let selection = emptySelection(KEY);
+    expect(selection.ids.size).toBe(0);
+    selection = toggleThreadSelected(selection, KEY, "b");
+    expect([...selection.ids]).toEqual(["b"]);
+    selection = toggleThreadSelected(selection, KEY, "d");
+    expect([...selection.ids].sort()).toEqual(["b", "d"]);
+    selection = toggleThreadSelected(selection, KEY, "b");
+    expect([...selection.ids]).toEqual(["d"]);
+  });
+
+  // The whole clear-on-filter-change rule, and the reason it is a property of
+  // the data structure rather than an effect: a selection is only ever handed
+  // back to the key it was made under.
+  it("is empty for any key it was not made under", () => {
+    const selection = toggleThreadSelected(emptySelection(KEY), KEY, "b");
+    expect(selectionForKey(selection, KEY).ids.size).toBe(1);
+    expect(selectionForKey(selection, OTHER).ids.size).toBe(0);
+    expect(selectionForKey(selection, OTHER).key).toBe(OTHER);
+  });
+
+  it("drops a stale selection when a mutation arrives under a new key", () => {
+    const selection = toggleThreadSelected(emptySelection(KEY), KEY, "b");
+    const next = toggleThreadSelected(selection, OTHER, "c");
+    expect([...next.ids]).toEqual(["c"]);
+    expect(next.key).toBe(OTHER);
+  });
+
+  it("shift-extends from the anchor in visible row order, in both directions", () => {
+    let selection = toggleThreadSelected(emptySelection(KEY), KEY, "d");
+    selection = extendThreadSelection(selection, KEY, "b", rows);
+    expect([...selection.ids].sort()).toEqual(["b", "c", "d"]);
+    // The anchor stays put, so a second shift-click re-ranges from the same
+    // origin rather than from the last row touched.
+    selection = extendThreadSelection(selection, KEY, "e", rows);
+    expect([...selection.ids].sort()).toEqual(["b", "c", "d", "e"]);
+    expect(selection.anchor).toBe("d");
+  });
+
+  it("shift-clicks with no anchor, or on a row no longer visible, behave as a plain toggle", () => {
+    const fresh = extendThreadSelection(emptySelection(KEY), KEY, "c", rows);
+    expect([...fresh.ids]).toEqual(["c"]);
+    const anchored = toggleThreadSelected(emptySelection(KEY), KEY, "a");
+    expect([...extendThreadSelection(anchored, KEY, "zz", rows).ids].sort()).toEqual(["a", "zz"]);
+  });
+
+  it("selects every visible row, and clears when they are all already selected", () => {
+    let selection = toggleAllOnPage(emptySelection(KEY), KEY, rows);
+    expect([...selection.ids].sort()).toEqual(rows);
+    selection = toggleAllOnPage(selection, KEY, rows);
+    expect(selection.ids.size).toBe(0);
+    expect(selection.anchor).toBeNull();
+  });
+
+  // The route caps trash/archive at 50 threads per request, so select-all
+  // stops there rather than building a selection the server would 400.
+  it("caps select-all at the move cap", () => {
+    const many = Array.from({ length: 120 }, (_value, index) => `t${index}`);
+    const selection = toggleAllOnPage(emptySelection(KEY), KEY, many);
+    expect(selection.ids.size).toBe(SELECT_ALL_CAP);
+    expect(selection.ids.has("t0")).toBe(true);
+    expect(selection.ids.has(`t${SELECT_ALL_CAP}`)).toBe(false);
+  });
+
+  it("returns the selected ids in visible order, dropping rows that have gone", () => {
+    let selection = toggleThreadSelected(emptySelection(KEY), KEY, "e");
+    selection = toggleThreadSelected(selection, KEY, "a");
+    selection = toggleThreadSelected(selection, KEY, "gone");
+    expect(selectedThreadIds(selection, KEY, rows)).toEqual(["a", "e"]);
+    expect(selectedThreadIds(selection, OTHER, rows)).toEqual([]);
+  });
+});
+
+describe("bulkActionBlocked", () => {
+  it("permits a selection inside each action's own cap", () => {
+    expect(bulkActionBlocked("archive", 50)).toBeNull();
+    expect(bulkActionBlocked("trash", 1)).toBeNull();
+    expect(bulkActionBlocked("hide", 200)).toBeNull();
+  });
+
+  it("refuses more threads than the server would accept, per action", () => {
+    expect(bulkActionBlocked("archive", 51)).toContain("50");
+    expect(bulkActionBlocked("trash", 51)).toContain("50");
+    expect(bulkActionBlocked("hide", 201)).toContain("200");
+  });
+});
+
+describe("buildFolderRows", () => {
+  const NOW = "2026-08-20T10:00:00.000Z";
+  const THEN = "2026-08-19T10:00:00.000Z";
+  const folder = (
+    name: string,
+    extra: Partial<SidebarFolderInput> = {},
+  ): SidebarFolderInput => ({
+    folder: name, specialUse: null, syncEnabled: true, selectable: true, locked: false,
+    lastDiscoveredAt: NOW, ...extra,
+  });
+
+  it("orders INBOX first, then the classified folders around the ordinary ones", () => {
+    const rows = buildFolderRows(
+      [
+        folder("Zebra"), folder("Trash", { specialUse: "trash", syncEnabled: false }),
+        folder("Apples"), folder("INBOX"), folder("Sent", { specialUse: "sent", locked: true }),
+        folder("Archive", { specialUse: "archive" }), folder("Junk", { specialUse: "junk", syncEnabled: false }),
+        folder("Drafts", { specialUse: "drafts" }),
+      ],
+      [{ folder: "Trash", count: 2 }, { folder: "Junk", count: 1 }],
+      { trashFolder: "Trash" },
+    );
+    expect(rows.map((row) => row.folder))
+      .toEqual(["INBOX", "Sent", "Drafts", "Archive", "Apples", "Zebra", "Junk", "Trash"]);
+  });
+
+  // The join is BY NAME against this account's folder rows: a count row for a
+  // folder this account does not have (another account's, or another user's --
+  // the counts are not owner-scoped) is not a folder to render.
+  it("joins counts by name and ignores count rows with no folder of their own", () => {
+    const rows = buildFolderRows(
+      [folder("INBOX"), folder("Work")],
+      [{ folder: "INBOX", count: 4 }, { folder: "Somebody Else", count: 9 }],
+      { trashFolder: null },
+    );
+    expect(rows.map((row) => [row.folder, row.unread])).toEqual([["INBOX", 4], ["Work", 0]]);
+  });
+
+  it("hides folders the picker switched off, and unselectable ones entirely", () => {
+    const rows = buildFolderRows(
+      [folder("INBOX"), folder("Off", { syncEnabled: false }), folder("Node", { selectable: false })],
+      [],
+      { trashFolder: null },
+    );
+    expect(rows.map((row) => row.folder)).toEqual(["INBOX"]);
+  });
+
+  // Two carve-outs, both for mail that would otherwise be unreachable: the
+  // account's Trash is where this CRM's own Trash action files rows (even
+  // unsynced), and any folder still holding unread mail must stay clickable.
+  it("keeps a switched-off Trash, and any switched-off folder holding unread mail", () => {
+    const rows = buildFolderRows(
+      [
+        folder("INBOX"), folder("Trash", { specialUse: "trash", syncEnabled: false }),
+        folder("Junk", { specialUse: "junk", syncEnabled: false }),
+        folder("Quiet", { syncEnabled: false }),
+      ],
+      [{ folder: "Junk", count: 3 }],
+      { trashFolder: "Trash" },
+    );
+    expect(rows.map((row) => row.folder)).toEqual(["INBOX", "Junk", "Trash"]);
+  });
+
+  // Byte-exact, like every other folder comparison in this app.
+  it("matches the trash target byte for byte", () => {
+    const rows = buildFolderRows(
+      [folder("Trash", { syncEnabled: false })], [], { trashFolder: "trash" },
+    );
+    expect(rows).toEqual([]);
+  });
+
+  // Stale = not re-stamped by the account's most recent discovery pass, which
+  // is exactly what a folder that vanished from the server looks like.
+  it("drops a vanished folder, unless it still holds unread mail", () => {
+    const rows = buildFolderRows(
+      [folder("INBOX"), folder("Gone", { lastDiscoveredAt: THEN }), folder("Ghost", { lastDiscoveredAt: THEN })],
+      [{ folder: "Ghost", count: 2 }],
+      { trashFolder: null },
+    );
+    expect(rows.map((row) => [row.folder, row.stale])).toEqual([["INBOX", false], ["Ghost", true]]);
+  });
+
+  it("treats a single discovery moment as nothing being stale", () => {
+    const rows = buildFolderRows([folder("INBOX", { lastDiscoveredAt: THEN })], [], { trashFolder: null });
+    expect(rows.map((row) => row.stale)).toEqual([false]);
+  });
+});
+
+describe("newestDiscovery", () => {
+  it("is the latest moment across the set, and empty for an empty one", () => {
+    expect(newestDiscovery([
+      { lastDiscoveredAt: "2026-08-19T10:00:00.000Z" },
+      { lastDiscoveredAt: "2026-08-20T10:00:00.000Z" },
+      { lastDiscoveredAt: "2026-08-01T10:00:00.000Z" },
+    ])).toBe("2026-08-20T10:00:00.000Z");
+    expect(newestDiscovery([])).toBe("");
+  });
+});
+
+describe("summarizeBulkResult", () => {
+  const ok = (threadId: string) => ({ threadId, ok: true });
+  const skip = (threadId: string, reason: BulkThreadSkipReason) =>
+    ({ threadId, ok: true, skipped: true, reason });
+  const fail = (threadId: string, reason: BulkThreadFailureReason, error = "nope") =>
+    ({ threadId, ok: false, error, reason });
+
+  it("counts the three outcomes apart in the headline", () => {
+    const summary = summarizeBulkResult("archive", [
+      ok("1"), ok("2"), skip("3", "already_in_target"), fail("4", "no_sync"),
+    ]);
+    expect(summary).toMatchObject({ moved: 2, skipped: 1, failed: 1 });
+    expect(summary.headline).toBe("2 archived, 1 skipped, 1 failed.");
+  });
+
+  // The one the brief pins: "nothing happened" must not read like "done".
+  it("says nothing happened when nothing did", () => {
+    const summary = summarizeBulkResult("archive", [
+      skip("1", "already_in_target"), skip("2", "out_of_scope"),
+    ]);
+    expect(summary.moved).toBe(0);
+    expect(summary.headline).toBe("Nothing archived, 2 skipped.");
+    // already_in_target and out_of_scope are the quiet pair: counted, never
+    // explained -- there is nothing for the user to do about either.
+    expect(summary.notes).toEqual([]);
+  });
+
+  it("uses the action's own verb", () => {
+    expect(summarizeBulkResult("trash", [ok("1")]).headline).toBe("1 moved to Trash.");
+    expect(summarizeBulkResult("hide", [ok("1"), ok("2")]).headline).toBe("2 hidden.");
+  });
+
+  // Every branch keys off the `reason` CODE. Nothing here may ever match on
+  // the free-text `error`, which is display-only (the house rule).
+  it("explains each actionable reason once, with its count", () => {
+    const summary = summarizeBulkResult("trash", [
+      fail("1", "no_sync"), fail("2", "no_sync"),
+      fail("3", "no_target"), fail("4", "not_found"),
+      skip("5", "awaiting_reconciliation"), skip("6", "archived_account"),
+    ]);
+    const notes = summary.notes.join(" | ");
+    expect(summary.notes).toHaveLength(5);
+    expect(notes).toContain("2 could not be moved: that mail account is reconnecting");
+    expect(notes).toContain("no Trash folder is set");
+    expect(notes).toContain("no longer exist");
+    expect(notes).toContain("after the next sync pass");
+    expect(notes).toContain("archived mail account");
+    // Two of the reasons are fixed in Settings, so the summary says so once.
+    expect(summary.settingsLink).toBe(true);
+  });
+
+  it("names the Archive folder in a no_target note for an archive action", () => {
+    const summary = summarizeBulkResult("archive", [fail("1", "no_target")]);
+    expect(summary.notes[0]).toContain("no Archive folder is set");
+  });
+
+  it("shows the server's own refusal text, capped and de-duplicated", () => {
+    const summary = summarizeBulkResult("trash", [
+      fail("1", "server_refused", "TRYCREATE"), fail("2", "server_refused", "TRYCREATE"),
+      fail("3", "server_refused", "over quota"),
+    ]);
+    const note = summary.notes[0] ?? "";
+    expect(note).toContain("3 were refused by the mail server");
+    expect(note).toContain("TRYCREATE");
+    expect(note).toContain("over quota");
+    // The identical refusal is shown once, not once per thread.
+    expect(note.split("TRYCREATE")).toHaveLength(2);
+  });
+
+  it("does not point at Settings for reasons Settings cannot fix", () => {
+    expect(summarizeBulkResult("trash", [fail("1", "server_refused", "no")]).settingsLink).toBe(false);
+  });
+});
+
+describe("bulkErrorMessage", () => {
+  // The API route documents that a 504 means the ANSWER was lost, not the
+  // action -- the queued moves carry on regardless -- so the copy must not
+  // claim a failure and the caller refetches.
+  it("treats a gateway timeout as an unknown outcome, not a failure", () => {
+    for (const status of [408, 502, 504]) {
+      expect(bulkErrorMessage(new ApiError("Gateway Time-out", status, "unknown"))).toBe(BULK_TIMEOUT_MESSAGE);
+    }
+  });
+
+  it("treats a network-level failure the same way", () => {
+    expect(bulkErrorMessage(new TypeError("Failed to fetch"))).toBe(BULK_TIMEOUT_MESSAGE);
+  });
+
+  it("shows a real API refusal as itself", () => {
+    expect(bulkErrorMessage(new ApiError("trash accepts at most 50 threads per request", 400, "validation")))
+      .toBe("trash accepts at most 50 threads per request");
+  });
+});
+
+describe("messageIsInTrash", () => {
+  const trashByAccount = new Map<string, string | null>([["a1", "Trash"], ["a2", null]]);
+
+  it("is true only for a message sitting in its own account's trash folder", () => {
+    expect(messageIsInTrash({ accountId: "a1", folder: "Trash" }, trashByAccount)).toBe(true);
+    expect(messageIsInTrash({ accountId: "a1", folder: "INBOX" }, trashByAccount)).toBe(false);
+    // Byte-exact: IMAP mailbox names are compared as bytes everywhere else here.
+    expect(messageIsInTrash({ accountId: "a1", folder: "trash" }, trashByAccount)).toBe(false);
+  });
+
+  it("is false when the account has no resolved trash folder, or is not ours to know", () => {
+    expect(messageIsInTrash({ accountId: "a2", folder: "Trash" }, trashByAccount)).toBe(false);
+    expect(messageIsInTrash({ accountId: "a9", folder: "Trash" }, trashByAccount)).toBe(false);
   });
 });

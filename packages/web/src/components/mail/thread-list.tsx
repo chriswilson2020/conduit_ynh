@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { clsx } from "clsx";
 import type { MailThreadListItem } from "@conduit/shared";
@@ -32,6 +32,15 @@ import { Button } from "../ui/button";
  */
 export type ThreadListFilters = Omit<MailThreadListParams, "cursor" | "limit">;
 
+/** What a row's checkbox reports: the row, and whether the click was a
+ * shift-click, plus the VISIBLE ROW ORDER a shift-range would run over. The
+ * order rides on the event because only this component knows it -- see the
+ * ref below for why it does not travel as a prop. */
+export interface ThreadToggle {
+  shift: boolean;
+  order: readonly string[];
+}
+
 export interface ThreadListProps {
   filters: ThreadListFilters;
   onSelect: (threadId: string) => void;
@@ -41,6 +50,24 @@ export interface ThreadListProps {
   /** A node, not just a string: the inbox's empty state links at Settings
    * when there is no mail account to have received anything yet. */
   emptyLabel?: ReactNode;
+  /**
+   * Multi-select, off unless a caller opts in (the inbox does; a record page's
+   * Mail tab has no bulk bar to act on a selection).
+   *
+   * The SELECTION ITSELF lives in the caller -- the bulk bar is its sibling, not
+   * this component's child -- and mail-lib owns the rules. All this does is
+   * render ticks and report clicks.
+   */
+  selectable?: boolean;
+  selectedIds?: ReadonlySet<string>;
+  onToggleThread?: (threadId: string, toggle: ThreadToggle) => void;
+  onToggleAll?: (order: readonly string[]) => void;
+  /** Whether the header checkbox reads as ticked; the caller decides, since it
+   * holds the selection (mail-lib's allOnPageSelected). */
+  allSelected?: boolean;
+  /** The visible rows, in order, whenever they change -- so the caller can turn
+   * its selection into a request without duplicating the accumulator. */
+  onRowsChange?: (threadIds: string[]) => void;
 }
 
 const DEFAULT_LIMIT = 25;
@@ -76,6 +103,7 @@ const DEFAULT_LIMIT = 25;
  */
 export function ThreadList({
   filters, onSelect, selectedId = null, limit = DEFAULT_LIMIT, emptyLabel = "No conversations",
+  selectable = false, selectedIds, onToggleThread, onToggleAll, allSelected = false, onRowsChange,
 }: ThreadListProps) {
   const key = threadFilterKey({ ...filters });
   const [pages, setPages] = useState<ThreadPages>(() => emptyThreadPages(key));
@@ -111,12 +139,50 @@ export function ThreadList({
   // for the duration of its own fetch could never show that it was fetching.
   const showLoadMore = pages.key === key && pages.nextCursor !== null;
 
+  /**
+   * The visible row order, for shift-ranges and select-all.
+   *
+   * Kept in a REF as well as reported upward, so the callback handed to every
+   * row can have `onToggleThread` as its only dependency. A callback that closed
+   * over the order directly would change identity on every appended page and
+   * re-render every memoised row in the list -- exactly the cost ThreadRow's
+   * memo exists to avoid.
+   */
+  const order = useMemo(() => threads.map((thread) => thread.id), [threads]);
+  const orderRef = useRef<readonly string[]>(order);
+  orderRef.current = order;
+
+  useEffect(() => {
+    onRowsChange?.(order);
+  }, [order, onRowsChange]);
+
+  const toggleThread = useCallback((threadId: string, shift: boolean) => {
+    onToggleThread?.(threadId, { shift, order: orderRef.current });
+  }, [onToggleThread]);
+
+  // Once anything is ticked, every row's checkbox stays visible: hunting for a
+  // second checkbox by hovering, mid-selection, is the one case where the
+  // hover-reveal gets in the way.
+  const anySelected = (selectedIds?.size ?? 0) > 0;
+
   return (
     <div data-testid="thread-list" className="flex min-w-0 flex-col">
       {error && (
         <p role="alert" className="px-4 py-2 text-sm text-red-600">
           Could not load conversations: {error.message}
         </p>
+      )}
+      {selectable && threads.length > 0 && (
+        <label className="flex items-center gap-2 px-3 py-1 text-xs text-slate-500">
+          <input
+            type="checkbox"
+            data-testid="thread-select-all"
+            checked={allSelected}
+            onChange={() => onToggleAll?.(orderRef.current)}
+            className="h-4 w-4"
+          />
+          Select all
+        </label>
       )}
       <ul className="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white">
         {isLoading && threads.length === 0 && (
@@ -134,6 +200,10 @@ export function ThreadList({
             selected={thread.id === selectedId}
             onSelect={onSelect}
             accountLabels={accountLabels}
+            selectable={selectable}
+            checked={selectedIds?.has(thread.id) ?? false}
+            anySelected={anySelected}
+            onToggle={toggleThread}
           />
         ))}
       </ul>
@@ -165,14 +235,27 @@ export function ThreadList({
  * `selected` is a boolean that changes for exactly two rows when the selection
  * moves. So a re-render of the list re-renders no rows at all unless their own
  * data moved.
+ *
+ * THE MULTI-SELECT PROPS KEEP THAT PROPERTY (Phase 4.1). `onToggle` is the
+ * list's own useCallback, stable because the visible row order it needs travels
+ * through a ref rather than through its closure; `checked` changes for the one
+ * row that was ticked (or, on a select-all, for the rows that changed);
+ * `anySelected` flips exactly twice per selection -- once when the first row is
+ * ticked and once when the last is cleared. `selectable` never changes at all.
  */
 const ThreadRow = memo(function ThreadRow({
-  thread, selected, onSelect, accountLabels,
+  thread, selected, onSelect, accountLabels, selectable, checked, anySelected, onToggle,
 }: {
   thread: MailThreadListItem;
   selected: boolean;
   onSelect: (threadId: string) => void;
   accountLabels: Map<string, string>;
+  selectable: boolean;
+  checked: boolean;
+  anySelected: boolean;
+  /** Takes the id and whether shift was held, so the list can hand every row
+   * ONE stable callback (mirroring conversation.tsx's onToggle). */
+  onToggle: (threadId: string, shift: boolean) => void;
 }) {
   const ref = useRef<HTMLButtonElement>(null);
 
@@ -186,7 +269,34 @@ const ThreadRow = memo(function ThreadRow({
   const senders = thread.senders.map(addressLabel).join(", ");
 
   return (
-    <li>
+    <li className={clsx("group flex items-start", selected ? "bg-slate-100" : "hover:bg-slate-50")}>
+      {selectable && (
+        // A SIBLING of the row button, not a child: a checkbox inside a button
+        // is invalid, and nesting one would also make every tick open the
+        // conversation. `opacity` rather than conditional rendering so the rows
+        // do not shift horizontally as the pointer moves down the list.
+        <label
+          className={clsx(
+            "flex shrink-0 items-center self-stretch pl-3 pr-1",
+            checked || anySelected
+              ? "opacity-100"
+              : "opacity-0 focus-within:opacity-100 group-hover:opacity-100",
+          )}
+        >
+          <input
+            type="checkbox"
+            data-testid={`thread-checkbox-${thread.id}`}
+            aria-label={`Select ${subjectLabel(thread.subject)}`}
+            checked={checked}
+            // React maps a checkbox's onChange onto the native CLICK, so the
+            // native event carries the modifier keys -- which is how a
+            // shift-click reaches the range logic. A keyboard tick is a
+            // synthesized click with no modifiers, i.e. a plain toggle.
+            onChange={(event) => onToggle(thread.id, isShiftClick(event.nativeEvent))}
+            className="h-4 w-4"
+          />
+        </label>
+      )}
       <button
         ref={ref}
         type="button"
@@ -194,8 +304,7 @@ const ThreadRow = memo(function ThreadRow({
         aria-current={selected ? "true" : undefined}
         onClick={() => onSelect(thread.id)}
         className={clsx(
-          "flex w-full flex-col gap-0.5 px-3 py-2 text-left",
-          selected ? "bg-slate-100" : "hover:bg-slate-50",
+          "flex min-w-0 flex-1 flex-col gap-0.5 px-3 py-2 text-left",
         )}
       >
         <span className="flex items-center gap-2">
@@ -238,6 +347,13 @@ const ThreadRow = memo(function ThreadRow({
     </li>
   );
 });
+
+/** Was the tick a shift-click? Narrowed rather than cast: a keyboard-driven
+ * change is a click event too, so the instanceof is what tells a real modifier
+ * from a synthesized one. */
+function isShiftClick(event: Event): boolean {
+  return event instanceof MouseEvent && event.shiftKey;
+}
 
 /**
  * The record links a thread carries, as names rather than ids: ONE COMPONENT

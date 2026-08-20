@@ -221,9 +221,26 @@ search, and the "Hide in CRM" state remains orthogonal.
   with unread badges; INBOX default view; Trash/Junk appear when sync-enabled OR when the
   CRM holds rows in them — moves create such rows even for unsynced Trash). Folder
   choice feeds the thread-list `folder` filter and is part of the accumulation filter key.
+  **Built (Task 5), with two shape notes.** (1) "the CRM holds rows in them" is not a
+  question this release's API can answer — there is no per-folder MESSAGE count, only the
+  per-folder UNREAD one — so the sidebar keeps a switched-off folder when it holds unread
+  mail, and always keeps the account's own `trash_folder`, which is where the CRM's Trash
+  action files rows. A switched-off folder holding only READ mail is therefore not listed;
+  the picker is one click away and turning it back on restores it. (2) Sections are per OWN
+  account (the folders endpoint is owner-only), and picking a folder scopes the view to that
+  account as well as to the folder name — otherwise, with two accounts, "INBOX" would name
+  both. That pair is exactly the combined-EXISTS case the route was built for. The BADGES
+  still collapse across accounts, per `?byFolder=1`'s documented shape.
 - **Multi-select**: checkbox per row (visible on hover/when any selected), shift-click
   ranges, select-all-on-page; a bulk-action bar (Archive / Trash / Hide in CRM) with
   per-thread failure toasts from the bulk result. Selection clears on filter/folder change.
+  **In the UNFILTERED list — no folder filter active — the bulk actions send NO folder**
+  (coordinator ruling, Task 5): the selection was not made in a folder view, so the request
+  carries the whole-thread mode instead, the same one the single-thread buttons use (every
+  message except those already in the target and those in the account's Sent folder). The
+  folder-scoped mode applies exactly when the list is showing one folder. Select-all is
+  capped at the route's own 50 for trash/archive, and the two move buttons disable
+  themselves above it rather than letting the request 400.
 - **Settings → Mail accounts**: per-account folder checklist (from the folders endpoint;
   INBOX/sent locked on; Junk/Trash default off), and editable Trash/Archive folder
   overrides with the auto-detected values as placeholders.
