@@ -680,8 +680,11 @@ test.describe.serial("Mail journey", () => {
   test("classifies the move targets and switches the extra folder on from Settings", async () => {
     // The seeded Junk message is nowhere in the CRM: junk and trash are the two
     // roles a folder is left switched OFF in when it is first seen, so nothing
-    // has ever walked that mailbox.
+    // has ever walked that mailbox. Alice's row is waited for first, so the
+    // absence below is an absence from a LOADED list rather than from one that
+    // has not arrived yet.
     await page.goto("/mail");
+    await expect(threadRow(aliceSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
     await expect(threadRow(junkSubject)).toHaveCount(0);
 
     await page.goto("/settings/mail");
