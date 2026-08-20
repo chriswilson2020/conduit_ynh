@@ -500,6 +500,11 @@ export const mailAccountSchema = z.object({
   smtpHost: z.string().min(1), smtpPort: z.number().int().positive(), smtpSecurity: mailSecuritySchema,
   username: z.string().min(1),
   sentFolder: z.string().min(1),
+  // Phase 4.1: resolved automatically from folder discovery when NULL,
+  // user-overridable in Settings (mail_accounts.trash_folder/archive_folder,
+  // db/schema.ts) -- NULL is a real, meaningful "not yet resolved" state,
+  // same reasoning as signatureHtml/lastError below, not an omitted field.
+  trashFolder: nullableString, archiveFolder: nullableString,
   signatureHtml: nullableString,
   backfillDays: z.number().int().positive().nullable(),
   status: mailAccountStatusSchema,
@@ -546,8 +551,22 @@ export type MailAccountCreateInput = z.infer<typeof mailAccountCreateInputSchema
 // concern, not something a single static shape can express, so credential
 // updates route through mailAccountCreateInputSchema's password fields at
 // the call site instead of living on this schema.
+// trashFolder/archiveFolder are `.extend()`ed on AFTER the create-derived
+// shape rather than living on mailAccountCreateInputSchema itself (and being
+// `.omit()`-free-riding through the derivation like every other field here):
+// nothing about them is ever supplied at CREATE time (Phase 4.1 spec --
+// they're resolved from folder discovery, which only starts once the
+// account exists and a first LIST pass has run), so create stays exactly as
+// clean as it was pre-4.1 and these two are genuinely update-only. Typed via
+// nullableString (not a plain optional string) so a blank-string submission
+// is REJECTED outright, not silently accepted -- unlike sentFolder's own ""
+// => "keep the column default" convention (normalizeSentFolder,
+// mail-accounts.ts), "" is never a meaningful override here, only a real
+// folder name or an explicit null. Trimming a real value is service-side
+// work in Task 4 (mirroring normalizeSentFolder), not a schema concern.
 export const mailAccountUpdateInputSchema = mailAccountCreateInputSchema
-  .omit({ password: true, smtpPassword: true }).partial();
+  .omit({ password: true, smtpPassword: true }).partial()
+  .extend({ trashFolder: nullableString.optional(), archiveFolder: nullableString.optional() });
 export type MailAccountUpdateInput = z.infer<typeof mailAccountUpdateInputSchema>;
 
 // The update-path counterpart to mailAccountCreateInputSchema's password/
@@ -657,16 +676,35 @@ export const mailAccountListSchema = z.object({
 export type MailAccountList = z.infer<typeof mailAccountListSchema>;
 
 // One row of GET /api/mail/accounts/:id/folders (Phase 4.1 Task 4's folder
-// picker) -- mirrors mail_account_folders (api: db/schema.ts) field for
-// field; see that table's comments for what each carries and why
-// syncEnabled/lastDiscoveredAt have no DB-level default.
+// picker). Every field through lastDiscoveredAt mirrors mail_account_folders
+// (api: db/schema.ts) field for field -- see that table's comments for what
+// each carries and why syncEnabled/lastDiscoveredAt have no DB-level
+// default -- EXCEPT `locked`, which has no DB column at all: it is computed
+// by the route (true for INBOX and the account's current sent_folder, the
+// two folders foldersOf always walks regardless of sync_enabled -- spec)
+// so the picker can grey them out without the client re-deriving that rule
+// itself.
 export const mailAccountFolderSchema = z.object({
   id: z.uuid(), accountId: z.uuid(), folder: z.string().min(1),
   specialUse: specialUseSchema.nullable(),
-  syncEnabled: z.boolean(), selectable: z.boolean(),
+  syncEnabled: z.boolean(), selectable: z.boolean(), locked: z.boolean(),
   lastDiscoveredAt: z.iso.datetime(), ...timestamps,
 });
 export type MailAccountFolder = z.infer<typeof mailAccountFolderSchema>;
+
+// Trimmed, non-blank IMAP folder name -- shared by every folder-carrying
+// input field below (folderPatchInputSchema.folder,
+// bulkThreadActionInputSchema.folder, threadListFiltersSchema.folder).
+// Mirrors normalizeSentFolder's rationale (api: mail-accounts.ts) at the zod
+// layer instead of the service layer: an IMAP mailbox name is compared byte
+// for byte everywhere it is used downstream, so " Archive " and "Archive"
+// must never become two different values purely because of incidental
+// whitespace. Unlike sentFolder, none of these three fields has a DB column
+// with its own default to fall back to when blank -- a blank folder
+// filter/target/patch is simply invalid input, not "use the default", hence
+// reject-after-trim (`.min(1)` on the trimmed value) rather than
+// normalizeSentFolder's "blank becomes absent".
+const folderNameSchema = z.string().trim().min(1);
 
 // PATCH /api/mail/accounts/:id/folders body (Task 4): toggles one folder's
 // sync_enabled. Identifies the row by folder NAME rather than id -- the
@@ -675,7 +713,7 @@ export type MailAccountFolder = z.infer<typeof mailAccountFolderSchema>;
 // staying symmetric with bulkThreadActionInputSchema's folder field below
 // (also a name, not an id).
 export const folderPatchInputSchema = z.object({
-  folder: z.string().min(1), syncEnabled: z.boolean(),
+  folder: folderNameSchema, syncEnabled: z.boolean(),
 });
 export type FolderPatchInput = z.infer<typeof folderPatchInputSchema>;
 
@@ -819,8 +857,14 @@ export const threadListFiltersSchema = z.object({
   archived: z.boolean().optional(),
   // The folder view driving the thread list (Phase 4.1): threads with >= 1
   // message in this folder (spec) -- absent means "every synced folder",
-  // same as every other optional filter here.
-  folder: z.string().min(1).optional(),
+  // same as every other optional filter here. When accountId AND folder are
+  // BOTH present, the route must build ONE combined EXISTS (a single
+  // subquery testing account_id = ? AND folder = ? together), never two
+  // separate per-filter EXISTS clauses -- the latter would each pass
+  // independently for a thread whose INBOX message sits on account A and
+  // whose matching-folder message sits on a DIFFERENT account B, wrongly
+  // including it in the result (Task 4).
+  folder: folderNameSchema.optional(),
   cursor: z.string().min(1).optional(),
   limit: z.number().int().positive().max(100).optional(),
 });
@@ -834,32 +878,58 @@ export type ThreadListFilters = z.infer<typeof threadListFiltersSchema>;
 export const bulkThreadActionKindSchema = z.enum(["trash", "archive", "hide"]);
 export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
 
-// POST /api/mail/threads/bulk body (Task 4). folder is the VIEW the
-// selection was made in, not a destination -- trash/archive always target
-// the owning account's trash_folder/archive_folder (spec: "only
-// Trash/Archive targets in v0.6.0"); it tells the move service which of
-// each thread's messages (the ones currently sitting in THAT folder) the
-// action applies to, per the selection-granularity ruling. threadIds capped
-// at 200: large enough for a full page of multi-select, small enough that
-// one request's per-account IMAP MOVE queueing stays bounded; `.min(1)`
-// because a bulk action against zero threads is not a request, it's a bug
-// in whatever sent it.
+// POST /api/mail/threads/bulk body (Task 4). folder is OPTIONAL and carries
+// two distinct modes (spec, Move write-back). PRESENT means folder-scoped --
+// the list multi-select case, where folder is the VIEW the selection was
+// made in and the move service acts only on each thread's messages
+// currently sitting in THAT folder, per the selection-granularity ruling.
+// ABSENT means whole-thread semantics -- the single-thread buttons
+// (conversation view, record Mail tabs), where the move service instead
+// acts on ALL of the thread's messages EXCEPT those already in the target
+// folder and those in the account's sent folder (archiving a conversation
+// must never empty Sent). Either way, trash/archive target the owning
+// account's trash_folder/archive_folder (spec: "only Trash/Archive targets
+// in v0.6.0"); `hide` ignores folder entirely in both modes -- it is the
+// CRM-side thread archive, which has no concept of an IMAP folder at all.
+// threadIds capped at 200: large enough for a full page of multi-select,
+// small enough that one request's per-account IMAP MOVE queueing stays
+// bounded; `.min(1)` because a bulk action against zero threads is not a
+// request, it's a bug in whatever sent it.
 export const bulkThreadActionInputSchema = z.object({
   threadIds: z.array(z.uuid()).min(1).max(200),
-  folder: z.string().min(1),
+  folder: folderNameSchema.optional(),
   action: bulkThreadActionKindSchema,
 });
 export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
 
-// POST /api/mail/threads/bulk response: one entry per requested thread, in
-// the same order, so the client can zip failures back to specific rows for
-// the toast/inline-alert (spec, Frontend section). error is present only
-// when ok is false, mirroring mailAccountTestResultSchema's per-protocol
-// shape above.
+// One entry of POST /api/mail/threads/bulk's response, in the same order as
+// the request's threadIds so the client can zip failures back to specific
+// rows for the toast/inline-alert (spec, Frontend section). Two
+// correlations are enforced structurally here, not left to convention:
+// `error` is present IFF `ok` is false (mirroring
+// mailAccountTestResultSchema's per-protocol shape above), and
+// `skipped: true` can only accompany `ok: true` -- a skip is the move
+// service finding nothing eligible to move (every message in this thread's
+// relevant folder view was awaiting reconciliation, NULL imap_uid), which
+// is a successful no-op, not a failure.
+const bulkThreadResultItemSchema = z.object({
+  threadId: z.uuid(),
+  ok: z.boolean(),
+  skipped: z.boolean().optional(),
+  error: z.string().optional(),
+}).superRefine((v, ctx) => {
+  if (v.ok && v.error !== undefined) {
+    ctx.addIssue({ code: "custom", path: ["error"], message: "error must be absent when ok is true" });
+  }
+  if (!v.ok && v.error === undefined) {
+    ctx.addIssue({ code: "custom", path: ["error"], message: "error is required when ok is false" });
+  }
+  if (v.skipped === true && !v.ok) {
+    ctx.addIssue({ code: "custom", path: ["skipped"], message: "skipped can only be true when ok is true" });
+  }
+});
 export const bulkThreadResultSchema = z.object({
-  results: z.array(z.object({
-    threadId: z.uuid(), ok: z.boolean(), error: z.string().optional(),
-  })),
+  results: z.array(bulkThreadResultItemSchema),
 });
 export type BulkThreadResult = z.infer<typeof bulkThreadResultSchema>;
 

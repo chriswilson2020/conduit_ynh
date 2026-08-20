@@ -169,7 +169,7 @@ function account(): MailAccount {
     label: "CI Dovecot", email: USERNAME,
     imapHost: IMAP_HOST, imapPort: IMAP_PORT, imapSecurity: "tls",
     smtpHost: SMTP_HOST, smtpPort: SMTP_PORT, smtpSecurity: "starttls",
-    username: USERNAME, sentFolder: "Sent", signatureHtml: null,
+    username: USERNAME, sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null,
     backfillDays: null, status: "active", lastError: null,
     lastSyncedAt: null, archivedAt: null, createdAt: now, updatedAt: now,
   };

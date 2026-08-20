@@ -21,6 +21,8 @@ const storedAccount: MailAccount = {
   smtpHost: "mail.example.com", smtpPort: 587, smtpSecurity: "starttls",
   username: "chris",
   sentFolder: "Sent",
+  trashFolder: null,
+  archiveFolder: null,
   signatureHtml: null,
   backfillDays: 90,
   status: "active",

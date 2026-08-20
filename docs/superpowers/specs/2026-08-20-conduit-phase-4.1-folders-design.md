@@ -35,9 +35,11 @@ Decisions taken with Chris in the 4.1 brainstorm:
 - `mail_folder_state` unchanged (it is already keyed by (account, folder) and generalises
   as-is). `sent_folder` on mail_accounts unchanged (APPEND target; discovery marks it
   special_use=sent when they agree).
-- No new indexes expected beyond UNIQUE; the existing (account_id, folder, imap_uid) index
-  serves the folder-scoped reads. Confirm with EXPLAIN during implementation (house rule:
-  hand-written indexes carry a named query).
+- No new indexes expected beyond UNIQUE. The existing (account_id, folder, imap_uid) index is
+  expected, unverified, to help the folder-scoped thread-list filter — it carries no
+  `thread_id`, so the filter's actual query shape (join or EXISTS back to `mail_threads`) is
+  what Task 4 must EXPLAIN against seeded data before this claim stands (house rule:
+  hand-written indexes carry a named query, and state only what was measured).
 
 ## Folder discovery & classification
 
@@ -69,10 +71,20 @@ falsy return per the established falsy-return discipline). `AccountSync` exposes
 contract as `markSeen`: runs between passes, fast-rejects with `SyncUnavailableError`
 during backoff, never overlaps a pass.
 
-Move service semantics, per thread, per account:
-1. Collect the thread's messages whose `folder` equals the CURRENT VIEW's folder (the
-   selection-granularity ruling) and whose `imap_uid` is NOT NULL (rows awaiting
-   reconciliation are skipped and reported per-thread — rare, self-heals next pass).
+Move service semantics, per thread, per account. Step 1 has two modes, selected by whether
+the caller supplied a `folder` (quality-review ruling, mirrored on `bulkThreadActionInput`
+below):
+1. Collect the thread's messages whose `imap_uid` is NOT NULL (rows awaiting reconciliation
+   are skipped and reported per-thread — rare, self-heals next pass), scoped one of two ways:
+   - **Folder-scoped** (`folder` present — the list multi-select case): only messages whose
+     `folder` equals the CURRENT VIEW's folder (the selection-granularity ruling).
+   - **Whole-thread** (`folder` absent — the single-thread buttons in the conversation view
+     and record Mail tabs): every one of the thread's messages EXCEPT those already in the
+     target folder (nothing to do) and those in the account's sent folder (archiving a
+     conversation must never empty Sent).
+   If the resulting set is empty (every eligible message across the thread awaited
+   reconciliation), the move is a no-op for this thread: reported as `{ ok: true, skipped:
+   true }`, not a failure.
 2. Optimistic DB update inside one transaction: `folder` = target, `imap_uid` = NULL,
    `updated_at` bumped; SSE hints published after commit.
 3. Queue the IMAP MOVE (grouped per account/folder, chunked per the existing UID_CHUNK).
@@ -98,11 +110,16 @@ search, and the "Hide in CRM" state remains orthogonal.
   selectable, locked flags for INBOX/sent).
 - `PATCH /api/mail/accounts/:id/folders` — toggle sync_enabled (owner-only; INBOX/sent
   locked; enabling triggers `syncNow`).
-- `POST /api/mail/threads/bulk` — `{ threadIds[], folder, action: "trash"|"archive"|"hide" }`
-  (folder = the view the selection was made in; `hide` is the existing CRM archive applied
-  in bulk). Server groups by account, applies the move service, returns per-thread results
-  `{ threadId, ok, error? }` — an account in backoff or with an unresolvable target folder
-  fails ITS threads with a message; others proceed. Cap threadIds at 200 per request.
+- `POST /api/mail/threads/bulk` — `{ threadIds[], folder?, action: "trash"|"archive"|"hide" }`.
+  `folder` is now OPTIONAL, carrying the move service's two modes above: present = the view
+  the selection was made in (list multi-select, folder-scoped); absent = whole-thread (the
+  conversation view/record-tab single-thread buttons). `hide` (the existing CRM archive
+  applied in bulk) ignores `folder` entirely either way. Server groups by account, applies
+  the move service, returns per-thread results `{ threadId, ok, skipped?, error? }` —
+  `skipped: true` (always paired with `ok: true`) means nothing moved because every eligible
+  message awaited reconciliation; `error` is present iff `ok` is false. An account in backoff
+  or with an unresolvable target folder fails ITS threads with a message; others proceed.
+  Cap threadIds at 200 per request.
 - Thread list gains a `folder` filter (threads with >= 1 message in that folder); the
   unread-count endpoint gains an optional per-folder variant for sidebar badges (one grouped
   query, not N).

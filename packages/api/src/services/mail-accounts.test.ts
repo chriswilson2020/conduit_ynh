@@ -107,6 +107,16 @@ describe("createAccount", () => {
     expect(unlimited.backfillDays).toBeNull();
   });
 
+  // trashFolder/archiveFolder are update-only (mailAccountUpdateInputSchema's
+  // own comment): mailAccountCreateInputSchema never accepts them, so a
+  // fresh account always starts out with nothing resolved yet -- folder
+  // discovery (Task 2) or a Settings override are the only ways either ever
+  // becomes non-null.
+  it("starts trashFolder/archiveFolder as null -- nothing is discovered at create time", async () => {
+    const account = await make({ email: "fresh@example.com" });
+    expect(account).toMatchObject({ trashFolder: null, archiveFolder: null });
+  });
+
   it("trims sent_folder on write, and treats a blank one as absent", async () => {
     // An IMAP mailbox name is compared byte for byte: a stored " Sent " is a
     // different mailbox from "Sent" everywhere it is used -- including
@@ -162,6 +172,24 @@ describe("updateAccount", () => {
     );
     expect(resubmitted.sentFolder).toBe("Archive");
     expect(resubmitted.updatedAt).toBe(moved.updatedAt);
+  });
+
+  it("persists trashFolder/archiveFolder overrides, and toMailAccount surfaces them back", async () => {
+    const account = await make();
+    const withOverrides = await updateAccount(
+      handle.db, actorId, account.id, { trashFolder: "Deleted Items", archiveFolder: "Archive" }, keyPath,
+    );
+    expect(withOverrides).toMatchObject({ trashFolder: "Deleted Items", archiveFolder: "Archive" });
+
+    // Re-fetched from the DB, not just the in-memory return value -- proves
+    // the columns actually persisted, not merely that toMailAccount echoed
+    // the submitted patch.
+    const refetched = await getOwnAccount(handle.db, actorId, account.id);
+    expect(refetched).toMatchObject({ trashFolder: "Deleted Items", archiveFolder: "Archive" });
+
+    // An explicit null clears a previously-set override.
+    const cleared = await updateAccount(handle.db, actorId, account.id, { trashFolder: null }, keyPath);
+    expect(cleared).toMatchObject({ trashFolder: null, archiveFolder: "Archive" });
   });
 
   it("absent/empty password fields keep the stored credentials", async () => {

@@ -115,7 +115,9 @@ function toMailAccount(row: MailAccountRow) {
     imapHost: row.imapHost, imapPort: row.imapPort, imapSecurity: row.imapSecurity as MailSecurity,
     smtpHost: row.smtpHost, smtpPort: row.smtpPort, smtpSecurity: row.smtpSecurity as MailSecurity,
     username: row.username,
-    sentFolder: row.sentFolder, signatureHtml: row.signatureHtml, backfillDays: row.backfillDays,
+    sentFolder: row.sentFolder,
+    trashFolder: row.trashFolder, archiveFolder: row.archiveFolder,
+    signatureHtml: row.signatureHtml, backfillDays: row.backfillDays,
     status: row.status as MailAccountStatus, lastError: row.lastError,
     lastSyncedAt: row.lastSyncedAt?.toISOString() ?? null,
     archivedAt: row.archivedAt?.toISOString() ?? null,
@@ -274,6 +276,13 @@ export async function updateAccount(
   // (and then overwrite) the "Sent" already in the column. A whitespace-only
   // submission normalises to undefined, i.e. drops out of the patch entirely
   // -- see normalizeSentFolder.
+  // trashFolder/archiveFolder deliberately get NO equivalent normalisation
+  // here yet -- the shared schema's nullableString already rejects a blank
+  // submission outright (mailAccountUpdateInputSchema's own comment), so
+  // there is no "" to normalise away, and unlike sentFolder there is no
+  // stored default a whitespace-only value should fall back to. Real-value
+  // trimming (" Archive " -> "Archive") is Task 4 work, once the folder
+  // picker actually submits these.
   const withSentFolder = rest.sentFolder !== undefined
     ? { ...rest, sentFolder: normalizeSentFolder(rest.sentFolder) }
     : rest;

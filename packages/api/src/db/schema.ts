@@ -387,6 +387,17 @@ export const mailAccountFolders = pgTable("mail_account_folders", {
   // (Task 2) at insert time. Same reasoning as deals.currency-style fields
   // elsewhere in this file (see deals.currency's comment above) -- config
   // the app decides, not a constant baked into the DDL.
+  //
+  // Provenance: this default is set ONLY on first sight -- Task 2's
+  // discovery upsert must never overwrite an existing row's sync_enabled on
+  // a later LIST pass (a user's toggle must survive re-discovery). One
+  // consequence, accepted: the no-clobber rule also freezes the FIRST-sight
+  // default forever. If a folder is later reclassified (e.g. a server
+  // starts advertising SPECIAL-USE it didn't before, flipping an ordinary
+  // folder to junk/trash), the already-stored sync_enabled does NOT
+  // re-default to match the new classification -- only special_use updates.
+  // Task 2 documents this precisely at the upsert site, where the no-clobber
+  // logic actually lives.
   syncEnabled: boolean("sync_enabled").notNull(),
   // \Noselect folders (a pure hierarchy separator, no messages of its own)
   // are still listed -- for the picker and for classification -- but never

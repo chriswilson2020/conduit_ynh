@@ -16,7 +16,7 @@ import { createContact } from "../services/contacts.js";
 import { createPipeline, createStage } from "../services/pipelines.js";
 import { createDeal } from "../services/deals.js";
 import { createProject } from "../services/projects.js";
-import { createDatabase, migrationsFolder } from "./client.js";
+import { createDatabase, migrationsFolder, type DatabaseHandle } from "./client.js";
 import {
   users, companies, contacts, pipelines, stages, deals, projects,
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
@@ -41,6 +41,77 @@ function accountValues(overrides: Partial<typeof mailAccounts.$inferInsert> = {}
     username: "chris", credentialsCiphertext: "v1:iv:tag:data",
     ...overrides,
   } satisfies typeof mailAccounts.$inferInsert;
+}
+
+/**
+ * Scaffolding shared by every "upgrade a populated pre-N database" drill --
+ * extracted from the two near-identical copies that used to live inline in
+ * the 0004 and 0005 tests below, so a future 0006 upgrade test inherits it
+ * for free instead of copying the ceremony a third time.
+ *
+ * Builds a trimmed migrations folder holding only the journal entries
+ * strictly before the one whose tag starts with `tag` (e.g. "0004"),
+ * derived from the REAL journal rather than hardcoded -- so this keeps
+ * working unmodified once a later migration ships and `tag` stops being the
+ * newest entry. Creates a throwaway scratch database, migrates it to that
+ * pre-N state, and hands the resulting handle to `fn`.
+ *
+ * `fn` owns everything that happens next: seeding old-shape data, applying
+ * the real (full) migrations folder -- the actual "upgrade" moment -- and
+ * asserting survival. That split is deliberate: which tables get seeded in
+ * the old shape, and what the post-upgrade assertions check, is the one
+ * thing that genuinely differs between drills, while the database
+ * lifecycle around it (create, migrate-to-old-state, close, drop, clean up
+ * the tmp folder -- always, even on failure) does not.
+ */
+async function withPreMigrationDatabase(
+  tag: string,
+  fn: (scratch: DatabaseHandle) => Promise<void>,
+): Promise<void> {
+  const realFolder = migrationsFolder();
+  const journal = JSON.parse(
+    readFileSync(path.join(realFolder, "meta", "_journal.json"), "utf8"),
+  ) as { entries: { idx: number; tag: string }[] };
+  const boundary = journal.entries.find((e) => e.tag.startsWith(`${tag}_`));
+  if (boundary === undefined) throw new Error(`could not find a ${tag} migration in the journal`);
+  const preEntries = journal.entries.filter((e) => e.idx < boundary.idx);
+  const tmpFolder = mkdtempSync(path.join(tmpdir(), `conduit-pre${tag}-`));
+  const dbName = `conduit_test_upgrade_${randomUUID().replace(/-/g, "")}`;
+
+  // CREATE DATABASE and every subsequent step live inside the try so the
+  // finally below always runs cleanup, including on a failure between
+  // creating the database and finishing the caller's migration/insert
+  // sequence (rather than leaking a scratch database that partially
+  // succeeded).
+  let scratch: DatabaseHandle | undefined;
+  try {
+    mkdirSync(path.join(tmpFolder, "meta"));
+    for (const entry of preEntries) {
+      copyFileSync(path.join(realFolder, `${entry.tag}.sql`), path.join(tmpFolder, `${entry.tag}.sql`));
+    }
+    writeFileSync(
+      path.join(tmpFolder, "meta", "_journal.json"),
+      JSON.stringify({ ...journal, entries: preEntries }),
+    );
+
+    await handle.db.execute(sql.raw(`CREATE DATABASE "${dbName}"`));
+    const scratchUrl = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${dbName}`);
+    scratch = createDatabase(scratchUrl, 1);
+
+    // Old state: everything strictly before `tag` applied.
+    await migrate(scratch.db, { migrationsFolder: tmpFolder });
+
+    await fn(scratch);
+  } finally {
+    await scratch?.close();
+    // WITH (FORCE) (PG 15+, confirmed on the dev server): disconnects any
+    // straggling connection to the scratch database itself rather than
+    // failing the drop -- belt-and-braces alongside the explicit close()
+    // above, since a lingering connection would otherwise leak the database
+    // this test just created.
+    await handle.db.execute(sql.raw(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`));
+    rmSync(tmpFolder, { recursive: true, force: true });
+  }
 }
 
 describe("mail schema (0004)", () => {
@@ -101,42 +172,7 @@ describe("mail schema (0004)", () => {
   // database (created and dropped here), never touching the shared
   // conduit_test database other sessions rely on.
   it("applies migration 0004 on top of a real database already migrated only through 0003 and already carrying data", async () => {
-    const dbName = `conduit_test_upgrade_${randomUUID().replace(/-/g, "")}`;
-    const realFolder = migrationsFolder();
-    const journal = JSON.parse(
-      readFileSync(path.join(realFolder, "meta", "_journal.json"), "utf8"),
-    ) as { entries: { idx: number; tag: string }[] };
-    // Derived, not hardcoded to idx <= 3: locates 0004 by tag and takes
-    // everything strictly before it, so a future 0005 (added after 0004
-    // ships and this migration stops being hand-editable) doesn't silently
-    // change what "pre-0004" means here.
-    const migration0004 = journal.entries.find((e) => e.tag.startsWith("0004_"));
-    if (migration0004 === undefined) throw new Error("could not find a 0004 migration in the journal");
-    const pre0004Entries = journal.entries.filter((e) => e.idx < migration0004.idx);
-    const tmpFolder = mkdtempSync(path.join(tmpdir(), "conduit-pre0004-"));
-
-    // CREATE DATABASE and every subsequent step live inside the try so the
-    // finally below always runs cleanup, including on a failure between
-    // creating the database and finishing the migration/insert sequence
-    // (rather than leaking a scratch database that partially succeeded).
-    let scratch: ReturnType<typeof createDatabase> | undefined;
-    try {
-      mkdirSync(path.join(tmpFolder, "meta"));
-      for (const entry of pre0004Entries) {
-        copyFileSync(path.join(realFolder, `${entry.tag}.sql`), path.join(tmpFolder, `${entry.tag}.sql`));
-      }
-      writeFileSync(
-        path.join(tmpFolder, "meta", "_journal.json"),
-        JSON.stringify({ ...journal, entries: pre0004Entries }),
-      );
-
-      await handle.db.execute(sql.raw(`CREATE DATABASE "${dbName}"`));
-      const scratchUrl = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${dbName}`);
-      scratch = createDatabase(scratchUrl, 1);
-
-      // Old state: only 0000-0003 applied.
-      await migrate(scratch.db, { migrationsFolder: tmpFolder });
-
+    await withPreMigrationDatabase("0004", async (scratch) => {
       // Real pre-existing data, inserted while the database is genuinely at
       // 0003 -- companies/contacts/pipelines/stages/deals/projects/users are
       // byte-identical between 0003 and 0004 (0004 touches none of them), so
@@ -157,7 +193,7 @@ describe("mail schema (0004)", () => {
       // Upgrade: apply the real, full migrations folder. With 0005 now in
       // the journal too, this applies both 0004 and 0005 in one go (0000-
       // 0003 are already recorded as applied).
-      await migrate(scratch.db, { migrationsFolder: realFolder });
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
 
       // The pre-existing data survived the upgrade untouched.
       const [rereadCompany] = await scratch.db.select().from(companies).where(eq(companies.id, company!.id));
@@ -179,16 +215,7 @@ describe("mail schema (0004)", () => {
       expect(thread).toMatchObject({
         companyId: company!.id, contactId: contact!.id, dealId: deal!.id, projectId: project!.id,
       });
-    } finally {
-      await scratch?.close();
-      // WITH (FORCE) (PG 15+, confirmed on the dev server): disconnects any
-      // straggling connection to the scratch database itself rather than
-      // failing the drop -- belt-and-braces alongside the explicit close()
-      // above, since a lingering connection would otherwise leak the
-      // database this test just created.
-      await handle.db.execute(sql.raw(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`));
-      rmSync(tmpFolder, { recursive: true, force: true });
-    }
+    });
   }, 30000);
 
   it("applies every column default when a row supplies only the required fields", async () => {
@@ -458,37 +485,7 @@ describe("mail folder schema (0005)", () => {
   // and the new table works against that same pre-existing account. Runs
   // against its own scratch database, never the shared conduit_test one.
   it("applies migration 0005 on top of a real database already migrated only through 0004 and already carrying mail data", async () => {
-    const dbName = `conduit_test_upgrade_${randomUUID().replace(/-/g, "")}`;
-    const realFolder = migrationsFolder();
-    const journal = JSON.parse(
-      readFileSync(path.join(realFolder, "meta", "_journal.json"), "utf8"),
-    ) as { entries: { idx: number; tag: string }[] };
-    // Derived, not hardcoded to idx <= 4: locates 0005 by tag and takes
-    // everything strictly before it, so a future 0006 doesn't silently
-    // change what "pre-0005" means here.
-    const migration0005 = journal.entries.find((e) => e.tag.startsWith("0005_"));
-    if (migration0005 === undefined) throw new Error("could not find a 0005 migration in the journal");
-    const pre0005Entries = journal.entries.filter((e) => e.idx < migration0005.idx);
-    const tmpFolder = mkdtempSync(path.join(tmpdir(), "conduit-pre0005-"));
-
-    let scratch: ReturnType<typeof createDatabase> | undefined;
-    try {
-      mkdirSync(path.join(tmpFolder, "meta"));
-      for (const entry of pre0005Entries) {
-        copyFileSync(path.join(realFolder, `${entry.tag}.sql`), path.join(tmpFolder, `${entry.tag}.sql`));
-      }
-      writeFileSync(
-        path.join(tmpFolder, "meta", "_journal.json"),
-        JSON.stringify({ ...journal, entries: pre0005Entries }),
-      );
-
-      await handle.db.execute(sql.raw(`CREATE DATABASE "${dbName}"`));
-      const scratchUrl = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${dbName}`);
-      scratch = createDatabase(scratchUrl, 1);
-
-      // Old state: only 0000-0004 applied.
-      await migrate(scratch.db, { migrationsFolder: tmpFolder });
-
+    await withPreMigrationDatabase("0005", async (scratch) => {
       // Real pre-existing mail data, inserted while the database is
       // genuinely at 0004. mail_threads/mail_messages are byte-identical
       // between 0004 and 0005, so the real schema.ts table objects describe
@@ -520,7 +517,7 @@ describe("mail folder schema (0005)", () => {
 
       // Upgrade: apply the real, full migrations folder. 0005 is the only
       // pending migration (0000-0004 are already recorded as applied).
-      await migrate(scratch.db, { migrationsFolder: realFolder });
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
 
       // The pre-existing mail data survived the upgrade untouched.
       const [rereadAccount] = await scratch.db.select().from(mailAccounts).where(eq(mailAccounts.id, account!.id));
@@ -538,16 +535,7 @@ describe("mail folder schema (0005)", () => {
         .values(folderValues(account!.id, { folder: "Archive", specialUse: "archive" }))
         .returning();
       expect(folderRow).toMatchObject({ accountId: account!.id, folder: "Archive", specialUse: "archive" });
-    } finally {
-      await scratch?.close();
-      // WITH (FORCE) (PG 15+, confirmed on the dev server): disconnects any
-      // straggling connection to the scratch database itself rather than
-      // failing the drop -- belt-and-braces alongside the explicit close()
-      // above, since a lingering connection would otherwise leak the
-      // database this test just created.
-      await handle.db.execute(sql.raw(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`));
-      rmSync(tmpFolder, { recursive: true, force: true });
-    }
+    });
   }, 30000);
 
   it("applies column defaults (selectable true, specialUse null) and leaves a fresh account's trash/archive folders NULL", async () => {
@@ -569,6 +557,51 @@ describe("mail folder schema (0005)", () => {
     ).rejects.toMatchObject({
       cause: { message: expect.stringMatching(/mail_account_folders_account_folder_unique|unique/i) },
     });
+  });
+
+  // Mirrors the 0004 block's own duplicate-mailbox-unique test above (the
+  // bare `cause: { code }` style, not a message regex -- an FK violation's
+  // message is verbose and less stable to match against than its code).
+  it("enforces the account_id foreign key on mail_account_folders", async () => {
+    await expect(
+      handle.db.insert(mailAccountFolders).values(folderValues(randomUUID())),
+    ).rejects.toMatchObject({ cause: { code: "23503" } });
+  });
+
+  // The exact shape Task 2's discovery upsert is built on: INSERT ...
+  // ON CONFLICT (account_id, folder) DO UPDATE, refreshing last_discovered_at
+  // (and, in the real upsert, special_use) while leaving sync_enabled
+  // untouched -- the no-clobber rule from this table's own syncEnabled
+  // comment (schema.ts), exercised here in isolation rather than waiting for
+  // Task 2's service to exist.
+  it("upserts on (account_id, folder) via ON CONFLICT DO UPDATE, preserving a user's syncEnabled toggle across re-discovery", async () => {
+    const [account] = await handle.db.insert(mailAccounts)
+      .values(accountValues({ email: "upsert@example.com" })).returning();
+    const firstSeen = new Date("2026-08-01T00:00:00.000Z");
+    const [inserted] = await handle.db.insert(mailAccountFolders)
+      .values(folderValues(account!.id, { folder: "Projects", syncEnabled: true, lastDiscoveredAt: firstSeen }))
+      .returning();
+    expect(inserted).toMatchObject({ syncEnabled: true });
+
+    // The user toggles it off in Settings, out of band from any discovery pass.
+    await handle.db.update(mailAccountFolders).set({ syncEnabled: false })
+      .where(eq(mailAccountFolders.id, inserted!.id));
+
+    // A later LIST pass re-sights the same folder and upserts it. The
+    // conflicting insert's own syncEnabled: true must NOT win -- the DO
+    // UPDATE set below deliberately omits syncEnabled, same as Task 2's real
+    // upsert will, so the row's current (user-toggled-off) value survives.
+    const secondSeen = new Date("2026-08-15T00:00:00.000Z");
+    const [reupserted] = await handle.db.insert(mailAccountFolders)
+      .values(folderValues(account!.id, {
+        folder: "Projects", syncEnabled: true, lastDiscoveredAt: secondSeen, specialUse: null,
+      }))
+      .onConflictDoUpdate({
+        target: [mailAccountFolders.accountId, mailAccountFolders.folder],
+        set: { lastDiscoveredAt: secondSeen, specialUse: null },
+      })
+      .returning();
+    expect(reupserted).toMatchObject({ id: inserted!.id, syncEnabled: false, lastDiscoveredAt: secondSeen });
   });
 
   // Mirrors the 0004 describe block's "keeps ... in sync with their DB

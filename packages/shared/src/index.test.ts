@@ -739,7 +739,7 @@ describe("mailAccountSchema", () => {
     imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
     smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
     username: "chris",
-    sentFolder: "Sent", signatureHtml: null, backfillDays: 90,
+    sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null, backfillDays: 90,
     status: "active" as const, lastError: null, lastSyncedAt: null,
     archivedAt: null, createdAt: now, updatedAt: now,
   };
@@ -750,6 +750,14 @@ describe("mailAccountSchema", () => {
 
   it("accepts a null backfillDays (NULL means sync everything)", () => {
     expect(mailAccountSchema.parse({ ...account, backfillDays: null }).backfillDays).toBeNull();
+  });
+
+  // Phase 4.1: resolved trash/archive folders are real, non-null strings
+  // once discovery (or a user override) has set them -- the account literal
+  // above only exercises the "not yet resolved" NULL case.
+  it("accepts resolved trashFolder/archiveFolder values", () => {
+    const resolved = { ...account, trashFolder: "Trash", archiveFolder: "Archive" };
+    expect(mailAccountSchema.parse(resolved)).toEqual(resolved);
   });
 
   it("rejects an imapSecurity value outside tls/starttls", () =>
@@ -811,6 +819,22 @@ describe("mailAccountUpdateInputSchema", () => {
 
   it("has no password field at all (blank-means-unchanged is a service concern)", () => {
     expect(Object.keys(mailAccountUpdateInputSchema.shape)).not.toContain("password");
+  });
+
+  // trashFolder/archiveFolder exist only on this update-derived shape (see
+  // its extend()-after-omit().partial() comment) -- both a real override and
+  // an explicit null (clearing one) must parse.
+  it("accepts trashFolder/archiveFolder overrides, including explicit null", () => {
+    const withOverrides = { trashFolder: "Trash", archiveFolder: null };
+    expect(mailAccountUpdateInputSchema.parse(withOverrides)).toEqual(withOverrides);
+  });
+
+  // nullableString's whole point here: "" is never a meaningful override
+  // (unlike sentFolder's own "" => keep-default convention), so it must be
+  // rejected outright rather than silently accepted or coerced to null.
+  it("rejects a blank-string trashFolder/archiveFolder submission", () => {
+    expect(() => mailAccountUpdateInputSchema.parse({ trashFolder: "" })).toThrow();
+    expect(() => mailAccountUpdateInputSchema.parse({ archiveFolder: "" })).toThrow();
   });
 });
 
@@ -913,7 +937,7 @@ describe("mailAccountListSchema", () => {
       imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
       smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
       username: "chris",
-      sentFolder: "Sent", signatureHtml: null, backfillDays: 90,
+      sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null, backfillDays: 90,
       status: "active" as const, lastError: null, lastSyncedAt: null,
       archivedAt: null, createdAt: now, updatedAt: now,
     };
@@ -932,25 +956,22 @@ describe("specialUseSchema", () => {
       expect(specialUseSchema.parse(value)).toBe(value);
     }
   });
-
-  it("rejects a value outside the five (an ordinary folder is NULL, not a sixth member)", () =>
-    expect(() => specialUseSchema.parse("none")).toThrow());
 });
 
 describe("mailAccountFolderSchema", () => {
-  it("accepts a classified folder row", () => {
+  it("accepts a classified, locked folder row", () => {
     const folder = {
       id: uuid1, accountId: uuid2, folder: "Archive",
-      specialUse: "archive" as const, syncEnabled: true, selectable: true,
+      specialUse: "archive" as const, syncEnabled: true, selectable: true, locked: false,
       lastDiscoveredAt: now, createdAt: now, updatedAt: now,
     };
     expect(mailAccountFolderSchema.parse(folder)).toEqual(folder);
   });
 
-  it("accepts an unclassified folder (specialUse null)", () => {
+  it("accepts an unclassified, locked folder (specialUse null, locked true for INBOX/sent)", () => {
     const folder = {
-      id: uuid1, accountId: uuid2, folder: "Sieve/Newsletters",
-      specialUse: null, syncEnabled: false, selectable: true,
+      id: uuid1, accountId: uuid2, folder: "INBOX",
+      specialUse: null, syncEnabled: true, selectable: true, locked: true,
       lastDiscoveredAt: now, createdAt: now, updatedAt: now,
     };
     expect(mailAccountFolderSchema.parse(folder)).toEqual(folder);
@@ -965,6 +986,15 @@ describe("folderPatchInputSchema", () => {
 
   it("rejects a patch missing syncEnabled", () =>
     expect(() => folderPatchInputSchema.parse({ folder: "Archive" })).toThrow());
+
+  // folderNameSchema's whole point: trims incidental whitespace (an IMAP
+  // mailbox name is compared byte for byte downstream) and rejects a
+  // whitespace-only name outright rather than accepting it as some
+  // meaningless "" folder.
+  it("trims a folder name and rejects a blank (whitespace-only) one", () => {
+    expect(folderPatchInputSchema.parse({ folder: "  Archive  ", syncEnabled: true }).folder).toBe("Archive");
+    expect(() => folderPatchInputSchema.parse({ folder: "   ", syncEnabled: true })).toThrow();
+  });
 });
 
 describe("mailThreadSchema", () => {
@@ -1056,7 +1086,8 @@ describe("mailAccountWithSyncStatsSchema", () => {
     id: uuid1, userId: uuid2, label: "Work", email: "chris@example.com",
     imapHost: "localhost", imapPort: 993, imapSecurity: "tls" as const,
     smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
-    username: "chris", sentFolder: "Sent", signatureHtml: null, backfillDays: 90,
+    username: "chris", sentFolder: "Sent", trashFolder: null, archiveFolder: null,
+    signatureHtml: null, backfillDays: 90,
     status: "active" as const, lastError: null, lastSyncedAt: null,
     archivedAt: null, createdAt: now, updatedAt: now,
   };
@@ -1155,15 +1186,41 @@ describe("threadListFiltersSchema", () => {
   it("accepts no filters at all (unfiltered list)", () => {
     expect(threadListFiltersSchema.parse({})).toEqual({});
   });
+
+  // folderNameSchema's trim/reject-blank behaviour, exercised through this
+  // filter specifically (folderPatchInputSchema's own describe block covers
+  // the shared schema in isolation).
+  it("trims the folder filter and rejects a blank (whitespace-only) one", () => {
+    expect(threadListFiltersSchema.parse({ folder: "  INBOX  " }).folder).toBe("INBOX");
+    expect(() => threadListFiltersSchema.parse({ folder: "   " })).toThrow();
+  });
 });
 
 describe("bulkThreadActionKindSchema and bulkThreadActionInputSchema", () => {
-  it("accepts each of the three action kinds", () => {
+  it("accepts each of the three action kinds, folder-scoped (folder present)", () => {
     for (const action of ["trash", "archive", "hide"] as const) {
       expect(bulkThreadActionKindSchema.parse(action)).toBe(action);
       const input = { threadIds: [uuid1], folder: "INBOX", action };
       expect(bulkThreadActionInputSchema.parse(input)).toEqual(input);
     }
+  });
+
+  // The whole-thread mode (single-thread conversation/record-tab buttons):
+  // folder absent entirely, not folder: undefined or "" -- the move
+  // service branches on presence, per this schema's own doc comment.
+  it("accepts folder absent (whole-thread mode, e.g. the conversation view's single-thread buttons)", () => {
+    const input = { threadIds: [uuid1], action: "archive" as const };
+    expect(bulkThreadActionInputSchema.parse(input)).toEqual(input);
+    expect("folder" in bulkThreadActionInputSchema.parse(input)).toBe(false);
+  });
+
+  it("trims a present folder and rejects a blank (whitespace-only) one", () => {
+    expect(
+      bulkThreadActionInputSchema.parse({ threadIds: [uuid1], folder: "  INBOX  ", action: "archive" }).folder,
+    ).toBe("INBOX");
+    expect(() =>
+      bulkThreadActionInputSchema.parse({ threadIds: [uuid1], folder: "   ", action: "archive" }),
+    ).toThrow();
   });
 
   it("rejects a threadIds array over the 200-thread cap", () => {
@@ -1184,23 +1241,36 @@ describe("bulkThreadActionKindSchema and bulkThreadActionInputSchema", () => {
     expect(() =>
       bulkThreadActionInputSchema.parse({ threadIds: [], folder: "INBOX", action: "archive" }),
     ).toThrow());
-
-  it("rejects an action outside trash/archive/hide", () =>
-    expect(() =>
-      bulkThreadActionInputSchema.parse({ threadIds: [uuid1], folder: "INBOX", action: "delete" }),
-    ).toThrow());
 });
 
 describe("bulkThreadResultSchema", () => {
-  it("accepts a mix of ok and failed per-thread results", () => {
+  it("accepts a mix of ok, skipped, and failed per-thread results", () => {
     const result = {
       results: [
         { threadId: uuid1, ok: true },
-        { threadId: uuid2, ok: false, error: "account in backoff" },
+        // skipped: nothing moved because every eligible message awaited
+        // reconciliation (NULL imap_uid) -- a successful no-op, not a failure.
+        { threadId: uuid2, ok: true, skipped: true },
+        { threadId: randomUUID(), ok: false, error: "account in backoff" },
       ],
     };
     expect(bulkThreadResultSchema.parse(result)).toEqual(result);
   });
+
+  it("rejects error present alongside ok: true", () =>
+    expect(() =>
+      bulkThreadResultSchema.parse({ results: [{ threadId: uuid1, ok: true, error: "should not be here" }] }),
+    ).toThrow());
+
+  it("rejects ok: false with no error message", () =>
+    expect(() =>
+      bulkThreadResultSchema.parse({ results: [{ threadId: uuid1, ok: false }] }),
+    ).toThrow());
+
+  it("rejects skipped: true paired with ok: false (a skip is never a failure)", () =>
+    expect(() =>
+      bulkThreadResultSchema.parse({ results: [{ threadId: uuid1, ok: false, skipped: true, error: "x" }] }),
+    ).toThrow());
 });
 
 describe("threadLinksInputSchema", () => {
