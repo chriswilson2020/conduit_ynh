@@ -346,7 +346,7 @@ describe("mail schema (0004)", () => {
     expect(indexes.length).toBeGreaterThan(0);
   });
 
-  it("has every hand-written index: the four mail_threads FKs, mail_messages(thread_id/message_id/account+folder+uid), mail_attachments(message_id), mail_accounts' duplicate-mailbox unique index", async () => {
+  it("has every hand-written index: the four mail_threads FKs, mail_messages(thread_id/message_id/account+folder+uid/unseen-thread), mail_attachments(message_id), mail_accounts' duplicate-mailbox unique index", async () => {
     const rows = await handle.db.execute<{ tablename: string; indexname: string; indexdef: string }>(
       sql`SELECT tablename, indexname, indexdef FROM pg_indexes
           WHERE tablename IN ('mail_threads','mail_messages','mail_attachments','mail_accounts')`,
@@ -358,11 +358,18 @@ describe("mail schema (0004)", () => {
       "mail_threads_last_message_at_idx",
       "mail_messages_thread_id_idx", "mail_messages_message_id_idx",
       "mail_messages_account_folder_uid_idx",
+      "mail_messages_unseen_thread_idx",
       "mail_attachments_message_id_idx",
       "mail_accounts_user_email_active_unique",
     ]) {
       expect(names).toContain(expected);
     }
+
+    // Genuinely PARTIAL, not just present: an unfiltered thread_id index
+    // already exists, and a non-partial duplicate of it would be dead weight
+    // rather than the unread badge's index.
+    const unseenIndex = rows.find((r) => r.indexname === "mail_messages_unseen_thread_idx");
+    expect(unseenIndex?.indexdef).toMatch(/WHERE.*seen = false/i);
 
     // Column ORDER is the point of this one, not just its existence: the
     // leading (account_id, folder) prefix is what serves the UIDVALIDITY

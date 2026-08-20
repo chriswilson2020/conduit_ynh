@@ -92,9 +92,10 @@ export type ListThreadsOptions = ThreadListFilters;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 /** A mailing-list thread has hundreds of distinct senders and a list row has
- * space for a couple of names. Capped here rather than in the client so the
- * response stays a bounded size whatever the data does. */
-const MAX_PARTICIPANTS = 5;
+ * space for a few names. Enforced in SQL (see loadAggregates' LATERAL), not
+ * just when building the response, so a noisy thread cannot make the QUERY
+ * expensive either -- the bound is on rows fetched, not only rows returned. */
+const MAX_SENDERS = 5;
 
 /** Aggregates computed per page of threads, not denormalised onto
  * mail_threads: every one of them changes on ingest, and a second writer on
@@ -103,52 +104,87 @@ const MAX_PARTICIPANTS = 5;
 interface ThreadAggregates {
   unread: boolean;
   snippet: string;
-  participants: MailAddress[];
+  senders: MailAddress[];
   accountIds: string[];
 }
 
+/**
+ * Three bounded queries, each returning AT MOST one row per thread (senders:
+ * at most MAX_SENDERS), so a page of 50 threads costs at most ~350 rows
+ * whatever the threads contain.
+ *
+ * The shape matters, not just the row count. The obvious single query --
+ * "every distinct sender of every thread on the page, snippet included" --
+ * returns a row per (thread, sender) and drags the snippet along on all of
+ * them: measured at 5,147 rows for one 50-thread page containing a single
+ * mailing-list thread. The fix is to ask each question at its own
+ * granularity.
+ */
 async function loadAggregates(db: Database, threadIds: string[]): Promise<Map<string, ThreadAggregates>> {
   const byThread = new Map<string, ThreadAggregates>();
   if (threadIds.length === 0) return byThread;
 
-  // One grouped row per thread for the two set-wide facts.
+  // 1. One grouped row per thread for the two set-wide facts.
   const grouped = await db.select({
     threadId: mailMessages.threadId,
     unread: sql<boolean>`bool_or(NOT ${mailMessages.seen})`,
-    accountIds: sql<string[]>`array_agg(DISTINCT ${mailMessages.accountId})`,
+    // ORDER BY inside the aggregate: array_agg has no defined output order
+    // without one, so the account chips on a multi-account thread row would
+    // otherwise be stable only by accident of the plan. By contract, not by
+    // luck.
+    accountIds: sql<string[]>`array_agg(DISTINCT ${mailMessages.accountId} ORDER BY ${mailMessages.accountId})`,
   }).from(mailMessages).where(inArray(mailMessages.threadId, threadIds))
     .groupBy(mailMessages.threadId);
 
-  // One row per (thread, distinct sender), each being that sender's most
-  // recent message in the thread. Two facts fall out of the same query: the
-  // participants list, and the thread's latest message -- the newest row here
-  // IS the thread's newest message, because the newest message is by
-  // definition its own sender's newest.
-  const lowerFrom = sql`lower(${mailMessages.fromAddr})`;
-  const senders = await db.selectDistinctOn([mailMessages.threadId, lowerFrom], {
+  // 2. The newest message per thread, for its snippet alone. DISTINCT ON
+  //    keyed on thread_id, so this is one row per thread -- the snippet is a
+  //    wide-ish column and there is no reason to fetch it for every message.
+  const latest = await db.selectDistinctOn([mailMessages.threadId], {
     threadId: mailMessages.threadId,
-    fromAddr: mailMessages.fromAddr,
-    fromName: mailMessages.fromName,
     snippet: mailMessages.snippet,
-    sentAt: mailMessages.sentAt,
   }).from(mailMessages).where(inArray(mailMessages.threadId, threadIds))
-    .orderBy(mailMessages.threadId, lowerFrom, desc(mailMessages.sentAt), desc(mailMessages.id));
+    .orderBy(mailMessages.threadId, desc(mailMessages.sentAt), desc(mailMessages.id));
+  const snippetByThread = new Map(latest.map((row) => [row.threadId, row.snippet]));
 
-  const sendersByThread = new Map<string, typeof senders>();
+  // 3. Up to MAX_SENDERS distinct senders per thread, most recent first. A
+  //    CROSS JOIN LATERAL because the LIMIT has to apply PER THREAD: the
+  //    inner DISTINCT ON collapses each sender to their newest message, and
+  //    the wrapper then takes the newest few of those. Written as raw SQL
+  //    because drizzle's builder has no lateral join.
+  //
+  //    The id list is interpolated as individual bound parameters rather than
+  //    an array literal -- it is at most MAX_LIMIT long, and this sidesteps
+  //    array-type inference entirely.
+  const idList = sql.join(threadIds.map((id) => sql`${id}::uuid`), sql`, `);
+  const senders = await db.execute<{ thread_id: string; from_addr: string; from_name: string | null }>(sql`
+    SELECT t.id AS thread_id, s.from_addr, s.from_name
+    FROM mail_threads t
+    CROSS JOIN LATERAL (
+      SELECT d.from_addr, d.from_name
+      FROM (
+        SELECT DISTINCT ON (lower(m.from_addr)) m.from_addr, m.from_name, m.sent_at, m.id
+        FROM mail_messages m
+        WHERE m.thread_id = t.id
+        ORDER BY lower(m.from_addr), m.sent_at DESC, m.id DESC
+      ) d
+      ORDER BY d.sent_at DESC, d.id DESC
+      LIMIT ${MAX_SENDERS}
+    ) s
+    WHERE t.id IN (${idList})
+  `);
+  const sendersByThread = new Map<string, MailAddress[]>();
   for (const row of senders) {
-    const list = sendersByThread.get(row.threadId);
-    if (list === undefined) sendersByThread.set(row.threadId, [row]);
-    else list.push(row);
+    const list = sendersByThread.get(row.thread_id);
+    const sender: MailAddress = { address: row.from_addr, name: row.from_name };
+    if (list === undefined) sendersByThread.set(row.thread_id, [sender]);
+    else list.push(sender);
   }
 
   for (const row of grouped) {
-    const rows = [...(sendersByThread.get(row.threadId) ?? [])]
-      .sort((a, b) => b.sentAt.getTime() - a.sentAt.getTime());
     byThread.set(row.threadId, {
       unread: row.unread,
-      snippet: rows[0]?.snippet ?? "",
-      participants: rows.slice(0, MAX_PARTICIPANTS)
-        .map((r) => ({ address: r.fromAddr, name: r.fromName })),
+      snippet: snippetByThread.get(row.threadId) ?? "",
+      senders: sendersByThread.get(row.threadId) ?? [],
       accountIds: row.accountIds,
     });
   }
@@ -224,7 +260,7 @@ export async function listThreads(
         // TypeError is an outage.
         unread: extra?.unread ?? false,
         snippet: extra?.snippet ?? "",
-        participants: extra?.participants ?? [],
+        senders: extra?.senders ?? [],
         accountIds: extra?.accountIds ?? [],
       } satisfies MailThreadListItem;
     }),
@@ -323,6 +359,16 @@ export interface SeenWriteBack {
  * Messages whose imap_uid is NULL are skipped in the groups: a message this
  * server APPENDed but has not yet re-sighted in the Sent folder has no UID to
  * name, and the flag will be right the moment the next pass ingests it.
+ *
+ * ARCHIVED THREADS ARE NOT REJECTED, deliberately, and this is the one
+ * mutation on a thread that is not (coordinator sign-off; setThreadLink and
+ * clearThreadLink both raise ArchivedError). An archived conversation is
+ * still openable -- archiving is a CRM-side "out of my inbox", not a lock --
+ * and opening it is exactly what marks it read. Read-marking is also not a
+ * content mutation: it changes no field a user authored, only whether they
+ * have looked at it. And the unread count already excludes archived threads,
+ * so refusing here would leave a thread that reads as unread forever with no
+ * way to clear it and nothing counting it.
  */
 export async function markThreadRead(
   db: Database, id: string,

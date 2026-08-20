@@ -31,6 +31,16 @@ const LIMIT_MAIL = 5;
  * subject/snippet are read as explicit columns; the tsvector itself is only
  * ever an expression in WHERE/ORDER BY and never selected -- it is a large
  * derived blob no client has any use for.
+ *
+ * KNOWN CEILING, accepted at self-hosted scale: the LIMIT 5 is on the OUTER
+ * query, so the inner DISTINCT ON sorts every matching message before
+ * anything is discarded. Cost therefore tracks match density, not the limit
+ * -- measured at 0.2ms for a rare term against 129ms and a 4.6MB sort spill
+ * for a term matching 90% of a large mailbox. That is the price of an EXACT
+ * global ranking (the best-ranked thread really is first), and it is the
+ * right trade for one household's mail. If it ever stops being: pre-filter
+ * the inner query by rank, or cap the candidate set before the DISTINCT ON,
+ * and accept approximate ordering in exchange.
  */
 async function searchMail(db: Database, q: string): Promise<SearchResults["mail"]> {
   const tsQuery = sql`websearch_to_tsquery('english', ${q})`;

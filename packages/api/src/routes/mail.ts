@@ -7,7 +7,9 @@ import {
   type MailAccountSyncStats,
 } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
-import { requireUser, mapDomainError, parseOrReject, validateCursor, idParamSchema } from "./helpers.js";
+import {
+  requireUser, mapDomainError, parseOrReject, validateCursor, idParamSchema, contentDisposition,
+} from "./helpers.js";
 import { openBlob } from "../services/blobs.js";
 import { decodeLastMessageAtCursor } from "../services/pagination.js";
 import type { SendMailSyncManager } from "../services/mail-send.js";
@@ -92,13 +94,6 @@ const linkKindParamSchema = z.object({ id: z.uuid(), kind: mailLinkKindSchema })
  */
 const INLINE_RENDERABLE_MIME = /^image\/(png|jpeg|jpg|gif|webp|bmp|avif|x-icon|vnd\.microsoft\.icon)$/i;
 
-/** Strip CR/LF (header injection) and quotes (which would end the
- * quoted-string early) from a stored filename before it goes in a header --
- * the same treatment files.ts gives its own download names. */
-function headerSafeFilename(name: string): string {
-  return name.replace(/[\r\n"]/g, "");
-}
-
 export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): void {
   // syncManager is the GETTER, captured here and called inside each handler:
   // the manager itself does not exist until after the server is listening
@@ -107,6 +102,21 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
 
   // --- Accounts ------------------------------------------------------------
 
+  /**
+   * FRESHNESS CONTRACT for `syncStats` (coordinator ruling): the numbers in
+   * this response are live AS OF THIS FETCH and nothing keeps them current
+   * afterwards. They are in-process counters on the sync loop, not rows, so
+   * no write publishes an SSE hint when they move -- `[["mail-accounts"]]`
+   * fires on account MUTATIONS and status flips, which is a different and
+   * much rarer event.
+   *
+   * Settings (Task 9) owns freshness for its own view and polls with a
+   * refetchInterval. Every other consumer must treat this list as an
+   * SSE-invalidated cache of the ACCOUNT ROWS and must not build anything
+   * that depends on stats being current -- if a live counter is ever needed
+   * somewhere else, it needs its own endpoint or its own hint, not a shorter
+   * assumption about this one.
+   */
   app.get("/api/mail/accounts", async (request, reply) => {
     const user = requireUser(request, reply);
     if (user === null) return;
@@ -356,20 +366,24 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     reply: FastifyReply, id: string, mode: "download" | "inline",
   ): Promise<unknown> {
     const attachment = await getAttachmentBlob(db, id, { inlineOnly: mode === "inline" });
-    const filename = headerSafeFilename(attachment.filename);
     // Always, on both routes: whatever Content-Type is declared below, a
     // browser must never be allowed to sniff its way to a different one.
     reply.header("X-Content-Type-Options", "nosniff");
+    // The stored byte count, so the client gets a progress bar and a
+    // definite end rather than a chunked stream of unknown length. Taken
+    // from the row ingest wrote, which is the length of the blob it wrote
+    // in the same transaction.
+    reply.header("Content-Length", attachment.sizeBytes);
     if (mode === "inline" && INLINE_RENDERABLE_MIME.test(attachment.mime)) {
       reply.header("Content-Type", attachment.mime);
-      reply.header("Content-Disposition", `inline; filename="${filename}"`);
+      reply.header("Content-Disposition", contentDisposition("inline", attachment.filename));
     } else {
       // The download route, and the inline route's non-image fallback: the
       // bytes are still served, but as a save rather than something the
       // browser renders in place. octet-stream on the fallback because the
       // stored mime is exactly what made it unsafe to declare.
       reply.header("Content-Type", mode === "inline" ? "application/octet-stream" : attachment.mime);
-      reply.header("Content-Disposition", `attachment; filename="${filename}"`);
+      reply.header("Content-Disposition", contentDisposition("attachment", attachment.filename));
     }
     return reply.send(openBlob(dataDir, attachment.blobPath));
   }

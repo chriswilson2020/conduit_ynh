@@ -117,6 +117,42 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
 }
 
 /**
+ * Build a `Content-Disposition` header value for a stored filename, safely for
+ * ANY filename -- including one no HTTP header can carry literally.
+ *
+ * Node rejects a header value containing a code point above U+00FF outright
+ * (ERR_INVALID_CHAR, a 500 rather than a download), and mail filenames reach
+ * us fully decoded: mailparser resolves RFC 2047 encoded-words, so a message
+ * from anywhere outside Latin-1 routinely produces one. Uploaded filenames
+ * have the same shape.
+ *
+ * So the value carries BOTH forms RFC 6266 defines:
+ *
+ * - `filename="..."` -- a pure-ASCII fallback for anything that does not
+ *   understand the extended form. Non-ASCII code points become "_"; CR/LF
+ *   (header injection) and quote/backslash (which would end the
+ *   quoted-string early) are dropped; an empty result becomes "download",
+ *   since a nameless disposition is worse than a generic one.
+ * - `filename*=UTF-8''...` -- RFC 5987/8187 extended notation, percent-encoded
+ *   UTF-8, which every current browser prefers over the fallback. encodeURIComponent
+ *   leaves `'`, `(`, `)` and `*` unescaped and none of them is an RFC 8187
+ *   attr-char, so they are escaped here afterwards.
+ *
+ * Shared shape with routes/files.ts's own download header, which still builds
+ * its own (and has the same latent bug); this lives here so that route can
+ * adopt it without a second implementation appearing.
+ */
+export function contentDisposition(type: "attachment" | "inline", filename: string): string {
+  // One pass covers control characters (CR/LF included) and everything above
+  // U+007F: the complement of printable ASCII.
+  const ascii = filename.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "").trim();
+  const fallback = ascii === "" ? "download" : ascii;
+  const encoded = encodeURIComponent(filename)
+    .replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `${type}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
+/**
  * Parse `data` against `schema`; on failure, send the uniform 400 validation
  * shape (first Zod issue's message) and return undefined. Callers must check for
  * undefined and return immediately -- the reply has already been sent.

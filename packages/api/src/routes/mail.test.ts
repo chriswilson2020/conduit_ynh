@@ -425,10 +425,92 @@ describe("mail thread list route", () => {
     expect(body.items.map((t) => t.subject)).toEqual(["Newer", "Older"]);
     expect(body.items[0]?.unread).toBe(true);
     expect(body.items[0]?.snippet).toBe("Newer body");
-    expect(body.items[0]?.participants.map((p) => p.address)).toEqual(["bob@example.com"]);
+    expect(body.items[0]?.senders.map((s) => s.address)).toEqual(["bob@example.com"]);
     expect(body.items[0]?.accountIds).toEqual([account.id]);
     expect(body.items[1]?.unread).toBe(false);
     expect(body.nextCursor).toBeNull();
+    await a.close();
+  });
+
+  it("caps senders at five per row, newest sender first", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ subject: "Mailing list", lastMessageAt: new Date("2026-08-08T10:00:00Z") });
+    // Eight distinct senders, oldest first, so the newest five are 3..7.
+    for (let i = 0; i < 8; i += 1) {
+      await seedMessage(threadId, account.id, {
+        sentAt: new Date(Date.UTC(2026, 7, 1 + i, 10)), fromAddr: `sender${i}@example.com`, fromName: `Sender ${i}`,
+      });
+    }
+    // A repeat of one sender, newest of all: it must collapse into that
+    // sender's single entry rather than appearing twice.
+    await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-09T10:00:00Z"), fromAddr: "SENDER3@example.com", fromName: "Sender 3",
+      snippet: "latest of all",
+    });
+
+    const response = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
+    const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
+    const senders = body.items[0]?.senders ?? [];
+    expect(senders).toHaveLength(5);
+    // Case-insensitive dedup: one entry for sender3, and it leads because its
+    // newest message is the newest in the thread.
+    expect(senders[0]?.address.toLowerCase()).toBe("sender3@example.com");
+    const addresses = senders.map((s) => s.address.toLowerCase());
+    expect(new Set(addresses).size).toBe(5);
+    expect(body.items[0]?.snippet).toBe("latest of all");
+    await a.close();
+  });
+
+  it("lists every account a thread is visible in, in a stable order", async () => {
+    const a = await app();
+    const first = await makeAccount(a);
+    const second = await makeAccount(a, { label: "Side", email: "side@example.com" });
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, first.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(threadId, second.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const response = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
+    const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
+    expect(body.items[0]?.accountIds).toEqual([first.id, second.id].sort());
+    await a.close();
+  });
+
+  // Ingest creates a thread and its first message in one transaction, so this
+  // is not a state the app can reach -- but a list row that throws on it
+  // would take the whole inbox down, and a defensive default is cheap.
+  it("renders a thread with no messages instead of failing the page", async () => {
+    const a = await app();
+    const threadId = await seedThread({ subject: "Empty", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+
+    const response = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
+    const row = body.items.find((t) => t.id === threadId);
+    expect(row).toBeDefined();
+    expect(row?.unread).toBe(false);
+    expect(row?.snippet).toBe("");
+    expect(row?.senders).toEqual([]);
+    expect(row?.accountIds).toEqual([]);
+    await a.close();
+  });
+
+  it("treats unread=false and unlinked=false on the wire as no filter, not as the inverse", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const contact = await makeContact(a);
+    const linkedRead = await seedThread({
+      subject: "Linked and read", lastMessageAt: new Date("2026-08-02T10:00:00Z"), contactId: contact.id,
+    });
+    await seedMessage(linkedRead, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: true });
+    const looseUnread = await seedThread({ subject: "Loose and unread", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(looseUnread, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: false });
+
+    for (const query of ["unread=false", "unlinked=false", "unread=false&unlinked=false"]) {
+      const response = await a.inject({ method: "GET", url: `/api/mail/threads?${query}`, headers: authHeaders });
+      const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
+      expect(body.items.map((t) => t.subject)).toEqual(["Linked and read", "Loose and unread"]);
+    }
     await a.close();
   });
 
@@ -656,6 +738,32 @@ describe("mail thread read route", () => {
     await a.close();
   });
 
+  // The one thread mutation an archive does NOT block, deliberately -- see
+  // markThreadRead's doc comment. An archived conversation is still openable,
+  // and opening it is what marks it read.
+  it("marks an ARCHIVED thread read rather than refusing it", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z"), archived: true });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, imapUid: 41 });
+
+    const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
+    expect(response.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(response.json()).archivedAt).not.toBeNull();
+    const rows = await handle.db.select({ seen: mailMessages.seen }).from(mailMessages)
+      .where(eq(mailMessages.threadId, threadId));
+    expect(rows.every((row) => row.seen)).toBe(true);
+    // Setting a link on the same archived thread IS refused -- the asymmetry
+    // is intentional, not an oversight.
+    const contact = await makeContact(a);
+    const link = await a.inject({
+      method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
+      payload: { kind: "contact", id: contact.id },
+    });
+    expect(link.statusCode).toBe(409);
+    await a.close();
+  });
+
   it("404s an unknown thread", async () => {
     const a = await app();
     const response = await a.inject({ method: "POST", url: `/api/mail/threads/${UNKNOWN_ID}/read`, headers: authHeaders });
@@ -847,8 +955,10 @@ describe("mail send route", () => {
 // --- Attachments ------------------------------------------------------------
 
 describe("mail attachment routes", () => {
+  // A fresh account per call: a test seeding two attachments on one app would
+  // otherwise hit the duplicate-mailbox 409 on the second.
   async function seedOne(a: App, opts: Parameters<typeof seedAttachment>[1] = {}) {
-    const account = await makeAccount(a);
+    const account = await makeAccount(a, { email: `chris+${randomUUID()}@example.com` });
     const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
     const messageId = await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
     return seedAttachment(messageId, opts);
@@ -863,9 +973,73 @@ describe("mail attachment routes", () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toBe("application/pdf");
-    expect(response.headers["content-disposition"]).toBe('attachment; filename="invoice.pdf"');
+    expect(response.headers["content-disposition"])
+      .toBe(`attachment; filename="invoice.pdf"; filename*=UTF-8''invoice.pdf`);
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
+    expect(response.headers["content-length"]).toBe(String(Buffer.byteLength(attachment.body, "utf8")));
     expect(response.body).toBe(attachment.body);
+    await a.close();
+  });
+
+  // mailparser decodes RFC 2047 encoded-words, so a filename arrives as full
+  // Unicode -- and Node refuses to put any code point above U+00FF in a
+  // header value at all (ERR_INVALID_CHAR, a 500 rather than a download).
+  // U+8ACB U+6C42 U+66F8 is "invoice" in Chinese; UTF-8 encodes it as
+  // E8 AB 8B E6 B1 82 E6 9B B8. The percent-encoding below is written out
+  // literally rather than recomputed, so this asserts the real bytes.
+  it("downloads a non-Latin filename with both an ASCII fallback and the RFC 5987 form", async () => {
+    const a = await app();
+    const filename = `${String.fromCharCode(0x8acb, 0x6c42, 0x66f8)}.pdf`;
+    const attachment = await seedOne(a, { filename, mime: "application/pdf" });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    const disposition = response.headers["content-disposition"];
+    expect(disposition).toBe(`attachment; filename="___.pdf"; filename*=UTF-8''%E8%AB%8B%E6%B1%82%E6%9B%B8.pdf`);
+    // The header value itself must be transmittable: pure ASCII, no raw
+    // Unicode anywhere in it.
+    expect(disposition).toMatch(/^[\x20-\x7E]*$/);
+    expect(response.body).toBe(attachment.body);
+    await a.close();
+  });
+
+  it("serves a non-Latin inline image filename the same way", async () => {
+    const a = await app();
+    const filename = `${String.fromCharCode(0x8acb, 0x6c42, 0x66f8)}.png`;
+    const attachment = await seedOne(a, { filename, mime: "image/png", isInline: true });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}/inline`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-disposition"])
+      .toBe(`inline; filename="___.png"; filename*=UTF-8''%E8%AB%8B%E6%B1%82%E6%9B%B8.png`);
+    expect(response.headers["content-length"]).toBe(String(Buffer.byteLength(attachment.body, "utf8")));
+    await a.close();
+  });
+
+  it("strips CR/LF and quotes from the ASCII fallback, and never emits an empty filename", async () => {
+    const a = await app();
+    const nasty = await seedOne(a, { filename: 'in"voice\r\nX-Injected: yes.pdf' });
+    const nastyResponse = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${nasty.id}`, headers: authHeaders,
+    });
+    expect(nastyResponse.statusCode).toBe(200);
+    expect(nastyResponse.headers["content-disposition"]).not.toContain("\r");
+    expect(nastyResponse.headers["content-disposition"]).not.toContain("\n");
+    expect(nastyResponse.headers["x-injected"]).toBeUndefined();
+    expect(nastyResponse.headers["content-disposition"])
+      .toBe(`attachment; filename="invoice__X-Injected: yes.pdf"; filename*=UTF-8''in%22voice%0D%0AX-Injected%3A%20yes.pdf`);
+
+    // A name with nothing left after stripping becomes "download" rather than
+    // an empty quoted-string.
+    const blank = await seedOne(a, { filename: '  ""  ' });
+    const blankResponse = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${blank.id}`, headers: authHeaders,
+    });
+    expect(blankResponse.headers["content-disposition"]).toContain('filename="download"');
     await a.close();
   });
 
@@ -878,7 +1052,8 @@ describe("mail attachment routes", () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toBe("image/png");
-    expect(response.headers["content-disposition"]).toBe('inline; filename="logo.png"');
+    expect(response.headers["content-disposition"])
+      .toBe(`inline; filename="logo.png"; filename*=UTF-8''logo.png`);
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
     await a.close();
   });
@@ -906,7 +1081,8 @@ describe("mail attachment routes", () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toBe("application/octet-stream");
-    expect(response.headers["content-disposition"]).toBe('attachment; filename="payload.html"');
+    expect(response.headers["content-disposition"])
+      .toBe(`attachment; filename="payload.html"; filename*=UTF-8''payload.html`);
     await a.close();
   });
 
@@ -957,6 +1133,29 @@ describe("mail template routes", () => {
     });
     expect(restored.statusCode).toBe(200);
     expect(emailTemplateSchema.parse(restored.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  it("lists archived templates only when archived=true is on the wire", async () => {
+    const a = await app();
+    const live = emailTemplateSchema.parse((await a.inject({
+      method: "POST", url: "/api/mail/templates", headers: authHeaders,
+      payload: { name: "Live", bodyHtml: "<p>Live</p>" },
+    })).json());
+    const filed = emailTemplateSchema.parse((await a.inject({
+      method: "POST", url: "/api/mail/templates", headers: authHeaders,
+      payload: { name: "Filed", bodyHtml: "<p>Filed</p>" },
+    })).json());
+    await a.inject({ method: "POST", url: `/api/mail/templates/${filed.id}/archive`, headers: authHeaders });
+
+    async function ids(query: string): Promise<string[]> {
+      const response = await a.inject({ method: "GET", url: `/api/mail/templates${query}`, headers: authHeaders });
+      expect(response.statusCode).toBe(200);
+      return emailTemplateSchema.array().parse(response.json()).map((t) => t.id);
+    }
+    expect(await ids("")).toEqual([live.id]);
+    expect(await ids("?archived=false")).toEqual([live.id]);
+    expect(await ids("?archived=true")).toEqual([filed.id]);
     await a.close();
   });
 

@@ -719,19 +719,23 @@ export type MailAttachment = z.infer<typeof mailAttachmentSchema>;
 
 // One row of GET /api/mail/threads. The four extra fields are everything the
 // thread-list row renders that is NOT on the thread itself (unread dot,
-// participants summary, snippet, account chip) -- derived per page from the
+// senders summary, snippet, account chip) -- derived per page from the
 // thread's messages rather than denormalised onto mail_threads, because
 // every one of them changes on ingest and none is worth a second writer.
-//
-// participants is capped server-side: a mailing-list thread has hundreds of
-// distinct From addresses and a list row shows three.
 export const mailThreadListItemSchema = mailThreadSchema.extend({
   /** At least one message in the thread is unseen. */
   unread: z.boolean(),
   /** The most recent message's snippet (already placeholder-free). */
   snippet: z.string(),
-  /** Distinct From addresses, most recent first, capped. */
-  participants: z.array(mailAddressSchema),
+  /**
+   * Distinct From addresses, most recent first, capped at five server-side
+   * (a mailing-list thread has hundreds and a list row shows a few).
+   *
+   * `senders`, not `participants`: it is derived from from_addr alone. The
+   * To and Cc lines are NOT folded in, so this is who WROTE in the thread,
+   * not everyone on it -- the honest name for what the column contains.
+   */
+  senders: z.array(mailAddressSchema),
   /** Every account whose mailbox this thread is visible in. */
   accountIds: z.array(z.uuid()),
 });

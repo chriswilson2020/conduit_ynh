@@ -1041,14 +1041,14 @@ describe("mailThreadListItemSchema", () => {
     companyId: null, contactId: uuid2, dealId: null, projectId: null,
     archivedAt: null, createdAt: now, updatedAt: now,
     unread: true, snippet: "Thanks for sending this over",
-    participants: [{ address: "bob@example.com", name: "Bob" }, { address: "root@localhost" }],
+    senders: [{ address: "bob@example.com", name: "Bob" }, { address: "root@localhost" }],
     accountIds: [uuid2],
   };
 
   it("accepts a full list row", () => expect(mailThreadListItemSchema.parse(row)).toEqual(row));
 
   it("requires the derived row fields the thread itself does not carry", () => {
-    for (const field of ["unread", "snippet", "participants", "accountIds"]) {
+    for (const field of ["unread", "snippet", "senders", "accountIds"]) {
       const { [field]: _dropped, ...rest } = row as Record<string, unknown>;
       expect(() => mailThreadListItemSchema.parse(rest)).toThrow();
     }
