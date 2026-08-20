@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { FormEvent } from "react";
+import type { FormEvent, ReactNode } from "react";
 import type {
   MailAccountCreateInput, MailAccountTestInput, MailAccountTestResult, MailAccountWithSyncStats,
   MailSecurity,
@@ -596,7 +596,7 @@ function AccountForm({
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
       {label}
