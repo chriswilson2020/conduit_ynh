@@ -127,22 +127,37 @@ function isTlsFailure(error: unknown): boolean {
  * The server's own reply text, for the errors where imapflow keeps it out of
  * the message.
  *
- * A command the server answered NO or BAD to rejects with the message
- * "Command failed" and nothing else: the sentence saying WHY -- "Mailbox
- * doesn't exist: Sent", "Permission denied" -- is put on `response`, and the
- * response code on `serverResponseCode`. That matters because an adapter
- * error's message is stored verbatim in mail_accounts.last_error and returned
- * verbatim by the test-connection endpoint (mail-imap.ts, ERROR
- * CLASSIFICATION), and "Command failed" is a dead end for the user and for
- * the next reader of the log alike. Found by the integration suite's
- * APPEND-to-a-renamed-Sent-folder case -- the shape a user actually hits.
+ * Every NO or BAD becomes an Error whose message is the bare string "Command
+ * failed". The sentence saying WHY -- "Mailbox doesn't exist: Sent",
+ * "Permission denied" -- goes onto a property instead, and WHICH property
+ * depends on the command:
  *
- * This cannot leak a credential: it is the server's reply to a command, and
- * neither imapflow nor this adapter puts a password in one.
+ * - `responseText` is set by the connection itself for every NO/BAD that
+ *   carries text, before any command-specific handling. It is read first
+ *   because for most commands it is the only one there is: FETCH -- the sync
+ *   loop's hottest path -- along with NOOP, IDLE and STATUS, sets nothing
+ *   else.
+ * - `response` is the PARSED RESPONSE OBJECT, replaced by a compiled string
+ *   only by the commands that run imapflow's enhanceCommandError (APPEND and
+ *   SEARCH among them). Hence the typeof check rather than a bare truthiness
+ *   one: it is what stops the object shape -- and status()'s habit of putting
+ *   an Error on this same property -- from being pasted into a message as
+ *   "[object Object]".
+ *
+ * This matters because an adapter error's message is stored verbatim in
+ * mail_accounts.last_error and returned verbatim by the test-connection
+ * endpoint (mail-imap.ts, ERROR CLASSIFICATION), so "Command failed" is a
+ * dead end for the user and for the next reader of the log alike. Found by
+ * the integration suite's APPEND to a renamed Sent folder -- the shape a user
+ * actually hits.
+ *
+ * Neither property can leak a credential: both are the server's reply to a
+ * command, and neither imapflow nor this adapter puts a password in one.
  */
 function serverResponseText(error: unknown): string | null {
   if (typeof error !== "object" || error === null) return null;
-  const { response } = error as { response?: unknown };
+  const { responseText, response } = error as { responseText?: unknown; response?: unknown };
+  if (typeof responseText === "string" && responseText.length > 0) return responseText;
   return typeof response === "string" && response.length > 0 ? response : null;
 }
 
@@ -592,12 +607,14 @@ export class ImapflowClient implements ImapClient {
     // INBOX for no reason. No INTERNALDATE either -- the server stamps its
     // own arrival time (contract).
     //
-    // BOTH falsy shapes, not just the `false` the .d.ts promises: the runtime
-    // returns UNDEFINED when the connection is not in a state it will APPEND
-    // from, and reading that as success would report a sent message as filed
-    // in Sent with nothing stored anywhere. (A server that REFUSES the append
-    // -- a renamed Sent folder, say -- throws instead, and arrives at the
-    // caller through normalizeMailError carrying the server's own text.)
+    // The falsy guard is DEFENSIVE, not a fix for anything observed: imapflow
+    // 1.7.1 coerces its internal `undefined` with `|| false` at this public
+    // boundary, so the .d.ts and the runtime agree today, and a server that
+    // REFUSES an append -- a renamed Sent folder, say -- throws rather than
+    // returning anything. `!result` costs nothing and keeps the second falsy
+    // shape covered if that coercion ever moves; the refusal path is the one
+    // that actually runs, and it reaches the caller through
+    // normalizeMailError carrying the server's own text.
     const result = await this.run<AppendResponseObject | false | undefined>(
       () => this.client.append(folder, raw, flags),
     );

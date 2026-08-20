@@ -557,7 +557,7 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
       expect(batch).toHaveLength(1);
     }, 60_000);
 
-    it("collapses a burst of deliveries into one wake, and the pass after it takes them all", async () => {
+    it("comes back from a burst of deliveries with the pass after it taking all of them", async () => {
       const base = await highestUid(deliverer, "INBOX");
       const controller = new AbortController();
       const guard = setTimeout(() => { controller.abort(); }, 30_000);
@@ -567,13 +567,17 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
         await deliverer.append("INBOX", rfc822({ subject: `${runId} storm ${index}` }), []);
       }
 
-      // One resolution, whatever the server sent: idle() latches on the first
-      // `exists` and detaches its listeners, so the remaining nineteen do not
-      // each start a pass of their own.
+      // What is actually under test is the SURVIVING of the burst. "One wake"
+      // needs no assertion -- a promise settles once, and idle()'s own latch
+      // detaches its listeners on the first `exists` -- but twenty untagged
+      // EXISTS arriving during one IDLE is still the shape that could leave
+      // the wait wedged, or the connection unusable for the pass that follows.
       const outcome = await waiting;
       clearTimeout(guard);
       expect(outcome).toBe("new-mail");
 
+      // And nothing is lost between the wake and that pass: the loop walks
+      // from its cursor, not from whatever the notification implied.
       const seen = await walkToEnd(idler, "INBOX", base, BATCH_SIZE);
       expect(seen).toHaveLength(STORM_MESSAGES);
     }, 90_000);

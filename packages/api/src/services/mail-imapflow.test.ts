@@ -140,32 +140,64 @@ describe("normalizeMailError", () => {
     expect(normalizeMailError(error).message).toBe("connection: Server does not support STARTTLS");
   });
 
-  it("recovers the server's own text from a bare Command failed", () => {
-    // What imapflow rejects a NO/BAD with: the message says nothing, and the
-    // sentence explaining it is parked on `response`. Since this message is
-    // what lands in mail_accounts.last_error and in the test-connection
-    // result, "Command failed" on its own is a dead end -- so the reply is
-    // folded in. (Found by the integration suite's APPEND to a renamed Sent
-    // folder.)
+  // imapflow rejects EVERY NO/BAD with the bare message "Command failed" and
+  // parks the sentence that explains it on a property. Since that message is
+  // what lands in mail_accounts.last_error and in the test-connection result,
+  // "Command failed" on its own is a dead end -- so the reply is folded in.
+  // (Found by the integration suite's APPEND to a renamed Sent folder.) Which
+  // property carries it depends on the command, hence the four cases here.
+  it("prefers responseText, which is the only one most commands set", () => {
+    // The connection sets this for every NO/BAD carrying text, before any
+    // command-specific handling. FETCH -- the sync loop's hottest path -- and
+    // NOOP, IDLE and STATUS have nothing else.
+    const error = Object.assign(new Error("Command failed"), {
+      responseText: "Invalid messageset",
+      responseStatus: "BAD",
+    });
+    expect(normalizeMailError(error).message).toBe("Command failed: Invalid messageset");
+    expect(normalizeMailError(error).cause).toBe(error);
+  });
+
+  it("falls back to response for the commands that compile it to a string", () => {
+    // APPEND and SEARCH run imapflow's enhanceCommandError, which replaces
+    // the parsed object on `response` with the compiled reply line.
     const error = Object.assign(new Error("Command failed"), {
       response: "A5 NO [TRYCREATE] Mailbox doesn't exist: Sent",
       serverResponseCode: "TRYCREATE",
     });
     expect(normalizeMailError(error).message)
       .toBe("Command failed: A5 NO [TRYCREATE] Mailbox doesn't exist: Sent");
-    expect(normalizeMailError(error).cause).toBe(error);
+  });
+
+  it("ignores a response that is not a string", () => {
+    // Its ORIGINAL shape is the parsed response object, and every command
+    // that does not enhance the error leaves it that way; status() puts an
+    // Error there instead. Interpolating either would put "[object Object]"
+    // in front of a user, which is worse than the bare message.
+    const parsed = Object.assign(new Error("Command failed"), {
+      response: { command: "NO", tag: "A5", attributes: [{ type: "TEXT", value: "nope" }] },
+    });
+    expect(normalizeMailError(parsed)).toBe(parsed);
+    expect(normalizeMailError(parsed).message).toBe("Command failed");
+
+    // status.js's own wrapper: the message is already readable, and the
+    // property holds the error it wrapped.
+    const wrapped = Object.assign(new Error("Mailbox doesn't exist: Archive"), {
+      code: "NotFound", response: new Error("Command failed"),
+    });
+    expect(normalizeMailError(wrapped)).toBe(wrapped);
   });
 
   it("does not repeat a server reply the message already carries", () => {
     const error = Object.assign(new Error("Mailbox doesn't exist"), {
-      response: "Mailbox doesn't exist",
+      responseText: "Mailbox doesn't exist",
     });
     expect(normalizeMailError(error)).toBe(error);
   });
 
   it("still classifies a connection failure that also carries a server reply", () => {
     const error = Object.assign(new Error("Command failed"), {
-      code: "EConnectionClosed", response: "connection closed mid-command",
+      code: "EConnectionClosed", responseText: "connection closed mid-command",
     });
     expect(normalizeMailError(error).message)
       .toBe("connection: Command failed: connection closed mid-command");
