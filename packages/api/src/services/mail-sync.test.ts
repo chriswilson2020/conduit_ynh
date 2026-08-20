@@ -153,6 +153,16 @@ class FakeImapClient implements ImapClient {
     { folder: "INBOX", selectable: true, delimiter: "/" },
     { folder: "Sent", specialUse: "sent", selectable: true, delimiter: "/" },
   ];
+  /**
+   * Folders the server no longer has: SELECTing one fails, exactly as a real
+   * server answers for a mailbox that was deleted or renamed underneath the
+   * CRM. Separate from `listed` rather than derived from it so a test can
+   * stage the two independently -- the interesting case for Task 3's walk is
+   * a row that mail_account_folders still HOLDS (rows are never deleted)
+   * while LIST has stopped reporting it, and asserting that costs nothing to
+   * the pass requires being able to build exactly that mismatch.
+   */
+  readonly missingFolders = new Set<string>();
   connectCalls = 0;
   disconnectCalls = 0;
   connectError: Error | null = null;
@@ -229,12 +239,22 @@ class FakeImapClient implements ImapClient {
   async status(folder: string): Promise<{ uidvalidity: number }> {
     return this.track({ op: "status", folder }, () => {
       if (this.statusError !== null) throw this.statusError;
+      // The real server's answer for a mailbox that is not there. It reads
+      // as a pass-level failure, which is the whole hazard: a stale row
+      // walked once is a pass that fails, and walked every pass is an
+      // account permanently in backoff.
+      if (this.missingFolders.has(folder)) {
+        throw new Error(`Command failed: Mailbox doesn't exist: ${folder}`);
+      }
       return { uidvalidity: this.folder(folder).uidvalidity };
     });
   }
 
   async fetchNewer(folder: string, options: FetchNewerOptions): Promise<ImapMessageDescriptor[]> {
     return this.track({ op: "fetchNewer", folder }, () => {
+      if (this.missingFolders.has(folder)) {
+        throw new Error(`Command failed: Mailbox doesn't exist: ${folder}`);
+      }
       this.fetchNewerOptions.push(options);
       const target = this.folder(folder);
       return [...target.messages.entries()]
@@ -789,7 +809,14 @@ describe("AccountSync: folder discovery", () => {
     expect(row.lastError).toContain("LIST refused");
     expect(client.opsOf("status")).toHaveLength(0);
     expect(await folderRows(accountId)).toEqual([]);
-    expect(clock.requested[0]).toBe(60_000);
+    // It backs off like any other pass-level failure. Asserted as PARITY --
+    // one failure counted, one wait outstanding -- rather than by restating
+    // the 60s/2min/4min schedule, which the backoff test above owns. Two
+    // copies of a literal schedule is one place for them to disagree, and the
+    // claim here is "LIST failures take the ordinary path", not "the ordinary
+    // path is 60 seconds".
+    expect(sync.stats.failures).toBe(1);
+    expect(clock.requested).toHaveLength(1);
 
     // And it recovers like any other pass-level failure.
     client.listError = null;

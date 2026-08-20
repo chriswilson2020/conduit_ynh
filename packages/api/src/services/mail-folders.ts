@@ -1,8 +1,9 @@
 import { and, eq, isNull, or, sql } from "drizzle-orm";
 import type { SpecialUse } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { mailAccountFolders, mailAccounts } from "../db/schema.js";
+import { mailAccountFolders, mailAccounts, type MailAccountFolderRow } from "../db/schema.js";
 import type { ImapFolderListing } from "./mail-imap.js";
+import { publish } from "./sse.js";
 
 /**
  * IMAP folder discovery: turning one LIST into `mail_account_folders` rows,
@@ -51,26 +52,46 @@ import type { ImapFolderListing } from "./mail-imap.js";
  * trash errs towards not syncing, which a user can undo in the picker, rather
  * than towards syncing a mailbox of deleted mail they never asked for.
  *
- * Each pattern anchors its LEADING edge on a word boundary and leaves the
- * trailing edge open. Both halves of that are load-bearing:
+ * Each pattern anchors its LEADING edge only, leaving the trailing edge open,
+ * and the anchor is "not preceded by a letter or a digit" rather than `\b`.
+ * All three halves of that are load-bearing:
  *
  * - Open at the end, so "Archives" and "Sent Items" classify. Requiring a
  *   trailing boundary would reject the plural, which is a completely ordinary
  *   way to name these folders.
  * - Anchored at the start, so "Presentations" is NOT sent mail. It really does
- *   contain the letters "sent", and a bare substring test would classify a
- *   user's own folder as their Sent mailbox.
+ *   contain the letters "sent" (pre-SENT-ations), and "Undeleted" contains
+ *   "deleted"; a bare substring test classifies both.
+ * - Anchored on LETTER-OR-DIGIT, not on `\b`. `\b` is defined against `\w`,
+ *   which includes the underscore, so it treats "_Trash" and "1_Archive" as
+ *   single unbroken words and classifies neither. Underscore-prefixed folder
+ *   names are a common way to sort a mailbox, and those two really are Trash
+ *   and Archive.
+ *
+ * The asymmetry that sets where the line goes: the two directions of error are
+ * NOT equally bad. Over-classifying a user's folder as trash or junk defaults
+ * it to not syncing -- visible, and one click in the picker to undo.
+ * UNDER-classifying a real Trash folder leaves it syncing, so the CRM quietly
+ * ingests deleted mail, AND leaves `trash_folder` NULL, so every bulk Trash
+ * action against that account fails with "no target". That is the direction
+ * worth being generous towards, which is why the anchor admits separators the
+ * way a human reading the name would.
+ *
+ * `\p{L}`/`\p{N}` with the `u` flag rather than `[A-Za-z0-9]`: folder names
+ * arrive from imapflow already decoded out of modified UTF-7, so non-ASCII
+ * names are ordinary here, and an ASCII-only class would find a "boundary"
+ * inside every accented word.
  *
  * "drafts" is spelled as the spec spells it, so a singular "Draft" folder goes
  * unclassified. Deliberate and cheap: drafts sync is out of scope for v0.6.0,
  * so the classification currently drives nothing but a label in the picker.
  */
 const NAME_HEURISTICS: [SpecialUse, RegExp][] = [
-  ["trash", /\b(?:trash|deleted)/i],
-  ["junk", /\b(?:junk|spam)/i],
-  ["archive", /\barchive/i],
-  ["drafts", /\bdrafts/i],
-  ["sent", /\bsent/i],
+  ["trash", /(?<![\p{L}\p{N}])(?:trash|deleted)/iu],
+  ["junk", /(?<![\p{L}\p{N}])(?:junk|spam)/iu],
+  ["archive", /(?<![\p{L}\p{N}])archive/iu],
+  ["drafts", /(?<![\p{L}\p{N}])drafts/iu],
+  ["sent", /(?<![\p{L}\p{N}])sent/iu],
 ];
 
 /**
@@ -170,66 +191,155 @@ function resolveTarget(
 // --- Discovery --------------------------------------------------------------
 
 /**
- * Record everything `listed` says about `accountId`'s folders.
+ * One listing per folder name, preferring the SELECTABLE entry.
+ *
+ * Deduplication is required, not tidying. Postgres refuses to let a single
+ * INSERT ... ON CONFLICT DO UPDATE affect one row twice (SQLSTATE 21000), so a
+ * listing containing the same mailbox twice would fail the whole statement --
+ * and because discovery is the first thing a pass does, that failure would
+ * back the account off before any mail was synced, on every pass, until the
+ * server stopped doing it.
+ *
+ * The one duplicate imapflow 1.7.1 can actually produce is INBOX. When the
+ * connection has a namespace prefix and nothing in the main listing claimed
+ * the INBOX slot, it runs a second LIST for INBOX alone and APPENDS the result
+ * (lib/commands/list.js) -- and the case where nothing claimed the slot
+ * despite INBOX being listed is precisely a phantom `\NonExistent` entry,
+ * which it deliberately refuses to let claim it. So the pair is a phantom and
+ * the real mailbox. (LSUB cannot add a duplicate: it merges into the entry
+ * with the same path and ignores anything unlisted.)
+ *
+ * Hence SELECTABLE WINS rather than first-seen. Recording the phantom would
+ * mark a real folder `\Noselect` -- dropping it from the walk and making it
+ * useless as a move target -- until some later LIST happened to arrive in the
+ * other order. Preferring the selectable entry gets that right whichever order
+ * they come in, which is the point: imapflow does sort classified entries
+ * ahead of unclassified ones, so today the real INBOX happens to come first
+ * anyway, and a tiebreak resting on that would be resting on a detail of
+ * another library's sort.
+ */
+export function dedupeListings(listed: ImapFolderListing[]): ImapFolderListing[] {
+  const unique = new Map<string, ImapFolderListing>();
+  for (const listing of listed) {
+    const kept = unique.get(listing.folder);
+    // Map.set on an existing key keeps its original position, so replacing a
+    // phantom does not reshuffle the listing order callers rely on.
+    if (kept === undefined || (!kept.selectable && listing.selectable)) {
+      unique.set(listing.folder, listing);
+    }
+  }
+  return [...unique.values()];
+}
+
+/**
+ * What one discovery pass did, shaped to be logged as-is -- the sync engine
+ * spreads this straight into its pino payload, which is why every field is a
+ * scalar or a short array of names rather than rows.
+ *
+ * `created`, `reclassified` and the two folder names are all RARE events on a
+ * settled mailbox: a steady account produces `{ listed: n }` and nothing else,
+ * so an info line gated on the others being non-empty stays quiet forever
+ * instead of once per poll interval.
+ */
+export interface FolderDiscoverySummary {
+  /** Distinct folders this LIST reported (after deduplication). */
+  listed: number;
+  /** Folder names seen for the FIRST time by this pass. */
+  created: string[];
+  /** Folder names whose `special_use` changed value in this pass. Note what
+   * this does not include: `sync_enabled` never changes here (the no-clobber
+   * rule), so a reclassification is exactly a role change and nothing else. */
+  reclassified: string[];
+  /**
+   * The account's Trash target as it stands AFTER a pass that resolved
+   * something onto the account, and null when this pass wrote nothing at all
+   * (nothing classified, or both columns were already set).
+   *
+   * Deliberately post-image rather than "the column this pass filled": a pass
+   * that fills only Archive reports the pre-existing Trash value alongside it,
+   * which is the more useful thing to read in a log line and costs no extra
+   * query -- RETURNING already has it. The gate on whether the line is
+   * emitted at all is still "did this pass write", so it stays rare.
+   */
+  trashFolder: string | null;
+  /** As trashFolder, for Archive. */
+  archiveFolder: string | null;
+}
+
+export interface FolderDiscovery {
+  /**
+   * The folders THIS LIST reported, as stored -- current `sync_enabled`,
+   * `selectable` and `special_use` included.
+   *
+   * This is the live set, and returning it is the point of the function
+   * returning anything at all. Task 3's walk must drive off exactly these rows
+   * rather than re-querying mail_account_folders, because the table also holds
+   * every folder ever seen: a mailbox deleted on the server keeps its row
+   * forever (by design -- staleness is read off `last_discovered_at`), and
+   * walking it would SELECT a folder that no longer exists, fail the pass, and
+   * back the account off on every pass from then on. A vanished folder must
+   * cost nothing; the rows below are what makes that free.
+   */
+  folders: MailAccountFolderRow[];
+  summary: FolderDiscoverySummary;
+}
+
+/**
+ * Record everything `listed` says about `accountId`'s folders, and return the
+ * live folder set plus a summary of what changed.
  *
  * `now` is the moment of discovery, stamped on every re-sighted row's
- * `last_discovered_at`. It is a parameter rather than a `new Date()` in here
- * so the sync engine can pass its own clock -- every wait and every timestamp
- * in that engine goes through one, which is what lets the staleness behaviour
- * be asserted instead of slept through.
+ * `last_discovered_at`. Required rather than defaulted: the only caller is the
+ * sync engine, every timestamp in that engine comes from its injected clock,
+ * and a default here would be a silent second source of "now" for whichever
+ * caller forgot -- exactly the drift a clock seam exists to prevent.
  *
- * Two statements, not one transaction. They are independent and each is
- * idempotent, so a failure between them costs at most one pass: the folders
- * are recorded and the account's targets are filled by the next LIST, which
- * is five minutes away. Wrapping them would buy atomicity nothing reads.
+ * NO LOGGER PARAMETER, deliberately. The summary is returned and the engine
+ * logs it, so this module stays a pure-ish db-and-rules function: its tests
+ * assert returned values rather than captured log calls, and the log line
+ * carries the engine's own `accountId`/pass context without this module
+ * needing to know that context exists. The one thing it does emit is the SSE
+ * hint in fillMoveTargets, which is not observability -- it is a write that
+ * clients must see.
+ *
+ * Three statements, not one transaction: a SELECT for the pre-image, the
+ * upsert, and at most one account UPDATE. They are independent and each is
+ * idempotent, so a failure between them costs at most one pass -- the folders
+ * are recorded and the account's targets are filled by the next LIST, which is
+ * five minutes away. Wrapping them would buy atomicity nothing reads.
  */
 export async function discoverFolders(
   db: Database,
   accountId: string,
   listed: ImapFolderListing[],
-  now: Date = new Date(),
-): Promise<void> {
-  // Deduplicated by folder name FIRST. Postgres refuses to let a single
-  // INSERT ... ON CONFLICT DO UPDATE affect one row twice (SQLSTATE 21000),
-  // so a listing containing the same mailbox twice would fail the whole
-  // statement -- and because discovery is the first thing a pass does, that
-  // failure would back the account off before any mail was synced, on every
-  // pass, until the server stopped doing it.
-  //
-  // The one duplicate imapflow 1.7.1 can actually produce is INBOX. When the
-  // connection has a namespace prefix and nothing in the main listing claimed
-  // the INBOX slot, it runs a second LIST for INBOX alone and APPENDS the
-  // result (lib/commands/list.js) -- and the case where nothing claimed the
-  // slot despite INBOX being listed is precisely a phantom `\NonExistent`
-  // entry, which it deliberately refuses to let claim it. So the pair is a
-  // phantom and the real mailbox. (LSUB cannot add a duplicate: it merges
-  // into the entry with the same path and ignores anything unlisted.)
-  //
-  // SELECTABLE WINS, therefore, rather than first-seen. Recording the phantom
-  // would mark a real folder `\Noselect` -- dropping it from the walk and
-  // making it useless as a move target -- until some later LIST happened to
-  // arrive in the other order. Preferring the selectable entry gets that
-  // right whichever order they come in, which is the point: imapflow does
-  // sort classified entries ahead of unclassified ones, so today the real
-  // INBOX happens to come first anyway, and a tiebreak resting on that would
-  // be resting on a detail of another library's sort.
-  const unique = new Map<string, ImapFolderListing>();
-  for (const listing of listed) {
-    const kept = unique.get(listing.folder);
-    // Map.set on an existing key keeps its original position, so replacing a
-    // phantom does not reshuffle the listing order the rest of this function
-    // relies on.
-    if (kept === undefined || (!kept.selectable && listing.selectable)) {
-      unique.set(listing.folder, listing);
-    }
+  now: Date,
+): Promise<FolderDiscovery> {
+  const unique = dedupeListings(listed);
+  if (unique.length === 0) {
+    return {
+      folders: [],
+      summary: { listed: 0, created: [], reclassified: [], trashFolder: null, archiveFolder: null },
+    };
   }
-  if (unique.size === 0) return;
 
-  const classified = [...unique.values()].map((listing) => ({
+  const classified = unique.map((listing) => ({
     listing, classification: classifyFolder(listing),
   }));
 
-  await db.insert(mailAccountFolders)
+  // The pre-image, for the created/reclassified diff below. Read rather than
+  // derived from the upsert, because `RETURNING` cannot say which rows it
+  // inserted and which it updated, and the previous `special_use` -- the thing
+  // a reclassification is defined against -- is not in the result at all.
+  //
+  // Unlocked, and that is fine: this account's own loop is serialised, so the
+  // only concurrent writer is Task 4's picker, which toggles `sync_enabled`
+  // and never `special_use`. A race here could at worst mislabel one log line.
+  const previous = new Map((await db
+    .select({ folder: mailAccountFolders.folder, specialUse: mailAccountFolders.specialUse })
+    .from(mailAccountFolders).where(eq(mailAccountFolders.accountId, accountId)))
+    .map((row) => [row.folder, row.specialUse]));
+
+  const folders = await db.insert(mailAccountFolders)
     .values(classified.map(({ listing, classification }) => ({
       accountId,
       folder: listing.folder,
@@ -282,22 +392,41 @@ export async function discoverFolders(
     // folder's classification last change". Nothing asks -- the picker reads
     // the current values, and staleness reads last_discovered_at -- and a
     // column that answered it would have to be a third one.
+    //
+    // `sql.identifier(<column>.name)` rather than a literal "excluded.foo":
+    // the fragment is then derived from the schema's own column name, so
+    // renaming a column in db/schema.ts cannot leave a hand-typed string here
+    // pointing at a column that no longer exists -- a mistake the type checker
+    // would not catch, because a raw sql`` fragment is opaque to it.
     .onConflictDoUpdate({
       target: [mailAccountFolders.accountId, mailAccountFolders.folder],
       set: {
-        specialUse: sql`excluded.special_use`,
-        selectable: sql`excluded.selectable`,
+        specialUse: sql`excluded.${sql.identifier(mailAccountFolders.specialUse.name)}`,
+        selectable: sql`excluded.${sql.identifier(mailAccountFolders.selectable.name)}`,
         lastDiscoveredAt: now,
         updatedAt: now,
       },
-    });
+    })
+    .returning();
 
   // Folders that vanish from LIST are NOT deleted here, and nothing marks
   // them: a row simply stops being re-stamped above, and "stale" is read off
   // last_discovered_at standing still (spec's data model, and the reason the
-  // table has no archivedAt). Their messages keep their history.
+  // table has no archivedAt). Their messages keep their history -- and they
+  // are absent from `folders` above, which is what keeps them out of the walk.
 
-  await fillMoveTargets(db, accountId, classified, now);
+  const created: string[] = [];
+  const reclassified: string[] = [];
+  for (const row of folders) {
+    if (!previous.has(row.folder)) created.push(row.folder);
+    else if (previous.get(row.folder) !== row.specialUse) reclassified.push(row.folder);
+  }
+
+  const targets = await fillMoveTargets(db, accountId, classified, now);
+  return {
+    folders,
+    summary: { listed: folders.length, created, reclassified, ...targets },
+  };
 }
 
 /**
@@ -320,19 +449,25 @@ export async function discoverFolders(
  * The WHERE guard keeps the statement from touching an account it has nothing
  * to add to. Without it every pass would bump `updated_at` on every account
  * forever, making the column mean "a sync pass happened" instead of "someone
- * changed this account".
+ * changed this account". It doubles as the "did anything happen?" signal:
+ * RETURNING yields a row only when the guard matched, so an empty result IS
+ * "nothing written" and needs no second read to establish.
+ *
+ * Returns what this pass actually WROTE (null for a column it did not), which
+ * is what the caller's summary reports.
  */
 async function fillMoveTargets(
   db: Database,
   accountId: string,
   classified: { listing: ImapFolderListing; classification: FolderClassification }[],
   now: Date,
-): Promise<void> {
+): Promise<{ trashFolder: string | null; archiveFolder: string | null }> {
+  const nothing = { trashFolder: null, archiveFolder: null };
   const trash = resolveTarget(classified, "trash");
   const archive = resolveTarget(classified, "archive");
-  if (trash === null && archive === null) return;
+  if (trash === null && archive === null) return nothing;
 
-  await db.update(mailAccounts)
+  const [row] = await db.update(mailAccounts)
     .set({
       trashFolder: sql`coalesce(${mailAccounts.trashFolder}, ${trash})`,
       archiveFolder: sql`coalesce(${mailAccounts.archiveFolder}, ${archive})`,
@@ -347,5 +482,23 @@ async function fillMoveTargets(
         trash === null ? undefined : isNull(mailAccounts.trashFolder),
         archive === null ? undefined : isNull(mailAccounts.archiveFolder),
       ),
-    ));
+    ))
+    .returning({
+      trashFolder: mailAccounts.trashFolder, archiveFolder: mailAccounts.archiveFolder,
+    });
+  if (row === undefined) return nothing;
+
+  // The account row changed, so anything showing it has to be told: the
+  // Settings form renders these two fields, and without this they would sit
+  // stale until something else happened to invalidate the query.
+  //
+  // publish() DIRECTLY, never mail-accounts.ts's update path -- and this is
+  // the load-bearing half. That path also fires the accountChanged hook, which
+  // SyncManager answers by RECONCILING the AccountSync for that account:
+  // restarting or tearing down the very loop whose pass is mid-execution
+  // inside this call. The hook exists for user edits arriving from outside the
+  // engine; a write the engine makes to itself must not re-enter it. Same
+  // reasoning, and the same shape, as AccountSync.writeAccountState.
+  publish({ keys: [["mail-accounts"]] });
+  return { trashFolder: row.trashFolder, archiveFolder: row.archiveFolder };
 }

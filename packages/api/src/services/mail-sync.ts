@@ -284,6 +284,7 @@ export class AccountSync {
   /** Per-pass tallies for the pass-complete log line. */
   private passIngested = 0;
   private passFlagChanges = 0;
+  private passFolders = 0;
   /** Mirror of the account row's last_error, so queued work refused during a
    * backoff can explain itself without a database read. */
   private lastErrorText: string | null = null;
@@ -520,6 +521,7 @@ export class AccountSync {
     this.passLastSkip = null;
     this.passIngested = 0;
     this.passFlagChanges = 0;
+    this.passFolders = 0;
     // A pass just ran, so any poll/backoff deadline still standing is spent:
     // the next one is measured from the end of THIS pass, not from whenever
     // the previous wait happened to be set up.
@@ -542,6 +544,11 @@ export class AccountSync {
       this.logger.info(
         {
           accountId: this.accountId,
+          // How many folders this pass's LIST reported. On the routine line
+          // rather than only the discovery one because it is the cheapest
+          // answer to "is the picker seeing the whole mailbox?" -- a number
+          // that quietly drops means a server stopped listing something.
+          folders: this.passFolders,
           ingested: this.passIngested,
           flagChanges: this.passFlagChanges,
           skipped: this.passSkips,
@@ -628,7 +635,24 @@ export class AccountSync {
     // `account` is deliberately not re-read afterwards even though discovery
     // can fill trash_folder/archive_folder on it: nothing the walk below reads
     // comes from those columns, and the next pass loads the row again anyway.
-    await discoverFolders(this.db, account.id, await client.list(), this.clock.now());
+    //
+    // The stop check matches the walk's: a shutdown that arrives while the
+    // connection was being made should not spend a LIST and an upsert on its
+    // way out.
+    if (this.stopped) return;
+    const listed = await client.list();
+    if (this.stopped) return;
+    const { summary } = await discoverFolders(this.db, account.id, listed, this.clock.now());
+    this.passFolders = summary.listed;
+    // Rare by construction -- a settled mailbox creates nothing and
+    // reclassifies nothing, so this stays silent instead of firing once per
+    // poll interval. Which makes it worth having at info: a folder appearing,
+    // changing role, or resolving a move target are exactly the events an
+    // operator wants to find in the journal afterwards.
+    if (summary.created.length > 0 || summary.reclassified.length > 0
+      || summary.trashFolder !== null || summary.archiveFolder !== null) {
+      this.logger.info({ accountId: this.accountId, ...summary }, "mail-sync: folders discovered");
+    }
     for (const folder of foldersOf(account)) {
       if (this.stopped) return;
       await this.syncFolder(client, account, folder);

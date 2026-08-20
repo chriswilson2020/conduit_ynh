@@ -1,20 +1,32 @@
-import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { and, asc, eq } from "drizzle-orm";
+import type { SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { mailAccountFolders, mailAccounts } from "../db/schema.js";
 import type { ImapFolderListing } from "./mail-imap.js";
-import { classifyFolder, discoverFolders, lastPathSegment } from "./mail-folders.js";
+import { classifyFolder, dedupeListings, discoverFolders, lastPathSegment } from "./mail-folders.js";
+import { subscribe } from "./sse.js";
 
 const handle = openTestDatabase();
 let userId: string;
+let hints: SseHint[];
+let unsubscribe: () => void;
 
 beforeEach(async () => {
   await truncateAll(handle);
   userId = (await resolveUser(handle.db, { username: "chris", email: null, fullName: null })).id;
+  hints = [];
+  unsubscribe = subscribe((hint) => { hints.push(hint); });
 });
 
+afterEach(() => { unsubscribe(); });
+
 afterAll(async () => { await handle.close(); });
+
+function accountHints(): SseHint[] {
+  return hints.filter((hint) => hint.keys.some((key) => key[0] === "mail-accounts"));
+}
 
 /** A listing as the adapter produces it. `delimiter` defaults to "/" -- the
  * cases where the separator is the point say so explicitly. */
@@ -117,16 +129,31 @@ describe("classifyFolder", () => {
   });
 
   it("does not classify a folder that merely CONTAINS a keyword mid-word", () => {
-    // The probe for the leading word boundary in NAME_HEURISTICS, which is
-    // otherwise a claim no test would notice being wrong: both of these
-    // classify under a bare substring test, and both are ordinary folders a
-    // user would be startled to find treated as a mail role. "Presentations"
-    // really does contain "sent" (p-r-e-"sent"-ations), and turning it into
-    // the Sent mailbox would put it behind the whole-thread move's
-    // never-empty-Sent exclusion; "Undeleted" contains "deleted", and
-    // classifying it trash would default it to not syncing at all.
+    // The probe for the leading anchor in NAME_HEURISTICS, which is otherwise
+    // a claim no test would notice being wrong: both of these classify under
+    // a bare substring test, and both are ordinary folders a user would be
+    // startled to find treated as a mail role. "Presentations" really does
+    // contain "sent" (p-r-e-"sent"-ations), and turning it into the Sent
+    // mailbox would put it behind the whole-thread move's never-empty-Sent
+    // exclusion; "Undeleted" contains "deleted", and classifying it trash
+    // would default it to not syncing at all.
     expect(classifyFolder(listing("Presentations")).specialUse).toBeNull();
     expect(classifyFolder(listing("Undeleted")).specialUse).toBeNull();
+  });
+
+  it("classifies across an underscore, which \\b would not", () => {
+    // Underscore-prefixed names are a common way to sort a mailbox, and `\b`
+    // is defined against `\w` -- which INCLUDES the underscore, so it reads
+    // "_Trash" as one unbroken word and classifies nothing. The anchor is
+    // letter-or-digit instead, which is why these two work.
+    //
+    // This is the direction worth being generous in: a missed Trash keeps
+    // syncing deleted mail into the CRM and leaves trash_folder NULL, so
+    // every bulk Trash action against the account fails for want of a target.
+    expect(classifyFolder(listing("_Trash")).specialUse).toBe("trash");
+    expect(classifyFolder(listing("1_Archive")).specialUse).toBe("archive");
+    // The separator does not have to be an underscore for this to hold.
+    expect(classifyFolder(listing("[Gmail]/Sent Mail", { delimiter: "/" })).specialUse).toBe("sent");
   });
 
   it("matches on the LAST path segment only, under either delimiter", () => {
@@ -150,6 +177,49 @@ describe("classifyFolder", () => {
     // order is fixed and documented rather than left to whichever regex the
     // engine happens to try.
     expect(classifyFolder(listing("Deleted Drafts")).specialUse).toBe("trash");
+  });
+});
+
+describe("dedupeListings", () => {
+  it("keeps one entry per folder, preferring the selectable one in either order", () => {
+    // The phantom-INBOX rule. imapflow's INBOX fixup appends a second LIST
+    // result for INBOX when a phantom \NonExistent entry stopped the first
+    // one claiming the slot, so the pair is a phantom and the real mailbox.
+    // Keeping the phantom would record INBOX as \Noselect: dropped from the
+    // walk, useless as a move target.
+    const phantomFirst = dedupeListings([
+      listing("INBOX", { selectable: false }),
+      listing("INBOX", { selectable: true }),
+    ]);
+    expect(phantomFirst).toHaveLength(1);
+    expect(phantomFirst[0]?.selectable).toBe(true);
+
+    const realFirst = dedupeListings([
+      listing("INBOX", { selectable: true }),
+      listing("INBOX", { selectable: false }),
+    ]);
+    expect(realFirst).toHaveLength(1);
+    expect(realFirst[0]?.selectable).toBe(true);
+  });
+
+  it("leaves order and every distinct folder alone", () => {
+    // Listing order is not decoration: resolveTarget breaks ties on it, so a
+    // dedupe that reshuffled would quietly change which folder becomes the
+    // account's Trash.
+    const listed = [listing("INBOX"), listing("Sent"), listing("Clients")];
+    expect(dedupeListings(listed).map((item) => item.folder)).toEqual(["INBOX", "Sent", "Clients"]);
+  });
+
+  it("keeps the FIRST of a duplicate pair when neither entry is more selectable", () => {
+    // No preference to apply, so insertion order decides -- stated rather
+    // than left to be inferred, because it is what makes the result
+    // deterministic at all.
+    const listed = [listing("Trash", { specialUse: "trash" }), listing("Trash")];
+    expect(dedupeListings(listed)).toEqual([listing("Trash", { specialUse: "trash" })]);
+  });
+
+  it("returns nothing for nothing", () => {
+    expect(dedupeListings([])).toEqual([]);
   });
 });
 
@@ -252,8 +322,103 @@ describe("discoverFolders", () => {
 
   it("is a no-op for an empty listing rather than a failure", async () => {
     const accountId = await makeAccount();
-    await expect(discoverFolders(handle.db, accountId, [], PASS_ONE)).resolves.toBeUndefined();
+    const result = await discoverFolders(handle.db, accountId, [], PASS_ONE);
+    expect(result.folders).toEqual([]);
+    expect(result.summary).toEqual({
+      listed: 0, created: [], reclassified: [], trashFolder: null, archiveFolder: null,
+    });
     expect(await rowsOf(accountId)).toEqual([]);
+  });
+
+  // --- The returned folder set and summary ---------------------------------
+
+  it("returns THIS LIST's rows, never the stale ones the table still holds", async () => {
+    const accountId = await makeAccount();
+    await discoverFolders(handle.db, accountId, [listing("INBOX"), listing("Old")], PASS_ONE);
+
+    // "Old" was deleted server-side. Its ROW survives (rows are never
+    // deleted) but it must not come back in the returned set: Task 3's walk
+    // drives off exactly these rows, and walking a mailbox the server no
+    // longer has fails the pass -- every pass, forever, since the row never
+    // goes away on its own.
+    const { folders } = await discoverFolders(
+      handle.db, accountId, [listing("INBOX"), listing("New")], PASS_TWO,
+    );
+    expect(folders.map((row) => row.folder).sort()).toEqual(["INBOX", "New"]);
+    expect((await rowsOf(accountId)).map((row) => row.folder)).toEqual(["INBOX", "New", "Old"]);
+  });
+
+  it("returns rows carrying the CURRENT sync_enabled, not the classification default", async () => {
+    const accountId = await makeAccount();
+    await discoverFolders(handle.db, accountId, [listing("Projects")], PASS_ONE);
+    await handle.db.update(mailAccountFolders).set({ syncEnabled: false })
+      .where(and(eq(mailAccountFolders.accountId, accountId), eq(mailAccountFolders.folder, "Projects")));
+
+    // The walk reads sync_enabled off these rows, so a returned row echoing
+    // the proposed insert rather than the stored value would re-enable a
+    // folder the user switched off -- the no-clobber rule undone one layer up.
+    const { folders } = await discoverFolders(handle.db, accountId, [listing("Projects")], PASS_TWO);
+    expect(folders).toHaveLength(1);
+    expect(folders[0]).toMatchObject({ folder: "Projects", syncEnabled: false });
+  });
+
+  it("summarises what changed, and reports nothing changed on a settled mailbox", async () => {
+    const accountId = await makeAccount();
+    const first = await discoverFolders(handle.db, accountId, [
+      listing("INBOX"), listing("Projects"),
+    ], PASS_ONE);
+    expect(first.summary).toMatchObject({
+      listed: 2, created: ["INBOX", "Projects"], reclassified: [],
+    });
+
+    // Same listing again: the steady state, and the reason the engine's
+    // discovery log line is gated on this being empty.
+    const second = await discoverFolders(handle.db, accountId, [
+      listing("INBOX"), listing("Projects"),
+    ], PASS_TWO);
+    expect(second.summary).toEqual({
+      listed: 2, created: [], reclassified: [], trashFolder: null, archiveFolder: null,
+    });
+
+    // A role appearing on an existing folder is a reclassification, not a
+    // creation -- and a new folder is a creation, not a reclassification.
+    const third = await discoverFolders(handle.db, accountId, [
+      listing("INBOX"), listing("Projects", { specialUse: "archive" }), listing("Clients"),
+    ], PASS_TWO);
+    expect(third.summary).toMatchObject({ listed: 3, created: ["Clients"], reclassified: ["Projects"] });
+  });
+
+  it("reports the resolved targets in the summary only on the pass that writes them", async () => {
+    const accountId = await makeAccount();
+    const listed = [listing("INBOX"), listing("Trash", { specialUse: "trash" })];
+
+    const first = await discoverFolders(handle.db, accountId, listed, PASS_ONE);
+    expect(first.summary).toMatchObject({ trashFolder: "Trash", archiveFolder: null });
+
+    // Second pass writes nothing (the column is already set), so it reports
+    // nothing -- which is what keeps the engine's info line rare.
+    const second = await discoverFolders(handle.db, accountId, listed, PASS_TWO);
+    expect(second.summary).toMatchObject({ trashFolder: null, archiveFolder: null });
+  });
+
+  it("publishes a mail-accounts hint when it resolves a target, and only then", async () => {
+    const accountId = await makeAccount();
+    const listed = [listing("INBOX"), listing("Archive", { specialUse: "archive" })];
+
+    // The Settings form renders these fields, so a write nothing announces
+    // leaves them stale on screen.
+    await discoverFolders(handle.db, accountId, listed, PASS_ONE);
+    expect(accountHints()).toHaveLength(1);
+
+    // A pass that writes nothing must stay silent, or a settled account would
+    // publish once per poll interval forever.
+    hints = [];
+    await discoverFolders(handle.db, accountId, listed, PASS_TWO);
+    expect(accountHints()).toHaveLength(0);
+
+    // ...including a pass with nothing to resolve at all.
+    await discoverFolders(handle.db, accountId, [listing("INBOX")], PASS_TWO);
+    expect(accountHints()).toHaveLength(0);
   });
 
   it("survives the same folder appearing twice in one listing", async () => {
