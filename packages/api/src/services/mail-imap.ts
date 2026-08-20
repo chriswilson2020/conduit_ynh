@@ -81,15 +81,15 @@ import type { IngestMessageInput, IngestResult } from "./mail-ingest.js";
  *   mail_accounts.last_error and returned verbatim by the test-connection
  *   endpoint, and both the settings UI (telling a user to check their
  *   password vs. their host) and mail-send.ts's 502 body branch on them. They
- *   live here, with the interface, so a consumer never has to import the
- *   imapflow/nodemailer-bound adapter module just to recognise one.
+ *   are DEFINED IN @conduit/shared, because that settings UI lives in
+ *   packages/web and cannot import from packages/api, and re-exported here so
+ *   nothing on this side has to know that.
  * - Neither the prefix nor the message may ever contain a password: the
  *   underlying libraries do not echo credentials into their own error text,
  *   and an adapter must not add any.
  */
 
-export const MAIL_AUTH_ERROR_PREFIX = "auth:";
-export const MAIL_CONNECTION_ERROR_PREFIX = "connection:";
+export { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
 
 /** Deliberately just UIDVALIDITY. UIDNEXT would be the obvious companion,
  * but nothing reads it -- the cursor is driven by what fetchNewer actually

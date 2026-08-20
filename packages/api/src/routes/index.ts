@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import multipart from "@fastify/multipart";
 import type { Database } from "../db/client.js";
+import type { SendMailSyncManager, SendMailTransportFactory } from "../services/mail-send.js";
 import { registerCompanyRoutes } from "./companies.js";
 import { registerContactRoutes } from "./contacts.js";
 import { registerNoteRoutes } from "./notes.js";
@@ -31,6 +32,26 @@ export interface CrmRouteDeps {
    * routes/mail.ts (Task 7) to pass into mail-accounts.ts's service calls.
    * Seam only -- unused until that route file exists. */
   mailKeyPath: string;
+  /**
+   * The live sync engine, fetched at REQUEST time rather than captured at
+   * registration time -- routes are registered while the HTTP server is still
+   * booting and the manager is only started after it is listening (see
+   * server.ts), so a value here would always be the null it had then.
+   *
+   * Returning null is an ordinary, supported answer, not a failure: sync is
+   * off under NODE_ENV=test and in any deployment without an adapter, and
+   * both consumers (mail-send's Sent-folder APPEND, Task 7's `\Seen`
+   * write-back) treat "no manager" and "no sync for this account" the same
+   * best-effort way.
+   */
+  syncManager: () => SendMailSyncManager | null;
+  /**
+   * Builds an SMTP transport for one send. Supplied by the composition root
+   * (server.ts) from parsed config, so nothing under routes/ or services/
+   * decides how a connection is configured -- see
+   * mail-imapflow.ts's createSmtpTransportFactory.
+   */
+  transportFactory: SendMailTransportFactory;
 }
 
 /**

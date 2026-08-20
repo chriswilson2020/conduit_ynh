@@ -275,6 +275,23 @@ export function normalizeSubject(subject: string): string {
 }
 
 /**
+ * Truncate to a UTF-8 byte budget without splitting a character. The
+ * TextDecoder is given the slice in streaming mode precisely so a partial
+ * trailing sequence is HELD BACK rather than replaced with U+FFFD -- which
+ * would otherwise corrupt the last character and, worse, do it differently
+ * depending on where the byte boundary fell.
+ *
+ * Lives here rather than in mail-ingest.ts (its first caller) because
+ * htmlToText below needs the same bound and this is the lower module of the
+ * two -- the dependency only runs one way.
+ */
+export function capUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const slice = Buffer.from(value, "utf8").subarray(0, maxBytes);
+  return new TextDecoder("utf-8").decode(slice, { stream: true });
+}
+
+/**
  * Collapse whitespace (including newlines) and take the first 160 Unicode
  * code points -- Array.from splits a string into code points, not UTF-16
  * code units, so a character outside the BMP (most emoji) landing right at
@@ -468,9 +485,15 @@ const C0_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
 // invariant documented below (callers pass HTML that already went through
 // sanitizeMailHtml, which re-serialises balanced markup) means no such
 // input can actually reach here; the cap is what keeps that a defence in
-// depth rather than a promise. 256KB is also mail-ingest.ts's own
-// MAX_BODY_TEXT_BYTES, so nothing beyond it could survive storage anyway.
-const MAX_HTML_LENGTH = 256 * 1024;
+// depth rather than a promise.
+//
+// A BYTE budget, applied with capUtf8, not a code-unit slice: the two are
+// only the same number for pure ASCII, and cutting a string at an arbitrary
+// code-unit index can split a surrogate pair and leave a lone half behind.
+// The measurements above are bytes-per-ASCII-character, so the bound they
+// justify is the byte one. It matches mail-ingest.ts's MAX_BODY_TEXT_BYTES,
+// which caps this function's output there anyway.
+const MAX_HTML_BYTES = 256 * 1024;
 
 /**
  * One numeric entity's replacement text. C0 controls decode to nothing
@@ -499,9 +522,9 @@ function decodeCodePoint(value: number): string {
  */
 export function htmlToText(html: string): string {
   // Both guards apply to the INPUT, before any transform runs: see
-  // C0_CONTROLS (marker forgery) and MAX_HTML_LENGTH (A_TAG_RE's quadratic
+  // C0_CONTROLS (marker forgery) and MAX_HTML_BYTES (A_TAG_RE's quadratic
   // worst case) above.
-  const bounded = html.slice(0, MAX_HTML_LENGTH).replace(C0_CONTROLS, "");
+  const bounded = capUtf8(html, MAX_HTML_BYTES).replace(C0_CONTROLS, "");
   // Links lose their visible markup like everything else below, so the
   // destination has to be captured and re-inserted as text before that
   // happens, or a plain-text reader has no way to reach it.

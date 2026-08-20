@@ -458,6 +458,23 @@ export type UsersResponse = z.infer<typeof usersResponseSchema>;
 
 // --- Mail (Phase 4) ------------------------------------------------------
 
+/**
+ * How a mail connection failure is classified, as a stable prefix on the
+ * error MESSAGE. The IMAP/SMTP adapter (api: services/mail-imapflow.ts) puts
+ * one of these at the front of anything it throws that it can classify; the
+ * text then travels, verbatim, into mail_accounts.last_error, the
+ * test-connection response and the send path's 502 body.
+ *
+ * They live in SHARED, not in the api package, because the consumers are on
+ * both sides of the wire: the settings UI branches on them to say "check your
+ * password" versus "the server could not be reached", and packages/web cannot
+ * import from packages/api. Anything unclassifiable carries no prefix at all
+ * rather than a guessed one -- a UI matching these must treat "neither" as an
+ * ordinary case, not an error.
+ */
+export const MAIL_AUTH_ERROR_PREFIX = "auth:";
+export const MAIL_CONNECTION_ERROR_PREFIX = "connection:";
+
 export const mailSecuritySchema = z.enum(["tls", "starttls"]);
 export type MailSecurity = z.infer<typeof mailSecuritySchema>;
 

@@ -11,7 +11,8 @@ import {
 import { saveBlob } from "./blobs.js";
 import { MailIngestError, NotFoundError } from "./errors.js";
 import {
-  extractAddresses, htmlToText, makeSnippet, normalizeSubject, sanitizeMailHtml, syntheticMessageId,
+  capUtf8, extractAddresses, htmlToText, makeSnippet, normalizeSubject, sanitizeMailHtml,
+  syntheticMessageId,
 } from "./mail-content.js";
 import { lockSiblingGroup } from "./pipelines.js";
 import { publish } from "./sse.js";
@@ -230,19 +231,6 @@ const MAX_RAW_BYTES = 25 * 1024 * 1024;
 // prevent. The bound has to sit where the superlinear curve is still flat,
 // not merely where real mail stops.
 const MAX_HEADER_BYTES = 64 * 1024;
-
-/**
- * Truncate to a UTF-8 byte budget without splitting a character. The
- * TextDecoder is given the slice in streaming mode precisely so a partial
- * trailing sequence is HELD BACK rather than replaced with U+FFFD -- which
- * would otherwise corrupt the last character and, worse, do it differently
- * depending on where the byte boundary fell.
- */
-function capUtf8(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  const slice = Buffer.from(value, "utf8").subarray(0, maxBytes);
-  return new TextDecoder("utf-8").decode(slice, { stream: true });
-}
 
 /**
  * Byte length of the message's header block -- everything before the first

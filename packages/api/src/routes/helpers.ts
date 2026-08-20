@@ -106,7 +106,11 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
   // the two mail-crypto branches above, the route that exercises this lands
   // in Task 7; the mapping is wired here so it gets it for free.
   if (error instanceof SmtpSendError) {
-    void reply.code(502).send({ error: "smtp_failed", message: error.message });
+    // `reason` rides alongside `message` because that is what it was built
+    // for: it is the adapter's normalized text, prefix and all, so the
+    // composer can branch on `auth:` vs `connection:` without parsing an
+    // English sentence out of `message`.
+    void reply.code(502).send({ error: "smtp_failed", message: error.message, reason: error.reason });
     return;
   }
   throw error;

@@ -389,6 +389,19 @@ describe("htmlToText", () => {
     expect(htmlToText("Totally safe &#x1;https://evil.example/&#x2;")).toBe("Totally safe https://evil.example/");
   });
 
+  it("caps its input by BYTES, without splitting a character at the boundary", () => {
+    // U+4E2D is three bytes, so filling the budget to one byte short of the
+    // cap leaves it straddling the boundary. A code-unit slice would cut it
+    // in half; capUtf8 holds the partial sequence back instead, so nothing
+    // decodes to U+FFFD.
+    const wide = String.fromCharCode(0x4e2d);
+    const text = htmlToText("a".repeat(256 * 1024 - 1) + wide + "trailing");
+    expect(text).not.toContain(String.fromCharCode(0xfffd));
+    expect(text).not.toContain(wide);
+    expect(text).not.toContain("trailing");
+    expect(text.endsWith("a")).toBe(true);
+  });
+
   it("caps its input length", () => {
     // A_TAG_RE is quadratic against unclosed <a> tags (the lazy inner group
     // rescans to the end of the string from every one of them). Unreachable

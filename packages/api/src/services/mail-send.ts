@@ -51,6 +51,24 @@ import { ingestMessage, type IngestedMessage } from "./mail-ingest.js";
 
 const SEEN_FLAG = "\\Seen";
 
+/**
+ * How long the Sent-folder APPEND may hold the send's HTTP response open.
+ *
+ * appendSent is queued onto the account's sync loop, which is serial: an
+ * APPEND enqueued while that loop is halfway through a first backfill does
+ * not run until the backfill does, which can be minutes. Awaiting it
+ * unbounded would leave the composer spinning long after the message had
+ * actually been sent -- and a user who gives up and presses Send again sends
+ * it twice. So the wait is bounded and a timeout falls into the same warn
+ * path as any other APPEND failure: the queued task is NOT cancelled (there
+ * is no cancellation in the ImapClient contract, and it will still run and
+ * still land the copy in Sent), it is simply no longer waited on.
+ *
+ * A few seconds: long enough for an idle or briefly-busy loop to pick the
+ * task up, short enough that a stuck one is never the user's problem.
+ */
+const APPEND_TIMEOUT_MS = 5_000;
+
 /** Mirrors mail-ingest.ts's own References cap: the nearest ancestors are the
  * ones threading consults, and this chain is about to be re-ingested through
  * that same cap anyway. */
@@ -93,7 +111,7 @@ export interface SendMailTransport {
 }
 
 /** Built per send, from the account row and its decrypted credentials.
- * mail-imapflow.ts's createSmtpTransport is the production implementation. */
+ * mail-imapflow.ts's createSmtpTransportFactory builds the production one. */
 export type SendMailTransportFactory =
   (account: MailAccount, credentials: MailCredentials) => SendMailTransport;
 
@@ -118,6 +136,33 @@ export interface SendMailDeps {
   syncManager: SendMailSyncManager | null;
   /** Defaults to the console logger, like the sync engine's own. */
   logger?: SyncLogger;
+  /** Test seam only: how long to wait for the Sent-folder APPEND before
+   * giving up on it (default APPEND_TIMEOUT_MS). A test proving the bound
+   * exists should not have to spend the real one waiting. */
+  appendTimeoutMs?: number;
+}
+
+/**
+ * Resolve `promise`, or reject with a timeout after `ms`. The source promise
+ * is left running -- there is nothing to cancel it with, and in the one case
+ * this is used for it is a queued task that should still complete.
+ *
+ * No unhandled rejection escapes a lost race: Promise.race subscribes to
+ * `promise`, so a late rejection is delivered to a handler that ignores it
+ * rather than to the process. The timer is always cleared (and unref'd, so it
+ * could never be the reason a shutdown waits).
+ */
+async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => { reject(new Error(message)); }, ms);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([promise, expiry]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 // --- Reply chain -----------------------------------------------------------
@@ -250,9 +295,22 @@ function toComposeAddresses(addresses: readonly MailAddress[]): { name?: string;
  * the second one too.
  */
 function buildEnvelope(from: string, input: SendMailInput): { from: string; to: string[] } {
-  const recipients = new Set<string>();
-  for (const entry of [...input.to, ...input.cc, ...input.bcc]) recipients.add(entry.address);
-  return { from, to: [...recipients] };
+  // Compared case-insensitively across the WHOLE address, but sent in the
+  // form the user typed. RFC 5321 makes only the domain case-insensitive and
+  // leaves the local part to the receiving server, so this can in principle
+  // merge two addresses a pedantic server would treat as different -- a
+  // compromise taken knowingly, because "Alice@x.com" on To and "alice@x.com"
+  // on Cc is a duplicate in every mail system anyone actually runs, and
+  // delivering the same message twice is the worse failure.
+  const seen = new Set<string>();
+  const to: string[] = [];
+  for (const entry of [...input.to, ...input.cc, ...input.bcc]) {
+    const key = entry.address.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    to.push(entry.address);
+  }
+  return { from, to };
 }
 
 // --- The send --------------------------------------------------------------
@@ -351,7 +409,14 @@ export async function sendMail(
   // explicit threadId would have chosen, so only a compose-seeded link on a
   // brand-new thread can actually be lost, and only in that window.
   try {
-    await deps.syncManager?.get(account.id)?.appendSent(raw);
+    const append = deps.syncManager?.get(account.id)?.appendSent(raw);
+    if (append !== undefined) {
+      await withTimeout(
+        append,
+        deps.appendTimeoutMs ?? APPEND_TIMEOUT_MS,
+        "the Sent-folder APPEND did not complete in time (the account's sync is busy)",
+      );
+    }
   } catch (error) {
     logger.warn(
       { accountId: account.id, err: errorText(error) },

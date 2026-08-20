@@ -3,8 +3,8 @@ import { fileURLToPath } from "node:url";
 import { parseConfig } from "./config.js";
 import { createDatabase, runMigrations } from "./db/client.js";
 import { buildApp } from "./app.js";
-import { createImapClientFactory } from "./services/mail-imapflow.js";
-import { startSyncManager } from "./services/mail-sync.js";
+import { createImapClientFactory, createSmtpTransportFactory } from "./services/mail-imapflow.js";
+import { startSyncManager, type SyncManager } from "./services/mail-sync.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -13,6 +13,20 @@ async function main(): Promise<void> {
   const { db, close } = createDatabase(config.databaseUrl);
 
   await runMigrations(db);
+
+  // Assigned once the manager is started, below. Routes registered by
+  // buildApp read it through the getter they are given, at request time, so
+  // this being null right now is not a problem to design around -- it is the
+  // state the app genuinely has until the server is listening.
+  let syncManager: SyncManager | null = null;
+
+  // Both mail seams are built HERE, the composition root, from parsed config:
+  // how a connection is configured (TLS verification in particular) is a
+  // deployment decision, and nothing under routes/ or services/ should be
+  // reading the environment to discover it.
+  const transportFactory = createSmtpTransportFactory({
+    rejectUnauthorized: config.mailTlsRejectUnauthorized,
+  });
 
   const app = await buildApp({
     config,
@@ -23,6 +37,7 @@ async function main(): Promise<void> {
     // <root>, then into web. (Compare db/client.ts's migrationsFolder(), which needs
     // two: server/db/client.js is nested one level deeper than server/server.js.)
     webRoot: process.env.WEB_ROOT ?? path.join(here, "..", "web"),
+    mail: { syncManager: () => syncManager, transportFactory },
   });
 
   // Loopback only. nginx is the sole ingress, and that is what makes the
@@ -42,7 +57,7 @@ async function main(): Promise<void> {
   // for one FRESH imapflow client per connection attempt (mail-imap.ts's
   // lifecycle contract). startSyncManager still starts nothing under
   // NODE_ENV=test.
-  const syncManager = await startSyncManager({
+  syncManager = await startSyncManager({
     db,
     dataDir: config.dataDir,
     mailKeyPath: config.mailKeyPath,

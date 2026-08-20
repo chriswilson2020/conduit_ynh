@@ -99,9 +99,13 @@ class FakeTransport implements SendMailTransport {
 class FakeAccountSync {
   readonly appended: Buffer[] = [];
   failure: Error | null = null;
+  /** A loop that never gets round to this task -- what an APPEND queued
+   * behind a first backfill actually looks like. */
+  neverDrains = false;
 
   appendSent(raw: Buffer | string): Promise<void> {
     if (this.failure !== null) return Promise.reject(this.failure);
+    if (this.neverDrains) return new Promise<void>(() => { /* never settles */ });
     this.appended.push(Buffer.isBuffer(raw) ? raw : Buffer.from(raw, "utf8"));
     return Promise.resolve();
   }
@@ -300,6 +304,25 @@ describe("sendMail", () => {
     expect(warnings).toHaveLength(1);
   });
 
+  it("does not wait indefinitely for a sync loop that is busy elsewhere", async () => {
+    const sync = new FakeAccountSync();
+    // The APPEND is queued onto a serial loop; one halfway through a first
+    // backfill will not reach it for minutes. Unbounded, the composer would
+    // spin long after the message had been sent -- and a user who gives up
+    // and presses Send again sends it twice.
+    sync.neverDrains = true;
+    syncs.set(accountId, sync);
+
+    const message = await sendMail(
+      handle.db, dataDir, actorId, input(), deps({ appendTimeoutMs: 20 }),
+    );
+
+    expect(message.id).toBeDefined();
+    expect(await storedMessages()).toHaveLength(1);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.details.err).toMatch(/did not complete in time/);
+  });
+
   it("sends and stores with no sync engine at all", async () => {
     // NODE_ENV=test, or a deployment whose sync is disabled: there is nothing
     // to APPEND through, and that is not a failure.
@@ -356,10 +379,17 @@ describe("sendMail", () => {
   it("does not send the same address twice when it is on two lists", async () => {
     await sendMail(
       handle.db, dataDir, actorId,
-      input({ cc: [{ address: "alice@example.com" }] }), deps(),
+      input({
+        to: [{ address: "Alice@Example.com", name: "Alice" }],
+        cc: [{ address: "alice@example.com" }],
+      }),
+      deps(),
     );
     // Two RCPT TO commands for one address would deliver the message twice.
-    expect(transport.sent[0]?.envelope.to).toEqual(["alice@example.com"]);
+    // Compared case-insensitively -- "Alice@Example.com" and
+    // "alice@example.com" are one mailbox in every mail system anyone runs --
+    // and sent in the form the user typed.
+    expect(transport.sent[0]?.envelope.to).toEqual(["Alice@Example.com"]);
   });
 
   it("builds the In-Reply-To and References chain of a reply", async () => {
@@ -502,7 +532,9 @@ describe("sendMail", () => {
     expect(stored[0]?.sizeBytes).toBe("the quoted price is 42".length);
   });
 
-  it("holds no file descriptors of its own while a send with attachments fails", async () => {
+  // Skipped rather than silently passing where /proc is unavailable (macOS),
+  // so "this ran and proved nothing" cannot be mistaken for "this passed".
+  it.skipIf(openFileDescriptors() === null)("holds no file descriptors of its own while a send with attachments fails", async () => {
     const fileId = await makeUpload(actorId, { name: "quote.txt" });
     // The failure that lives in the gap between loading attachments and
     // composing: credentials that cannot be decrypted. It is PERSISTENT (a
@@ -517,7 +549,7 @@ describe("sendMail", () => {
       )).rejects.toThrow();
     }
     const after = openFileDescriptors();
-    if (before === null || after === null) return; // see openFileDescriptors
+    if (before === null || after === null) throw new Error("unreachable: guarded by skipIf");
     // Attachments are handed to nodemailer as PATHS: nothing here opens a
     // file at all, so twenty failed sends move this number by nothing. (The
     // slack is for unrelated descriptors -- a pooled database connection --

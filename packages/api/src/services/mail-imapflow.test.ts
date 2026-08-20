@@ -3,7 +3,8 @@ import type { ImapConnectionSettings } from "./mail-imap.js";
 import {
   ImapIdleUnsupportedError, ImapflowClient,
   buildImapOptions, buildSmtpOptions, continueWalk, createImapClientFactory,
-  defaultTestConnectionDeps, imapVerify, nextWalk, normalizeMailError, smtpVerify,
+  defaultTestConnectionDeps, imapVerify, nextWalk, normalizeMailError, readFetchedSource,
+  requireSearchUids, smtpVerify,
 } from "./mail-imapflow.js";
 
 /**
@@ -118,10 +119,25 @@ describe("normalizeMailError", () => {
 
   it("prefixes socket, DNS and TLS failures with connection:", () => {
     for (const code of ["ECONNREFUSED", "ENOTFOUND", "ETIMEOUT", "NoConnection", "EConnectionClosed",
-      "CONNECT_TIMEOUT", "ECONNECTION", "ESOCKET", "DEPTH_ZERO_SELF_SIGNED_CERT"]) {
+      "CONNECT_TIMEOUT", "ECONNECTION", "ESOCKET", "DEPTH_ZERO_SELF_SIGNED_CERT",
+      // imapflow spells this pair with the transport appended. Text is the
+      // one a user gets for pointing "tls" at a plaintext port (or the
+      // reverse) -- the likeliest misconfiguration the settings form can
+      // produce, and useless to the user unless it is classed as a
+      // connection problem rather than left bare.
+      "ClosedAfterConnectText", "ClosedAfterConnectTLS",
+      "StateLogout", "ProxyError"]) {
       const error = Object.assign(new Error(`failed (${code})`), { code });
       expect(normalizeMailError(error).message).toBe(`connection: failed (${code})`);
     }
+  });
+
+  it("classifies a STARTTLS failure, which carries a flag and NO code", () => {
+    // imapflow's "Server does not support STARTTLS" sets tlsFailed and no
+    // code at all. It is exactly the wrong-host-or-security case, so leaving
+    // it unclassified would point the settings UI at the password field.
+    const error = Object.assign(new Error("Server does not support STARTTLS"), { tlsFailed: true });
+    expect(normalizeMailError(error).message).toBe("connection: Server does not support STARTTLS");
   });
 
   it("leaves an unclassifiable error exactly as it was", () => {
@@ -183,6 +199,34 @@ describe("the folder-walk cache", () => {
     // that arrived in between would go unseen.
     expect(nextWalk("INBOX", null, [1, 2, 3], [])).toBeNull();
     expect(nextWalk("INBOX", null, [], [])).toBeNull();
+  });
+});
+
+describe("falsy imapflow returns", () => {
+  // imapflow's .d.ts models "no result" as `false`, but a command whose
+  // connection died mid-flight resolves UNDEFINED -- and does it from inside
+  // a mailbox lock, where nothing else notices. Untranslated, that reaches
+  // mail_accounts.last_error as "found is not iterable" or a destructuring
+  // TypeError.
+  it("turns both falsy SEARCH shapes into a sentence", () => {
+    expect(requireSearchUids([3, 4], "INBOX", "SEARCH")).toEqual([3, 4]);
+    expect(() => requireSearchUids(false, "INBOX", "SEARCH")).toThrow("SEARCH in INBOX failed");
+    expect(() => requireSearchUids(undefined, "Sent", "SEARCH SINCE"))
+      .toThrow("SEARCH SINCE in Sent did not run (the connection went away)");
+  });
+
+  it("maps only fetchOne's `false` to the expunged case", () => {
+    const source = Buffer.from("From: a@b\r\n\r\nhi", "utf8");
+    expect(readFetchedSource({ source }, "INBOX", 7)).toBe(source);
+    // A genuine no-such-UID: the message was expunged between the listing
+    // and the fetch, which the contract calls an ordinary race.
+    expect(readFetchedSource(false, "INBOX", 7)).toBeNull();
+    // A dead connection is NOT that. Returning null here would tell the sync
+    // loop the message had been deleted, and its cursor would advance past a
+    // message it never read.
+    expect(() => readFetchedSource(undefined, "INBOX", 7))
+      .toThrow("fetch of INBOX/7 did not run (the connection went away)");
+    expect(() => readFetchedSource({}, "INBOX", 7)).toThrow("fetch of INBOX/7 returned no source");
   });
 });
 
