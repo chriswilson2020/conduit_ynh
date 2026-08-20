@@ -1,5 +1,6 @@
 import { ImapFlow, type ImapFlowOptions, type StatusObject, type AppendResponseObject } from "imapflow";
 import nodemailer from "nodemailer";
+import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
 import type { MailAccount, MailSecurity } from "@conduit/shared";
 import type { MailCredentials } from "./mail-crypto.js";
 import type { TestConnectionDeps, VerifySettings } from "./mail-accounts.js";
@@ -210,24 +211,14 @@ export function buildImapOptions(
   };
 }
 
-interface SmtpOptions {
-  host: string;
-  port: number;
-  secure: boolean;
-  requireTLS?: boolean;
-  auth: { user: string; pass: string };
-  connectionTimeout: number;
-  greetingTimeout: number;
-  socketTimeout: number;
-  tls?: { rejectUnauthorized: boolean };
-}
-
 /** nodemailer's SMTP transport options, same mapping and same reasoning as
  * buildImapOptions (nodemailer spells the STARTTLS requirement
- * `requireTLS`). */
+ * `requireTLS`). Typed as nodemailer's OWN option shape rather than a local
+ * interface, so the compiler checks these key names against the library
+ * instead of accepting a plausible-looking object. */
 export function buildSmtpOptions(
   settings: ConnectionSettings, options: MailAdapterOptions = {},
-): SmtpOptions {
+): SMTPTransport.Options {
   const rejectUnauthorized = options.rejectUnauthorized ?? defaultRejectUnauthorized();
   return {
     host: settings.host,
