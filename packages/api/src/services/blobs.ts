@@ -62,7 +62,22 @@ export async function saveBlob(dataDir: string, source: Readable): Promise<{ sha
   }
 }
 
-export function openBlob(dataDir: string, sha256: string) {
+/**
+ * Where a blob lives, with the same digest validation openBlob applies (the
+ * value is a path segment, so it must be provably a hash and not something
+ * with a "../" in it).
+ *
+ * Exported for callers that need to hand the LOCATION to something that will
+ * open it itself, rather than opening it here -- mail-send.ts passes it to
+ * nodemailer, so the file descriptor's whole lifetime belongs to the one
+ * library operation that reads it instead of being opened early and left to
+ * a caller to clean up.
+ */
+export function blobPath(dataDir: string, sha256: string): string {
   if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error("invalid sha256");
-  return createReadStream(path.join(dataDir, "files", sha256));
+  return path.join(dataDir, "files", sha256);
+}
+
+export function openBlob(dataDir: string, sha256: string) {
+  return createReadStream(blobPath(dataDir, sha256));
 }

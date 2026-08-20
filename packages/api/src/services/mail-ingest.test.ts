@@ -3,7 +3,7 @@ import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { asc, eq, sql } from "drizzle-orm";
-import type { SseHint } from "@conduit/shared";
+import type { MailAddress, SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { mailAccounts, mailAttachments, mailMessages, mailThreads } from "../db/schema.js";
@@ -146,6 +146,7 @@ interface IngestOptions {
   account?: string;
   threadId?: string;
   links?: IngestMessageLinks;
+  bccOverride?: MailAddress[];
 }
 
 function ingest(mail: FixtureMail | string, opts: IngestOptions = {}) {
@@ -157,6 +158,7 @@ function ingest(mail: FixtureMail | string, opts: IngestOptions = {}) {
     flags: opts.flags ?? [],
     ...(opts.threadId === undefined ? {} : { threadId: opts.threadId }),
     ...(opts.links === undefined ? {} : { links: opts.links }),
+    ...(opts.bccOverride === undefined ? {} : { bccOverride: opts.bccOverride }),
   });
 }
 
@@ -490,6 +492,53 @@ describe("ingestMessage: direction and seen", () => {
 
     const inbound = await ingest({ messageId: ROOT_ID, bcc: "secret@example.com" });
     expect(inbound.message.bccAddrs).toEqual([]);
+  });
+
+  it("stores bccOverride instead of the header for a message this system sent", async () => {
+    // mail-send composes without a Bcc header (that is what makes a blind
+    // copy blind) and stores the exact bytes it sent, so the recipients
+    // arrive alongside them instead. Normalised on the way in: address
+    // lowercased, a missing name stored as null, exactly like a parsed one.
+    const sent = await ingest({
+      messageId: "<sent@example.com>", from: "chris@example.com", to: "alice@example.com",
+    }, {
+      folder: "Sent",
+      bccOverride: [{ address: "Secret@Example.COM" }, { address: "boss@example.com", name: "The Boss" }],
+    });
+    expect(sent.message.bccAddrs).toEqual([
+      { address: "secret@example.com", name: null },
+      { address: "boss@example.com", name: "The Boss" },
+    ]);
+  });
+
+  it("lets bccOverride REPLACE a Bcc header rather than adding to it", async () => {
+    const sent = await ingest({
+      messageId: "<sent@example.com>", from: "chris@example.com", bcc: "fromheader@example.com",
+    }, { folder: "Sent", bccOverride: [{ address: "override@example.com" }] });
+    expect(sent.message.bccAddrs).toEqual([{ address: "override@example.com", name: null }]);
+  });
+
+  it("caps bccOverride like every other stored recipient list", async () => {
+    const many: MailAddress[] = Array.from(
+      { length: 250 }, (_unused, index) => ({ address: `bcc${index}@example.com` }),
+    );
+    const sent = await ingest({
+      messageId: "<sent@example.com>", from: "chris@example.com",
+    }, { folder: "Sent", bccOverride: many });
+    // MAX_PARTICIPANTS: a caller-supplied list is bounded on the same terms
+    // as a parsed header -- as jsonb it is a permanent row nothing can render.
+    expect(sent.message.bccAddrs).toHaveLength(200);
+    expect(sent.message.bccAddrs[0]).toEqual({ address: "bcc0@example.com", name: null });
+  });
+
+  it("ignores bccOverride outside the account's own sent folder", async () => {
+    // The gate, not the field, decides whether a Bcc may be stored: an
+    // override on an INBOX sighting changes nothing.
+    const spoofed = await ingest({
+      messageId: "<spoof@example.com>", from: "chris@example.com",
+    }, { folder: "INBOX", bccOverride: [{ address: "victim@example.com" }] });
+    expect(spoofed.message.direction).toBe("outbound");
+    expect(spoofed.message.bccAddrs).toEqual([]);
   });
 
   it("ignores a Bcc header on a message that merely SPOOFS the account's own address", async () => {

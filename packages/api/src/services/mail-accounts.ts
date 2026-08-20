@@ -85,6 +85,30 @@ function notifyAccountChanged(accountId: string, change: AccountChange): void {
   }
 }
 
+/**
+ * sent_folder, normalised at the WRITE.
+ *
+ * An IMAP mailbox name is compared byte for byte, so a stored " Sent " is a
+ * different mailbox from "Sent" everywhere it is used: mail-sync.ts trims it
+ * when it loads an account (so its passes and APPENDs agree with each other),
+ * but mail-ingest.ts compares the raw column against the folder a sighting
+ * came from to decide whether an outbound message is really in the account's
+ * own Sent folder -- and that comparison fails for every stray space, taking
+ * the Bcc rule with it. Trimming here means the two can never disagree in the
+ * first place; loadAccount's trim stays as the backstop for rows written
+ * before this.
+ *
+ * Whitespace-only becomes "no value", so the column default ("Sent") applies
+ * on create and nothing is written on update: "" is not a mailbox anyone can
+ * append to, and storing it would only turn a typo into a silent failure at
+ * send time.
+ */
+function normalizeSentFolder(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function toMailAccount(row: MailAccountRow) {
   return {
     id: row.id, userId: row.userId, label: row.label, email: row.email,
@@ -139,6 +163,7 @@ export async function createAccount(
     imapPassword: input.password,
     smtpPassword: input.smtpPassword ?? input.password,
   });
+  const sentFolder = normalizeSentFolder(input.sentFolder);
 
   let row: MailAccountRow | undefined;
   try {
@@ -152,7 +177,7 @@ export async function createAccount(
       // own default apply (sentFolder "Sent", backfillDays 90) while an
       // explicit null on backfillDays (meaning "sync everything") is preserved
       // rather than coerced back into the default.
-      ...(input.sentFolder !== undefined ? { sentFolder: input.sentFolder } : {}),
+      ...(sentFolder !== undefined ? { sentFolder } : {}),
       ...(input.backfillDays !== undefined ? { backfillDays: input.backfillDays } : {}),
       // Signatures render directly in the main document, no iframe/CSP
       // isolation (spec) -- this service is the only write path for
@@ -243,9 +268,18 @@ export async function updateAccount(
   // altered the markup -- a false "changed" for a resubmission that is
   // byte-identical to what's stored once normalised, which would wrongly
   // skip the same-value no-op short-circuit and fire an unearned SSE hint.
-  const normalizedRest = rest.signatureHtml != null
-    ? { ...rest, signatureHtml: sanitizeMailHtml(rest.signatureHtml) }
+  // sentFolder is trimmed here, alongside the signature and for the same
+  // reason: the diff below compares the submission against the STORED value,
+  // so a normalisation applied later would register " Sent " as a change from
+  // (and then overwrite) the "Sent" already in the column. A whitespace-only
+  // submission normalises to undefined, i.e. drops out of the patch entirely
+  // -- see normalizeSentFolder.
+  const withSentFolder = rest.sentFolder !== undefined
+    ? { ...rest, sentFolder: normalizeSentFolder(rest.sentFolder) }
     : rest;
+  const normalizedRest = withSentFolder.signatureHtml != null
+    ? { ...withSentFolder, signatureHtml: sanitizeMailHtml(withSentFolder.signatureHtml) }
+    : withSentFolder;
   const passwordProvided = password !== undefined && password !== "";
   const smtpPasswordProvided = smtpPassword !== undefined && smtpPassword !== "";
   const freshCredentialsCiphertext = passwordProvided

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { randomBytes } from "node:crypto";
+import { readdirSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +16,7 @@ import { createContact } from "./contacts.js";
 import { ArchivedError, ConflictError, NotFoundError, SmtpSendError } from "./errors.js";
 import { archiveAccount, createAccount } from "./mail-accounts.js";
 import type { MailCredentials } from "./mail-crypto.js";
+import { ingestMessage } from "./mail-ingest.js";
 import { SyncUnavailableError } from "./mail-sync.js";
 import {
   sendMail,
@@ -158,6 +160,20 @@ function headerOf(raw: string, name: string): string | null {
   const unfolded = raw.split("\r\n\r\n")[0]?.replace(/\r\n[ \t]+/g, " ") ?? "";
   const match = new RegExp(`^${name}:\\s*(.*)$`, "im").exec(unfolded);
   return match === null ? null : (match[1] as string).trim();
+}
+
+/**
+ * How many descriptors this process holds, or null where that cannot be
+ * asked. Linux only -- which is every machine this suite runs on (the dev
+ * server and CI), and returning null rather than guessing is what keeps the
+ * assertion honest anywhere else.
+ */
+function openFileDescriptors(): number | null {
+  try {
+    return readdirSync("/proc/self/fd").length;
+  } catch {
+    return null;
+  }
 }
 
 async function storedMessages() {
@@ -307,12 +323,34 @@ describe("sendMail", () => {
     expect(headerOf(transport.rawText(), "Bcc")).toBeNull();
     expect(headerOf(transport.rawText(), "Cc")).toBe("carol@example.com");
 
-    // The consequence of composing ONCE: the stored copy is byte-identical to
-    // what was sent, so the CRM's own record does not name the Bcc recipient
-    // either. (mail_messages.bcc_addrs exists for Sent-folder copies made by
-    // other mail clients, which do keep the header.)
+    // The CRM's own record still names them -- the list travels to ingest
+    // beside the bytes (bccOverride), because "what the recipients see" and
+    // "what the sender's Sent record holds" are different lists, and every
+    // ordinary mail client keeps the second one too.
     expect(message.ccAddrs).toEqual([{ address: "carol@example.com", name: null }]);
-    expect(message.bccAddrs).toEqual([]);
+    expect(message.bccAddrs).toEqual([{ address: "boss@example.com", name: null }]);
+  });
+
+  it("keeps the stored Bcc when the Sent folder later re-sights the same message", async () => {
+    const message = await sendMail(
+      handle.db, dataDir, actorId,
+      input({ bcc: [{ address: "boss@example.com" }] }), deps(),
+    );
+
+    // What the next Sent-folder pass does: the same bytes, now with a real
+    // UID -- and those bytes carry no Bcc header at all. It must take the
+    // duplicate path (record where the message was last seen) and leave the
+    // rest of the row alone, or the send's own record would be erased by the
+    // sync that was only supposed to fill in its UID.
+    const resighted = await ingestMessage(handle.db, dataDir, {
+      accountId, folder: "Sent", uid: 42,
+      raw: transport.sent[0]?.raw as Buffer, flags: ["\\Seen"],
+    });
+    expect(resighted.created).toBe(false);
+    expect(resighted.message.id).toBe(message.id);
+    expect(resighted.message.imapUid).toBe(42);
+    expect(resighted.message.bccAddrs).toEqual([{ address: "boss@example.com", name: null }]);
+    expect(await storedMessages()).toHaveLength(1);
   });
 
   it("does not send the same address twice when it is on two lists", async () => {
@@ -462,6 +500,29 @@ describe("sendMail", () => {
     expect(stored).toHaveLength(1);
     expect(stored[0]?.filename).toBe("quote.txt");
     expect(stored[0]?.sizeBytes).toBe("the quoted price is 42".length);
+  });
+
+  it("holds no file descriptors of its own while a send with attachments fails", async () => {
+    const fileId = await makeUpload(actorId, { name: "quote.txt" });
+    // The failure that lives in the gap between loading attachments and
+    // composing: credentials that cannot be decrypted. It is PERSISTENT (a
+    // missing or rotated mail.key fails identically every time), so anything
+    // leaked here accumulates for as long as the user keeps retrying.
+    const broken = deps({ mailKeyPath: path.join(dir, "absent.key") });
+
+    const before = openFileDescriptors();
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await expect(sendMail(
+        handle.db, dataDir, actorId, input({ attachmentIds: [fileId] }), broken,
+      )).rejects.toThrow();
+    }
+    const after = openFileDescriptors();
+    if (before === null || after === null) return; // see openFileDescriptors
+    // Attachments are handed to nodemailer as PATHS: nothing here opens a
+    // file at all, so twenty failed sends move this number by nothing. (The
+    // slack is for unrelated descriptors -- a pooled database connection --
+    // that the surrounding work may legitimately open.)
+    expect(after - before).toBeLessThan(5);
   });
 
   it("404s on an attachment belonging to someone else, before sending anything", async () => {

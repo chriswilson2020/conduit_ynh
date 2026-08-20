@@ -107,6 +107,20 @@ describe("createAccount", () => {
     expect(unlimited.backfillDays).toBeNull();
   });
 
+  it("trims sent_folder on write, and treats a blank one as absent", async () => {
+    // An IMAP mailbox name is compared byte for byte: a stored " Sent " is a
+    // different mailbox from "Sent" everywhere it is used -- including
+    // mail-ingest's check that an outbound message really is in this
+    // account's own sent folder, which is what guards the stored Bcc list.
+    const padded = await make({ sentFolder: "  Sent  " });
+    expect(padded.sentFolder).toBe("Sent");
+
+    // Whitespace-only is not a mailbox anyone can append to, so it means
+    // "not given" and the column default applies.
+    const blank = await make({ email: "blank@example.com", sentFolder: "   " });
+    expect(blank.sentFolder).toBe("Sent");
+  });
+
   it("publishes the mail-accounts SSE key", async () => {
     const hints: string[][][] = [];
     const unsub = subscribe((hint) => hints.push(hint.keys));
@@ -133,6 +147,21 @@ describe("updateAccount", () => {
     expect(updated.label).toBe("Renamed");
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
     expect(creds.imapPassword).toBe("original");
+  });
+
+  it("trims sent_folder on update, and treats a resubmitted padded value as no change", async () => {
+    const account = await make({ sentFolder: "Sent" });
+    const moved = await updateAccount(handle.db, actorId, account.id, { sentFolder: "  Archive  " }, keyPath);
+    expect(moved.sentFolder).toBe("Archive");
+
+    // Normalised BEFORE the same-value diff, like signatureHtml: comparing
+    // the raw submission against the stored (already trimmed) value would
+    // read " Archive " as a change and fire an unearned SSE hint.
+    const resubmitted = await updateAccount(
+      handle.db, actorId, account.id, { sentFolder: " Archive " }, keyPath,
+    );
+    expect(resubmitted.sentFolder).toBe("Archive");
+    expect(resubmitted.updatedAt).toBe(moved.updatedAt);
   });
 
   it("absent/empty password fields keep the stored credentials", async () => {

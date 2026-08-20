@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { simpleParser, type Attachment, type ParsedMail } from "mailparser";
+import type { MailAddress } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
   contacts, mailAccounts, mailAttachments, mailMessages, mailThreads,
@@ -132,6 +133,26 @@ export interface IngestMessageInput {
    * protects manual links.
    */
   links?: IngestMessageLinks;
+  /**
+   * The Bcc list to store INSTEAD of whatever the raw bytes carry, for a
+   * message this system just sent (mail-send).
+   *
+   * It exists because those two are not the same list and cannot be. A
+   * composed message's Bcc header is deliberately absent from the bytes that
+   * go out -- that is what makes a blind copy blind -- and mail-send stores
+   * the exact bytes it submitted, so without this the CRM's own record of a
+   * message it sent could never name its Bcc recipients, while a copy saved
+   * by any ordinary mail client (which keeps the header in its Sent folder)
+   * could.
+   *
+   * A REPLACEMENT, not an addition, and applied INSIDE the existing
+   * outbound-and-in-the-account's-own-sent-folder gate below -- so it changes
+   * what a trusted local send stores and nothing else. Inbound mail spoofing
+   * the account's own address into the INBOX still stores no Bcc at all,
+   * because that gate, not this field, is what decides whether a Bcc may be
+   * kept.
+   */
+  bccOverride?: MailAddress[];
 }
 
 export interface IngestResult {
@@ -322,6 +343,19 @@ function normalizeReferences(value: string | string[] | undefined): string[] {
     if (id !== null) out.push(id);
   }
   return out.slice(-MAX_REFERENCES);
+}
+
+/** One caller-supplied address in the shape this file stores: address folded
+ * to lowercase (so it matches the parsed lists and the contact lookups that
+ * compare against them), name absent-as-null rather than absent-as-missing.
+ * Mirrors mail-content.ts's flattenAddressObject, which does the same to
+ * addresses coming off the wire. */
+function normalizeAddress(address: MailAddress): { address: string; name: string | null } {
+  const name = address.name ?? null;
+  return {
+    address: address.address.toLowerCase(),
+    name: name !== null && name.length > 0 ? name : null,
+  };
 }
 
 /** IMAP system flags are case-insensitive (RFC 3501), so compare folded. */
@@ -766,8 +800,16 @@ async function ingestParsedMessage(
       // anyone can spoof your address into your INBOX; without the folder
       // check that forgery would smuggle its Bcc list into storage and out
       // through the thread view as if the CRM's user had sent it.
+      // bccOverride replaces the parsed list here, inside the gate, never
+      // around it -- see its doc comment on IngestMessageInput. Normalised
+      // into the same stored shape extractAddresses produces (lowercased
+      // address, name null rather than absent), so a row written by a send
+      // and one written from a Sent-folder header are indistinguishable
+      // afterwards. Capped like every other stored recipient list.
       bccAddrs: direction === "outbound" && input.folder === account.sentFolder
-        ? addresses.bcc.slice(0, MAX_PARTICIPANTS)
+        ? (input.bccOverride === undefined
+            ? addresses.bcc
+            : input.bccOverride.map(normalizeAddress)).slice(0, MAX_PARTICIPANTS)
         : [],
       subject: capUtf8(rawSubject, MAX_SUBJECT_BYTES),
       bodyText,

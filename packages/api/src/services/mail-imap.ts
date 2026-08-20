@@ -39,8 +39,10 @@ import type { IngestMessageInput, IngestResult } from "./mail-ingest.js";
  *   a cancellation path through every imapflow call for no benefit the loop
  *   can use. The consequence is load-bearing: the ONLY bound on how long a
  *   shutdown waits for a wedged network operation is the adapter's own
- *   timeouts, so it MUST set `connectTimeout`, `greetingTimeout` and
- *   `socketTimeout` on the imapflow client. SyncManager.stop() races a
+ *   timeouts, so it MUST set `connectionTimeout`, `greetingTimeout` and
+ *   `socketTimeout` on the imapflow client (imapflow's option really is
+ *   `connectionTimeout` -- spelling it any other way sets nothing and
+ *   silently leaves the 90-second default in place). SyncManager.stop() races a
  *   timeout of its own as a second line of defence, but a socket that never
  *   errors is otherwise a connection leaked for the process's lifetime.
  * - `idle()` takes an AbortSignal and should honour it PROMPTLY. AccountSync

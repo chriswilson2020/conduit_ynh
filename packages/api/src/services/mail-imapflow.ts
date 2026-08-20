@@ -1,9 +1,9 @@
 import { ImapFlow, type ImapFlowOptions, type StatusObject, type AppendResponseObject } from "imapflow";
 import nodemailer from "nodemailer";
 import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
-import type { MailAccount, MailSecurity } from "@conduit/shared";
-import type { MailCredentials } from "./mail-crypto.js";
+import type { MailSecurity } from "@conduit/shared";
 import type { TestConnectionDeps, VerifySettings } from "./mail-accounts.js";
+import type { SendMailTransportFactory } from "./mail-send.js";
 import {
   MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
   type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
@@ -651,7 +651,7 @@ export const defaultTestConnectionDeps: TestConnectionDeps = { imapVerify, smtpV
  * whether to check their password or their server -- see
  * normalizeMailError and mail-imap.ts's ERROR CLASSIFICATION.
  */
-export function createSmtpTransport(account: MailAccount, credentials: MailCredentials) {
+export const createSmtpTransport: SendMailTransportFactory = (account, credentials) => {
   const transport = nodemailer.createTransport(buildSmtpOptions({
     host: account.smtpHost,
     port: account.smtpPort,
@@ -660,7 +660,7 @@ export function createSmtpTransport(account: MailAccount, credentials: MailCrede
     password: credentials.smtpPassword,
   }));
   return {
-    async sendMail(message: { raw: Buffer; envelope: { from: string; to: string[] } }): Promise<unknown> {
+    async sendMail(message): Promise<unknown> {
       try {
         return await transport.sendMail(message);
       } catch (error) {
@@ -670,4 +670,4 @@ export function createSmtpTransport(account: MailAccount, credentials: MailCrede
       }
     },
   };
-}
+};

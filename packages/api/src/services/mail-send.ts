@@ -1,10 +1,9 @@
-import { Readable } from "node:stream";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import type { MailAccount, MailAddress, SendMailInput } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { files, mailMessages, mailThreads } from "../db/schema.js";
-import { openBlob } from "./blobs.js";
+import { blobPath } from "./blobs.js";
 import { ArchivedError, ConflictError, NotFoundError, SmtpSendError } from "./errors.js";
 import { getAccountCredentialsAsSystem, getOwnAccount } from "./mail-accounts.js";
 import { htmlToText, sanitizeMailHtml } from "./mail-content.js";
@@ -176,7 +175,8 @@ async function loadReplyChain(db: Database, threadId: string): Promise<ReplyChai
 interface ComposedAttachment {
   filename: string;
   contentType: string;
-  content: Readable;
+  /** A path, never an open stream -- see loadAttachments. */
+  path: string;
 }
 
 /**
@@ -191,8 +191,13 @@ interface ComposedAttachment {
  * someone else 404s exactly like one that does not exist, so this cannot be
  * used to probe for the existence of other people's uploads.
  *
- * Validation completes before a single stream is opened, so a rejected id
- * does not leave file descriptors open behind it.
+ * PATHS, NOT OPEN STREAMS. nodemailer opens each file itself while building
+ * the MIME and closes it again, so the descriptor's whole lifetime sits
+ * inside that one operation. Handing back open read streams instead made
+ * every failure BETWEEN this call and the build leak one descriptor per
+ * attachment -- and the failure that sits in that gap is credential
+ * decryption, which is persistent (a missing or rotated mail.key fails every
+ * time), so a user retrying a broken account leaked steadily.
  */
 async function loadAttachments(
   db: Database, dataDir: string, actorId: string, ids: readonly string[],
@@ -213,7 +218,7 @@ async function loadAttachments(
   return resolved.map((row) => ({
     filename: row.originalName,
     contentType: row.mime,
-    content: openBlob(dataDir, row.sha256),
+    path: blobPath(dataDir, row.sha256),
   }));
 }
 
@@ -238,10 +243,11 @@ function toComposeAddresses(addresses: readonly MailAddress[]): { name?: string;
  *
  * The composed bytes themselves carry NO Bcc header -- nodemailer's MimeNode
  * omits it from the built message unless asked otherwise -- so a blind copy
- * stays blind. One consequence of composing once and storing what was sent:
- * the CRM's own record of the message does not name its Bcc recipients
- * either. (mail_messages.bcc_addrs still earns its place: mail clients that
- * save their own Sent copy do keep the header, and ingest reads it there.)
+ * stays blind on the wire. The CRM's own record still names them: the list is
+ * handed to ingest separately as `bccOverride` (see the ingest call below),
+ * because "what the recipients see" and "what the sender's own Sent record
+ * holds" are genuinely different lists, and every ordinary mail client keeps
+ * the second one too.
  */
 function buildEnvelope(from: string, input: SendMailInput): { from: string; to: string[] } {
   const recipients = new Set<string>();
@@ -331,6 +337,19 @@ export async function sendMail(
   // rejects immediately (without touching the network) while the account is
   // in backoff -- SyncUnavailableError -- which is the designed behaviour and
   // lands here like any other failure.
+  //
+  // ACCEPTED RACE, milliseconds wide, at the seam between this APPEND and the
+  // ingest below: the Sent folder now holds the message, so a sync pass that
+  // happens to be walking Sent at this exact moment can ingest it first. This
+  // call's ingestMessage then takes the DUPLICATE path, which by design only
+  // records where the message was last seen -- so that send's `threadId` and
+  // compose-dialog `links` are dropped. Inherent to APPEND-before-ingest
+  // (reversing them would store a message before it exists on the server, and
+  // the APPEND is what other clients' Sent folders need). It is accepted
+  // rather than locked around because it is self-healing where it matters:
+  // the outgoing References chain resolves a reply onto the same thread the
+  // explicit threadId would have chosen, so only a compose-seeded link on a
+  // brand-new thread can actually be lost, and only in that window.
   try {
     await deps.syncManager?.get(account.id)?.appendSent(raw);
   } catch (error) {
@@ -357,6 +376,11 @@ export async function sendMail(
     // Compose-dialog seeds. Ingest applies them only to a thread this call
     // CREATES, so they are harmless (and ignored) on a reply.
     ...(input.links !== undefined ? { links: input.links } : {}),
+    // The one thing the bytes cannot tell ingest: they carry no Bcc header
+    // (that is what makes a blind copy blind), so the recipients are handed
+    // over separately. Ingest still decides whether to keep them -- its gate
+    // is unchanged, and an inbound message spoofing this address stores none.
+    ...(input.bcc.length > 0 ? { bccOverride: input.bcc } : {}),
   });
   return result.message;
 }
