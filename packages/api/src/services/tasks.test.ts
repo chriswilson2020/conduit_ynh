@@ -548,8 +548,8 @@ describe("task dependencies", () => {
       addDependency(handle.db, actorId, a.id, b.id),
       addDependency(handle.db, actorId, b.id, a.id),
     ]);
-    const fulfilled = results.filter((r): r is PromiseFulfilledResult<unknown> => r.status === "fulfilled");
-    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
     expect(fulfilled).toHaveLength(1);
     expect(rejected).toHaveLength(1);
     expect(rejected[0]?.reason).toBeInstanceOf(ConflictError);

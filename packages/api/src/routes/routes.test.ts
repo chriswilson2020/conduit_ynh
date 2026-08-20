@@ -29,6 +29,8 @@ const config: Config = {
   devUser: null,
   dataDir: "./data",
   defaultCurrency: "EUR",
+  mailKeyPath: "unused-in-tests",
+  mailTlsRejectUnauthorized: true,
 };
 
 const authHeaders = {

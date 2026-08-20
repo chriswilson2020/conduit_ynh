@@ -6,7 +6,7 @@
   "engines": { "node": ">=24" },
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "typecheck": "tsc -b && tsc --noEmit -p e2e",
+    "typecheck": "tsc -b && tsc --noEmit -p packages/api/tsconfig.test.json && tsc --noEmit -p packages/shared/tsconfig.test.json && tsc --noEmit -p packages/web && tsc --noEmit -p e2e",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",

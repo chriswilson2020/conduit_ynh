@@ -30,6 +30,8 @@ const baseConfig: Config = {
   devUser: "devuser",
   dataDir: "./data",
   defaultCurrency: "EUR",
+  mailKeyPath: "unused-in-tests",
+  mailTlsRejectUnauthorized: true,
 };
 
 // A Database pointed at an address nothing listens on, with a short connect

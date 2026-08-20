@@ -85,12 +85,16 @@ describe("encryptCredentials / decryptCredentials", () => {
     const ciphertext = encryptCredentials(key, creds);
     const parts = ciphertext.split(":");
     expect(parts).toHaveLength(4);
-    expect(parts[0]).toBe("v1");
+    const [version, ivB64, tagB64, dataB64] = parts;
+    if (version === undefined || ivB64 === undefined || tagB64 === undefined || dataB64 === undefined) {
+      throw new Error("expected 4 ':'-separated segments");
+    }
+    expect(version).toBe("v1");
     const base64Re = /^[A-Za-z0-9+/]*={0,2}$/;
-    expect(parts[1]).toMatch(base64Re);
-    expect(parts[2]).toMatch(base64Re);
-    expect(parts[3]).toMatch(base64Re);
-    expect(Buffer.from(parts[1], "base64")).toHaveLength(12); // random 12-byte IV
+    expect(ivB64).toMatch(base64Re);
+    expect(tagB64).toMatch(base64Re);
+    expect(dataB64).toMatch(base64Re);
+    expect(Buffer.from(ivB64, "base64")).toHaveLength(12); // random 12-byte IV
   });
 
   it("uses a random IV on every call: two encryptions of the same object differ", async () => {
@@ -104,8 +108,11 @@ describe("encryptCredentials / decryptCredentials", () => {
     const key = loadMailKey(await writeKey(randomBytes(32)));
     const ciphertext = encryptCredentials(key, creds);
     const [version, iv, tag, data] = ciphertext.split(":");
+    if (version === undefined || iv === undefined || tag === undefined || data === undefined) {
+      throw new Error("expected 4 ':'-separated segments");
+    }
     const dataBytes = Buffer.from(data, "base64");
-    dataBytes[0] = dataBytes[0] ^ 0xff;
+    dataBytes[0] = dataBytes[0]! ^ 0xff;
     const tampered = [version, iv, tag, dataBytes.toString("base64")].join(":");
     expect(() => decryptCredentials(key, tampered)).toThrow(MailCredentialDecryptError);
   });
@@ -114,8 +121,11 @@ describe("encryptCredentials / decryptCredentials", () => {
     const key = loadMailKey(await writeKey(randomBytes(32)));
     const ciphertext = encryptCredentials(key, creds);
     const [version, iv, tag, data] = ciphertext.split(":");
+    if (version === undefined || iv === undefined || tag === undefined || data === undefined) {
+      throw new Error("expected 4 ':'-separated segments");
+    }
     const tagBytes = Buffer.from(tag, "base64");
-    tagBytes[0] = tagBytes[0] ^ 0xff;
+    tagBytes[0] = tagBytes[0]! ^ 0xff;
     const tampered = [version, iv, tagBytes.toString("base64"), data].join(":");
     expect(() => decryptCredentials(key, tampered)).toThrow(MailCredentialDecryptError);
   });
@@ -160,6 +170,9 @@ describe("encryptCredentials / decryptCredentials", () => {
     const key = loadMailKey(await writeKey(randomBytes(32)));
     const ciphertext = encryptCredentials(key, creds);
     const [version, iv, tag, data] = ciphertext.split(":");
+    if (tag === undefined) {
+      throw new Error("expected a tag segment");
+    }
     const truncatedTag = Buffer.from(tag, "base64").subarray(0, 4).toString("base64");
     const tampered = [version, iv, truncatedTag, data].join(":");
     expect(() => decryptCredentials(key, tampered)).toThrow(MailCredentialDecryptError);
