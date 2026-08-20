@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { clsx } from "clsx";
 import type { MailAttachment, MailMessageWithAttachments } from "@conduit/shared";
 import { apiUrl } from "../../api";
-import { relativeTime } from "../../lib";
+import { humanSize, relativeTime } from "../../lib";
 import {
   useArchiveThread,
   useCompany,
@@ -315,12 +315,6 @@ function Message({
       )}
     </li>
   );
-}
-
-function humanSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** A download link to the authenticated attachment route -- the same

@@ -44,6 +44,22 @@ export function relativeTime(iso: string, now: Date = new Date()): string {
   return then.toLocaleDateString();
 }
 
+/**
+ * Byte count as something a person reads, for file and attachment chips.
+ *
+ * Lives here rather than in one of the two components that render such a chip
+ * (the record Files rail and the conversation's mail attachments): it was
+ * written twice, identically, the second time Phase 4 needed it.
+ *
+ * Binary units under decimal names, matching what the rest of this app's UI
+ * has always shown -- 1 KB is 1024 bytes here.
+ */
+export function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 /** Today as a YYYY-MM-DD string in the USER'S LOCAL calendar, not UTC.
  * toISOString() is always UTC, which misclassifies "due today" around local
  * midnight for any non-UTC timezone. Date-only strings in this app mean the

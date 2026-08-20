@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import type { ChangeEvent, DragEvent } from "react";
 import { clsx } from "clsx";
 import { ApiError, apiUrl } from "../../api";
+import { humanSize } from "../../lib";
 import { useFiles, useUploadFile, useUsers } from "../../queries";
 
 export interface FilesProps {
@@ -9,12 +10,6 @@ export interface FilesProps {
   contactId?: string;
   dealId?: string;
   projectId?: string;
-}
-
-function humanSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /**

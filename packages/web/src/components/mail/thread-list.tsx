@@ -59,6 +59,12 @@ const DEFAULT_LIMIT = 25;
  * rather than reset from an effect: an effect would leave one render (and one
  * fetch) in which the new filters are paired with the old filter's page-two
  * cursor.
+ *
+ * One consequence, accepted: only the CURRENT page is a live query, so after
+ * "load more" an SSE invalidation refreshes the page that is mounted and the
+ * earlier pages keep the rows they were fetched with until the list resets
+ * (a filter change, or a remount). New mail still bumps its thread to the top
+ * of page one -- it is just not re-fetched underneath an accumulated list.
  */
 export function ThreadList({
   filters, onSelect, selectedId = null, limit = DEFAULT_LIMIT, emptyLabel = "No conversations",

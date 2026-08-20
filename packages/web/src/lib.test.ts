@@ -1,5 +1,19 @@
 import { describe, it, expect } from "vitest";
-import { parseDecimal, relativeTime, todayLocalIso } from "./lib";
+import { humanSize, parseDecimal, relativeTime, todayLocalIso } from "./lib";
+
+describe("humanSize", () => {
+  it("reports bytes below a kilobyte", () => {
+    expect(humanSize(0)).toBe("0 B");
+    expect(humanSize(1023)).toBe("1023 B");
+  });
+
+  it("switches to KB at a kilobyte and MB at a megabyte", () => {
+    expect(humanSize(1024)).toBe("1.0 KB");
+    expect(humanSize(1024 * 1024 - 1)).toBe("1024.0 KB");
+    expect(humanSize(1024 * 1024)).toBe("1.0 MB");
+    expect(humanSize(5 * 1024 * 1024 + 512 * 1024)).toBe("5.5 MB");
+  });
+});
 
 describe("parseDecimal", () => {
   it("parses a plain dot-decimal amount", () => {
