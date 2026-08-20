@@ -1,0 +1,682 @@
+import { ImapFlow, type ImapFlowOptions, type StatusObject, type AppendResponseObject } from "imapflow";
+import nodemailer from "nodemailer";
+import type { MailAccount, MailSecurity } from "@conduit/shared";
+import type { MailCredentials } from "./mail-crypto.js";
+import type { TestConnectionDeps, VerifySettings } from "./mail-accounts.js";
+import {
+  MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
+  type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
+  type ImapFolderStatus, type ImapMessageDescriptor,
+} from "./mail-imap.js";
+
+/**
+ * The real IMAP and SMTP adapters: `ImapflowClient` (the `ImapClient` the
+ * sync engine drives), `imapVerify`/`smtpVerify` (the test-connection
+ * endpoint's real deps) and `createSmtpTransport` (mail-send's real
+ * transport factory).
+ *
+ * This is the ONE module that imports imapflow and nodemailer. Everything
+ * else in the mail stack talks to the interfaces in mail-imap.ts and
+ * mail-send.ts, which is what keeps the rest of it unit-testable without a
+ * mail server -- and why this file is deliberately thin: it maps settings to
+ * library options, normalises errors, and translates each library call into
+ * the contract's shape. Behaviour against a real server is Task 8's
+ * integration suite (a Dovecot + Mailpit pair in CI); the unit tests here
+ * cover only what can honestly be checked without one.
+ *
+ * Read mail-imap.ts's ADAPTER CONTRACT before changing anything here.
+ */
+
+// --- Timeouts --------------------------------------------------------------
+//
+// Nothing except idle() is cancellable (mail-imap.ts, CANCELLATION AND
+// SHUTDOWN), so these three are the ONLY bound on how long a wedged network
+// operation can hold the loop -- and SyncManager.stop() abandons a sync after
+// 15s, so past that they are also the only thing standing between a stuck
+// socket and a connection leaked for the process's lifetime.
+//
+// imapflow's own defaults (90s connect, 5min socket) are far too generous for
+// that: a poll interval is 5 minutes, so a default socket timeout means one
+// dead connection can occupy a whole interval doing nothing.
+
+/** DNS + TCP + TLS handshake, as one budget (imapflow calls this
+ * `connectionTimeout`; the contract's prose calls it connectTimeout). */
+const CONNECT_TIMEOUT_MS = 30_000;
+/** Server greeting after the socket is up. */
+const GREETING_TIMEOUT_MS = 15_000;
+/**
+ * Socket inactivity. Deliberately well under the 5-minute poll interval, so a
+ * connection that dies quietly between passes is noticed by the pass that
+ * follows rather than sitting there. imapflow treats a timeout DURING IDLE as
+ * a keepalive rather than a failure (it runs a NOOP and re-arms IDLE), so
+ * this doubles as the IDLE keepalive interval -- which is the other reason
+ * not to make it long: a NAT that drops idle flows sooner than this would
+ * otherwise silently stop delivering new-mail pushes.
+ */
+const SOCKET_TIMEOUT_MS = 120_000;
+
+/** The only folder IDLE is ever run on (mail-imap.ts's `idle` contract). */
+const INBOX = "INBOX";
+
+// --- Error classification --------------------------------------------------
+
+/**
+ * Error `code` values that mean "the connection did not happen, or did not
+ * survive" rather than anything about the credentials. Three sources, all
+ * flat strings on the error object: Node's own socket/DNS errno codes, the
+ * codes imapflow raises for its own timeouts and closures, and nodemailer's
+ * SMTP-side equivalents. TLS certificate failures are in here too -- from the
+ * user's point of view "this server's certificate is not trusted" is a
+ * problem with the SERVER they typed, not with their password, and that is
+ * the whole distinction the prefix exists to draw.
+ */
+const CONNECTION_ERROR_CODES = new Set([
+  // Node (net/dns/tls)
+  "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND",
+  "EAI_AGAIN", "EPIPE", "EPROTO", "ERR_TLS_CERT_ALTNAME_INVALID",
+  "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "CERT_HAS_EXPIRED",
+  // imapflow
+  "ETIMEOUT", "CONNECT_TIMEOUT", "GREETING_TIMEOUT", "UPGRADE_TIMEOUT",
+  "NoConnection", "EConnectionClosed", "ClosedAfterConnect", "ClosedAfterConnectTLS",
+  // nodemailer
+  "ECONNECTION", "ESOCKET", "ETLS", "EDNS",
+]);
+
+/** imapflow reports a rejected login with `authenticationFailed: true`;
+ * nodemailer has no such flag and uses `code: "EAUTH"` (plus ENOAUTH when a
+ * server demands authentication it was given none for). */
+const AUTH_ERROR_CODES = new Set(["EAUTH", "ENOAUTH"]);
+
+function errorCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null) return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
+function isAuthFailure(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  if ((error as { authenticationFailed?: unknown }).authenticationFailed === true) return true;
+  const code = errorCode(error);
+  return code !== null && AUTH_ERROR_CODES.has(code);
+}
+
+/**
+ * Give a library error a message the rest of the app can branch on, per
+ * mail-imap.ts's ERROR CLASSIFICATION contract: `auth:` for a rejected login,
+ * `connection:` for anything socket/DNS/TLS-shaped, and the original message
+ * untouched for everything else (a server rejecting a SELECT, a mailbox that
+ * does not exist -- guessing a class for those would be worse than saying
+ * nothing).
+ *
+ * The original error is kept on `cause`, and the returned message never adds
+ * anything that was not already in it -- in particular no password, which the
+ * caller holds but this function is never given.
+ *
+ * Idempotent: an already-prefixed message is returned as-is, so an error that
+ * passes through two layers (adapter -> mail-send) is not double-tagged.
+ */
+export function normalizeMailError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith(MAIL_AUTH_ERROR_PREFIX) || message.startsWith(MAIL_CONNECTION_ERROR_PREFIX)) {
+    return error instanceof Error ? error : new Error(message);
+  }
+  const code = errorCode(error);
+  const prefix = isAuthFailure(error)
+    ? MAIL_AUTH_ERROR_PREFIX
+    : (code !== null && CONNECTION_ERROR_CODES.has(code) ? MAIL_CONNECTION_ERROR_PREFIX : null);
+  if (prefix === null) return error instanceof Error ? error : new Error(message);
+  return new Error(`${prefix} ${message}`, { cause: error });
+}
+
+/**
+ * The server does not offer IDLE, so the sync loop should stop asking.
+ *
+ * mail-sync.ts latches "IDLE unavailable" on ANY rejection from `idle()` and
+ * polls from then on. This type is what makes that latch a FACT rather than a
+ * heuristic: it is raised from the advertised capability list before a single
+ * IDLE command is sent, so the loop is not guessing from a transient failure.
+ * Everything else that can go wrong mid-IDLE deliberately does NOT reject --
+ * see ImapflowClient.idle.
+ */
+export class ImapIdleUnsupportedError extends Error {
+  constructor(host: string) {
+    super(`connection: ${host} does not advertise the IDLE capability`);
+  }
+}
+
+// --- Option mapping --------------------------------------------------------
+
+/**
+ * Whether to verify server certificates when nothing says otherwise.
+ *
+ * Two readers, one flag. server.ts passes `config.mailTlsRejectUnauthorized`
+ * explicitly into the client factory (the composition root does the reading,
+ * like every other config value), but `imapVerify`/`smtpVerify` are handed to
+ * the routes as a fixed `TestConnectionDeps` pair with no room for a config
+ * parameter -- so they fall back to the environment directly. Both end at the
+ * same variable; see config.ts for why only the exact string "0" disables it.
+ */
+function defaultRejectUnauthorized(): boolean {
+  return process.env.MAIL_TLS_REJECT_UNAUTHORIZED !== "0";
+}
+
+export interface MailAdapterOptions {
+  /** Defaults to the environment (see defaultRejectUnauthorized). */
+  rejectUnauthorized?: boolean;
+}
+
+interface ConnectionSettings {
+  host: string;
+  port: number;
+  security: MailSecurity;
+  username: string;
+  password: string;
+}
+
+/**
+ * imapflow options for one account. Exported for the unit tests: the mapping
+ * (and the timeouts above) is the part of this adapter that can be checked
+ * without a server, so it is a function of its arguments rather than
+ * something buried in a constructor.
+ *
+ * `secure` is the whole TLS story: true means implicit TLS from the first
+ * byte (port 993), false means a cleartext connection that is upgraded --
+ * `requireTLS` is what makes that upgrade mandatory rather than
+ * opportunistic, so a server that quietly drops STARTTLS support fails
+ * instead of sending the password in the clear. There is no third mode: the
+ * mail_accounts CHECK constraint permits only tls|starttls (spec, Security).
+ */
+export function buildImapOptions(
+  settings: ConnectionSettings, options: MailAdapterOptions = {},
+): ImapFlowOptions {
+  const rejectUnauthorized = options.rejectUnauthorized ?? defaultRejectUnauthorized();
+  return {
+    host: settings.host,
+    port: settings.port,
+    secure: settings.security === "tls",
+    ...(settings.security === "starttls" ? { doSTARTTLS: true } : {}),
+    auth: { user: settings.username, pass: settings.password },
+    connectionTimeout: CONNECT_TIMEOUT_MS,
+    greetingTimeout: GREETING_TIMEOUT_MS,
+    socketTimeout: SOCKET_TIMEOUT_MS,
+    ...(rejectUnauthorized ? {} : { tls: { rejectUnauthorized: false } }),
+    // imapflow's default logger is pino at level TRACE: every command,
+    // response and connection event, per account, forever. The journal is
+    // not where mail sync reports itself -- the pass-complete line and
+    // mail_accounts.last_error are (mail-sync.ts) -- and every failure that
+    // matters escapes through this adapter as a thrown error anyway.
+    logger: false,
+  };
+}
+
+interface SmtpOptions {
+  host: string;
+  port: number;
+  secure: boolean;
+  requireTLS?: boolean;
+  auth: { user: string; pass: string };
+  connectionTimeout: number;
+  greetingTimeout: number;
+  socketTimeout: number;
+  tls?: { rejectUnauthorized: boolean };
+}
+
+/** nodemailer's SMTP transport options, same mapping and same reasoning as
+ * buildImapOptions (nodemailer spells the STARTTLS requirement
+ * `requireTLS`). */
+export function buildSmtpOptions(
+  settings: ConnectionSettings, options: MailAdapterOptions = {},
+): SmtpOptions {
+  const rejectUnauthorized = options.rejectUnauthorized ?? defaultRejectUnauthorized();
+  return {
+    host: settings.host,
+    port: settings.port,
+    secure: settings.security === "tls",
+    ...(settings.security === "starttls" ? { requireTLS: true } : {}),
+    auth: { user: settings.username, pass: settings.password },
+    connectionTimeout: CONNECT_TIMEOUT_MS,
+    greetingTimeout: GREETING_TIMEOUT_MS,
+    socketTimeout: SOCKET_TIMEOUT_MS,
+    ...(rejectUnauthorized ? {} : { tls: { rejectUnauthorized: false } }),
+  };
+}
+
+// --- The IMAP client -------------------------------------------------------
+
+/** One in-flight folder walk's remaining UIDs -- see fetchNewer. */
+export interface WalkCache {
+  folder: string;
+  /** The `sinceDate` the cached SEARCH was run with, as epoch ms. */
+  sinceDate: number | null;
+  /** The `sinceUid` the NEXT call must present to continue this walk: the
+   * highest UID the previous call returned. */
+  sinceUid: number;
+  /** UIDs above `sinceUid`, ascending, not yet handed out. */
+  uids: number[];
+}
+
+/**
+ * The cached remainder when `cache` continues the walk this call belongs to,
+ * or null when it does not and a fresh SEARCH is required.
+ *
+ * All three keys have to match. Folder and cursor are obvious; `sinceDate` is
+ * not, and is the one that would bite: it is set only while a folder's cursor
+ * is at 0 (AccountSync's backfill window), so a walk that started with a date
+ * filter and one that did not can otherwise present the same (folder,
+ * sinceUid) pair and read each other's UID lists.
+ */
+export function continueWalk(
+  cache: WalkCache | null, folder: string, sinceUid: number, sinceDate: number | null,
+): number[] | null {
+  if (cache === null) return null;
+  if (cache.folder !== folder || cache.sinceUid !== sinceUid || cache.sinceDate !== sinceDate) return null;
+  return cache.uids;
+}
+
+/**
+ * The cache to keep after handing out `batch`, or null to keep none.
+ *
+ * NOTHING IS CACHED once the list runs out, and that is the important half. A
+ * walk ends on a short batch, and the loop then saves that batch's highest
+ * UID as the folder cursor -- so the NEXT pass calls with exactly the
+ * (folder, sinceUid) the exhausted cache was keyed on. An empty list left
+ * behind would answer that call with "no messages" and the pass would
+ * conclude the folder was exhausted without ever asking the server, so mail
+ * that arrived in between would not be seen until some later pass happened to
+ * search again. A cache with nothing left in it has no value anyway: it can
+ * only ever save a search by ANSWERING one, and the only answer it has is a
+ * wrong one.
+ */
+export function nextWalk(
+  folder: string, sinceDate: number | null, batch: readonly number[], rest: readonly number[],
+): WalkCache | null {
+  const highest = batch.length === 0 ? null : batch[batch.length - 1] as number;
+  if (highest === null || rest.length === 0) return null;
+  return { folder, sinceDate, sinceUid: highest, uids: [...rest] };
+}
+
+/**
+ * `ImapClient` on top of imapflow. One instance per connection attempt --
+ * never reused after a failure, never shared between accounts (see
+ * mail-imap.ts's LIFECYCLE notes and createImapClientFactory below).
+ */
+export class ImapflowClient implements ImapClient {
+  private readonly client: ImapFlow;
+  private readonly host: string;
+  private walk: WalkCache | null = null;
+
+  constructor(settings: ImapConnectionSettings, options: MailAdapterOptions = {}) {
+    this.host = settings.host;
+    this.client = new ImapFlow(buildImapOptions(settings, options));
+    // MANDATORY, not hygiene: imapflow emits 'error' on the client for any
+    // failure that arrives outside a command (a socket dying mid-IDLE is the
+    // ordinary one), and an EventEmitter 'error' with no listener is an
+    // uncaught exception -- it would take the whole server down with it. The
+    // handler itself has nothing to do: every error that matters to the CRM
+    // reaches it through a rejected command instead, and the connection is
+    // already being torn down by the time this fires.
+    this.client.on("error", () => { /* see above: the command paths report */ });
+  }
+
+  async connect(): Promise<void> {
+    try {
+      await this.client.connect();
+    } catch (error) {
+      throw normalizeMailError(error);
+    }
+  }
+
+  /**
+   * close(), never logout(): this has to be safe after a FAILED connect
+   * (mail-imap.ts, LIFECYCLE), where a LOGOUT would be a command over a
+   * connection that may never have existed. Unconditional rather than
+   * "logout when connected, close otherwise" for a second reason too -- the
+   * only bound on a LOGOUT round-trip is SOCKET_TIMEOUT_MS, and a shutdown
+   * must not be able to spend two minutes being polite.
+   */
+  disconnect(): Promise<void> {
+    try {
+      this.client.close();
+    } catch {
+      // Nothing here is recoverable, and the caller (AccountSync.dropClient,
+      // or its own connect-failed path) is already handling a failure.
+    }
+    return Promise.resolve();
+  }
+
+  async status(folder: string): Promise<ImapFolderStatus> {
+    // The explicit type argument widens the result to include `false`
+    // deliberately: imapflow's own .d.ts promises a StatusObject, but the
+    // runtime returns false for a mailbox it could not query, and the
+    // contract requires a throw rather than a silent falsy value. (An
+    // annotation on the const would be narrowed straight back by control
+    // flow; passing the union as the generic argument is what keeps it.)
+    const status = await this.run<StatusObject | false>(
+      () => this.client.status(folder, { uidValidity: true }),
+    );
+    if (status === false) throw new Error(`could not read the status of ${folder}`);
+    const { uidValidity } = status;
+    if (uidValidity === undefined) {
+      throw new Error(`${folder} reported no UIDVALIDITY`);
+    }
+    // BigInt -> Number, per the contract: mail_folder_state.uidvalidity is a
+    // bigint column in mode "number", and a BigInt reaching the comparison
+    // would make every pass see a mismatch and re-walk the folder forever.
+    // UIDVALIDITY is a 32-bit value (RFC 3501), so this never loses precision.
+    return { uidvalidity: Number(uidValidity) };
+  }
+
+  /**
+   * The exactly-limit contract, on top of a SEARCH that has no LIMIT clause.
+   *
+   * One SEARCH per WALK, not per batch: the first call caches every UID above
+   * the cursor and each subsequent call whose `sinceUid` is the previous
+   * call's highest returned UID slices that cache. Anything that does not
+   * continue the chain -- a new pass, the other folder, a cursor reset --
+   * finds no matching cache and searches afresh, so the cache can never be a
+   * source of truth about what is on the server, only a way to avoid asking
+   * the same question 100 times during one backfill.
+   *
+   * Descriptors are produced for every UID in the batch even if the FETCH
+   * that follows reports fewer (a message expunged between the SEARCH and the
+   * FETCH). Dropping it would mean returning a SHORT batch, which the loop
+   * reads as "the folder is exhausted" -- truncating the sync at that point.
+   * Its flags are unknown, so it gets none; the loop's fetchRaw then returns
+   * null for it, which is the documented, ordinary "vanished" path.
+   *
+   * The exactly-limit guarantee is therefore "as of this walk's SEARCH": mail
+   * that arrives DURING a long backfill is not spliced into it, and the walk
+   * ends on the short batch that empties the cache. That costs nothing -- the
+   * cursor is at the last UID actually returned, so the next pass searches
+   * again and picks the newcomers up -- and it is what keeps one backfill to
+   * one SEARCH instead of one per batch.
+   */
+  async fetchNewer(folder: string, options: FetchNewerOptions): Promise<ImapMessageDescriptor[]> {
+    const { sinceUid, limit, sinceDate } = options;
+    const sinceKey = sinceDate === null ? null : sinceDate.getTime();
+    return await this.withMailbox(folder, async () => {
+      const cached = continueWalk(this.walk, folder, sinceUid, sinceKey);
+      let pending: number[];
+      if (cached !== null) {
+        pending = cached;
+      } else {
+        const found = await this.client.search({
+          // "n:*" is the whole point of the range: SEARCH cannot express a
+          // limit, so the lower bound is all the server can be told. Note the
+          // filter below -- IMAP evaluates `x:*` as the range between x and
+          // the HIGHEST existing UID, which means it matches the highest
+          // message even when x is beyond it (RFC 3501), so a cursor past the
+          // end of the mailbox would otherwise re-fetch the last message
+          // forever.
+          uid: `${sinceUid + 1}:*`,
+          ...(sinceDate === null ? {} : { since: sinceDate }),
+        }, { uid: true });
+        // false, not [], is imapflow's "the search did not run". Returning an
+        // empty array here would tell the loop the folder is exhausted and
+        // end the walk silently -- the exact failure the contract's
+        // RETURN-VALUE DISCIPLINE section is about.
+        if (found === false) throw new Error(`SEARCH failed in ${folder}`);
+        pending = [...found].filter((uid) => uid > sinceUid).sort((a, b) => a - b);
+      }
+
+      const batch = pending.slice(0, limit);
+      this.walk = nextWalk(folder, sinceKey, batch, pending.slice(limit));
+      if (batch.length === 0) return [];
+
+      const flagsByUid = new Map<number, string[]>();
+      for await (const message of this.client.fetch(batch, { uid: true, flags: true }, { uid: true })) {
+        flagsByUid.set(message.uid, [...(message.flags ?? [])]);
+      }
+      return batch.map((uid) => ({ uid, flags: flagsByUid.get(uid) ?? [] }));
+    });
+  }
+
+  async fetchRaw(folder: string, uid: number): Promise<Buffer | null> {
+    return await this.withMailbox(folder, async () => {
+      // `source: true` compiles to BODY.PEEK[] (imapflow's fetch command
+      // builder). PEEK is not an optimisation: a plain BODY[] fetch sets
+      // \Seen on the server, so syncing a mailbox would mark every message in
+      // it read in the user's own mail client. imapflow's download() would
+      // stream the same bytes, but it reports a missing message as an object
+      // with no content rather than as a clean miss -- fetchOne's `false`
+      // maps onto this method's "expunged" case exactly.
+      const message = await this.client.fetchOne(uid, { source: true }, { uid: true });
+      // The one place a falsy imapflow return maps to a value rather than a
+      // throw: no such UID means the message was expunged between the listing
+      // and this call, which is an ordinary race (contract).
+      if (message === false) return null;
+      const { source } = message;
+      if (source === undefined) throw new Error(`fetch of ${folder}/${uid} returned no source`);
+      return source;
+    });
+  }
+
+  async fetchFlags(folder: string, sinceDate: Date): Promise<ImapMessageDescriptor[]> {
+    return await this.withMailbox(folder, async () => {
+      const found = await this.client.search({ since: sinceDate }, { uid: true });
+      if (found === false) throw new Error(`SEARCH SINCE failed in ${folder}`);
+      const uids = [...found];
+      if (uids.length === 0) return [];
+      const out: ImapMessageDescriptor[] = [];
+      for await (const message of this.client.fetch(uids, { uid: true, flags: true }, { uid: true })) {
+        out.push({ uid: message.uid, flags: [...(message.flags ?? [])] });
+      }
+      return out;
+    });
+  }
+
+  async append(folder: string, raw: Buffer | string, flags: string[]): Promise<void> {
+    // No mailbox lock: APPEND names its target mailbox, and taking a lock
+    // would SELECT the Sent folder on the connection the loop is using for
+    // INBOX for no reason. No INTERNALDATE either -- the server stamps its
+    // own arrival time (contract).
+    const result = await this.run<AppendResponseObject | false>(
+      () => this.client.append(folder, raw, flags),
+    );
+    if (result === false) throw new Error(`APPEND to ${folder} was refused`);
+  }
+
+  async addFlags(folder: string, uids: number[], flags: string[]): Promise<void> {
+    if (uids.length === 0) return;
+    await this.withMailbox(folder, async () => {
+      // messageFlagsADD. messageFlagsSet would REPLACE the message's whole
+      // flag set, wiping \Answered/\Flagged/\Draft and any user keywords the
+      // account's other mail clients rely on (contract).
+      const ok = await this.client.messageFlagsAdd(uids, flags, { uid: true });
+      if (!ok) throw new Error(`could not add flags in ${folder}`);
+    });
+  }
+
+  /**
+   * Resolves when the server reports new mail, or promptly when `signal`
+   * aborts. Never resolves on its own otherwise: AccountSync caps the wait by
+   * aborting the signal, so a timer here would only fight it.
+   *
+   * The only rejection is ImapIdleUnsupportedError, raised from the
+   * capability list BEFORE any IDLE command is sent. Everything else that can
+   * go wrong -- the IDLE command failing, the connection closing underneath
+   * it -- resolves "aborted" instead, deliberately: mail-sync.ts latches
+   * poll-only mode on any rejection, for the life of the AccountSync, and a
+   * broken connection is not evidence about the server's capabilities. Ending
+   * the wait instead sends the loop into a pass, which discovers the dead
+   * connection, records it, backs off and reconnects -- the handling that
+   * failure actually wants.
+   *
+   * After the signal fires this returns without breaking the IDLE. That is
+   * safe (and intended) because imapflow's command queue runs a preCheck that
+   * sends DONE and waits for IDLE to finish before letting the next command
+   * through, so whatever the loop does next -- a pass, a queued markSeen, a
+   * close() -- breaks it. See mail-imap.ts's note on that contract.
+   */
+  async idle(signal: AbortSignal): Promise<IdleOutcome> {
+    if (signal.aborted) return "aborted";
+    if (!this.supportsIdle()) throw new ImapIdleUnsupportedError(this.host);
+    // IDLE needs a selected mailbox, and INBOX is the only one ever idled
+    // (contract) -- opened rather than locked, since a held lock would block
+    // the queued work this wait exists to be interrupted by.
+    try {
+      await this.client.mailboxOpen(INBOX);
+    } catch {
+      // A connection that can no longer select INBOX is a BROKEN connection,
+      // not a server without IDLE -- so this ends the wait rather than
+      // rejecting into the loop's poll-only latch. The pass that follows
+      // fails on the same dead connection, which records it, backs off and
+      // reconnects.
+      return "aborted";
+    }
+
+    return await new Promise<IdleOutcome>((resolve) => {
+      let settled = false;
+      const finish = (outcome: IdleOutcome): void => {
+        if (settled) return;
+        settled = true;
+        this.client.removeListener("exists", onExists);
+        this.client.removeListener("close", onClose);
+        signal.removeEventListener("abort", onAbort);
+        resolve(outcome);
+      };
+      const onExists = (): void => { finish("new-mail"); };
+      const onClose = (): void => { finish("aborted"); };
+      const onAbort = (): void => { finish("aborted"); };
+      this.client.on("exists", onExists);
+      this.client.on("close", onClose);
+      signal.addEventListener("abort", onAbort, { once: true });
+
+      // Not awaited: imapflow's idle() resolves when the IDLE ENDS, which is
+      // not the event being waited for (the mailbox-changed notification is),
+      // and it resolves immediately if the connection is already idling. Both
+      // handlers are attached so a late settlement -- including a rejection
+      // once the socket dies -- is absorbed rather than becoming an unhandled
+      // rejection.
+      void this.client.idle().then(
+        () => undefined,
+        () => { finish("aborted"); },
+      );
+    });
+  }
+
+  /** RFC 9051 folds IDLE into base IMAP4rev2, so a rev2 server need not
+   * advertise it separately (imapflow's own capability check does the same). */
+  private supportsIdle(): boolean {
+    const { capabilities, enabled } = this.client;
+    if (capabilities.has("IDLE")) return true;
+    return enabled.has("IMAP4REV2")
+      || (capabilities.has("IMAP4rev2") && !capabilities.has("IMAP4rev1"));
+  }
+
+  /** Every library call goes through here, so no imapflow error escapes this
+   * adapter unclassified (see normalizeMailError). */
+  private async run<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      throw normalizeMailError(error);
+    }
+  }
+
+  /**
+   * Run `operation` with `folder` selected and locked. The lock is what makes
+   * the SELECT and the commands that depend on it one unit -- imapflow
+   * serialises other work behind it, so nothing can select a different
+   * mailbox between a SEARCH and the FETCH that reads its results.
+   */
+  private async withMailbox<T>(folder: string, operation: () => Promise<T>): Promise<T> {
+    const lock = await this.run(() => this.client.getMailboxLock(folder));
+    try {
+      return await this.run(operation);
+    } finally {
+      lock.release();
+    }
+  }
+}
+
+/**
+ * The factory the sync engine is given. A plain arrow function per the
+ * contract's corollary: it MUST return a fresh instance per call, because
+ * AccountSync drops its client after any failure and asks again, and
+ * imapflow's connect() throws on a client that has already connected. Caching
+ * one client per account here would turn every reconnect into that throw.
+ */
+export function createImapClientFactory(
+  options: MailAdapterOptions = {},
+): (settings: ImapConnectionSettings) => ImapflowClient {
+  return (settings) => new ImapflowClient(settings, options);
+}
+
+// --- Verification (the test-connection endpoint's real deps) ---------------
+
+/**
+ * Log in and hang up. imapflow's `verifyOnly` does exactly that -- it logs
+ * out as soon as authentication succeeds -- so this never selects a mailbox
+ * or touches a message.
+ */
+export async function imapVerify(settings: VerifySettings): Promise<void> {
+  const client = new ImapFlow({ ...buildImapOptions(settings), verifyOnly: true });
+  client.on("error", () => { /* see ImapflowClient's constructor */ });
+  try {
+    await client.connect();
+  } catch (error) {
+    throw normalizeMailError(error);
+  } finally {
+    // verifyOnly already logged out on the success path; this is for the
+    // failure one, where a half-open socket would otherwise leak.
+    try {
+      client.close();
+    } catch { /* nothing to recover */ }
+  }
+}
+
+/** nodemailer's own connection+login check (EHLO, STARTTLS if required,
+ * AUTH), with no message sent. */
+export async function smtpVerify(settings: VerifySettings): Promise<void> {
+  const transport = nodemailer.createTransport(buildSmtpOptions(settings));
+  try {
+    await transport.verify();
+  } catch (error) {
+    throw normalizeMailError(error);
+  } finally {
+    transport.close();
+  }
+}
+
+/**
+ * The pair routes/mail.ts (Task 7) hands to mail-accounts.ts's
+ * testConnection. It exists as a value rather than being assembled at the
+ * route so there is exactly one place that says what "the real thing" means,
+ * and so the route file needs no imapflow/nodemailer import of its own.
+ */
+export const defaultTestConnectionDeps: TestConnectionDeps = { imapVerify, smtpVerify };
+
+// --- SMTP transport (mail-send's real factory) -----------------------------
+
+/**
+ * mail-send.ts's `transportFactory`: one non-pooled transport per send, so
+ * the SMTP connection is opened, used and closed with the message rather than
+ * being held open between compositions (a CRM sends a handful of messages a
+ * day, and a pool would be a permanent connection to keep alive for nothing).
+ *
+ * Errors are normalised on the way out so mail-send's 502 can tell the user
+ * whether to check their password or their server -- see
+ * normalizeMailError and mail-imap.ts's ERROR CLASSIFICATION.
+ */
+export function createSmtpTransport(account: MailAccount, credentials: MailCredentials) {
+  const transport = nodemailer.createTransport(buildSmtpOptions({
+    host: account.smtpHost,
+    port: account.smtpPort,
+    security: account.smtpSecurity,
+    username: account.username,
+    password: credentials.smtpPassword,
+  }));
+  return {
+    async sendMail(message: { raw: Buffer; envelope: { from: string; to: string[] } }): Promise<unknown> {
+      try {
+        return await transport.sendMail(message);
+      } catch (error) {
+        throw normalizeMailError(error);
+      } finally {
+        transport.close();
+      }
+    },
+  };
+}

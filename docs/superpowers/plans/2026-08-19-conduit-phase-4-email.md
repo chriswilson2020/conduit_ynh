@@ -131,6 +131,8 @@ A UID list plus a per-UID `fetchRaw`, rather than an async iterator yielding bod
 
 `mail-imapflow.ts`: `ImapflowClient implements ImapClient` — imapflow with `secure`/STARTTLS per `imap_security`, mailbox locks around ops, SEARCH SINCE for the backfill filter, `client.idle()` with AbortSignal race. Also export `imapVerify(settings)` / `smtpVerify(settings)` (nodemailer `verify()`) and wire them as the real deps of Task 3's testConnection. Unit tests: none beyond construction — this file is covered by Task 8's integration suite; keep it thin enough that that is honest.
 
+**Moved here from Task 8 (done, 20 Aug):** `config.ts`'s `MAIL_TLS_REJECT_UNAUTHORIZED` (default `1`; `0` makes the adapters pass `rejectUnauthorized: false`) is adapter-owned, so it landed with the adapter rather than with the CI job that uses it. Task 8 only has to SET the env now. server.ts passes `config.mailTlsRejectUnauthorized` into the client factory; `imapVerify`/`smtpVerify` read the env directly, because `TestConnectionDeps` fixes their signature and leaves no room for a config parameter.
+
 `mail-send.ts`: `sendMail(db, actorId, input, deps)` — deps `{ transportFactory, syncManager }`:
 
 ```typescript
@@ -167,7 +169,7 @@ Tests (~12): ordering matrix (SMTP fail → no row; APPEND fail → row + warn),
 
 ### Task 8: CI Dovecot + Mailpit integration
 
-TLS story (settled here, used by Tasks 8 and 11): the account schema keeps its strict `tls|starttls` CHECK — no plaintext mode exists anywhere. CI Dovecot serves IMAPS on 993 with a self-signed cert; Mailpit serves STARTTLS on 1025 with its built-in self-signed cert. `config.ts` gains `MAIL_TLS_REJECT_UNAUTHORIZED` (default `1`); when `0` (CI only) the adapter passes `rejectUnauthorized: false` to imapflow/nodemailer.
+TLS story (settled here, used by Tasks 8 and 11): the account schema keeps its strict `tls|starttls` CHECK — no plaintext mode exists anywhere. CI Dovecot serves IMAPS on 993 with a self-signed cert; Mailpit serves STARTTLS on 1025 with its built-in self-signed cert. `MAIL_TLS_REJECT_UNAUTHORIZED` (default `1`; when `0`, CI only, the adapters pass `rejectUnauthorized: false` to imapflow/nodemailer) already exists — it shipped with the adapter in Task 6, since that is what owns it. This task only sets it in the workflow env.
 
 `.github/workflows/test.yml`: `mailpit` (image `axllent/mailpit`, ports 1025/8025) fits the `services:` block. Dovecot needs config files (passwd-file auth: one user `conduit@test.local` / `testpass`, self-signed cert), and `services:` containers start before the workspace exists — so start it in a step instead: write the config + `openssl req` cert to a temp dir, then `docker run -d -v` the `dovecot/dovecot:2.3-latest` image, port 993. Add that step to both jobs. `packages/api/src/test/mail-integration.test.ts`, top-level `describe.skipIf(!process.env.MAIL_IT)`; test.yml sets `MAIL_IT=1`, host/port env, and `MAIL_TLS_REJECT_UNAUTHORIZED=0`. Integration coverage: login, APPEND then fetchNewer sees it, flags roundtrip via addFlags/fetchFlags, SEARCH SINCE backfill filter, idle wake on APPEND (with timeout guard), smtpVerify against Mailpit, nodemailer send → Mailpit API shows the message. Iterate via push; keep total runtime under ~90s. The e2e job's app boot env also gets `MAIL_TLS_REJECT_UNAUTHORIZED=0` plus `E2E_MAIL_*` host/port env consumed by mail.spec.ts (Task 11).
 

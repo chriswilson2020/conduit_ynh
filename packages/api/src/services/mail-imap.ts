@@ -68,7 +68,26 @@ import type { IngestMessageInput, IngestResult } from "./mail-ingest.js";
  *   mail_folder_state.uidvalidity is a bigint column in `mode: "number"`, and
  *   a BigInt reaching the comparison would make every pass see a mismatch and
  *   re-walk the folder forever.
+ *
+ * ERROR CLASSIFICATION
+ * - Every error an adapter throws should carry one of the two prefixes below
+ *   on its `message` when it can be classified: `auth:` for a rejected login,
+ *   `connection:` for a socket/DNS/TLS-level failure. Unclassifiable errors
+ *   are left alone rather than guessed at.
+ * - The prefixes are the CONTRACT, not an implementation detail of any one
+ *   adapter: an adapter error's message is stored verbatim in
+ *   mail_accounts.last_error and returned verbatim by the test-connection
+ *   endpoint, and both the settings UI (telling a user to check their
+ *   password vs. their host) and mail-send.ts's 502 body branch on them. They
+ *   live here, with the interface, so a consumer never has to import the
+ *   imapflow/nodemailer-bound adapter module just to recognise one.
+ * - Neither the prefix nor the message may ever contain a password: the
+ *   underlying libraries do not echo credentials into their own error text,
+ *   and an adapter must not add any.
  */
+
+export const MAIL_AUTH_ERROR_PREFIX = "auth:";
+export const MAIL_CONNECTION_ERROR_PREFIX = "connection:";
 
 /** Deliberately just UIDVALIDITY. UIDNEXT would be the obvious companion,
  * but nothing reads it -- the cursor is driven by what fetchNewer actually

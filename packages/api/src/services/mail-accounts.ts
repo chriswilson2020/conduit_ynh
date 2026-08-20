@@ -491,7 +491,11 @@ export async function listAccounts(db: Database, actorId: string): Promise<MailA
   } satisfies MailAccountList;
 }
 
-interface VerifySettings {
+/** One protocol's connection settings, as testConnection resolves them (and
+ * as mail-imapflow.ts's real imapVerify/smtpVerify consume them). Exported so
+ * the adapter can name the type rather than redeclare it and hope the two
+ * stay identical. */
+export interface VerifySettings {
   host: string; port: number; security: MailSecurity; username: string; password: string;
 }
 export interface TestConnectionDeps {

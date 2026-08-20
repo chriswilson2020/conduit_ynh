@@ -80,6 +80,16 @@ describe("parseConfig", () => {
     );
   });
 
+  it("verifies mail TLS certificates unless MAIL_TLS_REJECT_UNAUTHORIZED is exactly 0", () => {
+    expect(parseConfig(valid).mailTlsRejectUnauthorized).toBe(true);
+    expect(parseConfig({ ...valid, MAIL_TLS_REJECT_UNAUTHORIZED: "0" }).mailTlsRejectUnauthorized).toBe(false);
+    // Fails safe: anything that is not the exact opt-out string keeps
+    // verification on rather than being read as a loose boolean.
+    for (const value of ["1", "false", "no", "", "00"]) {
+      expect(parseConfig({ ...valid, MAIL_TLS_REJECT_UNAUTHORIZED: value }).mailTlsRejectUnauthorized).toBe(true);
+    }
+  });
+
   it("carries through an explicit DEFAULT_CURRENCY", () => {
     expect(parseConfig({ ...valid, DEFAULT_CURRENCY: "USD" }).defaultCurrency).toBe("USD");
   });

@@ -1,0 +1,248 @@
+import { describe, it, expect, afterEach } from "vitest";
+import type { ImapConnectionSettings } from "./mail-imap.js";
+import {
+  ImapIdleUnsupportedError, ImapflowClient,
+  buildImapOptions, buildSmtpOptions, continueWalk, createImapClientFactory,
+  defaultTestConnectionDeps, imapVerify, nextWalk, normalizeMailError, smtpVerify,
+} from "./mail-imapflow.js";
+
+/**
+ * Construction, option mapping and error classification only. Everything this
+ * adapter does against a real server -- login, SEARCH/FETCH, IDLE wake,
+ * APPEND, flag writes -- is Task 8's integration suite, driven against a
+ * Dovecot and a Mailpit container in CI. Mocking imapflow here would test the
+ * mock, so the split is: this file covers what is true without a server, and
+ * the adapter is kept thin enough that that is an honest boundary.
+ */
+
+const tlsSettings = {
+  host: "mail.example.com", port: 993, security: "tls" as const,
+  username: "chris", password: "hunter2",
+};
+const starttlsSettings = { ...tlsSettings, port: 143, security: "starttls" as const };
+
+const previousEnv = process.env.MAIL_TLS_REJECT_UNAUTHORIZED;
+afterEach(() => {
+  if (previousEnv === undefined) delete process.env.MAIL_TLS_REJECT_UNAUTHORIZED;
+  else process.env.MAIL_TLS_REJECT_UNAUTHORIZED = previousEnv;
+});
+
+describe("buildImapOptions", () => {
+  it("maps tls to an implicit-TLS connection", () => {
+    const options = buildImapOptions(tlsSettings, { rejectUnauthorized: true });
+    expect(options.secure).toBe(true);
+    // Combining secure with doSTARTTLS is a misconfiguration imapflow throws
+    // on, so the tls branch must not set it at all.
+    expect(options.doSTARTTLS).toBeUndefined();
+    expect(options.host).toBe("mail.example.com");
+    expect(options.port).toBe(993);
+    expect(options.auth).toEqual({ user: "chris", pass: "hunter2" });
+  });
+
+  it("maps starttls to a REQUIRED upgrade, never an opportunistic one", () => {
+    const options = buildImapOptions(starttlsSettings, { rejectUnauthorized: true });
+    expect(options.secure).toBe(false);
+    // Without this, imapflow upgrades only if the server offers STARTTLS and
+    // otherwise carries on in the clear -- with the password.
+    expect(options.doSTARTTLS).toBe(true);
+  });
+
+  it("sets all three timeouts, since nothing but idle() is cancellable", () => {
+    const options = buildImapOptions(tlsSettings, { rejectUnauthorized: true });
+    expect(options.connectionTimeout).toBeGreaterThan(0);
+    expect(options.greetingTimeout).toBeGreaterThan(0);
+    expect(options.socketTimeout).toBeGreaterThan(0);
+    // Under the 5-minute poll interval: a connection that died between
+    // passes must be noticed by the next one, not outlive it.
+    expect(options.socketTimeout).toBeLessThan(300_000);
+  });
+
+  it("silences imapflow's own logger", () => {
+    // The default is pino at level trace -- every command and response, per
+    // account, into the journal.
+    expect(buildImapOptions(tlsSettings).logger).toBe(false);
+  });
+
+  it("verifies certificates by default and relaxes only on an explicit opt-out", () => {
+    expect(buildImapOptions(tlsSettings, { rejectUnauthorized: true }).tls).toBeUndefined();
+    expect(buildImapOptions(tlsSettings, { rejectUnauthorized: false }).tls)
+      .toEqual({ rejectUnauthorized: false });
+  });
+
+  it("falls back to the environment when no option is passed", () => {
+    delete process.env.MAIL_TLS_REJECT_UNAUTHORIZED;
+    expect(buildImapOptions(tlsSettings).tls).toBeUndefined();
+    process.env.MAIL_TLS_REJECT_UNAUTHORIZED = "0";
+    expect(buildImapOptions(tlsSettings).tls).toEqual({ rejectUnauthorized: false });
+    // Only the exact opt-out string counts (config.ts fails safe the same way).
+    process.env.MAIL_TLS_REJECT_UNAUTHORIZED = "false";
+    expect(buildImapOptions(tlsSettings).tls).toBeUndefined();
+  });
+});
+
+describe("buildSmtpOptions", () => {
+  it("maps tls to secure and starttls to requireTLS", () => {
+    const secure = buildSmtpOptions(tlsSettings, { rejectUnauthorized: true });
+    expect(secure.secure).toBe(true);
+    expect(secure.requireTLS).toBeUndefined();
+
+    const upgraded = buildSmtpOptions({ ...starttlsSettings, port: 587 }, { rejectUnauthorized: true });
+    expect(upgraded.secure).toBe(false);
+    expect(upgraded.requireTLS).toBe(true);
+    expect(upgraded.port).toBe(587);
+  });
+
+  it("carries the same timeouts and TLS opt-out as the IMAP side", () => {
+    const options = buildSmtpOptions(tlsSettings, { rejectUnauthorized: false });
+    expect(options.connectionTimeout).toBe(buildImapOptions(tlsSettings).connectionTimeout);
+    expect(options.greetingTimeout).toBe(buildImapOptions(tlsSettings).greetingTimeout);
+    expect(options.socketTimeout).toBe(buildImapOptions(tlsSettings).socketTimeout);
+    expect(options.tls).toEqual({ rejectUnauthorized: false });
+  });
+
+  it("passes the SMTP credentials, not the IMAP ones", () => {
+    expect(buildSmtpOptions({ ...tlsSettings, password: "smtp-secret" }).auth)
+      .toEqual({ user: "chris", pass: "smtp-secret" });
+  });
+});
+
+describe("normalizeMailError", () => {
+  it("prefixes a rejected login with auth:", () => {
+    // imapflow's shape.
+    const imap = Object.assign(new Error("Invalid credentials"), { authenticationFailed: true });
+    expect(normalizeMailError(imap).message).toBe("auth: Invalid credentials");
+    // nodemailer's: no flag, just a code.
+    const smtp = Object.assign(new Error("Invalid login: 535 authentication failed"), { code: "EAUTH" });
+    expect(normalizeMailError(smtp).message).toBe("auth: Invalid login: 535 authentication failed");
+  });
+
+  it("prefixes socket, DNS and TLS failures with connection:", () => {
+    for (const code of ["ECONNREFUSED", "ENOTFOUND", "ETIMEOUT", "NoConnection", "EConnectionClosed",
+      "CONNECT_TIMEOUT", "ECONNECTION", "ESOCKET", "DEPTH_ZERO_SELF_SIGNED_CERT"]) {
+      const error = Object.assign(new Error(`failed (${code})`), { code });
+      expect(normalizeMailError(error).message).toBe(`connection: failed (${code})`);
+    }
+  });
+
+  it("leaves an unclassifiable error exactly as it was", () => {
+    // A server rejecting a SELECT is neither a credential nor a connection
+    // problem, and inventing a class for it would mislead the settings UI.
+    const error = new Error("Mailbox doesn't exist: Archive");
+    expect(normalizeMailError(error)).toBe(error);
+    expect(normalizeMailError(error).message).toBe("Mailbox doesn't exist: Archive");
+  });
+
+  it("does not prefix twice", () => {
+    const once = normalizeMailError(Object.assign(new Error("nope"), { code: "ECONNREFUSED" }));
+    expect(normalizeMailError(once).message).toBe("connection: nope");
+  });
+
+  it("keeps the original reachable on cause and never invents text", () => {
+    const original = Object.assign(new Error("Invalid credentials"), { authenticationFailed: true });
+    const normalized = normalizeMailError(original);
+    expect(normalized.cause).toBe(original);
+    // Nothing is added but the prefix -- in particular this function is
+    // never handed a password, so it cannot leak one.
+    expect(normalized.message.endsWith(original.message)).toBe(true);
+  });
+
+  it("copes with a thrown non-Error", () => {
+    expect(normalizeMailError("socket hang up").message).toBe("socket hang up");
+  });
+});
+
+describe("the folder-walk cache", () => {
+  // IMAP SEARCH has no LIMIT clause, so one walk searches once and slices the
+  // result across its batches. These two functions are the whole decision --
+  // and the only part of fetchNewer that can be checked without a server.
+  const cache = { folder: "INBOX", sinceDate: null, sinceUid: 50, uids: [51, 52, 53] };
+
+  it("continues a walk only for the same folder, cursor and backfill date", () => {
+    expect(continueWalk(cache, "INBOX", 50, null)).toEqual([51, 52, 53]);
+    expect(continueWalk(null, "INBOX", 50, null)).toBeNull();
+    expect(continueWalk(cache, "Sent", 50, null)).toBeNull();
+    expect(continueWalk(cache, "INBOX", 40, null)).toBeNull();
+    // sinceDate is set only while a folder's cursor is still at 0, so a
+    // backfill walk and an ordinary one can present the same (folder,
+    // sinceUid) pair -- and must not read each other's UID lists.
+    expect(continueWalk(cache, "INBOX", 50, 1_700_000_000_000)).toBeNull();
+    expect(continueWalk({ ...cache, sinceDate: 1_700_000_000_000 }, "INBOX", 50, null)).toBeNull();
+  });
+
+  it("caches the remainder, keyed on the batch's highest uid", () => {
+    expect(nextWalk("INBOX", null, [1, 2, 3], [4, 5])).toEqual({
+      folder: "INBOX", sinceDate: null, sinceUid: 3, uids: [4, 5],
+    });
+  });
+
+  it("caches NOTHING once the list runs out", () => {
+    // The walk ended, so the loop saves this batch's highest UID as the
+    // folder cursor -- and the next pass calls with exactly the key an
+    // exhausted cache would be stored under. An empty cached list would
+    // answer that call "no messages" without asking the server, and mail
+    // that arrived in between would go unseen.
+    expect(nextWalk("INBOX", null, [1, 2, 3], [])).toBeNull();
+    expect(nextWalk("INBOX", null, [], [])).toBeNull();
+  });
+});
+
+describe("ImapflowClient", () => {
+  const settings: ImapConnectionSettings = { accountId: "acct-1", ...tlsSettings };
+
+  it("is safe to disconnect after a connect that never happened", async () => {
+    // AccountSync.ensureConnected does exactly this on a failed connect, to
+    // avoid leaking a half-open socket.
+    const client = new ImapflowClient(settings, { rejectUnauthorized: true });
+    await expect(client.disconnect()).resolves.toBeUndefined();
+    await expect(client.disconnect()).resolves.toBeUndefined();
+  });
+
+  it("rejects idle() with a typed error when the server never advertised IDLE", async () => {
+    // Not connected, so the capability map is empty -- which is the same
+    // answer a server without IDLE gives, and the point is that this is read
+    // from the capability list rather than guessed from a failure.
+    const client = new ImapflowClient(settings, { rejectUnauthorized: true });
+    await expect(client.idle(new AbortController().signal)).rejects.toBeInstanceOf(ImapIdleUnsupportedError);
+    await client.disconnect();
+  });
+
+  it("returns without touching the server when idle() is handed an already-aborted signal", async () => {
+    const client = new ImapflowClient(settings, { rejectUnauthorized: true });
+    const controller = new AbortController();
+    controller.abort();
+    // Checked before the capability list, so a shutdown mid-wait does not
+    // turn into a spurious "server lacks IDLE".
+    await expect(client.idle(controller.signal)).resolves.toBe("aborted");
+    await client.disconnect();
+  });
+
+  it("addFlags with no uids does nothing at all", async () => {
+    const client = new ImapflowClient(settings, { rejectUnauthorized: true });
+    // No connection, so reaching the server would throw.
+    await expect(client.addFlags("INBOX", [], ["\\Seen"])).resolves.toBeUndefined();
+    await client.disconnect();
+  });
+});
+
+describe("createImapClientFactory", () => {
+  it("returns a FRESH client per call", async () => {
+    // The contract's corollary: AccountSync drops its client after any
+    // failure and asks again, and imapflow's connect() throws on a client
+    // that has already been connected -- so a cached instance would turn
+    // every reconnect into that throw.
+    const factory = createImapClientFactory({ rejectUnauthorized: true });
+    const settings: ImapConnectionSettings = { accountId: "acct-1", ...tlsSettings };
+    const first = factory(settings);
+    const second = factory(settings);
+    expect(first).not.toBe(second);
+    await first.disconnect();
+    await second.disconnect();
+  });
+});
+
+describe("defaultTestConnectionDeps", () => {
+  it("is the real verify pair", () => {
+    expect(defaultTestConnectionDeps.imapVerify).toBe(imapVerify);
+    expect(defaultTestConnectionDeps.smtpVerify).toBe(smtpVerify);
+  });
+});

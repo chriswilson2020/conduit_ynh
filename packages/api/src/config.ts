@@ -17,6 +17,15 @@ const envSchema = z.object({
   // the schema (same reason basePath's trailing-slash normalisation happens
   // post-parse instead of in the schema).
   MAIL_KEY_PATH: z.string().min(1).optional(),
+  // "0" turns off certificate verification for BOTH the IMAP and the SMTP
+  // connection; anything else (including the default) leaves it on. Exists
+  // for CI only, where Dovecot and Mailpit serve self-signed certificates
+  // that no trust store can validate -- there is no UI for it and no
+  // per-account variant, so the blast radius of a mistake is one deployment's
+  // env file rather than one account's settings. Kept as a string rather than
+  // a boolean coercion so that a typo ("true", "yes") fails SAFE: only the
+  // exact string "0" disables verification.
+  MAIL_TLS_REJECT_UNAUTHORIZED: z.string().default("1"),
 });
 
 export interface Config {
@@ -33,6 +42,9 @@ export interface Config {
   defaultCurrency: string;
   /** 32-byte AES-256-GCM key file for mail credential encryption; see mail-crypto.ts. */
   mailKeyPath: string;
+  /** Whether the IMAP/SMTP adapters verify server certificates. False only in
+   * CI (MAIL_TLS_REJECT_UNAUTHORIZED=0), never in a real deployment. */
+  mailTlsRejectUnauthorized: boolean;
 }
 
 export function parseConfig(env: Record<string, string | undefined>): Config {
@@ -67,5 +79,6 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     dataDir: value.DATA_DIR,
     defaultCurrency: value.DEFAULT_CURRENCY,
     mailKeyPath: value.MAIL_KEY_PATH ?? path.join(value.DATA_DIR, "mail.key"),
+    mailTlsRejectUnauthorized: value.MAIL_TLS_REJECT_UNAUTHORIZED !== "0",
   };
 }
