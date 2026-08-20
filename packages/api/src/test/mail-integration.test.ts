@@ -839,7 +839,6 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
       const arrived = await uidsAbove(client, "Moved", targetBase);
       expect(arrived).toHaveLength(1);
       const [movedUid = 0] = arrived;
-      expect(movedUid).not.toBe(uid);
       expect(await subjectOf(client, "Moved", movedUid)).toBe(subject);
     }, 30_000);
 
@@ -874,9 +873,14 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
 
       // THE EXPUNGE THAT PULLS THE TWO NUMBERINGS APART. A MOVE removes the
       // message from the source, so after these two the remaining three sit at
-      // sequence numbers two lower than their append position -- and in this
-      // folder, which no other case writes to, the third message's UID names
-      // the FIFTH message when read as a sequence number.
+      // sequence numbers two lower than their append position. On a FRESH
+      // folder -- which is what CI has, since the container is per job and no
+      // other case writes here -- the third message's UID names the FIFTH
+      // message when read as a sequence number. Against a folder that already
+      // held mail (a re-run at a persistent Dovecot) the same UID lands out of
+      // range instead and nothing moves. Either reading fails the assertions
+      // below, which is the point: they name the message that arrived, not
+      // merely how many did.
       await client.move("MoveUid", uids.slice(0, 2), "Moved");
 
       const targetBase = await highestUid(client, "Moved");

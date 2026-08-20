@@ -106,22 +106,37 @@ test.describe.serial("Mail journey", () => {
   const accountLabel = `CI Dovecot ${runId}`;
   const pipelineName = `Mail pipeline ${runId}`;
   const dealTitle = `Renewal deal ${runId}`;
-  /** Seeded into the Junk folder, which the CRM does not sync until the
-   * Settings picker says so -- so this subject is absent from the inbox until
-   * the folder step below, and that absence is itself an assertion. */
-  const junkSubject = `Newsletter ${runId}`;
-  /** The three the bulk actions act on: two archived in one gesture, one
-   * trashed after them. Kept apart from Alice's and Bob's threads so the
-   * earlier tests' assertions describe the same conversations afterwards as
-   * before. */
-  const archiveSubjects: [string, string] = [`Invoice ${runId}`, `Shipping ${runId}`];
-  const trashSubject = `Offer ${runId}`;
-
   let page: Page;
   let contactId: string;
   let aliceThreadId: string;
   let dealId: string;
   let accountId: string;
+
+  /**
+   * THE FOUR SUBJECTS BELOW ARE SCOPED PER ATTEMPT, not per run, and that is
+   * the difference between a retry that can pass and one that cannot.
+   *
+   * Everything Alice and Bob assert is a SET -- "this thread is here" -- which
+   * a previous attempt's leftovers cannot break. The folder journey opens with
+   * the opposite shape: "the Junk message is NOWHERE in the CRM yet", which is
+   * a statement about the whole list. A previous attempt that got as far as
+   * ticking the folder left a junk thread behind, and archiving its account
+   * does not unlist it (archive-not-delete; the threads deliberately stay), so
+   * a subject shared with that attempt would make this assertion unrecoverable
+   * -- failing every retry for a reason no retry can clear.
+   *
+   * `runId` is not enough on its own: it is module scope, and whether that is
+   * re-evaluated between attempts is Playwright's business (it discards the
+   * worker on failure today), not something this file should rest an
+   * unrecoverable assertion on. The retry INDEX is the fact that is true
+   * regardless, so it is what these are stamped with, in beforeAll.
+   */
+  let junkSubject = "";
+  /** The two archived in one gesture, and the one trashed after them. Kept
+   * apart from Alice's and Bob's threads so the earlier tests' assertions
+   * describe the same conversations afterwards as before. */
+  let archiveSubjects: [string, string] = ["", ""];
+  let trashSubject = "";
 
   // -- fixtures --------------------------------------------------------
 
@@ -372,8 +387,18 @@ test.describe.serial("Mail journey", () => {
 
   // --------------------------------------------------------------------
 
-  test.beforeAll(async ({ browser }) => {
+  test.beforeAll(async ({ browser }, testInfo) => {
     page = await browser.newPage();
+
+    // The per-ATTEMPT half of the scoping (see the declarations above): the
+    // retry index is what distinguishes this attempt's fixtures from the ones
+    // a previous attempt left in the mailbox and in the database, whether or
+    // not the module was re-evaluated in between. Assigned before seedMailbox
+    // below, which is what puts these subjects on the server.
+    const attemptId = `${runId}x${testInfo.retry}`;
+    junkSubject = `Newsletter ${attemptId}`;
+    archiveSubjects = [`Invoice ${attemptId}`, `Shipping ${attemptId}`];
+    trashSubject = `Offer ${attemptId}`;
 
     // A previous attempt's account would sync this same mailbox alongside the
     // one added below, ingesting every message twice (once per account, into
@@ -773,7 +798,12 @@ test.describe.serial("Mail journey", () => {
 
   test("moves the third to Trash, where the conversation still says where it went", async () => {
     await page.goto("/mail");
-    await page.getByTestId(`folder-${INBOX_FOLDER}`).click();
+    const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
+    await inboxRow.click();
+    // Asserted, not assumed: a click that did not land would leave the list in
+    // the "All mail" view, and a bulk action made there is the WHOLE-THREAD
+    // mode rather than the folder-scoped one -- a different request, silently.
+    await expect(inboxRow).toHaveAttribute("aria-current", "true");
     await expect(threadRow(trashSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
 
     await tickThread(trashSubject);
