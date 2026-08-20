@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { User } from "@conduit/shared";
 import {
   NotFoundError, ArchivedError, ConflictError, MailKeyMissingError, MailCredentialDecryptError,
+  SmtpSendError,
 } from "../services/errors.js";
 import { decodeCursor } from "../services/pagination.js";
 
@@ -33,7 +34,7 @@ export function requireUser(request: FastifyRequest, reply: FastifyReply): User 
 }
 
 /**
- * Maps the five domain error types every service can throw into their HTTP shape.
+ * Maps the domain error types services can throw into their HTTP shape.
  * Anything else is re-thrown so it reaches app.ts's setErrorHandler, which is the
  * single place that decides what a 5xx body looks like (and never echoes the
  * underlying error text) -- this function must not swallow or reshape those.
@@ -93,6 +94,19 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
       error: "mail_credentials_unreadable",
       message: "stored mail credentials could not be decrypted; submit a new password to re-establish them",
     });
+    return;
+  }
+  // 502, not 500: the request was well-formed and this server did its part --
+  // the upstream SMTP server is the one that refused. `reason` is echoed
+  // (unlike the two branches above) because it is the whole point: it is the
+  // adapter's own normalized text, carrying `auth:` or `connection:` so the
+  // composer can tell the user to check their password rather than their
+  // host, and mail-imapflow.ts guarantees no credential is in it. Nothing was
+  // stored, so the client still holds the draft and can retry it as-is. Like
+  // the two mail-crypto branches above, the route that exercises this lands
+  // in Task 7; the mapping is wired here so it gets it for free.
+  if (error instanceof SmtpSendError) {
+    void reply.code(502).send({ error: "smtp_failed", message: error.message });
     return;
   }
   throw error;

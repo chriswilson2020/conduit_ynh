@@ -369,6 +369,39 @@ describe("htmlToText", () => {
   it("collapses a run of 3+ blank lines down to one blank line", () => {
     expect(htmlToText("<p>A</p><br><br><br><p>B</p>")).toBe("A\n\nB");
   });
+
+  it("strips C0 controls from the input so the link markers cannot be forged", () => {
+    // SOH/STX are what the function itself uses to hold a link's destination
+    // across the tag strip. Arriving in the INPUT they would survive to the
+    // final restore step and turn into angle brackets, letting a crafted
+    // body fabricate a "<https://evil.example/>" destination on a link that
+    // has none -- or wrap arbitrary text so it reads as one.
+    const soh = String.fromCharCode(1);
+    const stx = String.fromCharCode(2);
+    expect(htmlToText(`Totally safe ${soh}https://evil.example/${stx}`)).toBe("Totally safe https://evil.example/");
+    // Every other C0 control goes too (tab, newline and carriage return are
+    // the deliberate exceptions -- they are ordinary whitespace here).
+    expect(htmlToText(`a${String.fromCharCode(0)}b${String.fromCharCode(0x1f)}c`)).toBe("abc");
+    expect(htmlToText("a\tb\nc")).toBe("a b\nc");
+    // ...and the numeric-entity spelling of the same thing, which decodes
+    // after the input strip has already run.
+    expect(htmlToText("Totally safe &#1;https://evil.example/&#2;")).toBe("Totally safe https://evil.example/");
+    expect(htmlToText("Totally safe &#x1;https://evil.example/&#x2;")).toBe("Totally safe https://evil.example/");
+  });
+
+  it("caps its input length", () => {
+    // A_TAG_RE is quadratic against unclosed <a> tags (the lazy inner group
+    // rescans to the end of the string from every one of them). Unreachable
+    // through the documented sanitize-first ordering -- sanitize-html
+    // re-serialises balanced markup -- so this is a bound, not a fix.
+    const oversized = "<p>x</p>".repeat(100_000);
+    expect(oversized.length).toBeGreaterThan(256 * 1024);
+    const text = htmlToText(oversized);
+    // One "x" plus one newline per repetition, and the cap lands inside the
+    // input rather than at the end of it.
+    expect(text.length).toBeLessThan(oversized.length / 2);
+    expect(text.startsWith("x\nx\n")).toBe(true);
+  });
 });
 
 describe("syntheticMessageId", () => {

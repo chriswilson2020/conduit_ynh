@@ -63,6 +63,32 @@ export class MailCredentialDecryptError extends Error {
 // not expected to ever reach a route handler.
 export class IncompleteTestConnectionSettingsError extends Error {}
 
+// Raised by mail-send.ts when the SMTP submission itself failed: the server
+// refused the connection, the login, or the message. Its own type because it
+// is the one mail failure a COMPOSING USER can act on immediately (fix the
+// address, check the password, try again in a minute) and the one that must
+// never be mistaken for a 500 -- nothing was stored, nothing was half-sent,
+// and the client still holds the draft. Maps to HTTP 502 `smtp_failed` at the
+// route layer: the CRM worked, the mail server it depends on did not.
+//
+// `reason` carries the adapter's normalized text (mail-imap.ts's `auth:` /
+// `connection:` prefixes) so the composer can say WHICH kind of failure it
+// was; it is truncated because it reaches a user-facing dialog, and it never
+// contains a credential (see mail-imapflow.ts's normalizeMailError).
+export class SmtpSendError extends Error {
+  readonly reason: string;
+
+  static readonly MAX_REASON_LENGTH = 300;
+
+  constructor(reason: string, options?: { cause?: unknown }) {
+    const truncated = reason.length > SmtpSendError.MAX_REASON_LENGTH
+      ? `${reason.slice(0, SmtpSendError.MAX_REASON_LENGTH)}...`
+      : reason;
+    super(`sending the message failed: ${truncated}`, options);
+    this.reason = truncated;
+  }
+}
+
 // Every failure escaping mail-ingest.ts's ingestMessage, wrapped with the
 // context the sync loop needs to act on it: which account, which folder,
 // which UID. Task 5's poison-message contract depends on this -- a message

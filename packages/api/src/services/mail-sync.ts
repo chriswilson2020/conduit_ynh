@@ -1304,26 +1304,39 @@ export class SyncManager {
     this.started = false;
     this.unregisterHook?.();
     this.unregisterHook = null;
-    // Drain in-flight reconciles first, or one could create a fresh
-    // AccountSync moments after everything was stopped.
     const chains = [...this.chain.values()];
     this.chain.clear();
-    await Promise.allSettled(chains);
-    const syncs = [...this.syncs.values()];
-    this.syncs.clear();
-    const stopping = Promise.allSettled(syncs.map((sync) => sync.stop()));
+    // Reconciles are drained BEFORE the syncs are stopped -- one still in
+    // flight could otherwise create a fresh AccountSync moments after
+    // everything was stopped -- but that drain is INSIDE the deadline below,
+    // not ahead of it. A reconcile's own await is `existing.stop()`, so a
+    // wedged sync wedges the chain that is stopping it, and draining first
+    // without a bound simply moved the unbounded wait one step earlier: the
+    // 15s cap was there while nothing needed capping.
+    //
+    // Snapshotting the syncs INSIDE the chain, rather than before it, is what
+    // keeps the ordering meaningful: a reconcile that ran to completion
+    // during the drain may have replaced a sync, and the replacement is the
+    // one that needs stopping.
+    let stopped = this.syncs.size;
+    const stopping = Promise.allSettled(chains).then(async () => {
+      const syncs = [...this.syncs.values()];
+      this.syncs.clear();
+      stopped = syncs.length;
+      await Promise.allSettled(syncs.map((sync) => sync.stop()));
+    });
     const clock = this.options.clock ?? systemSyncClock;
     const deadline = new AbortController();
     const timeout = clock.wait(STOP_TIMEOUT_MS, deadline.signal);
     const winner = await Promise.race([stopping.then(() => "stopped" as const), timeout.then(() => "timeout" as const)]);
-    // Releases whichever lost. `stopping` never rejects (allSettled) and is
-    // deliberately not awaited on the timeout path -- that is the whole
-    // point of the bound.
+    // Releases whichever lost. `stopping` never rejects (every await inside
+    // it is an allSettled) and is deliberately not awaited on the timeout
+    // path -- that is the whole point of the bound.
     deadline.abort();
     await timeout;
     if (winner === "timeout") {
       this.logger.warn(
-        { accounts: syncs.length, timeoutMs: STOP_TIMEOUT_MS },
+        { accounts: stopped, timeoutMs: STOP_TIMEOUT_MS },
         "mail-sync: gave up waiting for syncs to stop, abandoning them",
       );
     }

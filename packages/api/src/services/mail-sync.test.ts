@@ -152,6 +152,9 @@ class FakeImapClient implements ImapClient {
   readonly vanished = new Set<number>();
   /** While set, fetchRaw blocks on it -- used to hold a pass open. */
   gate: Promise<void> | null = null;
+  /** While set, disconnect() blocks on it -- a socket that will not go away,
+   * which is what a real adapter's timeouts (not this interface) bound. */
+  disconnectGate: Promise<void> | null = null;
   /** Highest number of the tracked operations in flight at once. Proves the
    * loop never runs two things against one account concurrently. (idle is
    * excluded on purpose: it is a long poll, and "in flight" is meaningless
@@ -196,6 +199,7 @@ class FakeImapClient implements ImapClient {
     // Any parked IDLE dies with the connection.
     this.idleResolve?.("aborted");
     this.idleResolve = null;
+    if (this.disconnectGate !== null) await this.disconnectGate;
   }
 
   async status(folder: string): Promise<{ uidvalidity: number }> {
@@ -1287,7 +1291,7 @@ describe("AccountSync: queued work", () => {
 describe("SyncManager", () => {
   const clients: FakeImapClient[] = [];
 
-  function makeManager(): SyncManager {
+  function makeManager(clock: ManualClock = new ManualClock()): SyncManager {
     const manager = new SyncManager({
       db: handle.db, dataDir, mailKeyPath: keyPath,
       clientFactory: (settings) => {
@@ -1295,7 +1299,7 @@ describe("SyncManager", () => {
         clients.push(client);
         return client;
       },
-      clock: new ManualClock(),
+      clock,
       logger: silentLogger,
       pollIntervalMs: 300_000,
     });
@@ -1422,6 +1426,38 @@ describe("SyncManager", () => {
     const late = await makeAccount({ email: "late@example.com", label: "Late" });
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(manager.get(late)).toBeUndefined();
+  });
+
+  it("bounds the wait for a WEDGED reconcile, not just for the syncs", async () => {
+    const clock = new ManualClock();
+    const manager = makeManager(clock);
+    await manager.start();
+    const accountId = await makeAccount();
+    await waitFor(() => manager.get(accountId) !== undefined, "the account's sync");
+    await waitFor(() => (manager.get(accountId)?.stats.passes ?? 0) >= 1, "its first pass");
+
+    // A reconcile's own await is `existing.stop()`, so a teardown that never
+    // finishes wedges the chain that is stopping it. Nothing in the
+    // ImapClient contract is cancellable except idle(), so this is exactly
+    // what a socket sitting inside an adapter's timeout looks like from here.
+    let release = (): void => { /* replaced below */ };
+    const wedge = new Promise<void>((resolve) => { release = resolve; });
+    for (const client of clients) client.disconnectGate = wedge;
+    const reconcile = manager.accountChanged(accountId);
+    await waitFor(() => clients.some((client) => client.disconnectCalls > 0), "the wedged teardown");
+
+    // stop() must still return: the drain is inside the deadline now, so the
+    // timeout can fire. (Before, the drain ran to completion FIRST and this
+    // wait would never even be requested -- the 15s cap was there while
+    // nothing needed capping.)
+    const stopping = manager.stop();
+    await waitFor(() => clock.pendingCount() > 0, "the stop deadline");
+    clock.fire();
+    await stopping;
+
+    // Let the abandoned reconcile unwind, so nothing outlives the test.
+    release();
+    await reconcile;
   });
 });
 

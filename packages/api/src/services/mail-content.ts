@@ -449,6 +449,44 @@ const A_TAG_RE = /<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi;
 const LINK_MARK_OPEN = String.fromCharCode(1);
 const LINK_MARK_CLOSE = String.fromCharCode(2);
 
+// Every C0 control except TAB (0x09), LF (0x0a) and CR (0x0d), which are
+// ordinary whitespace to the line handling below. Stripped from the INPUT,
+// before anything else runs, so the two link markers above can only ever
+// come from this function's own link rewrite: a body arriving with a
+// literal SOH/STX would otherwise survive every transform here and be
+// restored into angle brackets at the end, fabricating a link destination
+// ("<https://evil.example/>") on text that has none. sanitize-html does not
+// strip them -- they are text as far as it is concerned -- so this is the
+// only place that can close it.
+const C0_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
+
+// Hard input bound, in the same spirit as normalizeSubject's
+// MAX_SUBJECT_LENGTH. A_TAG_RE is quadratic against UNCLOSED <a> tags --
+// the lazy inner group rescans to the end of the string from each one and
+// never matches -- measured on the dev server at 38ms for 64KB, 662ms for
+// 256KB and 2.65s for 512KB of nothing but `<a href="x">`. The ordering
+// invariant documented below (callers pass HTML that already went through
+// sanitizeMailHtml, which re-serialises balanced markup) means no such
+// input can actually reach here; the cap is what keeps that a defence in
+// depth rather than a promise. 256KB is also mail-ingest.ts's own
+// MAX_BODY_TEXT_BYTES, so nothing beyond it could survive storage anyway.
+const MAX_HTML_LENGTH = 256 * 1024;
+
+/**
+ * One numeric entity's replacement text. C0 controls decode to nothing
+ * rather than to the character they name: the input strip above would
+ * otherwise be trivially bypassed by writing the marker as `&#1;`, since
+ * entity decoding runs AFTER it (and has to -- the markers are inserted
+ * before it, by the link rewrite). Out-of-range code points (a malformed
+ * `&#99999999;`) would make String.fromCodePoint throw, which is not worth
+ * a 500 on one bad entity.
+ */
+function decodeCodePoint(value: number): string {
+  if (!Number.isInteger(value) || value < 0 || value > 0x10ffff) return "";
+  if (value < 0x20 && value !== 0x09 && value !== 0x0a && value !== 0x0d) return "";
+  return String.fromCodePoint(value);
+}
+
 /**
  * Hand-rolled plain-text alternative for outgoing HTML mail (mail-send.ts's
  * text/plain part) -- not a new dependency, just tag stripping plus the
@@ -460,10 +498,14 @@ const LINK_MARK_CLOSE = String.fromCharCode(2);
  * HTML straight off the wire.
  */
 export function htmlToText(html: string): string {
+  // Both guards apply to the INPUT, before any transform runs: see
+  // C0_CONTROLS (marker forgery) and MAX_HTML_LENGTH (A_TAG_RE's quadratic
+  // worst case) above.
+  const bounded = html.slice(0, MAX_HTML_LENGTH).replace(C0_CONTROLS, "");
   // Links lose their visible markup like everything else below, so the
   // destination has to be captured and re-inserted as text before that
   // happens, or a plain-text reader has no way to reach it.
-  const withLinks = html.replace(A_TAG_RE, (_match: string, attrs: string, inner: string) => {
+  const withLinks = bounded.replace(A_TAG_RE, (_match: string, attrs: string, inner: string) => {
     const href = extractHref(attrs);
     return href !== undefined ? `${inner} ${LINK_MARK_OPEN}${href}${LINK_MARK_CLOSE}` : inner;
   });
@@ -484,8 +526,8 @@ export function htmlToText(html: string): string {
     .replace(/&gt;/gi, ">")
     .replace(/&quot;/gi, "\"")
     .replace(/&apos;/gi, "'")
-    .replace(/&#(\d+);/g, (_m: string, dec: string) => String.fromCodePoint(Number(dec)))
-    .replace(/&#[xX]([0-9a-fA-F]+);/g, (_m: string, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_m: string, dec: string) => decodeCodePoint(Number(dec)))
+    .replace(/&#[xX]([0-9a-fA-F]+);/g, (_m: string, hex: string) => decodeCodePoint(Number.parseInt(hex, 16)))
     .replace(/&amp;/gi, "&");
   return withEntities
     .split("\n")

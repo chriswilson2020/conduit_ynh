@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { parseConfig } from "./config.js";
 import { createDatabase, runMigrations } from "./db/client.js";
 import { buildApp } from "./app.js";
+import { createImapClientFactory } from "./services/mail-imapflow.js";
 import { startSyncManager } from "./services/mail-sync.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -36,14 +37,19 @@ async function main(): Promise<void> {
   // is why the manager's own start() only reads account rows, and every
   // connection attempt happens inside an AccountSync's guarded loop.
   //
-  // Task 6 completes this call by passing its imapflow adapter as
-  // `clientFactory`; until then startSyncManager logs and starts nothing,
-  // rather than marking every account broken with a client it does not have.
+  // `clientFactory` is what makes mail sync live: the manager reads each
+  // account row and its decrypted credentials itself, and asks this factory
+  // for one FRESH imapflow client per connection attempt (mail-imap.ts's
+  // lifecycle contract). startSyncManager still starts nothing under
+  // NODE_ENV=test.
   const syncManager = await startSyncManager({
     db,
     dataDir: config.dataDir,
     mailKeyPath: config.mailKeyPath,
     nodeEnv: config.nodeEnv,
+    clientFactory: createImapClientFactory({
+      rejectUnauthorized: config.mailTlsRejectUnauthorized,
+    }),
     logger: {
       info: (details, message) => { app.log.info(details, message); },
       warn: (details, message) => { app.log.warn(details, message); },
