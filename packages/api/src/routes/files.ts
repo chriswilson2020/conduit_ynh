@@ -27,9 +27,27 @@ import { attachFile, listFiles, getFile } from "../services/files.js";
  * with every legitimate document type a user ever uploads. Denying only the
  * render-capable handful a browser would act on as a document is the shape
  * that fits a download-only route.
+ *
+ * Matched against the caller's ALREADY-NORMALIZED mime (see the route below):
+ * this regex assumes lowercase with no surrounding whitespace, and does not
+ * re-normalize its input itself.
+ *
+ * The `+xml` suffix is matched as a family rather than enumerated by name:
+ * any RFC 7303 structured XML syntax (svg+xml, xhtml+xml, rss+xml, atom+xml,
+ * and any future one) is exactly as renderable as the ones spelled out
+ * individually, so closing the whole suffix in one rule means a mime this
+ * list has never heard of still gets caught, rather than only the ones
+ * someone thought to type in. text/xml and application/xml are the
+ * non-suffixed XML root types RFC 7303 also defines, so they are listed
+ * alongside text/html rather than folded into the suffix rule.
+ * multipart/x-mixed-replace is included because it drives a browser's
+ * server-push rendering (the "animated GIF via multipart" mechanism) --
+ * also render-capable, not a static document type at all.
  */
-const DOWNLOAD_DENY_MIME =
-  /^(text\/html|image\/svg\+xml|application\/xhtml\+xml|text\/xml|application\/xml)$/i;
+function isDownloadDeniedMime(mime: string): boolean {
+  return /\+xml$/.test(mime)
+    || /^(text\/html|text\/xml|application\/xml|text\/xsl|multipart\/x-mixed-replace)$/.test(mime);
+}
 
 // company_id/contact_id/deal_id/project_id are optional filters here, not the
 // required exactly-one notes.ts enforces on its list: unlike a note, "list
@@ -140,7 +158,18 @@ export function registerFileRoutes(app: FastifyInstance, { db, dataDir }: CrmRou
     // The stored byte count, so the client gets a progress bar and a
     // definite end rather than a chunked stream of unknown length.
     reply.header("Content-Length", file.sizeBytes);
-    reply.header("Content-Type", DOWNLOAD_DENY_MIME.test(file.mime) ? "application/octet-stream" : file.mime);
+    // Normalized BEFORE the denylist check and served in that normalized
+    // form: a stored mime of " text/html" (leading whitespace multer/busboy
+    // will happily accept from a crafted Content-Type on upload) fails the
+    // regex's anchored match verbatim, yet a browser trims optional
+    // whitespace (OWS) from a header value before parsing it -- so the
+    // unnormalized value would sail past this check and still be parsed as
+    // text/html downstream. Lowercased for the same reason: the regex
+    // literals are lowercase and MIME type/subtype tokens are case
+    // insensitive (RFC 2045), so "TEXT/HTML" must match exactly as
+    // "text/html" does.
+    const mime = file.mime.trim().toLowerCase();
+    reply.header("Content-Type", isDownloadDeniedMime(mime) ? "application/octet-stream" : mime);
     reply.header("Content-Disposition", contentDisposition("attachment", file.originalName));
     return reply.send(openBlob(dataDir, file.sha256));
   });

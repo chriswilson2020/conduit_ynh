@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
+import { eq } from "drizzle-orm";
 import {
   companySchema, contactSchema, noteSchema, fileMetaSchema, eventSchema,
   errorResponseSchema, listResponseSchema, searchResultsSchema,
@@ -14,6 +15,7 @@ import { buildApp, type BuildAppOptions } from "../app.js";
 import { listFiles } from "../services/files.js";
 import { listEvents } from "../services/timeline.js";
 import { todayDateOnly, addDays } from "../services/scheduling.js";
+import { files } from "../db/schema.js";
 import type { Config } from "../config.js";
 
 const handle = openTestDatabase();
@@ -425,8 +427,40 @@ describe("files routes", () => {
 
   // A hostile declared content type must never come back as the response's
   // DECLARED Content-Type, even under an attachment disposition -- see
-  // files.ts's DOWNLOAD_DENY_MIME comment for why nosniff alone is not enough.
-  it("re-types a downloaded text/html upload to application/octet-stream", async () => {
+  // files.ts's isDownloadDeniedMime comment for why nosniff alone is not
+  // enough. Table-driven over the deny list, its edge cases, and one control.
+  //
+  // Each case creates a file through a REAL upload (so it gets a genuine row,
+  // actor, blob, etc.) and then overwrites the stored mime column directly.
+  // That -- rather than trying to coax a particular byte sequence out of a
+  // hand-built multipart Content-Type header -- is what guarantees the exact
+  // stored value under test: whatever the upload path does or does not trim
+  // on the way in, the route's own normalize-then-deny step is what this
+  // test exists to pin down, so it drives that step from a stored value it
+  // fully controls.
+  it.each([
+    // Bare denylist entries.
+    { label: "text/html", stored: "text/html", expected: "application/octet-stream" },
+    { label: "text/xml", stored: "text/xml", expected: "application/octet-stream" },
+    { label: "application/xml", stored: "application/xml", expected: "application/octet-stream" },
+    { label: "text/xsl", stored: "text/xsl", expected: "application/octet-stream" },
+    { label: "multipart/x-mixed-replace", stored: "multipart/x-mixed-replace", expected: "application/octet-stream" },
+    // Named +xml family members.
+    { label: "image/svg+xml", stored: "image/svg+xml", expected: "application/octet-stream" },
+    { label: "application/xhtml+xml", stored: "application/xhtml+xml", expected: "application/octet-stream" },
+    // A +xml member the list never names explicitly -- caught only because
+    // the rule closes the whole suffix family, not a list of names.
+    { label: "application/rss+xml (unlisted +xml family member)", stored: "application/rss+xml", expected: "application/octet-stream" },
+    // Leading whitespace must not bypass the check: a browser trims OWS
+    // before parsing a declared Content-Type, so a stored " text/html" is
+    // exactly as dangerous as "text/html" and must be caught the same way.
+    { label: "leading-whitespace bypass attempt", stored: " text/html", expected: "application/octet-stream" },
+    // MIME tokens are case insensitive (RFC 2045); the regex is lowercase
+    // literals, so the comparison must lowercase first rather than miss this.
+    { label: "mixed-case bypass attempt", stored: "TEXT/HTML", expected: "application/octet-stream" },
+    // Control: a legitimate, harmless declared type must be left alone.
+    { label: "application/pdf (control, not denied)", stored: "application/pdf", expected: "application/pdf" },
+  ])("download denylist: $label", async ({ stored, expected }) => {
     const a = await app();
     const company = await a.inject({
       method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
@@ -435,7 +469,7 @@ describe("files routes", () => {
 
     const { body, boundary } = buildMultipart(
       { companyId },
-      { name: "payload.html", content: "<script>alert(1)</script>", mime: "text/html" },
+      { name: "payload.bin", content: "bytes", mime: "application/octet-stream" },
     );
     const upload = await a.inject({
       method: "POST", url: "/api/files",
@@ -444,15 +478,13 @@ describe("files routes", () => {
     });
     expect(upload.statusCode).toBe(201);
     const meta = fileMetaSchema.parse(upload.json());
-    expect(meta.mime).toBe("text/html");
+    await handle.db.update(files).set({ mime: stored }).where(eq(files.id, meta.id));
 
     const download = await a.inject({
       method: "GET", url: `/api/files/${meta.id}/download`, headers: authHeaders,
     });
     expect(download.statusCode).toBe(200);
-    expect(download.headers["content-type"]).toBe("application/octet-stream");
-    expect(download.headers["content-disposition"])
-      .toBe(`attachment; filename="payload.html"; filename*=UTF-8''payload.html`);
+    expect(download.headers["content-type"]).toBe(expected);
     expect(download.headers["x-content-type-options"]).toBe("nosniff");
     await a.close();
   });
