@@ -495,11 +495,12 @@ describe("moveThreads: per account", () => {
       .toEqual([["Archive", null], ["Clients", 152]]);
   });
 
-  it("never fails a thread for an ARCHIVED account's rows, so it stays archivable forever", async () => {
-    // Archiving a mail account keeps its messages (archive-not-delete) but
-    // tears its sync loop down for good. Reporting those rows as a failure
-    // would make every thread carrying one permanently un-archivable from any
-    // view, for a reason no user could act on.
+  it("never fails a thread for an ARCHIVED account's rows, so its live half still archives", async () => {
+    // Archiving a mail account keeps its messages (archive-not-delete) while
+    // its sync loop stays torn down until someone unarchives it. Reporting
+    // those rows as a failure would fail every thread carrying one for a
+    // reason nothing in the mail view connects to, or can act on -- the remedy
+    // is in Settings.
     const live = await makeAccount();
     const gone = await makeAccount({ label: "Old" });
     const threadId = await makeThread();

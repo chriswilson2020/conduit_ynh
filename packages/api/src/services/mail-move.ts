@@ -372,8 +372,8 @@ function accountStateOf(
  *   pass has not re-sighted): there is no UID to name it to the server. Rare,
  *   and it self-heals the moment the user asks again after the next pass.
  * - ALREADY IN THE TARGET FOLDER: nothing to do.
- * - OWNED BY AN ARCHIVED ACCOUNT: permanently unmovable, and deliberately not
- *   a failure -- see accountStateOf.
+ * - OWNED BY AN ARCHIVED ACCOUNT: unmovable while the account stays archived,
+ *   and deliberately not a failure -- see accountStateOf.
  *
  * THE RETURNED PROMISE WAITS FOR THE SERVER. Each queued MOVE runs on its
  * account's serial sync loop, so a bulk action against an account halfway
@@ -538,10 +538,10 @@ async function collectCandidates(
   for (const row of messages) {
     const state = states.get(row.accountId);
     if (state === undefined) continue;
-    // An archived account's rows are permanently unmovable, so they are
-    // dropped here beside the NULL uids rather than failing anything -- see
-    // accountStateOf for why reporting them would make a thread carrying one
-    // un-archivable forever.
+    // An archived account's rows cannot move while it stays archived, so they
+    // are dropped here beside the NULL uids rather than failing anything --
+    // see accountStateOf for why a failure whose only remedy is in Settings is
+    // the wrong answer to give the mail view.
     if (state.kind === "unmovable") continue;
     // Narrowing only: the WHERE above already excluded these rows. Kept
     // because the column is nullable, so its type stays `number | null`
