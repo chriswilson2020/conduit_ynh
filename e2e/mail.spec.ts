@@ -55,6 +55,15 @@ const ATTEMPT_TIMEOUT_MS = 5_000;
 const MINUTE_MS = 60_000;
 
 test.describe.serial("Mail journey", () => {
+  // Playwright's default test timeout is 30s, which is LESS than the sync
+  // budget below -- so without this the deadline in pollWithReload could
+  // never be reached, and a slow sync would report "test timeout of 30000ms
+  // exceeded" instead of the assertion that was actually still failing.
+  // Applied to the whole group: several tests here wait on a background sync
+  // pass, and the ones that do not are unaffected by having headroom they
+  // never use.
+  test.setTimeout(90_000);
+
   const runId = Date.now().toString(36);
 
   const aliceAddress = `alice-${runId}@example.com`;
@@ -253,7 +262,13 @@ test.describe.serial("Mail journey", () => {
     const { own } = await response.json() as { own: { id: string; archivedAt: string | null }[] };
     for (const account of own) {
       if (account.archivedAt === null) {
-        await page.request.post(`/api/mail/accounts/${account.id}/archive`);
+        // Checked, not fired and forgotten: this POST is the whole of what
+        // stands between a retry and a double-ingested conversation, and it
+        // is a line that only ever runs ON a retry -- so a 4xx here has to
+        // fail with "the archive was refused" rather than surface two steps
+        // later as a conversation with twice the messages it should have.
+        const archived = await page.request.post(`/api/mail/accounts/${account.id}/archive`);
+        expect(archived.ok()).toBe(true);
       }
     }
 
@@ -383,9 +398,11 @@ test.describe.serial("Mail journey", () => {
     await expect(page.frameLocator('[data-body-kind="html"]').locator("body")).toContainText(htmlMarker);
 
     // The older, text-only message renders as a <pre> once expanded -- no
-    // iframe, nothing to reach through.
+    // iframe, nothing to reach through. Addressed by its collapsed state
+    // rather than by position: the header toggle is the button carrying
+    // aria-expanded, which is what makes it the one to click.
     const plain = messages.first();
-    await plain.getByRole("button").first().click();
+    await plain.getByRole("button", { expanded: false }).click();
     await expect(plain.locator('[data-body-kind="text"]')).toContainText(textMarker);
 
     // Opening marked it read: the row's unread dot is gone and the badge is
