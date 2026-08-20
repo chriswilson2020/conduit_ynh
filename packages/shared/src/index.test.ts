@@ -1294,10 +1294,13 @@ describe("bulkThreadResultSchema", () => {
     // branches on these being updated with it.
     expect(bulkThreadFailureReasonSchema.options)
       .toEqual(["no_sync", "no_target", "not_found", "server_refused"]);
-    // In precedence order: the first two mean a message could not be moved,
-    // the last that the goal already holds (api: mail-move.ts's noteSkip).
+    // The first three in precedence order (a message could not be moved, a
+    // message could not be moved, the goal already holds); out_of_scope last
+    // because it takes no part in that precedence -- it is what a thread
+    // reports when NOTHING of it was in scope (api: mail-move.ts's
+    // noteSkip/skip).
     expect(bulkThreadSkipReasonSchema.options)
-      .toEqual(["archived_account", "awaiting_reconciliation", "already_in_target"]);
+      .toEqual(["archived_account", "awaiting_reconciliation", "already_in_target", "out_of_scope"]);
   });
 
   it("rejects error present alongside ok: true", () =>

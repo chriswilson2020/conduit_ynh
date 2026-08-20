@@ -1357,6 +1357,39 @@ describe("mail thread link and archive routes", () => {
     await a.close();
   });
 
+  it("trims the trash folder without eating letters from it", async () => {
+    const a = await app();
+    const dutch = await makeAccount(a);
+    const neighbour = await makeAccount(a, { label: "Side", email: "side@example.com" });
+    // A trash folder starting with the letter the trim set must NOT contain.
+    // Stored padded, so this pins the trimming AND the not-trimming at once.
+    await setMoveTargets(dutch.id, { trashFolder: "  vuilnisbak  " });
+    await setMoveTargets(neighbour.id, { trashFolder: "vuilnisbak" });
+
+    // Direction 1: mail IN that folder is carved out of the badge. With a
+    // stray "v" in the trim set the stored name became "uilnisbak", matched
+    // nothing, and this thread counted as unread forever -- unclearable,
+    // since nothing re-sights an unsynced Trash.
+    const trashed = await seedThread({ subject: "Trashed", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(trashed, dutch.id, {
+      sentAt: new Date("2026-08-03T10:00:00Z"), folder: "vuilnisbak", seen: false, imapUid: null,
+    });
+    // Direction 2: the NEIGHBOURING name is not the trash folder and must
+    // keep counting. Same stray "v" made "uilnisbak" trim-equal to the
+    // account's trash and silently excluded real unread mail.
+    const kept = await seedThread({ subject: "Kept", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(kept, neighbour.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), folder: "uilnisbak", seen: false,
+    });
+
+    const badge = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(mailUnreadCountSchema.parse(badge.json()).count).toBe(1);
+    const list = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
+    expect(listResponseSchema(mailThreadListItemSchema).parse(list.json())
+      .items.map((t) => [t.subject, t.unread])).toEqual([["Trashed", false], ["Kept", true]]);
+    await a.close();
+  });
+
   it("reports per-folder counts with ?byFolder=1, Trash row included", async () => {
     const a = await app();
     const account = await makeAccount(a);
@@ -1587,7 +1620,11 @@ describe("mail bulk thread action route", () => {
         threadId: refused, ok: false, reason: "no_sync",
         error: 'mail sync is not running for account "Stalled"',
       },
-      { threadId: already, ok: true, skipped: true, reason: "already_in_target" },
+      // Its only message is in Archive, so the INBOX view held nothing of it:
+      // the action never applied here, which is not the same statement as
+      // "already done" -- and the very same thread says already_in_target
+      // when asked from the Archive view below.
+      { threadId: already, ok: true, skipped: true, reason: "out_of_scope" },
       { threadId: pending, ok: true, skipped: true, reason: "awaiting_reconciliation" },
       {
         threadId: UNKNOWN_ID, ok: false, reason: "not_found",
@@ -1597,9 +1634,10 @@ describe("mail bulk thread action route", () => {
     // The healthy account still did its work: one refusal does not stop the rest.
     expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [71], targetFolder: "Archive" }]);
 
-    // And archiving FROM the Archive view is the literal already_in_target
-    // case: the message is in scope this time, and it is already where it was
-    // going, so nothing is queued for it.
+    // The SAME thread, asked from the Archive view, reports the other reason:
+    // its message is in scope this time and is already where it was going. Two
+    // views, two honest answers -- which is the whole point of the two values
+    // being separate.
     const fromTarget = await bulk(a, { threadIds: [already], folder: "Archive", action: "archive" });
     expect(bulkThreadResultSchema.parse(fromTarget.json()).results).toEqual([
       { threadId: already, ok: true, skipped: true, reason: "already_in_target" },

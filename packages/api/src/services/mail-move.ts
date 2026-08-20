@@ -167,10 +167,23 @@ const MAX_LOGGED_ERROR_CHARS = 500;
 
 type ResultItem = BulkThreadResult["results"][number];
 
+/**
+ * The skip reasons that are recorded against a MESSAGE, as opposed to the one
+ * that describes a thread nothing applied to.
+ *
+ * `out_of_scope` is deliberately not one of them: a row outside the view folder
+ * (or carved out as Sent) is never examined far enough to have a reason of its
+ * own -- see the scope-first ordering in collectCandidates -- so it can only be
+ * the answer when a thread finishes with nothing recorded at all. Typed out
+ * rather than commented, so noteSkip cannot be handed it by mistake and the
+ * rank table below cannot silently acquire a meaningless entry for it.
+ */
+type NotedSkipReason = Exclude<BulkThreadSkipReason, "out_of_scope">;
+
 /** Precedence when one thread hits several skip causes -- lower wins. Written
  * as a table rather than an if-chain so the order is one readable fact; see
  * Outcomes.noteSkip for why it runs this way round. */
-const SKIP_REASON_RANK: Record<BulkThreadSkipReason, number> = {
+const SKIP_REASON_RANK: Record<NotedSkipReason, number> = {
   archived_account: 0,
   awaiting_reconciliation: 1,
   already_in_target: 2,
@@ -251,7 +264,7 @@ class Outcomes {
    * has been looked at, so collection notes the causes as it goes and `skip`
    * resolves them at the end.
    */
-  private readonly skipReasons = new Map<string, BulkThreadSkipReason>();
+  private readonly skipReasons = new Map<string, NotedSkipReason>();
 
   fail(threadId: string, error: string, reason: BulkThreadFailureReason): void {
     const existing = this.byThread.get(threadId);
@@ -272,7 +285,7 @@ class Outcomes {
    * the goal already holds, so reporting an unfinished cause ahead of a
    * finished one is the honest ordering when a thread has both.
    */
-  noteSkip(threadId: string, reason: BulkThreadSkipReason): void {
+  noteSkip(threadId: string, reason: NotedSkipReason): void {
     const existing = this.skipReasons.get(threadId);
     if (existing !== undefined && SKIP_REASON_RANK[existing] <= SKIP_REASON_RANK[reason]) return;
     this.skipReasons.set(threadId, reason);
@@ -283,13 +296,13 @@ class Outcomes {
     if (this.byThread.has(threadId)) return;
     this.byThread.set(threadId, {
       threadId, ok: true, skipped: true,
-      // The fallback covers the causes the enum does not name: in
-      // folder-scoped mode every message was outside the view folder, and in
-      // whole-thread mode the thread was nothing but Sent mail. Both mean
-      // "nothing this action was going to move", which is what
-      // already_in_target tells a user -- but they are not literally that, and
-      // a UI that needs to tell them apart needs a fourth value here.
-      reason: this.skipReasons.get(threadId) ?? "already_in_target",
+      // Nothing recorded means nothing was ever in scope: in folder-scoped
+      // mode every message sits in some other folder, and in whole-thread mode
+      // the conversation is nothing but Sent mail. That is `out_of_scope`, and
+      // it is a different statement from already_in_target -- "this action
+      // never applied to this thread" rather than "it was already done" -- so
+      // it gets its own value rather than being folded into that one.
+      reason: this.skipReasons.get(threadId) ?? "out_of_scope",
     });
   }
 

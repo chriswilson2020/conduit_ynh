@@ -144,13 +144,20 @@ const MAX_SENDERS = 5;
  * not read as a second mailbox.
  *
  * btrim carries its whitespace set EXPLICITLY rather than relying on the
- * default (which is the space character alone) -- the set is JavaScript
- * `String.prototype.trim`'s ASCII range, so the two agree on every folder name
- * anyone can type. The one remaining gap, stated rather than papered over: JS
- * also strips U+00A0 and the other Unicode space separators, and this does not,
- * so a folder name padded with a non-breaking space would be trimmed by the
- * service-side write path and not by this comparison. Nothing produces such a
- * name today (discovery stores what the server listed).
+ * default (which is the space character alone). The set is literally: space,
+ * tab (0x09), newline (0x0A), carriage return (0x0D), form feed (0x0C) and
+ * vertical tab (0x0B) -- the ASCII whitespace JavaScript's
+ * `String.prototype.trim` strips, and nothing else. Naming it character by
+ * character rather than as "the same as .trim()" is deliberate: the two are
+ * written in different languages with different escape rules, and an earlier
+ * version of this claim was false because of exactly that (see
+ * trimmedTrashFolder for what `\v` turned out to mean in SQL).
+ *
+ * Where the two still differ, stated rather than papered over: JS also strips
+ * U+00A0 and the other Unicode space separators, and this does not, so a folder
+ * name padded with a non-breaking space would be trimmed by the service-side
+ * write path and not by this comparison. Nothing produces such a name today
+ * (discovery stores what the server listed).
  *
  * WHY THE COUNTING CARRIES THIS RATHER THAN THE MOVE. Trashing a message never
  * touches `seen` (services/mail-move.ts is explicit about not writing it: a
@@ -175,12 +182,28 @@ function notInAccountTrash(): SQL {
   return sql`(${mailAccounts.trashFolder} IS NULL OR ${folderKeySql(mailMessages.folder)} <> ${folderKeySql(trimmedTrashFolder())})`;
 }
 
-/** The account's trash folder, trimmed on JS's terms -- see notInAccountTrash
- * for why the whitespace set is spelled out. Written `\\t` and friends because
- * a JS template literal would turn a bare `\t` into a real tab byte, which is
- * both a different SQL literal and a non-ASCII-source hazard. */
+/**
+ * The account's trash folder, trimmed on JS's terms -- see notInAccountTrash
+ * for why the whitespace set is spelled out rather than left to btrim's default
+ * (which is the space character alone).
+ *
+ * The set is space, tab, newline, carriage return, form feed and VERTICAL TAB,
+ * the last written `\x0B` and not `\v`. THAT IS THE WHOLE POINT OF THIS
+ * COMMENT: PostgreSQL's escape-string syntax has no `\v`, and its documented
+ * rule for an unknown escape is to take the character literally -- so `E'\v'`
+ * is the LETTER v (probed: ascii 118, one character, no VT anywhere in it).
+ * With the letter in the set, btrim ate it: an account whose trash folder is
+ * "vuilnisbak" trimmed to "uilnisbak", so the carve-out matched nothing and
+ * its trashed unread mail counted forever, while a message actually in
+ * "uilnisbak" was excluded as though it were the trash. Both directions are
+ * pinned by tests.
+ *
+ * Written `\\x0B` in the source because a JS template literal would otherwise
+ * interpret the escape itself: a bare `\x0B` becomes a real VT byte, which is
+ * both a different SQL literal and a non-ASCII source file.
+ */
 function trimmedTrashFolder(): SQL {
-  return sql`btrim(${mailAccounts.trashFolder}, E' \\t\\n\\r\\f\\v')`;
+  return sql`btrim(${mailAccounts.trashFolder}, E' \\t\\n\\r\\f\\x0B')`;
 }
 
 /**
@@ -194,6 +217,11 @@ function trimmedTrashFolder(): SQL {
  * something. An account filter ALONE does not make a view in this sense -- it
  * carries no folder, so the flag stays the global one, exactly as it was before
  * Phase 4.1.
+ *
+ * That asymmetry has a matching gap on the sidebar's side: `?byFolder=1` counts
+ * by folder NAME across accounts and has no account-scoped variant in v0.6.0
+ * (mailUnreadFolderCountsSchema). The day one lands, revisit this rule --
+ * per-account badges would make an account filter part of the view after all.
  */
 interface UnreadScope {
   folder?: string | undefined;

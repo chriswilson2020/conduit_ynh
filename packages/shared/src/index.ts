@@ -979,19 +979,28 @@ export const bulkThreadFailureReasonSchema = z.enum([
 ]);
 export type BulkThreadFailureReason = z.infer<typeof bulkThreadFailureReasonSchema>;
 
-// WHY a thread was a no-op -- the spec's three empty-eligible-set causes
-// (Move write-back, step 1), in the precedence mail-move.ts applies when a
-// thread hits more than one:
+// WHY a thread was a no-op. The first three are the spec's
+// empty-eligible-set causes (Move write-back, step 1), listed in the
+// precedence mail-move.ts applies when one thread hits several:
 // - archived_account: its messages belong to an archived mail account, whose
 //   sync loop is torn down. Persistent, and fixable only in Settings, so it
-//   outranks the other two.
+//   outranks the others.
 // - awaiting_reconciliation: NULL imap_uid -- a just-sent message the Sent
 //   pass has not re-sighted. Transient; asking again after the next pass
 //   works.
 // - already_in_target: everything in scope is already in the target folder.
 //   The intended end state already holds.
+// - out_of_scope: nothing of this thread was in scope AT ALL -- in the
+//   folder-scoped mode every message is in some other folder, and in the
+//   whole-thread mode the conversation is nothing but Sent mail (which
+//   archiving must never empty). Distinct from already_in_target, which
+//   reports the goal as reached; this one reports that the action never
+//   applied to this thread, which is a different sentence to show a user and
+//   the reason it is its own value rather than a fourth meaning loaded onto
+//   the third. It takes no part in the precedence above: it is never recorded
+//   against a message, only used when a thread finishes with no reason at all.
 export const bulkThreadSkipReasonSchema = z.enum([
-  "archived_account", "awaiting_reconciliation", "already_in_target",
+  "archived_account", "awaiting_reconciliation", "already_in_target", "out_of_scope",
 ]);
 export type BulkThreadSkipReason = z.infer<typeof bulkThreadSkipReasonSchema>;
 

@@ -274,10 +274,9 @@ describe("moveThreads: the two modes", () => {
     const missed = await moveThreads(
       handle.db, actorId, { threadIds: [threadId], folder: "clients", action: "archive" }, deps(manager),
     );
-    // The fallback skip reason: "nothing this action was going to move". The
-    // enum has no value for "every message was outside the view folder", and
-    // already_in_target is the closest thing it can say (see Outcomes.skip).
-    expect(missed.results).toEqual([{ threadId, ok: true, skipped: true, reason: "already_in_target" }]);
+    // Nothing of this thread was in the named view, so the action never
+    // applied to it -- which is its own reason, not "already done".
+    expect(missed.results).toEqual([{ threadId, ok: true, skipped: true, reason: "out_of_scope" }]);
     expect(sync.calls).toHaveLength(1);
     expect((await messageRows(threadId))[1]).toMatchObject({ folder: "Clients", imapUid: 192 });
   });
@@ -383,7 +382,7 @@ describe("moveThreads: nothing to move", () => {
       handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
-    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "already_in_target" }]);
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "out_of_scope" }]);
     expect((await messageRows(threadId))[0]).toMatchObject({ folder: "Clients", imapUid: 51 });
   });
 

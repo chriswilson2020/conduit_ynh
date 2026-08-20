@@ -161,14 +161,19 @@ search, and the "Hide in CRM" state remains orthogonal.
   **`reason` is the machine-readable half, and the one a client branches on** — `error` stays
   free text for display and no UI may parse it (the house rule for every error shape).
   Failures carry `no_sync | no_target | not_found | server_refused`; skips carry
-  `archived_account | awaiting_reconciliation | already_in_target`, in that precedence when
-  one thread hits several (the first two mean a message could not be moved, the last that the
-  goal already holds). It is present exactly when there is something to explain — a failure
-  or a skip — and its half of the enum must match which; the shared schema enforces both.
-  `already_in_target` doubles as the fallback for a no-op the enum does not name (every
-  message outside the view folder, or a whole-thread action on Sent-only mail): telling those
-  apart would need a fourth value. The free-text `error` is capped on the way out, since a
-  mail server's refusal text is arbitrary and one response can carry 50 of them. An
+  `archived_account | awaiting_reconciliation | already_in_target | out_of_scope`, the first
+  three in that precedence when one thread hits several (a message could not be moved, a
+  message could not be moved, the goal already holds). It is present exactly when there is
+  something to explain — a failure or a skip — and its half of the enum must match which;
+  the shared schema enforces both. **`out_of_scope`** is the fourth skip value and takes no
+  part in that precedence: it means nothing of the thread was in scope at all — in the
+  folder-scoped mode every message is in some other folder, in the whole-thread mode the
+  conversation is nothing but Sent mail — which is a different statement from
+  `already_in_target` ("the action never applied here" vs "it was already done"), and one the
+  same thread can swap between: a thread whose only message sits in Archive reports
+  `out_of_scope` from the INBOX view and `already_in_target` from the Archive view. The
+  free-text `error` is capped on the way out, since a mail server's refusal text is arbitrary
+  and one response can carry 50 of them. An
   account in backoff, with an unresolvable target folder, or with no running sync loop while
   not archived fails ITS threads with a message — but only for messages the action was
   actually going to move; others proceed. Cap threadIds at 200 per request — the OUTER bound,
