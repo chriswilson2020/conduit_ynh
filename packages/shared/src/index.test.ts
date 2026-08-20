@@ -59,6 +59,8 @@ import {
   bulkThreadResultSchema,
   bulkThreadFailureReasonSchema,
   bulkThreadSkipReasonSchema,
+  BULK_THREAD_ACTION_CAP,
+  MOVE_ACTION_THREAD_CAP,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -1243,6 +1245,16 @@ describe("bulkThreadActionKindSchema and bulkThreadActionInputSchema", () => {
     expect(() =>
       bulkThreadActionInputSchema.parse({ threadIds: [], folder: "INBOX", action: "archive" }),
     ).toThrow());
+
+  // Both caps are exported because three packages key on them: this schema's
+  // own max, the route's tighter per-action check for trash/archive, and the
+  // web client's select-all (which must never build a request the route would
+  // 400). Pinned to their numbers here so a change to either is a deliberate
+  // act with a failing test, rather than something the client silently follows.
+  it("exports the caps the route and the web client both key on", () => {
+    expect(BULK_THREAD_ACTION_CAP).toBe(200);
+    expect(MOVE_ACTION_THREAD_CAP).toBe(50);
+  });
 });
 
 describe("bulkThreadResultSchema", () => {

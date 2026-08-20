@@ -73,7 +73,9 @@ import {
   type UpdateStageInput,
   type UpdateTaskInput,
 } from "@conduit/shared";
-import { ApiError, deleteJson, deleteRequest, getJson, patchJson, postForm, postJson } from "./api";
+import {
+  ApiError, ResponseShapeError, deleteJson, deleteRequest, getJson, patchJson, postForm, postJson,
+} from "./api";
 
 const companyListSchema = listResponseSchema(companySchema);
 const contactListSchema = listResponseSchema(contactSchema);
@@ -109,6 +111,11 @@ function toQueryString(params: Record<string, string | number | boolean | undefi
  * a log but unreadable wherever a caught error gets rendered to a user. This
  * wraps that: the full issue list still goes to the console for debugging,
  * but the thrown error carries a short, readable message instead.
+ *
+ * The thrown type is ResponseShapeError, not a bare Error, so a caller can tell
+ * "the server answered and this client could not read it" apart from "the
+ * request may never have been answered at all" -- see its doc comment in api.ts,
+ * and bulkErrorMessage, which must not offer its timeout copy for a 200.
  */
 function parseWith<T>(schema: { parse: (v: unknown) => T }, value: unknown, what: string): T {
   try {
@@ -117,7 +124,7 @@ function parseWith<T>(schema: { parse: (v: unknown) => T }, value: unknown, what
     // Contract drift between API and UI. Log the full issue list for debugging,
     // surface a short human message to whatever renders the error.
     console.error(`response validation failed for ${what}`, error);
-    throw new Error(`Unexpected response shape from the server (${what})`);
+    throw new ResponseShapeError(`Unexpected response shape from the server (${what})`);
   }
 }
 

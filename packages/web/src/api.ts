@@ -38,6 +38,18 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Thrown when a response the server called SUCCESSFUL does not match the schema
+ * this client parses it with (queries.ts's parseWith). It is contract drift
+ * between API and UI -- a bug on one side or the other -- and never a transport
+ * problem, which is the whole reason it has a type of its own: a caller that
+ * treats "the request may not have arrived" as a distinct case (mail-lib's
+ * bulkErrorMessage, whose timeout copy says the changes may still have applied)
+ * must not tell that story about a 200 whose body it could not read. Carries no
+ * status or code: there is no failing HTTP response behind it.
+ */
+export class ResponseShapeError extends Error {}
+
 export async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(apiUrl(path), { headers: { Accept: "application/json" } });
   if (!response.ok) {

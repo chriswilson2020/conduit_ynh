@@ -3,7 +3,7 @@ import type {
   BulkThreadFailureReason, BulkThreadSkipReason, MailThreadListItem,
 } from "@conduit/shared";
 import { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
-import { ApiError } from "../../api";
+import { ApiError, ResponseShapeError } from "../../api";
 import {
   buildFolderRows,
   bulkActionBlocked,
@@ -1047,7 +1047,10 @@ describe("summarizeBulkResult", () => {
     ]);
     const notes = summary.notes.join(" | ");
     expect(summary.notes).toHaveLength(5);
-    expect(notes).toContain("2 could not be moved: that mail account is reconnecting");
+    // Both of no_sync's causes, not just the transient one: the code means
+    // "no running sync loop", which covers a paused or errored account too.
+    expect(notes).toContain("2 could not be moved: that mail account is not syncing right now");
+    expect(notes).toContain("reconnecting or paused");
     expect(notes).toContain("no Trash folder is set");
     expect(notes).toContain("no longer exist");
     expect(notes).toContain("after the next sync pass");
@@ -1096,6 +1099,16 @@ describe("bulkErrorMessage", () => {
   it("shows a real API refusal as itself", () => {
     expect(bulkErrorMessage(new ApiError("trash accepts at most 50 threads per request", 400, "validation")))
       .toBe("trash accepts at most 50 threads per request");
+  });
+
+  // A parse failure happens AFTER a 200: the request arrived, the action ran,
+  // and only this client's reading of the answer failed. Telling the user it
+  // timed out would be false twice over -- about the request, and about
+  // whether the changes applied.
+  it("does not call a response-shape failure a timeout", () => {
+    const error = new ResponseShapeError("Unexpected response shape from the server (bulk thread action result)");
+    expect(bulkErrorMessage(error)).toBe(error.message);
+    expect(bulkErrorMessage(error)).not.toBe(BULK_TIMEOUT_MESSAGE);
   });
 });
 

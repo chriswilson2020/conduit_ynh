@@ -38,19 +38,32 @@ export interface FolderSidebarProps {
  * scopes the view to its account too, and the route builds one combined EXISTS
  * for the pair.
  */
-export function FolderSidebar({ accounts, folder, accountId, onSelect }: FolderSidebarProps) {
+export function FolderSidebar(props: FolderSidebarProps) {
+  // ABOVE the rail, so that the counts query below is never mounted for a user
+  // with no own mail account: there is no sidebar to badge, and the request
+  // would be one more thing for an unconfigured install's empty inbox to do
+  // before showing "add a mail account". A hook cannot be skipped, so the
+  // component holding it is what is skipped instead.
+  if (props.accounts.length === 0) return null;
+  return <FolderRail {...props} />;
+}
+
+function FolderRail({ accounts, folder, accountId, onSelect }: FolderSidebarProps) {
   // One query for every account's badges, mounted once here rather than per
   // section: it is a single grouped request, and the sections join to it by
   // name.
   const { data: counts } = useUnreadMailCountsByFolder();
 
-  if (accounts.length === 0) return null;
-
   return (
     <nav data-testid="folder-sidebar" aria-label="Folders" className="flex min-w-0 flex-col gap-3">
       <FolderButton
         label="All mail"
-        testId="folder-all"
+        // Not `folder-all`: folder rows below are addressed as
+        // `folder-<NAME>`, and a mailbox literally called "all" -- an ordinary
+        // name, and the one Gmail's IMAP gateway uses for [Gmail]/All Mail --
+        // would collide with it. `folder-view-all` names the VIEW, which is
+        // what this row is: no folder filter at all.
+        testId="folder-view-all"
         unread={null}
         active={folder === null}
         onClick={() => onSelect(null)}

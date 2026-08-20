@@ -221,7 +221,7 @@ search, and the "Hide in CRM" state remains orthogonal.
   with unread badges; INBOX default view; Trash/Junk appear when sync-enabled OR when the
   CRM holds rows in them — moves create such rows even for unsynced Trash). Folder
   choice feeds the thread-list `folder` filter and is part of the accumulation filter key.
-  **Built (Task 5), with two shape notes.** (1) "the CRM holds rows in them" is not a
+  **Built (Task 5), with three shape notes.** (1) "the CRM holds rows in them" is not a
   question this release's API can answer — there is no per-folder MESSAGE count, only the
   per-folder UNREAD one — so the sidebar keeps a switched-off folder when it holds unread
   mail, and always keeps the account's own `trash_folder`, which is where the CRM's Trash
@@ -230,7 +230,20 @@ search, and the "Hide in CRM" state remains orthogonal.
   account (the folders endpoint is owner-only), and picking a folder scopes the view to that
   account as well as to the folder name — otherwise, with two accounts, "INBOX" would name
   both. That pair is exactly the combined-EXISTS case the route was built for. The BADGES
-  still collapse across accounts, per `?byFolder=1`'s documented shape.
+  still collapse across accounts, per `?byFolder=1`'s documented shape. (3) STALE ROWS —
+  folders the account's most recent discovery pass did not re-sight, i.e. deleted or renamed
+  on the server (`last_discovered_at` behind the newest of the set; the pass stamps one
+  moment on every folder it sees, so no threshold is needed). A stale folder is DROPPED from
+  the sidebar unless the CRM still holds unread mail in it, in which case it stays, is marked
+  ("gone", italic) and stays clickable — mail this CRM holds must not become unreachable
+  because a mailbox vanished from the server. The carve-out is deliberately narrower than the
+  Trash one and is applied FIRST, so one case follows from it: an account whose `trash_folder`
+  has gone from the server AND holds no unread mail loses its sidebar row, even though the
+  CRM's own Trash action files rows there. Those threads are still reachable — global search,
+  every record's Mail tab, and the unfiltered list all show them, and the conversation's "in
+  Trash" chip still names the folder — and the alternative (a permanent row for a mailbox the
+  server no longer has) would be a dead click into an empty view. Re-creating the folder, or
+  pointing the account's Trash override at a live one in Settings, restores the row.
 - **Multi-select**: checkbox per row (visible on hover/when any selected), shift-click
   ranges, select-all-on-page; a bulk-action bar (Archive / Trash / Hide in CRM) with
   per-thread failure toasts from the bulk result. Selection clears on filter/folder change.

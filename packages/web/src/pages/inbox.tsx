@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { useMailAccounts } from "../queries";
-import { BulkBar } from "../components/mail/bulk-bar";
+import { BulkBar, BulkResult, type BulkOutcome } from "../components/mail/bulk-bar";
 import { Composer } from "../components/mail/composer";
 import { Conversation } from "../components/mail/conversation";
 import { FolderSidebar } from "../components/mail/folder-sidebar";
@@ -131,6 +131,28 @@ export function InboxPage() {
     setSelectionState(emptySelection(keyRef.current));
   }, []);
 
+  /**
+   * What the last bulk action did, WITH the filter key it was done under.
+   *
+   * It lives here rather than in the bar because the bar does not survive it:
+   * a completed action drops the selection, the bar is rendered only while the
+   * selection is non-empty, and the two state updates are one batched render --
+   * so a result held in the bar was destroyed before it could be painted, and
+   * every sentence of that feedback (per-thread notes, the Settings link, the
+   * timeout copy) was unreachable on this surface. Held here, it renders AFTER
+   * the rows it describes have gone, which is exactly when it is worth reading.
+   *
+   * Keyed like the selection, and for the same reason: "2 moved to Trash" is a
+   * statement about a view, and switching folder or filter leaves that view.
+   * Stamped from the ref at the moment the outcome arrives, so a result cannot
+   * outlive a view that is already gone.
+   */
+  const [outcome, setOutcome] = useState<{ key: string; outcome: BulkOutcome } | null>(null);
+  const handleOutcome = useCallback((next: BulkOutcome | null) => {
+    setOutcome(next === null ? null : { key: keyRef.current, outcome: next });
+  }, []);
+  const shownOutcome = outcome !== null && outcome.key === filterKey ? outcome.outcome : null;
+
   // Reference-guarded so a re-render that produced the same rows cannot loop
   // through this back into a new state object.
   const handleRows = useCallback((next: string[]) => {
@@ -225,10 +247,16 @@ export function InboxPage() {
               // The current view's folder, or nothing at all in the unfiltered
               // list -- the mode selector; see BulkBarProps.folder.
               folder={folder ?? undefined}
+              onOutcome={handleOutcome}
               onDone={clearSelection}
               onClear={clearSelection}
             />
           )}
+
+          {/* Outside the selection gate above, on purpose: this is what the
+              action LEFT BEHIND, and by the time it exists the selection is
+              already empty. */}
+          {shownOutcome !== null && <BulkResult outcome={shownOutcome} />}
 
           <ThreadList
             filters={filters}

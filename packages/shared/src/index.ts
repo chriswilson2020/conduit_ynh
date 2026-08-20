@@ -933,11 +933,18 @@ export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
 // a real mail server -- each queued MOVE runs on its account's serial sync
 // loop -- so the route applies a tighter per-action cap of 50 to those two
 // and rejects a larger request with the uniform 400 (api: routes/mail.ts's
-// bulk endpoint, Task 4 ruling). The tighter bound lives there rather than
-// here because it is a property of the ACTION, not of the body shape, and
-// this schema is also what the whole-thread single-id callers parse through.
+// bulk endpoint, Task 4 ruling). The CHECK lives there rather than in this
+// schema because it is a property of the ACTION, not of the body shape, and
+// this schema is also what the whole-thread single-id callers parse through
+// -- but the NUMBER lives here, next to the outer bound it tightens, because
+// the web client mirrors it too (web: mail-lib's select-all cap and its
+// per-action disable), and three copies of 50 in three packages is three
+// chances for the client to build a request the server answers with a 400.
+export const BULK_THREAD_ACTION_CAP = 200;
+export const MOVE_ACTION_THREAD_CAP = 50;
+
 export const bulkThreadActionInputSchema = z.object({
-  threadIds: z.array(z.uuid()).min(1).max(200),
+  threadIds: z.array(z.uuid()).min(1).max(BULK_THREAD_ACTION_CAP),
   folder: folderNameSchema.optional(),
   action: bulkThreadActionKindSchema,
 });

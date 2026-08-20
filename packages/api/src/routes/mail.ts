@@ -4,7 +4,7 @@ import {
   mailAccountCreateInputSchema, mailAccountUpdateInputSchema, mailAccountUpdatePasswordFieldsSchema,
   mailAccountTestInputSchema, mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
   createEmailTemplateInputSchema, updateEmailTemplateInputSchema,
-  bulkThreadActionInputSchema, folderPatchInputSchema,
+  bulkThreadActionInputSchema, folderPatchInputSchema, MOVE_ACTION_THREAD_CAP,
   type MailAccountSyncStats,
 } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
@@ -130,17 +130,6 @@ const linkKindParamSchema = z.object({ id: z.uuid(), kind: mailLinkKindSchema })
  * top-level navigation.
  */
 const INLINE_RENDERABLE_MIME = /^image\/(png|jpeg|jpg|gif|webp|bmp|avif|x-icon|vnd\.microsoft\.icon)$/i;
-
-/**
- * Threads per bulk request for `trash`/`archive` -- the two actions that talk
- * to a mail server. `hide` keeps the shared schema's 200, since it writes one
- * CRM column per thread and waits for nothing.
- *
- * 50 is a full page of multi-select (the list pages at 50) and no more, so the
- * longest a single request can hold a connection open is 50 threads' worth of
- * queued MOVEs behind whatever that account's serial loop is already doing.
- */
-const MOVE_ACTION_THREAD_CAP = 50;
 
 export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): void {
   // syncManager is the GETTER, captured here and called inside each handler:
@@ -526,8 +515,14 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     // ruling's answer to that wait -- bound the SIZE of the request rather than
     // its duration, since a timeout would produce exactly the "claimed a move
     // the server refused" state the move service's compensation exists to
-    // prevent. Enforced here rather than in the schema because it is a property
-    // of the ACTION, not of the body shape.
+    // prevent. 50 is a full page of multi-select (the list pages at 50) and no
+    // more, so the longest a single request can hold a connection open is 50
+    // threads' worth of queued MOVEs behind whatever that account's serial loop
+    // is already doing. Enforced HERE rather than in the schema because it is a
+    // property of the ACTION, not of the body shape; the NUMBER lives in
+    // @conduit/shared beside that schema, because the web client mirrors it (its
+    // select-all cap) and a client-side copy that drifted would build requests
+    // this line answers with a 400.
     if (input.action !== "hide" && input.threadIds.length > MOVE_ACTION_THREAD_CAP) {
       return reply.code(400).send({
         error: "validation",

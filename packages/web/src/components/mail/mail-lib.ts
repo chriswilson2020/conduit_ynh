@@ -2,8 +2,11 @@ import type {
   BulkThreadActionKind, BulkThreadResult, MailAddress, MailThreadListItem,
   MailUnreadFolderCount, SpecialUse,
 } from "@conduit/shared";
-import { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
-import { ApiError } from "../../api";
+import {
+  BULK_THREAD_ACTION_CAP, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
+  MOVE_ACTION_THREAD_CAP,
+} from "@conduit/shared";
+import { ApiError, ResponseShapeError } from "../../api";
 
 /**
  * The mail feature's pure parts, kept out of the components so they can be
@@ -809,21 +812,26 @@ export interface ThreadSelection {
 /**
  * The most rows one "select all" may tick.
  *
- * Pinned to the route's own per-request cap for `trash`/`archive` (50 --
- * routes/mail.ts's MOVE_ACTION_THREAD_CAP), so the obvious gesture cannot build
- * a selection the server would answer with a 400. It is deliberately not the
- * page size: the list ACCUMULATES pages, so "everything visible" grows past one
- * page as soon as "load more" is pressed, and a cap that tracked the page size
- * would quietly stop matching what the button ticks. `hide` could take 200, but
- * one number is easier to hold than a per-action select-all.
+ * THE SERVER'S OWN NUMBER, imported rather than copied: MOVE_ACTION_THREAD_CAP
+ * is the per-request cap the bulk route enforces for `trash`/`archive` (api:
+ * routes/mail.ts), and it lives in @conduit/shared beside the schema it
+ * tightens precisely so this line cannot drift from it -- a local 50 that
+ * outlived a server-side change would build selections the route answers with a
+ * 400. It is deliberately not the page size: the list ACCUMULATES pages, so
+ * "everything visible" grows past one page as soon as "load more" is pressed,
+ * and a cap that tracked the page size would quietly stop matching what the
+ * button ticks. `hide` could take the outer 200, but one number is easier to
+ * hold than a per-action select-all.
  */
-export const SELECT_ALL_CAP = 50;
+export const SELECT_ALL_CAP = MOVE_ACTION_THREAD_CAP;
 
-/** Per-action request caps, mirroring the API: the shared schema's 200 outer
- * bound, which only `hide` may reach, and the route's tighter 50 for the two
- * actions that wait on a real mail server. */
+/** Per-action request caps, mirroring the API: the shared schema's outer bound,
+ * which only `hide` may reach, and the route's tighter one for the two actions
+ * that wait on a real mail server. Both numbers come from @conduit/shared. */
 const BULK_ACTION_CAPS: Record<BulkThreadActionKind, number> = {
-  trash: 50, archive: 50, hide: 200,
+  trash: MOVE_ACTION_THREAD_CAP,
+  archive: MOVE_ACTION_THREAD_CAP,
+  hide: BULK_THREAD_ACTION_CAP,
 };
 
 export function emptySelection(key: string): ThreadSelection {
@@ -1147,9 +1155,16 @@ export function summarizeBulkResult(
   const notes: string[] = [];
   const count = (reason: string) => byReason.get(reason) ?? 0;
   // Failures first: they are the outcomes a user may need to act on.
+  // BOTH causes, because the code carries only one fact: no_sync means the
+  // account has no running sync loop and is not archived (shared:
+  // bulkThreadFailureReasonSchema), which covers an account backing off from a
+  // failed connection AND one whose loop is simply not running -- stopped,
+  // paused, or in an error state a human has to clear. "Reconnecting" alone
+  // named the transient half and promised the other half a recovery that
+  // waiting will not bring.
   if (count("no_sync") > 0) {
-    notes.push(`${count("no_sync")} could not be moved: that mail account is reconnecting`
-      + " \u2014 try again shortly.");
+    notes.push(`${count("no_sync")} could not be moved: that mail account is not syncing right now`
+      + " \u2014 it may be reconnecting or paused.");
   }
   if (count("no_target") > 0) {
     notes.push(`${count("no_target")} could not be moved: no ${actionTarget(action)} folder is set`
@@ -1190,15 +1205,27 @@ export function summarizeBulkResult(
  * request may well have been delivered, and nothing about the exception says
  * otherwise. Anything else -- a 400 over the cap, a 401 -- is a real refusal
  * and shows its own message.
+ *
+ * WHAT MUST NOT GET THIS COPY: a ResponseShapeError. That one is thrown AFTER a
+ * 2xx, by this client's own schema parse (queries.ts's parseWith), so the
+ * request plainly arrived and was answered -- "the request timed out" is a flat
+ * untruth about it, and "the changes may still have applied" understates a bulk
+ * action that certainly did apply. It is contract drift between this UI and the
+ * API -- a bug on one side or the other -- and it says so in its own words.
  */
 export const BULK_TIMEOUT_MESSAGE = "The request timed out \u2014 the changes may still have applied."
   + " The list has been refreshed.";
 
+/** The statuses that mean "the ANSWER was lost", not "the action was refused":
+ * the deployed nginx's own 504, and the 502/408 an intermediary can substitute
+ * for it. */
+const TIMEOUT_STATUSES = new Set([408, 502, 504]);
+
 export function bulkErrorMessage(error: unknown): string {
   if (error instanceof ApiError) {
-    return error.status === 504 || error.status === 502 || error.status === 408
-      ? BULK_TIMEOUT_MESSAGE : error.message;
+    return TIMEOUT_STATUSES.has(error.status) ? BULK_TIMEOUT_MESSAGE : error.message;
   }
+  if (error instanceof ResponseShapeError) return error.message;
   return BULK_TIMEOUT_MESSAGE;
 }
 
