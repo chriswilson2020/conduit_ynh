@@ -23,6 +23,24 @@ pushd "$install_dir" || ynh_die "Could not enter $install_dir"
     ynh_hide_warnings ynh_exec_as_app npm ci --omit=dev --no-audit --no-fund
 popd || ynh_die "Could not leave $install_dir"
 
+ynh_script_progression "Ensuring $app's mail credential key exists..."
+
+# The key arrived in 0.5.0, so anything upgraded from 0.4.x reaches this line
+# without one. See scripts/install for what the file is and why no MAIL_KEY_PATH
+# accompanies it.
+#
+# The [ -f ] guard is doing more than making the upgrade re-runnable. Every
+# stored IMAP/SMTP password is sealed under this exact key, and mail-crypto.ts
+# cannot distinguish a rotated key from a tampered ciphertext -- so overwriting
+# it would silently strand every configured mail account, with each one failing
+# to decrypt at its next sync. Restoring a lost key is an operator's job (it is
+# in the data_dir backup); an upgrade must never quietly mint a new one.
+if [ ! -f "$data_dir/mail.key" ]; then
+    openssl rand -out "$data_dir/mail.key" 32
+    chmod 600 "$data_dir/mail.key"
+    chown "$app:$app" "$data_dir/mail.key"
+fi
+
 ynh_script_progression "Updating $app's configuration..."
 
 ynh_config_add --template=".env" --destination="$install_dir/.env"

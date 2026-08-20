@@ -14,6 +14,26 @@ chown -R "$app:www-data" "$install_dir"
 chown -R "$app:$app" "$data_dir"
 chmod 750 "$data_dir"
 
+ynh_script_progression "Generating $app's mail credential key..."
+
+# 32 raw bytes of AES-256-GCM key material, sealing the IMAP/SMTP passwords in
+# mail_accounts.credentials_ciphertext (services/mail-crypto.ts, which requires
+# exactly KEY_BYTES = 32). Nothing else creates this file: the server reads it
+# lazily and answers 503 while it is absent, so an install that skips this step
+# fails at the first mail account rather than at boot.
+#
+# No MAIL_KEY_PATH is added to the .env template: config.ts leaves that env var
+# optional and falls back to "$DATA_DIR/mail.key", and the template already
+# carries DATA_DIR=__DATA_DIR__ -- so the default already resolves to exactly
+# this path, and an explicit entry would be a second copy of it to keep in sync.
+#
+# The key is written straight into $data_dir, which the block above has already
+# set to 750 $app:$app, so no other user can reach the file even in the instant
+# before chmod lands.
+openssl rand -out "$data_dir/mail.key" 32
+chmod 600 "$data_dir/mail.key"
+chown "$app:$app" "$data_dir/mail.key"
+
 ynh_script_progression "Installing Node.js runtime dependencies..."
 
 # The tarball ships compiled JS and built assets; only runtime deps are fetched.

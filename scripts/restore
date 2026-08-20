@@ -19,6 +19,27 @@ ynh_restore "$data_dir"
 chown -R "$app:$app" "$data_dir"
 chmod 750 "$data_dir"
 
+# mail.key needs no line of its own to be *backed up* -- scripts/backup takes
+# "$data_dir" whole rather than enumerating paths inside it, so the key rides
+# along with the blobs the same way. Two things still need saying here:
+#
+#  - Its mode is re-asserted rather than trusted, the same way .env's 400 is
+#    re-asserted above. The chmod 750 on the line above is not recursive, so it
+#    does not touch the key; this is about not depending on the archive to have
+#    carried a 600 through.
+#  - A backup taken before 0.5.0 has no key in it at all. Minting one here is
+#    safe precisely in that case and only in that case: such a backup restores
+#    a database with no mail accounts in it, so there are no ciphertexts for a
+#    fresh key to strand. Without this the app would restore into a permanent
+#    503 on every mail route until someone thought to run an upgrade.
+if [ -f "$data_dir/mail.key" ]; then
+    chmod 600 "$data_dir/mail.key"
+else
+    openssl rand -out "$data_dir/mail.key" 32
+    chmod 600 "$data_dir/mail.key"
+    chown "$app:$app" "$data_dir/mail.key"
+fi
+
 ynh_script_progression "Restoring the PostgreSQL database..."
 
 ynh_psql_db_shell < ./db.sql
