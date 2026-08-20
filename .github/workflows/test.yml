@@ -7,7 +7,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     services:
       postgres:
@@ -23,6 +23,23 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+
+      # The SMTP half of the mail integration suite. Mailpit fits here where
+      # Dovecot does not (see the "Start Dovecot" step): `sans:` makes it
+      # generate its own self-signed certificate at boot, so it needs no file
+      # from a workspace that does not exist yet when service containers start.
+      mailpit:
+        image: axllent/mailpit:v1.30.7
+        ports:
+          - 1025:1025
+          - 8025:8025
+        env:
+          MP_SMTP_TLS_CERT: sans:localhost,127.0.0.1
+          MP_SMTP_TLS_KEY: sans:localhost,127.0.0.1
+          # Mailpit only advertises AUTH LOGIN/PLAIN on an encrypted
+          # connection, so accepting any credentials still requires the
+          # STARTTLS upgrade the adapter demands before it sends them.
+          MP_SMTP_AUTH_ACCEPT_ANY: "true"
 
     env:
       # A full TCP connection string. postgres.js (packages/api/src/db/client.ts)
@@ -32,22 +49,64 @@ jobs:
       # sets for the dev server's socket connection never comes into play here.
       TEST_DATABASE_URL: postgres://conduit:conduit@localhost:5432/conduit_test
 
+      # The mail integration suite's gate and its targets
+      # (packages/api/src/test/mail-integration.test.ts). Without MAIL_IT the
+      # whole file skips, which is how it stays a no-op on a developer machine.
+      MAIL_IT: "1"
+      MAIL_IT_IMAP_HOST: 127.0.0.1
+      MAIL_IT_IMAP_PORT: "993"
+      MAIL_IT_IMAP_STARTTLS_PORT: "1144"
+      MAIL_IT_IMAP_NO_TLS_PORT: "1143"
+      MAIL_IT_SMTP_HOST: 127.0.0.1
+      MAIL_IT_SMTP_PORT: "1025"
+      MAIL_IT_MAILPIT_URL: http://127.0.0.1:8025
+      MAIL_IT_USERNAME: conduit@test.local
+      MAIL_IT_PASSWORD: testpass
+      # CI ONLY. Both mail servers here serve self-signed certificates, and
+      # the suite proves in both directions that this flag is what decides
+      # whether that is accepted. config.ts fails safe: only the exact string
+      # "0" turns verification off.
+      MAIL_TLS_REJECT_UNAUTHORIZED: "0"
+
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
           cache: npm
+      # Before `npm ci`, so the containers boot while dependencies install.
+      # Dovecot cannot be a service container: it needs config files, and
+      # service containers are created before the workspace is checked out.
+      - name: Start Dovecot
+        run: .github/scripts/start-dovecot.sh
       - name: Install dependencies
         run: npm ci
+      # Protocol-level, not TCP-level: `docker run -p` publishes through a
+      # proxy that accepts connections before Dovecot is listening behind it.
+      - name: Wait for the mail servers
+        run: node .github/scripts/wait-for-mail.mjs
+      # Belt and braces over the `auto = create` mailboxes in the Dovecot
+      # config: the suite has no create-mailbox call to fall back on, so the
+      # folders have to exist before it runs. A no-op (and a non-zero exit)
+      # when autocreation already did the job, hence the `|| true`.
+      - name: Ensure the integration mailboxes exist
+        run: >-
+          docker exec conduit-dovecot doveadm mailbox create
+          -u "$MAIL_IT_USERNAME" Sent Walk Drop Flags Dates Big || true
       - name: Typecheck
         run: npm run typecheck
       - name: Run tests
         run: npx vitest run
+      - name: Mail server logs
+        if: failure()
+        run: |
+          docker logs conduit-dovecot || true
+          docker logs conduit-dovecot-nostarttls || true
+          docker exec conduit-dovecot doveadm mailbox list -u "$MAIL_IT_USERNAME" || true
 
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     services:
       postgres:
@@ -64,11 +123,53 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # Same pair as the unit job, here for e2e/mail.spec.ts (Phase 4 Task 11):
+      # it seeds a thread over IMAP and reads the reply back out of Mailpit.
+      mailpit:
+        image: axllent/mailpit:v1.30.7
+        ports:
+          - 1025:1025
+          - 8025:8025
+        env:
+          MP_SMTP_TLS_CERT: sans:localhost,127.0.0.1
+          MP_SMTP_TLS_KEY: sans:localhost,127.0.0.1
+          MP_SMTP_AUTH_ACCEPT_ANY: "true"
+
     env:
       # Same shape as the `test` job's TEST_DATABASE_URL above: a full TCP
       # connection string for the postgres service container. playwright.config.ts's
       # webServer passes this through to the server it boots as DATABASE_URL.
       TEST_DATABASE_URL: postgres://conduit:conduit@localhost:5432/conduit_test
+
+      # Read by .github/scripts/start-dovecot.sh and wait-for-mail.mjs, which
+      # are shared with the unit job.
+      MAIL_IT_IMAP_HOST: 127.0.0.1
+      MAIL_IT_IMAP_PORT: "993"
+      MAIL_IT_IMAP_STARTTLS_PORT: "1144"
+      MAIL_IT_IMAP_NO_TLS_PORT: "1143"
+      MAIL_IT_SMTP_HOST: 127.0.0.1
+      MAIL_IT_SMTP_PORT: "1025"
+      MAIL_IT_MAILPIT_URL: http://127.0.0.1:8025
+      MAIL_IT_USERNAME: conduit@test.local
+      MAIL_IT_PASSWORD: testpass
+
+      # What e2e/mail.spec.ts reads. Deliberately its own names rather than
+      # the MAIL_IT_* set: the Playwright spec is a separate consumer of the
+      # same containers, and naming them apart keeps a change to one suite's
+      # fixture from silently retargeting the other's.
+      E2E_MAIL_IMAP_HOST: 127.0.0.1
+      E2E_MAIL_IMAP_PORT: "993"
+      E2E_MAIL_SMTP_HOST: 127.0.0.1
+      E2E_MAIL_SMTP_PORT: "1025"
+      E2E_MAIL_USERNAME: conduit@test.local
+      E2E_MAIL_PASSWORD: testpass
+      E2E_MAILPIT_URL: http://127.0.0.1:8025
+
+      # CI ONLY, and here it has to reach two processes: the Playwright
+      # process itself, and the app that playwright.config.ts's webServer
+      # boots (which passes this through explicitly -- its env block is a
+      # whitelist, not an inheritance).
+      MAIL_TLS_REJECT_UNAUTHORIZED: "0"
 
     steps:
       - uses: actions/checkout@v5
@@ -76,6 +177,8 @@ jobs:
         with:
           node-version: "24"
           cache: npm
+      - name: Start Dovecot
+        run: .github/scripts/start-dovecot.sh
       - name: Install dependencies
         run: npm ci
       # Browser binary only. NOT --with-deps: that shells out to apt-get, which
@@ -86,6 +189,24 @@ jobs:
       # rather than folding it back into this one, so an apt failure stays visible.
       - name: Install Playwright browser
         run: npx playwright install chromium
+      # The AES-256-GCM key mail_accounts.credentials_ciphertext is sealed
+      # with (mail-crypto.ts). config.ts defaults MAIL_KEY_PATH to
+      # $DATA_DIR/mail.key and DATA_DIR to ./data, and nothing creates the file
+      # -- scripts/install does that in a real deployment (Task 12). Reading it
+      # is lazy, so this only matters once a spec adds a mail account.
+      - name: Provision the mail credential key
+        run: |
+          mkdir -p data
+          openssl rand -out data/mail.key 32
+          chmod 600 data/mail.key
+      - name: Wait for the mail servers
+        run: node .github/scripts/wait-for-mail.mjs
+      # Same reason as the unit job: e2e/mail.spec.ts (Task 11) seeds its
+      # thread by APPENDing into folders it cannot create.
+      - name: Ensure the integration mailboxes exist
+        run: >-
+          docker exec conduit-dovecot doveadm mailbox create
+          -u "$MAIL_IT_USERNAME" Sent Walk Drop Flags Dates Big || true
       - name: Build workspaces
         run: npm run build
       - name: Run Playwright smoke tests
@@ -97,3 +218,8 @@ jobs:
           name: playwright-report
           path: playwright-report/
           retention-days: 7
+      - name: Mail server logs
+        if: failure()
+        run: |
+          docker logs conduit-dovecot || true
+          docker logs conduit-dovecot-nostarttls || true

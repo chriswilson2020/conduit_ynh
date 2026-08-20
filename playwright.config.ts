@@ -45,6 +45,14 @@ export default defineConfig({
       // with "password authentication failed" on any shell that does not already
       // export PGHOST (e.g. remote.sh's non-interactive ssh invocation).
       PGHOST: process.env.PGHOST ?? "/run/postgresql",
+      // This env block is a whitelist, not an inheritance, so a variable the
+      // job sets reaches the app under test only by being named here. CI's
+      // Dovecot and Mailpit serve self-signed certificates, and the mail
+      // account e2e/mail.spec.ts adds is synced by THIS process, not by the
+      // test's own connection -- so without the passthrough the app would
+      // refuse the server the spec just told it to use. Defaults to "1"
+      // (verify) everywhere else, exactly like config.ts.
+      MAIL_TLS_REJECT_UNAUTHORIZED: process.env.MAIL_TLS_REJECT_UNAUTHORIZED ?? "1",
       APP_VERSION: "0.1.0-e2e",
       CONDUIT_DEV_USER: "e2euser",
       BASE_PATH: "/",
