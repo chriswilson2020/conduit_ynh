@@ -102,6 +102,67 @@ namespace inbox {
     special_use = \Sent
     auto = create
   }
+
+  # --- SPECIAL-USE (Phase 4.1) ---------------------------------------------
+  #
+  # Dovecot returns these attributes in its LIST responses, which is what the
+  # folder-listing cases assert and what the e2e journey's account needs: the
+  # CRM fills trash_folder/archive_folder from a pass's classification, and a
+  # bulk Trash or Archive against an account with neither a stored nor a
+  # detected target refuses every thread with `no_target`.
+  #
+  # Junk is the e2e journey's "extra folder": junk and trash are the two roles
+  # the CRM leaves switched OFF on first sighting, so this is the one fixture
+  # whose seeded message stays out of the CRM until the Settings picker turns
+  # it on -- which is exactly the step that journey exists to prove.
+  mailbox Trash {
+    special_use = \Trash
+    auto = create
+  }
+  mailbox Junk {
+    special_use = \Junk
+    auto = create
+  }
+  mailbox Archive {
+    special_use = \Archive
+    auto = create
+  }
+  # THE NAME-BLIND PROBE, and the reason it is called this. Every other folder
+  # here would be classified from its NAME alone -- by imapflow's localized-name
+  # matching or by mail-folders.ts's own heuristics -- so none of them can prove
+  # that the role travelled over the wire. Nothing matches "Oubliette", so the
+  # only way it can arrive classified \Drafts is the server's SPECIAL-USE
+  # attribute. One role per folder throughout: imapflow resolves competing
+  # claims to a single winner and strips `specialUse` from the losers, so a
+  # second \Drafts mailbox here would silently unclassify this one.
+  mailbox Oubliette {
+    special_use = \Drafts
+    auto = create
+  }
+
+  # --- Move fixtures (Phase 4.1) -------------------------------------------
+  #
+  # Move/Moved are the source and target of the ordinary move cases; MoveUid is
+  # kept for the {uid: true} case alone, which needs a folder whose UIDs it can
+  # reason about from the start; MoveBulk/MoveBulkTarget carry the full
+  # UID_CHUNK move, whose 500 messages would otherwise slow every later
+  # fetchFlags over a shared folder.
+  mailbox Move {
+    auto = create
+  }
+  mailbox Moved {
+    auto = create
+  }
+  mailbox MoveUid {
+    auto = create
+  }
+  mailbox MoveBulk {
+    auto = create
+  }
+  mailbox MoveBulkTarget {
+    auto = create
+  }
+
   mailbox Walk {
     auto = create
   }

@@ -842,6 +842,27 @@ export class ImapflowClient implements ImapClient {
     });
   }
 
+  /**
+   * Did the server advertise `name` on this connection?
+   *
+   * NOT on the ImapClient contract, and nothing in the sync engine branches on
+   * it: the adapter's own paths read capabilities directly (supportsIdle
+   * below), and the two that matter most to this CRM -- MOVE and UIDPLUS -- are
+   * consumed inside imapflow rather than here. It is public because the promise
+   * they hold up is a claim about the SERVER, not about this code: without RFC
+   * 6851 MOVE imapflow emulates a move as COPY + \Deleted + EXPUNGE, and
+   * without UIDPLUS that EXPUNGE is unscoped (mail-imap.ts's `move` carries the
+   * full reasoning). "The CRM never expunges" is therefore only true while a
+   * server keeps advertising them, and the integration suite is where that is
+   * checked against a real one rather than inferred from a library's source.
+   *
+   * The name is matched as imapflow stores it -- upper-cased, the spelling the
+   * server sent -- so callers pass the wire spelling ("MOVE", "UIDPLUS").
+   */
+  hasCapability(name: string): boolean {
+    return this.client.capabilities.has(name);
+  }
+
   /** RFC 9051 folds IDLE into base IMAP4rev2, so a rev2 server need not
    * advertise it separately (imapflow's own capability check does the same). */
   private supportsIdle(): boolean {

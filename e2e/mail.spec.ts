@@ -51,8 +51,33 @@ const SYNC_TIMEOUT_MS = 60_000;
 /** Per-attempt budget inside pollWithReload, so a failing check reloads
  * rather than burning the whole deadline on one assertion. */
 const ATTEMPT_TIMEOUT_MS = 5_000;
+/** What one bulk action gets. It is not a fetch: the IMAP MOVEs it queues run
+ * on the account's SERIAL sync loop, behind whatever pass that loop is already
+ * in the middle of, so this is a mail server's budget rather than an HTTP
+ * one. */
+const BULK_TIMEOUT_MS = 60_000;
+/** And what the list refetch that follows one gets -- an ordinary invalidation,
+ * with room for CI's shared CPU. */
+const REFETCH_TIMEOUT_MS = 20_000;
 
 const MINUTE_MS = 60_000;
+
+/**
+ * The fixture mailboxes, byte-exact as .github/scripts/start-dovecot.sh
+ * declares them -- which is how the folders endpoint serves them, how the
+ * `folder-<NAME>` testids spell them, and how the bulk request matches them
+ * server-side. An IMAP mailbox name is bytes all the way down; nothing here is
+ * display-cased or normalized.
+ *
+ * Junk is the journey's "extra folder" and the fixture carries `\Junk` for
+ * exactly that reason: junk and trash are the two roles the CRM leaves
+ * switched OFF when it first sees them, so this is the one seeded folder whose
+ * message stays out of the CRM until the Settings picker turns it on.
+ */
+const INBOX_FOLDER = "INBOX";
+const JUNK_FOLDER = "Junk";
+const TRASH_FOLDER = "Trash";
+const ARCHIVE_FOLDER = "Archive";
 
 test.describe.serial("Mail journey", () => {
   // Playwright's default test timeout is 30s, which is LESS than the sync
@@ -81,11 +106,22 @@ test.describe.serial("Mail journey", () => {
   const accountLabel = `CI Dovecot ${runId}`;
   const pipelineName = `Mail pipeline ${runId}`;
   const dealTitle = `Renewal deal ${runId}`;
+  /** Seeded into the Junk folder, which the CRM does not sync until the
+   * Settings picker says so -- so this subject is absent from the inbox until
+   * the folder step below, and that absence is itself an assertion. */
+  const junkSubject = `Newsletter ${runId}`;
+  /** The three the bulk actions act on: two archived in one gesture, one
+   * trashed after them. Kept apart from Alice's and Bob's threads so the
+   * earlier tests' assertions describe the same conversations afterwards as
+   * before. */
+  const archiveSubjects: [string, string] = [`Invoice ${runId}`, `Shipping ${runId}`];
+  const trashSubject = `Offer ${runId}`;
 
   let page: Page;
   let contactId: string;
   let aliceThreadId: string;
   let dealId: string;
+  let accountId: string;
 
   // -- fixtures --------------------------------------------------------
 
@@ -108,7 +144,7 @@ test.describe.serial("Mail journey", () => {
    * default 90-day backfill window, and the first pass filters on
    * INTERNALDATE, which is what append's third argument sets.
    */
-  function fixtures(): { raw: Buffer; date: Date }[] {
+  function fixtures(): { raw: Buffer; date: Date; folder: string }[] {
     const now = Date.now();
     const aliceFirstAt = new Date(now - 30 * MINUTE_MS);
     const aliceSecondAt = new Date(now - 20 * MINUTE_MS);
@@ -117,6 +153,7 @@ test.describe.serial("Mail journey", () => {
 
     return [
       {
+        folder: INBOX_FOLDER,
         date: aliceFirstAt,
         raw: rfc822([
           `From: Alice Example <${aliceAddress}>`,
@@ -129,6 +166,7 @@ test.describe.serial("Mail journey", () => {
         ], `Hello from Alice. Marker ${textMarker}.`),
       },
       {
+        folder: INBOX_FOLDER,
         date: aliceSecondAt,
         raw: rfc822([
           `From: Alice Example <${aliceAddress}>`,
@@ -145,6 +183,7 @@ test.describe.serial("Mail journey", () => {
         ], `<html><body><p>Second one. Marker ${htmlMarker}.</p></body></html>`),
       },
       {
+        folder: INBOX_FOLDER,
         date: bobAt,
         raw: rfc822([
           `From: Bob Unrelated <${bobAddress}>`,
@@ -156,6 +195,44 @@ test.describe.serial("Mail journey", () => {
           "Content-Type: text/plain; charset=utf-8",
         ], `Nothing to do with Alice, and nobody in the CRM has this address.`),
       },
+      ...folderFixtures(now),
+    ];
+  }
+
+  /**
+   * The Phase 4.1 fixtures: one message in the folder the CRM does not sync
+   * until it is told to, and three in INBOX for the bulk actions.
+   *
+   * THE BULK THREE ARE SECONDS APART, not minutes, and that is what makes a
+   * shift-range over two of them deterministic. A range selection takes every
+   * row BETWEEN the two clicked ones, so the two archived here have to be
+   * neighbours in a list that is ordered by each thread's latest message and
+   * may also hold a previous attempt's threads (nothing empties the mailbox
+   * between Playwright retries). Nothing else in this mailbox -- from this
+   * attempt or any earlier one -- can carry a timestamp inside a window three
+   * seconds wide that was opened when this attempt started, so nothing can sort
+   * between them.
+   */
+  function folderFixtures(now: number): { raw: Buffer; date: Date; folder: string }[] {
+    const message = (subject: string, folder: string, date: Date) => ({
+      folder,
+      date,
+      raw: rfc822([
+        `From: Carol Vendor <carol-${runId}@example.com>`,
+        `To: Conduit <${USERNAME}>`,
+        `Subject: ${subject}`,
+        `Message-ID: <${subject.replace(/[^a-z0-9]+/gi, "-")}@example.com>`,
+        `Date: ${date.toUTCString()}`,
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=utf-8",
+      ], `Filed under ${folder}.`),
+    });
+
+    return [
+      message(junkSubject, JUNK_FOLDER, new Date(now - 5 * MINUTE_MS)),
+      message(archiveSubjects[0], INBOX_FOLDER, new Date(now - 3_000)),
+      message(archiveSubjects[1], INBOX_FOLDER, new Date(now - 2_000)),
+      message(trashSubject, INBOX_FOLDER, new Date(now - 1_000)),
     ];
   }
 
@@ -170,6 +247,24 @@ test.describe.serial("Mail journey", () => {
    * the workflow sets MAIL_TLS_REJECT_UNAUTHORIZED=0 for the app itself).
    */
   async function seedMailbox(): Promise<void> {
+    await withImap(async (client) => {
+      for (const fixture of fixtures()) {
+        await client.append(fixture.folder, fixture.raw, [], fixture.date);
+      }
+    });
+  }
+
+  /**
+   * One short-lived IMAP connection, for the two things this spec does outside
+   * the app: seeding the mailbox before any account exists, and reading a
+   * folder back afterwards to see where the CRM's moves actually put the mail.
+   *
+   * Raw imapflow rather than the app's adapter, deliberately and unlike the
+   * vitest integration suite: the point of the check below is that the MESSAGE
+   * IS ON THE SERVER, and asking the same code that moved it would be asking
+   * the app to mark its own homework.
+   */
+  async function withImap<T>(use: (client: ImapFlow) => Promise<T>): Promise<T> {
     const client = new ImapFlow({
       host: IMAP_HOST,
       port: IMAP_PORT,
@@ -180,12 +275,24 @@ test.describe.serial("Mail journey", () => {
     });
     await client.connect();
     try {
-      for (const fixture of fixtures()) {
-        await client.append("INBOX", fixture.raw, [], fixture.date);
-      }
+      return await use(client);
     } finally {
       await client.logout();
     }
+  }
+
+  /** Every subject currently in `folder`, straight off the server. Read-only,
+   * so this cannot be what marks a fixture \Seen. */
+  async function subjectsIn(folder: string): Promise<string[]> {
+    return await withImap(async (client) => {
+      const mailbox = await client.mailboxOpen(folder, { readOnly: true });
+      if (mailbox.exists === 0) return [];
+      const subjects: string[] = [];
+      for await (const message of client.fetch("1:*", { envelope: true })) {
+        subjects.push(message.envelope?.subject ?? "");
+      }
+      return subjects;
+    });
   }
 
   // -- helpers ---------------------------------------------------------
@@ -245,6 +352,22 @@ test.describe.serial("Mail journey", () => {
    * reach the input inside a control that may not be a plain input. */
   function accountField(name: string): Locator {
     return page.getByTestId("account-form").getByTestId(`field-${name}`).locator("input");
+  }
+
+  /**
+   * Tick the box beside a row.
+   *
+   * The checkbox is a SIBLING of the row button rather than a child of it (a
+   * checkbox inside a button is invalid markup, and every tick would open the
+   * conversation), so it is addressed by the thread's own id rather than
+   * through the row locator. With `shift` it extends the selection to a RANGE:
+   * React maps a checkbox's onChange onto the native click, which is what
+   * carries the modifier through to the list's range logic.
+   */
+  async function tickThread(subject: string, options: { shift?: boolean } = {}): Promise<void> {
+    const id = await idOf(threadRow(subject), "thread-row-");
+    await page.getByTestId(`thread-checkbox-${id}`)
+      .click(options.shift === true ? { modifiers: ["Shift"] } : {});
   }
 
   // --------------------------------------------------------------------
@@ -550,5 +673,117 @@ test.describe.serial("Mail journey", () => {
     // here.
     await expect(threadRow(aliceSubject)).toHaveCount(1);
     await expect(threadRow(bobSubject)).toHaveCount(0);
+  });
+
+  // -- Phase 4.1: folders, and the two moves that are real IMAP moves ------
+
+  test("classifies the move targets and switches the extra folder on from Settings", async () => {
+    // The seeded Junk message is nowhere in the CRM: junk and trash are the two
+    // roles a folder is left switched OFF in when it is first seen, so nothing
+    // has ever walked that mailbox.
+    await page.goto("/mail");
+    await expect(threadRow(junkSubject)).toHaveCount(0);
+
+    await page.goto("/settings/mail");
+    const card = page.locator('[data-testid^="mail-account-"]').filter({ hasText: accountLabel });
+    await expect(card).toBeVisible();
+    accountId = await idOf(card, "mail-account-");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+
+    // Discovery read the fixture's SPECIAL-USE attributes and filled the
+    // account's two move targets from them. Not decoration: an account with
+    // neither a stored nor a detected target refuses every thread of a bulk
+    // Archive or Trash with `no_target`, so both actions below rest on this.
+    await expect(page.getByTestId(`trash-folder-${accountId}`))
+      .toHaveValue(TRASH_FOLDER, { timeout: REFETCH_TIMEOUT_MS });
+    await expect(page.getByTestId(`archive-folder-${accountId}`)).toHaveValue(ARCHIVE_FOLDER);
+
+    // The picker addresses folders by their byte-exact server name, which is
+    // also what the sidebar row and the bulk request will carry.
+    const junkBox = page.getByTestId(`folder-picker-${JUNK_FOLDER}`);
+    await expect(junkBox).not.toBeChecked({ timeout: REFETCH_TIMEOUT_MS });
+    await junkBox.check();
+    await expect(junkBox).toBeChecked();
+  });
+
+  test("syncs the enabled folder and shows its message under the folder filter", async () => {
+    await page.goto("/mail");
+    // Enabling ASKED for a pass rather than waiting for one, so this is that
+    // pass walking the folder for the first time.
+    await pollWithReload(async () => {
+      await expect(threadRow(junkSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+    });
+
+    // NOTHING FROM HERE ON MAY RELOAD THE PAGE. The folder view is the inbox's
+    // own state, not a URL parameter, so a reload puts the list back to "All
+    // mail" -- and every assertion below is about a folder-scoped view.
+    const junkRow = page.getByTestId(`folder-${JUNK_FOLDER}`);
+    await expect(junkRow).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    await junkRow.click();
+    await expect(junkRow).toHaveAttribute("aria-current", "true");
+
+    await expect(threadRow(junkSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    // A real filter, not a highlight: Alice's conversation has no message here.
+    await expect(threadRow(aliceSubject)).toHaveCount(0);
+  });
+
+  test("archives two conversations in one gesture, and Dovecot has them in Archive", async () => {
+    await page.goto("/mail");
+    const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
+    await inboxRow.click();
+    await expect(inboxRow).toHaveAttribute("aria-current", "true");
+    await expect(threadRow(archiveSubjects[0])).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    // A tick and then a shift-click: the range takes every row BETWEEN the two,
+    // and these two are neighbours by construction (see folderFixtures). The
+    // count is the assertion that says so -- a range that had swept up a third
+    // row reads "3 selected" here rather than failing three assertions later.
+    await tickThread(archiveSubjects[1]);
+    await tickThread(archiveSubjects[0], { shift: true });
+    await expect(page.getByTestId("bulk-count")).toHaveText("2 selected");
+
+    await page.getByTestId("bulk-archive").click();
+
+    // `bulk-result` filling IS the wait for `bulk-pending` to clear: the bar
+    // unmounts as the result arrives and the two are never on screen together.
+    // Given a mail server's budget, not a fetch's -- the MOVEs queue behind
+    // whatever pass the account's serial loop is already running.
+    await expect(page.getByTestId("bulk-result"))
+      .toContainText("2 archived", { timeout: BULK_TIMEOUT_MS });
+    await expect(page.getByTestId("bulk-bar")).toHaveCount(0);
+
+    // Out of the folder they were archived from...
+    await expect(threadRow(archiveSubjects[0])).toHaveCount(0, { timeout: REFETCH_TIMEOUT_MS });
+    await expect(threadRow(archiveSubjects[1])).toHaveCount(0);
+
+    // ...and really on the server. Asked of Dovecot directly rather than of the
+    // app that says it put them there.
+    await expect.poll(() => subjectsIn(ARCHIVE_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toEqual(expect.arrayContaining(archiveSubjects));
+  });
+
+  test("moves the third to Trash, where the conversation still says where it went", async () => {
+    await page.goto("/mail");
+    await page.getByTestId(`folder-${INBOX_FOLDER}`).click();
+    await expect(threadRow(trashSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    await tickThread(trashSubject);
+    await expect(page.getByTestId("bulk-count")).toHaveText("1 selected");
+    await page.getByTestId("bulk-trash").click();
+
+    await expect(page.getByTestId("bulk-result"))
+      .toContainText("1 moved to Trash", { timeout: BULK_TIMEOUT_MS });
+    await expect(threadRow(trashSubject)).toHaveCount(0, { timeout: REFETCH_TIMEOUT_MS });
+    await expect.poll(() => subjectsIn(TRASH_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(trashSubject);
+
+    // THE CRM NEVER EXPUNGES. The conversation is still there to read -- "All
+    // mail" reaches it, since it has left the INBOX view for good -- and it
+    // says where its message now lives.
+    await page.getByTestId("folder-view-all").click();
+    await expect(threadRow(trashSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await threadRow(trashSubject).click();
+    await expect(page.getByTestId("conversation")).toBeVisible();
+    await expect(page.getByTestId("trash-chip")).toBeVisible();
   });
 });

@@ -1,12 +1,16 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { MailAccount } from "@conduit/shared";
 import type { MailCredentials } from "../services/mail-crypto.js";
-import type { ImapConnectionSettings } from "../services/mail-imap.js";
+import { classifyFolder } from "../services/mail-folders.js";
+import type { ImapConnectionSettings, ImapFolderListing } from "../services/mail-imap.js";
 import type { ImapflowClient, MailAdapterOptions } from "../services/mail-imapflow.js";
 import {
   createImapClientFactory, createSmtpTransportFactory, imapVerify, smtpVerify,
 } from "../services/mail-imapflow.js";
+import { UID_CHUNK } from "../services/mail-sync.js";
 
 /**
  * The ONLY place the real IMAP and SMTP stack runs: a Dovecot pair and a
@@ -34,6 +38,10 @@ import {
  * than created from here -- the ImapClient contract has no create-mailbox
  * call, so a test that needed one would have to reach past the adapter.
  *
+ * The one exception is `doveadm` below, which ADMINISTERS the fixture from
+ * outside (docker exec) for the single case that needs a folder to appear and
+ * then vanish mid-run. It speaks no IMAP: see its own note.
+ *
  * ISOLATION WITHOUT DELETES. The contract has no expunge either, so nothing
  * here empties a folder. Instead every case records the folder's highest UID
  * first and asserts only about what it appended above that, and every subject
@@ -58,6 +66,9 @@ const USERNAME = process.env.MAIL_IT_USERNAME ?? "conduit@test.local";
 const PASSWORD = process.env.MAIL_IT_PASSWORD ?? "testpass";
 /** Nothing listens here, so a connect fails immediately with ECONNREFUSED. */
 const DEAD_PORT = Number(process.env.MAIL_IT_DEAD_PORT ?? 1);
+/** The container the folder-listing cases administer their fixture in (see
+ * `doveadm` below). The same name .github/workflows/test.yml already uses. */
+const DOVECOT_CONTAINER = process.env.MAIL_IT_DOVECOT_CONTAINER ?? "conduit-dovecot";
 
 /** mail-sync.ts's own BATCH_SIZE: the walk cases use the real one. */
 const BATCH_SIZE = 50;
@@ -145,6 +156,50 @@ async function connectClient(
 async function highestUid(client: ImapflowClient, folder: string): Promise<number> {
   const present = await client.fetchFlags(folder, yesterday());
   return present.reduce((highest, message) => Math.max(highest, message.uid), 0);
+}
+
+/**
+ * Every UID above `base` in `folder`, ascending -- what a case appended, told
+ * apart from whatever the folder already held (see the isolation note above).
+ */
+async function uidsAbove(client: ImapflowClient, folder: string, base: number): Promise<number[]> {
+  const present = await client.fetchFlags(folder, yesterday());
+  return present.map((message) => message.uid)
+    .filter((uid) => uid > base)
+    .sort((left, right) => left - right);
+}
+
+/**
+ * One message's Subject: header, through the adapter's raw fetch.
+ *
+ * The descriptors carry a UID and flags and nothing else (ImapMessageDescriptor
+ * is deliberately that small), so this is how a move case says WHICH message it
+ * found at the other end rather than merely how many.
+ */
+async function subjectOf(client: ImapflowClient, folder: string, uid: number): Promise<string> {
+  const raw = await client.fetchRaw(folder, uid);
+  return (/^Subject: (.*)$/m.exec(raw?.toString("utf8") ?? "")?.[1] ?? "").trim();
+}
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Run one doveadm command in the Dovecot container, against the fixture user.
+ *
+ * THE ONE THING IN THIS FILE THAT IS NOT THE ADAPTER, and only because the
+ * adapter cannot be it: the ImapClient contract has no create- or
+ * delete-mailbox call (nothing in the CRM makes folders), so a case about a
+ * folder APPEARING and VANISHING on the server has no other way to make that
+ * happen. This is fixture ADMINISTRATION, the same thing the Dovecot config
+ * does for every other mailbox here and the same command the workflow already
+ * runs as a step -- not a second IMAP client working behind the adapter's back.
+ *
+ * Nothing is swallowed: a missing container or a refused doveadm is a broken
+ * fixture, and the case that follows would otherwise fail with a puzzle rather
+ * than with the reason.
+ */
+async function doveadm(...args: string[]): Promise<void> {
+  await execFileAsync("docker", ["exec", DOVECOT_CONTAINER, "doveadm", ...args]);
 }
 
 /** Walk a folder to exhaustion the way AccountSync does, returning the UIDs. */
@@ -649,5 +704,211 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
       });
       expect(await mailpitHasSubject(subject)).toBe(true);
     }, 60_000);
+  });
+
+  /**
+   * Phase 4.1's folder discovery, against a real LIST.
+   *
+   * What only a server can answer: whether the SPECIAL-USE attributes actually
+   * arrive (the whole classification chain starts there), and whether a folder
+   * that goes away stops being listed -- the server half of the walk's
+   * skip-a-vanished-folder rule and of the sidebar's "gone" row.
+   */
+  describe("folder listing", () => {
+    let client: ImapflowClient;
+    let listed: ImapFolderListing[] = [];
+
+    beforeAll(async () => {
+      client = await connectClient();
+      listed = await client.list();
+    });
+
+    function found(folder: string): ImapFolderListing | undefined {
+      return listed.find((entry) => entry.folder === folder);
+    }
+
+    it("lists INBOX and the fixture mailboxes, all selectable", () => {
+      // `\Noselect` is what the picker refuses to switch on and what the walk
+      // skips, so "every real mailbox is selectable" is worth stating once
+      // against a server rather than only against the mapping unit tests.
+      const inbox = found("INBOX");
+      expect(inbox?.selectable).toBe(true);
+      for (const folder of ["Sent", "Trash", "Junk", "Archive", "Move", "Moved"]) {
+        expect(found(folder)?.selectable, folder).toBe(true);
+      }
+    });
+
+    it("carries the server's SPECIAL-USE attributes", () => {
+      expect(found("Trash")?.specialUse).toBe("trash");
+      expect(found("Junk")?.specialUse).toBe("junk");
+      expect(found("Archive")?.specialUse).toBe("archive");
+      expect(found("Sent")?.specialUse).toBe("sent");
+      // An ordinary mailbox carries no role at all -- the absence is as much a
+      // part of the contract as the presence, since mail-folders.ts's
+      // `fromListing` tiebreak turns on exactly this.
+      expect(found("Move")?.specialUse).toBeUndefined();
+    });
+
+    it("reads a role off the wire that no NAME could have produced", () => {
+      // The proof that these roles are the SERVER's and not imapflow's
+      // localized-name matching or mail-folders.ts's own heuristics: nothing
+      // anywhere matches "Oubliette", so `\Drafts` can only have come from the
+      // mailbox's SPECIAL-USE attribute. Every other folder above would be
+      // classified from its name alone even if the attribute never arrived,
+      // which is why this fixture exists.
+      const probe: ImapFolderListing = {
+        folder: "Oubliette", specialUse: "drafts", selectable: true, delimiter: "/",
+      };
+      expect(found("Oubliette")).toEqual(probe);
+      expect(classifyFolder(probe)).toEqual({ specialUse: "drafts", fromListing: true });
+      expect(classifyFolder({ folder: "Oubliette", selectable: true, delimiter: "/" }))
+        .toEqual({ specialUse: null, fromListing: false });
+    });
+
+    it("reports a folder created on the server, and stops reporting a deleted one", async () => {
+      // The server half of the vanished-folder story: discovery leaves the ROW
+      // in place and the walk skips it (mail-folders.ts's header), and both of
+      // those rest on the folder genuinely dropping out of LIST rather than
+      // being listed as something unselectable.
+      const name = `Vanish-${runId}`;
+      await doveadm("mailbox", "create", "-u", USERNAME, name);
+      expect((await client.list()).map((entry) => entry.folder)).toContain(name);
+
+      await doveadm("mailbox", "delete", "-u", USERNAME, name);
+      expect((await client.list()).map((entry) => entry.folder)).not.toContain(name);
+    }, 30_000);
+  });
+
+  /**
+   * The move machinery (Phase 4.1's Trash and Archive), against a real server.
+   *
+   * Everything below was previously provable only by READING imapflow's
+   * source: that a refused move comes back as a falsy return rather than a
+   * throw, that `{ uid: true }` is what keeps UIDs from being read as sequence
+   * numbers, that a UID the folder no longer holds is an OK and not a NO. Each
+   * of those is a branch mail-move.ts's compensation depends on.
+   */
+  describe("moving messages", () => {
+    let client: ImapflowClient;
+
+    beforeAll(async () => { client = await connectClient(); });
+
+    it("advertises MOVE and UIDPLUS, which is what makes the never-expunge promise true", () => {
+      // One line each, and load-bearing: without RFC 6851 MOVE imapflow
+      // emulates the move as COPY + \Deleted + EXPUNGE, and without UIDPLUS
+      // that EXPUNGE is unscoped -- it would remove every message ANOTHER
+      // client had flagged \Deleted and not yet expunged. The CRM's promise is
+      // therefore a claim about the server, and this is where it is checked
+      // against one (mail-imap.ts's `move` carries the full reasoning).
+      expect(client.hasCapability("MOVE")).toBe(true);
+      expect(client.hasCapability("UIDPLUS")).toBe(true);
+    });
+
+    it("REJECTS a move to a folder the server does not have, leaving the message where it was", async () => {
+      // The single most load-bearing claim the adapter makes: imapflow catches
+      // the server's NO and returns `false` instead of throwing, so without the
+      // adapter's falsy guard mail-move.ts would record a move the server had
+      // refused and never run its compensating revert. Until now that was true
+      // by inspection of lib/commands/move.js; this is a real Dovecot saying no.
+      const base = await highestUid(client, "Move");
+      const subject = `${runId} refused move`;
+      await client.append("Move", rfc822({ subject }), ["\\Seen"]);
+      const [uid = 0] = await uidsAbove(client, "Move", base);
+
+      await expect(client.move("Move", [uid], `NoSuchFolder-${runId}`))
+        .rejects.toThrow(/was refused/);
+
+      // And nothing moved: the revert puts the CRM's rows back to exactly this.
+      expect(await uidsAbove(client, "Move", base)).toEqual([uid]);
+    }, 30_000);
+
+    it("moves a message out of one folder into another, where it is re-sighted under a NEW uid", async () => {
+      // The server half of the (account_id, message_id) upsert story: the
+      // target folder's next pass sees ONE message with a UID that has nothing
+      // to do with the old one, and ingest's duplicate guard is what stops that
+      // becoming a second copy of the conversation.
+      const sourceBase = await highestUid(client, "Move");
+      const targetBase = await highestUid(client, "Moved");
+      const subject = `${runId} round trip`;
+      await client.append("Move", rfc822({ subject }), ["\\Seen"]);
+      const [uid = 0] = await uidsAbove(client, "Move", sourceBase);
+
+      await client.move("Move", [uid], "Moved");
+
+      expect(await uidsAbove(client, "Move", sourceBase)).toEqual([]);
+      const arrived = await uidsAbove(client, "Moved", targetBase);
+      expect(arrived).toHaveLength(1);
+      const [movedUid = 0] = arrived;
+      expect(movedUid).not.toBe(uid);
+      expect(await subjectOf(client, "Moved", movedUid)).toBe(subject);
+    }, 30_000);
+
+    it("answers OK, not NO, for a UID the source folder no longer holds", async () => {
+      // What the CRM hits when a message was deleted in another mail client
+      // and then bulk-archived here: the stored UID names nothing. Dovecot
+      // answers such a MOVE with a plain OK, imapflow reports that truthily,
+      // and the adapter therefore does NOT throw -- so mail-move.ts leaves its
+      // optimistic row update standing instead of reverting a whole chunk over
+      // a message that was already gone.
+      const sourceBase = await highestUid(client, "Move");
+      await client.append("Move", rfc822({ subject: `${runId} stale uid` }), ["\\Seen"]);
+      const [uid = 0] = await uidsAbove(client, "Move", sourceBase);
+      await client.move("Move", [uid], "Moved");
+
+      const targetBase = await highestUid(client, "Moved");
+      await expect(client.move("Move", [uid], "Moved")).resolves.toBeUndefined();
+      expect(await uidsAbove(client, "Moved", targetBase)).toEqual([]);
+    }, 30_000);
+
+    it("moves BY UID, not by sequence number", async () => {
+      // `{ uid: true }` is one word in the adapter and the difference between
+      // moving the message the CRM meant and moving a different one: the CRM
+      // stores UIDs and nothing else.
+      const base = await highestUid(client, "MoveUid");
+      const subjects = [0, 1, 2, 3, 4].map((index) => `${runId} uid ${index}`);
+      for (const subject of subjects) {
+        await client.append("MoveUid", rfc822({ subject }), ["\\Seen"]);
+      }
+      const uids = await uidsAbove(client, "MoveUid", base);
+      expect(uids).toHaveLength(5);
+
+      // THE EXPUNGE THAT PULLS THE TWO NUMBERINGS APART. A MOVE removes the
+      // message from the source, so after these two the remaining three sit at
+      // sequence numbers two lower than their append position -- and in this
+      // folder, which no other case writes to, the third message's UID names
+      // the FIFTH message when read as a sequence number.
+      await client.move("MoveUid", uids.slice(0, 2), "Moved");
+
+      const targetBase = await highestUid(client, "Moved");
+      await client.move("MoveUid", [uids[2] ?? 0], "Moved");
+
+      const arrived = await uidsAbove(client, "Moved", targetBase);
+      expect(arrived).toHaveLength(1);
+      expect(await subjectOf(client, "Moved", arrived[0] ?? 0)).toBe(subjects[2]);
+      // ...and the message a sequence reading would have taken instead is
+      // still in the source, along with its neighbour.
+      expect(await uidsAbove(client, "MoveUid", base)).toEqual(uids.slice(3));
+    }, 60_000);
+
+    it(`moves a full ${UID_CHUNK}-UID chunk in one call`, async () => {
+      // UID_CHUNK is what mail-move.ts partitions a bulk action into, so this
+      // is the largest MOVE this app can emit. imapflow joins the array with
+      // commas rather than compacting it into a range (lib/imap-flow.js), so
+      // the command really is several kilobytes of UID list on one line -- and
+      // a server that would not take it is a thing to find out here rather
+      // than in the middle of a user's first "select all, archive".
+      const base = await highestUid(client, "MoveBulk");
+      const targetBase = await highestUid(client, "MoveBulkTarget");
+      for (let index = 0; index < UID_CHUNK; index += 1) {
+        await client.append("MoveBulk", rfc822({ subject: `${runId} chunk ${index}` }), ["\\Seen"]);
+      }
+      const uids = await uidsAbove(client, "MoveBulk", base);
+      expect(uids).toHaveLength(UID_CHUNK);
+
+      await client.move("MoveBulk", uids, "MoveBulkTarget");
+
+      expect(await uidsAbove(client, "MoveBulk", base)).toEqual([]);
+      expect(await uidsAbove(client, "MoveBulkTarget", targetBase)).toHaveLength(UID_CHUNK);
+    }, 180_000);
   });
 });
