@@ -194,12 +194,34 @@ export async function discoverFolders(
   // so a listing containing the same mailbox twice would fail the whole
   // statement -- and because discovery is the first thing a pass does, that
   // failure would back the account off before any mail was synced, on every
-  // pass, until the server stopped doing it. First sighting wins: imapflow
-  // sorts classified folders ahead of unclassified ones, so the first of a
-  // duplicate pair is the one carrying a role.
+  // pass, until the server stopped doing it.
+  //
+  // The one duplicate imapflow 1.7.1 can actually produce is INBOX. When the
+  // connection has a namespace prefix and nothing in the main listing claimed
+  // the INBOX slot, it runs a second LIST for INBOX alone and APPENDS the
+  // result (lib/commands/list.js) -- and the case where nothing claimed the
+  // slot despite INBOX being listed is precisely a phantom `\NonExistent`
+  // entry, which it deliberately refuses to let claim it. So the pair is a
+  // phantom and the real mailbox. (LSUB cannot add a duplicate: it merges
+  // into the entry with the same path and ignores anything unlisted.)
+  //
+  // SELECTABLE WINS, therefore, rather than first-seen. Recording the phantom
+  // would mark a real folder `\Noselect` -- dropping it from the walk and
+  // making it useless as a move target -- until some later LIST happened to
+  // arrive in the other order. Preferring the selectable entry gets that
+  // right whichever order they come in, which is the point: imapflow does
+  // sort classified entries ahead of unclassified ones, so today the real
+  // INBOX happens to come first anyway, and a tiebreak resting on that would
+  // be resting on a detail of another library's sort.
   const unique = new Map<string, ImapFolderListing>();
   for (const listing of listed) {
-    if (!unique.has(listing.folder)) unique.set(listing.folder, listing);
+    const kept = unique.get(listing.folder);
+    // Map.set on an existing key keeps its original position, so replacing a
+    // phantom does not reshuffle the listing order the rest of this function
+    // relies on.
+    if (kept === undefined || (!kept.selectable && listing.selectable)) {
+      unique.set(listing.folder, listing);
+    }
   }
   if (unique.size === 0) return;
 
@@ -244,6 +266,22 @@ export async function discoverFolders(
     // conflicting row picks up its own classification rather than some other
     // folder's. `lastDiscoveredAt`/`updatedAt` are bound directly instead --
     // one pass, one moment, identical for every row in it.
+    //
+    // `updatedAt` moves on EVERY re-sighting, including one that changes
+    // nothing else -- deliberately, and deliberately unlike fillMoveTargets
+    // below, which guards its UPDATE precisely to avoid that. The two are not
+    // in tension because the rows differ: `lastDiscoveredAt` is by design
+    // re-stamped every pass here, so the row is rewritten either way and
+    // `updated_at` tracking it costs nothing and stays true. An account row,
+    // by contrast, would not be touched at all in the no-op case, so bumping
+    // it there would invent a change and turn `updated_at` from "someone
+    // edited this account" into "a sync pass happened".
+    //
+    // The trade this leaves standing: `mail_account_folders.updated_at` is
+    // near-identical to `last_discovered_at` and cannot answer "when did this
+    // folder's classification last change". Nothing asks -- the picker reads
+    // the current values, and staleness reads last_discovered_at -- and a
+    // column that answered it would have to be a third one.
     .onConflictDoUpdate({
       target: [mailAccountFolders.accountId, mailAccountFolders.folder],
       set: {

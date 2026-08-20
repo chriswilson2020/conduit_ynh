@@ -116,6 +116,19 @@ describe("classifyFolder", () => {
     expect(classifyFolder(listing("Clients/Acme"))).toEqual({ specialUse: null, fromListing: false });
   });
 
+  it("does not classify a folder that merely CONTAINS a keyword mid-word", () => {
+    // The probe for the leading word boundary in NAME_HEURISTICS, which is
+    // otherwise a claim no test would notice being wrong: both of these
+    // classify under a bare substring test, and both are ordinary folders a
+    // user would be startled to find treated as a mail role. "Presentations"
+    // really does contain "sent" (p-r-e-"sent"-ations), and turning it into
+    // the Sent mailbox would put it behind the whole-thread move's
+    // never-empty-Sent exclusion; "Undeleted" contains "deleted", and
+    // classifying it trash would default it to not syncing at all.
+    expect(classifyFolder(listing("Presentations")).specialUse).toBeNull();
+    expect(classifyFolder(listing("Undeleted")).specialUse).toBeNull();
+  });
+
   it("matches on the LAST path segment only, under either delimiter", () => {
     // A child of Junk is not itself junk -- this is the whole reason the
     // heuristics are segment-scoped rather than run over the full path.
@@ -248,12 +261,34 @@ describe("discoverFolders", () => {
     // Postgres refuses to let one INSERT ... ON CONFLICT DO UPDATE touch the
     // same row twice (21000), so an unmerged duplicate would fail the whole
     // statement -- and, since discovery runs first in the pass, poison every
-    // pass for that account. The classified sighting is the one kept.
+    // pass for that account.
     await discoverFolders(handle.db, accountId, [
       listing("Trash", { specialUse: "trash" }),
       listing("Trash"),
     ], PASS_ONE);
     expect(await rowOf(accountId, "Trash")).toMatchObject({ specialUse: "trash", syncEnabled: false });
+  });
+
+  it("keeps the selectable entry when a duplicate pairs a phantom with the real mailbox", async () => {
+    const accountId = await makeAccount();
+    // imapflow's INBOX fixup appends a second LIST result for INBOX when a
+    // phantom \NonExistent entry stopped the first one claiming the slot, so
+    // the pair is the phantom and the real mailbox. Recording the phantom
+    // would mark INBOX unselectable and drop it from the walk -- in BOTH
+    // arrival orders, which is what makes this a real rule rather than a
+    // restatement of imapflow's sort.
+    await discoverFolders(handle.db, accountId, [
+      listing("INBOX", { selectable: false }),
+      listing("INBOX", { selectable: true }),
+    ], PASS_ONE);
+    expect(await rowOf(accountId, "INBOX")).toMatchObject({ selectable: true });
+
+    const other = await makeAccount({ email: "other@example.com" });
+    await discoverFolders(handle.db, other, [
+      listing("INBOX", { selectable: true }),
+      listing("INBOX", { selectable: false }),
+    ], PASS_ONE);
+    expect(await rowOf(other, "INBOX")).toMatchObject({ selectable: true });
   });
 
   it("stores an already-decoded non-ASCII folder name verbatim", async () => {
