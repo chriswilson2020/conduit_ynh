@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import type { MailThreadListItem } from "@conduit/shared";
 import { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
 import { ApiError } from "../../api";
 import {
@@ -18,7 +19,22 @@ import {
   substitutePlaceholders,
   substitutePlaceholdersHtml,
   templateSubject,
-} from "./composer-lib";
+  addressLabel,
+  emptyThreadPages,
+  FIRST_PAGE,
+  flattenThreadPages,
+  forwardBody,
+  forwardSubject,
+  mergeThreadPage,
+  messageFrameCsp,
+  messageFrameSrcdoc,
+  NO_SUBJECT_LABEL,
+  replyRecipients,
+  replySource,
+  replySubject,
+  subjectLabel,
+  threadFilterKey,
+} from "./mail-lib";
 
 describe("friendlyMailError", () => {
   it("maps the auth prefix to an actionable message", () => {
@@ -353,5 +369,277 @@ describe("htmlIsBlank", () => {
 describe("signatureBlock", () => {
   it("separates the signature from the body with an empty paragraph", () => {
     expect(signatureBlock("<p>Chris</p>")).toBe("<p></p><p>Chris</p>");
+  });
+});
+
+describe("subjectLabel", () => {
+  it("renders the placeholder for a subject-less thread", () => {
+    expect(subjectLabel("")).toBe(NO_SUBJECT_LABEL);
+  });
+
+  // The API stores '' for "no Subject header" and never the placeholder --
+  // whitespace is the same absence, and must not render as a blank row.
+  it("treats a whitespace-only subject as absent", () => {
+    expect(subjectLabel("   ")).toBe(NO_SUBJECT_LABEL);
+  });
+
+  it("passes a real subject through", () => {
+    expect(subjectLabel("Renewal quote")).toBe("Renewal quote");
+  });
+});
+
+describe("addressLabel", () => {
+  it("prefers the display name", () => {
+    expect(addressLabel({ address: "alice@example.com", name: "Alice" })).toBe("Alice");
+  });
+
+  it("falls back to the bare address", () => {
+    expect(addressLabel({ address: "alice@example.com", name: null })).toBe("alice@example.com");
+    expect(addressLabel({ address: "alice@example.com" })).toBe("alice@example.com");
+    expect(addressLabel({ address: "alice@example.com", name: "  " })).toBe("alice@example.com");
+  });
+});
+
+describe("threadFilterKey", () => {
+  it("is stable across key order", () => {
+    expect(threadFilterKey({ unread: true, accountId: "a" }))
+      .toBe(threadFilterKey({ accountId: "a", unread: true }));
+  });
+
+  it("ignores undefined values", () => {
+    expect(threadFilterKey({ accountId: "a", unread: undefined })).toBe(threadFilterKey({ accountId: "a" }));
+  });
+
+  it("distinguishes different filter sets", () => {
+    expect(threadFilterKey({ unread: true })).not.toBe(threadFilterKey({ unread: false }));
+    expect(threadFilterKey({})).not.toBe(threadFilterKey({ unlinked: true }));
+  });
+});
+
+describe("thread page accumulation", () => {
+  // The merge and the flatten only ever read `id`; the rest of a list row is
+  // irrelevant to them, so the fixtures say only what the code under test uses.
+  const thread = (id: string) => ({ id }) as unknown as MailThreadListItem;
+
+  it("collects pages in load order", () => {
+    let pages = emptyThreadPages("k");
+    pages = mergeThreadPage(pages, "k", undefined, [thread("a"), thread("b")]);
+    pages = mergeThreadPage(pages, "k", "cursor-1", [thread("c")]);
+    expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["a", "b", "c"]);
+    expect(pages.order).toEqual([FIRST_PAGE, "cursor-1"]);
+  });
+
+  // The whole point of keying on the filter set: a filter change must not
+  // leave the previous filter's rows on screen behind the new first page.
+  it("starts over when the filter key changes", () => {
+    let pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, [thread("a")]);
+    pages = mergeThreadPage(pages, "unread", undefined, [thread("z")]);
+    expect(pages.key).toBe("unread");
+    expect(pages.order).toEqual([FIRST_PAGE]);
+    expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["z"]);
+  });
+
+  it("replaces a page when that page refetches", () => {
+    let pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, [thread("a")]);
+    pages = mergeThreadPage(pages, "k", "cursor-1", [thread("b")]);
+    pages = mergeThreadPage(pages, "k", undefined, [thread("new"), thread("a")]);
+    expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["new", "a", "b"]);
+    expect(pages.order).toEqual([FIRST_PAGE, "cursor-1"]);
+  });
+
+  // Returning a fresh object for an unchanged page would set state on every
+  // render, forever: the merge runs from a render effect.
+  it("returns the same object when nothing changed", () => {
+    const items = [thread("a")];
+    const pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, items);
+    expect(mergeThreadPage(pages, "k", undefined, items)).toBe(pages);
+  });
+
+  it("de-duplicates a thread that moved up to the first page", () => {
+    let pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, [thread("a")]);
+    pages = mergeThreadPage(pages, "k", "cursor-1", [thread("b"), thread("a")]);
+    expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("replySource", () => {
+  const inbound = { id: "in", direction: "inbound" as const };
+  const outbound = { id: "out", direction: "outbound" as const };
+
+  it("answers the most recent inbound message", () => {
+    expect(replySource([inbound, outbound, { id: "in2", direction: "inbound" as const }])?.id).toBe("in2");
+  });
+
+  it("falls back to the last message when the thread is all outbound", () => {
+    expect(replySource([outbound, { id: "out2", direction: "outbound" as const }])?.id).toBe("out2");
+  });
+
+  it("has no answer for an empty thread", () => {
+    expect(replySource([])).toBeUndefined();
+  });
+});
+
+describe("replyRecipients", () => {
+  const message = {
+    fromAddr: "alice@example.com", fromName: "Alice",
+    toAddrs: [{ address: "me@corp.example", name: "Me" }, { address: "bob@example.com", name: "Bob" }],
+    ccAddrs: [{ address: "carol@example.com", name: null }],
+    direction: "inbound" as const,
+  };
+  const own = ["me@corp.example"];
+
+  it("replies to the sender alone", () => {
+    expect(replyRecipients(message, { all: false, ownAddresses: own }))
+      .toEqual({ to: [{ address: "alice@example.com", name: "Alice" }], cc: [] });
+  });
+
+  it("reply-all adds the other recipients", () => {
+    const { to, cc } = replyRecipients(message, { all: true, ownAddresses: own });
+    expect(to).toEqual([{ address: "alice@example.com", name: "Alice" }]);
+    expect(cc.map((entry) => entry.address)).toEqual(["bob@example.com", "carol@example.com"]);
+  });
+
+  // The correctness-critical rule: cc'ing our own mailbox would mail the user
+  // their own reply AND feed it back into the CRM as inbound mail.
+  it("excludes every own address, case-insensitively and whitespace-tolerantly", () => {
+    const { cc } = replyRecipients(
+      {
+        ...message,
+        toAddrs: [{ address: "ME@Corp.Example", name: null }, { address: " other@corp.example ", name: null }],
+        ccAddrs: [{ address: "bob@example.com", name: null }],
+      },
+      { all: true, ownAddresses: ["me@corp.example", "OTHER@corp.example "] },
+    );
+    expect(cc.map((entry) => entry.address)).toEqual(["bob@example.com"]);
+  });
+
+  it("never repeats the sender in cc", () => {
+    const { cc } = replyRecipients(
+      { ...message, ccAddrs: [{ address: "ALICE@example.com", name: null }] },
+      { all: true, ownAddresses: own },
+    );
+    expect(cc.map((entry) => entry.address)).toEqual(["bob@example.com"]);
+  });
+
+  it("de-duplicates a recipient listed on both To and Cc", () => {
+    const { cc } = replyRecipients(
+      { ...message, ccAddrs: [{ address: "BOB@example.com", name: null }] },
+      { all: true, ownAddresses: own },
+    );
+    expect(cc.map((entry) => entry.address)).toEqual(["bob@example.com"]);
+  });
+
+  // Replying to a conversation we started: the answer goes to whoever it was
+  // sent to, never back to ourselves.
+  it("addresses an outbound message's own recipients", () => {
+    const { to, cc } = replyRecipients(
+      { ...message, direction: "outbound" as const, fromAddr: "me@corp.example", fromName: "Me" },
+      { all: true, ownAddresses: own },
+    );
+    expect(to.map((entry) => entry.address)).toEqual(["bob@example.com"]);
+    expect(cc.map((entry) => entry.address)).toEqual(["carol@example.com"]);
+  });
+
+  it("tolerates an account list of none", () => {
+    const { to } = replyRecipients(message, { all: false, ownAddresses: [] });
+    expect(to).toEqual([{ address: "alice@example.com", name: "Alice" }]);
+  });
+});
+
+describe("replySubject / forwardSubject", () => {
+  it("prefixes once", () => {
+    expect(replySubject("Invoice")).toBe("Re: Invoice");
+    expect(replySubject("Re: Invoice")).toBe("Re: Invoice");
+    expect(replySubject("re:Invoice")).toBe("re:Invoice");
+    expect(forwardSubject("Invoice")).toBe("Fwd: Invoice");
+    expect(forwardSubject("Fwd: Invoice")).toBe("Fwd: Invoice");
+    expect(forwardSubject("Fw: Invoice")).toBe("Fw: Invoice");
+  });
+
+  it("handles a subject-less thread", () => {
+    expect(replySubject("")).toBe("Re: ");
+    expect(forwardSubject("  ")).toBe("Fwd: ");
+  });
+});
+
+describe("forwardBody", () => {
+  const message = {
+    fromAddr: "alice@example.com", fromName: "Alice <the> Boss",
+    toAddrs: [{ address: "me@corp.example", name: "Me" }],
+    ccAddrs: [],
+    direction: "inbound" as const,
+    subject: "Renewal", sentAt: "2026-08-19T10:00:00.000Z",
+    bodyHtml: "<p>Hello &amp; welcome</p>", bodyText: "Hello",
+  };
+  // A fixed formatter: the default reads the browser's locale, which is not
+  // something a unit test should be asserting against.
+  const at = () => "19 Aug 2026, 10:00";
+
+  it("quotes the sanitized html under a header block", () => {
+    const body = forwardBody(message, at);
+    expect(body).toContain("---------- Forwarded message ----------");
+    expect(body).toContain("From: Alice &lt;the&gt; Boss &lt;alice@example.com&gt;");
+    expect(body).toContain("Date: 19 Aug 2026, 10:00");
+    expect(body).toContain("Subject: Renewal");
+    expect(body).toContain("To: Me &lt;me@corp.example&gt;");
+    expect(body).toContain("<blockquote><p>Hello &amp; welcome</p></blockquote>");
+  });
+
+  it("omits the Cc line when there was none, and includes it when there was", () => {
+    expect(forwardBody(message, at)).not.toContain("Cc:");
+    expect(forwardBody({ ...message, ccAddrs: [{ address: "bob@example.com", name: null }] }, at))
+      .toContain("Cc: bob@example.com");
+  });
+
+  it("escapes a text-only body and keeps its line breaks", () => {
+    const body = forwardBody({ ...message, bodyHtml: null, bodyText: "line 1\nline <2>" }, at);
+    expect(body).toContain("<blockquote><p>line 1<br>line &lt;2&gt;</p></blockquote>");
+  });
+
+  it("labels a subject-less original", () => {
+    expect(forwardBody({ ...message, subject: "" }, at)).toContain(`Subject: ${NO_SUBJECT_LABEL}`);
+  });
+});
+
+describe("messageFrameCsp", () => {
+  it("blocks everything but same-origin images and inline styles by default", () => {
+    expect(messageFrameCsp("https://crm.example", { remoteImages: false }))
+      .toBe("default-src 'none'; img-src data: 'self' https://crm.example; style-src 'unsafe-inline'");
+  });
+
+  it("widens only img-src when remote images are allowed", () => {
+    expect(messageFrameCsp("https://crm.example", { remoteImages: true }))
+      .toBe("default-src 'none'; img-src data: 'self' https://crm.example https: http:; style-src 'unsafe-inline'");
+  });
+
+  it("omits an unknown origin rather than emitting an empty source", () => {
+    expect(messageFrameCsp("", { remoteImages: false }))
+      .toBe("default-src 'none'; img-src data: 'self'; style-src 'unsafe-inline'");
+  });
+
+  // The sandbox is allow-same-origin and nothing else (plan, 20 Aug ruling):
+  // no policy this builder emits may ever loosen script execution.
+  it("never emits a script source of any kind", () => {
+    for (const remoteImages of [true, false]) {
+      const csp = messageFrameCsp("https://crm.example", { remoteImages });
+      expect(csp).toContain("default-src 'none'");
+      expect(csp).not.toMatch(/allow-scripts|script-src|unsafe-eval/);
+    }
+  });
+});
+
+describe("messageFrameSrcdoc", () => {
+  it("carries the policy in a meta tag and the body verbatim", () => {
+    const csp = messageFrameCsp("https://crm.example", { remoteImages: false });
+    const doc = messageFrameSrcdoc("<p>Hi</p>", csp);
+    expect(doc).toContain(`<meta http-equiv="Content-Security-Policy" content="${csp}">`);
+    expect(doc).toContain('<meta name="referrer" content="no-referrer">');
+    expect(doc).toContain("<body><p>Hi</p></body>");
+  });
+
+  // A CSP is quoted with single quotes only, so it can never terminate the
+  // double-quoted content attribute it sits in.
+  it("emits a policy that cannot break out of its attribute", () => {
+    expect(messageFrameCsp("https://crm.example", { remoteImages: true })).not.toContain('"');
   });
 });

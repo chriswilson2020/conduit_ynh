@@ -23,7 +23,7 @@ import {
   type ComposerLinks,
   type ComposerRecipient,
   type TemplateContext,
-} from "./composer-lib";
+} from "./mail-lib";
 import { RichTextEditor, type RichTextHandle } from "./rich-text";
 import { Button } from "../ui/button";
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog";
@@ -49,7 +49,7 @@ export interface ComposerSeed {
   /**
    * Record links applied to a NEW thread (ignored server-side on a reply,
    * which already has one). Also decides which record an attachment upload is
-   * filed against -- see composer-lib's attachmentTarget, and note that a
+   * filed against -- see mail-lib's attachmentTarget, and note that a
    * seed with no links at all disables the attach control entirely, so a
    * reply opened from a conversation should pass the THREAD's links.
    */
@@ -413,7 +413,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
  * commits on a separator (comma/semicolon/newline), Enter, Tab or blur, and
  * suggests contact addresses as you type.
  *
- * All the parsing lives in composer-lib.ts (and is unit-tested there); this
+ * All the parsing lives in mail-lib.ts (and is unit-tested there); this
  * component is only the wiring.
  */
 function RecipientField({

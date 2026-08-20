@@ -11,7 +11,7 @@ import {
   useUnarchiveMailAccount,
   useUpdateMailAccount,
 } from "../queries";
-import { friendlyMailError, htmlIsBlank } from "../components/mail/composer-lib";
+import { friendlyMailError, htmlIsBlank } from "../components/mail/mail-lib";
 import {
   buildCreateInput,
   buildTestInput,

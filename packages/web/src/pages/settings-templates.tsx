@@ -8,7 +8,7 @@ import {
   useUnarchiveMailTemplate,
   useUpdateMailTemplate,
 } from "../queries";
-import { htmlIsBlank } from "../components/mail/composer-lib";
+import { htmlIsBlank } from "../components/mail/mail-lib";
 import { RichTextEditor } from "../components/mail/rich-text";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
