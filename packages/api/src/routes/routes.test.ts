@@ -366,12 +366,19 @@ describe("files routes", () => {
     const meta = fileMetaSchema.parse(upload.json());
     expect(meta.companyId).toBe(companyId);
     expect(meta.originalName).toBe("hello.txt");
+    // Storage-leg coverage: part.mimetype (the real, harmless mime a genuine
+    // upload declares) must reach the files row unmangled -- the deny-mime
+    // table below only ever seeds a stored mime directly via db.update, so
+    // without this assertion nothing exercises POST's own write of
+    // part.mimetype into the row at all.
+    expect(meta.mime).toBe("text/plain");
 
     const download = await a.inject({
       method: "GET", url: `/api/files/${meta.id}/download`, headers: authHeaders,
     });
     expect(download.statusCode).toBe(200);
     expect(download.body).toBe("hello world");
+    expect(download.headers["content-type"]).toBe("text/plain");
     expect(download.headers["content-disposition"])
       .toBe(`attachment; filename="hello.txt"; filename*=UTF-8''hello.txt`);
     expect(download.headers["x-content-type-options"]).toBe("nosniff");
