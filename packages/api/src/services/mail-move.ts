@@ -80,20 +80,27 @@ import { publish } from "./sse.js";
  * RESIDUAL STATES (accepted, rare, operator-fixable)
  * ---------------------------------------------------------------------------
  * The optimistic write and the server MOVE cannot be one atomic act, so there
- * are states this service can leave behind. All three have the same shape --
- * rows saying `folder` = target with a NULL uid while the message is still in
- * the source folder -- and the same reason they do not self-heal: the source
+ * are states this service can leave behind. The first two have the same shape
+ * -- rows saying `folder` = target with a NULL uid while the message is still
+ * in the source folder -- and the same reason they do not self-heal: the source
  * folder's cursor is already PAST that UID, so no later pass re-sights it
  * there (fetchNewer only walks upwards), and the target folder never had it.
- * Short of a UIDVALIDITY reset re-walking the source folder, they persist.
+ * Short of a UIDVALIDITY reset re-walking the source folder, they persist. The
+ * third is the opposite case and is listed anyway because it looks alarming:
+ * it diverges from neither the server nor itself, and it does self-heal.
  *
  * - A HARD CRASH between the optimistic commit and the queued MOVE (the
  *   process is killed, the machine loses power). The commit landed, the MOVE
- *   never ran, and nothing on restart knows a move was intended. Rare -- the
- *   window is one queue hop wide -- and accepted rather than solved: making it
- *   impossible would need an outbox table and a resume path, which is a lot of
- *   machinery for a state a user fixes by moving the message back in any mail
- *   client, or an operator by letting the folder re-walk.
+ *   never ran, and nothing on restart knows a move was intended. Accepted
+ *   rather than solved: making it impossible would need an outbox table and a
+ *   resume path, which is a lot of machinery for a state a user fixes by moving
+ *   the message back in any mail client, or an operator by letting the folder
+ *   re-walk. The window is not as narrow as "one queue hop" suggests, either:
+ *   it is however long the account's serial loop takes to REACH the queued
+ *   MOVE, which is milliseconds on an idle account but a whole first backfill
+ *   when the loop is mid-pass -- the same wait moveThreads' returned promise
+ *   inherits (see its "THE RETURNED PROMISE WAITS FOR THE SERVER" paragraph,
+ *   and the request cap Task 4's route applies because of it).
  * - A COMPENSATING REVERT THAT ITSELF FAILS (the database went away between
  *   the MOVE's rejection and the revert). Same state, but this one is LOUD:
  *   revertMove logs an error carrying the account, both folder names and the
@@ -137,10 +144,30 @@ export interface MoveThreadsDeps {
 /** Message ids per unrecoverable-divergence log line (see revertMove). */
 const MAX_LOGGED_IDS = 500;
 
+/**
+ * How much of a caught error's text a log line may carry, mirroring
+ * mail-sync.ts's MAX_LAST_ERROR_CHARS (and its `truncate`) for `last_error`.
+ *
+ * The one place it matters here is revertMove's failure, where the error comes
+ * from the DATABASE rather than from a mail server: a drizzle error quotes the
+ * failing statement AND every bind parameter, and this module's statements
+ * carry three parameters per row for a chunk of up to UID_CHUNK rows -- ~1500
+ * of them at full size. Untruncated, one revert failure writes a megabyte of
+ * uuids into the journal, burying the message ids that are the whole point of
+ * the line.
+ */
+const MAX_LOGGED_ERROR_CHARS = 500;
+
 type ResultItem = BulkThreadResult["results"][number];
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** As mail-sync.ts's own `truncate` -- same shape, same trailing ellipsis, so
+ * a truncated line reads the same wherever it was written. */
+function truncate(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
 /**
@@ -779,7 +806,9 @@ async function revertMove(
         // cap is never the thing that truncates -- it is there so raising
         // UID_CHUNK cannot quietly turn this into a megabyte of log.
         messageIds: chunk.slice(0, MAX_LOGGED_IDS).map((row) => row.id),
-        err: errorText(error),
+        // Capped: this error is a DRIVER error, and drizzle's wrapper quotes
+        // the statement and every parameter of it -- see MAX_LOGGED_ERROR_CHARS.
+        err: truncate(errorText(error), MAX_LOGGED_ERROR_CHARS),
       },
       "mail-move: could not revert an optimistic move -- these rows now claim a folder the server refused",
     );
