@@ -515,10 +515,12 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     // ruling's answer to that wait -- bound the SIZE of the request rather than
     // its duration, since a timeout would produce exactly the "claimed a move
     // the server refused" state the move service's compensation exists to
-    // prevent. 50 is a full page of multi-select (the list pages at 50) and no
-    // more, so the longest a single request can hold a connection open is 50
-    // threads' worth of queued MOVEs behind whatever that account's serial loop
-    // is already doing. Enforced HERE rather than in the schema because it is a
+    // prevent. 50 is two of this list's default pages (the thread list asks for
+    // 25 at a time, and accumulates), so the longest a single request can hold a
+    // connection open is 50 threads' worth of queued MOVEs behind whatever that
+    // account's serial loop is already doing -- and a user who has pressed "load
+    // more" once can still select everything on screen and act on it in one
+    // gesture. Enforced HERE rather than in the schema because it is a
     // property of the ACTION, not of the body shape; the NUMBER lives in
     // @conduit/shared beside that schema, because the web client mirrors it (its
     // select-all cap) and a client-side copy that drifted would build requests

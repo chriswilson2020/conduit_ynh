@@ -802,26 +802,39 @@ export function messageFrameSrcdoc(bodyHtml: string, csp: string): string {
  * `anchor` is the row a shift-click ranges FROM: the last row ticked by an
  * ordinary click. It survives a shift-click (see extendThreadSelection) so that
  * widening and narrowing a range works the way every mail client's does.
+ *
+ * `capped` is how many rows the LAST gesture would have ticked, when that was
+ * more than SELECT_ALL_CAP allows -- null whenever nothing was cut short. It is
+ * on the record rather than derived at the render site because only the
+ * operation knows what it was asked for: after the fact, a selection of exactly
+ * 50 out of 80 visible rows is indistinguishable from 50 rows ticked one at a
+ * time. Something has to say so out loud (see selectionLabel), or the gesture
+ * silently does less than the user asked.
  */
 export interface ThreadSelection {
   key: string;
   ids: ReadonlySet<string>;
   anchor: string | null;
+  capped: number | null;
 }
 
 /**
- * The most rows one "select all" may tick.
+ * The most rows ONE SELECTION may hold, whatever gesture built it.
  *
  * THE SERVER'S OWN NUMBER, imported rather than copied: MOVE_ACTION_THREAD_CAP
  * is the per-request cap the bulk route enforces for `trash`/`archive` (api:
  * routes/mail.ts), and it lives in @conduit/shared beside the schema it
  * tightens precisely so this line cannot drift from it -- a local 50 that
  * outlived a server-side change would build selections the route answers with a
- * 400. It is deliberately not the page size: the list ACCUMULATES pages, so
- * "everything visible" grows past one page as soon as "load more" is pressed,
- * and a cap that tracked the page size would quietly stop matching what the
- * button ticks. `hide` could take the outer 200, but one number is easier to
- * hold than a per-action select-all.
+ * 400. It is deliberately not the page size (the route's default page is 25, and
+ * the list ACCUMULATES pages, so "everything visible" grows past any page size
+ * as soon as "load more" is pressed). `hide` could take the outer 200, but one
+ * number is easier to hold than a per-action select-all.
+ *
+ * IT BOUNDS EVERY GESTURE, not just select-all: a shift-range over 80 rows and a
+ * select-all over 80 rows are the same request to the same endpoint, and a cap
+ * that only one of them respected would leave the other's Archive button
+ * disabled with no way back except unticking rows by hand.
  */
 export const SELECT_ALL_CAP = MOVE_ACTION_THREAD_CAP;
 
@@ -835,7 +848,31 @@ const BULK_ACTION_CAPS: Record<BulkThreadActionKind, number> = {
 };
 
 export function emptySelection(key: string): ThreadSelection {
-  return { key, ids: new Set(), anchor: null };
+  return { key, ids: new Set(), anchor: null, capped: null };
+}
+
+/**
+ * Add ids to a selection until the cap is reached, and report what the whole
+ * request would have been.
+ *
+ * `wanted` counts every id the gesture asked for INCLUDING the ones already
+ * ticked, because that is the number the user would count on screen: a range
+ * over 60 rows of which 10 were already ticked is a 60-row gesture, not a
+ * 50-row one. `capped` is that number when it exceeds what was taken, null
+ * otherwise -- so selectionLabel can say "50 of 60" without the caller having
+ * to remember what it asked for.
+ */
+function addUpToCap(
+  base: ReadonlySet<string>, incoming: readonly string[],
+): { ids: Set<string>; capped: number | null } {
+  const ids = new Set(base);
+  let wanted = base.size;
+  for (const id of incoming) {
+    if (!ids.has(id)) wanted += 1;
+    if (ids.size >= SELECT_ALL_CAP) continue;
+    ids.add(id);
+  }
+  return { ids, capped: wanted > ids.size ? wanted : null };
 }
 
 /**
@@ -847,17 +884,29 @@ export function selectionForKey(state: ThreadSelection, key: string): ThreadSele
   return state.key === key ? state : emptySelection(key);
 }
 
-/** Tick or untick one row, and make it the anchor for the next shift-click.
- * The anchor moves even on an UNTICK: it marks where the pointer last was,
- * which is what the next range should start from. */
+/**
+ * Tick or untick one row, and make it the anchor for the next shift-click. The
+ * anchor moves even on an UNTICK: it marks where the pointer last was, which is
+ * what the next range should start from.
+ *
+ * A single tick past the cap is REFUSED rather than swapping some other row out:
+ * the cap is a property of the request, not of this row, and silently dropping a
+ * row the user ticked earlier would be worse than not adding this one. The
+ * refusal is reported through `capped` (cap + 1 asked for), so the bar can
+ * explain a checkbox that did not tick. Unticking always works.
+ */
 export function toggleThreadSelected(
   state: ThreadSelection, key: string, threadId: string,
 ): ThreadSelection {
   const base = selectionForKey(state, key);
   const ids = new Set(base.ids);
-  if (ids.has(threadId)) ids.delete(threadId);
-  else ids.add(threadId);
-  return { key, ids, anchor: threadId };
+  if (ids.has(threadId)) {
+    ids.delete(threadId);
+    return { key, ids, anchor: threadId, capped: null };
+  }
+  if (ids.size >= SELECT_ALL_CAP) return { ...base, key, anchor: threadId, capped: ids.size + 1 };
+  ids.add(threadId);
+  return { key, ids, anchor: threadId, capped: null };
 }
 
 /**
@@ -871,6 +920,11 @@ export function toggleThreadSelected(
  * With no anchor, or when either end is no longer in the list (a refetch can
  * drop a row out from under a selection), this degrades to a plain toggle
  * rather than guessing at a range that no longer exists.
+ *
+ * The range is CAPPED like every other gesture: rows are taken from the anchor
+ * end outwards until the selection is full, and the rest are reported through
+ * `capped` rather than quietly not appearing. Dragging a 200-row range must not
+ * produce a selection no button will send.
  */
 export function extendThreadSelection(
   state: ThreadSelection, key: string, threadId: string, order: readonly string[],
@@ -881,14 +935,13 @@ export function extendThreadSelection(
   if (from < 0 || to < 0) return toggleThreadSelected(base, key, threadId);
   const lo = Math.min(from, to);
   const hi = Math.max(from, to);
-  const ids = new Set(base.ids);
-  for (let index = lo; index <= hi; index += 1) {
-    const id = order[index];
-    if (id !== undefined) ids.add(id);
-  }
+  // From the ANCHOR outwards, so the rows that survive a truncated range are the
+  // ones nearest where the user started rather than whichever end sorts first.
+  const range = order.slice(lo, hi + 1);
+  const { ids, capped } = addUpToCap(base.ids, from > to ? [...range].reverse() : range);
   // The anchor STAYS: a second shift-click re-ranges from the same origin,
   // which is how a user narrows a range they overshot.
-  return { key, ids, anchor: base.anchor };
+  return { key, ids, anchor: base.anchor, capped };
 }
 
 /**
@@ -897,6 +950,11 @@ export function extendThreadSelection(
  *
  * Clearing empties EVERYTHING, including any row that has since scrolled out of
  * the list; the button reads "none selected" afterwards and that must be true.
+ *
+ * Ticking COMPOSES over whatever is already selected and the cap applies to the
+ * total, not to the page: with 40 rows already ticked, "select all" over 80
+ * visible rows adds 10 and says so. Slicing the order to the cap first (the
+ * previous shape) could hand back 90.
  */
 export function toggleAllOnPage(
   state: ThreadSelection, key: string, order: readonly string[],
@@ -904,9 +962,8 @@ export function toggleAllOnPage(
   const base = selectionForKey(state, key);
   const page = order.slice(0, SELECT_ALL_CAP);
   if (page.length > 0 && page.every((id) => base.ids.has(id))) return emptySelection(key);
-  const ids = new Set(base.ids);
-  for (const id of page) ids.add(id);
-  return { key, ids, anchor: base.anchor };
+  const { ids, capped } = addUpToCap(base.ids, order);
+  return { key, ids, anchor: base.anchor, capped };
 }
 
 /** Whether the header checkbox should read as ticked: every row it would tick
@@ -947,6 +1004,36 @@ export function bulkActionBlocked(action: BulkThreadActionKind, count: number): 
   return `Select ${cap} conversations or fewer for this action (${count} selected).`;
 }
 
+/**
+ * What the bar says it is holding: "3 selected", or -- when the last gesture
+ * asked for more rows than one request may carry -- "50 of 80 selected
+ * (per-request limit)".
+ *
+ * The second form exists because the first one is a LIE about a truncated
+ * gesture: a user who shift-clicked to the bottom of an 80-row list and read "50
+ * selected" would reasonably conclude they had mis-clicked, and the difference
+ * between "the app took 50" and "I somehow selected 50" is the difference
+ * between a limit and a bug. It is rendered as ordinary text in the bar rather
+ * than as a title on a disabled control -- a tooltip on something that cannot be
+ * hovered on a touch screen, and is not read out by a screen reader, is not a
+ * message.
+ */
+export function selectionLabel(count: number, capped: number | null): string {
+  return capped === null
+    ? `${count} selected`
+    : `${count} of ${capped} selected (per-request limit)`;
+}
+
+/** How each action reads while it is still running. Present tense and the
+ * count, so a bar that is waiting on a mail server says what it is waiting
+ * for rather than only greying out. */
+export function bulkPendingLabel(action: BulkThreadActionKind, count: number): string {
+  const noun = count === 1 ? "conversation" : "conversations";
+  const verb = action === "hide" ? "Hiding" : action === "trash" ? "Moving" : "Archiving";
+  const tail = action === "trash" ? " to Trash" : "";
+  return `${verb} ${count} ${noun}${tail}\u2026`;
+}
+
 // ---------------------------------------------------------------------------
 // Folder sidebar shaping
 // ---------------------------------------------------------------------------
@@ -954,14 +1041,18 @@ export function bulkActionBlocked(action: BulkThreadActionKind, count: number): 
 /**
  * The fields the sidebar reads off one row of GET /api/mail/accounts/:id/folders
  * (MailAccountFolder). Structural rather than the schema type itself, so a test
- * can state a case in six fields -- the same reason ReplySource exists.
+ * can state a case in five fields -- the same reason ReplySource exists.
+ *
+ * `locked` is deliberately NOT among them: it is the route-computed "the picker
+ * may not switch this off" flag (INBOX and the account's Sent folder), which the
+ * Settings picker needs and the rail has no use for. A field this file does not
+ * read has no business being in the shape it asks callers for.
  */
 export interface SidebarFolderInput {
   folder: string;
   specialUse: SpecialUse | null;
   syncEnabled: boolean;
   selectable: boolean;
-  locked: boolean;
   lastDiscoveredAt: string;
 }
 
@@ -1038,9 +1129,14 @@ function folderRank(row: SidebarFolderRow): number {
  * - `\Noselect` rows hold no messages by definition and are never rows here.
  * - A switched-off folder is out because switching it off is how a user curates
  *   this list.
- * - The account's Trash stays IN even when unsynced, because this CRM's own
- *   Trash action files rows there and they must stay reachable. It is matched
- *   byte for byte, like every other folder comparison in this app.
+ * - THE TRASH TARGET IS ALWAYS IN, and that test comes FIRST -- before the
+ *   stale drop and before the sync-enabled one. This CRM's own Trash action
+ *   files rows there, so it is the one folder the app itself puts mail into;
+ *   dropping it because the server stopped listing it (a rename, or a Trash
+ *   that autoexpunges itself out of existence) would hide mail this app moved,
+ *   with no rail entry left to find it by. It is matched byte for byte, like
+ *   every other folder comparison in this app, and it keeps the "gone" marker
+ *   when it is stale -- listed, and honest about what it is.
  * - A folder still holding unread mail stays in whatever its flag says, so no
  *   unread conversation can become unreachable by a toggle.
  * A folder that is switched off, holds no unread mail and is not the Trash
@@ -1061,8 +1157,10 @@ export function buildFolderRows(
     const unread = unreadByFolder.get(folder.folder) ?? 0;
     const stale = folder.lastDiscoveredAt < newest;
     const isTrashTarget = options.trashFolder !== null && folder.folder === options.trashFolder;
-    if (stale && unread === 0) continue;
-    if (!folder.syncEnabled && !isTrashTarget && unread === 0) continue;
+    if (!isTrashTarget) {
+      if (stale && unread === 0) continue;
+      if (!folder.syncEnabled && unread === 0) continue;
+    }
     rows.push({ folder: folder.folder, unread, specialUse: folder.specialUse, stale });
   }
   return rows.sort((a, b) => {
@@ -1227,6 +1325,61 @@ export function bulkErrorMessage(error: unknown): string {
   }
   if (error instanceof ResponseShapeError) return error.message;
   return BULK_TIMEOUT_MESSAGE;
+}
+
+// ---------------------------------------------------------------------------
+// Move targets (the Settings picker's Trash/Archive overrides)
+// ---------------------------------------------------------------------------
+
+/** The two columns the override fields write, as the account row carries them:
+ * a stored folder name, or NULL for "nothing has been set or detected". */
+export interface MoveTargetAccount {
+  trashFolder: string | null;
+  archiveFolder: string | null;
+}
+
+/** A PATCH body carrying only the fields that were actually edited. Absent is
+ * not the same as null here: absent leaves the column alone, null clears it back
+ * to "detect this for me". */
+export interface MoveTargetPatch {
+  trashFolder?: string | null;
+  archiveFolder?: string | null;
+}
+
+/**
+ * What to send when the Trash/Archive override fields are saved.
+ *
+ * `null` for a field means UNTOUCHED -- the user has not typed in it this
+ * session -- and is the whole point of this function. The form used to seed both
+ * fields from the account at mount and send both on every save, which quietly
+ * destroyed data on a very ordinary sequence: open the picker on an account with
+ * no Trash set, leave that field alone, type an Archive folder, save. Between
+ * the mount and the save a discovery pass fills `trash_folder` from the server's
+ * SPECIAL-USE attributes (api: mail-folders.ts's fillMoveTargets), the field is
+ * still showing the empty string it was seeded with, and the save sends
+ * `trashFolder: null` -- wiping a target the user never looked at, and with it
+ * the account's ability to trash anything until the next pass.
+ *
+ * So: an untouched field is not in the patch at all. A touched one is trimmed;
+ * blank means null ("detect for me"), which is a real edit and IS sent. A
+ * touched field that ends up matching what the account already holds is dropped
+ * too -- typing a character and deleting it again is not an edit, and the same
+ * rule keeps the Save button honest about whether there is anything to save.
+ */
+export function moveTargetPatch(
+  trash: string | null, archive: string | null, account: MoveTargetAccount,
+): MoveTargetPatch {
+  const patch: MoveTargetPatch = {};
+  const edited = (draft: string | null, stored: string | null): string | null | undefined => {
+    if (draft === null) return undefined;
+    const next = draft.trim() === "" ? null : draft.trim();
+    return next === stored ? undefined : next;
+  };
+  const nextTrash = edited(trash, account.trashFolder);
+  if (nextTrash !== undefined) patch.trashFolder = nextTrash;
+  const nextArchive = edited(archive, account.archiveFolder);
+  if (nextArchive !== undefined) patch.archiveFolder = nextArchive;
+  return patch;
 }
 
 /**

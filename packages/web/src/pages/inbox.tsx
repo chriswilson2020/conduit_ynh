@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
-import { useMailAccounts } from "../queries";
+import type { BulkThreadActionKind } from "@conduit/shared";
+import { useBulkThreadAction, useMailAccounts } from "../queries";
+import { useLatest } from "../hooks";
 import { BulkBar, BulkResult, type BulkOutcome } from "../components/mail/bulk-bar";
 import { Composer } from "../components/mail/composer";
 import { Conversation } from "../components/mail/conversation";
@@ -8,10 +10,12 @@ import { FolderSidebar } from "../components/mail/folder-sidebar";
 import { ThreadList, type ThreadListFilters, type ThreadToggle } from "../components/mail/thread-list";
 import {
   allOnPageSelected,
+  bulkErrorMessage,
   emptySelection,
   extendThreadSelection,
   selectedThreadIds,
   selectionForKey,
+  summarizeBulkResult,
   threadFilterKey,
   toggleAllOnPage,
   toggleThreadSelected,
@@ -59,7 +63,15 @@ export function InboxPage() {
   // as a filter: an archived account has stopped syncing, so filtering by it
   // shows a frozen slice of history nobody asked for. Its threads still
   // render (and still carry its chip) under every other filter.
-  const ownActive = (accounts?.own ?? []).filter((account) => account.archivedAt === null);
+  //
+  // Memoised on the query's own data identity, which React Query only replaces
+  // when the accounts actually change: this array is a prop of the folder rail,
+  // whose sections are memoised, and a fresh array on every keystroke in the
+  // filter bar would re-render every account's folder list for nothing.
+  const ownActive = useMemo(
+    () => (accounts?.own ?? []).filter((account) => account.archivedAt === null),
+    [accounts],
+  );
   const filterAccounts = [
     ...ownActive.map((account) => ({ id: account.id, label: account.label, email: account.email })),
     ...(accounts?.others ?? []),
@@ -111,11 +123,12 @@ export function InboxPage() {
   const selection = selectionForKey(selectionState, filterKey);
   const [rows, setRows] = useState<readonly string[]>([]);
 
-  // The key as of this render, for the toggle callbacks below. They must be
-  // STABLE -- every memoised row takes the one the list derives from them -- so
-  // the key they act under travels through a ref rather than a dependency.
-  const keyRef = useRef(filterKey);
-  keyRef.current = filterKey;
+  // The key as of the last committed render, for the toggle callbacks below.
+  // They must be STABLE -- every memoised row takes the one the list derives
+  // from them -- so the key they act under travels through a ref rather than a
+  // dependency. Written from an effect (see useLatest), never during render: a
+  // render React discards must not be able to move it.
+  const keyRef = useLatest(filterKey);
 
   const toggleThread = useCallback((threadId: string, { shift, order }: ThreadToggle) => {
     setSelectionState((current) => (shift
@@ -150,8 +163,32 @@ export function InboxPage() {
   const [outcome, setOutcome] = useState<{ key: string; outcome: BulkOutcome } | null>(null);
   const handleOutcome = useCallback((next: BulkOutcome | null) => {
     setOutcome(next === null ? null : { key: keyRef.current, outcome: next });
-  }, []);
+  }, [keyRef]);
+  const dismissOutcome = useCallback(() => setOutcome(null), []);
   const shownOutcome = outcome !== null && outcome.key === filterKey ? outcome.outcome : null;
+
+  /**
+   * THE BULK MUTATION LIVES HERE, not in the bar, and this is not tidiness.
+   *
+   * A mutation observer fires the callbacks passed to `mutate` only while the
+   * component that called it still has listeners -- i.e. only while it is
+   * mounted (@tanstack/query-core's mutationObserver's own `hasListeners`
+   * guard). The bar unmounts the moment the selection clears, which is what a
+   * completed action does, so a mutation owned by the bar is one whose result
+   * can be dropped on the floor whenever the two race. Owned by the page, which
+   * outlives every selection, the callbacks always run.
+   *
+   * `isPending` is likewise a fact about the PAGE. Held in the bar, it was
+   * reborn `false` with each new bar: clearing the selection mid-flight and
+   * ticking another row produced a bar that cheerfully offered Trash again while
+   * the first request was still queued behind an account's serial sync loop --
+   * two moves of overlapping rows, the second acting on whatever the first had
+   * left behind. Everything that can change the request or the view it was made
+   * in is disabled while it runs (below).
+   */
+  const bulk = useBulkThreadAction();
+  const pendingAction = bulk.isPending ? bulk.variables?.action ?? null : null;
+  const busy = pendingAction !== null;
 
   // Reference-guarded so a re-render that produced the same rows cannot loop
   // through this back into a new state object.
@@ -161,6 +198,43 @@ export function InboxPage() {
   }, []);
 
   const selectedThreads = selectedThreadIds(selection, filterKey, rows);
+
+  /**
+   * Send one bulk action for the current selection.
+   *
+   * The order of the two callbacks' effects is what makes the feedback
+   * survivable: the outcome lands in THIS component's state, and only then is
+   * the selection dropped (which unmounts the bar). Nothing here invites a
+   * retry -- for `trash` a blind second attempt would move whatever is now in
+   * the source folder -- so the hook refetches from onSettled instead.
+   */
+  const runBulk = useCallback((action: BulkThreadActionKind) => {
+    if (selectedThreads.length === 0) return;
+    handleOutcome(null);
+    bulk.mutate(
+      {
+        threadIds: [...selectedThreads],
+        // `hide` ignores folder server-side either way; sending it only for the
+        // two move actions keeps the request saying exactly what it means. With
+        // no folder filter there is no folder view, so the request carries the
+        // whole-thread mode instead (see BulkBarProps.folder).
+        ...(folder !== null && action !== "hide" ? { folder } : {}),
+        action,
+      },
+      {
+        onSuccess: (result) => {
+          handleOutcome({ kind: "summary", summary: summarizeBulkResult(action, result.results) });
+          clearSelection();
+        },
+        // A throw is not necessarily a failed action: a proxy 504 means the
+        // ANSWER was lost while the queued moves carry on (routes/mail.ts).
+        onError: (error) => {
+          handleOutcome({ kind: "failure", message: bulkErrorMessage(error) });
+          clearSelection();
+        },
+      },
+    );
+  }, [bulk, clearSelection, folder, handleOutcome, selectedThreads]);
 
   // Stable, so the memoised rows in thread-list can bail out: a new closure
   // here every render would defeat their shallow comparison one prop before it
@@ -178,17 +252,21 @@ export function InboxPage() {
    * match a thread whose INBOX message is on one account and whose folder
    * message is on another), which is exactly what this sends it. With a single
    * account the account term is redundant and harmless.
+   *
+   * "All mail" (accountId null) clears BOTH. It is the row that says
+   * "everything", and leaving the account filter pinned from whichever folder
+   * was clicked before would answer it with one account's mail -- a filter the
+   * user did not set and, having just asked for everything, would not think to
+   * look for.
+   *
+   * Two arguments rather than one object: this identity is a prop of every
+   * memoised folder button in the rail, and an object built at the call site
+   * would be a new one on every render.
    */
-  function chooseFolder(choice: { accountId: string; folder: string } | null) {
-    if (choice === null) {
-      setFolder(null);
-      return;
-    }
-    setFolder(choice.folder);
-    if (filterAccounts.some((account) => account.id === choice.accountId)) {
-      setAccountChoice(choice.accountId);
-    }
-  }
+  const chooseFolder = useCallback((choiceAccountId: string | null, choiceFolder: string | null) => {
+    setFolder(choiceFolder);
+    setAccountChoice(choiceAccountId ?? ALL_ACCOUNTS);
+  }, []);
 
   return (
     <div data-testid="inbox" className="flex flex-col gap-4">
@@ -207,10 +285,18 @@ export function InboxPage() {
           page's own heading row. */}
       <div className="grid gap-4 lg:h-[calc(100vh-11rem)] lg:grid-cols-[minmax(0,11rem)_minmax(0,24rem)_minmax(0,1fr)]">
         <div className="min-w-0 lg:overflow-y-auto">
+          {/* Every control that could change WHICH rows are selected, or which
+              view they were selected in, is disabled while a bulk request is in
+              flight: the request carries ids and a folder that were true when it
+              was sent, and the answer has to be readable against the same view.
+              (The request itself is unaffected either way -- it is already at the
+              server -- but a folder switched underneath it would clear the
+              selection and file the result under a view nobody is looking at.) */}
           <FolderSidebar
             accounts={ownActive}
             folder={folder}
             accountId={accountId === ALL_ACCOUNTS ? null : accountId}
+            disabled={busy}
             onSelect={chooseFolder}
           />
         </div>
@@ -219,7 +305,7 @@ export function InboxPage() {
           <div className="flex flex-wrap items-center gap-2">
             {filterAccounts.length > 1 && (
               <div className="w-48">
-                <Select value={accountId} onValueChange={setAccountChoice}>
+                <Select value={accountId} onValueChange={setAccountChoice} disabled={busy}>
                   <SelectTrigger ariaLabel="Account" testId="filter-account">
                     <SelectValue />
                   </SelectTrigger>
@@ -232,41 +318,50 @@ export function InboxPage() {
                 </Select>
               </div>
             )}
-            <FilterToggle testId="filter-unread" label="Unread" on={unread} onChange={setUnread} />
-            <FilterToggle testId="filter-unlinked" label="Unlinked" on={unlinked} onChange={setUnlinked} />
+            <FilterToggle
+              testId="filter-unread" label="Unread" on={unread} disabled={busy} onChange={setUnread}
+            />
+            <FilterToggle
+              testId="filter-unlinked" label="Unlinked" on={unlinked} disabled={busy} onChange={setUnlinked}
+            />
             {/* "Hidden", not "Archived": since Phase 4.1 an Archive is a real
                 IMAP move, and this filter is the CRM-side "Hide in CRM" state
                 (mail_threads.archived_at), which is a different thing. The
                 testid predates the rename and stays as it is. */}
-            <FilterToggle testId="filter-archived" label="Hidden" on={hidden} onChange={setHidden} />
+            <FilterToggle
+              testId="filter-archived" label="Hidden" on={hidden} disabled={busy} onChange={setHidden}
+            />
           </div>
 
           {selectedThreads.length > 0 && (
             <BulkBar
-              threadIds={selectedThreads}
-              // The current view's folder, or nothing at all in the unfiltered
-              // list -- the mode selector; see BulkBarProps.folder.
-              folder={folder ?? undefined}
-              onOutcome={handleOutcome}
-              onDone={clearSelection}
+              count={selectedThreads.length}
+              capped={selection.capped}
+              pendingAction={pendingAction}
+              onRun={runBulk}
               onClear={clearSelection}
             />
           )}
 
           {/* Outside the selection gate above, on purpose: this is what the
               action LEFT BEHIND, and by the time it exists the selection is
-              already empty. */}
-          {shownOutcome !== null && <BulkResult outcome={shownOutcome} />}
+              already empty. Mounted unconditionally so its live region is
+              announced when it fills -- see BulkResult. */}
+          <BulkResult outcome={shownOutcome} onDismiss={dismissOutcome} />
 
           <ThreadList
             filters={filters}
             onSelect={select}
             selectedId={selectedId ?? null}
             selectable
+            selectionDisabled={busy}
             selectedIds={selection.ids}
             onToggleThread={toggleThread}
             onToggleAll={toggleAll}
             allSelected={allOnPageSelected(selection, filterKey, rows)}
+            // Neither none nor all: the header box reads as a dash rather than
+            // claiming one of the two.
+            someSelected={selectedThreads.length > 0}
             onRowsChange={handleRows}
             // An inbox with no mail account is not an empty inbox, it is an
             // unconfigured one (spec: "Empty state points at Settings ->
@@ -304,11 +399,12 @@ export function InboxPage() {
 }
 
 function FilterToggle({
-  testId, label, on, onChange,
+  testId, label, on, disabled = false, onChange,
 }: {
   testId: string;
   label: string;
   on: boolean;
+  disabled?: boolean;
   onChange: (next: boolean) => void;
 }) {
   return (
@@ -316,6 +412,7 @@ function FilterToggle({
       variant={on ? "default" : "outline"}
       data-testid={testId}
       aria-pressed={on}
+      disabled={disabled}
       onClick={() => onChange(!on)}
     >
       {label}

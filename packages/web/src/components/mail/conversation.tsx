@@ -289,19 +289,27 @@ export function Conversation({ threadId }: ConversationProps) {
         </div>
       </div>
 
-      {(moveSummary !== null || moveFailure !== null) && (
-        <div data-testid="conversation-move-result" role="status" aria-live="polite" className="flex flex-col gap-1">
-          {moveFailure !== null && <p className="text-sm text-red-600">{moveFailure}</p>}
-          {moveSummary !== null && (
-            <>
-              <p className="text-sm text-slate-600">{moveSummary.headline}</p>
-              {moveSummary.notes.map((note) => (
-                <p key={note} className="text-xs text-slate-500">{note}</p>
-              ))}
-            </>
-          )}
-        </div>
-      )}
+      {/* The live region is MOUNTED WHETHER OR NOT IT HAS ANYTHING TO SAY, and
+          only its contents come and go: a role="status" element inserted into
+          the DOM together with its text is announced unreliably, because
+          several screen readers only watch the regions that existed when they
+          took their snapshot. Empty, it occupies nothing. */}
+      <div
+        data-testid="conversation-move-result"
+        role="status"
+        aria-live="polite"
+        className="flex flex-col gap-1 empty:hidden"
+      >
+        {moveFailure !== null && <p className="text-sm text-red-600">{moveFailure}</p>}
+        {moveSummary !== null && (
+          <>
+            <p className="text-sm text-slate-600">{moveSummary.headline}</p>
+            {moveSummary.notes.map((note) => (
+              <p key={note} className="text-xs text-slate-500">{note}</p>
+            ))}
+          </>
+        )}
+      </div>
 
       <LinkPanel thread={thread} dealSuggestions={data.dealSuggestions} />
 

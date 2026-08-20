@@ -8,13 +8,16 @@ import {
   buildFolderRows,
   bulkActionBlocked,
   bulkErrorMessage,
+  bulkPendingLabel,
   BULK_TIMEOUT_MESSAGE,
   emptySelection,
   extendThreadSelection,
   messageIsInTrash,
+  moveTargetPatch,
   newestDiscovery,
   selectedThreadIds,
   selectionForKey,
+  selectionLabel,
   SELECT_ALL_CAP,
   summarizeBulkResult,
   toggleAllOnPage,
@@ -875,12 +878,74 @@ describe("thread selection", () => {
 
   // The route caps trash/archive at 50 threads per request, so select-all
   // stops there rather than building a selection the server would 400.
-  it("caps select-all at the move cap", () => {
+  it("caps select-all at the move cap, and says what was asked for", () => {
     const many = Array.from({ length: 120 }, (_value, index) => `t${index}`);
     const selection = toggleAllOnPage(emptySelection(KEY), KEY, many);
     expect(selection.ids.size).toBe(SELECT_ALL_CAP);
     expect(selection.ids.has("t0")).toBe(true);
     expect(selection.ids.has(`t${SELECT_ALL_CAP}`)).toBe(false);
+    // The truncation is REPORTED, not silent: 50 of the 120 asked for.
+    expect(selection.capped).toBe(120);
+  });
+
+  // The cap belongs to the REQUEST, so it applies to the total -- not to the
+  // page, which composing over an existing selection would otherwise exceed.
+  it("composes select-all over an existing selection without passing the cap", () => {
+    const many = Array.from({ length: 120 }, (_value, index) => `t${index}`);
+    // 40 rows ticked from the far end of the list, then "select all".
+    let selection = emptySelection(KEY);
+    for (const id of many.slice(80, 120)) selection = toggleThreadSelected(selection, KEY, id);
+    expect(selection.ids.size).toBe(40);
+    selection = toggleAllOnPage(selection, KEY, many);
+    expect(selection.ids.size).toBe(SELECT_ALL_CAP);
+    // The 40 that were already ticked are still ticked -- the gesture ADDS.
+    expect(selection.ids.has("t119")).toBe(true);
+    expect(selection.capped).toBe(120);
+  });
+
+  it("caps a shift-range too, keeping the rows nearest the anchor", () => {
+    const many = Array.from({ length: 120 }, (_value, index) => `t${index}`);
+    let selection = toggleThreadSelected(emptySelection(KEY), KEY, "t10");
+    selection = extendThreadSelection(selection, KEY, "t119", many);
+    expect(selection.ids.size).toBe(SELECT_ALL_CAP);
+    // Taken from the anchor outwards: t10 through t59, not the other end.
+    expect(selection.ids.has("t10")).toBe(true);
+    expect(selection.ids.has(`t${10 + SELECT_ALL_CAP - 1}`)).toBe(true);
+    expect(selection.ids.has(`t${10 + SELECT_ALL_CAP}`)).toBe(false);
+    expect(selection.capped).toBe(110);
+  });
+
+  it("ranges backwards from the anchor keep the rows nearest it as well", () => {
+    const many = Array.from({ length: 120 }, (_value, index) => `t${index}`);
+    let selection = toggleThreadSelected(emptySelection(KEY), KEY, "t119");
+    selection = extendThreadSelection(selection, KEY, "t0", many);
+    expect(selection.ids.size).toBe(SELECT_ALL_CAP);
+    expect(selection.ids.has("t119")).toBe(true);
+    expect(selection.ids.has("t70")).toBe(true);
+    expect(selection.ids.has("t69")).toBe(false);
+  });
+
+  it("refuses one tick past the cap rather than swapping a row out, and reports it", () => {
+    const many = Array.from({ length: 60 }, (_value, index) => `t${index}`);
+    let selection = toggleAllOnPage(emptySelection(KEY), KEY, many);
+    expect(selection.ids.size).toBe(SELECT_ALL_CAP);
+    selection = toggleThreadSelected(selection, KEY, "t59");
+    expect(selection.ids.size).toBe(SELECT_ALL_CAP);
+    expect(selection.ids.has("t59")).toBe(false);
+    expect(selection.ids.has("t0")).toBe(true);
+    expect(selection.capped).toBe(SELECT_ALL_CAP + 1);
+    // Unticking always works, and clears the notice with it.
+    selection = toggleThreadSelected(selection, KEY, "t0");
+    expect(selection.ids.size).toBe(SELECT_ALL_CAP - 1);
+    expect(selection.capped).toBeNull();
+  });
+
+  it("leaves `capped` null for gestures that fit", () => {
+    let selection = toggleAllOnPage(emptySelection(KEY), KEY, rows);
+    expect(selection.capped).toBeNull();
+    selection = toggleThreadSelected(emptySelection(KEY), KEY, "b");
+    expect(selection.capped).toBeNull();
+    expect(extendThreadSelection(selection, KEY, "e", rows).capped).toBeNull();
   });
 
   it("returns the selected ids in visible order, dropping rows that have gone", () => {
@@ -913,7 +978,7 @@ describe("buildFolderRows", () => {
     name: string,
     extra: Partial<SidebarFolderInput> = {},
   ): SidebarFolderInput => ({
-    folder: name, specialUse: null, syncEnabled: true, selectable: true, locked: false,
+    folder: name, specialUse: null, syncEnabled: true, selectable: true,
     lastDiscoveredAt: NOW, ...extra,
   });
 
@@ -921,7 +986,7 @@ describe("buildFolderRows", () => {
     const rows = buildFolderRows(
       [
         folder("Zebra"), folder("Trash", { specialUse: "trash", syncEnabled: false }),
-        folder("Apples"), folder("INBOX"), folder("Sent", { specialUse: "sent", locked: true }),
+        folder("Apples"), folder("INBOX"), folder("Sent", { specialUse: "sent" }),
         folder("Archive", { specialUse: "archive" }), folder("Junk", { specialUse: "junk", syncEnabled: false }),
         folder("Drafts", { specialUse: "drafts" }),
       ],
@@ -986,6 +1051,24 @@ describe("buildFolderRows", () => {
       { trashFolder: null },
     );
     expect(rows.map((row) => [row.folder, row.stale])).toEqual([["INBOX", false], ["Ghost", true]]);
+  });
+
+  // THE TRASH CARVE-OUT OUTRANKS THE STALE DROP. A Trash target that vanished
+  // from the server and holds no unread mail is the one row that must survive
+  // both rules: this CRM's own Trash action files mail there, and a rail with no
+  // entry for it is a rail that hides mail the app itself moved.
+  it("keeps a vanished, unsynced, zero-unread Trash target -- marked as gone", () => {
+    const rows = buildFolderRows(
+      [
+        folder("INBOX"),
+        folder("Trash", { specialUse: "trash", syncEnabled: false, lastDiscoveredAt: THEN }),
+        folder("Gone", { lastDiscoveredAt: THEN }),
+      ],
+      [],
+      { trashFolder: "Trash" },
+    );
+    expect(rows.map((row) => [row.folder, row.stale, row.unread]))
+      .toEqual([["INBOX", false, 0], ["Trash", true, 0]]);
   });
 
   it("treats a single discovery moment as nothing being stale", () => {
@@ -1079,6 +1162,101 @@ describe("summarizeBulkResult", () => {
 
   it("does not point at Settings for reasons Settings cannot fix", () => {
     expect(summarizeBulkResult("trash", [fail("1", "server_refused", "no")]).settingsLink).toBe(false);
+  });
+
+  // One response can carry fifty different sentences from a mail server having
+  // a bad day, and each of them can be a paragraph. Both bounds are enforced.
+  it("shows at most three distinct refusals, each truncated with an ellipsis", () => {
+    const long = `${"x".repeat(200)}`;
+    const summary = summarizeBulkResult("trash", [
+      fail("1", "server_refused", long),
+      fail("2", "server_refused", "second"),
+      fail("3", "server_refused", "third"),
+      fail("4", "server_refused", "fourth"),
+      fail("5", "server_refused", "fifth"),
+    ]);
+    const note = summary.notes[0] ?? "";
+    // The count is honest about all five even though three are quoted.
+    expect(note).toContain("5 were refused by the mail server");
+    expect(note).toContain("second");
+    expect(note).toContain("third");
+    expect(note).not.toContain("fourth");
+    expect(note).not.toContain("fifth");
+    // 120 characters of the long one, then the ellipsis -- not 200.
+    expect(note).toContain(`${"x".repeat(120)}\u2026`);
+    expect(note).not.toContain("x".repeat(121));
+  });
+
+  // Not a case any UI can currently produce (the route rejects an empty
+  // threadIds array), but the summary must not invent an outcome for it.
+  it("summarizes an empty result set as nothing having happened", () => {
+    const summary = summarizeBulkResult("archive", []);
+    expect(summary).toMatchObject({ moved: 0, skipped: 0, failed: 0, notes: [], settingsLink: false });
+    expect(summary.headline).toBe("Nothing archived.");
+  });
+});
+
+describe("selectionLabel", () => {
+  it("counts what is selected, and names the limit when a gesture was cut short", () => {
+    expect(selectionLabel(3, null)).toBe("3 selected");
+    expect(selectionLabel(50, 120)).toBe("50 of 120 selected (per-request limit)");
+  });
+});
+
+describe("bulkPendingLabel", () => {
+  it("says what is happening, in the action's own words", () => {
+    expect(bulkPendingLabel("archive", 3)).toBe("Archiving 3 conversations\u2026");
+    expect(bulkPendingLabel("trash", 2)).toBe("Moving 2 conversations to Trash\u2026");
+    expect(bulkPendingLabel("hide", 1)).toBe("Hiding 1 conversation\u2026");
+  });
+});
+
+describe("moveTargetPatch", () => {
+  const account = { trashFolder: "Trash", archiveFolder: null };
+
+  it("sends nothing at all when neither field was touched", () => {
+    expect(moveTargetPatch(null, null, account)).toEqual({});
+  });
+
+  /**
+   * The round trip this function exists for, in one test.
+   *
+   * The form is opened on an account with no Archive target, the user types one
+   * and saves -- and BETWEEN those two moments a discovery pass fills in the
+   * Trash target from the server's SPECIAL-USE attributes. The save must not
+   * carry an opinion about Trash: the old shape seeded both fields at mount and
+   * sent both, so it sent `trashFolder: null` and wiped what discovery had just
+   * detected.
+   */
+  it("leaves an untouched field alone even after the account gained a value", () => {
+    const before = { trashFolder: null, archiveFolder: null };
+    // Opened against `before`; only Archive is typed into.
+    const patch = moveTargetPatch(null, "Archive", before);
+    expect(patch).toEqual({ archiveFolder: "Archive" });
+    expect("trashFolder" in patch).toBe(false);
+    // The same edit, saved after a pass detected a Trash folder: still silent
+    // about Trash.
+    const patchAfterDiscovery = moveTargetPatch(null, "Archive", { trashFolder: "Trash", archiveFolder: null });
+    expect(patchAfterDiscovery).toEqual({ archiveFolder: "Archive" });
+  });
+
+  it("sends null for a field cleared on purpose -- the detect-for-me state", () => {
+    expect(moveTargetPatch("", null, account)).toEqual({ trashFolder: null });
+    expect(moveTargetPatch("   ", null, account)).toEqual({ trashFolder: null });
+  });
+
+  it("trims what it sends, and drops an edit that changed nothing", () => {
+    expect(moveTargetPatch("  Bin  ", null, account)).toEqual({ trashFolder: "Bin" });
+    // Typed and retyped the same value: not an edit.
+    expect(moveTargetPatch("Trash", null, account)).toEqual({});
+    expect(moveTargetPatch(" Trash ", null, account)).toEqual({});
+    // Clearing a field that is already null is not an edit either.
+    expect(moveTargetPatch(null, "", account)).toEqual({});
+  });
+
+  it("sends both when both were edited", () => {
+    expect(moveTargetPatch("Bin", "Filed", account))
+      .toEqual({ trashFolder: "Bin", archiveFolder: "Filed" });
   });
 });
 

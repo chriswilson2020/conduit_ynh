@@ -236,14 +236,13 @@ search, and the "Hide in CRM" state remains orthogonal.
   moment on every folder it sees, so no threshold is needed). A stale folder is DROPPED from
   the sidebar unless the CRM still holds unread mail in it, in which case it stays, is marked
   ("gone", italic) and stays clickable — mail this CRM holds must not become unreachable
-  because a mailbox vanished from the server. The carve-out is deliberately narrower than the
-  Trash one and is applied FIRST, so one case follows from it: an account whose `trash_folder`
-  has gone from the server AND holds no unread mail loses its sidebar row, even though the
-  CRM's own Trash action files rows there. Those threads are still reachable — global search,
-  every record's Mail tab, and the unfiltered list all show them, and the conversation's "in
-  Trash" chip still names the folder — and the alternative (a permanent row for a mailbox the
-  server no longer has) would be a dead click into an empty view. Re-creating the folder, or
-  pointing the account's Trash override at a live one in Settings, restores the row.
+  because a mailbox vanished from the server. **Precedence (coordinator ruling): the Trash
+  carve-out WINS.** The `trash_folder` test runs before the stale drop and before the
+  sync-enabled one, so an account's own Trash target is listed even when it has vanished from
+  the server and holds no unread mail — marked "gone", and still clickable. It is the one
+  folder this app itself files mail into, so a rail with no row for it would hide mail the
+  CRM moved there, and "the folder your Trash button writes to is missing" is a thing the
+  sidebar should say rather than a row it should silently omit.
 - **Multi-select**: checkbox per row (visible on hover/when any selected), shift-click
   ranges, select-all-on-page; a bulk-action bar (Archive / Trash / Hide in CRM) with
   per-thread failure toasts from the bulk result. Selection clears on filter/folder change.

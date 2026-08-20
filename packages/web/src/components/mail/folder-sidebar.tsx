@@ -1,8 +1,21 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import { clsx } from "clsx";
 import type { MailAccountWithSyncStats, MailUnreadFolderCount } from "@conduit/shared";
 import { useMailFolders, useUnreadMailCountsByFolder } from "../../queries";
-import { buildFolderRows, type SidebarFolderRow } from "./mail-lib";
+import { buildFolderRows } from "./mail-lib";
+
+/**
+ * Picking a folder names the account it belongs to as well: with two accounts,
+ * "INBOX" alone would mean both of them (see the section note). Both arguments
+ * are null for the "All mail" row, which clears the folder AND the account
+ * filter -- it is the row that means "everything".
+ *
+ * TWO ARGUMENTS, NOT ONE OBJECT, because this function's identity is a prop of
+ * every memoised row below: a `{ accountId, folder }` literal built at the call
+ * site would be a new object on every render and defeat the memo it is passed
+ * through.
+ */
+export type FolderChoice = (accountId: string | null, folder: string | null) => void;
 
 export interface FolderSidebarProps {
   /** The user's OWN, non-archived accounts. Folders are owner-only server-side
@@ -14,10 +27,15 @@ export interface FolderSidebarProps {
   folder: string | null;
   /** The account the current folder view is scoped to, when it is scoped. */
   accountId: string | null;
-  /** Picking a folder names the account it belongs to as well: with two
-   * accounts, "INBOX" alone would mean both of them (see the section note). */
-  onSelect: (choice: { accountId: string; folder: string } | null) => void;
+  /** Held still while the inbox is waiting on a bulk request: changing the view
+   * mid-flight would clear the selection that request was made from. */
+  disabled?: boolean;
+  onSelect: FolderChoice;
 }
+
+/** One stable empty array, so a render before the counts arrive does not hand
+ * every section a new `[]` and re-render all of them. */
+const NO_COUNTS: readonly MailUnreadFolderCount[] = [];
 
 /**
  * The inbox's folder rail: one section per own account, each listing that
@@ -48,7 +66,7 @@ export function FolderSidebar(props: FolderSidebarProps) {
   return <FolderRail {...props} />;
 }
 
-function FolderRail({ accounts, folder, accountId, onSelect }: FolderSidebarProps) {
+function FolderRail({ accounts, folder, accountId, disabled = false, onSelect }: FolderSidebarProps) {
   // One query for every account's badges, mounted once here rather than per
   // section: it is a single grouped request, and the sections join to it by
   // name.
@@ -65,17 +83,21 @@ function FolderRail({ accounts, folder, accountId, onSelect }: FolderSidebarProp
         // what this row is: no folder filter at all.
         testId="folder-view-all"
         unread={null}
+        accountId={null}
+        folder={null}
         active={folder === null}
-        onClick={() => onSelect(null)}
+        disabled={disabled}
+        onSelect={onSelect}
       />
       {accounts.map((account) => (
         <AccountFolders
           key={account.id}
           account={account}
-          counts={counts ?? []}
+          counts={counts ?? NO_COUNTS}
           showLabel={accounts.length > 1}
           folder={folder}
           accountId={accountId}
+          disabled={disabled}
           onSelect={onSelect}
         />
       ))}
@@ -89,16 +111,23 @@ function FolderRail({ accounts, folder, accountId, onSelect }: FolderSidebarProp
  * and hooks cannot be called in a loop, so the account that is not on screen
  * mounts no observer -- the same argument thread-list.tsx's per-kind link chips
  * make.
+ *
+ * MEMOISED, like the thread rows and for the same reason: this rail sits beside
+ * the busiest list in the app and re-renders with it, while its own inputs
+ * change only when mail arrives. Every prop is either a value React Query hands
+ * out (stable between refetches), a primitive, or the caller's stable callback,
+ * so the default shallow comparison is the right one.
  */
-function AccountFolders({
-  account, counts, showLabel, folder, accountId, onSelect,
+const AccountFolders = memo(function AccountFolders({
+  account, counts, showLabel, folder, accountId, disabled, onSelect,
 }: {
   account: MailAccountWithSyncStats;
   counts: readonly MailUnreadFolderCount[];
   showLabel: boolean;
   folder: string | null;
   accountId: string | null;
-  onSelect: (choice: { accountId: string; folder: string } | null) => void;
+  disabled: boolean;
+  onSelect: FolderChoice;
 }) {
   const { data: folders } = useMailFolders(account.id);
 
@@ -128,16 +157,24 @@ function AccountFolders({
           testId={`folder-${row.folder}`}
           unread={row.unread}
           stale={row.stale}
+          accountId={account.id}
+          folder={row.folder}
           active={folder === row.folder && (accountId === null || accountId === account.id)}
-          onClick={() => onSelect({ accountId: account.id, folder: row.folder })}
+          disabled={disabled}
+          onSelect={onSelect}
         />
       ))}
     </div>
   );
-}
+});
 
-function FolderButton({
-  label, testId, unread, stale = false, active, onClick,
+/** Memoised too: a rail of a dozen of these re-rendering on every keystroke in
+ * the filter bar is the cost AccountFolders' own memo exists to avoid, and it
+ * would pay it back one level down. Its props are all primitives plus the
+ * caller's stable onSelect -- which is why the click passes its ids as
+ * arguments rather than closing over an object. */
+const FolderButton = memo(function FolderButton({
+  label, testId, unread, stale = false, accountId, folder, active, disabled, onSelect,
 }: {
   label: string;
   testId: string;
@@ -145,26 +182,29 @@ function FolderButton({
    * badge already answers "unread anywhere". */
   unread: number | null;
   stale?: boolean;
+  accountId: string | null;
+  folder: string | null;
   active: boolean;
-  onClick: () => void;
+  disabled: boolean;
+  onSelect: FolderChoice;
 }) {
   return (
     <button
       type="button"
       data-testid={testId}
       aria-current={active ? "true" : undefined}
-      onClick={onClick}
+      disabled={disabled}
+      onClick={() => onSelect(accountId, folder)}
       className={clsx(
-        "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm",
+        "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm disabled:opacity-50",
         active ? "bg-slate-200 font-medium text-slate-900" : "text-slate-600 hover:bg-slate-100",
       )}
     >
       <span className={clsx("min-w-0 flex-1 truncate", stale && "italic text-slate-400")}>{label}</span>
       {stale && (
         // A folder the last discovery pass did not see -- deleted or renamed on
-        // the server -- that the CRM still holds unread mail in. It stays
-        // clickable so that mail is reachable; the title says why it looks
-        // different.
+        // the server -- that the CRM still holds mail in. It stays clickable so
+        // that mail is reachable; the title says why it looks different.
         <span className="shrink-0 text-[10px] uppercase text-slate-400" title="Not seen in the last sync">
           gone
         </span>
@@ -176,4 +216,4 @@ function FolderButton({
       )}
     </button>
   );
-}
+});

@@ -12,6 +12,7 @@ import {
   useProject,
   type MailThreadListParams,
 } from "../../queries";
+import { useLatest } from "../../hooks";
 import {
   addressLabel,
   advanceThreadPages,
@@ -65,6 +66,16 @@ export interface ThreadListProps {
   /** Whether the header checkbox reads as ticked; the caller decides, since it
    * holds the selection (mail-lib's allOnPageSelected). */
   allSelected?: boolean;
+  /** Some rows ticked, but not all of them: the header box renders
+   * INDETERMINATE rather than picking one of the two lies. */
+  someSelected?: boolean;
+  /**
+   * Freezes the ticks while the caller is acting on them (the inbox's bulk
+   * request). The rows stay readable and the conversation still opens -- only
+   * the selection is held still, because the request that is in flight names
+   * the ids that were selected when it was sent.
+   */
+  selectionDisabled?: boolean;
   /** The visible rows, in order, whenever they change -- so the caller can turn
    * its selection into a request without duplicating the accumulator. */
   onRowsChange?: (threadIds: string[]) => void;
@@ -103,7 +114,8 @@ const DEFAULT_LIMIT = 25;
  */
 export function ThreadList({
   filters, onSelect, selectedId = null, limit = DEFAULT_LIMIT, emptyLabel = "No conversations",
-  selectable = false, selectedIds, onToggleThread, onToggleAll, allSelected = false, onRowsChange,
+  selectable = false, selectedIds, onToggleThread, onToggleAll, allSelected = false,
+  someSelected = false, selectionDisabled = false, onRowsChange,
 }: ThreadListProps) {
   const key = threadFilterKey({ ...filters });
   const [pages, setPages] = useState<ThreadPages>(() => emptyThreadPages(key));
@@ -149,8 +161,7 @@ export function ThreadList({
    * memo exists to avoid.
    */
   const order = useMemo(() => threads.map((thread) => thread.id), [threads]);
-  const orderRef = useRef<readonly string[]>(order);
-  orderRef.current = order;
+  const orderRef = useLatest<readonly string[]>(order);
 
   useEffect(() => {
     onRowsChange?.(order);
@@ -158,10 +169,10 @@ export function ThreadList({
 
   const toggleThread = useCallback((threadId: string, shift: boolean) => {
     onToggleThread?.(threadId, { shift, order: orderRef.current });
-  }, [onToggleThread]);
+  }, [onToggleThread, orderRef]);
 
-  // Once anything is ticked, every row's checkbox stays visible: hunting for a
-  // second checkbox by hovering, mid-selection, is the one case where the
+  // Once anything is ticked, every row's checkbox stays fully visible: hunting
+  // for a second checkbox by hovering, mid-selection, is the one case where the
   // hover-reveal gets in the way.
   const anySelected = (selectedIds?.size ?? 0) > 0;
 
@@ -174,12 +185,13 @@ export function ThreadList({
       )}
       {selectable && threads.length > 0 && (
         <label className="flex items-center gap-2 px-3 py-1 text-xs text-slate-500">
-          <input
-            type="checkbox"
-            data-testid="thread-select-all"
+          <TriStateCheckbox
+            testId="thread-select-all"
             checked={allSelected}
+            indeterminate={someSelected && !allSelected}
+            disabled={selectionDisabled}
+            ariaLabel="Select all conversations"
             onChange={() => onToggleAll?.(orderRef.current)}
-            className="h-4 w-4"
           />
           Select all
         </label>
@@ -203,6 +215,7 @@ export function ThreadList({
             selectable={selectable}
             checked={selectedIds?.has(thread.id) ?? false}
             anySelected={anySelected}
+            selectionDisabled={selectionDisabled}
             onToggle={toggleThread}
           />
         ))}
@@ -241,10 +254,12 @@ export function ThreadList({
  * through a ref rather than through its closure; `checked` changes for the one
  * row that was ticked (or, on a select-all, for the rows that changed);
  * `anySelected` flips exactly twice per selection -- once when the first row is
- * ticked and once when the last is cleared. `selectable` never changes at all.
+ * ticked and once when the last is cleared. `selectable` never changes at all,
+ * and `selectionDisabled` flips twice per bulk request.
  */
 const ThreadRow = memo(function ThreadRow({
-  thread, selected, onSelect, accountLabels, selectable, checked, anySelected, onToggle,
+  thread, selected, onSelect, accountLabels, selectable, checked, anySelected,
+  selectionDisabled, onToggle,
 }: {
   thread: MailThreadListItem;
   selected: boolean;
@@ -253,6 +268,7 @@ const ThreadRow = memo(function ThreadRow({
   selectable: boolean;
   checked: boolean;
   anySelected: boolean;
+  selectionDisabled: boolean;
   /** Takes the id and whether shift was held, so the list can hand every row
    * ONE stable callback (mirroring conversation.tsx's onToggle). */
   onToggle: (threadId: string, shift: boolean) => void;
@@ -275,12 +291,18 @@ const ThreadRow = memo(function ThreadRow({
         // is invalid, and nesting one would also make every tick open the
         // conversation. `opacity` rather than conditional rendering so the rows
         // do not shift horizontally as the pointer moves down the list.
+        //
+        // NEVER opacity-0. A hover-reveal is not a reveal on a touch screen --
+        // there is no hover -- and a checkbox at zero opacity there is a control
+        // that does not exist: multi-select was simply unreachable on a phone or
+        // a tablet. Faded is enough to keep an unselected list quiet while still
+        // being visible and tappable everywhere.
         <label
           className={clsx(
-            "flex shrink-0 items-center self-stretch pl-3 pr-1",
+            "flex shrink-0 items-center self-stretch pl-3 pr-1 transition-opacity",
             checked || anySelected
               ? "opacity-100"
-              : "opacity-0 focus-within:opacity-100 group-hover:opacity-100",
+              : "opacity-40 focus-within:opacity-100 group-hover:opacity-100",
           )}
         >
           <input
@@ -288,6 +310,7 @@ const ThreadRow = memo(function ThreadRow({
             data-testid={`thread-checkbox-${thread.id}`}
             aria-label={`Select ${subjectLabel(thread.subject)}`}
             checked={checked}
+            disabled={selectionDisabled}
             // React maps a checkbox's onChange onto the native CLICK, so the
             // native event carries the modifier keys -- which is how a
             // shift-click reaches the range logic. A keyboard tick is a
@@ -353,6 +376,45 @@ const ThreadRow = memo(function ThreadRow({
  * from a synthesized one. */
 function isShiftClick(event: Event): boolean {
   return event instanceof MouseEvent && event.shiftKey;
+}
+
+/**
+ * A checkbox that can also read INDETERMINATE -- the header box when some rows
+ * are ticked and some are not.
+ *
+ * `indeterminate` is a DOM property with no HTML attribute behind it, so React
+ * cannot set it from JSX and it has to be written to the node itself. It is
+ * purely a visual/announced state: the box still reports `checked` when
+ * clicked, and the caller decides what a click means (here: tick everything, or
+ * clear everything).
+ */
+function TriStateCheckbox({
+  testId, checked, indeterminate, disabled, ariaLabel, onChange,
+}: {
+  testId: string;
+  checked: boolean;
+  indeterminate: boolean;
+  disabled: boolean;
+  ariaLabel: string;
+  onChange: () => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (ref.current !== null) ref.current.indeterminate = indeterminate;
+  }, [indeterminate]);
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      data-testid={testId}
+      aria-label={ariaLabel}
+      aria-checked={indeterminate ? "mixed" : checked}
+      checked={checked}
+      disabled={disabled}
+      onChange={onChange}
+      className="h-4 w-4"
+    />
+  );
 }
 
 /**

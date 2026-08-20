@@ -14,7 +14,9 @@ import {
   useUnarchiveMailAccount,
   useUpdateMailAccount,
 } from "../queries";
-import { friendlyMailError, htmlIsBlank, newestDiscovery } from "../components/mail/mail-lib";
+import {
+  friendlyMailError, htmlIsBlank, moveTargetPatch, newestDiscovery,
+} from "../components/mail/mail-lib";
 import {
   buildCreateInput,
   buildTestInput,
@@ -385,7 +387,12 @@ function FolderPicker({ account }: { account: MailAccountWithSyncStats }) {
                   type="checkbox"
                   data-testid={`folder-picker-${folder.folder}`}
                   checked={folder.syncEnabled}
-                  disabled={why !== undefined || setSync.isPending}
+                  // Only the row being toggled waits, not the whole list: one
+                  // PATCH is one folder, and freezing eleven other checkboxes
+                  // while a slow server answers for the twelfth turns a
+                  // curation pass into a queue.
+                  disabled={why !== undefined
+                    || (setSync.isPending && setSync.variables?.input.folder === folder.folder)}
                   onChange={(event) => setSync.mutate({
                     accountId: account.id,
                     // BY NAME, byte for byte as the endpoint listed it: that is
@@ -413,6 +420,11 @@ function FolderPicker({ account }: { account: MailAccountWithSyncStats }) {
         account={account}
         detectedTrash={detected("trash")}
         detectedArchive={detected("archive")}
+        // Every selectable folder the server listed, as suggestions. A move
+        // target is a mailbox NAME matched byte for byte server-side, so typing
+        // one by hand is exactly as fragile as it sounds; the list the account
+        // just discovered is the authority on what those bytes are.
+        folderNames={(folders ?? []).filter((row) => row.selectable).map((row) => row.folder)}
       />
     </div>
   );
@@ -430,35 +442,52 @@ function FolderPicker({ account }: { account: MailAccountWithSyncStats }) {
  * that account's threads with `no_target` rather than guessing.
  */
 function MoveTargets({
-  account, detectedTrash, detectedArchive,
+  account, detectedTrash, detectedArchive, folderNames,
 }: {
   account: MailAccountWithSyncStats;
   detectedTrash: string | undefined;
   detectedArchive: string | undefined;
+  folderNames: readonly string[];
 }) {
   const update = useUpdateMailAccount();
-  const [trash, setTrash] = useState(account.trashFolder ?? "");
-  const [archiveTo, setArchiveTo] = useState(account.archiveFolder ?? "");
+  // null is UNTOUCHED, and the difference is load-bearing: what these fields
+  // SHOW falls back to the account, and what they SAVE is only what was edited
+  // (mail-lib's moveTargetPatch). Seeding them with the account's values at
+  // mount, the way this used to, meant a save could send a stale empty string
+  // for a field a discovery pass had filled in the meantime -- wiping a target
+  // the user never touched.
+  const [trash, setTrash] = useState<string | null>(null);
+  const [archiveTo, setArchiveTo] = useState<string | null>(null);
 
   const placeholder = (detectedValue: string | undefined) =>
     (detectedValue === undefined ? "Detect for me" : `Detect for me (${detectedValue})`);
 
+  const patch = moveTargetPatch(trash, archiveTo, account);
+  const nothingToSave = Object.keys(patch).length === 0;
+  const listId = `folder-options-${account.id}`;
+
   return (
     <div className="mt-2 flex flex-col gap-2 border-t border-slate-100 pt-2">
+      {/* One list for both fields: either target may be any mailbox. */}
+      <datalist id={listId}>
+        {folderNames.map((name) => <option key={name} value={name} />)}
+      </datalist>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Trash folder" testId="trash-folder">
           <Input
-            value={trash}
+            value={trash ?? account.trashFolder ?? ""}
             onChange={(event) => setTrash(event.target.value)}
             placeholder={placeholder(detectedTrash)}
+            list={listId}
             data-testid={`trash-folder-${account.id}`}
           />
         </Field>
         <Field label="Archive folder" testId="archive-folder">
           <Input
-            value={archiveTo}
+            value={archiveTo ?? account.archiveFolder ?? ""}
             onChange={(event) => setArchiveTo(event.target.value)}
             placeholder={placeholder(detectedArchive)}
+            list={listId}
             data-testid={`archive-folder-${account.id}`}
           />
         </Field>
@@ -466,24 +495,21 @@ function MoveTargets({
       <div className="flex items-center gap-3">
         <Button
           data-testid={`save-move-targets-${account.id}`}
-          disabled={update.isPending}
-          onClick={() => update.mutate({
-            id: account.id,
-            // null, not "": the shared schema rejects a blank string outright,
-            // and null is the meaningful "not resolved yet" value the next
-            // discovery pass refills. Trimming is the service's job (mirroring
-            // normalizeSentFolder), but a whitespace-only field is a blank one
-            // here, not a folder called "   ".
-            patch: {
-              trashFolder: trash.trim() === "" ? null : trash.trim(),
-              archiveFolder: archiveTo.trim() === "" ? null : archiveTo.trim(),
-            },
-          })}
+          disabled={update.isPending || nothingToSave}
+          onClick={() => update.mutate(
+            { id: account.id, patch },
+            // Back to "untouched" on success, so the fields go on showing the
+            // account -- which is now what was just saved, and will be whatever
+            // a later discovery pass fills in.
+            { onSuccess: () => { setTrash(null); setArchiveTo(null); } },
+          )}
         >
           {update.isPending ? "Saving..." : "Save folders"}
         </Button>
         {update.isError && <p role="alert" className="text-sm text-red-600">{update.error.message}</p>}
-        {update.isSuccess && <p className="text-xs text-slate-400">Saved</p>}
+        {/* Only while nothing has been typed since: "Saved" beside a field
+            holding unsaved edits is a lie about the field next to it. */}
+        {update.isSuccess && nothingToSave && <p className="text-xs text-slate-400">Saved</p>}
       </div>
     </div>
   );
