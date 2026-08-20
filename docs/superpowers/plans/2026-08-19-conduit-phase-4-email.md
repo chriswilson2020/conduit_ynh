@@ -233,7 +233,10 @@ As built (Task 9, 20 Aug) — seven deviations from the paragraph above:
   TipTap normalises the markup on the way in, so there is nothing reliable left to match a previously
   inserted block against.
 - **The Settings nav highlight is computed**, not `activeProps`: one entry has to stay lit across both
-  tabs, so shell.tsx tests the basePath-prefixed pathname via `useRouterState`. There is no bare
+  tabs, so shell.tsx tests `useRouterState`'s `location.pathname` against a literal `"/settings"`. That
+  pathname is basepath-RELATIVE at every install path — a configured basepath installs router-core's own
+  basepath rewrite, whose input leg slices the base off before the location is stored, which is the same
+  fact every other nav item's basepath-relative `to`/activeProps already depends on. There is no bare
   `/settings` route — the nav links straight at `/settings/mail`.
 
 Pure logic lives in two tested libs rather than inside the components: `components/mail/composer-lib.ts`

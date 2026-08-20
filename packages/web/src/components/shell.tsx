@@ -1,6 +1,5 @@
 import type { ReactNode } from "react";
 import { Link, useRouterState } from "@tanstack/react-router";
-import { basePath } from "../api";
 import { GlobalSearch } from "./search";
 import { useSseInvalidation } from "./sse";
 
@@ -19,12 +18,15 @@ export function Shell({ children }: { children: ReactNode }) {
 
   // The Settings entry links at one of its two tabs but must stay highlighted
   // on both, and activeProps only knows about the link's own target -- so its
-  // active state is computed from the path instead. The router's
-  // location.pathname is the browser's, base and all (it decodes the raw
-  // history path and never strips the basepath), so the prefix is built from
-  // basePath() rather than assuming a root install.
-  const settingsPrefix = basePath() === "/" ? "/settings" : `${basePath()}/settings`;
-  const inSettings = useRouterState({ select: (state) => state.location.pathname.startsWith(settingsPrefix) });
+  // active state is computed from the path instead.
+  //
+  // The literal "/settings" is correct at every install path, root or subpath:
+  // a configured basepath installs router-core's own basepath rewrite, whose
+  // input leg slices the base off before the location is ever stored, so
+  // `location.pathname` is always basepath-RELATIVE ("/settings/mail", never
+  // "/conduit/settings/mail"). Every other nav item's `to`/activeProps above
+  // relies on exactly the same fact -- they are written basepath-relative too.
+  const inSettings = useRouterState({ select: (state) => state.location.pathname.startsWith("/settings") });
 
   return (
     <div data-testid="shell" className="flex min-h-screen bg-slate-50">
