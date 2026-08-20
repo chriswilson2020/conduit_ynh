@@ -307,6 +307,18 @@ Task 10 as built (20 Aug):
 - Accepted freshness limit: only the CURRENT page of the thread list is a live query, so after
   "load more" an SSE invalidation refreshes that page while earlier pages keep the rows they were
   fetched with until the list resets (filter change or remount).
+- **Accepted payload limit (v0.5.0): the thread-detail route returns EVERY message in the thread**
+  -- `GET /api/mail/threads/:id` has no cap, and each message carries its full sanitized body. A
+  5000-message mailing-list thread at ~50KB of body each is a response no browser tab survives
+  opening. Nothing in a normal CRM conversation comes close, which is why this ships as-is; the 4.x
+  fix is a server-side cap (newest N messages) plus a `truncated` flag the conversation renders as
+  a "load earlier messages" control, and it needs a schema field, so it is not a patch-release
+  change.
+- **Task 12 bundle note**: the web bundle is ONE chunk, measured at end of Task 10 as 332.1KB gzip
+  of JS plus 5.9KB of CSS -- ~338KB against the 400KB budget, so roughly 62KB of headroom, of which
+  Phase 4 spent about 20KB (TipTap, the mail views). When that headroom runs out, the `/mail` leaf
+  is the import() boundary to reach for first: it is a whole route's worth of components (composer,
+  conversation, thread list, link panel) that the four non-mail areas of the app never render.
 
 ### Task 11: Playwright journey
 

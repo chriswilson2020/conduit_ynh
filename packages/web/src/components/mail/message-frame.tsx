@@ -8,6 +8,10 @@ export interface MessageFrameProps {
   /** Flipped by the conversation's per-thread "Load remote images" button. */
   remoteImages: boolean;
   testId?: string;
+  /** Mirrors the `data-body-kind` the text branch carries, so a test can tell
+   * the two renderings apart -- only this one is reachable through a frame
+   * locator. */
+  bodyKind?: string;
 }
 
 /**
@@ -36,7 +40,7 @@ export interface MessageFrameProps {
  * is equally true of a link in any inbox, and a link that silently does
  * nothing reads as a broken app.
  */
-export function MessageFrame({ html, remoteImages, testId }: MessageFrameProps) {
+export function MessageFrame({ html, remoteImages, testId, bodyKind }: MessageFrameProps) {
   const srcDoc = useMemo(() => {
     // window.location.origin, not a hardcoded value: 'self' already covers the
     // app's origin for a same-origin frame, and naming the origin explicitly
@@ -48,6 +52,7 @@ export function MessageFrame({ html, remoteImages, testId }: MessageFrameProps) 
   return (
     <iframe
       data-testid={testId}
+      data-body-kind={bodyKind}
       title="Message body"
       sandbox={MESSAGE_FRAME_SANDBOX}
       referrerPolicy="no-referrer"

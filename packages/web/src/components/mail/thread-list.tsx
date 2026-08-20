@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { clsx } from "clsx";
 import type { MailThreadListItem } from "@conduit/shared";
@@ -14,6 +14,8 @@ import {
 } from "../../queries";
 import {
   addressLabel,
+  advanceThreadPages,
+  cursorForKey,
   emptyThreadPages,
   flattenThreadPages,
   mergeThreadPage,
@@ -61,7 +63,10 @@ const DEFAULT_LIMIT = 25;
  * The cursor is stored WITH the key it belongs to and read back through it,
  * rather than reset from an effect: an effect would leave one render (and one
  * fetch) in which the new filters are paired with the old filter's page-two
- * cursor.
+ * cursor. The cursor itself lives INSIDE the accumulator, with the key that
+ * issued it -- see mail-lib's ThreadPages for the bug that cost (a filter
+ * toggled on and off again used to resurrect a page-two cursor and lose page
+ * one).
  *
  * One consequence, accepted: only the CURRENT page is a live query, so after
  * "load more" an SSE invalidation refreshes the page that is mounted and the
@@ -73,9 +78,8 @@ export function ThreadList({
   filters, onSelect, selectedId = null, limit = DEFAULT_LIMIT, emptyLabel = "No conversations",
 }: ThreadListProps) {
   const key = threadFilterKey({ ...filters });
-  const [page, setPage] = useState<{ key: string; cursor?: string }>({ key });
-  const cursor = page.key === key ? page.cursor : undefined;
   const [pages, setPages] = useState<ThreadPages>(() => emptyThreadPages(key));
+  const cursor = cursorForKey(pages, key);
 
   const { data, isLoading, isFetching, error } = useMailThreads({ ...filters, cursor, limit });
 
@@ -83,7 +87,7 @@ export function ThreadList({
     if (data === undefined) return;
     // mergeThreadPage returns the SAME object when this page's items are the
     // array already stored, so this settles after one pass instead of looping.
-    setPages((current) => mergeThreadPage(current, key, cursor, data.items));
+    setPages((current) => mergeThreadPage(current, key, cursor, data.items, data.nextCursor));
   }, [data, key, cursor]);
 
   const threads = useMemo(
@@ -102,7 +106,10 @@ export function ThreadList({
     return map;
   }, [accounts]);
 
-  const showLoadMore = data?.nextCursor != null && data.nextCursor !== "";
+  // Read off the ACCUMULATOR, not off the live query: pressing "load more"
+  // switches to a cache entry with no data yet, and a button that unmounted
+  // for the duration of its own fetch could never show that it was fetching.
+  const showLoadMore = pages.key === key && pages.nextCursor !== null;
 
   return (
     <div data-testid="thread-list" className="flex min-w-0 flex-col">
@@ -115,7 +122,9 @@ export function ThreadList({
         {isLoading && threads.length === 0 && (
           <li className="px-4 py-3 text-sm text-slate-400">Loading...</li>
         )}
-        {!isLoading && threads.length === 0 && (
+        {/* Not while `error` is set: a failed fetch means "we do not know what
+            is here", which is not the same claim as "there is nothing here". */}
+        {!isLoading && !error && threads.length === 0 && (
           <li className="px-4 py-3 text-sm text-slate-400">{emptyLabel}</li>
         )}
         {threads.map((thread) => (
@@ -134,7 +143,7 @@ export function ThreadList({
           className="mt-2 self-start"
           data-testid="thread-list-more"
           disabled={isFetching}
-          onClick={() => setPage({ key, cursor: data?.nextCursor ?? undefined })}
+          onClick={() => setPages((current) => advanceThreadPages(current, key))}
         >
           {isFetching ? "Loading..." : "Load more"}
         </Button>
@@ -143,7 +152,21 @@ export function ThreadList({
   );
 }
 
-function ThreadRow({
+/**
+ * Memoised per-thread row, the same way gantt/bar.tsx memoises a bar and for
+ * the same reason: this list is the busiest thing on the page, and everything
+ * above it re-renders on every SSE invalidation, every selection change and
+ * every keystroke in the filter bar.
+ *
+ * The default shallow comparison is the RIGHT one here, prop by prop: `thread`
+ * is an object React Query hands out and only replaces when its page actually
+ * refetches, `accountLabels` is memoised on the accounts query, `onSelect` is
+ * the caller's stable callback (the inbox wraps its own in useCallback), and
+ * `selected` is a boolean that changes for exactly two rows when the selection
+ * moves. So a re-render of the list re-renders no rows at all unless their own
+ * data moved.
+ */
+const ThreadRow = memo(function ThreadRow({
   thread, selected, onSelect, accountLabels,
 }: {
   thread: MailThreadListItem;
@@ -176,14 +199,15 @@ function ThreadRow({
         )}
       >
         <span className="flex items-center gap-2">
-          <span
-            aria-hidden={!thread.unread}
-            aria-label={thread.unread ? "Unread" : undefined}
-            className={clsx(
-              "h-2 w-2 shrink-0 rounded-full",
-              thread.unread ? "bg-slate-900" : "bg-transparent",
-            )}
-          />
+          {/* role="img" so the label is announced: an aria-label on a bare
+              <span> is ignored by screen readers, which have no role to
+              attach it to. The placeholder half keeps the rows aligned and
+              stays hidden. */}
+          {thread.unread ? (
+            <span role="img" aria-label="Unread" className="h-2 w-2 shrink-0 rounded-full bg-slate-900" />
+          ) : (
+            <span aria-hidden="true" className="h-2 w-2 shrink-0 rounded-full bg-transparent" />
+          )}
           <span
             className={clsx(
               "min-w-0 flex-1 truncate text-sm",
@@ -205,42 +229,55 @@ function ThreadRow({
               </span>
             );
           })}
-          <ThreadLinkChips thread={thread} />
+          {thread.contactId !== null && <ContactChip contactId={thread.contactId} />}
+          {thread.companyId !== null && <CompanyChip companyId={thread.companyId} />}
+          {thread.dealId !== null && <DealChip dealId={thread.dealId} />}
+          {thread.projectId !== null && <ProjectChip projectId={thread.projectId} />}
         </span>
       </button>
     </li>
   );
-}
+});
 
 /**
- * The record links a thread carries, as names rather than ids.
+ * The record links a thread carries, as names rather than ids: ONE COMPONENT
+ * PER KIND, mounted only when that link exists.
  *
- * Resolved with the ordinary per-record detail hooks, one query per link and
- * none at all for a link that is absent (each hook is disabled on an empty
- * id). They are cache reads in almost every case -- the record pages, the
- * conversation's link panel and the pickers all populate the same
+ * The obvious shape -- a single ThreadLinkChips calling all four detail hooks
+ * with `id ?? ""` -- reads better and costs far more. A disabled query issues
+ * no request, but it is still a live cache observer, and an unlinked inbox of
+ * a hundred rows would mount four hundred of them for nothing. Split this way,
+ * an unlinked thread mounts NONE, and a linked one mounts exactly as many as
+ * it has links. (link-panel.tsx makes the same argument for its pickers: the
+ * component that is not being used should not be mounted.)
+ *
+ * The queries themselves are cache reads in almost every case -- the record
+ * pages, the conversation's link panel and the pickers all populate the same
  * ["company", id] / ["contact", id] / ["deal", id] / ["project", id] entries.
  */
-function ThreadLinkChips({ thread }: { thread: { companyId: string | null; contactId: string | null; dealId: string | null; projectId: string | null } }) {
-  const { data: company } = useCompany(thread.companyId ?? "");
-  const { data: contact } = useContact(thread.contactId ?? "");
-  const { data: deal } = useDeal(thread.dealId ?? "");
-  const { data: project } = useProject(thread.projectId ?? "");
-
-  const names = [
-    contact === undefined ? null : `${contact.firstName} ${contact.lastName ?? ""}`.trim(),
-    company?.name ?? null,
-    deal?.title ?? null,
-    project?.name ?? null,
-  ].filter((name): name is string => name !== null && name !== "");
-
+function LinkChip({ name }: { name: string | undefined }) {
+  if (name === undefined || name === "") return null;
   return (
-    <>
-      {names.map((name) => (
-        <span key={name} className="rounded bg-slate-900/5 px-1.5 py-0.5 text-[11px] text-slate-600">
-          {name}
-        </span>
-      ))}
-    </>
+    <span className="rounded bg-slate-900/5 px-1.5 py-0.5 text-[11px] text-slate-600">{name}</span>
   );
+}
+
+function ContactChip({ contactId }: { contactId: string }) {
+  const { data } = useContact(contactId);
+  return <LinkChip name={data === undefined ? undefined : `${data.firstName} ${data.lastName ?? ""}`.trim()} />;
+}
+
+function CompanyChip({ companyId }: { companyId: string }) {
+  const { data } = useCompany(companyId);
+  return <LinkChip name={data?.name} />;
+}
+
+function DealChip({ dealId }: { dealId: string }) {
+  const { data } = useDeal(dealId);
+  return <LinkChip name={data?.title} />;
+}
+
+function ProjectChip({ projectId }: { projectId: string }) {
+  const { data } = useProject(projectId);
+  return <LinkChip name={data?.name} />;
 }

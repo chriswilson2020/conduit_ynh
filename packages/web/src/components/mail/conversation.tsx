@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { clsx } from "clsx";
 import type { MailAttachment, MailMessageWithAttachments } from "@conduit/shared";
 import { apiUrl } from "../../api";
@@ -17,6 +17,7 @@ import { LinkPanel } from "./link-panel";
 import { MessageFrame } from "./message-frame";
 import {
   addressLabel,
+  composeErrorMessage,
   forwardBody,
   forwardSubject,
   replyRecipients,
@@ -47,12 +48,37 @@ export function Conversation({ threadId }: ConversationProps) {
   const unarchive = useUnarchiveThread();
   const { data: accounts } = useMailAccounts();
 
-  const [expanded, setExpanded] = useState<string[] | null>(null);
+  // null = "the user has not touched the accordion yet", which means the
+  // default below applies -- the latest message open, everything else closed.
+  // A Set, not an array: `has` on every row of a long thread should not be a
+  // scan, and a Set is what makes the toggle callback below stable.
+  const [expanded, setExpanded] = useState<ReadonlySet<string> | null>(null);
   const [remoteImages, setRemoteImages] = useState(false);
   const [seed, setSeed] = useState<ComposerSeed | null>(null);
 
   const thread = data?.thread;
   const messages = useMemo(() => data?.messages ?? [], [data]);
+
+  /**
+   * What "expanded" means before the user has touched anything: the last
+   * message alone. Kept in a ref, not read from `messages` inside the toggle,
+   * so `toggle` can have an EMPTY dependency list and therefore a stable
+   * identity -- which is what lets the memoised Message rows below actually
+   * bail out. Recomputed only when the last message changes.
+   */
+  const lastId = messages[messages.length - 1]?.id;
+  const defaultExpandedRef = useRef<ReadonlySet<string>>(new Set());
+  const defaultExpanded = useMemo(() => new Set(lastId === undefined ? [] : [lastId]), [lastId]);
+  defaultExpandedRef.current = defaultExpanded;
+
+  const toggle = useCallback((messageId: string) => {
+    setExpanded((current) => {
+      const next = new Set(current ?? defaultExpandedRef.current);
+      if (next.has(messageId)) next.delete(messageId);
+      else next.add(messageId);
+      return next;
+    });
+  }, []);
 
   // Names for the composer's template placeholders, from whatever the thread
   // is linked to. Both hooks are disabled when the link is absent.
@@ -158,17 +184,8 @@ export function Conversation({ threadId }: ConversationProps) {
   if (data === undefined || thread === undefined) return null;
 
   const archived = thread.archivedAt !== null;
-  const lastId = messages[messages.length - 1]?.id;
-  const expandedIds = expanded ?? (lastId === undefined ? [] : [lastId]);
-
-  function toggle(messageId: string) {
-    setExpanded((current) => {
-      const base = current ?? (lastId === undefined ? [] : [lastId]);
-      return base.includes(messageId)
-        ? base.filter((id) => id !== messageId)
-        : [...base, messageId];
-    });
-  }
+  const expandedIds = expanded ?? defaultExpandedRef.current;
+  const archiveError = archive.error ?? unarchive.error;
 
   return (
     <div data-testid="conversation" className="flex min-w-0 flex-col gap-3">
@@ -220,13 +237,19 @@ export function Conversation({ threadId }: ConversationProps) {
         </Button>
       </div>
 
+      {archiveError && (
+        <p role="alert" className="text-sm text-red-600">
+          {composeErrorMessage(archiveError)}
+        </p>
+      )}
+
       <ol className="flex flex-col gap-2">
         {messages.map((message) => (
           <Message
             key={message.id}
             message={message}
-            expanded={expandedIds.includes(message.id)}
-            onToggle={() => toggle(message.id)}
+            expanded={expandedIds.has(message.id)}
+            onToggle={toggle}
             remoteImages={remoteImages}
           />
         ))}
@@ -241,12 +264,22 @@ export function Conversation({ threadId }: ConversationProps) {
   );
 }
 
-function Message({
+/**
+ * Memoised per-message row, mirroring thread-list's ThreadRow (and gantt's
+ * bar) -- a long thread re-rendering every message on every mark-read
+ * invalidation, composer open or remote-images flip is the one avoidable cost
+ * here, and each message body is an iframe. Shallow comparison suffices:
+ * `message` comes from React Query and only changes when the thread refetches,
+ * `onToggle` is the stable useCallback above, and the two booleans change for
+ * one row (or, for remoteImages, deliberately for all of them).
+ */
+const Message = memo(function Message({
   message, expanded, onToggle, remoteImages,
 }: {
   message: MailMessageWithAttachments;
   expanded: boolean;
-  onToggle: () => void;
+  /** Takes the id, so the parent can hand every row ONE stable callback. */
+  onToggle: (messageId: string) => void;
   remoteImages: boolean;
 }) {
   const outbound = message.direction === "outbound";
@@ -264,7 +297,7 @@ function Message({
       <button
         type="button"
         aria-expanded={expanded}
-        onClick={onToggle}
+        onClick={() => onToggle(message.id)}
         className="flex w-full flex-col gap-0.5 px-3 py-2 text-left"
       >
         <span className="flex items-baseline gap-2">
@@ -286,19 +319,27 @@ function Message({
       </button>
 
       {expanded && (
+        // `body-<id>`, deliberately NOT `message-body-<id>`: the `message-`
+        // testid family is prefix-matched (`[data-testid^="message-"]` is how
+        // the rows are counted), and a second family nested inside it would
+        // double every count. `data-body-kind` tells a test which of the two
+        // renderings it got without guessing -- only the html branch is an
+        // iframe, and only an iframe can be reached with a frame locator.
         <div className="flex flex-col gap-2 border-t border-slate-100 px-3 py-2">
           {message.bodyHtml != null && message.bodyHtml !== "" ? (
             <MessageFrame
               html={message.bodyHtml}
               remoteImages={remoteImages}
-              testId={`message-body-${message.id}`}
+              testId={`body-${message.id}`}
+              bodyKind="html"
             />
           ) : (
             // Text-only mail renders directly: there is no untrusted markup to
             // isolate, and an iframe around a paragraph of plain text would
             // only cost a fixed-height box.
             <pre
-              data-testid={`message-body-${message.id}`}
+              data-testid={`body-${message.id}`}
+              data-body-kind="text"
               className="whitespace-pre-wrap break-words font-sans text-sm text-slate-800"
             >
               {message.bodyText}
@@ -315,7 +356,7 @@ function Message({
       )}
     </li>
   );
-}
+});
 
 /** A download link to the authenticated attachment route -- the same
  * same-origin, cookie-authenticated route the body's inline images use, but

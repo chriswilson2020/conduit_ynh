@@ -370,13 +370,30 @@ export function addressLabel(address: MailAddress): string {
  * silently starts over whenever the key differs, which is what makes "reset
  * on filter change" a property of the data structure rather than an effect
  * somebody has to remember to write.
+ *
+ * THE CURSORS LIVE IN HERE TOO, with the key that issued them, and that is
+ * load-bearing rather than tidy. When the component held the cursor in its own
+ * state beside this record, toggling a filter ON and then OFF again brought the
+ * old key back -- and with it the old page-two cursor, while the accumulator
+ * had been reset by the intervening filter. The list then fetched page two,
+ * accumulated only page two, and page ONE silently vanished. A cursor that
+ * belongs to a key cannot outlive it: `cursorForKey` below answers "page one"
+ * for any key this record is not currently holding, so a returning filter is
+ * page one by construction.
  */
 export interface ThreadPages {
   /** Filter identity these pages belong to. */
   key: string;
+  /** The page currently being requested; FIRST_PAGE for page one. */
+  cursor: string;
   /** Cursors in load order; the first page's cursor is FIRST_PAGE. */
   order: string[];
   byCursor: Record<string, readonly MailThreadListItem[]>;
+  /** `nextCursor` from the most recently merged page: what "load more" would
+   * ask for, or null when the server said this was the last page. Held here
+   * rather than read off the live query so the button survives its own fetch
+   * (the new page's cache entry has no data yet). */
+  nextCursor: string | null;
 }
 
 /** The first page is fetched with no cursor at all; "" stands in for it as a
@@ -385,7 +402,30 @@ export interface ThreadPages {
 export const FIRST_PAGE = "";
 
 export function emptyThreadPages(key: string): ThreadPages {
-  return { key, order: [], byCursor: {} };
+  return { key, cursor: FIRST_PAGE, order: [], byCursor: {}, nextCursor: null };
+}
+
+/**
+ * The cursor to fetch for `key`, or undefined for "page one, no cursor".
+ *
+ * The whole stale-cursor defence, in one function: a cursor is only ever
+ * handed back to the key that issued it. Any other key -- a filter just turned
+ * on, or one turned back on after being off -- starts at page one.
+ */
+export function cursorForKey(state: ThreadPages, key: string): string | undefined {
+  if (state.key !== key) return undefined;
+  return state.cursor === FIRST_PAGE ? undefined : state.cursor;
+}
+
+/**
+ * Move to the next page: what "load more" does. A no-op for a key this record
+ * is not holding, or when the last page said there is nothing after it -- so a
+ * double click, or a click racing a filter change, cannot walk past the end or
+ * apply one filter's cursor to another's list.
+ */
+export function advanceThreadPages(state: ThreadPages, key: string): ThreadPages {
+  if (state.key !== key || state.nextCursor === null) return state;
+  return { ...state, cursor: state.nextCursor };
 }
 
 /**
@@ -406,27 +446,30 @@ export function threadFilterKey(filters: Record<string, string | number | boolea
  * A different `key` discards everything: the pages on screen describe a filter
  * set nobody is looking at any more.
  *
- * A page whose items are the SAME ARRAY as the one already stored returns the
- * accumulator UNCHANGED, by reference. That matters: this runs from a render
- * effect, and returning a fresh object for an unchanged page would set state
- * on every render forever. React Query hands out a new array whenever a query
- * actually refetches, so a real refetch still replaces its page -- reference
- * equality is exactly the "nothing new arrived" test, not an approximation of
- * one.
+ * A page whose items are the SAME ARRAY as the one already stored, arriving
+ * with the same nextCursor, returns the accumulator UNCHANGED, by reference.
+ * That matters: this runs from a render effect, and returning a fresh object
+ * for an unchanged page would set state on every render forever. React Query
+ * hands out a new array whenever a query actually refetches, so a real refetch
+ * still replaces its page -- reference equality is exactly the "nothing new
+ * arrived" test, not an approximation of one.
  */
 export function mergeThreadPage(
   state: ThreadPages,
   key: string,
   cursor: string | undefined,
   items: readonly MailThreadListItem[],
+  nextCursor: string | null,
 ): ThreadPages {
   const base = state.key === key ? state : emptyThreadPages(key);
   const at = cursor ?? FIRST_PAGE;
-  if (base.byCursor[at] === items) return base;
+  if (base.byCursor[at] === items && base.cursor === at && base.nextCursor === nextCursor) return base;
   return {
     key,
+    cursor: at,
     order: base.order.includes(at) ? base.order : [...base.order, at],
     byCursor: { ...base.byCursor, [at]: items },
+    nextCursor,
   };
 }
 
@@ -698,11 +741,28 @@ export function messageFrameCsp(origin: string, options: { remoteImages: boolean
  * The styles are the minimum that keeps real-world mail from breaking the
  * layout -- images bounded to the frame's width, long unbroken strings wrapped
  * -- and are inline because the frame may load nothing from anywhere.
+ *
+ * THE TWO ARGUMENTS ARE SPLICED WITH DIFFERENT CONTRACTS, and the difference is
+ * the whole security story of this function:
+ *
+ * - `csp` is an ATTRIBUTE VALUE. It must be a policy string -- in practice one
+ *   built by messageFrameCsp above, whose grammar is directive names, scheme
+ *   and origin tokens, and CSP's own single-quoted keywords, so it can never
+ *   contain the double quote that would end the attribute. Because that is a
+ *   property of the CALLER rather than of this function, the splice escapes
+ *   double quotes anyway: safe by construction AND safe if a future policy
+ *   builder ever emits something quoted. Never pass caller-controlled text
+ *   here.
+ * - `bodyHtml` is MARKUP, spliced verbatim on purpose -- escaping it would
+ *   render a mail as its own source. It is only ever a body the API served,
+ *   which means it has been through mail-content.ts's sanitizer at ingest; the
+ *   sandbox and the CSP above are what contain whatever survived that. Never
+ *   pass un-sanitized HTML here.
  */
 export function messageFrameSrcdoc(bodyHtml: string, csp: string): string {
   return [
     "<!doctype html><html><head>",
-    `<meta http-equiv="Content-Security-Policy" content="${csp}">`,
+    `<meta http-equiv="Content-Security-Policy" content="${csp.replace(/"/g, "&quot;")}">`,
     '<meta name="referrer" content="no-referrer">',
     "<style>",
     "html,body{margin:0;padding:0}",

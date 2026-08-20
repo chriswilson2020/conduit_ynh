@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { useMailAccounts } from "../queries";
 import { Composer } from "../components/mail/composer";
@@ -51,8 +51,19 @@ export function InboxPage() {
   // reset from an effect, so there is never a render (or a fetch) using the
   // stranded id. The picker itself renders this value, so the trigger cannot
   // show a label that no longer exists either.
-  const accountId = filterAccounts.some((account) => account.id === accountChoice)
-    ? accountChoice : ALL_ACCOUNTS;
+  const accountStillOffered = filterAccounts.some((account) => account.id === accountChoice);
+  const accountId = accountStillOffered ? accountChoice : ALL_ACCOUNTS;
+
+  // ...and once the accounts have actually loaded, put the state back where the
+  // derivation already points. Without this the stranded id sits in state
+  // forever, quietly waiting to re-apply itself if that account is ever
+  // unarchived -- the same shape as the cursor bug in thread-list, benign only
+  // because the id is still meaningful. Guarded on `accounts` being loaded so
+  // the first render (no accounts yet) does not clear a legitimate choice.
+  useEffect(() => {
+    if (accounts === undefined || accountChoice === ALL_ACCOUNTS || accountStillOffered) return;
+    setAccountChoice(ALL_ACCOUNTS);
+  }, [accounts, accountChoice, accountStillOffered]);
 
   // Assumed true until the accounts actually arrive: "add a mail account"
   // must not flash on screen while the list is still loading.
@@ -70,9 +81,12 @@ export function InboxPage() {
     archived: archived ? true : undefined,
   };
 
-  function select(threadId: string) {
+  // Stable, so the memoised rows in thread-list can bail out: a new closure
+  // here every render would defeat their shallow comparison one prop before it
+  // started.
+  const select = useCallback((threadId: string) => {
     void navigate({ to: "/mail", search: { thread: threadId }, replace: true });
-  }
+  }, [navigate]);
 
   return (
     <div data-testid="inbox" className="flex flex-col gap-4">
@@ -83,8 +97,14 @@ export function InboxPage() {
         </Button>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)]">
-        <div className="flex min-w-0 flex-col gap-2">
+      {/* Each pane scrolls itself, within the viewport, rather than growing the
+          page: a thread list several "load more" pages long would otherwise
+          make the whole window scroll, and a row scrolled into view by the
+          `?thread=` deep link would drag the conversation off screen with it.
+          The height budget is the viewport minus the shell's header and this
+          page's own heading row. */}
+      <div className="grid gap-4 lg:h-[calc(100vh-11rem)] lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)]">
+        <div className="flex min-w-0 flex-col gap-2 lg:overflow-y-auto">
           <div className="flex flex-wrap items-center gap-2">
             {filterAccounts.length > 1 && (
               <div className="w-48">
@@ -126,7 +146,7 @@ export function InboxPage() {
           />
         </div>
 
-        <div className="min-w-0">
+        <div className="min-w-0 lg:overflow-y-auto">
           {selectedId === undefined ? (
             <p className="rounded-md border border-dashed border-slate-200 px-4 py-8 text-center text-sm text-slate-400">
               Select a conversation to read it.

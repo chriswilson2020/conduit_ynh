@@ -20,6 +20,8 @@ import {
   substitutePlaceholdersHtml,
   templateSubject,
   addressLabel,
+  advanceThreadPages,
+  cursorForKey,
   emptyThreadPages,
   FIRST_PAGE,
   flattenThreadPages,
@@ -424,8 +426,8 @@ describe("thread page accumulation", () => {
 
   it("collects pages in load order", () => {
     let pages = emptyThreadPages("k");
-    pages = mergeThreadPage(pages, "k", undefined, [thread("a"), thread("b")]);
-    pages = mergeThreadPage(pages, "k", "cursor-1", [thread("c")]);
+    pages = mergeThreadPage(pages, "k", undefined, [thread("a"), thread("b")], "cursor-1");
+    pages = mergeThreadPage(pages, "k", "cursor-1", [thread("c")], null);
     expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["a", "b", "c"]);
     expect(pages.order).toEqual([FIRST_PAGE, "cursor-1"]);
   });
@@ -433,17 +435,17 @@ describe("thread page accumulation", () => {
   // The whole point of keying on the filter set: a filter change must not
   // leave the previous filter's rows on screen behind the new first page.
   it("starts over when the filter key changes", () => {
-    let pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, [thread("a")]);
-    pages = mergeThreadPage(pages, "unread", undefined, [thread("z")]);
+    let pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, [thread("a")], null);
+    pages = mergeThreadPage(pages, "unread", undefined, [thread("z")], null);
     expect(pages.key).toBe("unread");
     expect(pages.order).toEqual([FIRST_PAGE]);
     expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["z"]);
   });
 
   it("replaces a page when that page refetches", () => {
-    let pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, [thread("a")]);
-    pages = mergeThreadPage(pages, "k", "cursor-1", [thread("b")]);
-    pages = mergeThreadPage(pages, "k", undefined, [thread("new"), thread("a")]);
+    let pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, [thread("a")], "cursor-1");
+    pages = mergeThreadPage(pages, "k", "cursor-1", [thread("b")], null);
+    pages = mergeThreadPage(pages, "k", undefined, [thread("new"), thread("a")], "cursor-1");
     expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["new", "a", "b"]);
     expect(pages.order).toEqual([FIRST_PAGE, "cursor-1"]);
   });
@@ -452,14 +454,78 @@ describe("thread page accumulation", () => {
   // render, forever: the merge runs from a render effect.
   it("returns the same object when nothing changed", () => {
     const items = [thread("a")];
-    const pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, items);
-    expect(mergeThreadPage(pages, "k", undefined, items)).toBe(pages);
+    const pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, items, "cursor-1");
+    expect(mergeThreadPage(pages, "k", undefined, items, "cursor-1")).toBe(pages);
+  });
+
+  it("does not return the same object when the server's nextCursor moved", () => {
+    const items = [thread("a")];
+    const pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, items, "cursor-1");
+    expect(mergeThreadPage(pages, "k", undefined, items, null).nextCursor).toBeNull();
   });
 
   it("de-duplicates a thread that moved up to the first page", () => {
-    let pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, [thread("a")]);
-    pages = mergeThreadPage(pages, "k", "cursor-1", [thread("b"), thread("a")]);
+    let pages = mergeThreadPage(emptyThreadPages("k"), "k", undefined, [thread("a")], "cursor-1");
+    pages = mergeThreadPage(pages, "k", "cursor-1", [thread("b"), thread("a")], null);
     expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("thread page cursors", () => {
+  const thread = (id: string) => ({ id }) as unknown as MailThreadListItem;
+
+  it("hands a cursor back only to the key that issued it", () => {
+    let pages = mergeThreadPage(emptyThreadPages("a"), "a", undefined, [thread("1")], "cursor-1");
+    expect(cursorForKey(pages, "a")).toBeUndefined();
+    pages = advanceThreadPages(pages, "a");
+    expect(cursorForKey(pages, "a")).toBe("cursor-1");
+    expect(cursorForKey(pages, "b")).toBeUndefined();
+  });
+
+  it("refuses to advance past the last page, or for another key", () => {
+    const pages = mergeThreadPage(emptyThreadPages("a"), "a", undefined, [thread("1")], null);
+    expect(advanceThreadPages(pages, "a")).toBe(pages);
+    const more = mergeThreadPage(emptyThreadPages("a"), "a", undefined, [thread("1")], "cursor-1");
+    expect(advanceThreadPages(more, "b")).toBe(more);
+  });
+
+  /**
+   * THE REGRESSION (quality review, 20 Aug). Load a second page, toggle a
+   * filter on, then toggle it back off. The returning key used to find the old
+   * page-two cursor still sitting in the component's own state -- while the
+   * accumulator had been reset by the intervening filter -- so the list
+   * fetched page two, accumulated page two alone, and page ONE silently
+   * disappeared. With the cursor living beside the key that issued it, the
+   * returning key is page one by construction.
+   */
+  it("does not revive a cursor when a filter is toggled off again", () => {
+    let pages = mergeThreadPage(emptyThreadPages("a"), "a", undefined, [thread("1")], "cursor-1");
+    pages = advanceThreadPages(pages, "a");
+    pages = mergeThreadPage(pages, "a", "cursor-1", [thread("2")], null);
+    expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["1", "2"]);
+
+    // Filter toggled ON: a key this record is not holding starts at page one...
+    expect(cursorForKey(pages, "b")).toBeUndefined();
+    pages = mergeThreadPage(pages, "b", undefined, [thread("9")], null);
+
+    // ...and toggled back OFF, the original key is page one too -- NOT
+    // "cursor-1", which is what used to lose page one.
+    expect(cursorForKey(pages, "a")).toBeUndefined();
+    pages = mergeThreadPage(pages, "a", cursorForKey(pages, "a"), [thread("1")], "cursor-1");
+    expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["1"]);
+    expect(pages.order).toEqual([FIRST_PAGE]);
+  });
+
+  // The same toggle, fast enough that the intervening filter's page one never
+  // landed: the cursor IS handed back, but the pages it belongs to are still
+  // there, so the worst case is re-fetching page two -- never a vanished page
+  // one.
+  it("keeps page one when the toggle beats the intervening fetch", () => {
+    let pages = mergeThreadPage(emptyThreadPages("a"), "a", undefined, [thread("1")], "cursor-1");
+    pages = advanceThreadPages(pages, "a");
+    pages = mergeThreadPage(pages, "a", "cursor-1", [thread("2")], null);
+    expect(cursorForKey(pages, "a")).toBe("cursor-1");
+    expect(flattenThreadPages(pages).map((item) => item.id)).toEqual(["1", "2"]);
   });
 });
 
@@ -632,6 +698,14 @@ describe("forwardBody", () => {
   it("labels a subject-less original", () => {
     expect(forwardBody({ ...message, subject: "" }, at)).toContain(`Subject: ${NO_SUBJECT_LABEL}`);
   });
+
+  // The other half of the html guard: a stored body_html of "" is as absent as
+  // null (both are ordinary for a text-only message), and quoting an empty
+  // blockquote would drop the text the message actually carried.
+  it("falls back to the text body for an empty html body", () => {
+    const body = forwardBody({ ...message, bodyHtml: "", bodyText: "plain only" }, at);
+    expect(body).toContain("<blockquote><p>plain only</p></blockquote>");
+  });
 });
 
 describe("messageFrameCsp", () => {
@@ -701,5 +775,20 @@ describe("messageFrameSrcdoc", () => {
   // double-quoted content attribute it sits in.
   it("emits a policy that cannot break out of its attribute", () => {
     expect(messageFrameCsp("https://crm.example", { remoteImages: true })).not.toContain('"');
+  });
+
+  // Belt and braces for the line above: the safety is a property of the CALLER
+  // (messageFrameCsp's grammar), so the splice escapes double quotes anyway.
+  it("escapes a double quote a future policy builder might emit", () => {
+    const doc = messageFrameSrcdoc("<p>Hi</p>", 'default-src "none"');
+    expect(doc).toContain('content="default-src &quot;none&quot;">');
+    expect(doc).toContain("<body><p>Hi</p></body>");
+  });
+
+  // The other splice, by contrast, is markup on purpose: escaping a sanitized
+  // body would render the mail as its own source.
+  it("does not escape the body", () => {
+    expect(messageFrameSrcdoc('<p class="x">Hi &amp; bye</p>', "default-src 'none'"))
+      .toContain('<body><p class="x">Hi &amp; bye</p></body>');
   });
 });
