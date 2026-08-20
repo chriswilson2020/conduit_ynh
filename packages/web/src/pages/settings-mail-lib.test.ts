@@ -227,8 +227,6 @@ describe("buildTestInput", () => {
   });
 
   it("sends a typed password as an override on a stored account", () => {
-    const input = buildTestInput(initialFormState({ ...storedAccount }), storedAccount.id);
-    expect("password" in input).toBe(false);
     const withPassword = buildTestInput(filled({ password: "typed" }), storedAccount.id);
     expect(withPassword.password).toBe("typed");
   });

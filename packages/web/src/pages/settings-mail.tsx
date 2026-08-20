@@ -367,10 +367,10 @@ function AccountForm({
       <DialogTitle>{isEdit ? "Edit mail account" : "Add mail account"}</DialogTitle>
 
       <div className="grid grid-cols-2 gap-3">
-        <Field label="Label">
+        <Field label="Label" testId="label">
           <Input value={state.label} onChange={(e) => set("label", e.target.value)} placeholder="Work" autoFocus />
         </Field>
-        <Field label="Email address">
+        <Field label="Email address" testId="email">
           <Input
             type="email"
             value={state.email}
@@ -386,27 +386,27 @@ function AccountForm({
       </div>
 
       <div className="grid grid-cols-3 gap-3">
-        <Field label="IMAP host">
+        <Field label="IMAP host" testId="imap-host">
           <Input value={state.imapHost} onChange={(e) => set("imapHost", e.target.value)} />
         </Field>
-        <Field label="IMAP port">
+        <Field label="IMAP port" testId="imap-port">
           <Input value={state.imapPort} onChange={(e) => set("imapPort", e.target.value)} inputMode="numeric" />
         </Field>
-        <Field label="IMAP security">
-          <SecuritySelect value={state.imapSecurity} onChange={(value) => set("imapSecurity", value)} />
+        <Field label="IMAP security" testId="imap-security">
+          <SecuritySelect value={state.imapSecurity} onChange={(value) => set("imapSecurity", value)} ariaLabel="IMAP security" />
         </Field>
-        <Field label="SMTP host">
+        <Field label="SMTP host" testId="smtp-host">
           <Input value={state.smtpHost} onChange={(e) => set("smtpHost", e.target.value)} />
         </Field>
-        <Field label="SMTP port">
+        <Field label="SMTP port" testId="smtp-port">
           <Input value={state.smtpPort} onChange={(e) => set("smtpPort", e.target.value)} inputMode="numeric" />
         </Field>
-        <Field label="SMTP security">
-          <SecuritySelect value={state.smtpSecurity} onChange={(value) => set("smtpSecurity", value)} />
+        <Field label="SMTP security" testId="smtp-security">
+          <SecuritySelect value={state.smtpSecurity} onChange={(value) => set("smtpSecurity", value)} ariaLabel="SMTP security" />
         </Field>
       </div>
 
-      <Field label="Username">
+      <Field label="Username" testId="username">
         <Input value={state.username} onChange={(e) => set("username", e.target.value)} autoComplete="username" />
       </Field>
 
@@ -420,7 +420,7 @@ function AccountForm({
       </label>
 
       <div className="grid grid-cols-2 gap-3">
-        <Field label={state.smtpDiffers ? "IMAP password" : "Password"}>
+        <Field label={state.smtpDiffers ? "IMAP password" : "Password"} testId="password">
           <Input
             type="password"
             value={state.password}
@@ -430,7 +430,7 @@ function AccountForm({
           />
         </Field>
         {state.smtpDiffers && (
-          <Field label="SMTP password">
+          <Field label="SMTP password" testId="smtp-password">
             <Input
               type="password"
               value={state.smtpPassword}
@@ -443,12 +443,12 @@ function AccountForm({
       </div>
 
       <div className="grid grid-cols-2 gap-3">
-        <Field label="Sent folder">
+        <Field label="Sent folder" testId="sent-folder">
           <Input value={state.sentFolder} onChange={(e) => set("sentFolder", e.target.value)} />
         </Field>
-        <Field label="Backfill">
+        <Field label="Backfill" testId="backfill">
           <Select value={state.backfill} onValueChange={(value) => set("backfill", value)}>
-            <SelectTrigger>
+            <SelectTrigger ariaLabel="Backfill">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -482,19 +482,30 @@ function AccountForm({
   );
 }
 
-function Field({ label, children }: { label: string; children: ReactNode }) {
+/** One labelled form control. The wrapper carries `field-<testId>`, mirroring
+ * task-drawer.tsx's Field, so a test can address a control whose own element
+ * is a Radix trigger rather than a plain input. */
+function Field({ label, testId, children }: { label: string; testId: string; children: ReactNode }) {
   return (
     <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
       {label}
-      {children}
+      <div data-testid={`field-${testId}`}>{children}</div>
     </label>
   );
 }
 
-function SecuritySelect({ value, onChange }: { value: MailSecurity; onChange: (value: MailSecurity) => void }) {
+function SecuritySelect({
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  value: MailSecurity;
+  onChange: (value: MailSecurity) => void;
+  ariaLabel: string;
+}) {
   return (
     <Select value={value} onValueChange={(next) => onChange(next as MailSecurity)}>
-      <SelectTrigger>
+      <SelectTrigger ariaLabel={ariaLabel}>
         <SelectValue />
       </SelectTrigger>
       <SelectContent>

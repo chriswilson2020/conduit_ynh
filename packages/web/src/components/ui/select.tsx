@@ -5,9 +5,28 @@ import { clsx } from "clsx";
 export const Select = RadixSelect.Root;
 export const SelectValue = RadixSelect.Value;
 
-export function SelectTrigger({ children, className }: { children: ReactNode; className?: string }) {
+/**
+ * `ariaLabel` matters more here than on a plain input: a Radix select trigger
+ * is a <button> whose only content is the CURRENT VALUE, so without one a
+ * screen reader (and any test looking it up by name) sees "tls" rather than
+ * "IMAP security". `testId` is optional and only used where the trigger is
+ * not already inside a testid'd field wrapper.
+ */
+export function SelectTrigger({
+  children,
+  className,
+  ariaLabel,
+  testId,
+}: {
+  children: ReactNode;
+  className?: string;
+  ariaLabel?: string;
+  testId?: string;
+}) {
   return (
     <RadixSelect.Trigger
+      aria-label={ariaLabel}
+      data-testid={testId}
       className={clsx(
         "inline-flex w-full items-center justify-between rounded-md border border-slate-300",
         "bg-white px-3 py-2 text-sm text-slate-900 focus:outline-none focus:ring-1 focus:ring-slate-500",

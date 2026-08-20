@@ -1,4 +1,4 @@
-import { forwardRef, useImperativeHandle } from "react";
+import { forwardRef, useImperativeHandle, useMemo } from "react";
 import Link from "@tiptap/extension-link";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -27,10 +27,35 @@ export interface RichTextEditorProps {
    */
   initialHtml?: string;
   onChange: (html: string) => void;
+  /**
+   * Fired once the editor instance exists and its document is mounted. The
+   * composer hangs its signature append off this rather than off a ref being
+   * populated, so nothing depends on when TipTap happens to fill the ref.
+   */
+  onCreate?: () => void;
   className?: string;
   testId?: string;
   ariaLabel?: string;
 }
+
+/**
+ * Module-level, and never rebuilt per render: useEditor calls setOptions on
+ * every render it sees new options, so a fresh array here would re-register
+ * the whole extension set on every keystroke.
+ *
+ * StarterKit v3 already BUNDLES the Link extension, so its copy is switched
+ * off (`link: false`) and a configured one registered alongside -- registering
+ * both would double-register the same extension name. `openOnClick: false`
+ * keeps a click inside the editor an edit rather than a navigation;
+ * `autolink` is what makes a typed URL become a link without a toolbar
+ * affordance for it.
+ */
+const EXTENSIONS = [
+  StarterKit.configure({ link: false }),
+  Link.configure({ openOnClick: false, autolink: true }),
+];
+
+const EDITOR_CLASS = "min-h-[8rem] w-full px-3 py-2 text-sm text-slate-900 focus:outline-none";
 
 const toolbarButtonClass =
   "rounded px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-50";
@@ -39,33 +64,29 @@ const activeToolbarButtonClass = "rounded bg-slate-200 px-2 py-1 text-xs font-me
 /**
  * The one rich-text editor in the app (Phase 4's first TipTap use): message
  * bodies, per-account signatures and email templates all render through it.
- *
- * StarterKit + Link, and nothing else. StarterKit v3 already BUNDLES the Link
- * extension, so its copy is switched off (`link: false`) and a configured one
- * registered alongside -- registering both would double-register the same
- * extension name. `openOnClick: false` keeps a click inside the editor an
- * edit rather than a navigation; `autolink` is what makes a typed URL become
- * a link without a toolbar affordance for it.
+ * StarterKit + Link, and nothing else -- see EXTENSIONS above.
  *
  * All output HTML is sanitized SERVER-side on every write path (signatures,
  * templates and compose bodies all run through mail-content.ts's shared
  * sanitizer), so this editor never has to be the security boundary.
  */
 export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
-  function RichTextEditor({ initialHtml = "", onChange, className, testId, ariaLabel }, ref) {
-    const editor = useEditor({
-      extensions: [
-        StarterKit.configure({ link: false }),
-        Link.configure({ openOnClick: false, autolink: true }),
-      ],
-      content: initialHtml,
-      editorProps: {
-        attributes: {
-          class: "min-h-[8rem] w-full px-3 py-2 text-sm text-slate-900 focus:outline-none",
-          ...(ariaLabel !== undefined ? { "aria-label": ariaLabel } : {}),
-          ...(testId !== undefined ? { "data-testid": testId } : {}),
-        },
+  function RichTextEditor({ initialHtml = "", onChange, onCreate, className, testId, ariaLabel }, ref) {
+    // Memoised for the same reason EXTENSIONS is hoisted: a new object here
+    // every render is a setOptions call every keystroke.
+    const editorProps = useMemo(() => ({
+      attributes: {
+        class: EDITOR_CLASS,
+        ...(ariaLabel !== undefined ? { "aria-label": ariaLabel } : {}),
+        ...(testId !== undefined ? { "data-testid": testId } : {}),
       },
+    }), [ariaLabel, testId]);
+
+    const editor = useEditor({
+      extensions: EXTENSIONS,
+      content: initialHtml,
+      editorProps,
+      onCreate: () => onCreate?.(),
       onUpdate: ({ editor: instance }) => onChange(instance.getHTML()),
     });
 

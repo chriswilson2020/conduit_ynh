@@ -383,7 +383,13 @@ export async function markThreadRead(
   const groups = new Map<string, SeenWriteBack>();
   for (const row of changed) {
     if (row.imapUid === null) continue;
-    const key = `${row.accountId} ${row.folder}`;
+    // NUL as the composite-key separator, written as the ESCAPE `\0` rather
+    // than a literal NUL byte in this source: the two are identical at
+    // runtime, but a raw NUL makes grep/ripgrep classify the whole file as
+    // binary and skip it silently. The separator itself stays NUL because a
+    // folder name is arbitrary user data that could contain any printable
+    // separator ("::" included) but never a NUL.
+    const key = `${row.accountId}\0${row.folder}`;
     const group = groups.get(key);
     if (group === undefined) groups.set(key, { accountId: row.accountId, folder: row.folder, uids: [row.imapUid] });
     else group.uids.push(row.imapUid);

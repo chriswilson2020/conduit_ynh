@@ -16,6 +16,7 @@ import {
   sendFailureMessage,
   signatureBlock,
   substitutePlaceholders,
+  substitutePlaceholdersHtml,
   templateSubject,
 } from "./composer-lib";
 
@@ -285,6 +286,37 @@ describe("substitutePlaceholders", () => {
   it("substitutes every occurrence, not just the first", () => {
     expect(substitutePlaceholders("{{user.name}} and {{user.name}}", { userName: "Chris" }))
       .toBe("Chris and Chris");
+  });
+});
+
+// The body path splices values into MARKUP, so a record name containing a
+// markup character has to survive as text rather than be eaten by the
+// server's sanitizer (or, worse, become markup).
+describe("substitutePlaceholdersHtml", () => {
+  it("escapes angle brackets in a substituted name", () => {
+    expect(substitutePlaceholdersHtml("<p>Hi {{contact.name}}</p>", { contactName: "Ben <ben@corp>" }))
+      .toBe("<p>Hi Ben &lt;ben@corp&gt;</p>");
+  });
+
+  it("escapes an ampersand exactly once", () => {
+    expect(substitutePlaceholdersHtml("<p>{{company.name}}</p>", { companyName: "Smith & Sons" }))
+      .toBe("<p>Smith &amp; Sons</p>");
+  });
+
+  it("does not escape the template's own markup, only the values", () => {
+    expect(substitutePlaceholdersHtml("<p><strong>{{user.name}}</strong></p>", { userName: "Chris" }))
+      .toBe("<p><strong>Chris</strong></p>");
+  });
+
+  it("leaves an unresolved placeholder literal, same as the text path", () => {
+    expect(substitutePlaceholdersHtml("<p>Hi {{contact.name}}</p>", {})).toBe("<p>Hi {{contact.name}}</p>");
+  });
+
+  it("leaves the subject path unescaped", () => {
+    // The subject is a header value, not markup: escaping there would put a
+    // literal "&lt;" in the user's subject line.
+    expect(substitutePlaceholders("Hi {{contact.name}}", { contactName: "Ben <ben@corp>" }))
+      .toBe("Hi Ben <ben@corp>");
   });
 });
 

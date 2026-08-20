@@ -192,20 +192,47 @@ export interface TemplateContext {
 
 const PLACEHOLDER = /\{\{\s*(contact|company|user)\.name\s*\}\}/g;
 
-/**
- * Substitutes `{{contact.name}}`, `{{company.name}}` and `{{user.name}}` from
- * the given context. A placeholder with nothing to fill it is LEFT LITERAL
- * (spec: "unresolved placeholders are left visible for the user to fill"),
- * never replaced with an empty string -- an email that silently reads "Hi ,"
- * is worse than one that visibly still needs a name.
- */
-export function substitutePlaceholders(input: string, context: TemplateContext): string {
+/** Text-node escaping for a value being spliced into markup. Ampersand
+ * first, or it would double-escape the entities the others produce. */
+function escapeHtmlText(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function substitute(input: string, context: TemplateContext, escape: (value: string) => string): string {
   return input.replace(PLACEHOLDER, (match, field: string) => {
     const value = field === "contact" ? context.contactName
       : field === "company" ? context.companyName
         : context.userName;
-    return value != null && value.trim() !== "" ? value : match;
+    return value != null && value.trim() !== "" ? escape(value) : match;
   });
+}
+
+/**
+ * Substitutes `{{contact.name}}`, `{{company.name}}` and `{{user.name}}` from
+ * the given context into PLAIN TEXT (the subject line). A placeholder with
+ * nothing to fill it is LEFT LITERAL (spec: "unresolved placeholders are left
+ * visible for the user to fill"), never replaced with an empty string -- an
+ * email that silently reads "Hi ," is worse than one that visibly still needs
+ * a name.
+ */
+export function substitutePlaceholders(input: string, context: TemplateContext): string {
+  return substitute(input, context, (value) => value);
+}
+
+/**
+ * The same substitution into an HTML template BODY, with every substituted
+ * value escaped as a text node.
+ *
+ * The values come from CRM records -- a contact called `Ben <ben@corp>` or a
+ * company called `Smith & Sons` is ordinary data, not an attack -- but
+ * splicing either into markup unescaped is still wrong: `<` opens a tag, so
+ * the name gets swallowed by the server's sanitizer on the way in and the
+ * user sees their template silently truncated. Escaping keeps the name
+ * visible and, incidentally, means a hostile record name cannot inject markup
+ * into a message body either.
+ */
+export function substitutePlaceholdersHtml(input: string, context: TemplateContext): string {
+  return substitute(input, context, escapeHtmlText);
 }
 
 /**

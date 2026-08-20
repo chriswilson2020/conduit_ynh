@@ -19,12 +19,6 @@ describe("parseDecimal", () => {
   });
 });
 
-// The timezone behaviour itself (the actual reason this helper exists --
-// local midnight vs. UTC midnight) needs clock injection to test properly,
-// which this suite doesn't have; these two just pin the format contract
-// every caller (task-board.tsx today, My Tasks/the Gantt's today line later)
-// relies on: a plain YYYY-MM-DD string that round-trips through a date-only
-// comparison/parse.
 // The injected `now` is what makes these deterministic -- see relativeTime's
 // own doc comment for why the clock is a parameter rather than read inside.
 describe("relativeTime", () => {
@@ -61,6 +55,12 @@ describe("relativeTime", () => {
   });
 });
 
+// The timezone behaviour itself (the actual reason this helper exists --
+// local midnight vs. UTC midnight) needs clock injection to test properly,
+// which this suite doesn't have; these two just pin the format contract
+// every caller (task-board.tsx today, My Tasks/the Gantt's today line later)
+// relies on: a plain YYYY-MM-DD string that round-trips through a date-only
+// comparison/parse.
 describe("todayLocalIso", () => {
   it("returns a zero-padded YYYY-MM-DD string", () => {
     expect(todayLocalIso()).toMatch(/^\d{4}-\d{2}-\d{2}$/);

@@ -262,6 +262,19 @@ Task 9 hands over (as built, 20 Aug):
 - **Global search already has a mail group server-side.** `searchResultsSchema.mail`
   (threadId/subject/snippet) is populated, but components/search.tsx still flattens only the original
   five groups. Task 10 adds the mail group's render and its navigation once `/mail` exists.
+- **Mount the composer in the FIRST commit, and smoke it end to end.** components/mail/composer.tsx is
+  546 lines that have never executed: nothing imports it yet, so the build only typechecks it. Wire it
+  into the inbox and actually compose, apply a template, attach, and send before building anything on
+  top of it.
+- **Exercise the eight dormant thread hooks early**, for the same reason: `useMailThreads`/`useMailThread`
+  /`useMarkThreadRead`/`useSetThreadLink`/`useClearThreadLink`/`useArchiveThread`/`useUnarchiveThread`/
+  `useUnreadMailCount` have never issued a request. Each one runs its response through `parseWith`, which
+  fails LOUDLY on any contract drift — give it that chance against the real API before three components
+  deep depend on the shapes.
+- **`composer-lib.ts` may want renaming** once the inbox imports `friendlyMailError` from it (the settings
+  page already does): it is the mail feature's lib, not the composer's. `mail-lib.ts` if the import list
+  makes the current name look wrong — a mechanical rename, worth doing in the same commit that widens its
+  audience rather than later.
 - **`useMailAccounts()` must stay option-less everywhere except Settings.** Its `refetchInterval` option
   exists solely for the settings page's `syncStats` freshness contract; every other consumer treats the
   hook as an SSE-invalidated cache of the account rows.
@@ -272,4 +285,4 @@ Task 9 hands over (as built, 20 Aug):
 
 ### Task 12: Packaging + release 0.5.0
 
-`scripts/install`: after data_dir setup — `openssl rand -out "$data_dir/mail.key" 32`, `chmod 600`, `chown $app:$app` (match the existing file-provisioning idiom in the script). `scripts/upgrade`: same, guarded by `[ -f ]`. `scripts/backup`/`restore`: mail.key rides the existing data_dir coverage — VERIFY that data_dir is fully included (it is for files); add an explicit line only if the scripts enumerate paths. Config: `MAIL_KEY_PATH` env in the systemd service/config template pointing at `$data_dir/mail.key`. Also in this task (Chris's decision, 19 Aug): merge branch `fix/fastify-static-advisories` (commit 901f205, @fastify/static v8 -> v10 security migration, verified against v0.4.3) into the phase branch before the version bump — regenerate the lockfile on the server after the merge, re-run the full suite, mention the migration in the release notes, and drop the `conduit_test_secfix` database on the dev server. Then Phase 2 Task 10 release mechanics verbatim (bump all versions to 0.5.0, CI gate, ff-merge to main, tag v0.5.0, Release workflow builds the asset, manifest sha update on main, branch cleanup, hand Chris the one sudo upgrade command). Live verification checklist: add real account (Chris's local Dovecot via preset), watch sync populate, link a deal, send a reply from the CRM and see it in his normal mail client's Sent. Plus one dev-only check that CI cannot make: run `npm run dev:web` (StrictMode is on in dev, while the CI e2e serves the production build where React never double-invokes an effect), open the composer and confirm the selected account's signature is appended exactly once — the specific risk is the `signedFor` ref surviving a simulated remount while TipTap rebuilds its editor, which would either skip or double the append.
+`scripts/install`: after data_dir setup — `openssl rand -out "$data_dir/mail.key" 32`, `chmod 600`, `chown $app:$app` (match the existing file-provisioning idiom in the script). `scripts/upgrade`: same, guarded by `[ -f ]`. `scripts/backup`/`restore`: mail.key rides the existing data_dir coverage — VERIFY that data_dir is fully included (it is for files); add an explicit line only if the scripts enumerate paths. Config: `MAIL_KEY_PATH` env in the systemd service/config template pointing at `$data_dir/mail.key`. Also in this task (Chris's decision, 19 Aug): merge branch `fix/fastify-static-advisories` (commit 901f205, @fastify/static v8 -> v10 security migration, verified against v0.4.3) into the phase branch before the version bump — regenerate the lockfile on the server after the merge, re-run the full suite, mention the migration in the release notes, and drop the `conduit_test_secfix` database on the dev server. Then Phase 2 Task 10 release mechanics verbatim (bump all versions to 0.5.0, CI gate, ff-merge to main, tag v0.5.0, Release workflow builds the asset, manifest sha update on main, branch cleanup, hand Chris the one sudo upgrade command). Live verification checklist: add real account (Chris's local Dovecot via preset), watch sync populate, link a deal, send a reply from the CRM and see it in his normal mail client's Sent.

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, KeyboardEvent } from "react";
+import { clsx } from "clsx";
 import type { FileMeta, SendMailInput } from "@conduit/shared";
 import {
   useContacts,
@@ -17,7 +18,7 @@ import {
   parseRecipientInput,
   resolveRecipients,
   signatureBlock,
-  substitutePlaceholders,
+  substitutePlaceholdersHtml,
   templateSubject,
   type ComposerLinks,
   type ComposerRecipient,
@@ -91,13 +92,19 @@ export function Composer({ open, onOpenChange, seed }: ComposerProps) {
 }
 
 function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => void }) {
-  const { data: accounts } = useMailAccounts();
-  const { data: templates = [] } = useMailTemplates();
+  const { data: accounts, isLoading: accountsLoading } = useMailAccounts();
+  // {archived:false} explicitly, matching the settings page's own call, so
+  // both share one ['email-templates', {archived:false}] cache entry.
+  const { data: templates = [] } = useMailTemplates({ archived: false });
   const { data: me } = useMe();
   const send = useSendMail();
   const upload = useUploadFile();
   const editorRef = useRef<RichTextHandle>(null);
 
+  // Only what the user PICKED lives in state; the effective selection is
+  // derived. An effect that back-filled the first account instead would flip
+  // the Radix select from uncontrolled (undefined) to controlled (a string)
+  // on the render after the accounts arrive, which Radix warns about.
   const [accountId, setAccountId] = useState<string | null>(seed?.accountId ?? null);
   const [to, setTo] = useState<ComposerRecipient[]>([...(seed?.to ?? [])]);
   const [cc, setCc] = useState<ComposerRecipient[]>([...(seed?.cc ?? [])]);
@@ -114,8 +121,12 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
   const [bodyHtml, setBodyHtml] = useState(seed?.bodyHtml ?? "");
   const [attachments, setAttachments] = useState<FileMeta[]>([]);
   const [localError, setLocalError] = useState<string | null>(null);
-  // Guards the signature append so it runs once per account SELECTION, not on
-  // every render that happens to see the same account.
+  // Bumped every time the editor announces itself (RichTextEditor's onCreate,
+  // which TipTap emits from a timeout AFTER the instance is live and skips
+  // entirely for an instance that was destroyed first). Everything about the
+  // signature hangs off this rather than off the ref being populated.
+  const [editorEpoch, setEditorEpoch] = useState(0);
+  // Which (editor instance, account) pair has already had a signature.
   const signedFor = useRef<string | null>(null);
 
   // Own, non-archived, non-error accounts: those are exactly the ones
@@ -125,27 +136,34 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
     [accounts],
   );
 
-  useEffect(() => {
-    if (accountId !== null || sendableAccounts.length === 0) return;
-    setAccountId(sendableAccounts[0]?.id ?? null);
-  }, [accountId, sendableAccounts]);
+  const selectedAccountId = accountId ?? sendableAccounts[0]?.id ?? null;
 
   /**
    * Signature behaviour, deliberately simple: the selected account's
-   * signature is appended ONCE, at the end of the body, each time an account
-   * is selected (including the initial auto-selection). Switching accounts
-   * appends the new one rather than trying to find and replace the old block
-   * -- once the text is in the editor it is ordinary editable content that
-   * the user may have rewritten, and TipTap's schema will have normalised the
-   * markup anyway, so there is nothing reliable left to match on.
+   * signature is appended ONCE, at the end of the body, for each (editor,
+   * account) pair -- the initial auto-selection included. Switching accounts
+   * appends the new one rather than trying to find and replace the old block:
+   * once the text is in the editor it is ordinary editable content the user
+   * may have rewritten, and TipTap's schema will have normalised the markup
+   * anyway, so there is nothing reliable left to match on.
+   *
+   * Keying the guard on the editor EPOCH rather than on the account alone is
+   * what makes this robust: an editor that gets rebuilt (a remount, or a
+   * TipTap version that recreates its instance) announces itself again, so
+   * the fresh, empty document gets the signature instead of silently losing
+   * it -- and because the append only ever runs after onCreate, it can never
+   * race the editor's own construction.
    */
   useEffect(() => {
-    if (accountId === null || signedFor.current === accountId) return;
-    signedFor.current = accountId;
-    const signature = sendableAccounts.find((account) => account.id === accountId)?.signatureHtml;
+    if (editorEpoch === 0 || selectedAccountId === null) return;
+    const key = `${editorEpoch}:${selectedAccountId}`;
+    if (signedFor.current === key) return;
+    signedFor.current = key;
+    const signature = sendableAccounts.find((account) => account.id === selectedAccountId)?.signatureHtml;
     if (signature == null || signature === "") return;
     editorRef.current?.appendAtEnd(signatureBlock(signature));
-  }, [accountId, sendableAccounts]);
+  }, [editorEpoch, selectedAccountId, sendableAccounts]);
+
 
   const context: TemplateContext = {
     contactName: seed?.context?.contactName,
@@ -174,12 +192,12 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
     if (template === undefined) return;
     setSubject((current) =>
       templateSubject(current, template.subject, { isReply: seed?.threadId !== undefined, context }));
-    editorRef.current?.insertAtCursor(substitutePlaceholders(template.bodyHtml, context));
+    editorRef.current?.insertAtCursor(substitutePlaceholdersHtml(template.bodyHtml, context));
   }
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    if (accountId === null) {
+    if (selectedAccountId === null) {
       setLocalError("Choose an account to send from.");
       return;
     }
@@ -189,14 +207,17 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
     const resolvedTo = resolveRecipients(to, toDraft);
     const resolvedCc = resolveRecipients(cc, ccDraft);
     const resolvedBcc = resolveRecipients(bcc, bccDraft);
-    setTo(resolvedTo.recipients);
-    setCc(resolvedCc.recipients);
-    setBcc(resolvedBcc.recipients);
     const invalid = [...resolvedTo.invalid, ...resolvedCc.invalid, ...resolvedBcc.invalid];
     if (invalid.length > 0) {
+      // Nothing is committed on this path: chipping the half of the line that
+      // parsed while the input still shows the whole string the user typed
+      // would leave the two disagreeing about what is addressed.
       setLocalError(`Not an email address: ${invalid.join(", ")}`);
       return;
     }
+    setTo(resolvedTo.recipients);
+    setCc(resolvedCc.recipients);
+    setBcc(resolvedBcc.recipients);
     setToDraft("");
     setCcDraft("");
     setBccDraft("");
@@ -210,7 +231,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
     }
     setLocalError(null);
     const input: SendMailInput = {
-      accountId,
+      accountId: selectedAccountId,
       threadId: seed?.threadId,
       to: resolvedTo.recipients,
       cc: resolvedCc.recipients,
@@ -229,13 +250,17 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
 
       <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
         From
-        {sendableAccounts.length === 0 ? (
+        {accountsLoading ? (
+          <p className="text-sm text-slate-400">Loading accounts...</p>
+        ) : sendableAccounts.length === 0 ? (
           <p className="text-sm text-slate-400">
             No active mail account. Add one in Settings {"\u2192"} Mail accounts.
           </p>
         ) : (
-          <Select value={accountId ?? undefined} onValueChange={(value) => setAccountId(value)}>
-            <SelectTrigger>
+          // Only rendered once there IS an account, so the derived value is a
+          // string from this select's very first render -- never undefined.
+          <Select value={selectedAccountId ?? undefined} onValueChange={(value) => setAccountId(value)}>
+            <SelectTrigger ariaLabel="From" testId="composer-account">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -304,7 +329,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
                 than putting the composer into a "template mode" it would then
                 have to leave. */}
             <Select value={NO_TEMPLATE} onValueChange={applyTemplate}>
-              <SelectTrigger>
+              <SelectTrigger ariaLabel="Template" testId="composer-template">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -322,14 +347,15 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
         ref={editorRef}
         initialHtml={seed?.bodyHtml ?? ""}
         onChange={setBodyHtml}
+        onCreate={() => setEditorEpoch((epoch) => epoch + 1)}
         ariaLabel="Message body"
         testId="composer-body"
       />
 
       <div className="flex flex-wrap items-center gap-2">
         <label
-          className={`cursor-pointer rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50 ${
-            target === null ? "cursor-not-allowed opacity-50" : ""
+          className={`rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50 ${
+            target === null ? "cursor-not-allowed opacity-50" : "cursor-pointer"
           }`}
         >
           {upload.isPending ? "Uploading..." : "Attach file"}
@@ -349,7 +375,11 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
             {file.originalName}
             <button
               type="button"
-              aria-label={`Remove ${file.originalName}`}
+              // "Do not attach", not "Remove": this only drops the file from
+              // THIS message. The upload is already a files row on the record
+              // it was filed against, and stays on that record's Files rail
+              // whether the message is ever sent or not.
+              aria-label={`Do not attach ${file.originalName}`}
               className="text-slate-400 hover:text-slate-900"
               onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== file.id))}
             >
@@ -369,7 +399,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
           data-testid="composer-send"
           // A typed-but-uncommitted recipient counts: handleSubmit resolves
           // the draft before it decides there is nobody to send to.
-          disabled={send.isPending || accountId === null || (to.length === 0 && toDraft.trim() === "")}
+          disabled={send.isPending || selectedAccountId === null || (to.length === 0 && toDraft.trim() === "")}
         >
           {send.isPending ? "Sending..." : "Send"}
         </Button>
@@ -406,6 +436,12 @@ function RecipientField({
 }) {
   const [debounced, setDebounced] = useState("");
   const [open, setOpen] = useState(false);
+  // -1 = nothing highlighted, which is the state the dropdown OPENS in.
+  // Unlike the global search (components/search.tsx, whose list is the only
+  // thing Enter can act on and which therefore highlights its first row), the
+  // typed text here is itself a valid answer -- so Enter commits what was
+  // typed until the user has actually arrowed into the list.
+  const [highlight, setHighlight] = useState(-1);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebounced(draft), 200);
@@ -430,9 +466,17 @@ function RecipientField({
     return out.slice(0, 8);
   }, [contactsData, recipients]);
 
+  // A fresh result set always drops the highlight back to "none" -- keyed on
+  // the fetched data (not `suggestions`, a new array every render), mirroring
+  // components/search.tsx.
+  useEffect(() => {
+    setHighlight(-1);
+  }, [contactsData]);
+
   function commit(recipient: ComposerRecipient) {
     onChange(dedupeRecipients([...recipients, recipient]));
     onDraftChange("");
+    setHighlight(-1);
     setOpen(false);
   }
 
@@ -460,12 +504,31 @@ function RecipientField({
     setOpen(false);
   }
 
+  const dropdownOpen = open && suggestions.length > 0;
+
   function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    // Arrow keys move a single highlight through the suggestions, the same
+    // pattern the global search uses; the dropdown is otherwise unreachable
+    // without a mouse.
+    if (dropdownOpen && event.key === "ArrowDown") {
+      event.preventDefault();
+      setHighlight((current) => Math.min(current + 1, suggestions.length - 1));
+      return;
+    }
+    if (dropdownOpen && event.key === "ArrowUp") {
+      event.preventDefault();
+      // Back past the top row returns to "none highlighted", so Enter goes
+      // back to committing what was typed.
+      setHighlight((current) => Math.max(current - 1, -1));
+      return;
+    }
     if (event.key === "Enter") {
-      // Always swallowed: Enter in a recipient field commits the token, and
+      // Always swallowed: Enter in a recipient field picks or commits, and
       // must never reach the form and send the message half-addressed.
       event.preventDefault();
-      commitDraft();
+      const highlighted = dropdownOpen && highlight >= 0 ? suggestions[highlight] : undefined;
+      if (highlighted !== undefined) commit(highlighted);
+      else commitDraft();
       return;
     }
     if (event.key === "Tab") {
@@ -476,7 +539,10 @@ function RecipientField({
     if (event.key === "Backspace" && draft === "" && recipients.length > 0) {
       onChange(recipients.slice(0, -1));
     }
-    if (event.key === "Escape") setOpen(false);
+    if (event.key === "Escape") {
+      setHighlight(-1);
+      setOpen(false);
+    }
   }
 
   return (
@@ -517,18 +583,22 @@ function RecipientField({
             }}
           />
         </div>
-        {open && suggestions.length > 0 && (
+        {dropdownOpen && (
           <ul className="absolute z-10 mt-1 max-h-56 w-full overflow-auto rounded-md border border-slate-200 bg-white shadow-lg">
-            {suggestions.map((suggestion) => (
+            {suggestions.map((suggestion, index) => (
               <li key={`${suggestion.name ?? ""}-${suggestion.address}`}>
                 <button
                   type="button"
                   data-testid="composer-suggestion"
-                  className="block w-full px-3 py-2 text-left text-sm hover:bg-slate-50"
+                  className={clsx(
+                    "block w-full px-3 py-2 text-left text-sm",
+                    index === highlight ? "bg-slate-100" : "hover:bg-slate-50",
+                  )}
                   // Keeps focus in the input: without this the mousedown
                   // blurs it, the dropdown unmounts, and the click lands on
                   // nothing.
                   onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setHighlight(index)}
                   onClick={() => commit(suggestion)}
                 >
                   <span className="block text-slate-900">{suggestion.name ?? suggestion.address}</span>
