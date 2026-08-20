@@ -370,7 +370,90 @@ describe("files routes", () => {
     });
     expect(download.statusCode).toBe(200);
     expect(download.body).toBe("hello world");
-    expect(download.headers["content-disposition"]).toBe('attachment; filename="hello.txt"');
+    expect(download.headers["content-disposition"])
+      .toBe(`attachment; filename="hello.txt"; filename*=UTF-8''hello.txt`);
+    expect(download.headers["x-content-type-options"]).toBe("nosniff");
+    expect(download.headers["content-length"]).toBe(String(Buffer.byteLength("hello world", "utf8")));
+    await a.close();
+  });
+
+  // mailparser's non-Latin-filename problem (see mail.test.ts) applies here too:
+  // Node refuses to put any code point above U+00FF in a header value at all
+  // (ERR_INVALID_CHAR, a 500 rather than a download), so this exercises the
+  // shared contentDisposition helper's RFC 5987 form via a genuine upload.
+  // U+8ACB U+6C42 U+66F8 is "invoice" in Chinese; sent through the extended
+  // filename*=UTF-8''percent-encoded-value form (real UTF-8 bytes on the wire
+  // would break the multipart header line itself), and the percent-encoding
+  // below is written out literally rather than recomputed, so this asserts the
+  // real bytes -- same technique the hostile-filename test below already uses.
+  it("downloads a non-Latin filename with both an ASCII fallback and the RFC 5987 form", async () => {
+    const a = await app();
+    const company = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    const companyId = company.json().id as string;
+
+    const filename = `${String.fromCharCode(0x8acb, 0x6c42, 0x66f8)}.pdf`;
+    const boundary = "----conduitCjkBoundary1234567890";
+    const body =
+      `--${boundary}\r\nContent-Disposition: form-data; name="companyId"\r\n\r\n${companyId}\r\n` +
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename*=UTF-8''${encodeURIComponent(filename)}\r\n` +
+      `Content-Type: application/pdf\r\n\r\npdf bytes\r\n` +
+      `--${boundary}--\r\n`;
+
+    const upload = await a.inject({
+      method: "POST", url: "/api/files",
+      headers: { ...authHeaders, "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload: body,
+    });
+    expect(upload.statusCode).toBe(201);
+    const meta = fileMetaSchema.parse(upload.json());
+    expect(meta.originalName).toBe(filename);
+
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${meta.id}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    const disposition = download.headers["content-disposition"];
+    expect(disposition).toBe(`attachment; filename="___.pdf"; filename*=UTF-8''%E8%AB%8B%E6%B1%82%E6%9B%B8.pdf`);
+    // The header value itself must be transmittable: pure ASCII, no raw
+    // Unicode anywhere in it.
+    expect(disposition).toMatch(/^[\x20-\x7E]*$/);
+    expect(download.body).toBe("pdf bytes");
+    await a.close();
+  });
+
+  // A hostile declared content type must never come back as the response's
+  // DECLARED Content-Type, even under an attachment disposition -- see
+  // files.ts's DOWNLOAD_DENY_MIME comment for why nosniff alone is not enough.
+  it("re-types a downloaded text/html upload to application/octet-stream", async () => {
+    const a = await app();
+    const company = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    const companyId = company.json().id as string;
+
+    const { body, boundary } = buildMultipart(
+      { companyId },
+      { name: "payload.html", content: "<script>alert(1)</script>", mime: "text/html" },
+    );
+    const upload = await a.inject({
+      method: "POST", url: "/api/files",
+      headers: { ...authHeaders, "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload: body,
+    });
+    expect(upload.statusCode).toBe(201);
+    const meta = fileMetaSchema.parse(upload.json());
+    expect(meta.mime).toBe("text/html");
+
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${meta.id}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.headers["content-type"]).toBe("application/octet-stream");
+    expect(download.headers["content-disposition"])
+      .toBe(`attachment; filename="payload.html"; filename*=UTF-8''payload.html`);
+    expect(download.headers["x-content-type-options"]).toBe("nosniff");
     await a.close();
   });
 
@@ -505,6 +588,11 @@ describe("files routes", () => {
   // filename*=charset''percent-encoded-value form (real CR/LF/quote bytes would
   // break the multipart header line itself; percent-encoding is how a client gets
   // those characters into a filename in the first place).
+  //
+  // The expected Content-Disposition below is contentDisposition()'s shape (see
+  // routes/helpers.ts): control characters become "_" and quotes/backslashes are
+  // dropped from the ASCII fallback, alongside the RFC 5987 filename* form -- not
+  // the old naive `.replace(/[\r\n"]/g, "")` this route used to build by hand.
   it("sanitizes a hostile filename's CR/LF/quote in Content-Disposition while preserving it in storage", async () => {
     const a = await app();
     const company = await a.inject({
@@ -541,7 +629,9 @@ describe("files routes", () => {
     // anywhere, and exactly those two structural quotes -- none embedded.
     expect(disposition).not.toMatch(/[\r\n]/);
     expect((disposition as string).match(/"/g)).toHaveLength(2);
-    expect(disposition).toBe(`attachment; filename="${hostileFilename.replace(/[\r\n"]/g, "")}"`);
+    expect(disposition)
+      .toBe(`attachment; filename="evil__X-Injected: 1.txt"; filename*=UTF-8''evil%0D%0AX-Injected%3A%201%22.txt`);
+    expect(download.headers["x-content-type-options"]).toBe("nosniff");
     await a.close();
   });
 });

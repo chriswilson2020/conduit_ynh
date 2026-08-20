@@ -2,9 +2,34 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { MultipartFile } from "@fastify/multipart";
 import { z } from "zod";
 import type { CrmRouteDeps } from "./index.js";
-import { requireUser, mapDomainError, parseOrReject, idParamSchema } from "./helpers.js";
+import { requireUser, mapDomainError, parseOrReject, idParamSchema, contentDisposition } from "./helpers.js";
 import { saveBlob, openBlob } from "../services/blobs.js";
 import { attachFile, listFiles, getFile } from "../services/files.js";
+
+/**
+ * Mimes this route must never hand back as the DECLARED Content-Type, even
+ * though every response here already carries `Content-Disposition:
+ * attachment`. An attachment disposition is a hint that stops most browsers
+ * from rendering the response as a navigation automatically, not a guarantee
+ * -- a user opening a downloaded file (or a future change adding a preview)
+ * would otherwise render attacker-controlled HTML/SVG/XML on the app's own
+ * origin, with the SSO session attached. `X-Content-Type-Options: nosniff`
+ * does not close that gap: it stops a browser GUESSING at a type, not one
+ * that is DECLARED, so the dangerous handful is re-typed to
+ * application/octet-stream instead.
+ *
+ * This is a DENYLIST, the deliberate opposite of mail.ts's
+ * INLINE_RENDERABLE_MIME allowlist for its inline route. That route exists
+ * for one narrow job (resolving a message body's `cid:` images), so
+ * enumerating the few mimes it needs is natural. This route's whole purpose
+ * is serving arbitrary uploaded attachments back down again -- PDFs, Office
+ * docs, archives, plain images -- so an allowlist would have to keep pace
+ * with every legitimate document type a user ever uploads. Denying only the
+ * render-capable handful a browser would act on as a document is the shape
+ * that fits a download-only route.
+ */
+const DOWNLOAD_DENY_MIME =
+  /^(text\/html|image\/svg\+xml|application\/xhtml\+xml|text\/xml|application\/xml)$/i;
 
 // company_id/contact_id/deal_id/project_id are optional filters here, not the
 // required exactly-one notes.ts enforces on its list: unlike a note, "list
@@ -109,11 +134,14 @@ export function registerFileRoutes(app: FastifyInstance, { db, dataDir }: CrmRou
     if (file === null) {
       return reply.code(404).send({ error: "not_found", message: `file ${params.id} not found` });
     }
-    // Strip CR/LF (header-injection) and quotes (would terminate the quoted-string
-    // early) from the stored name before it goes into a response header.
-    const filename = file.originalName.replace(/[\r\n"]/g, "");
-    reply.header("Content-Type", file.mime);
-    reply.header("Content-Disposition", `attachment; filename="${filename}"`);
+    // Always: whatever Content-Type is declared below, a browser must never
+    // be allowed to sniff its way to a different one.
+    reply.header("X-Content-Type-Options", "nosniff");
+    // The stored byte count, so the client gets a progress bar and a
+    // definite end rather than a chunked stream of unknown length.
+    reply.header("Content-Length", file.sizeBytes);
+    reply.header("Content-Type", DOWNLOAD_DENY_MIME.test(file.mime) ? "application/octet-stream" : file.mime);
+    reply.header("Content-Disposition", contentDisposition("attachment", file.originalName));
     return reply.send(openBlob(dataDir, file.sha256));
   });
 }
