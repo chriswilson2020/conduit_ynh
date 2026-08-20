@@ -10,6 +10,7 @@ import { ContactsPage } from "./pages/contacts";
 import { ContactDetailPage } from "./pages/contact-detail";
 import { DealDetailPage } from "./pages/deal-detail";
 import { GlobalGanttPage, ProjectGanttPage } from "./pages/gantt";
+import { InboxPage } from "./pages/inbox";
 import { MyTasksPage } from "./pages/my-tasks";
 import { PipelinesPage } from "./pages/pipelines";
 import { ProjectsPage } from "./pages/projects";
@@ -141,6 +142,18 @@ const globalGanttRoute = createRoute({
   component: GlobalGanttPage,
 });
 
+// The mail inbox (Phase 4). `?thread=<id>` preselects a conversation, the
+// same loosely-typed deep-link convention validateTaskSearch uses for the
+// task drawer -- a malformed or absent value degrades to "nothing selected".
+const mailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/mail",
+  validateSearch: (search: Record<string, unknown>): { thread?: string } => ({
+    thread: typeof search.thread === "string" ? search.thread : undefined,
+  }),
+  component: InboxPage,
+});
+
 // Settings (Phase 4) is the app's first non-record area: two sibling routes
 // under /settings, each rendering its own page inside the shared
 // SettingsLayout frame (components/settings-layout.tsx). The tabs there are
@@ -203,6 +216,7 @@ const routeTree = rootRoute.addChildren([
   projectGanttRoute,
   globalGanttRoute,
   myTasksRoute,
+  mailRoute,
   settingsMailRoute,
   settingsTemplatesRoute,
 ]);

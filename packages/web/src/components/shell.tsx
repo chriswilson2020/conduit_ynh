@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Link, useRouterState } from "@tanstack/react-router";
+import { useUnreadMailCount } from "../queries";
 import { GlobalSearch } from "./search";
 import { useSseInvalidation } from "./sse";
 
@@ -9,12 +10,26 @@ import { useSseInvalidation } from "./sse";
 const navLinkClass =
   "block rounded-md px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800 hover:text-white";
 const activeNavLinkClass = "block rounded-md px-3 py-2 text-sm font-medium bg-slate-800 text-white";
+// The Inbox entry carries a trailing unread badge, so its box is a flex row
+// rather than the plain block every other entry uses. Same two complete
+// strings for the same reason -- activeProps replaces, it does not merge.
+const navMailLinkClass =
+  "flex items-center justify-between rounded-md px-3 py-2 text-sm font-medium text-slate-300 hover:bg-slate-800 hover:text-white";
+const activeNavMailLinkClass =
+  "flex items-center justify-between rounded-md px-3 py-2 text-sm font-medium bg-slate-800 text-white";
 
 export function Shell({ children }: { children: ReactNode }) {
   // Mounted once here (Shell wraps every route, see router.tsx's
   // RootComponent), not per-page: one EventSource per browser tab, live for
   // as long as the app is open, not re-opened on every navigation.
   useSseInvalidation();
+
+  // Threads (not messages) holding something unseen. ["mail-unread"] is
+  // published by ingest AND by every thread mutation, so this follows both a
+  // new arrival and a mark-read through the same SSE invalidation every other
+  // key here uses -- nothing polls. Undefined while the first fetch is in
+  // flight, which reads the same as zero: no badge until there is a number.
+  const { data: unreadMail = 0 } = useUnreadMailCount();
 
   // The Settings entry links at one of its two tabs but must stay highlighted
   // on both, and activeProps only knows about the link's own target -- so its
@@ -33,6 +48,17 @@ export function Shell({ children }: { children: ReactNode }) {
       <aside className="flex w-56 shrink-0 flex-col bg-slate-900 text-white">
         <div className="px-4 py-5 text-lg font-semibold tracking-tight">Conduit</div>
         <nav className="flex flex-col gap-1 px-2">
+          <Link to="/mail" className={navMailLinkClass} activeProps={{ className: activeNavMailLinkClass }}>
+            Inbox
+            {unreadMail > 0 && (
+              <span
+                data-testid="unread-badge"
+                className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-900"
+              >
+                {unreadMail}
+              </span>
+            )}
+          </Link>
           <Link to="/companies" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
             Companies
           </Link>
