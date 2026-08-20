@@ -1,0 +1,73 @@
+# Conduit Phase 4.1 — Folders & Bulk Mail Actions Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** IMAP folder discovery with a per-account sync picker, a folder sidebar on the inbox, and thread-level multi-select with server-side Archive/Trash (IMAP MOVE) — released as v0.6.0.
+
+**Architecture:** One new table (`mail_account_folders`) + two columns on `mail_accounts`. Discovery rides each sync pass (LIST + SPECIAL-USE). The sync walk generalises from the hardcoded INBOX+Sent pair to the enabled-folder set. `ImapClient` gains `list()` and `move()`; moves run on the existing per-account serial queue with optimistic DB updates and compensating reverts. Spec: `docs/superpowers/specs/2026-08-20-conduit-phase-4.1-folders-design.md` — the authority on semantics; read it first.
+
+**Tech Stack:** No new dependencies. Existing engine contracts are BINDING: the adapter contract in `services/mail-imap.ts` (falsy-return discipline, connectionTimeout spelling, fresh-instance factory), the serial-queue semantics in `mail-sync.ts` (queued work between passes, `SyncUnavailableError` fast-reject in backoff), `UID_CHUNK` batching, the hand-written-index rule in `drizzle/0004_*.sql`'s warning block (never `drizzle-kit push`), and the Phase 4 review-derived comment discipline (state only what was measured).
+
+---
+
+## Conventions
+
+Identical to Phase 4's plan: every command on the dev server via `CONDUIT_REMOTE_DIR=/home/chris/conduit-phase4 ./scripts/remote.sh '<cmd>'`; NodeNext `.js` extensions in api, none in web; ASCII-only sources (fixtures via String.fromCharCode — NEVER \uXXXX escapes in the authoring pipeline, they become real bytes); byte-scan before commit; Playwright ONLY in CI (iterate via push + `gh run view --log-failed`; the dev box lacks browser libs); `parseWith` hooks + SSE-key-mirroring in web; testids for structure, roles for controls; archive-not-delete (the CRM never expunges). Suite at start: 1262 unit + 26 integration + 42 e2e, green. Branch `worktree-phase-4.1-folders` from the v0.5.0 release tip.
+
+## File structure
+
+| Path | Responsibility |
+|---|---|
+| `packages/api/drizzle/0005_*` + `db/schema.ts` | mail_account_folders; mail_accounts.trash_folder/archive_folder |
+| `packages/shared/src/index.ts` | folder schemas, bulk input/result, folder filter, special-use enum |
+| `packages/api/src/services/mail-folders.ts` | discovery upsert, classification, trash/archive resolution |
+| `packages/api/src/services/mail-move.ts` | per-thread folder-scoped move: optimistic update, queueing, compensation |
+| `packages/api/src/services/mail-imap.ts` + `mail-imapflow.ts` | `list()` + `move()` on the contract and adapter |
+| `packages/api/src/services/mail-sync.ts` | discovery in the pass, generalised foldersOf, `moveMessages` on the queue |
+| `packages/api/src/routes/mail.ts` | folders GET/PATCH, bulk endpoint, folder filter, per-folder unread |
+| `packages/web/src/components/mail/{folder-sidebar,bulk-bar}.tsx` + `mail-lib.ts` | sidebar, selection model, bulk actions |
+| `packages/web/src/pages/{inbox,settings-mail}.tsx` | folder view wiring, folder picker, Hide-in-CRM rename |
+| `packages/api/src/test/mail-integration.test.ts` | LIST/SPECIAL-USE + messageMove real-server cases |
+| `e2e/mail.spec.ts` | folder + bulk journey extension |
+
+---
+
+### Task 1: Schema 0005 + shared contracts
+
+Drizzle migration 0005 (a NEW file — 0004 shipped in v0.5.0 and is now immutable): `mail_account_folders` per the spec verbatim (UNIQUE (account_id, folder), the `special_use` CHECK, `selectable`, `sync_enabled`, `last_discovered_at`); `mail_accounts` gains nullable `trash_folder`/`archive_folder`. Follow the 0004 precedent for anything drizzle-kit can't express — expected: nothing this time (no generated columns); if an index proves needed it goes hand-written into 0005 with a named query, added to the warning-block list. Migration test extends the scratch-DB upgrade drill (0000→0004 + seeded mail data → 0005 → survival + new table usable). Shared: `mailAccountFolderSchema`, `folderPatchInput` (`{ folder, syncEnabled }`), `bulkThreadActionInput` (`{ threadIds (max 200), folder, action: trash|archive|hide }`), `bulkThreadResultSchema` (`{ results: [{threadId, ok, error?}] }`), `threadListFilters` gains `folder`, `specialUse` enum. Convergence drill for the shared `conduit_test` DB applies to 0005 normally (it is a new file — plain migrate works; no journal trickery needed or allowed). ~10 tests.
+
+### Task 2: Discovery + classification + adapter `list()`
+
+`mail-imap.ts` contract gains `list(): Promise<{folder, specialUse?, selectable}[]>` (document: imapflow `list()` decodes UTF-7 and surfaces SPECIAL-USE flags where the server offers RFC 6154; classify from `\Archive`/`\Drafts`/`\Junk`/`\Sent`/`\Trash`; `\Noselect` → selectable false; throw on falsy return per the discipline). Adapter implements it; fake gains a configurable folder list. `services/mail-folders.ts`: `discoverFolders(db, accountId, listed)` — upsert rows, set defaults on first sighting only (junk/trash → sync_enabled false, else true; NEVER overwrite a user's existing toggle), bump `last_discovered_at`, fill `trash_folder`/`archive_folder` on the account when NULL (classification precedence: SPECIAL-USE, then case-insensitive last-path-segment heuristics `trash|deleted`, `junk|spam`, `archive`, `drafts`, `sent`). `AccountSync`'s pass calls LIST + discovery as its first act (before the folder walk, so a new folder syncs the same pass it appears). Classification matrix + upsert/no-clobber + staleness tests, ~16.
+
+### Task 3: Walk generalisation + move operation
+
+- `foldersOf(account)` → query `mail_account_folders` for `sync_enabled AND selectable`, ALWAYS including INBOX and the trimmed `sent_folder` (locked; dedupe case-insensitively per the existing rule). Fallback when the table has no rows yet (pre-first-LIST): the old INBOX+sent pair, commented.
+- `mail-imap.ts` gains `move(folder, uids, targetFolder): Promise<void>` (adapter: `messageMove`; throw on falsy; document that UIDPLUS COPYUID data is deliberately discarded — re-sighting reconciles).
+- `AccountSync.moveMessages(folder, uids, targetFolder)` queued like `markSeen` (serial, `SyncUnavailableError` in backoff, chunked by `UID_CHUNK`).
+- `services/mail-move.ts`: `moveThreads(db, actorId, {threadIds, folder, action}, deps)` — per spec: resolve target per account (trash_folder/archive_folder; unresolvable → that account's threads fail with a message); per thread collect messages in the VIEW folder with non-NULL uid (NULL-uid rows → per-thread skip note); optimistic transaction (folder=target, imap_uid=NULL, SSE after commit); queue the IMAP move per account/folder chunk; on move rejection run the compensating revert for the failed chunk's rows and mark those threads failed (comment the partial-chunk honesty note from the spec). `hide` action delegates to the existing CRM archive in bulk.
+- Tests ~18: fake-driven move-races-pass serialisation, compensation, NULL-uid skip, chunk partition, per-account grouping, unresolvable target, hide delegation, re-sighting convergence through the real ingest (move then re-sight → uid restored, one row), and a folder enabled mid-life backfilling from its enablement (fresh cursor + backfill_days window — the engine's existing first-sync semantics, asserted for the generalised walk).
+
+### Task 4: Routes + folder filter
+
+`GET /api/mail/accounts/:id/folders` (owner-only; locked flags on INBOX/sent), `PATCH .../folders` (owner-only; reject toggling locked/nonexistent; enabling calls `syncNow`), `POST /api/mail/threads/bulk` (auth; cap 200; per-thread results; the move service's shape passes through). Thread list gains the `folder` filter (threads with >= 1 message in that folder — an EXISTS subquery on the (account_id, folder, imap_uid) index prefix; EXPLAIN it at 20k threads per the house bar). `GET /api/mail/unread-count` gains `?byFolder=1` returning `{folders: [{folder, count}]}` in ONE grouped query. Route tests ~16 incl. authz, locked-folder 409, bulk partial-failure shape, filter correctness with a moved message, per-folder counts.
+
+### Task 5: Web — sidebar, multi-select, picker
+
+- `mail-lib.ts`: selection model as pure logic (toggle, shift-range over the visible row order, clear-on-filter-change by construction — same keyed-structure principle as ThreadPages), folder-sidebar data shaping (per-account sections, badge counts, the Trash-visible-when-rows-exist rule). Tests ~14.
+- `folder-sidebar.tsx`: sections per account (single-account: flat list), unread badges (`useUnreadMailCount({byFolder})`), folder choice feeds `filters.folder` and the accumulation filter key.
+- `thread-list.tsx`: checkbox column (hover/when-selected visibility), shift-click ranges via the lib, select-all-on-page; selection lifted to the inbox page, cleared on any filter change.
+- `bulk-bar.tsx`: appears when selection non-empty — Archive / Trash / Hide in CRM buttons → `useBulkThreadAction` (invalidates mail keys + ["search"]); per-thread failures surfaced (toast or inline alert listing failed subjects).
+- `settings-mail.tsx`: folder checklist per account (locked rows disabled with a why-tooltip), Trash/Archive override fields with detected placeholders.
+- `conversation.tsx`: Archive/Trash single-thread buttons (same endpoint, one id); "Hide in CRM" rename EVERYWHERE the old archive appeared (list row affordances, conversation, filter label "Hidden").
+- Trash chip on message rows whose folder is the account's trash folder.
+- Testids: folder-sidebar, folder-<name>, thread-checkbox-<id>, bulk-bar, bulk-archive, bulk-trash, bulk-hide, folder-picker-<name>.
+- Verify: server build+typecheck+suite; the composer/inbox smoke pattern from Task 10 (throwaway stack) for the selection + bulk flow end-to-end.
+
+### Task 6: CI integration + e2e extension
+
+Integration (Task 8 suite, drives the adapter): LIST returns SPECIAL-USE against Dovecot (assert Trash/Junk classification on the real box — the CI Dovecot config auto-creates them; extend the config if a special-use attribute needs enabling); `messageMove` round-trip (move, re-fetch source (gone) and target (present)); move to a nonexistent folder → readable error (feeds the bulk per-thread messages). e2e: extend mail.spec.ts — enable a seeded extra folder via the picker → its message appears under the folder filter → select two threads (checkbox + shift) → Archive → rows leave the INBOX view AND a direct imapflow check shows them in the Archive folder → Trash the third → same via Trash. RunId-scoped sets throughout; the CI Dovecot's `auto = create` folder list gains the fixture folder + Archive + Trash. Keep the addition under ~30s of e2e runtime. CI iteration protocol as Phase 4 Tasks 8/11 (batch pushes, existing jobs green).
+
+### Task 7: Release 0.6.0
+
+Phase 4 Task 12 mechanics: bump versions (3 package.jsons + manifest 0.6.0~ynh1, lockfile on the server), no packaging-script changes expected (mail.key already provisioned; verify nothing new needs install-time setup), CI gate green, then the coordinator-gated ff-merge → tag → Release build → manifest sha commit → release notes (folders + bulk actions + the move-semantics note: the CRM never expunges) → branch cleanup → Chris's one sudo upgrade command. Live verification: his sieve-filed folders appear after the first pass; archive two threads from the CRM and see them move in another mail client; trash one and find it in that client's Trash; toggle a folder off and see it leave the sidebar.
