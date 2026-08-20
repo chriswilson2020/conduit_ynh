@@ -31,12 +31,17 @@ export async function registerSpa(app: FastifyInstance, options: SpaOptions): Pr
     // cache-control headers" section): blanket maxAge/immutable at the
     // plugin level, with index.html carved out separately below.
     //
-    // A per-file `setHeaders` hook is NOT an option here: @fastify/static
-    // calls it before computing its OWN Cache-Control from these same
-    // maxAge/immutable options, then unconditionally applies that computed
-    // header afterwards (`reply.headers(headers)` in its pumpSendToReply),
-    // clobbering whatever setHeaders set -- there is no per-file override
-    // once maxAge/immutable are configured at the plugin level.
+    // These stay plugin-level options rather than a per-file `setHeaders`
+    // hook. Under @fastify/static v8 that was the only thing that worked at
+    // all: v8 called setHeaders BEFORE computing its own Cache-Control from
+    // these same maxAge/immutable options and then applied that computed
+    // header unconditionally, clobbering whatever the hook had set. v10
+    // reversed the order (it applies its computed headers first, then calls
+    // setHeaders, and hands it a FastifyReply instead of the raw response),
+    // so a per-file override is possible now -- but there is nothing to
+    // override: every file this plugin serves wants exactly these headers,
+    // and index.html, the one file that must not, is kept away from the
+    // plugin entirely by globIgnore below.
     maxAge: "1y",
     immutable: true,
     // wildcard:false (above) makes this plugin enumerate every real file
