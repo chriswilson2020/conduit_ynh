@@ -1,8 +1,9 @@
-import { eq, inArray } from "drizzle-orm";
+import { and, inArray, isNotNull, sql } from "drizzle-orm";
 import type { BulkThreadActionInput, BulkThreadResult } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
 import { NotFoundError } from "./errors.js";
+import { folderKey } from "./mail-folders.js";
 import { consoleSyncLogger, type SyncLogger } from "./mail-imap.js";
 import { UID_CHUNK, chunked } from "./mail-sync.js";
 import { archiveThread } from "./mail-threads.js";
@@ -59,6 +60,48 @@ import { publish } from "./sse.js";
  * already belong to a thread. The re-sighting that follows goes through
  * ingestMessage in the ordinary way and takes the lock there. Its absence here
  * is a decision, not an oversight.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT A MOVE DOES NOT TOUCH
+ * ---------------------------------------------------------------------------
+ * `seen` is never written here, in either direction. Trashing an unread
+ * message does not mark it read -- it is still unread, it is simply in the
+ * Trash -- and the CRM has no business changing what a user has and has not
+ * looked at as a side effect of filing. That leaves one question this service
+ * deliberately does not answer: an unread message moved to Trash would go on
+ * counting towards the unread badge forever, since nothing ever re-sights an
+ * unsynced Trash. The coordinator's ruling puts the fix in the COUNTING, not
+ * in the move: Task 4's two unread queries exclude each account's
+ * trash_folder, so a trashed unread message stops counting while an ARCHIVED
+ * one keeps counting (archive is a filed message, still to be read). Nothing
+ * here changes if that ruling moves; the flag stays untouched either way.
+ *
+ * ---------------------------------------------------------------------------
+ * RESIDUAL STATES (accepted, rare, operator-fixable)
+ * ---------------------------------------------------------------------------
+ * The optimistic write and the server MOVE cannot be one atomic act, so there
+ * are states this service can leave behind. All three have the same shape --
+ * rows saying `folder` = target with a NULL uid while the message is still in
+ * the source folder -- and the same reason they do not self-heal: the source
+ * folder's cursor is already PAST that UID, so no later pass re-sights it
+ * there (fetchNewer only walks upwards), and the target folder never had it.
+ * Short of a UIDVALIDITY reset re-walking the source folder, they persist.
+ *
+ * - A HARD CRASH between the optimistic commit and the queued MOVE (the
+ *   process is killed, the machine loses power). The commit landed, the MOVE
+ *   never ran, and nothing on restart knows a move was intended. Rare -- the
+ *   window is one queue hop wide -- and accepted rather than solved: making it
+ *   impossible would need an outbox table and a resume path, which is a lot of
+ *   machinery for a state a user fixes by moving the message back in any mail
+ *   client, or an operator by letting the folder re-walk.
+ * - A COMPENSATING REVERT THAT ITSELF FAILS (the database went away between
+ *   the MOVE's rejection and the revert). Same state, but this one is LOUD:
+ *   revertMove logs an error carrying the account, both folder names and the
+ *   affected message ids precisely so an operator can find the rows.
+ * - A PARTIAL CHUNK, where an accepted chunk stays moved after a later one is
+ *   refused. Not divergence -- the database agrees with the server -- and it
+ *   converges properly on the next pass of the target folder IF that folder is
+ *   synced (Archive is by default; Trash is not -- see queueMoves).
  */
 
 // --- Seams -----------------------------------------------------------------
@@ -77,7 +120,7 @@ export interface MoveSyncAccount {
  *
  * Null when no manager exists (NODE_ENV=test, or a deployment with sync
  * disabled). UNLIKE the Sent-folder APPEND, that is not a "skip the
- * best-effort step" case -- see resolveAccount.
+ * best-effort step" case -- see accountStateOf.
  */
 export interface MoveSyncManager {
   get(accountId: string): MoveSyncAccount | undefined;
@@ -91,6 +134,9 @@ export interface MoveThreadsDeps {
 
 // --- Small helpers ---------------------------------------------------------
 
+/** Message ids per unrecoverable-divergence log line (see revertMove). */
+const MAX_LOGGED_IDS = 500;
+
 type ResultItem = BulkThreadResult["results"][number];
 
 function errorText(error: unknown): string {
@@ -98,27 +144,38 @@ function errorText(error: unknown): string {
 }
 
 /**
- * Do two stored folder names mean the same mailbox?
+ * Do two stored folder names mean the same mailbox? On mail-folders.ts's
+ * folderKey, which is where that rule (INBOX case-folded, everything else byte
+ * for byte) is written down once for the walk and this service alike.
  *
- * INBOX is the one name IMAP defines as case-insensitive (RFC 3501); every
- * other name is compared byte for byte, because "Archive" and "archive" really
- * are two mailboxes on a real server. Same rule as mail-sync.ts's foldersOf,
- * and it has to be: a message whose folder does not match the view it was
- * selected in is one this service silently leaves behind.
+ * Getting it wrong is silent in both directions: a message whose folder does
+ * not match the view it was selected in is one this service leaves behind, and
+ * one that matches too eagerly is a message moved out of a mailbox the user was
+ * not looking at.
  */
 function sameFolder(a: string, b: string): boolean {
-  if (a === b) return true;
-  return a.toUpperCase() === "INBOX" && b.toUpperCase() === "INBOX";
+  return folderKey(a) === folderKey(b);
 }
 
-/** One message this action may move. `folder`/`imapUid` are the values BEFORE
- * the optimistic update -- the compensating revert restores exactly these. */
+/**
+ * One message this action will move, carrying everything the later steps need
+ * so nothing has to look its account up again.
+ *
+ * `folder`/`imapUid` are the values BEFORE the optimistic update -- the
+ * compensating revert restores exactly these. `targetFolder`/`sync` are the
+ * account's, resolved once during collection and DENORMALISED onto the row: the
+ * alternative, re-reading the account later, would open a window in which a
+ * Settings edit changed the target between the optimistic UPDATE and the MOVE,
+ * sending messages somewhere the database does not say they went.
+ */
 interface Candidate {
   id: string;
   threadId: string;
   accountId: string;
   folder: string;
   imapUid: number;
+  targetFolder: string;
+  sync: MoveSyncAccount;
 }
 
 /** One queued IMAP MOVE: a chunk of one account's messages out of one source
@@ -165,6 +222,25 @@ class Outcomes {
   }
 
   /**
+   * What the summary log reports, counted off the FINISHED answers rather than
+   * off any one step's bookkeeping.
+   *
+   * That is the point: threads failed by an account-level refusal or by an
+   * unknown id never reach the queue, so a counter derived from the queue's
+   * failures said `failed: 0` for a bulk action in which every single thread
+   * failed -- the exact case an operator goes looking for.
+   */
+  tally(): { failed: number; skipped: number } {
+    let failed = 0;
+    let skipped = 0;
+    for (const item of this.byThread.values()) {
+      if (!item.ok) failed += 1;
+      else if (item.skipped === true) skipped += 1;
+    }
+    return { failed, skipped };
+  }
+
+  /**
    * One entry per REQUESTED id, in request order (the bulk contract, so the
    * client can zip failures back to rows). Duplicates in the request produce
    * duplicate entries rather than being collapsed -- the response is a
@@ -179,14 +255,6 @@ class Outcomes {
 }
 
 // --- Move targets ----------------------------------------------------------
-
-/** Everything one account contributes to a move: where its messages are going,
- * which of its folders is Sent (the whole-thread carve-out), and the sync loop
- * that will do the actual MOVE. */
-interface AccountContext {
-  targetFolder: string;
-  sync: MoveSyncAccount;
-}
 
 /**
  * What an account's OWN folders mean for the eligibility filters -- needed for
@@ -210,7 +278,7 @@ interface AccountScope {
  * - `unmovable`: an ARCHIVED account, whose rows are excluded outright.
  */
 type AccountState =
-  | { kind: "ready"; scope: AccountScope; context: AccountContext }
+  | { kind: "ready"; scope: AccountScope; targetFolder: string; sync: MoveSyncAccount }
   | { kind: "refused"; scope: AccountScope; error: string }
   | { kind: "unmovable"; scope: AccountScope };
 
@@ -275,7 +343,7 @@ function accountStateOf(
   if (sync === undefined) {
     return { kind: "refused", scope, error: `mail sync is not running for account "${account.label}"` };
   }
-  return { kind: "ready", scope, context: { targetFolder, sync } };
+  return { kind: "ready", scope, targetFolder, sync };
 }
 
 // --- The service -----------------------------------------------------------
@@ -313,8 +381,14 @@ function accountStateOf(
  * a bound worth adding here: the per-thread failure this function reports is
  * only trustworthy because it waited to see whether the server accepted, and a
  * timeout would produce exactly the "claimed a move the server refused" state
- * the compensation exists to prevent. A route that wants a bound must decide
- * what to tell the user in its place.
+ * the compensation exists to prevent.
+ *
+ * What Task 4's route does about that, per the coordinator's ruling, is cap
+ * the SIZE of the wait rather than its duration: trash/archive take at most 50
+ * thread ids per request (hide keeps the contract's 200, since it touches no
+ * mailbox), and the endpoint documents that a proxy 504 means the answer was
+ * lost, NOT that the move failed -- the work continues on the loop, and the
+ * client should refetch rather than retry blindly.
  */
 export async function moveThreads(
   db: Database, actorId: string, input: BulkThreadActionInput, deps: MoveThreadsDeps,
@@ -325,38 +399,41 @@ export async function moveThreads(
   // move its messages twice, but it still gets its own result entry.
   const unique = [...new Set(requested)];
   const outcomes = new Outcomes();
+  let messages = 0;
+  let refusedAccounts = 0;
 
   if (input.action === "hide") {
     await hideThreads(db, unique, outcomes);
-    logger.info(
-      { actorId, action: input.action, threads: unique.length },
-      "mail-move: bulk action",
+  } else {
+    // `action` is narrowed to the two MOVE kinds by the branch above, and is
+    // passed on explicitly so nothing downstream has to re-establish it.
+    const collected = await collectCandidates(
+      db, { folder: input.folder, action: input.action }, unique, deps.syncManager, outcomes,
     );
-    return { results: outcomes.list(requested) };
+    const { candidates } = collected;
+    messages = candidates.length;
+    refusedAccounts = collected.refusedAccounts;
+    if (candidates.length > 0) {
+      await applyOptimisticMove(db, candidates);
+      const failures = await queueMoves(db, candidates, logger);
+      for (const [threadId, error] of failures) outcomes.fail(threadId, error);
+      for (const row of candidates) outcomes.succeed(row.threadId);
+    }
+    // Whatever is still unclassified had nothing eligible to move -- every
+    // message either awaited reconciliation, sat outside the view folder, was
+    // already in the target, or belonged to an archived account. A successful
+    // no-op, not a failure.
+    for (const threadId of unique) if (!outcomes.has(threadId)) outcomes.skip(threadId);
   }
 
-  // `action` is narrowed to the two MOVE kinds by the early return above, and
-  // is passed on explicitly so nothing downstream has to re-establish it.
-  const { candidates, contexts } = await collectCandidates(
-    db, { folder: input.folder, action: input.action }, unique, deps.syncManager, outcomes,
-  );
-  let failed = 0;
-  if (candidates.length > 0) {
-    await applyOptimisticMove(db, candidates, contexts);
-    const failures = await queueMoves(db, candidates, contexts, logger);
-    for (const [threadId, error] of failures) outcomes.fail(threadId, error);
-    for (const row of candidates) outcomes.succeed(row.threadId);
-    failed = failures.size;
-  }
-  // Whatever is still unclassified had nothing eligible to move -- every
-  // message either awaited reconciliation, sat outside the view folder, or
-  // was already in the target. A successful no-op, not a failure.
-  for (const threadId of unique) if (!outcomes.has(threadId)) outcomes.skip(threadId);
-
+  // One line per bulk action, and the counts come off the ANSWERS (see
+  // Outcomes.tally) so they describe what the caller was actually told.
+  // `folder` is logged as received even for `hide`, which ignores it: what the
+  // request said is the useful thing to have in the journal.
   logger.info(
     {
       actorId, action: input.action, folder: input.folder ?? null,
-      threads: unique.length, messages: candidates.length, failed,
+      threads: unique.length, messages, refusedAccounts, ...outcomes.tally(),
     },
     "mail-move: bulk action",
   );
@@ -374,16 +451,29 @@ export async function moveThreads(
  * Sequential, and one failure does not stop the rest: an unknown id fails ITS
  * thread and the others still hide, which is the partial-failure shape the
  * bulk contract promises.
+ *
+ * ONE SSE HINT FOR THE BATCH, not one per thread: archiveThread's own hint is
+ * suppressed and this publishes a single frame carrying every hidden thread's
+ * keys, so hiding 200 threads costs one invalidation round instead of 200.
+ * The trade, stated because the single-thread path does not make it: that path
+ * publishes only when a thread's archived_at actually CHANGED, and this cannot
+ * tell -- archiveThread is idempotent and reports the thread either way -- so a
+ * bulk hide of threads that were all already hidden publishes one hint where
+ * the per-thread path would have published none. One redundant refetch round
+ * per request the user explicitly made is a better trade than 200 frames.
  */
 async function hideThreads(db: Database, threadIds: readonly string[], outcomes: Outcomes): Promise<void> {
+  const hidden = new Set<string>();
   for (const threadId of threadIds) {
     try {
-      await archiveThread(db, threadId);
+      await archiveThread(db, threadId, { publishHint: false });
       outcomes.succeed(threadId);
+      hidden.add(threadId);
     } catch (error) {
       outcomes.fail(threadId, errorText(error));
     }
   }
+  if (hidden.size > 0) publishMoveHints(hidden);
 }
 
 /**
@@ -409,21 +499,28 @@ async function collectCandidates(
   threadIds: readonly string[],
   syncManager: MoveSyncManager | null,
   outcomes: Outcomes,
-): Promise<{ candidates: Candidate[]; contexts: Map<string, AccountContext> }> {
+): Promise<{ candidates: Candidate[]; refusedAccounts: number }> {
   const { folder: viewFolder, action } = request;
-  const contexts = new Map<string, AccountContext>();
   const known = new Set((await db.select({ id: mailThreads.id }).from(mailThreads)
     .where(inArray(mailThreads.id, [...threadIds]))).map((row) => row.id));
   for (const threadId of threadIds) {
     if (!known.has(threadId)) outcomes.fail(threadId, new NotFoundError("mail thread", threadId).message);
   }
-  if (known.size === 0) return { candidates: [], contexts };
+  if (known.size === 0) return { candidates: [], refusedAccounts: 0 };
 
   const messages = await db.select({
     id: mailMessages.id, threadId: mailMessages.threadId, accountId: mailMessages.accountId,
     folder: mailMessages.folder, imapUid: mailMessages.imapUid,
-  }).from(mailMessages).where(inArray(mailMessages.threadId, [...known]));
-  if (messages.length === 0) return { candidates: [], contexts };
+  }).from(mailMessages).where(and(
+    inArray(mailMessages.threadId, [...known]),
+    // Rows awaiting reconciliation can never be moved (no UID to name them
+    // by), so they are dropped in SQL rather than carried into the loop below.
+    // Nothing observable changes -- a thread left with nothing eligible still
+    // reports `skipped` either way -- it is simply fewer rows to fetch on a
+    // long conversation.
+    isNotNull(mailMessages.imapUid),
+  ));
+  if (messages.length === 0) return { candidates: [], refusedAccounts: 0 };
 
   const accountIds = [...new Set(messages.map((row) => row.accountId))];
   const accountRows = await db.select({
@@ -433,11 +530,9 @@ async function collectCandidates(
   }).from(mailAccounts).where(inArray(mailAccounts.id, accountIds));
 
   const states = new Map<string, AccountState>();
-  for (const account of accountRows) {
-    const state = accountStateOf(account, action, syncManager);
-    states.set(account.id, state);
-    if (state.kind === "ready") contexts.set(account.id, state.context);
-  }
+  for (const account of accountRows) states.set(account.id, accountStateOf(account, action, syncManager));
+  /** Accounts whose refusal actually FIRED -- see the count returned below. */
+  const refused = new Set<string>();
 
   const candidates: Candidate[] = [];
   for (const row of messages) {
@@ -448,8 +543,9 @@ async function collectCandidates(
     // accountStateOf for why reporting them would make a thread carrying one
     // un-archivable forever.
     if (state.kind === "unmovable") continue;
-    // No UID, no way to name the message to the server. Rare and
-    // self-healing: the next pass over its folder fills the UID in.
+    // Narrowing only: the WHERE above already excluded these rows. Kept
+    // because the column is nullable, so its type stays `number | null`
+    // however the query filtered it.
     if (row.imapUid === null) continue;
 
     // EVERY ELIGIBILITY FILTER RUNS BEFORE THE REFUSAL BELOW, and the order is
@@ -485,18 +581,27 @@ async function collectCandidates(
       // In scope, and this account cannot move it: THIS is what fails the
       // thread. Every other account in the same request carries on (spec).
       outcomes.fail(row.threadId, state.error);
+      refused.add(row.accountId);
       continue;
     }
     candidates.push({
       id: row.id, threadId: row.threadId, accountId: row.accountId,
       folder: row.folder, imapUid: row.imapUid,
+      targetFolder: state.targetFolder, sync: state.sync,
     });
   }
-  // Ascending UID within a folder, so the partition into chunks is
-  // deterministic (a test can state which uids one queued call carries) and
-  // each chunk is a compact UID range for the server.
+  // Sorted by UID GLOBALLY, across every account and folder in the request.
+  // What that buys is a property of the grouping downstream rather than of
+  // this array: groupForQueue preserves the order it reads rows in, so each
+  // (account, folder) group comes out ascending, which makes the chunk
+  // boundaries deterministic (a test can name the uids one queued call
+  // carries) and each chunk a compact UID range for the server.
   candidates.sort((a, b) => a.imapUid - b.imapUid);
-  return { candidates, contexts };
+  // Counted as ACCOUNTS WHOSE REFUSAL FIRED, not accounts in the refused
+  // state: after the ordering fix above, an account that refuses but had
+  // nothing in scope affects no thread, and logging it as a refusal would send
+  // an operator looking for a failure the caller was never told about.
+  return { candidates, refusedAccounts: refused.size };
 }
 
 /**
@@ -513,19 +618,14 @@ async function collectCandidates(
  * refetch a change that never happened. Same rule as the sync engine's
  * writeAccountState.
  */
-async function applyOptimisticMove(
-  db: Database, candidates: readonly Candidate[], contexts: ReadonlyMap<string, AccountContext>,
-): Promise<void> {
+async function applyOptimisticMove(db: Database, candidates: readonly Candidate[]): Promise<void> {
   const now = new Date();
   const byTarget = new Map<string, string[]>();
   const threadIds = new Set<string>();
   for (const row of candidates) {
-    const context = contexts.get(row.accountId);
-    // Unreachable: a candidate exists only for an account that resolved.
-    if (context === undefined) continue;
     threadIds.add(row.threadId);
-    const ids = byTarget.get(context.targetFolder);
-    if (ids === undefined) byTarget.set(context.targetFolder, [row.id]);
+    const ids = byTarget.get(row.targetFolder);
+    if (ids === undefined) byTarget.set(row.targetFolder, [row.id]);
     else ids.push(row.id);
   }
   await db.transaction(async (tx) => {
@@ -540,10 +640,17 @@ async function applyOptimisticMove(
   publishMoveHints(threadIds);
 }
 
-/** Every key a moved message invalidates: the thread list (folder membership
- * changed), each thread's own detail, and the unread count (a message moved
- * into an unsynced Trash leaves the counted set). One publish carrying every
- * key, not one per thread -- the subscriber fan-out is per call. */
+/**
+ * Every key a moved (or hidden) thread invalidates: the thread list (folder
+ * membership changed), each thread's own detail, and the unread count. One
+ * publish carrying every key, not one per thread -- the subscriber fan-out is
+ * per call.
+ *
+ * `mail-unread` is in there because the COUNT can change without any `seen`
+ * flag changing: per the coordinator's ruling, Task 4's unread queries exclude
+ * each account's trash_folder, so trashing an unread message drops it out of
+ * the badge (while archiving one leaves it counted).
+ */
 function publishMoveHints(threadIds: ReadonlySet<string>): void {
   publish({
     keys: [["mail-threads"], ["mail-unread"], ...[...threadIds].map((id) => ["mail-thread", id])],
@@ -563,12 +670,21 @@ function publishMoveHints(threadIds: ReadonlySet<string>): void {
  * before a later one failed stays moved and its rows are NOT reverted -- there
  * is no un-MOVE, and the database agrees with the server. Only the failed
  * chunk's rows go back. One residual imprecision, stated rather than hidden:
- * AccountSync chunks internally at the same size, so a rejected call here
- * moved all or none of its UIDs -- but a future caller passing a larger group
- * could have part of it land while this reverts the lot. Either way the target
- * folder's next pass re-sights whatever the server actually holds and rewrites
- * `folder`/`imap_uid` from that, so the divergence lasts at most one poll
- * interval.
+ * AccountSync chunks internally at the same size, so a rejected call here moved
+ * all or none of its UIDs -- but a future caller passing a larger group could
+ * have part of it land while this reverts the lot.
+ *
+ * WHETHER THAT SELF-CORRECTS DEPENDS ON THE TARGET FOLDER, and only ARCHIVE
+ * can be relied on. An archive target is sync-enabled by default, so its next
+ * pass re-sights the messages and rewrites `folder`/`imap_uid` from what the
+ * server actually holds -- the divergence lasts a poll interval. A TRASH
+ * target is not synced by default (spec: junk/trash default off), so nothing
+ * ever re-sights it: rows the CRM reverted while the server had in fact moved
+ * them stay wrong until someone enables that folder in the picker or the
+ * source folder is re-walked by a UIDVALIDITY reset. That is the accepted
+ * shape of the Trash paragraph in this module's header, and the reason the
+ * revert below is the honest default rather than "leave it, a pass will sort
+ * it out".
  *
  * Sequential rather than concurrent, across accounts as well as within one:
  * each account's loop is serial anyway, so parallelism would buy only the
@@ -576,24 +692,30 @@ function publishMoveHints(threadIds: ReadonlySet<string>): void {
  * compensations in the one path where clarity is worth most.
  */
 async function queueMoves(
-  db: Database, candidates: readonly Candidate[],
-  contexts: ReadonlyMap<string, AccountContext>, logger: SyncLogger,
+  db: Database, candidates: readonly Candidate[], logger: SyncLogger,
 ): Promise<Map<string, string>> {
   const failures = new Map<string, string>();
-  for (const group of groupForQueue(candidates, contexts)) {
+  for (const group of groupForQueue(candidates)) {
     for (const chunk of chunked(group.rows, UID_CHUNK)) {
       try {
         await group.sync.moveMessages(group.folder, chunk.map((row) => row.imapUid), group.targetFolder);
       } catch (error) {
         const message = errorText(error);
+        const threads = [...new Set(chunk.map((row) => row.threadId))];
         logger.warn(
           {
             accountId: group.accountId, folder: group.folder, targetFolder: group.targetFolder,
-            messages: chunk.length, err: message,
+            messages: chunk.length,
+            // The threads the CALLER is about to be told failed, so the log
+            // line and the response can be lined up without re-deriving which
+            // conversations a chunk of message ids belonged to. Bounded by the
+            // route's own thread cap.
+            threads,
+            err: message,
           },
           "mail-move: the server refused a move, reverting those rows",
         );
-        await revertMove(db, chunk, logger);
+        await revertMove(db, group, chunk, logger);
         for (const row of chunk) failures.set(row.threadId, message);
       }
     }
@@ -602,31 +724,64 @@ async function queueMoves(
 }
 
 /**
- * Put one chunk's rows back exactly as they were: their own folder, their own
- * UID. One statement per row, because each row restores a DIFFERENT pair -- and
- * this is the failure path, bounded by one chunk, so the statement count is
- * the honest cost of getting the values right rather than a hot loop.
+ * Put one chunk's rows back exactly as they were: each to its OWN folder and
+ * its OWN uid.
+ *
+ * ONE STATEMENT, with the pairs carried in a VALUES join, rather than an
+ * UPDATE per row inside a transaction. Each row restores a different pair, so
+ * there is no single SET that covers them -- but a 500-row chunk is 500 round
+ * trips that way, and this runs while a user is waiting on a bulk action that
+ * has ALREADY failed. The failure path is the latency-sensitive one here: the
+ * success path returns as soon as the server accepts, while this one is
+ * strictly extra time added to an error. A single statement is also atomic on
+ * its own, which is what the transaction was there for.
  *
  * A failure to compensate is logged and swallowed: the caller is already
- * reporting this chunk's threads as failed, and throwing here would abandon
- * the remaining groups (whose moves may be perfectly fine) on top of it. The
- * rows are left optimistic, and the next pass over the source folder re-sights
- * the messages -- they never left it -- and restores their UIDs.
+ * reporting this chunk's threads as failed, and throwing would abandon the
+ * remaining groups -- whose moves may be perfectly fine -- on top of it. What
+ * it leaves behind is the one genuinely unrecoverable state this service can
+ * produce (rows claiming a folder the message never reached, with the source
+ * folder's cursor already past it, so no pass re-sights it), which is why the
+ * log line carries the account, both folder names and the message ids: it is
+ * an operator's only handle on the rows. See the header's RESIDUAL STATES.
  */
-async function revertMove(db: Database, chunk: readonly Candidate[], logger: SyncLogger): Promise<void> {
+async function revertMove(
+  db: Database, group: MoveGroup, chunk: readonly Candidate[], logger: SyncLogger,
+): Promise<void> {
   const now = new Date();
   try {
-    await db.transaction(async (tx) => {
-      for (const row of chunk) {
-        await tx.update(mailMessages)
-          .set({ folder: row.folder, imapUid: row.imapUid, updatedAt: now })
-          .where(eq(mailMessages.id, row.id));
-      }
-    });
+    // Casts on every value: a VALUES list carries no type information of its
+    // own, so an unadorned parameter arrives as text and fails against the
+    // uuid/bigint columns it is compared and assigned to.
+    const pairs = sql.join(
+      chunk.map((row) => sql`(${row.id}::uuid, ${row.folder}::text, ${row.imapUid}::bigint)`),
+      sql`, `,
+    );
+    // `now.toISOString()`, never the Date itself: a hand-written fragment
+    // bypasses drizzle's column mappers, so the value reaches postgres.js
+    // unconverted -- and it serialises no Date of its own, it throws on one.
+    const timestamp = now.toISOString();
+    await db.execute(sql`
+      update ${mailMessages} set
+        ${sql.identifier(mailMessages.folder.name)} = restored.folder,
+        ${sql.identifier(mailMessages.imapUid.name)} = restored.imap_uid,
+        ${sql.identifier(mailMessages.updatedAt.name)} = ${timestamp}::timestamptz
+      from (values ${pairs}) as restored(id, folder, imap_uid)
+      where ${mailMessages.id} = restored.id
+    `);
   } catch (error) {
     logger.error(
-      { messages: chunk.length, err: errorText(error) },
-      "mail-move: could not revert an optimistic move",
+      {
+        accountId: group.accountId, folder: group.folder, targetFolder: group.targetFolder,
+        messages: chunk.length,
+        // The rows an operator has to go and fix by hand. Capped so one line
+        // can never be unbounded; a chunk is at most UID_CHUNK, so today the
+        // cap is never the thing that truncates -- it is there so raising
+        // UID_CHUNK cannot quietly turn this into a megabyte of log.
+        messageIds: chunk.slice(0, MAX_LOGGED_IDS).map((row) => row.id),
+        err: errorText(error),
+      },
+      "mail-move: could not revert an optimistic move -- these rows now claim a folder the server refused",
     );
     return;
   }
@@ -641,18 +796,17 @@ async function revertMove(db: Database, chunk: readonly Candidate[], logger: Syn
  * SELECT is the one each message was in BEFORE the optimistic update, and a
  * whole-thread move can span several of them on one account.
  *
- * The contexts come from the collection step rather than being re-resolved
- * here. Re-reading the accounts would open a window in which a Settings edit
- * changed the target between the optimistic UPDATE and the MOVE, sending the
- * messages somewhere the database does not say they went.
+ * The target and the loop are read off the candidate rows, where collection
+ * put them. Re-resolving the account here would open a window in which a
+ * Settings edit changed the target between the optimistic UPDATE and the MOVE,
+ * sending the messages somewhere the database does not say they went.
+ *
+ * Insertion order is preserved per group, so each group's uids come out in the
+ * ascending order collectCandidates sorted them into.
  */
-function groupForQueue(
-  candidates: readonly Candidate[], contexts: ReadonlyMap<string, AccountContext>,
-): MoveGroup[] {
+function groupForQueue(candidates: readonly Candidate[]): MoveGroup[] {
   const groups = new Map<string, MoveGroup>();
   for (const row of candidates) {
-    const context = contexts.get(row.accountId);
-    if (context === undefined) continue;
     // NUL as the composite-key separator, written as the escape `\0` rather
     // than a literal NUL byte so grep does not classify this file as binary --
     // same convention (and the same reason) as mail-threads.ts's write-back
@@ -662,8 +816,8 @@ function groupForQueue(
     const group = groups.get(key);
     if (group === undefined) {
       groups.set(key, {
-        accountId: row.accountId, sync: context.sync, folder: row.folder,
-        targetFolder: context.targetFolder, rows: [row],
+        accountId: row.accountId, sync: row.sync, folder: row.folder,
+        targetFolder: row.targetFolder, rows: [row],
       });
     } else group.rows.push(row);
   }

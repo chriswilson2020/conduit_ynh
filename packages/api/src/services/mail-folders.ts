@@ -41,6 +41,36 @@ import { publish } from "./sse.js";
  *   there is no `deletedAt` on the table to set (db/schema.ts).
  */
 
+// --- Folder names -----------------------------------------------------------
+
+/** The one mailbox every account has, spelled as RFC 3501 spells it. Lives
+ * here rather than in the sync engine because it is a fact about IMAP folder
+ * NAMES, which is what this module owns -- see folderKey. */
+export const INBOX = "INBOX";
+
+/**
+ * The comparison key for a mailbox name: INBOX case-folded, everything else
+ * verbatim.
+ *
+ * THE ONE PLACE THAT RULE IS WRITTEN. RFC 3501 makes INBOX the single
+ * case-insensitive mailbox name, and leaves every other name case-SENSITIVE --
+ * on a real server "Archive" and "archive" are two different mailboxes, so
+ * case-folding everything would silently merge them. Both halves matter, and
+ * both are easy to get half-right in isolation, which is why the walk
+ * (mail-sync.ts's foldersOf, deduplicating what it syncs) and the move service
+ * (mail-move.ts's sameFolder, deciding whether a message is in the view folder
+ * or carved out as Sent) call this rather than each spelling it out.
+ *
+ * Names are compared, never rewritten: the key is for equality only, and what
+ * is stored and sent to the server stays exactly what the server listed.
+ * Callers are responsible for trimming their own stored values first (see
+ * normalizeSentFolder and mail-move's account read) -- whitespace is a storage
+ * artifact, not a case rule, and folding it in here would hide it.
+ */
+export function folderKey(folder: string): string {
+  return folder.toUpperCase() === INBOX ? INBOX : folder;
+}
+
 // --- Classification ---------------------------------------------------------
 
 /**

@@ -12,7 +12,7 @@ import {
   type IngestMessageFn, type SyncClock, type SyncLogger,
 } from "./mail-imap.js";
 import { getAccountCredentialsAsSystem, setAccountChangedHook } from "./mail-accounts.js";
-import { discoverFolders } from "./mail-folders.js";
+import { INBOX, discoverFolders, folderKey } from "./mail-folders.js";
 import { ingestMessage } from "./mail-ingest.js";
 import { publish } from "./sse.js";
 
@@ -42,8 +42,10 @@ import { publish } from "./sse.js";
  *   not advance.
  */
 
-/** The folder every account syncs, alongside its own `sent_folder`. */
-export const INBOX = "INBOX";
+/** The folder every account syncs, alongside its own `sent_folder`. Defined in
+ * mail-folders.ts (with folderKey, the case rule it belongs to) and re-exported
+ * here so nothing that already imports it from the engine has to move. */
+export { INBOX } from "./mail-folders.js";
 
 /** UIDs fetched per batch. The cursor advances once per batch, so this is
  * also the most work an interrupted pass can have to redo. */
@@ -1244,19 +1246,19 @@ export class AccountSync {
  * the same answer mail-send's APPEND to that folder already gives. The
  * misconfiguration is real; papering over it would only move the surprise.
  *
- * DEDUPE: INBOX is the one mailbox name IMAP defines as case-insensitive (RFC
- * 3501), so a sent_folder of "inbox" is the SAME folder and is not walked
- * twice; every other name is compared byte for byte, because on a real server
- * "Archive" and "archive" are two different mailboxes. `sentFolder` arrives
- * already trimmed (see loadAccount) and discovery stores names exactly as the
- * server listed them, so nothing here re-normalises anything.
+ * DEDUPE is on mail-folders.ts's folderKey -- INBOX case-folded, every other
+ * name byte for byte -- so a sent_folder of "inbox" is the SAME folder and is
+ * not walked twice, while "Archive" and "archive" stay the two different
+ * mailboxes a server would treat them as. `sentFolder` arrives already trimmed
+ * (see loadAccount) and discovery stores names exactly as the server listed
+ * them, so nothing here re-normalises anything.
  */
 function foldersOf(account: MailAccountRow, discovered: readonly MailAccountFolderRow[]): string[] {
   const walked: string[] = [INBOX];
   const seen = new Set<string>([INBOX]);
   const add = (folder: string): void => {
     if (folder.length === 0) return;
-    const key = folder.toUpperCase() === INBOX ? INBOX : folder;
+    const key = folderKey(folder);
     if (seen.has(key)) return;
     seen.add(key);
     walked.push(folder);

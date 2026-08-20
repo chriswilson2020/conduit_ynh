@@ -464,7 +464,9 @@ export async function clearThreadLink(db: Database, threadId: string, kind: Mail
  * server -- "archived" here means "out of the CRM inbox", and the user's own
  * mail client is left entirely alone.
  */
-async function setArchived(db: Database, id: string, archived: boolean): Promise<MailThread> {
+async function setArchived(
+  db: Database, id: string, archived: boolean, publishHint: boolean,
+): Promise<MailThread> {
   const [row] = await db.update(mailThreads)
     .set({ archivedAt: archived ? new Date() : null, updatedAt: new Date() })
     .where(and(
@@ -472,18 +474,32 @@ async function setArchived(db: Database, id: string, archived: boolean): Promise
       archived ? isNull(mailThreads.archivedAt) : isNotNull(mailThreads.archivedAt),
     )).returning();
   if (row !== undefined) {
-    publishThreadHint(id);
+    if (publishHint) publishThreadHint(id);
     return toThread(row);
   }
   const existing = await mustGetThread(db, id);
   return toThread(existing);
 }
 
-export function archiveThread(db: Database, id: string): Promise<MailThread> {
-  return setArchived(db, id, true);
+export interface ArchiveThreadOptions {
+  /**
+   * false to leave the SSE hint to the caller. The one caller that does is the
+   * bulk "Hide in CRM" path (services/mail-move.ts), which hides up to 200
+   * threads in a request and publishes ONE frame carrying all their keys
+   * instead of 200 -- the per-publish subscriber fan-out is what that saves.
+   * Defaults to true, so every single-thread caller keeps the behaviour it
+   * has.
+   */
+  publishHint?: boolean;
+}
+
+export function archiveThread(
+  db: Database, id: string, options: ArchiveThreadOptions = {},
+): Promise<MailThread> {
+  return setArchived(db, id, true, options.publishHint ?? true);
 }
 export function unarchiveThread(db: Database, id: string): Promise<MailThread> {
-  return setArchived(db, id, false);
+  return setArchived(db, id, false, true);
 }
 
 // --- Attachments -----------------------------------------------------------

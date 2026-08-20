@@ -32,6 +32,23 @@ afterAll(async () => { await handle.close(); });
 
 const silentLogger: SyncLogger = { info: () => {}, warn: () => {}, error: () => {} };
 
+interface LogLine {
+  details: Record<string, unknown>;
+  message: string;
+}
+
+/** Keeps what the service logged, for the paths whose whole point IS the log
+ * line: the unrecoverable-divergence error, and the summary counts. */
+class RecordingLogger implements SyncLogger {
+  readonly infos: LogLine[] = [];
+  readonly warns: LogLine[] = [];
+  readonly errors: LogLine[] = [];
+
+  info(details: Record<string, unknown>, message: string): void { this.infos.push({ details, message }); }
+  warn(details: Record<string, unknown>, message: string): void { this.warns.push({ details, message }); }
+  error(details: Record<string, unknown>, message: string): void { this.errors.push({ details, message }); }
+}
+
 // --- Fixtures ---------------------------------------------------------------
 
 /** One account per call, with its own address: mail_accounts is UNIQUE on
@@ -60,13 +77,21 @@ async function makeThread(subject = "Hello"): Promise<string> {
   return thread!.id;
 }
 
-/** Zero-padded into the Message-ID below, so ordering rows by message_id is
- * insertion order -- what every assertion here reads. An unpadded counter
- * sorts "m10" before "m9" and quietly reorders the expectations. */
+/**
+ * Zero-padded into the Message-ID below, so ordering rows by message_id is
+ * insertion order -- what every assertion here reads. An unpadded counter sorts
+ * "m10" before "m9" and quietly reorders the expectations.
+ *
+ * FOUR DIGITS is the bound, shared with the bulk fixture's own "bulk%04d" ids:
+ * the counter never resets (it is module-level, while the tables are truncated
+ * per test), so a file that grew past 9,999 messages would start overflowing
+ * the padding and reintroduce exactly the mis-ordering it prevents. Widen both
+ * if that day comes; today the whole file inserts a few hundred.
+ */
 let messageSeq = 0;
 
 async function makeMessage(input: {
-  threadId: string; accountId: string; folder: string; imapUid: number | null;
+  threadId: string; accountId: string; folder: string; imapUid: number | null; seen?: boolean;
 }): Promise<string> {
   messageSeq += 1;
   const [message] = await handle.db.insert(mailMessages).values({
@@ -75,6 +100,7 @@ async function makeMessage(input: {
     fromAddr: "alice@example.com", toAddrs: [{ address: "chris@example.com" }],
     sentAt: new Date("2026-08-19T09:00:00.000Z"),
     folder: input.folder, imapUid: input.imapUid, direction: "inbound",
+    seen: input.seen ?? false,
   }).returning();
   return message!.id;
 }
@@ -82,9 +108,17 @@ async function makeMessage(input: {
 async function messageRows(threadId?: string) {
   const rows = await handle.db.select({
     id: mailMessages.id, threadId: mailMessages.threadId, folder: mailMessages.folder,
-    imapUid: mailMessages.imapUid, accountId: mailMessages.accountId,
+    imapUid: mailMessages.imapUid, accountId: mailMessages.accountId, seen: mailMessages.seen,
   }).from(mailMessages).orderBy(asc(mailMessages.messageId));
   return threadId === undefined ? rows : rows.filter((row) => row.threadId === threadId);
+}
+
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 async function threadRow(threadId: string) {
@@ -116,12 +150,15 @@ class FakeSync implements MoveSyncAccount {
   /** 1-based index of the single call that should fail, or null. */
   failCall: number | null = null;
   failError = new Error("MOVE from INBOX to Archive was refused");
+  /** While set, every call parks on this after recording itself -- which is
+   * how two bulk requests can be held in flight at once. */
+  gate: Promise<void> | null = null;
 
-  moveMessages(folder: string, uids: readonly number[], targetFolder: string): Promise<void> {
-    this.calls.push({ folder, uids: [...uids], targetFolder });
-    if (this.error !== null) return Promise.reject(this.error);
-    if (this.failCall === this.calls.length) return Promise.reject(this.failError);
-    return Promise.resolve();
+  async moveMessages(folder: string, uids: readonly number[], targetFolder: string): Promise<void> {
+    const call = this.calls.push({ folder, uids: [...uids], targetFolder });
+    if (this.gate !== null) await this.gate;
+    if (this.error !== null) throw this.error;
+    if (this.failCall === call) throw this.failError;
   }
 }
 
@@ -213,6 +250,75 @@ describe("moveThreads: the two modes", () => {
 
     expect(result.results).toEqual([{ threadId, ok: true }]);
     expect(sync.calls).toEqual([{ folder: "Sent", uids: [31], targetFolder: "Trash" }]);
+  });
+
+  it("matches the view folder on the IMAP case rule, not byte for byte", async () => {
+    // INBOX is the one mailbox name RFC 3501 makes case-insensitive, so a view
+    // of "inbox" IS the folder the message is stored under -- while "Clients"
+    // and "clients" stay two different mailboxes.
+    const accountId = await makeAccount();
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 191 });
+    await makeMessage({ threadId, accountId, folder: "Clients", imapUid: 192 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+
+    const matched = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "inbox", action: "archive" }, deps(manager),
+    );
+    expect(matched.results).toEqual([{ threadId, ok: true }]);
+    expect(sync.calls).toEqual([{ folder: "INBOX", uids: [191], targetFolder: "Archive" }]);
+
+    // The other half of the same rule: a differently-cased ordinary folder
+    // matches nothing, so the action is a no-op rather than a wrong move.
+    const missed = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "clients", action: "archive" }, deps(manager),
+    );
+    expect(missed.results).toEqual([{ threadId, ok: true, skipped: true }]);
+    expect(sync.calls).toHaveLength(1);
+    expect((await messageRows(threadId))[1]).toMatchObject({ folder: "Clients", imapUid: 192 });
+  });
+
+  it("trims the account's stored folder names before comparing or targeting", async () => {
+    // A stored " Sent " must not become a second mailbox: untrimmed, the
+    // carve-out would miss and the conversation's Sent copy would be archived
+    // -- and the MOVE would name a mailbox no server has.
+    const accountId = await makeAccount({ sentFolder: "  Sent  ", archiveFolder: "  Archive  " });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 201 });
+    await makeMessage({ threadId, accountId, folder: "Sent", imapUid: 202 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], action: "archive" }, deps(manager),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true }]);
+    expect(sync.calls).toEqual([{ folder: "INBOX", uids: [201], targetFolder: "Archive" }]);
+    expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
+      .toEqual([["Archive", null], ["Sent", 202]]);
+  });
+
+  it("never touches `seen`, in either direction", async () => {
+    // Trashing an unread message does not mark it read -- it is unread mail
+    // that now lives in the Trash. The unread BADGE stops counting it, but
+    // that is the counting's job (Task 4 excludes each account's trash_folder
+    // from the unread queries, per the coordinator's ruling), never a flag
+    // this service writes behind the user's back.
+    const accountId = await makeAccount();
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 211, seen: false });
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 212, seen: true });
+    const manager = new FakeManager();
+    manager.for(accountId);
+
+    await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "trash" }, deps(manager),
+    );
+
+    expect((await messageRows(threadId)).map((row) => [row.folder, row.seen]))
+      .toEqual([["Trash", false], ["Trash", true]]);
   });
 
   it("sends trash to trash_folder and archive to archive_folder", async () => {
@@ -458,6 +564,31 @@ describe("moveThreads: per account", () => {
     expect(threadHints()).toHaveLength(0);
   });
 
+  it("fails a thread whose in-scope messages span a ready and a refused account", async () => {
+    // Both halves are in the view folder this time, so the refusal really does
+    // apply to something the action would have moved. Failure wins for the
+    // thread -- and the half that DID move stays moved, because there is no
+    // un-MOVE and the database now agrees with that server.
+    const ready = await makeAccount();
+    const stuck = await makeAccount({ label: "Personal", archiveFolder: null });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId: ready, folder: "INBOX", imapUid: 221 });
+    await makeMessage({ threadId, accountId: stuck, folder: "INBOX", imapUid: 222 });
+    const manager = new FakeManager();
+    const sync = manager.for(ready);
+    manager.for(stuck);
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+    );
+
+    expect(result.results[0]?.ok).toBe(false);
+    expect(result.results[0]?.error).toContain('account "Personal" has no Archive folder yet');
+    expect(sync.calls).toEqual([{ folder: "INBOX", uids: [221], targetFolder: "Archive" }]);
+    expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
+      .toEqual([["Archive", null], ["INBOX", 222]]);
+  });
+
   it("groups one thread's messages by account, each with its own target and loop", async () => {
     // A conversation both accounts are on -- one thread, messages on two
     // mailboxes (mail_threads is global; the account lives on the message).
@@ -511,10 +642,17 @@ describe("moveThreads: compensation", () => {
     const manager = new FakeManager();
     const sync = manager.for(accountId);
     sync.error = new Error("MOVE from INBOX to Archive was refused");
+    const logger = new RecordingLogger();
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
+      { syncManager: manager, logger },
     );
+
+    // The revert itself must have worked: its failure is logged at error and
+    // swallowed, so an empty error log is the proof the rows below came back
+    // rather than never having moved.
+    expect(logger.errors).toEqual([]);
 
     // The CRM must never claim a move the server refused: the row goes back
     // exactly as it was, UID included.
@@ -558,6 +696,84 @@ describe("moveThreads: compensation", () => {
     expect(stored[599]?.imapUid).toBe(600);
   });
 
+  it("logs the affected rows and carries on when the compensating revert itself fails", async () => {
+    const accountId = await makeAccount();
+    const threadId = await makeThread();
+    const messageId = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 231 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+    sync.error = new Error("MOVE from INBOX to Archive was refused");
+    const logger = new RecordingLogger();
+    // The database goes away between the MOVE's rejection and the revert.
+    // revertMove is the only caller of db.execute on this path, so failing it
+    // reproduces exactly that window.
+    const failingDb = new Proxy(handle.db, {
+      get(target, property, receiver: unknown) {
+        if (property === "execute") {
+          return () => Promise.reject(new Error("connection terminated unexpectedly"));
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    const result = await moveThreads(
+      failingDb, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
+      { syncManager: manager, logger },
+    );
+
+    // The thread is reported with the MOVE's failure, not the database's: the
+    // compensation is an attempt to clean up after that failure, not a second
+    // thing that happened to the user.
+    expect(result.results[0]?.ok).toBe(false);
+    expect(result.results[0]?.error).toBe("MOVE from INBOX to Archive was refused");
+    // Swallowed, so the remaining groups would still have been queued...
+    expect(logger.errors).toHaveLength(1);
+    // ...but LOUD, because this is the one unrecoverable state: the row now
+    // claims a folder the message never reached, and no pass re-sights it (the
+    // source folder's cursor is already past that UID). These fields are an
+    // operator's only handle on it.
+    expect(logger.errors[0]?.message).toContain("could not revert an optimistic move");
+    expect(logger.errors[0]?.details).toMatchObject({
+      accountId, folder: "INBOX", targetFolder: "Archive",
+      messages: 1, messageIds: [messageId],
+    });
+    expect((await messageRows(threadId))[0]).toMatchObject({ folder: "Archive", imapUid: null });
+  });
+
+  it("keeps two overlapping bulk actions apart", async () => {
+    const accountId = await makeAccount();
+    const first = await makeThread("one");
+    const second = await makeThread("two");
+    await makeMessage({ threadId: first, accountId, folder: "INBOX", imapUid: 241 });
+    await makeMessage({ threadId: second, accountId, folder: "INBOX", imapUid: 242 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+    let release = (): void => {};
+    sync.gate = new Promise<void>((resolve) => { release = resolve; });
+
+    // Two requests in flight at once -- one archiving, one trashing -- both
+    // parked on the seam before either finishes.
+    const archiving = moveThreads(
+      handle.db, actorId, { threadIds: [first], folder: "INBOX", action: "archive" }, deps(manager),
+    );
+    const trashing = moveThreads(
+      handle.db, actorId, { threadIds: [second], folder: "INBOX", action: "trash" }, deps(manager),
+    );
+    await waitFor(() => sync.calls.length === 2, "both moves to reach the sync seam");
+    release();
+    const [archived, trashed] = await Promise.all([archiving, trashing]);
+
+    // Nothing is shared between two calls: each collected its own rows, its own
+    // target and its own outcomes.
+    expect(archived.results).toEqual([{ threadId: first, ok: true }]);
+    expect(trashed.results).toEqual([{ threadId: second, ok: true }]);
+    expect([...sync.calls].sort((a, b) => (a.uids[0] ?? 0) - (b.uids[0] ?? 0))).toEqual([
+      { folder: "INBOX", uids: [241], targetFolder: "Archive" },
+      { folder: "INBOX", uids: [242], targetFolder: "Trash" },
+    ]);
+    expect((await messageRows()).map((row) => row.folder)).toEqual(["Archive", "Trash"]);
+  });
+
   it("fails the whole thread when only part of it was refused", async () => {
     // A thread with messages in two source folders: one call succeeds, one is
     // refused. Calling that a success because something worked is exactly the
@@ -580,6 +796,44 @@ describe("moveThreads: compensation", () => {
     ]);
     expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
       .toEqual([["Archive", null], ["Clients", 132]]);
+  });
+});
+
+// --- The summary log --------------------------------------------------------
+
+describe("moveThreads: the summary line", () => {
+  it("counts off the answers, so a wholly failed bulk does not log failed: 0", async () => {
+    // Nothing here reaches the queue: one thread is refused at the account
+    // level, one id does not exist, and one has only a message awaiting
+    // reconciliation. A counter derived from the QUEUE's failures reported
+    // `failed: 0` for all of it -- exactly the shape an operator goes looking
+    // for after a user says "none of them worked".
+    const stuck = await makeAccount({ label: "Personal", archiveFolder: null });
+    const ready = await makeAccount();
+    const refusedThread = await makeThread("refused");
+    const stalledThread = await makeThread("stalled");
+    await makeMessage({ threadId: refusedThread, accountId: stuck, folder: "INBOX", imapUid: 251 });
+    await makeMessage({ threadId: stalledThread, accountId: ready, folder: "INBOX", imapUid: null });
+    const manager = new FakeManager();
+    manager.for(stuck);
+    manager.for(ready);
+    const logger = new RecordingLogger();
+    const missing = "00000000-0000-4000-8000-000000000003";
+
+    await moveThreads(
+      handle.db, actorId,
+      { threadIds: [refusedThread, stalledThread, missing], folder: "INBOX", action: "archive" },
+      { syncManager: manager, logger },
+    );
+
+    expect(logger.infos).toHaveLength(1);
+    expect(logger.infos[0]?.details).toMatchObject({
+      actorId, action: "archive", folder: "INBOX",
+      threads: 3, messages: 0, failed: 2, skipped: 1,
+      // The account that refused something. An account that refuses but has
+      // nothing in scope is deliberately not counted here.
+      refusedAccounts: 1,
+    });
   });
 });
 
@@ -608,6 +862,14 @@ describe("moveThreads: hide", () => {
     // Nothing moved: the user's own mail client sees no change at all.
     expect((await messageRows()).map((row) => [row.folder, row.imapUid]))
       .toEqual([["INBOX", 141], ["INBOX", 142]]);
+    // ONE hint for the batch, carrying both threads' keys -- not one publish
+    // per thread. At the contract's 200-thread cap that is the difference
+    // between one invalidation round and two hundred.
+    const published = threadHints();
+    expect(published).toHaveLength(1);
+    expect(published[0]?.keys).toEqual([
+      ["mail-threads"], ["mail-unread"], ["mail-thread", first], ["mail-thread", second],
+    ]);
   });
 
   it("fails an unknown thread and still hides the others", async () => {
