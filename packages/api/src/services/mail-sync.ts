@@ -9,6 +9,7 @@ import {
   type IngestMessageFn, type SyncClock, type SyncLogger,
 } from "./mail-imap.js";
 import { getAccountCredentialsAsSystem, setAccountChangedHook } from "./mail-accounts.js";
+import { discoverFolders } from "./mail-folders.js";
 import { ingestMessage } from "./mail-ingest.js";
 import { publish } from "./sse.js";
 
@@ -94,8 +95,8 @@ const STOP_TIMEOUT_MS = 15_000;
 // already imports them from mail-sync.ts has to move.
 
 export type {
-  ImapClient, ImapClientFactory, ImapConnectionSettings, ImapFolderStatus,
-  ImapMessageDescriptor, FetchNewerOptions, IdleOutcome,
+  ImapClient, ImapClientFactory, ImapConnectionSettings, ImapFolderListing,
+  ImapFolderStatus, ImapMessageDescriptor, FetchNewerOptions, IdleOutcome,
   SyncClock, SyncLogger, IngestMessageFn,
 } from "./mail-imap.js";
 export { systemClock } from "./mail-imap.js";
@@ -610,6 +611,24 @@ export class AccountSync {
   private async runPass(): Promise<void> {
     const account = await this.loadAccount();
     const client = await this.ensureConnected(account);
+    // Discovery is the pass's FIRST act, before any folder is walked, and the
+    // order is the point (Phase 4.1 spec): a folder that appeared since the
+    // last pass is recorded here and then walked by THIS pass rather than the
+    // next one, so enabling a folder -- or a sieve rule creating one -- shows
+    // its mail a poll interval sooner.
+    //
+    // A LIST failure is therefore a PASS-LEVEL failure: it throws out of here
+    // into runPassGuarded, which records it on the account and backs off,
+    // exactly as a failed connect does. That is deliberate and not the poison
+    // path -- poison handling exists to stop ONE unreadable message stalling a
+    // folder forever, whereas a LIST that fails says the connection or the
+    // command is broken, and there is no partial work to preserve because
+    // nothing has been walked yet.
+    //
+    // `account` is deliberately not re-read afterwards even though discovery
+    // can fill trash_folder/archive_folder on it: nothing the walk below reads
+    // comes from those columns, and the next pass loads the row again anyway.
+    await discoverFolders(this.db, account.id, await client.list(), this.clock.now());
     for (const folder of foldersOf(account)) {
       if (this.stopped) return;
       await this.syncFolder(client, account, folder);

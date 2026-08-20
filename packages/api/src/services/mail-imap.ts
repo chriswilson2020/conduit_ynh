@@ -1,4 +1,4 @@
-import type { MailSecurity } from "@conduit/shared";
+import type { MailSecurity, SpecialUse } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import type { IngestMessageInput, IngestResult } from "./mail-ingest.js";
 
@@ -65,7 +65,10 @@ import type { IngestMessageInput, IngestResult } from "./mail-ingest.js";
  *   each of those into a thrown error (or, for `fetchRaw` specifically, an
  *   explicit `null` -- see below). Returning an empty array from a failed
  *   `search` would read to AccountSync as "the folder is exhausted" and
- *   silently end the walk.
+ *   silently end the walk. `list()` is held to the same rule for the same
+ *   reason: an empty listing is indistinguishable from "this account has no
+ *   folders", which discovery would write down as a mailbox where nothing
+ *   was found (see `list` below).
  * - `status()` must convert imapflow's `uidValidity` from BigInt to Number.
  *   mail_folder_state.uidvalidity is a bigint column in `mode: "number"`, and
  *   a BigInt reaching the comparison would make every pass see a mismatch and
@@ -106,6 +109,75 @@ export interface ImapMessageDescriptor {
   flags: string[];
 }
 
+/**
+ * One mailbox as the server LISTs it (Phase 4.1 folder discovery). Four
+ * fields, each one something services/mail-folders.ts actually reads -- the
+ * same rule the rest of this file follows.
+ */
+export interface ImapFolderListing {
+  /**
+   * The mailbox path, modified-UTF-7 (RFC 3501 section 5.1.3) ALREADY
+   * DECODED, and therefore storable verbatim in mail_account_folders.folder
+   * and usable verbatim as the argument to every other call on this
+   * interface.
+   *
+   * Verified in imapflow 1.7.1: its LIST handler builds each entry's `path`
+   * as `normalizePath(connection, decodePath(connection, <the wire value>))`
+   * (lib/commands/list.js, the untagged LIST handler), and its own typings
+   * call the result a "Mailbox path (unicode string)". `normalizePath`
+   * (lib/tools.js) does two further things worth knowing, both of which this
+   * code benefits from rather than works around: it spells INBOX as exactly
+   * "INBOX" whatever case the server used (RFC 3501 says the name is not case
+   * sensitive), so discovery's row matches the constant the walk uses; and it
+   * ensures the connection's namespace prefix, so the name really is one the
+   * server will accept in a SELECT.
+   */
+  folder: string;
+  /**
+   * The folder's classified role, or undefined when the adapter's source
+   * offered none. Only the five roles in @conduit/shared's SpecialUse are
+   * carried; see the adapter's mapping notes for the listing values that
+   * deliberately map to nothing.
+   *
+   * NOT a promise that the SERVER said so. imapflow fills its `specialUse`
+   * from the RFC 6154 SPECIAL-USE (or legacy XLIST) flag when the server
+   * offers one and from its OWN table of localized folder names when it does
+   * not, distinguishing the two only on a separate `specialUseSource`
+   * property (lib/special-use.js + lib/commands/list.js in 1.7.1). This
+   * field is therefore "the adapter's best classification", and
+   * mail-folders.ts treats it as the higher-precedence input to its own
+   * classification rather than as ground truth.
+   *
+   * At most one folder per role arrives classified. imapflow collects every
+   * candidate for a role and sets `specialUse` on the single winner
+   * (lib/commands/list.js resolves the conflict by source priority, then
+   * alphabetically). A mailbox with both "Trash" and "Deleted Items" hands
+   * one of them over unclassified -- which is one of the cases
+   * mail-folders.ts's name heuristics exist to catch.
+   */
+  specialUse?: SpecialUse;
+  /**
+   * false for a `\Noselect` mailbox: a pure hierarchy node that holds no
+   * messages and cannot be SELECTed. Discovery still records it (the picker
+   * shows it, and it can still be classified), but the sync walk must never
+   * open it -- a SELECT would simply fail.
+   */
+  selectable: boolean;
+  /**
+   * The server's hierarchy delimiter for this mailbox, or null when it
+   * reports none (a flat namespace: RFC 3501 permits NIL here).
+   *
+   * Carried rather than assumed because it genuinely varies between servers
+   * -- "." and "/" are both ordinary, imapflow's own typings say as much,
+   * and it arrives PER ENTRY rather than once per connection. mail-folders.ts
+   * needs it because its name heuristics run on the LAST PATH SEGMENT
+   * ("Lists/Junk mail" is a user's own folder, not the mailbox's Junk), and
+   * splitting on a guessed separator would either miss the segment or invent
+   * one.
+   */
+  delimiter: string | null;
+}
+
 export interface FetchNewerOptions {
   /** Exclusive lower bound: only UIDs strictly greater than this. */
   sinceUid: number;
@@ -135,6 +207,35 @@ export interface ImapClient {
   connect(): Promise<void>;
   /** Must tolerate being called after a failed connect(). */
   disconnect(): Promise<void>;
+  /**
+   * Every mailbox on the account (Phase 4.1). Called once at the START of
+   * each pass, before any folder is walked, so a folder that appeared since
+   * the last pass is discovered and synced by the same one.
+   *
+   * NO FILTERING. `\Noselect` mailboxes come back with `selectable: false`
+   * rather than being dropped, and nothing is excluded for being
+   * unsubscribed: mail_account_folders is the picker's list as well as the
+   * walk's, and a folder the user cannot see is a folder they cannot enable.
+   * Deciding what to sync is mail-folders.ts's and foldersOf's job, not the
+   * adapter's.
+   *
+   * Rejecting is a PASS-LEVEL failure -- it happens before the walk, so the
+   * pass has no partial work to keep, and AccountSync records it on the
+   * account and backs off exactly as it would for a failed connect. It is
+   * deliberately NOT the poison-message path (which exists to keep one
+   * unreadable message from stalling a folder forever); a LIST that fails is
+   * a broken connection or a refused command, and retrying it later is the
+   * whole of the correct response.
+   *
+   * A falsy return must be a throw, per RETURN-VALUE DISCIPLINE above. In
+   * imapflow 1.7.1 that is a DEFENSIVE guard rather than an observed shape --
+   * its `list()` dereferences the command result (`new Map(folders.map(...))`,
+   * lib/imap-flow.js) before returning it, so a falsy value would already
+   * have become a TypeError there -- but the guard costs nothing and turns
+   * such a shape into a sentence in mail_accounts.last_error instead of
+   * "undefined is not iterable". Same reasoning as `append`'s guard.
+   */
+  list(): Promise<ImapFolderListing[]>;
   /** UIDVALIDITY for the folder; a change means the cursor is worthless. */
   status(folder: string): Promise<ImapFolderStatus>;
   /**

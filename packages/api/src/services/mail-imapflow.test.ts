@@ -4,7 +4,8 @@ import {
   ImapIdleUnsupportedError, ImapflowClient,
   buildImapOptions, buildSmtpOptions, continueWalk, createImapClientFactory,
   defaultTestConnectionDeps, imapVerify, nextWalk, normalizeMailError, readFetchedSource,
-  requireSearchUids, smtpVerify,
+  readFolderListing, requireSearchUids, smtpVerify,
+  type ImapflowListEntry,
 } from "./mail-imapflow.js";
 
 /**
@@ -290,6 +291,115 @@ describe("falsy imapflow returns", () => {
     expect(() => readFetchedSource(undefined, "INBOX", 7))
       .toThrow("fetch of INBOX/7 did not run (the connection went away)");
     expect(() => readFetchedSource({}, "INBOX", 7)).toThrow("fetch of INBOX/7 returned no source");
+  });
+});
+
+describe("readFolderListing", () => {
+  /** An imapflow 1.7.1 LIST entry, with only the four properties the mapper
+   * reads. `flags` really is a Set there, not an array. */
+  function entry(
+    path: string,
+    options: { flags?: string[]; specialUse?: string; delimiter?: string | null } = {},
+  ): ImapflowListEntry {
+    return {
+      path,
+      flags: new Set(options.flags ?? []),
+      ...(options.specialUse === undefined ? {} : { specialUse: options.specialUse }),
+      delimiter: options.delimiter === undefined ? "/" : options.delimiter,
+    };
+  }
+
+  it("maps each of imapflow's five carried special-use strings to the shared enum", () => {
+    const listed = readFolderListing([
+      entry("Archive", { specialUse: "\\Archive" }),
+      entry("Drafts", { specialUse: "\\Drafts" }),
+      entry("Junk", { specialUse: "\\Junk" }),
+      entry("Sent", { specialUse: "\\Sent" }),
+      entry("Trash", { specialUse: "\\Trash" }),
+    ]);
+    expect(listed.map((item) => item.specialUse))
+      .toEqual(["archive", "drafts", "junk", "sent", "trash"]);
+  });
+
+  it("carries no role for the listing values outside the shared enum", () => {
+    // imapflow can also report "\\All" and "\\Flagged" (RFC 6154 roles the
+    // CRM has no column for) and a NON-STANDARD "\\Inbox" it applies to INBOX
+    // itself. None of the three is one of mail_account_folders.special_use's
+    // five values, and inventing a mapping -- \All to archive, say -- would
+    // make an all-mail view the account's archive target.
+    const listed = readFolderListing([
+      entry("INBOX", { specialUse: "\\Inbox" }),
+      entry("All Mail", { specialUse: "\\All" }),
+      entry("Starred", { specialUse: "\\Flagged" }),
+      entry("Projects"),
+    ]);
+    expect(listed.map((item) => item.specialUse)).toEqual([undefined, undefined, undefined, undefined]);
+    // ...and they are still LISTED. Discovery records every mailbox; only the
+    // role is unknown.
+    expect(listed.map((item) => item.folder)).toEqual(["INBOX", "All Mail", "Starred", "Projects"]);
+  });
+
+  it("reports \\Noselect (and \\NonExistent) folders as unselectable without dropping them", () => {
+    const listed = readFolderListing([
+      entry("Lists", { flags: ["\\Noselect", "\\HasChildren"] }),
+      entry("Lists/dev", { flags: ["\\HasNoChildren"] }),
+      // RFC 5258: \NonExistent implies \Noselect. imapflow adds \Noselect
+      // itself when it sees the exact spelling, but a differently-spelled
+      // attribute would not get that treatment -- and both are
+      // case-insensitive per RFC 3501, so the mapper checks both itself.
+      entry("Phantom", { flags: ["\\nonexistent"] }),
+      entry("Shouty", { flags: ["\\NOSELECT"] }),
+    ]);
+    expect(listed.map((item) => item.selectable)).toEqual([false, true, false, false]);
+    expect(listed).toHaveLength(4);
+  });
+
+  it("carries the server's own delimiter through, including none at all", () => {
+    // Dovecot's Maildir++ layout uses "." and its fs layout "/" -- and RFC
+    // 3501 allows NIL for a flat namespace. The classification heuristics run
+    // on the last path segment, so this is the difference between splitting
+    // "Lists.Junk" correctly and never splitting it at all.
+    const listed = readFolderListing([
+      entry("Lists.Junk", { delimiter: "." }),
+      entry("Lists/Junk", { delimiter: "/" }),
+      entry("Flat", { delimiter: null }),
+    ]);
+    expect(listed.map((item) => item.delimiter)).toEqual([".", "/", null]);
+  });
+
+  it("normalises an absent delimiter to null rather than undefined", () => {
+    // imapflow's own typings say `delimiter: string`, but its LIST handler
+    // assigns `untagged.attributes[1] && untagged.attributes[1].value`, so a
+    // NIL delimiter reaches the mapper as null or undefined. The contract's
+    // field is `string | null`, and one shape for "none" is what keeps
+    // mail-folders.ts from needing two.
+    const [listed] = readFolderListing([{ path: "Flat", flags: new Set<string>() }]);
+    expect(listed?.delimiter).toBeNull();
+  });
+
+  it("carries an already-decoded non-ASCII path through byte for byte", () => {
+    // imapflow decodes modified UTF-7 before this mapper ever sees a path, so
+    // the German Trash folder arrives as text, not as "Gel&APY-schte
+    // Elemente". Passing it through UNCHANGED is what makes the stored
+    // mail_account_folders.folder usable verbatim as an IMAP argument later:
+    // any normalisation here (case, Unicode form, trimming) would produce a
+    // name the server does not have. Built with fromCharCode because sources
+    // in this repo are ASCII.
+    const geloeschte = `Gel${String.fromCharCode(0xF6)}schte Elemente`;
+    const [listed] = readFolderListing([entry(geloeschte, { specialUse: "\\Trash" })]);
+    expect(listed?.folder).toBe(geloeschte);
+    expect(listed?.specialUse).toBe("trash");
+  });
+
+  it("throws for both falsy shapes rather than reporting an empty mailbox", () => {
+    // An empty array here is a real, meaningful answer ("this account has no
+    // folders at all"), which is exactly why a FAILED list must not produce
+    // one: discovery would write the failure down as a mailbox where nothing
+    // was found. Defensive in imapflow 1.7.1 -- see the contract's note.
+    expect(readFolderListing([])).toEqual([]);
+    expect(() => readFolderListing(false)).toThrow("LIST failed");
+    expect(() => readFolderListing(undefined))
+      .toThrow("LIST did not run (the connection went away)");
   });
 });
 

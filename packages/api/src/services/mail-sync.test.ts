@@ -8,14 +8,15 @@ import type { MailAccountCreateInput } from "@conduit/shared";
 import type { SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
-import { mailAccounts, mailFolderState, mailMessages, mailThreads } from "../db/schema.js";
+import { mailAccountFolders, mailAccounts, mailFolderState, mailMessages, mailThreads } from "../db/schema.js";
 import { MailIngestError, NotFoundError } from "./errors.js";
 import { archiveAccount, createAccount, updateAccount } from "./mail-accounts.js";
 import { ingestMessage } from "./mail-ingest.js";
 import {
   AccountSync, SyncManager, SyncStoppedError, SyncUnavailableError, startSyncManager,
   type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
-  type ImapMessageDescriptor, type IngestMessageFn, type SyncClock, type SyncLogger,
+  type ImapFolderListing, type ImapMessageDescriptor, type IngestMessageFn,
+  type SyncClock, type SyncLogger,
 } from "./mail-sync.js";
 import { subscribe } from "./sse.js";
 
@@ -139,9 +140,23 @@ class FakeImapClient implements ImapClient {
   readonly calls: FakeCall[] = [];
   readonly fetchNewerOptions: FetchNewerOptions[] = [];
   readonly settings: ImapConnectionSettings;
+  /**
+   * What LIST reports, mutable per test.
+   *
+   * The default is INBOX + Sent deliberately: those are exactly the two
+   * folders the walk has always covered, so every test written before folder
+   * discovery existed sees the same world it did -- discovery records the two
+   * it already syncs and resolves no move targets (neither is trash or
+   * archive), leaving the account row untouched.
+   */
+  listed: ImapFolderListing[] = [
+    { folder: "INBOX", selectable: true, delimiter: "/" },
+    { folder: "Sent", specialUse: "sent", selectable: true, delimiter: "/" },
+  ];
   connectCalls = 0;
   disconnectCalls = 0;
   connectError: Error | null = null;
+  listError: Error | null = null;
   statusError: Error | null = null;
   addFlagsError: Error | null = null;
   idleError: Error | null = null;
@@ -200,6 +215,15 @@ class FakeImapClient implements ImapClient {
     this.idleResolve?.("aborted");
     this.idleResolve = null;
     if (this.disconnectGate !== null) await this.disconnectGate;
+  }
+
+  /** Tracked like every other call, so the serialisation invariant
+   * (maxInFlight) and the pass's call ORDER both cover discovery. */
+  async list(): Promise<ImapFolderListing[]> {
+    return this.track({ op: "list" }, () => {
+      if (this.listError !== null) throw this.listError;
+      return this.listed.map((entry) => ({ ...entry }));
+    });
   }
 
   async status(folder: string): Promise<{ uidvalidity: number }> {
@@ -678,6 +702,121 @@ describe("AccountSync: backfill and cursor", () => {
   });
 });
 
+// --- Folder discovery in the pass -------------------------------------------
+
+describe("AccountSync: folder discovery", () => {
+  async function folderRows(accountId: string) {
+    return handle.db.select().from(mailAccountFolders)
+      .where(eq(mailAccountFolders.accountId, accountId))
+      .orderBy(asc(mailAccountFolders.folder));
+  }
+
+  it("runs LIST as the pass's first act, before any folder is walked", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+    client.folder("INBOX").add(1, rawMail({ messageId: "a@example.com" }));
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+
+    // The ORDER is the contract, not an implementation detail: discovery
+    // ahead of the walk is what lets a folder that appeared since the last
+    // pass be synced by THIS one (Task 3's generalised foldersOf reads the
+    // rows this call writes) rather than a poll interval later.
+    const ops = client.calls.map((call) => call.op);
+    expect(ops[0]).toBe("connect");
+    expect(ops[1]).toBe("list");
+    expect(ops.indexOf("list")).toBeLessThan(ops.indexOf("status"));
+    // ...and it is one LIST per pass, not one per folder.
+    expect(client.opsOf("list")).toHaveLength(1);
+    // Discovery goes through the same serial loop as everything else.
+    expect(client.maxInFlight).toBe(1);
+  });
+
+  it("records the listed folders with their classification and defaults", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+    client.listed = [
+      { folder: "INBOX", selectable: true, delimiter: "/" },
+      { folder: "Sent", specialUse: "sent", selectable: true, delimiter: "/" },
+      { folder: "Junk", specialUse: "junk", selectable: true, delimiter: "/" },
+      { folder: "Clients", selectable: true, delimiter: "/" },
+    ];
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+
+    expect((await folderRows(accountId)).map((row) => [row.folder, row.specialUse, row.syncEnabled]))
+      .toEqual([
+        ["Clients", null, true], ["INBOX", null, true],
+        ["Junk", "junk", false], ["Sent", "sent", true],
+      ]);
+  });
+
+  it("discovers a folder that appeared since the last pass, in the pass it appears", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    expect((await folderRows(accountId)).map((row) => row.folder)).toEqual(["INBOX", "Sent"]);
+
+    // A sieve rule creates a folder between passes -- the case that made
+    // discovery ride the pass at all (Chris's sieve-filed mail was invisible).
+    client.listed = [...client.listed, { folder: "Clients", selectable: true, delimiter: "/" }];
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 2, "the pass that sees it");
+
+    expect((await folderRows(accountId)).map((row) => row.folder)).toEqual(["Clients", "INBOX", "Sent"]);
+  });
+
+  it("treats a LIST failure as a pass-level failure, not a poison skip", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client, clock } = makeSync(accountId);
+    client.folder("INBOX").add(1, rawMail({ messageId: "a@example.com" }));
+    client.listError = new Error("NO [SERVERBUG] LIST refused");
+
+    sync.start();
+    await waitFor(() => sync.stats.failures >= 1, "the failed pass");
+
+    // Backoff, error status, error text -- the same handling a failed connect
+    // gets. Nothing was walked: LIST runs before the first status(), so the
+    // pass has no partial work to keep, which is exactly why this is the
+    // right failure class rather than the poison path (that exists to stop
+    // ONE unreadable message stalling a folder, and no message is involved).
+    const row = await accountRow(accountId);
+    expect(row.status).toBe("error");
+    expect(row.lastError).toContain("LIST refused");
+    expect(client.opsOf("status")).toHaveLength(0);
+    expect(await folderRows(accountId)).toEqual([]);
+    expect(clock.requested[0]).toBe(60_000);
+
+    // And it recovers like any other pass-level failure.
+    client.listError = null;
+    await waitFor(() => clock.pendingCount() > 0, "the backoff wait");
+    clock.fire();
+    await waitFor(() => sync.stats.passes >= 1, "the recovery pass");
+    expect((await accountRow(accountId)).status).toBe("active");
+    expect((await folderRows(accountId)).map((row) => row.folder)).toEqual(["INBOX", "Sent"]);
+  });
+
+  it("fills the account's move targets from the first pass that can classify them", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+    expect(await accountRow(accountId)).toMatchObject({ trashFolder: null, archiveFolder: null });
+
+    client.listed = [
+      { folder: "INBOX", selectable: true, delimiter: "/" },
+      { folder: "Trash", specialUse: "trash", selectable: true, delimiter: "/" },
+      { folder: "Archive", specialUse: "archive", selectable: true, delimiter: "/" },
+    ];
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+
+    expect(await accountRow(accountId)).toMatchObject({ trashFolder: "Trash", archiveFolder: "Archive" });
+  });
+});
+
 // --- Flag reconcile ---------------------------------------------------------
 
 describe("AccountSync: flag reconcile", () => {
@@ -1021,7 +1160,12 @@ describe("AccountSync: teardown", () => {
     sync.start();
     await waitFor(() => sync.stats.passes >= 1, "the first pass");
 
+    // Every child row first: this manufactures a state the app itself never
+    // produces (accounts are archived, never deleted -- archive-not-delete),
+    // so the foreign keys have to be cleared by hand. mail_account_folders
+    // joined the list when discovery started riding the pass.
     await handle.db.delete(mailFolderState).where(eq(mailFolderState.accountId, accountId));
+    await handle.db.delete(mailAccountFolders).where(eq(mailAccountFolders.accountId, accountId));
     await handle.db.delete(mailAccounts).where(eq(mailAccounts.id, accountId));
 
     sync.wake();

@@ -4,13 +4,13 @@ import {
 } from "imapflow";
 import nodemailer from "nodemailer";
 import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
-import type { MailSecurity } from "@conduit/shared";
+import type { MailSecurity, SpecialUse } from "@conduit/shared";
 import type { TestConnectionDeps, VerifySettings } from "./mail-accounts.js";
 import type { SendMailTransportFactory } from "./mail-send.js";
 import {
   MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
   type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
-  type ImapFolderStatus, type ImapMessageDescriptor,
+  type ImapFolderListing, type ImapFolderStatus, type ImapMessageDescriptor,
 } from "./mail-imap.js";
 
 /**
@@ -402,6 +402,86 @@ export function readFetchedSource(
 }
 
 /**
+ * The four properties `readFolderListing` reads off an imapflow 1.7.1 LIST
+ * entry, and nothing else. Structurally satisfied by imapflow's exported
+ * `ListResponse`, so the adapter passes the library's own array straight in,
+ * while the mapper stays callable with hand-built entries in a unit test.
+ *
+ * `delimiter` is widened to allow null/absent even though imapflow's typings
+ * declare a bare `string`: its LIST handler assigns
+ * `untagged.attributes[1] && untagged.attributes[1].value`, so a NIL
+ * delimiter (RFC 3501 permits one) really does arrive falsy at runtime.
+ */
+export interface ImapflowListEntry {
+  path: string;
+  flags: Set<string>;
+  specialUse?: string | undefined;
+  delimiter?: string | null | undefined;
+}
+
+/**
+ * imapflow's special-use strings -> mail_account_folders.special_use.
+ *
+ * The keys are imapflow's own canonical spellings, which is safe to match
+ * exactly: it never passes a server's spelling through here, it looks the
+ * server's flag up in its own table (lib/special-use.js) and stores the
+ * TABLE's constant on the entry.
+ *
+ * `\All`, `\Flagged` and the non-standard `\Inbox` imapflow puts on INBOX are
+ * deliberately absent. They are real values it can report, and none of them
+ * is one of the CRM's five roles -- mapping `\All` to archive would make a
+ * Gmail all-mail view the account's archive target, and every message the CRM
+ * "archived" would go nowhere.
+ */
+const SPECIAL_USE_BY_LISTING_FLAG = new Map<string, SpecialUse>([
+  ["\\Archive", "archive"],
+  ["\\Drafts", "drafts"],
+  ["\\Junk", "junk"],
+  ["\\Sent", "sent"],
+  ["\\Trash", "trash"],
+]);
+
+/** Mailbox attributes that mean "this cannot be SELECTed". Compared
+ * case-insensitively: RFC 3501 mailbox attributes are case-insensitive, and
+ * `flags` holds the SERVER's spelling verbatim (imapflow's own \NonExistent
+ * handling matches the exact spelling, so a server that shouts is a folder
+ * this adapter would otherwise hand to the walk to fail a SELECT on). */
+const UNSELECTABLE_FLAGS = new Set(["\\noselect", "\\nonexistent"]);
+
+/**
+ * imapflow's LIST result as the contract's listings, or a readable error for
+ * either falsy shape (see mail-imap.ts's `list`).
+ *
+ * Pure, so every mapping case is testable without a server -- the same split
+ * the rest of this file's exported helpers exist for. Nothing is filtered:
+ * unselectable and unclassified mailboxes are listings too, and choosing what
+ * to sync belongs to mail-folders.ts.
+ */
+export function readFolderListing(
+  entries: ImapflowListEntry[] | false | undefined,
+): ImapFolderListing[] {
+  if (entries === false) throw new Error("LIST failed");
+  if (!entries) throw new Error("LIST did not run (the connection went away)");
+  return entries.map((entry) => {
+    const role = entry.specialUse === undefined
+      ? undefined
+      : SPECIAL_USE_BY_LISTING_FLAG.get(entry.specialUse);
+    let selectable = true;
+    for (const flag of entry.flags) {
+      if (UNSELECTABLE_FLAGS.has(flag.toLowerCase())) { selectable = false; break; }
+    }
+    return {
+      folder: entry.path,
+      ...(role === undefined ? {} : { specialUse: role }),
+      selectable,
+      // One shape for "the server reports no hierarchy", so mail-folders.ts
+      // does not have to know about two.
+      delimiter: entry.delimiter === undefined || entry.delimiter === "" ? null : entry.delimiter,
+    };
+  });
+}
+
+/**
  * `ImapClient` on top of imapflow. One instance per connection attempt --
  * never reused after a failure, never shared between accounts (see
  * mail-imap.ts's LIFECYCLE notes and createImapClientFactory below).
@@ -448,6 +528,28 @@ export class ImapflowClient implements ImapClient {
       // or its own connect-failed path) is already handling a failure.
     }
     return Promise.resolve();
+  }
+
+  /**
+   * Every mailbox on the account, for Phase 4.1's folder discovery.
+   *
+   * No mailbox lock and no options: LIST names no mailbox, so locking one
+   * would SELECT a folder for nothing, and `statusQuery` would make imapflow
+   * issue a STATUS per mailbox (or ask for LIST-STATUS) -- message counts
+   * nothing here reads, on every pass. `specialUseHints` is likewise not
+   * passed: the CRM's overrides are mail_accounts.trash_folder /
+   * archive_folder, applied by mail-folders.ts where a user's choice can win
+   * over a classification, not fed back in as a listing hint.
+   *
+   * The explicit type argument widens the result to include the falsy shapes
+   * deliberately, the same way status() does -- see readFolderListing and the
+   * contract's note on why that guard is defensive here.
+   */
+  async list(): Promise<ImapFolderListing[]> {
+    const entries = await this.run<ImapflowListEntry[] | false | undefined>(
+      () => this.client.list(),
+    );
+    return readFolderListing(entries);
   }
 
   async status(folder: string): Promise<ImapFolderStatus> {
