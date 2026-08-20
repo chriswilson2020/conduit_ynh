@@ -5,7 +5,9 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema } from "@conduit/shared";
+import {
+  mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema,
+} from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { TEST_DATABASE_URL } from "../test/global-setup.js";
 import { resolveUser } from "../users.js";
@@ -17,7 +19,8 @@ import { createProject } from "../services/projects.js";
 import { createDatabase, migrationsFolder } from "./client.js";
 import {
   users, companies, contacts, pipelines, stages, deals, projects,
-  mailAccounts, mailFolderState, mailThreads, mailMessages, mailAttachments, emailTemplates,
+  mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
+  emailTemplates,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -431,5 +434,165 @@ describe("mail schema (0004)", () => {
 
     const [reread] = await handle.db.select().from(mailMessages).where(eq(mailMessages.id, message!.id));
     expect(reread?.toAddrs).toEqual(to);
+  });
+});
+
+describe("mail folder schema (0005)", () => {
+  /** Minimal valid mail_account_folders row, overridable per test. */
+  function folderValues(accountId: string, overrides: Partial<typeof mailAccountFolders.$inferInsert> = {}) {
+    return {
+      accountId, folder: "INBOX", syncEnabled: true, lastDiscoveredAt: new Date(),
+      ...overrides,
+    } satisfies typeof mailAccountFolders.$inferInsert;
+  }
+
+  // The genuine upgrade test, same shape as the 0004 one above: a real
+  // database migrated only through 0004 (0000-0004 applied, no
+  // mail_account_folders table and no mail_accounts.trash_folder/
+  // archive_folder columns yet), populated with real mail data while still
+  // in that old state, THEN migrated forward with 0005 -- proving the
+  // migration itself applies cleanly on top of a populated database, the
+  // pre-existing data survives untouched, the two new mail_accounts columns
+  // come back NULL (never guessed/backfilled) on a row that predates them,
+  // and the new table works against that same pre-existing account. Runs
+  // against its own scratch database, never the shared conduit_test one.
+  it("applies migration 0005 on top of a real database already migrated only through 0004 and already carrying mail data", async () => {
+    const dbName = `conduit_test_upgrade_${randomUUID().replace(/-/g, "")}`;
+    const realFolder = migrationsFolder();
+    const journal = JSON.parse(
+      readFileSync(path.join(realFolder, "meta", "_journal.json"), "utf8"),
+    ) as { entries: { idx: number; tag: string }[] };
+    // Derived, not hardcoded to idx <= 4: locates 0005 by tag and takes
+    // everything strictly before it, so a future 0006 doesn't silently
+    // change what "pre-0005" means here.
+    const migration0005 = journal.entries.find((e) => e.tag.startsWith("0005_"));
+    if (migration0005 === undefined) throw new Error("could not find a 0005 migration in the journal");
+    const pre0005Entries = journal.entries.filter((e) => e.idx < migration0005.idx);
+    const tmpFolder = mkdtempSync(path.join(tmpdir(), "conduit-pre0005-"));
+
+    let scratch: ReturnType<typeof createDatabase> | undefined;
+    try {
+      mkdirSync(path.join(tmpFolder, "meta"));
+      for (const entry of pre0005Entries) {
+        copyFileSync(path.join(realFolder, `${entry.tag}.sql`), path.join(tmpFolder, `${entry.tag}.sql`));
+      }
+      writeFileSync(
+        path.join(tmpFolder, "meta", "_journal.json"),
+        JSON.stringify({ ...journal, entries: pre0005Entries }),
+      );
+
+      await handle.db.execute(sql.raw(`CREATE DATABASE "${dbName}"`));
+      const scratchUrl = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${dbName}`);
+      scratch = createDatabase(scratchUrl, 1);
+
+      // Old state: only 0000-0004 applied.
+      await migrate(scratch.db, { migrationsFolder: tmpFolder });
+
+      // Real pre-existing mail data, inserted while the database is
+      // genuinely at 0004. mail_threads/mail_messages are byte-identical
+      // between 0004 and 0005, so the real schema.ts table objects describe
+      // their "old" shape exactly -- but mail_accounts is NOT (0005 adds
+      // trash_folder/archive_folder to it), so the live mailAccounts table
+      // object (which already carries those two columns) can't be used for
+      // THIS insert: drizzle would list them in the generated INSERT even
+      // though the pre-0005 table has no such columns yet, and Postgres
+      // would reject the statement outright. Raw SQL naming only the
+      // pre-0005 columns sidesteps that -- the one place in this test that
+      // must describe the OLD shape by hand rather than through schema.ts.
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const [account] = await scratch.db.execute<{ id: string }>(sql`
+        INSERT INTO mail_accounts
+          (user_id, label, email, imap_host, imap_port, imap_security,
+           smtp_host, smtp_port, smtp_security, username, credentials_ciphertext)
+        VALUES
+          (${user!.id}, 'Work', 'chris@example.com', 'localhost', 993, 'tls',
+           'localhost', 587, 'starttls', 'chris', 'v1:iv:tag:data')
+        RETURNING id
+      `);
+      const [thread] = await scratch.db.insert(mailThreads).values({
+        subject: "Re: Sieve rules", lastMessageAt: new Date(),
+      }).returning();
+      const [message] = await scratch.db.insert(mailMessages).values({
+        accountId: account!.id, threadId: thread!.id, messageId: "<pre0005@example.com>",
+        fromAddr: "bob@example.com", toAddrs: [], sentAt: new Date(), folder: "INBOX", direction: "inbound",
+      }).returning();
+
+      // Upgrade: apply the real, full migrations folder. 0005 is the only
+      // pending migration (0000-0004 are already recorded as applied).
+      await migrate(scratch.db, { migrationsFolder: realFolder });
+
+      // The pre-existing mail data survived the upgrade untouched.
+      const [rereadAccount] = await scratch.db.select().from(mailAccounts).where(eq(mailAccounts.id, account!.id));
+      expect(rereadAccount).toMatchObject({ id: account!.id, email: "chris@example.com" });
+      const [rereadMessage] = await scratch.db.select().from(mailMessages).where(eq(mailMessages.id, message!.id));
+      expect(rereadMessage?.messageId).toBe("<pre0005@example.com>");
+
+      // 0005's two new mail_accounts columns come back NULL on a row that
+      // existed before the upgrade -- nothing is ever guessed/backfilled.
+      expect(rereadAccount).toMatchObject({ trashFolder: null, archiveFolder: null });
+
+      // And 0005's new table works against that pre-existing (pre-migration)
+      // account, not just accounts inserted after the upgrade.
+      const [folderRow] = await scratch.db.insert(mailAccountFolders)
+        .values(folderValues(account!.id, { folder: "Archive", specialUse: "archive" }))
+        .returning();
+      expect(folderRow).toMatchObject({ accountId: account!.id, folder: "Archive", specialUse: "archive" });
+    } finally {
+      await scratch?.close();
+      // WITH (FORCE) (PG 15+, confirmed on the dev server): disconnects any
+      // straggling connection to the scratch database itself rather than
+      // failing the drop -- belt-and-braces alongside the explicit close()
+      // above, since a lingering connection would otherwise leak the
+      // database this test just created.
+      await handle.db.execute(sql.raw(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`));
+      rmSync(tmpFolder, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it("applies column defaults (selectable true, specialUse null) and leaves a fresh account's trash/archive folders NULL", async () => {
+    const [account] = await handle.db.insert(mailAccounts)
+      .values(accountValues({ email: "defaults@example.com" })).returning();
+    expect(account).toMatchObject({ trashFolder: null, archiveFolder: null });
+
+    const [folder] = await handle.db.insert(mailAccountFolders)
+      .values(folderValues(account!.id)).returning();
+    expect(folder).toMatchObject({ selectable: true, specialUse: null });
+  });
+
+  it("enforces UNIQUE (account_id, folder) on mail_account_folders", async () => {
+    const [account] = await handle.db.insert(mailAccounts)
+      .values(accountValues({ email: "unique@example.com" })).returning();
+    await handle.db.insert(mailAccountFolders).values(folderValues(account!.id));
+    await expect(
+      handle.db.insert(mailAccountFolders).values(folderValues(account!.id, { syncEnabled: false })),
+    ).rejects.toMatchObject({
+      cause: { message: expect.stringMatching(/mail_account_folders_account_folder_unique|unique/i) },
+    });
+  });
+
+  // Mirrors the 0004 describe block's "keeps ... in sync with their DB
+  // CHECKs" test above, for this migration's one enum CHECK.
+  it("keeps specialUseSchema in sync with mail_account_folders' special_use CHECK", async () => {
+    expect(specialUseSchema.options).toEqual(["archive", "drafts", "junk", "sent", "trash"]);
+
+    const [account] = await handle.db.insert(mailAccounts)
+      .values(accountValues({ email: "check@example.com" })).returning();
+
+    for (const specialUse of specialUseSchema.options) {
+      await handle.db.insert(mailAccountFolders)
+        .values(folderValues(account!.id, { folder: specialUse, specialUse }));
+    }
+    await expect(
+      handle.db.insert(mailAccountFolders)
+        .values(folderValues(account!.id, { folder: "bogus", specialUse: "bogus" })),
+    ).rejects.toMatchObject({
+      cause: { message: expect.stringMatching(/mail_account_folders_special_use_valid|check/i) },
+    });
+
+    // NULL is not "bogus" -- an ordinary, unclassified folder must insert
+    // cleanly (three-valued CHECK logic: NULL never fails an IN (...) list).
+    const [ordinary] = await handle.db.insert(mailAccountFolders)
+      .values(folderValues(account!.id, { folder: "Projects", specialUse: null })).returning();
+    expect(ordinary?.specialUse).toBeNull();
   });
 });

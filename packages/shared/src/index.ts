@@ -481,6 +481,14 @@ export type MailSecurity = z.infer<typeof mailSecuritySchema>;
 export const mailAccountStatusSchema = z.enum(["active", "error"]);
 export type MailAccountStatus = z.infer<typeof mailAccountStatusSchema>;
 
+// mail_account_folders.special_use's five classified values (Phase 4.1) --
+// the SPECIAL-USE attribute (RFC 6154) where the server offers it, else a
+// case-insensitive name-heuristic fallback (api: services/mail-folders.ts).
+// An ordinary, unclassified folder carries NULL here, not a sixth "none"
+// member -- see mailAccountFolderSchema's specialUse field below.
+export const specialUseSchema = z.enum(["archive", "drafts", "junk", "sent", "trash"]);
+export type SpecialUse = z.infer<typeof specialUseSchema>;
+
 // Deliberately excludes credentialsCiphertext (and any other secret) --
 // mail_accounts.credentials_ciphertext is never serialized to a client (see
 // the Phase 4 spec's "Key handling" section). This is the account shape
@@ -648,6 +656,29 @@ export const mailAccountListSchema = z.object({
 });
 export type MailAccountList = z.infer<typeof mailAccountListSchema>;
 
+// One row of GET /api/mail/accounts/:id/folders (Phase 4.1 Task 4's folder
+// picker) -- mirrors mail_account_folders (api: db/schema.ts) field for
+// field; see that table's comments for what each carries and why
+// syncEnabled/lastDiscoveredAt have no DB-level default.
+export const mailAccountFolderSchema = z.object({
+  id: z.uuid(), accountId: z.uuid(), folder: z.string().min(1),
+  specialUse: specialUseSchema.nullable(),
+  syncEnabled: z.boolean(), selectable: z.boolean(),
+  lastDiscoveredAt: z.iso.datetime(), ...timestamps,
+});
+export type MailAccountFolder = z.infer<typeof mailAccountFolderSchema>;
+
+// PATCH /api/mail/accounts/:id/folders body (Task 4): toggles one folder's
+// sync_enabled. Identifies the row by folder NAME rather than id -- the
+// picker renders straight from GET .../folders' list, and a name round-trip
+// buys the route nothing an id lookup wouldn't already give it, while
+// staying symmetric with bulkThreadActionInputSchema's folder field below
+// (also a name, not an id).
+export const folderPatchInputSchema = z.object({
+  folder: z.string().min(1), syncEnabled: z.boolean(),
+});
+export type FolderPatchInput = z.infer<typeof folderPatchInputSchema>;
+
 export const mailThreadSchema = z.object({
   id: z.uuid(),
   // No .min(1): a thread's subject derives from its first message's
@@ -786,10 +817,51 @@ export const threadListFiltersSchema = z.object({
   companyId: z.uuid().optional(), contactId: z.uuid().optional(),
   dealId: z.uuid().optional(), projectId: z.uuid().optional(),
   archived: z.boolean().optional(),
+  // The folder view driving the thread list (Phase 4.1): threads with >= 1
+  // message in this folder (spec) -- absent means "every synced folder",
+  // same as every other optional filter here.
+  folder: z.string().min(1).optional(),
   cursor: z.string().min(1).optional(),
   limit: z.number().int().positive().max(100).optional(),
 });
 export type ThreadListFilters = z.infer<typeof threadListFiltersSchema>;
+
+// The three bulk/single-thread mail actions (Phase 4.1). trash/archive MOVE
+// the underlying messages server-side (api: services/mail-move.ts, a later
+// task); hide is the pre-4.1 CRM-side thread archive (mail_threads
+// .archived_at) applied in bulk, renamed "Hide in CRM" in the UI so it is
+// never confused with the other two (spec).
+export const bulkThreadActionKindSchema = z.enum(["trash", "archive", "hide"]);
+export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
+
+// POST /api/mail/threads/bulk body (Task 4). folder is the VIEW the
+// selection was made in, not a destination -- trash/archive always target
+// the owning account's trash_folder/archive_folder (spec: "only
+// Trash/Archive targets in v0.6.0"); it tells the move service which of
+// each thread's messages (the ones currently sitting in THAT folder) the
+// action applies to, per the selection-granularity ruling. threadIds capped
+// at 200: large enough for a full page of multi-select, small enough that
+// one request's per-account IMAP MOVE queueing stays bounded; `.min(1)`
+// because a bulk action against zero threads is not a request, it's a bug
+// in whatever sent it.
+export const bulkThreadActionInputSchema = z.object({
+  threadIds: z.array(z.uuid()).min(1).max(200),
+  folder: z.string().min(1),
+  action: bulkThreadActionKindSchema,
+});
+export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
+
+// POST /api/mail/threads/bulk response: one entry per requested thread, in
+// the same order, so the client can zip failures back to specific rows for
+// the toast/inline-alert (spec, Frontend section). error is present only
+// when ok is false, mirroring mailAccountTestResultSchema's per-protocol
+// shape above.
+export const bulkThreadResultSchema = z.object({
+  results: z.array(z.object({
+    threadId: z.uuid(), ok: z.boolean(), error: z.string().optional(),
+  })),
+});
+export type BulkThreadResult = z.infer<typeof bulkThreadResultSchema>;
 
 export const mailLinkKindSchema = z.enum(["company", "contact", "deal", "project"]);
 export type MailLinkKind = z.infer<typeof mailLinkKindSchema>;

@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { randomUUID } from "node:crypto";
 import {
   userSchema,
   meResponseSchema,
@@ -50,6 +51,12 @@ import {
   sendMailInputSchema,
   emailTemplateSchema,
   createEmailTemplateInputSchema,
+  specialUseSchema,
+  mailAccountFolderSchema,
+  folderPatchInputSchema,
+  bulkThreadActionKindSchema,
+  bulkThreadActionInputSchema,
+  bulkThreadResultSchema,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -919,6 +926,47 @@ describe("mailAccountListSchema", () => {
   });
 });
 
+describe("specialUseSchema", () => {
+  it("accepts each of the five classified values", () => {
+    for (const value of ["archive", "drafts", "junk", "sent", "trash"] as const) {
+      expect(specialUseSchema.parse(value)).toBe(value);
+    }
+  });
+
+  it("rejects a value outside the five (an ordinary folder is NULL, not a sixth member)", () =>
+    expect(() => specialUseSchema.parse("none")).toThrow());
+});
+
+describe("mailAccountFolderSchema", () => {
+  it("accepts a classified folder row", () => {
+    const folder = {
+      id: uuid1, accountId: uuid2, folder: "Archive",
+      specialUse: "archive" as const, syncEnabled: true, selectable: true,
+      lastDiscoveredAt: now, createdAt: now, updatedAt: now,
+    };
+    expect(mailAccountFolderSchema.parse(folder)).toEqual(folder);
+  });
+
+  it("accepts an unclassified folder (specialUse null)", () => {
+    const folder = {
+      id: uuid1, accountId: uuid2, folder: "Sieve/Newsletters",
+      specialUse: null, syncEnabled: false, selectable: true,
+      lastDiscoveredAt: now, createdAt: now, updatedAt: now,
+    };
+    expect(mailAccountFolderSchema.parse(folder)).toEqual(folder);
+  });
+});
+
+describe("folderPatchInputSchema", () => {
+  it("accepts a sync_enabled toggle", () => {
+    const patch = { folder: "Archive", syncEnabled: false };
+    expect(folderPatchInputSchema.parse(patch)).toEqual(patch);
+  });
+
+  it("rejects a patch missing syncEnabled", () =>
+    expect(() => folderPatchInputSchema.parse({ folder: "Archive" })).toThrow());
+});
+
 describe("mailThreadSchema", () => {
   it("accepts a fully-linked thread", () => {
     const thread = {
@@ -1095,17 +1143,63 @@ describe("mailUnreadCountSchema", () => {
 });
 
 describe("threadListFiltersSchema", () => {
-  it("accepts every filter set at once", () => {
+  it("accepts every filter set at once, including the Phase 4.1 folder filter", () => {
     const filters = {
       accountId: uuid1, unread: true, unlinked: false,
       companyId: uuid2, contactId: uuid2, dealId: uuid2, projectId: uuid2,
-      archived: false, cursor: "abc", limit: 20,
+      archived: false, folder: "INBOX", cursor: "abc", limit: 20,
     };
     expect(threadListFiltersSchema.parse(filters)).toEqual(filters);
   });
 
   it("accepts no filters at all (unfiltered list)", () => {
     expect(threadListFiltersSchema.parse({})).toEqual({});
+  });
+});
+
+describe("bulkThreadActionKindSchema and bulkThreadActionInputSchema", () => {
+  it("accepts each of the three action kinds", () => {
+    for (const action of ["trash", "archive", "hide"] as const) {
+      expect(bulkThreadActionKindSchema.parse(action)).toBe(action);
+      const input = { threadIds: [uuid1], folder: "INBOX", action };
+      expect(bulkThreadActionInputSchema.parse(input)).toEqual(input);
+    }
+  });
+
+  it("rejects a threadIds array over the 200-thread cap", () => {
+    const threadIds = Array.from({ length: 201 }, () => randomUUID());
+    expect(() =>
+      bulkThreadActionInputSchema.parse({ threadIds, folder: "INBOX", action: "archive" }),
+    ).toThrow();
+  });
+
+  it("accepts exactly 200 threadIds (the cap itself is inclusive)", () => {
+    const threadIds = Array.from({ length: 200 }, () => randomUUID());
+    expect(
+      bulkThreadActionInputSchema.parse({ threadIds, folder: "INBOX", action: "archive" }).threadIds,
+    ).toHaveLength(200);
+  });
+
+  it("rejects an empty threadIds array (a bulk action needs at least one thread)", () =>
+    expect(() =>
+      bulkThreadActionInputSchema.parse({ threadIds: [], folder: "INBOX", action: "archive" }),
+    ).toThrow());
+
+  it("rejects an action outside trash/archive/hide", () =>
+    expect(() =>
+      bulkThreadActionInputSchema.parse({ threadIds: [uuid1], folder: "INBOX", action: "delete" }),
+    ).toThrow());
+});
+
+describe("bulkThreadResultSchema", () => {
+  it("accepts a mix of ok and failed per-thread results", () => {
+    const result = {
+      results: [
+        { threadId: uuid1, ok: true },
+        { threadId: uuid2, ok: false, error: "account in backoff" },
+      ],
+    };
+    expect(bulkThreadResultSchema.parse(result)).toEqual(result);
   });
 });
 

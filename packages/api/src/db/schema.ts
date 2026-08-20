@@ -330,6 +330,16 @@ export const mailAccounts = pgTable("mail_accounts", {
   // handling section. Never selected into any API response.
   credentialsCiphertext: text("credentials_ciphertext").notNull(),
   sentFolder: text("sent_folder").notNull().default("Sent"),
+  // Resolved automatically from a discovered folder's special_use
+  // classification when NULL (services/mail-folders.ts, Phase 4.1 Task 2);
+  // user-overridable in Settings. NULL is a real, meaningful state -- an
+  // account whose Trash/Archive folder hasn't been classified yet (no LIST
+  // pass has run, or the server offers neither SPECIAL-USE nor a matching
+  // name heuristic) -- not "sync everything", so a bulk move against such an
+  // account fails that account's threads with an explanatory error rather
+  // than guessing a folder name (Phase 4.1 spec, data model).
+  trashFolder: text("trash_folder"),
+  archiveFolder: text("archive_folder"),
   signatureHtml: text("signature_html"),
   // NULL = sync everything, not "sync nothing" -- see mail-sync.ts (later
   // task)'s backfill, which treats NULL as "no lower bound."
@@ -346,6 +356,56 @@ export const mailAccounts = pgTable("mail_accounts", {
   check("mail_accounts_status_valid", sql`status IN ('active','error')`),
 ]);
 export type MailAccountRow = typeof mailAccounts.$inferSelect;
+
+// One row per IMAP mailbox folder ever seen on an account (Phase 4.1's
+// folder discovery -- services/mail-folders.ts, a later task). Rows are
+// never deleted: a folder that vanishes from a later LIST keeps its row (and
+// its messages keep their history) but drops out of the sync walk and the
+// UI once last_discovered_at goes stale (Phase 4.1 spec, data model) --
+// there is deliberately no archivedAt/deletedAt column here, unlike almost
+// every other table in this file, because "stale" is read off
+// last_discovered_at itself rather than a separate flag.
+export const mailAccountFolders = pgTable("mail_account_folders", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  accountId: uuid("account_id").notNull().references(() => mailAccounts.id),
+  // The exact IMAP mailbox name, UTF-7 already decoded by imapflow's list()
+  // (spec) -- not a display label. INBOX and the account's sent_folder are
+  // the two well-known values every account carries even before the first
+  // LIST discovers anything else (they are always walked regardless of this
+  // table, per foldersOf's locked-on rule -- a later task).
+  folder: text("folder").notNull(),
+  // From the server's SPECIAL-USE attribute (RFC 6154) where offered, else a
+  // case-insensitive name-heuristic fallback, else NULL when neither
+  // classifies it (services/mail-folders.ts, Task 2). NULL is the normal
+  // case for an ordinary user-created folder, not an error state -- hence no
+  // "none" enum member, just NULL.
+  specialUse: text("special_use"),
+  // No SQL DEFAULT, unlike selectable below: the value this column takes on
+  // first sight DEPENDS on the row's own classification (false for
+  // junk/trash, true otherwise -- spec) rather than being one fixed value,
+  // so it can only be an app-level default computed by the discovery service
+  // (Task 2) at insert time. Same reasoning as mail_accounts.currency-style
+  // fields elsewhere in this file (see deals.currency's comment above) --
+  // config the app decides, not a constant baked into the DDL.
+  syncEnabled: boolean("sync_enabled").notNull(),
+  // \Noselect folders (a pure hierarchy separator, no messages of its own)
+  // are still listed -- for the picker and for classification -- but never
+  // walked by sync regardless of sync_enabled (spec).
+  selectable: boolean("selectable").notNull().default(true),
+  // Bumped on every LIST pass that still sees this folder; a folder that
+  // stops appearing keeps its last value here forever, which is exactly what
+  // marks it stale (see this table's own comment above). No SQL DEFAULT --
+  // always the real moment of discovery, supplied by the discovery service,
+  // never a row-creation artifact (same reasoning as mail_messages.sent_at
+  // and mail_folder_state.uidvalidity elsewhere in this file).
+  lastDiscoveredAt: timestamp("last_discovered_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  check("mail_account_folders_special_use_valid", sql`special_use IN ('archive','drafts','junk','sent','trash')`),
+  unique("mail_account_folders_account_folder_unique").on(t.accountId, t.folder),
+]);
+export type MailAccountFolderRow = typeof mailAccountFolders.$inferSelect;
 
 // The incremental-sync cursor per (account, folder). No created_at -- unlike
 // every other mail table, this one is pure mutable cursor state with no
