@@ -299,7 +299,8 @@ export type EventRow = typeof events.$inferSelect;
 //
 // Purely additive: no existing table changes. Indexes (the search GIN index,
 // mail_messages(thread_id), mail_messages(message_id),
-// mail_attachments(message_id), mail_threads(last_message_at), the four
+// mail_messages(account_id, folder, imap_uid), mail_attachments(message_id),
+// mail_threads(last_message_at), the four
 // mail_threads FK columns, and mail_accounts' partial unique index on
 // (user_id, lower(email)) WHERE archived_at IS NULL -- duplicate-mailbox
 // prevention, quality-review ruling) are deliberately NOT declared here via

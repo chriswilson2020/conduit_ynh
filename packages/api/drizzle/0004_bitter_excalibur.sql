@@ -130,6 +130,16 @@ CREATE INDEX "mail_messages_thread_id_idx" ON "mail_messages" USING btree ("thre
 -- chain -- the hottest write-path query in the sync engine. Without this,
 -- that's a sequential scan on every ingested message.
 CREATE INDEX "mail_messages_message_id_idx" ON "mail_messages" USING btree ("message_id");--> statement-breakpoint
+-- The sync engine's UID-keyed writes (quality-review ruling, Task 5). Three
+-- statements share this exact shape and all three would otherwise be
+-- account-wide sequential scans: mail-sync.ts's reconcileFlags mirrors \Seen
+-- once per folder per pass (WHERE account_id = ? AND folder = ? AND imap_uid
+-- IN (...)), loadCursor clears stale UIDs on a UIDVALIDITY re-walk (WHERE
+-- account_id = ? AND folder = ?, no UID term -- served by the leading two
+-- columns), and Task 7's read-marking write-back groups by the same key.
+-- Column order is selectivity plus prefix reuse: account_id and folder alone
+-- answer the re-walk clear, and the full triple answers the flag reconcile.
+CREATE INDEX "mail_messages_account_folder_uid_idx" ON "mail_messages" USING btree ("account_id","folder","imap_uid");--> statement-breakpoint
 -- Every thread-open loads its messages' attachments.
 CREATE INDEX "mail_attachments_message_id_idx" ON "mail_attachments" USING btree ("message_id");--> statement-breakpoint
 -- GET /api/mail/threads' default ordering: keyset pagination on

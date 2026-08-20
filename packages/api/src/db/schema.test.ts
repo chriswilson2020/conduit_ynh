@@ -346,7 +346,7 @@ describe("mail schema (0004)", () => {
     expect(indexes.length).toBeGreaterThan(0);
   });
 
-  it("has every hand-written index: the four mail_threads FKs, mail_messages(thread_id/message_id), mail_attachments(message_id), mail_accounts' duplicate-mailbox unique index", async () => {
+  it("has every hand-written index: the four mail_threads FKs, mail_messages(thread_id/message_id/account+folder+uid), mail_attachments(message_id), mail_accounts' duplicate-mailbox unique index", async () => {
     const rows = await handle.db.execute<{ tablename: string; indexname: string; indexdef: string }>(
       sql`SELECT tablename, indexname, indexdef FROM pg_indexes
           WHERE tablename IN ('mail_threads','mail_messages','mail_attachments','mail_accounts')`,
@@ -357,11 +357,18 @@ describe("mail schema (0004)", () => {
       "mail_threads_deal_id_idx", "mail_threads_project_id_idx",
       "mail_threads_last_message_at_idx",
       "mail_messages_thread_id_idx", "mail_messages_message_id_idx",
+      "mail_messages_account_folder_uid_idx",
       "mail_attachments_message_id_idx",
       "mail_accounts_user_email_active_unique",
     ]) {
       expect(names).toContain(expected);
     }
+
+    // Column ORDER is the point of this one, not just its existence: the
+    // leading (account_id, folder) prefix is what serves the UIDVALIDITY
+    // re-walk's UID clear, which carries no imap_uid term at all.
+    const uidIndex = rows.find((r) => r.indexname === "mail_messages_account_folder_uid_idx");
+    expect(uidIndex?.indexdef).toMatch(/\(account_id, folder, imap_uid\)/i);
 
     // Composite and DESC on both columns -- matches GET /api/mail/threads'
     // keyset pagination direction exactly, so that query is a single index

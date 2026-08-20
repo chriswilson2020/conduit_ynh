@@ -3,8 +3,13 @@ import type { MailSecurity } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { mailAccounts, mailFolderState, mailMessages, type MailAccountRow } from "../db/schema.js";
 import { ArchivedError, MailIngestError, NotFoundError } from "./errors.js";
+import {
+  consoleSyncLogger, systemClock as systemSyncClock,
+  type ImapClient, type ImapClientFactory, type ImapMessageDescriptor,
+  type IngestMessageFn, type SyncClock, type SyncLogger,
+} from "./mail-imap.js";
 import { getAccountCredentialsAsSystem, setAccountChangedHook } from "./mail-accounts.js";
-import { ingestMessage, type IngestMessageInput, type IngestResult } from "./mail-ingest.js";
+import { ingestMessage } from "./mail-ingest.js";
 import { publish } from "./sse.js";
 
 /**
@@ -64,7 +69,7 @@ const MAX_BACKOFF_MS = 32 * 60_000;
  */
 const POISON_RETRIES = 1;
 
-/** UIDs per setFlags/UPDATE statement, so a mailbox-wide operation cannot
+/** UIDs per addFlags/UPDATE statement, so a mailbox-wide operation cannot
  * become one statement with tens of thousands of bind parameters. */
 const UID_CHUNK = 500;
 
@@ -76,158 +81,24 @@ const MAX_LAST_ERROR_CHARS = 500;
 
 const SEEN_FLAG = "\\Seen";
 
+/** How long SyncManager.stop() waits for its syncs before abandoning them.
+ * Generous enough for any operation that is merely slow, short enough that a
+ * systemd restart does not stall behind one wedged socket. */
+const STOP_TIMEOUT_MS = 15_000;
+
 // --- The IMAP seam ---------------------------------------------------------
+//
+// The interface, its types, the clock and the logger live in mail-imap.ts --
+// that is the file Task 6's adapter is written against, and it carries the
+// full adapter contract as doc comments. Re-exported here so nothing that
+// already imports them from mail-sync.ts has to move.
 
-/** Deliberately just UIDVALIDITY. UIDNEXT would be the obvious companion,
- * but nothing here reads it -- the cursor is driven by what fetchNewer
- * actually returns, not by a predicted upper bound -- and every field in
- * this interface is one the real adapter has to implement. */
-export interface ImapFolderStatus {
-  uidvalidity: number;
-}
-
-/** One message as the server lists it: enough to decide what to ingest and
- * how to advance the cursor, WITHOUT its body (see fetchNewer). */
-export interface ImapMessageDescriptor {
-  uid: number;
-  flags: string[];
-}
-
-export interface FetchNewerOptions {
-  /** Exclusive lower bound: only UIDs strictly greater than this. */
-  sinceUid: number;
-  /** At most this many descriptors, lowest UID first. */
-  limit: number;
-  /** INTERNALDATE lower bound (the adapter issues SEARCH SINCE), or null for
-   * no lower bound. Set only while a folder's cursor is still at 0 -- see
-   * AccountSync.syncFolder. */
-  sinceDate: Date | null;
-}
-
-export type IdleOutcome = "new-mail" | "timeout" | "aborted";
-
-/**
- * The thin seam `AccountSync` talks to, with two implementations: the real
- * imapflow adapter (Task 6) and an in-memory fake in the unit tests. A seam
- * for testing, not an abstraction layer to grow (spec).
- *
- * The one deviation from the shape sketched in the plan is deliberate:
- * `fetchNewer` returns UID+flags DESCRIPTORS, and raw bodies come one at a
- * time from `fetchRaw`. Materialising a batch of 50 raw buffers would be up
- * to 50 x 25MB (mail-ingest.ts's MAX_RAW_BYTES) resident at once for no
- * reason -- ingest consumes them strictly one after another.
- *
- * A UID list plus a per-UID fetch, rather than an async iterator yielding
- * bodies, because:
- *
- *  1. Both callers of the batch address messages BY UID, not by position:
- *     the poison contract retries one UID, and the cursor advances to the
- *     highest UID of a batch. An iterator would have to be re-entered or
- *     have a raw buffer held aside to express either.
- *  2. An iterator that stayed open across the batch would hold the
- *     adapter's mailbox lock open across 50 ingest TRANSACTIONS -- each of
- *     which takes the global ingest advisory lock and writes attachment
- *     blobs. Discrete calls let the adapter take and release its mailbox
- *     lock per operation instead of pinning it behind unrelated database
- *     work.
- *  3. It maps directly onto imapflow (a `fetch` for flags, `download`/
- *     `fetchOne(uid, {source:true})` per message) and onto a fake that is
- *     just a Map.
- */
-export interface ImapClient {
-  /** Rejects on failure -> pass-level error -> backoff. */
-  connect(): Promise<void>;
-  disconnect(): Promise<void>;
-  /** UIDVALIDITY for the folder; a change means the cursor is worthless. */
-  status(folder: string): Promise<ImapFolderStatus>;
-  /** Ascending by UID. Bodies are NOT included -- see fetchRaw. */
-  fetchNewer(folder: string, options: FetchNewerOptions): Promise<ImapMessageDescriptor[]>;
-  /** One message's RFC822 source, or null when it no longer exists (expunged
-   * between the listing and this call -- an ordinary race, not an error). */
-  fetchRaw(folder: string, uid: number): Promise<Buffer | null>;
-  /** FLAGS-only fetch of everything with an INTERNALDATE at or after
-   * `sinceDate`, for the `\Seen` reconcile. */
-  fetchFlags(folder: string, sinceDate: Date): Promise<ImapMessageDescriptor[]>;
-  append(folder: string, raw: Buffer | string, flags: string[]): Promise<void>;
-  /** Adds flags (never removes) -- the only caller writes back `\Seen`. */
-  setFlags(folder: string, uids: number[], flags: string[]): Promise<void>;
-  /**
-   * Blocks until the server reports new mail, the adapter's own IDLE window
-   * closes ("timeout"), or `signal` aborts. AccountSync caps it at the poll
-   * interval by aborting the signal, so an adapter needs no timer of its
-   * own. Rejecting is allowed and handled: a server without IDLE degrades to
-   * poll-only (spec).
-   */
-  idle(folder: string, signal: AbortSignal): Promise<IdleOutcome>;
-}
-
-export interface ImapConnectionSettings {
-  accountId: string;
-  host: string;
-  port: number;
-  security: MailSecurity;
-  username: string;
-  password: string;
-}
-
-export type ImapClientFactory = (settings: ImapConnectionSettings) => ImapClient;
-
-// --- Injected time and logging ---------------------------------------------
-
-/**
- * Every wait in this file goes through here so tests never sleep. `wait`
- * NEVER rejects and always resolves early when `signal` aborts -- callers
- * treat "the wait ended" and "we were told to stop" identically and re-check
- * their own state afterwards.
- */
-export interface SyncClock {
-  now(): Date;
-  wait(ms: number, signal: AbortSignal): Promise<void>;
-}
-
-export const systemClock: SyncClock = {
-  now: () => new Date(),
-  wait(ms: number, signal: AbortSignal): Promise<void> {
-    if (signal.aborted) return Promise.resolve();
-    return new Promise<void>((resolve) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const onAbort = (): void => {
-        if (timer !== undefined) clearTimeout(timer);
-        resolve();
-      };
-      timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }, ms);
-      // A pending timer keeps the Node process alive. A five-minute poll
-      // wait must never be the reason a shutdown hangs -- SIGTERM already
-      // calls SyncManager.stop(), and this makes the timer harmless even on
-      // a path that does not.
-      timer.unref();
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-  },
-};
-
-/** Structurally compatible with Fastify's pino logger. */
-export interface SyncLogger {
-  info(details: Record<string, unknown>, message: string): void;
-  warn(details: Record<string, unknown>, message: string): void;
-  error(details: Record<string, unknown>, message: string): void;
-}
-
-const consoleLogger: SyncLogger = {
-  info: (details, message) => { console.info(message, details); },
-  warn: (details, message) => { console.warn(message, details); },
-  error: (details, message) => { console.error(message, details); },
-};
-
-/** Signature of mail-ingest.ts's ingestMessage; injectable purely as a test
- * seam (the poison contract's retry-then-succeed case cannot be produced by
- * any real message, since a message that fails once fails identically
- * forever). Production always uses the real function. */
-export type IngestMessageFn =
-  (db: Database, dataDir: string, input: IngestMessageInput) => Promise<IngestResult>;
+export type {
+  ImapClient, ImapClientFactory, ImapConnectionSettings, ImapFolderStatus,
+  ImapMessageDescriptor, FetchNewerOptions, IdleOutcome,
+  SyncClock, SyncLogger, IngestMessageFn,
+} from "./mail-imap.js";
+export { systemClock } from "./mail-imap.js";
 
 // --- Helpers ---------------------------------------------------------------
 
@@ -271,6 +142,26 @@ function isTeardownError(error: unknown): boolean {
 export class SyncStoppedError extends Error {
   constructor(accountId: string) {
     super(`mail sync for account ${accountId} has stopped`);
+  }
+}
+
+/**
+ * Queued work refused WITHOUT touching the network, because the account is
+ * in backoff after a failed pass. Two reasons it fails fast rather than
+ * trying: the connection is known to be broken, so the attempt would only
+ * add another connect to the rate the backoff exists to limit; and Task 7's
+ * route gets an immediate, explanatory answer for the user instead of one
+ * that arrives a connect-timeout later with nothing useful in it. The stored
+ * `last_error` rides along for exactly that.
+ */
+export class SyncUnavailableError extends Error {
+  readonly lastError: string | null;
+  constructor(accountId: string, lastError: string | null) {
+    super(
+      `mail sync for account ${accountId} is in backoff after a failed pass`
+      + (lastError === null ? "" : `: ${lastError}`),
+    );
+    this.lastError = lastError;
   }
 }
 
@@ -357,11 +248,44 @@ export class AccountSync {
    * True initially: start() runs a pass immediately.
    */
   private passDue = true;
+  /**
+   * Epoch ms the current poll/backoff wait is due to end, or null when no
+   * wait is outstanding. A DEADLINE rather than a duration, so an
+   * interruption resumes the remainder instead of restarting the clock --
+   * see waitForWork for the three failures that fixes.
+   */
+  private waitUntil: number | null = null;
+  /**
+   * Set when the server rejected IDLE; after that the loop polls and never
+   * asks again.
+   *
+   * Deliberately NOT cleared by the reconnect that the rejection itself
+   * causes. That reconnect happens at the start of the very next pass, so
+   * clearing there would have the loop ask again one poll interval later,
+   * fail again, log again and reconnect again -- 288 times a day, which is
+   * the entire behaviour this latch exists to remove. It is cleared instead
+   * on recovery from a pass-level FAILURE, where the connection really was
+   * broken and a fresh answer is worth having, and it is per-instance, so a
+   * manager restart (settings change) clears it too.
+   *
+   * The cost of a false positive -- a one-off IDLE error on a server that
+   * does support it -- is that the account polls every five minutes instead
+   * of getting instant push, until its next failure or restart. That is the
+   * spec's "degrade to poll-only silently", and a far better trade than a
+   * reconnect storm.
+   */
+  private idleUnsupported = false;
   private attempt = 0;
   /** Poison skips recorded during the CURRENT pass; written to last_error
    * when the pass completes. */
   private passSkips = 0;
   private passLastSkip: string | null = null;
+  /** Per-pass tallies for the pass-complete log line. */
+  private passIngested = 0;
+  private passFlagChanges = 0;
+  /** Mirror of the account row's last_error, so queued work refused during a
+   * backoff can explain itself without a database read. */
+  private lastErrorText: string | null = null;
 
   private readonly counters = {
     passes: 0, failures: 0, ingested: 0, poisonSkips: 0, idleWakes: 0,
@@ -373,8 +297,8 @@ export class AccountSync {
     this.dataDir = options.dataDir;
     this.mailKeyPath = options.mailKeyPath;
     this.clientFactory = options.clientFactory;
-    this.clock = options.clock ?? systemClock;
-    this.logger = options.logger ?? consoleLogger;
+    this.clock = options.clock ?? systemSyncClock;
+    this.logger = options.logger ?? consoleSyncLogger;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.ingest = options.ingest ?? ingestMessage;
     this.onStopped = options.onStopped ?? null;
@@ -402,6 +326,17 @@ export class AccountSync {
     this.waitController?.abort();
   }
 
+  /** Why queued work cannot run right now, or null when it can. */
+  private whyUnavailable(): Error | null {
+    if (this.stopped) return new SyncStoppedError(this.accountId);
+    // attempt > 0 means the last pass failed and the loop is sitting in a
+    // backoff. Queuing here would open a fresh TCP connection and LOGIN per
+    // task, at whatever rate the UI produces them -- straight through the
+    // rate limit the backoff exists to impose.
+    if (this.attempt > 0) return new SyncUnavailableError(this.accountId, this.lastErrorText);
+    return null;
+  }
+
   /**
    * Queue a `\Seen` write-back onto the loop (routes/mail.ts's thread-read
    * handler, Task 7). Resolves once the flags are on the server.
@@ -410,13 +345,16 @@ export class AccountSync {
    * (SyncStoppedError), so the returned promise must always be handled --
    * this is a best-effort side channel, and a caller that leaves it floating
    * turns a mail server hiccup into an unhandled rejection.
+   *
+   * Rejects IMMEDIATELY, without touching the network, while the account is
+   * in backoff: see whyUnavailable.
    */
   markSeen(folder: string, uids: readonly number[]): Promise<void> {
     if (uids.length === 0) return Promise.resolve();
     const list = [...uids];
     return this.enqueue("markSeen", async (client) => {
       for (const batch of chunked(list, UID_CHUNK)) {
-        await client.setFlags(folder, batch, [SEEN_FLAG]);
+        await client.addFlags(folder, batch, [SEEN_FLAG]);
       }
     });
   }
@@ -429,7 +367,8 @@ export class AccountSync {
    *
    * Rejects on failure, and must be handled for the same reason as markSeen
    * -- the send already succeeded by the time this runs, so its failure is a
-   * warning to log, never something to fail a request over.
+   * warning to log, never something to fail a request over. Same immediate
+   * rejection while the account is in backoff.
    */
   appendSent(raw: Buffer | string): Promise<void> {
     return this.enqueue("appendSent", async (client, account) => {
@@ -525,7 +464,8 @@ export class AccountSync {
     label: string,
     run: (client: ImapClient, account: MailAccountRow) => Promise<void>,
   ): Promise<void> {
-    if (this.stopped) return Promise.reject(new SyncStoppedError(this.accountId));
+    const unavailable = this.whyUnavailable();
+    if (unavailable !== null) return Promise.reject(unavailable);
     return new Promise<void>((resolve, reject) => {
       this.queue.push({ label, run, resolve, reject });
       // interrupt, NOT wake: the loop should come back and run this task
@@ -577,15 +517,37 @@ export class AccountSync {
   private async runPassGuarded(): Promise<PassOutcome> {
     this.passSkips = 0;
     this.passLastSkip = null;
+    this.passIngested = 0;
+    this.passFlagChanges = 0;
+    // A pass just ran, so any poll/backoff deadline still standing is spent:
+    // the next one is measured from the end of THIS pass, not from whenever
+    // the previous wait happened to be set up.
+    this.waitUntil = null;
+    const startedAt = this.clock.now().getTime();
     try {
       await this.runPass();
       if (this.stopped) return "ok";
       // A successful pass clears status/last_error -- EXCEPT for a poison
       // note from this same pass, which has to survive its own pass or it
       // would be written and cleared in the same breath.
-      await this.writeAccountState({ status: "active", lastError: this.passNote(), touchSynced: true });
+      const note = this.passNote();
+      await this.writeAccountState({ status: "active", lastError: note, touchSynced: true });
       this.attempt = 0;
+      this.lastErrorText = note;
       this.counters.passes += 1;
+      // One line per pass, at info. This is the only routine signal that the
+      // engine is alive at all, and without it a mailbox that quietly stops
+      // receiving looks identical to one nobody is writing to.
+      this.logger.info(
+        {
+          accountId: this.accountId,
+          ingested: this.passIngested,
+          flagChanges: this.passFlagChanges,
+          skipped: this.passSkips,
+          ms: this.clock.now().getTime() - startedAt,
+        },
+        "mail-sync: pass complete",
+      );
       return "ok";
     } catch (error) {
       if (isTeardownError(error)) {
@@ -600,10 +562,18 @@ export class AccountSync {
         "mail-sync: pass failed",
       );
       await this.dropClient();
+      // The connection was genuinely broken, so whatever it told us about
+      // IDLE is not evidence about the server -- give it another chance on
+      // the next one.
+      this.idleUnsupported = false;
+      const failureText = truncate(errorText(error), MAX_LAST_ERROR_CHARS);
+      // Kept in memory too, so queued work refused during the backoff can
+      // tell its caller WHY without a database read (see whyUnavailable).
+      this.lastErrorText = failureText;
       try {
         await this.writeAccountState({
           status: "error",
-          lastError: truncate(errorText(error), MAX_LAST_ERROR_CHARS),
+          lastError: failureText,
           touchSynced: false,
         });
       } catch (writeError) {
@@ -822,9 +792,10 @@ export class AccountSync {
         // the rows the re-walk does re-sight get their fresh UID from
         // ingest's duplicate-guard UPDATE.
         //
-        // Ordered before the cursor reset, and in one transaction with it,
-        // so a crash between the two leaves the mismatch still detectable
-        // and the whole step simply repeats.
+        // The two statements share a transaction, and that ATOMICITY is what
+        // gives the property -- not the order they appear in. Either both
+        // land or neither does, so there is no state in which the cursor has
+        // been reset while stale UIDs are still matchable.
         await tx.update(mailMessages)
           .set({ imapUid: null, updatedAt: this.clock.now() })
           .where(and(eq(mailMessages.accountId, accountId), eq(mailMessages.folder, folder)));
@@ -880,6 +851,7 @@ export class AccountSync {
           accountId: account.id, folder, uid: descriptor.uid, raw, flags: descriptor.flags,
         });
         this.counters.ingested += 1;
+        this.passIngested += 1;
         return;
       } catch (error) {
         // The account disappearing mid-pass is a teardown signal, never a
@@ -953,6 +925,7 @@ export class AccountSync {
           ))
           .returning({ threadId: mailMessages.threadId });
         for (const row of rows) threadIds.add(row.threadId);
+        this.passFlagChanges += rows.length;
       }
     }
     if (threadIds.size === 0) return;
@@ -1009,10 +982,25 @@ export class AccountSync {
    * depends on the last pass: IDLE (capped at the poll interval) after a
    * good one, backoff after a bad one.
    *
+   * Both are expressed as a DEADLINE (`waitUntil`), not as a fresh timer per
+   * entry, and that is what makes three separate problems go away at once.
+   * A queued task cuts the wait short, the loop drains it and comes straight
+   * back here; with a fresh timer each time, a mailbox getting a mark-read
+   * every four minutes would restart a five-minute poll wait forever and
+   * NEVER poll -- fatal on a server without IDLE, where the poll is the only
+   * thing that fetches mail. The same restart, applied to a backoff, hands
+   * every queued task its own connect attempt at full rate, which is exactly
+   * the reconnect storm the backoff exists to prevent. And a deadline is
+   * simultaneity-proof: two tasks arriving together resume the one remaining
+   * wait rather than racing to install two.
+   *
+   * The deadline is set once (`??=`), re-entered as `max(0, waitUntil -
+   * now)`, and cleared when a pass actually runs -- so the NEXT deadline is
+   * measured from the end of that pass.
+   *
    * A wait that ELAPSES means the next pass is due. A wait that was aborted
    * does not: `wake()` marks its own pass due, and a queued task
-   * deliberately marks none. `signal.aborted` is what tells the two apart,
-   * which is why it is read before any cleanup abort of our own.
+   * deliberately marks none.
    */
   private async waitForWork(passSucceeded: boolean): Promise<void> {
     try {
@@ -1024,17 +1012,18 @@ export class AccountSync {
       // from here on aborts this controller rather than missing it.
       this.waitController = controller;
       if (this.stopped) return;
+      const total = passSucceeded ? this.pollIntervalMs : this.backoffMs();
+      this.waitUntil ??= this.clock.now().getTime() + total;
+      const remaining = Math.max(0, this.waitUntil - this.clock.now().getTime());
       if (passSucceeded) {
-        if (await this.waitForNewMail(controller)) this.passDue = true;
+        if (await this.waitForNewMail(controller, remaining)) this.passDue = true;
       } else {
-        await this.clock.wait(this.backoffMs(), controller.signal);
-        // Aborted means something cut the backoff short. A queued task is
-        // the one thing that can do that without owing a pass, and when it
-        // does, the retry is NOT pulled forward -- the loop drains the queue
-        // and comes back here for a fresh backoff. A user's mark-read must
-        // not be able to accelerate a broken account's reconnect attempts.
+        await this.clock.wait(remaining, controller.signal);
         if (!controller.signal.aborted) this.passDue = true;
       }
+      // Only a deadline that was actually REACHED is spent. An aborted wait
+      // keeps its deadline so the next entry resumes the remainder.
+      if (this.passDue) this.waitUntil = null;
     } catch (error) {
       // clock.wait never rejects and waitForNewMail handles its own; this is
       // a backstop so a wait can never break the loop.
@@ -1048,16 +1037,20 @@ export class AccountSync {
   }
 
   /**
-   * IDLE on INBOX, capped at the poll interval. New mail, the adapter's own
-   * IDLE window closing, and the cap elapsing all mean the same thing -- run
-   * another pass -- and all three return true. An external abort (stop, or a
-   * queued task cutting in) returns false, so the caller knows no pass was
-   * earned.
+   * IDLE on INBOX, capped at the remaining poll deadline. New mail and the
+   * cap elapsing mean the same thing -- run another pass -- and both return
+   * true. An external abort (stop, or a queued task cutting in) returns
+   * false, so the caller knows no pass was earned.
    */
-  private async waitForNewMail(controller: AbortController): Promise<boolean> {
+  private async waitForNewMail(controller: AbortController, remaining: number): Promise<boolean> {
     const client = this.client;
-    const capped = this.clock.wait(this.pollIntervalMs, controller.signal);
-    if (client === null) {
+    const capped = this.clock.wait(remaining, controller.signal);
+    // Latched: a server that does not support IDLE says so once, and is
+    // never asked again on this connection. Without the latch, a no-IDLE
+    // account produced one WARN plus one drop-and-reconnect (a fresh TCP
+    // handshake and LOGIN) every poll interval -- 288 of each per day, per
+    // account, none of which ever changes the answer.
+    if (client === null || this.idleUnsupported) {
       await capped;
       return !controller.signal.aborted;
     }
@@ -1066,7 +1059,7 @@ export class AccountSync {
     // The rejection handler is attached BEFORE the race, not after: if the
     // cap wins and idle rejects later, an unhandled rejection would take the
     // process down under Node's default policy.
-    const idling = client.idle(INBOX, controller.signal).then(
+    const idling = client.idle(controller.signal).then(
       (outcome) => {
         if (outcome === "new-mail") this.counters.idleWakes += 1;
         return outcome;
@@ -1079,14 +1072,22 @@ export class AccountSync {
 
     await Promise.race([idling, capped]);
     if (idleError !== undefined) {
-      // Servers without IDLE degrade to poll-only, silently (spec). Waiting
-      // out the cap first is what makes that true: returning here would spin
-      // the loop as fast as the server can refuse IDLE.
-      this.logger.warn(
+      // Servers without IDLE degrade to poll-only, silently (spec). Logged
+      // ONCE, at info: this is a property of the server, not an incident.
+      // The client is still dropped this once, because the same rejection is
+      // also what a dead socket looks like and a reconnect is the only way
+      // to tell the two apart -- the latch clears on the next successful
+      // connect, so a genuinely transient failure costs one poll interval of
+      // IDLE rather than disabling it forever.
+      this.idleUnsupported = true;
+      this.logger.info(
         { accountId: this.accountId, err: errorText(idleError) },
-        "mail-sync: IDLE unavailable, falling back to polling",
+        "mail-sync: IDLE unavailable, falling back to polling for this connection",
       );
       await this.dropClient();
+      // Waiting out the cap is what makes the fallback silent rather than a
+      // spin: returning here would run passes as fast as the server can
+      // refuse IDLE.
       await capped;
     }
     // Read BEFORE the cleanup abort below, which would otherwise make every
@@ -1156,26 +1157,39 @@ export class SyncManager {
   }
 
   private get logger(): SyncLogger {
-    return this.options.logger ?? consoleLogger;
+    return this.options.logger ?? consoleSyncLogger;
   }
 
   /** Load every non-archived account and start syncing it. Idempotent. */
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
-    this.unregisterHook = setAccountChangedHook((accountId) => { this.onAccountChanged(accountId); });
+    this.unregisterHook = setAccountChangedHook((accountId, change) => {
+      this.onAccountChanged(accountId, change.connectionChanged);
+    });
     const rows = await this.options.db.select({ id: mailAccounts.id })
       .from(mailAccounts).where(isNull(mailAccounts.archivedAt));
     for (const row of rows) this.ensureSync(row.id);
     this.logger.info({ accounts: rows.length }, "mail-sync: sync manager started");
   }
 
-  /** Reconcile one account's sync with its current row: create, restart or
+  /**
+   * Reconcile one account's sync with its current row: create, restart or
    * tear down. Awaited by tests and syncNow; fired and forgotten by the
-   * account-changed hook. */
-  async accountChanged(accountId: string): Promise<void> {
+   * account-changed hook.
+   *
+   * `connectionChanged` says whether anything a CONNECTION is built from
+   * moved (host/port/security/username/password). mail-accounts.ts already
+   * computes exactly that for its own status-reset decision and passes it
+   * through the hook. When nothing did, the live sync is kept and merely
+   * woken: Task 9's settings form autosaves the signature editor, and
+   * dropping an IMAP connection and re-LOGINing on every keystroke-debounce
+   * would be absurd. Absent (the default) means "assume it did" -- create,
+   * archive and unarchive all take the full path.
+   */
+  async accountChanged(accountId: string, connectionChanged = true): Promise<void> {
     const previous = this.chain.get(accountId) ?? Promise.resolve();
-    const next = previous.then(() => this.applyAccountChange(accountId));
+    const next = previous.then(() => this.applyAccountChange(accountId, connectionChanged));
     // The chain link must never reject: a failed reconcile must not reject
     // the NEXT one, nor sit around as an unhandled rejection. The caller
     // still sees the real outcome through `next`.
@@ -1188,31 +1202,40 @@ export class SyncManager {
     }
   }
 
-  private async applyAccountChange(accountId: string): Promise<void> {
+  private async applyAccountChange(accountId: string, connectionChanged: boolean): Promise<void> {
     if (!this.started) return;
     const [row] = await this.options.db
       .select({ id: mailAccounts.id, archivedAt: mailAccounts.archivedAt })
       .from(mailAccounts).where(eq(mailAccounts.id, accountId));
-    // Always tear the old one down first, even when the account still
-    // exists: settings or credentials may have changed, and an AccountSync
-    // holds a connection built from the values it started with. A restart is
-    // the only way to be sure the next pass uses the current row -- and it
-    // is cheap, since the folder cursors live in the database.
     const existing = this.syncs.get(accountId);
+    const stillWanted = row !== undefined && row.archivedAt === null;
+
+    // Everything a connection is built from is captured when the client is
+    // created, so a change to any of it needs a new AccountSync -- a restart
+    // is the only way to be sure the next pass uses the current row, and it
+    // is cheap because the folder cursors live in the database. A change to
+    // anything else (label, signature, sent_folder, backfill window) is
+    // picked up by loadAccount on the very next pass, so the live sync just
+    // gets woken.
+    if (existing !== undefined && stillWanted && !connectionChanged) {
+      existing.wake();
+      return;
+    }
+
     if (existing !== undefined) {
       this.syncs.delete(accountId);
       await existing.stop();
     }
-    if (row === undefined || row.archivedAt !== null) return;
+    if (!stillWanted) return;
     if (!this.started) return;
     this.ensureSync(accountId);
   }
 
-  private onAccountChanged(accountId: string): void {
+  private onAccountChanged(accountId: string, connectionChanged: boolean): void {
     // The hook is synchronous and called from inside a CRUD service right
     // after its write committed: it must not throw, must not block the
     // response, and must not leave a floating rejection behind.
-    void this.accountChanged(accountId).catch((error: unknown) => {
+    void this.accountChanged(accountId, connectionChanged).catch((error: unknown) => {
       this.logger.error(
         { accountId, err: errorText(error) },
         "mail-sync: reconciling an account after a change failed",
@@ -1236,9 +1259,17 @@ export class SyncManager {
     sync.start();
   }
 
-  /** Run a pass for this account as soon as its loop is free, creating the
-   * AccountSync first if there is not one yet (the account-just-created
-   * path). */
+  /**
+   * Request a pass for this account, creating the AccountSync first if there
+   * is not one yet (the account-just-created path).
+   *
+   * RESOLVES WHEN THE PASS IS REQUESTED, NOT WHEN IT FINISHES. The loop is
+   * serial and may be mid-pass, mid-backoff or mid-queue when this lands, so
+   * "wait for the pass" would mean waiting on work that has nothing to do
+   * with the caller. Task 7's route should treat this as fire-and-forget and
+   * let the SSE hints report the result -- awaiting it as if it were "sync
+   * finished" would be wrong.
+   */
   async syncNow(accountId: string): Promise<void> {
     const existing = this.syncs.get(accountId);
     if (existing !== undefined) {
@@ -1256,6 +1287,15 @@ export class SyncManager {
     return this.syncs.get(accountId);
   }
 
+  /**
+   * Stop every sync, BOUNDED. server.ts awaits this before `app.close()`, so
+   * an unbounded wait here would hold the HTTP listener open for as long as
+   * one wedged network operation took to notice -- and nothing except
+   * `idle()` in the ImapClient contract is cancellable, so "as long as it
+   * takes" is the adapter's socket timeout, not ours. Past the deadline the
+   * remaining syncs are abandoned: each has already been told to stop and
+   * will unwind on its own, and the process is on its way out regardless.
+   */
   async stop(): Promise<void> {
     this.started = false;
     this.unregisterHook?.();
@@ -1267,7 +1307,22 @@ export class SyncManager {
     await Promise.allSettled(chains);
     const syncs = [...this.syncs.values()];
     this.syncs.clear();
-    await Promise.allSettled(syncs.map((sync) => sync.stop()));
+    const stopping = Promise.allSettled(syncs.map((sync) => sync.stop()));
+    const clock = this.options.clock ?? systemSyncClock;
+    const deadline = new AbortController();
+    const timeout = clock.wait(STOP_TIMEOUT_MS, deadline.signal);
+    const winner = await Promise.race([stopping.then(() => "stopped" as const), timeout.then(() => "timeout" as const)]);
+    // Releases whichever lost. `stopping` never rejects (allSettled) and is
+    // deliberately not awaited on the timeout path -- that is the whole
+    // point of the bound.
+    deadline.abort();
+    await timeout;
+    if (winner === "timeout") {
+      this.logger.warn(
+        { accounts: syncs.length, timeoutMs: STOP_TIMEOUT_MS },
+        "mail-sync: gave up waiting for syncs to stop, abandoning them",
+      );
+    }
   }
 }
 
@@ -1294,7 +1349,7 @@ export interface StartSyncManagerOptions extends Omit<SyncManagerOptions, "clien
  * these options by hand.
  */
 export async function startSyncManager(options: StartSyncManagerOptions): Promise<SyncManager | null> {
-  const logger = options.logger ?? consoleLogger;
+  const logger = options.logger ?? consoleSyncLogger;
   if (options.nodeEnv === "test" || process.env.NODE_ENV === "test") return null;
   const { clientFactory } = options;
   if (clientFactory === undefined) {

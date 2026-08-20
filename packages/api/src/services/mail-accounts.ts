@@ -21,25 +21,41 @@ function publishAccountsHint(): void {
 
 /**
  * Notified after every account mutation that changes whether or how this
- * account should be syncing: create (start one), update (restart, so the new
- * settings/credentials take effect), archive (tear down), unarchive (start
- * again). mail-sync.ts's SyncManager registers itself here at start() and
+ * account should be syncing: create (start one), update (restart or wake --
+ * see `connectionChanged`), archive (tear down), unarchive (start again).
+ * mail-sync.ts's SyncManager registers itself here at start() and
  * unregisters at stop().
  *
- * Registration runs in this direction -- the sync engine registering with the
- * accounts service, rather than this file importing the sync engine -- for
- * the same reason stream.ts registers with sse.ts's subscribe() instead of
- * sse.ts importing the route: the mutating service stays independent of the
- * consumer, mail-accounts.ts remains unit-testable with no sync engine in the
- * picture at all, and the two modules do not form an import cycle (mail-sync
- * has to import getAccountCredentialsAsSystem from here).
+ * Registration runs in this direction -- the sync engine registering with
+ * the accounts service, rather than this file importing the sync engine --
+ * so the mutating service stays independent of its consumer: mail-accounts.ts
+ * remains unit-testable with no sync engine in the picture at all, and the
+ * two modules do not form an import cycle (mail-sync has to import
+ * getAccountCredentialsAsSystem from here). sse.ts's subscribe() runs the
+ * same direction, but is NOT the precedent for the mechanism: that is a Set
+ * of many subscribers, and this is a single slot with last-writer-wins --
+ * this file's own design, appropriate because there is exactly one sync
+ * engine per process and a second registration means a bug, not a second
+ * listener.
  */
-type AccountChangedHook = (accountId: string) => void;
+export interface AccountChange {
+  /**
+   * Whether anything a CONNECTION is built from moved -- host, port,
+   * security, username, or either password. It is the only distinction the
+   * sync engine needs: a connection-affecting change forces a restart, while
+   * anything else (label, signature, sent_folder, backfill window) is picked
+   * up by the running loop's next account read. Computed here because this
+   * is where it is known; updateAccount already derives the same fact for
+   * its own status-reset decision.
+   */
+  connectionChanged: boolean;
+}
+type AccountChangedHook = (accountId: string, change: AccountChange) => void;
 let accountChangedHook: AccountChangedHook | null = null;
 
 /** Register the hook; returns an unregister function that only clears the
- * hook if it is still the one it installed (sse.ts's subscribe() precedent),
- * so a replaced registration cannot be torn down by a stale unregister. */
+ * hook if it is still the one it installed, so a replaced registration
+ * cannot be torn down by a stale unregister. */
 export function setAccountChangedHook(hook: AccountChangedHook): () => void {
   accountChangedHook = hook;
   return () => {
@@ -59,11 +75,11 @@ export function setAccountChangedHook(hook: AccountChangedHook): () => void {
  * manager's implementation kicks off its own async reconcile and handles that
  * promise internally.)
  */
-function notifyAccountChanged(accountId: string): void {
+function notifyAccountChanged(accountId: string, change: AccountChange): void {
   const hook = accountChangedHook;
   if (hook === null) return;
   try {
-    hook(accountId);
+    hook(accountId, change);
   } catch (error) {
     console.error("mail-accounts: account-changed hook threw", { accountId, error });
   }
@@ -155,7 +171,9 @@ export async function createAccount(
     throw err;
   }
   if (row === undefined) throw new Error("insert returned no row");
-  notifyAccountChanged(row.id);
+  // A brand-new account has no sync at all yet, so this is always the full
+  // create path.
+  notifyAccountChanged(row.id, { connectionChanged: true });
   publishAccountsHint();
   return toMailAccount(row);
 }
@@ -241,7 +259,7 @@ export async function updateAccount(
   // transaction, against the locked row).
   const wantsSmtpPasswordAloneChange = !passwordProvided && smtpPasswordProvided;
 
-  const { row, wrote } = await db.transaction(async (tx) => {
+  const { row, wrote, connectionChanged } = await db.transaction(async (tx) => {
     const [locked] = await tx.select().from(mailAccounts).where(eq(mailAccounts.id, id)).for("update");
     if (locked === undefined) throw new NotFoundError("mail account", id);
     if (locked.archivedAt !== null) throw new ArchivedError("mail account", id);
@@ -256,7 +274,9 @@ export async function updateAccount(
     // non-empty submission always counts as an intended change even if it
     // happens to match the old plaintext -- we do not decrypt just to compare.
     const wantsPasswordChange = passwordProvided || smtpPasswordProvided;
-    if (changedKeys.length === 0 && !wantsPasswordChange) return { row: locked, wrote: false };
+    if (changedKeys.length === 0 && !wantsPasswordChange) {
+      return { row: locked, wrote: false, connectionChanged: false };
+    }
 
     let credentialsCiphertext = freshCredentialsCiphertext;
     if (credentialsCiphertext === undefined && wantsSmtpPasswordAloneChange) {
@@ -311,12 +331,14 @@ export async function updateAccount(
       if (recheck === undefined) throw new NotFoundError("mail account", id);
       throw new ArchivedError("mail account", id);
     }
-    return { row: updated, wrote: true };
+    return { row: updated, wrote: true, connectionChanged: connectionFieldChanged };
   });
   if (wrote) {
-    // Restarts the AccountSync, so it picks up new settings/credentials and
-    // drops any backoff it was sitting in after the status reset.
-    notifyAccountChanged(id);
+    // Restarts the AccountSync when a connection field moved, so it picks up
+    // the new settings/credentials and drops any backoff it was sitting in
+    // after the status reset; otherwise just wakes it, since the running
+    // loop re-reads the account row on its very next pass anyway.
+    notifyAccountChanged(id, { connectionChanged });
     publishAccountsHint();
   }
   return toMailAccount(row);
@@ -353,7 +375,7 @@ export async function archiveAccount(db: Database, actorId: string, id: string):
   });
   if (wrote) {
     // Tears down this account's AccountSync (spec: archiving stops its sync).
-    notifyAccountChanged(id);
+    notifyAccountChanged(id, { connectionChanged: true });
     publishAccountsHint();
   }
   return toMailAccount(row);
@@ -384,7 +406,7 @@ export async function unarchiveAccount(db: Database, actorId: string, id: string
   });
   if (wrote) {
     // Starts an AccountSync for this account again.
-    notifyAccountChanged(id);
+    notifyAccountChanged(id, { connectionChanged: true });
     publishAccountsHint();
   }
   return toMailAccount(row);

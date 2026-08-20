@@ -12,7 +12,7 @@ import { mailAccounts } from "../db/schema.js";
 import { encryptCredentials } from "./mail-crypto.js";
 import {
   createAccount, updateAccount, archiveAccount, unarchiveAccount, getOwnAccount, getAccountCredentialsAsSystem,
-  listAccounts, testConnection, type TestConnectionDeps,
+  listAccounts, testConnection, setAccountChangedHook, type TestConnectionDeps,
 } from "./mail-accounts.js";
 import { NotFoundError, ArchivedError, ConflictError, MailCredentialDecryptError } from "./errors.js";
 import { subscribe } from "./sse.js";
@@ -759,5 +759,94 @@ describe("testConnection", () => {
     await archiveAccount(handle.db, actorId, account.id);
     await expect(testConnection(handle.db, actorId, { accountId: account.id }, keyPath, okDeps()))
       .rejects.toBeInstanceOf(ArchivedError);
+  });
+});
+
+describe("account-changed hook", () => {
+  interface HookCall { accountId: string; connectionChanged: boolean }
+
+  function record(): { calls: HookCall[]; off: () => void } {
+    const calls: HookCall[] = [];
+    const off = setAccountChangedHook((accountId, change) => {
+      calls.push({ accountId, connectionChanged: change.connectionChanged });
+    });
+    return { calls, off };
+  }
+
+  it("fires for create, update, archive and unarchive, flagging connection changes", async () => {
+    const { calls, off } = record();
+    try {
+      const account = await make();
+      expect(calls).toEqual([{ accountId: account.id, connectionChanged: true }]);
+
+      // A label edit changes nothing a connection is built from, so the sync
+      // engine is told it can keep its connection and just re-read the row.
+      calls.length = 0;
+      await updateAccount(handle.db, actorId, account.id, { label: "Renamed" }, keyPath);
+      expect(calls).toEqual([{ accountId: account.id, connectionChanged: false }]);
+
+      calls.length = 0;
+      await updateAccount(handle.db, actorId, account.id, { imapHost: "elsewhere.example" }, keyPath);
+      expect(calls).toEqual([{ accountId: account.id, connectionChanged: true }]);
+
+      // A password change counts even though no plain column moved: the
+      // credentials the live connection was built with are stale.
+      calls.length = 0;
+      await updateAccount(handle.db, actorId, account.id, { password: "new-secret" }, keyPath);
+      expect(calls).toEqual([{ accountId: account.id, connectionChanged: true }]);
+
+      calls.length = 0;
+      await archiveAccount(handle.db, actorId, account.id);
+      expect(calls).toEqual([{ accountId: account.id, connectionChanged: true }]);
+
+      // Unarchive has to notify too, or a restored account never syncs again
+      // until the process restarts.
+      calls.length = 0;
+      await unarchiveAccount(handle.db, actorId, account.id);
+      expect(calls).toEqual([{ accountId: account.id, connectionChanged: true }]);
+    } finally {
+      off();
+    }
+  });
+
+  it("does not fire for a no-op update", async () => {
+    const account = await make({ label: "Work" });
+    const { calls, off } = record();
+    try {
+      await updateAccount(handle.db, actorId, account.id, { label: "Work" }, keyPath);
+      expect(calls).toEqual([]);
+    } finally {
+      off();
+    }
+  });
+
+  it("survives a hook that throws: the CRUD write already committed", async () => {
+    // The hook runs after the transaction commits, so a sync-engine failure
+    // must never turn a successful save into a 500.
+    const off = setAccountChangedHook(() => { throw new Error("sync engine exploded"); });
+    try {
+      const account = await make();
+      const [row] = await handle.db.select().from(mailAccounts).where(eq(mailAccounts.id, account.id));
+      expect(row?.label).toBe("Work");
+    } finally {
+      off();
+    }
+  });
+
+  it("unregisters by identity, so a stale unregister cannot silence a newer hook", async () => {
+    const first: string[] = [];
+    const second: string[] = [];
+    const offFirst = setAccountChangedHook((id) => { first.push(id); });
+    const offSecond = setAccountChangedHook((id) => { second.push(id); });
+    try {
+      // The first registration is already displaced; its unregister must be a
+      // no-op rather than clearing the slot the second one now owns.
+      offFirst();
+      const account = await make();
+      expect(first).toEqual([]);
+      expect(second).toEqual([account.id]);
+    } finally {
+      offSecond();
+    }
   });
 });

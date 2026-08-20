@@ -13,7 +13,7 @@ import { MailIngestError, NotFoundError } from "./errors.js";
 import { archiveAccount, createAccount, updateAccount } from "./mail-accounts.js";
 import { ingestMessage } from "./mail-ingest.js";
 import {
-  AccountSync, SyncManager, SyncStoppedError, startSyncManager,
+  AccountSync, SyncManager, SyncStoppedError, SyncUnavailableError, startSyncManager,
   type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
   type ImapMessageDescriptor, type IngestMessageFn, type SyncClock, type SyncLogger,
 } from "./mail-sync.js";
@@ -143,7 +143,7 @@ class FakeImapClient implements ImapClient {
   disconnectCalls = 0;
   connectError: Error | null = null;
   statusError: Error | null = null;
-  setFlagsError: Error | null = null;
+  addFlagsError: Error | null = null;
   idleError: Error | null = null;
   idleEntries = 0;
   /** uid -> how many more times fetchRaw should throw for it. */
@@ -232,8 +232,11 @@ class FakeImapClient implements ImapClient {
     });
   }
 
+  readonly fetchFlagsSince: Date[] = [];
+
   async fetchFlags(folder: string, sinceDate: Date): Promise<ImapMessageDescriptor[]> {
     return this.track({ op: "fetchFlags", folder }, () => {
+      this.fetchFlagsSince.push(sinceDate);
       return [...this.folder(folder).messages.entries()]
         .filter(([, message]) => message.internalDate >= sinceDate)
         .sort((a, b) => a[0] - b[0])
@@ -249,9 +252,9 @@ class FakeImapClient implements ImapClient {
     });
   }
 
-  async setFlags(folder: string, uids: number[], flags: string[]): Promise<void> {
-    await this.track({ op: "setFlags", folder, uids: [...uids] }, () => {
-      if (this.setFlagsError !== null) throw this.setFlagsError;
+  async addFlags(folder: string, uids: number[], flags: string[]): Promise<void> {
+    await this.track({ op: "addFlags", folder, uids: [...uids] }, () => {
+      if (this.addFlagsError !== null) throw this.addFlagsError;
       const target = this.folder(folder);
       for (const uid of uids) {
         const message = target.messages.get(uid);
@@ -261,8 +264,8 @@ class FakeImapClient implements ImapClient {
     });
   }
 
-  idle(folder: string, signal: AbortSignal): Promise<IdleOutcome> {
-    this.calls.push({ op: "idle", folder });
+  idle(signal: AbortSignal): Promise<IdleOutcome> {
+    this.calls.push({ op: "idle", folder: "INBOX" });
     this.idleEntries += 1;
     if (this.idleError !== null) return Promise.reject(this.idleError);
     if (signal.aborted) return Promise.resolve("aborted");
@@ -309,6 +312,11 @@ class ManualClock implements SyncClock {
   wait(ms: number, signal: AbortSignal): Promise<void> {
     this.requested.push(ms);
     if (signal.aborted) return Promise.resolve();
+    // A zero-length wait resolves on its own, exactly as setTimeout(0) does.
+    // This is not a harness convenience: an already-expired deadline asks for
+    // 0, and parking on it would be the very starvation the deadline exists
+    // to prevent.
+    if (ms <= 0) return Promise.resolve();
     return new Promise<void>((resolve) => {
       const entry: PendingWait = { ms, done: false, resolve };
       this.pending.push(entry);
@@ -324,15 +332,30 @@ class ManualClock implements SyncClock {
     return this.pending.filter((entry) => !entry.done).length;
   }
 
-  /** End every wait currently outstanding, as if its timer had elapsed. */
+  /**
+   * End every wait currently outstanding, as if its timer had elapsed --
+   * and ADVANCE `now` by the longest of them. Time really passing is not
+   * cosmetic here: the loop's poll and backoff waits are deadlines, so a
+   * clock frozen at one instant would make every re-entry compute the full
+   * remaining interval again and the deadline behaviour would be untested.
+   */
   fire(): void {
     const snapshot = this.pending;
     this.pending = [];
+    let longest = 0;
     for (const entry of snapshot) {
       if (entry.done) continue;
+      if (entry.ms > longest) longest = entry.ms;
       entry.done = true;
       entry.resolve();
     }
+    this.current = new Date(this.current.getTime() + longest);
+  }
+
+  /** Move `now` forward without ending any wait -- for exercising a
+   * deadline that is partly, but not fully, spent. */
+  advance(ms: number): void {
+    this.current = new Date(this.current.getTime() + ms);
   }
 }
 
@@ -354,7 +377,9 @@ interface Harness {
 
 function makeSync(
   accountId: string,
-  options: { clock?: ManualClock; ingest?: IngestMessageFn; pollIntervalMs?: number } = {},
+  options: {
+    clock?: ManualClock; ingest?: IngestMessageFn; pollIntervalMs?: number; logger?: SyncLogger;
+  } = {},
 ): Harness {
   const clock = options.clock ?? new ManualClock();
   const client = new FakeImapClient({
@@ -369,7 +394,7 @@ function makeSync(
     // the loop's real connection churn.
     clientFactory: () => client,
     clock,
-    logger: silentLogger,
+    logger: options.logger ?? silentLogger,
     pollIntervalMs: options.pollIntervalMs ?? 300_000,
     ...(options.ingest === undefined ? {} : { ingest: options.ingest }),
   });
@@ -592,6 +617,44 @@ describe("AccountSync: backfill and cursor", () => {
     expect(stored.map((row) => row.folder).sort()).toEqual(["INBOX", "Sent"]);
   });
 
+  it("ends the folder pass rather than spinning when a batch does not advance the cursor", async () => {
+    // An adapter that keeps handing back UIDs at or below the cursor would
+    // otherwise loop forever, re-ingesting the same messages inside one
+    // pass. The bail is the difference between a bug and a hang.
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+    client.folder("INBOX").add(1, rawMail({ messageId: "stuck@example.com" }));
+    // Ignores sinceUid entirely -- always the same descriptor.
+    client.fetchNewer = async (folder: string) => {
+      client.calls.push({ op: "fetchNewer", folder });
+      return folder === "INBOX" ? [{ uid: 1, flags: [] }] : [];
+    };
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the pass to finish rather than hang");
+    // Two calls at most for INBOX: the first returns uid 1 and advances the
+    // cursor to 1, the second returns uid 1 again and bails.
+    expect(client.opsOf("fetchNewer").filter((call) => call.folder === "INBOX").length)
+      .toBeLessThanOrEqual(3);
+    expect((await messageRows())).toHaveLength(1);
+    expect((await accountRow(accountId)).status).toBe("active");
+  });
+
+  it("does not walk the sent folder twice when it is a differently-cased INBOX", async () => {
+    const accountId = await makeAccount({ backfillDays: null, sentFolder: "inbox" });
+    const { sync, client } = makeSync(accountId);
+    client.folder("INBOX").add(1, rawMail({ messageId: "one@example.com" }));
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+
+    // INBOX is the one case-insensitive mailbox name in IMAP (RFC 3501), so
+    // "inbox" is the SAME folder -- walking it twice would double every
+    // status/fetch round for nothing.
+    expect(client.opsOf("status").map((call) => call.folder)).toEqual(["INBOX"]);
+    expect((await cursorRows(accountId)).map((row) => row.folder)).toEqual(["INBOX"]);
+  });
+
   it("skips a message that was expunged between the listing and the fetch", async () => {
     const accountId = await makeAccount({ backfillDays: null });
     const { sync, client } = makeSync(accountId);
@@ -646,6 +709,32 @@ describe("AccountSync: flag reconcile", () => {
     await waitFor(() => sync.stats.passes >= 4, "the quiet pass");
     expect(hints).toEqual([]);
   });
+
+  it("asks for flags over a 30-day window that moves with the clock", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client, clock } = makeSync(accountId);
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    // Both folders, both windows: 30 days before the pass, whenever it ran.
+    const firstPassWindows = [...client.fetchFlagsSince];
+    expect(firstPassWindows).toHaveLength(2);
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    for (const since of firstPassWindows) {
+      expect(clock.now().getTime() - since.getTime()).toBe(thirtyDaysMs);
+    }
+
+    // Asserted as a relationship to "now", never as a fixed timestamp: the
+    // window has to MOVE, and a frozen expectation would pass even if it
+    // were computed once and cached forever.
+    await waitFor(() => clock.pendingCount() > 0, "the poll wait");
+    clock.fire();
+    await waitFor(() => sync.stats.passes >= 2, "the second pass");
+    const latest = client.fetchFlagsSince[client.fetchFlagsSince.length - 1];
+    expect(latest).toBeDefined();
+    expect(clock.now().getTime() - (latest as Date).getTime()).toBe(thirtyDaysMs);
+    expect((latest as Date).getTime()).toBeGreaterThan((firstPassWindows[0] as Date).getTime());
+  });
 });
 
 // --- Waking up --------------------------------------------------------------
@@ -683,9 +772,15 @@ describe("AccountSync: idle and polling", () => {
     expect(client.idleEntries).toBeGreaterThanOrEqual(1);
   });
 
-  it("degrades to poll-only when the server has no IDLE, without spinning", async () => {
+  it("degrades to poll-only when the server has no IDLE, without spinning, and asks only once", async () => {
     const accountId = await makeAccount({ backfillDays: null });
-    const { sync, client, clock } = makeSync(accountId);
+    const logs: { level: string; message: string }[] = [];
+    const logger: SyncLogger = {
+      info: (_d, message) => { logs.push({ level: "info", message }); },
+      warn: (_d, message) => { logs.push({ level: "warn", message }); },
+      error: (_d, message) => { logs.push({ level: "error", message }); },
+    };
+    const { sync, client, clock } = makeSync(accountId, { logger });
     client.idleError = new Error("IDLE not supported");
 
     sync.start();
@@ -696,9 +791,22 @@ describe("AccountSync: idle and polling", () => {
     // interval instead of returning straight into another pass.
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(sync.stats.passes).toBe(1);
+    const idleLogs = () => logs.filter((entry) => entry.message.includes("IDLE unavailable"));
+    expect(idleLogs()).toHaveLength(1);
+    // Info, not warn: a server without IDLE is a property of that server,
+    // not an incident to page anyone about.
+    expect(idleLogs()[0]?.level).toBe("info");
+
     await waitFor(() => clock.pendingCount() > 0, "the poll wait");
     clock.fire();
     await waitFor(() => sync.stats.passes >= 2, "the polled pass");
+    // Latched: the second wait does not ask again, and does not log again.
+    // Unlatched this cost one WARN plus one reconnect-and-LOGIN per poll --
+    // 288 of each per day, per account, none of them changing the answer.
+    const entriesAfterSecondPass = client.idleEntries;
+    await waitFor(() => clock.pendingCount() > 0, "the second poll wait");
+    expect(client.idleEntries).toBe(entriesAfterSecondPass);
+    expect(idleLogs()).toHaveLength(1);
   });
 });
 
@@ -849,6 +957,25 @@ describe("AccountSync: poison-message contract", () => {
     expect((await accountRow(accountId)).lastError).toBeNull();
   });
 
+  it("treats a non-MailIngestError from ingest as a pass-level failure, not poison", async () => {
+    // Poison-skipping is for messages ingest has JUDGED unreadable. Anything
+    // else escaping is a bug or an outage, and silently skipping UIDs for it
+    // would walk an entire mailbox one lost message at a time.
+    const accountId = await makeAccount({ backfillDays: null });
+    const broken: IngestMessageFn = () => Promise.reject(new TypeError("cannot read properties of undefined"));
+    const { sync, client } = makeSync(accountId, { ingest: broken });
+    client.folder("INBOX").add(1, rawMail({ messageId: "boom@example.com" }));
+
+    sync.start();
+    await waitFor(() => sync.stats.failures >= 1, "the pass-level failure");
+    expect(sync.stats.poisonSkips).toBe(0);
+    const row = await accountRow(accountId);
+    expect(row.status).toBe("error");
+    expect(row.lastError).toContain("cannot read properties");
+    // The cursor stayed put, so nothing was silently skipped.
+    expect((await cursorFor(accountId, "INBOX"))?.lastSeenUid).toBe(0);
+  });
+
   it("treats an account deleted mid-ingest as teardown, not as a poison message", async () => {
     const accountId = await makeAccount({ backfillDays: null });
     const gone: IngestMessageFn = async (_db, _dir, input) => {
@@ -919,6 +1046,31 @@ describe("AccountSync: teardown", () => {
     expect(sync.stats.failures).toBe(0);
   });
 
+  it("stops mid-pass without waiting for the rest of the folder", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+    const inbox = client.folder("INBOX");
+    for (let uid = 1; uid <= 10; uid += 1) inbox.add(uid, rawMail({ messageId: `m${uid}@example.com` }));
+
+    let release = (): void => {};
+    client.gate = new Promise<void>((resolve) => { release = resolve; });
+
+    sync.start();
+    await waitFor(() => client.opsOf("fetchRaw").length >= 1, "the pass to reach a fetch");
+    const stopping = sync.stop();
+    client.gate = null;
+    release();
+    await stopping;
+
+    expect(sync.stats.stopped).toBe(true);
+    expect(client.disconnectCalls).toBe(1);
+    // The folder walk abandoned the rest rather than draining all ten, and
+    // the cursor never advanced past the batch it was in -- the next start
+    // resumes from the database and re-ingests idempotently.
+    expect(client.opsOf("fetchRaw").length).toBeLessThan(10);
+    expect((await cursorFor(accountId, "INBOX"))?.lastSeenUid).toBe(0);
+  });
+
   it("stops cleanly: disconnects, leaves no wait pending, and refuses new work", async () => {
     const accountId = await makeAccount({ backfillDays: null });
     const { sync, client, clock } = makeSync(accountId);
@@ -955,17 +1107,17 @@ describe("AccountSync: queued work", () => {
     await waitFor(() => client.opsOf("fetchRaw").length >= 1, "the pass to reach a fetch");
     const queued = sync.markSeen("INBOX", [1, 2]);
     // Still queued: the loop is busy.
-    expect(client.opsOf("setFlags")).toHaveLength(0);
+    expect(client.opsOf("addFlags")).toHaveLength(0);
 
     client.gate = null;
     release();
     await queued;
 
     expect(client.maxInFlight).toBe(1);
-    const setFlagsIndex = client.calls.findIndex((call) => call.op === "setFlags");
+    const addFlagsIndex = client.calls.findIndex((call) => call.op === "addFlags");
     const lastFetchIndex = client.calls.map((call) => call.op).lastIndexOf("fetchRaw");
-    expect(setFlagsIndex).toBeGreaterThan(lastFetchIndex);
-    expect(client.opsOf("setFlags")[0]?.uids).toEqual([1, 2]);
+    expect(addFlagsIndex).toBeGreaterThan(lastFetchIndex);
+    expect(client.opsOf("addFlags")[0]?.uids).toEqual([1, 2]);
     expect(inbox.messages.get(1)?.flags).toContain("\\Seen");
   });
 
@@ -997,7 +1149,7 @@ describe("AccountSync: queued work", () => {
     sync.start();
     await waitFor(() => sync.stats.passes >= 1, "the first pass");
 
-    client.setFlagsError = new Error("connection lost");
+    client.addFlagsError = new Error("connection lost");
     // A user pressing "mark read" while the mail server is misbehaving gets
     // the failure back -- but it must not be what marks their account broken.
     await expect(sync.markSeen("INBOX", [1])).rejects.toThrow("connection lost");
@@ -1006,7 +1158,7 @@ describe("AccountSync: queued work", () => {
     expect(sync.stats.stopped).toBe(false);
 
     // And the loop carries on: the next pass still runs.
-    client.setFlagsError = null;
+    client.addFlagsError = null;
     sync.wake();
     await waitFor(() => sync.stats.passes >= 2, "the pass after the failed task");
   });
@@ -1027,7 +1179,7 @@ describe("AccountSync: queued work", () => {
     // The flag write ran; NOTHING else did. Task 7 calls this once per thread
     // the user opens, and a full status/fetch/reconcile round per click would
     // be pure waste.
-    expect(client.opsOf("setFlags")).toHaveLength(1);
+    expect(client.opsOf("addFlags")).toHaveLength(1);
     expect(client.opsOf("fetchNewer")).toHaveLength(fetches);
     expect(client.opsOf("status")).toHaveLength(statuses);
     expect(client.opsOf("fetchFlags")).toHaveLength(2);
@@ -1041,23 +1193,65 @@ describe("AccountSync: queued work", () => {
     expect(client.opsOf("fetchNewer").length).toBeGreaterThan(fetches);
   });
 
-  it("does not let queued work pull a backoff retry forward", async () => {
+  it("refuses queued work during a backoff, immediately and with the reason", async () => {
     const accountId = await makeAccount({ backfillDays: null });
     const { sync, client, clock } = makeSync(accountId);
-    client.statusError = new Error("NO [SERVERBUG]");
+    client.statusError = new Error("NO [SERVERBUG] mailbox unavailable");
 
     sync.start();
     await waitFor(() => sync.stats.failures >= 1, "the first failure");
     await waitFor(() => clock.pendingCount() > 0, "the backoff wait");
+    const connects = client.connectCalls;
 
-    // A mark-read landing mid-backoff runs, but must not count as the retry:
-    // a user clicking around must not accelerate a broken account's
-    // reconnect attempts.
-    await sync.markSeen("INBOX", [1]);
-    expect(client.opsOf("setFlags")).toHaveLength(1);
+    // Without this, every click during an outage opens a fresh TCP
+    // connection and LOGIN -- straight through the rate limit the backoff
+    // exists to impose -- and the user waits out a connect timeout to be
+    // told nothing useful.
+    const error = await sync.markSeen("INBOX", [1]).then(() => undefined, (err: unknown) => err);
+    expect(error).toBeInstanceOf(SyncUnavailableError);
+    expect((error as SyncUnavailableError).lastError).toContain("SERVERBUG");
+    expect(client.connectCalls).toBe(connects);
+    expect(client.opsOf("addFlags")).toHaveLength(0);
     expect(sync.stats.failures).toBe(1);
-    await waitFor(() => clock.pendingCount() > 0, "the fresh backoff wait");
     expect(sync.stats.passes).toBe(0);
+
+    // And it is allowed again as soon as a pass succeeds.
+    client.statusError = null;
+    clock.fire();
+    await waitFor(() => sync.stats.passes >= 1, "the recovery pass");
+    await sync.markSeen("INBOX", [1]);
+    expect(client.opsOf("addFlags")).toHaveLength(1);
+  });
+
+  it("keeps polling on a deadline, so repeated queued work cannot starve it", async () => {
+    // The failure this pins down is total on a server without IDLE: there,
+    // the poll is the ONLY thing that fetches mail, and a fresh timer per
+    // wait entry means a mailbox getting a mark-read every four minutes
+    // would restart a five-minute wait forever and never sync again.
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client, clock } = makeSync(accountId, { pollIntervalMs: 300_000 });
+    client.idleError = new Error("IDLE not supported");
+    client.folder("INBOX").add(1, rawMail({ messageId: "m1@example.com" }));
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+    await waitFor(() => clock.pendingCount() > 0, "the poll wait");
+    expect(clock.requested[clock.requested.length - 1]).toBe(300_000);
+
+    // Four minutes in, a mark-read cuts the wait short.
+    clock.advance(240_000);
+    await sync.markSeen("INBOX", [1]);
+    await waitFor(() => clock.pendingCount() > 0, "the resumed poll wait");
+    // RESUMED, not restarted: one minute of the five is left. A fresh timer
+    // here is the bug -- it would ask for 300_000 again, forever.
+    expect(clock.requested[clock.requested.length - 1]).toBe(60_000);
+
+    // Another four minutes takes it past the deadline, so the poll is due
+    // immediately rather than being pushed out a third time.
+    clock.advance(240_000);
+    await sync.markSeen("INBOX", [1]);
+    await waitFor(() => sync.stats.passes >= 2, "the poll that queued work could not starve");
+    expect(client.opsOf("addFlags")).toHaveLength(2);
   });
 
   it("trims a stored sent folder once, so the walk and the APPEND agree", async () => {
@@ -1084,7 +1278,7 @@ describe("AccountSync: queued work", () => {
     sync.start();
     await waitFor(() => sync.stats.passes >= 1, "the first pass");
     await sync.markSeen("INBOX", []);
-    expect(client.opsOf("setFlags")).toHaveLength(0);
+    expect(client.opsOf("addFlags")).toHaveLength(0);
   });
 });
 
@@ -1136,9 +1330,9 @@ describe("SyncManager", () => {
     const created = manager.get(accountId);
     await waitFor(() => (created?.stats.passes ?? 0) >= 1, "its first pass");
 
-    // Update: restarted, so the next pass uses the new settings. A restart is
-    // a NEW AccountSync, not the same one resumed.
-    await updateAccount(handle.db, actorId, accountId, { label: "Renamed" }, keyPath);
+    // Update to a connection field: restarted, so the next pass uses the new
+    // settings. A restart is a NEW AccountSync, not the same one resumed.
+    await updateAccount(handle.db, actorId, accountId, { username: "someone-else" }, keyPath);
     await waitFor(() => manager.get(accountId) !== undefined && manager.get(accountId) !== created,
       "the restarted sync");
     expect(created?.stats.stopped).toBe(true);
@@ -1159,11 +1353,38 @@ describe("SyncManager", () => {
       manager.accountChanged(accountId),
       manager.accountChanged(accountId),
     ]);
-    // Exactly one survivor -- overlapping reconciles must never leave two
-    // loops ingesting one mailbox.
-    expect(manager.get(accountId)).toBeDefined();
-    const live = clients.filter((client) => client.disconnectCalls === 0);
-    expect(live.length).toBeLessThanOrEqual(1);
+    // Exactly one survivor, and it must be ALIVE. Waiting for the survivor
+    // to complete a pass is what makes that real: asserting only "at most
+    // one live client" would pass with two loops running (before either
+    // connected) and would also pass with everything dead.
+    const survivor = manager.get(accountId);
+    expect(survivor).toBeDefined();
+    await waitFor(() => (survivor?.stats.passes ?? 0) >= 1, "the surviving sync's pass");
+    const live = clients.filter((client) => client.connectCalls > 0 && client.disconnectCalls === 0);
+    expect(live).toHaveLength(1);
+  });
+
+  it("restarts on a connection change but only wakes on any other edit", async () => {
+    const manager = makeManager();
+    await manager.start();
+    const accountId = await makeAccount();
+    await waitFor(() => manager.get(accountId) !== undefined, "the new account's sync");
+    const original = manager.get(accountId);
+    await waitFor(() => (original?.stats.passes ?? 0) >= 1, "its first pass");
+
+    // Task 9's settings form autosaves the signature editor. Dropping the
+    // IMAP connection and re-LOGINing per keystroke-debounce would be absurd
+    // -- the running loop re-reads the account row every pass anyway.
+    await updateAccount(handle.db, actorId, accountId, { label: "Renamed" }, keyPath);
+    await waitFor(() => (original?.stats.passes ?? 0) >= 2, "the woken pass");
+    expect(manager.get(accountId)).toBe(original);
+    expect(original?.stats.stopped).toBe(false);
+
+    // A host change, though, invalidates the live connection entirely.
+    await updateAccount(handle.db, actorId, accountId, { imapHost: "elsewhere.example.com" }, keyPath);
+    await waitFor(() => manager.get(accountId) !== undefined && manager.get(accountId) !== original,
+      "the restarted sync");
+    expect(original?.stats.stopped).toBe(true);
   });
 
   it("syncNow wakes an existing sync and creates one that is missing", async () => {
