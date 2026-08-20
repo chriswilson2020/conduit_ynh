@@ -914,8 +914,9 @@ export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
 // (spec, Move write-back step 1): every in-scope message was awaiting
 // reconciliation (NULL imap_uid), every one was already in the target
 // folder, or every one belongs to an ARCHIVED mail account -- whose rows
-// survive but can never be moved again, and are therefore excluded rather
-// than failed, so such a thread does not become un-archivable forever.
+// survive but cannot be moved while the account stays archived (unarchiving
+// in Settings restores its sync loop), and are therefore excluded rather
+// than failed: from the mail view the failure would be unactionable.
 const bulkThreadResultItemSchema = z.object({
   threadId: z.uuid(),
   ok: z.boolean(),

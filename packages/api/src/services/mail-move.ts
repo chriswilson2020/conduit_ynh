@@ -238,12 +238,13 @@ type AccountState =
  * folder's pass has nothing to re-sight.
  *
  * AN ARCHIVED ACCOUNT IS CHECKED FIRST, and is NOT a refusal. SyncManager
- * tears its loop down and will never build another (mail-sync.ts's
- * applyAccountChange), so "no loop" is permanent rather than a state a user
- * can fix -- while its message rows survive, because archiving an account
- * keeps its mail (archive-not-delete). Reported as a failure, those rows would
- * make every thread carrying one PERMANENTLY un-archivable from any view: the
- * bulk action would fail forever, for a reason nothing can act on. So they are
+ * tears its loop down for as long as the account stays archived (unarchiving
+ * rebuilds it -- mail-accounts.ts's unarchiveAccount notifies
+ * applyAccountChange, which calls ensureSync again) -- while its message rows
+ * survive, because archiving an account keeps its mail (archive-not-delete).
+ * Reported as a failure, those rows would fail every thread carrying one for
+ * a reason NOTHING IN THE MAIL VIEW connects to its cause or can fix: the
+ * remedy lives in Settings, months away from the click. So they are
  * treated exactly like a NULL uid -- excluded from the eligible set, never
  * failed -- and a thread whose whole in-scope set is such rows reports the
  * ordinary `{ ok: true, skipped: true }` no-op.

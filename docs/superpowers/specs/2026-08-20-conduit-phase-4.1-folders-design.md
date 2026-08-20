@@ -86,7 +86,8 @@ below):
    `{ ok: true, skipped: true }`, not a failure. Three things empty it: every in-scope
    message awaited reconciliation; every one was already in the target folder; or every one
    belongs to an ARCHIVED mail account, whose rows survive (archive-not-delete) but whose
-   sync loop is torn down for good — permanently unmovable, so they are excluded like a NULL
+   sync loop is torn down for as long as it stays archived (unarchiving rebuilds it) —
+   unmovable by anything a user can do from the mail view, so they are excluded like a NULL
    uid rather than failed, which would leave such a thread un-archivable from every view
    forever. A per-account refusal (below) applies only to messages that SURVIVE these
    filters: an account that cannot move must not fail a thread whose messages of its own
