@@ -36,17 +36,24 @@ Decisions taken with Chris in the 4.1 brainstorm:
   as-is). `sent_folder` on mail_accounts unchanged (APPEND target; discovery marks it
   special_use=sent when they agree).
 - ~~No new indexes expected beyond UNIQUE.~~ **MEASURED, and the expectation was wrong.**
-  Task 4 EXPLAINed the folder filter at 20,000 threads / 85,000 messages (2 accounts, 5
+  Task 4 EXPLAINed the folder filter at 20,000 threads / 85,000 messages (2 accounts, 7
   folders). The existing (account_id, folder, imap_uid) index cannot serve a folder-only
   filter — its leading column is absent from the predicate and it carries no `thread_id` —
   so the planner probed `mail_messages(thread_id)` once per candidate thread. Fine for a
-  folder whose mail is recent (INBOX: 0.3ms), but the honest worst case is a folder holding
-  only OLD threads, where the keyset walk passes nearly every thread before it fills a page:
-  **70.8ms and 123,003 shared buffer hits**. One hand-written index in 0005,
-  `mail_messages (folder, thread_id)`, takes that case to **6.6ms / 290 buffers** and turns
-  the ordinary cases' probes index-only (INBOX 357 → 26 buffers; a small folder 2,954 → 26;
-  an empty folder 5.3ms → 0.08ms). 1.6MB against a 32MB table. The index carries its named
-  query and the measurements in the migration, per the house rule.
+  folder whose mail is recent (INBOX: 0.31ms / 357 buffers), but the honest worst case is a
+  folder holding only OLD threads, where the ordered walk passes nearly every thread before
+  it fills a page: **61.5ms and 122,737 buffers** for a 60-thread folder. One hand-written
+  index in 0005, `mail_messages (folder, thread_id)`, takes that case to **3.8ms / 252** and
+  trims the ordinary ones (INBOX → 0.24ms / 254; a mid-sized folder 1.48ms / 2,954 →
+  1.08ms / 1,509; an empty folder 3.13ms / 824 → 0.05ms / 3). 1.6MB against a 35MB table.
+  Figures are the top-level `Limit` node's, not the `Planning:` block's buffers line — an
+  earlier draft of this bullet quoted the latter by mistake.
+  **The 16x is a PLAN FLIP and it is folder-size dependent**: with few enough threads in the
+  folder the planner drops the per-thread probe for a hash semi join over an index-only
+  scan; at 2,000 old threads it keeps the nested loop and the index only makes each probe
+  index-only (52.5ms / 110,443 → 36.3ms / 53,211 — about 1.5x time, 2x buffers). The index
+  is justified either way (nothing measured slower), but the headline number is not what
+  every folder gets. Named query and measurements live in the migration, per the house rule.
 
 ## Folder discovery & classification
 

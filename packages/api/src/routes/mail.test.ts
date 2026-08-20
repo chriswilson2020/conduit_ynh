@@ -569,15 +569,23 @@ describe("mail folder routes", () => {
       });
     }
 
-    // INBOX and the sent folder are always walked, so the switch is not real.
+    // INBOX and the sent folder are always walked, so the switch is not real
+    // in EITHER direction -- and the message says so without naming one, since
+    // it fires for a stray enable as readily as for a disable.
     const inbox = await patch({ folder: "INBOX", syncEnabled: false });
     expect(inbox.statusCode).toBe(409);
     expect(errorResponseSchema.parse(inbox.json())).toMatchObject({
       error: "conflict",
       message: 'folder "INBOX" is always synced (INBOX and the account\'s Sent folder)'
-        + " and cannot be switched off",
+        + " and cannot be toggled",
     });
-    expect((await patch({ folder: "Sent", syncEnabled: true })).statusCode).toBe(409);
+    const sent = await patch({ folder: "Sent", syncEnabled: true });
+    expect(sent.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(sent.json())).toMatchObject({
+      error: "conflict",
+      message: 'folder "Sent" is always synced (INBOX and the account\'s Sent folder)'
+        + " and cannot be toggled",
+    });
 
     // A \Noselect node holds no messages: enabling it would promise a sync
     // that can never happen.
@@ -1202,6 +1210,27 @@ describe("mail thread link and archive routes", () => {
     const items = listResponseSchema(mailThreadListItemSchema).parse(list.json()).items;
     // Filing a message is not reading it: the Archive row keeps its dot.
     expect(items.map((t) => [t.subject, t.unread])).toEqual([["Trashed", false], ["Archived", true]]);
+
+    // ...and the unread FILTER agrees with both of them. It is the third
+    // unread computation, and all three carve out Trash: without it this
+    // response returned the trashed thread while the same body said
+    // `unread: false` about it.
+    const filtered = await a.inject({
+      method: "GET", url: "/api/mail/threads?unread=true", headers: authHeaders,
+    });
+    const filteredItems = listResponseSchema(mailThreadListItemSchema).parse(filtered.json()).items;
+    expect(filteredItems.map((t) => t.subject)).toEqual(["Archived"]);
+    // A thread whose trashed message is unread but which ALSO has an unread
+    // message elsewhere still matches: the carve-out is per message, not per
+    // thread.
+    await seedMessage(items[0]!.id, account.id, {
+      sentAt: new Date("2026-08-03T11:00:00Z"), folder: "INBOX", seen: false, imapUid: 12,
+    });
+    const withInbox = await a.inject({
+      method: "GET", url: "/api/mail/threads?unread=true", headers: authHeaders,
+    });
+    expect(listResponseSchema(mailThreadListItemSchema).parse(withInbox.json())
+      .items.map((t) => t.subject)).toEqual(["Trashed", "Archived"]);
     await a.close();
   });
 
@@ -1398,6 +1427,19 @@ describe("mail bulk thread action route", () => {
     const hide = await bulk(a, { threadIds: ids, action: "hide" });
     expect(hide.statusCode).toBe(200);
     expect(bulkThreadResultSchema.parse(hide.json()).results).toHaveLength(51);
+
+    // Both caps bracketed on the passing side too, so neither is off by one:
+    // exactly 50 moves, and exactly 200 hides.
+    const atMoveCap = await bulk(a, {
+      threadIds: Array.from({ length: 50 }, () => randomUUID()), folder: "INBOX", action: "archive",
+    });
+    expect(atMoveCap.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(atMoveCap.json()).results).toHaveLength(50);
+    const atSharedCap = await bulk(a, {
+      threadIds: Array.from({ length: 200 }, () => randomUUID()), action: "hide",
+    });
+    expect(atSharedCap.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(atSharedCap.json()).results).toHaveLength(200);
 
     // The shared cap still holds above it, for every action.
     const tooMany = await bulk(a, {

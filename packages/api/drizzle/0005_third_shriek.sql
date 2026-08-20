@@ -31,19 +31,30 @@ ALTER TABLE "mail_account_folders" ADD CONSTRAINT "mail_account_folders_account_
 -- The existing (account_id, folder, imap_uid) index cannot serve it: with no
 -- account_id in the predicate its leading column is missing, and it carries no
 -- thread_id for the correlation. MEASURED at 20,000 threads / 85,000 messages
--- (2 accounts, 5 folders), plans compared before and after:
+-- (2 accounts, 7 folders), one run, before and after. Figures are the
+-- top-level `Limit` node's own time and buffers -- NOT the `Planning:` block's
+-- buffers line, which sits directly above `Planning Time` and is easy to
+-- misread as the query's:
 --
 --   * a folder holding only OLD threads -- the honest worst case, where the
---     keyset walk passes nearly every thread before it fills a page:
---     70.8ms / 123,003 shared buffer hits -> 6.6ms / 290. The planner flips
---     from probing mail_messages(thread_id) once per candidate thread to an
---     index-only scan of the folder's own thread ids;
---   * an ordinary large folder (INBOX, 12k threads): 357 buffer hits -> 26,
---     wall time unchanged at ~0.4ms (the probes become index-only);
---   * a small folder (2k threads): 2,954 -> 26 buffer hits, 1.6ms -> 1.3ms;
---   * an empty folder: 5.3ms -> 0.08ms.
+--     ordered walk passes nearly every thread before it fills a page:
+--     60 such threads, 61.5ms / 122,737 buffers -> 3.8ms / 252;
+--   * an ordinary large folder (INBOX, ~10.7k threads): 0.31ms / 357 ->
+--     0.24ms / 254;
+--   * a mid-sized folder spread over the whole range (~1.8k threads):
+--     1.48ms / 2,954 -> 1.08ms / 1,509;
+--   * an empty folder: 3.13ms / 824 -> 0.05ms / 3.
+--
+-- THE BIG WIN IS A PLAN FLIP, AND THE FLIP IS NOT UNIVERSAL. Where the planner
+-- can see that a folder holds few threads it abandons the per-thread probe for
+-- a hash semi join fed by an index-only scan (the 60-thread case above, 16x).
+-- Where it cannot -- 2,000 OLD threads, enough that the ordered walk still
+-- looks cheap enough to it -- it keeps the nested loop and the index only makes
+-- each probe index-only: 52.5ms / 110,443 -> 36.3ms / 53,211, about 1.5x in
+-- time and 2x in buffers. Worth having either way (no case measured slower),
+-- but do not read the headline number as what every folder gets.
 --
 -- Column order: folder leads because it is the only column the folder-only
 -- filter binds, and thread_id follows so the correlation is answered from the
--- index alone. 1.6MB at 85k messages, against a 32MB table.
+-- index alone. 1.6MB at 85k messages, against a 35MB table.
 CREATE INDEX "mail_messages_folder_thread_idx" ON "mail_messages" USING btree ("folder","thread_id");

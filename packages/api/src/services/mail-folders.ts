@@ -699,10 +699,14 @@ export async function setFolderSyncEnabled(
   ));
   if (existing === undefined) throw new NotFoundError("mail folder", input.folder);
   if (isLocked(existing.folder, account.sentFolder)) {
+    // Direction-NEUTRAL wording, deliberately: this fires for an enable just as
+    // often as for a disable (the picker renders locked rows checked, and a
+    // stray click sends syncEnabled: true), and "cannot be switched off" would
+    // be a plainly wrong sentence to show someone who was switching it on.
     throw new ConflictError(
       "mail folder", input.folder,
       `folder "${input.folder}" is always synced (INBOX and the account's Sent folder)`
-        + " and cannot be switched off",
+        + " and cannot be toggled",
     );
   }
   if (!existing.selectable) {

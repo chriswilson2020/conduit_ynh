@@ -102,8 +102,13 @@ const MAX_SENDERS = 5;
 
 /**
  * "This message is not sitting in its OWN account's Trash folder" -- the
- * predicate both unread computations apply (Phase 4.1 Task 4's coordinator
- * ruling), and the reason every query using it joins mail_accounts.
+ * predicate ALL THREE unread computations apply (Phase 4.1 Task 4's
+ * coordinator ruling), and the reason every query using it joins
+ * mail_accounts. The three: the nav badge (unreadThreadCount), each list row's
+ * `unread` flag (loadAggregates), and the list's `unread=true` FILTER
+ * (listThreads). They must agree -- two of the three carving Trash out while
+ * the filter did not is a contradiction a user reaches in one click, and it is
+ * exactly the bug the third site was added to fix.
  *
  * WHY THE COUNTING CARRIES THIS RATHER THAN THE MOVE. Trashing a message never
  * touches `seen` (services/mail-move.ts is explicit about not writing it: a
@@ -302,8 +307,18 @@ export async function listThreads(
     if (opts.folder !== undefined) terms.push(sql`${mailMessages.folder} = ${opts.folder}`);
     where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} WHERE ${sql.join(terms, sql` AND `)})`);
   }
+  // THE THIRD UNREAD COMPUTATION, and it applies the same Trash carve-out as
+  // the other two (notInAccountTrash). All three have to agree or the UI
+  // contradicts itself in a way a user can reach in one click: without the
+  // carve-out here, a thread whose only unseen message sits in Trash came back
+  // from ?unread=true carrying `unread: false` -- an unread filter returning a
+  // row the same response then says is read.
+  //
+  // The join lives INSIDE the subquery, which is why this cannot just borrow
+  // the outer query's FROM: the outer list selects from mail_threads alone, and
+  // an account is a property of each MESSAGE, not of the thread.
   if (opts.unread) {
-    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${mailMessages.seen} = false)`);
+    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} JOIN ${mailAccounts} ON ${mailAccounts.id} = ${mailMessages.accountId} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${mailMessages.seen} = false AND ${notInAccountTrash()})`);
   }
   const cur = opts.cursor ? decodeLastMessageAtCursor(opts.cursor) : null;
   if (cur) {
