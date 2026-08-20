@@ -702,8 +702,14 @@ test.describe.serial("Mail journey", () => {
     // also what the sidebar row and the bulk request will carry.
     const junkBox = page.getByTestId(`folder-picker-${JUNK_FOLDER}`);
     await expect(junkBox).not.toBeChecked({ timeout: REFETCH_TIMEOUT_MS });
-    await junkBox.check();
-    await expect(junkBox).toBeChecked();
+    // click(), NOT check(): the box is a CONTROLLED input whose `checked` comes
+    // from the folders query, so React puts it straight back to false while the
+    // PATCH is in flight -- and check() verifies the state immediately after
+    // clicking and fails with "clicking the checkbox did not change its state".
+    // The tick appears when the request lands and the query refetches, which is
+    // what the assertion below waits for.
+    await junkBox.click();
+    await expect(junkBox).toBeChecked({ timeout: REFETCH_TIMEOUT_MS });
   });
 
   test("syncs the enabled folder and shows its message under the folder filter", async () => {
