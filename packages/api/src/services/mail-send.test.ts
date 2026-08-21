@@ -474,6 +474,33 @@ describe("sendMail", () => {
     expect(transport.sent).toHaveLength(0);
   });
 
+  // The detail-cap pin on THIS service: the reply chain reads the thread's
+  // newest visible message DIRECTLY (its own one-row query), so a thread
+  // longer than the detail route's 50-message page still threads onto its
+  // true newest -- a future refactor routing the chain through the capped
+  // detail payload would still pass at 50 messages and must fail here.
+  it("builds the reply chain from the true newest message of a thread longer than the detail cap", async () => {
+    const [thread] = await handle.db.insert(mailThreads).values({
+      subject: "Long one", lastMessageAt: new Date("2026-08-02T10:00:00Z"), messageCount: 51,
+    }).returning({ id: mailThreads.id });
+    if (thread === undefined) throw new Error("no thread row");
+    const messageIds = Array.from({ length: 51 }, () => `${randomUUID()}@example.com`);
+    await handle.db.insert(mailMessages).values(messageIds.map((mid, index) => ({
+      accountId, threadId: thread.id, messageId: mid,
+      inReplyTo: null, referencesIds: [],
+      fromAddr: "alice@example.com", fromName: "Alice",
+      toAddrs: [{ address: "chris@example.com", name: "Chris" }], ccAddrs: [], bccAddrs: [],
+      subject: "Long one", bodyText: `Body ${index}`, bodyHtml: null, snippet: `Body ${index}`,
+      sentAt: new Date(Date.parse("2026-08-01T10:00:00Z") + index * 60_000),
+      folder: "INBOX", imapUid: 100 + index, seen: true, direction: "inbound" as const,
+    })));
+
+    await sendMail(handle.db, dataDir, actorId, input({ threadId: thread.id }), deps());
+
+    const newest = messageIds[messageIds.length - 1];
+    expect(headerOf(transport.rawText(), "In-Reply-To")).toBe(`<${newest}>`);
+  });
+
   // Structurally safe because the reply chain resolves through
   // mustGetThread, whose gate is VISIBILITY only (Phase 4.3) -- pinned so a
   // future hide term on that gate cannot silently lock the hider out of
