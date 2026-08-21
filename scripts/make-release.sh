@@ -97,13 +97,24 @@ node - "$VERSION" > "$STAGE/package.json" <<'NODE'
 const fs = require("node:fs");
 const version = process.argv[2];
 const api = JSON.parse(fs.readFileSync("packages/api/package.json", "utf8"));
+const root = JSON.parse(fs.readFileSync("package.json", "utf8"));
 const deps = { ...api.dependencies };
 // Point at the vendored copy staged above instead of the workspace wildcard
 // version ("*") that only resolves inside this monorepo.
 deps["@conduit/shared"] = "file:./server/shared";
+// Carry the monorepo root's `overrides` into the runtime package (Phase
+// 4.3's deepmerge-ts pin was the first): the lockfile resolved below is a
+// FRESH resolve against this generated package.json, so an override left
+// behind in the monorepo root would silently not reach the tarball -- and
+// the target server's `npm ci --omit=dev` installs exactly what that
+// lockfile says.
+const overrides = root.overrides ?? {};
 process.stdout.write(
   JSON.stringify(
-    { name: "conduit", version, private: true, type: "module", dependencies: deps },
+    {
+      name: "conduit", version, private: true, type: "module", dependencies: deps,
+      ...(Object.keys(overrides).length > 0 ? { overrides } : {}),
+    },
     null,
     2,
   ) + "\n",

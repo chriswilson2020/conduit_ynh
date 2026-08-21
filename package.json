@@ -19,5 +19,8 @@
     "imapflow": "^1.0.191",
     "typescript": "^5.9.0",
     "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "deepmerge-ts": "^8.0.0"
   }
 }
