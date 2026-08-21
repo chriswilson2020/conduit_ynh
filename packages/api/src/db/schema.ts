@@ -483,13 +483,15 @@ export type MailThreadRow = typeof mailThreads.$inferSelect;
 //
 // Composite PK (thread_id, user_id) rather than a surrogate id: the pair IS
 // the identity ("has U hidden T"), it is the natural conflict target for an
-// idempotent hide, and its index serves thread->hides lookups. Whether the
-// per-user list predicate also wants a (user_id, thread_id) index is an
-// EXPLAIN question for the read-path task (0007 stays unshipped and
-// editable through the phase) -- nothing is added speculatively, per the
-// house measure-first rule. Plain no-action FKs, matching every other FK in
-// this file (threads are archive-not-delete; no delete path exists to
-// cascade from).
+// idempotent hide, and its index serves every hide probe. The
+// (user_id, thread_id) index question was MEASURED and answered no by the
+// read-path task: the candidate index left the Hidden view's worst-case
+// plan untouched (the planner keeps the LIMIT-ordered thread scan and
+// merely probes a different index), so nothing ships -- figures in 0007's
+// own comment and beside listThreads in services/mail-threads.ts. Plain
+// no-action FKs, matching every other FK in this file: neither referenced
+// row is ever DELETED (threads have no delete path at all, and users are
+// upsert-only), so there is nothing for a cascade to do.
 export const mailThreadHides = pgTable("mail_thread_hides", {
   threadId: uuid("thread_id").notNull().references(() => mailThreads.id),
   userId: uuid("user_id").notNull().references(() => users.id),

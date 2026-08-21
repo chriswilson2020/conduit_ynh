@@ -356,20 +356,24 @@ export function visibleMessageSelfContained(userId: string, scope: MailVisibilit
  *
  * PRECONDITION, the same one visibleThreads carries: the composing query
  * must have mail_threads in scope UN-ALIASED (from-listed or joined), since
- * the EXISTS correlates against the table by name. Exported for search.ts's
- * mail group, the one default surface outside this file.
+ * the EXISTS correlates against the table by name.
  *
  * The probe is the composite-PK's own index ((thread_id, user_id) leads on
  * thread_id, which the correlation binds), so the default arm's NOT EXISTS
  * is an exact index probe per candidate thread -- see the Hidden-view
  * EXPLAIN note at listThreads for the measured numbers.
+ *
+ * Module-private: the Hidden view (listThreads' inverted arm) is the only
+ * consumer of the positive form.
  */
-export function hiddenByViewer(userId: string): SQL {
+function hiddenByViewer(userId: string): SQL {
   return sql`EXISTS (SELECT 1 FROM ${mailThreadHides} WHERE ${mailThreadHides.threadId} = ${mailThreads.id} AND ${mailThreadHides.userId} = ${userId})`;
 }
 
 /** The default-surface arm, named so call sites read as the rule they
- * implement ("visible AND NOT hidden"). Same precondition as its inverse. */
+ * implement ("visible AND NOT hidden"). Same precondition as its inverse.
+ * Exported for search.ts's mail group, the one default surface outside this
+ * file. */
 export function notHiddenByViewer(userId: string): SQL {
   return sql`NOT ${hiddenByViewer(userId)}`;
 }
@@ -737,10 +741,23 @@ export async function listThreads(
 
   // The LEFT JOIN exists solely to carry the viewer's hidden_at onto each
   // row without a per-row query: on the default view it is NULL by
-  // construction (the WHERE just excluded every thread with a hide row), on
-  // the Hidden view it is each row's own hide moment. At most one hide row
-  // exists per (thread, viewer) -- the composite PK -- so the join can never
-  // multiply page rows or disturb the keyset. The WHERE's hide arm stays the
+  // construction, on the Hidden view it is each row's own hide moment.
+  // "By construction" is a one-statement fact, not a hope about timing: the
+  // join and the WHERE's NOT EXISTS read the same table IN THE SAME
+  // STATEMENT, under one snapshot, so no concurrent hide can make the two
+  // disagree -- a row either had the viewer's hide row (excluded) or did
+  // not (joined NULL). At most one hide row exists per (thread, viewer) --
+  // the composite PK -- so the join can never multiply page rows or disturb
+  // the keyset.
+  //
+  // The join runs on the DEFAULT view too, where it can only ever produce
+  // NULL. Deliberate: one query shape for both views keeps the machinery
+  // genuinely shared (no second code path to drift, the Hidden view really
+  // is "the same query, inverted arm"), and the price is a per-returned-row
+  // PK probe measured at ~2 buffers/row (the 773-buffer default-page figure
+  // below includes it).
+  //
+  // The WHERE's hide arm stays the
   // EXISTS predicate rather than being folded into this join's null-test:
   // one shared predicate serves every default surface (badge, counts,
   // search have no such join), and both forms are the same PK probe.
@@ -1132,6 +1149,11 @@ export async function clearThreadLink(
  * Idempotent both ways, never an error: re-hiding keeps the ORIGINAL
  * hidden_at (the filing moment, not the repeat), and unhiding a thread that
  * was never hidden simply reports it un-hidden.
+ *
+ * The filing also survives NEW MAIL (spec Amendment 2): ingest bumps the
+ * thread and touches no hide row, so a hidden conversation grows quietly in
+ * the Hidden view instead of resurfacing -- see mail-ingest.ts's thread-bump
+ * comment, where the deliberate non-write lives.
  */
 async function setHidden(
   db: Database, userId: string, id: string, hidden: boolean, publishHint: boolean,
@@ -1162,8 +1184,15 @@ async function setHidden(
     // rather than inventing a timestamp: the no-op must report the filing
     // moment the standing row records (mirroring the pre-4.3 truthful
     // no-op), and under a concurrent unhide the honest answer is whatever
-    // state won -- null included. No hint either way: nothing changed here,
-    // and whichever writer did change it published its own.
+    // state won -- null included. Null has a SECOND way to happen: ON
+    // CONFLICT DO NOTHING does not wait out an in-flight uncommitted
+    // insert, so of two simultaneous Hide clicks the loser can land here
+    // while the winner's row is still uncommitted and invisible to this
+    // SELECT. The response then says "not hidden" for one beat --
+    // self-healing, because the winner's commit both places the row and
+    // publishes the hint that refetches every view. No hint from this arm
+    // either way: nothing changed HERE, and whichever writer did change it
+    // published its own.
     const [current] = await db.select().from(mailThreadHides)
       .where(and(eq(mailThreadHides.threadId, id), eq(mailThreadHides.userId, userId)));
     return toThread(thread, current?.hiddenAt ?? null);

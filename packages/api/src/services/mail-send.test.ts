@@ -9,7 +9,7 @@ import { asc, eq } from "drizzle-orm";
 import type { MailAccount, MailAccountCreateInput, SendMailInput } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
-import { files, mailAccounts, mailAttachments, mailMessages, mailThreads } from "../db/schema.js";
+import { files, mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads } from "../db/schema.js";
 import { saveBlob } from "./blobs.js";
 import { createCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
@@ -434,6 +434,29 @@ describe("sendMail", () => {
       input({ threadId: "00000000-0000-0000-0000-000000000000" }), deps(),
     )).rejects.toBeInstanceOf(NotFoundError);
     expect(transport.sent).toHaveLength(0);
+  });
+
+  // Structurally safe because the reply chain resolves through
+  // mustGetThread, whose gate is VISIBILITY only (Phase 4.3) -- pinned so a
+  // future hide term on that gate cannot silently lock the hider out of
+  // their own conversation: a hidden thread's detail stays open, and
+  // replying from it is a deliberate act.
+  it("sends a reply into a thread the sender has hidden, leaving the filing untouched", async () => {
+    const first = await sendMail(handle.db, dataDir, actorId, input(), deps());
+    await handle.db.insert(mailThreadHides).values({ threadId: first.threadId, userId: actorId });
+    transport.sent.length = 0;
+
+    const reply = await sendMail(
+      handle.db, dataDir, actorId,
+      input({ threadId: first.threadId, subject: "Re: Hello Alice" }), deps(),
+    );
+
+    expect(transport.sent).toHaveLength(1);
+    expect(reply.threadId).toBe(first.threadId);
+    // Replying neither unhides nor errors: the hide row still stands.
+    const [hide] = await handle.db.select().from(mailThreadHides)
+      .where(eq(mailThreadHides.threadId, first.threadId));
+    expect(hide?.userId).toBe(actorId);
   });
 
   // You may reply to what you may open (Phase 4.2 coordinator amendment):

@@ -92,6 +92,15 @@ predicate family:
    Hidden view or the conversation is deliberate, and per 4.2's sharing line a deal
    link then shares the thread while it stays hidden in the hider's own inbox). The
    old 409 test is rewritten to pin the new behaviour, not deleted.
+2. **Ingest into a hidden thread stays hidden** (Task 2 quality review, coordinator
+   ruling). A new inbound message landing in a thread the viewer hid leaves their
+   filing untouched: the thread stays out of their default list and unread badge and
+   the new message simply grows the conversation in their Hidden view, while every
+   other viewer's surfaces gain it normally. Resurfacing-on-new-mail is snooze
+   behaviour, which the Out-of-scope list explicitly defers — a hide means "gone
+   until I unhide it", not "gone until someone writes to me". Pinned two-sided
+   (hider unchanged, other viewer updated) so an ingest change cannot break it
+   silently.
 
 ## Out of scope (deferred, not rejected)
 

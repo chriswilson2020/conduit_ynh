@@ -46,4 +46,10 @@ WHERE "t"."archived_at" IS NOT NULL;--> statement-breakpoint
 -- the per-thread visibility EXISTS either way. Nothing the index can buy,
 -- so it is not added; full figures beside listThreads in
 -- services/mail-threads.ts.
+--
+-- RE-MEASURE TRIGGER: the badge/per-folder unread plans hash-anti-join the
+-- WHOLE hides table (21 buffers at the bench's 2,500 rows -- trivial, but
+-- linear in table size). If mail_thread_hides ever reaches the order of
+-- 25,000+ rows (thousands of hides per user), re-EXPLAIN those two queries
+-- and the Hidden view before assuming these figures still hold.
 ALTER TABLE "mail_threads" DROP COLUMN "archived_at";

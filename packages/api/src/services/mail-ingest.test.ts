@@ -6,11 +6,12 @@ import { asc, eq, sql } from "drizzle-orm";
 import type { MailAddress, SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
-import { mailAccounts, mailAttachments, mailMessages, mailThreads } from "../db/schema.js";
+import { mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads } from "../db/schema.js";
 import { createCompany } from "./companies.js";
 import { archiveContact, createContact } from "./contacts.js";
 import { MailIngestError, NotFoundError } from "./errors.js";
 import { ingestMessage, type IngestMessageLinks } from "./mail-ingest.js";
+import { listThreads, unreadThreadCount } from "./mail-threads.js";
 import { subscribe } from "./sse.js";
 
 const handle = openTestDatabase();
@@ -713,6 +714,37 @@ describe("ingestMessage: threading", () => {
       { account: otherAccountId, uid: 2 },
     );
     expect(reply.message.threadId).toBe(root.message.threadId);
+  });
+});
+
+// Spec Amendment 2 (Phase 4.3): NEW MAIL DOES NOT UNHIDE. The thread bump
+// deliberately touches no mail_thread_hides row (mail-ingest.ts's own
+// comment), so a viewer's filing survives the conversation growing --
+// resurfacing-on-new-mail is snooze behaviour, explicitly deferred. Pinned
+// two-sided so an ingest change cannot break either half silently.
+describe("ingestMessage: hidden threads (Amendment 2)", () => {
+  it("keeps a hidden thread hidden for the hider when new mail lands, while every other viewer's surfaces gain it", async () => {
+    await handle.db.update(mailAccounts).set({ visibility: "shared" })
+      .where(eq(mailAccounts.id, accountId));
+    const otherId = (await resolveUser(handle.db, { username: "dana", email: null, fullName: null })).id;
+    const root = await ingest({ messageId: ROOT_ID, subject: "Rollout" });
+    const threadId = root.message.threadId;
+    await handle.db.insert(mailThreadHides).values({ threadId, userId: actorId });
+
+    await ingest({ messageId: CHILD_ID, inReplyTo: ROOT_ID, subject: "Re: Rollout" }, { uid: 2 });
+
+    // The hider's filing stands: default list and badge stay clean...
+    expect((await listThreads(handle.db, actorId)).items).toEqual([]);
+    expect(await unreadThreadCount(handle.db, actorId)).toBe(0);
+    // ...while their Hidden view carries the GROWN conversation (the new
+    // message joined the thread, it just resurfaced nothing).
+    const hiddenView = await listThreads(handle.db, actorId, { hidden: true });
+    expect(hiddenView.items.map((t) => [t.id, t.messageCount])).toEqual([[threadId, 2]]);
+    // The other viewer of the shared mailbox sees the new mail normally:
+    // listed, two messages, unread, counted in their badge.
+    const others = await listThreads(handle.db, otherId);
+    expect(others.items.map((t) => [t.id, t.messageCount, t.unread])).toEqual([[threadId, 2, true]]);
+    expect(await unreadThreadCount(handle.db, otherId)).toBe(1);
   });
 });
 

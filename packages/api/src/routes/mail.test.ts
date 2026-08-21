@@ -3250,8 +3250,13 @@ describe("per-user hide", () => {
     }
 
     const before = await danasWorld();
-    // The hider files their own view; dana's whole world must read the same
-    // bytes afterwards -- a hide is not an event anyone else can observe.
+    // The hider files their own view; dana's whole HTTP world must read the
+    // same bytes afterwards. Scoped to HTTP deliberately: the one thing a
+    // hide DOES broadcast is its SSE invalidation frame, which sse.ts fans
+    // (thread id included) to every subscriber -- the known id-broadcast
+    // the bulk route's header documents. What this pins is that the frame
+    // buys an observer nothing: every surface they can actually ask answers
+    // identically.
     const hide = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
     expect(hide.statusCode).toBe(200);
     expect(await danasWorld()).toEqual(before);

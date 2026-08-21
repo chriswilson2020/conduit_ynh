@@ -850,6 +850,15 @@ async function ingestParsedMessage(
     // GREATEST, not a plain assignment: backfill ingests oldest-first but a
     // cross-folder or out-of-order sighting can still deliver an older
     // message after a newer one, and last_message_at drives the inbox sort.
+    //
+    // DELIBERATELY NO mail_thread_hides write here (Phase 4.3 spec,
+    // Amendment 2): new mail does NOT unhide. A viewer who filed this
+    // conversation away keeps it filed -- out of their default list and
+    // badge, growing quietly in their Hidden view -- while every other
+    // viewer's surfaces gain the message normally. Resurfacing-on-new-mail
+    // is snooze behaviour, explicitly deferred; whoever adds it must touch
+    // the hide rows HERE and flip the Amendment 2 pin consciously
+    // (mail-ingest.test.ts's hidden-threads block).
     await tx.update(mailThreads).set({
       messageCount: sql`${mailThreads.messageCount} + 1`,
       // ISO string, not the Date: drizzle only applies a column's own

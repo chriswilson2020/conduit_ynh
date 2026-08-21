@@ -765,13 +765,13 @@ describe("mail thread hides schema (0007)", () => {
       // apply here).
       const archivedAtIso = "2026-08-10T09:30:00.000Z";
       const [archived] = await scratch.db.execute<{ id: string }>(sql`
-        INSERT INTO mail_threads (subject, last_message_at, archived_at)
-        VALUES ('Filed away', now(), ${archivedAtIso})
+        INSERT INTO mail_threads (subject, last_message_at, message_count, archived_at)
+        VALUES ('Filed away', now(), 1, ${archivedAtIso})
         RETURNING id
       `);
       const [live] = await scratch.db.execute<{ id: string }>(sql`
-        INSERT INTO mail_threads (subject, last_message_at)
-        VALUES ('Still here', now())
+        INSERT INTO mail_threads (subject, last_message_at, message_count)
+        VALUES ('Still here', now(), 1)
         RETURNING id
       `);
 
@@ -851,6 +851,13 @@ describe("mail thread hides schema (0007)", () => {
       // rows drive the exclusion now that no column can), and each user's
       // Hidden view carries the pre-upgrade archive moment as their own
       // hiddenAt. Nobody's view changed; everyone can now unhide alone.
+      //
+      // ACCEPTED COUPLING: calling listThreads makes this drill break on a
+      // listThreads signature or visibility-rule change, not only on
+      // migration bugs. Deliberate -- the promise under test is "the
+      // upgraded database reads correctly through the app's own eyes", and
+      // that realism is worth the occasional unrelated-looking failure
+      // (fix: update this call site alongside the service change).
       for (const user of [chris!, alex!]) {
         const inbox = await listThreads(scratch.db, user.id);
         expect(inbox.items.map((t) => t.id)).toEqual([live!.id]);
