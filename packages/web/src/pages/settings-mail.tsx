@@ -111,8 +111,16 @@ export function SettingsMailPage() {
         {others.length > 0 && (
           <section className="flex flex-col gap-1">
             <h2 className="mt-4 text-sm font-semibold text-slate-900">Other users' mailboxes</h2>
+            {/* Phase 4.2 rewrote this line: the pre-4.2 copy ("their threads
+                are visible to you") states the INVERSE of private-by-default.
+                This list enumerates every synced mailbox regardless of
+                visibility -- that is its job (reply-all must steer clear of
+                all of them, and account chips need labels) -- so the sentence
+                must carry the sharing line, not promise visibility. */}
             <p className="text-xs text-slate-400">
-              Their threads are visible to you; their settings are not.
+              Listed so reply detection covers every synced mailbox. Their conversations are
+              visible to you only if the owner shares the mailbox or links a thread to a deal
+              or project; their settings are never visible.
             </p>
             <ul className="rounded-md border border-slate-200 bg-white">
               {others.map((account) => (
@@ -281,19 +289,23 @@ function AccountCard({
 function VisibilitySection({ account }: { account: MailAccountWithSyncStats }) {
   const update = useUpdateMailAccount();
   const shared = account.visibility === "shared";
+  const copyId = `visibility-copy-${account.id}`;
 
   return (
     <div className="mt-3 flex flex-col gap-1 border-t border-slate-100 pt-3">
       <div className="flex items-center gap-2">
         <span className="text-xs font-semibold uppercase text-slate-500">Visibility</span>
-        {/* role="switch": one control whose accessible name states the rule
-            and whose checked state answers it -- the label text beside it
-            reads the current value for everyone else. */}
+        {/* role="switch" + aria-checked carry the toggle semantics, and the
+            VISIBLE state text is the accessible name -- deliberately no
+            aria-label: a fixed label over changing button text violates
+            Label in Name (WCAG 2.5.3; a voice-control "click Private" must
+            hit this), so the name is what the eye reads and the sharing-line
+            copy rides along as the description instead. */}
         <Button
           variant="outline"
           role="switch"
           aria-checked={shared}
-          aria-label="Share this mailbox with every CRM user"
+          aria-describedby={copyId}
           data-testid={`visibility-toggle-${account.id}`}
           disabled={update.isPending}
           onClick={() => update.mutate({
@@ -305,7 +317,7 @@ function VisibilitySection({ account }: { account: MailAccountWithSyncStats }) {
         </Button>
       </div>
       {/* The sharing line, as the spec words it. */}
-      <p className="text-xs text-slate-400">
+      <p id={copyId} className="text-xs text-slate-400">
         Private: only you see this mailbox's conversations. Threads you link to a deal or
         project become visible on that record. Shared: every CRM user sees this mailbox.
       </p>

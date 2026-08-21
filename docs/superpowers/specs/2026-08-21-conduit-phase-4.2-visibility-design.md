@@ -70,9 +70,11 @@ touched piecemeal):
 
 ## Settings
 
-Per-account **Private / Shared** toggle beside the folder picker (owner-only, like every
-account setting; `visibility` rides `mailAccountSchema` + the update input). Copy states the
-sharing line: "Private: only you see this mailbox's conversations. Threads you link to a
+Per-account **Private / Shared** toggle on the owner's account card (as built, Task 4: its
+own Visibility section on the card, above the Signature/Folders sections rather than inside
+the folder picker — same card, wording amended to as-built per the spec review's D4;
+owner-only, like every account setting; `visibility` rides `mailAccountSchema` + the update
+input). Copy states the sharing line: "Private: only you see this mailbox's conversations. Threads you link to a
 deal or project become visible on that record. Shared: every CRM user sees this mailbox."
 Flipping publishes one frame carrying the existing `[["mail-accounts"]]` hint plus
 `[["mail-threads"]]` and `[["mail-unread"]]` (every user's lists, badge and per-folder

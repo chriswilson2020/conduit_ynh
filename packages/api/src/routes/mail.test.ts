@@ -2325,6 +2325,35 @@ describe("mail thread visibility", () => {
     await a.close();
   });
 
+  it("keeps an archived shared mailbox visible to every user -- archiving stops the sync, never the sharing", async () => {
+    const a = await app();
+    const shared = await makeAccount(a);
+    await setVisibility(shared.id, "shared");
+    const threadId = await seedThread({ subject: "Archived shared", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, shared.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
+
+    const archived = await a.inject({
+      method: "POST", url: `/api/mail/accounts/${shared.id}/archive`, headers: authHeaders,
+    });
+    expect(archived.statusCode).toBe(200);
+
+    // DELIBERATE, pinned as intent (Phase 4.2 Task 4 review): ownedOrShared
+    // carries no archivedAt term on purpose. Archiving is archive-not-delete
+    // (the threads stay listed for their owner -- the 4.1 rule), and
+    // visibility is a fact about the account ROW, not about whether its sync
+    // loop runs -- so an archived shared mailbox keeps its threads in every
+    // user's inbox, unread badge and search until someone unarchives it and
+    // flips it back to private (the account PATCH refuses archived rows, so
+    // unarchive -> flip is the only road back; the Settings toggle does not
+    // render on an archived card). A future change of that intent must flip
+    // this test consciously, not discover it as a surprise.
+    expect(await listIds(a, "", otherHeaders)).toEqual([threadId]);
+    const badge = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: otherHeaders });
+    expect(badge.statusCode).toBe(200);
+    expect(mailUnreadCountSchema.parse(badge.json()).count).toBe(1);
+    await a.close();
+  });
+
   it("excludes another user's private unread mail from the unscoped and folder-scoped unread filters", async () => {
     const a = await app();
     const priv = await makeAccount(a);
