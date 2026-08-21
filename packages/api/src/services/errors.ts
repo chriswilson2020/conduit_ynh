@@ -69,8 +69,12 @@ export class IncompleteTestConnectionSettingsError extends Error {}
 // The check runs at SEND time because a forwarded original never passes
 // through the upload route where compose attachments meet the cap, and it
 // refuses the WHOLE send rather than dropping the attachment: a forward that
-// silently shed a file would claim to carry what it does not. Maps to HTTP
-// 413 `too_large` at the route layer, the same status and code the upload
+// silently shed a file would claim to carry what it does not. BELT AND
+// BRACES today rather than a live refusal: ingest bounds every stored
+// attachment well under this (mail-ingest.ts's MAX_ATTACHMENT_BYTES note --
+// ~19.6MB is the real ceiling through current write paths), so nothing
+// reachable can trip it until an ingest bound moves. Maps to HTTP 413
+// `too_large` at the route layer, the same status and code the upload
 // route answers for an over-cap compose upload. The message names the file
 // and nothing the viewer cannot already see -- the id passed the same
 // visibility check the download route runs.

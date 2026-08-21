@@ -287,18 +287,30 @@ async function loadAttachments(
 /**
  * Per-attachment ceiling for a forward's re-attached originals: the SAME
  * 50MB the compose upload path enforces (routes/index.ts's multipart
- * fileSize limit, whose 413 files.ts answers -- change the two together),
- * applied here at send time because a stored original never passes through
- * that upload route. Per attachment with no cap on the sum, which is
- * exactly the compose semantics: each uploaded file is capped individually
- * and nothing bounds a send's total.
+ * fileSize limit, whose 413 files.ts answers), applied here at send time
+ * because a stored original never passes through that upload route. Per
+ * attachment with no cap on the sum, which is exactly the compose
+ * semantics: each uploaded file is capped individually and nothing bounds
+ * a send's total.
+ *
+ * BELT AND BRACES today, not a live limit -- mail-ingest.ts's own
+ * MAX_ATTACHMENT_BYTES (the THIRD 50MB literal; the three name one
+ * ceiling, change them together) already skips any over-50MB part at
+ * ingest, and its 25MB raw-message cap means no stored attachment can
+ * exceed ~19.6MB through any current write path, so this check is
+ * unreachable until one of those bounds moves (both cap tests state their
+ * over-cap row by UPDATE for exactly that reason). Kept for the same
+ * reason ingest keeps its half: the send path must stay bounded on its
+ * own terms, not by trusting another module's ceiling to hold forever.
  */
 export const MAX_FORWARD_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 
 /**
  * Forwarded originals (Phase 4.3, closing the v0.5.0 "forward no re-attach"
  * limitation): mail_attachments rows named by id, re-attached to the
- * outgoing message from the stored blobs.
+ * outgoing message from the stored blobs. Ids are DEDUPLICATED first (a
+ * doubled id must attach once, in its first position), per the schema's
+ * stated contract.
  *
  * AUTHORIZATION AND STORAGE ARE getAttachmentBlob's -- reused, never
  * re-derived: the same record-scope per-message visibility join that
@@ -307,15 +319,23 @@ export const MAX_FORWARD_ATTACHMENT_BYTES = 50 * 1024 * 1024;
  * one, and the blob digest comes off the same row the download route
  * streams from. The counterpart of loadAttachments' rule one shape over:
  * uploads are files rows the actor OWNS, forwarded originals are
- * mail_attachments rows the actor may READ.
+ * mail_attachments rows the actor may READ. That reuse is a deliberate
+ * trade against loadAttachments' single-query shape: one authz-carrying
+ * query PER ID rather than one inArray for the lot, because
+ * getAttachmentBlob's visibility join is the thing being reused and it
+ * answers for one id. Bounded and cheap where it runs: the wire cap is 50
+ * ids (the schema's max, mirroring ingest's MAX_ATTACHMENTS), each probe
+ * is a four-table join on a primary key, and a real forward carries a
+ * handful.
  *
  * THE SIZE CAP is checked against the stored size_bytes -- the byte count
  * ingest wrote in the same transaction as the blob, the number the download
  * route serves as Content-Length -- and an over-cap attachment refuses the
  * WHOLE send with AttachmentTooLargeError (see its class note for why
- * refusal beats silently dropping the file). The check runs in step 1 of
- * the send ordering: nothing has been submitted or stored yet, so the
- * refusal is a plain 4xx and the client still holds the draft.
+ * refusal beats silently dropping the file; see MAX_FORWARD_ATTACHMENT_BYTES
+ * above for why no current write path can store such a row). The check runs
+ * in step 1 of the send ordering: nothing has been submitted or stored yet,
+ * so the refusal is a plain 4xx and the client still holds the draft.
  *
  * PATHS, NOT OPEN STREAMS, for exactly loadAttachments' reason: nodemailer
  * opens and closes each file inside the one build, so a failure between
@@ -325,7 +345,7 @@ async function loadForwardAttachments(
   db: Database, dataDir: string, actorId: string, ids: readonly string[],
 ): Promise<ComposedAttachment[]> {
   const out: ComposedAttachment[] = [];
-  for (const id of ids) {
+  for (const id of [...new Set(ids)]) {
     const blob = await getAttachmentBlob(db, actorId, id, { inlineOnly: false });
     if (blob.sizeBytes > MAX_FORWARD_ATTACHMENT_BYTES) {
       throw new AttachmentTooLargeError(blob.filename, blob.sizeBytes, MAX_FORWARD_ATTACHMENT_BYTES);

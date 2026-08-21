@@ -113,25 +113,27 @@ export function Conversation({ threadId }: ConversationProps) {
    *
    * The guard is a ref holding the thread this component has already marked:
    * the mutation invalidates ["mail-thread", id], which re-renders this with
-   * fresh data, and a plain "has unread messages" condition would fire again
-   * on that render (and on every render until the refetch landed) -- a POST
-   * storm for one click. The ref is checked before the unread test rather
-   * than after, so a thread whose messages become unread again server-side
-   * while it is open is not re-marked underneath the user either.
+   * fresh data, so anything condition-shaped here would need to survive that
+   * re-render -- the ref is what does, one POST per opened thread. A thread
+   * whose messages become unread again server-side while it is open is not
+   * re-marked underneath the user either, for the same reason.
    *
-   * Under the detail cap the unseen test reads the RENDERED page (the
-   * newest 50), while the mark itself is always thread-wide server-side --
-   * so when it fires, everything readable marks. The one shape this
-   * heuristic misses is a thread whose only unseen messages are older than
-   * the page, which stays unmarked until Show-earlier renders them; an
-   * accepted sliver, since new mail is what makes a thread unread and new
-   * mail is always on the page.
+   * UNCONDITIONAL past the ref, deliberately -- no "has unread messages"
+   * pre-check. Under the detail cap this component only sees the newest 50,
+   * and a client-side unseen test over that page misses a reachable shape:
+   * the sync engine flips seen back to false on EXISTING rows when the IMAP
+   * flag is removed (and an initial sync ingests old unread wholesale), so
+   * a long thread's only unseen messages can sit entirely below the page --
+   * counted by the badge, invisible to the heuristic, stuck until
+   * Show-earlier. Idempotence is the SERVER's job and it already does it:
+   * markThreadRead writes only rows that are actually unseen and publishes
+   * no hint when nothing changed, so the cost of firing on an already-read
+   * thread is one no-op POST per open, not a refetch storm.
    */
   const markedRef = useRef<string | null>(null);
   useEffect(() => {
     if (data === undefined) return;
     if (markedRef.current === threadId) return;
-    if (!data.messages.some((message) => !message.seen)) return;
     markedRef.current = threadId;
     markRead.mutate(threadId);
   }, [threadId, data, markRead]);

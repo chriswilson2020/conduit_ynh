@@ -1316,25 +1316,37 @@ describe("mail thread read route", () => {
     await a.close();
   });
 
-  // The detail-cap pin on THIS route: mark-read marks the readable THREAD,
-  // never the rendered page. Opening a truncated conversation is still
-  // reading the conversation -- a cap that leaked into this write would
-  // leave 1 message unread per truncated open, with the badge counting a
-  // thread whose visible page shows nothing unread.
-  it("marks the whole readable thread under truncation, not just the rendered 50", async () => {
+  // The detail-cap pin on THIS route, in its DISCRIMINATING shape: the
+  // thread's only unseen message is OLDER than the rendered page (the
+  // stuck-badge case -- flag reconcile un-seeing an old row, or an initial
+  // sync ingesting old unread -- which is why the conversation view fires
+  // mark-read unconditionally per open rather than testing the page for
+  // unseen rows). Mark-read must mark the readable THREAD: a cap that
+  // leaked into this write would leave that row unread forever, the badge
+  // counting a thread whose visible page shows nothing unseen.
+  it("marks the whole readable thread under truncation -- an unseen message below the page still clears", async () => {
     const a = await app();
     const account = await makeAccount(a);
     const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
-    await seedMessageRun(threadId, account.id, 51, new Date("2026-08-01T10:00:00Z"), { seen: false });
+    await seedMessageRun(threadId, account.id, 50, new Date("2026-08-01T10:00:00Z"));
+    const unseenBelow = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-01T09:00:00Z"), seen: false, imapUid: 9,
+    });
 
+    // The trap stated: the page is truncated, carries not one unseen row --
+    // yet the badge counts the thread.
     const detail = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
-    expect(mailThreadDetailSchema.parse(detail.json()).truncated).toBe(true);
+    const body = mailThreadDetailSchema.parse(detail.json());
+    expect(body.truncated).toBe(true);
+    expect(body.messages.some((m) => !m.seen)).toBe(false);
+    const before = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(mailUnreadCountSchema.parse(before.json()).count).toBe(1);
 
     const read = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
     expect(read.statusCode).toBe(200);
-    const unseen = await handle.db.select({ id: mailMessages.id }).from(mailMessages)
-      .where(and(eq(mailMessages.threadId, threadId), eq(mailMessages.seen, false)));
-    expect(unseen).toHaveLength(0);
+    const [row] = await handle.db.select({ seen: mailMessages.seen }).from(mailMessages)
+      .where(eq(mailMessages.id, unseenBelow));
+    expect(row?.seen).toBe(true);
     const badge = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
     expect(mailUnreadCountSchema.parse(badge.json()).count).toBe(0);
     await a.close();

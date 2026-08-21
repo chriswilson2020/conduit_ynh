@@ -474,11 +474,15 @@ describe("sendMail", () => {
     expect(transport.sent).toHaveLength(0);
   });
 
-  // The detail-cap pin on THIS service: the reply chain reads the thread's
-  // newest visible message DIRECTLY (its own one-row query), so a thread
-  // longer than the detail route's 50-message page still threads onto its
-  // true newest -- a future refactor routing the chain through the capped
-  // detail payload would still pass at 50 messages and must fail here.
+  // The detail-cap coverage on THIS service: the reply chain reads the
+  // thread's newest visible message directly (its own one-row query the cap
+  // never touches), and this exercises it past the 50-message boundary. A
+  // MODEST pin, stated honestly: the capped detail page is the ascending
+  // TAIL, so its last element is the true newest by construction -- even a
+  // refactor that routed the chain through the capped payload would answer
+  // correctly here. What this holds still is the behaviour itself (a long
+  // thread's reply threads onto its true newest), not the implementation
+  // route to it.
   it("builds the reply chain from the true newest message of a thread longer than the detail cap", async () => {
     const [thread] = await handle.db.insert(mailThreads).values({
       subject: "Long one", lastMessageAt: new Date("2026-08-02T10:00:00Z"), messageCount: 51,
@@ -758,6 +762,20 @@ describe("sendMail", () => {
     expect(stored[0]?.filename).toBe("renewal-quote.pdf");
     expect(stored[0]?.sizeBytes).toBe("the quoted price is 42".length);
     expect(stored[0]?.id).not.toBe(original.attachmentId);
+  });
+
+  it("attaches a duplicated forward id once, not twice", async () => {
+    const original = await seedOriginal(accountId, { filename: "once.pdf" });
+
+    const message = await sendMail(
+      handle.db, dataDir, actorId,
+      input({ forwardAttachmentIds: [original.attachmentId, original.attachmentId] }), deps(),
+    );
+
+    const stored = await handle.db.select().from(mailAttachments)
+      .where(eq(mailAttachments.messageId, message.id));
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.filename).toBe("once.pdf");
   });
 
   it("refuses the whole send when a forwarded original is over the compose cap", async () => {

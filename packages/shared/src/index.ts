@@ -1222,7 +1222,15 @@ export const sendMailInputSchema = z.object({
   // tables: an upload is a files row the actor OWNS, a forwarded original is
   // a mail_attachments row the actor may READ (record-scope visibility, the
   // download route's own rule -- api: mail-send.ts's loadForwardAttachments).
-  forwardAttachmentIds: z.array(z.uuid()).optional().default([]),
+  // That right is the whole contract: the name says "forward" because that
+  // is the flow that sends it, but the field accepts any record-readable
+  // attachment id from any message -- the equivalent of downloading and
+  // re-attaching, minus the round trip. Duplicate ids attach ONCE (the
+  // service dedupes, first occurrence's position wins). max(50) mirrors
+  // ingest's MAX_ATTACHMENTS: no stored message holds more, so no honest
+  // forward names more. (attachmentIds above carries no max of its own --
+  // pre-existing, deliberately left untouched here.)
+  forwardAttachmentIds: z.array(z.uuid()).max(50).optional().default([]),
   links: z.object({
     companyId: z.uuid().optional(), contactId: z.uuid().optional(),
     dealId: z.uuid().optional(), projectId: z.uuid().optional(),

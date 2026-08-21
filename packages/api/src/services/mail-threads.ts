@@ -939,7 +939,10 @@ export async function getThreadDetail(
   // never the returned page, so both come from one aggregate pass that the
   // cap cannot touch. (Pre-cap, ownedByViewer was read off the message rows
   // themselves; a capped page can drop the one owned message -- older than
-  // the newest 50 -- so the aggregate is now the only honest source.)
+  // the newest 50 -- so the aggregate is now the only honest source.) This
+  // makes the detail two message queries per open instead of one -- the
+  // accepted price of the cap, and a bounded one: both are scoped to this
+  // single thread id, so each reads one conversation's rows, never a scan.
   // coalesce: bool_or over zero rows is NULL, and the defensively-rendered
   // message-less thread must answer false, not null.
   const [aggregate] = await db.select({
@@ -959,7 +962,13 @@ export async function getThreadDetail(
   // Oldest first: the conversation view renders in reading order, with only
   // the newest message expanded. A truncated page is the NEWEST 50 in that
   // same total order -- fetched newest-first so LIMIT keeps the right end,
-  // then reversed back into reading order.
+  // then reversed back into reading order. Known asymmetry, pre-existing:
+  // this order tie-breaks (sent_at, id) while mail-send.ts's loadReplyChain
+  // picks its one newest by (sent_at, created_at, id) -- two messages
+  // sharing a header date can therefore order differently between the
+  // rendered page and the reply chain's choice, which has never mattered
+  // (the chain wants A newest, not THE page's last row) but is recorded
+  // here so the difference reads as known, not accidental.
   const messageRows = truncated
     ? (await pageQuery
       .orderBy(desc(mailMessages.sentAt), desc(mailMessages.id))

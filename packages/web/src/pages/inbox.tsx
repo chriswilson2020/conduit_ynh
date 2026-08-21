@@ -340,11 +340,16 @@ export function InboxPage() {
               testId="filter-unlinked" label="Unlinked" on={unlinked} disabled={busy} onChange={setUnlinked}
             />
             {/* "Hidden", not "Archived": since Phase 4.1 an Archive is a real
-                IMAP move, and this filter is the CRM-side "Hide in CRM" state
-                (the `hidden` list flag), which is a different thing. The
-                testid predates the rename and stays as it is. */}
+                IMAP move, and this filter is the CRM-side Hidden view (the
+                `hidden` list flag -- the viewer's own filed-away threads),
+                which is a different thing. The testid joined the Task 3
+                rename sweep (coordinator ruling, same rationale as
+                hide-thread/unhide-thread): it was still spelled
+                `filter-archived`, nothing referenced it yet, and the rename
+                window closed with Task 4's e2e -- so it says what the chip
+                does before anything came to depend on the old spelling. */}
             <FilterToggle
-              testId="filter-archived" label="Hidden" on={hidden} disabled={busy} onChange={setHidden}
+              testId="filter-hidden" label="Hidden" on={hidden} disabled={busy} onChange={setHidden}
             />
           </div>
 

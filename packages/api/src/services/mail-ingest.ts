@@ -200,8 +200,10 @@ const MAX_PARTICIPANTS = 200;
 // Attachments are streamed to blob storage and never rewritten, so an
 // unbounded message is unbounded disk. 50 attachments is far past any real
 // message. The 50MB per-attachment bound (matching routes/index.ts's
-// deliberate-upload limit) is belt and braces rather than a live limit: a
-// message is already capped at MAX_RAW_BYTES, and base64 costs 4/3, so no
+// deliberate-upload limit and mail-send.ts's MAX_FORWARD_ATTACHMENT_BYTES --
+// one ceiling, three spellings, change together) is belt and braces rather
+// than a live limit: a message is already capped at MAX_RAW_BYTES, and
+// base64 costs 4/3, so no
 // single attachment reaching this code can exceed ~19.6MB today. It is
 // kept because the attachment path should stay bounded on its own terms --
 // raising the raw cap, or a future non-IMAP caller, must not silently make
