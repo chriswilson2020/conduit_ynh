@@ -821,20 +821,12 @@ describe("pipelines routes", () => {
     await a.close();
   });
 
-  it("lists pipelines filtered by scope, company_id, and archived", async () => {
+  it("lists pipelines filtered by scope and company_id", async () => {
     const a = await app();
     const company = await a.inject({ method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" } });
     const companyId = company.json().id as string;
     await makePipeline(a, { name: "Global", scope: "global" });
     const scoped = await makePipeline(a, { name: "Scoped", scope: "company", companyId });
-    // A second company-scoped pipeline, archived through its own route, so the
-    // archived arm below filters within one company rather than against an
-    // empty set. This is the wire-level pin the company page's "show archived"
-    // control rests on (Phase 4.3): the service filter predates it, but until
-    // here nothing proved `archived` survives the route's query schema.
-    const retired = await makePipeline(a, { name: "Retired", scope: "company", companyId });
-    const archived = await a.inject({ method: "POST", url: `/api/pipelines/${retired.id}/archive`, headers: authHeaders });
-    expect(archived.statusCode).toBe(200);
 
     const response = await a.inject({
       method: "GET", url: `/api/pipelines?scope=company&company_id=${companyId}`, headers: authHeaders,
@@ -842,10 +834,32 @@ describe("pipelines routes", () => {
     expect(response.statusCode).toBe(200);
     const body = z.array(pipelineSchema).parse(response.json());
     expect(body.map((p) => p.id)).toEqual([scoped.id]);
+    await a.close();
+  });
 
-    // The tri-state's other two spellings: an explicit false matches absent
-    // (live rows only), and true swaps the list to the archived rows -- each
-    // carrying a non-null archivedAt for the client's Archived chip.
+  // The wire-level pin the company page's "show archived" control rests on
+  // (Phase 4.3): the service filter predates it, but until here nothing
+  // proved `archived` survives this route's own query schema -- the test
+  // above CLAIMED "and archived" in its title for two phases without ever
+  // sending the flag.
+  it("swaps the company's list to its archived pipelines with archived=true, explicit false matching absent", async () => {
+    const a = await app();
+    const company = await a.inject({ method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" } });
+    const companyId = company.json().id as string;
+    const scoped = await makePipeline(a, { name: "Scoped", scope: "company", companyId });
+    // Archived through its own route, so the archived arm filters within one
+    // company rather than against an empty set.
+    const retired = await makePipeline(a, { name: "Retired", scope: "company", companyId });
+    const archived = await a.inject({ method: "POST", url: `/api/pipelines/${retired.id}/archive`, headers: authHeaders });
+    expect(archived.statusCode).toBe(200);
+
+    // All three tri-state spellings: absent and explicit false both mean the
+    // live rows; true swaps the list to the archived rows, each carrying a
+    // non-null archivedAt for the client's Archived chip.
+    const absent = await a.inject({
+      method: "GET", url: `/api/pipelines?company_id=${companyId}`, headers: authHeaders,
+    });
+    expect(z.array(pipelineSchema).parse(absent.json()).map((p) => p.id)).toEqual([scoped.id]);
     const explicitFalse = await a.inject({
       method: "GET", url: `/api/pipelines?company_id=${companyId}&archived=false`, headers: authHeaders,
     });
