@@ -1260,6 +1260,14 @@ describe("threadListFiltersSchema", () => {
       hidden: false, folder: "INBOX", cursor: "abc", limit: 20,
     };
     expect(threadListFiltersSchema.parse(filters)).toEqual(filters);
+    // Phase 4.3: `hidden` REPLACES `archived` -- both halves pinned on the
+    // shape itself (the blobPath idiom, same as mailThreadSchema's own
+    // hiddenAt/archivedAt pin), because zod STRIPS unknown keys: a stale
+    // caller still sending `archived` gets the default list silently rather
+    // than an error, so only a shape assertion can catch the flag drifting
+    // back.
+    expect(Object.keys(threadListFiltersSchema.shape)).toContain("hidden");
+    expect(Object.keys(threadListFiltersSchema.shape)).not.toContain("archived");
   });
 
   it("accepts no filters at all (unfiltered list)", () => {

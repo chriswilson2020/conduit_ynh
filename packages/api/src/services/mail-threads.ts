@@ -527,8 +527,8 @@ async function loadAggregates(
  * created_at is when the CRM first saw the conversation, which for a
  * backfilled mailbox is "all at once."
  *
- * Filters AND together. `archived` is the usual two-state flag (archived-only
- * when true, non-archived otherwise); `unread` and `unlinked` are toggles, so
+ * Filters AND together. `hidden` is the usual two-state flag (hidden-only
+ * when true, non-hidden otherwise); `unread` and `unlinked` are toggles, so
  * false means "do not filter", not "only read"/"only linked" -- the inbox has
  * no use for either inverse, and a toggle that filters when off would be a
  * surprising thing for a checkbox to do.

@@ -872,6 +872,12 @@ describe("mail thread list route", () => {
     expect(await subjects("unlinked=true")).toEqual(["Loose"]);
     expect(await subjects(`contact_id=${contact.id}`)).toEqual(["Linked"]);
     expect(await subjects("hidden=true")).toEqual(["Filed"]);
+    // The accepted consequence of the Phase 4.3 rename: the retired
+    // `archived` spelling is not an error but an UNKNOWN key, which zod
+    // strips -- a stale caller sending it gets the DEFAULT (not-hidden)
+    // list, never the Hidden view. Documented here as behaviour, pinned as
+    // shape in shared/index.test.ts's threadListFiltersSchema block.
+    expect(await subjects("archived=true")).toEqual(["Linked", "Loose"]);
     // ANDed, not ORed: an unread thread on the OTHER account matches neither.
     expect(await subjects(`unread=true&account_id=${second.id}`)).toEqual([]);
     await a.close();
