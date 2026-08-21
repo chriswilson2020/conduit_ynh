@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import type { Locator, Page } from "@playwright/test";
+import type { BrowserContext, Locator, Page } from "@playwright/test";
 import { ImapFlow } from "imapflow";
 
 /**
@@ -7,6 +7,21 @@ import { ImapFlow } from "imapflow";
  * IMAP, add the account through the settings form, watch the sync populate
  * the inbox, read the conversation, link a deal to it, reply, and find it
  * again through the filters, global search and the contact's Mail tab.
+ * Phase 4.2 extends the same journey with a SECOND USER (see the 4.2 section
+ * at the bottom): the private-by-default visibility model, the deal link as
+ * the deliberate sharing act, the Settings toggle, and the owner-only move
+ * rights, each asserted from user B's browser context.
+ *
+ * HOW THE SECOND USER WORKS, verified against the API's auth path rather
+ * than assumed: identityFromHeaders (api: auth.ts) uses the `ynh-user`
+ * header whenever the key is PRESENT, and falls back to CONDUIT_DEV_USER
+ * only when it is entirely absent -- in production SSOwat overwrites the
+ * header before proxying, but the e2e webServer has no SSOwat in front of
+ * it, so a context created with `extraHTTPHeaders: { "ynh-user": ... }` IS
+ * that user for every request it makes (page loads, fetches, SSE alike),
+ * and resolveUser (api: users.ts) upserts the row on first sight. That
+ * makes the spec's two-user journey a real journey here, not a seeded
+ * approximation.
  *
  * THIS FILE NEEDS THE CI MAIL FIXTURE and has no other home: it talks to the
  * Dovecot and Mailpit containers .github/workflows/test.yml's e2e job starts,
@@ -111,6 +126,21 @@ test.describe.serial("Mail journey", () => {
   let aliceThreadId: string;
   let dealId: string;
   let accountId: string;
+
+  /**
+   * User B (Phase 4.2): a second, accountless CRM user, driven through a
+   * second browser context whose every request carries `ynh-user` (see the
+   * file comment for why the API honours it here). The username is a plain
+   * constant, not runId-scoped: resolveUser upserts, so re-seeing the same
+   * user across runs and retries is exactly the production shape -- and B's
+   * world is defined by the visibility predicate, not by fixtures, so a
+   * stable identity leaks nothing between attempts PROVIDED no shared
+   * account outlives an attempt (the beforeAll reset below is what makes
+   * that hold).
+   */
+  const B_USERNAME = "e2euser-b";
+  let bContext: BrowserContext;
+  let bPage: Page;
 
   /**
    * THE FOUR SUBJECTS BELOW ARE SCOPED PER ATTEMPT, not per run, and that is
@@ -324,6 +354,14 @@ test.describe.serial("Mail journey", () => {
    * assertion timeouts so the loop actually gets to iterate.
    */
   async function pollWithReload(check: () => Promise<void>, timeoutMs = SYNC_TIMEOUT_MS): Promise<void> {
+    return pollWithReloadOn(page, check, timeoutMs);
+  }
+
+  /** The same loop against an explicit page -- the 4.2 tests drive user B's
+   * context through it while A's page holds its own state. */
+  async function pollWithReloadOn(
+    target: Page, check: () => Promise<void>, timeoutMs = SYNC_TIMEOUT_MS,
+  ): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       try {
@@ -331,7 +369,7 @@ test.describe.serial("Mail journey", () => {
         return;
       } catch (error) {
         if (Date.now() >= deadline) throw error;
-        await page.reload();
+        await target.reload();
       }
     }
   }
@@ -340,7 +378,11 @@ test.describe.serial("Mail journey", () => {
    * have to know in advance -- the same shape pipeline.spec.ts's columnByName
    * uses, and every subject carries the run id. */
   function threadRow(subject: string): Locator {
-    return page.locator('[data-testid^="thread-row-"]').filter({ hasText: subject });
+    return threadRowOn(page, subject);
+  }
+
+  function threadRowOn(target: Page, subject: string): Locator {
+    return target.locator('[data-testid^="thread-row-"]').filter({ hasText: subject });
   }
 
   async function idOf(locator: Locator, prefix: string): Promise<string> {
@@ -389,6 +431,11 @@ test.describe.serial("Mail journey", () => {
 
   test.beforeAll(async ({ browser }, testInfo) => {
     page = await browser.newPage();
+    // User B rides a context of their own; @playwright/test's newContext
+    // still applies the config's baseURL, and merges these headers into
+    // every request the context makes.
+    bContext = await browser.newContext({ extraHTTPHeaders: { "ynh-user": B_USERNAME } });
+    bPage = await bContext.newPage();
 
     // The per-ATTEMPT half of the scoping (see the declarations above): the
     // retry index is what distinguishes this attempt's fixtures from the ones
@@ -407,9 +454,26 @@ test.describe.serial("Mail journey", () => {
     // handles. A no-op on the first attempt, where there are no accounts.
     const response = await page.request.get("/api/mail/accounts");
     expect(response.ok()).toBe(true);
-    const { own } = await response.json() as { own: { id: string; archivedAt: string | null }[] };
+    const { own } = await response.json() as {
+      own: { id: string; archivedAt: string | null; visibility: "private" | "shared" }[];
+    };
     for (const account of own) {
       if (account.archivedAt === null) {
+        // Phase 4.2 retry hygiene, and it must run BEFORE the archive below:
+        // an attempt that failed between the shared flip and the flip back
+        // would leave a SHARED account behind, archiving does not clear
+        // visibility, and the account PATCH refuses archived rows -- so this
+        // is the one moment the leftover can be made private again. Without
+        // it, every previous attempt's threads would sit in user B's inbox
+        // and the 4.2 "empty" assertions would fail every retry for a reason
+        // no retry could clear (the same unrecoverability class the
+        // per-attempt subjects above exist for).
+        if (account.visibility === "shared") {
+          const flipped = await page.request.patch(`/api/mail/accounts/${account.id}`, {
+            data: { visibility: "private" },
+          });
+          expect(flipped.ok()).toBe(true);
+        }
         // Checked, not fired and forgotten: this POST is the whole of what
         // stands between a retry and a double-ingested conversation, and it
         // is a line that only ever runs ON a retry -- so a 4xx here has to
@@ -425,6 +489,7 @@ test.describe.serial("Mail journey", () => {
 
   test.afterAll(async () => {
     await page.close();
+    await bContext.close();
   });
 
   test("creates the contact the inbound mail will auto-link to", async () => {
@@ -824,5 +889,138 @@ test.describe.serial("Mail journey", () => {
     await threadRow(trashSubject).click();
     await expect(page.getByTestId("conversation")).toBeVisible();
     await expect(page.getByTestId("trash-chip")).toBeVisible();
+  });
+
+  // -- Phase 4.2: private by default, the deal link as the sharing act, the
+  //    Settings toggle, owner-only moves -- all from user B's own context ----
+
+  test("keeps the private mailbox out of the second user's inbox entirely", async () => {
+    await bPage.goto("/mail");
+    // The loaded-list sentinel and the assertion in one: B owns no mail
+    // account, so an EMPTY list renders the no-account pointer -- if any of
+    // A's threads leaked in, this node would not render at all. Absolute
+    // emptiness is safe across retries only because beforeAll flips every
+    // leftover account back to private: B's inbox is defined by the
+    // predicate (own OR shared accounts), not by this run's fixtures.
+    await expect(bPage.getByTestId("inbox-no-account")).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    await expect(threadRowOn(bPage, aliceSubject)).toHaveCount(0);
+    await expect(threadRowOn(bPage, bobSubject)).toHaveCount(0);
+    // The unread computations agree: nothing is WAITING in B's mailbox, so
+    // the nav badge is absent (shell.tsx renders nothing at zero).
+    await expect(bPage.getByTestId("unread-badge")).toHaveCount(0);
+  });
+
+  test("carries the deal-linked thread to the second user on the record and in search, not the inbox", async () => {
+    // The deal page is ordinary shared CRM; its Mail tab runs at record scope,
+    // where the deliberate deal link (made by A, clicks ago) IS the share.
+    await bPage.goto(`/deals/${dealId}`);
+    await bPage.getByTestId("mail-tab").click();
+    await expect(threadRowOn(bPage, aliceSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    // ...and ONLY that thread: Bob's, linked to nothing, stays A's alone.
+    await expect(threadRowOn(bPage, bobSubject)).toHaveCount(0);
+
+    // The row opens the full conversation for B (record-visible detail)...
+    await threadRowOn(bPage, aliceSubject).click();
+    await expect(bPage).toHaveURL(`/mail?thread=${aliceThreadId}`);
+    const conversation = bPage.getByTestId("conversation");
+    await expect(conversation).toBeVisible();
+    await expect(conversation).toContainText(aliceSubject);
+    // ...with the SERVER moves absent -- B owns no account this thread rides
+    // on, and a colleague must never reorganise A's actual mailbox -- while
+    // Hide in CRM stays, available to every viewer.
+    await expect(bPage.getByTestId("conversation-archive")).toHaveCount(0);
+    await expect(bPage.getByTestId("conversation-trash")).toHaveCount(0);
+    await expect(bPage.getByTestId("archive-thread")).toBeVisible();
+
+    // Search runs at record scope too: the linked thread is findable by body
+    // text from B's context.
+    await bPage.getByTestId("search-input").fill(textMarker);
+    await expect(
+      bPage.getByTestId("search-result").filter({ hasText: aliceSubject }),
+    ).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+
+    // But the INBOX is a mailbox view (the coordinator's inbox-scope ruling):
+    // the deliberately-linked thread surfaces on the record and in search,
+    // never in B's personal inbox.
+    await bPage.goto("/mail");
+    await expect(bPage.getByTestId("inbox-no-account")).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    await expect(threadRowOn(bPage, aliceSubject)).toHaveCount(0);
+  });
+
+  test("flips the mailbox to Shared from Settings, which opens B's inbox but not B's move rights", async () => {
+    await page.goto("/settings/mail");
+    const toggle = page.getByTestId(`visibility-toggle-${accountId}`);
+    await expect(toggle).toHaveText("Private", { timeout: REFETCH_TIMEOUT_MS });
+    await toggle.click();
+    // The switch is NOT optimistic (a same-value submit echoes nothing, so
+    // there is nothing to wait on): its label moves when the PATCH lands and
+    // the accounts query refetches, which is exactly what this waits for.
+    await expect(toggle).toHaveText("Shared", { timeout: REFETCH_TIMEOUT_MS });
+    // Persisted, not painted: a fresh load reads the stored row.
+    await page.reload();
+    await expect(page.getByTestId(`visibility-toggle-${accountId}`))
+      .toHaveText("Shared", { timeout: REFETCH_TIMEOUT_MS });
+
+    // B's inbox now carries the shared mailbox's threads -- the badge and the
+    // rows change for another user off one Settings click (the three-family
+    // SSE frame; the reload inside the poll is the belt to that braces).
+    await bPage.goto("/mail");
+    await pollWithReloadOn(bPage, async () => {
+      await expect(threadRowOn(bPage, aliceSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+      await expect(threadRowOn(bPage, bobSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+    });
+
+    // Shared is readable, not movable: selecting a row greys Archive/Trash
+    // with the reason as TEXT on the bar, and Hide in CRM stays live.
+    const bobThreadId = await idOf(threadRowOn(bPage, bobSubject), "thread-row-");
+    await bPage.getByTestId(`thread-checkbox-${bobThreadId}`).click();
+    await expect(bPage.getByTestId("bulk-count")).toHaveText("1 selected");
+    await expect(bPage.getByTestId("bulk-archive")).toBeDisabled();
+    await expect(bPage.getByTestId("bulk-trash")).toBeDisabled();
+    await expect(bPage.getByTestId("bulk-hide")).toBeEnabled();
+    await expect(bPage.getByTestId("bulk-owner-blocked"))
+      .toContainText("only the mailbox owner can archive or trash");
+    await bPage.getByTestId("bulk-clear").click();
+
+    // The conversation view agrees with the bar, and stays open for the next
+    // test's stale-pane check.
+    await threadRowOn(bPage, bobSubject).click();
+    await expect(bPage.getByTestId("conversation")).toBeVisible();
+    await expect(bPage.getByTestId("conversation-archive")).toHaveCount(0);
+    await expect(bPage.getByTestId("conversation-trash")).toHaveCount(0);
+    await expect(bPage.getByTestId("archive-thread")).toBeVisible();
+  });
+
+  test("flipping back to Private ends B's window with the calm gone state, not an error", async () => {
+    // B is parked on the open bobSubject conversation from the previous test.
+    await expect(bPage.getByTestId("conversation")).toBeVisible();
+
+    await page.goto("/settings/mail");
+    const toggle = page.getByTestId(`visibility-toggle-${accountId}`);
+    await expect(toggle).toHaveText("Shared", { timeout: REFETCH_TIMEOUT_MS });
+    await toggle.click();
+    await expect(toggle).toHaveText("Private", { timeout: REFETCH_TIMEOUT_MS });
+
+    // The flip's SSE frame deliberately carries no per-thread key (spec
+    // Amendment 5), so B's open pane lives on its cached bytes until its own
+    // next refetch -- the accepted, bounded staleness. The reload IS that
+    // refetch, made deterministic: the detail now answers the
+    // indistinguishable 404, and the pane must meet it with the calm gone
+    // state rather than a raw error line.
+    await pollWithReloadOn(bPage, async () => {
+      await expect(bPage.getByTestId("conversation-gone")).toBeVisible({ timeout: ATTEMPT_TIMEOUT_MS });
+    });
+    await expect(bPage.getByTestId("conversation-gone"))
+      .toContainText("This conversation is no longer available.");
+
+    // B's inbox is empty again; the deal-linked thread remains reachable on
+    // the record (asserted two tests up), which is the retroactive-unsharing
+    // semantics the spec settled: flipping back re-applies the predicate,
+    // nothing more. This flip is also the run's own hygiene -- the mailbox
+    // ends private, the state every attempt starts from.
+    await bPage.goto("/mail");
+    await expect(bPage.getByTestId("inbox-no-account")).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    await expect(threadRowOn(bPage, bobSubject)).toHaveCount(0);
+    await expect(threadRowOn(bPage, aliceSubject)).toHaveCount(0);
   });
 });
