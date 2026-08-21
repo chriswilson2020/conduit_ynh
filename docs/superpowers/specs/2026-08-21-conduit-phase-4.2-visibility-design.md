@@ -141,6 +141,20 @@ Ruled during Task 2's spec review; each supersedes the corresponding line above.
    change for every user too. The Settings line above is corrected in place. The frame
    deliberately carries no per-thread `["mail-thread", <id>]` keys, so an already-open
    conversation pane is NOT invalidated by a flip — it lives on its cached,
-   already-delivered bytes until the next refetch; the web layer (Task 4) decides
-   between accepting-and-documenting that window and closing the pane when its thread
-   leaves the list.
+   already-delivered bytes until the next refetch. Task 4's decision, coordinator-ruled:
+   that bounded window is ACCEPTED and documented, not engineered away — the bytes were
+   already delivered, nothing further leaks server-side, and close-on-list-exit
+   machinery would tie the pane (which renders off the URL param) to a list it is
+   deliberately independent of. The obligation that comes with accepting it: the pane
+   meets the eventual indistinguishable 404 with a calm "This conversation is no longer
+   available." state (web: conversation.tsx's `conversation-gone` branch, status-keyed
+   via mail-lib's isThreadGone), never a raw error line — pinned by unit tests and by
+   the two-user e2e journey's flip-back step.
+
+6. **The accounts endpoint keeps disclosing every account's existence** (ruled during
+   Task 2's review; recorded here by Task 4): `GET /api/mail/accounts` returns every
+   other user's account as id+label+email to all authenticated users — required so
+   reply-all can never cc a mailbox this CRM syncs, and for the account chips and
+   filter UI. A private mailbox's EXISTENCE, label and address therefore stay listed
+   to every user while its mail does not. Deliberate, and surfaced to the operator in
+   the v0.7.0 release notes rather than silently shipped.
