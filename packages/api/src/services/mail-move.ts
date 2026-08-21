@@ -177,16 +177,39 @@ type ResultItem = BulkThreadResult["results"][number];
  * the answer when a thread finishes with nothing recorded at all. Typed out
  * rather than commented, so noteSkip cannot be handed it by mistake and the
  * rank table below cannot silently acquire a meaningless entry for it.
+ *
+ * `not_owner` (Phase 4.2) is, BY CONTRAST, one of these -- unlike out_of_scope,
+ * it IS recorded per message: a message on an account the actor does not own
+ * is still examined far enough to be classified (Task 3 wires the actual
+ * ownership filter into collectCandidates), it is simply not this actor's to
+ * move. That is what earns it a slot in SKIP_REASON_RANK below rather than a
+ * third out_of_scope-style exclusion from this type.
  */
 type NotedSkipReason = Exclude<BulkThreadSkipReason, "out_of_scope">;
 
-/** Precedence when one thread hits several skip causes -- lower wins. Written
+/**
+ * Precedence when one thread hits several skip causes -- lower wins. Written
  * as a table rather than an if-chain so the order is one readable fact; see
- * Outcomes.noteSkip for why it runs this way round. */
+ * Outcomes.noteSkip for why it runs this way round.
+ *
+ * `not_owner` (Phase 4.2, Task 3 wires the filter that produces it) sits
+ * directly below archived_account: both are causes the CURRENT USER cannot
+ * clear by simply asking again, unlike the two below them (awaiting_
+ * reconciliation self-heals on the next sync pass; already_in_target means
+ * the goal already holds) -- but between the two, "not yours" is the more
+ * specific and, for THIS actor, the strictly LESS actionable of the pair
+ * (the account owner can unarchive an archived_account in Settings; no
+ * action available to a non-owner ever turns a not_owner message into one
+ * they can move), so it is ranked as the second-strongest cause rather than
+ * the strongest. This ordering only matters when one thread's messages hit
+ * more than one cause at once, which is rare -- see shared's
+ * bulkThreadSkipReasonSchema comment for the fuller reasoning.
+ */
 const SKIP_REASON_RANK: Record<NotedSkipReason, number> = {
   archived_account: 0,
-  awaiting_reconciliation: 1,
-  already_in_target: 2,
+  not_owner: 1,
+  awaiting_reconciliation: 2,
+  already_in_target: 3,
 };
 
 function errorText(error: unknown): string {
@@ -279,11 +302,16 @@ class Outcomes {
 
   /**
    * Note why one of this thread's messages was dropped from the eligible set.
-   * The strongest reason seen wins, in the enum's own order (archived_account,
-   * then awaiting_reconciliation, then already_in_target): the first two mean a
-   * message is somewhere the CRM could not move it FROM, while the last means
-   * the goal already holds, so reporting an unfinished cause ahead of a
-   * finished one is the honest ordering when a thread has both.
+   * The strongest reason seen wins, in SKIP_REASON_RANK's order (archived_
+   * account, then not_owner, then awaiting_reconciliation, then already_in_
+   * target): the first two mean a message is somewhere the CRM could not move
+   * it FROM (an account state or an ownership fact, neither fixable by this
+   * actor asking again), the third is transient, and the last means the goal
+   * already holds -- so reporting an unresolved-for-this-actor cause ahead of
+   * a self-resolving or already-finished one is the honest ordering when a
+   * thread has more than one. Task 3 wires the ownership filter that is the
+   * one caller of noteSkip(..., "not_owner") -- this class already carries the
+   * type and the rank slot the moment the shared enum grows the value.
    */
   noteSkip(threadId: string, reason: NotedSkipReason): void {
     const existing = this.skipReasons.get(threadId);
@@ -685,6 +713,13 @@ async function collectCandidates(
       outcomes.noteSkip(row.threadId, "already_in_target");
       continue;
     }
+    // Task 3 wires the ownership filter here: an in-scope row on an account
+    // the actor does not own drops out with noteSkip(row.threadId,
+    // "not_owner"), BEFORE the archived-account and refusal checks below --
+    // same "in scope decided first, ownership/availability decided next,
+    // refusal last" ordering this function already applies. Needs `accountRows`
+    // above to select `userId` and this function to take an `actorId` param.
+    //
     // An archived account's rows cannot move while it stays archived, so they
     // are dropped here beside the NULL uids rather than failing anything --
     // see accountStateOf for why a failure whose only remedy is in Settings is

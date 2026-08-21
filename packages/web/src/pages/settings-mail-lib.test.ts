@@ -25,6 +25,7 @@ const storedAccount: MailAccount = {
   archiveFolder: null,
   signatureHtml: null,
   backfillDays: 90,
+  visibility: "private",
   status: "active",
   lastError: null,
   lastSyncedAt: null,

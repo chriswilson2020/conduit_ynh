@@ -43,6 +43,13 @@
       "when": 1787225573578,
       "tag": "0005_third_shriek",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1787307920768,
+      "tag": "0006_regular_steve_rogers",
+      "breakpoints": true
     }
   ]
 }

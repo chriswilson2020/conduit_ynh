@@ -225,7 +225,7 @@ function account(): MailAccount {
     imapHost: IMAP_HOST, imapPort: IMAP_PORT, imapSecurity: "tls",
     smtpHost: SMTP_HOST, smtpPort: SMTP_PORT, smtpSecurity: "starttls",
     username: USERNAME, sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null,
-    backfillDays: null, status: "active", lastError: null,
+    backfillDays: null, visibility: "private", status: "active", lastError: null,
     lastSyncedAt: null, archivedAt: null, createdAt: now, updatedAt: now,
   };
 }

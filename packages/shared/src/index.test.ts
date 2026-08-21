@@ -744,6 +744,7 @@ describe("mailAccountSchema", () => {
     smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
     username: "chris",
     sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null, backfillDays: 90,
+    visibility: "private" as const,
     status: "active" as const, lastError: null, lastSyncedAt: null,
     archivedAt: null, createdAt: now, updatedAt: now,
   };
@@ -769,6 +770,15 @@ describe("mailAccountSchema", () => {
 
   it("rejects a status outside active/error", () =>
     expect(() => mailAccountSchema.parse({ ...account, status: "syncing" })).toThrow());
+
+  // Phase 4.2: accepts the 'shared' half of the enum too -- the fixture above
+  // only exercises the DB default ('private').
+  it("accepts a shared account", () => {
+    expect(mailAccountSchema.parse({ ...account, visibility: "shared" }).visibility).toBe("shared");
+  });
+
+  it("rejects a visibility value outside private/shared", () =>
+    expect(() => mailAccountSchema.parse({ ...account, visibility: "public" })).toThrow());
 
   // The whole point of this schema: no key on it may look like a credential.
   // schema.ts's mail_accounts.credentials_ciphertext (and imap/smtp passwords)
@@ -840,6 +850,20 @@ describe("mailAccountUpdateInputSchema", () => {
     expect(() => mailAccountUpdateInputSchema.parse({ trashFolder: "" })).toThrow();
     expect(() => mailAccountUpdateInputSchema.parse({ archiveFolder: "" })).toThrow();
   });
+
+  // Phase 4.2: `visibility` joins trashFolder/archiveFolder as an
+  // update-only field (see this schema's own comment on why
+  // mailAccountCreateInputSchema omits it entirely).
+  it("accepts a visibility override", () => {
+    expect(mailAccountUpdateInputSchema.parse({ visibility: "shared" })).toEqual({ visibility: "shared" });
+  });
+
+  it("has no visibility field on the create-derived (create input) schema", () => {
+    expect(Object.keys(mailAccountCreateInputSchema.shape)).not.toContain("visibility");
+  });
+
+  it("rejects a visibility value outside private/shared", () =>
+    expect(() => mailAccountUpdateInputSchema.parse({ visibility: "public" })).toThrow());
 });
 
 describe("mailAccountUpdatePasswordFieldsSchema", () => {
@@ -942,6 +966,7 @@ describe("mailAccountListSchema", () => {
       smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
       username: "chris",
       sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null, backfillDays: 90,
+      visibility: "private" as const,
       status: "active" as const, lastError: null, lastSyncedAt: null,
       archivedAt: null, createdAt: now, updatedAt: now,
     };
@@ -1092,6 +1117,7 @@ describe("mailAccountWithSyncStatsSchema", () => {
     smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
     username: "chris", sentFolder: "Sent", trashFolder: null, archiveFolder: null,
     signatureHtml: null, backfillDays: 90,
+    visibility: "private" as const,
     status: "active" as const, lastError: null, lastSyncedAt: null,
     archivedAt: null, createdAt: now, updatedAt: now,
   };
@@ -1126,42 +1152,61 @@ describe("mailThreadListItemSchema", () => {
     unread: true, snippet: "Thanks for sending this over",
     senders: [{ address: "bob@example.com", name: "Bob" }, { address: "root@localhost" }],
     accountIds: [uuid2],
+    // Phase 4.2: at least one message on this thread sits on an account this
+    // viewer owns.
+    ownedByViewer: true,
   };
 
   it("accepts a full list row", () => expect(mailThreadListItemSchema.parse(row)).toEqual(row));
 
   it("requires the derived row fields the thread itself does not carry", () => {
-    for (const field of ["unread", "snippet", "senders", "accountIds"]) {
+    for (const field of ["unread", "snippet", "senders", "accountIds", "ownedByViewer"]) {
       const { [field]: _dropped, ...rest } = row as Record<string, unknown>;
       expect(() => mailThreadListItemSchema.parse(rest)).toThrow();
     }
   });
+
+  // ownedByViewer is a plain fact about this thread's accounts, independent
+  // of unread/senders/accountIds -- a thread the viewer owns nothing on
+  // (every message on someone else's shared or deal-linked account) still
+  // parses, with the flag simply false.
+  it("accepts ownedByViewer: false (a thread the viewer owns no account on)", () => {
+    const notOwned = { ...row, ownedByViewer: false };
+    expect(mailThreadListItemSchema.parse(notOwned)).toEqual(notOwned);
+  });
 });
 
 describe("mailThreadDetailSchema", () => {
-  it("accepts a thread with messages, their attachments, and deal suggestions", () => {
-    const detail = {
-      thread: {
-        id: uuid1, subject: "Re: Proposal", lastMessageAt: now, messageCount: 1,
-        companyId: null, contactId: uuid2, dealId: null, projectId: null,
-        archivedAt: null, createdAt: now, updatedAt: now,
-      },
-      messages: [{
-        id: uuid2, accountId: uuid1, threadId: uuid1,
-        messageId: "<abc@example.com>", inReplyTo: null, referencesIds: [],
-        fromAddr: "bob@example.com", fromName: "Bob",
-        toAddrs: [{ address: "chris@example.com" }], ccAddrs: [], bccAddrs: [],
-        subject: "Hello", bodyText: "Hi", bodyHtml: "<p>Hi</p>", snippet: "Hi",
-        sentAt: now, folder: "INBOX", imapUid: 42, seen: true, direction: "inbound" as const,
-        createdAt: now, updatedAt: now,
-        attachments: [{
-          id: uuid1, messageId: uuid2, filename: "invoice.pdf", mime: "application/pdf",
-          sizeBytes: 10, contentId: null, isInline: false, createdAt: now,
-        }],
+  const detail = {
+    thread: {
+      id: uuid1, subject: "Re: Proposal", lastMessageAt: now, messageCount: 1,
+      companyId: null, contactId: uuid2, dealId: null, projectId: null,
+      archivedAt: null, createdAt: now, updatedAt: now,
+    },
+    messages: [{
+      id: uuid2, accountId: uuid1, threadId: uuid1,
+      messageId: "<abc@example.com>", inReplyTo: null, referencesIds: [],
+      fromAddr: "bob@example.com", fromName: "Bob",
+      toAddrs: [{ address: "chris@example.com" }], ccAddrs: [], bccAddrs: [],
+      subject: "Hello", bodyText: "Hi", bodyHtml: "<p>Hi</p>", snippet: "Hi",
+      sentAt: now, folder: "INBOX", imapUid: 42, seen: true, direction: "inbound" as const,
+      createdAt: now, updatedAt: now,
+      attachments: [{
+        id: uuid1, messageId: uuid2, filename: "invoice.pdf", mime: "application/pdf",
+        sizeBytes: 10, contentId: null, isInline: false, createdAt: now,
       }],
-      dealSuggestions: [{ id: uuid2, title: "Renewal" }],
-    };
+    }],
+    dealSuggestions: [{ id: uuid2, title: "Renewal" }],
+    ownedByViewer: true,
+  };
+
+  it("accepts a thread with messages, their attachments, and deal suggestions", () => {
     expect(mailThreadDetailSchema.parse(detail)).toEqual(detail);
+  });
+
+  it("requires ownedByViewer", () => {
+    const { ownedByViewer: _dropped, ...rest } = detail;
+    expect(() => mailThreadDetailSchema.parse(rest)).toThrow();
   });
 });
 
@@ -1301,18 +1346,31 @@ describe("bulkThreadResultSchema", () => {
     })).toThrow();
   });
 
+  // Phase 4.2: not_owner joins the SKIP half (it is a NotedSkipReason, unlike
+  // out_of_scope -- api: mail-move.ts's own comment on that distinction), so
+  // it must parse on that side and be refused on the failure side, same as
+  // every other skip reason exercised above.
+  it("accepts not_owner as a skip reason, and refuses it as a failure reason", () => {
+    const skip = { threadId: uuid1, ok: true, skipped: true, reason: "not_owner" as const };
+    expect(bulkThreadResultSchema.parse({ results: [skip] })).toEqual({ results: [skip] });
+    expect(() => bulkThreadResultSchema.parse({
+      results: [{ threadId: uuid1, ok: false, error: "not yours", reason: "not_owner" }],
+    })).toThrow();
+  });
+
   it("names every failure and skip reason the move service can produce", () => {
     // Pinned so a rename cannot quietly land without the client that
     // branches on these being updated with it.
     expect(bulkThreadFailureReasonSchema.options)
       .toEqual(["no_sync", "no_target", "not_found", "server_refused"]);
-    // The first three in precedence order (a message could not be moved, a
-    // message could not be moved, the goal already holds); out_of_scope last
-    // because it takes no part in that precedence -- it is what a thread
-    // reports when NOTHING of it was in scope (api: mail-move.ts's
+    // archived_account, not_owner, awaiting_reconciliation, already_in_target
+    // are in SKIP_REASON_RANK's precedence order (api: mail-move.ts) -- see
+    // that table's own comment for why not_owner sits second; out_of_scope
+    // last because it takes no part in that precedence -- it is what a
+    // thread reports when NOTHING of it was in scope (mail-move.ts's
     // noteSkip/skip).
     expect(bulkThreadSkipReasonSchema.options)
-      .toEqual(["archived_account", "awaiting_reconciliation", "already_in_target", "out_of_scope"]);
+      .toEqual(["archived_account", "not_owner", "awaiting_reconciliation", "already_in_target", "out_of_scope"]);
   });
 
   it("rejects error present alongside ok: true", () =>

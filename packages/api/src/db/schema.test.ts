@@ -6,7 +6,7 @@ import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSy
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema,
+  mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema, mailVisibilitySchema,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { TEST_DATABASE_URL } from "../test/global-setup.js";
@@ -221,7 +221,8 @@ describe("mail schema (0004)", () => {
   it("applies every column default when a row supplies only the required fields", async () => {
     const [account] = await handle.db.insert(mailAccounts).values(accountValues()).returning();
     expect(account).toMatchObject({
-      sentFolder: "Sent", backfillDays: 90, status: "active", signatureHtml: null, lastError: null,
+      sentFolder: "Sent", backfillDays: 90, visibility: "private", status: "active",
+      signatureHtml: null, lastError: null,
     });
 
     const [folder] = await handle.db.insert(mailFolderState).values({
@@ -665,5 +666,64 @@ describe("mail folder schema (0005)", () => {
     const [ordinary] = await handle.db.insert(mailAccountFolders)
       .values(folderValues(account!.id, { folder: "Projects", specialUse: null })).returning();
     expect(ordinary?.specialUse).toBeNull();
+  });
+});
+
+describe("mail visibility schema (0006)", () => {
+  // THE point of 0006: the column's own DEFAULT is the "everything becomes
+  // private" migration, not a separate UPDATE statement -- see
+  // mail_accounts.visibility's comment in schema.ts and the spec's Data
+  // model section ("No backfill statement needed"). This proves that on a
+  // database that was genuinely pre-0006, migrated only through 0005 and
+  // already carrying a real account row inserted BEFORE visibility existed
+  // as a column at all (raw SQL naming only the pre-0006 columns, same
+  // technique as the 0005 drill above for trash_folder/archive_folder).
+  // Mirrors the 0004/0005 upgrade drills: scratch database, never the shared
+  // conduit_test one.
+  it("applies migration 0006 on top of a real database already migrated only through 0005 -- a pre-existing account comes back visibility = 'private'", async () => {
+    await withPreMigrationDatabase("0006", async (scratch) => {
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const [account] = await scratch.db.execute<{ id: string }>(sql`
+        INSERT INTO mail_accounts
+          (user_id, label, email, imap_host, imap_port, imap_security,
+           smtp_host, smtp_port, smtp_security, username, credentials_ciphertext)
+        VALUES
+          (${user!.id}, 'Work', 'chris@example.com', 'localhost', 993, 'tls',
+           'localhost', 587, 'starttls', 'chris', 'v1:iv:tag:data')
+        RETURNING id
+      `);
+
+      // Upgrade: apply the real, full migrations folder. 0006 is the only
+      // pending migration (0000-0005 are already recorded as applied).
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // The pre-existing row survived, and the new column's DEFAULT alone
+      // made it private -- nothing here ever ran an UPDATE.
+      const [reread] = await scratch.db.select().from(mailAccounts).where(eq(mailAccounts.id, account!.id));
+      expect(reread).toMatchObject({ id: account!.id, email: "chris@example.com", visibility: "private" });
+    });
+  }, 30000);
+
+  it("defaults a fresh account's visibility to private", async () => {
+    const [account] = await handle.db.insert(mailAccounts)
+      .values(accountValues({ email: "fresh@example.com" })).returning();
+    expect(account?.visibility).toBe("private");
+  });
+
+  // Mirrors the 0004 block's "keeps mailSecuritySchema/... in sync" pattern
+  // for this migration's one enum CHECK.
+  it("keeps mailVisibilitySchema in sync with mail_accounts' visibility CHECK", async () => {
+    expect(mailVisibilitySchema.options).toEqual(["private", "shared"]);
+
+    for (const visibility of mailVisibilitySchema.options) {
+      await handle.db.insert(mailAccounts)
+        .values(accountValues({ visibility, label: visibility, email: `${visibility}@example.com` }));
+    }
+    await expect(
+      handle.db.insert(mailAccounts)
+        .values(accountValues({ visibility: "public", email: "bogus-visibility@example.com" })),
+    ).rejects.toMatchObject({
+      cause: { message: expect.stringMatching(/mail_accounts_visibility_valid|check/i) },
+    });
   });
 });

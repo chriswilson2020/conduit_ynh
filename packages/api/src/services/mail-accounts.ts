@@ -2,7 +2,7 @@ import { and, desc, eq, isNull, isNotNull, ne } from "drizzle-orm";
 import type {
   MailAccount, MailAccountCreateInput, MailAccountUpdateInput, MailAccountTestInput,
   MailAccountUpdatePasswordFields, MailAccountSummary, MailAccountList, MailAccountTestResult,
-  MailSecurity, MailAccountStatus,
+  MailSecurity, MailAccountStatus, MailVisibility,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { mailAccounts, type MailAccountRow } from "../db/schema.js";
@@ -150,6 +150,7 @@ function toMailAccount(row: MailAccountRow) {
     sentFolder: row.sentFolder,
     trashFolder: row.trashFolder, archiveFolder: row.archiveFolder,
     signatureHtml: row.signatureHtml, backfillDays: row.backfillDays,
+    visibility: row.visibility as MailVisibility,
     status: row.status as MailAccountStatus, lastError: row.lastError,
     lastSyncedAt: row.lastSyncedAt?.toISOString() ?? null,
     archivedAt: row.archivedAt?.toISOString() ?? null,
@@ -320,6 +321,16 @@ export async function updateAccount(
   // restarted (see notifyAccountChanged's call below). The running loop reads
   // the account row on its next pass, and mail-move.ts re-reads these two
   // columns at move time precisely because a pass can fill them underneath it.
+  //
+  // `visibility` (Phase 4.2) is the same shape of non-omission: flipping
+  // Private/Shared changes nothing IMAP/SMTP is built from either, so it is
+  // deliberately absent from CONNECTION_FIELDS too -- a wake, not a restart.
+  // What DOES differ from trashFolder/archiveFolder is the SSE fan-out: every
+  // OTHER user's thread list and unread count change when an account's
+  // visibility flips (the spec's Settings section), not just this account's
+  // own row -- Task 3 widens the hint below from `[["mail-accounts"]]` alone
+  // to also publish `[["mail-threads"]]` and `[["mail-unread"]]` when
+  // `visibility` is among `changedKeys`.
   const withSentFolder = rest.sentFolder !== undefined
     ? { ...rest, sentFolder: normalizeSentFolder(rest.sentFolder) }
     : rest;

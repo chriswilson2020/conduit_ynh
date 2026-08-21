@@ -86,6 +86,16 @@ describe("createAccount", () => {
     }
   });
 
+  // Phase 4.2: every account is BORN private (mail_accounts.visibility's DB
+  // default) -- mailAccountCreateInputSchema carries no field to override
+  // this at create time (see that schema's own comment), and toMailAccount
+  // must surface the DB default back rather than silently dropping the
+  // column.
+  it("defaults a newly-created account's visibility to private", async () => {
+    const account = await make();
+    expect(account.visibility).toBe("private");
+  });
+
   it("defaults smtpPassword to password when no override is given", async () => {
     const account = await make({ password: "shared-secret" });
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
@@ -190,6 +200,22 @@ describe("updateAccount", () => {
     // An explicit null clears a previously-set override.
     const cleared = await updateAccount(handle.db, actorId, account.id, { trashFolder: null }, keyPath);
     expect(cleared).toMatchObject({ trashFolder: null, archiveFolder: "Archive" });
+  });
+
+  // Phase 4.2: the owner-only Private/Shared toggle. Owner-scoping comes free
+  // from updateAccount's existing mustGetOwned/locked-row path (no separate
+  // guard needed) -- this test is about the FIELD flowing through, not
+  // re-proving ownership enforcement, which the "rejects a patch from a
+  // non-owner" test elsewhere in this file already covers for every field.
+  it("persists a visibility change, and toMailAccount surfaces it back", async () => {
+    const account = await make();
+    expect(account.visibility).toBe("private");
+
+    const flipped = await updateAccount(handle.db, actorId, account.id, { visibility: "shared" }, keyPath);
+    expect(flipped.visibility).toBe("shared");
+
+    const refetched = await getOwnAccount(handle.db, actorId, account.id);
+    expect(refetched.visibility).toBe("shared");
   });
 
   it("trims trashFolder/archiveFolder, and reads a resubmitted padded value as no change", async () => {
@@ -363,6 +389,19 @@ describe("updateAccount", () => {
     const updated = await updateAccount(handle.db, actorId, account.id, { signatureHtml: "<p>New sig</p>" }, keyPath);
     expect(updated.status).toBe("error");
     expect(updated.lastError).toBe("boom");
+  });
+
+  // Phase 4.2: flipping Private/Shared is not a connection change (mail-
+  // accounts.ts's CONNECTION_FIELDS comment) -- same shape as the label/
+  // backfillDays/signatureHtml cases above, proving `visibility` was not
+  // slipped into CONNECTION_FIELDS by mistake.
+  it("does NOT reset an errored account when only visibility changes", async () => {
+    const account = await make();
+    await forceError(account.id);
+    const updated = await updateAccount(handle.db, actorId, account.id, { visibility: "shared" }, keyPath);
+    expect(updated.status).toBe("error");
+    expect(updated.lastError).toBe("boom");
+    expect(updated.visibility).toBe("shared");
   });
 
   it("publishes the mail-accounts SSE key on a real write", async () => {
@@ -876,6 +915,13 @@ describe("account-changed hook", () => {
       // never dropped and re-LOGINed (Task 4).
       calls.length = 0;
       await updateAccount(handle.db, actorId, account.id, { trashFolder: "Deleted Items" }, keyPath);
+      expect(calls).toEqual([{ accountId: account.id, connectionChanged: false }]);
+
+      // Nor does visibility (Phase 4.2): flipping Private/Shared changes
+      // nothing IMAP/SMTP is built from either, so this is a wake, never a
+      // restart -- CONNECTION_FIELDS must not have picked it up.
+      calls.length = 0;
+      await updateAccount(handle.db, actorId, account.id, { visibility: "shared" }, keyPath);
       expect(calls).toEqual([{ accountId: account.id, connectionChanged: false }]);
 
       calls.length = 0;

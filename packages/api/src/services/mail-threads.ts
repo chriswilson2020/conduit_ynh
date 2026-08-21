@@ -476,6 +476,16 @@ export async function listThreads(
         snippet: extra?.snippet ?? "",
         senders: extra?.senders ?? [],
         accountIds: extra?.accountIds ?? [],
+        // Phase 4.2 contract seam: mailThreadListItemSchema requires
+        // ownedByViewer (packages/shared), but this function has no actor to
+        // compute it against yet -- Task 2 threads a userId through every
+        // read path in this file and answers it for real, in the same
+        // aggregate pass as accountIds/senders above (does the viewer own >=
+        // 1 account this thread has a message on?). `true` here is not a
+        // guess: it is today's actual behaviour (move rights are owner-only
+        // per the Phase 4.2 spec, but that gate is not wired until Task 3),
+        // so this placeholder changes nothing for any current caller.
+        ownedByViewer: true,
       } satisfies MailThreadListItem;
     }),
     nextCursor: rows.length > limit && last !== undefined
@@ -551,7 +561,13 @@ export async function getThreadDetail(db: Database, id: string, apiBase: string)
     attachments: byMessage.get(row.id) ?? [],
   }));
 
-  return { thread: toThread(thread), messages, dealSuggestions: await loadDealSuggestions(db, thread) };
+  return {
+    thread: toThread(thread), messages, dealSuggestions: await loadDealSuggestions(db, thread),
+    // Same Phase 4.2 seam as listThreads' ownedByViewer above -- see that
+    // comment for why `true` is a faithful placeholder, not a guess, until
+    // Task 2 threads an actor through this function.
+    ownedByViewer: true,
+  };
 }
 
 // --- Read ------------------------------------------------------------------

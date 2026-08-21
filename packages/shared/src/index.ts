@@ -481,6 +481,15 @@ export type MailSecurity = z.infer<typeof mailSecuritySchema>;
 export const mailAccountStatusSchema = z.enum(["active", "error"]);
 export type MailAccountStatus = z.infer<typeof mailAccountStatusSchema>;
 
+// Phase 4.2: private by default, per account (spec's Decisions table: "the
+// safe direction", the owner flips a mailbox to shared in Settings). Drives
+// the inbox/record visibility predicate (api: mail-threads.ts, Task 2) --
+// see mail_accounts.visibility's own comment (api: db/schema.ts) for what
+// 'private'/'shared' each mean and why the DB default alone is the whole
+// migration.
+export const mailVisibilitySchema = z.enum(["private", "shared"]);
+export type MailVisibility = z.infer<typeof mailVisibilitySchema>;
+
 // mail_account_folders.special_use's five classified values (Phase 4.1) --
 // the SPECIAL-USE attribute (RFC 6154) where the server offers it, else a
 // case-insensitive name-heuristic fallback (api: services/mail-folders.ts).
@@ -507,6 +516,7 @@ export const mailAccountSchema = z.object({
   trashFolder: nullableString, archiveFolder: nullableString,
   signatureHtml: nullableString,
   backfillDays: z.number().int().positive().nullable(),
+  visibility: mailVisibilitySchema,
   status: mailAccountStatusSchema,
   lastError: nullableString,
   lastSyncedAt: z.iso.datetime().nullable(),
@@ -532,6 +542,13 @@ export type MailAccountSummary = z.infer<typeof mailAccountSummarySchema>;
 // smtpPassword override, per the "SMTP differs" toggle in the Phase 4 spec's
 // Key handling section -- when smtpPassword is omitted, the service reuses
 // password for both protocols.
+//
+// No `visibility` here, deliberately (Phase 4.2): every account is BORN
+// private (mail_accounts.visibility's DB default, db/schema.ts) -- there is
+// no "create it shared" gesture, only a later, deliberate flip in Settings
+// once the mailbox exists. Same shape of omission as trashFolder/
+// archiveFolder below: a field that is genuinely update-only stays off the
+// create schema rather than being accepted-and-ignored.
 export const mailAccountCreateInputSchema = z.object({
   label: z.string().min(1), email: z.email(),
   imapHost: z.string().min(1), imapPort: z.number().int().positive(), imapSecurity: mailSecuritySchema,
@@ -564,9 +581,20 @@ export type MailAccountCreateInput = z.infer<typeof mailAccountCreateInputSchema
 // mail-accounts.ts), "" is never a meaningful override here, only a real
 // folder name or an explicit null. Trimming a real value is service-side
 // work in Task 4 (mirroring normalizeSentFolder), not a schema concern.
+//
+// `visibility` joins trashFolder/archiveFolder in this `.extend()`, for the
+// same reason: it is on THIS schema only, never mailAccountCreateInputSchema
+// (see that schema's own comment on why an account is always born private).
+// Owner-only like every other field here (mail-accounts.ts's updateAccount
+// runs every patch through mustGetOwned before it touches a row) -- flipping
+// it is a deliberate Settings act, not a connection change (Task 3 wires the
+// CONNECTION_FIELDS exclusion and the wider SSE hints this needs).
 export const mailAccountUpdateInputSchema = mailAccountCreateInputSchema
   .omit({ password: true, smtpPassword: true }).partial()
-  .extend({ trashFolder: nullableString.optional(), archiveFolder: nullableString.optional() });
+  .extend({
+    trashFolder: nullableString.optional(), archiveFolder: nullableString.optional(),
+    visibility: mailVisibilitySchema.optional(),
+  });
 export type MailAccountUpdateInput = z.infer<typeof mailAccountUpdateInputSchema>;
 
 // The update-path counterpart to mailAccountCreateInputSchema's password/
@@ -788,11 +816,12 @@ export const mailAttachmentSchema = z.object({
 });
 export type MailAttachment = z.infer<typeof mailAttachmentSchema>;
 
-// One row of GET /api/mail/threads. The four extra fields are everything the
+// One row of GET /api/mail/threads. The five extra fields are everything the
 // thread-list row renders that is NOT on the thread itself (unread dot,
-// senders summary, snippet, account chip) -- derived per page from the
-// thread's messages rather than denormalised onto mail_threads, because
-// every one of them changes on ingest and none is worth a second writer.
+// senders summary, snippet, account chip, move-rights flag) -- derived per
+// page from the thread's messages rather than denormalised onto mail_threads,
+// because every one of them changes on ingest and none is worth a second
+// writer.
 export const mailThreadListItemSchema = mailThreadSchema.extend({
   /** At least one message in the thread is unseen. */
   unread: z.boolean(),
@@ -809,6 +838,19 @@ export const mailThreadListItemSchema = mailThreadSchema.extend({
   senders: z.array(mailAddressSchema),
   /** Every account whose mailbox this thread is visible in. */
   accountIds: z.array(z.uuid()),
+  /**
+   * Phase 4.2: does the viewer own at least one account this thread carries a
+   * message on? Computed in the same aggregate pass as `accountIds`/`senders`
+   * (>= 1 message on an account owned by the requesting user), not persisted
+   * anywhere -- "owner" is a fact about the ACCOUNT, and a thread can span
+   * several. Drives Task 4's Archive/Trash gating (move rights are
+   * owner-only, per the spec's Move rights section): `false` means every
+   * message here belongs to someone else's mailbox, so only Hide-in-CRM
+   * applies. Named for the viewer specifically because it answers "can THIS
+   * request's actor move something here", not "does this thread have an
+   * owner" in the abstract.
+   */
+  ownedByViewer: z.boolean(),
 });
 export type MailThreadListItem = z.infer<typeof mailThreadListItemSchema>;
 
@@ -836,6 +878,15 @@ export const mailThreadDetailSchema = z.object({
   thread: mailThreadSchema,
   messages: z.array(mailMessageWithAttachmentsSchema),
   dealSuggestions: z.array(mailDealSuggestionSchema),
+  // Phase 4.2: the conversation view's own copy of mailThreadListItemSchema's
+  // `ownedByViewer` (same definition, same aggregate computation -- see that
+  // field's comment) -- a sibling of `thread`/`messages`/`dealSuggestions`
+  // rather than nested inside `thread`, because `thread` stays exactly the
+  // mail_threads row shape (mailThreadSchema, shared with the list item via
+  // `.extend()`) and this is a per-request, per-viewer derived fact about it,
+  // the same relationship `dealSuggestions` already has to `thread`. Drives
+  // Task 4's single-thread Archive/Trash buttons in the conversation view.
+  ownedByViewer: z.boolean(),
 });
 export type MailThreadDetail = z.infer<typeof mailThreadDetailSchema>;
 
@@ -986,12 +1037,27 @@ export const bulkThreadFailureReasonSchema = z.enum([
 ]);
 export type BulkThreadFailureReason = z.infer<typeof bulkThreadFailureReasonSchema>;
 
-// WHY a thread was a no-op. The first three are the spec's
-// empty-eligible-set causes (Move write-back, step 1), listed in the
-// precedence mail-move.ts applies when one thread hits several:
+// WHY a thread was a no-op. The first four are the spec's
+// empty-eligible-set causes (Move write-back, step 1, plus Phase 4.2's
+// ownership rule), listed in the precedence mail-move.ts's SKIP_REASON_RANK
+// applies when one thread hits several:
 // - archived_account: its messages belong to an archived mail account, whose
 //   sync loop is torn down. Persistent, and fixable only in Settings, so it
 //   outranks the others.
+// - not_owner (Phase 4.2, Task 3 wires the actual filter): its messages sit
+//   on an account the ACTOR does not own -- move rights are owner-only (spec:
+//   "a colleague must never reorganise your actual mailbox"). Ranked directly
+//   below archived_account: "not yours" is the most specific and least
+//   actionable of the four explanations (nothing the current user does, in
+//   Settings or anywhere else, ever changes it -- unlike archived_account,
+//   which the OWNER can fix by unarchiving), so when a thread mixes causes it
+//   is the one worth outranking the two self-resolving reasons below. UNLIKE
+//   out_of_scope, this one IS recorded against individual messages (a message
+//   this actor cannot move is still examined and classified, not skipped
+//   before it is looked at), which is what makes it a NotedSkipReason and
+//   gives it a rank slot at all -- see mail-move.ts's own NotedSkipReason
+//   comment for that distinction. The precedence only matters when one
+//   thread's messages hit more than one cause at once, which is rare.
 // - awaiting_reconciliation: NULL imap_uid -- a just-sent message the Sent
 //   pass has not re-sighted. Transient; asking again after the next pass
 //   works.
@@ -1007,7 +1073,7 @@ export type BulkThreadFailureReason = z.infer<typeof bulkThreadFailureReasonSche
 //   the third. It takes no part in the precedence above: it is never recorded
 //   against a message, only used when a thread finishes with no reason at all.
 export const bulkThreadSkipReasonSchema = z.enum([
-  "archived_account", "awaiting_reconciliation", "already_in_target", "out_of_scope",
+  "archived_account", "not_owner", "awaiting_reconciliation", "already_in_target", "out_of_scope",
 ]);
 export type BulkThreadSkipReason = z.infer<typeof bulkThreadSkipReasonSchema>;
 

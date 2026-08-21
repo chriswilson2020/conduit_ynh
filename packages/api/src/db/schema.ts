@@ -344,6 +344,19 @@ export const mailAccounts = pgTable("mail_accounts", {
   // NULL = sync everything, not "sync nothing" -- see mail-sync.ts (later
   // task)'s backfill, which treats NULL as "no lower bound."
   backfillDays: integer("backfill_days").default(90),
+  // Phase 4.2: private by default, per account (spec's Decisions table).
+  // Governs the inbox/record visibility predicate mail-threads.ts builds
+  // once and applies to every mail read path: 'private' means only the
+  // owner sees this mailbox's threads in their inbox (a thread can still
+  // surface to other users on a record it is deliberately linked to --
+  // that is the visibility predicate's record scope, not this column);
+  // 'shared' restores the pre-4.2 behaviour of every synced thread being
+  // visible to every CRM user. DEFAULT 'private' IS the migration: this
+  // column's ALTER default is what makes every pre-existing account
+  // private on upgrade, with no separate UPDATE/backfill statement needed
+  // (schema.test.ts's withPreMigrationDatabase("0006") drill asserts a
+  // pre-0006 row comes back private, not just that the column exists).
+  visibility: text("visibility").notNull().default("private"),
   status: text("status").notNull().default("active"),
   lastError: text("last_error"),
   lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
@@ -354,6 +367,7 @@ export const mailAccounts = pgTable("mail_accounts", {
   check("mail_accounts_imap_security_valid", sql`imap_security IN ('tls','starttls')`),
   check("mail_accounts_smtp_security_valid", sql`smtp_security IN ('tls','starttls')`),
   check("mail_accounts_status_valid", sql`status IN ('active','error')`),
+  check("mail_accounts_visibility_valid", sql`visibility IN ('private','shared')`),
 ]);
 export type MailAccountRow = typeof mailAccounts.$inferSelect;
 
