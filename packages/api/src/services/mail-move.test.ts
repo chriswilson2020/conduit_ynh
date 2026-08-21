@@ -880,10 +880,12 @@ describe("moveThreads: visibility and ownership", () => {
   });
 
   it("moves only the owned half of a mixed-ownership thread", async () => {
-    // One conversation, two mailboxes, two owners. chris sees the thread
-    // through his own half; sam's half is not his to file.
+    // One conversation, two mailboxes, two owners. sam's account is SHARED so
+    // his half is VISIBLE to chris -- in scope, examined, and dropped by the
+    // ownership check specifically (a private foreign half would instead
+    // never enter scope at all; the folder-crafted test below pins that).
     const mine = await makeAccount();
-    const theirs = await makeAccount({ userId: actorId, label: "Sams" });
+    const theirs = await makeAccount({ userId: actorId, label: "Sams", visibility: "shared" });
     const threadId = await makeThread();
     await makeMessage({ threadId, accountId: mine, folder: "INBOX", imapUid: 311 });
     await makeMessage({ threadId, accountId: theirs, folder: "INBOX", imapUid: 312 });
@@ -975,6 +977,68 @@ describe("moveThreads: visibility and ownership", () => {
 
     expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "not_owner" }]);
     expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 341 });
+  });
+
+  it("keeps invisible messages out of scope: a folder holding only foreign private copies is out_of_scope", async () => {
+    // Spec Amendment 4 (the D6 ruling). The thread is visible to chris
+    // through his own INBOX copy, but sam's PRIVATE copies in "Projects" are
+    // not chris's to see -- so a folder-scoped move on Projects answers with
+    // chris's own world (nothing of this thread there), never a not_owner
+    // that would disclose invisible messages sitting in that folder.
+    const mine = await makeAccount();
+    const theirs = await makeAccount({ userId: actorId, label: "Sams" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId: mine, folder: "INBOX", imapUid: 361 });
+    await makeMessage({ threadId, accountId: theirs, folder: "Projects", imapUid: 362 });
+
+    const result = await moveThreads(
+      handle.db, userId, { threadIds: [threadId], folder: "Projects", action: "archive" },
+      deps(new FakeManager()),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "out_of_scope" }]);
+    expect((await messageRows(threadId))[1]).toMatchObject({ folder: "Projects", imapUid: 362 });
+  });
+
+  it("reports the viewer's own awaiting_reconciliation, never a foreign invisible copy's not_owner", async () => {
+    // The other half of the same ruling: chris's own copy is merely
+    // un-re-sighted (NULL uid, self-healing), and sam's private copy must not
+    // outrank that with a "not yours" about messages chris cannot see --
+    // not_owner (rank 1) would beat awaiting_reconciliation (rank 2) if the
+    // invisible row were ever noted.
+    const mine = await makeAccount();
+    const theirs = await makeAccount({ userId: actorId, label: "Sams" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId: mine, folder: "INBOX", imapUid: null });
+    await makeMessage({ threadId, accountId: theirs, folder: "INBOX", imapUid: 371 });
+    const manager = new FakeManager();
+    manager.for(mine);
+
+    const result = await moveThreads(
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+    );
+
+    expect(result.results).toEqual([
+      { threadId, ok: true, skipped: true, reason: "awaiting_reconciliation" },
+    ]);
+    expect((await messageRows(threadId))[1]).toMatchObject({ folder: "INBOX", imapUid: 371 });
+  });
+
+  it("answers already_in_target for a visible unowned row already in the foreign target", async () => {
+    // The D5 ruling, pinned: the row loop asks "does the goal already hold?"
+    // before any ownership question -- a finished answer that needs no rights
+    // to be true, and (with invisible rows out of scope) one only ever given
+    // about a row the viewer can see. So the per-row order deliberately
+    // differs from SKIP_REASON_RANK here: rank 3 wins over rank 1.
+    const accountId = await makeAccount({ visibility: "shared" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "Archive", imapUid: 381 });
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], action: "archive" }, deps(new FakeManager()),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "already_in_target" }]);
   });
 
   it("gives no ownership answer for an unowned row outside the view folder", async () => {

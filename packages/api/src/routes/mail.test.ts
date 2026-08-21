@@ -1690,9 +1690,11 @@ describe("mail bulk thread action route", () => {
   it("gates each thread on visibility then ownership: own moves, shared skips, private and unknown answer alike", async () => {
     const a = await app();
     const { account, sync } = await readyAccount(a);
-    // dana's two accounts, both with resolved targets so only the Phase 4.2
-    // gates can be what stops a move: one shared (chris may see its threads,
-    // never file them), one private (chris must not learn it exists).
+    // dana's two accounts: one shared (chris may see its threads, never file
+    // them), one private (chris must not learn it exists). Both have resolved
+    // targets, and NEITHER gets a sync loop, ON PURPOSE -- unowned, that dead
+    // loop would have been a no_sync failure naming dana's account, so the
+    // answers below prove the Phase 4.2 gates decide before any refusal can.
     const shared = await makeAccount(a, { label: "Dana shared", email: "dana-shared@example.com" }, otherHeaders);
     await handle.db.update(mailAccounts).set({ visibility: "shared" }).where(eq(mailAccounts.id, shared.id));
     await setMoveTargets(shared.id, { trashFolder: "Trash", archiveFolder: "Archive" });

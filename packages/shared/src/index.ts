@@ -587,8 +587,10 @@ export type MailAccountCreateInput = z.infer<typeof mailAccountCreateInputSchema
 // (see that schema's own comment on why an account is always born private).
 // Owner-only like every other field here (mail-accounts.ts's updateAccount
 // runs every patch through mustGetOwned before it touches a row) -- flipping
-// it is a deliberate Settings act, not a connection change (Task 3 wires the
-// CONNECTION_FIELDS exclusion and the wider SSE hints this needs).
+// it is a deliberate Settings act, not a connection change: it is excluded
+// from updateAccount's CONNECTION_FIELDS (the sync loop is woken, never
+// restarted), and a real flip widens the post-commit SSE publish to carry
+// the thread-side key families beside [["mail-accounts"]].
 export const mailAccountUpdateInputSchema = mailAccountCreateInputSchema
   .omit({ password: true, smtpPassword: true }).partial()
   .extend({

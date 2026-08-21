@@ -215,7 +215,7 @@ function trimmedTrashFolder(): SQL {
 
 /**
  * WHO MAY SEE A MAIL THREAD (Phase 4.2). Two scopes, fixed by the spec's
- * predicate table, one helper pair carrying both -- the notInAccountTrash
+ * predicate table, one helper family carrying both -- the notInAccountTrash
  * pattern: built once here, composed into every read path rather than
  * re-derived per query.
  *
@@ -247,6 +247,10 @@ function trimmedTrashFolder(): SQL {
  * - visibleThreads: one THREAD is visible -- the self-contained
  *   EXISTS-over-messages form, for queries that select from mail_threads
  *   with no message scope of their own (the unscoped list, mustGetThread).
+ * - visibleMessageSelfContained: the record-scope MESSAGE term with both
+ *   arms wrapped in their own correlated EXISTS, for queries over bare
+ *   mail_messages rows with neither join in scope (markThreadRead's UPDATE,
+ *   mail-move's messages read).
  *
  * A thread with NO messages at all (unreachable through ingest, but the list
  * renders it defensively) is inbox-visible to nobody -- there is no account
@@ -284,6 +288,23 @@ export function visibleThreads(userId: string, scope: MailVisibilityScope): SQL 
   const carried = sql`EXISTS (SELECT 1 FROM ${mailMessages} JOIN ${mailAccounts} ON ${mailAccounts.id} = ${mailMessages.accountId} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${ownedOrShared(userId)})`;
   if (scope === "inbox") return carried;
   return sql`(${carried} OR ${recordLinked()})`;
+}
+
+/**
+ * The record-scope MESSAGE term in SELF-CONTAINED form: each arm is its own
+ * correlated EXISTS (mail_accounts for owned-or-shared, mail_threads for the
+ * deal/project arm), so unlike visibleMessageTerm it carries no join
+ * precondition -- a bare mail_messages row in scope is enough. Two callers,
+ * one source: markThreadRead's UPDATE below (where the readability decision
+ * and the write must be one atomic statement) and mail-move.ts's messages
+ * read (where a message the actor cannot see must never enter scope at all
+ * -- spec Amendment 4). Record scope only, because both callers sit behind a
+ * record-scope thread gate. Deliberately a WRAPPER over the same two pieces
+ * rather than a change to visibleMessageTerm itself: the composed queries'
+ * EXPLAIN record (0006's decision comment) measured that term as-is.
+ */
+export function visibleMessageSelfContained(userId: string): SQL {
+  return sql`(EXISTS (SELECT 1 FROM ${mailAccounts} WHERE ${mailAccounts.id} = ${mailMessages.accountId} AND ${ownedOrShared(userId)}) OR EXISTS (SELECT 1 FROM ${mailThreads} WHERE ${mailThreads.id} = ${mailMessages.threadId} AND ${recordLinked()}))`;
 }
 
 /**
@@ -840,9 +861,9 @@ export async function markThreadRead(
 ): Promise<{ thread: MailThread; writeBacks: SeenWriteBack[] }> {
   // mustGetThread is the visibility gate (an invisible thread 404s before
   // anything is written). Past it, the UPDATE's WHERE carries the record-
-  // scope message term entirely IN SQL -- the ownedOrShared account EXISTS
-  // and a correlated EXISTS over mail_threads for the deal/project arm -- so
-  // the readability decision and the write are one atomic statement. A JS
+  // scope message term entirely IN SQL -- visibleMessageSelfContained, the
+  // form whose arms are their own correlated EXISTS -- so the readability
+  // decision and the write are one atomic statement. A JS
   // snapshot of the link columns would race: link removal is open to any
   // record-visible viewer and the conversation view fires mark-read on open,
   // so a thread linked at gate time can be unlinked by UPDATE time, and a
@@ -861,7 +882,7 @@ export async function markThreadRead(
   const thread = await mustGetThread(db, userId, id);
   const readable = and(
     eq(mailMessages.threadId, id), eq(mailMessages.seen, false),
-    sql`(EXISTS (SELECT 1 FROM ${mailAccounts} WHERE ${mailAccounts.id} = ${mailMessages.accountId} AND ${ownedOrShared(userId)}) OR EXISTS (SELECT 1 FROM ${mailThreads} WHERE ${mailThreads.id} = ${mailMessages.threadId} AND ${recordLinked()}))`,
+    visibleMessageSelfContained(userId),
   );
   const changed = await db.update(mailMessages).set({ seen: true, updatedAt: new Date() })
     .where(readable)

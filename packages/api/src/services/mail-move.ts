@@ -8,7 +8,7 @@ import { NotFoundError } from "./errors.js";
 import { folderKey } from "./mail-folders.js";
 import { consoleSyncLogger, type SyncLogger } from "./mail-imap.js";
 import { UID_CHUNK, chunked } from "./mail-sync.js";
-import { archiveThread, visibleThreads } from "./mail-threads.js";
+import { archiveThread, visibleMessageSelfContained, visibleThreads } from "./mail-threads.js";
 import { publish } from "./sse.js";
 
 /**
@@ -57,13 +57,23 @@ import { publish } from "./sse.js";
  *   examined, so no account label, folder fact or skip reason can reach the
  *   response. The hide path resolves per thread through archiveThread
  *   (mail-threads' mustGetThread) and reports invisible identically.
- * - OWNERSHIP is decided second, among visible threads only: collectCandidates
+ *   Visibility is MESSAGE-granular past the thread gate too (spec Amendment
+ *   4): the messages read carries the self-contained record-scope term, so a
+ *   visible thread's foreign PRIVATE copies -- the unlinked cross-account
+ *   case -- never enter scope either: never examined, never noted. Without
+ *   that, a folder-scoped move on a folder holding only such copies would
+ *   answer not_owner where the viewer's own world truthfully says
+ *   out_of_scope, disclosing that invisible messages exist there.
+ * - OWNERSHIP is decided second, among visible messages only: collectCandidates
  *   compares each in-scope message's account owner against `actorId`, and an
  *   unowned row drops out as the noted skip `not_owner` (spec, Move rights:
  *   only the mailbox owner performs IMAP moves -- a colleague must never
- *   reorganise your actual mailbox; other viewers get Hide-in-CRM). The two
- *   are different answers on purpose: a visible thread is honestly told WHY
- *   nothing moved, an invisible one is denied existing at all.
+ *   reorganise your actual mailbox; other viewers get Hide-in-CRM).
+ *   `not_owner` therefore means precisely "a message you can SEE but do not
+ *   own" -- a shared account's, or any message of a deal/project-linked
+ *   thread. The two are different answers on purpose: a visible thread is
+ *   honestly told WHY nothing moved, an invisible one is denied existing at
+ *   all.
  *
  * The IMAP write happens through EACH MESSAGE'S OWN account's sync loop,
  * under that account's credentials -- the actor's identity never reaches a
@@ -224,6 +234,18 @@ type NotedSkipReason = Exclude<BulkThreadSkipReason, "out_of_scope">;
  * what mixed threads report. This ordering only matters when one thread's
  * messages hit more than one cause at once, which is rare -- see shared's
  * bulkThreadSkipReasonSchema comment for the fuller reasoning.
+ *
+ * THE PER-ROW CLASSIFICATION ORDER IS NOT THIS RANK ORDER, and answers a
+ * different question (coordinator ruling, Task 3 spec review): the rank
+ * arbitrates the THREAD-level answer among reasons already noted, while the
+ * row loop gives each row its cheapest finished answer first. Two visible
+ * consequences, both deliberate and both pinned by tests: a row already in
+ * its target reports already_in_target (rank 3) without any ownership check
+ * -- "the goal already holds" needs no rights to be true, and it can only be
+ * said of a row the viewer can SEE (invisible rows never enter the loop),
+ * whose folder facts the UI shows anyway; and a visible unowned row with a
+ * NULL uid reports not_owner rather than awaiting_reconciliation -- it is
+ * not yours to move regardless of its uid state.
  */
 const SKIP_REASON_RANK: Record<NotedSkipReason, number> = {
   archived_account: 0,
@@ -513,10 +535,11 @@ function accountStateOf(
  *
  * A thread the actor cannot SEE (record scope, the header's visibility gate)
  * fails as not_found before any of this -- indistinguishable from an id that
- * names nothing. Among visible threads, four kinds of message are dropped
- * from the eligible set in either mode, and a thread left with none is
- * reported `{ ok: true, skipped: true }` -- a successful no-op, never a
- * failure:
+ * names nothing -- and a visible thread's individually invisible messages
+ * are out of scope entirely, never examined and never reported on (spec
+ * Amendment 4). Among the visible messages, four kinds are dropped from the
+ * eligible set in either mode, and a thread left with none is reported
+ * `{ ok: true, skipped: true }` -- a successful no-op, never a failure:
  *
  * - AWAITING RECONCILIATION (`imap_uid` NULL -- a just-sent message the Sent
  *   pass has not re-sighted): there is no UID to name it to the server. Rare,
@@ -649,7 +672,9 @@ async function hideThreads(
  *
  * Three reads, in this order: the requested threads (to tell "no such thread"
  * apart from "nothing to move", with the visibility gate folded in), their
- * messages, and the accounts those messages belong to.
+ * VISIBLE messages (the actor's record scope, message-granular -- an
+ * invisible row never enters scope), and the accounts those messages belong
+ * to.
  *
  * THE ACCOUNTS ARE READ HERE, at move time, and never passed in or cached: a
  * sync pass fills trash_folder/archive_folder the first time it can classify
@@ -695,10 +720,21 @@ async function collectCandidates(
   // `awaiting_reconciliation` rather than the fallback skip reason, and a row
   // the query never returned cannot say so. The extra rows are few (a NULL uid
   // lasts until the next pass of the Sent folder).
+  //
+  // VISIBILITY, by contrast, IS filtered here, in SQL (spec Amendment 4): a
+  // message the actor cannot see must never enter scope, because everything
+  // the loop below does to a row is observable -- a noted reason, a refusal
+  // -- and each would disclose something about a mailbox the actor may not
+  // know exists (a foreign private copy's not_owner would reveal messages in
+  // a folder where the actor's own world truthfully has nothing, and would
+  // outrank the actor's own awaiting_reconciliation). Self-contained form
+  // because this select joins neither mail_accounts nor mail_threads.
   const messages = await db.select({
     id: mailMessages.id, threadId: mailMessages.threadId, accountId: mailMessages.accountId,
     folder: mailMessages.folder, imapUid: mailMessages.imapUid,
-  }).from(mailMessages).where(inArray(mailMessages.threadId, [...known]));
+  }).from(mailMessages).where(
+    and(inArray(mailMessages.threadId, [...known]), visibleMessageSelfContained(actorId)),
+  );
   if (messages.length === 0) return { candidates: [], refusedAccounts: 0 };
 
   const accountIds = [...new Set(messages.map((row) => row.accountId))];

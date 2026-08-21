@@ -69,8 +69,9 @@ Per-account **Private / Shared** toggle beside the folder picker (owner-only, li
 account setting; `visibility` rides `mailAccountSchema` + the update input). Copy states the
 sharing line: "Private: only you see this mailbox's conversations. Threads you link to a
 deal or project become visible on that record. Shared: every CRM user sees this mailbox."
-Flipping publishes the existing `[["mail-accounts"]]` hint plus `[["mail-threads"]]` (the
-lists' contents change for every user).
+Flipping publishes one frame carrying the existing `[["mail-accounts"]]` hint plus
+`[["mail-threads"]]` and `[["mail-unread"]]` (every user's lists, badge and per-folder
+counts change -- corrected from two families to three by Amendment 5).
 
 ## Out of scope (deferred, not rejected)
 
@@ -126,3 +127,15 @@ Ruled during Task 2's spec review; each supersedes the corresponding line above.
    anything is composed or sent — and builds its In-Reply-To/References chain from the
    newest message the viewer may read, never leaking an invisible message's Message-ID
    into outgoing headers.
+4. **Messages the actor cannot see are out of scope entirely on the move paths** (ruled
+   during Task 3's spec review). collectCandidates' messages read carries the
+   record-scope visibility term, so an invisible message is never examined and never
+   noted: a folder-scoped move on a folder holding only foreign private copies answers
+   `out_of_scope` (the viewer's own world's truth), and a foreign invisible copy can
+   never outrank the viewer's own skip reason. Among visible in-scope messages, unowned
+   ones note `not_owner` — which therefore means precisely "a message you can see but do
+   not own" (a shared account's, or any message of a deal/project-linked thread).
+5. **The visibility flip publishes three hint families, not the Settings section's
+   original two**: `[["mail-accounts"]]` + `[["mail-threads"]]` + `[["mail-unread"]]` —
+   the unread computations are visibility-scoped, so the badge and per-folder counts
+   change for every user too. The Settings line above is corrected in place.
