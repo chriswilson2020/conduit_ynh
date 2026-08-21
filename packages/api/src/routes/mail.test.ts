@@ -1687,6 +1687,53 @@ describe("mail bulk thread action route", () => {
     await a.close();
   });
 
+  it("gates each thread on visibility then ownership: own moves, shared skips, private and unknown answer alike", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    // dana's two accounts, both with resolved targets so only the Phase 4.2
+    // gates can be what stops a move: one shared (chris may see its threads,
+    // never file them), one private (chris must not learn it exists).
+    const shared = await makeAccount(a, { label: "Dana shared", email: "dana-shared@example.com" }, otherHeaders);
+    await handle.db.update(mailAccounts).set({ visibility: "shared" }).where(eq(mailAccounts.id, shared.id));
+    await setMoveTargets(shared.id, { trashFolder: "Trash", archiveFolder: "Archive" });
+    const priv = await makeAccount(a, { label: "Dana private", email: "dana-private@example.com" }, otherHeaders);
+    await setMoveTargets(priv.id, { trashFolder: "Trash", archiveFolder: "Archive" });
+
+    const mine = await seedThread({ subject: "Mine", lastMessageAt: new Date("2026-08-04T10:00:00Z") });
+    await seedMessage(mine, account.id, { sentAt: new Date("2026-08-04T10:00:00Z"), imapUid: 111 });
+    const unowned = await seedThread({ subject: "Theirs, shared", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    const unownedMessage = await seedMessage(unowned, shared.id, {
+      sentAt: new Date("2026-08-03T10:00:00Z"), imapUid: 112,
+    });
+    const invisible = await seedThread({ subject: "Theirs, private", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const invisibleMessage = await seedMessage(invisible, priv.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 113,
+    });
+
+    const response = await bulk(a, {
+      threadIds: [mine, unowned, invisible, UNKNOWN_ID], folder: "INBOX", action: "archive",
+    });
+    expect(response.statusCode).toBe(200);
+    const { results } = bulkThreadResultSchema.parse(response.json());
+    expect(results).toEqual([
+      { threadId: mine, ok: true },
+      // Visible but not chris's mailbox: an honest skip -- not a 404, and not
+      // a refusal naming dana's account state either.
+      { threadId: unowned, ok: true, skipped: true, reason: "not_owner" },
+      // Invisible: exactly the answer an id that names nothing gets.
+      { threadId: invisible, ok: false, reason: "not_found", error: `mail thread ${invisible} not found` },
+      { threadId: UNKNOWN_ID, ok: false, reason: "not_found", error: `mail thread ${UNKNOWN_ID} not found` },
+    ]);
+    // Indistinguishable beyond the id itself: substituting it maps one
+    // serialized answer onto the other, byte for byte.
+    expect(JSON.stringify(results[2]).replaceAll(invisible, UNKNOWN_ID)).toBe(JSON.stringify(results[3]));
+    // Only chris's own message moved; both of dana's mailboxes are untouched.
+    expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [111], targetFolder: "Archive" }]);
+    expect(await messageRow(unownedMessage)).toMatchObject({ folder: "INBOX", imapUid: 112 });
+    expect(await messageRow(invisibleMessage)).toMatchObject({ folder: "INBOX", imapUid: 113 });
+    await a.close();
+  });
+
   it("fails the thread with the server's own message when the queued MOVE is refused, and puts the row back", async () => {
     const a = await app();
     const { account, sync } = await readyAccount(a);

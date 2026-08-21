@@ -1,4 +1,4 @@
-import { inArray, sql } from "drizzle-orm";
+import { and, inArray, sql } from "drizzle-orm";
 import type {
   BulkThreadActionInput, BulkThreadFailureReason, BulkThreadResult, BulkThreadSkipReason,
 } from "@conduit/shared";
@@ -8,7 +8,7 @@ import { NotFoundError } from "./errors.js";
 import { folderKey } from "./mail-folders.js";
 import { consoleSyncLogger, type SyncLogger } from "./mail-imap.js";
 import { UID_CHUNK, chunked } from "./mail-sync.js";
-import { archiveThread } from "./mail-threads.js";
+import { archiveThread, visibleThreads } from "./mail-threads.js";
 import { publish } from "./sse.js";
 
 /**
@@ -41,26 +41,34 @@ import { publish } from "./sse.js";
  * message should look like.
  *
  * ---------------------------------------------------------------------------
- * OWNERSHIP: NOT YET ON THE MOVE PATHS
+ * VISIBILITY FIRST, OWNERSHIP SECOND (Phase 4.2)
  * ---------------------------------------------------------------------------
  * Thread ids ARE nameable by every user -- sse.ts fans ["mail-thread", <id>]
  * hints to every subscriber, so ids of threads on other users' private
- * accounts reach every logged-in client. The hide path below re-checks each
- * id through mail-threads' visibility gate, but the two MOVE paths do not
- * yet: `actorId` is still audit context for the log line and nothing else --
- * never a filter, never compared against an account's owner -- so an
- * invisible id currently gets a distinguishable per-thread answer, and with
- * a live sync loop the MOVE would move another user's private mail. The IMAP
- * write happens through EACH MESSAGE'S OWN account's sync loop, under that
- * account's credentials -- the actor's identity never reaches a mail server.
+ * accounts reach every logged-in client. Two ordered checks make that
+ * broadcast safe, and the ORDER is what keeps existence from leaking:
  *
- * Phase 4.2 Task 3 replaces this section, in two ordered steps: thread
- * resolution gains the VISIBILITY gate first (an invisible id fails with the
- * SAME not_found as a nonexistent one, byte-indistinguishable), and the
- * `not_owner` ownership filter then applies only among visible threads --
- * `actorId` stops being audit-only the moment collectCandidates compares it
- * against each message's account (per the spec's Move rights section and the
- * Task 2 DONE-block handoffs).
+ * - VISIBILITY is decided first, batched into collectCandidates' requested-
+ *   threads read (mail-threads' record-scope visibleThreads term, the same
+ *   rule as the thread detail route). A thread the actor cannot see is
+ *   absent from that read exactly as a nonexistent id is, so both take the
+ *   same not_found construction path -- byte-indistinguishable answers --
+ *   and none of an invisible thread's messages, accounts or folders is ever
+ *   examined, so no account label, folder fact or skip reason can reach the
+ *   response. The hide path resolves per thread through archiveThread
+ *   (mail-threads' mustGetThread) and reports invisible identically.
+ * - OWNERSHIP is decided second, among visible threads only: collectCandidates
+ *   compares each in-scope message's account owner against `actorId`, and an
+ *   unowned row drops out as the noted skip `not_owner` (spec, Move rights:
+ *   only the mailbox owner performs IMAP moves -- a colleague must never
+ *   reorganise your actual mailbox; other viewers get Hide-in-CRM). The two
+ *   are different answers on purpose: a visible thread is honestly told WHY
+ *   nothing moved, an invisible one is denied existing at all.
+ *
+ * The IMAP write happens through EACH MESSAGE'S OWN account's sync loop,
+ * under that account's credentials -- the actor's identity never reaches a
+ * mail server; `actorId` is the visibility/ownership subject above and the
+ * audit context for the summary log line.
  *
  * ---------------------------------------------------------------------------
  * NO INGEST ADVISORY LOCK
@@ -190,10 +198,10 @@ type ResultItem = BulkThreadResult["results"][number];
  *
  * `not_owner` (Phase 4.2) is, BY CONTRAST, one of these -- unlike out_of_scope,
  * it IS recorded per message: a message on an account the actor does not own
- * is still examined far enough to be classified (Task 3 wires the actual
- * ownership filter into collectCandidates), it is simply not this actor's to
- * move. That is what earns it a slot in SKIP_REASON_RANK below rather than a
- * third out_of_scope-style exclusion from this type.
+ * is still examined far enough to be classified (collectCandidates' ownership
+ * drop), it is simply not this actor's to move. That is what earns it a slot
+ * in SKIP_REASON_RANK below rather than a third out_of_scope-style exclusion
+ * from this type.
  */
 type NotedSkipReason = Exclude<BulkThreadSkipReason, "out_of_scope">;
 
@@ -202,20 +210,19 @@ type NotedSkipReason = Exclude<BulkThreadSkipReason, "out_of_scope">;
  * as a table rather than an if-chain so the order is one readable fact; see
  * Outcomes.noteSkip for why it runs this way round.
  *
- * `not_owner` (Phase 4.2, Task 3 wires the filter that produces it) sits
- * directly below archived_account: both are causes the CURRENT USER cannot
- * clear by simply asking again, unlike the two below them (awaiting_
- * reconciliation self-heals on the next sync pass; already_in_target means
- * the goal already holds). Between those two the deciding fact is
- * CONTINUITY, not specificity: archived_account is what a mixed thread
- * already reported before 4.2, so holding it at rank 0 means adding
- * not_owner changes no existing thread's reported reason -- an archived
- * account someone else owns keeps saying archived_account. The per-row
- * check order in collectCandidates agrees on purpose (the archived_account
- * drop runs before the ownership seam), so promoting not_owner to rank 0
- * would also mean moving that check, silently changing what mixed threads
- * report. This ordering only matters when one thread's messages hit more
- * than one cause at once, which is rare -- see shared's
+ * `not_owner` (Phase 4.2) sits directly below archived_account: both are
+ * causes the CURRENT USER cannot clear by simply asking again, unlike the
+ * two below them (awaiting_reconciliation self-heals on the next sync pass;
+ * already_in_target means the goal already holds). Between those two the
+ * deciding fact is CONTINUITY, not specificity: archived_account is what a
+ * mixed thread already reported before 4.2, so holding it at rank 0 means
+ * adding not_owner changes no existing thread's reported reason -- an
+ * archived account someone else owns keeps saying archived_account. The
+ * per-row check order in collectCandidates agrees on purpose (the
+ * archived_account drop runs before the ownership drop), so promoting
+ * not_owner to rank 0 would also mean moving that check, silently changing
+ * what mixed threads report. This ordering only matters when one thread's
+ * messages hit more than one cause at once, which is rare -- see shared's
  * bulkThreadSkipReasonSchema comment for the fuller reasoning.
  */
 const SKIP_REASON_RANK: Record<NotedSkipReason, number> = {
@@ -322,9 +329,8 @@ class Outcomes {
    * actor asking again), the third is transient, and the last means the goal
    * already holds -- so reporting an unresolved-for-this-actor cause ahead of
    * a self-resolving or already-finished one is the honest ordering when a
-   * thread has more than one. Task 3 wires the ownership filter that is the
-   * one caller of noteSkip(..., "not_owner") -- this class already carries the
-   * type and the rank slot the moment the shared enum grows the value.
+   * thread has more than one. collectCandidates' ownership drop is the one
+   * caller of noteSkip(..., "not_owner").
    */
   noteSkip(threadId: string, reason: NotedSkipReason): void {
     const existing = this.skipReasons.get(threadId);
@@ -505,9 +511,12 @@ function accountStateOf(
  *   the target folder and those in the account's Sent folder. Archiving a
  *   conversation must never empty Sent.
  *
- * Three kinds of message are dropped from the eligible set in either mode, and
- * a thread left with none is reported `{ ok: true, skipped: true }` -- a
- * successful no-op, never a failure:
+ * A thread the actor cannot SEE (record scope, the header's visibility gate)
+ * fails as not_found before any of this -- indistinguishable from an id that
+ * names nothing. Among visible threads, four kinds of message are dropped
+ * from the eligible set in either mode, and a thread left with none is
+ * reported `{ ok: true, skipped: true }` -- a successful no-op, never a
+ * failure:
  *
  * - AWAITING RECONCILIATION (`imap_uid` NULL -- a just-sent message the Sent
  *   pass has not re-sighted): there is no UID to name it to the server. Rare,
@@ -515,6 +524,8 @@ function accountStateOf(
  * - ALREADY IN THE TARGET FOLDER: nothing to do.
  * - OWNED BY AN ARCHIVED ACCOUNT: unmovable while the account stays archived,
  *   and deliberately not a failure -- see accountStateOf.
+ * - ON AN ACCOUNT THE ACTOR DOES NOT OWN: not this actor's to move (spec,
+ *   Move rights) -- see the header and collectCandidates' ownership drop.
  *
  * THE RETURNED PROMISE WAITS FOR THE SERVER. Each queued MOVE runs on its
  * account's serial sync loop, so a bulk action against an account halfway
@@ -549,7 +560,7 @@ export async function moveThreads(
     // `action` is narrowed to the two MOVE kinds by the branch above, and is
     // passed on explicitly so nothing downstream has to re-establish it.
     const collected = await collectCandidates(
-      db, { folder: input.folder, action: input.action }, unique, deps.syncManager, outcomes,
+      db, actorId, { folder: input.folder, action: input.action }, unique, deps.syncManager, outcomes,
     );
     const { candidates } = collected;
     messages = candidates.length;
@@ -630,14 +641,15 @@ async function hideThreads(
 
 /**
  * The messages this action will move, with the threads that cannot move
- * already recorded on `outcomes`: an unknown thread id, and any thread with an
+ * already recorded on `outcomes`: an unknown OR invisible thread id (one
+ * answer, deliberately -- see the gate below), and any thread with an
  * IN-SCOPE message on an account that refused (see the ordering note in the
  * row loop -- a refusal follows the eligibility filters, it never precedes
  * them).
  *
  * Three reads, in this order: the requested threads (to tell "no such thread"
- * apart from "nothing to move"), their messages, and the accounts those
- * messages belong to.
+ * apart from "nothing to move", with the visibility gate folded in), their
+ * messages, and the accounts those messages belong to.
  *
  * THE ACCOUNTS ARE READ HERE, at move time, and never passed in or cached: a
  * sync pass fills trash_folder/archive_folder the first time it can classify
@@ -647,14 +659,28 @@ async function hideThreads(
  */
 async function collectCandidates(
   db: Database,
+  actorId: string,
   request: { folder: string | undefined; action: "trash" | "archive" },
   threadIds: readonly string[],
   syncManager: MoveSyncManager | null,
   outcomes: Outcomes,
 ): Promise<{ candidates: Candidate[]; refusedAccounts: number }> {
   const { folder: viewFolder, action } = request;
+  // THE VISIBILITY GATE, folded into the requested-threads read -- one
+  // statement for the whole request, never a per-thread resolution loop. A
+  // thread the actor cannot see is absent from `known` exactly as a
+  // nonexistent id is, so both fall into the same not_found construction
+  // below, byte-indistinguishable -- and an invisible thread's messages are
+  // never fetched (the next read selects by `known`), so nothing later can
+  // leak an account label, a folder fact or a skip reason for it. Record
+  // scope, the same rule as the detail route's mustGetThread: a deal/project-
+  // linked thread on someone else's private account may be SEEN, and is then
+  // honestly refused per message as not_owner in the row loop, while an
+  // unlinked one must not have its existence confirmed by any
+  // distinguishable answer.
   const known = new Set((await db.select({ id: mailThreads.id }).from(mailThreads)
-    .where(inArray(mailThreads.id, [...threadIds]))).map((row) => row.id));
+    .where(and(inArray(mailThreads.id, [...threadIds]), visibleThreads(actorId, "record"))))
+    .map((row) => row.id));
   for (const threadId of threadIds) {
     if (!known.has(threadId)) {
       outcomes.fail(threadId, new NotFoundError("mail thread", threadId).message, "not_found");
@@ -677,13 +703,21 @@ async function collectCandidates(
 
   const accountIds = [...new Set(messages.map((row) => row.accountId))];
   const accountRows = await db.select({
-    id: mailAccounts.id, label: mailAccounts.label, archivedAt: mailAccounts.archivedAt,
+    id: mailAccounts.id, userId: mailAccounts.userId,
+    label: mailAccounts.label, archivedAt: mailAccounts.archivedAt,
     sentFolder: mailAccounts.sentFolder,
     trashFolder: mailAccounts.trashFolder, archiveFolder: mailAccounts.archiveFolder,
   }).from(mailAccounts).where(inArray(mailAccounts.id, accountIds));
 
   const states = new Map<string, AccountState>();
-  for (const account of accountRows) states.set(account.id, accountStateOf(account, action, syncManager));
+  // Kept beside `states` rather than inside AccountState: whose mailbox this
+  // is has nothing to do with what the account can carry out, and the
+  // ownership drop below needs it for every state kind alike.
+  const ownerOf = new Map<string, string>();
+  for (const account of accountRows) {
+    states.set(account.id, accountStateOf(account, action, syncManager));
+    ownerOf.set(account.id, account.userId);
+  }
   /** Accounts whose refusal actually FIRED -- see the count returned below. */
   const refused = new Set<string>();
 
@@ -738,15 +772,18 @@ async function collectCandidates(
       outcomes.noteSkip(row.threadId, "archived_account");
       continue;
     }
-    // Task 3 wires the ownership filter here, in SKIP_REASON_RANK's order
-    // (directly below archived_account): an in-scope row on an account the
-    // actor does not own drops out with noteSkip(row.threadId, "not_owner"),
-    // BEFORE the awaiting-reconciliation check and the refusal check below --
-    // same "in scope decided first, ownership/availability decided next,
-    // refusal last" ordering this function already applies. Needs
-    // `accountRows` above to select `userId` and this function to take an
-    // `actorId` param.
-    //
+    // OWNERSHIP, in SKIP_REASON_RANK's order (directly below the
+    // archived_account drop, whose precedence for a both-at-once account
+    // depends on running first): an in-scope row on an account the actor
+    // does not own is not this actor's to move (spec, Move rights), whatever
+    // else may be true of it -- checked BEFORE the awaiting-reconciliation
+    // and refusal checks below, so an unowned account's missing target or
+    // dead loop can never fail the thread with a refusal naming a mailbox
+    // the actor has no rights over.
+    if (ownerOf.get(row.accountId) !== actorId) {
+      outcomes.noteSkip(row.threadId, "not_owner");
+      continue;
+    }
     // No UID, no way to name this message to the server. Self-heals: the next
     // pass of its folder re-sights it and the upsert restores the uid.
     if (row.imapUid === null) {

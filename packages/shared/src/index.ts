@@ -1051,8 +1051,8 @@ export type BulkThreadFailureReason = z.infer<typeof bulkThreadFailureReasonSche
 // - archived_account: its messages belong to an archived mail account, whose
 //   sync loop is torn down. Persistent, and fixable only in Settings, so it
 //   outranks the others.
-// - not_owner (Phase 4.2, Task 3 wires the actual filter): its messages sit
-//   on an account the ACTOR does not own -- move rights are owner-only (spec:
+// - not_owner (Phase 4.2): its messages sit on an account the ACTOR does not
+//   own -- move rights are owner-only (spec:
 //   "a colleague must never reorganise your actual mailbox"). Ranked directly
 //   below archived_account, NOT above it, for continuity: archived_account is
 //   what a mixed thread already reported before 4.2, and keeping it at rank 0

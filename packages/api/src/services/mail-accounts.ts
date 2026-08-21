@@ -14,7 +14,9 @@ import { publish } from "./sse.js";
 /** Invalidation key every mail-account mutator publishes after its write commits.
  * Mail accounts emit NO events-table rows (mail stays out of the CRM timeline per
  * the Phase 4 spec) -- this SSE hint is the only invalidation signal, driving both
- * the settings page and (via the account-status flip) the inbox's error badge. */
+ * the settings page and (via the account-status flip) the inbox's error badge.
+ * One mutation widens the frame instead of calling this: a visibility flip in
+ * updateAccount, whose publish carries the thread-side keys too. */
 function publishAccountsHint(): void {
   publish({ keys: [["mail-accounts"]] });
 }
@@ -328,9 +330,9 @@ export async function updateAccount(
   // What DOES differ from trashFolder/archiveFolder is the SSE fan-out: every
   // OTHER user's thread list and unread count change when an account's
   // visibility flips (the spec's Settings section), not just this account's
-  // own row -- Task 3 widens the hint below from `[["mail-accounts"]]` alone
-  // to also publish `[["mail-threads"]]` and `[["mail-unread"]]` when
-  // `visibility` is among `changedKeys`.
+  // own row -- so when `visibility` is among `changedKeys` the post-commit
+  // publish below carries `[["mail-threads"]]` and `[["mail-unread"]]`
+  // beside `[["mail-accounts"]]`.
   const withSentFolder = rest.sentFolder !== undefined
     ? { ...rest, sentFolder: normalizeSentFolder(rest.sentFolder) }
     : rest;
@@ -355,7 +357,7 @@ export async function updateAccount(
   // transaction, against the locked row).
   const wantsSmtpPasswordAloneChange = !passwordProvided && smtpPasswordProvided;
 
-  const { row, wrote, connectionChanged } = await db.transaction(async (tx) => {
+  const { row, wrote, connectionChanged, visibilityChanged } = await db.transaction(async (tx) => {
     const [locked] = await tx.select().from(mailAccounts).where(eq(mailAccounts.id, id)).for("update");
     if (locked === undefined) throw new NotFoundError("mail account", id);
     if (locked.archivedAt !== null) throw new ArchivedError("mail account", id);
@@ -371,7 +373,7 @@ export async function updateAccount(
     // happens to match the old plaintext -- we do not decrypt just to compare.
     const wantsPasswordChange = passwordProvided || smtpPasswordProvided;
     if (changedKeys.length === 0 && !wantsPasswordChange) {
-      return { row: locked, wrote: false, connectionChanged: false };
+      return { row: locked, wrote: false, connectionChanged: false, visibilityChanged: false };
     }
 
     let credentialsCiphertext = freshCredentialsCiphertext;
@@ -427,7 +429,10 @@ export async function updateAccount(
       if (recheck === undefined) throw new NotFoundError("mail account", id);
       throw new ArchivedError("mail account", id);
     }
-    return { row: updated, wrote: true, connectionChanged: connectionFieldChanged };
+    return {
+      row: updated, wrote: true, connectionChanged: connectionFieldChanged,
+      visibilityChanged: changedKeys.includes("visibility"),
+    };
   });
   if (wrote) {
     // Restarts the AccountSync when a connection field moved, so it picks up
@@ -435,7 +440,17 @@ export async function updateAccount(
     // after the status reset; otherwise just wakes it, since the running
     // loop re-reads the account row on its very next pass anyway.
     notifyAccountChanged(id, { connectionChanged });
-    publishAccountsHint();
+    if (visibilityChanged) {
+      // A visibility flip changes what EVERY user's thread list and unread
+      // badge contain (the Phase 4.2 predicate reads this column), not just
+      // this account's settings row -- so the one post-commit publish carries
+      // the two thread-side key families beside the accounts key. Same-value
+      // patches never reach here (the no-op short-circuit above), so
+      // toggling nothing publishes nothing.
+      publish({ keys: [["mail-accounts"], ["mail-threads"], ["mail-unread"]] });
+    } else {
+      publishAccountsHint();
+    }
   }
   return toMailAccount(row);
 }

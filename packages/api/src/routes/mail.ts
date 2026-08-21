@@ -493,27 +493,24 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * server, "Hide in CRM" sets the pre-4.1 CRM-side thread archive
    * (services/mail-move.ts owns all three).
    *
-   * AUTH-ONLY at the route -- and, for the two MOVE actions, NOT yet
-   * visibility-gated behind it. Thread ids of other users' private threads
-   * ARE nameable here: sse.ts fans every hint to every subscriber, and
+   * AUTH-ONLY at the route, BY DESIGN -- the real gates live in the service,
+   * in a fixed order. Thread ids of other users' private threads ARE
+   * nameable here: sse.ts fans every hint to every subscriber, and
    * publishThreadHint / ingest's hints carry ["mail-thread", <id>] frames,
    * so every logged-in client continuously receives ids it may not open.
-   * The by-id routes answer such an id with mustGetThread's
-   * indistinguishable 404 and the hide action resolves through the same
-   * gate, but trash/archive currently hand the id straight to candidate
-   * collection -- an invisible thread today gets a per-thread answer that
-   * differs from a nonexistent one's not_found (e.g. no_target, carrying the
-   * private account's label), and with a live sync loop the MOVE would move
-   * another user's private mail.
-   *
-   * Phase 4.2 Task 3 closes this: mail-move's thread resolution gains the
-   * visibility gate FIRST (an invisible id fails with the SAME not_found as
-   * a nonexistent one, byte-indistinguishable), and the not_owner ownership
-   * filter then applies only among visible threads. The SSE id-broadcast is
-   * acceptable-by-design only once that gate exists. The IMAP write happens
-   * through each message's own account's sync loop under that account's
-   * credentials either way; the user id is audit context for the service's
-   * log line until Task 3 makes it a real input to candidate eligibility.
+   * That id-broadcast is acceptable-by-design because naming an id earns
+   * nothing: mail-move decides record-scope VISIBILITY first, batched into
+   * its requested-threads read, so an invisible id fails with the SAME
+   * not_found as a nonexistent one, byte-indistinguishable, before any of
+   * the thread's accounts or folders is examined (the by-id routes answer
+   * through mustGetThread's indistinguishable 404, and the hide action
+   * resolves through that same gate per thread). The not_owner OWNERSHIP
+   * filter then applies among visible threads only: Archive/Trash act on
+   * messages of accounts the ACTOR owns (spec, Move rights), and anyone
+   * else's messages skip rather than move. The IMAP write happens through
+   * each message's own account's sync loop under that account's credentials;
+   * the user id handed to the service is the subject of both gates as well
+   * as the audit context for its log line.
    *
    * ALWAYS 200 WHEN THE REQUEST ITSELF WAS VALID. Per-thread failures ride
    * INSIDE the body (`{threadId, ok, skipped?, error?}` per requested id, in

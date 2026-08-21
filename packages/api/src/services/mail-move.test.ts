@@ -3,7 +3,7 @@ import { asc, eq } from "drizzle-orm";
 import { bulkThreadResultSchema, type SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
-import { mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
+import { mailAccounts, mailMessages, mailThreads, projects } from "../db/schema.js";
 import type { SyncLogger } from "./mail-imap.js";
 import { moveThreads, type MoveSyncAccount, type MoveSyncManager } from "./mail-move.js";
 import { subscribe } from "./sse.js";
@@ -16,14 +16,14 @@ let unsubscribe: () => void;
 
 beforeEach(async () => {
   await truncateAll(handle);
+  // The account owner. The MOVE tests act as this user because Phase 4.2 made
+  // move rights owner-only -- an actor who owns nothing in a thread gets a
+  // not_owner skip, and one who cannot SEE it gets the nonexistent-id answer
+  // (see the service's VISIBILITY FIRST, OWNERSHIP SECOND header).
   userId = (await resolveUser(handle.db, { username: "chris", email: null, fullName: null })).id;
-  // A second user acting on the first's account: still the shape of every
-  // MOVE test here (actorId is audit context for the move paths until Task 3
-  // lands owner-only move rights -- see the service's OWNERSHIP note). The
-  // HIDE path is different since Phase 4.2: it resolves its thread through
-  // mail-threads' visibility gate, so the hide tests below make sam a real
-  // viewer (a shared account) rather than relying on the old
-  // everything-is-shared default.
+  // A second user, for the other side of those rules: the hide tests make sam
+  // a viewer (hide stays available to every viewer of a visible thread), and
+  // the visibility/ownership tests act as sam against chris's accounts.
   actorId = (await resolveUser(handle.db, { username: "sam", email: null, fullName: null })).id;
   hints = [];
   unsubscribe = subscribe((hint) => { hints.push(hint); });
@@ -198,7 +198,7 @@ describe("moveThreads: the two modes", () => {
     const sync = manager.for(accountId);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     // The selection-granularity ruling: a bulk action from the INBOX view acts
@@ -221,7 +221,7 @@ describe("moveThreads: the two modes", () => {
     const sync = manager.for(accountId);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], action: "archive" }, deps(manager),
     );
 
     expect(result.results).toEqual([{ threadId, ok: true }]);
@@ -248,7 +248,7 @@ describe("moveThreads: the two modes", () => {
     const sync = manager.for(accountId);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "Sent", action: "trash" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "Sent", action: "trash" }, deps(manager),
     );
 
     expect(result.results).toEqual([{ threadId, ok: true }]);
@@ -267,7 +267,7 @@ describe("moveThreads: the two modes", () => {
     const sync = manager.for(accountId);
 
     const matched = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "inbox", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "inbox", action: "archive" }, deps(manager),
     );
     expect(matched.results).toEqual([{ threadId, ok: true }]);
     expect(sync.calls).toEqual([{ folder: "INBOX", uids: [191], targetFolder: "Archive" }]);
@@ -275,7 +275,7 @@ describe("moveThreads: the two modes", () => {
     // The other half of the same rule: a differently-cased ordinary folder
     // matches nothing, so the action is a no-op rather than a wrong move.
     const missed = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "clients", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "clients", action: "archive" }, deps(manager),
     );
     // Nothing of this thread was in the named view, so the action never
     // applied to it -- which is its own reason, not "already done".
@@ -296,7 +296,7 @@ describe("moveThreads: the two modes", () => {
     const sync = manager.for(accountId);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], action: "archive" }, deps(manager),
     );
 
     expect(result.results).toEqual([{ threadId, ok: true }]);
@@ -319,7 +319,7 @@ describe("moveThreads: the two modes", () => {
     manager.for(accountId);
 
     await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "trash" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "trash" }, deps(manager),
     );
 
     expect((await messageRows(threadId)).map((row) => [row.folder, row.seen]))
@@ -335,8 +335,8 @@ describe("moveThreads: the two modes", () => {
     const manager = new FakeManager();
     const sync = manager.for(accountId);
 
-    await moveThreads(handle.db, actorId, { threadIds: [first], folder: "INBOX", action: "trash" }, deps(manager));
-    await moveThreads(handle.db, actorId, { threadIds: [second], folder: "INBOX", action: "archive" }, deps(manager));
+    await moveThreads(handle.db, userId, { threadIds: [first], folder: "INBOX", action: "trash" }, deps(manager));
+    await moveThreads(handle.db, userId, { threadIds: [second], folder: "INBOX", action: "archive" }, deps(manager));
 
     // The account's own names, whatever they are -- the CRM never guesses
     // "Trash" or "Archive" (spec: only Trash/Archive targets, resolved per
@@ -360,7 +360,7 @@ describe("moveThreads: nothing to move", () => {
     const sync = manager.for(accountId);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     // A successful no-op, not a failure: it self-heals the moment the next
@@ -382,7 +382,7 @@ describe("moveThreads: nothing to move", () => {
     manager.for(accountId);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "out_of_scope" }]);
@@ -398,7 +398,7 @@ describe("moveThreads: nothing to move", () => {
     const missing = "00000000-0000-4000-8000-000000000000";
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [missing, threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [missing, threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     expect(result.results).toEqual([
@@ -419,7 +419,7 @@ describe("moveThreads: nothing to move", () => {
     const sync = manager.for(accountId);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId, threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId, threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     // The response is a per-request answer the client zips back onto rows, so
@@ -439,7 +439,7 @@ describe("moveThreads: nothing to move", () => {
     const missing = "00000000-0000-4000-8000-000000000002";
 
     const result = await moveThreads(
-      handle.db, actorId,
+      handle.db, userId,
       { threadIds: [moved, stalled, missing], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
@@ -468,7 +468,7 @@ describe("moveThreads: per account", () => {
     const idleSync = manager.for(without);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [good, bad], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [good, bad], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     // NULL means "nothing has ever classified one", which is a sentence the
@@ -497,7 +497,7 @@ describe("moveThreads: per account", () => {
     manager.for(stuck);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     expect(result.results).toEqual([{ threadId, ok: true }]);
@@ -525,7 +525,7 @@ describe("moveThreads: per account", () => {
     const sync = manager.for(live);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     expect(result.results).toEqual([{ threadId, ok: true }]);
@@ -545,7 +545,7 @@ describe("moveThreads: per account", () => {
     const manager = new FakeManager();
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     // Same shape as a thread awaiting reconciliation: nothing eligible, so a
@@ -568,7 +568,7 @@ describe("moveThreads: per account", () => {
     const manager = new FakeManager();
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     // Moving the rows with nothing to carry the MOVE out would leave the CRM
@@ -595,7 +595,7 @@ describe("moveThreads: per account", () => {
     manager.for(stuck);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     expect(result.results[0]?.ok).toBe(false);
@@ -618,7 +618,7 @@ describe("moveThreads: per account", () => {
     const personalSync = manager.for(personal);
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     expect(result.results).toEqual([{ threadId, ok: true }]);
@@ -640,7 +640,7 @@ describe("moveThreads: compensation", () => {
     manager.for(accountId);
 
     await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "trash" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "trash" }, deps(manager),
     );
 
     // One publish carrying every key, after the commit: the list (folder
@@ -661,7 +661,7 @@ describe("moveThreads: compensation", () => {
     const logger = new RecordingLogger();
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
       { syncManager: manager, logger },
     );
 
@@ -697,7 +697,7 @@ describe("moveThreads: compensation", () => {
     sync.failCall = 2;
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
     );
 
     // Two commands, not one with 600 UIDs in it.
@@ -735,7 +735,7 @@ describe("moveThreads: compensation", () => {
     });
 
     const result = await moveThreads(
-      failingDb, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
+      failingDb, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
       { syncManager: manager, logger },
     );
 
@@ -772,10 +772,10 @@ describe("moveThreads: compensation", () => {
     // Two requests in flight at once -- one archiving, one trashing -- both
     // parked on the seam before either finishes.
     const archiving = moveThreads(
-      handle.db, actorId, { threadIds: [first], folder: "INBOX", action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [first], folder: "INBOX", action: "archive" }, deps(manager),
     );
     const trashing = moveThreads(
-      handle.db, actorId, { threadIds: [second], folder: "INBOX", action: "trash" }, deps(manager),
+      handle.db, userId, { threadIds: [second], folder: "INBOX", action: "trash" }, deps(manager),
     );
     await waitFor(() => sync.calls.length === 2, "both moves to reach the sync seam");
     release();
@@ -806,7 +806,7 @@ describe("moveThreads: compensation", () => {
     sync.failError = new Error("MOVE from Clients to Archive was refused");
 
     const result = await moveThreads(
-      handle.db, actorId, { threadIds: [threadId], action: "archive" }, deps(manager),
+      handle.db, userId, { threadIds: [threadId], action: "archive" }, deps(manager),
     );
 
     expect(result.results).toEqual([
@@ -839,19 +839,158 @@ describe("moveThreads: the summary line", () => {
     const missing = "00000000-0000-4000-8000-000000000003";
 
     await moveThreads(
-      handle.db, actorId,
+      handle.db, userId,
       { threadIds: [refusedThread, stalledThread, missing], folder: "INBOX", action: "archive" },
       { syncManager: manager, logger },
     );
 
     expect(logger.infos).toHaveLength(1);
     expect(logger.infos[0]?.details).toMatchObject({
-      actorId, action: "archive", folder: "INBOX",
+      actorId: userId, action: "archive", folder: "INBOX",
       threads: 3, messages: 0, failed: 2, skipped: 1,
       // The account that refused something. An account that refuses but has
       // nothing in scope is deliberately not counted here.
       refusedAccounts: 1,
     });
+  });
+});
+
+// --- Visibility, then ownership (Phase 4.2) ---------------------------------
+
+describe("moveThreads: visibility and ownership", () => {
+  it("skips a whole thread the actor can see but does not own, before any refusal can name it", async () => {
+    // chris's SHARED account: sam can see the thread (so not_found would be a
+    // lie) but owns no message in it (so nothing may move). The manager knows
+    // nothing about the account ON PURPOSE -- unowned, that dead loop would
+    // have been a no_sync failure naming chris's account, and the ownership
+    // drop running before the refusal check is what keeps it out of the
+    // answer.
+    const accountId = await makeAccount({ visibility: "shared" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 301 });
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
+      deps(new FakeManager()),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "not_owner" }]);
+    expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 301 });
+    expect(threadHints()).toHaveLength(0);
+  });
+
+  it("moves only the owned half of a mixed-ownership thread", async () => {
+    // One conversation, two mailboxes, two owners. chris sees the thread
+    // through his own half; sam's half is not his to file.
+    const mine = await makeAccount();
+    const theirs = await makeAccount({ userId: actorId, label: "Sams" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId: mine, folder: "INBOX", imapUid: 311 });
+    await makeMessage({ threadId, accountId: theirs, folder: "INBOX", imapUid: 312 });
+    const manager = new FakeManager();
+    const mySync = manager.for(mine);
+    const theirSync = manager.for(theirs);
+
+    const result = await moveThreads(
+      handle.db, userId, { threadIds: [threadId], folder: "INBOX", action: "archive" }, deps(manager),
+    );
+
+    // The owned half moves and the thread reports plain success (a move
+    // happened; the noted not_owner is only ever the answer when NOTHING
+    // moved). The unowned half is untouched in both places: no queued call
+    // ever reaches the other user's loop, and its row keeps folder and uid.
+    expect(result.results).toEqual([{ threadId, ok: true }]);
+    expect(mySync.calls).toEqual([{ folder: "INBOX", uids: [311], targetFolder: "Archive" }]);
+    expect(theirSync.calls).toEqual([]);
+    expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
+      .toEqual([["Archive", null], ["INBOX", 312]]);
+  });
+
+  it("reports archived_account, not not_owner, when both are true of the account", async () => {
+    // SKIP_REASON_RANK's continuity rule, pinned end to end: an archived
+    // account someone else owns keeps saying archived_account, exactly what a
+    // mixed thread reported before 4.2 -- which also pins the per-row check
+    // order (the archived_account drop runs before the ownership drop).
+    const accountId = await makeAccount({ visibility: "shared" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 321 });
+    await handle.db.update(mailAccounts)
+      .set({ archivedAt: new Date("2026-08-01T00:00:00.000Z") }).where(eq(mailAccounts.id, accountId));
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
+      deps(new FakeManager()),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "archived_account" }]);
+  });
+
+  it("answers an invisible thread byte-for-byte like a nonexistent one", async () => {
+    // The exact leak the 4.2 spec review probed: a private account with NO
+    // archive target used to answer no_target, carrying the account's label
+    // to a user who may not even know the account exists. Visibility is
+    // decided before that account is ever examined, so the label -- and every
+    // other fact -- stays out of the answer.
+    const accountId = await makeAccount({ label: "Chris private", archiveFolder: null });
+    const invisible = await makeThread("private to chris");
+    await makeMessage({ threadId: invisible, accountId, folder: "INBOX", imapUid: 331 });
+    const manager = new FakeManager();
+    manager.for(accountId);
+    const missing = "00000000-0000-4000-8000-000000000004";
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [invisible, missing], folder: "INBOX", action: "archive" },
+      deps(manager),
+    );
+
+    const [gated, unknown] = result.results;
+    expect(unknown).toEqual({
+      threadId: missing, ok: false, reason: "not_found",
+      error: `mail thread ${missing} not found`,
+    });
+    // Substituting the id is the ONLY thing separating the two serialized
+    // answers: same keys, same order, same error text shape.
+    expect(JSON.stringify(gated).replaceAll(invisible, missing)).toBe(JSON.stringify(unknown));
+    // And nothing about the invisible thread happened: no move, no hint.
+    expect((await messageRows(invisible))[0]).toMatchObject({ folder: "INBOX", imapUid: 331 });
+    expect(threadHints()).toHaveLength(0);
+  });
+
+  it("treats a record-linked private thread as visible, and then refuses it as not_owner", async () => {
+    // Visibility and ownership are different answers. A project link makes
+    // chris's private conversation record-visible to sam (the gate shares the
+    // detail route's scope), so the honest per-thread answer is "not yours to
+    // move" -- never the 404 that would deny a thread sam can open.
+    const accountId = await makeAccount();
+    const [project] = await handle.db.insert(projects).values({ name: "Rollout" }).returning();
+    const threadId = await makeThread();
+    await handle.db.update(mailThreads)
+      .set({ projectId: project!.id }).where(eq(mailThreads.id, threadId));
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 341 });
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "trash" },
+      deps(new FakeManager()),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "not_owner" }]);
+    expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 341 });
+  });
+
+  it("gives no ownership answer for an unowned row outside the view folder", async () => {
+    // Scope is decided first, unchanged by 4.2: the INBOX view held nothing
+    // of this thread, so the action never applied to it -- out_of_scope, not
+    // a not_owner statement about a folder the actor was not acting on.
+    const accountId = await makeAccount({ visibility: "shared" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "Clients", imapUid: 351 });
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
+      deps(new FakeManager()),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "out_of_scope" }]);
   });
 });
 

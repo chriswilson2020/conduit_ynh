@@ -277,8 +277,10 @@ export function visibleMessageTerm(userId: string, scope: MailVisibilityScope): 
   return sql`(${ownedOrShared(userId)} OR ${recordLinked()})`;
 }
 
-/** Thread granularity, correlated to an outer mail_threads row. */
-function visibleThreads(userId: string, scope: MailVisibilityScope): SQL {
+/** Thread granularity, correlated to an outer mail_threads row. Exported for
+ * mail-move.ts's bulk visibility gate, which folds the record scope into its
+ * requested-threads read -- the same rule as mustGetThread below, batched. */
+export function visibleThreads(userId: string, scope: MailVisibilityScope): SQL {
   const carried = sql`EXISTS (SELECT 1 FROM ${mailMessages} JOIN ${mailAccounts} ON ${mailAccounts.id} = ${mailMessages.accountId} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${ownedOrShared(userId)})`;
   if (scope === "inbox") return carried;
   return sql`(${carried} OR ${recordLinked()})`;

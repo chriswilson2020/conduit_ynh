@@ -417,6 +417,51 @@ describe("updateAccount", () => {
     }
   });
 
+  // Phase 4.2: a visibility flip changes what EVERY user's thread list and
+  // unread badge contain (the predicate reads mail_accounts.visibility), so
+  // its ONE post-commit publish carries the thread-side key families too.
+  it("publishes mail-accounts, mail-threads and mail-unread in one frame when visibility flips", async () => {
+    const account = await make();
+    const hints: string[][][] = [];
+    const unsub = subscribe((hint) => hints.push(hint.keys));
+    try {
+      await updateAccount(handle.db, actorId, account.id, { visibility: "shared" }, keyPath);
+      expect(hints).toEqual([[["mail-accounts"], ["mail-threads"], ["mail-unread"]]]);
+    } finally {
+      unsub();
+    }
+  });
+
+  it("keeps the narrow mail-accounts hint for an edit that does not touch visibility", async () => {
+    // The widened frame is earned by the flip alone -- an ordinary Settings
+    // edit must not tell every client to refetch every thread list.
+    const account = await make();
+    const hints: string[][][] = [];
+    const unsub = subscribe((hint) => hints.push(hint.keys));
+    try {
+      await updateAccount(handle.db, actorId, account.id, { label: "Renamed" }, keyPath);
+      expect(hints).toEqual([[["mail-accounts"]]]);
+    } finally {
+      unsub();
+    }
+  });
+
+  it("publishes nothing for a same-value visibility patch", async () => {
+    // The no-op short-circuit covers the toggle too: resubmitting the stored
+    // value must not fan a refetch-everything frame out to every client.
+    const account = await make();
+    await updateAccount(handle.db, actorId, account.id, { visibility: "shared" }, keyPath);
+    const hints: string[][][] = [];
+    const unsub = subscribe((hint) => hints.push(hint.keys));
+    try {
+      const result = await updateAccount(handle.db, actorId, account.id, { visibility: "shared" }, keyPath);
+      expect(result.visibility).toBe("shared");
+      expect(hints).toEqual([]);
+    } finally {
+      unsub();
+    }
+  });
+
   it("a same-value patch is a no-op: updatedAt unchanged", async () => {
     const account = await make({ label: "Same" });
     const result = await updateAccount(handle.db, actorId, account.id, { label: "Same" }, keyPath);
