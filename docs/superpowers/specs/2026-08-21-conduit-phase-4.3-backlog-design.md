@@ -82,6 +82,17 @@ predicate family:
   (advisory previously verified unreachable — this is hygiene, not a fix), lockfile
   regenerated on the server, full suite green.
 
+## Amendments (coordinator, during execution)
+
+1. **The archived-thread link guard retires with the shared state** (Task 1 quality
+   review, coordinator ruling). Pre-4.3, changing a thread's record links 409'd while
+   the thread was archived. Per-user hide has no shared "archived" state to guard: a
+   personal filing act must never gate a shared CRM mutation, so link changes work
+   regardless of any user's hide state — including the hider's own (linking from the
+   Hidden view or the conversation is deliberate, and per 4.2's sharing line a deal
+   link then shares the thread while it stays hidden in the hider's own inbox). The
+   old 409 test is rewritten to pin the new behaviour, not deleted.
+
 ## Out of scope (deferred, not rejected)
 
 Per-thread manual share/unshare; mail filing power tools (per-message selection,
