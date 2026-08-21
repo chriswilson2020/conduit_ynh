@@ -827,6 +827,14 @@ describe("pipelines routes", () => {
     const companyId = company.json().id as string;
     await makePipeline(a, { name: "Global", scope: "global" });
     const scoped = await makePipeline(a, { name: "Scoped", scope: "company", companyId });
+    // A second company-scoped pipeline, archived through its own route, so the
+    // archived arm below filters within one company rather than against an
+    // empty set. This is the wire-level pin the company page's "show archived"
+    // control rests on (Phase 4.3): the service filter predates it, but until
+    // here nothing proved `archived` survives the route's query schema.
+    const retired = await makePipeline(a, { name: "Retired", scope: "company", companyId });
+    const archived = await a.inject({ method: "POST", url: `/api/pipelines/${retired.id}/archive`, headers: authHeaders });
+    expect(archived.statusCode).toBe(200);
 
     const response = await a.inject({
       method: "GET", url: `/api/pipelines?scope=company&company_id=${companyId}`, headers: authHeaders,
@@ -834,6 +842,20 @@ describe("pipelines routes", () => {
     expect(response.statusCode).toBe(200);
     const body = z.array(pipelineSchema).parse(response.json());
     expect(body.map((p) => p.id)).toEqual([scoped.id]);
+
+    // The tri-state's other two spellings: an explicit false matches absent
+    // (live rows only), and true swaps the list to the archived rows -- each
+    // carrying a non-null archivedAt for the client's Archived chip.
+    const explicitFalse = await a.inject({
+      method: "GET", url: `/api/pipelines?company_id=${companyId}&archived=false`, headers: authHeaders,
+    });
+    expect(z.array(pipelineSchema).parse(explicitFalse.json()).map((p) => p.id)).toEqual([scoped.id]);
+    const archivedList = await a.inject({
+      method: "GET", url: `/api/pipelines?company_id=${companyId}&archived=true`, headers: authHeaders,
+    });
+    const archivedBody = z.array(pipelineSchema).parse(archivedList.json());
+    expect(archivedBody.map((p) => p.id)).toEqual([retired.id]);
+    expect(archivedBody[0]?.archivedAt).not.toBeNull();
     await a.close();
   });
 

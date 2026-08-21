@@ -44,7 +44,16 @@ export function CompanyDetailPage() {
   const { companyId } = useParams({ from: "/companies/$companyId" });
   const { data: company, isLoading, error } = useCompany(companyId);
   const { data: contactsData } = useContacts({ companyId });
-  const { data: pipelines = [] } = usePipelines({ companyId });
+  // Archived pipelines behind a "show archived" control (Phase 4.3): the
+  // checkbox swaps the list between live and archived, the same shape the
+  // pipelines index and entity-table's own "Archived" checkbox give every
+  // other archive-not-delete entity. The archived view needs no read-only
+  // gating HERE: this section renders pipelines as plain links, and the
+  // board they lead to already gates every mutating affordance on an
+  // archived pipeline (board.tsx's readOnly banner). The section's one
+  // mutation, New pipeline, creates a fresh live pipeline either way.
+  const [archivedPipelines, setArchivedPipelines] = useState(false);
+  const { data: pipelines = [] } = usePipelines({ companyId, archived: archivedPipelines });
   const updateCompany = useUpdateCompany();
   const archiveCompany = useArchiveCompany();
   const unarchiveCompany = useUnarchiveCompany();
@@ -211,14 +220,25 @@ export function CompanyDetailPage() {
         <section className="mt-6">
           <div className="mb-2 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-900">Pipelines</h2>
-            <Dialog open={newPipelineOpen} onOpenChange={setNewPipelineOpen}>
-              <DialogTrigger asChild>
-                <Button variant="outline">New pipeline</Button>
-              </DialogTrigger>
-              <DialogContent>
-                <NewPipelineDialog companyId={company.id} onClose={() => setNewPipelineOpen(false)} />
-              </DialogContent>
-            </Dialog>
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-2 text-sm text-slate-600">
+                <input
+                  type="checkbox"
+                  data-testid="show-archived-pipelines"
+                  checked={archivedPipelines}
+                  onChange={(event) => setArchivedPipelines(event.target.checked)}
+                />
+                Archived
+              </label>
+              <Dialog open={newPipelineOpen} onOpenChange={setNewPipelineOpen}>
+                <DialogTrigger asChild>
+                  <Button variant="outline">New pipeline</Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <NewPipelineDialog companyId={company.id} onClose={() => setNewPipelineOpen(false)} />
+                </DialogContent>
+              </Dialog>
+            </div>
           </div>
           <ul
             data-testid="company-pipelines"
@@ -229,13 +249,29 @@ export function CompanyDetailPage() {
                 <Link
                   to="/pipelines/$pipelineId"
                   params={{ pipelineId: pipeline.id }}
-                  className="block px-4 py-2 text-sm text-slate-900 hover:bg-slate-50"
+                  className="flex items-center gap-2 px-4 py-2 text-sm text-slate-900 hover:bg-slate-50"
                 >
                   {pipeline.name}
+                  {/* Set exactly on the archived view's rows (the default
+                      view lists archivedAt-null rows only), so the list
+                      says which state it is showing without this component
+                      tracking it per row. */}
+                  {pipeline.archivedAt !== null && (
+                    <span
+                      data-testid="pipeline-archived-chip"
+                      className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-500"
+                    >
+                      Archived
+                    </span>
+                  )}
                 </Link>
               </li>
             ))}
-            {pipelines.length === 0 && <li className="px-4 py-2 text-sm text-slate-400">No pipelines</li>}
+            {pipelines.length === 0 && (
+              <li className="px-4 py-2 text-sm text-slate-400">
+                {archivedPipelines ? "No archived pipelines" : "No pipelines"}
+              </li>
+            )}
           </ul>
         </section>
       </div>
