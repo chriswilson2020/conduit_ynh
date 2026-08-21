@@ -41,8 +41,8 @@ ram.runtime = "400M"
 [resources]
 
     [resources.sources.main]
-    url = "https://github.com/chriswilson2020/conduit_ynh/releases/download/v0.7.0/conduit-0.7.0.tar.gz"
-    sha256 = "f5c366ebcb205f93df67a6b3325c8bff9fa2d4fd44468bdee059d97efb4c66b7"
+    url = "https://github.com/chriswilson2020/conduit_ynh/releases/download/v0.8.0/conduit-0.8.0.tar.gz"
+    sha256 = "d728c9d63257a7d3e40c91136352a8bf90538855b5e01920828bc8c21c1677cc"
     autoupdate.strategy = "latest_github_release"
 
     [resources.system_user]
