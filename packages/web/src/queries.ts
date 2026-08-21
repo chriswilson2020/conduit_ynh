@@ -1514,12 +1514,26 @@ export function useMailThreads(params: MailThreadListParams = {}) {
 
 // Composite { thread, messages, dealSuggestions } response -- see
 // mailThreadDetailSchema in @conduit/shared for why the bundle is one fetch.
-export function useMailThread(id: string) {
+//
+// `all` is the detail cap's escape hatch (Phase 4.3): true asks for the
+// uncapped conversation (`?all=true`), absent/false the newest-50 page. The
+// two are separate cache entries -- distinct payloads must not share a key --
+// but both sit under the ["mail-thread", id] prefix, so every existing
+// invalidation (useInvalidateMailThread, the SSE hints) reaches both without
+// knowing the flag exists. `enabled` gates the `all` fetch until the
+// Show-earlier control actually asks (see conversation.tsx, which mounts
+// this pair and prefers the uncapped answer once it lands).
+export function useMailThread(id: string, opts: { all?: boolean; enabled?: boolean } = {}) {
+  const all = opts.all === true;
   return useQuery({
-    queryKey: ["mail-thread", id],
+    queryKey: all ? ["mail-thread", id, "all"] : ["mail-thread", id],
     queryFn: async () =>
-      parseWith(mailThreadDetailSchema, await getJson<unknown>(`/mail/threads/${id}`), "mail thread"),
-    enabled: id !== "",
+      parseWith(
+        mailThreadDetailSchema,
+        await getJson<unknown>(`/mail/threads/${id}${all ? "?all=true" : ""}`),
+        "mail thread",
+      ),
+    enabled: (opts.enabled ?? true) && id !== "",
   });
 }
 
@@ -1570,7 +1584,10 @@ export function useClearThreadLink() {
   });
 }
 
-export function useArchiveThread() {
+// Hide/Unhide in CRM, the per-actor filing pair (Phase 4.3). The hooks are
+// named for what they do; the WIRE keeps its `/archive`/`/unarchive` paths --
+// an address, not a label (api: routes/mail.ts's hide routes).
+export function useHideThread() {
   const invalidate = useInvalidateMailThread();
   return useMutation({
     mutationFn: async (id: string) =>
@@ -1579,7 +1596,7 @@ export function useArchiveThread() {
   });
 }
 
-export function useUnarchiveThread() {
+export function useUnhideThread() {
   const invalidate = useInvalidateMailThread();
   return useMutation({
     mutationFn: async (id: string) =>

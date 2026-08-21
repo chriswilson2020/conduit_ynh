@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { User } from "@conduit/shared";
 import {
   NotFoundError, ArchivedError, ConflictError, MailKeyMissingError, MailCredentialDecryptError,
-  SmtpSendError,
+  AttachmentTooLargeError, SmtpSendError,
 } from "../services/errors.js";
 import { decodeCursor } from "../services/pagination.js";
 
@@ -94,6 +94,16 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
       error: "mail_credentials_unreadable",
       message: "stored mail credentials could not be decrypted; submit a new password to re-establish them",
     });
+    return;
+  }
+  // 413 `too_large`, the SAME status and code files.ts's upload route
+  // answers for an over-cap compose upload -- one refusal shape for "that
+  // attachment is too big" however the attachment reached the send. The
+  // message is echoed: it names the file and the limit (both already visible
+  // to the viewer -- see the error class's own note), which is exactly what
+  // a composer dialog needs to say.
+  if (error instanceof AttachmentTooLargeError) {
+    void reply.code(413).send({ error: "too_large", message: error.message });
     return;
   }
   // 502, not 500: the request was well-formed and this server did its part --

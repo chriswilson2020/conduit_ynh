@@ -1447,8 +1447,21 @@ describe("sendMailInputSchema", () => {
     subject: "Hello", bodyHtml: "<p>Hi</p>",
   };
 
-  it("accepts a minimal compose (cc/bcc/attachmentIds default to empty)", () => {
-    expect(sendMailInputSchema.parse(base)).toEqual({ ...base, cc: [], bcc: [], attachmentIds: [] });
+  it("accepts a minimal compose (cc/bcc and both attachment lists default to empty)", () => {
+    expect(sendMailInputSchema.parse(base)).toEqual({
+      ...base, cc: [], bcc: [], attachmentIds: [], forwardAttachmentIds: [],
+    });
+  });
+
+  // The two attachment lists name different tables (files vs
+  // mail_attachments -- see the schema's own comments), so both must ride
+  // independently: a forward can carry re-attached originals AND a fresh
+  // upload.
+  it("carries forwardAttachmentIds alongside attachmentIds", () => {
+    const forward = { ...base, attachmentIds: [uuid1], forwardAttachmentIds: [uuid2] };
+    const parsed = sendMailInputSchema.parse(forward);
+    expect(parsed.attachmentIds).toEqual([uuid1]);
+    expect(parsed.forwardAttachmentIds).toEqual([uuid2]);
   });
 
   it("accepts a reply (threadId set) with links ignored/absent", () => {

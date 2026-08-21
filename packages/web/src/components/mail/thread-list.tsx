@@ -19,6 +19,7 @@ import {
   cursorForKey,
   emptyThreadPages,
   flattenThreadPages,
+  hiddenChipLabel,
   mergeThreadPage,
   subjectLabel,
   threadFilterKey,
@@ -302,6 +303,12 @@ const ThreadRow = memo(function ThreadRow({
   }, [selected]);
 
   const senders = thread.senders.map(addressLabel).join(", ");
+  // "Hidden <when>" from the VIEWER'S OWN filing moment -- hiddenAt is null
+  // by construction on every default-list row, so the chip appears exactly
+  // on the Hidden view's rows (mail-lib's hiddenChipLabel), naming when the
+  // thread was filed away and marking the row as one Unhide (in the
+  // conversation) restores.
+  const hiddenChip = hiddenChipLabel(thread.hiddenAt);
 
   return (
     <li className={clsx("group flex items-start", selected ? "bg-slate-100" : "hover:bg-slate-50")}>
@@ -372,6 +379,14 @@ const ThreadRow = memo(function ThreadRow({
         <span className="truncate pl-4 text-sm text-slate-900">{subjectLabel(thread.subject)}</span>
         <span className="truncate pl-4 text-xs text-slate-500">{thread.snippet}</span>
         <span className="flex flex-wrap items-center gap-1 pl-4">
+          {hiddenChip !== null && (
+            <span
+              data-testid="hidden-chip"
+              className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-500"
+            >
+              {hiddenChip}
+            </span>
+          )}
           {thread.accountIds.map((accountId) => {
             const label = accountLabels.get(accountId);
             return label === undefined ? null : (

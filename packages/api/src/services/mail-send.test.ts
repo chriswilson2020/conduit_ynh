@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -14,13 +14,15 @@ import { saveBlob } from "./blobs.js";
 import { createCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
 import { createProject } from "./projects.js";
-import { ArchivedError, ConflictError, NotFoundError, SmtpSendError } from "./errors.js";
+import {
+  ArchivedError, AttachmentTooLargeError, ConflictError, NotFoundError, SmtpSendError,
+} from "./errors.js";
 import { archiveAccount, createAccount } from "./mail-accounts.js";
 import type { MailCredentials } from "./mail-crypto.js";
 import { ingestMessage } from "./mail-ingest.js";
 import { SyncUnavailableError } from "./mail-sync.js";
 import {
-  sendMail,
+  MAX_FORWARD_ATTACHMENT_BYTES, sendMail,
   type SendMailDeps, type SendMailMessage, type SendMailSyncManager, type SendMailTransport,
 } from "./mail-send.js";
 
@@ -136,6 +138,7 @@ function input(overrides: Partial<SendMailInput> = {}): SendMailInput {
     subject: "Hello Alice",
     bodyHtml: "<p>Hi Alice</p>",
     attachmentIds: [],
+    forwardAttachmentIds: [],
     ...overrides,
   };
 }
@@ -198,6 +201,41 @@ async function makeUpload(
   }).returning({ id: files.id });
   if (row === undefined) throw new Error("file insert returned no row");
   return row.id;
+}
+
+/**
+ * An ingested original for a forward to re-attach: thread + message +
+ * attachment rows with the attachment's bytes really in blob storage --
+ * the shape ingest leaves behind, written directly (the same seeding move
+ * routes/mail.test.ts makes) because these tests are about the send path,
+ * not about ingest.
+ */
+async function seedOriginal(
+  accountId: string, opts: { filename?: string; body?: string } = {},
+): Promise<{ attachmentId: string; body: string }> {
+  const [thread] = await handle.db.insert(mailThreads).values({
+    subject: "Original", lastMessageAt: new Date("2026-08-01T10:00:00Z"), messageCount: 1,
+  }).returning({ id: mailThreads.id });
+  if (thread === undefined) throw new Error("seedOriginal: no thread row");
+  const [message] = await handle.db.insert(mailMessages).values({
+    accountId, threadId: thread.id,
+    messageId: `<${randomUUID()}@example.com>`,
+    inReplyTo: null, referencesIds: [],
+    fromAddr: "alice@example.com", fromName: "Alice",
+    toAddrs: [{ address: "chris@example.com", name: "Chris" }], ccAddrs: [], bccAddrs: [],
+    subject: "Original", bodyText: "Body", bodyHtml: "<p>Body</p>", snippet: "Body",
+    sentAt: new Date("2026-08-01T10:00:00Z"), folder: "INBOX", imapUid: 7, seen: true,
+    direction: "inbound",
+  }).returning({ id: mailMessages.id });
+  if (message === undefined) throw new Error("seedOriginal: no message row");
+  const body = opts.body ?? "original attachment bytes";
+  const { sha256, sizeBytes } = await saveBlob(dataDir, Readable.from([Buffer.from(body, "utf8")]));
+  const [attachment] = await handle.db.insert(mailAttachments).values({
+    messageId: message.id, filename: opts.filename ?? "quote.pdf", mime: "application/pdf",
+    sizeBytes, blobPath: sha256, contentId: null, isInline: false,
+  }).returning({ id: mailAttachments.id });
+  if (attachment === undefined) throw new Error("seedOriginal: no attachment row");
+  return { attachmentId: attachment.id, body };
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -665,5 +703,66 @@ describe("sendMail", () => {
     // after the submission would already have mailed the file out.
     expect(transport.sent).toHaveLength(0);
     expect(await storedMessages()).toHaveLength(0);
+  });
+
+  // --- Forward re-attach (Phase 4.3) ---------------------------------------
+
+  it("re-attaches a forwarded original from its stored blob, and ingest stores the forward's own copy", async () => {
+    const original = await seedOriginal(accountId, {
+      filename: "renewal-quote.pdf", body: "the quoted price is 42",
+    });
+
+    const message = await sendMail(
+      handle.db, dataDir, actorId, input({ forwardAttachmentIds: [original.attachmentId] }), deps(),
+    );
+
+    // The outgoing bytes carry the original's filename and content --
+    // streamed from the same blob the download route serves.
+    const raw = transport.rawText();
+    expect(raw).toContain("renewal-quote.pdf");
+    expect(raw).toContain(Buffer.from("the quoted price is 42", "utf8").toString("base64"));
+
+    // The forwarded copy that ingests back keeps the attachment linked,
+    // exactly as sent-mail ingestion always has: a NEW mail_attachments row
+    // on the outbound message, the original's row untouched on its own.
+    const stored = await handle.db.select().from(mailAttachments)
+      .where(eq(mailAttachments.messageId, message.id));
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.filename).toBe("renewal-quote.pdf");
+    expect(stored[0]?.sizeBytes).toBe("the quoted price is 42".length);
+    expect(stored[0]?.id).not.toBe(original.attachmentId);
+  });
+
+  it("refuses the whole send when a forwarded original is over the compose cap", async () => {
+    const original = await seedOriginal(accountId);
+    // The cap reads the stored size_bytes (the download route's own
+    // Content-Length source), so the over-cap original is stated on the row
+    // rather than materialized as 50MB of test blob.
+    await handle.db.update(mailAttachments).set({ sizeBytes: MAX_FORWARD_ATTACHMENT_BYTES + 1 })
+      .where(eq(mailAttachments.id, original.attachmentId));
+
+    await expect(sendMail(
+      handle.db, dataDir, actorId, input({ forwardAttachmentIds: [original.attachmentId] }), deps(),
+    )).rejects.toBeInstanceOf(AttachmentTooLargeError);
+    // Refused WHOLE, before the submission: no message left with the
+    // attachment silently dropped, and nothing outbound was stored.
+    expect(transport.sent).toHaveLength(0);
+    expect((await storedMessages()).filter((m) => m.direction === "outbound")).toHaveLength(0);
+  });
+
+  it("404s a forwarded original the sender may not read, before sending anything", async () => {
+    // On the OTHER user's private account: record-scope visibility is the
+    // rule (getAttachmentBlob's own), so the id answers exactly like a
+    // nonexistent one and the send never happens.
+    const theirAccount = await createAccount(handle.db, otherUserId, {
+      ...baseAccount, label: "Dana", email: "dana@example.com",
+    }, keyPath);
+    const original = await seedOriginal(theirAccount.id);
+
+    await expect(sendMail(
+      handle.db, dataDir, actorId, input({ forwardAttachmentIds: [original.attachmentId] }), deps(),
+    )).rejects.toBeInstanceOf(NotFoundError);
+    expect(transport.sent).toHaveLength(0);
+    expect((await storedMessages()).filter((m) => m.direction === "outbound")).toHaveLength(0);
   });
 });

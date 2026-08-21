@@ -7,6 +7,7 @@ import {
   MOVE_ACTION_THREAD_CAP,
 } from "@conduit/shared";
 import { ApiError, ResponseShapeError } from "../../api";
+import { relativeTime } from "../../lib";
 
 /**
  * The mail feature's pure parts, kept out of the components so they can be
@@ -642,12 +643,12 @@ function addressListText(addresses: readonly MailAddress[]): string {
  * escaped whole and its newlines become <br>, since the composer's editor is
  * an HTML document and would otherwise collapse them.
  *
- * ATTACHMENTS ARE NOT CARRIED OVER in v1, deliberately: POST /api/files links
- * a file to exactly one record, so re-attaching would mean COPYING each blob
- * onto the forward's own record rather than referencing the original rows.
- * That is a real feature (with a real storage cost), not a detail of this
- * function -- deferred rather than half-done. The forwarded body still shows
- * the reader that attachments existed, via the original's own markup.
+ * ATTACHMENTS ARE NOT THIS FUNCTION'S JOB: this builds the quoted BODY
+ * alone. The original's stored attachments ride the forward separately
+ * (Phase 4.3) -- the conversation seeds them into the composer as
+ * ComposerSeed.forwardAttachments and the API re-attaches the stored blobs
+ * by id (sendMailInputSchema's forwardAttachmentIds), no re-upload and no
+ * copy onto a record involved.
  */
 export function forwardBody(
   message: ForwardSource,
@@ -666,6 +667,42 @@ export function forwardBody(
     ? message.bodyHtml
     : `<p>${escapeHtmlText(message.bodyText).replace(/\r?\n/g, "<br>")}</p>`;
   return `<p></p><p>---------- Forwarded message ----------<br>${header}</p><blockquote>${body}</blockquote>`;
+}
+
+// ---------------------------------------------------------------------------
+// Detail cap + Hidden view labels (Phase 4.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The "Show earlier messages (N more)" control's label, or null when the
+ * control has nothing to offer (the payload was not truncated). N is
+ * totalMessages minus what the capped page rendered -- both facts of the
+ * SAME response (the server computes totalMessages over the same visible
+ * set the page was cut from), so the subtraction cannot go stale against a
+ * refetch. The truncated flag stays the gate rather than deriving one from
+ * the counts here: it is the server's own statement about this payload,
+ * and re-deriving it client-side is exactly the drift the flag exists to
+ * prevent.
+ */
+export function showEarlierLabel(
+  detail: { truncated: boolean; totalMessages: number; messages: readonly unknown[] },
+): string | null {
+  if (!detail.truncated) return null;
+  const more = detail.totalMessages - detail.messages.length;
+  if (more <= 0) return null;
+  return `Show earlier messages (${more} more)`;
+}
+
+/**
+ * The thread row's "Hidden <when>" chip, or null for no chip. `hiddenAt` is
+ * the VIEWER'S OWN filing moment (per-viewer by construction: null on every
+ * default-list row, set on Hidden-view rows and a hidden thread's detail --
+ * api: mail-threads.ts's toThread), so the chip appears exactly on the
+ * Hidden view's rows without the row knowing which view it is rendering in.
+ */
+export function hiddenChipLabel(hiddenAt: string | null, now: Date = new Date()): string | null {
+  if (hiddenAt === null) return null;
+  return `Hidden ${relativeTime(hiddenAt, now)}`;
 }
 
 // ---------------------------------------------------------------------------

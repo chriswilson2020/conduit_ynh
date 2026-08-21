@@ -6,14 +6,14 @@ import type {
 import { apiUrl } from "../../api";
 import { humanSize, relativeTime } from "../../lib";
 import {
-  useArchiveThread,
   useBulkThreadAction,
   useCompany,
   useContact,
+  useHideThread,
   useMailAccounts,
   useMailThread,
   useMarkThreadRead,
-  useUnarchiveThread,
+  useUnhideThread,
 } from "../../queries";
 import { Composer, type ComposerSeed } from "./composer";
 import { LinkPanel } from "./link-panel";
@@ -29,6 +29,7 @@ import {
   replyRecipients,
   replySource,
   replySubject,
+  showEarlierLabel,
   subjectLabel,
   summarizeBulkResult,
   THREAD_GONE_MESSAGE,
@@ -51,10 +52,20 @@ export interface ConversationProps {
  * clearer reset than an effect per piece of state.
  */
 export function Conversation({ threadId }: ConversationProps) {
-  const { data, isLoading, error } = useMailThread(threadId);
+  // The capped page and, once Show-earlier asks, the uncapped view (Phase
+  // 4.3 detail cap). Two cache entries under one ["mail-thread", id]
+  // prefix, so every existing invalidation reaches whichever is showing.
+  // The capped query stays mounted while the full one loads -- the
+  // conversation keeps rendering the newest 50 instead of blanking to a
+  // spinner -- and once the full payload lands it wins below.
+  const [showAll, setShowAll] = useState(false);
+  const capped = useMailThread(threadId);
+  const full = useMailThread(threadId, { all: true, enabled: showAll });
+  const data = showAll && full.data !== undefined ? full.data : capped.data;
+  const { isLoading, error } = capped;
   const markRead = useMarkThreadRead();
-  const archive = useArchiveThread();
-  const unarchive = useUnarchiveThread();
+  const hide = useHideThread();
+  const unhide = useUnhideThread();
   const { data: accounts } = useMailAccounts();
   const move = useBulkThreadAction();
   const [moveSummary, setMoveSummary] = useState<BulkActionSummary | null>(null);
@@ -107,6 +118,14 @@ export function Conversation({ threadId }: ConversationProps) {
    * storm for one click. The ref is checked before the unread test rather
    * than after, so a thread whose messages become unread again server-side
    * while it is open is not re-marked underneath the user either.
+   *
+   * Under the detail cap the unseen test reads the RENDERED page (the
+   * newest 50), while the mark itself is always thread-wide server-side --
+   * so when it fires, everything readable marks. The one shape this
+   * heuristic misses is a thread whose only unseen messages are older than
+   * the page, which stays unmarked until Show-earlier renders them; an
+   * accepted sliver, since new mail is what makes a thread unread and new
+   * mail is always on the page.
    */
   const markedRef = useRef<string | null>(null);
   useEffect(() => {
@@ -212,6 +231,13 @@ export function Conversation({ threadId }: ConversationProps) {
       // No threadId: a forward starts its own conversation with someone new.
       subject: forwardSubject(thread.subject),
       bodyHtml: forwardBody(source),
+      // The original's stored attachments ride along (Phase 4.3 forward
+      // re-attach): the composer lists them as removable chips and sends
+      // their ids as forwardAttachmentIds, which the API re-attaches from
+      // the same blobs the download chips below serve. All of them,
+      // inline images included -- an inline original arrives as an ordinary
+      // attachment, the same way every mail client forwards one.
+      forwardAttachments: source.attachments,
       links,
       context,
     });
@@ -249,15 +275,24 @@ export function Conversation({ threadId }: ConversationProps) {
   // the signed-in user's filing, never anyone else's.
   const hidden = thread.hiddenAt !== null;
   const expandedIds = expanded ?? defaultExpandedRef.current;
-  const archiveError = archive.error ?? unarchive.error;
+  const hideError = hide.error ?? unhide.error;
+  const earlierLabel = showEarlierLabel(data);
 
   return (
     <div data-testid="conversation" className="flex min-w-0 flex-col gap-3">
-      <div className="flex items-start justify-between gap-3">
+      {/* flex-wrap on the row and a shrinkable, self-wrapping action group
+          (the settings-mail header's idiom): at 1280px the conversation pane
+          is ~416px, narrower than the four buttons' single row, and the old
+          shrink-0 group overflowed the pane -- buttons clipped at its edge,
+          the subject crushed to a one-character column. Wrapped, the subject
+          takes its own full-width line(s) and the buttons wrap below,
+          right-aligned via ml-auto; on wide viewports where both fit, the
+          one-line justify-between layout is unchanged. */}
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <h2 className="min-w-0 break-words text-lg font-semibold text-slate-900">
           {subjectLabel(thread.subject)}
         </h2>
-        <div className="flex shrink-0 flex-wrap items-center gap-2">
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
           {!remoteImages && (
             <Button
               variant="outline"
@@ -303,24 +338,28 @@ export function Conversation({ threadId }: ConversationProps) {
               </Button>
             </>
           )}
-          {/* The CRM-only state, renamed "Hide in CRM" now that Archive above
-              means something else entirely. The testids predate the rename and
-              stay put: they are addresses, not labels. */}
+          {/* The CRM-only filing pair, driven by `hiddenAt` -- THIS viewer's
+              own hide row, so the button reflects and changes only their
+              filing. The hide-thread/unhide-thread testids are the Task 3
+              rename of the old archive-thread pair (coordinator ruling): two
+              actions spelled "archive" on one screen was a standing hazard,
+              and conversation-archive above -- the real IMAP move -- is the
+              one that keeps the name. */}
           {hidden ? (
             <Button
               variant="outline"
-              data-testid="unarchive-thread"
-              disabled={unarchive.isPending}
-              onClick={() => unarchive.mutate(thread.id)}
+              data-testid="unhide-thread"
+              disabled={unhide.isPending}
+              onClick={() => unhide.mutate(thread.id)}
             >
               Unhide
             </Button>
           ) : (
             <Button
               variant="outline"
-              data-testid="archive-thread"
-              disabled={archive.isPending}
-              onClick={() => archive.mutate(thread.id)}
+              data-testid="hide-thread"
+              disabled={hide.isPending}
+              onClick={() => hide.mutate(thread.id)}
             >
               Hide in CRM
             </Button>
@@ -362,10 +401,36 @@ export function Conversation({ threadId }: ConversationProps) {
         </Button>
       </div>
 
-      {archiveError && (
+      {hideError && (
         <p role="alert" className="text-sm text-red-600">
-          {composeErrorMessage(archiveError)}
+          {composeErrorMessage(hideError)}
         </p>
+      )}
+
+      {/* The detail cap's escape hatch, at the TOP of the conversation --
+          where the messages it would reveal belong. Rendered while the
+          shown payload is truncated; the capped page stays on screen while
+          the uncapped fetch runs (see the query pair above), so the button
+          carries its own pending/error state instead of blanking the pane. */}
+      {earlierLabel !== null && (
+        <div className="flex flex-col gap-1">
+          <Button
+            variant="outline"
+            className="self-start"
+            data-testid="show-earlier"
+            disabled={full.isFetching}
+            // A failed uncapped fetch leaves showAll set, so the retry path
+            // is an explicit refetch rather than a no-op state write.
+            onClick={() => (showAll ? void full.refetch() : setShowAll(true))}
+          >
+            {full.isFetching ? "Loading..." : earlierLabel}
+          </Button>
+          {showAll && full.error !== null && (
+            <p role="alert" className="text-sm text-red-600">
+              Could not load the earlier messages: {full.error.message}
+            </p>
+          )}
+        </div>
       )}
 
       <ol className="flex flex-col gap-2">

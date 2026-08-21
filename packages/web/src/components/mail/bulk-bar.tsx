@@ -51,8 +51,10 @@ export interface BulkBarProps {
  *
  * All three go through POST /api/mail/threads/bulk (see the inbox page, which
  * owns the mutation). The first two MOVE mail on the IMAP server (to the
- * account's Archive/Trash folder); the third is the CRM-only thread archive,
- * renamed "Hide in CRM" everywhere so the two can never be confused.
+ * account's Archive/Trash folder); the third is the CRM-only, PER-ACTOR
+ * filing act (Phase 4.3: hide rows for the clicking user alone -- nobody
+ * else's view moves), labelled "Hide in CRM" everywhere so the two can
+ * never be confused.
  *
  * `role="group"`, not `role="toolbar"`: a toolbar is a single tab stop with
  * arrow-key navigation between its controls, and implementing none of that

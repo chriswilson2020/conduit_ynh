@@ -950,7 +950,7 @@ test.describe.serial("Mail journey", () => {
     // Hide in CRM stays, available to every viewer.
     await expect(bPage.getByTestId("conversation-archive")).toHaveCount(0);
     await expect(bPage.getByTestId("conversation-trash")).toHaveCount(0);
-    await expect(bPage.getByTestId("archive-thread")).toBeVisible();
+    await expect(bPage.getByTestId("hide-thread")).toBeVisible();
 
     // Search runs at record scope too: the linked thread is findable by body
     // text from B's context.
@@ -1008,7 +1008,7 @@ test.describe.serial("Mail journey", () => {
     await expect(bPage.getByTestId("conversation")).toBeVisible();
     await expect(bPage.getByTestId("conversation-archive")).toHaveCount(0);
     await expect(bPage.getByTestId("conversation-trash")).toHaveCount(0);
-    await expect(bPage.getByTestId("archive-thread")).toBeVisible();
+    await expect(bPage.getByTestId("hide-thread")).toBeVisible();
   });
 
   test("flipping back to Private ends B's window with the calm gone state, not an error", async () => {

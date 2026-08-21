@@ -907,8 +907,20 @@ async function loadDealSuggestions(db: Database, thread: MailThreadRow): Promise
     .orderBy(desc(deals.createdAt), desc(deals.id)).limit(MAX_DEAL_SUGGESTIONS);
 }
 
+/**
+ * GET /api/mail/threads/:id returns at most this many messages unless
+ * `?all=true` asks for everything (Phase 4.3, closing the v0.5.0 "thread
+ * detail uncapped" limitation). A RENDERING PAYLOAD BOUND and nothing else:
+ * it caps what one response carries (every message body is a sanitized HTML
+ * document, and a mailing-list thread can hold hundreds), while mark-read,
+ * the reply chain and ownedByViewer keep reading the full visible set --
+ * markThreadRead and loadReplyChain never see this constant, and
+ * getThreadDetail computes its aggregate pair before the cap is applied.
+ */
+const THREAD_DETAIL_MESSAGE_CAP = 50;
+
 export async function getThreadDetail(
-  db: Database, userId: string, id: string, apiBase: string,
+  db: Database, userId: string, id: string, apiBase: string, opts: { all?: boolean } = {},
 ): Promise<MailThreadDetail> {
   const { thread, hiddenAt } = await mustGetThread(db, userId, id);
   // The per-message filter matters even after mustGetThread said yes: a
@@ -917,22 +929,49 @@ export async function getThreadDetail(
   // private mailbox), and the conversation view must not render their
   // bodies. Record scope, same as the gate above -- so on a deal/project-
   // linked thread every message is visible, which is what the deliberate
-  // link means.
-  //
-  // `ownedByViewer` is read off the same rows rather than asked separately:
-  // an owned account is visible in every scope, so the filter cannot have
-  // dropped a row that would have made it true.
-  const messageRows = await db.select({
-    ...MESSAGE_COLUMNS,
-    ownedByViewer: sql<boolean>`${mailAccounts.userId} = ${userId}`,
+  // link means. The CAP applies AFTER this filter: the bound is on what
+  // renders, so totalMessages counts the viewer's visible set and the page
+  // is the newest 50 OF that set -- an invisible message neither counts nor
+  // occupies a slot.
+  const visibleInThread = and(eq(mailMessages.threadId, id), visibleMessageTerm(userId, "record"));
+
+  // totalMessages and ownedByViewer are facts about the WHOLE visible set,
+  // never the returned page, so both come from one aggregate pass that the
+  // cap cannot touch. (Pre-cap, ownedByViewer was read off the message rows
+  // themselves; a capped page can drop the one owned message -- older than
+  // the newest 50 -- so the aggregate is now the only honest source.)
+  // coalesce: bool_or over zero rows is NULL, and the defensively-rendered
+  // message-less thread must answer false, not null.
+  const [aggregate] = await db.select({
+    total: sql<number>`count(*)::int`,
+    ownedByViewer: sql<boolean>`coalesce(bool_or(${mailAccounts.userId} = ${userId}), false)`,
   }).from(mailMessages)
     .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
     .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
-    .where(and(eq(mailMessages.threadId, id), visibleMessageTerm(userId, "record")))
-    // Oldest first: the conversation view renders in reading order, with only
-    // the newest message expanded.
-    .orderBy(asc(mailMessages.sentAt), asc(mailMessages.id));
+    .where(visibleInThread);
+  const totalMessages = aggregate?.total ?? 0;
+  const truncated = opts.all !== true && totalMessages > THREAD_DETAIL_MESSAGE_CAP;
 
+  const pageQuery = db.select({ ...MESSAGE_COLUMNS }).from(mailMessages)
+    .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
+    .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
+    .where(visibleInThread);
+  // Oldest first: the conversation view renders in reading order, with only
+  // the newest message expanded. A truncated page is the NEWEST 50 in that
+  // same total order -- fetched newest-first so LIMIT keeps the right end,
+  // then reversed back into reading order.
+  const messageRows = truncated
+    ? (await pageQuery
+      .orderBy(desc(mailMessages.sentAt), desc(mailMessages.id))
+      .limit(THREAD_DETAIL_MESSAGE_CAP)).reverse()
+    : await pageQuery.orderBy(asc(mailMessages.sentAt), asc(mailMessages.id));
+
+  // Attachment metadata is fetched for the RETURNED messages only -- a
+  // truncated response carries no chips for messages it does not render.
+  // The bytes themselves stay fetchable by id regardless: the messages are
+  // record-visible whether or not this page includes them, and
+  // getAttachmentBlob makes its own per-message visibility check, so
+  // truncation hides nothing from the attachment routes.
   const messageIds = messageRows.map((row) => row.id);
   const attachmentRows = messageIds.length === 0 ? [] : await db.select({
     id: mailAttachments.id, messageId: mailAttachments.messageId,
@@ -962,14 +1001,9 @@ export async function getThreadDetail(
 
   return {
     thread: toThread(thread, hiddenAt), messages, dealSuggestions: await loadDealSuggestions(db, thread),
-    ownedByViewer: messageRows.some((row) => row.ownedByViewer),
-    // Phase 4.3 Task 1 placeholders for the detail cap: no cap exists yet,
-    // so every response is already the uncapped view -- the real count of
-    // what was just returned, never truncated. Faithful no-ops until Task 3
-    // caps `messages` at the newest 50 visible (?all=true lifting it) and
-    // computes totalMessages as the visible total instead.
-    totalMessages: messages.length,
-    truncated: false,
+    ownedByViewer: aggregate?.ownedByViewer ?? false,
+    totalMessages,
+    truncated,
   };
 }
 

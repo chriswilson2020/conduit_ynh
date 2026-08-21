@@ -98,14 +98,11 @@ const threadListQuerySchema = z.object({
 });
 
 // GET /api/mail/threads/:id's only parameter (Phase 4.3): `all=true` asks
-// for the uncapped conversation once the detail cap lands -- the spec's own
-// spelling, in the same tri-state wire form as the list flags above.
-//
-// Task 1 placeholder: parsed -- so the wire contract, including its 400 on
-// a malformed value, is fixed from the start -- and then deliberately
-// unused. No cap exists yet, so every response already IS the uncapped
-// view and `all` changes nothing. Task 3 threads it into getThreadDetail
-// alongside the cap itself.
+// for the uncapped conversation -- the spec's own spelling, in the same
+// tri-state wire form as the list flags above (and with the same uniform
+// 400 on a malformed value). Absent/false is the capped view, the newest
+// 50 visible messages (mail-threads.ts's THREAD_DETAIL_MESSAGE_CAP); the
+// "Show earlier messages" control is what sends true.
 const threadDetailQuerySchema = z.object({
   all: z.enum(["true", "false"]).optional().transform((v) => v === "true"),
 });
@@ -378,15 +375,13 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
-    // Accepted and (for now) ignored -- see threadDetailQuerySchema's own
-    // placeholder note.
     const query = parseOrReject(threadDetailQuerySchema, request.query, reply);
     if (query === undefined) return;
     try {
       // basePath, not a hardcoded prefix: stored body_html carries
       // `mailattachment:` placeholders and is resolved to real routes here,
       // at serve time, so a `yunohost app change_url` needs no migration.
-      return await getThreadDetail(db, user.id, params.id, basePath);
+      return await getThreadDetail(db, user.id, params.id, basePath, { all: query.all });
     } catch (error) {
       mapDomainError(reply, error);
     }

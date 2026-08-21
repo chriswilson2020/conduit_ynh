@@ -63,6 +63,26 @@ export class MailCredentialDecryptError extends Error {
 // not expected to ever reach a route handler.
 export class IncompleteTestConnectionSettingsError extends Error {}
 
+// Raised by mail-send.ts when a forward re-attaches a stored original larger
+// than the compose attachment cap (mail-send.ts's
+// MAX_FORWARD_ATTACHMENT_BYTES -- the same 50MB the upload route enforces).
+// The check runs at SEND time because a forwarded original never passes
+// through the upload route where compose attachments meet the cap, and it
+// refuses the WHOLE send rather than dropping the attachment: a forward that
+// silently shed a file would claim to carry what it does not. Maps to HTTP
+// 413 `too_large` at the route layer, the same status and code the upload
+// route answers for an over-cap compose upload. The message names the file
+// and nothing the viewer cannot already see -- the id passed the same
+// visibility check the download route runs.
+export class AttachmentTooLargeError extends Error {
+  constructor(filename: string, sizeBytes: number, limitBytes: number) {
+    super(
+      `attachment "${filename}" is ${sizeBytes} bytes, `
+      + `over the ${Math.floor(limitBytes / (1024 * 1024))}MB limit for mail attachments`,
+    );
+  }
+}
+
 // Raised by mail-send.ts when the SMTP submission itself failed: the server
 // refused the connection, the login, or the message. Its own type because it
 // is the one mail failure a COMPOSING USER can act on immediately (fix the

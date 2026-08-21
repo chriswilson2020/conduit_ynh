@@ -51,6 +51,7 @@ import {
   flattenThreadPages,
   forwardBody,
   forwardSubject,
+  hiddenChipLabel,
   mergeThreadPage,
   MESSAGE_FRAME_SANDBOX,
   messageFrameCsp,
@@ -59,6 +60,7 @@ import {
   replyRecipients,
   replySource,
   replySubject,
+  showEarlierLabel,
   subjectLabel,
   threadFilterKey,
 } from "./mail-lib";
@@ -729,6 +731,43 @@ describe("forwardBody", () => {
   it("falls back to the text body for an empty html body", () => {
     const body = forwardBody({ ...message, bodyHtml: "", bodyText: "plain only" }, at);
     expect(body).toContain("<blockquote><p>plain only</p></blockquote>");
+  });
+});
+
+describe("showEarlierLabel", () => {
+  const detail = (truncated: boolean, totalMessages: number, rendered: number) => ({
+    truncated, totalMessages, messages: Array.from({ length: rendered }),
+  });
+
+  it("derives N from the visible total minus the rendered page", () => {
+    expect(showEarlierLabel(detail(true, 51, 50))).toBe("Show earlier messages (1 more)");
+    expect(showEarlierLabel(detail(true, 80, 50))).toBe("Show earlier messages (30 more)");
+  });
+
+  it("offers nothing for an untruncated payload, whatever the counts say", () => {
+    expect(showEarlierLabel(detail(false, 50, 50))).toBeNull();
+    // The uncapped (?all=true) response: everything rendered, truncated
+    // false -- the control must disappear once it has done its job.
+    expect(showEarlierLabel(detail(false, 80, 80))).toBeNull();
+  });
+
+  it("offers nothing when a truncated payload has no missing messages to show", () => {
+    // Defensive: the server never says truncated without a remainder, but a
+    // "(0 more)" button would be a lie worth guarding against anyway.
+    expect(showEarlierLabel(detail(true, 50, 50))).toBeNull();
+  });
+});
+
+describe("hiddenChipLabel", () => {
+  const now = new Date("2026-08-21T12:00:00.000Z");
+
+  it("labels a hidden row with the viewer's own filing moment, relatively", () => {
+    expect(hiddenChipLabel("2026-08-21T10:00:00.000Z", now)).toBe("Hidden 2h ago");
+    expect(hiddenChipLabel("2026-08-19T10:00:00.000Z", now)).toBe("Hidden 2d ago");
+  });
+
+  it("renders no chip for a null hiddenAt -- every default-list row", () => {
+    expect(hiddenChipLabel(null, now)).toBeNull();
   });
 });
 

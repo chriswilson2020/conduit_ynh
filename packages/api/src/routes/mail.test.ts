@@ -253,6 +253,36 @@ async function seedMessage(threadId: string, accountId: string, seed: MessageSee
   return row.id;
 }
 
+/**
+ * `count` messages in one INSERT, a minute apart from `start`, returned in
+ * reading order (sent_at ascending) -- the detail-cap tests need fifty-plus
+ * rows, and fifty round trips per fixture would double this file's runtime
+ * for nothing. Same row shape seedMessage writes, minus the per-message
+ * options none of those tests vary.
+ */
+async function seedMessageRun(
+  threadId: string, accountId: string, count: number, start: Date,
+  overrides: Partial<Pick<MessageSeed, "seen" | "imapUid">> = {},
+): Promise<string[]> {
+  const rows = await handle.db.insert(mailMessages).values(
+    Array.from({ length: count }, (_, index) => ({
+      accountId, threadId,
+      messageId: `<${randomUUID()}@example.com>`,
+      inReplyTo: null, referencesIds: [],
+      fromAddr: "alice@example.com", fromName: "Alice",
+      toAddrs: [{ address: "chris@example.com", name: "Chris" }], ccAddrs: [], bccAddrs: [],
+      subject: "Quarterly review", bodyText: `Body ${index}`,
+      bodyHtml: `<p>Body ${index}</p>`, snippet: `Body ${index}`,
+      sentAt: new Date(start.getTime() + index * 60_000),
+      folder: "INBOX",
+      imapUid: overrides.imapUid === undefined ? 10 + index : overrides.imapUid,
+      seen: overrides.seen ?? true,
+      direction: "inbound" as const,
+    })),
+  ).returning({ id: mailMessages.id, sentAt: mailMessages.sentAt });
+  return rows.sort((a, b) => a.sentAt.getTime() - b.sentAt.getTime()).map((row) => row.id);
+}
+
 /** Write real bytes into the blob store and register them as an attachment of
  * `messageId`, so the download/inline routes have something to stream. */
 async function seedAttachment(
@@ -1025,33 +1055,122 @@ describe("mail thread detail route", () => {
     await a.close();
   });
 
-  // Phase 4.3 Task 1: the detail-cap CONTRACT ships before the cap does.
-  // mailThreadDetailSchema already REQUIRES the pair (every parse in this
-  // describe block would fail without it); this pins the placeholder VALUES
-  // -- the honest uncapped answer -- and the `all` flag's wire contract:
-  // accepted and currently a no-op (every response already IS the uncapped
-  // view), with a malformed value taking the uniform 400. Task 3 makes
-  // `all` lift a real cap.
-  it("reports the uncapped view (totalMessages = returned count, truncated false); all=true is a no-op and a malformed all 400s", async () => {
+  // The detail cap (Phase 4.3): the newest 50 VISIBLE messages, with
+  // totalMessages/truncated describing the payload and `?all=true` lifting
+  // the cap. The boundary pair (exactly 50, then 51) pins that the cap
+  // fires strictly ABOVE 50 and that what a truncated page drops is the
+  // OLDEST end of the reading order.
+  it("returns exactly 50 untruncated, and at 51 drops the oldest into a truncated newest-50 page", async () => {
     const a = await app();
     const account = await makeAccount(a);
     const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
-    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
-    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    const first50 = await seedMessageRun(threadId, account.id, 50, new Date("2026-08-01T10:00:00Z"));
 
-    const plain = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
-    expect(plain.statusCode).toBe(200);
-    const body = mailThreadDetailSchema.parse(plain.json());
-    expect(body.messages).toHaveLength(2);
-    expect(body.totalMessages).toBe(2);
-    expect(body.truncated).toBe(false);
+    const atCap = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    expect(atCap.statusCode).toBe(200);
+    const atCapBody = mailThreadDetailSchema.parse(atCap.json());
+    expect(atCapBody.messages.map((m) => m.id)).toEqual(first50);
+    expect(atCapBody.totalMessages).toBe(50);
+    expect(atCapBody.truncated).toBe(false);
 
+    // The 51st is the OLDEST, so which message a truncated page loses is
+    // observable: this one, and only this one.
+    const oldest = await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-01T09:00:00Z") });
+
+    const over = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    const overBody = mailThreadDetailSchema.parse(over.json());
+    expect(overBody.messages.map((m) => m.id)).toEqual(first50);
+    expect(overBody.totalMessages).toBe(51);
+    expect(overBody.truncated).toBe(true);
+
+    // ?all=true is the uncapped view of the same thread: everything in
+    // reading order, and truncated false because THIS payload was not.
     const uncapped = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}?all=true`, headers: authHeaders });
-    expect(uncapped.statusCode).toBe(200);
-    expect(mailThreadDetailSchema.parse(uncapped.json())).toEqual(body);
+    const uncappedBody = mailThreadDetailSchema.parse(uncapped.json());
+    expect(uncappedBody.messages.map((m) => m.id)).toEqual([oldest, ...first50]);
+    expect(uncappedBody.totalMessages).toBe(51);
+    expect(uncappedBody.truncated).toBe(false);
 
     const malformed = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}?all=banana`, headers: authHeaders });
     expect(malformed.statusCode).toBe(400);
+    await a.close();
+  });
+
+  // The cap composes with per-message visibility, applied AFTER it: the
+  // bound is on what renders for THIS viewer, so an invisible message
+  // neither counts toward totalMessages nor occupies one of the 50 slots --
+  // and each viewer of a cross-account thread gets their own arithmetic.
+  it("caps the VISIBLE set per viewer: invisible messages neither count nor fill slots", async () => {
+    const a = await app();
+    const chrisPrivate = await makeAccount(a);
+    const danaPrivate = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const chrisIds = await seedMessageRun(threadId, chrisPrivate.id, 52, new Date("2026-08-01T10:00:00Z"));
+    const danaIds = await seedMessageRun(threadId, danaPrivate.id, 3, new Date("2026-08-01T08:00:00Z"));
+
+    const forChris = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    const chrisBody = mailThreadDetailSchema.parse(forChris.json());
+    // 52 visible to chris (dana's are not): totalMessages counts exactly
+    // those, and the page is the newest 50 OF them.
+    expect(chrisBody.totalMessages).toBe(52);
+    expect(chrisBody.truncated).toBe(true);
+    expect(chrisBody.messages.map((m) => m.id)).toEqual(chrisIds.slice(2));
+
+    // Dana's own view of the same thread: her 3 messages, under the cap,
+    // untruncated -- the arithmetic is per viewer, not per thread.
+    const forDana = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: otherHeaders });
+    const danaBody = mailThreadDetailSchema.parse(forDana.json());
+    expect(danaBody.totalMessages).toBe(3);
+    expect(danaBody.truncated).toBe(false);
+    expect(danaBody.messages.map((m) => m.id)).toEqual(danaIds);
+    await a.close();
+  });
+
+  // ownedByViewer is an aggregate over the FULL visible set (its schema
+  // comment's claim), which the cap must not narrow: a viewer whose only
+  // owned message is older than the newest 50 still owns a message here,
+  // and the conversation view's Archive/Trash buttons hang off this flag.
+  it("keeps ownedByViewer true when the viewer's only owned message is truncated away", async () => {
+    const a = await app();
+    const chrisOwn = await makeAccount(a);
+    const danaShared = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    await setVisibility(danaShared.id, "shared");
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const own = await seedMessage(threadId, chrisOwn.id, { sentAt: new Date("2026-08-01T09:00:00Z") });
+    await seedMessageRun(threadId, danaShared.id, 52, new Date("2026-08-01T10:00:00Z"));
+
+    const detail = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    const body = mailThreadDetailSchema.parse(detail.json());
+    expect(body.truncated).toBe(true);
+    expect(body.messages.some((m) => m.id === own)).toBe(false);
+    expect(body.ownedByViewer).toBe(true);
+    await a.close();
+  });
+
+  // The truncated payload omits the older messages' attachment METADATA
+  // (no chips for messages it does not render), but the bytes stay
+  // record-visible and fetchable by id -- truncation is a payload bound,
+  // not a visibility change, and getAttachmentBlob runs its own
+  // per-message check either way.
+  it("keeps a non-returned message's attachment fetchable by id", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessageRun(threadId, account.id, 50, new Date("2026-08-01T10:00:00Z"));
+    const oldest = await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-01T09:00:00Z") });
+    const attachment = await seedAttachment(oldest, { filename: "old-quote.pdf", body: "the original quote" });
+
+    const detail = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    const body = mailThreadDetailSchema.parse(detail.json());
+    expect(body.truncated).toBe(true);
+    expect(body.messages.some((m) => m.id === oldest)).toBe(false);
+    expect(JSON.stringify(body)).not.toContain(attachment.id);
+
+    const download = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.body).toBe(attachment.body);
     await a.close();
   });
 
@@ -1194,6 +1313,30 @@ describe("mail thread read route", () => {
     const rows = await handle.db.select({ seen: mailMessages.seen }).from(mailMessages)
       .where(eq(mailMessages.threadId, threadId));
     expect(rows.every((row) => row.seen)).toBe(true);
+    await a.close();
+  });
+
+  // The detail-cap pin on THIS route: mark-read marks the readable THREAD,
+  // never the rendered page. Opening a truncated conversation is still
+  // reading the conversation -- a cap that leaked into this write would
+  // leave 1 message unread per truncated open, with the badge counting a
+  // thread whose visible page shows nothing unread.
+  it("marks the whole readable thread under truncation, not just the rendered 50", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessageRun(threadId, account.id, 51, new Date("2026-08-01T10:00:00Z"), { seen: false });
+
+    const detail = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    expect(mailThreadDetailSchema.parse(detail.json()).truncated).toBe(true);
+
+    const read = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
+    expect(read.statusCode).toBe(200);
+    const unseen = await handle.db.select({ id: mailMessages.id }).from(mailMessages)
+      .where(and(eq(mailMessages.threadId, threadId), eq(mailMessages.seen, false)));
+    expect(unseen).toHaveLength(0);
+    const badge = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
+    expect(mailUnreadCountSchema.parse(badge.json()).count).toBe(0);
     await a.close();
   });
 
@@ -2041,6 +2184,43 @@ describe("mail send route", () => {
     });
     expect(response.statusCode).toBe(409);
     expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  // The forward re-attach wire contract (Phase 4.3): `forwardAttachmentIds`
+  // names mail_attachments rows, and an over-cap original maps to the same
+  // 413 `too_large` the upload route answers -- the send refused whole, the
+  // draft still in the client's hands. The full mechanics (raw bytes,
+  // ingest linkage, visibility 404) live with the service in
+  // mail-send.test.ts; this pins the route's two answers.
+  it("re-attaches a forwarded original on the wire and 413s one over the compose cap", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const messageId = await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    const attachment = await seedAttachment(messageId, { filename: "quote.pdf", body: "the quoted price is 42" });
+
+    const sent = await a.inject({
+      method: "POST", url: "/api/mail/send", headers: authHeaders,
+      payload: sendPayload(account.id, { forwardAttachmentIds: [attachment.id] }),
+    });
+    expect(sent.statusCode).toBe(201);
+    expect(transport.sent[0]?.raw.toString("utf8")).toContain("quote.pdf");
+
+    // The stored size_bytes is what the cap reads (the same column the
+    // download route serves as Content-Length), so an over-cap original is
+    // stated on the row rather than materialized as 51MB of test blob.
+    await handle.db.update(mailAttachments).set({ sizeBytes: 51 * 1024 * 1024 })
+      .where(eq(mailAttachments.id, attachment.id));
+    const refused = await a.inject({
+      method: "POST", url: "/api/mail/send", headers: authHeaders,
+      payload: sendPayload(account.id, { forwardAttachmentIds: [attachment.id] }),
+    });
+    expect(refused.statusCode).toBe(413);
+    const body = errorResponseSchema.parse(refused.json());
+    expect(body.error).toBe("too_large");
+    expect(body.message).toContain("quote.pdf");
+    expect(transport.sent).toHaveLength(1);
     await a.close();
   });
 });

@@ -25,7 +25,10 @@ export interface CrmRouteDeps {
   /** Directory holding uploaded file blobs (see services/blobs.ts). */
   dataDir: string;
   /** Test-only override for the multipart file-size cap, so a 413-path test can
-   * upload a few KB instead of 50MB. Defaults to 50MB in production. */
+   * upload a few KB instead of 50MB. Defaults to 50MB in production -- the
+   * same ceiling mail-send.ts's MAX_FORWARD_ATTACHMENT_BYTES applies to a
+   * forward's re-attached originals (which never pass through this plugin);
+   * change the two together. */
   multipartFileSizeLimit?: number;
   /** Applied by deals.ts's POST /api/deals when the caller omits a currency --
    * threaded straight from config.defaultCurrency (see config.ts). */

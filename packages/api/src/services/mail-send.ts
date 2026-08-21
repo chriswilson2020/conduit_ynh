@@ -4,10 +4,12 @@ import type { MailAccount, MailAddress, SendMailInput } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { files, mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
 import { blobPath } from "./blobs.js";
-import { ArchivedError, ConflictError, NotFoundError, SmtpSendError } from "./errors.js";
+import {
+  ArchivedError, AttachmentTooLargeError, ConflictError, NotFoundError, SmtpSendError,
+} from "./errors.js";
 import { getAccountCredentialsAsSystem, getOwnAccount } from "./mail-accounts.js";
 import { htmlToText, sanitizeMailHtml } from "./mail-content.js";
-import { mustGetThread, visibleMessageTerm } from "./mail-threads.js";
+import { getAttachmentBlob, mustGetThread, visibleMessageTerm } from "./mail-threads.js";
 import type { MailCredentials } from "./mail-crypto.js";
 import {
   MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX, consoleSyncLogger, type SyncLogger,
@@ -282,6 +284,57 @@ async function loadAttachments(
   }));
 }
 
+/**
+ * Per-attachment ceiling for a forward's re-attached originals: the SAME
+ * 50MB the compose upload path enforces (routes/index.ts's multipart
+ * fileSize limit, whose 413 files.ts answers -- change the two together),
+ * applied here at send time because a stored original never passes through
+ * that upload route. Per attachment with no cap on the sum, which is
+ * exactly the compose semantics: each uploaded file is capped individually
+ * and nothing bounds a send's total.
+ */
+export const MAX_FORWARD_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Forwarded originals (Phase 4.3, closing the v0.5.0 "forward no re-attach"
+ * limitation): mail_attachments rows named by id, re-attached to the
+ * outgoing message from the stored blobs.
+ *
+ * AUTHORIZATION AND STORAGE ARE getAttachmentBlob's -- reused, never
+ * re-derived: the same record-scope per-message visibility join that
+ * decides whether this viewer may DOWNLOAD these bytes decides whether they
+ * may mail them onward, an invisible id 404s exactly like a nonexistent
+ * one, and the blob digest comes off the same row the download route
+ * streams from. The counterpart of loadAttachments' rule one shape over:
+ * uploads are files rows the actor OWNS, forwarded originals are
+ * mail_attachments rows the actor may READ.
+ *
+ * THE SIZE CAP is checked against the stored size_bytes -- the byte count
+ * ingest wrote in the same transaction as the blob, the number the download
+ * route serves as Content-Length -- and an over-cap attachment refuses the
+ * WHOLE send with AttachmentTooLargeError (see its class note for why
+ * refusal beats silently dropping the file). The check runs in step 1 of
+ * the send ordering: nothing has been submitted or stored yet, so the
+ * refusal is a plain 4xx and the client still holds the draft.
+ *
+ * PATHS, NOT OPEN STREAMS, for exactly loadAttachments' reason: nodemailer
+ * opens and closes each file inside the one build, so a failure between
+ * here and the compose leaks no descriptor.
+ */
+async function loadForwardAttachments(
+  db: Database, dataDir: string, actorId: string, ids: readonly string[],
+): Promise<ComposedAttachment[]> {
+  const out: ComposedAttachment[] = [];
+  for (const id of ids) {
+    const blob = await getAttachmentBlob(db, actorId, id, { inlineOnly: false });
+    if (blob.sizeBytes > MAX_FORWARD_ATTACHMENT_BYTES) {
+      throw new AttachmentTooLargeError(blob.filename, blob.sizeBytes, MAX_FORWARD_ATTACHMENT_BYTES);
+    }
+    out.push({ filename: blob.filename, contentType: blob.mime, path: blobPath(dataDir, blob.blobPath) });
+  }
+  return out;
+}
+
 // --- Composition -----------------------------------------------------------
 
 function toComposeAddresses(addresses: readonly MailAddress[]): { name?: string; address: string }[] {
@@ -359,7 +412,13 @@ export async function sendMail(
   }
 
   const chain = input.threadId === undefined ? NEW_THREAD : await loadReplyChain(db, actorId, input.threadId);
-  const attachments = await loadAttachments(db, dataDir, actorId, input.attachmentIds);
+  // Uploads first, then a forward's re-attached originals -- the order the
+  // composer lists them. Both loaders run in step 1 (checks only, nothing
+  // sent or stored yet), so either one's 404 or size refusal is a plain 4xx.
+  const attachments = [
+    ...await loadAttachments(db, dataDir, actorId, input.attachmentIds),
+    ...await loadForwardAttachments(db, dataDir, actorId, input.forwardAttachmentIds),
+  ];
   // Only now, once every check that can reject has passed (mail-accounts.ts's
   // getAccountCredentialsAsSystem does NO owner check of its own -- that is
   // this function's job, and it is done above).

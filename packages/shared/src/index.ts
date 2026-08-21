@@ -908,15 +908,16 @@ export const mailThreadDetailSchema = z.object({
   ownedByViewer: z.boolean(),
   // Phase 4.3 (detail cap): how many messages this thread holds FOR THIS
   // VIEWER in total -- the same visibility-filtered set `messages` draws
-  // from -- and whether `messages` was truncated to the newest 50 of them
-  // (`?all=true` on the detail route lifts the cap; the "Show earlier
-  // messages (N more)" control derives N from totalMessages minus what it
-  // rendered).
-  //
-  // Task 1 placeholders: no cap exists yet, so the server returns the full
-  // set with totalMessages = messages.length and truncated = false --
-  // faithful no-ops (every response already IS the uncapped view) until
-  // Task 3 implements the cap in getThreadDetail.
+  // from, so invisible messages count toward neither -- and whether
+  // `messages` was truncated to the newest 50 of them (`?all=true` on the
+  // detail route lifts the cap; the "Show earlier messages (N more)"
+  // control derives N from totalMessages minus what it rendered). Both
+  // describe THIS payload: an uncapped response, whether under the cap or
+  // via all=true, carries truncated false and totalMessages =
+  // messages.length. The cap is a rendering payload bound and nothing else
+  // -- mark-read, the reply chain and ownedByViewer are still computed from
+  // the full visible set server-side (api: mail-threads.ts's
+  // getThreadDetail).
   totalMessages: z.number().int().nonnegative(),
   truncated: z.boolean(),
 });
@@ -1213,6 +1214,15 @@ export const sendMailInputSchema = z.object({
   // here by that upload's id; mail_attachments rows only exist for messages
   // already ingested, which an in-progress compose is not.
   attachmentIds: z.array(z.uuid()).optional().default([]),
+  // mail_attachments.id, the OTHER table (Phase 4.3, closing the v0.5.0
+  // "forward no re-attach" limitation): a forward's re-attached originals,
+  // streamed onto the outgoing mail from the same stored blobs the
+  // attachment download route serves. A separate field rather than a widened
+  // attachmentIds because the two name different rights as well as different
+  // tables: an upload is a files row the actor OWNS, a forwarded original is
+  // a mail_attachments row the actor may READ (record-scope visibility, the
+  // download route's own rule -- api: mail-send.ts's loadForwardAttachments).
+  forwardAttachmentIds: z.array(z.uuid()).optional().default([]),
   links: z.object({
     companyId: z.uuid().optional(), contactId: z.uuid().optional(),
     dealId: z.uuid().optional(), projectId: z.uuid().optional(),

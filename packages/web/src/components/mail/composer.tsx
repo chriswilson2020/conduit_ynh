@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, KeyboardEvent } from "react";
 import { clsx } from "clsx";
-import type { FileMeta, SendMailInput } from "@conduit/shared";
+import type { FileMeta, MailAttachment, SendMailInput } from "@conduit/shared";
 import {
   useContacts,
   useMailAccounts,
@@ -46,6 +46,15 @@ export interface ComposerSeed {
   cc?: readonly ComposerRecipient[];
   /** Pre-filled body -- a forward's quoted original, typically. */
   bodyHtml?: string;
+  /**
+   * A forward's re-attached originals (Phase 4.3): the source message's
+   * stored attachments, listed as removable chips and sent by id as
+   * forwardAttachmentIds -- the API streams them onto the outgoing mail
+   * from the blobs it already holds, so nothing is re-uploaded. Distinct
+   * from the upload flow because the ids name a different table (see the
+   * shared sendMailInputSchema's own comments).
+   */
+  forwardAttachments?: readonly MailAttachment[];
   /**
    * Record links applied to a NEW thread (ignored server-side on a reply,
    * which already has one). Also decides which record an attachment upload is
@@ -120,6 +129,10 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
   const [subject, setSubject] = useState(seed?.subject ?? "");
   const [bodyHtml, setBodyHtml] = useState(seed?.bodyHtml ?? "");
   const [attachments, setAttachments] = useState<FileMeta[]>([]);
+  // The forward's re-attached originals, seeded whole and removable one by
+  // one -- dropping one only leaves it off THIS message, exactly like the
+  // upload chips (the original stays on its own message regardless).
+  const [forwarded, setForwarded] = useState<readonly MailAttachment[]>(seed?.forwardAttachments ?? []);
   const [localError, setLocalError] = useState<string | null>(null);
   // Bumped every time the editor announces itself (RichTextEditor's onCreate,
   // which TipTap emits from a timeout AFTER the instance is live and skips
@@ -239,6 +252,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
       subject,
       bodyHtml,
       attachmentIds: attachments.map((file) => file.id),
+      forwardAttachmentIds: forwarded.map((attachment) => attachment.id),
       links: seed?.links,
     };
     send.mutate(input, { onSuccess: onClose });
@@ -366,6 +380,26 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
             Attachments need a linked record (compose from a contact, company, deal or project).
           </span>
         )}
+        {forwarded.map((attachment) => (
+          <span
+            key={attachment.id}
+            data-testid={`composer-forward-attachment-${attachment.id}`}
+            className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700"
+          >
+            {attachment.filename}
+            <button
+              type="button"
+              // Same wording rule as the upload chips below: dropping the
+              // chip only leaves the file off THIS message -- the original
+              // keeps its own attachment either way.
+              aria-label={`Do not attach ${attachment.filename}`}
+              className="text-slate-400 hover:text-slate-900"
+              onClick={() => setForwarded((current) => current.filter((entry) => entry.id !== attachment.id))}
+            >
+              {"\u00D7"}
+            </button>
+          </span>
+        ))}
         {attachments.map((file) => (
           <span
             key={file.id}
