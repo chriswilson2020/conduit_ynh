@@ -1024,6 +1024,24 @@ describe("moveThreads: visibility and ownership", () => {
     expect((await messageRows(threadId))[1]).toMatchObject({ folder: "INBOX", imapUid: 371 });
   });
 
+  it("answers not_owner for a visible unowned message awaiting reconciliation", async () => {
+    // The row loop gives each row ONE answer, at the first check that
+    // settles it -- and ownership settles this row before its NULL uid is
+    // ever consulted, landing where the rank would have anyway (1 beats 2).
+    // Reporting awaiting_reconciliation instead would tell the actor to wait
+    // for a pass that can never make this mail theirs to move.
+    const accountId = await makeAccount({ visibility: "shared" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: null });
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [threadId], folder: "INBOX", action: "archive" },
+      deps(new FakeManager()),
+    );
+
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "not_owner" }]);
+  });
+
   it("answers already_in_target for a visible unowned row already in the foreign target", async () => {
     // The D5 ruling, pinned: the row loop asks "does the goal already hold?"
     // before any ownership question -- a finished answer that needs no rights

@@ -11,14 +11,16 @@ import { encryptCredentialsAt, decryptCredentialsAt, type MailCredentials } from
 import { sanitizeMailHtml } from "./mail-content.js";
 import { publish } from "./sse.js";
 
-/** Invalidation key every mail-account mutator publishes after its write commits.
+/** Invalidation frame every mail-account mutator publishes after its write commits.
  * Mail accounts emit NO events-table rows (mail stays out of the CRM timeline per
  * the Phase 4 spec) -- this SSE hint is the only invalidation signal, driving both
  * the settings page and (via the account-status flip) the inbox's error badge.
- * One mutation widens the frame instead of calling this: a visibility flip in
- * updateAccount, whose publish carries the thread-side keys too. */
-function publishAccountsHint(): void {
-  publish({ keys: [["mail-accounts"]] });
+ * `widenWith` exists for the one mutation whose blast radius is bigger than the
+ * settings page -- updateAccount's visibility flip appends the thread-side key
+ * families to the SAME single frame -- so the accounts key has one definition
+ * here and a widened publish still costs one frame. */
+function publishAccountsHint(widenWith: string[][] = []): void {
+  publish({ keys: [["mail-accounts"], ...widenWith] });
 }
 
 /**
@@ -440,17 +442,13 @@ export async function updateAccount(
     // after the status reset; otherwise just wakes it, since the running
     // loop re-reads the account row on its very next pass anyway.
     notifyAccountChanged(id, { connectionChanged });
-    if (visibilityChanged) {
-      // A visibility flip changes what EVERY user's thread list and unread
-      // badge contain (the Phase 4.2 predicate reads this column), not just
-      // this account's settings row -- so the one post-commit publish carries
-      // the two thread-side key families beside the accounts key. Same-value
-      // patches never reach here (the no-op short-circuit above), so
-      // toggling nothing publishes nothing.
-      publish({ keys: [["mail-accounts"], ["mail-threads"], ["mail-unread"]] });
-    } else {
-      publishAccountsHint();
-    }
+    // A visibility flip changes what EVERY user's thread list and unread
+    // badge contain (the Phase 4.2 predicate reads this column), not just
+    // this account's settings row -- so the one post-commit publish widens
+    // to carry the two thread-side key families beside the accounts key.
+    // Same-value patches never reach here (the no-op short-circuit above),
+    // so toggling nothing publishes nothing.
+    publishAccountsHint(visibilityChanged ? [["mail-threads"], ["mail-unread"]] : []);
   }
   return toMailAccount(row);
 }

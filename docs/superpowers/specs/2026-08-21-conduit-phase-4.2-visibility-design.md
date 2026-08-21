@@ -138,4 +138,9 @@ Ruled during Task 2's spec review; each supersedes the corresponding line above.
 5. **The visibility flip publishes three hint families, not the Settings section's
    original two**: `[["mail-accounts"]]` + `[["mail-threads"]]` + `[["mail-unread"]]` —
    the unread computations are visibility-scoped, so the badge and per-folder counts
-   change for every user too. The Settings line above is corrected in place.
+   change for every user too. The Settings line above is corrected in place. The frame
+   deliberately carries no per-thread `["mail-thread", <id>]` keys, so an already-open
+   conversation pane is NOT invalidated by a flip — it lives on its cached,
+   already-delivered bytes until the next refetch; the web layer (Task 4) decides
+   between accepting-and-documenting that window and closing the pane when its thread
+   leaves the list.

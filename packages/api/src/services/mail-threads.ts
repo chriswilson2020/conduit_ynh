@@ -19,8 +19,9 @@ import { publish } from "./sse.js";
 /**
  * Threads are PRIVATE BY DEFAULT, per account (Phase 4.2): what a viewer may
  * read is decided by mail_accounts.visibility and the deliberate deal/project
- * links, through the one predicate pair below (visibleMessageTerm /
- * visibleThreads -- see their shared header for the model). Every read path
+ * links, through the one predicate family below (visibleMessageTerm /
+ * visibleThreads / visibleMessageSelfContained -- see their shared header for
+ * the model). Every read path
  * in this file therefore takes the requesting user's id as an explicit
  * parameter -- threaded from the route's requireUser, never ambient -- and so
  * does every thread mutation, because each one returns the thread row and a
@@ -247,10 +248,10 @@ function trimmedTrashFolder(): SQL {
  * - visibleThreads: one THREAD is visible -- the self-contained
  *   EXISTS-over-messages form, for queries that select from mail_threads
  *   with no message scope of their own (the unscoped list, mustGetThread).
- * - visibleMessageSelfContained: the record-scope MESSAGE term with both
- *   arms wrapped in their own correlated EXISTS, for queries over bare
- *   mail_messages rows with neither join in scope (markThreadRead's UPDATE,
- *   mail-move's messages read).
+ * - visibleMessageSelfContained: the MESSAGE term with each arm wrapped in
+ *   its own correlated EXISTS, for queries over bare mail_messages rows with
+ *   neither join in scope (markThreadRead's UPDATE, mail-move's messages
+ *   read).
  *
  * A thread with NO messages at all (unreachable through ingest, but the list
  * renders it defensively) is inbox-visible to nobody -- there is no account
@@ -291,20 +292,33 @@ export function visibleThreads(userId: string, scope: MailVisibilityScope): SQL 
 }
 
 /**
- * The record-scope MESSAGE term in SELF-CONTAINED form: each arm is its own
- * correlated EXISTS (mail_accounts for owned-or-shared, mail_threads for the
- * deal/project arm), so unlike visibleMessageTerm it carries no join
- * precondition -- a bare mail_messages row in scope is enough. Two callers,
- * one source: markThreadRead's UPDATE below (where the readability decision
- * and the write must be one atomic statement) and mail-move.ts's messages
- * read (where a message the actor cannot see must never enter scope at all
- * -- spec Amendment 4). Record scope only, because both callers sit behind a
- * record-scope thread gate. Deliberately a WRAPPER over the same two pieces
- * rather than a change to visibleMessageTerm itself: the composed queries'
- * EXPLAIN record (0006's decision comment) measured that term as-is.
+ * The MESSAGE term in SELF-CONTAINED form: each arm is its own correlated
+ * EXISTS (mail_accounts for owned-or-shared; record scope adds the
+ * mail_threads deal/project arm), so unlike visibleMessageTerm it needs
+ * neither table joined. PRECONDITION, the one it does keep: the composing
+ * query must have mail_messages itself in scope, UN-ALIASED -- the
+ * correlations name the table directly. Past that it is deliberately
+ * alias-proof: both arms open their own FROM, so a mail_accounts or
+ * mail_threads the outer query happens to join is SHADOWED rather than
+ * correlated against -- that is the point (markThreadRead's UPDATE joins
+ * neither; mail-move's messages read must not accidentally couple to one).
+ *
+ * Takes the scope parameter its siblings take, for the same reason they do:
+ * a caller reaching for "the self-contained one" on an inbox surface must be
+ * forced to SAY inbox, not silently inherit the record arm and widen a
+ * mailbox view to every deal-linked thread. Today's two callers --
+ * markThreadRead's UPDATE (the readability decision and the write must be
+ * one atomic statement) and mail-move.ts's messages read (a message the
+ * actor cannot see must never enter scope at all, spec Amendment 4) -- both
+ * pass "record", the scope of their shared thread gate. Deliberately a
+ * WRAPPER over the same pieces rather than a change to visibleMessageTerm
+ * itself: the composed queries' EXPLAIN record (0006's decision comment)
+ * measured that term as-is.
  */
-export function visibleMessageSelfContained(userId: string): SQL {
-  return sql`(EXISTS (SELECT 1 FROM ${mailAccounts} WHERE ${mailAccounts.id} = ${mailMessages.accountId} AND ${ownedOrShared(userId)}) OR EXISTS (SELECT 1 FROM ${mailThreads} WHERE ${mailThreads.id} = ${mailMessages.threadId} AND ${recordLinked()}))`;
+export function visibleMessageSelfContained(userId: string, scope: MailVisibilityScope): SQL {
+  const owned = sql`EXISTS (SELECT 1 FROM ${mailAccounts} WHERE ${mailAccounts.id} = ${mailMessages.accountId} AND ${ownedOrShared(userId)})`;
+  if (scope === "inbox") return owned;
+  return sql`(${owned} OR EXISTS (SELECT 1 FROM ${mailThreads} WHERE ${mailThreads.id} = ${mailMessages.threadId} AND ${recordLinked()}))`;
 }
 
 /**
@@ -882,7 +896,7 @@ export async function markThreadRead(
   const thread = await mustGetThread(db, userId, id);
   const readable = and(
     eq(mailMessages.threadId, id), eq(mailMessages.seen, false),
-    visibleMessageSelfContained(userId),
+    visibleMessageSelfContained(userId, "record"),
   );
   const changed = await db.update(mailMessages).set({ seen: true, updatedAt: new Date() })
     .where(readable)

@@ -75,6 +75,17 @@ import { publish } from "./sse.js";
  *   honestly told WHY nothing moved, an invisible one is denied existing at
  *   all.
  *
+ * THE GATE IS A POINT-IN-TIME READ at collection, and the ownership drop is
+ * what makes that safe: every row that reaches candidates.push sits on an
+ * account the actor OWNS, and owned implies visible in every scope -- so no
+ * visibility flip between collection and the queued MOVE can hide a
+ * candidate from its own actor. That subset property is LOAD-BEARING:
+ * whoever relaxes move rights (say, "colleagues may file the shared
+ * mailbox") must re-open the staleness question, because candidates would
+ * stop being messages on the actor's own accounts, and a flip landing
+ * between collectCandidates and queueMoves would move mail the actor may no
+ * longer see.
+ *
  * The IMAP write happens through EACH MESSAGE'S OWN account's sync loop,
  * under that account's credentials -- the actor's identity never reaches a
  * mail server; `actorId` is the visibility/ownership subject above and the
@@ -228,24 +239,27 @@ type NotedSkipReason = Exclude<BulkThreadSkipReason, "out_of_scope">;
  * mixed thread already reported before 4.2, so holding it at rank 0 means
  * adding not_owner changes no existing thread's reported reason -- an
  * archived account someone else owns keeps saying archived_account. The
- * per-row check order in collectCandidates agrees on purpose (the
+ * per-row check order in collectCandidates agrees FOR THAT PAIR (the
  * archived_account drop runs before the ownership drop), so promoting
  * not_owner to rank 0 would also mean moving that check, silently changing
  * what mixed threads report. This ordering only matters when one thread's
  * messages hit more than one cause at once, which is rare -- see shared's
  * bulkThreadSkipReasonSchema comment for the fuller reasoning.
  *
- * THE PER-ROW CLASSIFICATION ORDER IS NOT THIS RANK ORDER, and answers a
- * different question (coordinator ruling, Task 3 spec review): the rank
- * arbitrates the THREAD-level answer among reasons already noted, while the
- * row loop gives each row its cheapest finished answer first. Two visible
- * consequences, both deliberate and both pinned by tests: a row already in
- * its target reports already_in_target (rank 3) without any ownership check
- * -- "the goal already holds" needs no rights to be true, and it can only be
- * said of a row the viewer can SEE (invisible rows never enter the loop),
- * whose folder facts the UI shows anyway; and a visible unowned row with a
- * NULL uid reports not_owner rather than awaiting_reconciliation -- it is
- * not yours to move regardless of its uid state.
+ * The row loop's own check order and this rank coincide for the three
+ * NOTED-in-place reasons (archived_account, then not_owner, then
+ * awaiting_reconciliation) and diverge in exactly one place: already_in_
+ * target is HOISTED to the front of the loop, because "the goal already
+ * holds" is a finished answer needing no uid, no live sync and no ownership
+ * check to be true -- and (post-Amendment-4) one only ever given about a row
+ * the viewer can SEE, whose folder facts the UI shows anyway. The two orders
+ * answer different questions: the rank arbitrates the THREAD-level answer
+ * among reasons rows actually noted, while the loop gives each row exactly
+ * ONE answer, at the first check that settles it. A visible unowned row with
+ * a NULL uid is that single-answer rule at work, not a second divergence: it
+ * notes not_owner -- where the rank would have landed it anyway (1 beats 2)
+ * -- because the mail is not the actor's to move regardless of uid state.
+ * Both the hoist and the NULL-uid case are pinned by tests.
  */
 const SKIP_REASON_RANK: Record<NotedSkipReason, number> = {
   archived_account: 0,
@@ -728,12 +742,15 @@ async function collectCandidates(
   // know exists (a foreign private copy's not_owner would reveal messages in
   // a folder where the actor's own world truthfully has nothing, and would
   // outrank the actor's own awaiting_reconciliation). Self-contained form
-  // because this select joins neither mail_accounts nor mail_threads.
+  // because this select joins neither mail_accounts nor mail_threads. Cost:
+  // bounded by the route's 50-thread cap on MOVE requests, and both EXISTS
+  // arms are primary-key probes per row -- a different class from the
+  // unbounded list scans the 0005/0006 EXPLAIN records measure.
   const messages = await db.select({
     id: mailMessages.id, threadId: mailMessages.threadId, accountId: mailMessages.accountId,
     folder: mailMessages.folder, imapUid: mailMessages.imapUid,
   }).from(mailMessages).where(
-    and(inArray(mailMessages.threadId, [...known]), visibleMessageSelfContained(actorId)),
+    and(inArray(mailMessages.threadId, [...known]), visibleMessageSelfContained(actorId, "record")),
   );
   if (messages.length === 0) return { candidates: [], refusedAccounts: 0 };
 
