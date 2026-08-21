@@ -8,7 +8,8 @@ import { and, eq } from "drizzle-orm";
 import {
   contactSchema, dealSchema, errorResponseSchema, listResponseSchema, pipelineSchema, stageSchema,
   mailAccountSchema, mailAccountListSchema, mailAccountTestResultSchema, mailThreadSchema,
-  mailThreadListItemSchema, mailThreadDetailSchema, mailMessageSchema, mailUnreadCountSchema,
+  mailThreadListItemSchema, mailThreadDetailSchema, markThreadReadResponseSchema,
+  mailMessageSchema, mailUnreadCountSchema,
   mailUnreadFolderCountsSchema, mailAccountFolderSchema, bulkThreadResultSchema,
   emailTemplateSchema, searchResultsSchema,
   type MailAccountCreateInput, type MailAccountSyncStats, type SendMailInput,
@@ -1100,13 +1101,17 @@ describe("mail thread detail route", () => {
   // bound is on what renders for THIS viewer, so an invisible message
   // neither counts toward totalMessages nor occupies one of the 50 slots --
   // and each viewer of a cross-account thread gets their own arithmetic.
+  // The invisible messages sit at the NEWEST end on purpose: a regression
+  // that capped BEFORE filtering would hand dana's rows the newest-50
+  // window's top slots and push chris's own off the bottom, so it fails
+  // the page-id assertion below, not just the totalMessages count.
   it("caps the VISIBLE set per viewer: invisible messages neither count nor fill slots", async () => {
     const a = await app();
     const chrisPrivate = await makeAccount(a);
     const danaPrivate = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
     const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
     const chrisIds = await seedMessageRun(threadId, chrisPrivate.id, 52, new Date("2026-08-01T10:00:00Z"));
-    const danaIds = await seedMessageRun(threadId, danaPrivate.id, 3, new Date("2026-08-01T08:00:00Z"));
+    const danaIds = await seedMessageRun(threadId, danaPrivate.id, 3, new Date("2026-08-02T10:00:00Z"));
 
     const forChris = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
     const chrisBody = mailThreadDetailSchema.parse(forChris.json());
@@ -1251,11 +1256,21 @@ describe("mail thread read route", () => {
 
     const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
     expect(response.statusCode).toBe(200);
-    expect(mailThreadSchema.parse(response.json()).id).toBe(threadId);
+    const body = markThreadReadResponseSchema.parse(response.json());
+    expect(body.thread.id).toBe(threadId);
+    expect(body.changed).toBe(true);
 
     const after = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
     expect(mailUnreadCountSchema.parse(after.json()).count).toBe(0);
     expect(sync.markSeenCalls).toEqual([{ folder: "INBOX", uids: [11, 12] }]);
+
+    // The idempotent second read: nothing left to flip, and the response
+    // SAYS so -- `changed: false` is what stops the client refetching four
+    // key families for a write that wrote nothing (the server-side half,
+    // no SSE hint on a no-op, is pinned at the service).
+    const again = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
+    expect(again.statusCode).toBe(200);
+    expect(markThreadReadResponseSchema.parse(again.json()).changed).toBe(false);
     await a.close();
   });
 
@@ -1309,7 +1324,7 @@ describe("mail thread read route", () => {
 
     const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
     expect(response.statusCode).toBe(200);
-    expect(mailThreadSchema.parse(response.json()).hiddenAt).not.toBeNull();
+    expect(markThreadReadResponseSchema.parse(response.json()).thread.hiddenAt).not.toBeNull();
     const rows = await handle.db.select({ seen: mailMessages.seen }).from(mailMessages)
       .where(eq(mailMessages.threadId, threadId));
     expect(rows.every((row) => row.seen)).toBe(true);
@@ -1344,6 +1359,10 @@ describe("mail thread read route", () => {
 
     const read = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
     expect(read.statusCode).toBe(200);
+    // changed is TRUE although the rendered page held no unseen row -- the
+    // very case that shows why the client cannot derive this flag from the
+    // page and has to be told.
+    expect(markThreadReadResponseSchema.parse(read.json()).changed).toBe(true);
     const [row] = await handle.db.select({ seen: mailMessages.seen }).from(mailMessages)
       .where(eq(mailMessages.id, unseenBelow));
     expect(row?.seen).toBe(true);
@@ -2233,6 +2252,23 @@ describe("mail send route", () => {
     expect(body.error).toBe("too_large");
     expect(body.message).toContain("quote.pdf");
     expect(transport.sent).toHaveLength(1);
+    await a.close();
+  });
+
+  // The max(50) sits on the RAW list, BEFORE the server's dedupe (shared
+  // schema's own contract): 51 entries 400 even though deduping would
+  // bring them to 50 -- pinned with a duplicate present so a reordering of
+  // the two steps (dedupe-then-max would accept this) fails here.
+  it("400s 51 forward ids even when a duplicate would dedupe them under the cap", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const ids = Array.from({ length: 50 }, () => randomUUID());
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/send", headers: authHeaders,
+      payload: sendPayload(account.id, { forwardAttachmentIds: [...ids, ids[0] as string] }),
+    });
+    expect(response.statusCode).toBe(400);
+    expect(transport.sent).toHaveLength(0);
     await a.close();
   });
 });

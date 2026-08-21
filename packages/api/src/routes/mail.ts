@@ -432,7 +432,10 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
         onFailure(error);
       }
     }
-    return result.thread;
+    // {thread, changed}, not the bare thread: `changed` is what lets the
+    // client skip its invalidation cascade when this was a no-op -- see the
+    // shared markThreadReadResponseSchema.
+    return { thread: result.thread, changed: result.changed };
   });
 
   app.post("/api/mail/threads/:id/links", async (request, reply) => {

@@ -43,6 +43,7 @@ import {
   mailThreadSchema,
   mailThreadListItemSchema,
   mailThreadDetailSchema,
+  markThreadReadResponseSchema,
   mailUnreadCountSchema,
   mailMessageSchema,
   mailAttachmentSchema,
@@ -1212,8 +1213,8 @@ describe("mailThreadDetailSchema", () => {
     }],
     dealSuggestions: [{ id: uuid2, title: "Renewal" }],
     ownedByViewer: true,
-    // Phase 4.3 detail-cap pair -- the uncapped shape every response has
-    // until the cap lands (see mailThreadDetailSchema's own comment).
+    // Phase 4.3 detail-cap pair, here in the untruncated shape: everything
+    // rendered, totalMessages = messages.length (see the schema's comment).
     totalMessages: 1,
     truncated: false,
   };
@@ -1237,6 +1238,26 @@ describe("mailThreadDetailSchema", () => {
     }
     const truncatedPage = { ...detail, totalMessages: 120, truncated: true };
     expect(mailThreadDetailSchema.parse(truncatedPage)).toEqual(truncatedPage);
+  });
+});
+
+describe("markThreadReadResponseSchema", () => {
+  const thread = {
+    id: uuid1, subject: "Re: Proposal", lastMessageAt: now, messageCount: 1,
+    companyId: null, contactId: null, dealId: null, projectId: null,
+    hiddenAt: null, createdAt: now, updatedAt: now,
+  };
+
+  it("accepts the {thread, changed} pair either way the write went", () => {
+    expect(markThreadReadResponseSchema.parse({ thread, changed: true }).changed).toBe(true);
+    expect(markThreadReadResponseSchema.parse({ thread, changed: false }).changed).toBe(false);
+  });
+
+  // `changed` is REQUIRED: an absent flag would make the client guess
+  // between "no-op" and "old server", and guessing "changed" re-creates
+  // the cascade the flag exists to stop.
+  it("rejects a response missing changed", () => {
+    expect(() => markThreadReadResponseSchema.parse({ thread })).toThrow();
   });
 });
 

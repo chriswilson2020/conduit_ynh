@@ -914,7 +914,11 @@ export const mailThreadDetailSchema = z.object({
   // control derives N from totalMessages minus what it rendered). Both
   // describe THIS payload: an uncapped response, whether under the cap or
   // via all=true, carries truncated false and totalMessages =
-  // messages.length. The cap is a rendering payload bound and nothing else
+  // messages.length -- an invariant that holds BY CONSTRUCTION, because the
+  // server computes the counts as window aggregates on the page query
+  // itself (one statement, one snapshot: a concurrent ingest cannot wedge a
+  // contradiction between the page and its totals). The cap is a rendering
+  // payload bound and nothing else
   // -- mark-read, the reply chain and ownedByViewer are still computed from
   // the full visible set server-side (api: mail-threads.ts's
   // getThreadDetail).
@@ -922,6 +926,21 @@ export const mailThreadDetailSchema = z.object({
   truncated: z.boolean(),
 });
 export type MailThreadDetail = z.infer<typeof mailThreadDetailSchema>;
+
+// POST /api/mail/threads/:id/read -- the thread as this viewer now sees it,
+// plus whether the write actually flipped anything. `changed` is the
+// CLIENT half of no-op suppression: the server already publishes no SSE
+// hint when nothing was unseen (api: mail-threads.ts's markThreadRead), and
+// this flag lets the requester skip its own invalidation cascade too --
+// the conversation view fires mark-read unconditionally on open, so
+// without it every click down an already-read inbox cost a round of
+// refetches for a write that wrote nothing. SSE remains the always-path
+// for REAL changes; this gates only the requester's own follow-ups.
+export const markThreadReadResponseSchema = z.object({
+  thread: mailThreadSchema,
+  changed: z.boolean(),
+});
+export type MarkThreadReadResponse = z.infer<typeof markThreadReadResponseSchema>;
 
 // GET /api/mail/unread-count -- distinct threads THE VIEWER HAS NOT HIDDEN
 // holding at least one unseen message (per-user hides, Phase 4.3: a thread
@@ -1227,9 +1246,12 @@ export const sendMailInputSchema = z.object({
   // attachment id from any message -- the equivalent of downloading and
   // re-attaching, minus the round trip. Duplicate ids attach ONCE (the
   // service dedupes, first occurrence's position wins). max(50) mirrors
-  // ingest's MAX_ATTACHMENTS: no stored message holds more, so no honest
-  // forward names more. (attachmentIds above carries no max of its own --
-  // pre-existing, deliberately left untouched here.)
+  // ingest's MAX_ATTACHMENTS -- no stored message holds more, so no honest
+  // forward names more -- and it is checked on the RAW list, before the
+  // server's dedupe: 51 entries 400 even when deduping would bring them
+  // under the cap, because a request that repeats itself past the limit is
+  // malformed, not generously interpretable. (attachmentIds above carries
+  // no max of its own -- pre-existing, deliberately left untouched here.)
   forwardAttachmentIds: z.array(z.uuid()).max(50).optional().default([]),
   links: z.object({
     companyId: z.uuid().optional(), contactId: z.uuid().optional(),

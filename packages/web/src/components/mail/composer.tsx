@@ -375,11 +375,6 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
           {upload.isPending ? "Uploading..." : "Attach file"}
           <input type="file" className="hidden" onChange={handleUpload} disabled={target === null || upload.isPending} />
         </label>
-        {target === null && (
-          <span className="text-xs text-slate-400">
-            Attachments need a linked record (compose from a contact, company, deal or project).
-          </span>
-        )}
         {forwarded.map((attachment) => (
           <span
             key={attachment.id}
@@ -421,6 +416,15 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
             </button>
           </span>
         ))}
+        {/* AFTER the chips, deliberately: the sentence explains the greyed
+            UPLOAD control, and a forward's re-attached chips work fine
+            without a linked record -- rendered directly above working
+            chips it read as contradicting them. */}
+        {target === null && (
+          <span className="text-xs text-slate-400">
+            Attachments need a linked record (compose from a contact, company, deal or project).
+          </span>
+        )}
       </div>
 
       {localError !== null && <p role="alert" className="text-sm text-red-600">{localError}</p>}

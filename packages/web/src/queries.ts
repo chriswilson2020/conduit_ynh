@@ -20,6 +20,7 @@ import {
   mailThreadSchema,
   mailUnreadCountSchema,
   mailUnreadFolderCountsSchema,
+  markThreadReadResponseSchema,
   meResponseSchema,
   midpoint,
   noteSchema,
@@ -55,6 +56,7 @@ import {
   type MailLinkKind,
   type MailMessage,
   type MailThread,
+  type MarkThreadReadResponse,
   type Pipeline,
   type PipelineScope,
   type Project,
@@ -1549,12 +1551,25 @@ function useInvalidateMailThread() {
   };
 }
 
+// Invalidation is GATED on the response's `changed` flag: the conversation
+// view fires this unconditionally on open (its unseen state is not
+// derivable from a capped page -- see conversation.tsx), so an already-read
+// thread would otherwise cost a full invalidation round per click for a
+// write that wrote nothing. The server publishes no SSE hint on that same
+// no-op path; when something DID change, both this gate and the hint fire,
+// and SSE remains the always-path for every other client.
 export function useMarkThreadRead() {
   const invalidate = useInvalidateMailThread();
   return useMutation({
     mutationFn: async (id: string) =>
-      parseWith(mailThreadSchema, await postJson<unknown>(`/mail/threads/${id}/read`), "mail thread"),
-    onSuccess: (thread: MailThread) => invalidate(thread.id),
+      parseWith(
+        markThreadReadResponseSchema,
+        await postJson<unknown>(`/mail/threads/${id}/read`),
+        "mark thread read",
+      ),
+    onSuccess: (result: MarkThreadReadResponse) => {
+      if (result.changed) invalidate(result.thread.id);
+    },
   });
 }
 

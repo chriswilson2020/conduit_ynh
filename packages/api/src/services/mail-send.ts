@@ -432,9 +432,11 @@ export async function sendMail(
   }
 
   const chain = input.threadId === undefined ? NEW_THREAD : await loadReplyChain(db, actorId, input.threadId);
-  // Uploads first, then a forward's re-attached originals -- the order the
-  // composer lists them. Both loaders run in step 1 (checks only, nothing
-  // sent or stored yet), so either one's 404 or size refusal is a plain 4xx.
+  // Uploads first, then a forward's re-attached originals, on the WIRE --
+  // the composer displays the two the other way round (forwarded chips
+  // first); MIME part order is not display order and nothing reads meaning
+  // into it. Both loaders run in step 1 (checks only, nothing sent or
+  // stored yet), so either one's 404 or size refusal is a plain 4xx.
   const attachments = [
     ...await loadAttachments(db, dataDir, actorId, input.attachmentIds),
     ...await loadForwardAttachments(db, dataDir, actorId, input.forwardAttachmentIds),
@@ -470,7 +472,12 @@ export async function sendMail(
     ...(attachments.length > 0 ? { attachments } : {}),
   });
   // ONE composition; see this module's doc comment. build() resolves the
-  // attachment streams and generates the Message-ID.
+  // attachment streams and generates the Message-ID. A blob PATH that does
+  // not resolve -- possible only through storage corruption, since blobs
+  // are content-addressed and nothing ever deletes them -- surfaces here as
+  // build() rejecting, i.e. a bare 500 with nothing sent and nothing
+  // stored. Accepted, and pre-existing for uploads: a 500 is the honest
+  // answer for a store that has lost bytes it promised to hold.
   const raw = await composer.compile().build();
 
   try {

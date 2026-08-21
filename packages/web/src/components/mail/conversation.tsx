@@ -56,10 +56,14 @@ export function Conversation({ threadId }: ConversationProps) {
   // 4.3 detail cap). Two cache entries under one ["mail-thread", id]
   // prefix, so every existing invalidation reaches whichever is showing.
   // The capped query stays mounted while the full one loads -- the
-  // conversation keeps rendering the newest 50 instead of blanking to a
-  // spinner -- and once the full payload lands it wins below.
+  // conversation keeps rendering the newest 50 (a disabled query keeps its
+  // cached data) instead of blanking to a spinner -- and once the full
+  // payload lands it wins below. Exactly one of the pair is enabled at a
+  // time: once showAll flips, refetching a capped payload nobody renders
+  // any more would be pure waste. showAll resets per conversation via the
+  // key={threadId} remount (the inbox is this component's only mount site).
   const [showAll, setShowAll] = useState(false);
-  const capped = useMailThread(threadId);
+  const capped = useMailThread(threadId, { enabled: !showAll });
   const full = useMailThread(threadId, { all: true, enabled: showAll });
   const data = showAll && full.data !== undefined ? full.data : capped.data;
   const { isLoading, error } = capped;
@@ -126,9 +130,11 @@ export function Conversation({ threadId }: ConversationProps) {
    * a long thread's only unseen messages can sit entirely below the page --
    * counted by the badge, invisible to the heuristic, stuck until
    * Show-earlier. Idempotence is the SERVER's job and it already does it:
-   * markThreadRead writes only rows that are actually unseen and publishes
-   * no hint when nothing changed, so the cost of firing on an already-read
-   * thread is one no-op POST per open, not a refetch storm.
+   * markThreadRead writes only rows that are actually unseen, publishes no
+   * hint when nothing changed, and reports that verdict back as `changed`
+   * -- which useMarkThreadRead gates its invalidations on -- so the cost
+   * of firing on an already-read thread is one no-op POST per open and
+   * nothing else: no hint, no follow-up refetches.
    */
   const markedRef = useRef<string | null>(null);
   useEffect(() => {
@@ -287,10 +293,12 @@ export function Conversation({ threadId }: ConversationProps) {
           is ~416px, narrower than the four buttons' single row, and the old
           shrink-0 group overflowed the pane -- buttons clipped at its edge,
           the subject crushed to a one-character column. Wrapped, the subject
-          takes its own full-width line(s) and the buttons wrap below,
-          right-aligned via ml-auto; on wide viewports where both fit, the
-          one-line justify-between layout is unchanged. */}
-      <div className="flex flex-wrap items-start justify-between gap-3">
+          takes its own full-width line(s) and the buttons wrap below;
+          ml-auto on the group is the ONE right-alignment mechanism (it
+          covers both the shared line and the wrapped one, where a row-level
+          justify-between would go dead), so the row carries none. On wide
+          viewports where both fit, the one-line layout is unchanged. */}
+      <div className="flex flex-wrap items-start gap-3">
         <h2 className="min-w-0 break-words text-lg font-semibold text-slate-900">
           {subjectLabel(thread.subject)}
         </h2>
