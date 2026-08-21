@@ -243,8 +243,10 @@ export function Conversation({ threadId }: ConversationProps) {
   }
   if (data === undefined || thread === undefined) return null;
 
-  // Phase 4.3: hiddenAt is the per-viewer hide state (Task 1 still serves
-  // the thread-global value under the new name -- behaviour identical).
+  // Phase 4.3: hiddenAt is THIS viewer's own hide state (their
+  // mail_thread_hides row's timestamp, null when they have not hidden the
+  // thread) -- so the Hide/Unhide button below reflects and changes only
+  // the signed-in user's filing, never anyone else's.
   const hidden = thread.hiddenAt !== null;
   const expandedIds = expanded ?? defaultExpandedRef.current;
   const archiveError = archive.error ?? unarchive.error;

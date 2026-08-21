@@ -5,6 +5,7 @@ import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { mailAccounts, mailMessages, mailThreadHides, mailThreads, projects } from "../db/schema.js";
 import type { SyncLogger } from "./mail-imap.js";
+import { hideThread, unhideThread } from "./mail-threads.js";
 import { moveThreads, type MoveSyncAccount, type MoveSyncManager } from "./mail-move.js";
 import { subscribe } from "./sse.js";
 
@@ -1158,5 +1159,26 @@ describe("moveThreads: hide", () => {
     // Nothing was hidden: no hide row was written for anyone.
     expect(await hideRowFor(invisible, actorId)).toBeUndefined();
     expect(await hideRowFor(invisible, userId)).toBeUndefined();
+  });
+
+  // The single-thread path's half of the trade hideThreads' header states:
+  // hideThread/unhideThread publish only when the actor's hide row was
+  // actually WRITTEN or DELETED, so an idempotent no-op costs no client a
+  // refetch. (The bulk path deliberately cannot tell and publishes one
+  // batch frame either way -- the tests above pin that side.)
+  it("publishes one hint per real hide or unhide and none for the idempotent no-ops", async () => {
+    const accountId = await makeAccount({ visibility: "shared" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 161 });
+
+    await hideThread(handle.db, actorId, threadId);
+    expect(threadHints()).toHaveLength(1);
+    await hideThread(handle.db, actorId, threadId);
+    expect(threadHints()).toHaveLength(1);
+
+    await unhideThread(handle.db, actorId, threadId);
+    expect(threadHints()).toHaveLength(2);
+    await unhideThread(handle.db, actorId, threadId);
+    expect(threadHints()).toHaveLength(2);
   });
 });

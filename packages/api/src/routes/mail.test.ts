@@ -305,6 +305,22 @@ async function setMoveTargets(
   await handle.db.update(mailAccounts).set(targets).where(eq(mailAccounts.id, accountId));
 }
 
+/** Accounts are born private; tests that need the shared arm flip the row
+ * directly (the Settings PATCH that also does this has its own tests).
+ * Shared by the visibility and per-user-hide suites. */
+async function setVisibility(accountId: string, visibility: "private" | "shared"): Promise<void> {
+  await handle.db.update(mailAccounts).set({ visibility }).where(eq(mailAccounts.id, accountId));
+}
+
+/** One viewer's thread list as ids -- the shape most matrix assertions read. */
+async function listIds(a: App, query: string, headers: Record<string, string>): Promise<string[]> {
+  const response = await a.inject({
+    method: "GET", url: `/api/mail/threads${query === "" ? "" : `?${query}`}`, headers,
+  });
+  expect(response.statusCode).toBe(200);
+  return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items.map((t) => t.id);
+}
+
 async function makeContact(a: App, overrides: Record<string, unknown> = {}) {
   const response = await a.inject({
     method: "POST", url: "/api/contacts", headers: authHeaders,
@@ -2328,12 +2344,6 @@ describe("search route: mail group", () => {
 // unread computations, search, and the attachment bytes. chris owns every
 // seeded mailbox; dana is the other authenticated user.
 describe("mail thread visibility", () => {
-  /** Accounts are born private; tests that need the shared arm flip the row
-   * directly (the Settings PATCH that also does this has its own tests). */
-  async function setVisibility(accountId: string, visibility: "private" | "shared"): Promise<void> {
-    await handle.db.update(mailAccounts).set({ visibility }).where(eq(mailAccounts.id, accountId));
-  }
-
   async function makeProject(a: App): Promise<{ id: string }> {
     const response = await a.inject({
       method: "POST", url: "/api/projects", headers: authHeaders, payload: { name: `Rollout ${randomUUID()}` },
@@ -2348,14 +2358,6 @@ describe("mail thread visibility", () => {
     });
     expect(response.statusCode).toBe(201);
     return response.json() as { id: string };
-  }
-
-  async function listIds(a: App, query: string, headers: Record<string, string>): Promise<string[]> {
-    const response = await a.inject({
-      method: "GET", url: `/api/mail/threads${query === "" ? "" : `?${query}`}`, headers,
-    });
-    expect(response.statusCode).toBe(200);
-    return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items.map((t) => t.id);
   }
 
   it("shows another user only shared-account threads in the inbox -- no link widens the mailbox view", async () => {
@@ -3067,18 +3069,6 @@ describe("mail thread visibility", () => {
 // views and nobody else's anything, and it never changes what anyone MAY
 // see -- only what the hider's default surfaces bother showing.
 describe("per-user hide", () => {
-  async function setVisibility(accountId: string, visibility: "private" | "shared"): Promise<void> {
-    await handle.db.update(mailAccounts).set({ visibility }).where(eq(mailAccounts.id, accountId));
-  }
-
-  async function listIds(a: App, query: string, headers: typeof authHeaders): Promise<string[]> {
-    const response = await a.inject({
-      method: "GET", url: `/api/mail/threads${query === "" ? "" : `?${query}`}`, headers,
-    });
-    expect(response.statusCode).toBe(200);
-    return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items.map((t) => t.id);
-  }
-
   async function badge(a: App, headers: typeof authHeaders): Promise<number> {
     const response = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers });
     return mailUnreadCountSchema.parse(response.json()).count;
@@ -3229,6 +3219,11 @@ describe("per-user hide", () => {
     await a.close();
   });
 
+  // The INVISIBLE-thread half of "other users are entirely unaffected":
+  // dana could not see the thread to begin with, so what this pins is that
+  // the hide gives her no HINT of its existence either -- every leg of her
+  // world is empty before and stays byte-identically empty after. The
+  // discriminating (visible-thread) half is the next test.
   it("never leaks existence: hiding a visible thread changes nothing for a user who cannot see it", async () => {
     const a = await app();
     // A PRIVATE thread of chris's: dana may not see it, hidden or not.
@@ -3262,6 +3257,53 @@ describe("per-user hide", () => {
     expect(await danasWorld()).toEqual(before);
     expect(before.detailStatus).toBe(404);
     expect(before.inbox).toEqual([]);
+    await a.close();
+  });
+
+  // The VISIBLE-thread half, and the discriminating one: dana genuinely
+  // sees this thread on every surface, so a leak of chris's hide would have
+  // real bytes to change. The spec's "Other users are entirely unaffected
+  // by your hides" pinned as ONE world-comparison -- full row payloads, not
+  // just ids, so a leaked hiddenAt, a flipped unread dot or a bumped
+  // updated_at (the hide never touches the shared thread row) would all
+  // fail it -- rather than as piecemeal per-surface assertions.
+  it("leaves another VIEWER's whole world byte-identical when the hider files a thread they both see", async () => {
+    const a = await app();
+    const shared = await makeAccount(a, { label: "Both", email: `both+${randomUUID()}@example.com` });
+    await setVisibility(shared.id, "shared");
+    const threadId = await seedThread({
+      subject: "Shared quellwater", lastMessageAt: new Date("2026-08-02T10:00:00Z"),
+    });
+    await seedMessage(threadId, shared.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), seen: false,
+      subject: "Shared quellwater", bodyText: "quellwater plans", snippet: "shared",
+    });
+
+    async function danasWorld() {
+      const inbox = await a.inject({ method: "GET", url: "/api/mail/threads", headers: otherHeaders });
+      const hiddenView = await a.inject({ method: "GET", url: "/api/mail/threads?hidden=true", headers: otherHeaders });
+      const search = await a.inject({ method: "GET", url: "/api/search?q=quellwater", headers: otherHeaders });
+      const detail = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: otherHeaders });
+      expect(detail.statusCode).toBe(200);
+      return {
+        inbox: listResponseSchema(mailThreadListItemSchema).parse(inbox.json()),
+        hiddenView: listResponseSchema(mailThreadListItemSchema).parse(hiddenView.json()),
+        badge: await badge(a, otherHeaders),
+        mailHits: searchResultsSchema.parse(search.json()).mail,
+        detail: mailThreadDetailSchema.parse(detail.json()),
+      };
+    }
+
+    const before = await danasWorld();
+    // The premise that gives the comparison teeth: her world actually
+    // carries the thread everywhere before the hide.
+    expect(before.inbox.items.map((t) => t.id)).toEqual([threadId]);
+    expect(before.badge).toBe(1);
+    expect(before.mailHits.map((hit) => hit.threadId)).toEqual([threadId]);
+
+    const hide = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
+    expect(hide.statusCode).toBe(200);
+    expect(await danasWorld()).toEqual(before);
     await a.close();
   });
 });

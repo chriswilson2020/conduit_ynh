@@ -13,9 +13,11 @@ import { publish } from "./sse.js";
 
 /**
  * The bulk thread actions (Phase 4.1): Trash and Archive MOVE the underlying
- * messages on the IMAP server, "Hide in CRM" sets the pre-4.1 CRM-side thread
- * archive. One entry point, `moveThreads`, because the three arrive on one
- * endpoint and the client wants one per-thread answer whichever it asked for.
+ * messages on the IMAP server, "Hide in CRM" writes the ACTOR'S OWN
+ * mail_thread_hides rows (per-user since Phase 4.3 -- it files the threads
+ * out of the actor's views and nobody else's). One entry point,
+ * `moveThreads`, because the three arrive on one endpoint and the client
+ * wants one per-thread answer whichever it asked for.
  *
  * ---------------------------------------------------------------------------
  * WHAT A MOVE ACTUALLY IS HERE

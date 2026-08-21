@@ -518,8 +518,9 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
 
   /**
    * The bulk thread actions: Trash and Archive MOVE messages on the IMAP
-   * server, "Hide in CRM" sets the pre-4.1 CRM-side thread archive
-   * (services/mail-move.ts owns all three).
+   * server, "Hide in CRM" writes the ACTOR'S own per-user hide rows
+   * (mail_thread_hides, Phase 4.3 -- nobody else's views change;
+   * services/mail-move.ts owns all three).
    *
    * AUTH-ONLY at the route, BY DESIGN -- the real gates live in the service,
    * in a fixed order. Thread ids of other users' private threads ARE
@@ -565,7 +566,8 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     const input = parseOrReject(bulkThreadActionInputSchema, request.body, reply);
     if (input === undefined) return;
     // The shared schema's 200 is the outer bound and only `hide` may reach it:
-    // hiding is a CRM-side column write per thread, while trash/archive each
+    // hiding is one CRM-side hide-row insert per thread (the actor's own
+    // mail_thread_hides row), while trash/archive each
     // wait on a real mail server. Capping the two MOVE actions lower is the
     // ruling's answer to that wait -- bound the SIZE of the request rather than
     // its duration, since a timeout would produce exactly the "claimed a move

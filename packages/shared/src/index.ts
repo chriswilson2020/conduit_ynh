@@ -1017,7 +1017,8 @@ export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
 // must never empty Sent). Either way, trash/archive target the owning
 // account's trash_folder/archive_folder (spec: "only Trash/Archive targets
 // in v0.6.0"); `hide` ignores folder entirely in both modes -- it is the
-// CRM-side thread archive, which has no concept of an IMAP folder at all.
+// per-actor CRM-side filing act (mail_thread_hides, Phase 4.3), which has
+// no concept of an IMAP folder at all.
 // threadIds capped at 200: large enough for a full page of multi-select,
 // small enough that one request's per-account IMAP MOVE queueing stays
 // bounded; `.min(1)` because a bulk action against zero threads is not a
