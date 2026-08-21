@@ -674,7 +674,7 @@ describe("mail folder routes", () => {
 });
 
 describe("mail thread list route", () => {
-  it("lists non-archived threads newest-first with their derived row fields", async () => {
+  it("lists non-hidden threads newest-first with their derived row fields", async () => {
     const a = await app();
     const account = await makeAccount(a);
     const older = await seedThread({ subject: "Older", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
@@ -845,7 +845,7 @@ describe("mail thread list route", () => {
     await a.close();
   });
 
-  it("filters by account, unread, archived and the four record links, ANDed together", async () => {
+  it("filters by account, unread, hidden and the four record links, ANDed together", async () => {
     const a = await app();
     const first = await makeAccount(a);
     const second = await makeAccount(a, { label: "Side", email: "side@example.com" });
@@ -871,7 +871,7 @@ describe("mail thread list route", () => {
     expect(await subjects("unread=true")).toEqual(["Linked"]);
     expect(await subjects("unlinked=true")).toEqual(["Loose"]);
     expect(await subjects(`contact_id=${contact.id}`)).toEqual(["Linked"]);
-    expect(await subjects("archived=true")).toEqual(["Filed"]);
+    expect(await subjects("hidden=true")).toEqual(["Filed"]);
     // ANDed, not ORed: an unread thread on the OTHER account matches neither.
     expect(await subjects(`unread=true&account_id=${second.id}`)).toEqual([]);
     await a.close();
@@ -963,6 +963,36 @@ describe("mail thread detail route", () => {
     // The tsvector column must never ride along on a message.
     expect(response.json()).not.toHaveProperty("messages.0.search");
     expect(JSON.stringify(response.json())).not.toContain("blobPath");
+    await a.close();
+  });
+
+  // Phase 4.3 Task 1: the detail-cap CONTRACT ships before the cap does.
+  // mailThreadDetailSchema already REQUIRES the pair (every parse in this
+  // describe block would fail without it); this pins the placeholder VALUES
+  // -- the honest uncapped answer -- and the `all` flag's wire contract:
+  // accepted and currently a no-op (every response already IS the uncapped
+  // view), with a malformed value taking the uniform 400. Task 3 makes
+  // `all` lift a real cap.
+  it("reports the uncapped view (totalMessages = returned count, truncated false); all=true is a no-op and a malformed all 400s", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const plain = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    expect(plain.statusCode).toBe(200);
+    const body = mailThreadDetailSchema.parse(plain.json());
+    expect(body.messages).toHaveLength(2);
+    expect(body.totalMessages).toBe(2);
+    expect(body.truncated).toBe(false);
+
+    const uncapped = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}?all=true`, headers: authHeaders });
+    expect(uncapped.statusCode).toBe(200);
+    expect(mailThreadDetailSchema.parse(uncapped.json())).toEqual(body);
+
+    const malformed = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}?all=banana`, headers: authHeaders });
+    expect(malformed.statusCode).toBe(400);
     await a.close();
   });
 
@@ -1098,7 +1128,7 @@ describe("mail thread read route", () => {
 
     const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
     expect(response.statusCode).toBe(200);
-    expect(mailThreadSchema.parse(response.json()).archivedAt).not.toBeNull();
+    expect(mailThreadSchema.parse(response.json()).hiddenAt).not.toBeNull();
     const rows = await handle.db.select({ seen: mailMessages.seen }).from(mailMessages)
       .where(eq(mailMessages.threadId, threadId));
     expect(rows.every((row) => row.seen)).toBe(true);
@@ -1188,7 +1218,7 @@ describe("mail thread link and archive routes", () => {
 
     const archived = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
     expect(archived.statusCode).toBe(200);
-    expect(mailThreadSchema.parse(archived.json()).archivedAt).not.toBeNull();
+    expect(mailThreadSchema.parse(archived.json()).hiddenAt).not.toBeNull();
 
     const whileArchived = await a.inject({
       method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
@@ -1198,7 +1228,7 @@ describe("mail thread link and archive routes", () => {
 
     const restored = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
     expect(restored.statusCode).toBe(200);
-    expect(mailThreadSchema.parse(restored.json()).archivedAt).toBeNull();
+    expect(mailThreadSchema.parse(restored.json()).hiddenAt).toBeNull();
 
     const unknown = await a.inject({ method: "POST", url: `/api/mail/threads/${UNKNOWN_ID}/archive`, headers: authHeaders });
     expect(unknown.statusCode).toBe(404);
@@ -1215,17 +1245,17 @@ describe("mail thread link and archive routes", () => {
     await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
 
     const first = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
-    expect(mailThreadSchema.parse(first.json()).archivedAt).not.toBeNull();
+    expect(mailThreadSchema.parse(first.json()).hiddenAt).not.toBeNull();
     const second = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
     expect(second.statusCode).toBe(200);
     // The truthful no-op: still archived, never a report of the pre-archive row.
-    expect(mailThreadSchema.parse(second.json()).archivedAt).not.toBeNull();
+    expect(mailThreadSchema.parse(second.json()).hiddenAt).not.toBeNull();
 
     const restored = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
-    expect(mailThreadSchema.parse(restored.json()).archivedAt).toBeNull();
+    expect(mailThreadSchema.parse(restored.json()).hiddenAt).toBeNull();
     const again = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
     expect(again.statusCode).toBe(200);
-    expect(mailThreadSchema.parse(again.json()).archivedAt).toBeNull();
+    expect(mailThreadSchema.parse(again.json()).hiddenAt).toBeNull();
     await a.close();
   });
 
@@ -2866,7 +2896,7 @@ describe("mail thread visibility", () => {
     await a.close();
   });
 
-  it("applies the same predicate to the hidden list: archived=true shows only what the viewer may see", async () => {
+  it("applies the same predicate to the hidden list: hidden=true shows only what the viewer may see", async () => {
     const a = await app();
     const priv = await makeAccount(a);
     const shared = await makeAccount(a, { label: "Team", email: "team@example.com" });
@@ -2880,8 +2910,8 @@ describe("mail thread visibility", () => {
     });
     await seedMessage(hiddenShared, shared.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
 
-    expect(await listIds(a, "archived=true", authHeaders)).toEqual([hiddenPrivate, hiddenShared]);
-    expect(await listIds(a, "archived=true", otherHeaders)).toEqual([hiddenShared]);
+    expect(await listIds(a, "hidden=true", authHeaders)).toEqual([hiddenPrivate, hiddenShared]);
+    expect(await listIds(a, "hidden=true", otherHeaders)).toEqual([hiddenShared]);
     await a.close();
   });
 

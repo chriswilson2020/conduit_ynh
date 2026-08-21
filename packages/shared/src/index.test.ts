@@ -1031,7 +1031,7 @@ describe("mailThreadSchema", () => {
     const thread = {
       id: uuid1, subject: "Re: Proposal", lastMessageAt: now, messageCount: 3,
       companyId: uuid2, contactId: uuid2, dealId: uuid2, projectId: uuid2,
-      archivedAt: null, createdAt: now, updatedAt: now,
+      hiddenAt: null, createdAt: now, updatedAt: now,
     };
     expect(mailThreadSchema.parse(thread)).toEqual(thread);
   });
@@ -1040,9 +1040,23 @@ describe("mailThreadSchema", () => {
     const thread = {
       id: uuid1, subject: "Hello", lastMessageAt: now, messageCount: 1,
       companyId: null, contactId: null, dealId: null, projectId: null,
-      archivedAt: null, createdAt: now, updatedAt: now,
+      hiddenAt: null, createdAt: now, updatedAt: now,
     };
     expect(mailThreadSchema.parse(thread)).toEqual(thread);
+  });
+
+  // Phase 4.3: hiddenAt (the viewer's own hide moment) REPLACES the retired
+  // thread-global archivedAt -- both halves pinned on the shape itself, the
+  // blobPath idiom, so no fixture choice can mask a drift back.
+  it("carries hiddenAt (a hidden thread's timestamp parses) and no archivedAt at all", () => {
+    const thread = {
+      id: uuid1, subject: "Hello", lastMessageAt: now, messageCount: 1,
+      companyId: null, contactId: null, dealId: null, projectId: null,
+      hiddenAt: now, createdAt: now, updatedAt: now,
+    };
+    expect(mailThreadSchema.parse(thread)).toEqual(thread);
+    expect(Object.keys(mailThreadSchema.shape)).toContain("hiddenAt");
+    expect(Object.keys(mailThreadSchema.shape)).not.toContain("archivedAt");
   });
 });
 
@@ -1148,7 +1162,7 @@ describe("mailThreadListItemSchema", () => {
   const row = {
     id: uuid1, subject: "Re: Proposal", lastMessageAt: now, messageCount: 3,
     companyId: null, contactId: uuid2, dealId: null, projectId: null,
-    archivedAt: null, createdAt: now, updatedAt: now,
+    hiddenAt: null, createdAt: now, updatedAt: now,
     unread: true, snippet: "Thanks for sending this over",
     senders: [{ address: "bob@example.com", name: "Bob" }, { address: "root@localhost" }],
     accountIds: [uuid2],
@@ -1181,7 +1195,7 @@ describe("mailThreadDetailSchema", () => {
     thread: {
       id: uuid1, subject: "Re: Proposal", lastMessageAt: now, messageCount: 1,
       companyId: null, contactId: uuid2, dealId: null, projectId: null,
-      archivedAt: null, createdAt: now, updatedAt: now,
+      hiddenAt: null, createdAt: now, updatedAt: now,
     },
     messages: [{
       id: uuid2, accountId: uuid1, threadId: uuid1,
@@ -1198,6 +1212,10 @@ describe("mailThreadDetailSchema", () => {
     }],
     dealSuggestions: [{ id: uuid2, title: "Renewal" }],
     ownedByViewer: true,
+    // Phase 4.3 detail-cap pair -- the uncapped shape every response has
+    // until the cap lands (see mailThreadDetailSchema's own comment).
+    totalMessages: 1,
+    truncated: false,
   };
 
   it("accepts a thread with messages, their attachments, and deal suggestions", () => {
@@ -1207,6 +1225,18 @@ describe("mailThreadDetailSchema", () => {
   it("requires ownedByViewer", () => {
     const { ownedByViewer: _dropped, ...rest } = detail;
     expect(() => mailThreadDetailSchema.parse(rest)).toThrow();
+  });
+
+  // Phase 4.3: the detail-cap pair is REQUIRED, not optional -- a client
+  // rendering "Show earlier messages (N more)" must never have to guess
+  // whether an absent flag means "not truncated" or "old server".
+  it("requires the detail-cap pair, and accepts a truncated page (fewer messages than totalMessages)", () => {
+    for (const field of ["totalMessages", "truncated"]) {
+      const { [field]: _dropped, ...rest } = detail as Record<string, unknown>;
+      expect(() => mailThreadDetailSchema.parse(rest)).toThrow();
+    }
+    const truncatedPage = { ...detail, totalMessages: 120, truncated: true };
+    expect(mailThreadDetailSchema.parse(truncatedPage)).toEqual(truncatedPage);
   });
 });
 
@@ -1223,11 +1253,11 @@ describe("mailUnreadCountSchema", () => {
 });
 
 describe("threadListFiltersSchema", () => {
-  it("accepts every filter set at once, including the Phase 4.1 folder filter", () => {
+  it("accepts every filter set at once, including the Phase 4.1 folder filter and the Phase 4.3 hidden flag", () => {
     const filters = {
       accountId: uuid1, unread: true, unlinked: false,
       companyId: uuid2, contactId: uuid2, dealId: uuid2, projectId: uuid2,
-      archived: false, folder: "INBOX", cursor: "abc", limit: 20,
+      hidden: false, folder: "INBOX", cursor: "abc", limit: 20,
     };
     expect(threadListFiltersSchema.parse(filters)).toEqual(filters);
   });

@@ -760,7 +760,19 @@ export const mailThreadSchema = z.object({
   lastMessageAt: z.iso.datetime(), messageCount: z.number().int().nonnegative(),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
   projectId: z.uuid().nullable(),
-  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+  // Phase 4.3: PER-VIEWER, unlike every other field here -- when THIS
+  // REQUEST'S viewer hid the thread (their mail_thread_hides row's
+  // hidden_at), null when they have not. Replaces the retired thread-global
+  // archivedAt: since 4.3 a hide is a per-person filing act, so "is it
+  // hidden" has no thread-global answer to expose.
+  //
+  // Task 1 placeholder: the server still maps mail_threads.archived_at here
+  // (mail-threads.ts's toThread) -- the thread-global value standing in for
+  // the per-viewer one. Faithful, not a guess: with the pre-4.3 semantics
+  // every viewer shares one hide state, and 0007's backfill carries this
+  // exact value into every user's hide row, so the two sources agree until
+  // Task 2 swaps toThread to read the viewer's own row.
+  hiddenAt: z.iso.datetime().nullable(), ...timestamps,
 });
 export type MailThread = z.infer<typeof mailThreadSchema>;
 
@@ -896,6 +908,19 @@ export const mailThreadDetailSchema = z.object({
   // the conversation view's single-thread Archive/Trash buttons (web:
   // conversation.tsx renders them only when this is true).
   ownedByViewer: z.boolean(),
+  // Phase 4.3 (detail cap): how many messages this thread holds FOR THIS
+  // VIEWER in total -- the same visibility-filtered set `messages` draws
+  // from -- and whether `messages` was truncated to the newest 50 of them
+  // (`?all=true` on the detail route lifts the cap; the "Show earlier
+  // messages (N more)" control derives N from totalMessages minus what it
+  // rendered).
+  //
+  // Task 1 placeholders: no cap exists yet, so the server returns the full
+  // set with totalMessages = messages.length and truncated = false --
+  // faithful no-ops (every response already IS the uncapped view) until
+  // Task 3 implements the cap in getThreadDetail.
+  totalMessages: z.number().int().nonnegative(),
+  truncated: z.boolean(),
 });
 export type MailThreadDetail = z.infer<typeof mailThreadDetailSchema>;
 
@@ -938,7 +963,7 @@ export type MailUnreadFolderCounts = z.infer<typeof mailUnreadFolderCountsSchema
 
 // Query-side filter contract for GET /api/mail/threads (route layer maps its
 // snake_case querystring onto this camelCase shape, same division of labour
-// as e.g. tasks.ts's listQuerySchema/listTasks). unread/unlinked/archived
+// as e.g. tasks.ts's listQuerySchema/listTasks). unread/unlinked/hidden
 // are plain booleans here, not the wire tri-state string -- that coercion is
 // the route's job, same as every other listQuerySchema in routes/*.ts.
 export const threadListFiltersSchema = z.object({
@@ -947,7 +972,19 @@ export const threadListFiltersSchema = z.object({
   unlinked: z.boolean().optional(),
   companyId: z.uuid().optional(), contactId: z.uuid().optional(),
   dealId: z.uuid().optional(), projectId: z.uuid().optional(),
-  archived: z.boolean().optional(),
+  // Phase 4.3: the Hidden view. Absent (or false) = the default view,
+  // threads the VIEWER has not hidden; true = only the viewer's hidden
+  // threads, the inbox's Hidden filter (spec: `?hidden=true` on the thread
+  // list). Renames the pre-4.3 `archived` flag to match what the UI has
+  // called it since 4.1 ("Hide in CRM") and what it now actually is.
+  //
+  // Task 1 placeholder: the server still applies this against the
+  // thread-global mail_threads.archived_at (hidden=true lists archived
+  // threads, absent excludes them) -- today's behaviour made explicit under
+  // the new name, exact under the same single-hide-state reasoning as
+  // mailThreadSchema.hiddenAt above. Task 2 swaps the predicate to the
+  // viewer's mail_thread_hides rows.
+  hidden: z.boolean().optional(),
   // The folder view driving the thread list (Phase 4.1): threads with >= 1
   // message in this folder (spec) -- absent means "every synced folder",
   // same as every other optional filter here. When accountId AND folder are

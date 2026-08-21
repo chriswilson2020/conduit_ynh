@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, boolean, check, unique, customType } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, boolean, check, unique, primaryKey, customType } from "drizzle-orm/pg-core";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -468,6 +468,34 @@ export const mailThreads = pgTable("mail_threads", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 export type MailThreadRow = typeof mailThreads.$inferSelect;
+
+// Phase 4.3: one row = "this USER has hidden this THREAD from their own CRM
+// mail views" -- the per-user successor to the thread-global
+// mail_threads.archived_at above. Migration 0007 backfills one hide row per
+// (archived thread x existing user), carrying archived_at as hidden_at, so
+// the upgrade changes nobody's view (spec, Migration decision); the phase's
+// read-path task then drops archived_at and swaps every filter to this
+// table, per the plan's two-step sequencing note -- until that lands,
+// archived_at remains the live source of truth and nothing reads this table
+// yet.
+//
+// Composite PK (thread_id, user_id) rather than a surrogate id: the pair IS
+// the identity ("has U hidden T"), it is the natural conflict target for an
+// idempotent hide, and its index serves thread->hides lookups. Whether the
+// per-user list predicate also wants a (user_id, thread_id) index is an
+// EXPLAIN question for the read-path task (0007 stays unshipped and
+// editable through the phase) -- nothing is added speculatively, per the
+// house measure-first rule. Plain no-action FKs, matching every other FK in
+// this file (threads are archive-not-delete; no delete path exists to
+// cascade from).
+export const mailThreadHides = pgTable("mail_thread_hides", {
+  threadId: uuid("thread_id").notNull().references(() => mailThreads.id),
+  userId: uuid("user_id").notNull().references(() => users.id),
+  hiddenAt: timestamp("hidden_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.threadId, t.userId] }),
+]);
+export type MailThreadHideRow = typeof mailThreadHides.$inferSelect;
 
 /**
  * jsonb shape of mail_messages.to_addrs/cc_addrs/bcc_addrs -- mirrors

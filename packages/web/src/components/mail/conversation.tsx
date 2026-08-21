@@ -243,7 +243,9 @@ export function Conversation({ threadId }: ConversationProps) {
   }
   if (data === undefined || thread === undefined) return null;
 
-  const archived = thread.archivedAt !== null;
+  // Phase 4.3: hiddenAt is the per-viewer hide state (Task 1 still serves
+  // the thread-global value under the new name -- behaviour identical).
+  const hidden = thread.hiddenAt !== null;
   const expandedIds = expanded ?? defaultExpandedRef.current;
   const archiveError = archive.error ?? unarchive.error;
 
@@ -302,7 +304,7 @@ export function Conversation({ threadId }: ConversationProps) {
           {/* The CRM-only state, renamed "Hide in CRM" now that Archive above
               means something else entirely. The testids predate the rename and
               stay put: they are addresses, not labels. */}
-          {archived ? (
+          {hidden ? (
             <Button
               variant="outline"
               data-testid="unarchive-thread"

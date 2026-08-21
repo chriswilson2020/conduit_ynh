@@ -113,7 +113,7 @@ export function InboxPage() {
     accountId: accountId === ALL_ACCOUNTS ? undefined : accountId,
     unread: unread ? true : undefined,
     unlinked: unlinked ? true : undefined,
-    archived: hidden ? true : undefined,
+    hidden: hidden ? true : undefined,
     folder: folder ?? undefined,
   };
 
@@ -341,7 +341,7 @@ export function InboxPage() {
             />
             {/* "Hidden", not "Archived": since Phase 4.1 an Archive is a real
                 IMAP move, and this filter is the CRM-side "Hide in CRM" state
-                (mail_threads.archived_at), which is a different thing. The
+                (the `hidden` list flag), which is a different thing. The
                 testid predates the rename and stays as it is. */}
             <FilterToggle
               testId="filter-archived" label="Hidden" on={hidden} disabled={busy} onChange={setHidden}

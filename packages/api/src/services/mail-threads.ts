@@ -47,7 +47,14 @@ function toThread(row: MailThreadRow): MailThread {
     id: row.id, subject: row.subject,
     lastMessageAt: row.lastMessageAt.toISOString(), messageCount: row.messageCount,
     companyId: row.companyId, contactId: row.contactId, dealId: row.dealId, projectId: row.projectId,
-    archivedAt: row.archivedAt?.toISOString() ?? null,
+    // Phase 4.3 Task 1 placeholder: hiddenAt is PER-VIEWER by contract
+    // (mailThreadSchema's own comment), but this maps the thread-global
+    // archived_at -- the value standing in for the viewer's hide row.
+    // Faithful, not a guess: pre-4.3 every viewer shares this one hide
+    // state, and 0007's backfill writes exactly this value into every
+    // user's hide row, so the two sources cannot disagree yet. Task 2 drops
+    // archived_at and sources this from the viewer's mail_thread_hides row.
+    hiddenAt: row.archivedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
   };
 }
@@ -542,7 +549,14 @@ export async function listThreads(
   // link there.
   const scope: MailVisibilityScope =
     opts.companyId || opts.contactId || opts.dealId || opts.projectId ? "record" : "inbox";
-  const where = [opts.archived ? isNotNull(mailThreads.archivedAt) : isNull(mailThreads.archivedAt)];
+  // Phase 4.3 Task 1 placeholder: the `hidden` flag (the Hidden view) still
+  // reads the thread-global archived_at -- hidden=true lists archived
+  // threads, absent/false excludes them, byte-for-byte the pre-4.3
+  // `archived` filter under its new name. Task 2 swaps this arm to the
+  // viewer's mail_thread_hides rows (default: AND NOT hidden(U,T); Hidden
+  // view: AND hidden(U,T), composed with -- never replacing -- the 4.2
+  // visibility terms below).
+  const where = [opts.hidden ? isNotNull(mailThreads.archivedAt) : isNull(mailThreads.archivedAt)];
   if (opts.companyId) where.push(eq(mailThreads.companyId, opts.companyId));
   if (opts.contactId) where.push(eq(mailThreads.contactId, opts.contactId));
   if (opts.dealId) where.push(eq(mailThreads.dealId, opts.dealId));
@@ -834,6 +848,13 @@ export async function getThreadDetail(
   return {
     thread: toThread(thread), messages, dealSuggestions: await loadDealSuggestions(db, thread),
     ownedByViewer: messageRows.some((row) => row.ownedByViewer),
+    // Phase 4.3 Task 1 placeholders for the detail cap: no cap exists yet,
+    // so every response is already the uncapped view -- the real count of
+    // what was just returned, never truncated. Faithful no-ops until Task 3
+    // caps `messages` at the newest 50 visible (?all=true lifting it) and
+    // computes totalMessages as the visible total instead.
+    totalMessages: messages.length,
+    truncated: false,
   };
 }
 

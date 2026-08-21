@@ -20,7 +20,7 @@ import { createDatabase, migrationsFolder, type DatabaseHandle } from "./client.
 import {
   users, companies, contacts, pipelines, stages, deals, projects,
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
-  emailTemplates,
+  mailThreadHides, emailTemplates,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -739,5 +739,142 @@ describe("mail visibility schema (0006)", () => {
     ).rejects.toMatchObject({
       cause: { message: expect.stringMatching(/mail_accounts_visibility_valid|check/i) },
     });
+  });
+});
+
+describe("mail thread hides schema (0007)", () => {
+  // THE point of 0007's backfill: the migration itself writes one hide row
+  // per (archived thread x existing user), carrying archived_at as
+  // hidden_at, so the upgrade changes nobody's view (Phase 4.3 spec,
+  // Migration row). Proven on a database genuinely at 0006 with the threads
+  // seeded BEFORE the hides table exists, mirroring the 0004/0005/0006
+  // drills: scratch database, never the shared conduit_test one.
+  //
+  // The thread inserts are raw SQL naming archived_at explicitly (the
+  // 0005/0006 old-shape technique) even though mail_threads is currently
+  // byte-identical between 0006 and 0007: archived_at is exactly the column
+  // this phase's read-path task drops from schema.ts, at which point a
+  // drizzle insert could no longer name it -- raw SQL keeps this drill's
+  // seeding valid across that step.
+  it("applies migration 0007 on top of a real database migrated only through 0006 -- the backfill hides a pre-existing archived thread for every pre-existing user, and archived_at survives", async () => {
+    await withPreMigrationDatabase("0007", async (scratch) => {
+      const [chris] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const [alex] = await scratch.db.insert(users).values({ username: "alex" }).returning();
+      // Bound as an ISO STRING, not a Date: db.execute's raw path hands
+      // parameters straight to postgres.js, which serializes strings but not
+      // Date instances (the drizzle query builder's Date mapping does not
+      // apply here).
+      const archivedAtIso = "2026-08-10T09:30:00.000Z";
+      const [archived] = await scratch.db.execute<{ id: string }>(sql`
+        INSERT INTO mail_threads (subject, last_message_at, archived_at)
+        VALUES ('Filed away', now(), ${archivedAtIso})
+        RETURNING id
+      `);
+      const [live] = await scratch.db.execute<{ id: string }>(sql`
+        INSERT INTO mail_threads (subject, last_message_at)
+        VALUES ('Still here', now())
+        RETURNING id
+      `);
+
+      // Pin the drill's own premise before upgrading (the 0006 drill's
+      // pattern): no mail_thread_hides table exists yet, so the rows
+      // asserted after migrate() can only have come from the migration's own
+      // backfill, not from anything this test wrote.
+      const [preState] = await scratch.db.execute<{ present: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.tables WHERE table_name = 'mail_thread_hides'
+        ) AS present
+      `);
+      expect(preState?.present).toBe(false);
+
+      // Upgrade: apply the real, full migrations folder. 0007 is the only
+      // pending migration (0000-0006 are already recorded as applied).
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // The archived thread came back hidden for BOTH pre-existing users,
+      // each row carrying the thread's own archived_at as hidden_at -- the
+      // original filing moment, not the upgrade moment.
+      const hides = await scratch.db.select().from(mailThreadHides);
+      expect(
+        hides.map((row) => ({ threadId: row.threadId, userId: row.userId })).sort(
+          (a, b) => a.userId.localeCompare(b.userId),
+        ),
+      ).toEqual(
+        [
+          { threadId: archived!.id, userId: chris!.id },
+          { threadId: archived!.id, userId: alex!.id },
+        ].sort((a, b) => a.userId.localeCompare(b.userId)),
+      );
+      for (const row of hides) expect(row.hiddenAt.toISOString()).toBe(archivedAtIso);
+
+      // The live thread is hidden for nobody -- its id appears in no hide
+      // row at all (already implied by the exact-set assertion above, stated
+      // here as the decision it is).
+      expect(hides.some((row) => row.threadId === live!.id)).toBe(false);
+
+      // This task's half of the two-step sequencing note: archived_at is
+      // STILL a column after 0007 -- the drop belongs to the read-path task,
+      // which appends it to this same migration before release.
+      const [postColumn] = await scratch.db.execute<{ present: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'mail_threads' AND column_name = 'archived_at'
+        ) AS present
+      `);
+      expect(postColumn?.present).toBe(true);
+    });
+  }, 30000);
+
+  /** One thread on the shared test database, for the constraint tests below. */
+  async function seedThread(): Promise<string> {
+    const [thread] = await handle.db.insert(mailThreads).values({
+      subject: "Hello", lastMessageAt: new Date(),
+    }).returning();
+    return thread!.id;
+  }
+
+  it("enforces PRIMARY KEY (thread_id, user_id): re-hiding collides, while a second user or a second thread does not", async () => {
+    const threadId = await seedThread();
+    const otherThreadId = await seedThread();
+    const otherUserId = (await resolveUser(handle.db, { username: "alex", email: null, fullName: null })).id;
+
+    await handle.db.insert(mailThreadHides).values({ threadId, userId });
+    // Same (thread, user) pair again: the composite PK is what makes a
+    // repeated hide a conflict target rather than a silent duplicate.
+    await expect(
+      handle.db.insert(mailThreadHides).values({ threadId, userId }),
+    ).rejects.toMatchObject({ cause: { code: "23505" } });
+
+    // The pair is the identity, not either column alone: the same thread
+    // hidden by ANOTHER user, and the same user hiding another thread, are
+    // both new facts.
+    const [otherUsers] = await handle.db.insert(mailThreadHides)
+      .values({ threadId, userId: otherUserId }).returning();
+    expect(otherUsers).toMatchObject({ threadId, userId: otherUserId });
+    const [otherThread] = await handle.db.insert(mailThreadHides)
+      .values({ threadId: otherThreadId, userId }).returning();
+    expect(otherThread).toMatchObject({ threadId: otherThreadId, userId });
+  });
+
+  it("enforces both foreign keys", async () => {
+    const threadId = await seedThread();
+    await expect(
+      handle.db.insert(mailThreadHides).values({ threadId: randomUUID(), userId }),
+    ).rejects.toMatchObject({ cause: { code: "23503" } });
+    await expect(
+      handle.db.insert(mailThreadHides).values({ threadId, userId: randomUUID() }),
+    ).rejects.toMatchObject({ cause: { code: "23503" } });
+  });
+
+  it("defaults hidden_at to now() when a hide names only the pair", async () => {
+    const threadId = await seedThread();
+    const before = Date.now();
+    const [row] = await handle.db.insert(mailThreadHides).values({ threadId, userId }).returning();
+    const after = Date.now();
+    expect(row?.hiddenAt).toBeInstanceOf(Date);
+    // A DB-clock default, so bounded rather than exact -- and the bounds are
+    // generous because the DB and test clocks are separate.
+    expect(row!.hiddenAt.getTime()).toBeGreaterThanOrEqual(before - 5000);
+    expect(row!.hiddenAt.getTime()).toBeLessThanOrEqual(after + 5000);
   });
 });

@@ -66,7 +66,7 @@ export interface MailRouteSyncManager extends SendMailSyncManager {
   syncNow(accountId: string): Promise<void>;
 }
 
-// unread/unlinked/archived are the same tri-state wire flag companies.ts's
+// unread/unlinked/hidden are the same tri-state wire flag companies.ts's
 // listQuerySchema documents ("true"/"false"/absent, never z.coerce.boolean(),
 // which would read the literal string "false" as true). snake_case here,
 // camelCase in the shared threadListFiltersSchema the service consumes --
@@ -79,7 +79,12 @@ const threadListQuerySchema = z.object({
   contact_id: z.uuid().optional(),
   deal_id: z.uuid().optional(),
   project_id: z.uuid().optional(),
-  archived: z.enum(["true", "false"]).optional().transform((v) => v === "true"),
+  // Phase 4.3: `hidden=true` is the Hidden view (the spec's spelling),
+  // renaming the pre-4.3 `archived` flag -- see the shared
+  // threadListFiltersSchema.hidden for the semantics and the Task 1
+  // placeholder note. Client and server ship as one unit, so the old
+  // spelling has no external caller to keep an alias for.
+  hidden: z.enum(["true", "false"]).optional().transform((v) => v === "true"),
   // The folder view (Phase 4.1): threads with at least one message in this
   // folder. Trimmed and non-blank, mirroring the shared folderNameSchema every
   // other folder-carrying field parses through -- an IMAP mailbox name is
@@ -89,6 +94,19 @@ const threadListQuerySchema = z.object({
   folder: z.string().trim().min(1).optional(),
   cursor: z.string().min(1).optional(),
   limit: z.coerce.number().int().positive().max(100).optional(),
+});
+
+// GET /api/mail/threads/:id's only parameter (Phase 4.3): `all=true` asks
+// for the uncapped conversation once the detail cap lands -- the spec's own
+// spelling, in the same tri-state wire form as the list flags above.
+//
+// Task 1 placeholder: parsed -- so the wire contract, including its 400 on
+// a malformed value, is fixed from the start -- and then deliberately
+// unused. No cap exists yet, so every response already IS the uncapped
+// view and `all` changes nothing. Task 3 threads it into getThreadDetail
+// alongside the cap itself.
+const threadDetailQuerySchema = z.object({
+  all: z.enum(["true", "false"]).optional().transform((v) => v === "true"),
 });
 
 // GET /api/mail/unread-count's only parameter. `byFolder=1` and nothing else:
@@ -349,7 +367,7 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
       accountId: query.account_id, unread: query.unread, unlinked: query.unlinked,
       companyId: query.company_id, contactId: query.contact_id,
       dealId: query.deal_id, projectId: query.project_id,
-      archived: query.archived, folder: query.folder,
+      hidden: query.hidden, folder: query.folder,
       cursor: query.cursor, limit: query.limit,
     });
   });
@@ -359,6 +377,10 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
+    // Accepted and (for now) ignored -- see threadDetailQuerySchema's own
+    // placeholder note.
+    const query = parseOrReject(threadDetailQuerySchema, request.query, reply);
+    if (query === undefined) return;
     try {
       // basePath, not a hardcoded prefix: stored body_html carries
       // `mailattachment:` placeholders and is resolved to real routes here,

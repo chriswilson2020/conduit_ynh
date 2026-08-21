@@ -1479,7 +1479,10 @@ export interface MailThreadListParams {
   contactId?: string;
   dealId?: string;
   projectId?: string;
-  archived?: boolean;
+  /** The Hidden view (Phase 4.3): true lists only the viewer's hidden
+   * threads, absent is the default not-hidden view -- the route's `hidden`
+   * tri-state flag (see the shared threadListFiltersSchema.hidden). */
+  hidden?: boolean;
   /** The folder view (Phase 4.1): threads with at least one message in this
    * folder. Sent BYTE-EXACT as the folders endpoint listed it -- an IMAP
    * mailbox name is matched as bytes all the way down. */
@@ -1498,7 +1501,7 @@ export function useMailThreads(params: MailThreadListParams = {}) {
       const qs = toQueryString({
         account_id: params.accountId, unread: params.unread, unlinked: params.unlinked,
         company_id: params.companyId, contact_id: params.contactId, deal_id: params.dealId,
-        project_id: params.projectId, archived: params.archived,
+        project_id: params.projectId, hidden: params.hidden,
         // `folder`, not `folder_id` or a snake_case variant: it is a NAME, and
         // the route's own query schema spells it exactly this way.
         folder: params.folder,
