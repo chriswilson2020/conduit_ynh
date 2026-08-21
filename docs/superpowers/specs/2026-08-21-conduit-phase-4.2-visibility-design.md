@@ -1,0 +1,102 @@
+# Conduit Phase 4.2 — Mail visibility: private by default
+
+## Context
+
+Phases 4/4.1 shipped shared-visibility mail (a deliberate brainstorm decision, modelled on
+Pipedrive's small-team default): every CRM user sees every synced thread. The day Chris added
+a second real user, the assumption behind that decision expired — deal-linked mail being
+team-visible is the CRM's value; a whole personal INBOX being team-visible is a different
+trade. Phase 4.2 inverts the default. Ships as v0.7.0.
+
+Decisions taken with Chris in the 4.2 brainstorm:
+
+| Decision | Choice |
+|---|---|
+| Default | **Private by default, per account.** `mail_accounts` gains `visibility` (`private`\|`shared`), default private. The migration makes EVERY existing account private — the safe direction; the owner flips a mailbox to shared in Settings. |
+| Sharing line | **Automation never shares; deliberate acts do.** A private account's thread becomes visible to other users only through a DEAL or PROJECT link (always click-made). Automatic contact/company links keep working — auto-linking, suggestions, the owner's own record views — but never expose content to others. |
+| Move rights | **Only the mailbox owner performs IMAP moves.** Archive/Trash act on messages of accounts the ACTOR owns; other viewers of a shared-visible thread get Hide-in-CRM only. A colleague must never reorganise your actual mailbox. |
+| Inbox scope (coordinator ruling) | **The inbox is a mailbox view; records are the CRM view.** Folder/inbox lists show only threads carried by your own accounts or shared accounts. Deliberately-linked threads from someone else's private account surface on the record Mail tabs and in search — not in your personal inbox. |
+
+## Data model (migration 0006, additive)
+
+- `mail_accounts` gains `visibility` text NOT NULL CHECK (`private`|`shared`) DEFAULT
+  `'private'`. No backfill statement needed — the default applies to existing rows via the
+  ALTER, which IS the "everything becomes private" migration decision. No other schema
+  changes; no new indexes expected (the predicate reuses existing joins — Task authors
+  EXPLAIN before claiming, per the house rule).
+
+## The visibility predicate (the core of the phase)
+
+One SQL helper (the `notInAccountTrash` pattern: built once in `mail-threads.ts`, used
+everywhere) defining, for user U and thread T:
+
+- **inbox-visible(U, T)**: T has >= 1 message on an account owned by U, OR on an account
+  with `visibility = 'shared'`.
+- **record-visible(U, T)**: inbox-visible(U, T) OR (T.`deal_id` IS NOT NULL OR
+  T.`project_id` IS NOT NULL).
+
+Application, exhaustively (every mail read path — the 4.1 reviews proved these drift when
+touched piecemeal):
+
+| Surface | Predicate |
+|---|---|
+| Thread list (inbox + folder views) | inbox-visible |
+| Thread detail | record-visible; invisible → the indistinguishable 404 |
+| All three unread computations (badge, list flag/filter, byFolder) | inbox-visible (scoped per the 4.1 unread-scopes-to-the-view rule, unchanged otherwise) |
+| Record Mail tabs | contact/company tabs: record-visible restricted to threads linked to that record; deal/project tabs: record-visible |
+| Search mail group | record-visible |
+| Deal suggestions | unchanged (they render inside a thread view the caller can already see) |
+| SSE | unchanged — hints are content-free invalidation keys; per-user results differ at refetch time |
+
+## Move rights & bulk semantics
+
+- `moveThreads` gains the actor-ownership rule: messages on accounts NOT owned by the actor
+  are excluded from candidates with a new skip reason `not_owner` (the archived-account
+  pattern — skip semantics, never failure; a thread whose whole in-scope set is unowned
+  reports `{ok: true, skipped: true, reason: "not_owner"}`).
+- The shared `bulkThreadSkipReason` enum gains `not_owner`; superRefine halves updated.
+- UI: Archive/Trash controls render only when the thread carries >= 1 message on an account
+  the viewer owns (the thread payload gains a lightweight `ownedByViewer` boolean computed in
+  the same aggregate pass); Hide-in-CRM stays available to every viewer. Hide remains
+  thread-global in v0.7.0 (one user hiding hides for all — documented limitation; per-user
+  hide is deferred).
+- Mark-read: unchanged (any viewer; `\Seen` write-back already flows through each message's
+  own account loop and is a reading act, not a filing act).
+
+## Settings
+
+Per-account **Private / Shared** toggle beside the folder picker (owner-only, like every
+account setting; `visibility` rides `mailAccountSchema` + the update input). Copy states the
+sharing line: "Private: only you see this mailbox's conversations. Threads you link to a
+deal or project become visible on that record. Shared: every CRM user sees this mailbox."
+Flipping publishes the existing `[["mail-accounts"]]` hint plus `[["mail-threads"]]` (the
+lists' contents change for every user).
+
+## Out of scope (deferred, not rejected)
+
+Per-user Hide-in-CRM; per-thread manual share/unshare overrides; visibility for email
+templates (stay shared); an audit trail of who viewed what; retroactive unsharing semantics
+beyond flipping the account back to private (which simply re-applies the predicate — linked
+threads remain record-visible, by design).
+
+## Testing
+
+- Unit: the predicate matrix (owner/other x private/shared x unlinked/contact-linked/
+  deal-linked) across EVERY surface in the table above — the three unread computations each
+  get the matrix; route authz tests for detail-404, list exclusion, search exclusion;
+  moveThreads' not_owner skip incl. the mixed-ownership thread (owned half moves, unowned
+  half skips); the ownedByViewer aggregate.
+- e2e: a second CI user (the harness supports per-request user headers — verify; else a
+  seeded second account under the same user exercises the predicate's account-ownership arm
+  and the UI gating, with the two-user matrix covered at route level). Journey: user B sees
+  an empty inbox while A's mail syncs; A links a thread to a deal; B sees it on the deal's
+  Mail tab and in search but NOT in B's inbox; B's Archive/Trash controls absent there,
+  Hide-in-CRM present.
+- Suite baseline at start: 1472 unit + 36 integration + 46 e2e, green.
+
+## Rollout
+
+v0.7.0, the standard mechanics. Live verification: Chris's account flips to private on
+upgrade (his new user sees an empty inbox immediately — the phase's acceptance test);
+linking a thread to a deal makes exactly that thread appear for the other user on the deal;
+flipping a mailbox to shared restores 4.1 behaviour for it.
