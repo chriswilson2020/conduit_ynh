@@ -1042,7 +1042,7 @@ export function bulkOwnershipBlocked(
 ): string | null {
   if (action === "hide" || unowned <= 0) return null;
   const what = unowned === 1 ? "1 selected conversation is" : `${unowned} selected conversations are`;
-  return `${what} in a mailbox you don't own \u2014 ${NOT_OWNER_EXPLANATION}.`;
+  return `${what} in a mailbox you don't own: ${NOT_OWNER_EXPLANATION}.`;
 }
 
 /**

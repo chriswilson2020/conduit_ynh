@@ -57,7 +57,12 @@ touched piecemeal):
 - The shared `bulkThreadSkipReason` enum gains `not_owner`; superRefine halves updated.
 - UI: Archive/Trash controls render only when the thread carries >= 1 message on an account
   the viewer owns (the thread payload gains a lightweight `ownedByViewer` boolean computed in
-  the same aggregate pass); Hide-in-CRM stays available to every viewer. Hide remains
+  the same aggregate pass); Hide-in-CRM stays available to every viewer. As built (Task 4,
+  per the plan's UX note): "render only when" is the CONVERSATION's shape — its two buttons
+  are absent for a non-owner — while the multi-select BULK BAR disables the two moves with
+  the reason as visible text whenever the selection holds any unowned thread, because a bar
+  whose buttons vanish as ticks change reads as breakage, and the disabled-with-reason note
+  is the 4.1 blocked-note pattern. Hide remains
   thread-global in v0.7.0 (one user hiding hides for all — documented limitation; per-user
   hide is deferred).
 - Mark-read: unchanged (any viewer; `\Seen` write-back already flows through each message's

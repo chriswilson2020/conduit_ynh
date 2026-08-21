@@ -137,8 +137,14 @@ test.describe.serial("Mail journey", () => {
    * stable identity leaks nothing between attempts PROVIDED no shared
    * account outlives an attempt (the beforeAll reset below is what makes
    * that hold).
+   *
+   * NOT a name containing "e2euser": both users live in every user picker
+   * from here on (resolveUser rows are global), and a B name that carried
+   * the dev user's name as a substring turned every loose
+   * getByRole(..., { name: "e2euser" }) into a strict-mode ambiguity --
+   * tasks.spec.ts's assignee pick was the real casualty.
    */
-  const B_USERNAME = "e2euser-b";
+  const B_USERNAME = "e2e-second-user";
   let bContext: BrowserContext;
   let bPage: Page;
 

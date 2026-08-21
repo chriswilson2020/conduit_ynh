@@ -349,9 +349,14 @@ test.describe.serial("Tasks/Gantt journey", () => {
     await ownerSelect.click();
     // playwright.config.ts's webServer sets CONDUIT_DEV_USER=e2euser, and
     // auth.ts's devUser fallback identity gives that user both username AND
-    // fullName "e2euser" -- OwnerSelect renders `fullName ?? username`, so
-    // "e2euser" is this environment's one real (non-"Unassigned") option.
-    await page.getByRole("option", { name: "e2euser" }).click();
+    // fullName "e2euser" -- OwnerSelect renders `fullName ?? username`.
+    // EXACT, because it is no longer the only real option: the mail spec's
+    // Phase 4.2 two-user journey signs in a second user (mail.spec.ts's
+    // B_USERNAME), whose row is in this picker whenever that spec has run
+    // first (it has, under CI's single worker and alphabetical file order)
+    // -- and getByRole's default substring matching would call any name
+    // containing "e2euser" ambiguous.
+    await page.getByRole("option", { name: "e2euser", exact: true }).click();
     await expect(page.getByTestId("field-assigneeUserId")).toContainText("e2euser");
     await closeDrawer();
 

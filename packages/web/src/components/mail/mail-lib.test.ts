@@ -987,9 +987,9 @@ describe("bulkOwnershipBlocked", () => {
 
   it("blocks Archive and Trash when any selected thread is unowned, counting them", () => {
     expect(bulkOwnershipBlocked("archive", 1))
-      .toBe(`1 selected conversation is in a mailbox you don't own \u2014 ${NOT_OWNER_EXPLANATION}.`);
+      .toBe(`1 selected conversation is in a mailbox you don't own: ${NOT_OWNER_EXPLANATION}.`);
     expect(bulkOwnershipBlocked("trash", 3))
-      .toBe(`3 selected conversations are in a mailbox you don't own \u2014 ${NOT_OWNER_EXPLANATION}.`);
+      .toBe(`3 selected conversations are in a mailbox you don't own: ${NOT_OWNER_EXPLANATION}.`);
   });
 
   // The spec's Move rights line, verbatim -- shared with the per-thread
