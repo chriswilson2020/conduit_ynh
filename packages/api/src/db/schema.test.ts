@@ -693,6 +693,20 @@ describe("mail visibility schema (0006)", () => {
         RETURNING id
       `);
 
+      // Pin the drill's own premise before upgrading. The raw insert above
+      // would ALSO succeed on a fully-migrated table (it simply names no
+      // visibility, so the DEFAULT would fire at insert time), and 'private'
+      // below would then pass without the ALTER proving anything. Same hole
+      // the 0005 drill closes with its "ON A DATABASE THIS TEST MIGRATED
+      // FROM THE FILES" index assertions.
+      const [preState] = await scratch.db.execute<{ present: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'mail_accounts' AND column_name = 'visibility'
+        ) AS present
+      `);
+      expect(preState?.present).toBe(false);
+
       // Upgrade: apply the real, full migrations folder. 0006 is the only
       // pending migration (0000-0005 are already recorded as applied).
       await migrate(scratch.db, { migrationsFolder: migrationsFolder() });

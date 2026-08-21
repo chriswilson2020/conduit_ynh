@@ -41,6 +41,13 @@ const LIMIT_MAIL = 5;
  * right trade for one household's mail. If it ever stops being: pre-filter
  * the inner query by rank, or cap the candidate set before the DISTINCT ON,
  * and accept approximate ordering in exchange.
+ *
+ * PHASE 4.2, Task 2 replaces this: no actor reaches this function and no
+ * mail_accounts join exists here, so today every user's search sees every
+ * thread's subject and snippet -- 4.1's shared-visibility behaviour. Task 2
+ * threads the actor through the search call chain and applies
+ * record-visible(U, T) (spec table: "Search mail group"); this is the one
+ * mail read path that lives outside mail-threads.ts.
  */
 async function searchMail(db: Database, q: string): Promise<SearchResults["mail"]> {
   const tsQuery = sql`websearch_to_tsquery('english', ${q})`;

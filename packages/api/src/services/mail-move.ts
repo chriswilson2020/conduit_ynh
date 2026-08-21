@@ -200,13 +200,16 @@ type NotedSkipReason = Exclude<BulkThreadSkipReason, "out_of_scope">;
  * directly below archived_account: both are causes the CURRENT USER cannot
  * clear by simply asking again, unlike the two below them (awaiting_
  * reconciliation self-heals on the next sync pass; already_in_target means
- * the goal already holds) -- but between the two, "not yours" is the more
- * specific and, for THIS actor, the strictly LESS actionable of the pair
- * (the account owner can unarchive an archived_account in Settings; no
- * action available to a non-owner ever turns a not_owner message into one
- * they can move), so it is ranked as the second-strongest cause rather than
- * the strongest. This ordering only matters when one thread's messages hit
- * more than one cause at once, which is rare -- see shared's
+ * the goal already holds). Between those two the deciding fact is
+ * CONTINUITY, not specificity: archived_account is what a mixed thread
+ * already reported before 4.2, so holding it at rank 0 means adding
+ * not_owner changes no existing thread's reported reason -- an archived
+ * account someone else owns keeps saying archived_account. The per-row
+ * check order in collectCandidates agrees on purpose (the archived_account
+ * drop runs before the ownership seam), so promoting not_owner to rank 0
+ * would also mean moving that check, silently changing what mixed threads
+ * report. This ordering only matters when one thread's messages hit more
+ * than one cause at once, which is rare -- see shared's
  * bulkThreadSkipReasonSchema comment for the fuller reasoning.
  */
 const SKIP_REASON_RANK: Record<NotedSkipReason, number> = {

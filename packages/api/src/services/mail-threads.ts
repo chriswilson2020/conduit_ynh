@@ -828,11 +828,12 @@ export async function unreadThreadCount(db: Database): Promise<number> {
  * anywhere?" -- where mail in the Trash is not waiting for anything.
  *
  * A row therefore appears for any folder holding unread mail, INCLUDING ones
- * the picker has switched off, ones that have vanished from the server, and
- * ones belonging to another user's account (the counts are not owner-scoped,
- * matching the shared-visibility thread list). The sidebar joins these to the
- * folders endpoint by name and renders what it recognises -- see the plan's
- * Task 5 note.
+ * the picker has switched off and ones that have vanished from the server.
+ * Today a row also appears for folders belonging to another user's account --
+ * 4.1's shared-visibility behaviour, which Phase 4.2 Task 2 replaces: this
+ * query gains its mail_accounts join purely so inbox-visible(U, T) can scope
+ * the counts to the viewer. The sidebar joins these to the folders endpoint
+ * by name and renders what it recognises -- see the 4.1 plan's Task 5 note.
  *
  * Folders are counted by NAME across accounts, per the response shape the spec
  * fixes ({folder, count}, no accountId): two accounts' INBOXes are one row

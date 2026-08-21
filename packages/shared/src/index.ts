@@ -1049,11 +1049,13 @@ export type BulkThreadFailureReason = z.infer<typeof bulkThreadFailureReasonSche
 // - not_owner (Phase 4.2, Task 3 wires the actual filter): its messages sit
 //   on an account the ACTOR does not own -- move rights are owner-only (spec:
 //   "a colleague must never reorganise your actual mailbox"). Ranked directly
-//   below archived_account: "not yours" is the most specific and least
-//   actionable of the four explanations (nothing the current user does, in
-//   Settings or anywhere else, ever changes it -- unlike archived_account,
-//   which the OWNER can fix by unarchiving), so when a thread mixes causes it
-//   is the one worth outranking the two self-resolving reasons below. UNLIKE
+//   below archived_account, NOT above it, for continuity: archived_account is
+//   what a mixed thread already reported before 4.2, and keeping it at rank 0
+//   means adding not_owner changes no existing thread's reported reason (an
+//   archived account someone else owns keeps saying archived_account -- see
+//   mail-move.ts's SKIP_REASON_RANK comment, whose per-row check order agrees
+//   on purpose). It still outranks the two self-resolving reasons below,
+//   which clear on their own or by simply asking again. UNLIKE
 //   out_of_scope, this one IS recorded against individual messages (a message
 //   this actor cannot move is still examined and classified, not skipped
 //   before it is looked at), which is what makes it a NotedSkipReason and
