@@ -1,6 +1,6 @@
 import type {
-  BulkThreadActionKind, BulkThreadResult, MailAddress, MailThreadListItem,
-  MailUnreadFolderCount, SpecialUse,
+  BulkThreadActionKind, BulkThreadResult, BulkThreadResultReason, MailAddress,
+  MailThreadListItem, MailUnreadFolderCount, SpecialUse,
 } from "@conduit/shared";
 import {
   BULK_THREAD_ACTION_CAP, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
@@ -1005,6 +1005,47 @@ export function bulkActionBlocked(action: BulkThreadActionKind, count: number): 
 }
 
 /**
+ * The move-rights sentence, exactly as the spec's Move rights line words it.
+ * One string for both of its surfaces -- the bulk bar's disabled-state note
+ * (bulkOwnershipBlocked below) and the per-thread not_owner note
+ * (REASON_NOTES) -- so the reason a button was grey and the reason a click
+ * skipped can never phrase the same rule two ways. Deliberately not "your
+ * account" and deliberately no pointer at Settings: the mailbox in question
+ * can be ANOTHER user's, whose sharing is not the viewer's to change.
+ */
+export const NOT_OWNER_EXPLANATION =
+  "only the mailbox owner can archive or trash \u2014 Hide in CRM is available to everyone";
+
+/**
+ * Why the two MOVE actions cannot be sent for this selection, or null when
+ * they can: Phase 4.2's owner-only move rights, as a disabled-with-reason
+ * state (the same blocked-note pattern as bulkActionBlocked, and text on the
+ * bar for the same reason -- a `title` on a disabled button is invisible to a
+ * touch screen and silent to a screen reader).
+ *
+ * `unowned` counts the SELECTED threads whose `ownedByViewer` is false --
+ * threads carrying no message on any account the viewer owns. One such
+ * thread blocks Archive/Trash for the whole selection: the per-thread
+ * not_owner skip would answer honestly anyway, but a button that knowingly
+ * sends some rows to a no-op is worse UX than saying so first. `hide` is
+ * never blocked -- Hide in CRM is exactly the action every viewer keeps.
+ *
+ * The inverse does NOT hold, and the caller must not read it here: owned is
+ * necessary, not sufficient. The flag is thread-global while moves are
+ * folder-scoped, so an unblocked Archive can still come back not_owner for
+ * the folder in view (as well as archived/awaiting) -- the per-reason notes
+ * in summarizeBulkResult are the backstop for everything this pre-check
+ * cannot know.
+ */
+export function bulkOwnershipBlocked(
+  action: BulkThreadActionKind, unowned: number,
+): string | null {
+  if (action === "hide" || unowned <= 0) return null;
+  const what = unowned === 1 ? "1 selected conversation is" : `${unowned} selected conversations are`;
+  return `${what} in a mailbox you don't own \u2014 ${NOT_OWNER_EXPLANATION}.`;
+}
+
+/**
  * What the bar says it is holding: "3 selected", or -- when the last gesture
  * asked for more rows than one request may carry -- "50 of 80 selected
  * (per-request limit)".
@@ -1186,7 +1227,17 @@ export interface BulkActionSummary {
   headline: string;
   /** One sentence per reason worth explaining, most actionable first. */
   notes: string[];
-  /** At least one note is fixed in Settings -> Mail, so the caller can link. */
+  /**
+   * At least one note is fixed in the VIEWER'S OWN Settings -> Mail, so the
+   * caller can link there. Since Phase 4.2 that is `no_target` alone:
+   * `archived_account` can describe someone ELSE'S account (it outranks
+   * not_owner in the skip precedence, so a shared or deal-linked thread's
+   * skip can be about a mailbox the viewer cannot administer), and a link to
+   * the viewer's own Settings would point at a page that cannot fix it.
+   * no_target still qualifies -- the ownership drop runs before the refusal
+   * check server-side (mail-move.ts), so a no_target is always about an
+   * account the actor owns.
+   */
   settingsLink: boolean;
 }
 
@@ -1212,28 +1263,80 @@ function truncate(text: string): string {
   return trimmed.length <= MAX_REFUSAL_CHARS ? trimmed : `${trimmed.slice(0, MAX_REFUSAL_CHARS)}\u2026`;
 }
 
+/** What a note builder may read besides its own count: the action (for the
+ * target-folder name) and the distinct server refusal strings. */
+interface BulkNoteContext {
+  action: BulkThreadActionKind;
+  refusals: readonly string[];
+}
+
 /**
- * What to tell the user about one bulk response.
+ * One entry PER SHARED REASON CODE, in display order (most actionable first),
+ * each either a note builder or the deliberate `null` of "counted, never
+ * explained".
  *
- * EVERY BRANCH IS ON THE `reason` CODE, never on the free-text `error` -- the
- * house rule for every error shape in this app (api.ts's ApiError doc comment),
- * and the reason the API grew the code in the first place. `error` is display
- * text and appears in exactly one note, `server_refused`'s, where the mail
- * server's own words are the only thing that could explain the refusal.
+ * The Record over the shared enum is the point (the same pattern
+ * mail-move.ts's SKIP_REASON_RANK uses): the previous shape was a
+ * string-keyed count() map, on which a newly added reason fell through
+ * SILENT with no compile nudge -- exactly how `not_owner` shipped from the
+ * API with no copy here. Now a reason joining bulkThreadResultReasonSchema
+ * is a type error on this table until someone decides its sentence, and
+ * "quiet" has to be written down as a null rather than happening by
+ * omission.
  *
- * `already_in_target` and `out_of_scope` are deliberately QUIET: both mean the
- * user asked for something that was already true of those threads (the goal
- * holds / the action never applied there), neither is fixable or worth a
- * sentence, and both are still COUNTED so the headline stays honest. That
- * honesty is the point of the headline's shape: "Nothing archived, 2 skipped."
- * must not be mistakable for "2 archived."
- *
- * `not_owner` (Phase 4.2) currently falls through QUIET too, but that is NOT
- * a deliberate choice like the two above -- `count()` below is string-keyed,
- * so a new shared reason with no branch here compiles clean and says
- * nothing, with no type error to catch the gap. Phase 4.2 Task 4 decides
- * not_owner's actual surface (its own note, folded into a UI-gating message,
- * or something else) -- until then, do not read its silence here as settled.
+ * What the entries say, and why:
+ * - Every note keys off the reason CODE, never the free-text `error` -- the
+ *   house rule for every error shape in this app (api.ts's ApiError doc
+ *   comment). `error` is display text and appears in exactly one note,
+ *   `server_refused`'s, where the mail server's own words are the only thing
+ *   that could explain the refusal.
+ * - no_sync names BOTH its causes: the code means "no running sync loop, not
+ *   archived" (shared: bulkThreadFailureReasonSchema), which covers an
+ *   account backing off from a failed connection AND one whose loop is
+ *   stopped, paused, or in an error state a human has to clear.
+ *   "Reconnecting" alone promised the second half a recovery that waiting
+ *   will not bring.
+ * - not_found says "could not be found", nothing more specific: since Phase
+ *   4.2 it also legitimately describes a thread the viewer JUST SAW, whose
+ *   account was flipped back to private mid-session -- the route answers
+ *   byte-identically for nonexistent and invisible (the indistinguishable
+ *   404), and this copy must not un-blur that line by claiming the thread
+ *   was deleted.
+ * - archived_account and not_owner may both describe someone ELSE'S mailbox
+ *   (archived_account outranks not_owner in the skip precedence, so it wins
+ *   on a shared account's archived rows), which is why neither says "your
+ *   account" or points at Settings. not_owner's sentence is the spec's Move
+ *   rights line, and it can follow an ENABLED Archive click: `ownedByViewer`
+ *   is thread-global while moves are folder-scoped, so a thread owned
+ *   elsewhere can still answer not_owner for the folder in view -- this note
+ *   is that click's explanation, not just the disabled state's.
+ * - already_in_target and out_of_scope are the deliberate quiet pair: both
+ *   mean what was asked was already true of those threads, neither is
+ *   fixable or worth a sentence, and both are still COUNTED so the headline
+ *   stays honest ("Nothing archived, 2 skipped." must not read as "2
+ *   archived.").
+ */
+const REASON_NOTES: Record<BulkThreadResultReason, ((count: number, context: BulkNoteContext) => string) | null> = {
+  no_sync: (count) => `${count} could not be moved: that mail account is not syncing right now`
+    + " \u2014 it may be reconnecting or paused.",
+  no_target: (count, { action }) => `${count} could not be moved: no ${actionTarget(action)} folder is set`
+    + " for that account yet.",
+  not_found: (count) => `${count} could not be found \u2014 the list has been refreshed.`,
+  server_refused: (count, { refusals }) => {
+    const shown = refusals.slice(0, MAX_REFUSALS_SHOWN).map(truncate).join("; ");
+    return `${count} were refused by the mail server: ${shown}`;
+  },
+  awaiting_reconciliation: (count) => `${count} will complete after the next sync pass.`,
+  archived_account: (count) => `${count} belong to an archived mail account`
+    + " \u2014 its mail can be moved again once its owner unarchives it.",
+  not_owner: (count) => `${count} skipped: ${NOT_OWNER_EXPLANATION}.`,
+  already_in_target: null,
+  out_of_scope: null,
+};
+
+/**
+ * What to tell the user about one bulk response. Counting and copy both run
+ * off REASON_NOTES above, which is where every per-reason decision lives.
  */
 export function summarizeBulkResult(
   action: BulkThreadActionKind, results: readonly BulkResultItem[],
@@ -1241,7 +1344,7 @@ export function summarizeBulkResult(
   let moved = 0;
   let skipped = 0;
   let failed = 0;
-  const byReason = new Map<string, number>();
+  const byReason = new Map<BulkThreadResultReason, number>();
   const refusals: string[] = [];
   for (const result of results) {
     if (!result.ok) failed += 1;
@@ -1258,44 +1361,20 @@ export function summarizeBulkResult(
   if (skipped > 0) parts.push(`${skipped} skipped`);
   if (failed > 0) parts.push(`${failed} failed`);
 
+  const context: BulkNoteContext = { action, refusals };
   const notes: string[] = [];
-  const count = (reason: string) => byReason.get(reason) ?? 0;
-  // Failures first: they are the outcomes a user may need to act on.
-  // BOTH causes, because the code carries only one fact: no_sync means the
-  // account has no running sync loop and is not archived (shared:
-  // bulkThreadFailureReasonSchema), which covers an account backing off from a
-  // failed connection AND one whose loop is simply not running -- stopped,
-  // paused, or in an error state a human has to clear. "Reconnecting" alone
-  // named the transient half and promised the other half a recovery that
-  // waiting will not bring.
-  if (count("no_sync") > 0) {
-    notes.push(`${count("no_sync")} could not be moved: that mail account is not syncing right now`
-      + " \u2014 it may be reconnecting or paused.");
-  }
-  if (count("no_target") > 0) {
-    notes.push(`${count("no_target")} could not be moved: no ${actionTarget(action)} folder is set`
-      + " for that account yet.");
-  }
-  if (count("not_found") > 0) {
-    notes.push(`${count("not_found")} no longer exist \u2014 the list has been refreshed.`);
-  }
-  if (count("server_refused") > 0) {
-    const shown = refusals.slice(0, MAX_REFUSALS_SHOWN).map(truncate).join("; ");
-    notes.push(`${count("server_refused")} were refused by the mail server: ${shown}`);
-  }
-  if (count("awaiting_reconciliation") > 0) {
-    notes.push(`${count("awaiting_reconciliation")} will complete after the next sync pass.`);
-  }
-  if (count("archived_account") > 0) {
-    notes.push(`${count("archived_account")} belong to an archived mail account`
-      + " \u2014 unarchive it in Settings to move its mail.");
+  // Insertion order of the table IS the display order.
+  for (const [reason, note] of Object.entries(REASON_NOTES) as
+    [BulkThreadResultReason, (typeof REASON_NOTES)[BulkThreadResultReason]][]) {
+    const count = byReason.get(reason) ?? 0;
+    if (count > 0 && note !== null) notes.push(note(count, context));
   }
 
   return {
     moved, skipped, failed,
     headline: `${parts.join(", ")}.`,
     notes,
-    settingsLink: count("no_target") > 0 || count("archived_account") > 0,
+    settingsLink: (byReason.get("no_target") ?? 0) > 0,
   };
 }
 
@@ -1334,6 +1413,27 @@ export function bulkErrorMessage(error: unknown): string {
   if (error instanceof ResponseShapeError) return error.message;
   return BULK_TIMEOUT_MESSAGE;
 }
+
+/**
+ * Did a thread fetch answer "there is no such conversation for you"?
+ *
+ * The status test, in one place: the detail route's 404 is deliberately
+ * indistinguishable across "never existed", "deleted" and -- since Phase 4.2
+ * -- "its account went back to private while you had it open" (an open pane
+ * lives on its cached bytes until its next refetch; the flip's SSE frame
+ * carries no per-thread key, an accepted, documented window). The
+ * conversation view branches here to show its calm "no longer available"
+ * state instead of a raw error line, and branches on STATUS, not on message
+ * text, per the house rule (api.ts's ApiError doc comment).
+ */
+export function isThreadGone(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404;
+}
+
+/** What the conversation pane says for a thread its fetch cannot see. One
+ * sentence, no cause offered: the 404 is indistinguishable by design, and
+ * copy that guessed at "deleted" or "unshared" would un-blur that line. */
+export const THREAD_GONE_MESSAGE = "This conversation is no longer available.";
 
 // ---------------------------------------------------------------------------
 // Move targets (the Settings picker's Trash/Archive overrides)

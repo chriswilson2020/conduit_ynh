@@ -8,8 +8,12 @@ import {
   buildFolderRows,
   bulkActionBlocked,
   bulkErrorMessage,
+  bulkOwnershipBlocked,
   bulkPendingLabel,
   BULK_TIMEOUT_MESSAGE,
+  isThreadGone,
+  NOT_OWNER_EXPLANATION,
+  THREAD_GONE_MESSAGE,
   emptySelection,
   extendThreadSelection,
   messageIsInTrash,
@@ -971,6 +975,69 @@ describe("bulkActionBlocked", () => {
   });
 });
 
+// Phase 4.2's owner-only move rights, as the bulk bar's disabled-with-reason
+// state. The reason renders as TEXT on the bar (the 4.1 blocked-note
+// pattern): a title on a disabled button reaches neither a touch screen nor
+// a screen reader.
+describe("bulkOwnershipBlocked", () => {
+  it("permits the moves when every selected thread is owned", () => {
+    expect(bulkOwnershipBlocked("archive", 0)).toBeNull();
+    expect(bulkOwnershipBlocked("trash", 0)).toBeNull();
+  });
+
+  it("blocks Archive and Trash when any selected thread is unowned, counting them", () => {
+    expect(bulkOwnershipBlocked("archive", 1))
+      .toBe(`1 selected conversation is in a mailbox you don't own \u2014 ${NOT_OWNER_EXPLANATION}.`);
+    expect(bulkOwnershipBlocked("trash", 3))
+      .toBe(`3 selected conversations are in a mailbox you don't own \u2014 ${NOT_OWNER_EXPLANATION}.`);
+  });
+
+  // The spec's Move rights line, verbatim -- shared with the per-thread
+  // not_owner note so the two surfaces cannot phrase one rule two ways. It
+  // must name the rule, not "your account", and must not send the viewer to
+  // Settings: the mailbox can be another user's.
+  it("phrases the rule as the spec words it, with no Settings pointer", () => {
+    expect(NOT_OWNER_EXPLANATION)
+      .toBe("only the mailbox owner can archive or trash \u2014 Hide in CRM is available to everyone");
+    expect(NOT_OWNER_EXPLANATION).not.toContain("your account");
+    expect(NOT_OWNER_EXPLANATION).not.toContain("Settings");
+  });
+
+  // Hide in CRM is exactly what every viewer keeps -- an unowned selection
+  // must never grey it out.
+  it("never blocks hide", () => {
+    expect(bulkOwnershipBlocked("hide", 50)).toBeNull();
+  });
+});
+
+// The conversation pane's "gone" branch: the detail route's 404 is deliberately
+// indistinguishable across nonexistent, deleted and flipped-to-private (the
+// accepted stale-pane window -- a flip's SSE frame carries no per-thread key,
+// so an open pane meets the 404 at its next refetch). Status-based, never
+// message-text-based.
+describe("isThreadGone", () => {
+  it("recognises the detail route's 404, by status alone", () => {
+    expect(isThreadGone(new ApiError("mail thread x not found", 404, "not_found"))).toBe(true);
+    // Whatever the message says: the branch must not read text.
+    expect(isThreadGone(new ApiError("anything at all", 404, "unknown"))).toBe(true);
+  });
+
+  it("does not swallow other failures into the calm state", () => {
+    expect(isThreadGone(new ApiError("boom", 500, "internal"))).toBe(false);
+    expect(isThreadGone(new ApiError("nope", 403, "forbidden"))).toBe(false);
+    expect(isThreadGone(new Error("network down"))).toBe(false);
+    expect(isThreadGone(undefined)).toBe(false);
+  });
+
+  // One sentence, no cause: copy that guessed "deleted" or "unshared" would
+  // un-blur the indistinguishable 404.
+  it("keeps the gone copy cause-free", () => {
+    expect(THREAD_GONE_MESSAGE).toBe("This conversation is no longer available.");
+    expect(THREAD_GONE_MESSAGE).not.toContain("deleted");
+    expect(THREAD_GONE_MESSAGE).not.toContain("private");
+  });
+});
+
 describe("buildFolderRows", () => {
   const NOW = "2026-08-20T10:00:00.000Z";
   const THEN = "2026-08-19T10:00:00.000Z";
@@ -1135,11 +1202,44 @@ describe("summarizeBulkResult", () => {
     expect(notes).toContain("2 could not be moved: that mail account is not syncing right now");
     expect(notes).toContain("reconnecting or paused");
     expect(notes).toContain("no Trash folder is set");
-    expect(notes).toContain("no longer exist");
+    // "could not be found", never "deleted"/"no longer exist": since 4.2 the
+    // same code also describes a thread whose account went private
+    // mid-session, and the route's 404 is indistinguishable BY DESIGN --
+    // copy that claimed deletion would un-blur that line.
+    expect(notes).toContain("could not be found");
     expect(notes).toContain("after the next sync pass");
     expect(notes).toContain("archived mail account");
-    // Two of the reasons are fixed in Settings, so the summary says so once.
+    // no_target is fixed in the viewer's own Settings, so the summary links.
     expect(summary.settingsLink).toBe(true);
+  });
+
+  // Phase 4.2: the owner-only move rule, in the spec's own words. The skip
+  // can arrive AFTER an enabled Archive click (ownedByViewer is thread-global
+  // while moves are folder-scoped), so this note is the click's explanation,
+  // not just decoration on a state the UI already prevented.
+  it("explains a not_owner skip with the move-rights sentence", () => {
+    const summary = summarizeBulkResult("archive", [skip("1", "not_owner"), skip("2", "not_owner")]);
+    expect(summary.headline).toBe("Nothing archived, 2 skipped.");
+    expect(summary.notes).toEqual([
+      "2 skipped: only the mailbox owner can archive or trash"
+      + " \u2014 Hide in CRM is available to everyone.",
+    ]);
+    // Another user's sharing is not fixable in the viewer's Settings.
+    expect(summary.settingsLink).toBe(false);
+  });
+
+  // archived_account can describe someone ELSE'S mailbox since 4.2 (it
+  // outranks not_owner), so its note must neither say "your account" nor
+  // send the viewer to their own Settings -- and the Settings link must not
+  // fire for it either.
+  it("keeps the archived_account note neutral about whose account it is", () => {
+    const summary = summarizeBulkResult("trash", [skip("1", "archived_account")]);
+    const note = summary.notes[0] ?? "";
+    expect(note).toContain("archived mail account");
+    expect(note).toContain("its owner");
+    expect(note).not.toContain("your");
+    expect(note).not.toContain("Settings");
+    expect(summary.settingsLink).toBe(false);
   });
 
   it("names the Archive folder in a no_target note for an archive action", () => {

@@ -24,12 +24,14 @@ import {
   composeErrorMessage,
   forwardBody,
   forwardSubject,
+  isThreadGone,
   messageIsInTrash,
   replyRecipients,
   replySource,
   replySubject,
   subjectLabel,
   summarizeBulkResult,
+  THREAD_GONE_MESSAGE,
   type BulkActionSummary,
   type ComposerLinks,
 } from "./mail-lib";
@@ -217,6 +219,22 @@ export function Conversation({ threadId }: ConversationProps) {
 
   if (isLoading) return <p className="text-sm text-slate-400">Loading...</p>;
   if (error) {
+    // The calm branch for the indistinguishable 404 (mail-lib's isThreadGone).
+    // It matters most for a pane that was ALREADY OPEN: a visibility flip does
+    // not invalidate ["mail-thread", id] (the accepted stale-pane window --
+    // spec Amendment 5), so the open conversation lives on its cached bytes
+    // until an ordinary refetch meets the 404. TanStack keeps the stale `data`
+    // when a refetch errors, and this branch runs BEFORE the data render on
+    // purpose: continuing to paint a conversation the server just said does
+    // not exist for this viewer would turn "bounded staleness" into
+    // "indefinite", one focus refetch at a time.
+    if (isThreadGone(error)) {
+      return (
+        <p data-testid="conversation-gone" className="rounded-md border border-dashed border-slate-200 px-4 py-8 text-center text-sm text-slate-400">
+          {THREAD_GONE_MESSAGE}
+        </p>
+      );
+    }
     return (
       <p role="alert" className="text-sm text-red-600">
         Could not load this conversation: {error.message}
@@ -247,23 +265,40 @@ export function Conversation({ threadId }: ConversationProps) {
           )}
           {/* The two SERVER moves. "Archive" here files the mail in the
               account's Archive folder over IMAP, so it sticks in every mail
-              client -- unlike the CRM-side state next to it. */}
-          <Button
-            variant="outline"
-            data-testid="conversation-archive"
-            disabled={move.isPending}
-            onClick={() => runMove("archive")}
-          >
-            Archive
-          </Button>
-          <Button
-            variant="outline"
-            data-testid="conversation-trash"
-            disabled={move.isPending}
-            onClick={() => runMove("trash")}
-          >
-            Trash
-          </Button>
+              client -- unlike the CRM-side state next to it.
+
+              RENDERED ONLY FOR AN OWNER (Phase 4.2): moves are owner-only
+              (the spec's Move rights line), and `ownedByViewer` -- computed
+              server-side per request, >= 1 message on an account the viewer
+              owns -- is the payload's answer. Absent, not disabled, per the
+              spec's UI line; every other viewer of a shared or deal-linked
+              thread keeps Hide in CRM below. Owned does NOT mean every click
+              succeeds: the flag is thread-global while the in-scope set is
+              not (Sent is excluded, rows can be archived/awaiting, and a
+              whole-thread move can find only unowned rows in scope), so the
+              per-reason notes in the move result below remain the backstop
+              for a not_owner or any other skip arriving AFTER an enabled
+              click. */}
+          {data.ownedByViewer && (
+            <>
+              <Button
+                variant="outline"
+                data-testid="conversation-archive"
+                disabled={move.isPending}
+                onClick={() => runMove("archive")}
+              >
+                Archive
+              </Button>
+              <Button
+                variant="outline"
+                data-testid="conversation-trash"
+                disabled={move.isPending}
+                onClick={() => runMove("trash")}
+              >
+                Trash
+              </Button>
+            </>
+          )}
           {/* The CRM-only state, renamed "Hide in CRM" now that Archive above
               means something else entirely. The testids predate the rename and
               stay put: they are addresses, not labels. */}

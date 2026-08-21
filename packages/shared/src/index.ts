@@ -850,8 +850,9 @@ export const mailThreadListItemSchema = mailThreadSchema.extend({
    * message on? Computed in the same aggregate pass as `accountIds`/`senders`
    * (>= 1 message on an account owned by the requesting user), not persisted
    * anywhere -- "owner" is a fact about the ACCOUNT, and a thread can span
-   * several. Drives Task 4's Archive/Trash gating (move rights are
-   * owner-only, per the spec's Move rights section): `false` means every
+   * several. Drives the bulk bar's Archive/Trash gating (move rights are
+   * owner-only, per the spec's Move rights section; web: bulk-bar.tsx's
+   * disabled-with-reason state off this flag): `false` means every
    * message here belongs to someone else's mailbox, so only Hide-in-CRM
    * applies. Named for the viewer specifically because it answers "can THIS
    * request's actor move something here", not "does this thread have an
@@ -892,7 +893,8 @@ export const mailThreadDetailSchema = z.object({
   // mail_threads row shape (mailThreadSchema, shared with the list item via
   // `.extend()`) and this is a per-request, per-viewer derived fact about it,
   // the same relationship `dealSuggestions` already has to `thread`. Drives
-  // Task 4's single-thread Archive/Trash buttons in the conversation view.
+  // the conversation view's single-thread Archive/Trash buttons (web:
+  // conversation.tsx renders them only when this is true).
   ownedByViewer: z.boolean(),
 });
 export type MailThreadDetail = z.infer<typeof mailThreadDetailSchema>;

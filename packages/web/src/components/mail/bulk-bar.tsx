@@ -2,6 +2,7 @@ import { Link } from "@tanstack/react-router";
 import type { BulkThreadActionKind } from "@conduit/shared";
 import {
   bulkActionBlocked,
+  bulkOwnershipBlocked,
   bulkPendingLabel,
   selectionLabel,
   type BulkActionSummary,
@@ -28,6 +29,11 @@ export type BulkOutcome =
 export interface BulkBarProps {
   /** How many threads the action would be sent for. */
   count: number;
+  /** How many of them the viewer owns no account on (`ownedByViewer: false`,
+   * Phase 4.2) -- one such thread disables Archive/Trash for the whole
+   * selection, with the reason as text (bulkOwnershipBlocked). Hide is
+   * unaffected. */
+  unowned: number;
   /** What the last gesture asked for, when the cap cut it short (mail-lib's
    * ThreadSelection.capped) -- shown as text, not as a tooltip. */
   capped: number | null;
@@ -53,7 +59,7 @@ export interface BulkBarProps {
  * while claiming the role leaves a keyboard user pressing arrows at buttons
  * that do not respond. A labelled group is what this actually is.
  */
-export function BulkBar({ count, capped, pendingAction, onRun, onClear }: BulkBarProps) {
+export function BulkBar({ count, unowned, capped, pendingAction, onRun, onClear }: BulkBarProps) {
   const pending = pendingAction !== null;
   return (
     <div
@@ -69,15 +75,15 @@ export function BulkBar({ count, capped, pendingAction, onRun, onClear }: BulkBa
         </span>
         <BulkButton
           testId="bulk-archive" label="Archive" action="archive"
-          count={count} pending={pending} onRun={onRun}
+          count={count} unowned={unowned} pending={pending} onRun={onRun}
         />
         <BulkButton
           testId="bulk-trash" label="Trash" action="trash"
-          count={count} pending={pending} onRun={onRun}
+          count={count} unowned={unowned} pending={pending} onRun={onRun}
         />
         <BulkButton
           testId="bulk-hide" label="Hide in CRM" action="hide"
-          count={count} pending={pending} onRun={onRun}
+          count={count} unowned={unowned} pending={pending} onRun={onRun}
         />
         <Button variant="ghost" data-testid="bulk-clear" onClick={onClear} disabled={pending}>
           Clear
@@ -94,53 +100,72 @@ export function BulkBar({ count, capped, pendingAction, onRun, onClear }: BulkBa
           {bulkPendingLabel(pendingAction, count)}
         </p>
       )}
-      {!pending && <BulkBlockedNote count={count} />}
+      {!pending && <BulkBlockedNote count={count} unowned={unowned} />}
     </div>
   );
 }
 
 /**
- * The cap message for whichever actions the current selection is too large for.
- * One line, not one per button: the two move actions share a cap, and "Select 50
- * or fewer" twice is noise.
+ * The reasons the greyed-out buttons cannot give themselves, as text.
  *
- * UNREACHABLE TODAY, ON PURPOSE, and kept. mail-lib caps every selection gesture
- * at SELECT_ALL_CAP, which is the move actions' own cap, so no selection this UI
- * can build is too large for any of the three -- this is the second half of a
- * belt-and-braces pair, and the belt is what the user actually meets. It stays
- * because the two numbers are independent: SELECT_ALL_CAP is a client decision
- * about one gesture, the per-action caps mirror the server's, and the day
- * select-all is allowed the outer 200 for `hide` (the obvious next step, noted
- * in mail-lib) this line is what tells a user with 200 rows ticked why Archive
- * is grey -- which is exactly why it is text and not a `title`.
+ * TWO INDEPENDENT LINES, because they answer different questions and can
+ * apply at once (200 rows ticked, some unowned: the cap line explains the
+ * grey Hide, the ownership line the grey moves).
+ *
+ * The CAP line is unreachable today, on purpose, and kept. mail-lib caps
+ * every selection gesture at SELECT_ALL_CAP, which is the move actions' own
+ * cap, so no selection this UI can build is too large for any of the three --
+ * this is the second half of a belt-and-braces pair, and the belt is what the
+ * user actually meets. It stays because the two numbers are independent:
+ * SELECT_ALL_CAP is a client decision about one gesture, the per-action caps
+ * mirror the server's, and the day select-all is allowed the outer 200 for
+ * `hide` (the obvious next step, noted in mail-lib) this line is what tells a
+ * user with 200 rows ticked why Archive is grey -- which is exactly why it is
+ * text and not a `title`.
+ *
+ * The OWNERSHIP line (Phase 4.2) is entirely reachable: tick any thread of a
+ * shared or deal-linked mailbox the viewer does not own and the two moves
+ * grey out with this explanation, while Hide stays live.
  */
-function BulkBlockedNote({ count }: { count: number }) {
+function BulkBlockedNote({ count, unowned }: { count: number; unowned: number }) {
   const moves = bulkActionBlocked("archive", count);
   const hide = bulkActionBlocked("hide", count);
-  const note = hide ?? moves;
-  if (note === null) return null;
+  const capNote = hide ?? moves;
+  const ownerNote = bulkOwnershipBlocked("archive", unowned);
   return (
-    <p data-testid="bulk-blocked" className="text-xs text-amber-700">
-      {note}{hide === null && " Hide in CRM still works."}
-    </p>
+    <>
+      {capNote !== null && (
+        <p data-testid="bulk-blocked" className="text-xs text-amber-700">
+          {capNote}{hide === null && " Hide in CRM still works."}
+        </p>
+      )}
+      {ownerNote !== null && (
+        <p data-testid="bulk-owner-blocked" className="text-xs text-amber-700">
+          {ownerNote}
+        </p>
+      )}
+    </>
   );
 }
 
-/** One action button, disabled while anything is in flight and while the
+/** One action button, disabled while anything is in flight, while the
  * selection is larger than that action's per-request cap (50 for the two that
- * wait on a mail server, 200 for the CRM-side hide -- the reason is rendered as
- * text by BulkBlockedNote above rather than hidden in a title). */
+ * wait on a mail server, 200 for the CRM-side hide), and -- for the two moves
+ * -- while any selected thread is unowned (Phase 4.2's owner-only move
+ * rights). Every reason is rendered as text by BulkBlockedNote above rather
+ * than hidden in a title. */
 function BulkButton({
-  testId, label, action, count, pending, onRun,
+  testId, label, action, count, unowned, pending, onRun,
 }: {
   testId: string;
   label: string;
   action: BulkThreadActionKind;
   count: number;
+  unowned: number;
   pending: boolean;
   onRun: (action: BulkThreadActionKind) => void;
 }) {
-  const blocked = bulkActionBlocked(action, count);
+  const blocked = bulkActionBlocked(action, count) ?? bulkOwnershipBlocked(action, unowned);
   return (
     <Button
       variant="outline"

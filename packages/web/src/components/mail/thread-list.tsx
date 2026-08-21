@@ -42,6 +42,16 @@ export interface ThreadToggle {
   order: readonly string[];
 }
 
+/** One visible row as onRowsChange reports it: the id, plus the one per-row
+ * fact the caller's bulk bar needs (Phase 4.2's move-rights gating) -- a pair
+ * rather than the whole MailThreadListItem, so the caller's
+ * reference-equality guard has exactly two fields to compare and a refetch
+ * that changed neither does not ripple a new array upward. */
+export interface ThreadRowInfo {
+  id: string;
+  ownedByViewer: boolean;
+}
+
 export interface ThreadListProps {
   filters: ThreadListFilters;
   onSelect: (threadId: string) => void;
@@ -77,8 +87,9 @@ export interface ThreadListProps {
    */
   selectionDisabled?: boolean;
   /** The visible rows, in order, whenever they change -- so the caller can turn
-   * its selection into a request without duplicating the accumulator. */
-  onRowsChange?: (threadIds: string[]) => void;
+   * its selection into a request (and gate its move buttons on each row's
+   * ownership) without duplicating the accumulator. */
+  onRowsChange?: (rows: ThreadRowInfo[]) => void;
 }
 
 const DEFAULT_LIMIT = 25;
@@ -163,9 +174,17 @@ export function ThreadList({
   const order = useMemo(() => threads.map((thread) => thread.id), [threads]);
   const orderRef = useLatest<readonly string[]>(order);
 
+  // Reported as {id, ownedByViewer} pairs, not bare ids: the inbox's bulk bar
+  // greys Archive/Trash whenever a selected thread is unowned, and this is
+  // the one channel that already carries "the visible rows" to it.
+  const rowsInfo = useMemo(
+    () => threads.map((thread) => ({ id: thread.id, ownedByViewer: thread.ownedByViewer })),
+    [threads],
+  );
+
   useEffect(() => {
-    onRowsChange?.(order);
-  }, [order, onRowsChange]);
+    onRowsChange?.(rowsInfo);
+  }, [rowsInfo, onRowsChange]);
 
   const toggleThread = useCallback((threadId: string, shift: boolean) => {
     onToggleThread?.(threadId, { shift, order: orderRef.current });

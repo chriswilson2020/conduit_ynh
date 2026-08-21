@@ -249,6 +249,11 @@ function AccountCard({
       {test.isError && <p role="alert" className="mt-2 text-sm text-red-600">{test.error.message}</p>}
       {test.data !== undefined && <TestResult result={test.data} />}
 
+      {/* NOT on an archived card: the account PATCH refuses archived rows
+          outright (mail-accounts.ts's ArchivedError), so a toggle here would
+          be a control that can only fail. An archived shared mailbox keeps
+          its visibility until it is unarchived -- flip it there. */}
+      {!isArchived && <VisibilitySection account={account} />}
       {showSignature && !isArchived && <SignatureEditor account={account} />}
       {/* Folders stay editable on an ARCHIVED account too: its rows survive
           (archive-not-delete), curating them while the mailbox is put away is
@@ -256,6 +261,58 @@ function AccountCard({
           finds no sync loop to ask for a pass. */}
       {showFolders && <FolderPicker account={account} />}
     </section>
+  );
+}
+
+/**
+ * The per-account Private / Shared toggle (Phase 4.2). Owner-only like every
+ * account setting -- it renders on the owner's own card, and the PATCH it
+ * sends 404s for anyone else.
+ *
+ * A PLAIN mutation, deliberately not an optimistic one: the switch shows the
+ * account row's own value and waits for the PATCH + refetch to move it. An
+ * optimistic flip would need an echo to confirm or roll back, and a
+ * same-value submit publishes NO SSE frame at all (updateAccount's no-op
+ * short-circuit) -- an optimistic UI waiting on that echo would hang on
+ * exactly the gesture that changes nothing. The useUpdateMailAccount hook's
+ * own ["mail-accounts"] invalidation is what moves the switch, a fetch
+ * round-trip after the click.
+ */
+function VisibilitySection({ account }: { account: MailAccountWithSyncStats }) {
+  const update = useUpdateMailAccount();
+  const shared = account.visibility === "shared";
+
+  return (
+    <div className="mt-3 flex flex-col gap-1 border-t border-slate-100 pt-3">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-semibold uppercase text-slate-500">Visibility</span>
+        {/* role="switch": one control whose accessible name states the rule
+            and whose checked state answers it -- the label text beside it
+            reads the current value for everyone else. */}
+        <Button
+          variant="outline"
+          role="switch"
+          aria-checked={shared}
+          aria-label="Share this mailbox with every CRM user"
+          data-testid={`visibility-toggle-${account.id}`}
+          disabled={update.isPending}
+          onClick={() => update.mutate({
+            id: account.id,
+            patch: { visibility: shared ? "private" : "shared" },
+          })}
+        >
+          {update.isPending ? "Saving..." : shared ? "Shared" : "Private"}
+        </Button>
+      </div>
+      {/* The sharing line, as the spec words it. */}
+      <p className="text-xs text-slate-400">
+        Private: only you see this mailbox's conversations. Threads you link to a deal or
+        project become visible on that record. Shared: every CRM user sees this mailbox.
+      </p>
+      {update.isError && (
+        <p role="alert" className="text-sm text-red-600">{update.error.message}</p>
+      )}
+    </div>
   );
 }
 

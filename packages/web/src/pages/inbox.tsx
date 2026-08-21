@@ -7,7 +7,9 @@ import { BulkBar, BulkResult, type BulkOutcome } from "../components/mail/bulk-b
 import { Composer } from "../components/mail/composer";
 import { Conversation } from "../components/mail/conversation";
 import { FolderSidebar } from "../components/mail/folder-sidebar";
-import { ThreadList, type ThreadListFilters, type ThreadToggle } from "../components/mail/thread-list";
+import {
+  ThreadList, type ThreadListFilters, type ThreadRowInfo, type ThreadToggle,
+} from "../components/mail/thread-list";
 import {
   allOnPageSelected,
   bulkErrorMessage,
@@ -121,7 +123,7 @@ export function InboxPage() {
 
   const [selectionState, setSelectionState] = useState<ThreadSelection>(() => emptySelection(filterKey));
   const selection = selectionForKey(selectionState, filterKey);
-  const [rows, setRows] = useState<readonly string[]>([]);
+  const [rows, setRows] = useState<readonly ThreadRowInfo[]>([]);
 
   // The key as of the last committed render, for the toggle callbacks below.
   // They must be STABLE -- every memoised row takes the one the list derives
@@ -191,13 +193,26 @@ export function InboxPage() {
   const busy = pendingAction !== null;
 
   // Reference-guarded so a re-render that produced the same rows cannot loop
-  // through this back into a new state object.
-  const handleRows = useCallback((next: string[]) => {
-    setRows((current) => (current.length === next.length && current.every((id, i) => id === next[i])
+  // through this back into a new state object. Both fields compare: a refetch
+  // that flips a row's ownedByViewer (a new message landing on an account the
+  // viewer owns) must reach the bulk bar's gating below, not be swallowed as
+  // "same ids".
+  const handleRows = useCallback((next: ThreadRowInfo[]) => {
+    setRows((current) => (current.length === next.length
+      && current.every((row, i) => row.id === next[i]?.id && row.ownedByViewer === next[i]?.ownedByViewer)
       ? current : next));
   }, []);
 
-  const selectedThreads = selectedThreadIds(selection, filterKey, rows);
+  const rowOrder = useMemo(() => rows.map((row) => row.id), [rows]);
+  const selectedThreads = selectedThreadIds(selection, filterKey, rowOrder);
+  // Selected AND visible AND unowned -- exactly the rows a move request would
+  // send that the server's ownership rule would skip whole. One is enough to
+  // grey Archive/Trash on the bar (mail-lib's bulkOwnershipBlocked); Hide
+  // stays live for everyone.
+  const unownedSelected = useMemo(
+    () => rows.filter((row) => selection.ids.has(row.id) && !row.ownedByViewer).length,
+    [rows, selection],
+  );
 
   /**
    * Send one bulk action for the current selection.
@@ -336,6 +351,7 @@ export function InboxPage() {
           {selectedThreads.length > 0 && (
             <BulkBar
               count={selectedThreads.length}
+              unowned={unownedSelected}
               capped={selection.capped}
               pendingAction={pendingAction}
               onRun={runBulk}
@@ -358,7 +374,7 @@ export function InboxPage() {
             selectedIds={selection.ids}
             onToggleThread={toggleThread}
             onToggleAll={toggleAll}
-            allSelected={allOnPageSelected(selection, filterKey, rows)}
+            allSelected={allOnPageSelected(selection, filterKey, rowOrder)}
             // Neither none nor all: the header box reads as a dash rather than
             // claiming one of the two.
             someSelected={selectedThreads.length > 0}
