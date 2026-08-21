@@ -463,6 +463,20 @@ test.describe.serial("Mail journey", () => {
     const { own } = await response.json() as {
       own: { id: string; archivedAt: string | null; visibility: "private" | "shared" }[];
     };
+    // Only LIVE accounts need (or admit) the visibility reset -- a
+    // shared+archived leftover would be uncleanable from here (the PATCH
+    // refuses archived rows) and would poison B's empty-inbox assertions
+    // permanently, but that state cannot arise in this suite, by
+    // construction: CI's postgres is fresh per run, and within a run the
+    // ONLY archiver of accounts is this very block, which always flips a
+    // shared account private FIRST -- the journey's own tests flip
+    // visibility but never archive, so every account this loop archives is
+    // private at that moment, and nothing can re-share it afterwards (the
+    // toggle does not render on archived cards and the PATCH refuses them).
+    // If this spec is ever pointed at a PERSISTENT database where that
+    // invariant does not hold, widen the flip to unarchive -> flip ->
+    // re-archive (the documented recovery road) rather than deleting this
+    // comment.
     for (const account of own) {
       if (account.archivedAt === null) {
         // Phase 4.2 retry hygiene, and it must run BEFORE the archive below:

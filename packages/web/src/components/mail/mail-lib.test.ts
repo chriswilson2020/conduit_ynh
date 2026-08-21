@@ -1213,6 +1213,34 @@ describe("summarizeBulkResult", () => {
     expect(summary.settingsLink).toBe(true);
   });
 
+  // REASON_NOTES' insertion order IS the display order ("most actionable
+  // first"), and this is the assertion that keeps that load-bearing: the
+  // per-reason tests above are deliberately order-independent (toContain over
+  // a join), so without this a silent reordering of the table would ship
+  // unnoticed. One of each noted reason, fed in scrambled, expected in table
+  // order -- which also pins every singular form exactly ("was refused",
+  // "belongs to").
+  it("renders the notes in the table's display order, failures before skips", () => {
+    const summary = summarizeBulkResult("trash", [
+      skip("1", "not_owner"), fail("2", "not_found"),
+      skip("3", "archived_account"), fail("4", "server_refused", "TRYCREATE"),
+      skip("5", "awaiting_reconciliation"), fail("6", "no_target"),
+      fail("7", "no_sync"),
+    ]);
+    expect(summary.notes).toEqual([
+      "1 could not be moved: that mail account is not syncing right now"
+      + " \u2014 it may be reconnecting or paused.",
+      "1 could not be moved: no Trash folder is set for that account yet.",
+      "1 could not be found \u2014 the list has been refreshed.",
+      "1 was refused by the mail server: TRYCREATE.",
+      "1 will complete after the next sync pass.",
+      "1 belongs to an archived mail account"
+      + " \u2014 its mail can be moved again once its owner unarchives it.",
+      "1 skipped: only the mailbox owner can archive or trash"
+      + " \u2014 Hide in CRM is available to everyone.",
+    ]);
+  });
+
   // Phase 4.2: the owner-only move rule, in the spec's own words. The skip
   // can arrive AFTER an enabled Archive click (ownedByViewer is thread-global
   // while moves are folder-scoped), so this note is the click's explanation,

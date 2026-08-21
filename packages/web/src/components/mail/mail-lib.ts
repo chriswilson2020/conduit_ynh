@@ -1324,10 +1324,10 @@ const REASON_NOTES: Record<BulkThreadResultReason, ((count: number, context: Bul
   not_found: (count) => `${count} could not be found \u2014 the list has been refreshed.`,
   server_refused: (count, { refusals }) => {
     const shown = refusals.slice(0, MAX_REFUSALS_SHOWN).map(truncate).join("; ");
-    return `${count} were refused by the mail server: ${shown}`;
+    return `${count} ${count === 1 ? "was" : "were"} refused by the mail server: ${shown}.`;
   },
   awaiting_reconciliation: (count) => `${count} will complete after the next sync pass.`,
-  archived_account: (count) => `${count} belong to an archived mail account`
+  archived_account: (count) => `${count} ${count === 1 ? "belongs" : "belong"} to an archived mail account`
     + " \u2014 its mail can be moved again once its owner unarchives it.",
   not_owner: (count) => `${count} skipped: ${NOT_OWNER_EXPLANATION}.`,
   already_in_target: null,
