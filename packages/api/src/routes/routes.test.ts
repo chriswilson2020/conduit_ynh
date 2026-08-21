@@ -869,7 +869,9 @@ describe("pipelines routes", () => {
     });
     const archivedBody = z.array(pipelineSchema).parse(archivedList.json());
     expect(archivedBody.map((p) => p.id)).toEqual([retired.id]);
-    expect(archivedBody[0]?.archivedAt).not.toBeNull();
+    // ?? null so an ABSENT row fails this line on its own (undefined would
+    // sail through .not.toBeNull()) instead of leaning on the toEqual above.
+    expect(archivedBody[0]?.archivedAt ?? null).not.toBeNull();
     await a.close();
   });
 

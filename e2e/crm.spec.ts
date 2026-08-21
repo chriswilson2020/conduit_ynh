@@ -217,7 +217,9 @@ test.describe.serial("CRM journey", () => {
     // deal moves are gated by the same `archived` flag) are absent.
     await row.click();
     await expect(page).toHaveURL(pipelineUrl);
-    await expect(page.getByText("This pipeline is archived. The board is read-only.")).toBeVisible();
+    // The house selector for the board's archived banner (pipeline.spec.ts's
+    // form), not the full copy string.
+    await expect(page.getByRole("alert")).toContainText("archived");
     await expect(page.getByTestId("unarchive-pipeline-button")).toBeVisible();
     await expect(page.getByTestId("archive-pipeline-button")).toHaveCount(0);
   });

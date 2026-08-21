@@ -124,6 +124,36 @@ NODE
 echo "Resolving lockfile..."
 ( cd "$STAGE" && npm install --package-lock-only --omit=dev >/dev/null )
 
+# The permanent form of the v0.8.0 dry-run check: every root override must be
+# REALIZED in the staged lockfile. The stage resolve above is a fresh one, so
+# a regression in the overrides carry-through (or an npm behavior change)
+# would otherwise ship a tarball that silently drops the pin -- the exact
+# near-miss that motivated carrying overrides in the first place. `semver` is
+# require()d from the monorepo root's node_modules (this script already runs
+# from ROOT with dependencies installed; a missing module fails loudly here,
+# never silently skips). A non-string override value means someone introduced
+# a nested/object override -- extend this guard rather than working around it.
+echo "Checking override pins survived the stage resolve..."
+node - "$STAGE/package-lock.json" <<'NODE'
+const fs = require("node:fs");
+const semver = require("semver");
+const overrides = JSON.parse(fs.readFileSync("package.json", "utf8")).overrides ?? {};
+const lock = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+for (const [name, range] of Object.entries(overrides)) {
+  if (typeof range !== "string") {
+    throw new Error(`override for ${name} is not a plain range string -- extend this guard`);
+  }
+  const version = lock.packages?.[`node_modules/${name}`]?.version;
+  if (version === undefined) {
+    throw new Error(`override ${name}@${range}: package absent from the staged lockfile`);
+  }
+  if (!semver.satisfies(version, range)) {
+    throw new Error(`override ${name}@${range}: staged lockfile resolves ${version}`);
+  }
+  console.log(`  ${name}@${range} -> ${version}`);
+}
+NODE
+
 echo "Creating tarball..."
 cd "$ROOT/release"
 tar czf "conduit-${VERSION}.tar.gz" conduit

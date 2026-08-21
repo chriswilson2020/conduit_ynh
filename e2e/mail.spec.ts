@@ -669,6 +669,27 @@ test.describe.serial("Mail journey", () => {
       }
     }
 
+    // Phase 4.3 retry hygiene, the same class as the visibility flip above:
+    // the hide journey ends with A's Hidden view EMPTY (its post-unhide
+    // negative asserts the "No hidden conversations" label as the
+    // loaded-list sentinel), and an attempt that failed between its hide
+    // and its unhide would leave a hidden thread behind that per-attempt
+    // SUBJECT scoping cannot clear -- hide state is keyed on the thread,
+    // not on this attempt's fixtures, and archiving the account above does
+    // not unlist its threads. Unhiding whatever a previous attempt left
+    // makes the empty-Hidden-view claim true by construction. Bounded loop
+    // only because the list pages; a first attempt breaks out immediately.
+    for (let round = 0; round < 5; round += 1) {
+      const hiddenList = await page.request.get("/api/mail/threads?hidden=true");
+      expect(hiddenList.ok()).toBe(true);
+      const { items } = await hiddenList.json() as { items: { id: string }[] };
+      if (items.length === 0) break;
+      for (const item of items) {
+        const unhidden = await page.request.post(`/api/mail/threads/${item.id}/unarchive`);
+        expect(unhidden.ok()).toBe(true);
+      }
+    }
+
     await seedMailbox();
   });
 
@@ -1264,18 +1285,32 @@ test.describe.serial("Mail journey", () => {
     const conversation = page.getByTestId("conversation");
     await expect(conversation).toBeVisible();
 
-    const pane = await conversation.boundingBox();
-    expect(pane).not.toBeNull();
     // A's own conversation renders all four actions: the remote-images
     // opt-in, the two owner-only server moves, and the CRM-side Hide.
-    for (const testId of ["load-remote-images", "conversation-archive", "conversation-trash", "hide-thread"]) {
-      const button = page.getByTestId(testId);
-      await expect(button).toBeVisible();
-      const box = await button.boundingBox();
-      expect(box).not.toBeNull();
-      expect(box!.x).toBeGreaterThanOrEqual(pane!.x - 1);
-      expect(box!.x + box!.width).toBeLessThanOrEqual(pane!.x + pane!.width + 1);
+    const actionIds = ["load-remote-images", "conversation-archive", "conversation-trash", "hide-thread"];
+    for (const testId of actionIds) {
+      await expect(page.getByTestId(testId)).toBeVisible();
     }
+    // The containment math is POLLED rather than snapshotted once: a late
+    // web-font load can reflow widths after first paint. Hardening only --
+    // no flake was observed with the single-shot form.
+    await expect.poll(async () => {
+      const pane = await conversation.boundingBox();
+      if (pane === null) return "conversation: no bounding box";
+      const overflowing: string[] = [];
+      for (const testId of actionIds) {
+        const box = await page.getByTestId(testId).boundingBox();
+        if (box === null || box.x < pane.x - 1 || box.x + box.width > pane.x + pane.width + 1) {
+          overflowing.push(testId);
+        }
+      }
+      return overflowing.length === 0 ? "contained" : `overflowing: ${overflowing.join(", ")}`;
+    }).toBe("contained");
+
+    // Put the shared page back on Playwright's default viewport: this
+    // serial file shares one page, and the +80px of height would otherwise
+    // ride silently into every test after this one.
+    await page.setViewportSize({ width: 1280, height: 720 });
   });
 
   test("forwards the fixture message and the stored attachment rides to Mailpit", async () => {
@@ -1421,8 +1456,12 @@ test.describe.serial("Mail journey", () => {
     await page.getByTestId("unhide-thread").click();
     await expect(page.getByTestId("hide-thread")).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
     // The Hidden list beside the pane lets go of the row as the unhide
-    // lands -- the conversation itself stays open.
+    // lands -- the conversation itself stays open -- and the emptied view
+    // says so out loud: the empty label is this negative's loaded-list
+    // sentinel (beforeAll's unhide hygiene is what makes "empty" hold even
+    // on a retry after a mid-journey failure).
     await expect(threadRow(hideSubject)).toHaveCount(0, { timeout: REFETCH_TIMEOUT_MS });
+    await expect(page.getByTestId("thread-list")).toContainText("No hidden conversations");
 
     // Restored to the default inbox (a fresh load resets the filter).
     await page.goto("/mail");

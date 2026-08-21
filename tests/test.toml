@@ -10,20 +10,20 @@ test_format = 1.0
     # manifest.toml HAS moved on: the version has been bumped release after
     # release since v0.1.2 -- 0.2.0 through 0.8.0~ynh1 (see
     # `git log -p -- manifest.toml`) -- so genuine prior releases to upgrade
-    # from exist. What does not exist is the package_check harness in
-    # this repo's CI: nothing here runs package_check today, so a
-    # test_upgrade_from block would be dead configuration until that harness is
-    # stood up -- which is its own piece of work, not a line in this file.
+    # from exist. What does not exist is the package_check harness in this
+    # repo's CI: nothing here runs package_check today, so a
+    # test_upgrade_from block would be dead configuration until that harness
+    # is stood up -- which is its own piece of work, not a line in this file.
     #
     # The migration rehearsal this project actually runs is the in-suite
-    # upgrade drill: withPreMigrationDatabase (packages/api/src/db/
-    # schema.test.ts) applies every migration up to a cut-off against a
+    # upgrade drill, withPreMigrationDatabase in packages/api/src/db/
+    # schema.test.ts: it applies every migration up to a cut-off against a
     # scratch database, seeds real pre-upgrade data, then runs the remaining
-    # migrations and asserts through the app's own services. For v0.8.0's 0007 (create + backfill + DROP
-    # COLUMN in one transaction) that drill seeds pre-upgrade archived threads
-    # and proves both users' post-upgrade inboxes through the real listThreads
-    # -- a stronger, more specific rehearsal than package_check's generic
-    # install-old-then-upgrade pass.
+    # migrations and asserts through the app's own services. For v0.8.0's
+    # 0007 (create + backfill + DROP COLUMN in one transaction) that drill
+    # seeds pre-upgrade archived threads and proves both users' post-upgrade
+    # inboxes through the real listThreads -- a stronger, more specific
+    # rehearsal than package_check's generic install-old-then-upgrade pass.
     #
     # Backlog: wire YunoHost package_check upgrade testing (test_upgrade_from
     # against the newest published release) when package-harness CI is set up.
