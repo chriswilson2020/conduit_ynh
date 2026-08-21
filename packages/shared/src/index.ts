@@ -1009,13 +1009,15 @@ export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
 // mailAccountTestResultSchema's per-protocol shape above), and
 // `skipped: true` can only accompany `ok: true` -- a skip is the move
 // service finding nothing eligible to move in this thread's relevant scope,
-// which is a successful no-op, not a failure. Three things produce it
-// (spec, Move write-back step 1): every in-scope message was awaiting
-// reconciliation (NULL imap_uid), every one was already in the target
-// folder, or every one belongs to an ARCHIVED mail account -- whose rows
-// survive but cannot be moved while the account stays archived (unarchiving
-// in Settings restores its sync loop), and are therefore excluded rather
-// than failed: from the mail view the failure would be unactionable.
+// which is a successful no-op, not a failure. Four things produce it
+// (spec, Move write-back step 1, plus Phase 4.2's ownership rule): every
+// in-scope message was awaiting reconciliation (NULL imap_uid), every one
+// was already in the target folder, every one belongs to an ARCHIVED mail
+// account -- whose rows survive but cannot be moved while the account stays
+// archived (unarchiving in Settings restores its sync loop) -- or every one
+// sits on an account the ACTOR does not own (Phase 4.2: move rights are
+// owner-only), and are therefore excluded rather than failed: from the mail
+// view the failure would be unactionable.
 // WHY a thread failed, as a code rather than a sentence. `error` stays for
 // display -- it carries the account label, or the server's own refusal text --
 // but a client must never branch on English (the house rule api.ts states for

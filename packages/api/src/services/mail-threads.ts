@@ -24,6 +24,10 @@ import { publish } from "./sse.js";
  * theatre; the only owner-scoped mail surfaces are ACCOUNTS (settings and
  * credentials) and SEND (whose From address is someone's identity), both of
  * which live in mail-accounts.ts / mail-send.ts.
+ *
+ * Phase 4.2 Task 2 replaces this section: mail_accounts.visibility ends
+ * unconditional sharing, and every read path in this file gets an actor and
+ * a predicate.
  */
 
 /** Every mail-thread mutation invalidates the same three key families: the

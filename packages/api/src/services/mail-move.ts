@@ -52,6 +52,10 @@ import { publish } from "./sse.js";
  * EACH MESSAGE'S OWN account's sync loop, under that account's credentials --
  * the actor's identity never reaches a mail server.
  *
+ * Phase 4.2 Task 3 replaces this section: move rights become owner-only, and
+ * `actorId` stops being audit-only the moment collectCandidates compares it
+ * against each message's account.
+ *
  * ---------------------------------------------------------------------------
  * NO INGEST ADVISORY LOCK
  * ---------------------------------------------------------------------------
@@ -706,20 +710,13 @@ async function collectCandidates(
     // where "nothing to do" is just as true -- and where moving a message into
     // the mailbox it is already in would churn its UID for nothing. A refused
     // account may have no target at all, in which case there is no folder for
-    // a message to be "already in". It is tested FIRST of the three, because a
-    // message that is already where it was going needs no uid and no live sync
-    // to be finished with.
+    // a message to be "already in". It is tested BEFORE every other drop
+    // below, because a message that is already where it was going needs no
+    // uid, no live sync, and no ownership check to be finished with.
     if (targetFolder !== null && sameFolder(row.folder, targetFolder)) {
       outcomes.noteSkip(row.threadId, "already_in_target");
       continue;
     }
-    // Task 3 wires the ownership filter here: an in-scope row on an account
-    // the actor does not own drops out with noteSkip(row.threadId,
-    // "not_owner"), BEFORE the archived-account and refusal checks below --
-    // same "in scope decided first, ownership/availability decided next,
-    // refusal last" ordering this function already applies. Needs `accountRows`
-    // above to select `userId` and this function to take an `actorId` param.
-    //
     // An archived account's rows cannot move while it stays archived, so they
     // are dropped here beside the NULL uids rather than failing anything --
     // see accountStateOf for why a failure whose only remedy is in Settings is
@@ -728,6 +725,15 @@ async function collectCandidates(
       outcomes.noteSkip(row.threadId, "archived_account");
       continue;
     }
+    // Task 3 wires the ownership filter here, in SKIP_REASON_RANK's order
+    // (directly below archived_account): an in-scope row on an account the
+    // actor does not own drops out with noteSkip(row.threadId, "not_owner"),
+    // BEFORE the awaiting-reconciliation check and the refusal check below --
+    // same "in scope decided first, ownership/availability decided next,
+    // refusal last" ordering this function already applies. Needs
+    // `accountRows` above to select `userId` and this function to take an
+    // `actorId` param.
+    //
     // No UID, no way to name this message to the server. Self-heals: the next
     // pass of its folder re-sights it and the upsert restores the uid.
     if (row.imapUid === null) {

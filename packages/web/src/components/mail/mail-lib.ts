@@ -1226,6 +1226,13 @@ function truncate(text: string): string {
  * sentence, and both are still COUNTED so the headline stays honest. That
  * honesty is the point of the headline's shape: "Nothing archived, 2 skipped."
  * must not be mistakable for "2 archived."
+ *
+ * `not_owner` (Phase 4.2) currently falls through QUIET too, but that is NOT
+ * a deliberate choice like the two above -- `count()` below is string-keyed,
+ * so a new shared reason with no branch here compiles clean and says
+ * nothing, with no type error to catch the gap. Phase 4.2 Task 4 decides
+ * not_owner's actual surface (its own note, folded into a UI-gating message,
+ * or something else) -- until then, do not read its silence here as settled.
  */
 export function summarizeBulkResult(
   action: BulkThreadActionKind, results: readonly BulkResultItem[],
