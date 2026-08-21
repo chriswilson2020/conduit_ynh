@@ -463,21 +463,23 @@ export const mailThreads = pgTable("mail_threads", {
   contactId: uuid("contact_id").references(() => contacts.id),
   dealId: uuid("deal_id").references(() => deals.id),
   projectId: uuid("project_id").references(() => projects.id),
-  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  // No archived/hidden column: since Phase 4.3 "hidden" is a per-viewer fact
+  // (mail_thread_hides below), never a property of the shared thread row.
+  // The pre-4.3 thread-global archived_at was dropped by 0007's second half.
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 export type MailThreadRow = typeof mailThreads.$inferSelect;
 
 // Phase 4.3: one row = "this USER has hidden this THREAD from their own CRM
-// mail views" -- the per-user successor to the thread-global
-// mail_threads.archived_at above. Migration 0007 backfills one hide row per
+// mail views" -- the per-user successor to the retired thread-global
+// mail_threads.archived_at. Migration 0007 backfilled one hide row per
 // (archived thread x existing user), carrying archived_at as hidden_at, so
-// the upgrade changes nobody's view (spec, Migration decision); the phase's
-// read-path task then drops archived_at and swaps every filter to this
-// table, per the plan's two-step sequencing note -- until that lands,
-// archived_at remains the live source of truth and nothing reads this table
-// yet.
+// the upgrade changed nobody's view (spec, Migration decision), then dropped
+// the column. This table is now the ONLY source of hide state: every default
+// mail read path excludes the viewer's hidden threads through
+// mail-threads.ts's hiddenByViewer predicate, and the Hidden view inverts
+// that same arm.
 //
 // Composite PK (thread_id, user_id) rather than a surrogate id: the pair IS
 // the identity ("has U hidden T"), it is the natural conflict target for an

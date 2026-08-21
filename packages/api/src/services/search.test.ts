@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import { randomUUID } from "node:crypto";
 import { searchResultsSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
-import { mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
+import { mailAccounts, mailMessages, mailThreadHides, mailThreads } from "../db/schema.js";
 import { resolveUser } from "../users.js";
 import { createCompany, archiveCompany } from "./companies.js";
 import { createContact, archiveContact } from "./contacts.js";
@@ -214,15 +214,20 @@ describe("search service: mail group", () => {
 
   async function makeMailThread(
     subject: string,
-    opts: { archived?: boolean; contactId?: string; dealId?: string; projectId?: string } = {},
+    opts: { contactId?: string; dealId?: string; projectId?: string } = {},
   ): Promise<string> {
     const [row] = await handle.db.insert(mailThreads).values({
       subject, lastMessageAt: new Date("2026-08-02T10:00:00Z"), messageCount: 1,
-      archivedAt: opts.archived === true ? new Date() : null,
       contactId: opts.contactId ?? null, dealId: opts.dealId ?? null, projectId: opts.projectId ?? null,
     }).returning();
     if (row === undefined) throw new Error("makeMailThread: no row");
     return row.id;
+  }
+
+  /** Files the thread out of ONE user's views (Phase 4.3): a hide is a
+   * per-viewer row now, so the fixture names whose it is. */
+  async function hideFor(threadId: string, userId: string): Promise<void> {
+    await handle.db.insert(mailThreadHides).values({ threadId, userId });
   }
 
   async function makeMailMessage(
@@ -263,15 +268,22 @@ describe("search service: mail group", () => {
     expect(result.mail).toHaveLength(5);
   });
 
-  it("excludes archived threads", async () => {
-    const accountId = await makeMailAccount();
+  // The hide is PER-VIEWER (Phase 4.3): the hider's results lose the thread,
+  // any other viewer's keep it -- search follows the same default-surface
+  // rule as the inbox and the badges.
+  it("excludes threads the viewer hid, for that viewer alone", async () => {
+    const otherId = (await resolveUser(handle.db, { username: "dana", email: null, fullName: null })).id;
+    const accountId = await makeMailAccount({ visibility: "shared" });
     const live = await makeMailThread("Fenwold live");
     await makeMailMessage(live, accountId, { subject: "Fenwold", bodyText: "fenwold notes", snippet: "live" });
-    const filed = await makeMailThread("Fenwold filed", { archived: true });
+    const filed = await makeMailThread("Fenwold filed");
+    await hideFor(filed, actorId);
     await makeMailMessage(filed, accountId, { subject: "Fenwold", bodyText: "fenwold notes", snippet: "filed" });
 
     const result = await search(handle.db, actorId, "fenwold");
     expect(result.mail.map((hit) => hit.threadId)).toEqual([live]);
+    const others = await search(handle.db, otherId, "fenwold");
+    expect(others.mail.map((hit) => hit.threadId).sort()).toEqual([live, filed].sort());
   });
 
   // websearch_to_tsquery, not to_tsquery: a human types punctuation and

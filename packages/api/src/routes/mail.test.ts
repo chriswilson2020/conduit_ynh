@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   contactSchema, dealSchema, errorResponseSchema, listResponseSchema, pipelineSchema, stageSchema,
   mailAccountSchema, mailAccountListSchema, mailAccountTestResultSchema, mailThreadSchema,
@@ -16,8 +16,9 @@ import {
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { buildApp } from "../app.js";
 import type { Config } from "../config.js";
+import { resolveUser } from "../users.js";
 import {
-  mailAccountFolders, mailAccounts, mailAttachments, mailMessages, mailThreads,
+  mailAccountFolders, mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads,
 } from "../db/schema.js";
 import { saveBlob } from "../services/blobs.js";
 import type { SendMailMessage, SendMailTransport } from "../services/mail-send.js";
@@ -170,7 +171,6 @@ interface ThreadSeed {
   subject?: string;
   lastMessageAt: Date;
   companyId?: string; contactId?: string; dealId?: string; projectId?: string;
-  archived?: boolean;
 }
 
 async function seedThread(seed: ThreadSeed): Promise<string> {
@@ -180,10 +180,42 @@ async function seedThread(seed: ThreadSeed): Promise<string> {
     messageCount: 1,
     companyId: seed.companyId ?? null, contactId: seed.contactId ?? null,
     dealId: seed.dealId ?? null, projectId: seed.projectId ?? null,
-    archivedAt: seed.archived === true ? new Date() : null,
   }).returning();
   if (row === undefined) throw new Error("seedThread: no row");
   return row.id;
+}
+
+/** The user row behind a set of request headers. resolveUser is the SAME
+ * upsert the auth hook runs on every request, so calling it here neither
+ * duplicates a user nor depends on whether that identity has sent a request
+ * yet -- which matters because hide rows carry a user FK and most fixtures
+ * seed before the first inject(). */
+async function userIdFor(headers: typeof authHeaders): Promise<string> {
+  return (await resolveUser(handle.db, {
+    username: headers["ynh-user"], email: headers["ynh-user-email"], fullName: headers["ynh-user-fullname"],
+  })).id;
+}
+
+/** One per-user hide row -- the Phase 4.3 successor to this file's old
+ * `archived: true` thread seed: hiding is per-actor now, so a fixture must
+ * SAY whose views it is filing the thread out of. */
+async function hideFor(
+  threadId: string, headers: typeof authHeaders = authHeaders, hiddenAt?: Date,
+): Promise<void> {
+  await handle.db.insert(mailThreadHides).values({
+    threadId, userId: await userIdFor(headers),
+    ...(hiddenAt === undefined ? {} : { hiddenAt }),
+  });
+}
+
+/** The viewer's hide row for a thread, or undefined -- what the per-user
+ * assertions below read instead of the retired thread-global column. */
+async function hideRow(threadId: string, headers: typeof authHeaders = authHeaders) {
+  const userId = await userIdFor(headers);
+  const [row] = await handle.db.select().from(mailThreadHides).where(
+    and(eq(mailThreadHides.threadId, threadId), eq(mailThreadHides.userId, userId)),
+  );
+  return row;
 }
 
 interface MessageSeed {
@@ -679,12 +711,13 @@ describe("mail thread list route", () => {
     const account = await makeAccount(a);
     const older = await seedThread({ subject: "Older", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
     const newer = await seedThread({ subject: "Newer", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
-    const archived = await seedThread({ subject: "Gone", lastMessageAt: new Date("2026-08-03T10:00:00Z"), archived: true });
+    const hidden = await seedThread({ subject: "Gone", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await hideFor(hidden);
     await seedMessage(older, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: true, snippet: "Older body" });
     await seedMessage(newer, account.id, {
       sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, snippet: "Newer body", fromAddr: "bob@example.com", fromName: "Bob",
     });
-    await seedMessage(archived, account.id, { sentAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(hidden, account.id, { sentAt: new Date("2026-08-03T10:00:00Z") });
 
     const response = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
     expect(response.statusCode).toBe(200);
@@ -695,6 +728,9 @@ describe("mail thread list route", () => {
     expect(body.items[0]?.senders.map((s) => s.address)).toEqual(["bob@example.com"]);
     expect(body.items[0]?.accountIds).toEqual([account.id]);
     expect(body.items[1]?.unread).toBe(false);
+    // Default-view rows carry hiddenAt null BY CONSTRUCTION -- a thread the
+    // viewer hid cannot be on this page at all.
+    expect(body.items.map((t) => t.hiddenAt)).toEqual([null, null]);
     expect(body.nextCursor).toBeNull();
     await a.close();
   });
@@ -857,8 +893,9 @@ describe("mail thread list route", () => {
     await seedMessage(linked, first.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
     const loose = await seedThread({ subject: "Loose", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
     await seedMessage(loose, second.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: true });
-    const archived = await seedThread({ subject: "Filed", lastMessageAt: new Date("2026-08-03T10:00:00Z"), archived: true });
-    await seedMessage(archived, first.id, { sentAt: new Date("2026-08-03T10:00:00Z") });
+    const filed = await seedThread({ subject: "Filed", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await hideFor(filed);
+    await seedMessage(filed, first.id, { sentAt: new Date("2026-08-03T10:00:00Z") });
 
     async function subjects(query: string): Promise<string[]> {
       const response = await a.inject({ method: "GET", url: `/api/mail/threads?${query}`, headers: authHeaders });
@@ -1123,13 +1160,16 @@ describe("mail thread read route", () => {
     await a.close();
   });
 
-  // The one thread mutation an archive does NOT block, deliberately -- see
-  // markThreadRead's doc comment. An archived conversation is still openable,
-  // and opening it is what marks it read.
-  it("marks an ARCHIVED thread read rather than refusing it", async () => {
+  // Hiding never blocks anything (since Amendment 1 retired the link guard,
+  // NO thread mutation tests hide state) -- and mark-read is where that
+  // matters most: a hidden conversation is still openable, opening it is
+  // what marks it read, and the response still reports the VIEWER'S own
+  // hide state on the echoed thread.
+  it("marks a HIDDEN thread read rather than refusing it", async () => {
     const a = await app();
     const account = await makeAccount(a);
-    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z"), archived: true });
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await hideFor(threadId);
     await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, imapUid: 41 });
 
     const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: authHeaders });
@@ -1138,14 +1178,6 @@ describe("mail thread read route", () => {
     const rows = await handle.db.select({ seen: mailMessages.seen }).from(mailMessages)
       .where(eq(mailMessages.threadId, threadId));
     expect(rows.every((row) => row.seen)).toBe(true);
-    // Setting a link on the same archived thread IS refused -- the asymmetry
-    // is intentional, not an oversight.
-    const contact = await makeContact(a);
-    const link = await a.inject({
-      method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
-      payload: { kind: "contact", id: contact.id },
-    });
-    expect(link.statusCode).toBe(409);
     await a.close();
   });
 
@@ -1157,9 +1189,9 @@ describe("mail thread read route", () => {
   });
 });
 
-// --- Threads: links and archive ---------------------------------------------
+// --- Threads: links and hide -------------------------------------------------
 
-describe("mail thread link and archive routes", () => {
+describe("mail thread link and hide routes", () => {
   it("sets and clears each of the four links", async () => {
     const a = await app();
     const account = await makeAccount(a);
@@ -1215,63 +1247,109 @@ describe("mail thread link and archive routes", () => {
     await a.close();
   });
 
-  it("archives and unarchives a thread CRM-side, and refuses link changes while archived", async () => {
+  // The Amendment 1 rewrite of the pre-4.3 "refuses link changes while
+  // archived" 409 pin: that guard RETIRED with the thread-global state it
+  // guarded. A hide is one person's filing act and gates no shared CRM
+  // mutation -- in either direction.
+  it("hides and unhides a thread CRM-side for the actor alone, and link changes work regardless of anyone's hide state", async () => {
     const a = await app();
-    const account = await makeAccount(a);
+    const priv = await makeAccount(a);
     const contact = await makeContact(a);
+    const deal = await makeDeal(a);
     const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
-    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
 
-    const archived = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
-    expect(archived.statusCode).toBe(200);
-    expect(mailThreadSchema.parse(archived.json()).hiddenAt).not.toBeNull();
+    const hidden = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
+    expect(hidden.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(hidden.json()).hiddenAt).not.toBeNull();
+    // Per-actor: the hider's row exists, nobody else's does.
+    expect(await hideRow(threadId, authHeaders)).toBeDefined();
+    expect(await hideRow(threadId, otherHeaders)).toBeUndefined();
 
-    const whileArchived = await a.inject({
+    // The hider links their OWN hidden thread fine -- linking from the
+    // Hidden view or the conversation is a deliberate act -- and the echoed
+    // thread still reports THEIR hide state.
+    const ownLink = await a.inject({
       method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
+      payload: { kind: "deal", id: deal.id },
+    });
+    expect(ownLink.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(ownLink.json()).dealId).toBe(deal.id);
+    expect(mailThreadSchema.parse(ownLink.json()).hiddenAt).not.toBeNull();
+
+    // Per 4.2's sharing line the deal link SHARES the private thread --
+    // ANOTHER user can now see it and change links on it, with the hider's
+    // hide gating nothing (and the other viewer's own hiddenAt is null:
+    // hide state never leaks across users).
+    const othersLink = await a.inject({
+      method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: otherHeaders,
       payload: { kind: "contact", id: contact.id },
     });
-    expect(whileArchived.statusCode).toBe(409);
+    expect(othersLink.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(othersLink.json()).contactId).toBe(contact.id);
+    expect(mailThreadSchema.parse(othersLink.json()).hiddenAt).toBeNull();
+
+    // The sharing/hiding composition, pinned on its own (spec Amendment 1):
+    // the SAME deal link that shares the thread onto the other user's deal
+    // tab leaves it hidden in the hider's own views -- excluded from the
+    // hider's deal tab (a default surface), listed in their Hidden view.
+    async function dealTab(headers: typeof authHeaders): Promise<string[]> {
+      const response = await a.inject({
+        method: "GET", url: `/api/mail/threads?deal_id=${deal.id}`, headers,
+      });
+      return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items.map((t) => t.id);
+    }
+    expect(await dealTab(otherHeaders)).toEqual([threadId]);
+    expect(await dealTab(authHeaders)).toEqual([]);
+    const hiddenView = await a.inject({ method: "GET", url: "/api/mail/threads?hidden=true", headers: authHeaders });
+    expect(listResponseSchema(mailThreadListItemSchema).parse(hiddenView.json()).items.map((t) => t.id))
+      .toEqual([threadId]);
 
     const restored = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
     expect(restored.statusCode).toBe(200);
     expect(mailThreadSchema.parse(restored.json()).hiddenAt).toBeNull();
+    expect(await dealTab(authHeaders)).toEqual([threadId]);
 
     const unknown = await a.inject({ method: "POST", url: `/api/mail/threads/${UNKNOWN_ID}/archive`, headers: authHeaders });
     expect(unknown.statusCode).toBe(404);
     await a.close();
   });
 
-  // The no-op branch answers from a RE-READ, not the pre-update snapshot, so
-  // a repeated request reports the row's current state truthfully -- the
-  // shape a lost concurrent-archive race takes.
-  it("answers a repeated archive and a repeated unarchive with the row's current state", async () => {
+  // Idempotent both ways, never an error (spec, Hide/unhide semantics). The
+  // hide no-op answers from a RE-READ of the standing hide row, so a
+  // repeated request reports the ORIGINAL filing moment -- never a fresh
+  // timestamp, and never a report of the pre-hide state.
+  it("answers a repeated hide with the original hidden_at and a repeated unhide with null", async () => {
     const a = await app();
     const account = await makeAccount(a);
     const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
     await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
 
     const first = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
-    expect(mailThreadSchema.parse(first.json()).hiddenAt).not.toBeNull();
+    const firstAt = mailThreadSchema.parse(first.json()).hiddenAt;
+    expect(firstAt).not.toBeNull();
     const second = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
     expect(second.statusCode).toBe(200);
-    // The truthful no-op: still archived, never a report of the pre-archive row.
-    expect(mailThreadSchema.parse(second.json()).hiddenAt).not.toBeNull();
+    // The truthful no-op: the SAME filing moment, not a re-stamp.
+    expect(mailThreadSchema.parse(second.json()).hiddenAt).toBe(firstAt);
 
     const restored = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
     expect(mailThreadSchema.parse(restored.json()).hiddenAt).toBeNull();
     const again = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
     expect(again.statusCode).toBe(200);
     expect(mailThreadSchema.parse(again.json()).hiddenAt).toBeNull();
+    expect(await hideRow(threadId)).toBeUndefined();
     await a.close();
   });
 
-  it("counts unread threads, not unread messages, and ignores archived threads", async () => {
+  it("counts unread threads, not unread messages, and ignores threads the viewer hid", async () => {
     const a = await app();
     const account = await makeAccount(a);
     const busy = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
     await seedMessage(busy, account.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: false });
     await seedMessage(busy, account.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
-    const filed = await seedThread({ lastMessageAt: new Date("2026-08-03T10:00:00Z"), archived: true });
+    const filed = await seedThread({ lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await hideFor(filed);
     await seedMessage(filed, account.id, { sentAt: new Date("2026-08-03T10:00:00Z"), seen: false });
 
     const response = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: authHeaders });
@@ -1579,13 +1657,14 @@ describe("mail bulk thread action route", () => {
     // retention owns actual destruction.
     expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [51], targetFolder: "Trash" }]);
 
-    // "Hide in CRM" is the pre-4.1 thread archive in bulk: a CRM column, no
-    // IMAP work at all, and `folder` is ignored entirely.
+    // "Hide in CRM" is the per-actor filing act in bulk (Phase 4.3): a hide
+    // row for the REQUESTING user alone, no IMAP work at all, and `folder`
+    // is ignored entirely.
     const hide = await bulk(a, { threadIds: [hidden], action: "hide" });
     expect(hide.statusCode).toBe(200);
     expect(bulkThreadResultSchema.parse(hide.json()).results).toEqual([{ threadId: hidden, ok: true }]);
-    const [row] = await handle.db.select().from(mailThreads).where(eq(mailThreads.id, hidden));
-    expect(row?.archivedAt).not.toBeNull();
+    expect(await hideRow(hidden, authHeaders)).toBeDefined();
+    expect(await hideRow(hidden, otherHeaders)).toBeUndefined();
     expect(await messageRow(hiddenMessage)).toMatchObject({ folder: "INBOX", imapUid: 52 });
     expect(sync.moveCalls).toHaveLength(1);
     await a.close();
@@ -2200,7 +2279,7 @@ describe("mail template routes", () => {
 // --- Search -----------------------------------------------------------------
 
 describe("search route: mail group", () => {
-  it("returns one best-ranked hit per thread, rank ordered, excluding archived threads", async () => {
+  it("returns one best-ranked hit per thread, rank ordered, excluding threads the viewer hid", async () => {
     const a = await app();
     const account = await makeAccount(a);
 
@@ -2218,15 +2297,16 @@ describe("search route: mail group", () => {
       sentAt: new Date("2026-08-03T10:00:00Z"), subject: "Lunch",
       bodyText: "we can talk about the invoice at lunch some time", snippet: "weak hit",
     });
-    const filed = await seedThread({ subject: "Filed", lastMessageAt: new Date("2026-08-04T10:00:00Z"), archived: true });
+    const filed = await seedThread({ subject: "Filed", lastMessageAt: new Date("2026-08-04T10:00:00Z") });
+    await hideFor(filed);
     await seedMessage(filed, account.id, {
-      sentAt: new Date("2026-08-04T10:00:00Z"), subject: "Invoice", bodyText: "invoice", snippet: "archived hit",
+      sentAt: new Date("2026-08-04T10:00:00Z"), subject: "Invoice", bodyText: "invoice", snippet: "hidden hit",
     });
 
     const response = await a.inject({ method: "GET", url: "/api/search?q=invoice", headers: authHeaders });
     expect(response.statusCode).toBe(200);
     const body = searchResultsSchema.parse(response.json());
-    // One row per thread, strongest first, archived thread absent.
+    // One row per thread, strongest first, the viewer's hidden thread absent.
     expect(body.mail.map((hit) => hit.threadId)).toEqual([strong, weak]);
     expect(body.mail[0]?.snippet).toBe("best hit");
     await a.close();
@@ -2725,10 +2805,12 @@ describe("mail thread visibility", () => {
       expect(response.statusCode).toBe(404);
       expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
     }
-    // Nothing changed: still unseen, unarchived, unlinked.
+    // Nothing changed: still unseen, unlinked, and hidden for NOBODY -- the
+    // route 404'd before any hide row could be written, so hiding an
+    // invisible thread id discloses nothing even by side effect.
     const [thread] = await handle.db.select().from(mailThreads).where(eq(mailThreads.id, threadId));
-    expect(thread?.archivedAt).toBeNull();
     expect(thread?.contactId).toBeNull();
+    expect(await handle.db.select().from(mailThreadHides).where(eq(mailThreadHides.threadId, threadId))).toEqual([]);
     const [message] = await handle.db.select().from(mailMessages).where(eq(mailMessages.threadId, threadId));
     expect(message?.seen).toBe(false);
     await a.close();
@@ -2902,19 +2984,27 @@ describe("mail thread visibility", () => {
     await a.close();
   });
 
-  it("applies the same predicate to the hidden list: hidden=true shows only what the viewer may see", async () => {
+  it("applies the same predicate to the Hidden view: hidden=true shows only what the viewer may see, of what THEY hid", async () => {
     const a = await app();
     const priv = await makeAccount(a);
     const shared = await makeAccount(a, { label: "Team", email: "team@example.com" });
     await setVisibility(shared.id, "shared");
+    // BOTH users hid both threads, so the two Hidden views differ only by
+    // VISIBILITY: hiding an invisible thread through the fixture must not
+    // make it appear anywhere (hidden-but-invisible stays invisible -- the
+    // hide arm composes with the 4.2 predicate, never overrides it).
     const hiddenPrivate = await seedThread({
-      subject: "Hidden private", lastMessageAt: new Date("2026-08-02T10:00:00Z"), archived: true,
+      subject: "Hidden private", lastMessageAt: new Date("2026-08-02T10:00:00Z"),
     });
     await seedMessage(hiddenPrivate, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
     const hiddenShared = await seedThread({
-      subject: "Hidden shared", lastMessageAt: new Date("2026-08-01T10:00:00Z"), archived: true,
+      subject: "Hidden shared", lastMessageAt: new Date("2026-08-01T10:00:00Z"),
     });
     await seedMessage(hiddenShared, shared.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+    for (const headers of [authHeaders, otherHeaders]) {
+      await hideFor(hiddenPrivate, headers);
+      await hideFor(hiddenShared, headers);
+    }
 
     expect(await listIds(a, "hidden=true", authHeaders)).toEqual([hiddenPrivate, hiddenShared]);
     expect(await listIds(a, "hidden=true", otherHeaders)).toEqual([hiddenShared]);
@@ -2964,6 +3054,214 @@ describe("mail thread visibility", () => {
     // Search is a CRM surface (record scope): the deliberate deal link and
     // the shared mailbox are findable, the private and auto-linked mail is not.
     expect(await mailHits(otherHeaders)).toEqual([dealLinked, onShared].sort());
+    await a.close();
+  });
+});
+
+// --- Per-user hide (Phase 4.3) ----------------------------------------------
+//
+// The hide matrix -- (hider | other user) x (default list | Hidden view |
+// detail | both standalone unread computations + the inherited list flag |
+// record tabs | search) -- composed with the 4.2 visibility predicate. The
+// spine of every test here: a hide changes exactly ONE person's default
+// views and nobody else's anything, and it never changes what anyone MAY
+// see -- only what the hider's default surfaces bother showing.
+describe("per-user hide", () => {
+  async function setVisibility(accountId: string, visibility: "private" | "shared"): Promise<void> {
+    await handle.db.update(mailAccounts).set({ visibility }).where(eq(mailAccounts.id, accountId));
+  }
+
+  async function listIds(a: App, query: string, headers: typeof authHeaders): Promise<string[]> {
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/threads${query === "" ? "" : `?${query}`}`, headers,
+    });
+    expect(response.statusCode).toBe(200);
+    return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items.map((t) => t.id);
+  }
+
+  async function badge(a: App, headers: typeof authHeaders): Promise<number> {
+    const response = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers });
+    return mailUnreadCountSchema.parse(response.json()).count;
+  }
+
+  /** One shared-mailbox thread both users can see -- the base fixture the
+   * matrix varies around. */
+  async function sharedThread(a: App, opts: { seen?: boolean; subject?: string; day?: number } = {}) {
+    const account = await makeAccount(a, { label: `Team ${randomUUID()}`, email: `team+${randomUUID()}@example.com` });
+    await setVisibility(account.id, "shared");
+    const when = new Date(Date.UTC(2026, 7, opts.day ?? 2, 10));
+    const threadId = await seedThread({ subject: opts.subject ?? "Shared talk", lastMessageAt: when });
+    await seedMessage(threadId, account.id, { sentAt: when, seen: opts.seen ?? true });
+    return { account, threadId };
+  }
+
+  it("removes a hidden thread from the hider's default list only, and lists it in the hider's Hidden view with THEIR hiddenAt", async () => {
+    const a = await app();
+    const { threadId } = await sharedThread(a);
+    const hiddenAt = new Date("2026-08-05T09:00:00.000Z");
+    await hideFor(threadId, authHeaders, hiddenAt);
+
+    expect(await listIds(a, "", authHeaders)).toEqual([]);
+    expect(await listIds(a, "", otherHeaders)).toEqual([threadId]);
+    expect(await listIds(a, "hidden=true", otherHeaders)).toEqual([]);
+
+    const hiddenView = await a.inject({ method: "GET", url: "/api/mail/threads?hidden=true", headers: authHeaders });
+    const rows = listResponseSchema(mailThreadListItemSchema).parse(hiddenView.json()).items;
+    expect(rows.map((t) => t.id)).toEqual([threadId]);
+    // hiddenAt on a Hidden-view row is the viewer's own filing moment,
+    // straight off their hide row -- not anyone else's, not the request time.
+    expect(rows[0]?.hiddenAt).toBe(hiddenAt.toISOString());
+    // The other viewer's default row reports THEIR hide state: null.
+    const others = await a.inject({ method: "GET", url: "/api/mail/threads", headers: otherHeaders });
+    expect(listResponseSchema(mailThreadListItemSchema).parse(others.json()).items[0]?.hiddenAt).toBeNull();
+    await a.close();
+  });
+
+  it("unhide restores the thread to the hider's default list and empties their Hidden view", async () => {
+    const a = await app();
+    const { threadId } = await sharedThread(a);
+    await hideFor(threadId, authHeaders);
+
+    const restored = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
+    expect(restored.statusCode).toBe(200);
+    expect(await listIds(a, "", authHeaders)).toEqual([threadId]);
+    expect(await listIds(a, "hidden=true", authHeaders)).toEqual([]);
+    // The other user's view never moved through any of it.
+    expect(await listIds(a, "", otherHeaders)).toEqual([threadId]);
+    await a.close();
+  });
+
+  it("keeps a hidden thread's detail fully open, reporting each viewer's own hiddenAt", async () => {
+    const a = await app();
+    const { threadId } = await sharedThread(a);
+    await hideFor(threadId, authHeaders);
+
+    // Hiding is filing, not a lock: the hider can still open the
+    // conversation (it is where Unhide lives), messages included.
+    const own = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    expect(own.statusCode).toBe(200);
+    const ownDetail = mailThreadDetailSchema.parse(own.json());
+    expect(ownDetail.thread.hiddenAt).not.toBeNull();
+    expect(ownDetail.messages).toHaveLength(1);
+
+    const others = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: otherHeaders });
+    expect(others.statusCode).toBe(200);
+    expect(mailThreadDetailSchema.parse(others.json()).thread.hiddenAt).toBeNull();
+    await a.close();
+  });
+
+  it("drops a hidden unread thread from the hider's badge and per-folder counts, keeping the other viewer's", async () => {
+    const a = await app();
+    const { threadId } = await sharedThread(a, { seen: false });
+    await hideFor(threadId, authHeaders);
+
+    expect(await badge(a, authHeaders)).toBe(0);
+    expect(await badge(a, otherHeaders)).toBe(1);
+
+    async function inboxFolderCount(headers: typeof authHeaders): Promise<number | undefined> {
+      const response = await a.inject({ method: "GET", url: "/api/mail/unread-count?byFolder=1", headers });
+      const { folders } = mailUnreadFolderCountsSchema.parse(response.json());
+      return folders.find((f) => f.folder === "INBOX")?.count;
+    }
+    // No INBOX row at all for the hider -- their one unread thread there is
+    // filed away -- while the other viewer's sidebar still counts it.
+    expect(await inboxFolderCount(authHeaders)).toBeUndefined();
+    expect(await inboxFolderCount(otherHeaders)).toBe(1);
+    await a.close();
+  });
+
+  it("inherits the exclusion in the unread list filter and flag -- no third computation to drift", async () => {
+    const a = await app();
+    const { threadId: hidden } = await sharedThread(a, { seen: false, subject: "Hidden unread", day: 3 });
+    const { threadId: visible } = await sharedThread(a, { seen: false, subject: "Visible unread", day: 2 });
+    await hideFor(hidden, authHeaders);
+
+    // ?unread=true rides listThreads' WHERE, so the hidden unread thread is
+    // out for the hider and in for everyone else -- same term, not a copy.
+    expect(await listIds(a, "unread=true", authHeaders)).toEqual([visible]);
+    expect(await listIds(a, "unread=true", otherHeaders)).toEqual([hidden, visible]);
+    await a.close();
+  });
+
+  it("keeps hidden threads off the hider's record tabs while the Hidden view composes with the record filter", async () => {
+    const a = await app();
+    const contact = await makeContact(a);
+    const account = await makeAccount(a, { label: "Tabbed", email: `tab+${randomUUID()}@example.com` });
+    await setVisibility(account.id, "shared");
+    const when = new Date("2026-08-02T10:00:00Z");
+    const threadId = await seedThread({ subject: "Contact talk", lastMessageAt: when, contactId: contact.id });
+    await seedMessage(threadId, account.id, { sentAt: when });
+    await hideFor(threadId, authHeaders);
+
+    // Record tabs are default surfaces: the hider's contact tab loses the
+    // thread, the other viewer's keeps it (shared mailbox, so they may see
+    // it there).
+    expect(await listIds(a, `contact_id=${contact.id}`, authHeaders)).toEqual([]);
+    expect(await listIds(a, `contact_id=${contact.id}`, otherHeaders)).toEqual([threadId]);
+    // ...and the record filter composes with the Hidden view unchanged: the
+    // same machinery, one inverted arm.
+    expect(await listIds(a, `contact_id=${contact.id}&hidden=true`, authHeaders)).toEqual([threadId]);
+    await a.close();
+  });
+
+  it("composes the Hidden view with the folder, account and unread filters", async () => {
+    const a = await app();
+    const first = await makeAccount(a, { label: "First", email: `first+${randomUUID()}@example.com` });
+    const second = await makeAccount(a, { label: "Second", email: `second+${randomUUID()}@example.com` });
+
+    const inboxUnread = await seedThread({ subject: "Hidden inbox unread", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(inboxUnread, first.id, { sentAt: new Date("2026-08-03T10:00:00Z"), folder: "INBOX", seen: false });
+    const projectsRead = await seedThread({ subject: "Hidden projects read", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(projectsRead, second.id, { sentAt: new Date("2026-08-02T10:00:00Z"), folder: "Projects", seen: true });
+    const notHidden = await seedThread({ subject: "Still inbox", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(notHidden, first.id, { sentAt: new Date("2026-08-01T10:00:00Z"), folder: "INBOX", seen: false });
+    await hideFor(inboxUnread, authHeaders);
+    await hideFor(projectsRead, authHeaders);
+
+    expect(await listIds(a, "hidden=true", authHeaders)).toEqual([inboxUnread, projectsRead]);
+    expect(await listIds(a, "hidden=true&folder=INBOX", authHeaders)).toEqual([inboxUnread]);
+    expect(await listIds(a, "hidden=true&folder=Projects", authHeaders)).toEqual([projectsRead]);
+    expect(await listIds(a, `hidden=true&account_id=${second.id}`, authHeaders)).toEqual([projectsRead]);
+    expect(await listIds(a, "hidden=true&unread=true", authHeaders)).toEqual([inboxUnread]);
+    // The default views agree from the other side of the same arm.
+    expect(await listIds(a, "folder=INBOX", authHeaders)).toEqual([notHidden]);
+    expect(await listIds(a, "unread=true", authHeaders)).toEqual([notHidden]);
+    await a.close();
+  });
+
+  it("never leaks existence: hiding a visible thread changes nothing for a user who cannot see it", async () => {
+    const a = await app();
+    // A PRIVATE thread of chris's: dana may not see it, hidden or not.
+    const priv = await makeAccount(a);
+    const threadId = await seedThread({
+      subject: "Private glimmerfen", lastMessageAt: new Date("2026-08-02T10:00:00Z"),
+    });
+    await seedMessage(threadId, priv.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), seen: false,
+      subject: "Private glimmerfen", bodyText: "glimmerfen plans", snippet: "private",
+    });
+
+    async function danasWorld() {
+      const search = await a.inject({ method: "GET", url: "/api/search?q=glimmerfen", headers: otherHeaders });
+      return {
+        inbox: await listIds(a, "", otherHeaders),
+        hiddenView: await listIds(a, "hidden=true", otherHeaders),
+        badge: await badge(a, otherHeaders),
+        mailHits: searchResultsSchema.parse(search.json()).mail.map((hit) => hit.threadId),
+        detailStatus: (await a.inject({
+          method: "GET", url: `/api/mail/threads/${threadId}`, headers: otherHeaders,
+        })).statusCode,
+      };
+    }
+
+    const before = await danasWorld();
+    // The hider files their own view; dana's whole world must read the same
+    // bytes afterwards -- a hide is not an event anyone else can observe.
+    const hide = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
+    expect(hide.statusCode).toBe(200);
+    expect(await danasWorld()).toEqual(before);
+    expect(before.detailStatus).toBe(404);
+    expect(before.inbox).toEqual([]);
     await a.close();
   });
 });

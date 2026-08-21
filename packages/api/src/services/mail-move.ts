@@ -8,7 +8,7 @@ import { NotFoundError } from "./errors.js";
 import { folderKey } from "./mail-folders.js";
 import { consoleSyncLogger, type SyncLogger } from "./mail-imap.js";
 import { UID_CHUNK, chunked } from "./mail-sync.js";
-import { archiveThread, visibleMessageSelfContained, visibleThreads } from "./mail-threads.js";
+import { hideThread, visibleMessageSelfContained, visibleThreads } from "./mail-threads.js";
 import { publish } from "./sse.js";
 
 /**
@@ -55,7 +55,7 @@ import { publish } from "./sse.js";
  *   same not_found construction path -- byte-indistinguishable answers --
  *   and none of an invisible thread's messages, accounts or folders is ever
  *   examined, so no account label, folder fact or skip reason can reach the
- *   response. The hide path resolves per thread through archiveThread
+ *   response. The hide path resolves per thread through hideThread
  *   (mail-threads' mustGetThread) and reports invisible identically.
  *   Visibility is MESSAGE-granular past the thread gate too (spec Amendment
  *   4): the messages read carries the self-contained record-scope term, so a
@@ -535,8 +535,9 @@ function accountStateOf(
  * Apply one bulk action to `input.threadIds`, returning one result per
  * requested thread.
  *
- * `hide` is the CRM-side thread archive applied in bulk and touches no
- * mailbox. `trash`/`archive` MOVE messages, in the two modes
+ * `hide` is the per-actor Hide-in-CRM (mail_thread_hides rows for the ACTOR
+ * alone, Phase 4.3) applied in bulk and touches no mailbox -- and nobody
+ * else's view. `trash`/`archive` MOVE messages, in the two modes
  * `bulkThreadActionInputSchema.folder` selects:
  *
  * - FOLDER-SCOPED (`folder` present -- the list multi-select): only each
@@ -633,12 +634,14 @@ export async function moveThreads(
 }
 
 /**
- * "Hide in CRM": the pre-4.1 thread archive, one thread at a time.
+ * "Hide in CRM": one hide row per thread FOR THE ACTOR (Phase 4.3 -- the
+ * bulk action files the conversations out of the actor's own views and
+ * nobody else's), one thread at a time.
  *
  * Delegated to mail-threads.ts rather than reimplemented in bulk, because that
- * function owns the idempotence (archiving an archived thread is a no-op that
- * still succeeds) and the SSE hint. `folder` is ignored entirely in both
- * modes: a CRM-side flag has no concept of an IMAP folder.
+ * function owns the idempotence (hiding an already-hidden thread is a no-op
+ * that still succeeds) and the SSE hint. `folder` is ignored entirely in both
+ * modes: a CRM-side filing act has no concept of an IMAP folder.
  *
  * Sequential, and one failure does not stop the rest: an unknown id fails ITS
  * thread and the others still hide, which is the partial-failure shape the
@@ -649,15 +652,16 @@ export async function moveThreads(
  * database went away mid-batch) is not a fact about one thread, has no
  * honest `reason` code to carry, and is re-thrown to become the 500 it is.
  *
- * ONE SSE HINT FOR THE BATCH, not one per thread: archiveThread's own hint is
+ * ONE SSE HINT FOR THE BATCH, not one per thread: hideThread's own hint is
  * suppressed and this publishes a single frame carrying every hidden thread's
  * keys, so hiding 200 threads costs one invalidation round instead of 200.
  * The trade, stated because the single-thread path does not make it: that path
- * publishes only when a thread's archived_at actually CHANGED, and this cannot
- * tell -- archiveThread is idempotent and reports the thread either way -- so a
- * bulk hide of threads that were all already hidden publishes one hint where
- * the per-thread path would have published none. One redundant refetch round
- * per request the user explicitly made is a better trade than 200 frames.
+ * publishes only when the actor's hide row was actually WRITTEN, and this
+ * cannot tell -- hideThread is idempotent and reports the thread either way --
+ * so a bulk hide of threads that were all already hidden publishes one hint
+ * where the per-thread path would have published none. One redundant refetch
+ * round per request the user explicitly made is a better trade than 200
+ * frames.
  */
 async function hideThreads(
   db: Database, actorId: string, threadIds: readonly string[], outcomes: Outcomes,
@@ -665,7 +669,7 @@ async function hideThreads(
   const hidden = new Set<string>();
   for (const threadId of threadIds) {
     try {
-      await archiveThread(db, actorId, threadId, { publishHint: false });
+      await hideThread(db, actorId, threadId, { publishHint: false });
       outcomes.succeed(threadId);
       hidden.add(threadId);
     } catch (error) {

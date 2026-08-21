@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { bulkThreadResultSchema, type SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
-import { mailAccounts, mailMessages, mailThreads, projects } from "../db/schema.js";
+import { mailAccounts, mailMessages, mailThreadHides, mailThreads, projects } from "../db/schema.js";
 import type { SyncLogger } from "./mail-imap.js";
 import { moveThreads, type MoveSyncAccount, type MoveSyncManager } from "./mail-move.js";
 import { subscribe } from "./sse.js";
@@ -124,8 +124,13 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5_00
   }
 }
 
-async function threadRow(threadId: string) {
-  const [row] = await handle.db.select().from(mailThreads).where(eq(mailThreads.id, threadId));
+/** One user's hide row for a thread, or undefined (Phase 4.3: `hide` writes
+ * mail_thread_hides for the ACTOR alone -- what these tests assert instead
+ * of the retired thread-global column). */
+async function hideRowFor(threadId: string, forUserId: string) {
+  const [row] = await handle.db.select().from(mailThreadHides).where(
+    and(eq(mailThreadHides.threadId, threadId), eq(mailThreadHides.userId, forUserId)),
+  );
   return row;
 }
 
@@ -1079,7 +1084,7 @@ describe("moveThreads: visibility and ownership", () => {
 // --- Hide in CRM ------------------------------------------------------------
 
 describe("moveThreads: hide", () => {
-  it("archives the threads CRM-side and touches no mailbox", async () => {
+  it("hides the threads for the ACTOR alone, CRM-side, and touches no mailbox", async () => {
     // Shared account: sam (the actor) is a viewer of these threads, which is
     // what "Hide-in-CRM stays available to every viewer" means -- hide's
     // thread lookup goes through the Phase 4.2 visibility gate.
@@ -1091,15 +1096,19 @@ describe("moveThreads: hide", () => {
     const manager = new FakeManager();
     const sync = manager.for(accountId);
 
-    // `folder` is supplied and must be ignored: a CRM-side flag has no
+    // `folder` is supplied and must be ignored: a CRM-side filing act has no
     // concept of an IMAP folder.
     const result = await moveThreads(
       handle.db, actorId, { threadIds: [first, second], folder: "INBOX", action: "hide" }, deps(manager),
     );
 
     expect(result.results).toEqual([{ threadId: first, ok: true }, { threadId: second, ok: true }]);
-    expect((await threadRow(first))?.archivedAt).not.toBeNull();
-    expect((await threadRow(second))?.archivedAt).not.toBeNull();
+    // Per-actor (Phase 4.3): sam's hide rows exist, and the mailbox OWNER
+    // gets none -- a bulk hide files the actor's own views and nobody else's.
+    expect(await hideRowFor(first, actorId)).toBeDefined();
+    expect(await hideRowFor(second, actorId)).toBeDefined();
+    expect(await hideRowFor(first, userId)).toBeUndefined();
+    expect(await hideRowFor(second, userId)).toBeUndefined();
     expect(sync.calls).toEqual([]);
     // Nothing moved: the user's own mail client sees no change at all.
     expect((await messageRows()).map((row) => [row.folder, row.imapUid]))
@@ -1127,7 +1136,7 @@ describe("moveThreads: hide", () => {
     expect(result.results[0]?.ok).toBe(false);
     expect(result.results[0]?.error).toContain("not found");
     expect(result.results[1]).toEqual({ threadId, ok: true });
-    expect((await threadRow(threadId))?.archivedAt).not.toBeNull();
+    expect(await hideRowFor(threadId, actorId)).toBeDefined();
   });
 
   // The same NotFoundError, from the same seam (mail-threads' mustGetThread):
@@ -1146,7 +1155,8 @@ describe("moveThreads: hide", () => {
     expect(result.results[0]?.ok).toBe(false);
     expect(result.results[0]?.reason).toBe("not_found");
     expect(result.results[0]?.error).toContain("not found");
-    // Nothing was hidden: the flag is untouched.
-    expect((await threadRow(invisible))?.archivedAt).toBeNull();
+    // Nothing was hidden: no hide row was written for anyone.
+    expect(await hideRowFor(invisible, actorId)).toBeUndefined();
+    expect(await hideRowFor(invisible, userId)).toBeUndefined();
   });
 });

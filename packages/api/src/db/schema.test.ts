@@ -16,6 +16,7 @@ import { createContact } from "../services/contacts.js";
 import { createPipeline, createStage } from "../services/pipelines.js";
 import { createDeal } from "../services/deals.js";
 import { createProject } from "../services/projects.js";
+import { listThreads } from "../services/mail-threads.js";
 import { createDatabase, migrationsFolder, type DatabaseHandle } from "./client.js";
 import {
   users, companies, contacts, pipelines, stages, deals, projects,
@@ -751,12 +752,10 @@ describe("mail thread hides schema (0007)", () => {
   // drills: scratch database, never the shared conduit_test one.
   //
   // The thread inserts are raw SQL naming archived_at explicitly (the
-  // 0005/0006 old-shape technique) even though mail_threads is currently
-  // byte-identical between 0006 and 0007: archived_at is exactly the column
-  // this phase's read-path task drops from schema.ts, at which point a
-  // drizzle insert could no longer name it -- raw SQL keeps this drill's
-  // seeding valid across that step.
-  it("applies migration 0007 on top of a real database migrated only through 0006 -- the backfill hides a pre-existing archived thread for every pre-existing user, and archived_at survives", async () => {
+  // 0005/0006 old-shape technique): 0007's second half DROPPED that column
+  // from schema.ts, so a drizzle insert can no longer name it -- raw SQL is
+  // what lets this drill still seed the genuine pre-0007 shape.
+  it("applies migration 0007 on top of a real database migrated only through 0006 -- the backfill hides a pre-existing archived thread for every pre-existing user, archived_at is gone, and the hide rows drive the default list", async () => {
     await withPreMigrationDatabase("0007", async (scratch) => {
       const [chris] = await scratch.db.insert(users).values({ username: "chris" }).returning();
       const [alex] = await scratch.db.insert(users).values({ username: "alex" }).returning();
@@ -775,6 +774,29 @@ describe("mail thread hides schema (0007)", () => {
         VALUES ('Still here', now())
         RETURNING id
       `);
+
+      // A SHARED mailbox with one message per thread, so both users can SEE
+      // both threads post-upgrade (the 4.2 visibility predicate hides a
+      // message-less thread from every inbox) -- what turns the final
+      // assertions into a real proof that it is the HIDE rows, not
+      // visibility, deciding each list. mail_accounts/mail_messages are
+      // byte-identical between 0006 and 0007, so drizzle inserts describe
+      // this old shape exactly.
+      const [account] = await scratch.db.insert(mailAccounts).values({
+        userId: chris!.id, label: "Team", email: "team@example.com",
+        imapHost: "localhost", imapPort: 993, imapSecurity: "tls",
+        smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls",
+        username: "chris", credentialsCiphertext: "v1:iv:tag:data",
+        visibility: "shared",
+      }).returning();
+      for (const thread of [archived!, live!]) {
+        await scratch.db.insert(mailMessages).values({
+          accountId: account!.id, threadId: thread.id,
+          messageId: `<${thread.id}@example.com>`,
+          fromAddr: "alice@example.com", toAddrs: [{ address: "chris@example.com" }],
+          sentAt: new Date("2026-08-09T10:00:00.000Z"), folder: "INBOX", direction: "inbound",
+        });
+      }
 
       // Pin the drill's own premise before upgrading (the 0006 drill's
       // pattern): no mail_thread_hides table exists yet, so the rows
@@ -812,16 +834,31 @@ describe("mail thread hides schema (0007)", () => {
       // here as the decision it is).
       expect(hides.some((row) => row.threadId === live!.id)).toBe(false);
 
-      // This task's half of the two-step sequencing note: archived_at is
-      // STILL a column after 0007 -- the drop belongs to the read-path task,
-      // which appends it to this same migration before release.
+      // The sequencing note's second half, landed: the thread-global column
+      // is GONE. Everything asserted below can only be coming from the
+      // backfilled hide rows.
       const [postColumn] = await scratch.db.execute<{ present: boolean }>(sql`
         SELECT EXISTS (
           SELECT 1 FROM information_schema.columns
           WHERE table_name = 'mail_threads' AND column_name = 'archived_at'
         ) AS present
       `);
-      expect(postColumn?.present).toBe(true);
+      expect(postColumn?.present).toBe(false);
+
+      // The upgrade promise, read the way a user reads it -- through the
+      // REAL list service on the upgraded database: each user's default
+      // inbox shows exactly the never-archived thread (the backfilled hide
+      // rows drive the exclusion now that no column can), and each user's
+      // Hidden view carries the pre-upgrade archive moment as their own
+      // hiddenAt. Nobody's view changed; everyone can now unhide alone.
+      for (const user of [chris!, alex!]) {
+        const inbox = await listThreads(scratch.db, user.id);
+        expect(inbox.items.map((t) => t.id)).toEqual([live!.id]);
+        expect(inbox.items[0]?.hiddenAt).toBeNull();
+        const hiddenView = await listThreads(scratch.db, user.id, { hidden: true });
+        expect(hiddenView.items.map((t) => t.id)).toEqual([archived!.id]);
+        expect(hiddenView.items[0]?.hiddenAt).toBe(archivedAtIso);
+      }
     });
   }, 30000);
 

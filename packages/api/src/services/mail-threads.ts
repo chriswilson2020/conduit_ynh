@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, isNotNull, lt, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt, or, sql, type SQL } from "drizzle-orm";
 import type {
   MailAddress, MailAttachment, MailDealSuggestion, MailDirection, MailLinkKind, MailMessage,
   MailMessageWithAttachments, MailThread, MailThreadDetail, MailThreadListItem,
@@ -7,7 +7,7 @@ import type {
 import type { Database } from "../db/client.js";
 import {
   companies, contacts, deals, projects,
-  mailAccounts, mailAttachments, mailMessages, mailThreads,
+  mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads,
   type MailMessageRow, type MailThreadRow,
 } from "../db/schema.js";
 import { NotFoundError, ArchivedError } from "./errors.js";
@@ -28,6 +28,10 @@ import { publish } from "./sse.js";
  * write that echoes a row back is a read path too. Threads themselves are
  * still global rows ("a conversation two users are both on is one thread");
  * visibility is a per-viewer FILTER over them, never a column on the thread.
+ * Phase 4.3 added a second per-viewer filter in the same shape: the HIDE
+ * (hiddenByViewer below) -- what a viewer has filed out of their own
+ * default surfaces, composed with visibility and, like it, never a column
+ * on the thread.
  *
  * The other owner-scoped mail surfaces are unchanged from Phase 4: ACCOUNTS
  * (settings and credentials) and SEND (whose From address is someone's
@@ -42,19 +46,23 @@ function publishThreadHint(threadId: string): void {
   publish({ keys: [["mail-threads"], ["mail-thread", threadId], ["mail-unread"]] });
 }
 
-function toThread(row: MailThreadRow): MailThread {
+/**
+ * `hiddenAt` is the ONE per-viewer field on the wire thread shape
+ * (mailThreadSchema's own comment): the requesting viewer's
+ * mail_thread_hides row's hidden_at, null when they have not hidden the
+ * thread. It rides in as an explicit second argument rather than a column
+ * because the thread row genuinely does not carry it -- since 4.3 "hidden"
+ * has no thread-global answer -- and an explicit parameter makes every call
+ * site SAY whose hide state it is echoing. mustGetThread fetches it once for
+ * the by-id surfaces; listThreads' page join carries it per row; the hide/
+ * unhide writes produce it themselves as the state they just wrote.
+ */
+function toThread(row: MailThreadRow, hiddenAt: Date | null): MailThread {
   return {
     id: row.id, subject: row.subject,
     lastMessageAt: row.lastMessageAt.toISOString(), messageCount: row.messageCount,
     companyId: row.companyId, contactId: row.contactId, dealId: row.dealId, projectId: row.projectId,
-    // Phase 4.3 Task 1 placeholder: hiddenAt is PER-VIEWER by contract
-    // (mailThreadSchema's own comment), but this maps the thread-global
-    // archived_at -- the value standing in for the viewer's hide row.
-    // Faithful, not a guess: pre-4.3 every viewer shares this one hide
-    // state, and 0007's backfill writes exactly this value into every
-    // user's hide row, so the two sources cannot disagree yet. Task 2 drops
-    // archived_at and sources this from the viewer's mail_thread_hides row.
-    hiddenAt: row.archivedAt?.toISOString() ?? null,
+    hiddenAt: hiddenAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
   };
 }
@@ -329,6 +337,44 @@ export function visibleMessageSelfContained(userId: string, scope: MailVisibilit
 }
 
 /**
+ * HAS THIS VIEWER HIDDEN THIS THREAD (Phase 4.3): EXISTS a mail_thread_hides
+ * row for (the outer mail_threads row, userId). The per-viewer successor to
+ * the retired thread-global archived_at test, COMPOSED WITH the visibility
+ * family above, never replacing it -- visibility decides what a viewer MAY
+ * see, the hide decides what they have filed out of their own default views,
+ * and every default mail surface applies both (visible AND NOT hidden). The
+ * Hidden view (`?hidden=true`) inverts only this arm (visible AND hidden) on
+ * the same list machinery.
+ *
+ * THREAD granularity, deliberately -- a hide is a filing act on the whole
+ * conversation -- so unlike visibleMessageTerm this arm never folds into the
+ * message-scoped EXISTS subqueries: there is no per-message hide fact whose
+ * split-row trap a fold would prevent (the fold discipline protects
+ * SAME-MESSAGE conjunctions; "hidden" has no message to share a row with).
+ * It composes as its own top-level term instead, the way the thread-global
+ * column it replaces did.
+ *
+ * PRECONDITION, the same one visibleThreads carries: the composing query
+ * must have mail_threads in scope UN-ALIASED (from-listed or joined), since
+ * the EXISTS correlates against the table by name. Exported for search.ts's
+ * mail group, the one default surface outside this file.
+ *
+ * The probe is the composite-PK's own index ((thread_id, user_id) leads on
+ * thread_id, which the correlation binds), so the default arm's NOT EXISTS
+ * is an exact index probe per candidate thread -- see the Hidden-view
+ * EXPLAIN note at listThreads for the measured numbers.
+ */
+export function hiddenByViewer(userId: string): SQL {
+  return sql`EXISTS (SELECT 1 FROM ${mailThreadHides} WHERE ${mailThreadHides.threadId} = ${mailThreads.id} AND ${mailThreadHides.userId} = ${userId})`;
+}
+
+/** The default-surface arm, named so call sites read as the rule they
+ * implement ("visible AND NOT hidden"). Same precondition as its inverse. */
+export function notHiddenByViewer(userId: string): SQL {
+  return sql`NOT ${hiddenByViewer(userId)}`;
+}
+
+/**
  * The VIEW a list request is showing, as far as "unread" is concerned: the
  * folder filter it carries, and the account filter alongside it.
  *
@@ -549,14 +595,14 @@ export async function listThreads(
   // link there.
   const scope: MailVisibilityScope =
     opts.companyId || opts.contactId || opts.dealId || opts.projectId ? "record" : "inbox";
-  // Phase 4.3 Task 1 placeholder: the `hidden` flag (the Hidden view) still
-  // reads the thread-global archived_at -- hidden=true lists archived
-  // threads, absent/false excludes them, byte-for-byte the pre-4.3
-  // `archived` filter under its new name. Task 2 swaps this arm to the
-  // viewer's mail_thread_hides rows (default: AND NOT hidden(U,T); Hidden
-  // view: AND hidden(U,T), composed with -- never replacing -- the 4.2
-  // visibility terms below).
-  const where = [opts.hidden ? isNotNull(mailThreads.archivedAt) : isNull(mailThreads.archivedAt)];
+  // The hide arm (Phase 4.3): the default list excludes threads THIS VIEWER
+  // has hidden, the Hidden view (`?hidden=true`) lists exactly those -- one
+  // inverted term on the same machinery, so every other filter below
+  // (folder/account/unread/links) composes with both views unchanged. The
+  // 4.2 visibility terms further down are composed with, never replaced:
+  // hiding is filing, not access, and an invisible thread stays invisible
+  // whether or not anyone hid it (see hiddenByViewer's header).
+  const where = [opts.hidden ? hiddenByViewer(userId) : notHiddenByViewer(userId)];
   if (opts.companyId) where.push(eq(mailThreads.companyId, opts.companyId));
   if (opts.contactId) where.push(eq(mailThreads.contactId, opts.contactId));
   if (opts.dealId) where.push(eq(mailThreads.dealId, opts.dealId));
@@ -689,7 +735,42 @@ export async function listThreads(
     )!);
   }
 
-  const rows = await db.select().from(mailThreads).where(and(...where))
+  // The LEFT JOIN exists solely to carry the viewer's hidden_at onto each
+  // row without a per-row query: on the default view it is NULL by
+  // construction (the WHERE just excluded every thread with a hide row), on
+  // the Hidden view it is each row's own hide moment. At most one hide row
+  // exists per (thread, viewer) -- the composite PK -- so the join can never
+  // multiply page rows or disturb the keyset. The WHERE's hide arm stays the
+  // EXISTS predicate rather than being folded into this join's null-test:
+  // one shared predicate serves every default surface (badge, counts,
+  // search have no such join), and both forms are the same PK probe.
+  //
+  // HIDE-ARM COST, measured (0005/0006 methodology: 20,000 threads / 80,000
+  // messages, two users' private accounts, viewer owning one; 1,250 hides
+  // per user, the VIEWER'S all in the old half -- the skew that makes the
+  // Hidden view walk furthest; warm, top-level Limit node time + buffers):
+  //   * DEFAULT list page: 0.70ms / 773 buffers -- the NOT EXISTS is an
+  //     index-only probe of the composite PK per candidate row (Heap
+  //     Fetches: 0), and the hidden_at join adds ~2 buffers per returned
+  //     row.
+  //   * HIDDEN view, worst case: 11.8ms / 21,317 buffers -- the planner
+  //     keeps the LIMIT-ordered thread-index scan and probes hides per
+  //     thread, so a viewer whose hides are all old walks the visible half
+  //     of the index before the first hit. Bounded by one index-only walk
+  //     of mail_threads, accepted for a click-rare maintenance view. A
+  //     (user_id, thread_id) index was measured and DOES NOT change this
+  //     plan (12.7ms / 21,317 -- same shape, different probe target), and a
+  //     forced drive-from-hides plan (materialized CTE) bought only ~2ms
+  //     (9.7ms / 4,046 buffers): the time is the per-thread visibility
+  //     EXISTS either way. So 0007 ships no second index and the Hidden
+  //     view keeps the shared machinery (the migration's own comment
+  //     records the same decision).
+  const rows = await db.select({ thread: mailThreads, hiddenAt: mailThreadHides.hiddenAt })
+    .from(mailThreads)
+    .leftJoin(mailThreadHides, and(
+      eq(mailThreadHides.threadId, mailThreads.id), eq(mailThreadHides.userId, userId),
+    ))
+    .where(and(...where))
     .orderBy(desc(mailThreads.lastMessageAt), desc(mailThreads.id)).limit(limit + 1);
   const page = rows.slice(0, limit);
   // The page's rows are described in the same scope the filters selected them
@@ -710,14 +791,14 @@ export async function listThreads(
   // with no visible message cannot reach a list at all, and what remains is
   // a count and a clock reading, never body content.
   const aggregates = await loadAggregates(
-    db, userId, page.map((row) => row.id), { folder: opts.folder, accountId: opts.accountId }, scope,
+    db, userId, page.map((row) => row.thread.id), { folder: opts.folder, accountId: opts.accountId }, scope,
   );
   const last = page[page.length - 1];
   return {
-    items: page.map((row) => {
+    items: page.map(({ thread: row, hiddenAt }) => {
       const extra = aggregates.get(row.id);
       return {
-        ...toThread(row),
+        ...toThread(row, hiddenAt),
         // A thread with no messages cannot exist (ingest creates both in one
         // transaction), but the map lookup is still optional-shaped rather
         // than asserted: an empty inbox row is a rendering nuisance, a thrown
@@ -737,7 +818,7 @@ export async function listThreads(
       } satisfies MailThreadListItem;
     }),
     nextCursor: rows.length > limit && last !== undefined
-      ? encodeCursor({ lastMessageAt: last.lastMessageAt.toISOString(), id: last.id }) : null,
+      ? encodeCursor({ lastMessageAt: last.thread.lastMessageAt.toISOString(), id: last.thread.id }) : null,
   };
 }
 
@@ -746,18 +827,35 @@ export async function listThreads(
 /**
  * The one seam every by-id thread surface goes through, and therefore the
  * visibility gate for all of them: detail, mark-read, the link writes,
- * archive/hide, and reply (mail-send.ts's loadReplyChain -- the export
+ * hide/unhide, and reply (mail-send.ts's loadReplyChain -- the export
  * exists for it) all resolve their thread here first. Record scope, because
  * by-id surfaces serve the record views as much as the inbox (a deal's Mail
  * tab opens the same detail route).
+ *
+ * VISIBILITY ONLY, deliberately no hide term: a hidden thread's detail stays
+ * fully openable (hiding is a filing act, not a lock, and the conversation
+ * view is where Unhide lives), so the by-id gate must never mistake the
+ * viewer's own filing for invisibility.
+ *
+ * The viewer's hidden_at rides along from a LEFT JOIN on their own hide row
+ * (at most one exists -- the composite PK -- so the join cannot multiply the
+ * row): every caller that echoes the thread back needs it for toThread, and
+ * fetching it here once is what keeps writeLink's UPDATE..RETURNING -- which
+ * cannot join -- out of the hide table entirely.
  *
  * An invisible thread throws the SAME NotFoundError a nonexistent id does --
  * one error, built in one place, so a caller probing ids can never tell
  * "hidden from you" apart from "not there" by status or body (mirrors
  * mail-folders.ts's mustGetOwnedAccount).
  */
-export async function mustGetThread(db: Database, userId: string, id: string): Promise<MailThreadRow> {
-  const [row] = await db.select().from(mailThreads)
+export async function mustGetThread(
+  db: Database, userId: string, id: string,
+): Promise<{ thread: MailThreadRow; hiddenAt: Date | null }> {
+  const [row] = await db.select({ thread: mailThreads, hiddenAt: mailThreadHides.hiddenAt })
+    .from(mailThreads)
+    .leftJoin(mailThreadHides, and(
+      eq(mailThreadHides.threadId, mailThreads.id), eq(mailThreadHides.userId, userId),
+    ))
     .where(and(eq(mailThreads.id, id), visibleThreads(userId, "record")));
   if (row === undefined) throw new NotFoundError("mail thread", id);
   return row;
@@ -795,7 +893,7 @@ async function loadDealSuggestions(db: Database, thread: MailThreadRow): Promise
 export async function getThreadDetail(
   db: Database, userId: string, id: string, apiBase: string,
 ): Promise<MailThreadDetail> {
-  const thread = await mustGetThread(db, userId, id);
+  const { thread, hiddenAt } = await mustGetThread(db, userId, id);
   // The per-message filter matters even after mustGetThread said yes: a
   // visible thread can still carry messages the viewer may not read (the
   // cross-account conversation whose other half lives in someone else's
@@ -846,7 +944,7 @@ export async function getThreadDetail(
   }));
 
   return {
-    thread: toThread(thread), messages, dealSuggestions: await loadDealSuggestions(db, thread),
+    thread: toThread(thread, hiddenAt), messages, dealSuggestions: await loadDealSuggestions(db, thread),
     ownedByViewer: messageRows.some((row) => row.ownedByViewer),
     // Phase 4.3 Task 1 placeholders for the detail cap: no cap exists yet,
     // so every response is already the uncapped view -- the real count of
@@ -881,15 +979,15 @@ export interface SeenWriteBack {
  * server APPENDed but has not yet re-sighted in the Sent folder has no UID to
  * name, and the flag will be right the moment the next pass ingests it.
  *
- * ARCHIVED THREADS ARE NOT REJECTED, deliberately, and this is the one
- * mutation on a thread that is not (coordinator sign-off; setThreadLink and
- * clearThreadLink both raise ArchivedError). An archived conversation is
- * still openable -- archiving is a CRM-side "out of my inbox", not a lock --
- * and opening it is exactly what marks it read. Read-marking is also not a
- * content mutation: it changes no field a user authored, only whether they
- * have looked at it. And the unread count already excludes archived threads,
- * so refusing here would leave a thread that reads as unread forever with no
- * way to clear it and nothing counting it.
+ * HIDDEN THREADS ARE NOT REJECTED -- since Phase 4.3 NO thread mutation
+ * tests hide state at all (spec Amendment 1 retired the last one, the
+ * archived-thread link guard, together with the thread-global flag it
+ * guarded): a hide is one person's filing act and must never gate anything.
+ * A hidden conversation is still openable -- the conversation view is where
+ * Unhide lives -- and opening it is exactly what marks it read. The unread
+ * computations already exclude the viewer's hidden threads, so refusing here
+ * would leave a thread that reads as unread forever with no way to clear it
+ * and nothing counting it.
  */
 export async function markThreadRead(
   db: Database, userId: string, id: string,
@@ -914,7 +1012,7 @@ export async function markThreadRead(
   // built from the returned rows. Any viewer of a visible thread may still
   // mark it read -- reading is not a filing act, so Task 3's owner-only move
   // rule does not apply here.
-  const thread = await mustGetThread(db, userId, id);
+  const { thread, hiddenAt } = await mustGetThread(db, userId, id);
   const readable = and(
     eq(mailMessages.threadId, id), eq(mailMessages.seen, false),
     visibleMessageSelfContained(userId, "record"),
@@ -944,7 +1042,7 @@ export async function markThreadRead(
   // every other no-op short-circuit in the codebase (a hint for a write that
   // did not happen makes every client refetch for nothing).
   if (changed.length > 0) publishThreadHint(id);
-  return { thread: toThread(thread), writeBacks: [...groups.values()] };
+  return { thread: toThread(thread, hiddenAt), writeBacks: [...groups.values()] };
 }
 
 // --- Links -----------------------------------------------------------------
@@ -970,80 +1068,117 @@ async function assertLinkTargetActive(db: Database, kind: MailLinkKind, id: stri
   if (row.archivedAt !== null) throw new ArchivedError(kind, id);
 }
 
-async function writeLink(db: Database, threadId: string, kind: MailLinkKind, value: string | null): Promise<MailThread> {
+/**
+ * NO HIDE GUARD in either direction (spec Amendment 1, retiring the pre-4.3
+ * archived-thread 409): a hide is one person's filing act, and a personal
+ * filing act must never gate a shared CRM mutation -- neither another user's
+ * link change nor the hider's own (linking from the Hidden view or the
+ * conversation is deliberate). Per 4.2's sharing line a deal link then
+ * SHARES the thread while it stays hidden in the hider's own inbox --
+ * coherent and intended. The old guard's TOCTOU arm (`archived_at IS NULL`
+ * in this WHERE) died with the state it guarded, so the UPDATE keeps the id
+ * predicate alone.
+ *
+ * `viewerHiddenAt` is the gate-time snapshot mustGetThread fetched -- this
+ * UPDATE..RETURNING cannot join the hide table, and the echoed row must
+ * still carry the VIEWER'S hide state (toThread's contract). A hide/unhide
+ * racing in between goes unreflected in this one response, which is the
+ * ordinary staleness any read-then-respond pair has; the next refetch tells
+ * the truth.
+ */
+async function writeLink(
+  db: Database, threadId: string, kind: MailLinkKind, value: string | null, viewerHiddenAt: Date | null,
+): Promise<MailThread> {
   const patch: Partial<typeof mailThreads.$inferInsert> = { updatedAt: new Date() };
   patch[LINK_FIELDS[kind]] = value;
   const [row] = await db.update(mailThreads).set(patch)
-    .where(and(eq(mailThreads.id, threadId), isNull(mailThreads.archivedAt)))
+    .where(eq(mailThreads.id, threadId))
     .returning();
-  // archived_at IS NULL in the WHERE keeps the guard atomic against a
-  // concurrent archive; the read in setThreadLink/clearThreadLink is what
-  // produces the friendly error, this is what makes it true.
-  if (row === undefined) throw new ArchivedError("mail thread", threadId);
+  // Unreachable past mustGetThread -- threads have no delete path -- but a
+  // vanished row must not become a TypeError (setHidden's arm, same shape).
+  if (row === undefined) throw new NotFoundError("mail thread", threadId);
   publishThreadHint(threadId);
-  return toThread(row);
+  return toThread(row, viewerHiddenAt);
 }
 
 export async function setThreadLink(
   db: Database, userId: string, threadId: string, kind: MailLinkKind, targetId: string,
 ): Promise<MailThread> {
-  const thread = await mustGetThread(db, userId, threadId);
-  if (thread.archivedAt !== null) throw new ArchivedError("mail thread", threadId);
+  const { hiddenAt } = await mustGetThread(db, userId, threadId);
   await assertLinkTargetActive(db, kind, targetId);
-  return writeLink(db, threadId, kind, targetId);
+  return writeLink(db, threadId, kind, targetId, hiddenAt);
 }
 
 /** Idempotent: clearing a link that is already null still succeeds and still
- * returns the thread, the same way archive/unarchive treat a no-op. */
+ * returns the thread, the same way hide/unhide treat a no-op. */
 export async function clearThreadLink(
   db: Database, userId: string, threadId: string, kind: MailLinkKind,
 ): Promise<MailThread> {
-  const thread = await mustGetThread(db, userId, threadId);
-  if (thread.archivedAt !== null) throw new ArchivedError("mail thread", threadId);
-  return writeLink(db, threadId, kind, null);
+  const { hiddenAt } = await mustGetThread(db, userId, threadId);
+  return writeLink(db, threadId, kind, null, hiddenAt);
 }
 
-// --- Archive ---------------------------------------------------------------
+// --- Hide (per-user) --------------------------------------------------------
 
 /**
- * CRM-side only, exactly as the spec says: this sets mail_threads.archived_at
- * and touches no mailbox. Nothing is moved, expunged or flagged on the IMAP
- * server -- "archived" here means "out of the CRM inbox", and the user's own
- * mail client is left entirely alone.
+ * CRM-side AND per-actor (Phase 4.3): hiding writes the ACTOR'S OWN
+ * mail_thread_hides row and unhiding deletes it -- the shared thread row is
+ * never touched (a personal filing act has no business bumping a row every
+ * viewer reads, updated_at included), and no mailbox is either: nothing is
+ * moved, expunged or flagged on the IMAP server. "Hidden" means "out of MY
+ * CRM inbox", other users' views are entirely unaffected, and any viewer of
+ * a visible thread may hide or unhide it for themselves.
+ *
+ * Idempotent both ways, never an error: re-hiding keeps the ORIGINAL
+ * hidden_at (the filing moment, not the repeat), and unhiding a thread that
+ * was never hidden simply reports it un-hidden.
  */
-async function setArchived(
-  db: Database, userId: string, id: string, archived: boolean, publishHint: boolean,
+async function setHidden(
+  db: Database, userId: string, id: string, hidden: boolean, publishHint: boolean,
 ): Promise<MailThread> {
   // The read comes FIRST because it is the visibility gate: this mutation
-  // echoes the thread row back, which makes it a read path too, and blind
-  // update-then-read would both flip an invisible thread's flag and hand its
-  // subject to whoever guessed the id. mustGetThread 404s an invisible
-  // thread exactly like a nonexistent one, before anything is written.
-  await mustGetThread(db, userId, id);
-  const [row] = await db.update(mailThreads)
-    .set({ archivedAt: archived ? new Date() : null, updatedAt: new Date() })
-    .where(and(
-      eq(mailThreads.id, id),
-      archived ? isNull(mailThreads.archivedAt) : isNotNull(mailThreads.archivedAt),
-    )).returning();
-  if (row !== undefined) {
-    if (publishHint) publishThreadHint(id);
-    return toThread(row);
+  // echoes the thread row back, which makes it a read path too, and a blind
+  // hide-row write would both file an invisible thread and hand its subject
+  // to whoever guessed the id. mustGetThread 404s an invisible thread
+  // exactly like a nonexistent one, before anything is written -- so hiding
+  // an invisible thread id discloses nothing, not even by side effect.
+  const { thread } = await mustGetThread(db, userId, id);
+  if (hidden) {
+    // ON CONFLICT DO NOTHING on the composite PK is the whole idempotence
+    // story: one statement either files the thread now or proves someone
+    // (this user, another tab) already had. No transaction and no new
+    // locking -- mail_threads is never FOR UPDATE'd anywhere, and the FK
+    // check takes only FOR KEY SHARE on the thread row, compatible with
+    // ingest's non-key updates.
+    const [row] = await db.insert(mailThreadHides)
+      .values({ threadId: id, userId })
+      .onConflictDoNothing({ target: [mailThreadHides.threadId, mailThreadHides.userId] })
+      .returning();
+    if (row !== undefined) {
+      if (publishHint) publishThreadHint(id);
+      return toThread(thread, row.hiddenAt);
+    }
+    // Already hidden when the INSERT returned nothing. RE-READ the hide row
+    // rather than inventing a timestamp: the no-op must report the filing
+    // moment the standing row records (mirroring the pre-4.3 truthful
+    // no-op), and under a concurrent unhide the honest answer is whatever
+    // state won -- null included. No hint either way: nothing changed here,
+    // and whichever writer did change it published its own.
+    const [current] = await db.select().from(mailThreadHides)
+      .where(and(eq(mailThreadHides.threadId, id), eq(mailThreadHides.userId, userId)));
+    return toThread(thread, current?.hiddenAt ?? null);
   }
-  // Already in the requested state when the guarded UPDATE matched nothing.
-  // RE-READ rather than echoing the pre-update snapshot: under a concurrent
-  // archive this caller's no-op must report the row as the winning writer
-  // left it, not as it looked before the race. No second visibility gate
-  // (mustGetThread above already decided it) and no hint (the writer that
-  // changed the row published its own). The undefined arm is unreachable --
-  // threads have no delete path -- but a vanished row must not become a
-  // TypeError.
-  const [current] = await db.select().from(mailThreads).where(eq(mailThreads.id, id));
-  if (current === undefined) throw new NotFoundError("mail thread", id);
-  return toThread(current);
+  // Unhide: DELETE..RETURNING tells no-op (nothing returned, no hint --
+  // nothing changed) apart from a real unhide in the same statement. Either
+  // way the answer is the state this call guarantees: not hidden.
+  const [removed] = await db.delete(mailThreadHides)
+    .where(and(eq(mailThreadHides.threadId, id), eq(mailThreadHides.userId, userId)))
+    .returning();
+  if (removed !== undefined && publishHint) publishThreadHint(id);
+  return toThread(thread, null);
 }
 
-export interface ArchiveThreadOptions {
+export interface HideThreadOptions {
   /**
    * false to leave the SSE hint to the caller. The one caller that does is the
    * bulk "Hide in CRM" path (services/mail-move.ts), which hides up to 200
@@ -1055,13 +1190,16 @@ export interface ArchiveThreadOptions {
   publishHint?: boolean;
 }
 
-export function archiveThread(
-  db: Database, userId: string, id: string, options: ArchiveThreadOptions = {},
+/** The conversation's Hide button and the bulk path's per-thread step. The
+ * wire route keeps its historical /archive spelling (client and UI have said
+ * "Hide in CRM" since 4.1; the path is an address, not a label). */
+export function hideThread(
+  db: Database, userId: string, id: string, options: HideThreadOptions = {},
 ): Promise<MailThread> {
-  return setArchived(db, userId, id, true, options.publishHint ?? true);
+  return setHidden(db, userId, id, true, options.publishHint ?? true);
 }
-export function unarchiveThread(db: Database, userId: string, id: string): Promise<MailThread> {
-  return setArchived(db, userId, id, false, true);
+export function unhideThread(db: Database, userId: string, id: string): Promise<MailThread> {
+  return setHidden(db, userId, id, false, true);
 }
 
 // --- Attachments -----------------------------------------------------------
@@ -1123,10 +1261,14 @@ export async function getAttachmentBlob(
 // --- Unread count ----------------------------------------------------------
 
 /**
- * Distinct non-archived threads holding at least one unseen message that is
- * not in its account's Trash -- the inbox nav badge. Counted over threads
- * rather than messages for the same reason the list is thread-shaped: a
- * ten-message unread conversation is one thing to deal with, not ten.
+ * Distinct threads THIS VIEWER has not hidden, holding at least one unseen
+ * message that is not in its account's Trash -- the inbox nav badge. Counted
+ * over threads rather than messages for the same reason the list is
+ * thread-shaped: a ten-message unread conversation is one thing to deal
+ * with, not ten. The hide arm is notHiddenByViewer, the same term as the
+ * default list (correlated to the joined mail_threads row): a thread the
+ * viewer filed away must not go on counting at them, while everyone else's
+ * badge still counts it.
  *
  * The Trash carve-out is notInAccountTrash's; archive-folder mail still
  * counts. The visibility term is INBOX scope on the same message row: the
@@ -1138,11 +1280,17 @@ export async function getAttachmentBlob(
  * folds its EXISTS: unseen, not-in-trash and visible must hold on the SAME
  * message.
  *
- * The visibility term costs this query nothing structural: measured at
- * 20,000 threads / 82,000 messages / ~8,000 unread split across two users'
- * private accounts, 10.5ms / 322 buffers with the unseen partial index
- * (drizzle/0005) still serving an Index Only Scan, Heap Fetches: 0 -- its
- * INCLUDE payload already carries the account_id the visibility join reads.
+ * The visibility term costs this query nothing structural: measured in 4.2
+ * at 20,000 threads / 82,000 messages / ~8,000 unread split across two
+ * users' private accounts, 10.5ms / 322 buffers with the unseen partial
+ * index (drizzle/0005) still serving an Index Only Scan, Heap Fetches: 0 --
+ * its INCLUDE payload already carries the account_id the visibility join
+ * reads. The 4.3 hide arm re-measured the same class on ITS OWN dataset
+ * (20,000 / 80,000 / 8,000 unread, 1,250 hides per user -- different seed,
+ * so the two figures must not be compared to each other): 9.3ms / 364
+ * buffers, the planner turning NOT EXISTS into a hash anti join whose hides
+ * side is a 21-buffer scan of the whole (tiny) table, the unseen partial
+ * index still index-only with Heap Fetches: 0.
  */
 export async function unreadThreadCount(db: Database, userId: string): Promise<number> {
   const [row] = await db.select({
@@ -1151,7 +1299,7 @@ export async function unreadThreadCount(db: Database, userId: string): Promise<n
     .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
     .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
     .where(and(
-      isNull(mailThreads.archivedAt), eq(mailMessages.seen, false),
+      notHiddenByViewer(userId), eq(mailMessages.seen, false),
       notInAccountTrash(), visibleMessageTerm(userId, "inbox"),
     ));
   return row?.count ?? 0;
@@ -1176,8 +1324,11 @@ export async function unreadThreadCount(db: Database, userId: string): Promise<n
  * anywhere?" -- where mail in the Trash is not waiting for anything.
  *
  * A row therefore appears for any folder holding unread mail the VIEWER MAY
- * SEE, including folders the picker has switched off and ones that have
- * vanished from the server. The mail_accounts join exists purely to carry
+ * SEE -- in a thread they have not hidden (the mail_threads join carries
+ * notHiddenByViewer, same as the badge above: a filed thread's unread mail
+ * counts in nobody's sidebar but its other viewers') -- including folders
+ * the picker has switched off and ones that have vanished from the server.
+ * The mail_accounts join exists purely to carry
  * the visibility term -- inbox scope, like every unread computation: the
  * sidebar is the mailbox view, so a folder that exists only in someone
  * else's private mailbox contributes no row here (its NAME staying unlisted
@@ -1192,7 +1343,10 @@ export async function unreadThreadCount(db: Database, userId: string): Promise<n
  * accounts, 11.5ms / 325 buffers, the unseen partial index still an Index
  * Only Scan with Heap Fetches: 0 -- `folder` and `account_id` both come off
  * its INCLUDE payload, so gaining the accounts join did not cost the
- * index-only property it was built for.
+ * index-only property it was built for. The 4.3 hide arm, re-measured on
+ * its own dataset (20,000 / 80,000 / 8,000 unread, 1,250 hides per user --
+ * a different seed, so not comparable to the figure above): 10.1ms / 370
+ * buffers, the same hash-anti-join shape as the badge, Heap Fetches still 0.
  *
  * Folders are counted by NAME across accounts, per the response shape the spec
  * fixes ({folder, count}, no accountId): two accounts' INBOXes are one row
@@ -1207,7 +1361,7 @@ export async function unreadCountsByFolder(db: Database, userId: string): Promis
     .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
     .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
     .where(and(
-      isNull(mailThreads.archivedAt), eq(mailMessages.seen, false),
+      notHiddenByViewer(userId), eq(mailMessages.seen, false),
       visibleMessageTerm(userId, "inbox"),
     ))
     .groupBy(mailMessages.folder)

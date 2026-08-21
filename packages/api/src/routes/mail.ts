@@ -21,7 +21,7 @@ import {
 } from "../services/mail-accounts.js";
 import {
   listThreads, getThreadDetail, markThreadRead, setThreadLink, clearThreadLink,
-  archiveThread, unarchiveThread, unreadThreadCount, unreadCountsByFolder,
+  hideThread, unhideThread, unreadThreadCount, unreadCountsByFolder,
   getAttachmentBlob, toMessage,
 } from "../services/mail-threads.js";
 import { listAccountFolders, setFolderSyncEnabled } from "../services/mail-folders.js";
@@ -79,11 +79,12 @@ const threadListQuerySchema = z.object({
   contact_id: z.uuid().optional(),
   deal_id: z.uuid().optional(),
   project_id: z.uuid().optional(),
-  // Phase 4.3: `hidden=true` is the Hidden view (the spec's spelling),
-  // renaming the pre-4.3 `archived` flag -- see the shared
-  // threadListFiltersSchema.hidden for the semantics and the Task 1
-  // placeholder note. Client and server ship as one unit, so the old
-  // spelling has no external caller to keep an alias for.
+  // Phase 4.3: `hidden=true` is the Hidden view (the spec's spelling) --
+  // the threads THIS VIEWER has hidden; absent/false is the default list,
+  // which excludes them. See the shared threadListFiltersSchema.hidden for
+  // the semantics. The flag renamed the pre-4.3 `archived` spelling; client
+  // and server ship as one unit, so the old spelling has no external caller
+  // to keep an alias for.
   hidden: z.enum(["true", "false"]).optional().transform((v) => v === "true"),
   // The folder view (Phase 4.1): threads with at least one message in this
   // folder. Trimmed and non-blank, mirroring the shared folderNameSchema every
@@ -465,14 +466,19 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     }
   });
 
-  // CRM-side only: nothing is moved or expunged on the IMAP server.
+  // Hide in CRM, for THIS USER alone (Phase 4.3): writes the actor's own
+  // mail_thread_hides row -- nothing moves or is expunged on the IMAP
+  // server, and no other user's view changes. The /archive path spelling is
+  // the pre-4.3 wire address, kept because a path is an address, not a
+  // label (the UI has said "Hide in CRM" since 4.1; the service is
+  // hideThread).
   app.post("/api/mail/threads/:id/archive", async (request, reply) => {
     const user = requireUser(request, reply);
     if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
     try {
-      return await archiveThread(db, user.id, params.id);
+      return await hideThread(db, user.id, params.id);
     } catch (error) {
       mapDomainError(reply, error);
     }
@@ -484,7 +490,7 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
     try {
-      return await unarchiveThread(db, user.id, params.id);
+      return await unhideThread(db, user.id, params.id);
     } catch (error) {
       mapDomainError(reply, error);
     }

@@ -21,4 +21,29 @@ INSERT INTO "mail_thread_hides" ("thread_id", "user_id", "hidden_at")
 SELECT "t"."id", "u"."id", "t"."archived_at"
 FROM "mail_threads" "t"
 CROSS JOIN "users" "u"
-WHERE "t"."archived_at" IS NOT NULL;
+WHERE "t"."archived_at" IS NOT NULL;--> statement-breakpoint
+-- The migration's second half (the plan's two-step sequencing note),
+-- appended by the read-path task while 0007 was still unshipped: with the
+-- backfill above written, the thread-global flag retires ENTIRELY. Nothing
+-- reads or writes it past this migration -- every mail read path filters by
+-- the viewer's own hide rows instead -- and a half-retired column would be
+-- two sources of truth (spec, Data model). The DROP runs after the backfill
+-- in the same migration, so no state is lost between the two statements.
+--
+-- NO (user_id, thread_id) INDEX rides this migration, and that is a
+-- MEASURED decision (0006's precedent). On the 0005/0006 methodology
+-- (20,000 threads / 80,000 messages, two users' private accounts, viewer
+-- owning one; 1,250 hides per user, the viewer's all in the OLD half --
+-- the skew that hurts most; warm runs, top-level node time and buffers):
+-- the default arm's NOT EXISTS is an exact composite-PK index-only probe
+-- (list page 0.70ms / 773 buffers, Heap Fetches: 0), and the Hidden view's
+-- worst case (11.8ms / 21,317 buffers -- the ordered thread scan walks
+-- 10,408 rows probing per thread before filling a page) is UNCHANGED by
+-- the candidate index: the planner keeps the same LIMIT-ordered probe plan
+-- and simply probes the new index instead (12.7ms / 21,317). A forced
+-- hides-driven plan (materialized CTE) was measured too: 9.7ms / 4,046
+-- buffers -- 5x fewer buffers but only ~2ms faster, because the time is
+-- the per-thread visibility EXISTS either way. Nothing the index can buy,
+-- so it is not added; full figures beside listThreads in
+-- services/mail-threads.ts.
+ALTER TABLE "mail_threads" DROP COLUMN "archived_at";

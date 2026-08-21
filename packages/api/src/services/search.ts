@@ -2,7 +2,7 @@ import { and, desc, eq, ilike, isNull, or, sql } from "drizzle-orm";
 import type { SearchResults } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { companies, contacts, notes, deals, tasks, mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
-import { visibleMessageTerm } from "./mail-threads.js";
+import { notHiddenByViewer, visibleMessageTerm } from "./mail-threads.js";
 import { escapeLike } from "./pagination.js";
 
 const LIMIT_PER_TYPE = 8;
@@ -25,9 +25,12 @@ const LIMIT_MAIL = 5;
  *
  * websearch_to_tsquery, not to_tsquery: it takes whatever a human types --
  * bare words, "quoted phrases", or/-negation -- and never throws on
- * punctuation the way to_tsquery does. Archived threads are excluded like
- * every other group here; message-level `seen`/direction are not filtered,
- * because finding something you already read (or sent) is the normal case.
+ * punctuation the way to_tsquery does. Threads THE VIEWER HID are excluded
+ * (mail-threads.ts's notHiddenByViewer, Phase 4.3 -- search is a default
+ * surface, and what you filed out of your inbox stays out of your results
+ * while remaining findable by everyone else); message-level `seen`/direction
+ * are not filtered, because finding something you already read (or sent) is
+ * the normal case.
  *
  * subject/snippet are read as explicit columns; the tsvector itself is only
  * ever an expression in WHERE/ORDER BY and never selected -- it is a large
@@ -71,7 +74,11 @@ async function searchMail(db: Database, userId: string, q: string): Promise<Sear
     .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
     .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
     .where(and(
-      isNull(mailThreads.archivedAt),
+      // The joined mail_threads row is what the hide term correlates
+      // against (its precondition); like the archived_at test it replaces,
+      // this is thread-level -- the per-message granularity below belongs
+      // to VISIBILITY alone.
+      notHiddenByViewer(userId),
       visibleMessageTerm(userId, "record"),
       sql`${mailMessages.search} @@ ${tsQuery}`,
     ))

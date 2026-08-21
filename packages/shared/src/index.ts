@@ -764,14 +764,12 @@ export const mailThreadSchema = z.object({
   // REQUEST'S viewer hid the thread (their mail_thread_hides row's
   // hidden_at), null when they have not. Replaces the retired thread-global
   // archivedAt: since 4.3 a hide is a per-person filing act, so "is it
-  // hidden" has no thread-global answer to expose.
-  //
-  // Task 1 placeholder: the server still maps mail_threads.archived_at here
-  // (mail-threads.ts's toThread) -- the thread-global value standing in for
-  // the per-viewer one. Faithful, not a guess: with the pre-4.3 semantics
-  // every viewer shares one hide state, and 0007's backfill carries this
-  // exact value into every user's hide row, so the two sources agree until
-  // Task 2 swaps toThread to read the viewer's own row.
+  // hidden" has no thread-global answer to expose. Sourced from the
+  // viewer's own hide row (api: mail-threads.ts's toThread takes it as an
+  // explicit argument -- mustGetThread's join on the by-id surfaces, the
+  // list page's join per row): null by construction on every default list
+  // row (hidden threads are excluded there), the filing moment on every
+  // Hidden-view row and on a hidden thread's still-openable detail.
   hiddenAt: z.iso.datetime().nullable(), ...timestamps,
 });
 export type MailThread = z.infer<typeof mailThreadSchema>;
@@ -924,8 +922,10 @@ export const mailThreadDetailSchema = z.object({
 });
 export type MailThreadDetail = z.infer<typeof mailThreadDetailSchema>;
 
-// GET /api/mail/unread-count -- distinct non-archived threads holding at
-// least one unseen message. A count of THREADS, not messages: it drives the
+// GET /api/mail/unread-count -- distinct threads THE VIEWER HAS NOT HIDDEN
+// holding at least one unseen message (per-user hides, Phase 4.3: a thread
+// you filed away stops counting at you and keeps counting at everyone
+// else). A count of THREADS, not messages: it drives the
 // inbox nav badge, which counts conversations the way the thread list does.
 // Messages sitting in their account's trash_folder do NOT count (Phase 4.1
 // Task 4): trashing an unread message must not leave the badge counting it
@@ -975,15 +975,12 @@ export const threadListFiltersSchema = z.object({
   // Phase 4.3: the Hidden view. Absent (or false) = the default view,
   // threads the VIEWER has not hidden; true = only the viewer's hidden
   // threads, the inbox's Hidden filter (spec: `?hidden=true` on the thread
-  // list). Renames the pre-4.3 `archived` flag to match what the UI has
-  // called it since 4.1 ("Hide in CRM") and what it now actually is.
-  //
-  // Task 1 placeholder: the server still applies this against the
-  // thread-global mail_threads.archived_at (hidden=true lists archived
-  // threads, absent excludes them) -- today's behaviour made explicit under
-  // the new name, exact under the same single-hide-state reasoning as
-  // mailThreadSchema.hiddenAt above. Task 2 swaps the predicate to the
-  // viewer's mail_thread_hides rows.
+  // list). Applied against the viewer's own mail_thread_hides rows (api:
+  // mail-threads.ts's hiddenByViewer), composed with -- never replacing --
+  // the 4.2 visibility predicate, so the Hidden view still shows only what
+  // its viewer may see and every other filter here works in both views.
+  // Renames the pre-4.3 `archived` flag to match what the UI has called it
+  // since 4.1 ("Hide in CRM") and what it now actually is.
   hidden: z.boolean().optional(),
   // The folder view driving the thread list (Phase 4.1): threads with >= 1
   // message in this folder (spec) -- absent means "every synced folder",
@@ -1001,10 +998,10 @@ export const threadListFiltersSchema = z.object({
 export type ThreadListFilters = z.infer<typeof threadListFiltersSchema>;
 
 // The three bulk/single-thread mail actions (Phase 4.1). trash/archive MOVE
-// the underlying messages server-side (api: services/mail-move.ts, a later
-// task); hide is the pre-4.1 CRM-side thread archive (mail_threads
-// .archived_at) applied in bulk, renamed "Hide in CRM" in the UI so it is
-// never confused with the other two (spec).
+// the underlying messages server-side (api: services/mail-move.ts); hide is
+// the CRM-side, PER-ACTOR filing act (one mail_thread_hides row per thread
+// for the requesting user, Phase 4.3) applied in bulk, named "Hide in CRM"
+// in the UI so it is never confused with the other two (spec).
 export const bulkThreadActionKindSchema = z.enum(["trash", "archive", "hide"]);
 export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
 
