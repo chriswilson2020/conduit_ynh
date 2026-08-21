@@ -2,10 +2,11 @@ import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
 // One serial journey through the core CRM flows: company -> contact -> note
-// -> file -> search -> archive/unarchive -> not-found. Tests run in file
-// order, share a single page (state accumulates across them: companyId and
-// contactId captured in one test are used by later ones), and a failure
-// stops the remaining tests rather than cascading into confusing failures.
+// -> file -> search -> archive/unarchive -> archived pipeline -> not-found.
+// Tests run in file order, share a single page (state accumulates across
+// them: companyId and contactId captured in one test are used by later
+// ones), and a failure stops the remaining tests rather than cascading into
+// confusing failures.
 //
 // Names are all derived from a run id so the journey is safe both in CI
 // (fresh DB per run) and locally (DB may carry leftovers from a previous
@@ -173,6 +174,52 @@ test.describe.serial("CRM journey", () => {
     await page.goto("/companies");
     await page.getByPlaceholder("Filter...").fill(runId);
     await expect(page.getByTestId(`row-${companyId}`)).toBeVisible();
+  });
+
+  // Phase 4.3: a company's archived pipelines stay reachable -- behind the
+  // same "Archived" checkbox shape the companies list uses -- and the board
+  // an archived pipeline opens into is read-only.
+  test("archives a pipeline and finds it read-only behind the company's Archived control", async () => {
+    const pipelineName = `Renewals ${runId}`;
+
+    // Create it from the company page, as a user would; creation lands on
+    // the new board.
+    await page.goto(`/companies/${companyId}`);
+    await page.getByRole("button", { name: "New pipeline" }).click();
+    await page.getByPlaceholder("Pipeline name").fill(pipelineName);
+    await page.getByRole("button", { name: "Create" }).click();
+    await expect(page).toHaveURL(/\/pipelines\/[0-9a-f-]{36}$/);
+    const pipelineUrl = page.url();
+
+    // Archive it from the board (confirm dialog), which navigates back to
+    // the pipelines index.
+    page.once("dialog", (dialog) => void dialog.accept());
+    await page.getByTestId("archive-pipeline-button").click();
+    await expect(page).toHaveURL(/\/pipelines$/);
+
+    // The company's default Pipelines list no longer carries it -- and the
+    // empty label doubles as the loaded-list sentinel, since this pipeline
+    // was the company's only one.
+    await page.goto(`/companies/${companyId}`);
+    const pipelinesList = page.getByTestId("company-pipelines");
+    await expect(pipelinesList).toContainText("No pipelines");
+    await expect(pipelinesList).not.toContainText(pipelineName);
+
+    // Behind the control it is listed again, wearing the Archived chip.
+    await page.getByTestId("show-archived-pipelines").click();
+    const row = pipelinesList.getByRole("link", { name: new RegExp(pipelineName) });
+    await expect(row).toBeVisible();
+    await expect(row.getByTestId("pipeline-archived-chip")).toBeVisible();
+
+    // Read-only means the BOARD it opens into is read-only: the archived
+    // banner is up, Unarchive is offered, and the mutating affordances
+    // (archive button here standing in for the gated set -- stage edits and
+    // deal moves are gated by the same `archived` flag) are absent.
+    await row.click();
+    await expect(page).toHaveURL(pipelineUrl);
+    await expect(page.getByText("This pipeline is archived. The board is read-only.")).toBeVisible();
+    await expect(page.getByTestId("unarchive-pipeline-button")).toBeVisible();
+    await expect(page.getByTestId("archive-pipeline-button")).toHaveCount(0);
   });
 
   test("shows a not-found card for a missing company id", async () => {

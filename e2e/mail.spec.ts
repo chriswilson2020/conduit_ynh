@@ -10,7 +10,11 @@ import { ImapFlow } from "imapflow";
  * Phase 4.2 extends the same journey with a SECOND USER (see the 4.2 section
  * at the bottom): the private-by-default visibility model, the deal link as
  * the deliberate sharing act, the Settings toggle, and the owner-only move
- * rights, each asserted from user B's browser context.
+ * rights, each asserted from user B's browser context. Phase 4.3 closes the
+ * file with the detail cap's Show earlier on a 51-message fixture thread,
+ * the 1280px conversation-header containment guard, forward re-attach
+ * verified in Mailpit's copy of the outgoing mail, and the per-user hide
+ * journey (A's filing changes A's surfaces alone; B keeps reading).
  *
  * HOW THE SECOND USER WORKS, verified against the API's auth path rather
  * than assumed: identityFromHeaders (api: auth.ts) uses the `ynh-user`
@@ -174,6 +178,31 @@ test.describe.serial("Mail journey", () => {
   let archiveSubjects: [string, string] = ["", ""];
   let trashSubject = "";
 
+  /**
+   * The Phase 4.3 fixtures, per-attempt for the same unrecoverability
+   * reasons as the folder journey's above: the detail-cap test asserts a
+   * message COUNT (exactly 50 of 51), and the hide journey asserts
+   * whole-list negatives ("gone from A's inbox and search") -- both shapes
+   * a previous attempt's same-subject leftovers would fail forever.
+   * `attemptTag` is the same `${runId}x${retry}` stamp, kept whole because
+   * the fixtures' Message-IDs need it too (a retried APPEND with a reused
+   * Message-ID would thread into the previous attempt's conversation).
+   */
+  let attemptTag = "";
+  /** The 51-message thread the detail cap truncates to 50. */
+  let longSubject = "";
+  /** The one-message thread whose stored attachment the forward re-attaches. */
+  let attachSubject = "";
+  let attachmentName = "";
+  /** The thread A hides, and the never-hidden thread sharing its body
+   * marker -- the sentinel that keeps the post-hide search negative a
+   * statement about a LOADED result list (the dropdown's "No results" also
+   * renders while the query is still in flight, so absence alone proves
+   * nothing). */
+  let hideSubject = "";
+  let sentinelSubject = "";
+  let hideMarker = "";
+
   // -- fixtures --------------------------------------------------------
 
   /** One message, CRLF-terminated the way it goes onto the wire: this buffer
@@ -247,7 +276,102 @@ test.describe.serial("Mail journey", () => {
         ], `Nothing to do with Alice, and nobody in the CRM has this address.`),
       },
       ...folderFixtures(now),
+      ...phase43Fixtures(now),
     ];
+  }
+
+  /**
+   * The Phase 4.3 fixtures: a 51-message thread for the detail cap (the cap
+   * is 50, so exactly one message -- the root -- falls off the capped page),
+   * one message carrying a real MIME attachment for the forward re-attach
+   * journey, and the hide journey's thread plus its search sentinel (see the
+   * declarations above for why the sentinel exists).
+   *
+   * All dates sit HOURS old: inside the account form's default 90-day
+   * backfill window, older than every Phase 4/4.1 fixture (so the earlier
+   * journeys' rows keep their list positions), and far outside the bulk
+   * trio's seconds-wide window (so the shift-range there still cannot sweep
+   * anything else up).
+   */
+  function phase43Fixtures(now: number): { raw: Buffer; date: Date; folder: string }[] {
+    // The long thread is a real References chain onto one root, like Alice's:
+    // that is what mail-ingest's threading consults. Each body names its own
+    // ordinal, so the ROW's snippet reading "Message 51" is the signal the
+    // whole thread has been ingested (the sync test waits on it).
+    const longStart = now - 240 * MINUTE_MS;
+    const longRootId = `<long-0-${attemptTag}@example.com>`;
+    const longThread = Array.from({ length: 51 }, (_, index) => {
+      const date = new Date(longStart + index * MINUTE_MS);
+      return {
+        folder: INBOX_FOLDER,
+        date,
+        raw: rfc822([
+          `From: Frank Longwind <frank-${runId}@example.com>`,
+          `To: Conduit <${USERNAME}>`,
+          `Subject: ${index === 0 ? longSubject : `Re: ${longSubject}`}`,
+          `Message-ID: <long-${index}-${attemptTag}@example.com>`,
+          ...(index === 0 ? [] : [`In-Reply-To: ${longRootId}`, `References: ${longRootId}`]),
+          `Date: ${date.toUTCString()}`,
+          "MIME-Version: 1.0",
+          "Content-Type: text/plain; charset=utf-8",
+        ], `Message ${index + 1} of the long thread.`),
+      };
+    });
+
+    // One text part plus one base64 attachment part -- the smallest honest
+    // multipart/mixed. The attachment lands as a mail_attachments row with
+    // stored bytes, which is exactly what the forward re-attaches.
+    const attachAt = new Date(now - 90 * MINUTE_MS);
+    const boundary = `b-${attemptTag}`;
+    const attachmentBase64 = Buffer.from(`Forwarded fixture payload ${attemptTag}.`, "utf8").toString("base64");
+    const attachMessage = {
+      folder: INBOX_FOLDER,
+      date: attachAt,
+      raw: rfc822([
+        `From: Grace Sender <grace-${runId}@example.com>`,
+        `To: Conduit <${USERNAME}>`,
+        `Subject: ${attachSubject}`,
+        `Message-ID: <attach-1-${attemptTag}@example.com>`,
+        `Date: ${attachAt.toUTCString()}`,
+        "MIME-Version: 1.0",
+        `Content-Type: multipart/mixed; boundary="${boundary}"`,
+      ], [
+        `--${boundary}`,
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        "The spec is attached.",
+        `--${boundary}`,
+        `Content-Type: text/plain; name="${attachmentName}"`,
+        "Content-Transfer-Encoding: base64",
+        `Content-Disposition: attachment; filename="${attachmentName}"`,
+        "",
+        attachmentBase64,
+        `--${boundary}--`,
+      ].join("\r\n")),
+    };
+
+    // The hide pair. BOTH bodies carry hideMarker: after A hides the
+    // Handover thread, a search for the marker must still find the Briefing
+    // one -- which is what makes "Handover is absent from the results" an
+    // absence from a loaded list rather than from a query still in flight.
+    const hidePair = [
+      { subject: hideSubject, from: `Dana Handover <dana-${runId}@example.com>`, id: "hide", at: new Date(now - 60 * MINUTE_MS) },
+      { subject: sentinelSubject, from: `Erik Briefing <erik-${runId}@example.com>`, id: "sentinel", at: new Date(now - 55 * MINUTE_MS) },
+    ].map(({ subject, from, id, at }) => ({
+      folder: INBOX_FOLDER,
+      date: at,
+      raw: rfc822([
+        `From: ${from}`,
+        `To: Conduit <${USERNAME}>`,
+        `Subject: ${subject}`,
+        `Message-ID: <${id}-1-${attemptTag}@example.com>`,
+        `Date: ${at.toUTCString()}`,
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=utf-8",
+      ], `Please read this. Marker ${hideMarker}.`),
+    }));
+
+    return [...longThread, attachMessage, ...hidePair];
   }
 
   /**
@@ -396,6 +520,35 @@ test.describe.serial("Mail journey", () => {
     return (testId as string).replace(prefix, "");
   }
 
+  /**
+   * Click "Load more" until every page of the thread list is on screen.
+   *
+   * The Phase 4.3 fixtures are dated HOURS old, deliberately, so they can
+   * never disturb the earlier journeys' page-one geography -- the flip side
+   * is that on a retry, with previous attempts' leftover threads piled
+   * newest-first above them, they can sit below the first page of 25. A row
+   * assertion made after this helper is about the WHOLE list, which is also
+   * the only honest shape for the hide journey's absence claims. Bounded
+   * rather than clever: even three attempts' pile-up is two pages, and if
+   * the list never finishes materializing it is the caller's own row
+   * assertion that should fail, with the better message.
+   */
+  async function loadAllThreadsOn(target: Page): Promise<void> {
+    for (let round = 0; round < 20; round += 1) {
+      const more = target.getByTestId("thread-list-more");
+      if ((await more.count()) === 0) return;
+      try {
+        // A short timeout: the button is disabled while its page is in
+        // flight, and waiting out actionability here IS the pacing.
+        await more.click({ timeout: 1_000 });
+      } catch {
+        // Disabled, or unmounted between the count and the click (the last
+        // page landed) -- either way, look again after a beat.
+        await target.waitForTimeout(250);
+      }
+    }
+  }
+
   /** The nav badge's number, with ABSENT read as zero -- shell.tsx renders
    * nothing at all at zero rather than a "0". */
   async function unreadBadge(): Promise<number> {
@@ -452,6 +605,18 @@ test.describe.serial("Mail journey", () => {
     junkSubject = `Newsletter ${attemptId}`;
     archiveSubjects = [`Invoice ${attemptId}`, `Shipping ${attemptId}`];
     trashSubject = `Offer ${attemptId}`;
+
+    // The Phase 4.3 set (see the declarations above). No subject here is a
+    // substring of another, because threadRow matches by hasText.
+    attemptTag = attemptId;
+    longSubject = `Longthread ${attemptId}`;
+    attachSubject = `Spec attached ${attemptId}`;
+    attachmentName = `spec-${attemptId}.txt`;
+    hideSubject = `Handover ${attemptId}`;
+    sentinelSubject = `Briefing ${attemptId}`;
+    // One alphanumeric token, same reason as textMarker above: it travels
+    // through websearch_to_tsquery as a single lexeme.
+    hideMarker = `hidemarker${attemptId}`;
 
     // A previous attempt's account would sync this same mailbox alongside the
     // one added below, ingesting every message twice (once per account, into
@@ -584,6 +749,20 @@ test.describe.serial("Mail journey", () => {
       // was marked read would make it unread again, and the conversation is
       // only marked once per mount.
       await expect(threadRow(aliceSubject)).toContainText(htmlMarker, { timeout: ATTEMPT_TIMEOUT_MS });
+      // The Phase 4.3 fixtures too, INCLUDING the long thread's final
+      // message (its row's snippet is the newest body, so "Message 51" means
+      // the whole chain is in). Waited for here, not in the 4.3 tests
+      // themselves, because the unread-badge test below reads the badge as a
+      // delta of its own making -- a fixture still trickling in AFTER this
+      // test would move the badge between that test's before-read and its
+      // assertion, a race no per-test poll further down could close. Dated
+      // hours old, these rows can sit past page one on a retry, hence the
+      // load-all first (see loadAllThreadsOn).
+      await loadAllThreadsOn(page);
+      await expect(threadRow(longSubject)).toContainText("Message 51", { timeout: ATTEMPT_TIMEOUT_MS });
+      await expect(threadRow(attachSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+      await expect(threadRow(hideSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+      await expect(threadRow(sentinelSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
     });
 
     aliceThreadId = await idOf(threadRow(aliceSubject), "thread-row-");
@@ -1042,5 +1221,223 @@ test.describe.serial("Mail journey", () => {
     await expect(bPage.getByTestId("inbox-no-account")).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
     await expect(threadRowOn(bPage, bobSubject)).toHaveCount(0);
     await expect(threadRowOn(bPage, aliceSubject)).toHaveCount(0);
+  });
+
+  // -- Phase 4.3: the detail cap's Show earlier, the 1280px header guard,
+  //    forward re-attach over the wire, and the per-user hide journey -------
+
+  test("caps the 51-message conversation at 50 and Show earlier loads the rest", async () => {
+    await page.goto("/mail");
+    // Alice's row is the loaded-list sentinel; the long thread, dated hours
+    // old, can sit past page one on a retry (see loadAllThreadsOn).
+    await expect(threadRow(aliceSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await loadAllThreadsOn(page);
+    await expect(threadRow(longSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+    await threadRow(longSubject).click();
+
+    const conversation = page.getByTestId("conversation");
+    await expect(conversation).toBeVisible();
+    // The payload bound: the newest 50 of 51, plus the control saying
+    // exactly what it is holding back.
+    const messages = conversation.locator('[data-testid^="message-"]');
+    await expect(messages).toHaveCount(50, { timeout: REFETCH_TIMEOUT_MS });
+    const showEarlier = page.getByTestId("show-earlier");
+    await expect(showEarlier).toHaveText("Show earlier messages (1 more)");
+
+    await showEarlier.click();
+    await expect(messages).toHaveCount(51, { timeout: REFETCH_TIMEOUT_MS });
+    // Nothing held back any more: the uncapped payload is not truncated, so
+    // the control has nothing to offer and unmounts.
+    await expect(showEarlier).toHaveCount(0);
+  });
+
+  test("keeps the conversation header's actions inside the pane at 1280px wide", async () => {
+    // Set explicitly rather than inherited from Playwright's default, so a
+    // future default change cannot quietly turn this into an assertion
+    // about some other width. This is the overlap fix's only guard: before
+    // the Task 3 flex-wrap fix, the four header actions overflowed the
+    // ~416px conversation pane at exactly this viewport and clipped at its
+    // edge -- so the assertion is horizontal CONTAINMENT in the pane, which
+    // clipping cannot satisfy, not mere visibility, which it can.
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto(`/mail?thread=${aliceThreadId}`);
+    const conversation = page.getByTestId("conversation");
+    await expect(conversation).toBeVisible();
+
+    const pane = await conversation.boundingBox();
+    expect(pane).not.toBeNull();
+    // A's own conversation renders all four actions: the remote-images
+    // opt-in, the two owner-only server moves, and the CRM-side Hide.
+    for (const testId of ["load-remote-images", "conversation-archive", "conversation-trash", "hide-thread"]) {
+      const button = page.getByTestId(testId);
+      await expect(button).toBeVisible();
+      const box = await button.boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.x).toBeGreaterThanOrEqual(pane!.x - 1);
+      expect(box!.x + box!.width).toBeLessThanOrEqual(pane!.x + pane!.width + 1);
+    }
+  });
+
+  test("forwards the fixture message and the stored attachment rides to Mailpit", async () => {
+    await page.goto("/mail");
+    await expect(threadRow(aliceSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await loadAllThreadsOn(page);
+    await expect(threadRow(attachSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+    await threadRow(attachSubject).click();
+    await expect(page.getByTestId("conversation")).toBeVisible();
+    // The ingested original's attachment chip, on the (newest, expanded)
+    // message: the stored blob the forward will re-attach.
+    await expect(
+      page.locator('[data-testid^="attachment-"]').filter({ hasText: attachmentName }),
+    ).toBeVisible();
+
+    await page.getByTestId("forward-button").click();
+    const composer = page.getByTestId("composer");
+    await expect(composer).toBeVisible();
+    // Seeded as a removable chip carrying the attachment's id -- the Task 3
+    // composer surface, exercised for real for the first time here.
+    const chip = composer.locator('[data-testid^="composer-forward-attachment-"]');
+    await expect(chip).toHaveCount(1);
+    await expect(chip).toContainText(attachmentName);
+    await expect(page.getByTestId("composer-subject")).toHaveValue(`Fwd: ${attachSubject}`);
+
+    const forwardTarget = `fwd-target-${attemptTag}@example.com`;
+    await page.getByTestId("composer-to").fill(forwardTarget);
+    await page.getByTestId("composer-to").press("Enter");
+    await page.getByTestId("composer-send").click();
+    await expect(composer).toBeHidden({ timeout: 30_000 });
+
+    // Mailpit holds the forward, addressed as typed. The chip alone would
+    // only prove the composer UI; the wire is where re-attach either works
+    // or does not.
+    const expectedSubject = `Fwd: ${attachSubject}`;
+    let mailpitId = "";
+    await expect.poll(async () => {
+      const response = await page.request.get(`${MAILPIT_URL}/api/v1/messages?limit=200`);
+      if (!response.ok()) return null;
+      const body = await response.json() as {
+        messages?: { ID?: string; Subject?: string; To?: { Address?: string }[] }[];
+      };
+      const hit = (body.messages ?? []).find((message) =>
+        message.Subject === expectedSubject
+        && (message.To ?? []).some((entry) => entry.Address === forwardTarget)) ?? null;
+      mailpitId = hit?.ID ?? "";
+      return hit;
+    }, { timeout: 20_000 }).not.toBeNull();
+
+    // ...and its detail lists the re-attached file by name: the bytes
+    // crossed SMTP as a real attachment part.
+    const detail = await page.request.get(`${MAILPIT_URL}/api/v1/message/${mailpitId}`);
+    expect(detail.ok()).toBe(true);
+    const parsed = await detail.json() as { Attachments?: { FileName?: string }[] };
+    expect((parsed.Attachments ?? []).map((entry) => entry.FileName)).toContain(attachmentName);
+  });
+
+  test("shares the mailbox again and A hides the handover thread for A alone", async () => {
+    // The hide journey needs the SAME thread in two inboxes, and only a
+    // shared account puts it in B's -- so the 4.2 closer's hygiene flip is
+    // undone here and redone at the end of the journey.
+    await page.goto("/settings/mail");
+    const toggle = page.getByTestId(`visibility-toggle-${accountId}`);
+    await expect(toggle).toHaveText("Private", { timeout: REFETCH_TIMEOUT_MS });
+    await toggle.click();
+    await expect(toggle).toHaveText("Shared", { timeout: REFETCH_TIMEOUT_MS });
+
+    // B's inbox carries the handover thread now.
+    await bPage.goto("/mail");
+    await pollWithReloadOn(bPage, async () => {
+      await loadAllThreadsOn(bPage);
+      await expect(threadRowOn(bPage, hideSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+    });
+
+    // A's inbox and search both find it -- the positive halves that make
+    // the post-hide negatives statements about something that was there.
+    await page.goto("/mail");
+    await expect(threadRow(aliceSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await loadAllThreadsOn(page);
+    await expect(threadRow(hideSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+    await page.getByTestId("search-input").fill(hideMarker);
+    const hideResult = page.getByTestId("search-result").filter({ hasText: hideSubject });
+    await expect(hideResult).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    await expect(page.getByTestId("search-result").filter({ hasText: sentinelSubject })).toBeVisible();
+
+    // Open through the result (which also closes the dropdown) and hide.
+    // The conversation STAYS OPEN -- a hide is a filing act, not a lock --
+    // with the button flipped to Unhide: the hiddenAt-driven button state,
+    // exercised on screen.
+    await hideResult.click();
+    await expect(page.getByTestId("conversation")).toBeVisible();
+    await page.getByTestId("hide-thread").click();
+    await expect(page.getByTestId("unhide-thread")).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+
+    // Gone from A's default inbox: an absence from the WHOLE loaded list,
+    // with Alice's row as the loaded sentinel.
+    await page.goto("/mail");
+    await pollWithReload(async () => {
+      await expect(threadRow(aliceSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+      await loadAllThreadsOn(page);
+      await expect(threadRow(hideSubject)).toHaveCount(0);
+    });
+
+    // ...and from A's search, where the sentinel thread -- same body
+    // marker, never hidden -- still answering is what proves the result
+    // list loaded rather than merely not having arrived ("No results" also
+    // renders while the query is in flight).
+    await pollWithReload(async () => {
+      await page.getByTestId("search-input").fill(hideMarker);
+      await expect(page.getByTestId("search-result").filter({ hasText: sentinelSubject }))
+        .toBeVisible({ timeout: ATTEMPT_TIMEOUT_MS });
+      await expect(page.getByTestId("search-result").filter({ hasText: hideSubject })).toHaveCount(0);
+    });
+  });
+
+  test("keeps B's inbox untouched and lists the hidden thread in A's Hidden view", async () => {
+    // B first: A's filing is A's alone, and B's default inbox still lists
+    // the thread A just hid.
+    await bPage.goto("/mail");
+    await expect(threadRowOn(bPage, aliceSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await loadAllThreadsOn(bPage);
+    await expect(threadRowOn(bPage, hideSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+
+    // A's Hidden view: the same list machinery with the inverted hide arm.
+    // The row wears the viewer's own filing moment as its chip; Alice's
+    // live thread has no business here.
+    await page.goto("/mail");
+    await page.getByTestId("filter-hidden").click();
+    await expect(threadRow(hideSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await expect(threadRow(hideSubject).getByTestId("hidden-chip")).toBeVisible();
+    await expect(threadRow(hideSubject).getByTestId("hidden-chip")).toContainText("Hidden");
+    await expect(threadRow(aliceSubject)).toHaveCount(0);
+  });
+
+  test("unhides from the conversation, restoring A's inbox, and re-privatizes the mailbox", async () => {
+    // Unhide lives in the conversation, reached here the way a user would:
+    // from the Hidden view's row.
+    await page.goto("/mail");
+    await page.getByTestId("filter-hidden").click();
+    await expect(threadRow(hideSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await threadRow(hideSubject).click();
+    await expect(page.getByTestId("conversation")).toBeVisible();
+    await page.getByTestId("unhide-thread").click();
+    await expect(page.getByTestId("hide-thread")).toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    // The Hidden list beside the pane lets go of the row as the unhide
+    // lands -- the conversation itself stays open.
+    await expect(threadRow(hideSubject)).toHaveCount(0, { timeout: REFETCH_TIMEOUT_MS });
+
+    // Restored to the default inbox (a fresh load resets the filter).
+    await page.goto("/mail");
+    await pollWithReload(async () => {
+      await expect(threadRow(aliceSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+      await loadAllThreadsOn(page);
+      await expect(threadRow(hideSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+    });
+
+    // The journey's own hygiene, mirroring the 4.2 closer: the mailbox ends
+    // Private, the state every attempt starts from.
+    await page.goto("/settings/mail");
+    const toggle = page.getByTestId(`visibility-toggle-${accountId}`);
+    await expect(toggle).toHaveText("Shared", { timeout: REFETCH_TIMEOUT_MS });
+    await toggle.click();
+    await expect(toggle).toHaveText("Private", { timeout: REFETCH_TIMEOUT_MS });
   });
 });
