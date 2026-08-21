@@ -8,7 +8,8 @@ const querySchema = z.object({ q: z.string().optional() });
 
 export function registerSearchRoutes(app: FastifyInstance, { db }: CrmRouteDeps): void {
   app.get("/api/search", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const query = parseOrReject(querySchema, request.query, reply);
     if (query === undefined) return;
     // Whitespace-only q is treated the same as absent: return empty groups without
@@ -16,6 +17,8 @@ export function registerSearchRoutes(app: FastifyInstance, { db }: CrmRouteDeps)
     // match everything up to LIMIT_PER_TYPE.
     const q = query.q?.trim() ?? "";
     if (q === "") return { companies: [], contacts: [], notes: [], deals: [], tasks: [], mail: [] };
-    return search(db, q);
+    // The viewer's id scopes the MAIL group only (mail visibility, Phase
+    // 4.2); every other group is shared CRM data.
+    return search(db, user.id, q);
   });
 }

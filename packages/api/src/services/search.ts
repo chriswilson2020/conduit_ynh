@@ -1,7 +1,8 @@
 import { and, desc, eq, ilike, isNull, or, sql } from "drizzle-orm";
 import type { SearchResults } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { companies, contacts, notes, deals, tasks, mailMessages, mailThreads } from "../db/schema.js";
+import { companies, contacts, notes, deals, tasks, mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
+import { visibleMessageTerm } from "./mail-threads.js";
 import { escapeLike } from "./pagination.js";
 
 const LIMIT_PER_TYPE = 8;
@@ -42,14 +43,20 @@ const LIMIT_MAIL = 5;
  * the inner query by rank, or cap the candidate set before the DISTINCT ON,
  * and accept approximate ordering in exchange.
  *
- * PHASE 4.2, Task 2 replaces this: no actor reaches this function and no
- * mail_accounts join exists here, so today every user's search sees every
- * thread's subject and snippet -- 4.1's shared-visibility behaviour. Task 2
- * threads the actor through the search call chain and applies
- * record-visible(U, T) (spec table: "Search mail group"); this is the one
- * mail read path that lives outside mail-threads.ts.
+ * VISIBILITY (Phase 4.2): the viewer's id rides the whole search call chain
+ * (route -> search -> here) so this query can filter by mail-threads.ts's
+ * visibleMessageTerm -- record scope, per the spec's table: search is a CRM
+ * surface like the record tabs, so a deliberately deal/project-linked thread
+ * from someone else's private mailbox IS findable, while their unlinked (or
+ * merely auto-contact-linked) mail is not. The term is applied at MESSAGE
+ * granularity inside the ranking query, not as a thread test around it: the
+ * hit this group renders is one message's subject and snippet, and on a
+ * visible thread whose other half lives in a private mailbox, an invisible
+ * message must neither rank nor leak its snippet -- the best VISIBLE match
+ * represents the thread instead. This is the one mail read path outside
+ * mail-threads.ts, which is why the term is imported rather than re-derived.
  */
-async function searchMail(db: Database, q: string): Promise<SearchResults["mail"]> {
+async function searchMail(db: Database, userId: string, q: string): Promise<SearchResults["mail"]> {
   const tsQuery = sql`websearch_to_tsquery('english', ${q})`;
   const rank = sql<number>`ts_rank(${mailMessages.search}, ${tsQuery})`;
   const best = db
@@ -61,7 +68,12 @@ async function searchMail(db: Database, q: string): Promise<SearchResults["mail"
     })
     .from(mailMessages)
     .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
-    .where(and(isNull(mailThreads.archivedAt), sql`${mailMessages.search} @@ ${tsQuery}`))
+    .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
+    .where(and(
+      isNull(mailThreads.archivedAt),
+      visibleMessageTerm(userId, "record"),
+      sql`${mailMessages.search} @@ ${tsQuery}`,
+    ))
     // sent_at breaks a rank tie toward the newest message, so a thread whose
     // messages all rank identically shows its latest one.
     .orderBy(mailMessages.threadId, desc(rank), desc(mailMessages.sentAt))
@@ -91,7 +103,12 @@ function snippet(body: string, q: string): string {
   return `${start > 0 ? "..." : ""}${points.slice(start, end).join("")}${end < points.length ? "..." : ""}`;
 }
 
-export async function search(db: Database, q: string): Promise<SearchResults> {
+/**
+ * `userId` exists for the mail group alone (see searchMail's visibility
+ * note); every other group searches shared CRM records and ignores it.
+ * Threaded as a parameter from the route's requireUser, never ambient state.
+ */
+export async function search(db: Database, userId: string, q: string): Promise<SearchResults> {
   const p = `%${escapeLike(q)}%`;
   const [companyRows, contactRows, noteRows, dealRows, taskRows, mailRows] = await Promise.all([
     db.select({ id: companies.id, name: companies.name }).from(companies)
@@ -138,7 +155,7 @@ export async function search(db: Database, q: string): Promise<SearchResults> {
     // lifecycle action) hides a task from search.
     db.select({ id: tasks.id, title: tasks.title, projectId: tasks.projectId }).from(tasks)
       .where(and(isNull(tasks.archivedAt), ilike(tasks.title, p))).limit(LIMIT_PER_TYPE),
-    searchMail(db, q),
+    searchMail(db, userId, q),
   ]);
   return {
     companies: companyRows,

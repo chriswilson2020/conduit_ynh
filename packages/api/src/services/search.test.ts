@@ -35,7 +35,7 @@ describe("search service", () => {
     const contact = await createContact(handle.db, actorId, { firstName: "Zylexo", lastName: "Person" });
     const note = await createNote(handle.db, actorId, { body: "a note about Zylexo plans", companyId: company.id });
 
-    const result = await search(handle.db, "Zylexo");
+    const result = await search(handle.db, actorId, "Zylexo");
     expect(() => searchResultsSchema.parse(result)).not.toThrow();
     expect(result.companies.map((c) => c.id)).toContain(company.id);
     expect(result.contacts.map((c) => c.id)).toContain(contact.id);
@@ -47,7 +47,7 @@ describe("search service", () => {
   it("finds a deal by a title fragment", async () => {
     const deal = await makeDeal("Zylexo renewal");
 
-    const result = await search(handle.db, "Zylexo");
+    const result = await search(handle.db, actorId, "Zylexo");
     expect(result.deals.map((d) => d.id)).toContain(deal.id);
     expect(result.deals.find((d) => d.id === deal.id)?.title).toBe("Zylexo renewal");
   });
@@ -56,7 +56,7 @@ describe("search service", () => {
     const deal = await makeDeal("Vortixel contract");
     await archiveDeal(handle.db, actorId, deal.id);
 
-    const result = await search(handle.db, "Vortixel");
+    const result = await search(handle.db, actorId, "Vortixel");
     expect(result.deals.map((d) => d.id)).not.toContain(deal.id);
   });
 
@@ -68,7 +68,7 @@ describe("search service", () => {
     const deal = await makeDeal("Wexfordbay expansion");
     await winDeal(handle.db, actorId, deal.id);
 
-    const result = await search(handle.db, "Wexfordbay");
+    const result = await search(handle.db, actorId, "Wexfordbay");
     expect(result.deals.map((d) => d.id)).toContain(deal.id);
   });
 
@@ -76,7 +76,7 @@ describe("search service", () => {
     const company = await createCompany(handle.db, actorId, { name: "Vortixel Inc" });
     await archiveCompany(handle.db, actorId, company.id);
 
-    const result = await search(handle.db, "Vortixel");
+    const result = await search(handle.db, actorId, "Vortixel");
     expect(result.companies).toHaveLength(0);
   });
 
@@ -85,7 +85,7 @@ describe("search service", () => {
       firstName: "Nora", lastName: "Quill", emails: ["nora.quill@wexfordbay.example"],
     });
 
-    const result = await search(handle.db, "wexfordbay");
+    const result = await search(handle.db, actorId, "wexfordbay");
     expect(result.contacts.map((c) => c.id)).toContain(contact.id);
   });
 
@@ -98,7 +98,7 @@ describe("search service", () => {
     const startBody = `findme ${"y".repeat(210)}`;
     const startNote = await createNote(handle.db, actorId, { body: startBody, companyId: company.id });
 
-    const result = await search(handle.db, "findme");
+    const result = await search(handle.db, actorId, "findme");
     const midSnippet = result.notes.find((n) => n.id === midNote.id)?.snippet;
     const startSnippet = result.notes.find((n) => n.id === startNote.id)?.snippet;
 
@@ -117,7 +117,7 @@ describe("search service", () => {
     const match = await createNote(handle.db, actorId, { body: "50% off deal", companyId: company.id });
     const decoy = await createNote(handle.db, actorId, { body: "500 units", companyId: company.id });
 
-    const result = await search(handle.db, "50%");
+    const result = await search(handle.db, actorId, "50%");
     const ids = result.notes.map((n) => n.id);
     expect(ids).toContain(match.id);
     expect(ids).not.toContain(decoy.id);
@@ -128,7 +128,7 @@ describe("search service", () => {
     const note = await createNote(handle.db, actorId, { body: "archivax secret plans", companyId: company.id });
     await archiveCompany(handle.db, actorId, company.id);
 
-    const result = await search(handle.db, "archivax");
+    const result = await search(handle.db, actorId, "archivax");
     expect(result.notes.map((n) => n.id)).not.toContain(note.id);
   });
 
@@ -145,7 +145,7 @@ describe("search service", () => {
     const body = `${pad}findme${pad}`;
     const note = await createNote(handle.db, actorId, { body, companyId: company.id });
 
-    const result = await search(handle.db, "findme");
+    const result = await search(handle.db, actorId, "findme");
     const found = result.notes.find((n) => n.id === note.id);
     expect(found).toBeDefined();
     expect(lonePairPattern.test(found?.snippet ?? "")).toBe(false);
@@ -155,7 +155,7 @@ describe("search service", () => {
     const project = await createProject(handle.db, actorId, { name: "Launch" });
     const task = await createTask(handle.db, actorId, { title: "Zylexo onboarding call", projectId: project.id });
 
-    const result = await search(handle.db, "Zylexo");
+    const result = await search(handle.db, actorId, "Zylexo");
     expect(result.tasks.map((t) => t.id)).toContain(task.id);
     const found = result.tasks.find((t) => t.id === task.id);
     expect(found?.title).toBe("Zylexo onboarding call");
@@ -169,7 +169,7 @@ describe("search service", () => {
     const task = await createTask(handle.db, actorId, { title: "Wexfordbay migration" });
     await setTaskStatus(handle.db, actorId, task.id, "done");
 
-    const result = await search(handle.db, "Wexfordbay");
+    const result = await search(handle.db, actorId, "Wexfordbay");
     expect(result.tasks.map((t) => t.id)).toContain(task.id);
   });
 
@@ -177,7 +177,7 @@ describe("search service", () => {
     const task = await createTask(handle.db, actorId, { title: "Vortixel cleanup" });
     await archiveTask(handle.db, actorId, task.id);
 
-    const result = await search(handle.db, "Vortixel");
+    const result = await search(handle.db, actorId, "Vortixel");
     expect(result.tasks.map((t) => t.id)).not.toContain(task.id);
   });
 
@@ -186,7 +186,7 @@ describe("search service", () => {
     const note = await createNote(handle.db, actorId, { body: "marlowe finch follow-up notes", contactId: contact.id });
     await archiveContact(handle.db, actorId, contact.id);
 
-    const result = await search(handle.db, "marlowe finch");
+    const result = await search(handle.db, actorId, "marlowe finch");
     expect(result.notes.map((n) => n.id)).not.toContain(note.id);
   });
 });
@@ -198,21 +198,28 @@ describe("search service: mail group", () => {
   // Rows are inserted directly rather than through ingest: this group is a
   // query, and driving mailparser to reach it would only make the fixture
   // harder to read. credentials_ciphertext is never decrypted on this path.
-  async function makeMailAccount(): Promise<string> {
+  async function makeMailAccount(
+    opts: { owner?: string; visibility?: "private" | "shared" } = {},
+  ): Promise<string> {
     const [row] = await handle.db.insert(mailAccounts).values({
-      userId: actorId, label: "Work", email: `chris+${randomUUID()}@example.com`,
+      userId: opts.owner ?? actorId, label: "Work", email: `chris+${randomUUID()}@example.com`,
       imapHost: "localhost", imapPort: 993, imapSecurity: "tls",
       smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls",
       username: "chris", credentialsCiphertext: "v1:unused-in-search-tests",
+      visibility: opts.visibility ?? "private",
     }).returning();
     if (row === undefined) throw new Error("makeMailAccount: no row");
     return row.id;
   }
 
-  async function makeMailThread(subject: string, archived = false): Promise<string> {
+  async function makeMailThread(
+    subject: string,
+    opts: { archived?: boolean; contactId?: string; dealId?: string; projectId?: string } = {},
+  ): Promise<string> {
     const [row] = await handle.db.insert(mailThreads).values({
       subject, lastMessageAt: new Date("2026-08-02T10:00:00Z"), messageCount: 1,
-      archivedAt: archived ? new Date() : null,
+      archivedAt: opts.archived === true ? new Date() : null,
+      contactId: opts.contactId ?? null, dealId: opts.dealId ?? null, projectId: opts.projectId ?? null,
     }).returning();
     if (row === undefined) throw new Error("makeMailThread: no row");
     return row.id;
@@ -239,7 +246,7 @@ describe("search service: mail group", () => {
       });
     }
 
-    const result = await search(handle.db, "quokkaline");
+    const result = await search(handle.db, actorId, "quokkaline");
     expect(() => searchResultsSchema.parse(result)).not.toThrow();
     expect(result.mail.filter((hit) => hit.threadId === threadId)).toHaveLength(1);
   });
@@ -252,7 +259,7 @@ describe("search service: mail group", () => {
         subject: `Bramblewick ${i}`, bodyText: "bramblewick update", snippet: `snippet ${i}`,
       });
     }
-    const result = await search(handle.db, "bramblewick");
+    const result = await search(handle.db, actorId, "bramblewick");
     expect(result.mail).toHaveLength(5);
   });
 
@@ -260,10 +267,10 @@ describe("search service: mail group", () => {
     const accountId = await makeMailAccount();
     const live = await makeMailThread("Fenwold live");
     await makeMailMessage(live, accountId, { subject: "Fenwold", bodyText: "fenwold notes", snippet: "live" });
-    const filed = await makeMailThread("Fenwold filed", true);
+    const filed = await makeMailThread("Fenwold filed", { archived: true });
     await makeMailMessage(filed, accountId, { subject: "Fenwold", bodyText: "fenwold notes", snippet: "filed" });
 
-    const result = await search(handle.db, "fenwold");
+    const result = await search(handle.db, actorId, "fenwold");
     expect(result.mail.map((hit) => hit.threadId)).toEqual([live]);
   });
 
@@ -277,9 +284,88 @@ describe("search service: mail group", () => {
     });
 
     for (const q of ["grimsdale!!", "grimsdale & | contract", '"grimsdale contract"', "grimsdale -unrelated"]) {
-      const result = await search(handle.db, q);
+      const result = await search(handle.db, actorId, q);
       expect(() => searchResultsSchema.parse(result)).not.toThrow();
     }
-    expect((await search(handle.db, "grimsdale!!")).mail.map((hit) => hit.threadId)).toEqual([threadId]);
+    expect((await search(handle.db, actorId, "grimsdale!!")).mail.map((hit) => hit.threadId)).toEqual([threadId]);
+  });
+
+  // Phase 4.2: the mail group is record-scoped per viewer (searchMail's
+  // visibility note). Every other group stays shared CRM data.
+  describe("visibility", () => {
+    let otherId: string;
+    beforeEach(async () => {
+      otherId = (await resolveUser(handle.db, { username: "dana", email: null, fullName: null })).id;
+    });
+
+    async function seedSearchable(subject: string, accountId: string, threadId: string): Promise<void> {
+      await makeMailMessage(threadId, accountId, {
+        subject, bodyText: `${subject} thornapple notes`, snippet: subject,
+      });
+    }
+
+    it("applies the record-visible matrix: shared and deal/project-linked mail is findable, private and auto-linked mail is not", async () => {
+      const priv = await makeMailAccount();
+      const shared = await makeMailAccount({ visibility: "shared" });
+      const contact = await createContact(handle.db, actorId, { firstName: "Ada", lastName: "Marsh" });
+      const deal = await makeDeal("Thornapple renewal");
+      const project = await createProject(handle.db, actorId, { name: "Thornapple rollout" });
+
+      const unlinked = await makeMailThread("Unlinked");
+      await seedSearchable("Unlinked", priv, unlinked);
+      const contactLinked = await makeMailThread("Contact", { contactId: contact.id });
+      await seedSearchable("Contact", priv, contactLinked);
+      const dealLinked = await makeMailThread("Deal", { dealId: deal.id });
+      await seedSearchable("Deal", priv, dealLinked);
+      const projectLinked = await makeMailThread("Project", { projectId: project.id });
+      await seedSearchable("Project", priv, projectLinked);
+      const onShared = await makeMailThread("Shared");
+      await seedSearchable("Shared", shared, onShared);
+
+      const ownHits = (await search(handle.db, actorId, "thornapple")).mail.map((hit) => hit.threadId).sort();
+      expect(ownHits).toEqual([unlinked, contactLinked, dealLinked, projectLinked, onShared].sort());
+      const otherHits = (await search(handle.db, otherId, "thornapple")).mail.map((hit) => hit.threadId).sort();
+      expect(otherHits).toEqual([dealLinked, projectLinked, onShared].sort());
+    });
+
+    it("never matches on an invisible message, even when its thread is visible to the viewer", async () => {
+      const chrisPrivate = await makeMailAccount();
+      const danaOwn = await makeMailAccount({ owner: otherId });
+      // One conversation in two mailboxes: dana's copy never mentions the
+      // term; chris's copy -- the only match -- is private to chris.
+      const threadId = await makeMailThread("Cross");
+      await makeMailMessage(threadId, danaOwn, {
+        subject: "Re: plans", bodyText: "nothing relevant here", snippet: "dana copy",
+      });
+      await makeMailMessage(threadId, chrisPrivate, {
+        subject: "bristlecomb", bodyText: "bristlecomb figures", snippet: "chris only",
+      });
+
+      expect((await search(handle.db, actorId, "bristlecomb")).mail.map((hit) => hit.threadId)).toEqual([threadId]);
+      // The thread being visible to dana does not make chris's message
+      // searchable: the term is applied per message, inside the ranking.
+      expect((await search(handle.db, otherId, "bristlecomb")).mail).toEqual([]);
+    });
+
+    it("represents a visible thread by its best VISIBLE match, not by an invisible stronger one", async () => {
+      const chrisPrivate = await makeMailAccount();
+      const danaOwn = await makeMailAccount({ owner: otherId });
+      const threadId = await makeMailThread("Cross");
+      await makeMailMessage(threadId, danaOwn, {
+        subject: "Re: plans", bodyText: "one mention of saltmarsh", snippet: "dana hit",
+      });
+      // Stronger match, invisible to dana: must neither rank for dana nor
+      // leak its snippet into dana's result row.
+      await makeMailMessage(threadId, chrisPrivate, {
+        subject: "saltmarsh saltmarsh", bodyText: "saltmarsh saltmarsh saltmarsh", snippet: "chris hit",
+      });
+
+      const own = (await search(handle.db, actorId, "saltmarsh")).mail;
+      expect(own.map((hit) => hit.threadId)).toEqual([threadId]);
+      expect(own[0]?.snippet).toBe("chris hit");
+      const other = (await search(handle.db, otherId, "saltmarsh")).mail;
+      expect(other.map((hit) => hit.threadId)).toEqual([threadId]);
+      expect(other[0]?.snippet).toBe("dana hit");
+    });
   });
 });

@@ -823,9 +823,11 @@ export type MailAttachment = z.infer<typeof mailAttachmentSchema>;
 // because every one of them changes on ingest and none is worth a second
 // writer.
 export const mailThreadListItemSchema = mailThreadSchema.extend({
-  /** At least one message in the thread is unseen. */
+  /** At least one message is unseen -- among the messages THIS list's view
+   * shows this viewer (the 4.1 unread-scopes-to-the-view ruling, composed
+   * with the 4.2 visibility predicate; api: mail-threads.ts). */
   unread: z.boolean(),
-  /** The most recent message's snippet (already placeholder-free). */
+  /** The most recent VISIBLE message's snippet (already placeholder-free). */
   snippet: z.string(),
   /**
    * Distinct From addresses, most recent first, capped at five server-side
@@ -836,7 +838,10 @@ export const mailThreadListItemSchema = mailThreadSchema.extend({
    * not everyone on it -- the honest name for what the column contains.
    */
   senders: z.array(mailAddressSchema),
-  /** Every account whose mailbox this thread is visible in. */
+  /** Every account whose mailbox carries this thread -- restricted to the
+   * accounts the VIEWER may see into for this list's scope (own and shared
+   * mailboxes; on record views, a deal/project-linked thread's private
+   * accounts too). */
   accountIds: z.array(z.uuid()),
   /**
    * Phase 4.2: does the viewer own at least one account this thread carries a

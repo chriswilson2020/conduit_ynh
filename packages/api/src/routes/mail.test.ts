@@ -745,12 +745,22 @@ describe("mail thread list route", () => {
 
   // Ingest creates a thread and its first message in one transaction, so this
   // is not a state the app can reach -- but a list row that throws on it
-  // would take the whole inbox down, and a defensive default is cheap.
+  // would take the whole inbox down, and a defensive default is cheap. Since
+  // Phase 4.2 a message-less thread is only VISIBLE at all through a
+  // deal/project link (no message means no account to own or share, so it is
+  // inbox-visible to nobody), so the defensive row is exercised through the
+  // record view that can still reach it -- and the inbox's exclusion of it is
+  // asserted alongside.
   it("renders a thread with no messages instead of failing the page", async () => {
     const a = await app();
-    const threadId = await seedThread({ subject: "Empty", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const deal = await makeDeal(a);
+    const threadId = await seedThread({
+      subject: "Empty", lastMessageAt: new Date("2026-08-02T10:00:00Z"), dealId: deal.id,
+    });
 
-    const response = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/threads?deal_id=${deal.id}`, headers: authHeaders,
+    });
     expect(response.statusCode).toBe(200);
     const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
     const row = body.items.find((t) => t.id === threadId);
@@ -759,6 +769,13 @@ describe("mail thread list route", () => {
     expect(row?.snippet).toBe("");
     expect(row?.senders).toEqual([]);
     expect(row?.accountIds).toEqual([]);
+    // No accounts means no owned account: the fallback must be the honest
+    // false, not a default toward move rights nobody can have.
+    expect(row?.ownedByViewer).toBe(false);
+
+    const inbox = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
+    const inboxBody = listResponseSchema(mailThreadListItemSchema).parse(inbox.json());
+    expect(inboxBody.items.map((t) => t.id)).not.toContain(threadId);
     await a.close();
   });
 
@@ -2110,6 +2127,595 @@ describe("search route: mail group", () => {
     const a = await app();
     const response = await a.inject({ method: "GET", url: "/api/search?q=%20", headers: authHeaders });
     expect(searchResultsSchema.parse(response.json()).mail).toEqual([]);
+    await a.close();
+  });
+});
+
+// --- Visibility (Phase 4.2) -------------------------------------------------
+//
+// The predicate matrix -- (owner | other viewer) x (private | shared account)
+// x (unlinked | contact-linked | deal-linked thread) -- exercised against
+// every read surface: list (inbox and record scopes), detail, all three
+// unread computations, search, and the attachment bytes. chris owns every
+// seeded mailbox; dana is the other authenticated user.
+describe("mail thread visibility", () => {
+  /** Accounts are born private; tests that need the shared arm flip the row
+   * directly (the Settings PATCH that also does this has its own tests). */
+  async function setVisibility(accountId: string, visibility: "private" | "shared"): Promise<void> {
+    await handle.db.update(mailAccounts).set({ visibility }).where(eq(mailAccounts.id, accountId));
+  }
+
+  async function makeProject(a: App): Promise<{ id: string }> {
+    const response = await a.inject({
+      method: "POST", url: "/api/projects", headers: authHeaders, payload: { name: `Rollout ${randomUUID()}` },
+    });
+    expect(response.statusCode).toBe(201);
+    return response.json() as { id: string };
+  }
+
+  async function makeCompany(a: App): Promise<{ id: string }> {
+    const response = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: `Acme ${randomUUID()}` },
+    });
+    expect(response.statusCode).toBe(201);
+    return response.json() as { id: string };
+  }
+
+  async function listIds(a: App, query: string, headers: Record<string, string>): Promise<string[]> {
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/threads${query === "" ? "" : `?${query}`}`, headers,
+    });
+    expect(response.statusCode).toBe(200);
+    return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items.map((t) => t.id);
+  }
+
+  it("shows another user only shared-account threads in the inbox -- no link widens the mailbox view", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const shared = await makeAccount(a, { label: "Team", email: "team@example.com" });
+    await setVisibility(shared.id, "shared");
+    const contact = await makeContact(a);
+    const deal = await makeDeal(a);
+
+    const unlinked = await seedThread({ subject: "Unlinked", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(unlinked, priv.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+    const contactLinked = await seedThread({
+      subject: "Contact", lastMessageAt: new Date("2026-08-02T10:00:00Z"), contactId: contact.id,
+    });
+    await seedMessage(contactLinked, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    const dealLinked = await seedThread({
+      subject: "Deal", lastMessageAt: new Date("2026-08-03T10:00:00Z"), dealId: deal.id,
+    });
+    await seedMessage(dealLinked, priv.id, { sentAt: new Date("2026-08-03T10:00:00Z") });
+    const onShared = await seedThread({ subject: "Shared", lastMessageAt: new Date("2026-08-04T10:00:00Z") });
+    await seedMessage(onShared, shared.id, { sentAt: new Date("2026-08-04T10:00:00Z") });
+
+    // The owner's inbox is untouched by the predicate: every thread is theirs.
+    expect(await listIds(a, "", authHeaders)).toEqual([onShared, dealLinked, contactLinked, unlinked]);
+    // The other user's inbox is a mailbox view: only the shared mailbox's
+    // thread. Neither the auto-shaped contact link nor the deliberate deal
+    // link puts a private conversation in someone else's INBOX.
+    expect(await listIds(a, "", otherHeaders)).toEqual([onShared]);
+    await a.close();
+  });
+
+  it("keeps the deal-link distinction: visible on the deal tab and in search, still absent from the inbox", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const deal = await makeDeal(a);
+    const threadId = await seedThread({
+      subject: "Renewal terms", lastMessageAt: new Date("2026-08-02T10:00:00Z"), dealId: deal.id,
+    });
+    await seedMessage(threadId, priv.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), subject: "Renewal terms",
+      bodyText: "quibbleworth pricing attached", snippet: "quibbleworth pricing",
+    });
+
+    expect(await listIds(a, "", otherHeaders)).toEqual([]);
+    expect(await listIds(a, `deal_id=${deal.id}`, otherHeaders)).toEqual([threadId]);
+    const found = await a.inject({ method: "GET", url: "/api/search?q=quibbleworth", headers: otherHeaders });
+    expect(searchResultsSchema.parse(found.json()).mail.map((hit) => hit.threadId)).toEqual([threadId]);
+    await a.close();
+  });
+
+  it("folds visibility into the folder EXISTS: a split thread does not surface in a folder it has no visible message in", async () => {
+    const a = await app();
+    const chrisPrivate = await makeAccount(a);
+    const danaOwn = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+
+    // The trap shape: dana's own INBOX message plus a Projects message on
+    // chris's private account. Independent folder and visibility EXISTS
+    // would each pass and put the thread in dana's Projects view with
+    // nothing visible there.
+    const split = await seedThread({ subject: "Split", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(split, danaOwn.id, { sentAt: new Date("2026-08-01T10:00:00Z"), folder: "INBOX" });
+    await seedMessage(split, chrisPrivate.id, { sentAt: new Date("2026-08-02T10:00:00Z"), folder: "Projects" });
+
+    expect(await listIds(a, "folder=Projects", otherHeaders)).toEqual([]);
+    expect(await listIds(a, "folder=INBOX", otherHeaders)).toEqual([split]);
+    // The owner's Projects view has it -- the fold is per viewer, not global.
+    expect(await listIds(a, "folder=Projects", authHeaders)).toEqual([split]);
+    await a.close();
+  });
+
+  it("returns nothing for an account filter naming a mailbox the viewer may not see into", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const threadId = await seedThread({ subject: "Mine", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    expect(await listIds(a, `account_id=${priv.id}`, otherHeaders)).toEqual([]);
+    expect(await listIds(a, `account_id=${priv.id}`, authHeaders)).toEqual([threadId]);
+    // Flipping the mailbox to shared is exactly what opens the same filter up.
+    await setVisibility(priv.id, "shared");
+    expect(await listIds(a, `account_id=${priv.id}`, otherHeaders)).toEqual([threadId]);
+    await a.close();
+  });
+
+  it("excludes another user's private unread mail from the unscoped and folder-scoped unread filters", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const shared = await makeAccount(a, { label: "Team", email: "team@example.com" });
+    await setVisibility(shared.id, "shared");
+    const privUnread = await seedThread({ subject: "Private unread", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(privUnread, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
+    const sharedUnread = await seedThread({ subject: "Shared unread", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(sharedUnread, shared.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: false });
+
+    expect(await listIds(a, "unread=true", authHeaders)).toEqual([privUnread, sharedUnread]);
+    expect(await listIds(a, "unread=true", otherHeaders)).toEqual([sharedUnread]);
+    expect(await listIds(a, "folder=INBOX&unread=true", otherHeaders)).toEqual([sharedUnread]);
+    expect(await listIds(a, "folder=INBOX&unread=true", authHeaders)).toEqual([privUnread, sharedUnread]);
+    await a.close();
+  });
+
+  it("never shares through a contact or company link: the record tabs stay owner-and-shared only", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const contact = await makeContact(a);
+    const company = await makeCompany(a);
+    const onContact = await seedThread({
+      subject: "Contact tab", lastMessageAt: new Date("2026-08-02T10:00:00Z"), contactId: contact.id,
+    });
+    await seedMessage(onContact, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    const onCompany = await seedThread({
+      subject: "Company tab", lastMessageAt: new Date("2026-08-01T10:00:00Z"), companyId: company.id,
+    });
+    await seedMessage(onCompany, priv.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+
+    expect(await listIds(a, `contact_id=${contact.id}`, authHeaders)).toEqual([onContact]);
+    expect(await listIds(a, `contact_id=${contact.id}`, otherHeaders)).toEqual([]);
+    expect(await listIds(a, `company_id=${company.id}`, authHeaders)).toEqual([onCompany]);
+    expect(await listIds(a, `company_id=${company.id}`, otherHeaders)).toEqual([]);
+    await a.close();
+  });
+
+  it("shows a deal- or project-linked private thread on its record tab for every user, content included", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const deal = await makeDeal(a);
+    const project = await makeProject(a);
+    const onDeal = await seedThread({
+      subject: "Deal tab", lastMessageAt: new Date("2026-08-02T10:00:00Z"), dealId: deal.id,
+    });
+    await seedMessage(onDeal, priv.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), snippet: "deal snippet", fromAddr: "bob@example.com", fromName: "Bob",
+    });
+    const onProject = await seedThread({
+      subject: "Project tab", lastMessageAt: new Date("2026-08-01T10:00:00Z"), projectId: project.id,
+    });
+    await seedMessage(onProject, priv.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/threads?deal_id=${deal.id}`, headers: otherHeaders,
+    });
+    const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
+    expect(body.items.map((t) => t.id)).toEqual([onDeal]);
+    // Record scope means the linked conversation's content really is shared:
+    // the row renders the private message's snippet, sender and account chip
+    // for the other viewer -- who still owns none of it.
+    expect(body.items[0]?.snippet).toBe("deal snippet");
+    expect(body.items[0]?.senders.map((s) => s.address)).toEqual(["bob@example.com"]);
+    expect(body.items[0]?.accountIds).toEqual([priv.id]);
+    expect(body.items[0]?.ownedByViewer).toBe(false);
+
+    expect(await listIds(a, `project_id=${project.id}`, otherHeaders)).toEqual([onProject]);
+    await a.close();
+  });
+
+  it("keeps a contact tab honest when the thread is ALSO deal-linked: record-visible, so the other user sees it there", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const contact = await makeContact(a);
+    const deal = await makeDeal(a);
+    const threadId = await seedThread({
+      subject: "Both links", lastMessageAt: new Date("2026-08-02T10:00:00Z"),
+      contactId: contact.id, dealId: deal.id,
+    });
+    await seedMessage(threadId, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    // The contact tab filters to contact-linked threads and asks
+    // record-visible of them -- which the deal link satisfies. The sharing
+    // line is the deliberate deal link, not which tab renders the result.
+    expect(await listIds(a, `contact_id=${contact.id}`, otherHeaders)).toEqual([threadId]);
+    await a.close();
+  });
+
+  it("reports ownedByViewer per viewer on the same shared thread", async () => {
+    const a = await app();
+    const shared = await makeAccount(a);
+    await setVisibility(shared.id, "shared");
+    const threadId = await seedThread({ subject: "Shared", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, shared.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    async function ownedFlag(headers: Record<string, string>): Promise<boolean | undefined> {
+      const response = await a.inject({ method: "GET", url: "/api/mail/threads", headers });
+      return listResponseSchema(mailThreadListItemSchema).parse(response.json()).items[0]?.ownedByViewer;
+    }
+    expect(await ownedFlag(authHeaders)).toBe(true);
+    expect(await ownedFlag(otherHeaders)).toBe(false);
+
+    const chrisDetail = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    expect(mailThreadDetailSchema.parse(chrisDetail.json()).ownedByViewer).toBe(true);
+    const danaDetail = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: otherHeaders });
+    expect(mailThreadDetailSchema.parse(danaDetail.json()).ownedByViewer).toBe(false);
+    await a.close();
+  });
+
+  it("renders a cross-account thread's row from the viewer's visible messages only", async () => {
+    const a = await app();
+    const chrisPrivate = await makeAccount(a);
+    const danaOwn = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    // One conversation, two mailboxes: dana's copy is older and read; chris's
+    // copy is newer, unseen, and from a sender dana's mailbox never saw.
+    const threadId = await seedThread({ subject: "Cross", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, danaOwn.id, {
+      sentAt: new Date("2026-08-01T10:00:00Z"), seen: true, snippet: "dana copy",
+      fromAddr: "alice@example.com", fromName: "Alice",
+    });
+    await seedMessage(threadId, chrisPrivate.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, snippet: "chris only",
+      fromAddr: "secret@example.com", fromName: "Secret Sender",
+    });
+
+    const response = await a.inject({ method: "GET", url: "/api/mail/threads", headers: otherHeaders });
+    const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
+    const row = body.items.find((t) => t.id === threadId);
+    // The thread is visible (dana's own mailbox carries it), but the row must
+    // be built from dana's view of it: no snippet, sender, account chip or
+    // unread dot from the message that lives only in chris's private mailbox.
+    expect(row?.snippet).toBe("dana copy");
+    expect(row?.senders.map((s) => s.address)).toEqual(["alice@example.com"]);
+    expect(row?.accountIds).toEqual([danaOwn.id]);
+    expect(row?.unread).toBe(false);
+    expect(row?.ownedByViewer).toBe(true);
+
+    // Symmetric for chris: dana's mailbox is just as private in the other
+    // direction, so chris's row is built from chris's copy alone.
+    const chrisView = await a.inject({ method: "GET", url: "/api/mail/threads", headers: authHeaders });
+    const chrisRow = listResponseSchema(mailThreadListItemSchema).parse(chrisView.json())
+      .items.find((t) => t.id === threadId);
+    expect(chrisRow?.snippet).toBe("chris only");
+    expect(chrisRow?.senders.map((s) => s.address)).toEqual(["secret@example.com"]);
+    expect(chrisRow?.accountIds).toEqual([chrisPrivate.id]);
+    expect(chrisRow?.unread).toBe(true);
+    await a.close();
+  });
+
+  it("404s an invisible thread's detail indistinguishably from a nonexistent one", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const contact = await makeContact(a);
+    const unlinked = await seedThread({ subject: "Private", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(unlinked, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    const contactLinked = await seedThread({
+      subject: "Auto-linked", lastMessageAt: new Date("2026-08-01T10:00:00Z"), contactId: contact.id,
+    });
+    await seedMessage(contactLinked, priv.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+
+    const missing = await a.inject({ method: "GET", url: `/api/mail/threads/${UNKNOWN_ID}`, headers: otherHeaders });
+    expect(missing.statusCode).toBe(404);
+    for (const threadId of [unlinked, contactLinked]) {
+      const hidden = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: otherHeaders });
+      expect(hidden.statusCode).toBe(404);
+      // Identical bodies modulo the id: nothing in the response separates
+      // "hidden from you" from "not there".
+      expect(JSON.stringify(hidden.json()).replaceAll(threadId, UNKNOWN_ID)).toBe(JSON.stringify(missing.json()));
+      // The owner still opens both.
+      const own = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+      expect(own.statusCode).toBe(200);
+    }
+    await a.close();
+  });
+
+  it("opens a deal-linked private thread's detail for another user, messages included", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const deal = await makeDeal(a);
+    const threadId = await seedThread({
+      subject: "Linked", lastMessageAt: new Date("2026-08-02T10:00:00Z"), dealId: deal.id,
+    });
+    const messageId = await seedMessage(threadId, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const response = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: otherHeaders });
+    expect(response.statusCode).toBe(200);
+    const body = mailThreadDetailSchema.parse(response.json());
+    expect(body.messages.map((m) => m.id)).toEqual([messageId]);
+    expect(body.ownedByViewer).toBe(false);
+    await a.close();
+  });
+
+  it("filters invisible messages (and their attachments) out of a visible thread's detail, per viewer", async () => {
+    const a = await app();
+    const chrisPrivate = await makeAccount(a);
+    const danaOwn = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    const threadId = await seedThread({ subject: "Cross", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const danaMessage = await seedMessage(threadId, danaOwn.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+    const chrisMessage = await seedMessage(threadId, chrisPrivate.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    const chrisAttachment = await seedAttachment(chrisMessage, { filename: "secret.pdf" });
+
+    const danaView = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: otherHeaders });
+    const danaBody = mailThreadDetailSchema.parse(danaView.json());
+    expect(danaBody.messages.map((m) => m.id)).toEqual([danaMessage]);
+    expect(JSON.stringify(danaView.json())).not.toContain(chrisAttachment.id);
+
+    // Symmetric: chris's view of the same thread hides dana's private copy.
+    const chrisView = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: authHeaders });
+    expect(mailThreadDetailSchema.parse(chrisView.json()).messages.map((m) => m.id)).toEqual([chrisMessage]);
+    await a.close();
+  });
+
+  it("scopes the badge to the viewer's mailboxes: private and merely deal-linked unread mail never counts for others", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const shared = await makeAccount(a, { label: "Team", email: "team@example.com" });
+    await setVisibility(shared.id, "shared");
+    const deal = await makeDeal(a);
+
+    const privUnread = await seedThread({ subject: "Private", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(privUnread, priv.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: false });
+    const dealUnread = await seedThread({
+      subject: "Deal", lastMessageAt: new Date("2026-08-02T10:00:00Z"), dealId: deal.id,
+    });
+    await seedMessage(dealUnread, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
+    const sharedUnread = await seedThread({ subject: "Shared", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(sharedUnread, shared.id, { sentAt: new Date("2026-08-03T10:00:00Z"), seen: false });
+
+    async function badge(headers: Record<string, string>): Promise<number> {
+      const response = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers });
+      return mailUnreadCountSchema.parse(response.json()).count;
+    }
+    // All three are the owner's own mailboxes.
+    expect(await badge(authHeaders)).toBe(3);
+    // The badge is the inbox's number, and the inbox is a mailbox view: the
+    // deal-linked thread is record-visible to dana but not WAITING for dana.
+    expect(await badge(otherHeaders)).toBe(1);
+    await a.close();
+  });
+
+  it("scopes the per-folder counts to the viewer, leaving private folder names unlisted", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const shared = await makeAccount(a, { label: "Team", email: "team@example.com" });
+    await setVisibility(shared.id, "shared");
+    const privThread = await seedThread({ subject: "Private", lastMessageAt: new Date("2026-08-01T10:00:00Z") });
+    await seedMessage(privThread, priv.id, {
+      sentAt: new Date("2026-08-01T10:00:00Z"), seen: false, folder: "Clients",
+    });
+    const bothThread = await seedThread({ subject: "Both", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(bothThread, priv.id, { sentAt: new Date("2026-08-02T09:00:00Z"), seen: false, folder: "INBOX" });
+    const sharedThread = await seedThread({ subject: "Shared", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(sharedThread, shared.id, { sentAt: new Date("2026-08-03T10:00:00Z"), seen: false, folder: "INBOX" });
+
+    async function folders(headers: Record<string, string>): Promise<Record<string, number>> {
+      const response = await a.inject({ method: "GET", url: "/api/mail/unread-count?byFolder=1", headers });
+      const body = mailUnreadFolderCountsSchema.parse(response.json());
+      return Object.fromEntries(body.folders.map((row) => [row.folder, row.count]));
+    }
+    expect(await folders(authHeaders)).toEqual({ Clients: 1, INBOX: 2 });
+    // dana's sidebar: the private mailbox contributes nothing -- not even the
+    // NAME of its Clients folder -- and INBOX counts only the shared thread.
+    expect(await folders(otherHeaders)).toEqual({ INBOX: 1 });
+    await a.close();
+  });
+
+  it("serves attachment bytes only for a visible thread, on both attachment routes", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const deal = await makeDeal(a);
+    const threadId = await seedThread({ subject: "Files", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const messageId = await seedMessage(threadId, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    const attachment = await seedAttachment(messageId, { filename: "contract.pdf" });
+    const inline = await seedAttachment(messageId, { filename: "logo.png", mime: "image/png", isInline: true });
+
+    for (const url of [`/api/mail/attachments/${attachment.id}`, `/api/mail/attachments/${inline.id}/inline`]) {
+      const hidden = await a.inject({ method: "GET", url, headers: otherHeaders });
+      expect(hidden.statusCode).toBe(404);
+      const own = await a.inject({ method: "GET", url, headers: authHeaders });
+      expect(own.statusCode).toBe(200);
+    }
+
+    // The deliberate deal link shares the conversation -- bytes included.
+    await handle.db.update(mailThreads).set({ dealId: deal.id }).where(eq(mailThreads.id, threadId));
+    const nowVisible = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}`, headers: otherHeaders,
+    });
+    expect(nowVisible.statusCode).toBe(200);
+    expect(nowVisible.body).toBe(attachment.body);
+    await a.close();
+  });
+
+  it("hides an invisible message's attachment even when its thread is visible to the viewer", async () => {
+    const a = await app();
+    const chrisPrivate = await makeAccount(a);
+    const danaOwn = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    const threadId = await seedThread({ subject: "Cross", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, danaOwn.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+    const chrisMessage = await seedMessage(threadId, chrisPrivate.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    const attachment = await seedAttachment(chrisMessage, { filename: "secret.pdf" });
+
+    // Message granularity: dana sees the THREAD (their own mailbox carries
+    // it), but this attachment hangs off the message that lives only in
+    // chris's private mailbox.
+    const hidden = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}`, headers: otherHeaders,
+    });
+    expect(hidden.statusCode).toBe(404);
+    const own = await a.inject({
+      method: "GET", url: `/api/mail/attachments/${attachment.id}`, headers: authHeaders,
+    });
+    expect(own.statusCode).toBe(200);
+    await a.close();
+  });
+
+  it("404s every by-id thread mutation on an invisible thread, writing nothing", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const contact = await makeContact(a);
+    const threadId = await seedThread({ subject: "Private", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
+
+    const attempts = [
+      { method: "POST" as const, url: `/api/mail/threads/${threadId}/read` },
+      { method: "POST" as const, url: `/api/mail/threads/${threadId}/links`, payload: { kind: "contact", id: contact.id } },
+      { method: "DELETE" as const, url: `/api/mail/threads/${threadId}/links/contact` },
+      { method: "POST" as const, url: `/api/mail/threads/${threadId}/archive` },
+      { method: "POST" as const, url: `/api/mail/threads/${threadId}/unarchive` },
+    ];
+    for (const attempt of attempts) {
+      const response = await a.inject({ ...attempt, headers: otherHeaders });
+      expect(response.statusCode).toBe(404);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    }
+    // Nothing changed: still unseen, unarchived, unlinked.
+    const [thread] = await handle.db.select().from(mailThreads).where(eq(mailThreads.id, threadId));
+    expect(thread?.archivedAt).toBeNull();
+    expect(thread?.contactId).toBeNull();
+    const [message] = await handle.db.select().from(mailMessages).where(eq(mailMessages.threadId, threadId));
+    expect(message?.seen).toBe(false);
+    await a.close();
+  });
+
+  it("lets any viewer of a shared thread mark it read -- reading is not a filing act", async () => {
+    const a = await app();
+    const shared = await makeAccount(a);
+    await setVisibility(shared.id, "shared");
+    const threadId = await seedThread({ subject: "Shared", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, shared.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, imapUid: 21 });
+
+    const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: otherHeaders });
+    expect(response.statusCode).toBe(200);
+    const [message] = await handle.db.select().from(mailMessages).where(eq(mailMessages.threadId, threadId));
+    expect(message?.seen).toBe(true);
+    await a.close();
+  });
+
+  it("lights the deal tab's unread dot from the linked private message -- the record view CAN see it", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const deal = await makeDeal(a);
+    const threadId = await seedThread({
+      subject: "Deal", lastMessageAt: new Date("2026-08-02T10:00:00Z"), dealId: deal.id,
+    });
+    await seedMessage(threadId, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
+
+    // Same thread, two scopes, two honest answers: dana's INBOX (a mailbox
+    // view) has no unread here -- no row at all -- while the deal tab (the
+    // CRM view) shows the row unread, because in THAT view the private
+    // message is readable and unseen.
+    const response = await a.inject({
+      method: "GET", url: `/api/mail/threads?deal_id=${deal.id}`, headers: otherHeaders,
+    });
+    const body = listResponseSchema(mailThreadListItemSchema).parse(response.json());
+    expect(body.items[0]?.id).toBe(threadId);
+    expect(body.items[0]?.unread).toBe(true);
+    // ...and the badge still reads 0 for dana: record-visible is not "in my
+    // mailbox" (the badge test above pins the same line from the other side).
+    const badge = await a.inject({ method: "GET", url: "/api/mail/unread-count", headers: otherHeaders });
+    expect(mailUnreadCountSchema.parse(badge.json()).count).toBe(0);
+    await a.close();
+  });
+
+  it("keeps deal-linked private unread mail out of the other user's per-folder counts", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const deal = await makeDeal(a);
+    const threadId = await seedThread({
+      subject: "Deal", lastMessageAt: new Date("2026-08-02T10:00:00Z"), dealId: deal.id,
+    });
+    await seedMessage(threadId, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
+
+    // The sidebar is the mailbox view, like the badge: a deal link makes the
+    // conversation record-visible, not part of dana's mailbox topology.
+    const response = await a.inject({ method: "GET", url: "/api/mail/unread-count?byFolder=1", headers: otherHeaders });
+    expect(mailUnreadFolderCountsSchema.parse(response.json()).folders).toEqual([]);
+    const own = await a.inject({ method: "GET", url: "/api/mail/unread-count?byFolder=1", headers: authHeaders });
+    expect(mailUnreadFolderCountsSchema.parse(own.json()).folders).toEqual([{ folder: "INBOX", count: 1 }]);
+    await a.close();
+  });
+
+  it("applies the same predicate to the hidden list: archived=true shows only what the viewer may see", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const shared = await makeAccount(a, { label: "Team", email: "team@example.com" });
+    await setVisibility(shared.id, "shared");
+    const hiddenPrivate = await seedThread({
+      subject: "Hidden private", lastMessageAt: new Date("2026-08-02T10:00:00Z"), archived: true,
+    });
+    await seedMessage(hiddenPrivate, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+    const hiddenShared = await seedThread({
+      subject: "Hidden shared", lastMessageAt: new Date("2026-08-01T10:00:00Z"), archived: true,
+    });
+    await seedMessage(hiddenShared, shared.id, { sentAt: new Date("2026-08-01T10:00:00Z") });
+
+    expect(await listIds(a, "archived=true", authHeaders)).toEqual([hiddenPrivate, hiddenShared]);
+    expect(await listIds(a, "archived=true", otherHeaders)).toEqual([hiddenShared]);
+    await a.close();
+  });
+
+  it("opens a project-linked private thread for another user -- the record scope's other deliberate arm", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const project = await makeProject(a);
+    const threadId = await seedThread({
+      subject: "Project bound", lastMessageAt: new Date("2026-08-02T10:00:00Z"), projectId: project.id,
+    });
+    await seedMessage(threadId, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const response = await a.inject({ method: "GET", url: `/api/mail/threads/${threadId}`, headers: otherHeaders });
+    expect(response.statusCode).toBe(200);
+    expect(mailThreadDetailSchema.parse(response.json()).thread.id).toBe(threadId);
+    await a.close();
+  });
+
+  it("excludes another user's private mail from search unless deliberately linked or shared", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const shared = await makeAccount(a, { label: "Team", email: "team@example.com" });
+    await setVisibility(shared.id, "shared");
+    const contact = await makeContact(a);
+    const deal = await makeDeal(a);
+
+    async function seedSearchable(subject: string, accountId: string, links: Partial<ThreadSeed> = {}): Promise<string> {
+      const threadId = await seedThread({ subject, lastMessageAt: new Date("2026-08-02T10:00:00Z"), ...links });
+      await seedMessage(threadId, accountId, {
+        sentAt: new Date("2026-08-02T10:00:00Z"), subject, bodyText: `${subject} glimmerfen notes`, snippet: subject,
+      });
+      return threadId;
+    }
+    const unlinked = await seedSearchable("Unlinked", priv.id);
+    const contactLinked = await seedSearchable("Contact", priv.id, { contactId: contact.id });
+    const dealLinked = await seedSearchable("Deal", priv.id, { dealId: deal.id });
+    const onShared = await seedSearchable("Shared", shared.id);
+
+    async function mailHits(headers: Record<string, string>): Promise<string[]> {
+      const response = await a.inject({ method: "GET", url: "/api/search?q=glimmerfen", headers });
+      return searchResultsSchema.parse(response.json()).mail.map((hit) => hit.threadId).sort();
+    }
+    expect(await mailHits(authHeaders)).toEqual([unlinked, contactLinked, dealLinked, onShared].sort());
+    // Search is a CRM surface (record scope): the deliberate deal link and
+    // the shared mailbox are findable, the private and auto-linked mail is not.
+    expect(await mailHits(otherHeaders)).toEqual([dealLinked, onShared].sort());
     await a.close();
   });
 });

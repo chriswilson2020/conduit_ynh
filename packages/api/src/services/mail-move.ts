@@ -41,20 +41,21 @@ import { publish } from "./sse.js";
  * message should look like.
  *
  * ---------------------------------------------------------------------------
- * OWNERSHIP: NONE, DELIBERATELY
+ * OWNERSHIP: NOT YET ON THE MOVE PATHS
  * ---------------------------------------------------------------------------
- * Mail is shared-visibility in this CRM. Every thread route is auth-only
- * (routes/mail.ts), unlike the ACCOUNT routes, which are owner-scoped -- so
- * any user may archive or trash any thread, matching the shared-inbox model
- * the thread list already implements. `actorId` is therefore audit context for
- * the log line and nothing else: it is never a filter, and it is never
- * compared against an account's owner. The IMAP write still happens through
- * EACH MESSAGE'S OWN account's sync loop, under that account's credentials --
- * the actor's identity never reaches a mail server.
+ * Since Phase 4.2's visibility predicate, an actor can only NAME threads the
+ * lists showed them (and the hide path below re-checks that through
+ * mail-threads' visibility gate) -- but on the two MOVE paths `actorId` is
+ * still audit context for the log line and nothing else: it is never a
+ * filter, and it is never compared against an account's owner, so a viewer
+ * of a shared-visible thread can still move its messages. The IMAP write
+ * happens through EACH MESSAGE'S OWN account's sync loop, under that
+ * account's credentials -- the actor's identity never reaches a mail server.
  *
  * Phase 4.2 Task 3 replaces this section: move rights become owner-only, and
  * `actorId` stops being audit-only the moment collectCandidates compares it
- * against each message's account.
+ * against each message's account (skip reason `not_owner`, per the spec's
+ * Move rights section).
  *
  * ---------------------------------------------------------------------------
  * NO INGEST ADVISORY LOCK
@@ -538,7 +539,7 @@ export async function moveThreads(
   let refusedAccounts = 0;
 
   if (input.action === "hide") {
-    await hideThreads(db, unique, outcomes);
+    await hideThreads(db, actorId, unique, outcomes);
   } else {
     // `action` is narrowed to the two MOVE kinds by the branch above, and is
     // passed on explicitly so nothing downstream has to re-establish it.
@@ -588,10 +589,12 @@ export async function moveThreads(
  *
  * Sequential, and one failure does not stop the rest: an unknown id fails ITS
  * thread and the others still hide, which is the partial-failure shape the
- * bulk contract promises. AN UNKNOWN ID IS THE ONLY per-thread failure this
- * path has, so it is the only one caught: anything else (the database went
- * away mid-batch) is not a fact about one thread, has no honest `reason` code
- * to carry, and is re-thrown to become the 500 it is.
+ * bulk contract promises. THE NotFoundError IS THE ONLY per-thread failure
+ * this path has, so it is the only one caught -- since Phase 4.2 it covers
+ * both an unknown id and a thread the actor cannot see, which mail-threads'
+ * mustGetThread deliberately reports identically. Anything else (the
+ * database went away mid-batch) is not a fact about one thread, has no
+ * honest `reason` code to carry, and is re-thrown to become the 500 it is.
  *
  * ONE SSE HINT FOR THE BATCH, not one per thread: archiveThread's own hint is
  * suppressed and this publishes a single frame carrying every hidden thread's
@@ -603,11 +606,13 @@ export async function moveThreads(
  * the per-thread path would have published none. One redundant refetch round
  * per request the user explicitly made is a better trade than 200 frames.
  */
-async function hideThreads(db: Database, threadIds: readonly string[], outcomes: Outcomes): Promise<void> {
+async function hideThreads(
+  db: Database, actorId: string, threadIds: readonly string[], outcomes: Outcomes,
+): Promise<void> {
   const hidden = new Set<string>();
   for (const threadId of threadIds) {
     try {
-      await archiveThread(db, threadId, { publishHint: false });
+      await archiveThread(db, actorId, threadId, { publishHint: false });
       outcomes.succeed(threadId);
       hidden.add(threadId);
     } catch (error) {

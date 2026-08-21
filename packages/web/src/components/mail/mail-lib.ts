@@ -1111,10 +1111,11 @@ function folderRank(row: SidebarFolderRow): number {
  * THE JOIN DIRECTION IS THE CONTRACT (Task 4's handover). `counts` is a plain
  * group-by over unread mail with no accountId on it, so it can carry folders
  * this account has switched off, folders that have VANISHED from the server,
- * and folders belonging to somebody else's account entirely -- mail is
- * shared-visibility here and the counts are not owner-scoped. Iterating the
- * FOLDERS and looking counts up is what makes an unmatched count row a
- * non-event rather than a phantom sidebar entry. The same shape means two
+ * and (since Phase 4.2, within what the viewer may see -- the server scopes
+ * the counts to the viewer's own and shared accounts) folders belonging to a
+ * SHARED account of somebody else's entirely. Iterating the FOLDERS and
+ * looking counts up is what makes an unmatched count row a non-event rather
+ * than a phantom sidebar entry. The same shape means two
  * accounts' INBOXes share one count row; single-account installs (this
  * release's target) are unaffected, and a per-account badge would need an
  * account-scoped variant of the endpoint that v0.6.0 does not have.

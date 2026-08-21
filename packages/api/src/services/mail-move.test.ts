@@ -17,10 +17,13 @@ let unsubscribe: () => void;
 beforeEach(async () => {
   await truncateAll(handle);
   userId = (await resolveUser(handle.db, { username: "chris", email: null, fullName: null })).id;
-  // Any user may act on any thread -- mail is shared-visibility, and actorId
-  // is audit context only (see the service's OWNERSHIP note). A second user
-  // acting on the first's account is therefore the ordinary case, not an
-  // authorization test.
+  // A second user acting on the first's account: still the shape of every
+  // MOVE test here (actorId is audit context for the move paths until Task 3
+  // lands owner-only move rights -- see the service's OWNERSHIP note). The
+  // HIDE path is different since Phase 4.2: it resolves its thread through
+  // mail-threads' visibility gate, so the hide tests below make sam a real
+  // viewer (a shared account) rather than relying on the old
+  // everything-is-shared default.
   actorId = (await resolveUser(handle.db, { username: "sam", email: null, fullName: null })).id;
   hints = [];
   unsubscribe = subscribe((hint) => { hints.push(hint); });
@@ -856,7 +859,10 @@ describe("moveThreads: the summary line", () => {
 
 describe("moveThreads: hide", () => {
   it("archives the threads CRM-side and touches no mailbox", async () => {
-    const accountId = await makeAccount();
+    // Shared account: sam (the actor) is a viewer of these threads, which is
+    // what "Hide-in-CRM stays available to every viewer" means -- hide's
+    // thread lookup goes through the Phase 4.2 visibility gate.
+    const accountId = await makeAccount({ visibility: "shared" });
     const first = await makeThread("one");
     const second = await makeThread("two");
     await makeMessage({ threadId: first, accountId, folder: "INBOX", imapUid: 141 });
@@ -888,7 +894,9 @@ describe("moveThreads: hide", () => {
   });
 
   it("fails an unknown thread and still hides the others", async () => {
+    const accountId = await makeAccount({ visibility: "shared" });
     const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 151 });
     const missing = "00000000-0000-4000-8000-000000000001";
 
     const result = await moveThreads(
@@ -899,5 +907,25 @@ describe("moveThreads: hide", () => {
     expect(result.results[0]?.error).toContain("not found");
     expect(result.results[1]).toEqual({ threadId, ok: true });
     expect((await threadRow(threadId))?.archivedAt).not.toBeNull();
+  });
+
+  // The same NotFoundError, from the same seam (mail-threads' mustGetThread):
+  // "a thread the actor cannot see" and "no such thread" are one per-thread
+  // failure, indistinguishable by design -- hide never confirms the existence
+  // of someone else's private conversation.
+  it("fails a thread the actor cannot see exactly like an unknown one", async () => {
+    const privateAccount = await makeAccount();
+    const invisible = await makeThread("private to chris");
+    await makeMessage({ threadId: invisible, accountId: privateAccount, folder: "INBOX", imapUid: 152 });
+
+    const result = await moveThreads(
+      handle.db, actorId, { threadIds: [invisible], action: "hide" }, deps(null),
+    );
+
+    expect(result.results[0]?.ok).toBe(false);
+    expect(result.results[0]?.reason).toBe("not_found");
+    expect(result.results[0]?.error).toContain("not found");
+    // Nothing was hidden: the flag is untouched.
+    expect((await threadRow(invisible))?.archivedAt).toBeNull();
   });
 });

@@ -237,13 +237,14 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * Owner-only, exactly like the account routes above and unlike every THREAD
    * route -- these rows are part of an account's SETTINGS (what it syncs, what
    * its server's mailbox topology looks like), and settings belong to their
-   * owner. Not a secrecy claim about the names themselves: mail is
-   * shared-visibility here, so any authenticated user can already see a folder
-   * name on a message row or in a folder filter. What owner-scoping protects
-   * is the picker's configuration surface and the shape of someone else's
-   * mailbox, including folders that hold no CRM mail at all. A foreign id 404s
-   * the same way a nonexistent one does (mail-folders.ts's
-   * mustGetOwnedAccount), so the two cannot be told apart.
+   * owner. Since Phase 4.2 the visibility model agrees with this scoping from
+   * the other side too: a PRIVATE account's folder names no longer surface to
+   * other users anywhere (message rows, folder filters and the per-folder
+   * counts are all predicate-scoped), while a shared account's folder names
+   * ride its visible messages -- but its SETTINGS surface here stays
+   * owner-only either way. A foreign id 404s the same way a nonexistent one
+   * does (mail-folders.ts's mustGetOwnedAccount), so the two cannot be told
+   * apart.
    *
    * `locked` on each row is computed by the service from the account's CURRENT
    * sent_folder and is not a column -- see isLocked for why storing it would
@@ -331,15 +332,20 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
 
   // --- Threads -------------------------------------------------------------
 
+  // Every thread route passes the authenticated user's id into the service:
+  // Phase 4.2's visibility predicate scopes what each viewer's queries return
+  // (services/mail-threads.ts's predicate header), so the actor is a real
+  // parameter of every mail read now, not just audit context.
   app.get("/api/mail/threads", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const query = parseOrReject(threadListQuerySchema, request.query, reply);
     if (query === undefined) return;
     // The mail list pages by (last_message_at, id), so a created_at cursor
     // minted by any other list must be rejected here rather than silently
     // paging from a timestamp that means something else.
     if (!validateCursor(query.cursor, reply, decodeLastMessageAtCursor)) return;
-    return listThreads(db, {
+    return listThreads(db, user.id, {
       accountId: query.account_id, unread: query.unread, unlinked: query.unlinked,
       companyId: query.company_id, contactId: query.contact_id,
       dealId: query.deal_id, projectId: query.project_id,
@@ -349,14 +355,15 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   });
 
   app.get("/api/mail/threads/:id", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
     try {
       // basePath, not a hardcoded prefix: stored body_html carries
       // `mailattachment:` placeholders and is resolved to real routes here,
       // at serve time, so a `yunohost app change_url` needs no migration.
-      return await getThreadDetail(db, params.id, basePath);
+      return await getThreadDetail(db, user.id, params.id, basePath);
     } catch (error) {
       mapDomainError(reply, error);
     }
@@ -377,12 +384,13 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * answer is about the CRM's own state.
    */
   app.post("/api/mail/threads/:id/read", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
     let result;
     try {
-      result = await markThreadRead(db, params.id);
+      result = await markThreadRead(db, user.id, params.id);
     } catch (error) {
       mapDomainError(reply, error);
       return;
@@ -410,24 +418,26 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   });
 
   app.post("/api/mail/threads/:id/links", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
     const input = parseOrReject(threadLinksInputSchema, request.body, reply);
     if (input === undefined) return;
     try {
-      return await setThreadLink(db, params.id, input.kind, input.id);
+      return await setThreadLink(db, user.id, params.id, input.kind, input.id);
     } catch (error) {
       mapDomainError(reply, error);
     }
   });
 
   app.delete("/api/mail/threads/:id/links/:kind", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const params = parseOrReject(linkKindParamSchema, request.params, reply);
     if (params === undefined) return;
     try {
-      return await clearThreadLink(db, params.id, params.kind);
+      return await clearThreadLink(db, user.id, params.id, params.kind);
     } catch (error) {
       mapDomainError(reply, error);
     }
@@ -435,22 +445,24 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
 
   // CRM-side only: nothing is moved or expunged on the IMAP server.
   app.post("/api/mail/threads/:id/archive", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
     try {
-      return await archiveThread(db, params.id);
+      return await archiveThread(db, user.id, params.id);
     } catch (error) {
       mapDomainError(reply, error);
     }
   });
 
   app.post("/api/mail/threads/:id/unarchive", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
     try {
-      return await unarchiveThread(db, params.id);
+      return await unarchiveThread(db, user.id, params.id);
     } catch (error) {
       mapDomainError(reply, error);
     }
@@ -468,11 +480,12 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * list of visibly unread mail is a lie.
    */
   app.get("/api/mail/unread-count", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const query = parseOrReject(unreadCountQuerySchema, request.query, reply);
     if (query === undefined) return;
-    if (query.byFolder === "1") return { folders: await unreadCountsByFolder(db) };
-    return { count: await unreadThreadCount(db) };
+    if (query.byFolder === "1") return { folders: await unreadCountsByFolder(db, user.id) };
+    return { count: await unreadThreadCount(db, user.id) };
   });
 
   /**
@@ -480,10 +493,14 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * server, "Hide in CRM" sets the pre-4.1 CRM-side thread archive
    * (services/mail-move.ts owns all three).
    *
-   * AUTH-ONLY, not owner-scoped, like every other thread route: mail is
-   * shared-visibility in this CRM, and the IMAP write still happens through
-   * each message's own account's sync loop under that account's credentials.
-   * The user id is audit context for the service's log line.
+   * AUTH-ONLY at the route, like every other thread route: visibility is
+   * enforced by the predicate the lists apply (a caller cannot NAME a thread
+   * id no predicate-filtered list ever showed them, and probing ids meets
+   * mustGetThread's indistinguishable 404 on the by-id routes), and the IMAP
+   * write still happens through each message's own account's sync loop under
+   * that account's credentials. The user id is audit context for the
+   * service's log line until Phase 4.2 Task 3 lands the owner-only move
+   * filter, which makes it a real input to candidate eligibility.
    *
    * ALWAYS 200 WHEN THE REQUEST ITSELF WAS VALID. Per-thread failures ride
    * INSIDE the body (`{threadId, ok, skipped?, error?}` per requested id, in
@@ -572,9 +589,11 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   // --- Attachments ---------------------------------------------------------
 
   async function serveAttachment(
-    reply: FastifyReply, id: string, mode: "download" | "inline",
+    reply: FastifyReply, userId: string, id: string, mode: "download" | "inline",
   ): Promise<unknown> {
-    const attachment = await getAttachmentBlob(db, id, { inlineOnly: mode === "inline" });
+    // userId feeds the visibility check inside getAttachmentBlob: attachment
+    // bytes are as scoped as the thread detail that lists them.
+    const attachment = await getAttachmentBlob(db, userId, id, { inlineOnly: mode === "inline" });
     // Always, on both routes: whatever Content-Type is declared below, a
     // browser must never be allowed to sniff its way to a different one.
     reply.header("X-Content-Type-Options", "nosniff");
@@ -598,11 +617,12 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   }
 
   app.get("/api/mail/attachments/:id", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
     try {
-      return await serveAttachment(reply, params.id, "download");
+      return await serveAttachment(reply, user.id, params.id, "download");
     } catch (error) {
       mapDomainError(reply, error);
     }
@@ -616,11 +636,12 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   // the session cookie and reach this route through the SSOwat proxy the way
   // any other request does.
   app.get("/api/mail/attachments/:id/inline", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const params = parseOrReject(idParamSchema, request.params, reply);
     if (params === undefined) return;
     try {
-      return await serveAttachment(reply, params.id, "inline");
+      return await serveAttachment(reply, user.id, params.id, "inline");
     } catch (error) {
       mapDomainError(reply, error);
     }

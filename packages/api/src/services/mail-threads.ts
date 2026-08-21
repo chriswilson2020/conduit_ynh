@@ -17,17 +17,20 @@ import { decodeLastMessageAtCursor, encodeCursor } from "./pagination.js";
 import { publish } from "./sse.js";
 
 /**
- * Threads are SHARED, exactly like companies/contacts/deals: every
- * authenticated user sees every thread (Phase 4 spec, "a conversation two
- * users are both on is one thread" -- there is no per-user visibility column
- * on mail_threads to scope by). Owner checks in this file would therefore be
- * theatre; the only owner-scoped mail surfaces are ACCOUNTS (settings and
- * credentials) and SEND (whose From address is someone's identity), both of
- * which live in mail-accounts.ts / mail-send.ts.
+ * Threads are PRIVATE BY DEFAULT, per account (Phase 4.2): what a viewer may
+ * read is decided by mail_accounts.visibility and the deliberate deal/project
+ * links, through the one predicate pair below (visibleMessageTerm /
+ * visibleThreads -- see their shared header for the model). Every read path
+ * in this file therefore takes the requesting user's id as an explicit
+ * parameter -- threaded from the route's requireUser, never ambient -- and so
+ * does every thread mutation, because each one returns the thread row and a
+ * write that echoes a row back is a read path too. Threads themselves are
+ * still global rows ("a conversation two users are both on is one thread");
+ * visibility is a per-viewer FILTER over them, never a column on the thread.
  *
- * Phase 4.2 Task 2 replaces this section: mail_accounts.visibility ends
- * unconditional sharing, and every read path in this file gets an actor and
- * a predicate.
+ * The other owner-scoped mail surfaces are unchanged from Phase 4: ACCOUNTS
+ * (settings and credentials) and SEND (whose From address is someone's
+ * identity) live in mail-accounts.ts / mail-send.ts.
  */
 
 /** Every mail-thread mutation invalidates the same three key families: the
@@ -211,6 +214,74 @@ function trimmedTrashFolder(): SQL {
 }
 
 /**
+ * WHO MAY SEE A MAIL THREAD (Phase 4.2). Two scopes, fixed by the spec's
+ * predicate table, one helper pair carrying both -- the notInAccountTrash
+ * pattern: built once here, composed into every read path rather than
+ * re-derived per query.
+ *
+ * - inbox-visible(U, T): T carries at least one message on an account U owns,
+ *   or on an account whose visibility is 'shared'. The inbox is a MAILBOX
+ *   view (coordinator ruling): the thread list's folder/inbox surfaces, the
+ *   nav badge and the sidebar's per-folder counts all use this scope -- so a
+ *   thread someone else deliberately linked to a deal still never appears in
+ *   YOUR inbox, because it is not in your mailbox.
+ * - record-visible(U, T): inbox-visible(U, T) OR the thread is linked to a
+ *   deal or project. Records are the CRM view, and a deal/project link is
+ *   always a deliberate, click-made act (ingest's auto-linker writes only
+ *   contact/company) whose meaning is exactly "this conversation is part of
+ *   the record's history". Contact/company links NEVER widen visibility --
+ *   auto-linking must not quietly share a private mailbox.
+ *
+ * The pair differs in GRANULARITY, and both granularities are load-bearing:
+ *
+ * - visibleMessageTerm: one MESSAGE is visible -- its account is the
+ *   viewer's or shared, or (record scope) its thread carries a deal/project
+ *   link. Two distinct jobs. First, it is the term that must FOLD INTO any
+ *   EXISTS that already scopes messages by folder/account, on the SAME row
+ *   (see listThreads' one-subquery note -- a separate visibility EXISTS
+ *   would readmit the split-thread trap). Second, it is what every
+ *   content-RENDERING query filters by (snippet, senders, detail messages,
+ *   attachment bytes): a visible thread can still carry messages the viewer
+ *   may NOT see -- its other half lives in someone else's private mailbox --
+ *   and a thread-granularity check alone would render their content anyway.
+ * - visibleThreads: one THREAD is visible -- the self-contained
+ *   EXISTS-over-messages form, for queries that select from mail_threads
+ *   with no message scope of their own (the unscoped list, mustGetThread).
+ *
+ * A thread with NO messages at all (unreachable through ingest, but the list
+ * renders it defensively) is inbox-visible to nobody -- there is no account
+ * to own or share -- and record-visible only through a deal/project link.
+ */
+export type MailVisibilityScope = "inbox" | "record";
+
+function ownedOrShared(userId: string): SQL {
+  return sql`(${mailAccounts.userId} = ${userId} OR ${mailAccounts.visibility} = 'shared')`;
+}
+
+/** The record scope's widening term. deal_id/project_id live on mail_threads,
+ * so a query composing the record scope must have mail_threads in scope --
+ * joined, or correlated from an outer query. */
+function recordLinked(): SQL {
+  return sql`(${mailThreads.dealId} IS NOT NULL OR ${mailThreads.projectId} IS NOT NULL)`;
+}
+
+/** Message granularity. Requires mail_accounts joined to the message row;
+ * record scope additionally requires mail_threads in scope (see recordLinked).
+ * Exported for the one mail read path outside this file: search.ts's mail
+ * group, which composes it into its own per-message query. */
+export function visibleMessageTerm(userId: string, scope: MailVisibilityScope): SQL {
+  if (scope === "inbox") return ownedOrShared(userId);
+  return sql`(${ownedOrShared(userId)} OR ${recordLinked()})`;
+}
+
+/** Thread granularity, correlated to an outer mail_threads row. */
+function visibleThreads(userId: string, scope: MailVisibilityScope): SQL {
+  const carried = sql`EXISTS (SELECT 1 FROM ${mailMessages} JOIN ${mailAccounts} ON ${mailAccounts.id} = ${mailMessages.accountId} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${ownedOrShared(userId)})`;
+  if (scope === "inbox") return carried;
+  return sql`(${carried} OR ${recordLinked()})`;
+}
+
+/**
  * The VIEW a list request is showing, as far as "unread" is concerned: the
  * folder filter it carries, and the account filter alongside it.
  *
@@ -258,6 +329,7 @@ interface ThreadAggregates {
   snippet: string;
   senders: MailAddress[];
   accountIds: string[];
+  ownedByViewer: boolean;
 }
 
 /**
@@ -271,27 +343,52 @@ interface ThreadAggregates {
  * them: measured at 5,147 rows for one 50-thread page containing a single
  * mailing-list thread. The fix is to ask each question at its own
  * granularity.
+ *
+ * ALL THREE queries filter by visibleMessageTerm in the LIST'S OWN SCOPE,
+ * and for the snippet and senders queries that filter is a content guard,
+ * not bookkeeping: a thread can be visible while some of its messages are
+ * not (the cross-account conversation whose other half lives in someone
+ * else's private mailbox), and without the term a visible row would render
+ * an invisible message's snippet and senders. The thread-level predicate the
+ * page's rows already passed cannot prevent that -- only a per-message
+ * filter can. Every thread that passed the list's predicate has >= 1 message
+ * passing this term in the same scope (the predicate's EXISTS names such a
+ * message), so the filter can empty a grouped row only for the no-messages
+ * thread, which the ?? fallbacks below already cover.
  */
 async function loadAggregates(
-  db: Database, threadIds: string[], view: UnreadScope,
+  db: Database, userId: string, threadIds: string[], view: UnreadScope, scope: MailVisibilityScope,
 ): Promise<Map<string, ThreadAggregates>> {
   const byThread = new Map<string, ThreadAggregates>();
   if (threadIds.length === 0) return byThread;
 
-  // 1. One grouped row per thread for the two set-wide facts.
+  // 1. One grouped row per thread for the three set-wide facts.
   //
   //    The unread flag answers whichever question the LIST is asking -- see
   //    the two scopes on notInAccountTrash. In a folder view it is "unseen in
   //    THIS folder" (so the Trash view's dots match the Trash badge, instead of
   //    every row claiming to be read under a badge that says otherwise); with
   //    no folder it is "unseen anywhere except a Trash", which is the badge's
-  //    own question and the reason for the join to mail_accounts.
+  //    own question. Either way it is computed over the view's VISIBLE
+  //    messages only (the WHERE below), so an unseen message the viewer
+  //    cannot read never lights a dot for them.
   //
-  //    `accountIds` is deliberately NOT scoped by either. That field says which
-  //    mailboxes a thread is visible in, for the account chips, and a thread
-  //    whose only message on one account now sits in that account's Trash is
-  //    still a thread that account has -- the chip is about provenance, not
-  //    about unread.
+  //    `accountIds` is deliberately NOT scoped by folder or unread-ness. That
+  //    field says which mailboxes a thread is visible in, for the account
+  //    chips, and a thread whose only message on one account now sits in that
+  //    account's Trash is still a thread that account has -- the chip is
+  //    about provenance, not about unread. It IS visibility-filtered like
+  //    everything here: a private account the viewer may not see into is not
+  //    one of their chips.
+  //
+  //    `ownedByViewer` rides the same pass (the shared schema's contract:
+  //    same aggregate computation as accountIds). Owned accounts are a subset
+  //    of visible ones in either scope, so computing it over the filtered set
+  //    loses nothing.
+  //
+  //    The mail_threads join exists for the record scope's deal/project term
+  //    (see recordLinked); in inbox scope it is a no-op PK join over a page
+  //    of rows.
   const grouped = await db.select({
     threadId: mailMessages.threadId,
     unread: sql<boolean>`bool_or(NOT ${mailMessages.seen} AND ${unreadPredicate(view)})`,
@@ -300,46 +397,56 @@ async function loadAggregates(
     // otherwise be stable only by accident of the plan. By contract, not by
     // luck.
     accountIds: sql<string[]>`array_agg(DISTINCT ${mailMessages.accountId} ORDER BY ${mailMessages.accountId})`,
+    ownedByViewer: sql<boolean>`bool_or(${mailAccounts.userId} = ${userId})`,
   }).from(mailMessages)
     .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
-    .where(inArray(mailMessages.threadId, threadIds))
+    .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
+    .where(and(inArray(mailMessages.threadId, threadIds), visibleMessageTerm(userId, scope)))
     .groupBy(mailMessages.threadId);
 
-  // 2. The newest message per thread, for its snippet alone. DISTINCT ON
-  //    keyed on thread_id, so this is one row per thread -- the snippet is a
-  //    wide-ish column and there is no reason to fetch it for every message.
+  // 2. The newest VISIBLE message per thread, for its snippet alone. DISTINCT
+  //    ON keyed on thread_id, so this is one row per thread -- the snippet is
+  //    a wide-ish column and there is no reason to fetch it for every message.
   const latest = await db.selectDistinctOn([mailMessages.threadId], {
     threadId: mailMessages.threadId,
     snippet: mailMessages.snippet,
-  }).from(mailMessages).where(inArray(mailMessages.threadId, threadIds))
+  }).from(mailMessages)
+    .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
+    .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
+    .where(and(inArray(mailMessages.threadId, threadIds), visibleMessageTerm(userId, scope)))
     .orderBy(mailMessages.threadId, desc(mailMessages.sentAt), desc(mailMessages.id));
   const snippetByThread = new Map(latest.map((row) => [row.threadId, row.snippet]));
 
-  // 3. Up to MAX_SENDERS distinct senders per thread, most recent first. A
-  //    CROSS JOIN LATERAL because the LIMIT has to apply PER THREAD: the
-  //    inner DISTINCT ON collapses each sender to their newest message, and
-  //    the wrapper then takes the newest few of those. Written as raw SQL
-  //    because drizzle's builder has no lateral join.
+  // 3. Up to MAX_SENDERS distinct VISIBLE senders per thread, most recent
+  //    first. A CROSS JOIN LATERAL because the LIMIT has to apply PER THREAD:
+  //    the inner DISTINCT ON collapses each sender to their newest message,
+  //    and the wrapper then takes the newest few of those. Written as raw SQL
+  //    because drizzle's builder has no lateral join. mail_threads is
+  //    deliberately NOT aliased, so visibleMessageTerm's correlated
+  //    references resolve to the outer row and the term composes here
+  //    verbatim instead of being hand-copied in alias spelling.
   //
   //    The id list is interpolated as individual bound parameters rather than
   //    an array literal -- it is at most MAX_LIMIT long, and this sidesteps
   //    array-type inference entirely.
   const idList = sql.join(threadIds.map((id) => sql`${id}::uuid`), sql`, `);
   const senders = await db.execute<{ thread_id: string; from_addr: string; from_name: string | null }>(sql`
-    SELECT t.id AS thread_id, s.from_addr, s.from_name
-    FROM mail_threads t
+    SELECT ${mailThreads.id} AS thread_id, s.from_addr, s.from_name
+    FROM ${mailThreads}
     CROSS JOIN LATERAL (
       SELECT d.from_addr, d.from_name
       FROM (
-        SELECT DISTINCT ON (lower(m.from_addr)) m.from_addr, m.from_name, m.sent_at, m.id
-        FROM mail_messages m
-        WHERE m.thread_id = t.id
-        ORDER BY lower(m.from_addr), m.sent_at DESC, m.id DESC
+        SELECT DISTINCT ON (lower(${mailMessages.fromAddr}))
+          ${mailMessages.fromAddr}, ${mailMessages.fromName}, ${mailMessages.sentAt}, ${mailMessages.id}
+        FROM ${mailMessages}
+        JOIN ${mailAccounts} ON ${mailAccounts.id} = ${mailMessages.accountId}
+        WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${visibleMessageTerm(userId, scope)}
+        ORDER BY lower(${mailMessages.fromAddr}), ${mailMessages.sentAt} DESC, ${mailMessages.id} DESC
       ) d
       ORDER BY d.sent_at DESC, d.id DESC
       LIMIT ${MAX_SENDERS}
     ) s
-    WHERE t.id IN (${idList})
+    WHERE ${mailThreads.id} IN (${idList})
   `);
   const sendersByThread = new Map<string, MailAddress[]>();
   for (const row of senders) {
@@ -355,6 +462,7 @@ async function loadAggregates(
       snippet: snippetByThread.get(row.threadId) ?? "",
       senders: sendersByThread.get(row.threadId) ?? [],
       accountIds: row.accountIds,
+      ownedByViewer: row.ownedByViewer,
     });
   }
   return byThread;
@@ -375,9 +483,21 @@ async function loadAggregates(
  * surprising thing for a checkbox to do.
  */
 export async function listThreads(
-  db: Database, opts: ListThreadsOptions = {},
+  db: Database, userId: string, opts: ListThreadsOptions = {},
 ): Promise<{ items: MailThreadListItem[]; nextCursor: string | null }> {
   const limit = Math.min(opts.limit ?? DEFAULT_LIMIT, MAX_LIMIT);
+  // One endpoint, two surfaces, two scopes (the spec's predicate table): a
+  // request filtering by any of the four record links IS a record Mail tab
+  // (the CRM view -- deliberately deal/project-linked threads from someone
+  // else's private mailbox belong there), and everything else is an
+  // inbox/folder view (the mailbox view -- they do not). The contact/company
+  // tabs' "restricted to threads linked to that record" half is the filter
+  // itself; record scope is what it may see within that restriction, and a
+  // contact link alone never satisfies record-visible, so another user's
+  // private threads stay off a contact tab even though auto-linking put the
+  // link there.
+  const scope: MailVisibilityScope =
+    opts.companyId || opts.contactId || opts.dealId || opts.projectId ? "record" : "inbox";
   const where = [opts.archived ? isNotNull(mailThreads.archivedAt) : isNull(mailThreads.archivedAt)];
   if (opts.companyId) where.push(eq(mailThreads.companyId, opts.companyId));
   if (opts.contactId) where.push(eq(mailThreads.contactId, opts.contactId));
@@ -427,25 +547,69 @@ export async function listThreads(
   // Projects; a second, independent EXISTS would match a thread with an unseen
   // message in INBOX and a read one in Projects, which is the same
   // each-clause-passes-separately trap as the cross-account case above.
+  //
+  // THE VISIBILITY TERM RIDES THIS SAME SUBQUERY TOO, for exactly the same
+  // reason -- it is one more column test that must hold on the SAME row. A
+  // thread with a Projects message on someone else's private account and an
+  // INBOX message on the viewer's own account passes a folder EXISTS and a
+  // separate visibility EXISTS independently, and would surface in the
+  // viewer's Projects view with nothing they can see there. Folded, the test
+  // is "a message in Projects THAT THE VIEWER MAY SEE", which is what the
+  // folder sidebar means. The message-granularity term also subsumes the
+  // thread-level predicate here (any witnessing row proves the thread
+  // visible in this scope), so no visibleThreads term is added alongside --
+  // that one belongs to the else-branch, where no message subquery exists to
+  // fold into.
+  //
+  // COST OF THE FOLD, measured on 0005's methodology (20,000 threads /
+  // 82,000 messages, 2 accounts owned by two users, both private, viewer
+  // owning one; top-level Limit node time and buffers, warm, same dataset
+  // for before/after). The folded subquery reads account_id, which
+  // mail_messages_folder_thread_idx (drizzle/0005) does not carry -- but the
+  // feared regression toward 0005's 61.5ms class never appears, because the
+  // accounts join BINDS account_id and unlocks 0004's (account_id, folder,
+  // imap_uid) index, so the planner drives folder probes from the one or two
+  // visible account rows instead:
+  //   * 60-old-threads folder (0005's worst case), visible arm:
+  //     0.72ms / 191 buffers folder-only -> 0.54ms / 187 folded;
+  //   * a folder existing only in the other user's private mailbox:
+  //     0.10ms / 3 buffers, zero rows;
+  //   * INBOX: 0.36ms / 157 -> 0.83ms / 411; a ~1.8k-thread spread folder:
+  //     1.26ms / 1,673 -> 3.2ms / 3,484 (the planner switches to per-thread
+  //     mail_messages_thread_id_idx probes) -- the real price, roughly 2x
+  //     buffers on probe-heavy views, accepted at self-hosted scale;
+  //   * empty folder: 0.05ms / 3 (folder_thread_idx still proves absence).
+  // A candidate replacement index (folder, thread_id) INCLUDE (account_id)
+  // was measured too: spread folder 265 buffers but 6.1ms (plan flip to hash
+  // semi join over a seq scan plus sort), INBOX 0.56ms / 361 -- no decisive
+  // win, so 0006 adds no index. The unscoped shapes below measured 0.46ms
+  // (visibleThreads EXISTS) and 1.26ms (?unread=true, Heap Fetches: 0 on the
+  // unseen INCLUDE index) on the same dataset.
   const scoped = opts.folder !== undefined;
   if (opts.accountId !== undefined || opts.folder !== undefined) {
     const terms: SQL[] = [sql`${mailMessages.threadId} = ${mailThreads.id}`];
     if (opts.accountId !== undefined) terms.push(sql`${mailMessages.accountId} = ${opts.accountId}`);
     if (opts.folder !== undefined) terms.push(sql`${mailMessages.folder} = ${opts.folder}`);
     if (opts.unread && scoped) terms.push(sql`${mailMessages.seen} = false`);
-    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} WHERE ${sql.join(terms, sql` AND `)})`);
+    terms.push(visibleMessageTerm(userId, scope));
+    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} JOIN ${mailAccounts} ON ${mailAccounts.id} = ${mailMessages.accountId} WHERE ${sql.join(terms, sql` AND `)})`);
+  } else {
+    where.push(visibleThreads(userId, scope));
   }
   // The UNSCOPED unread filter -- no folder, so the question is the badge's,
   // and the answer has to be the badge's too. It carries the Trash carve-out
   // for that reason: without it, a thread whose only unseen message sits in
   // Trash came back from `?unread=true` carrying `unread: false`, an unread
-  // filter returning a row the same response calls read.
+  // filter returning a row the same response calls read. The visibility term
+  // is folded here as well -- the unseen message must itself be one the
+  // viewer may see in this scope, or someone else's private unread mail
+  // would match a filter whose rows then render as read.
   //
   // The join lives INSIDE the subquery, which is why this cannot borrow the
   // outer query's FROM: the outer list selects from mail_threads alone, and an
   // account is a property of each MESSAGE, not of the thread.
   if (opts.unread && !scoped) {
-    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} JOIN ${mailAccounts} ON ${mailAccounts.id} = ${mailMessages.accountId} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${mailMessages.seen} = false AND ${notInAccountTrash()})`);
+    where.push(sql`EXISTS (SELECT 1 FROM ${mailMessages} JOIN ${mailAccounts} ON ${mailAccounts.id} = ${mailMessages.accountId} WHERE ${mailMessages.threadId} = ${mailThreads.id} AND ${mailMessages.seen} = false AND ${notInAccountTrash()} AND ${visibleMessageTerm(userId, scope)})`);
   }
   const cur = opts.cursor ? decodeLastMessageAtCursor(opts.cursor) : null;
   if (cur) {
@@ -462,9 +626,11 @@ export async function listThreads(
     .orderBy(desc(mailThreads.lastMessageAt), desc(mailThreads.id)).limit(limit + 1);
   const page = rows.slice(0, limit);
   // The page's rows are described in the same scope the filters selected them
-  // in, so a row's unread dot answers the question its own view asked.
+  // in -- the unread view AND the visibility scope -- so a row's unread dot
+  // answers the question its own view asked, and a row never renders content
+  // from a message this view's scope would not let the viewer open.
   const aggregates = await loadAggregates(
-    db, page.map((row) => row.id), { folder: opts.folder, accountId: opts.accountId },
+    db, userId, page.map((row) => row.id), { folder: opts.folder, accountId: opts.accountId }, scope,
   );
   const last = page[page.length - 1];
   return {
@@ -475,21 +641,19 @@ export async function listThreads(
         // A thread with no messages cannot exist (ingest creates both in one
         // transaction), but the map lookup is still optional-shaped rather
         // than asserted: an empty inbox row is a rendering nuisance, a thrown
-        // TypeError is an outage.
+        // TypeError is an outage. Since Phase 4.2 the row is only reachable
+        // through a record view (a deal/project link is the one thing that
+        // makes a message-less thread visible at all -- see the predicate
+        // header), and its fallbacks are the honest empty answers -- false
+        // for ownedByViewer especially, because "the viewer owns >= 1
+        // account here" cannot be true of a thread that has no accounts, and
+        // defaulting toward move rights nobody has would gate real buttons
+        // onto a mailbox that does not exist.
         unread: extra?.unread ?? false,
         snippet: extra?.snippet ?? "",
         senders: extra?.senders ?? [],
         accountIds: extra?.accountIds ?? [],
-        // Phase 4.2 contract seam: mailThreadListItemSchema requires
-        // ownedByViewer (packages/shared), but this function has no actor to
-        // compute it against yet -- Task 2 threads a userId through every
-        // read path in this file and answers it for real, in the same
-        // aggregate pass as accountIds/senders above (does the viewer own >=
-        // 1 account this thread has a message on?). `true` here is not a
-        // guess: it is today's actual behaviour (move rights are owner-only
-        // per the Phase 4.2 spec, but that gate is not wired until Task 3),
-        // so this placeholder changes nothing for any current caller.
-        ownedByViewer: true,
+        ownedByViewer: extra?.ownedByViewer ?? false,
       } satisfies MailThreadListItem;
     }),
     nextCursor: rows.length > limit && last !== undefined
@@ -499,8 +663,21 @@ export async function listThreads(
 
 // --- Detail ----------------------------------------------------------------
 
-async function mustGetThread(db: Database, id: string): Promise<MailThreadRow> {
-  const [row] = await db.select().from(mailThreads).where(eq(mailThreads.id, id));
+/**
+ * The one seam every by-id thread surface goes through, and therefore the
+ * visibility gate for all of them: detail, mark-read, the link writes, and
+ * archive/hide all resolve their thread here first. Record scope, because
+ * by-id surfaces serve the record views as much as the inbox (a deal's Mail
+ * tab opens the same detail route).
+ *
+ * An invisible thread throws the SAME NotFoundError a nonexistent id does --
+ * one error, built in one place, so a caller probing ids can never tell
+ * "hidden from you" apart from "not there" by status, body, or timing of the
+ * code path (mirrors mail-folders.ts's mustGetOwnedAccount).
+ */
+async function mustGetThread(db: Database, userId: string, id: string): Promise<MailThreadRow> {
+  const [row] = await db.select().from(mailThreads)
+    .where(and(eq(mailThreads.id, id), visibleThreads(userId, "record")));
   if (row === undefined) throw new NotFoundError("mail thread", id);
   return row;
 }
@@ -518,6 +695,10 @@ const MAX_DEAL_SUGGESTIONS = 5;
  * gets no suggestions at all -- the link panel shows the link instead -- and
  * a thread linked to nobody gets none either, since there would be nothing to
  * derive them from.
+ *
+ * No visibility term, per the spec's predicate table: suggestions render only
+ * inside a thread detail the caller already passed mustGetThread for, and
+ * deals themselves are shared CRM records, not mailbox content.
  */
 async function loadDealSuggestions(db: Database, thread: MailThreadRow): Promise<MailDealSuggestion[]> {
   if (thread.dealId !== null) return [];
@@ -530,10 +711,28 @@ async function loadDealSuggestions(db: Database, thread: MailThreadRow): Promise
     .orderBy(desc(deals.createdAt), desc(deals.id)).limit(MAX_DEAL_SUGGESTIONS);
 }
 
-export async function getThreadDetail(db: Database, id: string, apiBase: string): Promise<MailThreadDetail> {
-  const thread = await mustGetThread(db, id);
-  const messageRows = await db.select(MESSAGE_COLUMNS).from(mailMessages)
-    .where(eq(mailMessages.threadId, id))
+export async function getThreadDetail(
+  db: Database, userId: string, id: string, apiBase: string,
+): Promise<MailThreadDetail> {
+  const thread = await mustGetThread(db, userId, id);
+  // The per-message filter matters even after mustGetThread said yes: a
+  // visible thread can still carry messages the viewer may not read (the
+  // cross-account conversation whose other half lives in someone else's
+  // private mailbox), and the conversation view must not render their
+  // bodies. Record scope, same as the gate above -- so on a deal/project-
+  // linked thread every message is visible, which is what the deliberate
+  // link means.
+  //
+  // `ownedByViewer` is read off the same rows rather than asked separately:
+  // an owned account is visible in every scope, so the filter cannot have
+  // dropped a row that would have made it true.
+  const messageRows = await db.select({
+    ...MESSAGE_COLUMNS,
+    ownedByViewer: sql<boolean>`${mailAccounts.userId} = ${userId}`,
+  }).from(mailMessages)
+    .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
+    .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
+    .where(and(eq(mailMessages.threadId, id), visibleMessageTerm(userId, "record")))
     // Oldest first: the conversation view renders in reading order, with only
     // the newest message expanded.
     .orderBy(asc(mailMessages.sentAt), asc(mailMessages.id));
@@ -567,10 +766,7 @@ export async function getThreadDetail(db: Database, id: string, apiBase: string)
 
   return {
     thread: toThread(thread), messages, dealSuggestions: await loadDealSuggestions(db, thread),
-    // Same Phase 4.2 seam as listThreads' ownedByViewer above -- see that
-    // comment for why `true` is a faithful placeholder, not a guess, until
-    // Task 2 threads an actor through this function.
-    ownedByViewer: true,
+    ownedByViewer: messageRows.some((row) => row.ownedByViewer),
   };
 }
 
@@ -605,9 +801,16 @@ export interface SeenWriteBack {
  * way to clear it and nothing counting it.
  */
 export async function markThreadRead(
-  db: Database, id: string,
+  db: Database, userId: string, id: string,
 ): Promise<{ thread: MailThread; writeBacks: SeenWriteBack[] }> {
-  const thread = await mustGetThread(db, id);
+  // mustGetThread is the visibility gate (an invisible thread 404s before
+  // anything is written); past it, the write itself is deliberately NOT
+  // per-viewer or per-account -- the spec's mark-read ruling: ANY viewer of a
+  // visible thread marks the whole conversation read, and the `\Seen`
+  // write-back still flows through each message's own account loop under
+  // that account's credentials. Reading is not a filing act, so the
+  // owner-only move rule (Task 3) does not apply here.
+  const thread = await mustGetThread(db, userId, id);
   const changed = await db.update(mailMessages).set({ seen: true, updatedAt: new Date() })
     .where(and(eq(mailMessages.threadId, id), eq(mailMessages.seen, false)))
     .returning({
@@ -674,9 +877,9 @@ async function writeLink(db: Database, threadId: string, kind: MailLinkKind, val
 }
 
 export async function setThreadLink(
-  db: Database, threadId: string, kind: MailLinkKind, targetId: string,
+  db: Database, userId: string, threadId: string, kind: MailLinkKind, targetId: string,
 ): Promise<MailThread> {
-  const thread = await mustGetThread(db, threadId);
+  const thread = await mustGetThread(db, userId, threadId);
   if (thread.archivedAt !== null) throw new ArchivedError("mail thread", threadId);
   await assertLinkTargetActive(db, kind, targetId);
   return writeLink(db, threadId, kind, targetId);
@@ -684,8 +887,10 @@ export async function setThreadLink(
 
 /** Idempotent: clearing a link that is already null still succeeds and still
  * returns the thread, the same way archive/unarchive treat a no-op. */
-export async function clearThreadLink(db: Database, threadId: string, kind: MailLinkKind): Promise<MailThread> {
-  const thread = await mustGetThread(db, threadId);
+export async function clearThreadLink(
+  db: Database, userId: string, threadId: string, kind: MailLinkKind,
+): Promise<MailThread> {
+  const thread = await mustGetThread(db, userId, threadId);
   if (thread.archivedAt !== null) throw new ArchivedError("mail thread", threadId);
   return writeLink(db, threadId, kind, null);
 }
@@ -699,8 +904,14 @@ export async function clearThreadLink(db: Database, threadId: string, kind: Mail
  * mail client is left entirely alone.
  */
 async function setArchived(
-  db: Database, id: string, archived: boolean, publishHint: boolean,
+  db: Database, userId: string, id: string, archived: boolean, publishHint: boolean,
 ): Promise<MailThread> {
+  // The read comes FIRST because it is the visibility gate: this mutation
+  // echoes the thread row back, which makes it a read path too, and blind
+  // update-then-read would both flip an invisible thread's flag and hand its
+  // subject to whoever guessed the id. mustGetThread 404s an invisible
+  // thread exactly like a nonexistent one, before anything is written.
+  const existing = await mustGetThread(db, userId, id);
   const [row] = await db.update(mailThreads)
     .set({ archivedAt: archived ? new Date() : null, updatedAt: new Date() })
     .where(and(
@@ -711,7 +922,9 @@ async function setArchived(
     if (publishHint) publishThreadHint(id);
     return toThread(row);
   }
-  const existing = await mustGetThread(db, id);
+  // Already in the requested state: the idempotent no-op, answered from the
+  // row read above. The state guard in the WHERE is still what keeps the
+  // no-op decision atomic against a concurrent archive.
   return toThread(existing);
 }
 
@@ -728,12 +941,12 @@ export interface ArchiveThreadOptions {
 }
 
 export function archiveThread(
-  db: Database, id: string, options: ArchiveThreadOptions = {},
+  db: Database, userId: string, id: string, options: ArchiveThreadOptions = {},
 ): Promise<MailThread> {
-  return setArchived(db, id, true, options.publishHint ?? true);
+  return setArchived(db, userId, id, true, options.publishHint ?? true);
 }
-export function unarchiveThread(db: Database, id: string): Promise<MailThread> {
-  return setArchived(db, id, false, true);
+export function unarchiveThread(db: Database, userId: string, id: string): Promise<MailThread> {
+  return setArchived(db, userId, id, false, true);
 }
 
 // --- Attachments -----------------------------------------------------------
@@ -754,16 +967,19 @@ export interface MailAttachmentBlob {
 /**
  * Look up one attachment for serving.
  *
- * The join to mail_messages/mail_threads is the AUTHORIZATION check, such as
- * it is. Attachment ids are attacker-influenced: an inbound message can carry
+ * The join to mail_messages/mail_threads/mail_accounts is the AUTHORIZATION
+ * check. Attachment ids are attacker-influenced: an inbound message can carry
  * `<img src="cid:...">` for any Content-ID it likes, and while
  * sanitizeMailHtml refuses to emit a `mailattachment:` placeholder it did not
  * mint itself, a hand-written request to this route can still name any uuid.
- * Because mail visibility is SHARED -- every authenticated user sees every
- * thread -- "does a message and thread exist for this attachment" is the whole
- * of the authorization question, and the 404 below is the answer. The FKs make
- * the join redundant in a healthy database, which is exactly why it is written
- * out: it states the rule rather than relying on a constraint elsewhere.
+ * The question is therefore "may THIS viewer read the message this attachment
+ * belongs to" -- visibleMessageTerm at message granularity, because a visible
+ * thread can still carry an invisible message and that message's bytes must
+ * not be fetchable by id either. Record scope, matching mustGetThread: these
+ * bytes serve the record surfaces (a deal's Mail tab renders the same bodies
+ * and download chips) as much as the inbox, so what the detail route shows,
+ * this route serves, and nothing more. An invisible attachment and a
+ * nonexistent one share the same 404.
  *
  * `inlineOnly` is the second half of the guard, for the route that serves
  * bytes for rendering rather than saving: it serves only rows ingest itself
@@ -771,7 +987,7 @@ export interface MailAttachmentBlob {
  * ordinary file attachment someone points an <img> at.
  */
 export async function getAttachmentBlob(
-  db: Database, id: string, opts: { inlineOnly: boolean },
+  db: Database, userId: string, id: string, opts: { inlineOnly: boolean },
 ): Promise<MailAttachmentBlob> {
   const [row] = await db.select({
     id: mailAttachments.id, filename: mailAttachments.filename, mime: mailAttachments.mime,
@@ -780,7 +996,8 @@ export async function getAttachmentBlob(
   }).from(mailAttachments)
     .innerJoin(mailMessages, eq(mailMessages.id, mailAttachments.messageId))
     .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
-    .where(eq(mailAttachments.id, id));
+    .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
+    .where(and(eq(mailAttachments.id, id), visibleMessageTerm(userId, "record")));
   if (row === undefined) throw new NotFoundError("mail attachment", id);
   // Same 404, not a 403: whether an existing attachment happens to be inline
   // is not something this route needs to disclose.
@@ -796,16 +1013,32 @@ export async function getAttachmentBlob(
  * rather than messages for the same reason the list is thread-shaped: a
  * ten-message unread conversation is one thing to deal with, not ten.
  *
- * The Trash carve-out is notInAccountTrash's, and the join to mail_accounts is
- * there for it alone. Archive-folder mail still counts.
+ * The Trash carve-out is notInAccountTrash's; archive-folder mail still
+ * counts. The visibility term is INBOX scope on the same message row: the
+ * badge is the mailbox view's headline number, so the unseen message must
+ * itself be one the viewer's inbox can show -- someone else's private unread
+ * mail never counts here, and neither does a deal-linked thread's (it is
+ * record-visible, but it is not in this viewer's mailbox). All three
+ * message-row conditions live in one WHERE for the same reason the list
+ * folds its EXISTS: unseen, not-in-trash and visible must hold on the SAME
+ * message.
+ *
+ * The visibility term costs this query nothing structural: measured at
+ * 20,000 threads / 82,000 messages / ~8,000 unread split across two users'
+ * private accounts, 10.5ms / 322 buffers with the unseen partial index
+ * (drizzle/0005) still serving an Index Only Scan, Heap Fetches: 0 -- its
+ * INCLUDE payload already carries the account_id the visibility join reads.
  */
-export async function unreadThreadCount(db: Database): Promise<number> {
+export async function unreadThreadCount(db: Database, userId: string): Promise<number> {
   const [row] = await db.select({
     count: sql<number>`count(DISTINCT ${mailMessages.threadId})::int`,
   }).from(mailMessages)
     .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
     .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
-    .where(and(isNull(mailThreads.archivedAt), eq(mailMessages.seen, false), notInAccountTrash()));
+    .where(and(
+      isNull(mailThreads.archivedAt), eq(mailMessages.seen, false),
+      notInAccountTrash(), visibleMessageTerm(userId, "inbox"),
+    ));
   return row?.count ?? 0;
 }
 
@@ -827,26 +1060,41 @@ export async function unreadThreadCount(db: Database): Promise<number> {
  * The badge above answers the other question -- "how much is waiting for me,
  * anywhere?" -- where mail in the Trash is not waiting for anything.
  *
- * A row therefore appears for any folder holding unread mail, INCLUDING ones
- * the picker has switched off and ones that have vanished from the server.
- * Today a row also appears for folders belonging to another user's account --
- * 4.1's shared-visibility behaviour, which Phase 4.2 Task 2 replaces: this
- * query gains its mail_accounts join purely so inbox-visible(U, T) can scope
- * the counts to the viewer. The sidebar joins these to the folders endpoint
- * by name and renders what it recognises -- see the 4.1 plan's Task 5 note.
+ * A row therefore appears for any folder holding unread mail the VIEWER MAY
+ * SEE, including folders the picker has switched off and ones that have
+ * vanished from the server. The mail_accounts join exists purely to carry
+ * the visibility term -- inbox scope, like every unread computation: the
+ * sidebar is the mailbox view, so a folder that exists only in someone
+ * else's private mailbox contributes no row here (its NAME staying unlisted
+ * is part of what private means), while a shared account's folders count for
+ * everyone. The term sits in the same WHERE as `seen = false`, so what is
+ * counted is "a visible unseen message in F", never two facts about
+ * different messages. The sidebar joins these to the folders endpoint by
+ * name and renders what it recognises -- see the 4.1 plan's Task 5 note.
+ *
+ * The join was the risk 0005's INCLUDE index was re-measured for: at 20,000
+ * threads / 82,000 messages / ~8,000 unread split across two users' private
+ * accounts, 11.5ms / 325 buffers, the unseen partial index still an Index
+ * Only Scan with Heap Fetches: 0 -- `folder` and `account_id` both come off
+ * its INCLUDE payload, so gaining the accounts join did not cost the
+ * index-only property it was built for.
  *
  * Folders are counted by NAME across accounts, per the response shape the spec
  * fixes ({folder, count}, no accountId): two accounts' INBOXes are one row
  * here. See mailUnreadFolderCountsSchema in packages/shared for what that means
  * for a multi-account sidebar.
  */
-export async function unreadCountsByFolder(db: Database): Promise<MailUnreadFolderCount[]> {
+export async function unreadCountsByFolder(db: Database, userId: string): Promise<MailUnreadFolderCount[]> {
   return db.select({
     folder: mailMessages.folder,
     count: sql<number>`count(DISTINCT ${mailMessages.threadId})::int`,
   }).from(mailMessages)
     .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
-    .where(and(isNull(mailThreads.archivedAt), eq(mailMessages.seen, false)))
+    .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
+    .where(and(
+      isNull(mailThreads.archivedAt), eq(mailMessages.seen, false),
+      visibleMessageTerm(userId, "inbox"),
+    ))
     .groupBy(mailMessages.folder)
     .orderBy(asc(mailMessages.folder));
 }
