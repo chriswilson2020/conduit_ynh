@@ -628,7 +628,16 @@ export async function listThreads(
   // The page's rows are described in the same scope the filters selected them
   // in -- the unread view AND the visibility scope -- so a row's unread dot
   // answers the question its own view asked, and a row never renders content
-  // from a message this view's scope would not let the viewer open.
+  // from a message this view's scope would not let the viewer open. TWO
+  // thread-level aggregates are the documented exception (coordinator-
+  // accepted): `messageCount` and `lastMessageAt` come off the mail_threads
+  // row itself and stay thread-global, so a viewer of half a cross-account
+  // thread sees the whole conversation's count, ordered by a timestamp an
+  // invisible message may have set. Per-viewer versions would make the
+  // keyset cursor (which rides lastMessageAt) unstable -- the same thread
+  // would paginate differently per viewer and shift whenever the other
+  // half moved -- for metadata of low sensitivity: a count and a clock
+  // reading, never content.
   const aggregates = await loadAggregates(
     db, userId, page.map((row) => row.id), { folder: opts.folder, accountId: opts.accountId }, scope,
   );
@@ -665,8 +674,9 @@ export async function listThreads(
 
 /**
  * The one seam every by-id thread surface goes through, and therefore the
- * visibility gate for all of them: detail, mark-read, the link writes, and
- * archive/hide all resolve their thread here first. Record scope, because
+ * visibility gate for all of them: detail, mark-read, the link writes,
+ * archive/hide, and reply (mail-send.ts's loadReplyChain -- the export
+ * exists for it) all resolve their thread here first. Record scope, because
  * by-id surfaces serve the record views as much as the inbox (a deal's Mail
  * tab opens the same detail route).
  *
@@ -675,7 +685,7 @@ export async function listThreads(
  * "hidden from you" apart from "not there" by status, body, or timing of the
  * code path (mirrors mail-folders.ts's mustGetOwnedAccount).
  */
-async function mustGetThread(db: Database, userId: string, id: string): Promise<MailThreadRow> {
+export async function mustGetThread(db: Database, userId: string, id: string): Promise<MailThreadRow> {
   const [row] = await db.select().from(mailThreads)
     .where(and(eq(mailThreads.id, id), visibleThreads(userId, "record")));
   if (row === undefined) throw new NotFoundError("mail thread", id);
@@ -780,7 +790,10 @@ export interface SeenWriteBack {
 }
 
 /**
- * Mark every message in the thread seen, in the DATABASE. The IMAP side is
+ * Mark the thread's messages seen, in the DATABASE -- every message THIS
+ * VIEWER'S record scope can read, which is what a reading act can honestly
+ * claim (coordinator amendment, superseding the spec's original "unchanged
+ * (any viewer)" line; see the spec's Amendments section). The IMAP side is
  * the caller's job: this returns the write-back groups rather than talking to
  * the sync engine itself, which keeps this module free of the sync engine
  * entirely and puts the best-effort decision (see routes/mail.ts) in one
@@ -804,15 +817,28 @@ export async function markThreadRead(
   db: Database, userId: string, id: string,
 ): Promise<{ thread: MailThread; writeBacks: SeenWriteBack[] }> {
   // mustGetThread is the visibility gate (an invisible thread 404s before
-  // anything is written); past it, the write itself is deliberately NOT
-  // per-viewer or per-account -- the spec's mark-read ruling: ANY viewer of a
-  // visible thread marks the whole conversation read, and the `\Seen`
-  // write-back still flows through each message's own account loop under
-  // that account's credentials. Reading is not a filing act, so the
-  // owner-only move rule (Task 3) does not apply here.
+  // anything is written). Past it, the UPDATE carries visibleMessageTerm's
+  // record scope -- the same scope as the detail this click comes from -- so
+  // "mark read" applies to exactly what the viewer could read. On a
+  // deal/project-linked thread that is every message (the link shares the
+  // whole conversation, so the whole thread marks, as it always did); on an
+  // UNLINKED cross-account thread it is the viewer's own half, and the other
+  // user's private copies keep their seen state -- consequently no `\Seen`
+  // write-back group is ever built for an account whose messages the viewer
+  // cannot read, because the groups are built from the returned rows. The
+  // record arm is decided here in JS off the row mustGetThread just returned
+  // (an UPDATE has no thread join to read deal_id/project_id from); the
+  // account arm is the predicate's own ownedOrShared core, so the rule still
+  // has one source. Any viewer of a visible thread may still mark it read --
+  // reading is not a filing act, so Task 3's owner-only move rule does not
+  // apply here.
   const thread = await mustGetThread(db, userId, id);
+  const readable = [eq(mailMessages.threadId, id), eq(mailMessages.seen, false)];
+  if (thread.dealId === null && thread.projectId === null) {
+    readable.push(sql`EXISTS (SELECT 1 FROM ${mailAccounts} WHERE ${mailAccounts.id} = ${mailMessages.accountId} AND ${ownedOrShared(userId)})`);
+  }
   const changed = await db.update(mailMessages).set({ seen: true, updatedAt: new Date() })
-    .where(and(eq(mailMessages.threadId, id), eq(mailMessages.seen, false)))
+    .where(and(...readable))
     .returning({
       accountId: mailMessages.accountId, folder: mailMessages.folder, imapUid: mailMessages.imapUid,
     });

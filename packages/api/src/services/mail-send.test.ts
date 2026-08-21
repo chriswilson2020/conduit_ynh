@@ -13,6 +13,7 @@ import { files, mailAccounts, mailAttachments, mailMessages, mailThreads } from 
 import { saveBlob } from "./blobs.js";
 import { createCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
+import { createProject } from "./projects.js";
 import { ArchivedError, ConflictError, NotFoundError, SmtpSendError } from "./errors.js";
 import { archiveAccount, createAccount } from "./mail-accounts.js";
 import type { MailCredentials } from "./mail-crypto.js";
@@ -433,6 +434,80 @@ describe("sendMail", () => {
       input({ threadId: "00000000-0000-0000-0000-000000000000" }), deps(),
     )).rejects.toBeInstanceOf(NotFoundError);
     expect(transport.sent).toHaveLength(0);
+  });
+
+  // You may reply to what you may open (Phase 4.2 coordinator amendment):
+  // the reply chain resolves its thread through mustGetThread's visibility
+  // gate, so an invisible threadId is the same NotFoundError as an unknown
+  // one -- before anything is composed, sent, or ingested.
+  it("rejects a reply into another user's private thread exactly like a nonexistent one", async () => {
+    const danaAccount = await createAccount(handle.db, otherUserId, {
+      ...baseAccount, email: "dana@example.com", label: "Dana", username: "dana",
+    }, keyPath);
+    const danaSend = await sendMail(
+      handle.db, dataDir, otherUserId, input({ accountId: danaAccount.id }), deps(),
+    );
+    transport.sent.length = 0;
+
+    await expect(sendMail(
+      handle.db, dataDir, actorId, input({ threadId: danaSend.threadId }), deps(),
+    )).rejects.toBeInstanceOf(NotFoundError);
+    expect(transport.sent).toHaveLength(0);
+    // Nothing was ingested: dana's original message is still the only row.
+    expect(await storedMessages()).toHaveLength(1);
+  });
+
+  it("replies into another user's private thread once a project link shares it", async () => {
+    const danaAccount = await createAccount(handle.db, otherUserId, {
+      ...baseAccount, email: "dana@example.com", label: "Dana", username: "dana",
+    }, keyPath);
+    const danaSend = await sendMail(
+      handle.db, dataDir, otherUserId, input({ accountId: danaAccount.id }), deps(),
+    );
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    await handle.db.update(mailThreads).set({ projectId: project.id })
+      .where(eq(mailThreads.id, danaSend.threadId));
+    transport.sent.length = 0;
+
+    const reply = await sendMail(
+      handle.db, dataDir, actorId,
+      input({ threadId: danaSend.threadId, subject: "Re: Hello Alice" }), deps(),
+    );
+
+    // The link makes every message visible, so the chain is the thread's
+    // true newest -- dana's message -- and the reply threads onto it.
+    const raw = transport.rawText();
+    expect(headerOf(raw, "In-Reply-To")).toBe(`<${danaSend.messageId}>`);
+    expect(reply.threadId).toBe(danaSend.threadId);
+  });
+
+  it("builds the reply chain from the viewer's own newest VISIBLE message on a cross-account thread", async () => {
+    const chrisSend = await sendMail(handle.db, dataDir, actorId, input(), deps());
+    // Dana's copy of the conversation gained a NEWER message chris's mailbox
+    // never saw -- private to dana, so chris's reply must neither name its
+    // Message-ID in the headers nor thread onto it.
+    const danaAccount = await createAccount(handle.db, otherUserId, {
+      ...baseAccount, email: "dana@example.com", label: "Dana", username: "dana",
+    }, keyPath);
+    await handle.db.insert(mailMessages).values({
+      accountId: danaAccount.id, threadId: chrisSend.threadId,
+      messageId: "dana-only-newer@example.com",
+      referencesIds: [chrisSend.messageId],
+      fromAddr: "dana@example.com", fromName: "Dana",
+      toAddrs: [{ address: "alice@example.com" }],
+      subject: "Re: Hello Alice", bodyText: "dana only", snippet: "dana only",
+      sentAt: new Date(Date.now() + 60_000), folder: "INBOX", seen: true, direction: "inbound",
+    });
+    transport.sent.length = 0;
+
+    await sendMail(
+      handle.db, dataDir, actorId,
+      input({ threadId: chrisSend.threadId, subject: "Re: Hello Alice" }), deps(),
+    );
+
+    const raw = transport.rawText();
+    expect(headerOf(raw, "In-Reply-To")).toBe(`<${chrisSend.messageId}>`);
+    expect(raw).not.toContain("dana-only-newer@example.com");
   });
 
   it("applies the compose dialog's links to a new thread", async () => {

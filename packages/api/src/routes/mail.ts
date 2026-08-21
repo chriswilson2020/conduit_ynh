@@ -493,14 +493,27 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * server, "Hide in CRM" sets the pre-4.1 CRM-side thread archive
    * (services/mail-move.ts owns all three).
    *
-   * AUTH-ONLY at the route, like every other thread route: visibility is
-   * enforced by the predicate the lists apply (a caller cannot NAME a thread
-   * id no predicate-filtered list ever showed them, and probing ids meets
-   * mustGetThread's indistinguishable 404 on the by-id routes), and the IMAP
-   * write still happens through each message's own account's sync loop under
-   * that account's credentials. The user id is audit context for the
-   * service's log line until Phase 4.2 Task 3 lands the owner-only move
-   * filter, which makes it a real input to candidate eligibility.
+   * AUTH-ONLY at the route -- and, for the two MOVE actions, NOT yet
+   * visibility-gated behind it. Thread ids of other users' private threads
+   * ARE nameable here: sse.ts fans every hint to every subscriber, and
+   * publishThreadHint / ingest's hints carry ["mail-thread", <id>] frames,
+   * so every logged-in client continuously receives ids it may not open.
+   * The by-id routes answer such an id with mustGetThread's
+   * indistinguishable 404 and the hide action resolves through the same
+   * gate, but trash/archive currently hand the id straight to candidate
+   * collection -- an invisible thread today gets a per-thread answer that
+   * differs from a nonexistent one's not_found (e.g. no_target, carrying the
+   * private account's label), and with a live sync loop the MOVE would move
+   * another user's private mail.
+   *
+   * Phase 4.2 Task 3 closes this: mail-move's thread resolution gains the
+   * visibility gate FIRST (an invisible id fails with the SAME not_found as
+   * a nonexistent one, byte-indistinguishable), and the not_owner ownership
+   * filter then applies only among visible threads. The SSE id-broadcast is
+   * acceptable-by-design only once that gate exists. The IMAP write happens
+   * through each message's own account's sync loop under that account's
+   * credentials either way; the user id is audit context for the service's
+   * log line until Task 3 makes it a real input to candidate eligibility.
    *
    * ALWAYS 200 WHEN THE REQUEST ITSELF WAS VALID. Per-thread failures ride
    * INSIDE the body (`{threadId, ok, skipped?, error?}` per requested id, in

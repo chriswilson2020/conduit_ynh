@@ -2,11 +2,12 @@ import { and, desc, eq, inArray } from "drizzle-orm";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import type { MailAccount, MailAddress, SendMailInput } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { files, mailMessages, mailThreads } from "../db/schema.js";
+import { files, mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
 import { blobPath } from "./blobs.js";
 import { ArchivedError, ConflictError, NotFoundError, SmtpSendError } from "./errors.js";
 import { getAccountCredentialsAsSystem, getOwnAccount } from "./mail-accounts.js";
 import { htmlToText, sanitizeMailHtml } from "./mail-content.js";
+import { mustGetThread, visibleMessageTerm } from "./mail-threads.js";
 import type { MailCredentials } from "./mail-crypto.js";
 import {
   MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX, consoleSyncLogger, type SyncLogger,
@@ -176,30 +177,44 @@ const NEW_THREAD: ReplyChain = { inReplyTo: null, references: [] };
 
 /**
  * In-Reply-To and References for a reply, built from the thread's most recent
- * message: In-Reply-To names that message, References is its own chain plus
- * itself (RFC 5322's rule, and what every mail client threads on).
+ * VISIBLE message: In-Reply-To names that message, References is its own
+ * chain plus itself (RFC 5322's rule, and what every mail client threads on).
+ *
+ * YOU MAY REPLY TO WHAT YOU MAY OPEN (coordinator amendment, Phase 4.2): the
+ * thread resolves through mustGetThread's record-scope visibility gate, so an
+ * invisible threadId gets the indistinguishable NotFoundError before any
+ * header is built or anything is sent. The chain then reads the newest
+ * message the viewer's record scope can read -- visibleMessageTerm, the same
+ * scope as the detail the composer replies from -- so a reply never carries
+ * an invisible message's Message-ID out in its headers, and on an unlinked
+ * cross-account conversation the sent copy threads onto the viewer's own
+ * half. On a deal/project-linked thread every message is visible, so the
+ * chain is the thread's true newest, as before.
  *
  * "Most recent" is by sent_at, the header date -- the same ordering the
  * conversation view renders in. A thread whose last message has no usable id
  * (see DERIVED_ID_PREFIX) still gets a valid, if shorter, chain rather than a
  * fabricated one.
  */
-async function loadReplyChain(db: Database, threadId: string): Promise<ReplyChain> {
-  const [thread] = await db.select({ id: mailThreads.id })
-    .from(mailThreads).where(eq(mailThreads.id, threadId));
-  if (thread === undefined) throw new NotFoundError("mail thread", threadId);
+async function loadReplyChain(db: Database, userId: string, threadId: string): Promise<ReplyChain> {
+  await mustGetThread(db, userId, threadId);
 
   const [last] = await db
     .select({ messageId: mailMessages.messageId, referencesIds: mailMessages.referencesIds })
-    .from(mailMessages).where(eq(mailMessages.threadId, threadId))
+    .from(mailMessages)
+    .innerJoin(mailAccounts, eq(mailAccounts.id, mailMessages.accountId))
+    .innerJoin(mailThreads, eq(mailThreads.id, mailMessages.threadId))
+    .where(and(eq(mailMessages.threadId, threadId), visibleMessageTerm(userId, "record")))
     // createdAt then id after sentAt: two messages can share a header date
     // (a sender's clock, or a message with no Date at all), and an ordering
     // that is not total would make the chain depend on the planner.
     .orderBy(desc(mailMessages.sentAt), desc(mailMessages.createdAt), desc(mailMessages.id))
     .limit(1);
   // An empty thread cannot exist through ingest (a thread is created with its
-  // first message), but nothing constrains it in the schema, so this reads as
-  // "compose into the thread" rather than throwing.
+  // first message) -- though a visible one with zero VISIBLE messages can
+  // only be the message-less defensive case, since a deal/project link makes
+  // every message visible -- so this reads as "compose into the thread"
+  // rather than throwing.
   if (last === undefined) return NEW_THREAD;
 
   const chain: string[] = [];
@@ -343,7 +358,7 @@ export async function sendMail(
     );
   }
 
-  const chain = input.threadId === undefined ? NEW_THREAD : await loadReplyChain(db, input.threadId);
+  const chain = input.threadId === undefined ? NEW_THREAD : await loadReplyChain(db, actorId, input.threadId);
   const attachments = await loadAttachments(db, dataDir, actorId, input.attachmentIds);
   // Only now, once every check that can reject has passed (mail-accounts.ts's
   // getAccountCredentialsAsSystem does NO owner check of its own -- that is

@@ -100,3 +100,29 @@ v0.7.0, the standard mechanics. Live verification: Chris's account flips to priv
 upgrade (his new user sees an empty inbox immediately — the phase's acceptance test);
 linking a thread to a deal makes exactly that thread appear for the other user on the deal;
 flipping a mailbox to shared restores 4.1 behaviour for it.
+
+## Amendments (coordinator, during execution)
+
+Ruled during Task 2's spec review; each supersedes the corresponding line above.
+
+1. **Record Mail tabs' unread flag and filter run at RECORD scope**, deviating from the
+   predicate table's "all three unread computations: inbox-visible" row. A deal/project
+   tab renders a linked private thread's content, so an unseen message the tab lets the
+   viewer read must not render as read there — the row's dot and `?unread=true` on a
+   record-filtered list both compose the unread-scopes-to-the-view rule with
+   record-visible. The badge, the inbox/folder lists' unread, and the per-folder counts
+   stay inbox-visible: record-visible mail is readable on the record, not WAITING in
+   anyone else's mailbox.
+2. **Mark-read is scoped to the messages the viewer's record scope can read**, superseding
+   "Mark-read: unchanged (any viewer)". Marking read is a reading act, so it applies to
+   what the view lets you read: on a deal/project-linked thread that is every message
+   (whole thread marks, as before); on an unlinked cross-account thread it is the viewer's
+   own half — the other user's private copies keep their seen state, and no `\Seen`
+   write-back group is built for an account whose messages the viewer cannot see. Any
+   viewer of a visible thread may still mark it read.
+3. **Reply requires record-visibility of the target thread** ("you may reply to what you
+   may open"): the send path resolves a reply's `threadId` through the same visibility
+   gate as the detail route — an invisible thread is the indistinguishable 404, before
+   anything is composed or sent — and builds its In-Reply-To/References chain from the
+   newest message the viewer may read, never leaking an invisible message's Message-ID
+   into outgoing headers.

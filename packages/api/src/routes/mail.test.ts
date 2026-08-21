@@ -2610,6 +2610,81 @@ describe("mail thread visibility", () => {
     await a.close();
   });
 
+  // Mark-read scopes to what the viewer can read (coordinator amendment):
+  // on an UNLINKED cross-account thread, the viewer's half marks read and
+  // the other user's private copies keep their seen state -- and because the
+  // write-back groups are built from the rows the UPDATE returned, no \Seen
+  // ever flows toward an account whose messages the viewer cannot see.
+  it("marks only the viewer's own half of an unlinked cross-account thread read", async () => {
+    const a = await app();
+    const chrisPrivate = await makeAccount(a);
+    const danaOwn = await makeAccount(a, { label: "Dana", email: "dana@example.com" }, otherHeaders);
+    const threadId = await seedThread({ subject: "Cross", lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const danaMessage = await seedMessage(threadId, danaOwn.id, {
+      sentAt: new Date("2026-08-01T10:00:00Z"), seen: false, imapUid: 31,
+    });
+    const chrisMessage = await seedMessage(threadId, chrisPrivate.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, imapUid: 32,
+    });
+    const danaSync = new FakeAccountSync();
+    const chrisSync = new FakeAccountSync();
+    syncs.set(danaOwn.id, danaSync);
+    syncs.set(chrisPrivate.id, chrisSync);
+
+    const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: otherHeaders });
+    expect(response.statusCode).toBe(200);
+    const rows = await handle.db.select().from(mailMessages).where(eq(mailMessages.threadId, threadId));
+    expect(rows.find((row) => row.id === danaMessage)?.seen).toBe(true);
+    // chris's private copy is untouched -- dana never read it.
+    expect(rows.find((row) => row.id === chrisMessage)?.seen).toBe(false);
+    expect(danaSync.markSeenCalls).toEqual([{ folder: "INBOX", uids: [31] }]);
+    expect(chrisSync.markSeenCalls).toEqual([]);
+    await a.close();
+  });
+
+  it("marks the whole of a deal-linked thread read for any viewer -- the link makes every message readable", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const deal = await makeDeal(a);
+    const threadId = await seedThread({
+      subject: "Deal", lastMessageAt: new Date("2026-08-02T10:00:00Z"), dealId: deal.id,
+    });
+    const messageId = await seedMessage(threadId, priv.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), seen: false, imapUid: 41,
+    });
+    const sync = new FakeAccountSync();
+    syncs.set(priv.id, sync);
+
+    const response = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/read`, headers: otherHeaders });
+    expect(response.statusCode).toBe(200);
+    const [message] = await handle.db.select().from(mailMessages).where(eq(mailMessages.id, messageId));
+    expect(message?.seen).toBe(true);
+    expect(sync.markSeenCalls).toEqual([{ folder: "INBOX", uids: [41] }]);
+    await a.close();
+  });
+
+  it("applies record scope to the unread FILTER on a deal tab, not just the flag", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const deal = await makeDeal(a);
+    const unread = await seedThread({
+      subject: "Deal unread", lastMessageAt: new Date("2026-08-02T10:00:00Z"), dealId: deal.id,
+    });
+    await seedMessage(unread, priv.id, { sentAt: new Date("2026-08-02T10:00:00Z"), seen: false });
+    const read = await seedThread({
+      subject: "Deal read", lastMessageAt: new Date("2026-08-01T10:00:00Z"), dealId: deal.id,
+    });
+    await seedMessage(read, priv.id, { sentAt: new Date("2026-08-01T10:00:00Z"), seen: true });
+
+    // The tab CAN read the private unseen message (record scope), so
+    // filtering the tab to unread keeps that thread -- for the other user
+    // exactly as for the owner -- and drops the fully-read one.
+    expect(await listIds(a, `deal_id=${deal.id}&unread=true`, otherHeaders)).toEqual([unread]);
+    expect(await listIds(a, `deal_id=${deal.id}&unread=true`, authHeaders)).toEqual([unread]);
+    expect(await listIds(a, `deal_id=${deal.id}`, otherHeaders)).toEqual([unread, read]);
+    await a.close();
+  });
+
   it("lights the deal tab's unread dot from the linked private message -- the record view CAN see it", async () => {
     const a = await app();
     const priv = await makeAccount(a);
