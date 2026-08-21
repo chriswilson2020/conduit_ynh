@@ -53,8 +53,9 @@ const LIMIT_MAIL = 5;
  * hit this group renders is one message's subject and snippet, and on a
  * visible thread whose other half lives in a private mailbox, an invisible
  * message must neither rank nor leak its snippet -- the best VISIBLE match
- * represents the thread instead. This is the one mail read path outside
- * mail-threads.ts, which is why the term is imported rather than re-derived.
+ * represents the thread instead. This is one of the two mail read paths
+ * outside mail-threads.ts (mail-send.ts's reply chain is the other), which
+ * is why the term is imported rather than re-derived.
  */
 async function searchMail(db: Database, userId: string, q: string): Promise<SearchResults["mail"]> {
   const tsQuery = sql`websearch_to_tsquery('english', ${q})`;

@@ -1205,6 +1205,30 @@ describe("mail thread link and archive routes", () => {
     await a.close();
   });
 
+  // The no-op branch answers from a RE-READ, not the pre-update snapshot, so
+  // a repeated request reports the row's current state truthfully -- the
+  // shape a lost concurrent-archive race takes.
+  it("answers a repeated archive and a repeated unarchive with the row's current state", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const first = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
+    expect(mailThreadSchema.parse(first.json()).archivedAt).not.toBeNull();
+    const second = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders });
+    expect(second.statusCode).toBe(200);
+    // The truthful no-op: still archived, never a report of the pre-archive row.
+    expect(mailThreadSchema.parse(second.json()).archivedAt).not.toBeNull();
+
+    const restored = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
+    expect(mailThreadSchema.parse(restored.json()).archivedAt).toBeNull();
+    const again = await a.inject({ method: "POST", url: `/api/mail/threads/${threadId}/unarchive`, headers: authHeaders });
+    expect(again.statusCode).toBe(200);
+    expect(mailThreadSchema.parse(again.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
   it("counts unread threads, not unread messages, and ignores archived threads", async () => {
     const a = await app();
     const account = await makeAccount(a);
@@ -2726,6 +2750,41 @@ describe("mail thread visibility", () => {
     expect(mailUnreadFolderCountsSchema.parse(response.json()).folders).toEqual([]);
     const own = await a.inject({ method: "GET", url: "/api/mail/unread-count?byFolder=1", headers: authHeaders });
     expect(mailUnreadFolderCountsSchema.parse(own.json()).folders).toEqual([{ folder: "INBOX", count: 1 }]);
+    await a.close();
+  });
+
+  it("applies the predicate BEFORE the page limit: invisible threads neither fill pages nor break the keyset", async () => {
+    const a = await app();
+    const priv = await makeAccount(a);
+    const shared = await makeAccount(a, { label: "Team", email: "team@example.com" });
+    await setVisibility(shared.id, "shared");
+    // Visible and invisible threads interleaved by last_message_at, so a
+    // filter applied AFTER the limit would return short, gappy pages while
+    // every per-page assertion elsewhere stayed green.
+    async function seedOn(accountId: string, subject: string, day: number): Promise<string> {
+      const threadId = await seedThread({ subject, lastMessageAt: new Date(Date.UTC(2026, 7, day, 10)) });
+      await seedMessage(threadId, accountId, { sentAt: new Date(Date.UTC(2026, 7, day, 10)) });
+      return threadId;
+    }
+    const v1 = await seedOn(shared.id, "Visible 1", 5);
+    await seedOn(priv.id, "Invisible 1", 4);
+    const v2 = await seedOn(shared.id, "Visible 2", 3);
+    await seedOn(priv.id, "Invisible 2", 2);
+    const v3 = await seedOn(shared.id, "Visible 3", 1);
+
+    const first = await a.inject({ method: "GET", url: "/api/mail/threads?limit=2", headers: otherHeaders });
+    const page1 = listResponseSchema(mailThreadListItemSchema).parse(first.json());
+    expect(page1.items.map((t) => t.id)).toEqual([v1, v2]);
+    expect(page1.nextCursor).not.toBeNull();
+
+    const second = await a.inject({
+      method: "GET",
+      url: `/api/mail/threads?limit=2&cursor=${encodeURIComponent(page1.nextCursor ?? "")}`,
+      headers: otherHeaders,
+    });
+    const page2 = listResponseSchema(mailThreadListItemSchema).parse(second.json());
+    expect(page2.items.map((t) => t.id)).toEqual([v3]);
+    expect(page2.nextCursor).toBeNull();
     await a.close();
   });
 

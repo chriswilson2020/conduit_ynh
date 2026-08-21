@@ -43,19 +43,24 @@ import { publish } from "./sse.js";
  * ---------------------------------------------------------------------------
  * OWNERSHIP: NOT YET ON THE MOVE PATHS
  * ---------------------------------------------------------------------------
- * Since Phase 4.2's visibility predicate, an actor can only NAME threads the
- * lists showed them (and the hide path below re-checks that through
- * mail-threads' visibility gate) -- but on the two MOVE paths `actorId` is
- * still audit context for the log line and nothing else: it is never a
- * filter, and it is never compared against an account's owner, so a viewer
- * of a shared-visible thread can still move its messages. The IMAP write
- * happens through EACH MESSAGE'S OWN account's sync loop, under that
+ * Thread ids ARE nameable by every user -- sse.ts fans ["mail-thread", <id>]
+ * hints to every subscriber, so ids of threads on other users' private
+ * accounts reach every logged-in client. The hide path below re-checks each
+ * id through mail-threads' visibility gate, but the two MOVE paths do not
+ * yet: `actorId` is still audit context for the log line and nothing else --
+ * never a filter, never compared against an account's owner -- so an
+ * invisible id currently gets a distinguishable per-thread answer, and with
+ * a live sync loop the MOVE would move another user's private mail. The IMAP
+ * write happens through EACH MESSAGE'S OWN account's sync loop, under that
  * account's credentials -- the actor's identity never reaches a mail server.
  *
- * Phase 4.2 Task 3 replaces this section: move rights become owner-only, and
+ * Phase 4.2 Task 3 replaces this section, in two ordered steps: thread
+ * resolution gains the VISIBILITY gate first (an invisible id fails with the
+ * SAME not_found as a nonexistent one, byte-indistinguishable), and the
+ * `not_owner` ownership filter then applies only among visible threads --
  * `actorId` stops being audit-only the moment collectCandidates compares it
- * against each message's account (skip reason `not_owner`, per the spec's
- * Move rights section).
+ * against each message's account (per the spec's Move rights section and the
+ * Task 2 DONE-block handoffs).
  *
  * ---------------------------------------------------------------------------
  * NO INGEST ADVISORY LOCK

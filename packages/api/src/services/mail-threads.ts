@@ -265,10 +265,13 @@ function recordLinked(): SQL {
   return sql`(${mailThreads.dealId} IS NOT NULL OR ${mailThreads.projectId} IS NOT NULL)`;
 }
 
-/** Message granularity. Requires mail_accounts joined to the message row;
- * record scope additionally requires mail_threads in scope (see recordLinked).
- * Exported for the one mail read path outside this file: search.ts's mail
- * group, which composes it into its own per-message query. */
+/** Message granularity. PRECONDITION, enforced by nothing at compile time:
+ * the composing query must have mail_accounts in scope (joined to the
+ * message row), and for record scope mail_threads too -- a missing join
+ * fails only at runtime, as PostgreSQL's "missing FROM-clause entry" error.
+ * Exported for the two mail read paths outside this file, search.ts's mail
+ * group and mail-send.ts's reply chain, which compose it into their own
+ * per-message queries. */
 export function visibleMessageTerm(userId: string, scope: MailVisibilityScope): SQL {
   if (scope === "inbox") return ownedOrShared(userId);
   return sql`(${ownedOrShared(userId)} OR ${recordLinked()})`;
@@ -353,8 +356,12 @@ interface ThreadAggregates {
  * page's rows already passed cannot prevent that -- only a per-message
  * filter can. Every thread that passed the list's predicate has >= 1 message
  * passing this term in the same scope (the predicate's EXISTS names such a
- * message), so the filter can empty a grouped row only for the no-messages
- * thread, which the ?? fallbacks below already cover.
+ * message) -- an invariant of one statement's snapshot, though: the page
+ * query and these aggregates are separate statements, so an unlink or a
+ * visibility flip landing between them can empty a REAL row's aggregates,
+ * not just the no-messages thread's. Either way the ?? fallbacks below
+ * cover it, and the degradation is the safe direction -- an empty row
+ * (unread false, ownedByViewer false), never leaked content.
  */
 async function loadAggregates(
   db: Database, userId: string, threadIds: string[], view: UnreadScope, scope: MailVisibilityScope,
@@ -562,16 +569,20 @@ export async function listThreads(
   // fold into.
   //
   // COST OF THE FOLD, measured on 0005's methodology (20,000 threads /
-  // 82,000 messages, 2 accounts owned by two users, both private, viewer
-  // owning one; top-level Limit node time and buffers, warm, same dataset
-  // for before/after). The folded subquery reads account_id, which
-  // mail_messages_folder_thread_idx (drizzle/0005) does not carry -- but the
-  // feared regression toward 0005's 61.5ms class never appears, because the
-  // accounts join BINDS account_id and unlocks 0004's (account_id, folder,
-  // imap_uid) index, so the planner drives folder probes from the one or two
-  // visible account rows instead:
-  //   * 60-old-threads folder (0005's worst case), visible arm:
-  //     0.72ms / 191 buffers folder-only -> 0.54ms / 187 folded;
+  // 82,000 messages; 2 accounts owned by two users, both PRIVATE, viewer
+  // owning one -- the narrowest configuration, where the term restricts
+  // hardest; top-level Limit node time and buffers, warm). Every
+  // before-figure is this dataset's own re-measured pre-4.2-shape baseline,
+  // NOT 0005's published numbers (different seed and machine state -- the
+  // two files' figures must not be compared to each other). The folded
+  // subquery reads account_id, which mail_messages_folder_thread_idx
+  // (drizzle/0005) does not carry -- but the feared regression toward
+  // 0005's 61.5ms class never appears, because the accounts join BINDS
+  // account_id and unlocks 0004's (account_id, folder, imap_uid) index, so
+  // the planner drives folder probes from the visible account rows instead:
+  //   * 60-old-threads folder (0005's worst case), visible arm: does not
+  //     regress -- 0.72ms / 191 buffers folder-only -> 0.54ms / 187 folded
+  //     (the time delta is within single-warm-run noise; buffers are flat);
   //   * a folder existing only in the other user's private mailbox:
   //     0.10ms / 3 buffers, zero rows;
   //   * INBOX: 0.36ms / 157 -> 0.83ms / 411; a ~1.8k-thread spread folder:
@@ -582,9 +593,14 @@ export async function listThreads(
   // A candidate replacement index (folder, thread_id) INCLUDE (account_id)
   // was measured too: spread folder 265 buffers but 6.1ms (plan flip to hash
   // semi join over a seq scan plus sort), INBOX 0.56ms / 361 -- no decisive
-  // win, so 0006 adds no index. The unscoped shapes below measured 0.46ms
-  // (visibleThreads EXISTS) and 1.26ms (?unread=true, Heap Fetches: 0 on the
-  // unseen INCLUDE index) on the same dataset.
+  // win, so 0006 adds no index; that decision is evidenced for the measured
+  // configuration. The ALL-SHARED configuration (every mailbox flipped to
+  // shared, restoring 4.1 behaviour) is unmeasured and expected no worse:
+  // ownedOrShared then matches every account row, so the term restricts
+  // nothing while the join still hands the planner its account_id binding.
+  // The unscoped shapes below measured 0.46ms (visibleThreads EXISTS) and
+  // 1.26ms (?unread=true, Heap Fetches: 0 on the unseen INCLUDE index) on
+  // the same dataset.
   const scoped = opts.folder !== undefined;
   if (opts.accountId !== undefined || opts.folder !== undefined) {
     const terms: SQL[] = [sql`${mailMessages.threadId} = ${mailThreads.id}`];
@@ -628,16 +644,20 @@ export async function listThreads(
   // The page's rows are described in the same scope the filters selected them
   // in -- the unread view AND the visibility scope -- so a row's unread dot
   // answers the question its own view asked, and a row never renders content
-  // from a message this view's scope would not let the viewer open. TWO
-  // thread-level aggregates are the documented exception (coordinator-
-  // accepted): `messageCount` and `lastMessageAt` come off the mail_threads
-  // row itself and stay thread-global, so a viewer of half a cross-account
+  // from a message this view's scope would not let the viewer open. The
+  // documented exception (coordinator-accepted) is the thread ROW itself:
+  // everything toThread carries is thread-global, most pointedly
+  // `messageCount` and `lastMessageAt` (a viewer of half a cross-account
   // thread sees the whole conversation's count, ordered by a timestamp an
-  // invisible message may have set. Per-viewer versions would make the
-  // keyset cursor (which rides lastMessageAt) unstable -- the same thread
-  // would paginate differently per viewer and shift whenever the other
-  // half moved -- for metadata of low sensitivity: a count and a clock
-  // reading, never content.
+  // invisible message may have set) but also `subject`, which ingest
+  // normalized from the thread's FIRST message -- possibly one the viewer
+  // cannot read. Per-viewer versions would make the keyset cursor (which
+  // rides lastMessageAt) unstable -- the same thread would paginate
+  // differently per viewer and shift whenever the other half moved -- for
+  // metadata of low sensitivity: an inbox-visible thread means the viewer
+  // holds their own copy of the conversation (subject included), a thread
+  // with no visible message cannot reach a list at all, and what remains is
+  // a count and a clock reading, never body content.
   const aggregates = await loadAggregates(
     db, userId, page.map((row) => row.id), { folder: opts.folder, accountId: opts.accountId }, scope,
   );
@@ -682,8 +702,8 @@ export async function listThreads(
  *
  * An invisible thread throws the SAME NotFoundError a nonexistent id does --
  * one error, built in one place, so a caller probing ids can never tell
- * "hidden from you" apart from "not there" by status, body, or timing of the
- * code path (mirrors mail-folders.ts's mustGetOwnedAccount).
+ * "hidden from you" apart from "not there" by status or body (mirrors
+ * mail-folders.ts's mustGetOwnedAccount).
  */
 export async function mustGetThread(db: Database, userId: string, id: string): Promise<MailThreadRow> {
   const [row] = await db.select().from(mailThreads)
@@ -817,28 +837,32 @@ export async function markThreadRead(
   db: Database, userId: string, id: string,
 ): Promise<{ thread: MailThread; writeBacks: SeenWriteBack[] }> {
   // mustGetThread is the visibility gate (an invisible thread 404s before
-  // anything is written). Past it, the UPDATE carries visibleMessageTerm's
-  // record scope -- the same scope as the detail this click comes from -- so
-  // "mark read" applies to exactly what the viewer could read. On a
-  // deal/project-linked thread that is every message (the link shares the
-  // whole conversation, so the whole thread marks, as it always did); on an
-  // UNLINKED cross-account thread it is the viewer's own half, and the other
-  // user's private copies keep their seen state -- consequently no `\Seen`
-  // write-back group is ever built for an account whose messages the viewer
-  // cannot read, because the groups are built from the returned rows. The
-  // record arm is decided here in JS off the row mustGetThread just returned
-  // (an UPDATE has no thread join to read deal_id/project_id from); the
-  // account arm is the predicate's own ownedOrShared core, so the rule still
-  // has one source. Any viewer of a visible thread may still mark it read --
-  // reading is not a filing act, so Task 3's owner-only move rule does not
-  // apply here.
+  // anything is written). Past it, the UPDATE's WHERE carries the record-
+  // scope message term entirely IN SQL -- the ownedOrShared account EXISTS
+  // and a correlated EXISTS over mail_threads for the deal/project arm -- so
+  // the readability decision and the write are one atomic statement. A JS
+  // snapshot of the link columns would race: link removal is open to any
+  // record-visible viewer and the conversation view fires mark-read on open,
+  // so a thread linked at gate time can be unlinked by UPDATE time, and a
+  // snapshot that already decided "linked" would mark another user's private
+  // copies and send `\Seen` toward their server -- exactly what the
+  // mark-read amendment forbids.
+  //
+  // On a deal/project-linked thread every message matches (the whole thread
+  // marks, as it always did); on an UNLINKED cross-account thread only the
+  // viewer's own half does, and the other user's private copies keep their
+  // seen state -- consequently no `\Seen` write-back group is ever built for
+  // an account whose messages the viewer cannot read, because the groups are
+  // built from the returned rows. Any viewer of a visible thread may still
+  // mark it read -- reading is not a filing act, so Task 3's owner-only move
+  // rule does not apply here.
   const thread = await mustGetThread(db, userId, id);
-  const readable = [eq(mailMessages.threadId, id), eq(mailMessages.seen, false)];
-  if (thread.dealId === null && thread.projectId === null) {
-    readable.push(sql`EXISTS (SELECT 1 FROM ${mailAccounts} WHERE ${mailAccounts.id} = ${mailMessages.accountId} AND ${ownedOrShared(userId)})`);
-  }
+  const readable = and(
+    eq(mailMessages.threadId, id), eq(mailMessages.seen, false),
+    sql`(EXISTS (SELECT 1 FROM ${mailAccounts} WHERE ${mailAccounts.id} = ${mailMessages.accountId} AND ${ownedOrShared(userId)}) OR EXISTS (SELECT 1 FROM ${mailThreads} WHERE ${mailThreads.id} = ${mailMessages.threadId} AND ${recordLinked()}))`,
+  );
   const changed = await db.update(mailMessages).set({ seen: true, updatedAt: new Date() })
-    .where(and(...readable))
+    .where(readable)
     .returning({
       accountId: mailMessages.accountId, folder: mailMessages.folder, imapUid: mailMessages.imapUid,
     });
@@ -937,7 +961,7 @@ async function setArchived(
   // update-then-read would both flip an invisible thread's flag and hand its
   // subject to whoever guessed the id. mustGetThread 404s an invisible
   // thread exactly like a nonexistent one, before anything is written.
-  const existing = await mustGetThread(db, userId, id);
+  await mustGetThread(db, userId, id);
   const [row] = await db.update(mailThreads)
     .set({ archivedAt: archived ? new Date() : null, updatedAt: new Date() })
     .where(and(
@@ -948,10 +972,17 @@ async function setArchived(
     if (publishHint) publishThreadHint(id);
     return toThread(row);
   }
-  // Already in the requested state: the idempotent no-op, answered from the
-  // row read above. The state guard in the WHERE is still what keeps the
-  // no-op decision atomic against a concurrent archive.
-  return toThread(existing);
+  // Already in the requested state when the guarded UPDATE matched nothing.
+  // RE-READ rather than echoing the pre-update snapshot: under a concurrent
+  // archive this caller's no-op must report the row as the winning writer
+  // left it, not as it looked before the race. No second visibility gate
+  // (mustGetThread above already decided it) and no hint (the writer that
+  // changed the row published its own). The undefined arm is unreachable --
+  // threads have no delete path -- but a vanished row must not become a
+  // TypeError.
+  const [current] = await db.select().from(mailThreads).where(eq(mailThreads.id, id));
+  if (current === undefined) throw new NotFoundError("mail thread", id);
+  return toThread(current);
 }
 
 export interface ArchiveThreadOptions {

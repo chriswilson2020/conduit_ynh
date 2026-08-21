@@ -33,6 +33,9 @@ Migration 0006: `mail_accounts.visibility` text NOT NULL CHECK (`private`|`share
 > - The MOVE paths remain deliberately unchecked until then (mail-move.ts's OWNERSHIP section says so in present tense); hide already resolves through the gate and reports invisible as `not_found`.
 > - Link add/remove rights are unchanged and deliberately NOT restricted: any record-visible viewer can link/unlink. Noted as deferred backlog — the deal link is now a sharing control, and who may operate it deserves its own ruling later, not a slipped-in restriction.
 > - Mark-read's write-back grouping is now visibility-scoped (amendment b); Task 3's `not_owner` work must not regress it — the groups are built from the UPDATE's returned rows, so any change to that WHERE changes what flows to the sync loops.
+> - Task 3's bulk visibility gate must BATCH: ride collectCandidates' existing `inArray` thread read (one statement for the whole request), NOT a per-thread mustGetThread loop — hideThreads' per-thread read-then-write shape (now 2 round trips x up to 200 ids) is the shape NOT to copy.
+> - Design option logged for Task 3+, not to be taken now: making `visibleMessageTerm`'s record arm self-contained (an EXISTS over mail_threads inside the term, as markThreadRead's UPDATE now does inline) would drop the caller-must-join-mail_threads precondition and the q3 de-aliasing hazard — but it changes every composed query's plan, so it invalidates the EXPLAIN record just taken and carries a mandatory re-measure.
+> - For Task 4, a ruling to record: `/api/mail/accounts` still returns every other user's account as id+label+email to all authenticated users (needed so reply-all cannot cc a synced mailbox, and for the account chips) — a private mailbox's EXISTENCE and address stay disclosed while its mail does not. Task 4 documents this in the spec and the release notes surface it to Chris.
 
 ### Task 3: Move rights + the Settings toggle (API side)
 

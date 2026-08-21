@@ -4,16 +4,26 @@ ALTER TABLE "mail_accounts" ADD COLUMN "visibility" text DEFAULT 'private' NOT N
 -- accounts join into every folder-scoped EXISTS (services/mail-threads.ts),
 -- whose subquery now reads account_id -- a column 0005's
 -- mail_messages_folder_thread_idx does not carry. Re-EXPLAINed on 0005's
--- methodology (20,000 threads / 82,000 messages, two users' private
--- accounts): the join BINDS account_id, so the planner reaches for 0004's
--- (account_id, folder, imap_uid) index instead and 0005's worst case
--- IMPROVES (60-old-threads folder: 0.72ms/191 buffers -> 0.54ms/187 folded);
--- the probe-heavy views pay ~2x buffers (INBOX 0.36ms/157 -> 0.83ms/411,
--- ~1.8k-thread folder 1.26ms/1,673 -> 3.2ms/3,484). A candidate
--- (folder, thread_id) INCLUDE (account_id) replacement bought no decisive
--- win (spread folder 265 buffers but 6.1ms via a plan flip; INBOX
--- 0.56ms/361), so it was not added. The unseen partial index keeps
--- Heap Fetches: 0 under its new accounts join (badge 10.5ms/322, per-folder
--- 11.5ms/325) -- its INCLUDE payload already carries account_id. Full
--- figures beside each query in services/mail-threads.ts.
+-- methodology (20,000 threads / 82,000 messages; two users' PRIVATE
+-- accounts, viewer owning one -- the narrowest configuration, where the
+-- term restricts hardest). Every before-figure below is that same
+-- dataset's own re-measured baseline with the pre-4.2 query shape -- NOT
+-- 0005's published numbers, which came from a different seed and machine
+-- state and cannot be compared across files. The join BINDS account_id, so
+-- the planner reaches for 0004's (account_id, folder, imap_uid) index
+-- instead, and 0005's worst case does not regress (60-old-threads folder:
+-- 0.72ms/191 buffers -> 0.54ms/187 folded; the time delta is within
+-- single-warm-run noise, buffers are flat); the probe-heavy views pay ~2x
+-- buffers (INBOX 0.36ms/157 -> 0.83ms/411, ~1.8k-thread folder
+-- 1.26ms/1,673 -> 3.2ms/3,484). A candidate (folder, thread_id) INCLUDE
+-- (account_id) replacement bought no decisive win (spread folder 265
+-- buffers but 6.1ms via a plan flip; INBOX 0.56ms/361), so it was not
+-- added -- a decision evidenced for the measured configuration. The
+-- ALL-SHARED configuration (what flipping every mailbox to shared
+-- restores) is unmeasured and expected no worse: ownedOrShared then
+-- matches every account row, so the term restricts nothing and the join
+-- still hands the planner its account_id binding. The unseen partial index
+-- keeps Heap Fetches: 0 under its new accounts join (badge 10.5ms/322,
+-- per-folder 11.5ms/325) -- its INCLUDE payload already carries
+-- account_id. Full figures beside each query in services/mail-threads.ts.
 ALTER TABLE "mail_accounts" ADD CONSTRAINT "mail_accounts_visibility_valid" CHECK (visibility IN ('private','shared'));
