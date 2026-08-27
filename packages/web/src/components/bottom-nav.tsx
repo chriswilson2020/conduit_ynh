@@ -53,6 +53,26 @@ const SHEET_SHAPE = {
   full: "fixed inset-0",
 } as const;
 
+/**
+ * The accessible half of "you are here", spread onto a tab or a row.
+ *
+ * The bar computes its own active state from nav-lib rather than leaning on
+ * TanStack's, so the accessible marker has to come from the same rule as the
+ * colour -- otherwise the two states this navigation has are conveyed to a
+ * screen reader by nothing at all. The measured gap was exactly where the two
+ * rules disagree: Settings matches on `/settings` while it LINKS to
+ * `/settings/mail`, so on the Templates tab TanStack sets nothing.
+ *
+ * Returned as a spread-or-nothing rather than as `aria-current={x ?? undefined}`
+ * deliberately. Link merges its own computed props with the caller's, and an
+ * explicit `undefined` from the caller can win -- which would STRIP the marker
+ * from the tabs TanStack gets right today. Passing the attribute only when it
+ * is true can only ever add.
+ */
+function currentProps(active: boolean, value: "page" | "true"): { "aria-current"?: "page" | "true" } {
+  return active ? { "aria-current": value } : {};
+}
+
 function SearchIcon() {
   return (
     <svg
@@ -95,6 +115,7 @@ function Sheet({
   title,
   shape,
   trigger,
+  onOpenAutoFocus,
   children,
 }: {
   open: boolean;
@@ -103,6 +124,14 @@ function Sheet({
   title: string;
   shape: keyof typeof SHEET_SHAPE;
   trigger: ReactNode;
+  /**
+   * Where focus lands when the sheet opens. Radix's default is the first
+   * tabbable descendant, and since the header comes before the content that is
+   * the Close button -- fine for a list of choices, wrong for a sheet whose
+   * whole purpose is typing into something. Call `preventDefault()` and focus
+   * what the sheet is actually for.
+   */
+  onOpenAutoFocus?: (event: Event) => void;
   children: ReactNode;
 }) {
   return (
@@ -113,6 +142,7 @@ function Sheet({
         <RadixDialog.Content
           data-testid={testId}
           aria-describedby={undefined}
+          onOpenAutoFocus={onOpenAutoFocus}
           className={clsx(
             "flex flex-col overflow-hidden bg-white pb-[env(safe-area-inset-bottom)] shadow-xl focus:outline-none",
             SHEET_SHAPE[shape],
@@ -147,42 +177,52 @@ function Sheet({
  * fixed positioning with bottom padding on <main> so the last row of a list is
  * not parked under the bar.
  *
- * The `pb-[env(...)]` is 0px in this app today -- index.html's viewport meta
- * has no `viewport-fit=cover`, so the layout viewport already stops short of
- * the home indicator and every safe-area inset resolves to zero. It is kept
+ * The bar's own safe-area padding resolves to 0px in this app today, because
+ * index.html's viewport meta has no `viewport-fit=cover` and the layout
+ * viewport therefore already stops short of the home indicator. It is kept
  * because it costs nothing and becomes the correct padding the moment that
- * meta changes, which is Task 2's call.
+ * meta changes, which is Task 2's call. It is named in prose WITHOUT its
+ * bracket syntax on purpose, here and in shell.tsx: Tailwind v4 scans this
+ * file as plain text and emits ANY bracketed class it finds -- a comment is
+ * not a comment to it -- so an abbreviated one compiles to CSS that
+ * lightningcss rejects, and every later build carries a warning that reads
+ * like a real bug. Spell such a class out in full or leave the brackets off.
  */
 export function BottomNav({ unreadMail }: { unreadMail: number }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const { primary, overflow } = splitNav(NAV_DESTINATIONS);
+  const inOverflow = isAnyNavDestinationActive(pathname, overflow);
 
   return (
     <nav
       data-testid="bottom-nav"
       className="fixed inset-x-0 bottom-0 flex border-t border-slate-200 bg-white pb-[env(safe-area-inset-bottom)]"
     >
-      {primary.map((destination) => (
-        <Link
-          key={destination.id}
-          to={destination.to}
-          data-testid={`nav-${destination.id}`}
-          className={isNavDestinationActive(pathname, destination) ? activeTabClass : tabClass}
-        >
-          <span className="flex items-center gap-1">
-            {destination.label}
-            {destination.id === "mail" && unreadMail > 0 && (
-              <span
-                data-testid="unread-badge"
-                className="rounded-full bg-slate-900 px-1.5 py-0.5 text-[10px] font-semibold text-white"
-              >
-                {unreadMail}
-              </span>
-            )}
-          </span>
-        </Link>
-      ))}
+      {primary.map((destination) => {
+        const active = isNavDestinationActive(pathname, destination);
+        return (
+          <Link
+            key={destination.id}
+            to={destination.to}
+            data-testid={`nav-${destination.id}`}
+            {...currentProps(active, "page")}
+            className={active ? activeTabClass : tabClass}
+          >
+            <span className="flex items-center gap-1">
+              {destination.label}
+              {destination.id === "mail" && unreadMail > 0 && (
+                <span
+                  data-testid="unread-badge"
+                  className="rounded-full bg-slate-900 px-1.5 py-0.5 text-[10px] font-semibold text-white"
+                >
+                  {unreadMail}
+                </span>
+              )}
+            </span>
+          </Link>
+        );
+      })}
       <Sheet
         open={moreOpen}
         onOpenChange={setMoreOpen}
@@ -192,24 +232,29 @@ export function BottomNav({ unreadMail }: { unreadMail: number }) {
         trigger={
           <RadixDialog.Trigger
             data-testid="bottom-nav-more"
-            className={isAnyNavDestinationActive(pathname, overflow) ? activeTabClass : tabClass}
+            {...currentProps(inOverflow, "true")}
+            className={inOverflow ? activeTabClass : tabClass}
           >
             More
           </RadixDialog.Trigger>
         }
       >
         <div className="flex flex-col gap-1">
-          {overflow.map((destination) => (
-            <Link
-              key={destination.id}
-              to={destination.to}
-              data-testid={`nav-${destination.id}`}
-              onClick={() => setMoreOpen(false)}
-              className={isNavDestinationActive(pathname, destination) ? activeSheetRowClass : sheetRowClass}
-            >
-              {destination.label}
-            </Link>
-          ))}
+          {overflow.map((destination) => {
+            const active = isNavDestinationActive(pathname, destination);
+            return (
+              <Link
+                key={destination.id}
+                to={destination.to}
+                data-testid={`nav-${destination.id}`}
+                {...currentProps(active, "page")}
+                onClick={() => setMoreOpen(false)}
+                className={active ? activeSheetRowClass : sheetRowClass}
+              >
+                {destination.label}
+              </Link>
+            );
+          })}
         </div>
       </Sheet>
     </nav>
@@ -241,6 +286,27 @@ export function MobileSearch() {
       testId="search-sheet"
       title="Search"
       shape="full"
+      onOpenAutoFocus={(event) => {
+        // Radix would focus the first tabbable descendant, which is Close --
+        // it sits in the header, and the header precedes the content. On a
+        // full-screen search surface with no keyboard that is the worst
+        // possible landing: a screen reader announces "Close, button" for a
+        // sheet whose entire purpose is typing, and a phone user gets no
+        // keyboard until they find and tap the field themselves.
+        //
+        // The input is found by tag rather than through a ref because the
+        // alternative is threading one through GlobalSearch and ui/input.tsx,
+        // and that primitive types its props as InputHTMLAttributes with no
+        // ref among them -- widening it is Task 2's file and Task 2's call.
+        // This sheet holds exactly one input, and Sheet's title makes which
+        // one unambiguous.
+        const content = event.currentTarget;
+        if (!(content instanceof HTMLElement)) return;
+        const input = content.querySelector("input");
+        if (input === null) return;
+        event.preventDefault();
+        input.focus();
+      }}
       trigger={
         <RadixDialog.Trigger
           data-testid="open-search"

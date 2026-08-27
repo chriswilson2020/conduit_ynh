@@ -90,6 +90,13 @@ describe("isNavDestinationActive", () => {
 });
 
 /**
+ * Where the phone's word for a destination is deliberately not the desktop's.
+ * One entry today: the sidebar's "Inbox" is the bar's "Mail". Anything else
+ * that diverges has to be added here, in front of a reader.
+ */
+const SIDEBAR_LABEL: Record<string, string> = { mail: "Inbox" };
+
+/**
  * The phase's scope rule is that nothing the app can do is desktop-only, and
  * the shell is where that is easiest to break: a ninth sidebar entry added
  * later without a matching line in NAV_DESTINATIONS would be reachable at a
@@ -99,8 +106,17 @@ describe("isNavDestinationActive", () => {
  * Reading the sidebar's source is deliberate rather than lazy. shell.tsx keeps
  * its links as hand-written JSX -- this phase may not alter the desktop shell,
  * and rewriting them into a map over this list would do exactly that -- so a
- * runtime assertion has nothing to compare against. Labels are not compared,
- * only targets: the sidebar says "Inbox" where the bar says "Mail".
+ * runtime assertion has nothing to compare against.
+ *
+ * TARGET, LABEL AND POSITION are all compared, because two mutations proved
+ * that comparing a set of targets was not enough to support what this file
+ * claims. Renaming a destination here left the sidebar saying "Gantt" while
+ * the sheet said "Timeline", and swapping two sidebar links left the sheet's
+ * order silently diverging from the order NAV_DESTINATIONS says it copies --
+ * both with every test still green. The one deliberate divergence is declared
+ * in SIDEBAR_LABEL below rather than tolerated by a loose assertion: a phone
+ * tab is narrow, so a future task may well want a shorter word there, and it
+ * should have to write that down.
  *
  * KNOW WHAT THIS GUARD CANNOT SEE, because it is the mechanical basis for the
  * phase's central promise and a false sense of it is worse than none. It
@@ -113,10 +129,21 @@ describe("isNavDestinationActive", () => {
  * test must be taught the new spelling in the same commit.
  */
 describe("NAV_DESTINATIONS", () => {
-  it("covers exactly the destinations the desktop sidebar links to", () => {
+  it("matches the desktop sidebar's links in target, label AND order", () => {
     const shell = readFileSync(new URL("./shell.tsx", import.meta.url), "utf8");
-    const linked = [...shell.matchAll(/to="(\/[^"]*)"/g)].map((match) => match[1] ?? "");
-    expect(linked.sort()).toEqual(NAV_DESTINATIONS.map((destination) => destination.to).sort());
+    // Each sidebar entry is `<Link to="/x" ...>` with its label on the next
+    // line; the mail entry's badge markup starts on the line after that, so
+    // stopping at the first newline, `<` or `{` takes the word and nothing
+    // else.
+    const linked = [...shell.matchAll(/to="(\/[^"]*)"[^>]*>\s*([^\n<{]+)/g)].map((match) => [
+      match[1] ?? "",
+      (match[2] ?? "").trim(),
+    ]);
+    const expected = NAV_DESTINATIONS.map((destination) => [
+      destination.to,
+      SIDEBAR_LABEL[destination.id] ?? destination.label,
+    ]);
+    expect(linked).toEqual(expected);
   });
 
   it("gives every destination a unique id and target", () => {

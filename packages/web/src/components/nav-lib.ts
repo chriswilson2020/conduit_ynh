@@ -30,11 +30,17 @@ export interface NavDestination {
  * Every destination the shell offers, in the desktop sidebar's own order.
  *
  * This list and the sidebar's literal JSX in shell.tsx are pinned to each
- * other by nav-lib.test.ts: the phase's definition of done is that nothing is
- * desktop-only, and a ninth sidebar entry added without a line here would be
- * exactly that -- reachable at a desk and nowhere else. The sidebar is not
- * driven FROM this list because this phase may not alter the desktop shell at
- * all, and rewriting eight hand-tuned links into a map would do just that.
+ * other by nav-lib.test.ts -- in TARGET, LABEL AND POSITION, so "the sidebar's
+ * own order" above is a fact the suite enforces rather than a hope. The
+ * phase's definition of done is that nothing is desktop-only, and a ninth
+ * sidebar entry added without a line here would be exactly that: reachable at
+ * a desk and nowhere else. The sidebar is not driven FROM this list because
+ * this phase may not alter the desktop shell at all, and rewriting eight
+ * hand-tuned links into a map would do just that.
+ *
+ * A label that must legitimately differ between the two (the sidebar says
+ * "Inbox" where the bar says "Mail") is declared in that test's SIDEBAR_LABEL
+ * rather than allowed by a looser comparison.
  */
 export const NAV_DESTINATIONS = [
   { id: "mail", label: "Mail", to: "/mail", match: "/mail" },
