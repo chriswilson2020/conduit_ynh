@@ -442,13 +442,21 @@ export async function updateAccount(
     // after the status reset; otherwise just wakes it, since the running
     // loop re-reads the account row on its very next pass anyway.
     notifyAccountChanged(id, { connectionChanged });
-    // A visibility flip changes what EVERY user's thread list and unread
-    // badge contain (the Phase 4.2 predicate reads this column), not just
-    // this account's settings row -- so the one post-commit publish widens
-    // to carry the two thread-side key families beside the accounts key.
+    // A visibility flip changes what EVERY user's thread list, unread badge
+    // and RECORD TIMELINE contain (the Phase 4.2 predicate reads this
+    // column), not just this account's settings row -- so the one post-commit
+    // publish widens to carry those key families beside the accounts key.
+    // `["events"]` joined them in Phase 5 Task 4: a timeline's mail entries
+    // are filtered through that same predicate at read time
+    // (services/timeline.ts), so flipping shared -> private must retire them
+    // from other users' timelines as surely as from their thread lists, and
+    // private -> shared must make them appear. A cached timeline is never a
+    // leak -- the server re-filters every request, so a stale client holds
+    // only what it was already entitled to see -- but it would go on offering
+    // a click through to a thread that is no longer there.
     // Same-value patches never reach here (the no-op short-circuit above),
     // so toggling nothing publishes nothing.
-    publishAccountsHint(visibilityChanged ? [["mail-threads"], ["mail-unread"]] : []);
+    publishAccountsHint(visibilityChanged ? [["mail-threads"], ["mail-unread"], ["events"]] : []);
   }
   return toMailAccount(row);
 }

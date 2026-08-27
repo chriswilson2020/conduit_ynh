@@ -38,12 +38,29 @@ import { publish } from "./sse.js";
  * identity) live in mail-accounts.ts / mail-send.ts.
  */
 
-/** Every mail-thread mutation invalidates the same three key families: the
- * list, this one thread's detail, and the unread badge. Mirrors the hint
+/** Every mail-thread mutation invalidates the same four key families: the
+ * list, this one thread's detail, the unread badge, and -- since Phase 5 put
+ * mail on the record timeline -- `["events"]`. Mirrors the hint
  * mail-ingest.ts publishes when a new message lands, so a client only has to
- * know one set of keys. */
+ * know one set of keys.
+ *
+ * `["events"]` IS HERE BECAUSE THIS FILE'S WRITES NOW CHANGE WHAT A TIMELINE
+ * RENDERS, which was not true before Phase 5 Task 4. A timeline's mail
+ * entries are filtered per viewer through the 4.2 visibility predicate and
+ * the 4.3 hide predicate at read time (services/timeline.ts), so hiding a
+ * thread REMOVES its entries from that viewer's timelines and linking one to
+ * a deal or project ADDS them to other viewers' -- while a cached timeline
+ * goes on showing the old answer, offering a click through to a thread the
+ * viewer just filed away. Never a leak (the server re-filters every request;
+ * a stale client holds only what it was already entitled to see), but a dead
+ * surface this task would otherwise have created.
+ *
+ * OVER-INVALIDATION IS THE ACCEPTED TRADE, as it already is elsewhere: most
+ * thread mutations move no timeline row at all, and every one of them
+ * refetches the rails anyway. updateMeeting is the standing precedent --
+ * it publishes `["events"]` deliberately while writing no event. */
 function publishThreadHint(threadId: string): void {
-  publish({ keys: [["mail-threads"], ["mail-thread", threadId], ["mail-unread"]] });
+  publish({ keys: [["mail-threads"], ["mail-thread", threadId], ["mail-unread"], ["events"]] });
 }
 
 /**

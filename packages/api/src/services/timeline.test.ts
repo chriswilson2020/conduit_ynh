@@ -377,7 +377,11 @@ describe("timeline mail privacy", () => {
       if (cell.hidden) await hideFor(threadId, viewerId);
       await mailEvent(threadId, links);
 
-      const page = await listEvents(handle.db, viewerId, { companyId });
+      // limit 100, not the default 50: this loop accumulates a row per cell
+      // on ONE company's timeline, and a visible row that simply fell off the
+      // end of the page would read as EXCLUDED -- which is a PASS for every
+      // negative cell, and a silent one.
+      const page = await listEvents(handle.db, viewerId, { companyId, limit: 100 });
       const row = page.items.find((e) => e.mailThreadId === threadId);
       // Three distinguishable outcomes, so "excluded" can never be confused
       // with "present but unlabelled".
@@ -386,6 +390,11 @@ describe("timeline mail privacy", () => {
         : (row.mailSubject === null ? "PRESENT-WITHOUT-SUBJECT" : row.mailSubject);
       expected[name] = cell.visible ? name : "EXCLUDED";
     }
+    // label() must be INJECTIVE over Cell, and nothing in the type system
+    // makes it so: add a fifth dimension, forget to extend label(), and cells
+    // collide in `seen` and `expected` alike. They would still agree -- one
+    // iteration writes both -- so half the matrix would vanish, green.
+    expect(Object.keys(seen)).toHaveLength(MATRIX.length);
     expect(seen).toEqual(expected);
   });
 

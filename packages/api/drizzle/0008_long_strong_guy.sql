@@ -137,7 +137,10 @@ CREATE INDEX "meeting_attendees_meeting_id_idx" ON "meeting_attendees" USING btr
 -- dataset, both WITH this index present).
 CREATE INDEX "events_meeting_id_idx" ON "events" USING btree ("meeting_id") WHERE "meeting_id" IS NOT NULL;--> statement-breakpoint
 -- The mail-timeline throttle's existence check, and the ONLY consumer this
--- index has. services/mail-ingest.ts's emitMailEvent asks "has this thread
+-- index has -- the twin of this note lives in that function's own header
+-- (services/mail-ingest.ts's emitMailEvent, "COST OF THAT CHECK"), and the
+-- two name each other so neither can be updated alone.
+-- services/mail-ingest.ts's emitMailEvent asks "has this thread
 -- already emitted this verb today, in UTC?" once per ingested message, INSIDE
 -- the global ingest lock -- so this cost is per MESSAGE and serialised, not
 -- per page request, which is why it earns an index at a tenth of the row
@@ -190,7 +193,14 @@ CREATE INDEX "events_mail_thread_id_idx" ON "events" USING btree ("mail_thread_i
 -- record-FK indexes at all. RE-MEASURE TRIGGER, IN EVENTS ROWS: on the order
 -- of 1M events (~150ms by linear extrapolation from the 300k figure --
 -- extrapolated, not measured), EXPLAIN listEvents' five record filters and
--- index the record-FK columns then.
+-- index the record-FK columns then -- AND CONFIRM THE MAIL JOIN IS STILL A
+-- NESTED LOOP ABOVE THE SORT. That shape is what makes Phase 5 Task 4's
+-- mail_threads probe cost O(limit) rather than O(table), and it rests on a
+-- cost estimate rather than a guarantee: forced onto the alternative the
+-- planner keeps in reserve (a Hash Right Join over every thread and a
+-- sequential scan of every message) the same rail query measured 531ms, a
+-- 23x regression no longer bounded by the page size. services/timeline.ts's
+-- header carries the numbers.
 -- NO BACKFILL RIDES THIS MIGRATION, and that is a decision, not an omission
 -- (Phase 5 spec, Data model): the two new events columns stay NULL on every
 -- pre-existing row and no historical mail is turned into timeline entries.

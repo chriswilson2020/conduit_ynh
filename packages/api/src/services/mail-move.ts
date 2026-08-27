@@ -923,10 +923,22 @@ async function applyOptimisticMove(db: Database, candidates: readonly Candidate[
  * flag changing: per the coordinator's ruling, Task 4's unread queries exclude
  * each account's trash_folder, so trashing an unread message drops it out of
  * the badge (while archiving one leaves it counted).
+ *
+ * `events` joined them in Phase 5 Task 4, for the same reason it joined
+ * mail-threads.ts's publishThreadHint: the bulk "Hide in CRM" path routes
+ * through here (hideThreads passes publishHint: false precisely so this one
+ * publish covers the lot), and hiding a thread removes its entries from that
+ * viewer's record timelines, which the 4.3 predicate filters at read time.
+ * A bulk hide of 200 threads is the LARGEST timeline change this file can
+ * make, so it is the last one that should be left publishing nothing.
  */
 function publishMoveHints(threadIds: ReadonlySet<string>): void {
   publish({
-    keys: [["mail-threads"], ["mail-unread"], ...[...threadIds].map((id) => ["mail-thread", id])],
+    keys: [
+      ["mail-threads"], ["mail-unread"],
+      ...[...threadIds].map((id) => ["mail-thread", id]),
+      ["events"],
+    ],
   });
 }
 

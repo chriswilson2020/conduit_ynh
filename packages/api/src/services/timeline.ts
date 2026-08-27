@@ -68,7 +68,12 @@ export interface ListEventsOptions {
  * links (mail-ingest.ts) and every filter here is one of those FKs. REVISIT
  * IT the day an unfiltered "all activity" timeline lands: that surface would
  * be a mailbox view, and "record" would make it one degree more permissive
- * than the inbox it sits beside.
+ * than the inbox it sits beside. That day is a UI change away, not a code
+ * change away -- routes/events.ts already treats an unfiltered request as
+ * valid, so `GET /api/events?limit=100` returns a cross-record mail stream
+ * under record scope right now. It grants nothing the record Mail tabs do not
+ * (identical gate, quality-review-verified), so this is a note about where
+ * the boundary sits, not a hole.
  *
  * THE PREDICATES RIDE THE JOIN'S ON CLAUSE, not a separate WHERE term, and
  * the shape is load-bearing twice over. Correctness: the subject can only be
@@ -114,6 +119,22 @@ export interface ListEventsOptions {
  *     events.mail_thread_id AND ...)` in the WHERE: 779ms and SERIAL, 14x
  *     this shape.
  * Do not fold the ON-clause terms into the WHERE in either form.
+ *
+ * THE PLAN SHAPE THE COST DEPENDS ON, and it is worth naming because the
+ * shape, not the row count, is what keeps this affordable: the planner puts
+ * the Nested Loop Left Join ABOVE the Gather Merge, so mail_threads is probed
+ * roughly once per row the page actually returns (~61 loops for a 51-row
+ * page) rather than once per row scanned. The quality review confirmed that
+ * holds at 50x the threads and 5x the mail rows measured here -- the join
+ * cost is O(limit), not O(table).
+ *
+ * WHAT HOLDS IT IS A COST ESTIMATE, NOT A GUARANTEE (92,095 against
+ * 1,261,350 for the alternative on the measured dataset). Forced off it --
+ * `SET enable_nestloop = off` on the same rail query -- the planner takes a
+ * Hash Right Join, scans every thread and sequentially scans every message:
+ * 531ms, a 23x regression, and one no longer bounded by the page size. That
+ * is the statistics cliff to watch for; drizzle/0008's read-side re-measure
+ * trigger says to check for it by name.
  */
 export async function listEvents(
   db: Database, viewerId: string, opts: ListEventsOptions,

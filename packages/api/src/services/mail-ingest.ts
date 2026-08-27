@@ -588,24 +588,17 @@ async function autoLinkThread(tx: Database, threadId: string, participants: stri
  * check and the insert. A constraint could not express the rule anyway --
  * "same UTC day" is not a column.
  *
- * COST OF THAT CHECK, AND THE INDEX THIS DELIBERATELY DOES NOT SHIP.
- * `events` carries no index on mail_thread_id, so the check is a scan of the
- * whole table, once per ingested message, INSIDE the global ingest lock.
- * MEASURED (300,000 events of which 30,000 carry mail_thread_id, warm,
- * top-level Execution Time): 35ms / 4,077 buffers as a parallel sequential
- * scan; 0.14ms / 17 buffers with a candidate
- * `CREATE INDEX events_mail_thread_id_idx ON events (mail_thread_id) WHERE
- * mail_thread_id IS NOT NULL` (288 kB against a 32 MB table, and it leaves
- * every read plan in services/timeline.ts unchanged -- 55ms and 38ms against
- * 56ms and 35ms without it, all within run-to-run noise). This deployment
- * holds thousands of events, where the same scan is sub-millisecond, and the
- * index is not this task's to add. RE-MEASURE TRIGGER, IN EVENTS ROWS because
- * that is what this scan is over: on the order of 100k events -- roughly 12ms
- * per message by linear extrapolation, which is the point at which one
- * mailbox's sync starts holding the global lock long enough to be felt by
- * another account's. That is ten times sooner than the ~1M-row trigger
- * drizzle/0008 records for the read side, because this cost is per MESSAGE
- * and serialised, not per page request.
+ * COST OF THAT CHECK, AND THE INDEX 0008 SHIPS FOR EXACTLY THIS QUERY.
+ * `events_mail_thread_id_idx` (drizzle/0008 lines 139-164, partial on
+ * mail_thread_id IS NOT NULL) exists for this one statement and nothing else
+ * -- no read path in services/timeline.ts can use it, which that block
+ * records in full. It earns its place because this cost is per MESSAGE and
+ * serialised behind the global ingest lock, not per page request. MEASURED
+ * (300,000 events of which 30,000 carry mail_thread_id, warm, top-level
+ * Execution Time): 35ms / 4,077 buffers as a parallel sequential scan without
+ * it, 0.027-0.14ms / 17 buffers with it. Without an index this scan is what
+ * would put one mailbox's sync in another account's way; with it, the check
+ * is bounded by one thread's own entries.
  *
  * A THREAD WITH NO RECORD LINKS EMITS NOTHING. There is no timeline for the
  * entry to appear on: every listEvents filter is one of the four record FKs,
@@ -617,6 +610,15 @@ async function autoLinkThread(tx: Database, threadId: string, participants: stri
  * The actor is the OWNER OF THE ACCOUNT the message arrived on, which is the
  * closest thing a machine-generated row has to a person. It is not a leak in
  * its own right: the row reaches nobody who cannot already see the thread.
+ *
+ * THIS RUNS INSIDE INGEST'S TRANSACTION, so a failure here rolls the MESSAGE
+ * back -- out as MailIngestError, into Phase 4's poison contract (retry once,
+ * recordPoison, skip the UID). That is the intended trade rather than an
+ * oversight: a message that will be re-fetched next pass is a smaller harm
+ * than a message stored with its timeline entry silently missing, and no
+ * realistic permanent failure exists to make the trade bite (every events FK
+ * is NO ACTION, the verb is a literal the CHECK already accepts, and the
+ * actor comes from the account row's own FK'd user).
  *
  * KNOWN LIMITATION, shared with every other event row (the Task 2 DONE
  * block's D6): record links are a SNAPSHOT at emission. Linking a thread to a
@@ -632,6 +634,27 @@ async function autoLinkThread(tx: Database, threadId: string, participants: stri
  * re-emitting on every link change, which would double entries on the
  * timelines that already had them -- and it is a delay of at most a day on a
  * record that has just been linked, not a permanent gap.
+ *
+ * AND TWO MORE CONSEQUENCES OF THE SAME RULE, stated so they are not
+ * inferred later from a bug report:
+ *
+ *   - WITHIN A DAY, THE FIRST MESSAGE WINS BOTH THE TIMESTAMP AND THE FK
+ *     SNAPSHOT. A thread whose only substantive reply lands at 23:00 renders
+ *     on the timeline at the 08:00 of that morning's throwaway note, under
+ *     whatever links the thread carried then. Defensible -- the entry means
+ *     "this conversation was active today", and the Mail tab holds the
+ *     messages -- but it is not "when the interesting mail arrived".
+ *
+ *   - A MAIL ACCOUNT ADDED AFTER THE UPGRADE IS A DE FACTO BACKFILL, and it
+ *     is the ordinary case for the second and third user of a self-hosted
+ *     CRM. Its first sync ingests the whole mailbox as created: true, so
+ *     every auto-linked thread emits -- all stamped NOW, in IMAP UID order
+ *     rather than in the order the conversations happened. 0008's NO BACKFILL
+ *     note covers historical messages ALREADY STORED; it does not cover this,
+ *     because nothing is being synthesised -- these are ordinary first
+ *     sightings. Whoever writes the release notes should say so beside the
+ *     no-backfill line, or a new user's first day will look like a timeline
+ *     flood with no explanation.
  */
 async function emitMailEvent(
   tx: Database, threadId: string, direction: "inbound" | "outbound", actorUserId: string,

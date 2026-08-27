@@ -13,6 +13,9 @@ import { resolveUser } from "../users.js";
 import { events, mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads } from "../db/schema.js";
 import { createCompany } from "./companies.js";
 import { archiveContact, createContact } from "./contacts.js";
+import { createDeal } from "./deals.js";
+import { createPipeline, createStage } from "./pipelines.js";
+import { createProject } from "./projects.js";
 import { MailIngestError, NotFoundError } from "./errors.js";
 import { ingestMessage, type IngestMessageLinks } from "./mail-ingest.js";
 import { listThreads, unreadThreadCount } from "./mail-threads.js";
@@ -1245,6 +1248,48 @@ describe("ingestMessage: timeline entries", () => {
     expect(serialised).not.toContain("grimsby.underhay@example.net");
   });
 
+  // THE HEADLINE USE CASE, and the one every other test here misses: the
+  // fixtures above all reach their links through the auto-linker, which
+  // writes ONLY contact and company. A deal or project link is the
+  // deliberate, click-made kind -- and the only kind Phase 4.2's model treats
+  // as WIDENING visibility, so these are precisely the entries another user
+  // is meant to see. Nulling the two columns in emitMailEvent's insert left
+  // the whole suite green before this existed (quality review), while mail
+  // silently stopped reaching deal and project timelines.
+  //
+  // The compose-seed path (`links`, applied on a thread this call creates) is
+  // how a thread acquires them at ingest time; a human linking an existing
+  // thread later is the D6/O3 case in emitMailEvent's header, not this one.
+  it("carries a deal and a project link from the thread onto the entry, and both timelines get it", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const pipeline = await createPipeline(handle.db, actorId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, actorId, pipeline.id, { name: "Lead" });
+    const deal = await createDeal(handle.db, actorId, {
+      title: "Renewal", pipelineId: pipeline.id, stageId: stage.id, companyId: company.id,
+    }, "EUR");
+    const project = await createProject(handle.db, actorId, { name: "Launch", companyId: company.id });
+
+    // A sender no contact matches, so the auto-linker writes nothing and the
+    // two columns under test can only have come from the thread's own links.
+    await ingest({ messageId: ROOT_ID, from: "stranger@elsewhere.example" }, {
+      links: { dealId: deal.id, projectId: project.id },
+    });
+
+    const rows = await eventRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.dealId).toBe(deal.id);
+    expect(rows[0]?.projectId).toBe(project.id);
+    expect(rows[0]?.companyId).toBeNull();
+    expect(rows[0]?.contactId).toBeNull();
+
+    // And the entry is actually reachable from both records, which is the
+    // point of stamping the FKs at all.
+    const onDeal = await listEvents(handle.db, actorId, { dealId: deal.id });
+    expect(onDeal.items.filter((e) => e.verb === "mail_received")).toHaveLength(1);
+    const onProject = await listEvents(handle.db, actorId, { projectId: project.id });
+    expect(onProject.items.filter((e) => e.verb === "mail_received")).toHaveLength(1);
+  });
+
   it("emits mail_sent for an outbound message", async () => {
     await linkedContact();
     await ingest({
@@ -1316,23 +1361,30 @@ describe("ingestMessage: timeline entries", () => {
   // are asserted -- one of them contradicts a session-local boundary
   // whichever side it falls.
   //
-  // The two instants are computed here from Date's own UTC accessors, not by
-  // repeating the service's SQL: a copy of the expression would be mutated
-  // alongside it and prove nothing.
+  // Both instants are derived from ONE reading of the DATABASE's clock, not
+  // from `new Date()`: the service compares against the database's `now()`,
+  // and for the few hundred milliseconds a year in which the two machines'
+  // clocks straddle UTC midnight, correct code would fail an assertion built
+  // on the wrong one. They are computed by arithmetic on that reading rather
+  // than by repeating the service's own SQL -- a copy of the expression would
+  // be mutated alongside it and prove nothing.
   it("takes its day boundary from UTC, not from the server's session time zone", async () => {
     // A dedicated handle whose sessions all run at +14. The zone rides the
     // connection URL rather than a `SET TIME ZONE` on the shared pool, where
     // which of the two pooled connections a later query lands on is not
-    // something a test can pin.
-    const zoned = createDatabase(
-      `${TEST_DATABASE_URL}?options=-c%20TimeZone%3DPacific%2FKiritimati`, 1,
-    );
+    // something a test can pin. URL-composed, because TEST_DATABASE_URL may
+    // already carry a query string of its own.
+    const zonedUrl = new URL(TEST_DATABASE_URL);
+    zonedUrl.searchParams.set("options", "-c TimeZone=Pacific/Kiritimati");
+    const zoned = createDatabase(zonedUrl.toString(), 1);
     try {
       expect((await zoned.db.execute<{ TimeZone: string }>(sql`SHOW TimeZone`))[0]?.TimeZone)
         .toBe("Pacific/Kiritimati");
 
-      const now = new Date();
-      const utcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+      const [clock] = await handle.db.execute<{ now: Date }>(sql`SELECT now() AS now`);
+      if (clock === undefined) throw new Error("SELECT now() returned no row");
+      const dbNow = new Date(clock.now);
+      const utcMidnight = Date.UTC(dbNow.getUTCFullYear(), dbNow.getUTCMonth(), dbNow.getUTCDate());
       const justInsideToday = new Date(utcMidnight + 30 * 60 * 1000);
       const justBeforeToday = new Date(utcMidnight - 30 * 60 * 1000);
 
@@ -1340,7 +1392,8 @@ describe("ingestMessage: timeline entries", () => {
       const [thread] = await handle.db.insert(mailThreads).values({
         subject: "Boundary", lastMessageAt: new Date(), messageCount: 0, companyId,
       }).returning({ id: mailThreads.id });
-      const threadId = thread?.id ?? "";
+      if (thread === undefined) throw new Error("thread insert returned no row");
+      const threadId = thread.id;
 
       // PROBE 1: today's entry already exists, half an hour after UTC
       // midnight. A UTC boundary sees it and suppresses; a +14 local boundary

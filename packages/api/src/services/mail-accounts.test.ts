@@ -420,13 +420,17 @@ describe("updateAccount", () => {
   // Phase 4.2: a visibility flip changes what EVERY user's thread list and
   // unread badge contain (the predicate reads mail_accounts.visibility), so
   // its ONE post-commit publish carries the thread-side key families too.
-  it("publishes mail-accounts, mail-threads and mail-unread in one frame when visibility flips", async () => {
+  // Phase 5 Task 4 added `events`: the same predicate decides which mail
+  // entries a viewer's RECORD TIMELINE renders, so flipping shared -> private
+  // must retire them there as surely as from the thread list, and flipping
+  // the other way must make them appear.
+  it("publishes mail-accounts, mail-threads, mail-unread and events in one frame when visibility flips", async () => {
     const account = await make();
     const hints: string[][][] = [];
     const unsub = subscribe((hint) => hints.push(hint.keys));
     try {
       await updateAccount(handle.db, actorId, account.id, { visibility: "shared" }, keyPath);
-      expect(hints).toEqual([[["mail-accounts"], ["mail-threads"], ["mail-unread"]]]);
+      expect(hints).toEqual([[["mail-accounts"], ["mail-threads"], ["mail-unread"], ["events"]]]);
     } finally {
       unsub();
     }

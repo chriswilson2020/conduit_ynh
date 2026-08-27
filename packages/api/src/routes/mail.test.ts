@@ -22,6 +22,7 @@ import {
   mailAccountFolders, mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads,
 } from "../db/schema.js";
 import { saveBlob } from "../services/blobs.js";
+import { subscribe } from "../services/sse.js";
 import type { SendMailMessage, SendMailTransport } from "../services/mail-send.js";
 import type { MailRouteSyncManager } from "./mail.js";
 
@@ -1382,6 +1383,43 @@ describe("mail thread read route", () => {
 // --- Threads: links and hide -------------------------------------------------
 
 describe("mail thread link and hide routes", () => {
+  // Phase 5 Task 4 coupled this file's writes to the RECORD TIMELINE: mail
+  // entries there are filtered per viewer through the 4.2 visibility
+  // predicate and the 4.3 hide predicate at READ time (services/timeline.ts),
+  // so a hide removes entries from that viewer's timelines and a deal link
+  // adds them to other viewers'. Without `events` on these frames a cached
+  // timeline goes on offering a click through to a thread the viewer just
+  // filed away -- never a leak, since the server re-filters every request,
+  // but a dead surface this task would have created. Deleting `["events"]`
+  // from publishThreadHint fails exactly this test.
+  it("publishes the events key when a link changes and when a thread is hidden", async () => {
+    const a = await app();
+    const account = await makeAccount(a);
+    const deal = await makeDeal(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    await seedMessage(threadId, account.id, { sentAt: new Date("2026-08-02T10:00:00Z") });
+
+    const frames: string[][][] = [];
+    const unsub = subscribe((hint) => frames.push(hint.keys));
+    try {
+      const linked = await a.inject({
+        method: "POST", url: `/api/mail/threads/${threadId}/links`, headers: authHeaders,
+        payload: { kind: "deal", id: deal.id },
+      });
+      expect(linked.statusCode).toBe(200);
+      const hidden = await a.inject({
+        method: "POST", url: `/api/mail/threads/${threadId}/archive`, headers: authHeaders,
+      });
+      expect(hidden.statusCode).toBe(200);
+
+      expect(frames).toHaveLength(2);
+      expect(frames.map((keys) => keys.some((key) => key[0] === "events"))).toEqual([true, true]);
+    } finally {
+      unsub();
+    }
+    await a.close();
+  });
+
   it("sets and clears each of the four links", async () => {
     const a = await app();
     const account = await makeAccount(a);

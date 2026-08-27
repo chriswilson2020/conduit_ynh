@@ -650,11 +650,14 @@ describe("moveThreads: compensation", () => {
     );
 
     // One publish carrying every key, after the commit: the list (folder
-    // membership changed), the thread itself, and the unread count (a message
-    // moved into an unsynced Trash leaves the counted set).
+    // membership changed), the thread itself, the unread count (a message
+    // moved into an unsynced Trash leaves the counted set), and -- since
+    // Phase 5 put mail on the record timeline -- `events`, because the bulk
+    // hide path routes through this same publish and a hidden thread's
+    // entries leave that viewer's timelines.
     const published = threadHints();
     expect(published).toHaveLength(1);
-    expect(published[0]?.keys).toEqual([["mail-threads"], ["mail-unread"], ["mail-thread", threadId]]);
+    expect(published[0]?.keys).toEqual([["mail-threads"], ["mail-unread"], ["mail-thread", threadId], ["events"]]);
   });
 
   it("reverts the rows and fails the thread when the server refuses the move", async () => {
@@ -1120,7 +1123,7 @@ describe("moveThreads: hide", () => {
     const published = threadHints();
     expect(published).toHaveLength(1);
     expect(published[0]?.keys).toEqual([
-      ["mail-threads"], ["mail-unread"], ["mail-thread", first], ["mail-thread", second],
+      ["mail-threads"], ["mail-unread"], ["mail-thread", first], ["mail-thread", second], ["events"],
     ]);
   });
 
