@@ -134,6 +134,13 @@ function summarize(event: Event): string {
       return "added a dependency";
     case "dependency_removed":
       return "removed a dependency";
+    // TASK 5 OWES THIS SWITCH THREE CASES. Unlike VERB_BADGE above, which the
+    // exhaustive Record type forces the compiler to complete, a missing case
+    // here falls through to the default arm below and renders the raw verb --
+    // so between Task 4's emission and Task 5's rendering, a timeline shows
+    // the literal strings "met", "mail_received" and "mail_sent". `met` reads
+    // its meeting's title and links to it; the two mail verbs render the
+    // DERIVED mailSubject (never a stored one) and link to the thread.
     default:
       return event.verb;
   }

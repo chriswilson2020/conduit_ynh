@@ -1028,10 +1028,18 @@ describe("meetings schema (0008)", () => {
         cause: { message: expect.stringMatching(/events_verb_valid|check/i) },
       });
 
-      // 0008's two hand-written partial unique indexes arrived with it, ON A
-      // DATABASE THIS TEST MIGRATED FROM THE FILES -- the 0005 drill's
-      // assertion, for the same reason: they exist in no snapshot, so only a
-      // from-the-files migration proves the .sql file still carries them.
+      // 0008's three hand-written indexes arrived with it, ON A DATABASE THIS
+      // TEST MIGRATED FROM THE FILES -- the 0005 drill's assertion, for the
+      // same reason: they exist in no snapshot, so only a from-the-files
+      // migration proves the .sql file still carries them.
+      //
+      // The COLUMN LIST is asserted, not just UNIQUE plus the predicate: a
+      // quality-review mutation reduced the contact index to ("contact_id")
+      // alone -- which silently turns "a contact can be on this meeting once"
+      // into "a contact can be on ONE MEETING EVER" -- and the weaker
+      // assertion passed. Order is pinned too, since leading with the
+      // identity column is what makes each index probe-usable by it (see the
+      // migration's own COLUMN ORDER note).
       const indexes = await scratch.db.execute<{ indexname: string; indexdef: string }>(
         sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'meeting_attendees'`,
       );
@@ -1041,8 +1049,19 @@ describe("meetings schema (0008)", () => {
       ]) {
         const index = indexes.find((row) => row.indexname === name);
         expect(index?.indexdef).toMatch(/UNIQUE/i);
+        expect(index?.indexdef).toMatch(new RegExp(`\\(${column}, ?meeting_id\\)`, "i"));
         expect(index?.indexdef).toMatch(new RegExp(`WHERE.*${column} IS NOT NULL`, "i"));
       }
+
+      // The hydration index (quality-review ruling): plain, whole-table, on
+      // meeting_id alone -- the only index a GUEST row appears in, since both
+      // partial uniques exclude guests by construction. Asserted NOT UNIQUE
+      // and NOT partial: either would break attendee hydration for exactly
+      // the rows it exists to serve.
+      const hydration = indexes.find((row) => row.indexname === "meeting_attendees_meeting_id_idx");
+      expect(hydration?.indexdef).toMatch(/\(meeting_id\)/i);
+      expect(hydration?.indexdef).not.toMatch(/UNIQUE/i);
+      expect(hydration?.indexdef).not.toMatch(/WHERE/i);
     });
   }, 30000);
 

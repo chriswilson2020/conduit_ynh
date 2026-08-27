@@ -1349,9 +1349,19 @@ const attendeeIdentityFields = {
 // happily store. `!= null` covers undefined too, so this reads identically on
 // the stored row (three nullable fields) and on the input shape (the same
 // three, optional).
+//
+// The key list is DERIVED from attendeeIdentityFields rather than restated,
+// which is what makes that record's "a fourth kind of attendee could never
+// arrive on one and not the other" claim true of this predicate as well. A
+// hand-written list would fail PERMISSIVELY on a fourth kind -- zod would
+// accept a row naming two identities, and the CHECK would raise 23514 as a
+// 500 where a 400 belongs.
+const attendeeIdentityKeys = Object.keys(attendeeIdentityFields) as
+  (keyof typeof attendeeIdentityFields)[];
+
 const attendeeExactlyOne = (
   v: { contactId?: string | null; userId?: string | null; guestName?: string | null },
-) => [v.contactId, v.userId, v.guestName].filter((x) => x != null).length === 1;
+) => attendeeIdentityKeys.filter((key) => v[key] != null).length === 1;
 
 const attendeeExactlyOneMessage =
   "exactly one of contactId, userId or guestName identifies an attendee";
@@ -1376,17 +1386,30 @@ export const meetingAttendeeInputSchema = z
   });
 export type MeetingAttendeeInput = z.infer<typeof meetingAttendeeInputSchema>;
 
-// This predicate and the meetings_has_link DB CHECK
-// (num_nonnulls(company_id, contact_id, deal_id, project_id) >= 1, api:
-// db/schema.ts) are likewise ONE RULE IN TWO PLACES -- the spec's
-// reachability decision, which exists because v0.9.0 ships no top-level
-// meetings list: a meeting linked to nothing could never be reached again
-// from any screen. AT LEAST one, not exactly one (the events multi-FK model,
-// not notes' exactly-one): a deal meeting legitimately carries its company
-// too, and appears on both records.
-const meetingAtLeastOneLink = (
+/**
+ * This predicate and the meetings_has_link DB CHECK
+ * (num_nonnulls(company_id, contact_id, deal_id, project_id) >= 1, api:
+ * db/schema.ts) are likewise ONE RULE IN TWO PLACES -- the spec's
+ * reachability decision, which exists because v0.9.0 ships no top-level
+ * meetings list: a meeting linked to nothing could never be reached again
+ * from any screen. AT LEAST one, not exactly one (the events multi-FK model,
+ * not notes' exactly-one): a deal meeting legitimately carries its company
+ * too, and appears on both records.
+ *
+ * Exported for the same reason taskDatesPaired above is: services/meetings.ts's
+ * updateMeeting must re-assert this invariant against the MERGED row (the
+ * stored links with the patch applied), because meetingUpdateInputSchema
+ * deliberately carries no such refine -- a patch sees one snapshot, never its
+ * persisted counterpart, so only the service can tell "clearing companyId
+ * while dealId stays" from "clearing the last link". Without that check the
+ * CHECK fires and a 400 arrives as a 500. The parameter type accepts a merge
+ * result unchanged.
+ */
+export function meetingAtLeastOneLink(
   v: { companyId?: string | null; contactId?: string | null; dealId?: string | null; projectId?: string | null },
-) => [v.companyId, v.contactId, v.dealId, v.projectId].some((x) => x != null);
+): boolean {
+  return [v.companyId, v.contactId, v.dealId, v.projectId].some((x) => x != null);
+}
 
 export const meetingSchema = z.object({
   id: z.uuid(), title: z.string().min(1),
@@ -1449,8 +1472,10 @@ export type MeetingCreateInput = z.infer<typeof meetingCreateInputSchema>;
 // legitimate and must not be rejected, while a patch that genuinely empties
 // the last link can only be caught against the stored row -- which is what
 // meetings_has_link does, as the backstop it exists to be. Task 2's
-// updateMeeting therefore re-asserts the rule against the merged row and
-// surfaces the failure as a 4xx rather than letting the CHECK raise a 500.
+// updateMeeting therefore re-asserts the rule against the merged row --
+// through the exported meetingAtLeastOneLink above, never a second copy of
+// it -- and surfaces the failure as a 4xx rather than letting the CHECK
+// raise a 500.
 export const meetingUpdateInputSchema = meetingInputShape.partial();
 export type MeetingUpdateInput = z.infer<typeof meetingUpdateInputSchema>;
 

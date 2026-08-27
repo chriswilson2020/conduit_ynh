@@ -68,6 +68,7 @@ import {
   meetingCreateInputSchema,
   meetingUpdateInputSchema,
   meetingListFiltersSchema,
+  meetingAtLeastOneLink,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -1683,6 +1684,18 @@ describe("meetingCreateInputSchema and meetingUpdateInputSchema", () => {
   // with nothing" -- and must survive parsing rather than being stripped.
   it("keeps an empty attendees array on a patch (replace-with-empty)", () => {
     expect(meetingUpdateInputSchema.parse({ attendees: [] })).toEqual({ attendees: [] });
+  });
+
+  // The exported predicate is what updateMeeting re-asserts against the
+  // MERGED row (taskDatesPaired's precedent), so it is pinned as a callable
+  // in its own right, not only through the create schema: a merge result --
+  // stored links with the patch applied -- is exactly the shape it takes.
+  it("exports meetingAtLeastOneLink, which reads a merged row the same way it reads an input", () => {
+    const stored = { companyId: uuid1, contactId: null, dealId: uuid2, projectId: null };
+    expect(meetingAtLeastOneLink({ ...stored, companyId: null })).toBe(true);
+    expect(meetingAtLeastOneLink({ ...stored, companyId: null, dealId: null })).toBe(false);
+    expect(meetingAtLeastOneLink({})).toBe(false);
+    expect(meetingAtLeastOneLink({ projectId: uuid1 })).toBe(true);
   });
 });
 
