@@ -128,6 +128,20 @@ produced.
    The single-letter scheme itself stands (there is still no icon library); if a future phase pushes
    the verb list past the free letters, that is the moment to revisit the scheme, not now.
 
+2. **The follow-up link rides the `events.meeting_id` COLUMN, not the event payload**
+   (Task 3 spec review). This document's Follow-up tasks section says the meeting's id is
+   "recorded on the task's originating event payload"; the plan repeats it. That wording
+   predates the data model above, which gives `events` a real `meeting_id` FK -- and that
+   column is what the read criterion filters (`verb = 'created' AND task_id IS NOT NULL`,
+   by `meeting_id`), what migration 0008 indexes, and what already reaches the client as
+   `Event.meetingId`. A payload copy would be a second spelling of one fact, unindexed and
+   free to disagree. The column is correct; only the prose was loose.
+   Consequence, which Task 5 must design around: the follow-up task's `created` row carries
+   `payload: {}` -- as every task's creation row does, none of which name even the task --
+   so its timeline entry cannot render the meeting's TITLE. It renders generic wording and
+   links to the meeting through `Event.meetingId`. The `met` entry is the one that names the
+   meeting, and it is on the same timelines.
+
 ## Out of scope (deferred, not rejected)
 
 Top-level Meetings page and "my meetings this week"; calendar integration of any kind

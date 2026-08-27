@@ -147,9 +147,10 @@ function fieldChanged(a: unknown, b: unknown): boolean {
 
 /**
  * Where a task came from, when it came from something other than a plain
- * "new task" (Phase 5: a meeting's follow-up). OPTIONAL at every call site --
- * POST /api/tasks and every test that predates it pass nothing and are
- * untouched -- and deliberately an object rather than a bare `meetingId`
+ * "new task" (Phase 5: a meeting's follow-up). OPTIONAL, so the ordinary
+ * three-argument call carries no origin: a task created directly has none to
+ * record, and services/meetings.ts's createMeetingTask is the only caller
+ * that passes one. Deliberately an object rather than a bare `meetingId`
  * string, so a second kind of origin (a mail thread, say) is a field here
  * instead of a fifth positional parameter.
  *
