@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { Meeting, MeetingAttendee, Task } from "@conduit/shared";
+import type { Meeting, MeetingAttendee, MeetingDetail, Task } from "@conduit/shared";
 import {
   useArchiveMeeting,
   useContact,
@@ -64,10 +64,18 @@ export function Meetings({
   companyId, contactId, dealId, projectId, selectedMeetingId, onSelectMeeting,
 }: MeetingsProps) {
   const links: RecordLinks = { companyId, contactId, dealId, projectId };
+  // THE LIST'S STATE LIVES HERE, not in MeetingList, because master-detail
+  // UNMOUNTS the list while a meeting is open. Held one level down, "Archived"
+  // silently unticked itself on the way back from an archived meeting -- so
+  // the reader returned to the LIVE list, which by definition does not contain
+  // the meeting they were just reading. The accumulated pages went with it,
+  // which also made the accumulator decorative here: its state could never
+  // survive a detail visit.
+  const list = useMeetingList(links);
   return (
     <div data-testid="meetings" className="flex flex-col gap-4">
       {selectedMeetingId === null
-        ? <MeetingList links={links} onSelect={onSelectMeeting} />
+        ? <MeetingList list={list} links={links} onSelect={onSelectMeeting} />
         : <MeetingView meetingId={selectedMeetingId} onBack={() => onSelectMeeting(null)} />}
     </div>
   );
@@ -77,20 +85,37 @@ export function Meetings({
 // The list
 // ---------------------------------------------------------------------------
 
-function MeetingList({ links, onSelect }: { links: RecordLinks; onSelect: (id: string) => void }) {
-  const [archived, setArchived] = useState(false);
-  const [formOpen, setFormOpen] = useState(false);
+interface MeetingListState {
+  archived: boolean;
+  setArchived: (next: boolean) => void;
+  rows: Meeting[];
+  isLoading: boolean;
+  isError: boolean;
+  hasMore: boolean;
+  loadMore: () => void;
+  /** Back to page one, discarding every accumulated page. */
+  reset: () => void;
+  retry: () => void;
+}
 
-  // Same cursor-page accumulator the timeline and the inbox use, keyed on the
-  // filter set -- so toggling "Archived" starts at page one rather than
-  // applying the live list's cursor to the archived one, and a background
-  // ["meetings"] invalidation (another user logging a meeting on this record,
-  // or a follow-up task changing a task count) replaces the page it refetched
-  // instead of appending it again.
+/**
+ * The Meetings tab's list state, as one hook so it can be owned by the
+ * component that stays mounted across the master-detail swap (see Meetings
+ * above) while still being read by the one that renders it.
+ *
+ * Pages accumulate through the same cursor-page record the timeline and the
+ * inbox use, keyed on the filter set -- so toggling "Archived" starts at page
+ * one rather than applying the live list's cursor to the archived list, and a
+ * background ["meetings"] invalidation (another user logging a meeting here,
+ * or a follow-up task changing a task count) REPLACES the page it refetched
+ * instead of appending it again.
+ */
+function useMeetingList(links: RecordLinks): MeetingListState {
+  const [archived, setArchived] = useState(false);
   const key = threadFilterKey({ ...links, archived });
   const [pages, setPages] = useState<ThreadPages<Meeting>>(() => emptyThreadPages<Meeting>(key));
   const cursor = cursorForKey(pages, key);
-  const { data, isLoading } = useMeetings({ ...links, archived, cursor });
+  const { data, isLoading, isError, refetch } = useMeetings({ ...links, archived, cursor });
 
   useEffect(() => {
     if (!data) return;
@@ -98,7 +123,39 @@ function MeetingList({ links, onSelect }: { links: RecordLinks; onSelect: (id: s
   }, [data, cursor, key]);
 
   const rows = useMemo(() => (pages.key === key ? flattenThreadPages(pages) : []), [pages, key]);
-  const hasMore = pages.key === key && pages.nextCursor !== null;
+
+  return {
+    archived,
+    setArchived,
+    rows,
+    isLoading,
+    isError,
+    // pages.key can lag `key` by one render (the merge runs in an effect), and
+    // offering the previous filter's "Load more" for that render would page
+    // the wrong list.
+    hasMore: pages.key === key && pages.nextCursor !== null,
+    loadMore: () => setPages((current) => advanceThreadPages(current, key)),
+    // A NEW MEETING LANDS ON PAGE ONE, and page one is a frozen snapshot once
+    // any later page has been loaded: the accumulator holds it under its own
+    // cursor while only the CURRENT page's query is mounted, so no
+    // invalidation refetches it. Without this, a meeting logged after any
+    // "Load more" click would simply never appear. Starting over is both
+    // correct and cheap.
+    reset: () => setPages(emptyThreadPages<Meeting>(key)),
+    // The only escape from a failed page fetch. `loadMore` cannot serve: the
+    // cursor is ALREADY at nextCursor, so advancing again produces the same
+    // query key, which TanStack answers from its error state without going
+    // near the network. Clicking would look like doing something and do
+    // nothing, forever.
+    retry: () => { void refetch(); },
+  };
+}
+
+function MeetingList({
+  list, links, onSelect,
+}: { list: MeetingListState; links: RecordLinks; onSelect: (id: string) => void }) {
+  const [formOpen, setFormOpen] = useState(false);
+  const { archived, rows, isLoading, isError } = list;
 
   return (
     <>
@@ -111,26 +168,48 @@ function MeetingList({ links, onSelect }: { links: RecordLinks; onSelect: (id: s
             type="checkbox"
             data-testid="show-archived-meetings"
             checked={archived}
-            onChange={(event) => setArchived(event.target.checked)}
+            onChange={(event) => list.setArchived(event.target.checked)}
           />
           Archived
         </label>
       </div>
 
-      {formOpen && <MeetingForm links={links} onDone={() => setFormOpen(false)} />}
+      {formOpen && (
+        <MeetingForm
+          links={links}
+          onDone={() => {
+            setFormOpen(false);
+            list.reset();
+          }}
+        />
+      )}
 
       {isLoading && rows.length === 0 && <p className="text-sm text-slate-400">Loading...</p>}
       <ul className="flex flex-col gap-2">
         {rows.map((meeting) => (
           <MeetingRow key={meeting.id} meeting={meeting} onSelect={onSelect} />
         ))}
-        {!isLoading && rows.length === 0 && (
-          <li className="text-sm text-slate-400">{archived ? "No archived meetings" : "No meetings yet"}</li>
+        {/* An empty list and a FAILED list are different facts, and rendering
+            the first for the second is the worse of the two mistakes: "No
+            meetings yet" on a record that has plenty reads as data loss. */}
+        {!isLoading && !isError && rows.length === 0 && (
+          <li data-testid="meetings-empty" className="text-sm text-slate-400">
+            {archived ? "No archived meetings" : "No meetings yet"}
+          </li>
         )}
       </ul>
 
-      {hasMore && (
-        <Button variant="outline" onClick={() => setPages((current) => advanceThreadPages(current, key))}>
+      {isError ? (
+        <div className="flex items-center gap-2">
+          <p role="alert" data-testid="meetings-error" className="text-xs text-red-600">
+            {rows.length === 0 ? "Could not load meetings." : "Could not load more meetings."}
+          </p>
+          <Button variant="outline" className="px-2 py-1 text-xs" data-testid="meetings-retry" onClick={list.retry}>
+            Retry
+          </Button>
+        </div>
+      ) : list.hasMore && (
+        <Button variant="outline" data-testid="meetings-load-more" onClick={list.loadMore}>
           Load more
         </Button>
       )}
@@ -410,33 +489,33 @@ function useUserLabel(): (userId: string) => string {
 // One meeting
 // ---------------------------------------------------------------------------
 
+/**
+ * One meeting: the shell that fetches it, and the frame that is always
+ * present.
+ *
+ * THE BACK CONTROL AND THE ERROR ARE NOT ALTERNATIVES. An earlier shape
+ * returned the error INSTEAD of the view, which put `meeting-back` behind the
+ * very condition a reader needs it for: the rail's selection still held this
+ * meeting, so a failed fetch left no exit but navigating away or reloading the
+ * page. It also threw away good data -- TanStack keeps `data` through an
+ * error, so with a 10s staleTime and refetch-on-focus, one transient blip
+ * after a refocus replaced a perfectly readable meeting (title, notes,
+ * attendees, tasks) with a single red line.
+ *
+ * That shape was copied from conversation.tsx, where error-beats-stale-data is
+ * a DELIBERATE privacy decision -- a thread the server has stopped saying you
+ * may see must stop being painted. No such rule applies to a meeting: it is
+ * visible to every user of this CRM, so stale is strictly better than blank,
+ * and the error belongs beside it as a banner.
+ */
 function MeetingView({ meetingId, onBack }: { meetingId: string; onBack: () => void }) {
   const { data, isLoading, error } = useMeeting(meetingId);
-  const meeting = data?.meeting;
-  // THE ARCHIVED-PROJECT GATE'S ONE FETCH. GET /api/projects/:id answers for
-  // an archived project too, and the hook keys on ["project", id] -- so this
-  // is a cache read whenever the rail is already on that project's page, and
-  // one request otherwise. See addTaskBlockedReason for why it is needed at
-  // all.
-  const { data: project } = useProject(meeting?.projectId ?? "");
-  const { data: users = [] } = useUsers();
   const archiveMeeting = useArchiveMeeting();
   const unarchiveMeeting = useUnarchiveMeeting();
   const [banner, setBanner] = useState<string | null>(null);
-  const [addingTask, setAddingTask] = useState(false);
 
-  if (isLoading) return <p className="text-sm text-slate-400">Loading...</p>;
-  if (error !== null) return <p className="text-sm text-red-600">{meetingErrorMessage(error)}</p>;
-  if (data === undefined || meeting === undefined) return null;
-
-  const owner = users.find((u) => u.id === meeting.ownerUserId);
-  const duration = durationLabel(meeting.durationMinutes);
-  const archived = meeting.archivedAt !== null;
-  const blockedReason = addTaskBlockedReason({
-    meetingArchived: archived,
-    projectId: meeting.projectId,
-    project,
-  });
+  const meeting = data?.meeting;
+  const loadError = error === null ? null : meetingErrorMessage(error);
 
   function toggleArchive(next: boolean) {
     setBanner(null);
@@ -450,7 +529,7 @@ function MeetingView({ meetingId, onBack }: { meetingId: string; onBack: () => v
         <Button variant="ghost" className="px-2 py-1 text-xs" data-testid="meeting-back" onClick={onBack}>
           {"\u2190"} All meetings
         </Button>
-        {archived ? (
+        {meeting !== undefined && (meeting.archivedAt !== null ? (
           <Button
             variant="outline"
             className="px-2 py-1 text-xs"
@@ -468,9 +547,45 @@ function MeetingView({ meetingId, onBack }: { meetingId: string; onBack: () => v
           >
             Archive
           </Button>
-        )}
+        ))}
       </div>
 
+      {loadError !== null && (
+        <p role="alert" data-testid="meeting-error" className="text-xs text-red-600">{loadError}</p>
+      )}
+      {banner !== null && <p role="alert" className="text-xs text-red-600">{banner}</p>}
+
+      {data === undefined
+        ? isLoading && <p className="text-sm text-slate-400">Loading...</p>
+        : <MeetingBody detail={data} />}
+    </div>
+  );
+}
+
+function MeetingBody({ detail }: { detail: MeetingDetail }) {
+  const { meeting } = detail;
+  // THE ARCHIVED-PROJECT GATE'S ONE FETCH. GET /api/projects/:id answers for
+  // an archived project too, and the hook keys on ["project", id] -- so this
+  // is a cache read whenever the rail is already on that project's page, and
+  // one request otherwise. `isError` is passed rather than discarded so a
+  // failed fetch does not read as one still running: see
+  // addTaskBlockedReason.
+  const { data: project, isError: projectFailed } = useProject(meeting.projectId ?? "");
+  const { data: users = [] } = useUsers();
+  const [addingTask, setAddingTask] = useState(false);
+
+  const owner = users.find((u) => u.id === meeting.ownerUserId);
+  const duration = durationLabel(meeting.durationMinutes);
+  const archived = meeting.archivedAt !== null;
+  const blockedReason = addTaskBlockedReason({
+    meetingArchived: archived,
+    projectId: meeting.projectId,
+    project,
+    projectFailed,
+  });
+
+  return (
+    <>
       <div>
         <h3 className="text-sm font-medium text-slate-900">{meeting.title}</h3>
         <p className="text-xs text-slate-400">
@@ -480,8 +595,6 @@ function MeetingView({ meetingId, onBack }: { meetingId: string; onBack: () => v
         </p>
         {archived && <p className="text-xs text-slate-500">This meeting is archived.</p>}
       </div>
-
-      {banner !== null && <p role="alert" className="text-xs text-red-600">{banner}</p>}
 
       <section className="flex flex-col gap-1">
         <span className="text-xs font-medium text-slate-500">Attendees</span>
@@ -517,7 +630,7 @@ function MeetingView({ meetingId, onBack }: { meetingId: string; onBack: () => v
 
       <section className="flex flex-col gap-2">
         <div className="flex items-center justify-between gap-2">
-          <span className="text-xs font-medium text-slate-500">{taskCountLabel(data.tasks.length)}</span>
+          <span className="text-xs font-medium text-slate-500">{taskCountLabel(detail.tasks.length)}</span>
           <Button
             variant="outline"
             className="px-2 py-1 text-xs"
@@ -528,6 +641,9 @@ function MeetingView({ meetingId, onBack }: { meetingId: string; onBack: () => v
             {addingTask ? "Cancel" : "Add task"}
           </Button>
         </div>
+        {/* One testid for all four reasons, deliberately: they differ in TEXT,
+            not in kind, and a test that wants to tell "checking" from "the
+            project is archived" apart must read the message either way. */}
         {blockedReason !== null && (
           <p data-testid="meeting-add-task-blocked" className="text-xs text-slate-500">
             {blockedReason}
@@ -537,12 +653,12 @@ function MeetingView({ meetingId, onBack }: { meetingId: string; onBack: () => v
           <AddTaskForm meetingId={meeting.id} onDone={() => setAddingTask(false)} />
         )}
         <ul className="flex flex-col gap-1">
-          {data.tasks.map((task) => (
+          {detail.tasks.map((task) => (
             <FollowUpRow key={task.id} task={task} />
           ))}
         </ul>
       </section>
-    </div>
+    </>
   );
 }
 

@@ -45,7 +45,9 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
   const key = threadFilterKey({ companyId, contactId, dealId, projectId, taskId });
   const [pages, setPages] = useState<ThreadPages<Event>>(() => emptyThreadPages<Event>(key));
   const cursor = cursorForKey(pages, key);
-  const { data, isLoading } = useEvents({ companyId, contactId, dealId, projectId, taskId, cursor });
+  const { data, isLoading, isError, refetch } = useEvents({
+    companyId, contactId, dealId, projectId, taskId, cursor,
+  });
   const { data: users = [] } = useUsers();
   const userMap = useMemo(() => new Map(users.map((user) => [user.id, user.username])), [users]);
 
@@ -65,7 +67,15 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
   return (
     <div data-testid="timeline" className="flex flex-col gap-3">
       {isLoading && rows.length === 0 && <p className="text-sm text-slate-400">Loading...</p>}
-      {!isLoading && rows.length === 0 && <p className="text-sm text-slate-400">No activity yet</p>}
+      {/* A record with no activity and a timeline that FAILED to load are
+          different facts. Rendering the first for the second is the worse
+          mistake -- "No activity yet" on a busy record reads as data loss --
+          and it is newly easy to hit: an old browser tab against a v0.9.0 API
+          throws on the three verbs it has never heard of, so the whole page
+          fails to parse. */}
+      {!isLoading && !isError && rows.length === 0 && (
+        <p data-testid="timeline-empty" className="text-sm text-slate-400">No activity yet</p>
+      )}
       <ul className="flex flex-col gap-3">
         {rows.map((event) => (
           <li key={event.id} data-testid="timeline-entry" className="flex gap-3 text-sm">
@@ -88,8 +98,31 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
           </li>
         ))}
       </ul>
-      {hasMore && (
-        <Button variant="outline" onClick={() => setPages((current) => advanceThreadPages(current, key))}>
+      {isError ? (
+        <div className="flex items-center gap-2">
+          <p role="alert" data-testid="timeline-error" className="text-xs text-red-600">
+            {rows.length === 0 ? "Could not load this timeline." : "Could not load more activity."}
+          </p>
+          {/* Retry, not "Load more": after a failed page fetch the cursor is
+              ALREADY at nextCursor, so advancing again produces the same query
+              key and TanStack answers it from its error state without going
+              near the network -- a control that looks like it does something
+              and does nothing, forever. */}
+          <Button
+            variant="outline"
+            className="px-2 py-1 text-xs"
+            data-testid="timeline-retry"
+            onClick={() => { void refetch(); }}
+          >
+            Retry
+          </Button>
+        </div>
+      ) : hasMore && (
+        <Button
+          variant="outline"
+          data-testid="timeline-load-more"
+          onClick={() => setPages((current) => advanceThreadPages(current, key))}
+        >
           Load more
         </Button>
       )}

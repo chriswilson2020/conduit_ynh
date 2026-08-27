@@ -4,8 +4,10 @@ import { meetingCreateInputSchema, meetingTaskCreateInputSchema } from "@conduit
 import { ApiError } from "../../api";
 import {
   MEETING_ARCHIVED_REASON,
+  ATTENDEE_SUMMARY_CAP,
   PROJECT_ARCHIVED_REASON,
   PROJECT_UNKNOWN_REASON,
+  PROJECT_UNREADABLE_REASON,
   addAttendeeDraft,
   addTaskBlockedReason,
   attendeeDraftsToInput,
@@ -97,6 +99,14 @@ describe("row labels", () => {
   it("names up to the cap and counts the rest", () => {
     expect(summarizeAttendees([1, 2, 3, 4, 5], 3)).toEqual({ shown: [1, 2, 3], overflow: 2 });
     expect(summarizeAttendees([1, 2], 3)).toEqual({ shown: [1, 2], overflow: 0 });
+  });
+
+  it("caps at three by DEFAULT, which is what bounds a page's request fan-out", () => {
+    // Every assertion above passes `cap` explicitly, so the constant itself --
+    // the one that decides how many `GET /api/contacts/:id` calls a page of
+    // rows can issue -- was unpinned: raising it to 10 left the suite green.
+    expect(ATTENDEE_SUMMARY_CAP).toBe(3);
+    expect(summarizeAttendees([1, 2, 3, 4, 5])).toEqual({ shown: [1, 2, 3], overflow: 2 });
   });
 });
 
@@ -219,6 +229,15 @@ describe("addTaskBlockedReason", () => {
       .toBe(PROJECT_UNKNOWN_REASON);
   });
 
+  it("says the project could not be LOADED when its fetch failed, not that it is still checking", () => {
+    // Same block, different sentence. useProject retries once and then stops,
+    // so "Checking this meeting's project..." would sit under a permanently
+    // disabled control describing work nobody is doing.
+    expect(addTaskBlockedReason({
+      meetingArchived: false, projectId: "p1", project: undefined, projectFailed: true,
+    })).toBe(PROJECT_UNREADABLE_REASON);
+  });
+
   it("blocks an archived meeting first, whatever its project says", () => {
     expect(addTaskBlockedReason({
       meetingArchived: true, projectId: "p1", project: { archivedAt: null },
@@ -252,6 +271,21 @@ describe("error messages", () => {
     const message = followUpErrorMessage(new ApiError("project <id> is archived", 409, "archived"));
     expect(message).toContain("meeting");
     expect(message).toContain("project");
+  });
+
+  it("keeps each not_found line true of the paths that reach it", () => {
+    // Neither arm was asserted anywhere, which is how the previous round's
+    // rewrite of this exact string landed unguarded. meetingErrorMessage
+    // serves TWO paths -- an archive of a meeting that is gone, and a create
+    // whose linked record or attendee identity was missing -- so its line must
+    // name both; followUpErrorMessage's only 404 is createMeetingTask's own
+    // mustGet, so its line stays about the meeting.
+    const meeting = meetingErrorMessage(new ApiError("meeting <id> not found", 404, "not_found"));
+    expect(meeting).toContain("meeting");
+    expect(meeting).toContain("refers to");
+    const followUp = followUpErrorMessage(new ApiError("meeting <id> not found", 404, "not_found"));
+    expect(followUp).toContain("no longer exists");
+    expect(followUp).not.toContain("refers to");
   });
 
   it("falls through to the server's own message for anything else", () => {

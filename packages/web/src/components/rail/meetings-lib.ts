@@ -341,12 +341,20 @@ export const MEETING_ARCHIVED_REASON =
 export const PROJECT_ARCHIVED_REASON =
   "This meeting's project is archived, so it cannot take new tasks. Unarchive the project first.";
 
-/** Shown while the meeting's project is still being fetched. Blocking rather
- * than allowing is deliberate: the only two outcomes are "briefly disabled"
- * and "a 409 nothing on screen explains", and the first is the smaller harm.
- * A project link is a real FK to a row nothing ever deletes, so this state
- * resolves on the next successful fetch. */
+/** Shown while the meeting's project is still IN FLIGHT. Blocking rather than
+ * allowing is deliberate: the only two outcomes are "briefly disabled" and
+ * "a 409 nothing on screen explains", and the first is the smaller harm. */
 export const PROJECT_UNKNOWN_REASON = "Checking this meeting's project...";
+
+/** And when that fetch has FAILED, which is a different sentence: the check is
+ * over, not in progress, so saying "checking..." would leave a stalled control
+ * describing work nobody is doing. The block itself still stands -- the reason
+ * this gate exists is that we cannot tell an archived project from an archived
+ * meeting AFTER the fact, and not knowing the project's state is not a licence
+ * to guess -- but the copy has to be honest about which of the two states it
+ * is in, and offer the one action that resolves it. */
+export const PROJECT_UNREADABLE_REASON =
+  "This meeting's project could not be loaded, so follow-up tasks are unavailable. Refresh to try again.";
 
 /**
  * Why "Add task" is unavailable, or null when it is available.
@@ -354,16 +362,22 @@ export const PROJECT_UNKNOWN_REASON = "Checking this meeting's project...";
  * `project` is whatever `useProject(meeting.projectId ?? "")` currently holds
  * -- `GET /api/projects/:id` returns archived projects, and the hook keys on
  * ["project", id], so a rail showing several meetings in one project pays for
- * one fetch, not one per meeting.
+ * one fetch, not one per meeting. `projectFailed` is that query's `isError`,
+ * which the caller must pass rather than discard: without it the two
+ * "project is undefined" states are indistinguishable here, and a failed fetch
+ * reads as a fetch still running.
  */
 export function addTaskBlockedReason(input: {
   meetingArchived: boolean;
   projectId: string | null;
   project: { archivedAt: string | null } | undefined;
+  projectFailed?: boolean;
 }): string | null {
   if (input.meetingArchived) return MEETING_ARCHIVED_REASON;
   if (input.projectId === null) return null;
-  if (input.project === undefined) return PROJECT_UNKNOWN_REASON;
+  if (input.project === undefined) {
+    return input.projectFailed === true ? PROJECT_UNREADABLE_REASON : PROJECT_UNKNOWN_REASON;
+  }
   return input.project.archivedAt === null ? null : PROJECT_ARCHIVED_REASON;
 }
 
