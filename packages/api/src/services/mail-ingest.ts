@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
-import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { simpleParser, type Attachment, type ParsedMail } from "mailparser";
 import type { MailAddress } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
-  contacts, mailAccounts, mailAttachments, mailMessages, mailThreads,
+  contacts, events, mailAccounts, mailAttachments, mailMessages, mailThreads,
   type MailMessageRow,
 } from "../db/schema.js";
 import { saveBlob } from "./blobs.js";
@@ -558,6 +558,117 @@ async function autoLinkThread(tx: Database, threadId: string, participants: stri
 }
 
 /**
+ * The thread's timeline entry for this message: `mail_received` inbound,
+ * `mail_sent` outbound (Phase 5 spec, "Mail in the timeline").
+ *
+ * A POINTER AND NOTHING ELSE. The row carries the thread's four record FKs
+ * -- which timeline it belongs on -- plus mail_thread_id, and an EMPTY
+ * payload. No subject, no snippet, no address, no participant name goes in,
+ * here or anywhere else on the row: an event is readable by every user of
+ * the CRM, while a thread is readable only by whoever Phase 4.2's visibility
+ * rules and Phase 4.3's hides admit. Anything stored here would be a copy of
+ * private mail sitting outside both. The subject a client shows is derived at
+ * READ time, under those same predicates, by services/timeline.ts.
+ * mail-ingest.test.ts asserts the stored payload's KEY SET, so adding a field
+ * to this insert fails a test rather than shipping a leak.
+ *
+ * ONE EVENT PER (THREAD, VERB) PER CALENDAR DAY, IN UTC -- said explicitly
+ * because the boundary is the server's `now() AT TIME ZONE 'UTC'`, not the
+ * viewer's local midnight, so a late-evening exchange in a western timezone
+ * can straddle two entries and an early-morning one in an eastern timezone
+ * can share a day with the previous evening. That is the accepted cost of a
+ * boundary that does not depend on who is looking. Without the throttle a
+ * fifty-message thread would bury a record's whole timeline; the Mail tab
+ * remains the place to read every message.
+ *
+ * The throttle is an existence check followed by an insert, with no unique
+ * constraint behind it, and it is safe because every caller reaches here
+ * holding INGEST_LOCK_KEY (taken at the top of the transaction, and the same
+ * lock mail-send's own ingest takes): no second writer can insert between the
+ * check and the insert. A constraint could not express the rule anyway --
+ * "same UTC day" is not a column.
+ *
+ * COST OF THAT CHECK, AND THE INDEX THIS DELIBERATELY DOES NOT SHIP.
+ * `events` carries no index on mail_thread_id, so the check is a scan of the
+ * whole table, once per ingested message, INSIDE the global ingest lock.
+ * MEASURED (300,000 events of which 30,000 carry mail_thread_id, warm,
+ * top-level Execution Time): 35ms / 4,077 buffers as a parallel sequential
+ * scan; 0.14ms / 17 buffers with a candidate
+ * `CREATE INDEX events_mail_thread_id_idx ON events (mail_thread_id) WHERE
+ * mail_thread_id IS NOT NULL` (288 kB against a 32 MB table, and it leaves
+ * every read plan in services/timeline.ts unchanged -- 55ms and 38ms against
+ * 56ms and 35ms without it, all within run-to-run noise). This deployment
+ * holds thousands of events, where the same scan is sub-millisecond, and the
+ * index is not this task's to add. RE-MEASURE TRIGGER, IN EVENTS ROWS because
+ * that is what this scan is over: on the order of 100k events -- roughly 12ms
+ * per message by linear extrapolation, which is the point at which one
+ * mailbox's sync starts holding the global lock long enough to be felt by
+ * another account's. That is ten times sooner than the ~1M-row trigger
+ * drizzle/0008 records for the read side, because this cost is per MESSAGE
+ * and serialised, not per page request.
+ *
+ * A THREAD WITH NO RECORD LINKS EMITS NOTHING. There is no timeline for the
+ * entry to appear on: every listEvents filter is one of the four record FKs,
+ * so a row with all four null is unreachable, and writing it would only add
+ * rows to the fastest-growing table in the schema. The check runs AFTER
+ * auto-linking, so a thread that has just acquired its contact/company link
+ * from this very message does emit.
+ *
+ * The actor is the OWNER OF THE ACCOUNT the message arrived on, which is the
+ * closest thing a machine-generated row has to a person. It is not a leak in
+ * its own right: the row reaches nobody who cannot already see the thread.
+ *
+ * KNOWN LIMITATION, shared with every other event row (the Task 2 DONE
+ * block's D6): record links are a SNAPSHOT at emission. Linking a thread to a
+ * deal later does not move mail entries already written onto that deal's
+ * timeline -- only entries from that point on. Append-only history; a fix
+ * would mean rewriting it.
+ */
+async function emitMailEvent(
+  tx: Database, threadId: string, direction: "inbound" | "outbound", actorUserId: string,
+): Promise<boolean> {
+  const verb = direction === "outbound" ? "mail_sent" : "mail_received";
+  // Re-read rather than reuse anything held from earlier in the transaction:
+  // autoLinkThread may have just written contact_id/company_id, and on an
+  // existing thread the links are whatever a human or an earlier ingest made
+  // them.
+  const [thread] = await tx.select({
+    companyId: mailThreads.companyId, contactId: mailThreads.contactId,
+    dealId: mailThreads.dealId, projectId: mailThreads.projectId,
+  }).from(mailThreads).where(eq(mailThreads.id, threadId));
+  if (thread === undefined) return false;
+  if (thread.companyId === null && thread.contactId === null
+    && thread.dealId === null && thread.projectId === null) return false;
+
+  // The day boundary is computed in SQL, from the same `now()` the inserted
+  // row's created_at default takes (both are the transaction's start time),
+  // so the window this checks and the timestamp it writes cannot disagree
+  // across a midnight or an app/database clock skew. Written as a range over
+  // the bare column rather than as a cast of it -- `(created_at AT TIME ZONE
+  // 'UTC')::date = ...` says the same thing but puts the comparison out of
+  // reach of any index on this column, and `events` is the table most likely
+  // to gain one.
+  const [already] = await tx.select({ id: events.id }).from(events).where(and(
+    eq(events.mailThreadId, threadId),
+    eq(events.verb, verb),
+    gte(events.createdAt, sql`date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`),
+  )).limit(1);
+  if (already !== undefined) return false;
+
+  await tx.insert(events).values({
+    verb, actorUserId,
+    companyId: thread.companyId, contactId: thread.contactId,
+    dealId: thread.dealId, projectId: thread.projectId,
+    mailThreadId: threadId,
+    // Empty, and stated rather than left to the column default so the rule is
+    // visible at the one place it could ever be broken. See this function's
+    // header: nothing about the mail may be stored on this row.
+    payload: {},
+  });
+  return true;
+}
+
+/**
  * Ingest one raw message into the CRM: parse, thread, store attachments,
  * insert, bump the thread, auto-link -- in one transaction, idempotent per
  * (account, message id).
@@ -664,6 +775,8 @@ async function ingestParsedMessage(
     // account's ingest just to be told the row is gone is pure contention.
     const [account] = await tx.select({
       id: mailAccounts.id, email: mailAccounts.email, sentFolder: mailAccounts.sentFolder,
+      // The actor on this message's timeline entry (emitMailEvent).
+      userId: mailAccounts.userId,
     }).from(mailAccounts).where(eq(mailAccounts.id, input.accountId));
     if (account === undefined) throw new NotFoundError("mail account", input.accountId);
 
@@ -694,12 +807,12 @@ async function ingestParsedMessage(
       const changed = existing.folder !== input.folder
         || existing.imapUid !== input.uid
         || existing.seen !== seen;
-      if (!changed) return { created: false, message: existing, threadId: existing.threadId, changed };
+      if (!changed) return { created: false, message: existing, threadId: existing.threadId, changed, timelineEntry: false };
       const [updated] = await tx.update(mailMessages)
         .set({ folder: input.folder, imapUid: input.uid, seen, updatedAt: new Date() })
         .where(eq(mailMessages.id, existing.id)).returning(messageColumns);
       if (updated === undefined) throw new Error("mail message update returned no row");
-      return { created: false, message: updated, threadId: updated.threadId, changed };
+      return { created: false, message: updated, threadId: updated.threadId, changed, timelineEntry: false };
     }
 
     // --- Thread resolution ----------------------------------------------
@@ -893,7 +1006,15 @@ async function ingestParsedMessage(
     }
     await autoLinkThread(tx, threadId, participants);
 
-    return { created: true, message: inserted, threadId, changed: true };
+    // --- Timeline entry ---------------------------------------------------
+    // AFTER auto-linking, because the links decide both whether this emits at
+    // all and which timelines it lands on (see emitMailEvent's header). New
+    // messages only: this is below the duplicate guard's early returns, so a
+    // refetch or a second-folder sighting -- which is not new mail -- adds
+    // nothing to any timeline.
+    const timelineEntry = await emitMailEvent(tx, threadId, direction, account.userId);
+
+    return { created: true, message: inserted, threadId, changed: true, timelineEntry };
   });
 
   // After commit, per the house convention (a hint for a rolled-back write
@@ -902,7 +1023,14 @@ async function ingestParsedMessage(
   // folder, and firing three invalidation keys per unchanged message would
   // turn one reset into a client-side refetch storm.
   if (result.changed) {
-    publish({ keys: [["mail-threads"], ["mail-thread", result.threadId], ["mail-unread"]] });
+    publish({ keys: [
+      ["mail-threads"], ["mail-thread", result.threadId], ["mail-unread"],
+      // Only when a timeline entry was actually written (throttled away, or
+      // an unlinked thread, and nothing on any timeline moved): the record
+      // rails would otherwise refetch on every message of a busy thread for a
+      // response that cannot have changed.
+      ...(result.timelineEntry ? [["events"]] : []),
+    ] });
   }
   return { created: result.created, message: result.message, threadId: result.threadId };
 }

@@ -15,6 +15,7 @@ import { openTestDatabase, truncateAll } from "../test/db.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
 import { listFiles } from "../services/files.js";
 import { listEvents } from "../services/timeline.js";
+import { resolveUser } from "../users.js";
 import { todayDateOnly, addDays } from "../services/scheduling.js";
 import { files } from "../db/schema.js";
 import type { Config } from "../config.js";
@@ -618,7 +619,10 @@ describe("files routes", () => {
     expect(parsed.error).toBe("too_large");
 
     expect(await listFiles(handle.db, { companyId })).toHaveLength(0);
-    const events = await listEvents(handle.db, { companyId });
+    // The viewer is the same user the request above authenticated as; every
+    // listEvents call names one since Phase 5 (mail rows are viewer-scoped).
+    const viewerId = (await resolveUser(handle.db, { username: "chris", email: null, fullName: null })).id;
+    const events = await listEvents(handle.db, viewerId, { companyId });
     expect(events.items.some((e) => e.verb === "file_attached")).toBe(false);
     await a.close();
   });

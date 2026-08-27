@@ -157,6 +157,23 @@ export const eventSchema = z.object({
   // entirely rather than stubbed (api: timeline.ts, Task 4 -- which adds the
   // derived `mailSubject` field for that rendered value).
   mailThreadId: z.uuid().nullable(),
+  // DERIVED AT READ TIME, NEVER STORED. There is no mail_subject column and
+  // no payload key holding it: services/timeline.ts reads it from the joined
+  // mail_threads row in the same statement -- and through the same join whose
+  // ON clause carries Phase 4.2's record-visible predicate and Phase 4.3's
+  // not-hidden predicate -- so a subject cannot be produced for a thread the
+  // viewer may not see. That coupling is the point: were the field stored on
+  // the event, it would be readable by every user of the CRM, and were it
+  // joined separately from the predicate, a broken predicate would leak it.
+  // Non-null exactly when mailThreadId is (mail_threads.subject is NOT NULL
+  // and an unfiltered row is a row that passed both predicates); null on
+  // every non-mail event, which is nearly all of them.
+  //
+  // A RENAME IS INVISIBLE HERE, deliberately: threads take their subject once
+  // from their first message and never rewrite it (api: mail-ingest.ts), so
+  // unlike a meeting's payload title this value cannot go stale against the
+  // record it names.
+  mailSubject: z.string().nullable(),
   payload: z.record(z.string(), z.unknown()), createdAt: z.iso.datetime(),
 });
 export type Event = z.infer<typeof eventSchema>;

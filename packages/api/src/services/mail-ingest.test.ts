@@ -2,16 +2,17 @@ import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { asc, eq, sql } from "drizzle-orm";
+import { asc, eq, isNotNull, sql } from "drizzle-orm";
 import type { MailAddress, SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
-import { mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads } from "../db/schema.js";
+import { events, mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads } from "../db/schema.js";
 import { createCompany } from "./companies.js";
 import { archiveContact, createContact } from "./contacts.js";
 import { MailIngestError, NotFoundError } from "./errors.js";
 import { ingestMessage, type IngestMessageLinks } from "./mail-ingest.js";
 import { listThreads, unreadThreadCount } from "./mail-threads.js";
+import { listEvents } from "./timeline.js";
 import { subscribe } from "./sse.js";
 
 const handle = openTestDatabase();
@@ -1161,5 +1162,214 @@ describe("ingestMessage: SSE", () => {
     } finally {
       stop();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Timeline entries (Phase 5 Task 4). Ingest is the only writer of mail events,
+// and what it writes is a POINTER: the thread's record FKs plus mail_thread_id,
+// with an EMPTY payload. The privacy rule this half has to hold is that
+// nothing about the message reaches the events table at all -- an event row is
+// readable by every user of the CRM, a thread is not (services/timeline.ts
+// applies 4.2 visibility and 4.3 hides to decide who sees the row and renders
+// the subject live). The read half's matrix lives in timeline.test.ts.
+// ---------------------------------------------------------------------------
+describe("ingestMessage: timeline entries", () => {
+  /** Only the rows ingest could have written. The fixtures below create a
+   * company and a contact, each of which emits its own `created` row, and
+   * those are not what any assertion here is about. */
+  async function eventRows() {
+    return handle.db.select().from(events).where(isNotNull(events.mailThreadId))
+      .orderBy(asc(events.createdAt), asc(events.id));
+  }
+
+  /** A contact whose address the auto-linker will match, plus the company that
+   * link drags onto the thread -- the ordinary way a thread acquires the
+   * record links that put its entry on a timeline. */
+  async function linkedContact(email = "alice@example.com") {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const contact = await createContact(handle.db, actorId, {
+      firstName: "Alice", emails: [email], companyId: company.id,
+    });
+    return { companyId: company.id, contactId: contact.id };
+  }
+
+  it("emits mail_received as a pointer: the thread's record FKs, the thread id, and a payload with no keys", async () => {
+    const { companyId, contactId } = await linkedContact();
+    const result = await ingest({
+      messageId: ROOT_ID, from: "alice@example.com", subject: "Confidential salary review",
+      text: "the body nobody else may read",
+    });
+
+    const rows = await eventRows();
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row?.verb).toBe("mail_received");
+    expect(row?.mailThreadId).toBe(result.message.threadId);
+    expect(row?.companyId).toBe(companyId);
+    expect(row?.contactId).toBe(contactId);
+    expect(row?.dealId).toBeNull();
+    expect(row?.projectId).toBeNull();
+    expect(row?.meetingId).toBeNull();
+    // The account's owner: the closest thing a machine-written row has to a
+    // person, and no wider than the row itself, which reaches nobody who
+    // cannot already see the thread.
+    expect(row?.actorUserId).toBe(actorId);
+
+    // THE ASSERTION THAT MATTERS. Keys, not values: a future field named
+    // anything at all -- subject, snippet, preview, from -- trips this the day
+    // it is added, which a value check on today's field names would not.
+    expect(Object.keys(row?.payload as Record<string, unknown>)).toEqual([]);
+    // And nothing leaked into a column either. The whole row, serialised,
+    // must not contain a syllable of the message.
+    const serialised = JSON.stringify(row);
+    expect(serialised).not.toContain("Confidential");
+    expect(serialised).not.toContain("nobody else may read");
+    expect(serialised).not.toContain("alice@example.com");
+  });
+
+  it("emits mail_sent for an outbound message", async () => {
+    await linkedContact();
+    await ingest({
+      messageId: ROOT_ID, from: "chris@example.com", to: "alice@example.com",
+    }, { folder: "Sent" });
+
+    const rows = await eventRows();
+    expect(rows.map((row) => row.verb)).toEqual(["mail_sent"]);
+    expect(Object.keys(rows[0]?.payload as Record<string, unknown>)).toEqual([]);
+  });
+
+  // The throttle. One event per (thread, verb) per UTC calendar day: without
+  // it a fifty-message thread would bury a record's whole timeline, and the
+  // Mail tab is where every message is read anyway.
+  it("emits nothing for a second message of the same thread and direction on the same day", async () => {
+    await linkedContact();
+    await ingest({ messageId: ROOT_ID, from: "alice@example.com" });
+    await ingest({
+      messageId: CHILD_ID, references: [ROOT_ID], from: "alice@example.com",
+    }, { uid: 2 });
+
+    const rows = await eventRows();
+    expect(rows.map((row) => row.verb)).toEqual(["mail_received"]);
+  });
+
+  it("emits the opposite direction on the same day", async () => {
+    await linkedContact();
+    const first = await ingest({ messageId: ROOT_ID, from: "alice@example.com" });
+    const second = await ingest({
+      messageId: CHILD_ID, references: [ROOT_ID], from: "chris@example.com", to: "alice@example.com",
+    }, { uid: 2, folder: "Sent" });
+    // Same conversation, so this is genuinely one thread with two entries.
+    expect(second.message.threadId).toBe(first.message.threadId);
+
+    const rows = await eventRows();
+    expect(rows.map((row) => row.verb).sort()).toEqual(["mail_received", "mail_sent"]);
+  });
+
+  it("emits again the next day", async () => {
+    await linkedContact();
+    const first = await ingest({ messageId: ROOT_ID, from: "alice@example.com" });
+    // Move yesterday's entry out of today's window rather than moving the
+    // clock: the boundary is the database's own `now()`, so backdating the
+    // stored row is what exercises it honestly.
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    await handle.db.update(events).set({ createdAt: yesterday })
+      .where(eq(events.mailThreadId, first.message.threadId));
+
+    await ingest({
+      messageId: CHILD_ID, references: [ROOT_ID], from: "alice@example.com",
+    }, { uid: 2 });
+    const rows = await eventRows();
+    expect(rows.map((row) => row.verb)).toEqual(["mail_received", "mail_received"]);
+  });
+
+  it("throttles per thread, so another conversation the same day gets its own entry", async () => {
+    await linkedContact();
+    await ingest({ messageId: ROOT_ID, from: "alice@example.com" });
+    await ingest({ messageId: PARENT_ID, from: "alice@example.com" }, { uid: 2 });
+
+    const rows = await eventRows();
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.mailThreadId)).size).toBe(2);
+  });
+
+  // No record links means no timeline for the entry to appear on -- every
+  // listEvents filter is one of the four record FKs -- so writing the row
+  // would only grow the fastest-growing table in the schema for nothing.
+  it("emits nothing for a thread with no record links", async () => {
+    await ingest({ messageId: ROOT_ID, from: "stranger@elsewhere.example" });
+    expect(await eventRows()).toHaveLength(0);
+  });
+
+  // The link check runs AFTER auto-linking, so the message that first links a
+  // thread is itself the one that puts it on the timeline.
+  it("starts emitting from the message that first links the thread", async () => {
+    const first = await ingest({ messageId: ROOT_ID, from: "alice@example.com" });
+    expect(await eventRows()).toHaveLength(0);
+
+    await linkedContact();
+    const second = await ingest({
+      messageId: CHILD_ID, references: [ROOT_ID], from: "alice@example.com",
+    }, { uid: 2 });
+    expect(second.message.threadId).toBe(first.message.threadId);
+    const rows = await eventRows();
+    expect(rows.map((row) => row.verb)).toEqual(["mail_received"]);
+  });
+
+  // A refetch or a second-folder sighting is not new mail.
+  it("adds no entry for a re-sighting of a message already stored", async () => {
+    await linkedContact();
+    const raw = rawMail({ messageId: ROOT_ID, from: "alice@example.com" });
+    await ingest(raw, { folder: "INBOX", uid: 1 });
+    await ingest(raw, { folder: "Archive", uid: 9 });
+    expect(await eventRows()).toHaveLength(1);
+  });
+
+  it("publishes the events key only when an entry was actually written", async () => {
+    await linkedContact();
+    const { hints, stop } = captureHints();
+    try {
+      const first = await ingest({ messageId: ROOT_ID, from: "alice@example.com" });
+      expect(hints).toEqual([{
+        keys: [
+          ["mail-threads"], ["mail-thread", first.message.threadId], ["mail-unread"], ["events"],
+        ],
+      }]);
+      // Throttled away: nothing on any timeline moved, so the rails must not
+      // be told to refetch.
+      await ingest({
+        messageId: CHILD_ID, references: [ROOT_ID], from: "alice@example.com",
+      }, { uid: 2 });
+      expect(hints).toHaveLength(2);
+      expect(hints[1]?.keys.some((key) => key[0] === "events")).toBe(false);
+    } finally {
+      stop();
+    }
+  });
+
+  // The bridge between this file and timeline.test.ts's matrix, which builds
+  // its event rows by hand: a REAL ingested message, read back through the
+  // real read path, so the hand-written twin cannot drift out of step.
+  it("reaches the linked record's timeline with the thread's live subject, and only for a viewer who may see it", async () => {
+    const otherId = (await resolveUser(handle.db, { username: "dana", email: null, fullName: null })).id;
+    const { companyId } = await linkedContact();
+    const result = await ingest({
+      messageId: ROOT_ID, from: "alice@example.com", subject: "Re: Quarterly report",
+    });
+
+    const owner = await listEvents(handle.db, actorId, { companyId });
+    const entry = owner.items.find((e) => e.verb === "mail_received");
+    expect(entry?.mailThreadId).toBe(result.message.threadId);
+    // Normalised once from the first message (mail-content.ts), so the "Re: "
+    // is gone -- and it is read from the thread at request time, not from the
+    // event.
+    expect(entry?.mailSubject).toBe("Quarterly report");
+
+    // The account is private and hers is not the mailbox: the row is absent
+    // for her, not stubbed. The company's own "created" entry proves the page
+    // loaded.
+    const other = await listEvents(handle.db, otherId, { companyId });
+    expect(other.items.some((e) => e.mailThreadId !== null)).toBe(false);
+    expect(other.items.some((e) => e.verb === "created")).toBe(true);
   });
 });

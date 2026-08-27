@@ -448,12 +448,12 @@ describe("eventVerbSchema", () => {
     expect(() => eventVerbSchema.parse("deleted")).toThrow());
 });
 
-describe("eventSchema taskId/projectId/meetingId/mailThreadId", () => {
+describe("eventSchema taskId/projectId/meetingId/mailThreadId/mailSubject", () => {
   it("round-trips an event carrying both a taskId and a projectId", () => {
     const value = {
       id: uuid1, verb: "shifted" as const, actorUserId: uuid1,
       companyId: null, contactId: null, dealId: null, taskId: uuid2, projectId: uuid1,
-      meetingId: null, mailThreadId: null,
+      meetingId: null, mailThreadId: null, mailSubject: null,
       payload: {}, createdAt: new Date().toISOString(),
     };
     expect(eventSchema.parse(value)).toEqual(value);
@@ -463,29 +463,38 @@ describe("eventSchema taskId/projectId/meetingId/mailThreadId", () => {
     const value = {
       id: uuid1, verb: "created" as const, actorUserId: uuid1,
       companyId: uuid2, contactId: null, dealId: null, taskId: null, projectId: null,
-      meetingId: null, mailThreadId: null,
+      meetingId: null, mailThreadId: null, mailSubject: null,
       payload: {}, createdAt: new Date().toISOString(),
     };
     expect(eventSchema.parse(value)).toEqual(value);
   });
 
-  // Phase 5's two pointers. Both are REQUIRED keys (nullable, not optional):
-  // an event serialized without them is a producer that has not been updated,
-  // and it should fail loudly here rather than reach a client as an entry
-  // that silently cannot link back to its meeting or thread.
-  it("round-trips a meeting event's meetingId and a mail event's mailThreadId, and requires both keys", () => {
+  // Phase 5's two pointers, plus the derived subject. All three are REQUIRED
+  // keys (nullable, not optional): an event serialized without them is a
+  // producer that has not been updated, and it should fail loudly here rather
+  // than reach a client as an entry that silently cannot link back to its
+  // meeting or thread -- or, for mailSubject, as a mail entry with no label,
+  // which a client cannot tell from a thread it was never given.
+  it("round-trips a meeting event's meetingId and a mail event's mailThreadId/mailSubject, and requires all three keys", () => {
     const base = {
       id: uuid1, actorUserId: uuid1,
       companyId: uuid2, contactId: null, dealId: null, taskId: null, projectId: null,
       payload: {}, createdAt: new Date().toISOString(),
     };
-    const met = { ...base, verb: "met" as const, meetingId: uuid2, mailThreadId: null };
+    const met = { ...base, verb: "met" as const, meetingId: uuid2, mailThreadId: null, mailSubject: null };
     expect(eventSchema.parse(met)).toEqual(met);
-    const mail = { ...base, verb: "mail_received" as const, meetingId: null, mailThreadId: uuid2 };
+    // mailSubject is derived at read time from the thread under the viewer's
+    // own predicates and stored nowhere (api: services/timeline.ts); it is a
+    // wire field only, which is why no payload key here carries it.
+    const mail = {
+      ...base, verb: "mail_received" as const,
+      meetingId: null, mailThreadId: uuid2, mailSubject: "Quarterly report",
+    };
     expect(eventSchema.parse(mail)).toEqual(mail);
 
-    expect(() => eventSchema.parse({ ...base, verb: "created", mailThreadId: null })).toThrow();
-    expect(() => eventSchema.parse({ ...base, verb: "created", meetingId: null })).toThrow();
+    expect(() => eventSchema.parse({ ...base, verb: "created", mailThreadId: null, mailSubject: null })).toThrow();
+    expect(() => eventSchema.parse({ ...base, verb: "created", meetingId: null, mailSubject: null })).toThrow();
+    expect(() => eventSchema.parse({ ...base, verb: "created", meetingId: null, mailThreadId: null })).toThrow();
   });
 });
 

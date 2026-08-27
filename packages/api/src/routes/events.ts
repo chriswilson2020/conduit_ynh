@@ -20,11 +20,19 @@ const listQuerySchema = z.object({
 
 export function registerEventRoutes(app: FastifyInstance, { db }: CrmRouteDeps): void {
   app.get("/api/events", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    // The user is kept, not merely asserted: since Phase 5 the timeline is
+    // viewer-scoped -- a mail entry whose thread this viewer may not see (4.2
+    // visibility composed with 4.3 hides) is excluded from the response
+    // entirely by services/timeline.ts. This is the only listEvents caller in
+    // the API, and it serves every timeline surface there is: the record
+    // rails, a project's timeline and the task drawer are all this route with
+    // a different filter.
+    const user = requireUser(request, reply);
+    if (user === null) return;
     const query = parseOrReject(listQuerySchema, request.query, reply);
     if (query === undefined) return;
     if (!validateCursor(query.cursor, reply)) return;
-    return listEvents(db, {
+    return listEvents(db, user.id, {
       companyId: query.company_id, contactId: query.contact_id, dealId: query.deal_id,
       taskId: query.task_id, projectId: query.project_id,
       cursor: query.cursor, limit: query.limit,

@@ -698,7 +698,7 @@ describe("follow-up tasks from a meeting", () => {
 
     const task = await createMeetingTask(handle.db, actorId, meeting.id, { title: "Send the deck" });
 
-    const own = await listEvents(handle.db, { taskId: task.id });
+    const own = await listEvents(handle.db, actorId, { taskId: task.id });
     expect(own.items.map((e) => e.verb)).toEqual(["created"]);
     expect(own.items[0]?.meetingId).toBe(meeting.id);
     const rows = await handle.db.select().from(events).where(eq(events.taskId, task.id));
@@ -782,13 +782,13 @@ describe("follow-up tasks from a meeting", () => {
 
     const task = await createMeetingTask(handle.db, actorId, meeting.id, { title: "Send the deck" });
 
-    const attended = await listEvents(handle.db, { contactId: dana.id });
+    const attended = await listEvents(handle.db, actorId, { contactId: dana.id });
     expect(attended.items.some((e) => e.taskId === task.id)).toBe(false);
     // What she does see: the meeting itself, and her own creation row.
     expect(attended.items.map((e) => e.verb)).toEqual(["met", "created"]);
     expect(attended.items[1]?.contactId).toBe(dana.id);
 
-    const onCompany = await listEvents(handle.db, { companyId: company.id });
+    const onCompany = await listEvents(handle.db, actorId, { companyId: company.id });
     expect(onCompany.items.some((e) => e.taskId === task.id && e.meetingId === meeting.id)).toBe(true);
   });
 });
