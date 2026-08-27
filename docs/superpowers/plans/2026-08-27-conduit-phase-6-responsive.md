@@ -14,7 +14,7 @@
 
 | File | Responsibility |
 |---|---|
-| `packages/web/tailwind.config.*` + `packages/web/src/lib.ts` | the one breakpoint constant, shared |
+| `packages/web/src/styles.css` + `packages/web/src/lib.ts` | the one breakpoint constant, shared. **CORRECTED:** this plan's first draft named `tailwind.config.*`; no such file exists and none should — Tailwind v4 is CSS-first (`tailwindcss ^4` + `@tailwindcss/vite`), so the stylesheet IS the config. |
 | `packages/web/src/use-is-mobile.ts` (new) + its test | the hook, over `matchMedia` |
 | `packages/web/src/components/shell.tsx` | sidebar above the breakpoint, bottom bar below |
 | `packages/web/src/components/bottom-nav.tsx` (new) + `nav-lib.ts` (new) | the bar, the More sheet, the primary/overflow split (pure, tested) |
@@ -50,6 +50,10 @@ Touch targets on the bar and the sheet reach 44px. `data-testid`s: `bottom-nav`,
 - **Dialogs and drawers become full-height sheets** below the breakpoint (task drawer, composer, link panel, meeting form). Prefer one change in the shared UI primitive over per-caller changes.
 - **Touch targets ≥44px** below the breakpoint for icon buttons, tab triggers, list rows, menu items.
 - **The record rail's five tabs must survive a narrow width** — check what they do today at 375px and fix if they overflow or truncate illegibly.
+- **INHERITED FROM TASK 1 (its review measured these; they are yours because they live in files Task 1 could not touch):**
+  - **The sidebar does not fit a landscape phone.** Measured 384px tall (68px title + 8 rows x 36px + 7 gaps) against roughly 345-350px of viewport on a 14 Pro in landscape, which sits ABOVE the breakpoint and so keeps the sidebar by design. The `<aside>` has no `overflow-y` and the root is `flex min-h-screen`, so the whole document scrolls vertically — on the one axis landscape has none of. Cheap, desktop-safe remedy: `max-lg:overflow-y-auto` on the aside. Also note those nav rows are 36px touch targets on a touch device above the breakpoint.
+  - **`ui/input.tsx` computes to 38px**, not 44. Task 1 deliberately left it because that primitive is yours AND it is the same element as the desktop header's search box, so a bare `min-h-11` would grow the desktop input and break the hard requirement. A `max-md:` variant IS desktop-safe — that is the shape to use.
+  - **`env(safe-area-inset-bottom)` currently evaluates to 0px everywhere**, because `packages/web/index.html`'s viewport meta has no `viewport-fit=cover`. The bottom bar's reservation is correct by accident (the browser reserves the home-indicator strip itself). Adding `viewport-fit=cover` is a real change with top/left/right consequences — decide it deliberately or leave it and let Task 1's corrected comment stand.
 
 Pure-lib tests where logic appears; otherwise this task is proven by Task 6's e2e and by the desktop suite staying green. ~6 tests.
 
@@ -80,6 +84,8 @@ Above the breakpoint the board is untouched — including its drag-and-drop. ~8 
 Below the breakpoint the chart renders **read-only with pan and zoom**, and **tapping a bar opens the task drawer** (where dates and dependencies are both editable — this is what makes the phase's no-capability-gap claim true, so verify it end to end rather than assuming).
 
 **A drag must not appear to start.** If touch drag is unsupported, the bar must not show a drag affordance or move under the finger and snap back — that is worse than a plain tap target.
+
+**INHERITED FROM TASK 1's review:** the Gantt's own `sticky` elements carry `z-20`/`z-30` (`gantt/chart.tsx:240,242`; `gantt/timescale.tsx:82,136`) and are NOT portalled. `<main>` is not a stacking context (`overflow-auto` alone does not create one), so they participate in the root stacking context above the bottom bar's `z-index: auto` and can paint OVER it — the bar's bottom padding keeps ordinary content clear but not these. Every other overlay in the app is portalled to the end of `<body>` and lands above the bar for free; the Gantt is the exception.
 
 Above the breakpoint, unchanged: drag-to-reschedule, dependency editing, the compactor. ~6 tests.
 
