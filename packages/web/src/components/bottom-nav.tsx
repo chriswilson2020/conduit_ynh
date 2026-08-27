@@ -9,10 +9,10 @@ import { GlobalSearch } from "./search";
 /**
  * The shell's chrome BELOW the breakpoint: the bottom tab bar, the More sheet
  * behind it, and the header's search sheet. All three live in one file because
- * all three are the same object -- a sheet -- and this phase may not touch
- * components/ui, whose dialog primitives the next task converts to sheets
- * wholesale. When it does, Sheet below is what it should promote and this file
- * should import.
+ * all three are the same object -- a sheet -- and this TASK may not touch
+ * components/ui (the plan assigns that directory to Task 2, whose job is
+ * converting the dialog primitives to sheets wholesale). When it does, Sheet
+ * below is what it should promote and this file should import.
  *
  * Nothing here renders above the breakpoint: shell.tsx picks between this and
  * the sidebar with useIsMobile(), so the two never coexist in the DOM. That is
@@ -77,6 +77,14 @@ function SearchIcon() {
  * shape -- an outside; without a button in the header, opening search would be
  * the one dead end this phase's definition of done forbids.
  *
+ * THE CONTRACT FOR ANYTHING PUT INSIDE ONE: if it can navigate, it must close
+ * the sheet itself. Radix cannot see a navigation that happens inside its own
+ * content, so a sheet left open after one covers the page the user asked for
+ * with a surface that looks like nothing happened. Both callers below honour
+ * it -- the More rows through onClick, the search through its onNavigate --
+ * and nav-lib.test.ts guards the second, which is the one where the closing
+ * has to travel through another component to get here.
+ *
  * aria-describedby is cleared explicitly because these sheets carry no
  * description element, and Radix otherwise points at an id that is not there.
  */
@@ -133,8 +141,17 @@ function Sheet({
  * every overlay in this app (dialogs, the task drawer, the sheets above) is
  * portalled to the end of <body> with no z-index of its own -- so they land
  * above the bar for free, while a z-index here would float the bar over an
- * open drawer. shell.tsx pays for the fixed positioning with bottom padding on
- * <main> so the last row of a list is not parked under the bar.
+ * open drawer. The one exception found so far is the Gantt, whose sticky
+ * chart/timescale elements carry a z-index and are NOT portalled; that is
+ * recorded against Task 5, which owns those files. shell.tsx pays for the
+ * fixed positioning with bottom padding on <main> so the last row of a list is
+ * not parked under the bar.
+ *
+ * The `pb-[env(...)]` is 0px in this app today -- index.html's viewport meta
+ * has no `viewport-fit=cover`, so the layout viewport already stops short of
+ * the home indicator and every safe-area inset resolves to zero. It is kept
+ * because it costs nothing and becomes the correct padding the moment that
+ * meta changes, which is Task 2's call.
  */
 export function BottomNav({ unreadMail }: { unreadMail: number }) {
   const [moreOpen, setMoreOpen] = useState(false);
@@ -207,6 +224,12 @@ export function BottomNav({ unreadMail }: { unreadMail: number }) {
  * `search-input` a single element on the page -- the desktop header's copy and
  * this one are never both rendered, since shell.tsx picks one branch or the
  * other.
+ *
+ * onNavigate is what takes the sheet down when a result is chosen. Choosing a
+ * result is the whole point of opening this, so it is the ONE interaction that
+ * must not leave the sheet standing -- and it is invisible to Radix, which
+ * only knows about Escape and clicks outside a surface that here has no
+ * outside.
  */
 export function MobileSearch() {
   const [open, setOpen] = useState(false);
@@ -228,7 +251,7 @@ export function MobileSearch() {
         </RadixDialog.Trigger>
       }
     >
-      <GlobalSearch />
+      <GlobalSearch onNavigate={() => setOpen(false)} />
     </Sheet>
   );
 }

@@ -101,6 +101,16 @@ describe("isNavDestinationActive", () => {
  * and rewriting them into a map over this list would do exactly that -- so a
  * runtime assertion has nothing to compare against. Labels are not compared,
  * only targets: the sidebar says "Inbox" where the bar says "Mail".
+ *
+ * KNOW WHAT THIS GUARD CANNOT SEE, because it is the mechanical basis for the
+ * phase's central promise and a false sense of it is worse than none. It
+ * matches ONE SPELLING: a string literal in `to="..."`. A sidebar entry
+ * written as `to={ROUTES.reports}`, as a template literal, or as a plain
+ * `<a href>` slips past it silently -- the test still passes while the
+ * destination really is desktop-only. It guards against the likely mistake
+ * (someone copies an existing sidebar line and forgets this list), not against
+ * a determined one. If a later task changes how those links are spelled, this
+ * test must be taught the new spelling in the same commit.
  */
 describe("NAV_DESTINATIONS", () => {
   it("covers exactly the destinations the desktop sidebar links to", () => {
@@ -114,5 +124,29 @@ describe("NAV_DESTINATIONS", () => {
     const targets = NAV_DESTINATIONS.map((destination) => destination.to);
     expect(new Set(ids).size).toBe(ids.length);
     expect(new Set(targets).size).toBe(targets.length);
+  });
+});
+
+/**
+ * The sheets' dismissal contract, guarded the only way a repo with no
+ * testing-library can guard a wiring: by reading the source.
+ *
+ * The rule is in Sheet's doc comment -- anything inside a sheet that navigates
+ * must close it, because Radix sees only Escape and outside clicks, and the
+ * full-shape sheet has neither. The More rows close themselves inline, where
+ * anyone editing them can see it. Search cannot: the click happens inside
+ * GlobalSearch, so the closing travels out through a prop, and dropping that
+ * one attribute silently restores the bug where the app navigates BEHIND the
+ * open sheet and the user is left staring at their own query.
+ *
+ * The same caveat as the guard above applies -- this matches a spelling, not a
+ * behaviour, and the click-through itself is Task 6's e2e.
+ */
+describe("the phone chrome's search sheet", () => {
+  it("hands GlobalSearch a way to close the sheet it is inside", () => {
+    const chrome = readFileSync(new URL("./bottom-nav.tsx", import.meta.url), "utf8");
+    const rendered = [...chrome.matchAll(/<GlobalSearch\b[^>]*>/g)].map((match) => match[0]);
+    expect(rendered).toHaveLength(1);
+    expect(rendered[0]).toContain("onNavigate=");
   });
 });

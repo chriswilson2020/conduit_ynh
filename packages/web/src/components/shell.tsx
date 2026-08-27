@@ -118,9 +118,16 @@ export function Shell({ children }: { children: ReactNode }) {
         {/*
           The bottom bar is `fixed`, so it overlays the end of a scrolled page;
           the extra bottom padding below the breakpoint is what keeps the last
-          row of a list out from under it. Spelled as a calc so the reserved
-          space grows with the home-indicator inset the bar itself pads for,
-          rather than assuming a fixed one.
+          row of a list out from under it.
+
+          The env() term is 0px in this app TODAY and the reservation is really
+          the flat 6rem: index.html's viewport meta has no `viewport-fit=cover`,
+          so the layout viewport is already inset past the home indicator and
+          every safe-area-inset-* resolves to zero by definition. The 6rem
+          clears the bar on its own, so this is correct either way -- the term
+          is here so the reservation still tracks the bar (which pads by the
+          same inset) if Task 2 ever adds `viewport-fit=cover`, which is its
+          decision to make and has top/left/right consequences of its own.
         */}
         <main
           className={clsx(

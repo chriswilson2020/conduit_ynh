@@ -31,8 +31,15 @@ const GROUP_LABEL: Record<FlatResult["kind"], string> = {
  * array, in Companies/Contacts/Notes/Deals/Tasks/Mail order
  * (searchResultsSchema's own field order), so ArrowUp/ArrowDown can move a
  * single highlight index across all of them regardless of group.
+ *
+ * `onNavigate` fires after a result is chosen, for a caller that has its own
+ * surface to take down. The desktop header passes nothing and is unchanged;
+ * the phone's search sheet passes its dismiss, because closing the dropdown is
+ * not enough there -- the sheet is a full-screen modal with no outside to tap
+ * and no Escape key to press, so without this the app navigates BEHIND it and
+ * the user is left looking at their own query with no sign anything happened.
  */
-export function GlobalSearch() {
+export function GlobalSearch({ onNavigate }: { onNavigate?: () => void } = {}) {
   const navigate = useNavigate();
   const containerRef = useRef<HTMLDivElement>(null);
   const [rawQuery, setRawQuery] = useState("");
@@ -152,6 +159,9 @@ export function GlobalSearch() {
   function selectResult(entry: FlatResult) {
     goTo(entry);
     setOpen(false);
+    // Unconditional, and it is the LAST statement rather than a branch inside
+    // goTo: every kind of result navigates, so every kind must tell the caller.
+    onNavigate?.();
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {

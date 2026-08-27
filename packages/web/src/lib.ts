@@ -289,17 +289,24 @@ export function flattenCursorPages<T extends { id: string }>(state: CursorPages<
  * uses rather than in px, so redeclaring it in styles.css changes nothing at
  * all for the 32 breakpoint utilities already in this package.
  *
- * Chosen for where the two interaction models actually belong, which is not
- * simply "phone vs not":
+ * The conventional choice, and the cases it lands on:
  *
  *  - Every phone in PORTRAIT (430px at the widest current handset) is below
- *    it, which is the case the phone UI is designed for.
+ *    it. That is the dominant phone case and the one the phone UI is built
+ *    for, which is what settles the value.
  *  - A tablet in portrait (768px) is at or above it and keeps the sidebar,
- *    which it has width for.
- *  - A large phone in LANDSCAPE (844px and up) is above it and also keeps the
- *    sidebar. That is deliberate, not an oversight: in landscape the scarce
- *    axis is HEIGHT (393px on a 14 Pro), and the sidebar spends width while a
- *    bottom tab bar would spend the axis there is none of.
+ *    which it has both axes for.
+ *  - A large phone in LANDSCAPE (844px and up) is above it and therefore also
+ *    keeps the sidebar. This is a CONSEQUENCE of the width above, not a claim
+ *    that the sidebar fits there -- it does not. Measured: the aside is 384px
+ *    tall (68px title + 8 rows x 36px + 7 x 4px gaps) against roughly 345-350px
+ *    of viewport height on a 14 Pro in landscape. It carries no `overflow-y`
+ *    and the root is `flex min-h-screen`, so the DOCUMENT scrolls vertically --
+ *    on the one axis a landscape phone has none of -- and <main>'s own scroll
+ *    region has its bottom pushed off-screen. Those nav rows are also 36px
+ *    touch targets on a touch device sitting above the breakpoint. The cheap,
+ *    desktop-safe remedy is `max-lg:overflow-y-auto` on the aside, and it
+ *    belongs to Task 2, which owns that sweep; the plan records it there.
  *
  * `rem` in a media query resolves against the browser's INITIAL font size, not
  * the root element's, and matchMedia evaluates it by the same rule -- so the
