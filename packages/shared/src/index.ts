@@ -118,7 +118,9 @@ export type FileMeta = z.infer<typeof fileMetaSchema>;
 // Meeting archive/unarchive reuse "archived"/"unarchived" rather than adding
 // meeting-specific verbs, the same way task reopening reuses "reopened".
 // Kept in the same order as the events_verb_valid DB CHECK (api:
-// db/schema.ts), which schema.test.ts pins member-for-member.
+// db/schema.ts), which timeline.test.ts pins member-for-member (schema.test.ts
+// covers the migration and the CHECK's own accept/reject behaviour, not the
+// member-for-member correspondence).
 export const eventVerbSchema = z.enum([
   "created", "updated", "archived", "unarchived", "note_added", "file_attached",
   "stage_changed", "won", "lost", "reopened",

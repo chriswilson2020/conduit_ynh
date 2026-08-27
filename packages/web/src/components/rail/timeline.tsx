@@ -11,8 +11,12 @@ export interface TimelineProps {
   taskId?: string;
 }
 
-// Single-letter badges rather than pictographic icons: ASCII, unambiguous per
-// verb, and there is no icon library in this project (see the task spec).
+// Single-letter badges rather than pictographic icons: ASCII, one distinct
+// letter per verb, and there is no icon library in this project (see the task
+// spec). Distinctness is the whole point -- two verbs sharing a letter make a
+// record's timeline unreadable -- so a new verb takes a free letter, or takes
+// a used one only when a coordinator ruling moves the incumbent (Phase 5
+// Amendment 1 did exactly that; see `met` below).
 const VERB_BADGE: Record<Event["verb"], string> = {
   created: "C",
   updated: "U",
@@ -27,23 +31,26 @@ const VERB_BADGE: Record<Event["verb"], string> = {
   // Task 8's real task-event badges (Phase 3 Task 2 widened eventVerbSchema
   // with these four; P2.1 only stubbed the map exhaustively typed against
   // it -- see search.ts's own tasks: [] stub for that same stub-now/
-  // wire-later precedent). Letters chosen to stay unique against every
-  // badge above: H (sHifted), D (completeD), P (dePendency added),
-  // M (reMoved).
+  // wire-later precedent). Letters chosen to stay distinct from every badge
+  // above: H (sHifted), D (completeD), P (dePendency added). The fourth was
+  // M (reMoved) until Phase 5 Amendment 1 moved it to X so `met` could have
+  // M: a dependency removal is among the rarest entries a timeline carries
+  // and a meeting among the most common, so the mnemonic letter belongs to
+  // the meeting -- and X reads as "removed" at least as well as M did.
   shifted: "H",
   completed: "D",
   dependency_added: "P",
-  dependency_removed: "M",
-  // Phase 5's three verbs, at the letters the spec assigns them (met = M,
-  // mail_received = R, mail_sent = T). Two of the three COLLIDE with badges
-  // above -- M is already dependency_removed's and R is already unarchived's
-  // -- so the uniqueness the comment at the head of this map claims no longer
-  // holds. Recorded rather than silently reassigned: this map is exhaustively
-  // typed against eventVerbSchema, so Task 1 must fill these in to compile,
-  // but the badge letters are the spec's own and rendering these three rows
-  // (link targets, the derived mail subject) is Task 5's.
+  dependency_removed: "X",
+  // Phase 5's three verbs, at the letters spec Amendment 1 settles. The
+  // spec's first draft collided twice (met = M against dependency_removed,
+  // mail_received = R against unarchived); the ruling gave the intuitive
+  // letter to whichever verb a user sees more often, which moved
+  // dependency_removed to X above and put mail_received on I (Inbound) so
+  // unarchived keeps R untouched. Rendering these three rows -- link targets
+  // and the derived mail subject -- is still Task 5's; only the letters and
+  // the compile-forced entries live here.
   met: "M",
-  mail_received: "R",
+  mail_received: "I",
   mail_sent: "T",
 };
 
