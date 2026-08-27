@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import type { BrowserContext, Locator, Page } from "@playwright/test";
+import { typeIntoEditor } from "./helpers.js";
 
 /**
  * One serial journey through Phase 5's meetings: log a meeting on a company
@@ -214,7 +215,17 @@ test.describe.serial("Meetings journey", () => {
     // The picker is a picker, not a field: its trigger goes back to the
     // invitation rather than reporting the person just added...
     await expect(form.getByTestId("meeting-add-user")).toContainText("Add a colleague...");
-    // ...which means the same colleague can be offered again, and the
+    // ...and the OPTION LIST IS GONE, which the trigger assertion above does
+    // not say: that one gates the trigger's own re-render, while the options
+    // live in a Radix portal (ui/select.tsx's SelectContent, role="listbox")
+    // that unmounts on its own schedule. Nothing configures an exit
+    // animation and CI has burned no retries here, so this is stated rather
+    // than fixed -- an explicit gate instead of a race this test happens to
+    // win. Without it, the second open below could resolve its option
+    // against the FIRST portal, and "clicked a node that was on its way out"
+    // is the kind of flake that reads as a duplicate-guard failure.
+    await expect(page.getByRole("listbox")).toHaveCount(0);
+    // Re-opened, because the same colleague can be offered again, and the
     // DUPLICATE GUARD is what has to answer -- before the round trip that
     // would come back 409 duplicate_attendee.
     await form.getByTestId("meeting-add-user").click();
@@ -231,9 +242,10 @@ test.describe.serial("Meetings journey", () => {
 
     // Real key events rather than fill(): the notes are a TipTap document,
     // not an input, and its model is built from what the editor sees happen
-    // to it (mail.spec.ts's composer takes the same route).
-    await form.getByTestId("meeting-notes").click();
-    await page.keyboard.type(notesText);
+    // to it (mail.spec.ts's composer takes the same route, through the same
+    // helper -- see e2e/helpers.ts for what the bare click-and-type shape
+    // was letting through).
+    await typeIntoEditor(form.getByTestId("meeting-notes"), notesText);
 
     await form.getByTestId("meeting-submit").click();
     await expect(page.getByTestId("meeting-form")).toHaveCount(0);

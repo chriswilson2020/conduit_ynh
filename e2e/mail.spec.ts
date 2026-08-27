@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 import type { BrowserContext, Locator, Page } from "@playwright/test";
 import { ImapFlow } from "imapflow";
+import { typeIntoEditor } from "./helpers.js";
 
 /**
  * One serial journey through the Phase 4 mail flows: seed a mailbox over
@@ -1003,11 +1004,12 @@ test.describe.serial("Mail journey", () => {
     // To and Subject arrive seeded from the thread (Alice, "Re: <subject>");
     // only the body is typed. Real key events rather than fill(): the body is
     // a TipTap document, not an input, and its model is built from what the
-    // editor sees happen to it.
+    // editor sees happen to it -- through typeIntoEditor (e2e/helpers.ts),
+    // which is what makes "the editor did not take this" fail here rather
+    // than as an empty body several tests down.
     await expect(composer).toContainText(aliceAddress);
     await expect(page.getByTestId("composer-subject")).toHaveValue(`Re: ${aliceSubject}`);
-    await page.getByTestId("composer-body").click();
-    await page.keyboard.type(replyBody);
+    await typeIntoEditor(page.getByTestId("composer-body"), replyBody);
     await page.getByTestId("composer-send").click();
     await expect(composer).toBeHidden({ timeout: 30_000 });
 
@@ -1620,8 +1622,7 @@ test.describe.serial("Mail journey", () => {
     await expect(page.getByTestId("composer")).toBeVisible();
     // Real key events, as the Alice reply above: the body is a TipTap
     // document, not an input.
-    await page.getByTestId("composer-body").click();
-    await page.keyboard.type(timelineReplyBody);
+    await typeIntoEditor(page.getByTestId("composer-body"), timelineReplyBody);
     await page.getByTestId("composer-send").click();
     await expect(page.getByTestId("composer")).toBeHidden({ timeout: 30_000 });
 
@@ -1650,13 +1651,36 @@ test.describe.serial("Mail journey", () => {
     // ...and A's mail is not there -- NEITHER DIRECTION, the inbound entry
     // or the reply A just sent. Not a redacted stub, not an "activity you
     // cannot see" placeholder: an entry like that would leak both the
-    // existence and the timing of someone else's mail. NO ROW AT ALL, which
-    // is why the second assertion is about the mail entry's own link (the
-    // one element every mail entry has and no other entry does) rather than
-    // only about the subject text.
+    // existence and the timing of someone else's mail. NO ROW AT ALL.
+    //
+    // THREE ASSERTIONS, AND NONE OF THEM IS THE OTHERS' SPELLING. This is
+    // the phase's most important test and the trio is what it is worth;
+    // delete one and the leg still passes while covering less:
+    //
+    //   1. the SUBJECT, which is the content itself -- a row rendered from a
+    //      thread B may not read.
+    //   2. the LINK, which is the one element a mail entry has and no other
+    //      entry does -- a row that showed no subject but still offered
+    //      "View conversation".
+    //   3. the WORD, which is the row carrying neither: a deliberate
+    //      redacted placeholder. Nothing renders one today (it would take
+    //      the API deciding to serve the row AND the web deciding to draw
+    //      it), but if anything ever does it goes through summarize()'s
+    //      mail_received/mail_sent arms (web: rail/timeline-lib.ts), and
+    //      "received mail"/"sent mail" is the part of those a redaction has
+    //      no reason to remove. That is the shape assertions 1 and 2 both
+    //      miss.
+    //
+    // \b rather than a bare /mail/: this very contact's Emails field was
+    // filled in beforeAll, so her timeline carries an "updated emails" entry
+    // -- ordinary CRM activity, which B can and should see. The boundaries
+    // are what keep the third assertion about mail rather than about the
+    // word inside "emails".
     await expect(bPage.getByTestId("timeline-entry").filter({ hasText: timelineSubject }))
       .toHaveCount(0);
     await expect(bPage.getByTestId("timeline").getByTestId("timeline-thread-link")).toHaveCount(0);
+    await expect(bPage.getByTestId("timeline-entry").filter({ hasText: /\bmail\b/ }))
+      .toHaveCount(0);
   });
 
   test("opens the link panel's contact picker on the conversation", async () => {
