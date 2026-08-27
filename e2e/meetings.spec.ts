@@ -45,6 +45,7 @@ test.describe.serial("Meetings journey", () => {
   let otherCompanyName = "";
   let contactName = "";
   let guestName = "";
+  let coldCompanyName = "";
   let meetingTitle = "";
   let notesText = "";
   let followUpTitle = "";
@@ -77,6 +78,7 @@ test.describe.serial("Meetings journey", () => {
     attemptId = `${runId}x${testInfo.retry}`;
     companyName = `Meetco ${attemptId}`;
     otherCompanyName = `Elsewhere ${attemptId}`;
+    coldCompanyName = `Coldco ${attemptId}`;
     contactName = `Cara ${attemptId}`;
     guestName = `Gwen Guest ${attemptId}`;
     meetingTitle = `Kickoff ${attemptId}`;
@@ -168,11 +170,12 @@ test.describe.serial("Meetings journey", () => {
     await page.goto(`/companies/${companyId}`);
 
     // Nothing in the tab is mounted before its trigger is clicked -- but the
-    // claim needs the page to have RENDERED to mean anything: company-detail
-    // returns a bare "Loading..." while its record is in flight, in which
-    // frame every testid on the page is absent. The rail's default tab
-    // carrying this company's own creation entry is the loaded sentinel that
-    // makes the absence beside it a real absence rather than a race won.
+    // claim needs the page to have RENDERED to mean anything, and a page
+    // whose record is still in flight has no Meetings tab CONTENT either
+    // (its rail is up, on Timeline, since v0.9.1 renders the loading state
+    // inside the frame). The rail's default tab carrying this company's own
+    // creation entry is the loaded sentinel that makes the absence beside it
+    // a real absence rather than a race won.
     await expect(page.getByTestId("timeline-entry").filter({ hasText: "created" })).toBeVisible();
     await expect(page.getByTestId("meetings")).toHaveCount(0);
     await openMeetingsTab();
@@ -216,24 +219,32 @@ test.describe.serial("Meetings journey", () => {
     // invitation rather than reporting the person just added...
     await expect(form.getByTestId("meeting-add-user")).toContainText("Add a colleague...");
     // ...and the OPTION LIST IS GONE, which the trigger assertion above does
-    // not say -- and cannot: OwnerSelect is rendered with value={null} and a
-    // fixed unassignedLabel, so its trigger has read "Add a colleague..."
-    // since the form first painted. That line states the picker's contract
-    // (a picker, not a field); it waits for nothing. The options meanwhile
-    // live in a Radix portal (ui/select.tsx's SelectContent, role="listbox")
-    // that unmounts on its own schedule. Nothing configures an exit
-    // animation and CI has burned no retries here, so this is stated rather
-    // than fixed -- an explicit gate instead of a race this test happens to
-    // win. Without it, the second open below could resolve its option
-    // against the FIRST portal, and "clicked a node that was on its way out"
-    // is the kind of flake that reads as a duplicate-guard failure.
+    // not say -- and cannot: UserPicker pins Radix at "no selection", so that
+    // text is its placeholder and has been on the trigger since the form
+    // first painted. That line states the picker's contract (a picker, not a
+    // field); it waits for nothing. The options meanwhile live in a Radix
+    // portal (ui/select.tsx's SelectContent, role="listbox") that unmounts on
+    // its own schedule. Nothing configures an exit animation and CI has
+    // burned no retries here, so this is an explicit gate rather than a race
+    // this test happens to win -- and it still guards the re-open below,
+    // where a lingering FIRST portal would be a listbox that DOES still offer
+    // e2euser: the absence asserted there would fail against a stale node,
+    // reading as the filter not working.
     await expect(page.getByRole("listbox")).toHaveCount(0);
-    // Re-opened, because the same colleague can be offered again, and the
-    // DUPLICATE GUARD is what has to answer -- before the round trip that
-    // would come back 409 duplicate_attendee.
+    // Re-opened, because THE DUPLICATE GUARD IS NOW AN ABSENCE: a colleague
+    // already on the list is not offered a second time, so there is nothing
+    // to click that could reach the API's 409 duplicate_attendee. (The guard
+    // itself is unchanged and still answers for CONTACTS, which are picked
+    // from a search that knows nothing about this draft -- meetings-lib's own
+    // tests pin that.) Gated on the list being OPEN first: a picker that
+    // failed to open at all would satisfy an absence vacuously.
     await form.getByTestId("meeting-add-user").click();
-    await page.getByRole("option", { name: "e2euser", exact: true }).click();
-    await expect(form.getByRole("alert")).toContainText("already on the attendee list");
+    await expect(page.getByRole("listbox")).toBeVisible();
+    await expect(page.getByRole("option", { name: "e2euser", exact: true })).toHaveCount(0);
+    // Dismissed by hand, since nothing was picked: a Radix Select is modal,
+    // and an open portal would swallow the clicks the rest of this test makes.
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("listbox")).toHaveCount(0);
 
     // The guest: free text, nobody the CRM knows.
     await form.getByTestId("meeting-guest").fill(guestName);
@@ -391,18 +402,16 @@ test.describe.serial("Meetings journey", () => {
   });
 
   test("keeps one record's open meeting off another record's tab", async () => {
-    // BOTH RECORDS ARE VISITED FIRST, and that is the whole setup rather
-    // than a warm-up. The rail's record-keyed selection is only reachable
-    // when the destination renders with no loading gap: company-detail
-    // returns a bare "Loading..." while its own record is in flight, which
-    // unmounts the rail and takes the selection with it -- so a navigation
-    // to a company this browser has never fetched clears the selection by
-    // accident, and proves nothing about the guard. With both records in the
-    // query cache the page renders straight from it, the mounted rail simply
-    // receives new props, and the guard is the only thing standing between
-    // company A's open meeting and company B's tab. (That is also the case
-    // it was written against: moving between two records you have just been
-    // looking at.)
+    // BOTH RECORDS ARE VISITED FIRST, which keeps this test on the WARM
+    // case: the page renders straight from the query cache, the mounted rail
+    // simply receives new props, and the guard is the only thing standing
+    // between company A's open meeting and company B's tab. That is the case
+    // the guard was written against -- moving between two records you have
+    // just been looking at -- and the setup is kept now that it is no longer
+    // forced. It used to be: a detail page's loading state REPLACED the page
+    // before v0.9.1, so a navigation to a record this browser had never
+    // fetched unmounted the rail and cleared the selection by accident,
+    // proving nothing about the guard. The test below covers that half now.
     await page.goto(`/companies/${otherCompanyId}`);
     await expect(page.getByRole("heading", { name: otherCompanyName })).toBeVisible();
     await searchTo(companyName, `/companies/${companyId}`);
@@ -441,6 +450,41 @@ test.describe.serial("Meetings journey", () => {
     await searchTo(companyName, `/companies/${companyId}`);
     await expect(page.getByTestId("meeting-view")).toBeVisible();
     await expect(page.getByTestId("meeting-view")).toContainText(meetingTitle);
+  });
+
+  test("keeps the rail's tab across a navigation to a record never fetched here", async () => {
+    // THE COLD HALF of the case above, and the reason the one above has to
+    // warm both records first. A detail page renders a loading state before
+    // it has its record, and until v0.9.1 that state REPLACED the page --
+    // rail included -- so an ordinary link to a record this browser had not
+    // seen dropped the reader's tab and open meeting on the way. The pages
+    // now render it inside their frame, which leaves the rail mounted
+    // throughout and rail.tsx's record key the only thing deciding what it
+    // shows.
+    //
+    // THE COMPANY IS CREATED THROUGH THE API, deliberately: a record created
+    // on screen is in the query cache from the moment it exists, so every
+    // navigation this journey otherwise makes is a warm one that renders
+    // straight from cache and never reaches the loading state at all.
+    const created = await page.request.post("/api/companies", { data: { name: coldCompanyName } });
+    expect(created.status()).toBe(201);
+    const coldCompanyId = (await created.json() as { id: string }).id;
+
+    // page.goto, not a router hop: the full load empties the query cache, so
+    // the navigation below is cold no matter what the tests before it
+    // fetched.
+    await page.goto(`/companies/${companyId}`);
+    await openMeetingsTab();
+
+    await searchTo(coldCompanyName, `/companies/${coldCompanyId}`);
+    // MEETINGS IS NOT THE RAIL'S DEFAULT TAB (Timeline is), which is what
+    // makes this an assertion rather than a coincidence: a rail that had
+    // been unmounted and rebuilt would have come back on Timeline, with
+    // nothing under this testid at all.
+    await expect(page.getByTestId("meetings")).toBeVisible();
+    // Renders in the LIST and needs no fetch, so it holds while the record
+    // is still in flight -- which is exactly the frame this test is about.
+    await expect(page.getByTestId("log-meeting")).toBeVisible();
   });
 
   test("closes the follow-up affordance when the meeting's project is archived", async () => {

@@ -18,6 +18,7 @@ import {
 } from "../../lib";
 import { RichTextEditor, RichTextView } from "../mail/rich-text";
 import { OwnerSelect } from "../owner-select";
+import { UserPicker } from "../user-picker";
 import { STATUS_LABEL, TYPE_LABEL } from "../../pages/task-board";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -294,7 +295,7 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
   const [pickingContact, setPickingContact] = useState(false);
   const [guest, setGuest] = useState("");
   const createMeeting = useCreateMeeting();
-  const nameForUser = useUserLabel();
+  const chosenUserIds = draft.attendees.flatMap((a) => (a.kind === "user" ? [a.id] : []));
 
   function addAttendee(next: AttendeeDraft) {
     const merged = addAttendeeDraft(draft.attendees, next);
@@ -403,15 +404,16 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
             Add contact
           </Button>
           <div className="w-44">
-            <OwnerSelect
-              value={null}
-              unassignedLabel="Add a colleague..."
+            {/* Colleagues already on the list are not offered again, so the
+                duplicate this used to answer with an error cannot be asked
+                for. addAttendee's guard still covers contacts, which are
+                picked from a search that knows nothing about this draft. */}
+            <UserPicker
+              chosenUserIds={chosenUserIds}
+              placeholder="Add a colleague..."
               ariaLabel="Add a user attendee"
               testId="meeting-add-user"
-              onChange={(userId) => {
-                if (userId === null) return;
-                addAttendee({ kind: "user", id: userId, label: nameForUser(userId) });
-              }}
+              onPick={(id, label) => addAttendee({ kind: "user", id, label })}
             />
           </div>
         </div>
@@ -470,15 +472,6 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
       </div>
     </div>
   );
-}
-
-/** The user picker hands back an id; this names them for the chip. Reads the
- * same ["users"] cache entry the picker itself renders from, so it is never a
- * second request -- and the ellipsis is for the render in which that entry is
- * not there yet, not for a user who does not exist. */
-function useUserLabel(): (userId: string) => string {
-  const { data: users = [] } = useUsers();
-  return (userId: string) => userLabel(users.find((u) => u.id === userId), "...");
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +610,7 @@ function MeetingBody({ detail }: { detail: MeetingDetail }) {
             key={meeting.updatedAt}
             html={meeting.notes}
             testId="meeting-notes-body"
+            ariaLabel="Meeting notes"
             className="rounded-md border border-slate-200 px-3 py-2"
           />
         )}

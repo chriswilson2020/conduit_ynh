@@ -106,7 +106,30 @@ export function CompanyDetailPage() {
     unarchiveCompany.mutate(company.id, { onError: reportError });
   }
 
-  if (isLoading) return <p>Loading...</p>;
+  // THE FRAME OUTLIVES THE FETCH, and every detail page in this app now says
+  // so the same way. A page-level `return <p>Loading...</p>` replaces the
+  // whole layout, so a navigation to a record this browser has not fetched
+  // before -- which is most of them -- UNMOUNTED the rail on the way, taking
+  // its open tab and its selected meeting with it. Neither has anything to do
+  // with the record being fetched, and rail.tsx's record-keyed guard cannot
+  // help: it decides what a MOUNTED rail shows, and only ever ran between two
+  // records already in the query cache.
+  //
+  // The rail is handed the ROUTE param here and below, never `company.id`, so
+  // that guard's key is the same string across the loading render and the
+  // loaded one by construction rather than by the server echoing the id back.
+  if (isLoading) {
+    return (
+      <div className="flex flex-col gap-6 lg:flex-row">
+        <div className="min-w-0 lg:w-2/3">
+          <p>Loading...</p>
+        </div>
+        <aside className="min-w-0 lg:w-1/3">
+          <Rail companyId={companyId} />
+        </aside>
+      </div>
+    );
+  }
 
   if (error) {
     if (error instanceof ApiError && error.status === 404) {
@@ -276,7 +299,7 @@ export function CompanyDetailPage() {
         </section>
       </div>
       <aside className="min-w-0 lg:w-1/3">
-        <Rail companyId={company.id} />
+        <Rail companyId={companyId} />
       </aside>
     </div>
   );

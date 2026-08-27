@@ -45,14 +45,39 @@ export interface RichTextEditorProps {
  *
  * StarterKit v3 already BUNDLES the Link extension, so its copy is switched
  * off (`link: false`) and a configured one registered alongside -- registering
- * both would double-register the same extension name. `openOnClick: false`
- * keeps a click inside the editor an edit rather than a navigation;
- * `autolink` is what makes a typed URL become a link without a toolbar
- * affordance for it.
+ * both would double-register the same extension name. `autolink` is what
+ * makes a typed URL become a link without a toolbar affordance for it.
+ *
+ * `openOnClick: false` GOVERNS THE EDITOR ONLY, and reads as more than it is.
+ * TipTap's click plugin bails on a view that is not editable
+ * (`if (!view.editable) return false`, extension-link's clickHandler), so no
+ * value of this option changes anything in RichTextView below. A click on a
+ * link in the EDITOR stays an edit because of this line; a click on a link in
+ * the READ-ONLY view is the browser following an ordinary anchor, which
+ * ProseMirror does not intercept -- verified against this exact
+ * configuration: the click reaches the document unprevented and the
+ * navigation happens, just as it does for an anchor outside any editor.
+ *
+ * That makes the anchor's own attributes the whole of the read-only
+ * behaviour, so they are stated here instead of inherited from the
+ * extension's defaults. `target="_blank"` because this CRM is a single-page
+ * app: a note's link is an aside, and following it in the same tab would
+ * throw away the reader's place (an open form, the rail's tab, a scroll
+ * position). `rel="noopener noreferrer"` because that is about where the link
+ * GOES rather than who wrote it -- a page opened with target=_blank can
+ * otherwise reach back through window.opener. Both are exactly what the API's
+ * sanitizer already forces onto stored HTML (api: services/mail-content.ts),
+ * so the render and the stored document agree by construction rather than by
+ * coincidence. MessageFrame's sandboxed iframe is the mail precaution that
+ * does NOT carry over: that one is for documents written by strangers.
  */
 const EXTENSIONS = [
   StarterKit.configure({ link: false }),
-  Link.configure({ openOnClick: false, autolink: true }),
+  Link.configure({
+    openOnClick: false,
+    autolink: true,
+    HTMLAttributes: { target: "_blank", rel: "noopener noreferrer" },
+  }),
 ];
 
 const EDITOR_CLASS = "min-h-[8rem] w-full px-3 py-2 text-sm text-slate-900 focus:outline-none";
@@ -82,14 +107,27 @@ const activeToolbarButtonClass = "rounded bg-slate-200 px-2 py-1 text-xs font-me
  * `content` is read ONCE, like the editor's `initialHtml` -- a caller whose
  * HTML changes remounts this (meetings.tsx keys it on the meeting's
  * updatedAt).
+ *
+ * `ariaLabel` brings `role="region"` with it, which is what makes the label
+ * count: the editor above can carry a bare aria-label because a
+ * contenteditable is a textbox and takes one, while this renders as a plain
+ * container that an unlabelled name would simply not be announced on. A named
+ * region is also how a screen reader reaches the notes without walking the
+ * whole rail.
  */
-export function RichTextView({ html, className, testId }: { html: string; className?: string; testId?: string }) {
+export function RichTextView({ html, className, testId, ariaLabel }: {
+  html: string;
+  className?: string;
+  testId?: string;
+  ariaLabel?: string;
+}) {
   const editorProps = useMemo(() => ({
     attributes: {
       class: "text-sm text-slate-900 focus:outline-none",
+      ...(ariaLabel !== undefined ? { role: "region", "aria-label": ariaLabel } : {}),
       ...(testId !== undefined ? { "data-testid": testId } : {}),
     },
-  }), [testId]);
+  }), [ariaLabel, testId]);
 
   const editor = useEditor({ extensions: EXTENSIONS, content: html, editable: false, editorProps });
 

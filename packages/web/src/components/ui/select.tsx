@@ -39,10 +39,30 @@ export function SelectTrigger({
   );
 }
 
-export function SelectContent({ children }: { children: ReactNode }) {
+/**
+ * `position` is Radix's own, forwarded for the one caller that cannot use the
+ * default: item-aligned positioning is computed from the SELECTED item, and
+ * components/user-picker.tsx is pinned at "no selection" by design AND can
+ * legitimately offer nothing, which is the case where Radix has no item to
+ * position against and leaves the popup unplaced. Fields keep the default,
+ * which lines the current value up with the trigger; "popper" anchors the
+ * list under the trigger instead, with a small offset so it does not sit on
+ * top of it.
+ */
+export function SelectContent({
+  children,
+  position,
+}: {
+  children: ReactNode;
+  position?: "item-aligned" | "popper";
+}) {
   return (
     <RadixSelect.Portal>
-      <RadixSelect.Content className="overflow-hidden rounded-md border border-slate-200 bg-white shadow-md">
+      <RadixSelect.Content
+        position={position}
+        sideOffset={position === "popper" ? 4 : undefined}
+        className="overflow-hidden rounded-md border border-slate-200 bg-white shadow-md"
+      >
         <RadixSelect.Viewport className="p-1">{children}</RadixSelect.Viewport>
       </RadixSelect.Content>
     </RadixSelect.Portal>

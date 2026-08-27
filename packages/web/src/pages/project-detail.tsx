@@ -116,7 +116,20 @@ export function ProjectDetailPage() {
     unarchiveProject.mutate(project.id, { onError: reportError });
   }
 
-  if (isLoading) return <p>Loading...</p>;
+  // Inside the frame, not in place of it, and with the route param rather
+  // than `project.id` -- see company-detail.tsx for what that keeps alive.
+  if (isLoading) {
+    return (
+      <div className="flex flex-col gap-6 lg:flex-row">
+        <div className="min-w-0 lg:w-2/3">
+          <p>Loading...</p>
+        </div>
+        <aside className="min-w-0 lg:w-1/3">
+          <Rail projectId={projectId} />
+        </aside>
+      </div>
+    );
+  }
 
   if (error) {
     if (error instanceof ApiError && error.status === 404) {
@@ -353,7 +366,7 @@ export function ProjectDetailPage() {
         </section>
       </div>
       <aside className="min-w-0 lg:w-1/3">
-        <Rail projectId={project.id} />
+        <Rail projectId={projectId} />
       </aside>
     </div>
   );
