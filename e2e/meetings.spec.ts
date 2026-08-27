@@ -370,13 +370,29 @@ test.describe.serial("Meetings journey", () => {
   });
 
   test("keeps one record's open meeting off another record's tab", async () => {
-    await page.goto(`/companies/${companyId}`);
+    // BOTH RECORDS ARE VISITED FIRST, and that is the whole setup rather
+    // than a warm-up. The rail's record-keyed selection is only reachable
+    // when the destination renders with no loading gap: company-detail
+    // returns a bare "Loading..." while its own record is in flight, which
+    // unmounts the rail and takes the selection with it -- so a navigation
+    // to a company this browser has never fetched clears the selection by
+    // accident, and proves nothing about the guard. With both records in the
+    // query cache the page renders straight from it, the mounted rail simply
+    // receives new props, and the guard is the only thing standing between
+    // company A's open meeting and company B's tab. (That is also the case
+    // it was written against: moving between two records you have just been
+    // looking at.)
+    await page.goto(`/companies/${otherCompanyId}`);
+    await expect(page.getByRole("heading", { name: otherCompanyName })).toBeVisible();
+    await searchTo(companyName, `/companies/${companyId}`);
     await openMeetingsTab();
     await openMeeting(meetingTitle);
 
-    // A router navigation between two companies, which does NOT remount the
-    // detail page or the rail inside it -- so the open meeting would still
-    // be open here if the selection did not carry the record it belongs to.
+    // A router navigation between two companies, which now does NOT remount
+    // the detail page or the rail inside it -- so the open meeting would
+    // still be open here if the selection did not carry the record it
+    // belongs to. The tab strip's own state surviving the navigation is what
+    // says the rail was not remounted.
     await searchTo(otherCompanyName, `/companies/${otherCompanyId}`);
     await expect(page.getByTestId("meetings")).toBeVisible();
     // "Log a meeting" renders in the LIST and nowhere else, so it is the
