@@ -361,3 +361,54 @@ Release prep: bump 0.9.0 (three package.jsons + manifest `0.9.0~ynh1`), regenera
 ---
 
 Sequencing: 1→2→3, then 4 (needs only Task 1's schema; may run once 1 lands), 5 after 2+4's contracts, 6 last. Each task: implement → adversarial spec review → quality review, the standing loop. The spec's Decisions table and the mail-privacy matrix are the completeness checklists.
+
+---
+
+## Release record (v0.9.0)
+
+**Gate:** Test-workflow run 33091274333 on tip 50bc34d — the merge candidate,
+green on both jobs (1719 unit + 36 integration; 71 e2e in 39.2s, zero retries).
+Recorded here rather than in the Task 6 DONE block because a commit cannot name
+the CI run that covers it; this line lands in the manifest commit, which is made
+after the gate is known. **Released:** tag v0.9.0, Release run 33094190478,
+tarball sha256 `0092dc12...a13717` — verified twice, from the build log and by
+downloading the published asset and re-hashing it.
+
+**Backlog carried out of Phase 5** (final quality review, not gating):
+
+- **The privacy leg's residual hole.** e2e catches a leaked timeline row that
+  carries a subject, and one that carries a mail link. It does NOT catch a row
+  carrying neither — a deliberate "activity you cannot see" placeholder. That
+  needs two coordinated changes (the API stops filtering AND the web adds a
+  redacted render), so it is not a plausible single regression, but it is the
+  one shape the test does not close. One line closes it: assert no entry
+  matching `/mail/` on B's timeline.
+- **Contenteditable typed without verification** — the suite clicks a TipTap
+  editor and types with no assertion that focus landed; a view not yet attached
+  drops leading characters and the failure surfaces in the NEXT test with a
+  misleading message. House pattern (mail.spec.ts does the same), so it is a
+  suite-wide property to fix once, not a Phase 5 defect.
+- **Portal re-open without an unmount gate** — the duplicate-attendee test opens
+  a Radix Select twice; the trigger-reverted assertion between them is a good
+  gate but not proof the first portal unmounted. No exit animation is
+  configured and CI burned zero retries; a watch item, not a finding.
+- **The cold-navigation rail remount** — a detail page's bare `Loading...`
+  replaces its frame, so most real cross-record navigations remount the rail and
+  clear the meeting selection by accident; the record-keyed guard only does work
+  between two records already cached. The fix that closes the class: render a
+  detail page's loading state INSIDE its frame rather than in place of it.
+- **The cursor-page helpers' home** — `mail-lib`'s `ThreadPages<T>` now serves
+  three consumers, two of them in `rail/`, creating a rail->mail import edge that
+  exists only because of where the code lives. Move to `packages/web/src/lib.ts`,
+  rename `Thread*` -> `Cursor*`, drop the `= MailThreadListItem` default.
+- **Label duplication** — `userLabel` exists in three copies inside meetings.tsx
+  alone with three different fallbacks (nine app-wide); `meetingWhenLabel` is
+  written twice byte-identically; `recordKey` duplicates `threadFilterKey`'s job.
+- **`OwnerSelect`-as-attendee-picker** — correct today (verified against Radix's
+  `useControllableState`), but a `role="combobox"` reporting a value that never
+  changes is the wrong primitive, and already-added colleagues stay in the option
+  list so re-picking errors instead of not being offered. A ~20-line `UserPicker`
+  is the honest shape.
+- **Dead links in rendered meeting notes** — `openOnClick: false` is right for
+  the editor, wrong for the read-only view; `RichTextView` also takes no
+  `ariaLabel`, so the notes region is unlabelled.
