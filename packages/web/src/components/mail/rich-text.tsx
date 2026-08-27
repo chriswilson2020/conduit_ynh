@@ -70,6 +70,45 @@ const activeToolbarButtonClass = "rounded bg-slate-200 px-2 py-1 text-xs font-me
  * templates and compose bodies all run through mail-content.ts's shared
  * sanitizer), so this editor never has to be the security boundary.
  */
+/**
+ * Read-only rendering of HTML this app itself produced: meeting notes
+ * (Phase 5), which are written in the editor below and sanitized server-side
+ * on write with the shared `sanitizeMailHtml` profile.
+ *
+ * NOT `dangerouslySetInnerHTML`, which appears nowhere in this codebase and
+ * should not start here. TipTap parses the HTML into a ProseMirror document
+ * against EXTENSIONS' schema and renders that -- so anything the schema does
+ * not know is dropped on the way in, which makes the render a second,
+ * independent narrowing after the server's sanitizer rather than a raw
+ * injection point that trusts it completely.
+ *
+ * Not MessageFrame either: that iframe (with its no-scripts sandbox and
+ * injected CSP) exists for mail, which arrives from strangers. Meeting notes
+ * are written by authenticated users of this CRM through the editor below,
+ * and a fixed-height sandboxed frame would be a strange way to show three
+ * lines of notes in a rail.
+ *
+ * `content` is read ONCE, like the editor's `initialHtml` -- a caller whose
+ * HTML changes remounts this (meetings.tsx keys it on the meeting's
+ * updatedAt).
+ */
+export function RichTextView({ html, className, testId }: { html: string; className?: string; testId?: string }) {
+  const editorProps = useMemo(() => ({
+    attributes: {
+      class: "text-sm text-slate-900 focus:outline-none",
+      ...(testId !== undefined ? { "data-testid": testId } : {}),
+    },
+  }), [testId]);
+
+  const editor = useEditor({ extensions: EXTENSIONS, content: html, editable: false, editorProps });
+
+  return (
+    <div className={clsx("text-sm text-slate-900", className)}>
+      <EditorContent editor={editor} />
+    </div>
+  );
+}
+
 export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
   function RichTextEditor({ initialHtml = "", onChange, onCreate, className, testId, ariaLabel }, ref) {
     // Memoised for the same reason EXTENSIONS is hoisted: a new object here

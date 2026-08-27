@@ -361,7 +361,7 @@ export function addressLabel(address: MailAddress): string {
 }
 
 // ---------------------------------------------------------------------------
-// Thread-list page accumulation
+// Cursor-page accumulation
 // ---------------------------------------------------------------------------
 
 /**
@@ -387,15 +387,24 @@ export function addressLabel(address: MailAddress): string {
  * belongs to a key cannot outlive it: `cursorForKey` below answers "page one"
  * for any key this record is not currently holding, so a returning filter is
  * page one by construction.
+ *
+ * GENERIC SINCE PHASE 5, when the record timeline needed exactly this
+ * accumulation (rail/timeline.tsx) and a second copy of it would have been the
+ * alternative -- one of them would have grown the fix the other did not. `T`
+ * needs only an `id`, which is what flattenThreadPages dedupes on. The
+ * `Thread` in these names is historical: renaming the type and its five
+ * functions across the inbox, the thread list and their tests was judged more
+ * churn than the names are worth, and the default type parameter keeps every
+ * mail call site reading exactly as it did.
  */
-export interface ThreadPages {
+export interface ThreadPages<T extends { id: string } = MailThreadListItem> {
   /** Filter identity these pages belong to. */
   key: string;
   /** The page currently being requested; FIRST_PAGE for page one. */
   cursor: string;
   /** Cursors in load order; the first page's cursor is FIRST_PAGE. */
   order: string[];
-  byCursor: Record<string, readonly MailThreadListItem[]>;
+  byCursor: Record<string, readonly T[]>;
   /** `nextCursor` from the most recently merged page: what "load more" would
    * ask for, or null when the server said this was the last page. Held here
    * rather than read off the live query so the button survives its own fetch
@@ -408,7 +417,7 @@ export interface ThreadPages {
  * `.min(1)`). */
 export const FIRST_PAGE = "";
 
-export function emptyThreadPages(key: string): ThreadPages {
+export function emptyThreadPages<T extends { id: string } = MailThreadListItem>(key: string): ThreadPages<T> {
   return { key, cursor: FIRST_PAGE, order: [], byCursor: {}, nextCursor: null };
 }
 
@@ -419,7 +428,7 @@ export function emptyThreadPages(key: string): ThreadPages {
  * handed back to the key that issued it. Any other key -- a filter just turned
  * on, or one turned back on after being off -- starts at page one.
  */
-export function cursorForKey(state: ThreadPages, key: string): string | undefined {
+export function cursorForKey<T extends { id: string }>(state: ThreadPages<T>, key: string): string | undefined {
   if (state.key !== key) return undefined;
   return state.cursor === FIRST_PAGE ? undefined : state.cursor;
 }
@@ -430,7 +439,9 @@ export function cursorForKey(state: ThreadPages, key: string): string | undefine
  * double click, or a click racing a filter change, cannot walk past the end or
  * apply one filter's cursor to another's list.
  */
-export function advanceThreadPages(state: ThreadPages, key: string): ThreadPages {
+export function advanceThreadPages<T extends { id: string }>(
+  state: ThreadPages<T>, key: string,
+): ThreadPages<T> {
   if (state.key !== key || state.nextCursor === null) return state;
   return { ...state, cursor: state.nextCursor };
 }
@@ -461,14 +472,14 @@ export function threadFilterKey(filters: Record<string, string | number | boolea
  * still replaces its page -- reference equality is exactly the "nothing new
  * arrived" test, not an approximation of one.
  */
-export function mergeThreadPage(
-  state: ThreadPages,
+export function mergeThreadPage<T extends { id: string }>(
+  state: ThreadPages<T>,
   key: string,
   cursor: string | undefined,
-  items: readonly MailThreadListItem[],
+  items: readonly T[],
   nextCursor: string | null,
-): ThreadPages {
-  const base = state.key === key ? state : emptyThreadPages(key);
+): ThreadPages<T> {
+  const base = state.key === key ? state : emptyThreadPages<T>(key);
   const at = cursor ?? FIRST_PAGE;
   if (base.byCursor[at] === items && base.cursor === at && base.nextCursor === nextCursor) return base;
   return {
@@ -481,16 +492,18 @@ export function mergeThreadPage(
 }
 
 /**
- * The accumulated rows, in page order, de-duplicated by thread id with the
- * FIRST sighting winning. The dedupe is not paranoia: a thread that gets a new
+ * The accumulated rows, in page order, de-duplicated by id with the FIRST
+ * sighting winning. The dedupe is not paranoia: a thread that gets a new
  * message while a later page is on screen is re-ordered to the top of page one
  * by the server's (last_message_at, id) keyset, and would otherwise be
  * rendered twice -- once from the refreshed first page and once from the stale
- * later one. First-wins keeps the fresher copy.
+ * later one. First-wins keeps the fresher copy. Every keyset in this app has
+ * the same property (an event or a meeting arriving mid-scroll shifts the same
+ * way), which is why this rule generalised along with the type.
  */
-export function flattenThreadPages(state: ThreadPages): MailThreadListItem[] {
+export function flattenThreadPages<T extends { id: string }>(state: ThreadPages<T>): T[] {
   const seen = new Set<string>();
-  const out: MailThreadListItem[] = [];
+  const out: T[] = [];
   for (const cursor of state.order) {
     for (const item of state.byCursor[cursor] ?? []) {
       if (seen.has(item.id)) continue;

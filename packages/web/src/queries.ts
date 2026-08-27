@@ -22,6 +22,8 @@ import {
   mailUnreadFolderCountsSchema,
   markThreadReadResponseSchema,
   meResponseSchema,
+  meetingDetailSchema,
+  meetingSchema,
   midpoint,
   noteSchema,
   pipelineSchema,
@@ -57,6 +59,9 @@ import {
   type MailMessage,
   type MailThread,
   type MarkThreadReadResponse,
+  type Meeting,
+  type MeetingCreateInput,
+  type MeetingTaskCreateInput,
   type Pipeline,
   type PipelineScope,
   type Project,
@@ -93,6 +98,7 @@ const taskDependencyListSchema = taskDependencySchema.array();
 const mailThreadListSchema = listResponseSchema(mailThreadListItemSchema);
 const mailAccountFolderListSchema = mailAccountFolderSchema.array();
 const emailTemplateListSchema = emailTemplateSchema.array();
+const meetingListSchema = listResponseSchema(meetingSchema);
 
 /** Builds a `?a=1&b=2` query string, dropping keys whose value is undefined. */
 function toQueryString(params: Record<string, string | number | boolean | undefined>): string {
@@ -1771,6 +1777,133 @@ export function useBulkThreadAction() {
       for (const threadId of input.threadIds) {
         void queryClient.invalidateQueries({ queryKey: ["mail-thread", threadId] });
       }
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Meetings (Phase 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The keys below are EXACTLY the ones the meetings service publishes --
+ * ["meetings"], ["meeting", id], ["events"] (api: services/meetings.ts's
+ * publishMeetingHint) -- so components/sse.tsx invalidates them with no
+ * meetings-specific case, exactly as the mail keys work.
+ *
+ * ["search"] is deliberately NOT among them, here or in the mutation hooks:
+ * meetings are not a search group (searchResultsSchema has no meetings
+ * member), so nothing about a meeting can change a search result. Notes and
+ * files invalidate it because their bodies and filenames ARE indexed.
+ *
+ * No viewer segment on any key, matching every other family in this file: the
+ * cache is per browser session and identity comes from the reverse proxy's
+ * Ynh-User header, which cannot change within one (Phase 5 Task 4's O4
+ * ruling, which settled this for the mail keys and applies unchanged here).
+ */
+export interface MeetingListParams extends EntityFilterParams {
+  archived?: boolean;
+  cursor?: string;
+  limit?: number;
+}
+
+export function useMeetings(params: MeetingListParams = {}) {
+  return useQuery({
+    queryKey: ["meetings", params],
+    queryFn: async () => {
+      const qs = toQueryString({
+        company_id: params.companyId, contact_id: params.contactId,
+        deal_id: params.dealId, project_id: params.projectId,
+        archived: params.archived, cursor: params.cursor, limit: params.limit,
+      });
+      return parseWith(meetingListSchema, await getJson<unknown>(`/meetings${qs}`), "meetings list");
+    },
+    // GET /api/meetings without a record filter is a valid "every meeting"
+    // request server-side, but nothing in v0.9.0 wants one -- there is no
+    // top-level meetings page -- and firing it from a rail that has not
+    // resolved its record yet would fetch the whole table. Mirrors useNotes.
+    enabled: params.companyId !== undefined || params.contactId !== undefined || params.dealId !== undefined
+      || params.projectId !== undefined,
+  });
+}
+
+/** GET /api/meetings/:id, which answers `{ meeting, tasks }`
+ * (meetingDetailSchema) -- the follow-up tasks ride the detail payload while
+ * list rows carry only `taskCount`. */
+export function useMeeting(id: string) {
+  return useQuery({
+    queryKey: ["meeting", id],
+    queryFn: async () => parseWith(meetingDetailSchema, await getJson<unknown>(`/meetings/${id}`), "meeting"),
+    enabled: id !== "",
+  });
+}
+
+/**
+ * PATCH/archive/unarchive answer with a bare `Meeting` while GET answers
+ * `{ meeting, tasks }`, so a mutation result cannot be written through into
+ * the detail cache -- there is no `tasks` half to write. Invalidate both, and
+ * let the refetch produce the one shape each cache entry holds.
+ */
+function useInvalidateMeeting() {
+  const queryClient = useQueryClient();
+  return (id?: string) => {
+    void queryClient.invalidateQueries({ queryKey: ["meetings"] });
+    void queryClient.invalidateQueries({ queryKey: ["events"] });
+    if (id !== undefined) void queryClient.invalidateQueries({ queryKey: ["meeting", id] });
+  };
+}
+
+export function useCreateMeeting() {
+  const invalidate = useInvalidateMeeting();
+  return useMutation({
+    mutationFn: async (input: MeetingCreateInput) =>
+      parseWith(meetingSchema, await postJson<unknown>("/meetings", input), "meeting"),
+    onSuccess: (meeting: Meeting) => invalidate(meeting.id),
+  });
+}
+
+export function useArchiveMeeting() {
+  const invalidate = useInvalidateMeeting();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(meetingSchema, await postJson<unknown>(`/meetings/${id}/archive`), "meeting"),
+    onSuccess: (meeting: Meeting) => invalidate(meeting.id),
+  });
+}
+
+export function useUnarchiveMeeting() {
+  const invalidate = useInvalidateMeeting();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(meetingSchema, await postJson<unknown>(`/meetings/${id}/unarchive`), "meeting"),
+    onSuccess: (meeting: Meeting) => invalidate(meeting.id),
+  });
+}
+
+/**
+ * A follow-up task, created through the meeting rather than through
+ * POST /api/tasks -- the meeting's four record links are INHERITED server-side
+ * and the body carries none of them (meetingTaskCreateInputSchema omits them,
+ * and a link sent anyway is silently dropped by zod's non-strict parse).
+ * 201 answers with the TASK, the same shape POST /api/tasks does.
+ *
+ * Both invalidations run locally rather than being left to the SSE hop: the
+ * server does publish the meeting's keys as well as the task's, but that hop
+ * carries a 100ms coalesce window (components/sse.tsx) and a mutation the user
+ * just watched should not wait on a round trip through the event stream to
+ * show its result. The task half reuses useInvalidateTask so a follow-up task
+ * reaches My Tasks, the board and the Gantt exactly as a directly created one
+ * does.
+ */
+export function useCreateMeetingTask() {
+  const invalidateTask = useInvalidateTask();
+  const invalidateMeeting = useInvalidateMeeting();
+  return useMutation({
+    mutationFn: async ({ meetingId, input }: { meetingId: string; input: MeetingTaskCreateInput }) =>
+      parseWith(taskSchema, await postJson<unknown>(`/meetings/${meetingId}/tasks`, input), "task"),
+    onSuccess: (task: Task, { meetingId }) => {
+      invalidateTask(task);
+      invalidateMeeting(meetingId);
     },
   });
 }

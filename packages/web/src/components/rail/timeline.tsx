@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "@tanstack/react-router";
 import type { Event } from "@conduit/shared";
 import { useEvents, useUsers } from "../../queries";
+import {
+  advanceThreadPages, cursorForKey, emptyThreadPages, flattenThreadPages, mergeThreadPage,
+  threadFilterKey, type ThreadPages,
+} from "../mail/mail-lib";
 import { Button } from "../ui/button";
+import { VERB_BADGE, eventLink, summarize } from "./timeline-lib";
 
 export interface TimelineProps {
   companyId?: string;
@@ -9,170 +15,52 @@ export interface TimelineProps {
   dealId?: string;
   projectId?: string;
   taskId?: string;
-}
-
-// Single-letter badges rather than pictographic icons: ASCII, one distinct
-// letter per verb, and there is no icon library in this project (see the task
-// spec). Distinctness is the whole point -- two verbs sharing a letter make a
-// record's timeline unreadable -- so a new verb takes a free letter, or takes
-// a used one only when a coordinator ruling moves the incumbent (Phase 5
-// Amendment 1 did exactly that; see `met` below).
-const VERB_BADGE: Record<Event["verb"], string> = {
-  created: "C",
-  updated: "U",
-  archived: "A",
-  unarchived: "R",
-  note_added: "N",
-  file_attached: "F",
-  stage_changed: "S",
-  won: "W",
-  lost: "L",
-  reopened: "O",
-  // Task 8's real task-event badges (Phase 3 Task 2 widened eventVerbSchema
-  // with these four; P2.1 only stubbed the map exhaustively typed against
-  // it -- see search.ts's own tasks: [] stub for that same stub-now/
-  // wire-later precedent). Letters chosen to stay distinct from every badge
-  // above: H (sHifted), D (completeD), P (dePendency added). The fourth was
-  // M (reMoved) until Phase 5 Amendment 1 moved it to X so `met` could have
-  // M: a dependency removal is among the rarest entries a timeline carries
-  // and a meeting among the most common, so the mnemonic letter belongs to
-  // the meeting -- and X reads as "removed" at least as well as M did.
-  shifted: "H",
-  completed: "D",
-  dependency_added: "P",
-  dependency_removed: "X",
-  // Phase 5's three verbs, at the letters spec Amendment 1 settles. The
-  // spec's first draft collided twice (met = M against dependency_removed,
-  // mail_received = R against unarchived); the ruling gave the intuitive
-  // letter to whichever verb a user sees more often, which moved
-  // dependency_removed to X above and put mail_received on I (Inbound) so
-  // unarchived keeps R untouched. Rendering these three rows -- link targets
-  // and the derived mail subject -- is still Task 5's; only the letters and
-  // the compile-forced entries live here.
-  met: "M",
-  mail_received: "I",
-  mail_sent: "T",
-};
-
-/**
- * Turns an event's untyped `payload` (z.record(string, unknown) -- see
- * shared's eventSchema) into the one-line human summary the spec calls for.
- * Each case narrows defensively: the payload shape is a server-side
- * convention, not something Zod verifies field-by-field here, so a missing or
- * mistyped key degrades to an empty/verb-only string instead of throwing.
- */
-function summarize(event: Event): string {
-  switch (event.verb) {
-    case "updated": {
-      const changed = event.payload.changed;
-      return `updated ${Array.isArray(changed) ? changed.join(", ") : ""}`;
-    }
-    case "note_added": {
-      const preview = event.payload.preview;
-      return `"${typeof preview === "string" ? preview : ""}"`;
-    }
-    case "file_attached": {
-      const name = event.payload.originalName;
-      return typeof name === "string" ? name : "";
-    }
-    // Payload shape written by moveDeal in services/deals.ts: { from, to,
-    // fromName, toName }. fromName/toName are used (not from/to, which are
-    // stage ids) so this never needs a second round trip to resolve a name.
-    case "stage_changed": {
-      const fromName = event.payload.fromName;
-      const toName = event.payload.toName;
-      if (typeof fromName === "string" && typeof toName === "string") {
-        return `moved from ${fromName} to ${toName}`;
-      }
-      if (typeof toName === "string") return `moved to ${toName}`;
-      return "moved stage";
-    }
-    // Payload shape written by setStatus's target === "won" branch:
-    // { valueCents, currency }. Falls back to a bare "won" when either is
-    // missing (e.g. an unpriced deal has valueCents: null).
-    case "won": {
-      const valueCents = event.payload.valueCents;
-      const currency = event.payload.currency;
-      if (typeof valueCents === "number" && typeof currency === "string") {
-        const formatted = new Intl.NumberFormat(undefined, { style: "currency", currency }).format(valueCents / 100);
-        return `won ${formatted}`;
-      }
-      return "won";
-    }
-    // Payload shape written by setStatus's target === "lost" branch: { reason }.
-    case "lost": {
-      const reason = event.payload.reason;
-      return typeof reason === "string" && reason !== "" ? `lost: ${reason}` : "lost";
-    }
-    case "reopened":
-      return "reopened";
-    // Payload shape written by scheduling.ts's shiftTask: { from: {start,
-    // due}, to: {start, due}, cascadedFrom }. cascadedFrom is the DRAGGED
-    // task's id for every event other than the dragged task's own (which
-    // carries null) -- rendered generically as "(cascaded)" rather than
-    // resolving that id to a title, mirroring dependency_added/_removed
-    // below. `compacted: true` (Phase 3.1's compactSchedule, scheduling.ts)
-    // is a THIRD, independent marker on the same verb -- a compaction event's
-    // own cascadedFrom is always null (compactSchedule has no "one dragged
-    // task" to trace back to), so this appends alongside "(cascaded)" rather
-    // than replacing it, even though in practice the two never co-occur.
-    case "shifted": {
-      const fromRange = formatDateRange(event.payload.from);
-      const toRange = formatDateRange(event.payload.to);
-      if (fromRange === null || toRange === null) return "shifted";
-      const cascaded = typeof event.payload.cascadedFrom === "string";
-      const compacted = event.payload.compacted === true;
-      return `shifted ${fromRange} ${"\u2192"} ${toRange}${cascaded ? " (cascaded)" : ""}${compacted ? " (compacted)" : ""}`;
-    }
-    case "completed":
-      return "completed";
-    // Payload for both: { predecessorId }, written by addDependency/
-    // removeDependency in services/tasks.ts. predecessorId is a raw uuid --
-    // rendered generically (no lookup of the predecessor's title), since a
-    // timeline event has no project/task context handy to fetch it with.
-    case "dependency_added":
-      return "added a dependency";
-    case "dependency_removed":
-      return "removed a dependency";
-    // TASK 5 OWES THIS SWITCH THREE CASES. Unlike VERB_BADGE above, which the
-    // exhaustive Record type forces the compiler to complete, a missing case
-    // here falls through to the default arm below and renders the raw verb --
-    // so between Task 4's emission and Task 5's rendering, a timeline shows
-    // the literal strings "met", "mail_received" and "mail_sent". `met` reads
-    // its meeting's title and links to it; the two mail verbs render the
-    // DERIVED mailSubject (never a stored one) and link to the thread.
-    default:
-      return event.verb;
-  }
-}
-
-/** Narrows a shifted event's `from`/`to` payload half ({start, due}, both
- * date strings) into "start\u2013due", or null when the shape doesn't match
- * -- see summarize()'s "shifted" case. */
-function formatDateRange(part: unknown): string | null {
-  if (typeof part !== "object" || part === null) return null;
-  const { start, due } = part as Record<string, unknown>;
-  if (typeof start !== "string" || typeof due !== "string") return null;
-  return `${start}\u2013${due}`;
+  /**
+   * Opens a meeting, for the entries that name one. v0.9.0 ships no meetings
+   * route -- a meeting lives inside its record's Meetings tab -- so only the
+   * rail, which owns both tabs, can honour this; the task drawer renders the
+   * same timeline without it, and those entries stay plain text there rather
+   * than offering a link to somewhere that does not exist.
+   */
+  onOpenMeeting?: (meetingId: string) => void;
 }
 
 /**
- * Company/contact activity feed. Paginates the same way companies.tsx does:
- * accumulated `rows` plus a `cursor` that only advances on "Load more", so a
- * fresh mount (new companyId/contactId, since this remounts per detail page)
- * starts clean.
+ * Company/contact/deal/project/task activity feed.
+ *
+ * PAGES ARE ACCUMULATED THROUGH mail-lib's cursor-page record, not through a
+ * "rows so far" array. The array version (which this replaces) appended
+ * whatever the current query held whenever that query's DATA changed, which
+ * was harmless while only this browser's own writes invalidated ["events"] --
+ * and stopped being harmless in Phase 5, where mail ingest publishes that key
+ * in the background (Task 4). Every such invalidation re-appended the loaded
+ * page to itself. The same array also survived a change of record: this
+ * component does not remount when the route params change under it (nor when
+ * the task drawer switches tasks), so page two of the company you were just
+ * looking at stayed on screen under the next one's name. Keying the
+ * accumulator on the filter set fixes both by construction -- see
+ * mail-lib's ThreadPages, whose doc comment carries the full reasoning.
  */
-export function Timeline({ companyId, contactId, dealId, projectId, taskId }: TimelineProps) {
-  const [cursor, setCursor] = useState<string | undefined>(undefined);
-  const [rows, setRows] = useState<Event[]>([]);
+export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOpenMeeting }: TimelineProps) {
+  const key = threadFilterKey({ companyId, contactId, dealId, projectId, taskId });
+  const [pages, setPages] = useState<ThreadPages<Event>>(() => emptyThreadPages<Event>(key));
+  const cursor = cursorForKey(pages, key);
   const { data, isLoading } = useEvents({ companyId, contactId, dealId, projectId, taskId, cursor });
   const { data: users = [] } = useUsers();
   const userMap = useMemo(() => new Map(users.map((user) => [user.id, user.username])), [users]);
 
   useEffect(() => {
     if (!data) return;
-    setRows((prev) => (cursor === undefined ? data.items : [...prev, ...data.items]));
-  }, [data, cursor]);
+    // mergeThreadPage returns the SAME object when nothing about this page
+    // changed, so this cannot loop on its own state.
+    setPages((current) => mergeThreadPage(current, key, cursor, data.items, data.nextCursor));
+  }, [data, cursor, key]);
+
+  // pages.key can lag `key` by one render (the merge above runs in an effect),
+  // and rendering the previous record's rows for that render is exactly the
+  // leak the accumulator exists to prevent.
+  const rows = useMemo(() => (pages.key === key ? flattenThreadPages(pages) : []), [pages, key]);
+  const hasMore = pages.key === key && pages.nextCursor !== null;
 
   return (
     <div data-testid="timeline" className="flex flex-col gap-3">
@@ -192,16 +80,58 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId }: Ti
                 <span className="font-medium">{userMap.get(event.actorUserId) ?? "\u2014"}</span>{" "}
                 {summarize(event)}
               </p>
-              <p className="text-xs text-slate-400">{new Date(event.createdAt).toLocaleString()}</p>
+              <p className="flex items-center gap-2 text-xs text-slate-400">
+                <span>{new Date(event.createdAt).toLocaleString()}</span>
+                <EntryLink event={event} onOpenMeeting={onOpenMeeting} />
+              </p>
             </div>
           </li>
         ))}
       </ul>
-      {data?.nextCursor && (
-        <Button variant="outline" onClick={() => setCursor(data.nextCursor ?? undefined)}>
+      {hasMore && (
+        <Button variant="outline" onClick={() => setPages((current) => advanceThreadPages(current, key))}>
           Load more
         </Button>
       )}
     </div>
+  );
+}
+
+/**
+ * Where an entry leads, when it leads anywhere: a mail entry to the
+ * conversation in the inbox, a meeting entry to the meeting in this record's
+ * own Meetings tab.
+ *
+ * The mail half is a real <Link> because /mail?thread=<id> is a real route
+ * (the same deep link the inbox and global search already use); the meeting
+ * half is a button because there is no meetings route to link to, and its
+ * absence is what makes `onOpenMeeting` optional rather than the rail simply
+ * always passing one.
+ */
+function EntryLink({ event, onOpenMeeting }: { event: Event; onOpenMeeting?: (meetingId: string) => void }) {
+  const link = eventLink(event);
+  if (link === null) return null;
+  if (link.kind === "thread") {
+    return (
+      <Link
+        to="/mail"
+        search={{ thread: link.threadId }}
+        data-testid="timeline-thread-link"
+        className="font-medium text-slate-500 underline hover:text-slate-900"
+      >
+        View conversation
+      </Link>
+    );
+  }
+  if (onOpenMeeting === undefined) return null;
+  return (
+    <button
+      type="button"
+      data-testid="timeline-meeting-link"
+      className="font-medium text-slate-500 underline hover:text-slate-900"
+      onClick={() => onOpenMeeting(link.meetingId)}
+    >
+      View meeting
+    </button>
   );
 }
