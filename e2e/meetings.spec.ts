@@ -166,7 +166,13 @@ test.describe.serial("Meetings journey", () => {
   test("logs a meeting on the company with a contact, a colleague and a guest", async () => {
     await page.goto(`/companies/${companyId}`);
 
-    // Nothing in the tab is mounted before its trigger is clicked.
+    // Nothing in the tab is mounted before its trigger is clicked -- but the
+    // claim needs the page to have RENDERED to mean anything: company-detail
+    // returns a bare "Loading..." while its record is in flight, in which
+    // frame every testid on the page is absent. The rail's default tab
+    // carrying this company's own creation entry is the loaded sentinel that
+    // makes the absence beside it a real absence rather than a race won.
+    await expect(page.getByTestId("timeline-entry").filter({ hasText: "created" })).toBeVisible();
     await expect(page.getByTestId("meetings")).toHaveCount(0);
     await openMeetingsTab();
     await expect(page.getByTestId("meetings-empty")).toHaveText("No meetings yet");

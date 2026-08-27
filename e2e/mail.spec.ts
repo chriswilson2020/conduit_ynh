@@ -232,6 +232,8 @@ test.describe.serial("Mail journey", () => {
   let timelineAddress = "";
   let timelineSubject = "";
   let timelineContactId = "";
+  let timelineThreadId = "";
+  let timelineReplyBody = "";
 
   // -- fixtures --------------------------------------------------------
 
@@ -680,6 +682,7 @@ test.describe.serial("Mail journey", () => {
     timelineContactName = `Cora ${attemptId}`;
     timelineAddress = `cora-${attemptId}@example.com`;
     timelineSubject = `Pilot quote ${attemptId}`;
+    timelineReplyBody = `Thanks Cora ${attemptId}`;
 
     // A previous attempt's account would sync this same mailbox alongside the
     // one added below, ingesting every message twice (once per account, into
@@ -1593,6 +1596,45 @@ test.describe.serial("Mail journey", () => {
     await entry.getByTestId("timeline-thread-link").click();
     await expect(page).toHaveURL(/\/mail\?thread=[0-9a-f-]{36}$/);
     await expect(page.getByTestId("conversation")).toContainText(timelineSubject);
+    // Where the entry led IS the thread id, so it is taken from the link's
+    // own destination rather than looked up: the next test replies on it.
+    timelineThreadId = new URL(page.url()).searchParams.get("thread") as string;
+  });
+
+  test("puts the reply to her on that same timeline as an outbound entry", async () => {
+    // THE SPEC'S TESTING LINE IS ABOUT AN EXCHANGE, and the outbound half
+    // rides the same emission with the opposite verb -- mail-send has no
+    // insert path of its own, it hands what it sent to the same ingest.
+    //
+    // ON HER THREAD, NOT ON ALICE'S DEAL-LINKED ONE, and that is a retry
+    // decision rather than a stylistic one. The throttle is one entry per
+    // thread per direction per UTC day, so a second attempt's reply on a
+    // thread that already emitted today emits nothing at all -- and Alice's
+    // thread and her deal are scoped per RUN, so an attempt that re-created
+    // the deal would be asserting against a record no entry can reach until
+    // tomorrow. Cora's thread is per-attempt down to its Message-ID, which
+    // makes every attempt's reply a first sighting.
+    await page.goto(`/mail?thread=${timelineThreadId}`);
+    await expect(page.getByTestId("conversation")).toBeVisible();
+    await page.getByTestId("reply-button").click();
+    await expect(page.getByTestId("composer")).toBeVisible();
+    // Real key events, as the Alice reply above: the body is a TipTap
+    // document, not an input.
+    await page.getByTestId("composer-body").click();
+    await page.keyboard.type(timelineReplyBody);
+    await page.getByTestId("composer-send").click();
+    await expect(page.getByTestId("composer")).toBeHidden({ timeout: 30_000 });
+
+    // Both halves of the exchange, on the record: one entry per direction,
+    // each carrying the thread's subject and neither carrying its content.
+    await page.goto(`/contacts/${timelineContactId}`);
+    await expect(page.getByTestId("timeline")).toBeVisible();
+    await expect(page.getByTestId("timeline-entry")
+      .filter({ hasText: `sent mail "${timelineSubject}"` }))
+      .toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await expect(page.getByTestId("timeline-entry")
+      .filter({ hasText: `received mail "${timelineSubject}"` }))
+      .toHaveCount(1);
   });
 
   test("keeps that private conversation off the second user's timeline for the same contact", async () => {
@@ -1605,11 +1647,13 @@ test.describe.serial("Mail journey", () => {
     await expect(bPage.getByTestId("timeline-entry").filter({ hasText: "created" }))
       .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
 
-    // ...and A's mail is not there. Not a redacted stub, not an "activity
-    // you cannot see" placeholder -- an entry like that would leak both the
+    // ...and A's mail is not there -- NEITHER DIRECTION, the inbound entry
+    // or the reply A just sent. Not a redacted stub, not an "activity you
+    // cannot see" placeholder: an entry like that would leak both the
     // existence and the timing of someone else's mail. NO ROW AT ALL, which
-    // is why the second assertion is about the mail entry's own link rather
-    // than only about the subject text.
+    // is why the second assertion is about the mail entry's own link (the
+    // one element every mail entry has and no other entry does) rather than
+    // only about the subject text.
     await expect(bPage.getByTestId("timeline-entry").filter({ hasText: timelineSubject }))
       .toHaveCount(0);
     await expect(bPage.getByTestId("timeline").getByTestId("timeline-thread-link")).toHaveCount(0);
