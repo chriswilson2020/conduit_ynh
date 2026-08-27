@@ -62,7 +62,13 @@ export interface ListEventsOptions {
  * merely auto-contact-linked, mail stays off it. THREAD granularity is the
  * right one here for the same reason listThreads uses it: what this row
  * renders is a thread-level fact (the subject the thread took from its first
- * message), never a message's content.
+ * message), never a message's content. The scope is HARD-FIXED rather than a
+ * parameter, and correctly so today -- every timeline this function serves is
+ * a record's, because a mail event only exists when its thread carries record
+ * links (mail-ingest.ts) and every filter here is one of those FKs. REVISIT
+ * IT the day an unfiltered "all activity" timeline lands: that surface would
+ * be a mailbox view, and "record" would make it one degree more permissive
+ * than the inbox it sits beside.
  *
  * THE PREDICATES RIDE THE JOIN'S ON CLAUSE, not a separate WHERE term, and
  * the shape is load-bearing twice over. Correctness: the subject can only be
@@ -74,10 +80,16 @@ export interface ListEventsOptions {
  * applied to a fetched page returns short pages and mints a cursor past rows
  * the viewer never saw).
  *
- * THE ON CLAUSE IS ALSO THE ONLY FORM THAT KEEPS THE SCAN PARALLEL, which is
- * the same trap Task 2's `IN` rewrite climbed out of one arm above, and it was
- * MEASURED rather than assumed -- `events` is the fastest-growing table in
- * this schema and it ships no index a record filter can use. Dataset: 300,000
+ * THE ON CLAUSE WAS ALSO THE ONLY FORM THAT KEPT THE SCAN PARALLEL ON THE
+ * DATASET BELOW -- the same trap Task 2's `IN` rewrite climbed out of one arm
+ * above, and MEASURED rather than assumed, because `events` is the
+ * fastest-growing table in this schema and ships no index a record filter can
+ * use. STATED AS A MEASUREMENT, NOT A LAW: the spec review could not
+ * reproduce the difference on an EMPTY database, where every shape plans
+ * serially and this one's own scan carries a hashed SubPlan that is itself
+ * parallel-restricted. Row-count statistics plausibly explain that, but a
+ * future reader re-running this needs the dataset to see what was seen.
+ * Dataset: 300,000
  * events of which 30,000 carry mail_thread_id, over 2,000 threads / 6,000
  * messages / 2 PRIVATE accounts owned by two users (the narrowest
  * configuration, where the visibility term restricts hardest -- 0006's

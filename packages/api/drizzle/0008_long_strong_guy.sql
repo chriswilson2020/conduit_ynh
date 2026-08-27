@@ -135,7 +135,33 @@ CREATE INDEX "meeting_attendees_meeting_id_idx" ON "meeting_attendees" USING btr
 -- the IN-rather-than-EXISTS rewrite recorded in that file (a correlated
 -- EXISTS is not parallel-safe: 162.7ms serial vs 44.8ms parallel on this same
 -- dataset, both WITH this index present).
-CREATE INDEX "events_meeting_id_idx" ON "events" USING btree ("meeting_id") WHERE "meeting_id" IS NOT NULL;
+CREATE INDEX "events_meeting_id_idx" ON "events" USING btree ("meeting_id") WHERE "meeting_id" IS NOT NULL;--> statement-breakpoint
+-- The mail-timeline throttle's existence check, and the ONLY consumer this
+-- index has. services/mail-ingest.ts's emitMailEvent asks "has this thread
+-- already emitted this verb today, in UTC?" once per ingested message, INSIDE
+-- the global ingest lock -- so this cost is per MESSAGE and serialised, not
+-- per page request, which is why it earns an index at a tenth of the row
+-- count the read side's trigger below names.
+--
+-- NO READ PATH CAN USE IT, verified rather than assumed (spec review):
+-- services/timeline.ts's only reference to mail_thread_id is the
+-- `IS NULL OR mail_threads.id IS NOT NULL` disjunct, which no partial index
+-- can serve, and its LEFT JOIN drives from `events` INTO mail_threads'
+-- primary key rather than the other way about. This index is therefore write
+-- cost plus exactly one query, and that query is the one that needed it.
+--
+-- MEASURED (300,000 events of which 30,000 carry mail_thread_id, over 2,000
+-- threads / 6,000 messages / 2 private accounts, warm, top-level Execution
+-- Time): the check is 35ms / 4,077 buffers as a parallel sequential scan
+-- without this index, 0.14ms / 17 buffers with it (bitmap index scan, 15 heap
+-- blocks). 288 kB against a 32 MB table. Every listEvents plan is unchanged
+-- either way -- unfiltered page 55ms with against 56ms without,
+-- company-filtered 38ms against 35ms, all inside run-to-run noise.
+--
+-- PARTIAL on mail_thread_id IS NOT NULL for the same reason its meeting twin
+-- above is: 30,000 of 300,000 rows on that dataset, and every note, file and
+-- stage-change row stays out of it entirely.
+CREATE INDEX "events_mail_thread_id_idx" ON "events" USING btree ("mail_thread_id") WHERE "mail_thread_id" IS NOT NULL;
 -- NO INDEX ON THE MEETINGS SIDE, and that is a MEASURED deferral rather than
 -- an oversight. At 50k meetings the record-filtered keyset page IS the cost
 -- centre (782 buffers / 4.3ms, and 43 buffers / 0.10ms with a candidate

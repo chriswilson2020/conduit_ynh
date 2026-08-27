@@ -5,6 +5,10 @@ import path from "node:path";
 import { asc, eq, isNotNull, sql } from "drizzle-orm";
 import type { MailAddress, SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
+// The UTC-boundary test opens its own handle at a non-UTC session time zone;
+// see it for why the zone cannot ride the shared pool.
+import { TEST_DATABASE_URL } from "../test/global-setup.js";
+import { createDatabase } from "../db/client.js";
 import { resolveUser } from "../users.js";
 import { events, mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads } from "../db/schema.js";
 import { createCompany } from "./companies.js";
@@ -1196,8 +1200,17 @@ describe("ingestMessage: timeline entries", () => {
 
   it("emits mail_received as a pointer: the thread's record FKs, the thread id, and a payload with no keys", async () => {
     const { companyId, contactId } = await linkedContact();
+    // Every field a leak could ride carries a distinctive marker, and they
+    // are deliberately of DIFFERENT KINDS: a subject, a body phrase, a
+    // sender address, a sender DISPLAY NAME and a RECIPIENT address. A
+    // fixture whose From has no display name and whose To is the account's
+    // own address cannot tell a column holding either of those from a column
+    // holding nothing (spec review, O2).
     const result = await ingest({
-      messageId: ROOT_ID, from: "alice@example.com", subject: "Confidential salary review",
+      messageId: ROOT_ID,
+      from: "Alicorn Featherstone <alice@example.com>",
+      to: "chris@example.com, grimsby.underhay@example.net",
+      subject: "Confidential salary review",
       text: "the body nobody else may read",
     });
 
@@ -1221,11 +1234,15 @@ describe("ingestMessage: timeline entries", () => {
     // it is added, which a value check on today's field names would not.
     expect(Object.keys(row?.payload as Record<string, unknown>)).toEqual([]);
     // And nothing leaked into a column either. The whole row, serialised,
-    // must not contain a syllable of the message.
+    // must not contain a syllable of the message -- subject, body, sender
+    // address, sender name, or the recipient nobody outside the thread has
+    // any business learning about.
     const serialised = JSON.stringify(row);
     expect(serialised).not.toContain("Confidential");
     expect(serialised).not.toContain("nobody else may read");
     expect(serialised).not.toContain("alice@example.com");
+    expect(serialised).not.toContain("Alicorn");
+    expect(serialised).not.toContain("grimsby.underhay@example.net");
   });
 
   it("emits mail_sent for an outbound message", async () => {
@@ -1281,6 +1298,78 @@ describe("ingestMessage: timeline entries", () => {
     }, { uid: 2 });
     const rows = await eventRows();
     expect(rows.map((row) => row.verb)).toEqual(["mail_received", "mail_received"]);
+  });
+
+  // THE DAY BOUNDARY IS UTC'S, AND THAT IS ENFORCED HERE RATHER THAN MERELY
+  // STATED. Spec review found this the one green mutation: rewriting
+  // emitMailEvent's boundary to a session-local `date_trunc('day', now())`
+  // left the whole suite passing, because the dev and CI session TimeZone is
+  // Etc/UTC and the two expressions coincide there. A future edit could
+  // therefore make the throttle depend on whatever zone the server happens to
+  // be configured with, and nothing would notice.
+  //
+  // Pacific/Kiritimati is UTC+14, the largest offset in the tz database, and
+  // at +14 the local day boundary NEVER coincides with the UTC one: local
+  // midnight lands 14 hours before UTC midnight for the first ten hours of
+  // the UTC day and 10 hours after it for the remaining fourteen. Which way
+  // it lands depends on the time of day the suite runs, so BOTH probes below
+  // are asserted -- one of them contradicts a session-local boundary
+  // whichever side it falls.
+  //
+  // The two instants are computed here from Date's own UTC accessors, not by
+  // repeating the service's SQL: a copy of the expression would be mutated
+  // alongside it and prove nothing.
+  it("takes its day boundary from UTC, not from the server's session time zone", async () => {
+    // A dedicated handle whose sessions all run at +14. The zone rides the
+    // connection URL rather than a `SET TIME ZONE` on the shared pool, where
+    // which of the two pooled connections a later query lands on is not
+    // something a test can pin.
+    const zoned = createDatabase(
+      `${TEST_DATABASE_URL}?options=-c%20TimeZone%3DPacific%2FKiritimati`, 1,
+    );
+    try {
+      expect((await zoned.db.execute<{ TimeZone: string }>(sql`SHOW TimeZone`))[0]?.TimeZone)
+        .toBe("Pacific/Kiritimati");
+
+      const now = new Date();
+      const utcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+      const justInsideToday = new Date(utcMidnight + 30 * 60 * 1000);
+      const justBeforeToday = new Date(utcMidnight - 30 * 60 * 1000);
+
+      const { companyId } = await linkedContact();
+      const [thread] = await handle.db.insert(mailThreads).values({
+        subject: "Boundary", lastMessageAt: new Date(), messageCount: 0, companyId,
+      }).returning({ id: mailThreads.id });
+      const threadId = thread?.id ?? "";
+
+      // PROBE 1: today's entry already exists, half an hour after UTC
+      // midnight. A UTC boundary sees it and suppresses; a +14 local boundary
+      // in the afternoon half of the UTC day starts AFTER it and would emit a
+      // second entry for the same thread, verb and day.
+      await handle.db.insert(events).values({
+        verb: "mail_received", actorUserId: actorId, companyId,
+        mailThreadId: threadId, payload: {}, createdAt: justInsideToday,
+      });
+      await ingestMessage(zoned.db, dataDir, {
+        accountId, folder: "INBOX", uid: 1, flags: [], threadId,
+        raw: rawMail({ messageId: ROOT_ID, from: "alice@example.com" }),
+      });
+      expect(await eventRows()).toHaveLength(1);
+
+      // PROBE 2: the only entry is half an hour BEFORE UTC midnight, so it
+      // belongs to yesterday and today's message must produce its own. A +14
+      // local boundary in the morning half of the UTC day starts 14 hours
+      // earlier, swallows that row into "today", and would suppress.
+      await handle.db.update(events).set({ createdAt: justBeforeToday })
+        .where(eq(events.mailThreadId, threadId));
+      await ingestMessage(zoned.db, dataDir, {
+        accountId, folder: "INBOX", uid: 2, flags: [], threadId,
+        raw: rawMail({ messageId: CHILD_ID, references: [ROOT_ID], from: "alice@example.com" }),
+      });
+      expect(await eventRows()).toHaveLength(2);
+    } finally {
+      await zoned.close();
+    }
   });
 
   it("throttles per thread, so another conversation the same day gets its own entry", async () => {

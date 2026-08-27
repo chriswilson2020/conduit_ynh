@@ -623,6 +623,15 @@ async function autoLinkThread(tx: Database, threadId: string, participants: stri
  * deal later does not move mail entries already written onto that deal's
  * timeline -- only entries from that point on. Append-only history; a fix
  * would mean rewriting it.
+ *
+ * AND ONE THE THROTTLE ADDS TO IT (spec review, O3): the two rules interact.
+ * If a thread gains a deal link AFTER that day's entry was emitted, the rest
+ * of the day's messages are throttled away, so the newly-linked record's
+ * timeline shows nothing of that conversation until the next UTC day. That
+ * follows from the throttle exactly as specified -- the alternative is
+ * re-emitting on every link change, which would double entries on the
+ * timelines that already had them -- and it is a delay of at most a day on a
+ * record that has just been linked, not a permanent gap.
  */
 async function emitMailEvent(
   tx: Database, threadId: string, direction: "inbound" | "outbound", actorUserId: string,

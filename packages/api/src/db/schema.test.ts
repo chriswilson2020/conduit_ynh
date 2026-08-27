@@ -1078,6 +1078,18 @@ describe("meetings schema (0008)", () => {
       expect(meetingIdIndex?.indexdef).toMatch(/\(meeting_id\)/i);
       expect(meetingIdIndex?.indexdef).toMatch(/WHERE.*meeting_id IS NOT NULL/i);
       expect(meetingIdIndex?.indexdef).not.toMatch(/UNIQUE/i);
+
+      // The fifth, and the twin of the one above on the other pointer column:
+      // the mail-timeline throttle's existence check (services/
+      // mail-ingest.ts) runs once per ingested message inside the global
+      // ingest lock, and `events` carries nothing else it could use. The
+      // COLUMN LIST is asserted alongside the predicate for the reason the
+      // quality round found on the attendee indexes: UNIQUE-and-predicate
+      // alone passed against an index over the wrong columns entirely.
+      const mailThreadIdIndex = eventsIndexes.find((row) => row.indexname === "events_mail_thread_id_idx");
+      expect(mailThreadIdIndex?.indexdef).toMatch(/\(mail_thread_id\)/i);
+      expect(mailThreadIdIndex?.indexdef).toMatch(/WHERE.*mail_thread_id IS NOT NULL/i);
+      expect(mailThreadIdIndex?.indexdef).not.toMatch(/UNIQUE/i);
     });
   }, 30000);
 
