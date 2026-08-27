@@ -3,9 +3,9 @@ import { Link } from "@tanstack/react-router";
 import type { Event } from "@conduit/shared";
 import { useEvents, useUsers } from "../../queries";
 import {
-  advanceThreadPages, cursorForKey, emptyThreadPages, flattenThreadPages, mergeThreadPage,
-  threadFilterKey, type ThreadPages,
-} from "../mail/mail-lib";
+  advanceCursorPages, cursorForKey, emptyCursorPages, flattenCursorPages, identityKey,
+  mergeCursorPage, type CursorPages,
+} from "../../lib";
 import { Button } from "../ui/button";
 import { VERB_BADGE, eventLink, summarize } from "./timeline-lib";
 
@@ -28,7 +28,7 @@ export interface TimelineProps {
 /**
  * Company/contact/deal/project/task activity feed.
  *
- * PAGES ARE ACCUMULATED THROUGH mail-lib's cursor-page record, not through a
+ * PAGES ARE ACCUMULATED THROUGH lib.ts's cursor-page record, not through a
  * "rows so far" array. The array version (which this replaces) appended
  * whatever the current query held whenever that query's DATA changed, which
  * was harmless while only this browser's own writes invalidated ["events"] --
@@ -39,29 +39,33 @@ export interface TimelineProps {
  * the task drawer switches tasks), so page two of the company you were just
  * looking at stayed on screen under the next one's name. Keying the
  * accumulator on the filter set fixes both by construction -- see
- * mail-lib's ThreadPages, whose doc comment carries the full reasoning.
+ * lib.ts's CursorPages, whose doc comment carries the full reasoning.
  */
 export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOpenMeeting }: TimelineProps) {
-  const key = threadFilterKey({ companyId, contactId, dealId, projectId, taskId });
-  const [pages, setPages] = useState<ThreadPages<Event>>(() => emptyThreadPages<Event>(key));
+  const key = identityKey({ companyId, contactId, dealId, projectId, taskId });
+  const [pages, setPages] = useState<CursorPages<Event>>(() => emptyCursorPages<Event>(key));
   const cursor = cursorForKey(pages, key);
   const { data, isLoading, isError, refetch } = useEvents({
     companyId, contactId, dealId, projectId, taskId, cursor,
   });
   const { data: users = [] } = useUsers();
+  // The LOGIN, deliberately, rather than lib.ts's userLabel: every rail tab
+  // that names a person (this one, Notes, Files) shows the username, so routing
+  // just this one through the full-name label would spell the same person two
+  // ways on one rail. Changing all three is a visible change, not a refactor.
   const userMap = useMemo(() => new Map(users.map((user) => [user.id, user.username])), [users]);
 
   useEffect(() => {
     if (!data) return;
-    // mergeThreadPage returns the SAME object when nothing about this page
+    // mergeCursorPage returns the SAME object when nothing about this page
     // changed, so this cannot loop on its own state.
-    setPages((current) => mergeThreadPage(current, key, cursor, data.items, data.nextCursor));
+    setPages((current) => mergeCursorPage(current, key, cursor, data.items, data.nextCursor));
   }, [data, cursor, key]);
 
   // pages.key can lag `key` by one render (the merge above runs in an effect),
   // and rendering the previous record's rows for that render is exactly the
   // leak the accumulator exists to prevent.
-  const rows = useMemo(() => (pages.key === key ? flattenThreadPages(pages) : []), [pages, key]);
+  const rows = useMemo(() => (pages.key === key ? flattenCursorPages(pages) : []), [pages, key]);
   const hasMore = pages.key === key && pages.nextCursor !== null;
 
   return (
@@ -121,7 +125,7 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
         <Button
           variant="outline"
           data-testid="timeline-load-more"
-          onClick={() => setPages((current) => advanceThreadPages(current, key))}
+          onClick={() => setPages((current) => advanceCursorPages(current, key))}
         >
           Load more
         </Button>

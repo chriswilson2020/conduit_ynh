@@ -1,6 +1,6 @@
 import type {
   BulkThreadActionKind, BulkThreadResult, BulkThreadResultReason, MailAddress,
-  MailThreadListItem, MailUnreadFolderCount, SpecialUse,
+  MailUnreadFolderCount, SpecialUse,
 } from "@conduit/shared";
 import {
   BULK_THREAD_ACTION_CAP, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
@@ -13,8 +13,11 @@ import { relativeTime } from "../../lib";
  * The mail feature's pure parts, kept out of the components so they can be
  * unit-tested without a DOM: recipient token parsing, template placeholder
  * substitution, the mapping from the shared mail error prefixes to something
- * a user can act on, the inbox's page accumulation, and the reply/forward and
+ * a user can act on, the thread selection, and the reply/forward and
  * message-frame rules the conversation view is built from.
+ *
+ * The inbox's page accumulation was here until v0.9.1, when a third and fourth
+ * consumer outside mail moved it to src/lib.ts (CursorPages).
  *
  * Named `mail-lib`, not `composer-lib` (its Task 9 name): the composer, the
  * settings page, the inbox and the conversation all import from here, so it
@@ -361,160 +364,6 @@ export function addressLabel(address: MailAddress): string {
 }
 
 // ---------------------------------------------------------------------------
-// Cursor-page accumulation
-// ---------------------------------------------------------------------------
-
-/**
- * The inbox pages by keyset cursor and the cursor is part of the query key
- * (queries.ts's useMailThreads), so every page is its OWN cache entry -- this
- * is deliberately not an infinite query, matching the house pattern. The
- * accumulation across pages is therefore the component's job, and this is it:
- * a small immutable record of which pages have been loaded for which filter
- * set.
- *
- * Keyed on the filter set (see threadFilterKey) so that changing a filter
- * cannot leave the previous filter's pages on screen -- the merge below
- * silently starts over whenever the key differs, which is what makes "reset
- * on filter change" a property of the data structure rather than an effect
- * somebody has to remember to write.
- *
- * THE CURSORS LIVE IN HERE TOO, with the key that issued them, and that is
- * load-bearing rather than tidy. When the component held the cursor in its own
- * state beside this record, toggling a filter ON and then OFF again brought the
- * old key back -- and with it the old page-two cursor, while the accumulator
- * had been reset by the intervening filter. The list then fetched page two,
- * accumulated only page two, and page ONE silently vanished. A cursor that
- * belongs to a key cannot outlive it: `cursorForKey` below answers "page one"
- * for any key this record is not currently holding, so a returning filter is
- * page one by construction.
- *
- * GENERIC SINCE PHASE 5, when the record timeline needed exactly this
- * accumulation (rail/timeline.tsx) and a second copy of it would have been the
- * alternative -- one of them would have grown the fix the other did not. `T`
- * needs only an `id`, which is what flattenThreadPages dedupes on. The
- * `Thread` in these names is historical: renaming the type and its five
- * functions across the inbox, the thread list and their tests was judged more
- * churn than the names are worth, and the default type parameter keeps every
- * mail call site reading exactly as it did.
- */
-export interface ThreadPages<T extends { id: string } = MailThreadListItem> {
-  /** Filter identity these pages belong to. */
-  key: string;
-  /** The page currently being requested; FIRST_PAGE for page one. */
-  cursor: string;
-  /** Cursors in load order; the first page's cursor is FIRST_PAGE. */
-  order: string[];
-  byCursor: Record<string, readonly T[]>;
-  /** `nextCursor` from the most recently merged page: what "load more" would
-   * ask for, or null when the server said this was the last page. Held here
-   * rather than read off the live query so the button survives its own fetch
-   * (the new page's cache entry has no data yet). */
-  nextCursor: string | null;
-}
-
-/** The first page is fetched with no cursor at all; "" stands in for it as a
- * map key, and can never collide with a real cursor (the route holds those to
- * `.min(1)`). */
-export const FIRST_PAGE = "";
-
-export function emptyThreadPages<T extends { id: string } = MailThreadListItem>(key: string): ThreadPages<T> {
-  return { key, cursor: FIRST_PAGE, order: [], byCursor: {}, nextCursor: null };
-}
-
-/**
- * The cursor to fetch for `key`, or undefined for "page one, no cursor".
- *
- * The whole stale-cursor defence, in one function: a cursor is only ever
- * handed back to the key that issued it. Any other key -- a filter just turned
- * on, or one turned back on after being off -- starts at page one.
- */
-export function cursorForKey<T extends { id: string }>(state: ThreadPages<T>, key: string): string | undefined {
-  if (state.key !== key) return undefined;
-  return state.cursor === FIRST_PAGE ? undefined : state.cursor;
-}
-
-/**
- * Move to the next page: what "load more" does. A no-op for a key this record
- * is not holding, or when the last page said there is nothing after it -- so a
- * double click, or a click racing a filter change, cannot walk past the end or
- * apply one filter's cursor to another's list.
- */
-export function advanceThreadPages<T extends { id: string }>(
-  state: ThreadPages<T>, key: string,
-): ThreadPages<T> {
-  if (state.key !== key || state.nextCursor === null) return state;
-  return { ...state, cursor: state.nextCursor };
-}
-
-/**
- * A stable string identity for one filter set. Sorted by key and built only
- * from defined values, so two filter objects that mean the same thing produce
- * the same string regardless of how they were assembled.
- */
-export function threadFilterKey(filters: Record<string, string | number | boolean | undefined>): string {
-  const entries = Object.entries(filters)
-    .filter((entry): entry is [string, string | number | boolean] => entry[1] !== undefined)
-    .sort((a, b) => a[0].localeCompare(b[0]));
-  return JSON.stringify(entries);
-}
-
-/**
- * Fold one fetched page into the accumulator.
- *
- * A different `key` discards everything: the pages on screen describe a filter
- * set nobody is looking at any more.
- *
- * A page whose items are the SAME ARRAY as the one already stored, arriving
- * with the same nextCursor, returns the accumulator UNCHANGED, by reference.
- * That matters: this runs from a render effect, and returning a fresh object
- * for an unchanged page would set state on every render forever. React Query
- * hands out a new array whenever a query actually refetches, so a real refetch
- * still replaces its page -- reference equality is exactly the "nothing new
- * arrived" test, not an approximation of one.
- */
-export function mergeThreadPage<T extends { id: string }>(
-  state: ThreadPages<T>,
-  key: string,
-  cursor: string | undefined,
-  items: readonly T[],
-  nextCursor: string | null,
-): ThreadPages<T> {
-  const base = state.key === key ? state : emptyThreadPages<T>(key);
-  const at = cursor ?? FIRST_PAGE;
-  if (base.byCursor[at] === items && base.cursor === at && base.nextCursor === nextCursor) return base;
-  return {
-    key,
-    cursor: at,
-    order: base.order.includes(at) ? base.order : [...base.order, at],
-    byCursor: { ...base.byCursor, [at]: items },
-    nextCursor,
-  };
-}
-
-/**
- * The accumulated rows, in page order, de-duplicated by id with the FIRST
- * sighting winning. The dedupe is not paranoia: a thread that gets a new
- * message while a later page is on screen is re-ordered to the top of page one
- * by the server's (last_message_at, id) keyset, and would otherwise be
- * rendered twice -- once from the refreshed first page and once from the stale
- * later one. First-wins keeps the fresher copy. Every keyset in this app has
- * the same property (an event or a meeting arriving mid-scroll shifts the same
- * way), which is why this rule generalised along with the type.
- */
-export function flattenThreadPages<T extends { id: string }>(state: ThreadPages<T>): T[] {
-  const seen = new Set<string>();
-  const out: T[] = [];
-  for (const cursor of state.order) {
-    for (const item of state.byCursor[cursor] ?? []) {
-      if (seen.has(item.id)) continue;
-      seen.add(item.id);
-      out.push(item);
-    }
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
 // Reply / reply-all / forward
 // ---------------------------------------------------------------------------
 
@@ -840,7 +689,7 @@ export function messageFrameSrcdoc(bodyHtml: string, csp: string): string {
  * Which rows of the thread list are ticked, and which filter set they were
  * ticked under.
  *
- * The `key` is the SAME filter identity ThreadPages uses (threadFilterKey), and
+ * The `key` is the SAME filter identity CursorPages uses (lib.ts's identityKey), and
  * it is here for the same reason: "the selection clears when the filter or the
  * folder changes" is a property of this record rather than an effect somebody
  * has to remember to write. Every function below runs the incoming state

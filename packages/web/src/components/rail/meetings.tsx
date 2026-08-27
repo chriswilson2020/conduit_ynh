@@ -13,9 +13,9 @@ import {
 } from "../../queries";
 import { EntityPicker } from "../entity-picker";
 import {
-  advanceThreadPages, cursorForKey, emptyThreadPages, flattenThreadPages, mergeThreadPage,
-  threadFilterKey, type ThreadPages,
-} from "../mail/mail-lib";
+  advanceCursorPages, cursorForKey, emptyCursorPages, flattenCursorPages, identityKey,
+  mergeCursorPage, userLabel, type CursorPages,
+} from "../../lib";
 import { RichTextEditor, RichTextView } from "../mail/rich-text";
 import { OwnerSelect } from "../owner-select";
 import { STATUS_LABEL, TYPE_LABEL } from "../../pages/task-board";
@@ -29,11 +29,11 @@ import {
   attendeeLabel,
   buildFollowUpInput,
   buildMeetingInput,
-  durationLabel,
   emptyFollowUpDraft,
   emptyMeetingDraft,
   followUpErrorMessage,
   meetingErrorMessage,
+  meetingWhenLabel,
   summarizeAttendees,
   taskCountLabel,
   type AttendeeDraft,
@@ -112,17 +112,17 @@ interface MeetingListState {
  */
 function useMeetingList(links: RecordLinks): MeetingListState {
   const [archived, setArchived] = useState(false);
-  const key = threadFilterKey({ ...links, archived });
-  const [pages, setPages] = useState<ThreadPages<Meeting>>(() => emptyThreadPages<Meeting>(key));
+  const key = identityKey({ ...links, archived });
+  const [pages, setPages] = useState<CursorPages<Meeting>>(() => emptyCursorPages<Meeting>(key));
   const cursor = cursorForKey(pages, key);
   const { data, isLoading, isError, refetch } = useMeetings({ ...links, archived, cursor });
 
   useEffect(() => {
     if (!data) return;
-    setPages((current) => mergeThreadPage(current, key, cursor, data.items, data.nextCursor));
+    setPages((current) => mergeCursorPage(current, key, cursor, data.items, data.nextCursor));
   }, [data, cursor, key]);
 
-  const rows = useMemo(() => (pages.key === key ? flattenThreadPages(pages) : []), [pages, key]);
+  const rows = useMemo(() => (pages.key === key ? flattenCursorPages(pages) : []), [pages, key]);
 
   return {
     archived,
@@ -134,14 +134,14 @@ function useMeetingList(links: RecordLinks): MeetingListState {
     // offering the previous filter's "Load more" for that render would page
     // the wrong list.
     hasMore: pages.key === key && pages.nextCursor !== null,
-    loadMore: () => setPages((current) => advanceThreadPages(current, key)),
+    loadMore: () => setPages((current) => advanceCursorPages(current, key)),
     // A NEW MEETING LANDS ON PAGE ONE, and page one is a frozen snapshot once
     // any later page has been loaded: the accumulator holds it under its own
     // cursor while only the CURRENT page's query is mounted, so no
     // invalidation refetches it. Without this, a meeting logged after any
     // "Load more" click would simply never appear. Starting over is both
     // correct and cheap.
-    reset: () => setPages(emptyThreadPages<Meeting>(key)),
+    reset: () => setPages(emptyCursorPages<Meeting>(key)),
     // The only escape from a failed page fetch. `loadMore` cannot serve: the
     // cursor is ALREADY at nextCursor, so advancing again produces the same
     // query key, which TanStack answers from its error state without going
@@ -218,7 +218,6 @@ function MeetingList({
 }
 
 function MeetingRow({ meeting, onSelect }: { meeting: Meeting; onSelect: (id: string) => void }) {
-  const duration = durationLabel(meeting.durationMinutes);
   return (
     <li data-testid={`meeting-row-${meeting.id}`} className="rounded-md border border-slate-200 bg-white">
       <button
@@ -228,8 +227,7 @@ function MeetingRow({ meeting, onSelect }: { meeting: Meeting; onSelect: (id: st
       >
         <span className="block text-sm font-medium text-slate-900">{meeting.title}</span>
         <span className="mt-0.5 block text-xs text-slate-400">
-          {new Date(meeting.occurredAt).toLocaleString()}
-          {duration === null ? "" : ` \u00B7 ${duration}`}
+          {meetingWhenLabel(meeting.occurredAt, meeting.durationMinutes)}
         </span>
         <span className="mt-0.5 block text-xs text-slate-500">
           <AttendeeSummary attendees={meeting.attendees} />
@@ -273,7 +271,7 @@ function AttendeeName({ attendee }: { attendee: MeetingAttendee }) {
     <>
       {attendeeLabel(attendee, {
         contactName: contact === undefined ? undefined : `${contact.firstName} ${contact.lastName ?? ""}`.trim(),
-        userName: user === undefined ? undefined : user.fullName ?? user.username,
+        userName: userLabel(user, undefined),
       })}
     </>
   );
@@ -296,7 +294,7 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
   const [pickingContact, setPickingContact] = useState(false);
   const [guest, setGuest] = useState("");
   const createMeeting = useCreateMeeting();
-  const userLabel = useUserLabel();
+  const nameForUser = useUserLabel();
 
   function addAttendee(next: AttendeeDraft) {
     const merged = addAttendeeDraft(draft.attendees, next);
@@ -412,7 +410,7 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
               testId="meeting-add-user"
               onChange={(userId) => {
                 if (userId === null) return;
-                addAttendee({ kind: "user", id: userId, label: userLabel(userId) });
+                addAttendee({ kind: "user", id: userId, label: nameForUser(userId) });
               }}
             />
           </div>
@@ -476,13 +474,11 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
 
 /** The user picker hands back an id; this names them for the chip. Reads the
  * same ["users"] cache entry the picker itself renders from, so it is never a
- * second request. */
+ * second request -- and the ellipsis is for the render in which that entry is
+ * not there yet, not for a user who does not exist. */
 function useUserLabel(): (userId: string) => string {
   const { data: users = [] } = useUsers();
-  return (userId: string) => {
-    const user = users.find((u) => u.id === userId);
-    return user === undefined ? "..." : user.fullName ?? user.username;
-  };
+  return (userId: string) => userLabel(users.find((u) => u.id === userId), "...");
 }
 
 // ---------------------------------------------------------------------------
@@ -575,7 +571,6 @@ function MeetingBody({ detail }: { detail: MeetingDetail }) {
   const [addingTask, setAddingTask] = useState(false);
 
   const owner = users.find((u) => u.id === meeting.ownerUserId);
-  const duration = durationLabel(meeting.durationMinutes);
   const archived = meeting.archivedAt !== null;
   const blockedReason = addTaskBlockedReason({
     meetingArchived: archived,
@@ -589,9 +584,8 @@ function MeetingBody({ detail }: { detail: MeetingDetail }) {
       <div>
         <h3 className="text-sm font-medium text-slate-900">{meeting.title}</h3>
         <p className="text-xs text-slate-400">
-          {new Date(meeting.occurredAt).toLocaleString()}
-          {duration === null ? "" : ` \u00B7 ${duration}`}
-          {` \u00B7 logged by ${owner === undefined ? "\u2014" : owner.fullName ?? owner.username}`}
+          {meetingWhenLabel(meeting.occurredAt, meeting.durationMinutes)}
+          {` \u00B7 logged by ${userLabel(owner, "\u2014")}`}
         </p>
         {archived && <p className="text-xs text-slate-500">This meeting is archived.</p>}
       </div>

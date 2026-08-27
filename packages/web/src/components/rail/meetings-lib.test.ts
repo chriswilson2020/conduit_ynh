@@ -19,6 +19,7 @@ import {
   followUpErrorMessage,
   localInputToIso,
   meetingErrorMessage,
+  meetingWhenLabel,
   nowLocalInput,
   summarizeAttendees,
   taskCountLabel,
@@ -81,6 +82,16 @@ describe("row labels", () => {
     expect(durationLabel(45)).toBe("45m");
     expect(durationLabel(60)).toBe("1h");
     expect(durationLabel(90)).toBe("1h 30m");
+  });
+
+  // The clock half is the browser's own format, so what this pins is the
+  // COMPOSITION -- the time, and the duration after it only when one was
+  // recorded -- which is what was written twice before it was a function.
+  it("composes when a meeting was and how long it ran", () => {
+    const iso = "2026-08-14T09:30:00.000Z";
+    const when = new Date(iso).toLocaleString();
+    expect(meetingWhenLabel(iso, null)).toBe(when);
+    expect(meetingWhenLabel(iso, 90)).toBe(`${when} \u00B7 1h 30m`);
   });
 
   it("counts follow-up tasks in words", () => {

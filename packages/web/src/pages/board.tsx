@@ -16,7 +16,7 @@ import { Funnel } from "../components/funnel";
 import {
   KanbanEmptyPlaceholder, kanbanSortableItems, useKanbanBoard, useKanbanCardSortable, useKanbanColumnDroppable,
 } from "../components/kanban-core";
-import { parseDecimal } from "../lib";
+import { parseDecimal, userLabel } from "../lib";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -43,7 +43,7 @@ export function BoardPage() {
     [companiesData],
   );
   const userInitials = useMemo(
-    () => new Map(users.map((user) => [user.id, (user.fullName ?? user.username).slice(0, 1).toUpperCase()])),
+    () => new Map(users.map((user) => [user.id, userLabel(user, "").slice(0, 1).toUpperCase()])),
     [users],
   );
 

@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { Project } from "@conduit/shared";
+import { userLabel } from "../lib";
 import { useCompanies, useCreateProject, useProjects, useUsers } from "../queries";
 import { EntityTable, type EntityTableColumn } from "../components/entity-table";
 import { Button } from "../components/ui/button";
@@ -34,7 +35,7 @@ export function ProjectsPage() {
     [companiesData],
   );
   const userMap = useMemo(
-    () => new Map(users.map((user) => [user.id, user.fullName ?? user.username])),
+    () => new Map(users.map((user) => [user.id, userLabel(user, "")])),
     [users],
   );
 

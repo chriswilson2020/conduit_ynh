@@ -2,7 +2,16 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { clsx } from "clsx";
 import type { MailThreadListItem } from "@conduit/shared";
-import { relativeTime } from "../../lib";
+import {
+  advanceCursorPages,
+  cursorForKey,
+  emptyCursorPages,
+  flattenCursorPages,
+  identityKey,
+  mergeCursorPage,
+  relativeTime,
+  type CursorPages,
+} from "../../lib";
 import {
   useCompany,
   useContact,
@@ -13,18 +22,7 @@ import {
   type MailThreadListParams,
 } from "../../queries";
 import { useLatest } from "../../hooks";
-import {
-  addressLabel,
-  advanceThreadPages,
-  cursorForKey,
-  emptyThreadPages,
-  flattenThreadPages,
-  hiddenChipLabel,
-  mergeThreadPage,
-  subjectLabel,
-  threadFilterKey,
-  type ThreadPages,
-} from "./mail-lib";
+import { addressLabel, hiddenChipLabel, subjectLabel } from "./mail-lib";
 import { Button } from "../ui/button";
 
 /**
@@ -106,7 +104,7 @@ const DEFAULT_LIMIT = 25;
  * query key, so each page is its own cache entry and this is deliberately not
  * an infinite query (Task 9's handover note, and the house pattern every other
  * "load more" list here follows). The pages are accumulated in state instead,
- * keyed on the filter set: mail-lib's mergeThreadPage starts over whenever
+ * keyed on the filter set: lib.ts's mergeCursorPage starts over whenever
  * that key changes, so changing a filter can never leave the previous filter's
  * rows on screen.
  *
@@ -114,7 +112,7 @@ const DEFAULT_LIMIT = 25;
  * rather than reset from an effect: an effect would leave one render (and one
  * fetch) in which the new filters are paired with the old filter's page-two
  * cursor. The cursor itself lives INSIDE the accumulator, with the key that
- * issued it -- see mail-lib's ThreadPages for the bug that cost (a filter
+ * issued it -- see lib.ts's CursorPages for the bug that cost (a filter
  * toggled on and off again used to resurrect a page-two cursor and lose page
  * one).
  *
@@ -129,21 +127,23 @@ export function ThreadList({
   selectable = false, selectedIds, onToggleThread, onToggleAll, allSelected = false,
   someSelected = false, selectionDisabled = false, onRowsChange,
 }: ThreadListProps) {
-  const key = threadFilterKey({ ...filters });
-  const [pages, setPages] = useState<ThreadPages>(() => emptyThreadPages(key));
+  const key = identityKey({ ...filters });
+  const [pages, setPages] = useState<CursorPages<MailThreadListItem>>(
+    () => emptyCursorPages<MailThreadListItem>(key),
+  );
   const cursor = cursorForKey(pages, key);
 
   const { data, isLoading, isFetching, error } = useMailThreads({ ...filters, cursor, limit });
 
   useEffect(() => {
     if (data === undefined) return;
-    // mergeThreadPage returns the SAME object when this page's items are the
+    // mergeCursorPage returns the SAME object when this page's items are the
     // array already stored, so this settles after one pass instead of looping.
-    setPages((current) => mergeThreadPage(current, key, cursor, data.items, data.nextCursor));
+    setPages((current) => mergeCursorPage(current, key, cursor, data.items, data.nextCursor));
   }, [data, key, cursor]);
 
   const threads = useMemo(
-    () => (pages.key === key ? flattenThreadPages(pages) : []),
+    () => (pages.key === key ? flattenCursorPages(pages) : []),
     [pages, key],
   );
 
@@ -246,7 +246,7 @@ export function ThreadList({
           className="mt-2 self-start"
           data-testid="thread-list-more"
           disabled={isFetching}
-          onClick={() => setPages((current) => advanceThreadPages(current, key))}
+          onClick={() => setPages((current) => advanceCursorPages(current, key))}
         >
           {isFetching ? "Loading..." : "Load more"}
         </Button>

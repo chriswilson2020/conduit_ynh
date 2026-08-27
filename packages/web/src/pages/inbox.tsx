@@ -10,6 +10,7 @@ import { FolderSidebar } from "../components/mail/folder-sidebar";
 import {
   ThreadList, type ThreadListFilters, type ThreadRowInfo, type ThreadToggle,
 } from "../components/mail/thread-list";
+import { identityKey } from "../lib";
 import {
   allOnPageSelected,
   bulkErrorMessage,
@@ -18,7 +19,6 @@ import {
   selectedThreadIds,
   selectionForKey,
   summarizeBulkResult,
-  threadFilterKey,
   toggleAllOnPage,
   toggleThreadSelected,
   type ThreadSelection,
@@ -45,7 +45,7 @@ const ALL_ACCOUNTS = "all";
  * The MULTI-SELECT (Phase 4.1) is the other kind of selection here and lives in
  * ordinary state, keyed on the filter set: mail-lib's selectionForKey hands it
  * back only to the filters it was made under, so changing a filter or a folder
- * clears it by construction -- the same principle ThreadPages uses for paging,
+ * clears it by construction -- the same principle CursorPages uses for paging,
  * and for the same reason (there is no render in which the new view holds the
  * old view's selection).
  */
@@ -119,7 +119,7 @@ export function InboxPage() {
 
   // The filter identity BOTH the paging accumulator and the selection are keyed
   // on -- computed once here so the two cannot drift apart.
-  const filterKey = threadFilterKey({ ...filters });
+  const filterKey = identityKey({ ...filters });
 
   const [selectionState, setSelectionState] = useState<ThreadSelection>(() => emptySelection(filterKey));
   const selection = selectionForKey(selectionState, filterKey);

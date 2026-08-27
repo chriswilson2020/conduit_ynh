@@ -84,6 +84,23 @@ export function durationLabel(minutes: number | null): string | null {
   return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
 }
 
+/**
+ * "14/08/2026, 09:30 \u00B7 1h 30m" -- when a meeting happened and how long it
+ * ran, in the one composition both a list row and the meeting's own header
+ * show. It was written twice, byte-identically, before it was a function.
+ *
+ * Takes the ISO string rather than a formatted one because the clock format is
+ * the READER'S: toLocaleString renders a meeting's time in the browser's
+ * locale and timezone, which is the only sense in which "when" is a fact about
+ * a meeting the reader can act on. A meeting with no recorded duration is just
+ * the time -- see durationLabel for why that is null rather than "0m".
+ */
+export function meetingWhenLabel(occurredAt: string, durationMinutes: number | null): string {
+  const when = new Date(occurredAt).toLocaleString();
+  const duration = durationLabel(durationMinutes);
+  return duration === null ? when : `${when} \u00B7 ${duration}`;
+}
+
 export function taskCountLabel(count: number): string {
   if (count === 0) return "No follow-up tasks";
   return count === 1 ? "1 follow-up task" : `${count} follow-up tasks`;

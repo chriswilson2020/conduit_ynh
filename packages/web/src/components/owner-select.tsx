@@ -1,3 +1,4 @@
+import { userLabel } from "../lib";
 import { useUsers } from "../queries";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 
@@ -47,7 +48,7 @@ export function OwnerSelect({
         <SelectItem value={UNASSIGNED}>{unassignedLabel}</SelectItem>
         {users.map((user) => (
           <SelectItem key={user.id} value={user.id}>
-            {user.fullName ?? user.username}
+            {userLabel(user, "")}
           </SelectItem>
         ))}
       </SelectContent>

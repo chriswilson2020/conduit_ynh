@@ -12,7 +12,7 @@ import { TaskDrawer } from "../components/task-drawer";
 import {
   KanbanEmptyPlaceholder, kanbanSortableItems, useKanbanBoard, useKanbanCardSortable, useKanbanColumnDroppable,
 } from "../components/kanban-core";
-import { todayLocalIso } from "../lib";
+import { todayLocalIso, userLabel } from "../lib";
 
 // Fixed status columns, not stages (per the design's task board: kanban
 // machinery reused with a fixed column set instead of a per-pipeline one).
@@ -61,7 +61,7 @@ export function TaskBoardPage() {
   }
 
   const userInitials = useMemo(
-    () => new Map(users.map((user) => [user.id, (user.fullName ?? user.username).slice(0, 1).toUpperCase()])),
+    () => new Map(users.map((user) => [user.id, userLabel(user, "").slice(0, 1).toUpperCase()])),
     [users],
   );
 

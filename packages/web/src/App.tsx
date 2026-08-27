@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { MeResponse, HealthResponse } from "@conduit/shared";
 import { fetchMe, fetchHealth, basePath } from "./api";
+import { userLabel } from "./lib";
 
 // Identity and health are fetched independently, not with Promise.all. The
 // user resolver caches a resolved identity for up to 60 seconds, so during a
@@ -61,7 +62,7 @@ export function App() {
     <div>
       <h1>Conduit</h1>
       <p data-testid="greeting">
-        Logged in as {user.fullName ?? user.username} ({user.username})
+        Logged in as {userLabel(user, "")} ({user.username})
       </p>
       <dl>
         <dt>Version</dt>

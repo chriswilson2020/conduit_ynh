@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, KeyboardEvent } from "react";
 import { clsx } from "clsx";
 import type { FileMeta, MailAttachment, SendMailInput } from "@conduit/shared";
+import { userLabel } from "../../lib";
 import {
   useContacts,
   useMailAccounts,
@@ -181,7 +182,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
   const context: TemplateContext = {
     contactName: seed?.context?.contactName,
     companyName: seed?.context?.companyName,
-    userName: me?.fullName ?? me?.username,
+    userName: userLabel(me, undefined),
   };
 
   const target = attachmentTarget(seed?.links);

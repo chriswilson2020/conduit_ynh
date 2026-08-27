@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { identityKey } from "../../lib";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
 import { Timeline } from "./timeline";
 import { Notes } from "./notes";
@@ -40,8 +41,10 @@ export function Rail({ companyId, contactId, dealId, projectId }: RailProps) {
   // with new props), so a plain `string | null` here would leave company a's
   // meeting open on company b's tab -- the same shape of bug the timeline's
   // page accumulator solves by keying on its filter set, and solved the same
-  // way rather than by an effect that has to remember to fire.
-  const recordKey = `${companyId ?? ""}|${contactId ?? ""}|${dealId ?? ""}|${projectId ?? ""}`;
+  // way rather than by an effect that has to remember to fire. Literally the
+  // same way: identityKey is the builder those accumulators key on, rather
+  // than a second hand-rolled scheme one import away from it.
+  const recordKey = identityKey({ companyId, contactId, dealId, projectId });
   const [selection, setSelection] = useState<{ recordKey: string; meetingId: string | null }>(
     { recordKey, meetingId: null },
   );
