@@ -27,7 +27,8 @@ Decisions taken with Chris in the 5 brainstorm:
 
 - **`meetings`**: `id`, `title` text NOT NULL, `occurred_at` timestamptz NOT NULL,
   `duration_minutes` integer NULL (unknown is honest; not every logged meeting has one),
-  `notes` text NULL (TipTap HTML, sanitized on write like notes.body),
+  `notes` text NULL (TipTap HTML, sanitized on write with the shared `sanitizeMailHtml`
+  profile — NOT "like notes.body", which is plain text: corrected during Task 1),
   `owner_user_id` FK users NOT NULL, the four record FKs
   `company_id`/`contact_id`/`deal_id`/`project_id` (nullable, several may be set at once —
   the `events` model, NOT notes' exactly-one CHECK: a meeting about a deal legitimately
@@ -109,10 +110,23 @@ produced.
   "Add task" affordance. Archive available; archived hidden behind the house
   "show archived" control.
 - **Timeline** renders the three new verbs with the existing single-letter badge idiom
-  (no icon library in this project): `met` = M, `mail_received` = R, `mail_sent` = T.
+  (no icon library in this project), with the letters set by Amendment 1: `met` = M,
+  `mail_received` = I, `mail_sent` = T, and `dependency_removed` moving M -> X.
   A meeting entry links to its meeting; a mail entry links to its thread.
 - Attendee input: contact/user pickers plus a free-text guest field; the existing
   entity-picker patterns, no new component library.
+
+## Amendments (coordinator, during execution)
+
+1. **Timeline badge letters** (Task 1 spec review). The spec's proposed letters collided with
+   existing ones: `met` = M against `dependency_removed` = M, and `mail_received` = R against
+   `unarchived` = R. A record's timeline would show two different M entries. Ruling, decided on
+   frequency — the intuitive letter belongs to the verb a user actually sees most: **`met` = M**
+   (and `dependency_removed` moves to **X**, which is a better mnemonic for "removed" than M was),
+   **`mail_received` = I** (Inbound; `unarchived` keeps R untouched), **`mail_sent` = T**. One
+   existing badge therefore changes appearance — the rarest one in the set, to a clearer letter.
+   The single-letter scheme itself stands (there is still no icon library); if a future phase pushes
+   the verb list past the free letters, that is the moment to revisit the scheme, not now.
 
 ## Out of scope (deferred, not rejected)
 
