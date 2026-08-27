@@ -336,9 +336,11 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
       </label>
 
       {templates.length > 0 && (
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 max-md:flex-wrap">
           <span className="text-xs font-medium text-slate-600">Template</span>
-          <div className="w-64">
+          {/* The select takes its own line below the breakpoint; 16rem beside
+              the label is wider than a phone's content box. */}
+          <div className="w-64 max-md:w-full">
             {/* Value stays on the sentinel: picking an entry APPLIES it (the
                 subject when composing fresh, the body at the caret) rather
                 than putting the composer into a "template mode" it would then
@@ -389,7 +391,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
               // chip only leaves the file off THIS message -- the original
               // keeps its own attachment either way.
               aria-label={`Do not attach ${attachment.filename}`}
-              className="text-slate-400 hover:text-slate-900"
+              className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
               onClick={() => setForwarded((current) => current.filter((entry) => entry.id !== attachment.id))}
             >
               {"\u00D7"}
@@ -410,7 +412,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
               // it was filed against, and stays on that record's Files rail
               // whether the message is ever sent or not.
               aria-label={`Do not attach ${file.originalName}`}
-              className="text-slate-400 hover:text-slate-900"
+              className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
               onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== file.id))}
             >
               {"\u00D7"}
@@ -598,7 +600,7 @@ function RecipientField({
               <button
                 type="button"
                 aria-label={`Remove ${recipient.address}`}
-                className="text-slate-400 hover:text-slate-900"
+                className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
                 onClick={() => onChange(recipients.filter((entry) => entry.address !== recipient.address))}
               >
                 {"\u00D7"}

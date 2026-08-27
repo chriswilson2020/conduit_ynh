@@ -1,18 +1,18 @@
 import { useState } from "react";
-import type { ReactNode } from "react";
-import * as RadixDialog from "@radix-ui/react-dialog";
 import { Link, useRouterState } from "@tanstack/react-router";
-import { clsx } from "clsx";
+import { Dialog, DialogTrigger, SheetBody, SheetContent, SheetHeader } from "./ui/dialog";
 import { NAV_DESTINATIONS, isAnyNavDestinationActive, isNavDestinationActive, splitNav } from "./nav-lib";
 import { GlobalSearch } from "./search";
 
 /**
  * The shell's chrome BELOW the breakpoint: the bottom tab bar, the More sheet
- * behind it, and the header's search sheet. All three live in one file because
- * all three are the same object -- a sheet -- and this TASK may not touch
- * components/ui (the plan assigns that directory to Task 2, whose job is
- * converting the dialog primitives to sheets wholesale). When it does, Sheet
- * below is what it should promote and this file should import.
+ * behind it, and the header's search sheet.
+ *
+ * The sheet itself no longer lives here. Task 1 had to keep it local because
+ * components/ui was Task 2's directory; Task 2 folded it into ui/dialog.tsx
+ * beside the dialog and the drawer, which is where the shared Portal >
+ * Overlay > Content skeleton now lives, and this file composes it like any
+ * other caller.
  *
  * Nothing here renders above the breakpoint: shell.tsx picks between this and
  * the sidebar with useIsMobile(), so the two never coexist in the DOM. That is
@@ -41,17 +41,6 @@ const sheetRowClass =
   "flex min-h-11 items-center rounded-md px-3 py-2 text-base font-medium text-slate-700 hover:bg-slate-100";
 const activeSheetRowClass =
   "flex min-h-11 items-center rounded-md px-3 py-2 text-base font-medium bg-slate-100 text-slate-900";
-
-// Complete strings again, for the same reason: which edges a sheet is pinned
-// to is not a property one composes half of.
-const SHEET_SHAPE = {
-  // Pinned to the bottom edge and capped, so the page behind stays partly
-  // visible -- right for a short list of choices.
-  bottom: "fixed inset-x-0 bottom-0 max-h-[85vh] rounded-t-xl",
-  // Edge to edge, for a surface that needs the screen: global search opens its
-  // own result list underneath the input, and a capped sheet would scroll it.
-  full: "fixed inset-0",
-} as const;
 
 /**
  * The accessible half of "you are here", spread onto a tab or a row.
@@ -90,99 +79,26 @@ function SearchIcon() {
 }
 
 /**
- * A modal sheet with a titled header and an explicit Close.
- *
- * The Close is not decoration. Radix dismisses on Escape and on an outside
- * click, and a phone offers neither a keyboard nor -- for the full-screen
- * shape -- an outside; without a button in the header, opening search would be
- * the one dead end this phase's definition of done forbids.
- *
- * THE CONTRACT FOR ANYTHING PUT INSIDE ONE: if it can navigate, it must close
- * the sheet itself. Radix cannot see a navigation that happens inside its own
- * content, so a sheet left open after one covers the page the user asked for
- * with a surface that looks like nothing happened. Both callers below honour
- * it -- the More rows through onClick, the search through its onNavigate --
- * and nav-lib.test.ts guards the second, which is the one where the closing
- * has to travel through another component to get here.
- *
- * aria-describedby is cleared explicitly because these sheets carry no
- * description element, and Radix otherwise points at an id that is not there.
- */
-function Sheet({
-  open,
-  onOpenChange,
-  testId,
-  title,
-  shape,
-  trigger,
-  onOpenAutoFocus,
-  children,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  testId: string;
-  title: string;
-  shape: keyof typeof SHEET_SHAPE;
-  trigger: ReactNode;
-  /**
-   * Where focus lands when the sheet opens. Radix's default is the first
-   * tabbable descendant, and since the header comes before the content that is
-   * the Close button -- fine for a list of choices, wrong for a sheet whose
-   * whole purpose is typing into something. Call `preventDefault()` and focus
-   * what the sheet is actually for.
-   */
-  onOpenAutoFocus?: (event: Event) => void;
-  children: ReactNode;
-}) {
-  return (
-    <RadixDialog.Root open={open} onOpenChange={onOpenChange}>
-      {trigger}
-      <RadixDialog.Portal>
-        <RadixDialog.Overlay className="fixed inset-0 bg-slate-900/40" />
-        <RadixDialog.Content
-          data-testid={testId}
-          aria-describedby={undefined}
-          onOpenAutoFocus={onOpenAutoFocus}
-          className={clsx(
-            "flex flex-col overflow-hidden bg-white pb-[env(safe-area-inset-bottom)] shadow-xl focus:outline-none",
-            SHEET_SHAPE[shape],
-          )}
-        >
-          <div className="flex items-center justify-between gap-2 border-b border-slate-200 px-4 py-3">
-            <RadixDialog.Title className="text-base font-semibold text-slate-900">{title}</RadixDialog.Title>
-            <RadixDialog.Close
-              data-testid={`${testId}-close`}
-              className="flex min-h-11 min-w-11 items-center justify-center rounded-md px-3 text-sm font-medium text-slate-600 hover:bg-slate-100"
-            >
-              Close
-            </RadixDialog.Close>
-          </div>
-          <div className="flex-1 overflow-y-auto p-4">{children}</div>
-        </RadixDialog.Content>
-      </RadixDialog.Portal>
-    </RadixDialog.Root>
-  );
-}
-
-/**
  * The bottom tab bar: four primary destinations plus More.
  *
  * `fixed` with NO z-index, deliberately. Paint order then follows the DOM, and
- * every overlay in this app (dialogs, the task drawer, the sheets above) is
- * portalled to the end of <body> with no z-index of its own -- so they land
- * above the bar for free, while a z-index here would float the bar over an
- * open drawer. The one exception found so far is the Gantt, whose sticky
- * chart/timescale elements carry a z-index and are NOT portalled; that is
- * recorded against Task 5, which owns those files. shell.tsx pays for the
+ * every overlay in this app (dialogs, the task drawer, the sheets in
+ * ui/dialog.tsx) is portalled to the end of <body> with no z-index of its own
+ * -- so they land above the bar for free, while a z-index here would float the
+ * bar over an open drawer. The one exception found so far is the Gantt, whose
+ * sticky chart/timescale elements carry a z-index and are NOT portalled; that
+ * is recorded against Task 5, which owns those files. shell.tsx pays for the
  * fixed positioning with bottom padding on <main> so the last row of a list is
  * not parked under the bar.
  *
  * The bar's own safe-area padding resolves to 0px in this app today, because
  * index.html's viewport meta has no `viewport-fit=cover` and the layout
- * viewport therefore already stops short of the home indicator. It is kept
- * because it costs nothing and becomes the correct padding the moment that
- * meta changes, which is Task 2's call. It is named in prose WITHOUT its
- * bracket syntax on purpose, here and in shell.tsx: Tailwind v4 scans this
+ * viewport therefore already stops short of the home indicator. Task 2 looked
+ * at adding it and deliberately did not -- index.html records why -- so the
+ * term stays inert and correct, and becomes the right padding on the day
+ * somebody does the full inset audit that meta demands. It is named in prose
+ * WITHOUT its bracket syntax on purpose, here and in shell.tsx: Tailwind v4
+ * scans this
  * file as plain text and emits ANY bracketed class it finds -- a comment is
  * not a comment to it -- so an abbreviated one compiles to CSS that
  * lightningcss rejects, and every later build carries a warning that reads
@@ -223,40 +139,37 @@ export function BottomNav({ unreadMail }: { unreadMail: number }) {
           </Link>
         );
       })}
-      <Sheet
-        open={moreOpen}
-        onOpenChange={setMoreOpen}
-        testId="more-sheet"
-        title="More"
-        shape="bottom"
-        trigger={
-          <RadixDialog.Trigger
-            data-testid="bottom-nav-more"
-            {...currentProps(inOverflow, "true")}
-            className={inOverflow ? activeTabClass : tabClass}
-          >
-            More
-          </RadixDialog.Trigger>
-        }
-      >
-        <div className="flex flex-col gap-1">
-          {overflow.map((destination) => {
-            const active = isNavDestinationActive(pathname, destination);
-            return (
-              <Link
-                key={destination.id}
-                to={destination.to}
-                data-testid={`nav-${destination.id}`}
-                {...currentProps(active, "page")}
-                onClick={() => setMoreOpen(false)}
-                className={active ? activeSheetRowClass : sheetRowClass}
-              >
-                {destination.label}
-              </Link>
-            );
-          })}
-        </div>
-      </Sheet>
+      <Dialog open={moreOpen} onOpenChange={setMoreOpen}>
+        <DialogTrigger
+          data-testid="bottom-nav-more"
+          {...currentProps(inOverflow, "true")}
+          className={inOverflow ? activeTabClass : tabClass}
+        >
+          More
+        </DialogTrigger>
+        <SheetContent shape="bottom" data-testid="more-sheet">
+          <SheetHeader title="More" closeTestId="more-sheet-close" />
+          <SheetBody>
+            <div className="flex flex-col gap-1">
+              {overflow.map((destination) => {
+                const active = isNavDestinationActive(pathname, destination);
+                return (
+                  <Link
+                    key={destination.id}
+                    to={destination.to}
+                    data-testid={`nav-${destination.id}`}
+                    {...currentProps(active, "page")}
+                    onClick={() => setMoreOpen(false)}
+                    className={active ? activeSheetRowClass : sheetRowClass}
+                  >
+                    {destination.label}
+                  </Link>
+                );
+              })}
+            </div>
+          </SheetBody>
+        </SheetContent>
+      </Dialog>
     </nav>
   );
 }
@@ -280,44 +193,43 @@ export function MobileSearch() {
   const [open, setOpen] = useState(false);
 
   return (
-    <Sheet
-      open={open}
-      onOpenChange={setOpen}
-      testId="search-sheet"
-      title="Search"
-      shape="full"
-      onOpenAutoFocus={(event) => {
-        // Radix would focus the first tabbable descendant, which is Close --
-        // it sits in the header, and the header precedes the content. On a
-        // full-screen search surface with no keyboard that is the worst
-        // possible landing: a screen reader announces "Close, button" for a
-        // sheet whose entire purpose is typing, and a phone user gets no
-        // keyboard until they find and tap the field themselves.
-        //
-        // The input is found by tag rather than through a ref because the
-        // alternative is threading one through GlobalSearch and ui/input.tsx,
-        // and that primitive types its props as InputHTMLAttributes with no
-        // ref among them -- widening it is Task 2's file and Task 2's call.
-        // This sheet holds exactly one input, and Sheet's title makes which
-        // one unambiguous.
-        const content = event.currentTarget;
-        if (!(content instanceof HTMLElement)) return;
-        const input = content.querySelector("input");
-        if (input === null) return;
-        event.preventDefault();
-        input.focus();
-      }}
-      trigger={
-        <RadixDialog.Trigger
-          data-testid="open-search"
-          aria-label="Search"
-          className="flex min-h-11 min-w-11 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100"
-        >
-          <SearchIcon />
-        </RadixDialog.Trigger>
-      }
-    >
-      <GlobalSearch onNavigate={() => setOpen(false)} />
-    </Sheet>
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger
+        data-testid="open-search"
+        aria-label="Search"
+        className="flex min-h-11 min-w-11 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100"
+      >
+        <SearchIcon />
+      </DialogTrigger>
+      <SheetContent
+        shape="full"
+        data-testid="search-sheet"
+        onOpenAutoFocus={(event) => {
+          // Radix would focus the first tabbable descendant, which is Close --
+          // it sits in the header, and the header precedes the content. On a
+          // full-screen search surface with no keyboard that is the worst
+          // possible landing: a screen reader announces "Close, button" for a
+          // sheet whose entire purpose is typing, and a phone user gets no
+          // keyboard until they find and tap the field themselves.
+          //
+          // The input is found by tag rather than through a ref because the
+          // alternative is threading one through GlobalSearch and ui/input.tsx,
+          // and that primitive types its props as InputHTMLAttributes with no
+          // ref among them. This sheet holds exactly one input, and the
+          // header's title makes which one unambiguous.
+          const content = event.currentTarget;
+          if (!(content instanceof HTMLElement)) return;
+          const input = content.querySelector("input");
+          if (input === null) return;
+          event.preventDefault();
+          input.focus();
+        }}
+      >
+        <SheetHeader title="Search" closeTestId="search-sheet-close" />
+        <SheetBody>
+          <GlobalSearch onNavigate={() => setOpen(false)} />
+        </SheetBody>
+      </SheetContent>
+    </Dialog>
   );
 }

@@ -58,7 +58,8 @@ export function PipelinesPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-slate-900">Pipelines</h1>
         <div className="flex items-center gap-3">
-          <label className="flex items-center gap-2 text-sm text-slate-600">
+          {/* The label is the touch target, not the 13px box inside it. */}
+          <label className="flex items-center gap-2 text-sm text-slate-600 max-md:min-h-11">
             <input type="checkbox" checked={archived} onChange={(event) => setArchived(event.target.checked)} />
             Archived
           </label>

@@ -284,14 +284,21 @@ function TaskDrawerBody({ taskId }: { taskId: string }) {
 
       <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
         <span className="text-sm font-medium text-slate-500">Dates</span>
-        <div data-testid="field-dates" className="mt-2 flex items-center gap-2">
+        {/*
+          Two date pickers, an arrow and Save on one line need more width than
+          a phone has; wrapping puts Save under the pair rather than squeezing
+          a native date control until it drops its own segments. Task 5 opens
+          this drawer from a Gantt bar, so this row is the phone's ONLY way to
+          reschedule -- it has to survive the narrow case.
+        */}
+        <div data-testid="field-dates" className="mt-2 flex items-center gap-2 max-md:flex-wrap">
           <input
             type="date"
             aria-label="Start date"
             value={startDraft}
             onChange={(event) => setStartDraft(event.target.value)}
             disabled={archived}
-            className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 disabled:cursor-not-allowed disabled:bg-slate-50"
+            className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 disabled:cursor-not-allowed disabled:bg-slate-50 max-md:min-h-11"
           />
           <span className="text-slate-400">{"\u2192"}</span>
           <input
@@ -300,7 +307,7 @@ function TaskDrawerBody({ taskId }: { taskId: string }) {
             value={dueDraft}
             onChange={(event) => setDueDraft(event.target.value)}
             disabled={archived}
-            className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 disabled:cursor-not-allowed disabled:bg-slate-50"
+            className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 disabled:cursor-not-allowed disabled:bg-slate-50 max-md:min-h-11"
           />
           <Button onClick={handleSaveDates} disabled={archived || !datesPaired || !datesDirty}>
             Save
@@ -320,7 +327,7 @@ function TaskDrawerBody({ taskId }: { taskId: string }) {
           onChange={(event) => setProgressDraft(event.target.value)}
           onBlur={handleProgressBlur}
           disabled={archived}
-          className="w-24 rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 disabled:cursor-not-allowed disabled:bg-slate-50"
+          className="w-24 rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 disabled:cursor-not-allowed disabled:bg-slate-50 max-md:min-h-11"
         />
         <span className="ml-2 text-sm text-slate-400">%</span>
       </Field>

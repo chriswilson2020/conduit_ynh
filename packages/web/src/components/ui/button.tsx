@@ -24,7 +24,12 @@ export function Button({ variant = "default", type = "button", className, ...pro
     <button
       type={type}
       className={clsx(
-        "inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium",
+        // The 44px floor below the breakpoint, and only there -- an unscoped
+        // one would grow every desktop button. Callers that shrink a button
+        // with their own px/py/text-xs (the meeting form's chips, the link
+        // panel's) still clear the floor on a phone, because nothing here or
+        // in those callers sets a height for the floor to argue with.
+        "inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium max-md:min-h-11",
         "transition-colors disabled:cursor-not-allowed disabled:opacity-50",
         variantClasses[variant],
         className,

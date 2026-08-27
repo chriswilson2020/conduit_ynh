@@ -347,7 +347,13 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
         />
       </label>
 
-      <div className="flex gap-2">
+      {/*
+        The one side-by-side field pair in this form, stacked below the
+        breakpoint: a datetime-local control has a wide intrinsic width of its
+        own, and sharing a 300px rail column with a 7rem number field left it
+        clipping its own AM/PM segment.
+      */}
+      <div className="flex gap-2 max-md:flex-col">
         <label className="flex flex-1 flex-col gap-1 text-xs font-medium text-slate-500">
           When
           <Input
@@ -357,7 +363,7 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
             onChange={(event) => setDraft((current) => ({ ...current, when: event.target.value }))}
           />
         </label>
-        <label className="flex w-28 flex-col gap-1 text-xs font-medium text-slate-500">
+        <label className="flex w-28 flex-col gap-1 text-xs font-medium text-slate-500 max-md:w-full">
           Minutes
           <Input
             type="number"
@@ -385,7 +391,12 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
               <button
                 type="button"
                 aria-label={`Remove ${attendeeDraftLabel(attendee)}`}
-                className="text-slate-400 hover:text-slate-900"
+                // A bare glyph is a ~10px target. The chip cannot grow to 44px
+                // without becoming a button-sized box, so the tap area is
+                // widened instead of the chip: negative margin keeps the
+                // painted glyph where it was and lets the hit box overhang the
+                // chip's padding.
+                className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
                 onClick={() => removeAttendee(index)}
               >
                 {"\u00D7"}

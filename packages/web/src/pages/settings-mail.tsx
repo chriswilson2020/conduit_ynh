@@ -541,7 +541,7 @@ function MoveTargets({
       <datalist id={listId}>
         {folderNames.map((name) => <option key={name} value={name} />)}
       </datalist>
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
         <Field label="Trash folder" testId="trash-folder">
           <Input
             value={trash ?? account.trashFolder ?? ""}
@@ -643,7 +643,14 @@ function AccountForm({
     <form data-testid="account-form" onSubmit={handleSubmit} className="flex flex-col gap-4">
       <DialogTitle>{isEdit ? "Edit mail account" : "Add mail account"}</DialogTitle>
 
-      <div className="grid grid-cols-2 gap-3">
+      {/*
+        Every field grid in this file collapses to one column below the
+        breakpoint -- the phase's "forms single-column, inputs full-width"
+        rule. This is the widest form in the app (a three-column row of
+        host/port/security twice over), and a 327px phone gives each of those
+        cells about 100px.
+      */}
+      <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
         <Field label="Label" testId="label">
           <Input value={state.label} onChange={(e) => set("label", e.target.value)} placeholder="Work" autoFocus />
         </Field>
@@ -662,7 +669,7 @@ function AccountForm({
         <Button variant="ghost" onClick={applyDovecotPreset}>Local Dovecot</Button>
       </div>
 
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-3 gap-3 max-md:grid-cols-1">
         <Field label="IMAP host" testId="imap-host">
           <Input value={state.imapHost} onChange={(e) => set("imapHost", e.target.value)} />
         </Field>
@@ -696,7 +703,7 @@ function AccountForm({
         SMTP password differs from IMAP
       </label>
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
         <Field label={state.smtpDiffers ? "IMAP password" : "Password"} testId="password">
           <Input
             type="password"
@@ -719,7 +726,7 @@ function AccountForm({
         )}
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
         <Field label="Sent folder" testId="sent-folder">
           <Input value={state.sentFolder} onChange={(e) => set("sentFolder", e.target.value)} />
         </Field>

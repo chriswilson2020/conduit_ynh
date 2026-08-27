@@ -141,7 +141,11 @@ export function FieldCard({
                   <span
                     className={clsx(
                       "block px-2 py-2",
-                      field.editable && !archived && "cursor-pointer rounded hover:bg-slate-50",
+                      // The floor goes on the EDITABLE branch only: this span
+                      // is the tap-to-edit target, and a read-only field is
+                      // text, not a control -- giving every "--" on a detail
+                      // page 44px of height would just pad the page out.
+                      field.editable && !archived && "cursor-pointer rounded hover:bg-slate-50 max-md:min-h-11",
                       field.multiline && "whitespace-pre-wrap",
                     )}
                     onClick={() => startEdit(field)}

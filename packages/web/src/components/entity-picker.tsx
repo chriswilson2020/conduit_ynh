@@ -97,7 +97,7 @@ function PickerResults({ results, onPick }: { results: { id: string; label: stri
           <button
             type="button"
             data-testid={`link-option-${result.id}`}
-            className="block w-full rounded px-2 py-1 text-left text-sm text-slate-900 hover:bg-slate-100"
+            className="block w-full rounded px-2 py-1 text-left text-sm text-slate-900 hover:bg-slate-100 max-md:min-h-11"
             onClick={() => onPick(result.id, result.label)}
           >
             {result.label}

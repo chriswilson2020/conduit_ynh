@@ -76,7 +76,7 @@ export function LinkPanel({ thread, dealSuggestions }: LinkPanelProps) {
               <button
                 type="button"
                 aria-label={`Unlink ${KIND_LABEL[kind].toLowerCase()}`}
-                className="text-slate-400 hover:text-slate-900"
+                className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
                 onClick={() => clearLink.mutate({ threadId: thread.id, kind })}
               >
                 {"\u00D7"}
@@ -112,7 +112,7 @@ export function LinkPanel({ thread, dealSuggestions }: LinkPanelProps) {
               key={suggestion.id}
               type="button"
               data-testid={`deal-suggestion-${suggestion.id}`}
-              className="self-start rounded bg-slate-100 px-2 py-1 text-xs text-slate-700 hover:bg-slate-200"
+              className="self-start rounded bg-slate-100 px-2 py-1 text-xs text-slate-700 hover:bg-slate-200 max-md:min-h-11"
               onClick={() => link("deal", suggestion.id)}
             >
               Link {suggestion.title}

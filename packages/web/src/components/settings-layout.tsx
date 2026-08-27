@@ -4,9 +4,14 @@ import { Link } from "@tanstack/react-router";
 // activeProps.className REPLACES the base className (see shell.tsx's own note
 // on the same Link behaviour), so each of these is a complete class list, not
 // a base plus an "active" fragment.
+// These are tab triggers in everything but their implementation, so they take
+// the same 44px floor below the breakpoint that ui/tabs.tsx gives the real
+// ones. inline-flex because a Link is inline: a min-height on an inline box
+// does nothing at all.
 const tabClass =
-  "border-b-2 border-transparent px-3 py-2 text-sm font-medium text-slate-500 hover:text-slate-900";
-const activeTabClass = "border-b-2 border-slate-900 px-3 py-2 text-sm font-medium text-slate-900";
+  "border-b-2 border-transparent px-3 py-2 text-sm font-medium text-slate-500 hover:text-slate-900 max-md:inline-flex max-md:min-h-11 max-md:items-center";
+const activeTabClass =
+  "border-b-2 border-slate-900 px-3 py-2 text-sm font-medium text-slate-900 max-md:inline-flex max-md:min-h-11 max-md:items-center";
 
 /**
  * The Settings area's frame: a title and the two-tab nav every settings page

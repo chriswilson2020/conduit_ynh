@@ -118,6 +118,13 @@ const SIDEBAR_LABEL: Record<string, string> = { mail: "Inbox" };
  * tab is narrow, so a future task may well want a shorter word there, and it
  * should have to write that down.
  *
+ * SCOPED TO THE <aside>, not to the whole file. Before this it scraped every
+ * `to="/..."` in shell.tsx and demanded exact equality against this list, so
+ * ANY link added anywhere else in that file -- making the wordmark a link
+ * home, a "skip to content" affordance, a link in the header -- failed it with
+ * a diff that named neither the cause nor the fix. The sidebar is what this
+ * test is about, so the sidebar is what it now reads.
+ *
  * KNOW WHAT THIS GUARD CANNOT SEE, because it is the mechanical basis for the
  * phase's central promise and a false sense of it is worse than none. It
  * matches ONE SPELLING: a string literal in `to="..."`. A sidebar entry
@@ -126,16 +133,24 @@ const SIDEBAR_LABEL: Record<string, string> = { mail: "Inbox" };
  * destination really is desktop-only. It guards against the likely mistake
  * (someone copies an existing sidebar line and forgets this list), not against
  * a determined one. If a later task changes how those links are spelled, this
- * test must be taught the new spelling in the same commit.
+ * test must be taught the new spelling in the same commit. The same goes for
+ * the scoping: a sidebar that stops being one <aside> block needs this slice
+ * rewritten, and the sentinel assertions below are what make that fail loudly
+ * instead of silently guarding an empty string.
  */
 describe("NAV_DESTINATIONS", () => {
   it("matches the desktop sidebar's links in target, label AND order", () => {
     const shell = readFileSync(new URL("./shell.tsx", import.meta.url), "utf8");
+    const start = shell.indexOf("<aside");
+    const end = shell.indexOf("</aside>");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const sidebar = shell.slice(start, end);
     // Each sidebar entry is `<Link to="/x" ...>` with its label on the next
     // line; the mail entry's badge markup starts on the line after that, so
     // stopping at the first newline, `<` or `{` takes the word and nothing
     // else.
-    const linked = [...shell.matchAll(/to="(\/[^"]*)"[^>]*>\s*([^\n<{]+)/g)].map((match) => [
+    const linked = [...sidebar.matchAll(/to="(\/[^"]*)"[^>]*>\s*([^\n<{]+)/g)].map((match) => [
       match[1] ?? "",
       (match[2] ?? "").trim(),
     ]);

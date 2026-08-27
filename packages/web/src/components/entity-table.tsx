@@ -34,6 +34,13 @@ export interface EntityTableProps<T extends { id: string }> {
  * survive across renders (accumulated rows, the cursor) lives in the calling
  * page, not here -- this component only owns the small, purely-local UI state
  * (draft filter text, whether the create dialog is open).
+ *
+ * Below the breakpoint the table reads as stacked cards. That took ONE change
+ * here (the per-cell heading labels below) and one in ui/table.tsx, rather
+ * than five in the pages, because the pages hand this component a `columns`
+ * array and never touch the markup: companies, contacts and projects all get
+ * the card layout without a line changing in any of them. See ui/table.tsx for
+ * what the switch costs.
  */
 export function EntityTable<T extends { id: string }>({
   columns,
@@ -62,15 +69,22 @@ export function EntityTable<T extends { id: string }>({
 
   return (
     <div data-testid="entity-table" className="flex flex-col gap-4">
-      <div className="flex items-center gap-3">
+      {/*
+        Below the breakpoint the filter takes the whole first line and the
+        toggle and New wrap under it: at 375px the three of them share 327px,
+        which leaves the field about 150px -- narrower than most of what gets
+        typed into it.
+      */}
+      <div className="flex items-center gap-3 max-md:flex-wrap">
         <Input
           value={q}
           onChange={(event) => setQ(event.target.value)}
           placeholder="Filter..."
           aria-label="Filter"
-          className="max-w-xs"
+          className="max-w-xs max-md:max-w-none"
         />
-        <label className="flex items-center gap-2 text-sm text-slate-600">
+        {/* The label is the touch target, not the 13px box inside it. */}
+        <label className="flex items-center gap-2 text-sm text-slate-600 max-md:min-h-11">
           <input
             type="checkbox"
             checked={archived}
@@ -106,7 +120,24 @@ export function EntityTable<T extends { id: string }>({
               className={onRowClick ? "cursor-pointer" : undefined}
             >
               {columns.map((column) => (
-                <TableCell key={column.key}>{column.render(row)}</TableCell>
+                <TableCell key={column.key}>
+                  {/*
+                    The column heading, repeated per cell and shown only where
+                    the heading row is not: ui/table.tsx turns the table into
+                    stacked cards below the breakpoint and hides <thead>, which
+                    would otherwise leave a bare "--" or a bare date with
+                    nothing saying what it is.
+
+                    A rendered element rather than a `content: attr(...)`
+                    pseudo, because a pseudo-element's generated text is read
+                    by some screen readers and not others, and this IS the
+                    field's name once the heading row is gone. On a desktop it
+                    is display:none, which takes it out of the accessibility
+                    tree entirely -- the heading row is doing the job there.
+                  */}
+                  <span className="text-xs font-medium uppercase text-slate-400 md:hidden">{column.header}</span>
+                  {column.render(row)}
+                </TableCell>
               ))}
             </TableRow>
           ))}

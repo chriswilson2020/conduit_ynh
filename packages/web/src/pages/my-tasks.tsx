@@ -213,9 +213,21 @@ function TaskRow({
 }) {
   const overdue = task.dueDate !== null && task.status !== "done" && task.dueDate < todayLocalIso();
   return (
+    /*
+      BELOW THE BREAKPOINT THE ROW WRAPS ONTO TWO LINES: title first, then the
+      project, the date and the type badge under it. On one line at 375px the
+      three fixed-width metadata columns (w-32 + w-24 + the badge, plus gaps)
+      claim 276px of the 327px content box and leave the title about 24px --
+      the one thing on the row that has to be readable.
+
+      The break is forced by the title's flex-basis rather than by a wrapper
+      element, because a wrapper would restructure the desktop row as well.
+      2rem is the checkbox and its gap, so the title fills the rest of line one
+      exactly and everything after it is pushed to line two.
+    */
     <li
       data-testid={`task-row-${task.id}`}
-      className="flex cursor-pointer items-center gap-3 px-4 py-2 text-sm text-slate-900 hover:bg-slate-50"
+      className="flex cursor-pointer items-center gap-3 px-4 py-2 text-sm text-slate-900 hover:bg-slate-50 max-md:min-h-11 max-md:flex-wrap max-md:py-3"
       onClick={() => onRowClick(task.id)}
     >
       <input
@@ -225,9 +237,23 @@ function TaskRow({
         onChange={(event) => onToggle(task, event.target.checked)}
         aria-label={`Mark "${task.title}" ${task.status === "done" ? "not done" : "done"}`}
       />
-      <span className={task.status === "done" ? "flex-1 text-slate-400 line-through" : "flex-1"}>{task.title}</span>
-      <span className="w-32 shrink-0 truncate text-xs text-slate-500">{projectName ?? "\u2014"}</span>
-      <span className={overdue ? "w-24 shrink-0 text-xs font-medium text-red-600" : "w-24 shrink-0 text-xs text-slate-400"}>
+      <span
+        className={
+          task.status === "done"
+            ? "flex-1 text-slate-400 line-through max-md:basis-[calc(100%-2rem)]"
+            : "flex-1 max-md:basis-[calc(100%-2rem)]"
+        }
+      >
+        {task.title}
+      </span>
+      <span className="w-32 shrink-0 truncate text-xs text-slate-500 max-md:w-auto">{projectName ?? "\u2014"}</span>
+      <span
+        className={
+          overdue
+            ? "w-24 shrink-0 text-xs font-medium text-red-600 max-md:w-auto"
+            : "w-24 shrink-0 text-xs text-slate-400 max-md:w-auto"
+        }
+      >
         {task.dueDate ?? "\u2014"}
       </span>
       <span

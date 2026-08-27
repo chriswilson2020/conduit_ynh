@@ -30,6 +30,7 @@ export function SelectTrigger({
       className={clsx(
         "inline-flex w-full items-center justify-between rounded-md border border-slate-300",
         "bg-white px-3 py-2 text-sm text-slate-900 focus:outline-none focus:ring-1 focus:ring-slate-500",
+        "max-md:min-h-11",
         className,
       )}
     >
@@ -76,6 +77,10 @@ export function SelectItem({ value, children }: { value: string; children: React
       className={clsx(
         "cursor-pointer rounded px-2 py-1.5 text-sm text-slate-900 outline-none",
         "data-[highlighted]:bg-slate-100 data-[state=checked]:font-medium",
+        // A menu item is one of the four things the phase names for the 44px
+        // floor. min-h alone would leave the label pinned to the top of a
+        // taller box, so the phone form is also a centring flex row.
+        "max-md:flex max-md:min-h-11 max-md:items-center",
       )}
     >
       <RadixSelect.ItemText>{children}</RadixSelect.ItemText>

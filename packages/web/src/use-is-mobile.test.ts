@@ -51,6 +51,30 @@ describe("mobileMediaQuery", () => {
   });
 });
 
+/**
+ * The other cross-file fact the phone layer's comments rest on, pinned here
+ * beside the breakpoint for the same reason: it is asserted in prose in three
+ * places and enforced by nothing.
+ *
+ * Task 2 decided AGAINST `viewport-fit=cover` (the reasoning is in
+ * components/shell.tsx). That decision is what makes every
+ * env(safe-area-inset-*) in this app resolve to 0px, which in turn is why the
+ * bottom bar's padding and <main>'s 6rem reservation are correct as written.
+ *
+ * This test exists to fail the day someone adds it. That is not a veto -- it
+ * is a reasonable thing to want -- but it obliges an inset audit of every
+ * fixed and full-bleed surface on all four edges, including the desktop
+ * sidebar a phone still shows in landscape. Whoever takes that on updates this
+ * test, and the three comments it names, in the same commit.
+ */
+describe("the viewport meta", () => {
+  it("does not opt into the display cutout, so the safe-area insets stay 0px", () => {
+    const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+    const meta = /<meta name="viewport" content="([^"]*)"/.exec(html);
+    expect(meta?.[1]).toBe("width=device-width, initial-scale=1.0");
+  });
+});
+
 describe("readIsMobile", () => {
   it("reads a matching query as mobile", () => {
     expect(readIsMobile(fakeQuery(true))).toBe(true);

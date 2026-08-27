@@ -63,8 +63,45 @@ export function Shell({ children }: { children: ReactNode }) {
 
   return (
     <div data-testid="shell" className="flex min-h-screen bg-slate-50">
+      {/*
+        THE SIDEBAR GETS ITS OWN SCROLL ON A SHORT VIEWPORT, and only there.
+
+        A large phone in LANDSCAPE is 844px wide, above the 48rem breakpoint,
+        so it keeps this sidebar by design -- but it is only ~345-350px tall,
+        and the sidebar's content is 384px. As a stretched item of a
+        `flex min-h-screen` row, its content set the row's height, so the
+        DOCUMENT scrolled vertically on the one axis a landscape phone has none
+        of, and <main>'s own scroll region had its bottom pushed off-screen.
+
+        `overflow-y-auto` alone does NOT fix that, which is worth writing down
+        because it is the obvious remedy and it was measured failing: an
+        overflow container still reports its content height as its hypothetical
+        cross size, so the row stayed 384px tall and the document still grew.
+        The height cap is what does the work; the scroll is what keeps the
+        eighth link reachable once capped; `sticky top-0` keeps the sidebar in
+        place while <main> scrolls past it, which is what it did before when
+        the document did not scroll at all.
+
+        `max-lg:` rather than `max-md:` because the failure is a SHORT viewport
+        and every viewport between the two breakpoints is one that a phone in
+        landscape can be. Above 64rem nothing here applies, so the desktop
+        shell -- including e2e/tasks.spec.ts's hard-coded 224px arithmetic --
+        is untouched.
+
+        The cap is in the same unit as the root's own `min-h-screen` on
+        purpose. A dynamic-viewport cap would be the shorter of the two on iOS
+        while the toolbars are showing, and the root would still hold the page
+        open to the taller one -- leaving a strip of page background below a
+        sidebar that is supposed to reach the bottom.
+
+        What this does NOT change: the rows inside are 36px, under the 44px
+        floor, on a landscape phone that is a touch device. They are left
+        alone deliberately. This is the desktop sidebar, the floor is scoped
+        to below the breakpoint everywhere else in the sweep, and raising
+        these would also raise them for a 1000px-wide laptop window.
+      */}
       {!isMobile && (
-        <aside className="flex w-56 shrink-0 flex-col bg-slate-900 text-white">
+        <aside className="flex w-56 shrink-0 flex-col bg-slate-900 text-white max-lg:sticky max-lg:top-0 max-lg:h-screen max-lg:overflow-y-auto">
           <div className="px-4 py-5 text-lg font-semibold tracking-tight">Conduit</div>
           <nav className="flex flex-col gap-1 px-2">
             <Link to="/mail" className={navMailLinkClass} activeProps={{ className: activeNavMailLinkClass }}>
@@ -120,14 +157,28 @@ export function Shell({ children }: { children: ReactNode }) {
           the extra bottom padding below the breakpoint is what keeps the last
           row of a list out from under it.
 
-          The env() term is 0px in this app TODAY and the reservation is really
-          the flat 6rem: index.html's viewport meta has no `viewport-fit=cover`,
-          so the layout viewport is already inset past the home indicator and
-          every safe-area-inset-* resolves to zero by definition. The 6rem
-          clears the bar on its own, so this is correct either way -- the term
-          is here so the reservation still tracks the bar (which pads by the
-          same inset) if Task 2 ever adds `viewport-fit=cover`, which is its
-          decision to make and has top/left/right consequences of its own.
+          THE env() TERM IS 0px IN THIS APP AND STAYS THAT WAY. The reservation
+          is really the flat 6rem, which clears the bar on its own.
+
+          The reason is index.html's viewport meta, which has no
+          `viewport-fit=cover`: without it the layout viewport already stops
+          short of the notch and the home indicator, the browser reserves those
+          strips itself, and every safe-area inset resolves to zero by
+          definition. Task 2 weighed adding it and deliberately did not. It is
+          not a one-line improvement -- it moves the layout viewport out under
+          the hardware on ALL FOUR edges, so every full-bleed and fixed surface
+          then needs its own inset: this header and <main> (px-6), the bar and
+          the sheets (pinned to the edges), the task drawer's right edge, and
+          -- in LANDSCAPE, which is above the breakpoint and therefore still
+          renders the sidebar above -- that sidebar's left edge against the
+          notch. That is a landscape audit on hardware this loop cannot test,
+          bought for no visible gain, since the space is already reserved.
+
+          So the term is inert and correct, and becomes the right padding on
+          the day somebody does that audit. Whoever does it should know that
+          this comment, the one in components/bottom-nav.tsx, and the
+          assertion in use-is-mobile.test.ts that pins the meta all stop being
+          true in the same commit.
         */}
         <main
           className={clsx(

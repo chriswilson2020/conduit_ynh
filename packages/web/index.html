@@ -7,6 +7,10 @@
          path, but at a deep link like /deals/123 the browser would otherwise
          resolve them against /deals/ and 404. This anchors them to the mount. -->
     <base href="__BASE_HREF__" />
+    <!-- NO `viewport-fit=cover`, decided rather than defaulted. It is what makes
+         every env(safe-area-inset-*) in this app resolve to 0px; the reasoning,
+         and what adding it would oblige, are in components/shell.tsx beside the
+         reservation that depends on it. -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Conduit</title>
     <script>
