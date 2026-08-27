@@ -10,11 +10,19 @@ import { ImapFlow } from "imapflow";
  * Phase 4.2 extends the same journey with a SECOND USER (see the 4.2 section
  * at the bottom): the private-by-default visibility model, the deal link as
  * the deliberate sharing act, the Settings toggle, and the owner-only move
- * rights, each asserted from user B's browser context. Phase 4.3 closes the
- * file with the detail cap's Show earlier on a 51-message fixture thread,
+ * rights, each asserted from user B's browser context. Phase 4.3 continues
+ * with the detail cap's Show earlier on a 51-message fixture thread,
  * the 1280px conversation-header containment guard, forward re-attach
  * verified in Mailpit's copy of the outgoing mail, and the per-user hide
  * journey (A's filing changes A's surfaces alone; B keeps reading).
+ * Phase 5 closes the file with mail on the RECORD TIMELINE: an auto-linked
+ * conversation becomes an entry on its contact's timeline, carrying that
+ * thread's subject rendered live and a link back to the conversation -- and
+ * the same entry is absent, entirely rather than redacted, from the second
+ * user's view of that same record. That leg lives here rather than in
+ * e2e/meetings.spec.ts because it needs both of this file's fixtures: a real
+ * ingested thread on a PRIVATE mailbox, and a second browser context that is
+ * genuinely a different user.
  *
  * HOW THE SECOND USER WORKS, verified against the API's auth path rather
  * than assumed: identityFromHeaders (api: auth.ts) uses the `ynh-user`
@@ -203,6 +211,28 @@ test.describe.serial("Mail journey", () => {
   let sentinelSubject = "";
   let hideMarker = "";
 
+  /**
+   * The Phase 5 timeline fixture: one inbound message from a contact who
+   * exists in the CRM before the first sync pass, so the auto-linker binds
+   * the thread to her -- and to her ALONE. No deal, no project: under the
+   * record-visibility rule those two links are the deliberate sharing act,
+   * and a contact link is not, so this conversation stays A's while A's
+   * mailbox is private. That is what makes it the honest subject of the
+   * privacy leg at the bottom of this file.
+   *
+   * PER ATTEMPT, address included, and that is not decoration. Auto-linking
+   * is an exact address match resolved once, at ingest: a previous attempt's
+   * contact holding the same address could take this attempt's thread, and
+   * this attempt's contact -- whose timeline both the positive and the
+   * negative are asserted against -- would then be a record nothing ever
+   * happened on. Failing forever, on every retry, for a reason no retry
+   * could clear.
+   */
+  let timelineContactName = "";
+  let timelineAddress = "";
+  let timelineSubject = "";
+  let timelineContactId = "";
+
   // -- fixtures --------------------------------------------------------
 
   /** One message, CRLF-terminated the way it goes onto the wire: this buffer
@@ -277,7 +307,34 @@ test.describe.serial("Mail journey", () => {
       },
       ...folderFixtures(now),
       ...phase43Fixtures(now),
+      ...phase5Fixtures(now),
     ];
+  }
+
+  /**
+   * The Phase 5 fixture: one message from a contact the CRM already knows,
+   * which the ingest auto-links and -- Phase 5 being what it is -- turns into
+   * a timeline entry on her record.
+   *
+   * Dated with the 4.3 set rather than with the minutes-old opening ones, for
+   * the same two reasons: inside the account form's default 90-day backfill
+   * window, and nowhere near the bulk trio's seconds-wide range window.
+   */
+  function phase5Fixtures(now: number): { raw: Buffer; date: Date; folder: string }[] {
+    const at = new Date(now - 75 * MINUTE_MS);
+    return [{
+      folder: INBOX_FOLDER,
+      date: at,
+      raw: rfc822([
+        `From: Cora Vendor <${timelineAddress}>`,
+        `To: Conduit <${USERNAME}>`,
+        `Subject: ${timelineSubject}`,
+        `Message-ID: <timeline-1-${attemptTag}@example.com>`,
+        `Date: ${at.toUTCString()}`,
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=utf-8",
+      ], "Here is the quote you asked for."),
+    }];
   }
 
   /**
@@ -618,6 +675,12 @@ test.describe.serial("Mail journey", () => {
     // through websearch_to_tsquery as a single lexeme.
     hideMarker = `hidemarker${attemptId}`;
 
+    // The Phase 5 set (see the declarations above for why the ADDRESS is
+    // per-attempt and not merely per-run).
+    timelineContactName = `Cora ${attemptId}`;
+    timelineAddress = `cora-${attemptId}@example.com`;
+    timelineSubject = `Pilot quote ${attemptId}`;
+
     // A previous attempt's account would sync this same mailbox alongside the
     // one added below, ingesting every message twice (once per account, into
     // the same thread) and doubling the conversation. Archiving stops its
@@ -716,6 +779,28 @@ test.describe.serial("Mail journey", () => {
     await expect(emails).toContainText(aliceAddress);
   });
 
+  // Phase 5. Created HERE, beside Alice, rather than down in the Phase 5
+  // section where it is used: auto-linking happens once, at ingest, so a
+  // contact created after the account below has synced would never be found
+  // by the message already in the mailbox -- and a thread linked to her by
+  // hand afterwards would still emit no timeline entry, because an entry's
+  // record links are a snapshot taken when the message arrived.
+  test("creates the contact whose private thread the timeline leg needs", async () => {
+    await page.goto("/contacts");
+    await page.getByRole("button", { name: "New" }).click();
+    await page.getByPlaceholder("First name").fill(timelineContactName);
+    await page.getByRole("button", { name: "Create" }).click();
+
+    await expect(page).toHaveURL(/\/contacts\/[0-9a-f-]{36}$/);
+    timelineContactId = page.url().split("/").pop() as string;
+
+    const emails = page.getByTestId("field-emails");
+    await emails.click();
+    await emails.locator("input").fill(timelineAddress);
+    await emails.locator("input").press("Enter");
+    await expect(emails).toContainText(timelineAddress);
+  });
+
   test("adds the mail account from the Dovecot preset and tests both protocols", async () => {
     await page.goto("/settings/mail");
     await expect(page.getByTestId("mail-settings")).toBeVisible();
@@ -784,6 +869,11 @@ test.describe.serial("Mail journey", () => {
       await expect(threadRow(attachSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
       await expect(threadRow(hideSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
       await expect(threadRow(sentinelSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+      // The Phase 5 fixture, waited for HERE for the badge reason spelled
+      // out above and not merely for tidiness: it arrives unread like every
+      // other fixture, so one still trickling in after this test would move
+      // the badge between the next test's before-read and its delta.
+      await expect(threadRow(timelineSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
     });
 
     aliceThreadId = await idOf(threadRow(aliceSubject), "thread-row-");
@@ -1478,5 +1568,72 @@ test.describe.serial("Mail journey", () => {
     await expect(toggle).toHaveText("Shared", { timeout: REFETCH_TIMEOUT_MS });
     await toggle.click();
     await expect(toggle).toHaveText("Private", { timeout: REFETCH_TIMEOUT_MS });
+  });
+
+  // -- Phase 5: mail on the record timeline, the two-user privacy leg, and
+  //    the link panel's picker ------------------------------------------
+  //
+  // The mailbox is PRIVATE by the time these run (the two tests above each
+  // end by putting it back), which is the state the privacy leg is about.
+
+  test("puts the conversation on its contact's timeline, with the subject rendered live", async () => {
+    await page.goto(`/contacts/${timelineContactId}`);
+    // Timeline is the rail's default tab. Nothing here clicks "Load more":
+    // this contact's timeline holds three entries at most, and a paginated
+    // timeline freezes its first page.
+    await expect(page.getByTestId("timeline")).toBeVisible();
+    const entry = page.getByTestId("timeline-entry")
+      .filter({ hasText: `received mail "${timelineSubject}"` });
+    await expect(entry).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    // THE SUBJECT ON THAT ENTRY IS NOT STORED ON IT. The event carries a
+    // pointer to the thread and no content at all; the subject is read
+    // through the visibility rules at request time, which is exactly why the
+    // next test can be true. What the reader gets is the conversation.
+    await entry.getByTestId("timeline-thread-link").click();
+    await expect(page).toHaveURL(/\/mail\?thread=[0-9a-f-]{36}$/);
+    await expect(page.getByTestId("conversation")).toContainText(timelineSubject);
+  });
+
+  test("keeps that private conversation off the second user's timeline for the same contact", async () => {
+    await bPage.goto(`/contacts/${timelineContactId}`);
+
+    // THE LOADED-LIST SENTINEL, and it has to come first: the contact's own
+    // creation entry is ordinary CRM activity that every user can see, so
+    // its arrival is what makes the absence below a statement about a
+    // timeline that LOADED rather than one that has not answered yet.
+    await expect(bPage.getByTestId("timeline-entry").filter({ hasText: "created" }))
+      .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+
+    // ...and A's mail is not there. Not a redacted stub, not an "activity
+    // you cannot see" placeholder -- an entry like that would leak both the
+    // existence and the timing of someone else's mail. NO ROW AT ALL, which
+    // is why the second assertion is about the mail entry's own link rather
+    // than only about the subject text.
+    await expect(bPage.getByTestId("timeline-entry").filter({ hasText: timelineSubject }))
+      .toHaveCount(0);
+    await expect(bPage.getByTestId("timeline").getByTestId("timeline-thread-link")).toHaveCount(0);
+  });
+
+  test("opens the link panel's contact picker on the conversation", async () => {
+    // The app's ONE entity picker moved out of this panel in Phase 5, so the
+    // Meetings tab's attendee input could use it (e2e/meetings.spec.ts picks
+    // a contact through the other copy). Nothing asserted its addresses from
+    // outside before, in either place: this is the mail half of closing that.
+    await page.goto(`/mail?thread=${aliceThreadId}`);
+    await expect(page.getByTestId("conversation")).toBeVisible();
+
+    const panel = page.getByTestId("link-panel");
+    await panel.getByTestId("link-contact").click();
+    const search = panel.getByTestId("link-search-contact");
+    await expect(search).toBeVisible();
+    await search.fill(contactName);
+    await expect(panel.getByTestId(`link-option-${contactId}`)).toBeVisible();
+
+    // Cancelled rather than picked: this thread is already linked to Alice
+    // (auto-linked at ingest, asserted several tests up), and re-linking her
+    // would prove nothing while moving state the earlier assertions describe.
+    await panel.getByRole("button", { name: "Cancel" }).click();
+    await expect(panel.getByTestId("link-search-contact")).toHaveCount(0);
   });
 });
