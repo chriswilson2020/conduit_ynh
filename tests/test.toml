@@ -8,7 +8,7 @@ test_format = 1.0
     # an oversight (coordinator ruling, v0.8.0 spec review).
     #
     # manifest.toml HAS moved on: the version has been bumped release after
-    # release since v0.1.2 -- 0.2.0 through 0.8.0~ynh1 (see
+    # release since v0.1.2 -- 0.2.0 through 0.9.0~ynh1 (see
     # `git log -p -- manifest.toml`) -- so genuine prior releases to upgrade
     # from exist. What does not exist is the package_check harness in this
     # repo's CI: nothing here runs package_check today, so a
