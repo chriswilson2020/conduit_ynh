@@ -70,6 +70,22 @@ export interface RichTextEditorProps {
  * so the render and the stored document agree by construction rather than by
  * coincidence. MessageFrame's sandboxed iframe is the mail precaution that
  * does NOT carry over: that one is for documents written by strangers.
+ *
+ * ONE OF THE TWO IS NOT THE INHERITED VALUE. `target="_blank"` already was
+ * the extension's default; `rel` was `noopener noreferrer nofollow`, and
+ * `nofollow` is deliberately dropped so the render matches the sanitizer
+ * byte for byte. Stating both together is what makes that legible -- a
+ * reader diffing this against the extension's defaults would otherwise find
+ * one unexplained discrepancy in the comment written to explain the
+ * mechanism.
+ *
+ * BLAST RADIUS: EXTENSIONS is shared with RichTextEditor, so this reaches
+ * the mail composer, signatures and templates as well as the read-only
+ * view. It changes no stored or sent byte: every producer runs through
+ * sanitizeMailHtml, whose simpleTransform overwrites rel and target on
+ * every anchor unconditionally, and tiptap parses both attributes from the
+ * DOM when rendering stored HTML, so a stored anchor renders as stored
+ * regardless of what is configured here.
  */
 const EXTENSIONS = [
   StarterKit.configure({ link: false }),
