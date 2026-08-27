@@ -68,7 +68,7 @@ describe("meetings service", () => {
     expect(met[0]?.dealId).toBe(deal.id);
     expect(met[0]?.contactId).toBeNull();
     // The timeline renders exclusively from the payload (web:
-    // rail/timeline.tsx's summarize), and event rows are append-only history:
+    // rail/timeline-lib.ts's summarize), and event rows are append-only history:
     // a row written without its render data renders blank forever.
     expect(met[0]?.payload).toEqual({ title: "Kickoff" });
   });

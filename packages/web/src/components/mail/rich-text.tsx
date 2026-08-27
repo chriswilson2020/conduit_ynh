@@ -62,15 +62,6 @@ const toolbarButtonClass =
 const activeToolbarButtonClass = "rounded bg-slate-200 px-2 py-1 text-xs font-medium text-slate-900";
 
 /**
- * The one rich-text editor in the app (Phase 4's first TipTap use): message
- * bodies, per-account signatures and email templates all render through it.
- * StarterKit + Link, and nothing else -- see EXTENSIONS above.
- *
- * All output HTML is sanitized SERVER-side on every write path (signatures,
- * templates and compose bodies all run through mail-content.ts's shared
- * sanitizer), so this editor never has to be the security boundary.
- */
-/**
  * Read-only rendering of HTML this app itself produced: meeting notes
  * (Phase 5), which are written in the editor below and sanitized server-side
  * on write with the shared `sanitizeMailHtml` profile.
@@ -109,6 +100,15 @@ export function RichTextView({ html, className, testId }: { html: string; classN
   );
 }
 
+/**
+ * The one rich-text editor in the app (Phase 4's first TipTap use): message
+ * bodies, per-account signatures and email templates all render through it.
+ * StarterKit + Link, and nothing else -- see EXTENSIONS above.
+ *
+ * All output HTML is sanitized SERVER-side on every write path (signatures,
+ * templates and compose bodies all run through mail-content.ts's shared
+ * sanitizer), so this editor never has to be the security boundary.
+ */
 export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
   function RichTextEditor({ initialHtml = "", onChange, onCreate, className, testId, ariaLabel }, ref) {
     // Memoised for the same reason EXTENSIONS is hoisted: a new object here

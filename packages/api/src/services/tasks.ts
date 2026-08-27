@@ -240,7 +240,7 @@ export async function createTask(
       // second spelling of one fact. The payload stays {} because a task's
       // `created` entry renders as bare "created" for every task -- it does
       // not even name the task -- so there is no render data for this row to
-      // be missing (web: rail/timeline.tsx's summarize).
+      // be missing (web: rail/timeline-lib.ts's summarize).
       meetingId: origin?.meetingId ?? null,
       payload: {},
     });

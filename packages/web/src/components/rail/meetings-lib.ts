@@ -378,6 +378,17 @@ export function addTaskBlockedReason(input: {
  * BECAUSE they are meant to be branched on: DuplicateAttendeeError was given
  * its own code purely so a client could tell "fix this one row of the attendee
  * list" from "refetch and retry" (api: services/errors.ts).
+ *
+ * ONE CODE IS DELIBERATELY NOT BRANCHED, and the omission rests on something
+ * worth naming. A generic 409 `conflict` reaches nothing here because the only
+ * meeting write that can raise one is updateMeeting emptying a meeting's last
+ * record link -- and v0.9.0 ships no meeting-EDIT affordance, so that request
+ * cannot be made from this tab. THE DAY AN EDIT FORM LANDS, this mapper owes
+ * `conflict` its own arm: Task 2 gave the duplicate-attendee case a code of
+ * its own precisely so the two could be told apart, its intent being that a
+ * duplicate attendee is one row of the attendee list to fix while an emptied
+ * last link is a different section of the form entirely. Falling through to
+ * the server's interpolated message would tell the user neither.
  */
 export function meetingErrorMessage(error: unknown): string {
   if (error instanceof ApiError) {
@@ -386,8 +397,16 @@ export function meetingErrorMessage(error: unknown): string {
         return "That person is already an attendee of this meeting.";
       case "archived":
         return "This meeting is archived. Unarchive it to make changes.";
+      // Two paths reach this, and the wording has to be true of both: an
+      // archive/unarchive of a meeting that is gone, and a CREATE whose linked
+      // record or attendee identity was not found (createMeeting
+      // existence-checks all of them, and answers 404 for any that is
+      // missing). Neither is reachable in an app that archives rather than
+      // deletes, which is why one line covers the class instead of guessing
+      // which of the two happened. followUpErrorMessage's own arm below stays
+      // meeting-specific: createMeetingTask's only 404 is its mustGet.
       case "not_found":
-        return "This meeting no longer exists. Refresh to see the current list.";
+        return "This meeting, or something it refers to, could not be found. Refresh to see the current state.";
       default:
         return error.message;
     }

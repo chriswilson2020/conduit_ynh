@@ -11,9 +11,13 @@ import { Input } from "./ui/input";
  * the Meetings tab needed the same "find a contact by typing" interaction for
  * its attendee input. It sits at components/ root rather than inside either
  * feature for the reason owner-select.tsx does: a picker used by two features
- * belongs to neither. Nothing about the component changed in the move --
- * including its `link-`prefixed testids, which existing mail e2e locates it
- * by.
+ * belongs to neither. Nothing about the component changed in the move,
+ * its `link-`prefixed testids included: those are the mail link panel's
+ * established addresses, and renaming them for tidiness would be churn in a
+ * shipped feature to no end. (No e2e spec references them today -- checked
+ * repo-wide during the Phase 5 spec review -- so the move is unguarded from
+ * outside either way; that is a gap for e2e to close, not a reason to
+ * rename.)
  *
  * `MailLinkKind` is reused as the kind enum rather than a second identical
  * union being declared here: its four members ARE the four record kinds this

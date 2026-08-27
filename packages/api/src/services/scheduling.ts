@@ -617,7 +617,7 @@ export async function compactSchedule(db: Database, actorId: string, projectId: 
           cascadedFrom: null,
           // Distinguishes a compaction-driven move from an interactive drag's
           // own `shifted` event on the timeline (see the doc comment on this
-          // function, and timeline.tsx's summarize()) -- cascadedFrom alone
+          // function, and timeline-lib.ts's summarize()) -- cascadedFrom alone
           // can't do that here since it's always null for compactSchedule.
           compacted: true,
         },

@@ -224,6 +224,20 @@ describe("addTaskBlockedReason", () => {
       meetingArchived: true, projectId: "p1", project: { archivedAt: null },
     })).toBe(MEETING_ARCHIVED_REASON);
   });
+
+  it("names the MEETING when both it and its project are archived", () => {
+    // The case that actually pins the ORDER, and the reason it is its own
+    // test: with only the meeting archived, a project-first implementation
+    // answers identically, so the assertion above passes under that mutation
+    // and every other one in this file does too. The meeting is the nearer
+    // cause and the one the reader can act on from this very view -- its own
+    // Unarchive button is on screen, the project's is a page away -- so it
+    // must win. Mutation-verified: reordering the two checks fails exactly
+    // this test and nothing else.
+    expect(addTaskBlockedReason({
+      meetingArchived: true, projectId: "p1", project: { archivedAt: "2026-08-01T00:00:00.000Z" },
+    })).toBe(MEETING_ARCHIVED_REASON);
+  });
 });
 
 describe("error messages", () => {
