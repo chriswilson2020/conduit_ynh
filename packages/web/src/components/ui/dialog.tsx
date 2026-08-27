@@ -30,10 +30,18 @@ type ContentProps = ComponentPropsWithoutRef<typeof RadixDialog.Content>;
  * base with `md:` restoring the desk) for one reason: this phase must not
  * change the desktop, and leaving the desktop string LITERALLY the one that
  * shipped is a stronger guarantee than re-deriving it from a phone base and
- * hoping every property came back. It costs a property-for-property override
- * -- `max-md:left-0` against `left-1/2`, not a blanket `max-md:inset-0`,
- * because Tailwind orders the inset shorthand BEFORE the longhands and a
- * variant only reliably beats the base utility of the SAME property.
+ * hoping every property came back.
+ *
+ * The overrides are written property-for-property -- `max-md:left-0` against
+ * `left-1/2`, never a blanket `max-md:inset-0`. BE CLEAR ABOUT WHY, because
+ * the obvious reason is wrong and was believed here for a round: Tailwind does
+ * order the inset shorthand before the longhands, but only WITHIN the base
+ * utility layer. Every `max-md` rule is emitted after that layer ends, in a
+ * single media block of its own, so a blanket `max-md:inset-0` would in fact
+ * have beaten `left-1/2`. The property-for-property form is kept because it is
+ * the one that does not depend on knowing that -- it stays correct if the
+ * shape gains a `md:` sibling, if a caller passes its own variant class, or if
+ * a future Tailwind emits variants differently. It is defensive, not required.
  */
 const SHAPES = {
   /**
@@ -115,17 +123,28 @@ function Overlaid({
  * click on the page around the card. Turn the same dialog into a full-screen
  * sheet and BOTH of those disappear -- a phone has no Escape key, and a
  * surface pinned to all four edges has no outside to click. Eight of this
- * app's DialogContent callers have no Cancel button of their own (the create
+ * app's DialogContent callers have no Cancel button of their own -- the create
  * dialogs on companies, contacts, projects, pipelines, the task board, the
- * company page's two, the deal and project pages'), and every one of them
- * would have become exactly the dead end the phase's definition of done
- * forbids.
+ * board's New deal, the company page's two, and the project page's -- and
+ * every one of them would have become exactly the dead end the phase's
+ * definition of done forbids.
  *
  * The control is `md:hidden`, so at a desk it is display:none -- out of the
  * accessibility tree, no pixel changed, and the dialogs that DO have a Cancel
  * are not given a second one there. It sits in the flow above the caller's
  * children rather than absolutely over them, because a caller's first child is
  * usually its title and an overlay would sooner or later land on top of one.
+ *
+ * A HAZARD THIS CREATES FOR THE NEXT DIALOG, since it is invisible until it
+ * bites: below the breakpoint this Close is the FIRST TABBABLE CHILD of every
+ * dialog, and Radix's default opening focus is the first tabbable descendant.
+ * That is exactly the bug Task 1 had to fix for the search sheet -- a surface
+ * whose whole purpose is typing, announcing "Close, button" on open. It does
+ * not bite today only because every no-Cancel caller marks its first input
+ * `autoFocus`, and Radix's FocusScope skips its own autofocus once focus is
+ * already inside the content. A new dialog added WITHOUT an autoFocus'd field
+ * will open focused here. Give it one, or pass `onOpenAutoFocus` (the whole of
+ * Radix's Content props are forwarded) and focus what the dialog is for.
  */
 export function DialogContent({ children, ...rest }: ContentProps) {
   return (

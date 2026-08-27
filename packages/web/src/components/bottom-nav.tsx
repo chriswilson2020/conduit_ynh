@@ -98,9 +98,8 @@ function SearchIcon() {
  * term stays inert and correct, and becomes the right padding on the day
  * somebody does the full inset audit that meta demands. It is named in prose
  * WITHOUT its bracket syntax on purpose, here and in shell.tsx: Tailwind v4
- * scans this
- * file as plain text and emits ANY bracketed class it finds -- a comment is
- * not a comment to it -- so an abbreviated one compiles to CSS that
+ * scans this file as plain text and emits ANY bracketed class it finds -- a
+ * comment is not a comment to it -- so an abbreviated one compiles to CSS that
  * lightningcss rejects, and every later build carries a warning that reads
  * like a real bug. Spell such a class out in full or leave the brackets off.
  */

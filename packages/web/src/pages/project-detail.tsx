@@ -267,7 +267,9 @@ export function ProjectDetailPage() {
               value={project.color ?? DEFAULT_COLOR}
               onChange={(event) => handleColorChange(event.target.value)}
               disabled={archived}
-              className="h-8 w-16 cursor-pointer rounded border border-slate-300 disabled:cursor-not-allowed"
+              // 64x32 at a desk; the floor applies to the short axis only,
+              // since 64 already clears it on the long one.
+              className="h-8 w-16 cursor-pointer rounded border border-slate-300 disabled:cursor-not-allowed max-md:h-11"
             />
           </div>
         </div>

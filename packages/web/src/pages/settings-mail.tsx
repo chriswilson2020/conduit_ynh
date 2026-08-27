@@ -447,7 +447,10 @@ function FolderPicker({ account }: { account: MailAccountWithSyncStats }) {
             <li key={folder.id}>
               <label
                 className={clsx(
-                  "flex items-center gap-2 text-sm",
+                  // A list row, and the label IS the row: it wraps the 13px
+                  // box and the folder name, so flooring it here is what makes
+                  // the whole row tappable rather than the checkbox alone.
+                  "flex items-center gap-2 text-sm max-md:min-h-11",
                   why === undefined ? "text-slate-700" : "text-slate-400",
                 )}
                 title={why}
@@ -694,7 +697,8 @@ function AccountForm({
         <Input value={state.username} onChange={(e) => set("username", e.target.value)} autoComplete="username" />
       </Field>
 
-      <label className="flex items-center gap-2 text-sm text-slate-600">
+      {/* The label is the touch target, not the 13px box inside it. */}
+      <label className="flex items-center gap-2 text-sm text-slate-600 max-md:min-h-11">
         <input
           type="checkbox"
           checked={state.smtpDiffers}

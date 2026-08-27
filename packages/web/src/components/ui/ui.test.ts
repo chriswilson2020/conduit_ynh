@@ -72,17 +72,32 @@ describe("the modal skeleton", () => {
   });
 
   /**
-   * A caller's own class and the shape's have the same specificity, so which
-   * wins is decided by the order Tailwind emits them, not by the order they
-   * are written -- and the phone form only reliably beats a base utility of
-   * the SAME property. The shape undoes exactly three families a caller
-   * currently reaches for: the width cap, the height cap, and scrolling.
+   * A caller's class and the shape's have the same specificity, so which wins
+   * is decided by the order Tailwind emits them, not by the order they are
+   * written. Below the breakpoint the shape wins on the three families a
+   * caller currently reaches for -- the width cap, the height cap and
+   * scrolling -- because every `max-md` rule is emitted after the whole base
+   * utility layer. So the invariant this guards is not which VALUES the
+   * callers pass but which PROPERTIES they touch: a dialog sized some other
+   * way (a fixed width, its own inset, a radius) would leave the phone sheet
+   * wearing half a desktop card, and has to teach the shape a matching
+   * override before it gets past here.
    *
-   * So the invariant is not which values the callers pass (those may change
-   * freely) but which PROPERTIES they touch. A caller that sized its dialog
-   * some other way -- a fixed width, its own inset, a radius -- would leave
-   * the phone sheet wearing half a desktop card, and has to teach the shape a
-   * matching override before it can get past this test.
+   * DO NOT READ THIS AS "the caller's cap applies at a desk", because two of
+   * the three do not. Tailwind sorts `max-w-*` alphabetically, not by size, so
+   * `.max-w-md` from the shape is emitted AFTER `.max-w-2xl` and `.max-w-3xl`
+   * and wins in the base layer: measured at 1280, a DialogContent carrying
+   * `max-w-3xl` computes `max-width: 448px`. The width caps on composer.tsx,
+   * settings-mail.tsx and settings-templates.tsx are inert at every width.
+   * That is PRE-EXISTING and deliberately not fixed by this phase -- widening
+   * three dialogs is a desktop change -- but nothing here should imply
+   * otherwise. The height caps are a different utility from the shape's and do
+   * apply at a desk.
+   *
+   * WHAT THIS GUARD CANNOT SEE, the same caveat nav-lib.test.ts's two source
+   * readers carry: it matches ONE SPELLING, a literal
+   * `<DialogContent className="...">`. A caller composing its class with
+   * clsx(), a template literal, or a variable slips past silently.
    */
   it("lets callers tune only the properties the phone shape undoes", () => {
     const dialog = here("dialog.tsx");

@@ -98,9 +98,20 @@ const EXTENSIONS = [
 
 const EDITOR_CLASS = "min-h-[8rem] w-full px-3 py-2 text-sm text-slate-900 focus:outline-none";
 
+// Two complete strings rather than a base plus an "active" fragment, the
+// convention this package uses wherever a control has exactly two states.
+//
+// These are the clearest ICON BUTTONS in the app -- a single letter or a
+// bullet each, 24x24 and 19x24 at rest -- and this editor is inside three
+// surfaces a phone has to be able to use: the composer (a full-screen sheet),
+// the meeting form, and both settings pages. The floor is `max-md:` for the
+// usual reason, and inline-flex with it because min-height on its own would
+// leave the glyph sitting at the top of a 44px box.
+const TOOLBAR_BUTTON_TOUCH = "max-md:inline-flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center";
 const toolbarButtonClass =
-  "rounded px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-50";
-const activeToolbarButtonClass = "rounded bg-slate-200 px-2 py-1 text-xs font-medium text-slate-900";
+  `rounded px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-50 ${TOOLBAR_BUTTON_TOUCH}`;
+const activeToolbarButtonClass =
+  `rounded bg-slate-200 px-2 py-1 text-xs font-medium text-slate-900 ${TOOLBAR_BUTTON_TOUCH}`;
 
 /**
  * Read-only rendering of HTML this app itself produced: meeting notes

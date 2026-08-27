@@ -244,7 +244,8 @@ export function CompanyDetailPage() {
           <div className="mb-2 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-900">Pipelines</h2>
             <div className="flex items-center gap-3">
-              <label className="flex items-center gap-2 text-sm text-slate-600">
+              {/* The label is the touch target, not the 13px box inside it. */}
+              <label className="flex items-center gap-2 text-sm text-slate-600 max-md:min-h-11">
                 <input
                   type="checkbox"
                   data-testid="show-archived-pipelines"
