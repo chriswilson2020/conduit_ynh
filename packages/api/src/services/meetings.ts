@@ -1,8 +1,8 @@
 import { and, asc, desc, eq, inArray, isNull, isNotNull, lt, or, sql } from "drizzle-orm";
 import { meetingAtLeastOneLink } from "@conduit/shared";
 import type {
-  Meeting, MeetingAttendee, MeetingAttendeeInput, MeetingCreateInput, MeetingDetail,
-  MeetingListFilters, MeetingUpdateInput, Task,
+  CreateTaskInput, Meeting, MeetingAttendee, MeetingAttendeeInput, MeetingCreateInput,
+  MeetingDetail, MeetingListFilters, MeetingUpdateInput, Task,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
@@ -12,7 +12,7 @@ import {
 import { NotFoundError, ArchivedError, ConflictError, DuplicateAttendeeError } from "./errors.js";
 import { sanitizeMailHtml } from "./mail-content.js";
 import { decodeOccurredAtCursor, encodeCursor } from "./pagination.js";
-import { toTask } from "./tasks.js";
+import { createTask, toTask } from "./tasks.js";
 import { publish } from "./sse.js";
 
 /**
@@ -116,8 +116,11 @@ const taskCreatedFromMeeting = and(eq(events.verb, "created"), isNotNull(events.
  * never "once Task 3 writes rows" -- scanning 300k events to return nothing
  * costs the same as scanning them to return five. events_meeting_id_idx
  * (drizzle/0008, partial on meeting_id IS NOT NULL) took a page's count from
- * 42.7ms / 4,243 buffers to 0.120ms / 103; that migration's comment carries
- * the full figures.
+ * 42.7ms / 4,243 buffers to 0.120ms / 103. RE-MEASURED with Task 3's rows
+ * really there (300,005 events of which 110,005 carry a meeting, 60,000
+ * follow-up tasks over 50,000 meetings, warm): a 50-id page returning 100
+ * matching rows is 0.198ms / 155 buffers, against 34.7ms / 4,477 with the
+ * index dropped. That migration's comment carries both sets of figures.
  */
 async function loadTaskCounts(db: Database, meetingIds: string[]): Promise<Map<string, number>> {
   const byMeeting = new Map<string, number>();
@@ -137,7 +140,11 @@ async function loadTaskCounts(db: Database, meetingIds: string[]): Promise<Map<s
 /** The follow-up tasks one meeting produced, under taskCreatedFromMeeting's
  * criterion. Oldest first, which is the order they were added in. Served by
  * the same events_meeting_id_idx as the count above: 39.6ms / 4,258 buffers
- * without it, 0.046ms / 19 with (drizzle/0008 carries the methodology). */
+ * without it, 0.046ms / 19 with (drizzle/0008 carries the methodology).
+ * Re-measured with real rows -- 0.050ms / 14 for a meeting with two tasks,
+ * against 36.1ms / 4,485 with the index dropped: the EXISTS stays a semi-join
+ * driven from the index into tasks_pkey, and 60,000 tasks in the table do not
+ * turn it into a scan of `tasks`. */
 async function loadMeetingTasks(db: Database, meetingId: string): Promise<Task[]> {
   const rows = await db.select().from(tasks)
     .where(sql`EXISTS (SELECT 1 FROM ${events} WHERE ${events.taskId} = ${tasks.id} AND ${events.meetingId} = ${meetingId} AND ${taskCreatedFromMeeting})`)
@@ -567,6 +574,68 @@ async function setArchived(db: Database, actorId: string, id: string, archived: 
 }
 export const archiveMeeting = (db: Database, a: string, id: string) => setArchived(db, a, id, true);
 export const unarchiveMeeting = (db: Database, a: string, id: string) => setArchived(db, a, id, false);
+
+/**
+ * A follow-up task from a meeting: the spec's action item that becomes a real
+ * task, carrying the meeting's links so it lands on the right records without
+ * anyone re-picking them.
+ *
+ * THROUGH createTask, NEVER A SECOND CREATION PATH. Sibling positioning, the
+ * dates pairing, the parent/one-level rule, the archived-project refusal, the
+ * SSE hint and the compactor's assumptions all live in that function; a task
+ * inserted here would be a task exempt from every one of them, and the
+ * exemption would only ever be noticed as a bug. The meeting rides along as
+ * createTask's `origin`, which stamps events.meeting_id on the task's own
+ * `created` row -- the one row taskCreatedFromMeeting above reads back.
+ *
+ * ARCHIVED MEETINGS REFUSE (coordinator ruling), as a 409 `archived` and not
+ * a 404: an archived meeting still exists and is still readable, it has just
+ * been filed away, and filing it away means it does not sprout new work.
+ * Unarchive it and the same request works -- exactly what the code updateMeeting
+ * answers for a patch on an archived meeting tells a client. Read-then-write,
+ * with no lock spanning the two (a concurrent archive between them yields a
+ * task from a just-archived meeting): the same shape tasks.ts's
+ * assertProjectActive already has for an archived project, and closing it
+ * would mean holding a transaction across createTask's own -- the second
+ * creation path this function exists to avoid.
+ */
+export async function createMeetingTask(
+  db: Database, actorId: string, meetingId: string, input: CreateTaskInput,
+): Promise<Task> {
+  const meeting = await mustGet(db, meetingId);
+  if (meeting.archivedAt !== null) throw new ArchivedError("meeting", meetingId);
+
+  // THE MEETING'S LINKS ARE DEFAULTS, NOT A CAGE: each of the four falls back
+  // to the meeting's only when the caller said nothing about it. `!==
+  // undefined` (the house merge idiom) is what distinguishes "said nothing"
+  // from an explicit null -- a caller who deliberately clears a link gets an
+  // unlinked task rather than the meeting's, which is the same three-state
+  // reading updateMeeting's merge uses. The wire shape
+  // (meetingTaskCreateInputSchema) omits all four in v0.9.0, so today only a
+  // direct service caller can override; the merge is written this way because
+  // "inherit unless told otherwise" is the rule, and a version of it that
+  // could only inherit would have to be rewritten the moment the form offers
+  // the choice.
+  //
+  // Nothing re-validates the inherited links here: createTask asserts every
+  // one it is handed (existence for company/contact/deal, still-active for
+  // project), so a meeting linked to an archived project refuses a follow-up
+  // task exactly as a directly-supplied one would -- one rule, one place.
+  const task = await createTask(db, actorId, {
+    ...input,
+    companyId: input.companyId !== undefined ? input.companyId : meeting.companyId,
+    contactId: input.contactId !== undefined ? input.contactId : meeting.contactId,
+    dealId: input.dealId !== undefined ? input.dealId : meeting.dealId,
+    projectId: input.projectId !== undefined ? input.projectId : meeting.projectId,
+  }, { meetingId: meeting.id });
+
+  // createTask published its own task keys; this publishes the meeting's,
+  // because the meeting a client is looking at just changed too -- taskCount
+  // on every list row and the detail payload's task list are both derived from
+  // the event that write just inserted.
+  publishMeetingHint(meeting.id);
+  return task;
+}
 
 // --- List ------------------------------------------------------------------
 

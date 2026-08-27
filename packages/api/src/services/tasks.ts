@@ -145,7 +145,28 @@ function fieldChanged(a: unknown, b: unknown): boolean {
   return a !== b;
 }
 
-export async function createTask(db: Database, actorId: string, input: CreateTaskInput): Promise<Task> {
+/**
+ * Where a task came from, when it came from something other than a plain
+ * "new task" (Phase 5: a meeting's follow-up). OPTIONAL at every call site --
+ * POST /api/tasks and every test that predates it pass nothing and are
+ * untouched -- and deliberately an object rather than a bare `meetingId`
+ * string, so a second kind of origin (a mail thread, say) is a field here
+ * instead of a fifth positional parameter.
+ *
+ * It exists because the provenance has to ride createTask's OWN event insert.
+ * services/meetings.ts's taskCreatedFromMeeting reads `verb = 'created' AND
+ * task_id IS NOT NULL` filtered by events.meeting_id, i.e. the task's own
+ * creation row must carry the meeting; and appending a second `created` row
+ * after this function returns would satisfy that count while putting TWO
+ * creation entries for one task on that task's timeline, in a separate
+ * transaction that a crash could leave unwritten. One row, stamped where it
+ * is already being written.
+ */
+export interface TaskOrigin { meetingId: string }
+
+export async function createTask(
+  db: Database, actorId: string, input: CreateTaskInput, origin?: TaskOrigin,
+): Promise<Task> {
   // createTaskInputSchema's .refine already enforces this at the HTTP
   // boundary; re-assert here for a direct service caller (tests, or a future
   // internal caller) that constructs the input by hand and bypasses zod.
@@ -202,7 +223,17 @@ export async function createTask(db: Database, actorId: string, input: CreateTas
     const eventCompanyId = await resolveEventCompanyId(tx, row);
     await tx.insert(events).values({
       verb: "created", actorUserId: actorId, taskId: row.id, projectId: row.projectId,
-      companyId: eventCompanyId, payload: {},
+      companyId: eventCompanyId,
+      // The COLUMN carries the provenance, not the payload: it is what
+      // meetings.ts's criterion reads, what events_meeting_id_idx
+      // (drizzle/0008) indexes, and it already reaches the client as
+      // Event.meetingId (shared's eventSchema), so a payload copy would be a
+      // second spelling of one fact. The payload stays {} because a task's
+      // `created` entry renders as bare "created" for every task -- it does
+      // not even name the task -- so there is no render data for this row to
+      // be missing (web: rail/timeline.tsx's summarize).
+      meetingId: origin?.meetingId ?? null,
+      payload: {},
     });
     return toTask(row);
   });

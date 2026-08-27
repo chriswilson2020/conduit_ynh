@@ -102,6 +102,21 @@ CREATE INDEX "meeting_attendees_meeting_id_idx" ON "meeting_attendees" USING btr
 --   * detail task list (one meeting): 39.6ms / 4,258 -> 0.046ms / 19 (index
 --     scan feeding PK probes into tasks).
 --
+-- RE-MEASURED IN TASK 3, once the follow-up rows those two queries look for
+-- actually existed (the figures above are the same scans returning nothing).
+-- Same 300,005 events, now 110,005 of them carrying meeting_id: 50,005
+-- lifecycle rows plus 60,000 follow-up creation rows over 50,000 meetings and
+-- 60,000 tasks, warm:
+--   * list-page count (50 ids, 100 matching rows): 0.198ms / 155 buffers
+--     (bitmap index scan, 5 heap blocks) -- 34.7ms / 4,477 with the index
+--     dropped;
+--   * detail task list (one meeting, 2 tasks): 0.050ms / 14 -- 36.1ms / 4,485
+--     dropped.
+-- Both plans held their shape: real rows did not turn the detail query's
+-- EXISTS into a scan of `tasks` (the planner still drives the semi-join from
+-- this index into tasks_pkey), and the index grew to 2,528 kB against a 35 MB
+-- table.
+--
 -- PARTIAL on meeting_id IS NOT NULL, and it is the shape of the data that
 -- makes that worth stating: only a meeting's own three verbs ever set the
 -- column, so the index holds 50,005 of the 300,005 rows -- 1,552 kB against a

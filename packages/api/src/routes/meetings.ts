@@ -1,10 +1,13 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { meetingCreateInputSchema, meetingUpdateInputSchema } from "@conduit/shared";
+import {
+  meetingCreateInputSchema, meetingTaskCreateInputSchema, meetingUpdateInputSchema,
+} from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
 import { requireUser, mapDomainError, parseOrReject, validateCursor, idParamSchema } from "./helpers.js";
 import {
   createMeeting, getMeeting, updateMeeting, archiveMeeting, unarchiveMeeting, listMeetings,
+  createMeetingTask,
 } from "../services/meetings.js";
 import { decodeOccurredAtCursor } from "../services/pagination.js";
 
@@ -89,6 +92,31 @@ export function registerMeetingRoutes(app: FastifyInstance, { db }: CrmRouteDeps
     if (params === undefined) return;
     try {
       return await archiveMeeting(db, user.id, params.id);
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
+  });
+
+  // The follow-up task affordance. 201 with the TASK (not the meeting): the
+  // task is what was created, and it is the shape POST /api/tasks already
+  // answers with, so a client has one task-created response shape however the
+  // task was reached. The meeting's own list row and detail payload pick the
+  // new task up on their next read -- both derive it from the event this write
+  // stamped -- and the meeting's SSE keys are published for exactly that.
+  //
+  // No record links in the body: they are inherited from the meeting (see
+  // meetingTaskCreateInputSchema, which omits them). 404 for an unknown
+  // meeting, 409 `archived` for one that has been filed away.
+  app.post("/api/meetings/:id/tasks", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(meetingTaskCreateInputSchema, request.body, reply);
+    if (input === undefined) return;
+    try {
+      const task = await createMeetingTask(db, user.id, params.id, input);
+      return reply.code(201).send(task);
     } catch (error) {
       mapDomainError(reply, error);
     }

@@ -5,12 +5,15 @@ import { resolveUser } from "../users.js";
 import { events, meetingAttendees } from "../db/schema.js";
 import {
   createMeeting, getMeeting, updateMeeting, archiveMeeting, unarchiveMeeting, listMeetings,
+  createMeetingTask,
 } from "./meetings.js";
 import { createCompany, archiveCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
 import { createPipeline, createStage } from "./pipelines.js";
 import { createDeal } from "./deals.js";
-import { createTask, updateTask } from "./tasks.js";
+import { createProject, archiveProject } from "./projects.js";
+import { createTask, updateTask, archiveTask, listTasks } from "./tasks.js";
+import { listEvents } from "./timeline.js";
 import { NotFoundError, ArchivedError, ConflictError } from "./errors.js";
 
 const handle = openTestDatabase();
@@ -561,5 +564,198 @@ describe("meetings service", () => {
     const { items } = await listMeetings(handle.db, {});
     expect(items.map((m) => m.attendees.length)).toEqual([2, 1, 0]);
     expect(items[1]?.attendees[0]?.userId).toBe(actorId);
+  });
+});
+
+/**
+ * Follow-up tasks (Task 3). The write path behind POST /api/meetings/:id/tasks,
+ * and the other half of the criterion the block above pinned by hand: these
+ * tests drive the REAL writer, so a stamp that stopped matching
+ * taskCreatedFromMeeting fails here instead of being papered over by a
+ * hand-written row.
+ */
+describe("follow-up tasks from a meeting", () => {
+  it("inherits all four of the meeting's record links onto the task", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const contact = await createContact(handle.db, actorId, { firstName: "Dana", companyId: company.id });
+    const pipeline = await createPipeline(handle.db, actorId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, actorId, pipeline.id, { name: "Lead" });
+    const deal = await createDeal(
+      handle.db, actorId,
+      { title: "Acme deal", pipelineId: pipeline.id, stageId: stage.id, companyId: company.id }, "EUR",
+    );
+    const project = await createProject(handle.db, actorId, { name: "Rollout", companyId: company.id });
+    const meeting = await createMeeting(handle.db, actorId, {
+      title: "Kickoff", occurredAt: daysAgo(1),
+      companyId: company.id, contactId: contact.id, dealId: deal.id, projectId: project.id,
+    });
+
+    const task = await createMeetingTask(handle.db, actorId, meeting.id, { title: "Send the deck" });
+
+    expect(task.title).toBe("Send the deck");
+    expect(task.companyId).toBe(company.id);
+    expect(task.contactId).toBe(contact.id);
+    expect(task.dealId).toBe(deal.id);
+    expect(task.projectId).toBe(project.id);
+
+    // The provenance sits on the task's OWN creation row, in the column
+    // taskCreatedFromMeeting reads -- not in the payload, and not on a second
+    // row appended after the fact.
+    const created = await handle.db.select().from(events)
+      .where(and(eq(events.taskId, task.id), eq(events.verb, "created")));
+    expect(created).toHaveLength(1);
+    expect(created[0]?.meetingId).toBe(meeting.id);
+    expect(created[0]?.payload).toEqual({});
+  });
+
+  // The meeting's links are DEFAULTS, not a cage: a caller who names a link
+  // gets that one, and a caller who explicitly nulls one gets no link at all
+  // rather than the meeting's -- the same three-state reading updateMeeting's
+  // merge uses.
+  it("lets a caller-supplied link win over the meeting's, including an explicit null", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const other = await createCompany(handle.db, actorId, { name: "Other" });
+    const contact = await createContact(handle.db, actorId, { firstName: "Dana" });
+    const meeting = await createMeeting(handle.db, actorId, {
+      title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id, contactId: contact.id,
+    });
+
+    const overridden = await createMeetingTask(handle.db, actorId, meeting.id,
+      { title: "Chase the other side", companyId: other.id });
+    expect(overridden.companyId).toBe(other.id);
+    // The links nobody mentioned still inherit: overriding one is not a reset
+    // of all four.
+    expect(overridden.contactId).toBe(contact.id);
+
+    const cleared = await createMeetingTask(handle.db, actorId, meeting.id,
+      { title: "Internal only", contactId: null });
+    expect(cleared.contactId).toBeNull();
+    expect(cleared.companyId).toBe(company.id);
+  });
+
+  it("refuses a follow-up task on an archived meeting, and 404s an unknown one", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const meeting = await createMeeting(handle.db, actorId,
+      { title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id });
+    await archiveMeeting(handle.db, actorId, meeting.id);
+
+    // ArchivedError (409 `archived` at the route), not NotFoundError: the
+    // meeting exists and is still readable, it has just been filed away -- and
+    // filing it away means it does not sprout new work.
+    await expect(createMeetingTask(handle.db, actorId, meeting.id, { title: "Too late" }))
+      .rejects.toBeInstanceOf(ArchivedError);
+    await expect(createMeetingTask(handle.db, actorId, UNKNOWN_ID, { title: "Nowhere" }))
+      .rejects.toBeInstanceOf(NotFoundError);
+    // Neither refusal wrote anything.
+    expect(await listTasks(handle.db, {})).toEqual([]);
+    expect((await getMeeting(handle.db, meeting.id)).meeting.taskCount).toBe(0);
+
+    // Unarchiving lifts the refusal, with nothing else about the request
+    // changing.
+    await unarchiveMeeting(handle.db, actorId, meeting.id);
+    const task = await createMeetingTask(handle.db, actorId, meeting.id, { title: "Now fine" });
+    expect(task.companyId).toBe(company.id);
+  });
+
+  // The whole point of routing through createTask is that a follow-up task is
+  // an ORDINARY task. These three arms are behaviours only that function has:
+  // a copied insert would append no position, would accept a lone date, and
+  // would happily plant new work in an archived project.
+  it("creates the task through createTask, so every existing task rule still applies", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const project = await createProject(handle.db, actorId, { name: "Rollout", companyId: company.id });
+    const meeting = await createMeeting(handle.db, actorId,
+      { title: "Kickoff", occurredAt: daysAgo(1), projectId: project.id });
+
+    const first = await createTask(handle.db, actorId, { title: "Already there", projectId: project.id });
+    const followUp = await createMeetingTask(handle.db, actorId, meeting.id, { title: "Send the deck" });
+    // Appended after its new siblings, at the fractional position createTask
+    // computes under the sibling-group lock.
+    expect(followUp.projectId).toBe(project.id);
+    expect(followUp.position > first.position).toBe(true);
+
+    // tasks_dates_paired, re-asserted by createTask for a direct service caller.
+    await expect(createMeetingTask(handle.db, actorId, meeting.id,
+      { title: "Half dated", startDate: "2026-09-01" })).rejects.toThrow(/startDate and dueDate/);
+
+    // An archived project has deliberately stopped accepting new work, and it
+    // makes no difference that this task arrived through a meeting.
+    await archiveProject(handle.db, actorId, project.id);
+    await expect(createMeetingTask(handle.db, actorId, meeting.id, { title: "Too late" }))
+      .rejects.toThrow(/project .* is archived/);
+  });
+
+  // THE ANTI-DOUBLE-RENDER PIN. Stamping the meeting onto createTask's own
+  // event insert is what keeps this at one: an implementation that appended a
+  // second `created` row afterwards would satisfy taskCount just as well while
+  // putting two "created" entries for one task on that task's timeline.
+  it("writes exactly one creation entry for the task it produced", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const meeting = await createMeeting(handle.db, actorId,
+      { title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id });
+
+    const task = await createMeetingTask(handle.db, actorId, meeting.id, { title: "Send the deck" });
+
+    const own = await listEvents(handle.db, { taskId: task.id });
+    expect(own.items.map((e) => e.verb)).toEqual(["created"]);
+    expect(own.items[0]?.meetingId).toBe(meeting.id);
+    const rows = await handle.db.select().from(events).where(eq(events.taskId, task.id));
+    expect(rows).toHaveLength(1);
+  });
+
+  it("lists the tasks it produced on the detail payload, with the list row's count agreeing", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const meeting = await createMeeting(handle.db, actorId,
+      { title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id });
+    const other = await createMeeting(handle.db, actorId,
+      { title: "Unrelated", occurredAt: daysAgo(2), companyId: company.id });
+
+    const one = await createMeetingTask(handle.db, actorId, meeting.id, { title: "One" });
+    const two = await createMeetingTask(handle.db, actorId, meeting.id, { title: "Two" });
+    // Same company, same actor, no meeting: the count is about provenance, not
+    // about which records a task happens to touch.
+    await createTask(handle.db, actorId, { title: "Not from a meeting", companyId: company.id });
+
+    const detail = await getMeeting(handle.db, meeting.id);
+    expect(detail.tasks.map((t) => t.id)).toEqual([one.id, two.id]);
+    expect(detail.meeting.taskCount).toBe(2);
+
+    const counts = new Map((await listMeetings(handle.db, { companyId: company.id }))
+      .items.map((m) => [m.id, m.taskCount]));
+    expect(counts.get(meeting.id)).toBe(2);
+    expect(counts.get(other.id)).toBe(0);
+
+    // Archiving a follow-up task does not un-create it: the event still says
+    // this meeting produced it, so the count and the list stay the same set.
+    await archiveTask(handle.db, actorId, one.id);
+    const after = await getMeeting(handle.db, meeting.id);
+    expect(after.tasks.map((t) => t.id)).toEqual([one.id, two.id]);
+    expect(after.meeting.taskCount).toBe(2);
+  });
+
+  // Composed with the read-time widening (services/timeline.ts): attendance
+  // carries the MEETING to a contact's timeline, not everything the meeting
+  // spawned. timeline.test.ts pins that rule with a hand-written row; this
+  // proves the real writer produces exactly the row the arm must exclude, and
+  // that the exclusion is not vacuous -- the same row does reach the company's
+  // timeline, through the task's own inherited link.
+  it("keeps a follow-up task's creation entry off an attendee-only contact's timeline", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const dana = await createContact(handle.db, actorId, { firstName: "Dana" });
+    const meeting = await createMeeting(handle.db, actorId, {
+      title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id,
+      attendees: [{ contactId: dana.id }],
+    });
+
+    const task = await createMeetingTask(handle.db, actorId, meeting.id, { title: "Send the deck" });
+
+    const attended = await listEvents(handle.db, { contactId: dana.id });
+    expect(attended.items.some((e) => e.taskId === task.id)).toBe(false);
+    // What she does see: the meeting itself, and her own creation row.
+    expect(attended.items.map((e) => e.verb)).toEqual(["met", "created"]);
+    expect(attended.items[1]?.contactId).toBe(dana.id);
+
+    const onCompany = await listEvents(handle.db, { companyId: company.id });
+    expect(onCompany.items.some((e) => e.taskId === task.id && e.meetingId === meeting.id)).toBe(true);
   });
 });

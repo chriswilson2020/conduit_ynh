@@ -1853,6 +1853,83 @@ describe("meetings routes", () => {
     await a.close();
   });
 
+  it("creates a follow-up task with the meeting's links inherited, and lists it back on the meeting", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    const meeting = await makeMeeting(a, { title: "Kickoff", occurredAt, companyId: company.id });
+
+    const response = await a.inject({
+      method: "POST", url: `/api/meetings/${meeting.id}/tasks`, headers: authHeaders,
+      payload: { title: "Send the deck", type: "email" },
+    });
+    // 201 with the TASK, the same shape POST /api/tasks answers with -- one
+    // task-created response however the task was reached.
+    expect(response.statusCode).toBe(201);
+    const task = taskSchema.parse(response.json());
+    expect(task.companyId).toBe(company.id);
+    expect(task.type).toBe("email");
+
+    const detail = await a.inject({
+      method: "GET", url: `/api/meetings/${meeting.id}`, headers: authHeaders,
+    });
+    const body = meetingDetailSchema.parse(detail.json());
+    expect(body.tasks.map((t) => t.id)).toEqual([task.id]);
+    expect(body.meeting.taskCount).toBe(1);
+    await a.close();
+  });
+
+  // The wire shape omits the four record links (they are inherited), and zod's
+  // non-strict parse drops one sent anyway rather than rejecting the request --
+  // the same parse every other input schema in this codebase uses. The
+  // meeting's link is what the task gets, which is the point of the affordance.
+  it("ignores a record link sent in the follow-up body", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    const other = await makeCompany(a);
+    const meeting = await makeMeeting(a, { title: "Kickoff", occurredAt, companyId: company.id });
+
+    const response = await a.inject({
+      method: "POST", url: `/api/meetings/${meeting.id}/tasks`, headers: authHeaders,
+      payload: { title: "Send the deck", companyId: other.id },
+    });
+    expect(response.statusCode).toBe(201);
+    expect(taskSchema.parse(response.json()).companyId).toBe(company.id);
+
+    // The task rules travel with the route: a lone date is a 400 here exactly
+    // as it is on POST /api/tasks.
+    const halfDated = await a.inject({
+      method: "POST", url: `/api/meetings/${meeting.id}/tasks`, headers: authHeaders,
+      payload: { title: "Half dated", startDate: "2026-09-01" },
+    });
+    expect(halfDated.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(halfDated.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  it("returns 404 for a follow-up task on an unknown meeting and 409 archived on an archived one", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    const meeting = await makeMeeting(a, { title: "Kickoff", occurredAt, companyId: company.id });
+
+    const missing = await a.inject({
+      method: "POST", url: `/api/meetings/${unknownId}/tasks`, headers: authHeaders,
+      payload: { title: "Nowhere" },
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(missing.json()).error).toBe("not_found");
+
+    await a.inject({ method: "POST", url: `/api/meetings/${meeting.id}/archive`, headers: authHeaders });
+    const archived = await a.inject({
+      method: "POST", url: `/api/meetings/${meeting.id}/tasks`, headers: authHeaders,
+      payload: { title: "Too late" },
+    });
+    expect(archived.statusCode).toBe(409);
+    // `archived`, not `conflict`: unarchive the meeting and the same request
+    // works, which is what that code tells a client.
+    expect(errorResponseSchema.parse(archived.json()).error).toBe("archived");
+    await a.close();
+  });
+
   it("returns 401 without an identity header on every meetings route", async () => {
     const a = await app();
     const calls = [
@@ -1862,6 +1939,7 @@ describe("meetings routes", () => {
       { method: "PATCH" as const, url: `/api/meetings/${unknownId}` },
       { method: "POST" as const, url: `/api/meetings/${unknownId}/archive` },
       { method: "POST" as const, url: `/api/meetings/${unknownId}/unarchive` },
+      { method: "POST" as const, url: `/api/meetings/${unknownId}/tasks` },
     ];
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });

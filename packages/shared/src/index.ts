@@ -1531,3 +1531,30 @@ export const meetingListFiltersSchema = z.object({
   limit: z.number().int().positive().max(100).optional(),
 });
 export type MeetingListFilters = z.infer<typeof meetingListFiltersSchema>;
+
+/**
+ * Body of POST /api/meetings/:id/tasks -- the follow-up task a meeting
+ * produces (spec's Follow-ups decision).
+ *
+ * DERIVED from the same shape createTaskInputSchema is built on, minus the
+ * four record links, rather than restated: a task field added later (a
+ * priority, an estimate) arrives on this affordance too, where a hand-copied
+ * list would silently leave the meeting's Add-task form behind the task
+ * drawer's. The .refine is re-applied because .omit() returns the bare object
+ * shape, and a follow-up task obeys tasks_dates_paired exactly like any other
+ * (the whole point of routing this through createTask).
+ *
+ * THE LINKS ARE OMITTED BECAUSE THEY ARE INHERITED: the task takes the
+ * meeting's company/contact/deal/project, which is what "lands in the right
+ * place without re-picking" means in the spec. api: services/meetings.ts's
+ * createMeetingTask treats those as DEFAULTS and lets a caller-supplied link
+ * win, so the merge stays correct for a direct service caller; this wire
+ * shape simply does not offer the override in v0.9.0, and zod's non-strict
+ * parse drops a link sent anyway.
+ */
+export const meetingTaskCreateInputSchema = taskInputShape
+  .omit({ companyId: true, contactId: true, dealId: true, projectId: true })
+  .refine(taskDatesPaired, {
+    message: "startDate and dueDate must both be set (with startDate <= dueDate) or both omitted",
+  });
+export type MeetingTaskCreateInput = z.infer<typeof meetingTaskCreateInputSchema>;
