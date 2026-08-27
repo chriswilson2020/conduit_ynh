@@ -63,6 +63,7 @@ import {
   BULK_THREAD_ACTION_CAP,
   MOVE_ACTION_THREAD_CAP,
   meetingSchema,
+  meetingDetailSchema,
   meetingAttendeeSchema,
   meetingAttendeeInputSchema,
   meetingCreateInputSchema,
@@ -1586,8 +1587,16 @@ describe("meetingAttendeeSchema and meetingAttendeeInputSchema", () => {
     expect(() => meetingAttendeeInputSchema.parse({ contactId: null, userId: null, guestName: null })).toThrow();
   });
 
-  it("rejects a blank guest name", () =>
-    expect(() => meetingAttendeeInputSchema.parse({ guestName: "" })).toThrow());
+  // Trimmed before .min(1) (see attendeeIdentityFields): a whitespace-only
+  // guest name is a 400 here rather than a nameless attendee row that
+  // satisfies both this schema and the exactly-one CHECK, which only counts
+  // non-nulls. A padded name arrives at the service already trimmed.
+  it("rejects a blank or whitespace-only guest name, and trims a padded one", () => {
+    expect(() => meetingAttendeeInputSchema.parse({ guestName: "" })).toThrow();
+    expect(() => meetingAttendeeInputSchema.parse({ guestName: "   " })).toThrow();
+    expect(meetingAttendeeInputSchema.parse({ guestName: "  Their lawyer  " }))
+      .toEqual({ guestName: "Their lawyer" });
+  });
 });
 
 describe("meetingSchema", () => {
@@ -1597,6 +1606,7 @@ describe("meetingSchema", () => {
     notes: "<p>Agreed the scope</p>", ownerUserId: uuid2,
     companyId: uuid2, contactId: null, dealId: null, projectId: null,
     attendees: [{ id: uuid2, meetingId: uuid1, contactId: uuid1, userId: null, guestName: null }],
+    taskCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,
   };
 
@@ -1623,6 +1633,42 @@ describe("meetingSchema", () => {
   it("requires the attendees array to be present", () => {
     const { attendees: _attendees, ...withoutAttendees } = meeting;
     expect(() => meetingSchema.parse(withoutAttendees)).toThrow();
+  });
+
+  // taskCount rides every meeting (the rail's list rows render it); the tasks
+  // themselves ride the detail payload alone. A count is a whole
+  // non-negative number or it is not a count.
+  it("requires a whole non-negative taskCount", () => {
+    expect(meetingSchema.parse({ ...meeting, taskCount: 3 }).taskCount).toBe(3);
+    for (const taskCount of [-1, 1.5, "2"]) {
+      expect(() => meetingSchema.parse({ ...meeting, taskCount })).toThrow();
+    }
+    const { taskCount: _taskCount, ...withoutCount } = meeting;
+    expect(() => meetingSchema.parse(withoutCount)).toThrow();
+  });
+});
+
+describe("meetingDetailSchema", () => {
+  const now = new Date().toISOString();
+  const meeting = {
+    id: uuid1, title: "Kickoff", occurredAt: now, durationMinutes: null,
+    notes: null, ownerUserId: uuid2,
+    companyId: uuid2, contactId: null, dealId: null, projectId: null,
+    attendees: [], taskCount: 0,
+    archivedAt: null, createdAt: now, updatedAt: now,
+  };
+
+  // The mailThreadSchema/mailThreadDetailSchema split: `tasks` is a sibling
+  // of `meeting`, never a field inside it, so the meeting stays exactly the
+  // shape every other meeting-returning path answers with.
+  it("round-trips a meeting with no follow-up tasks yet", () => {
+    const detail = { meeting, tasks: [] };
+    expect(meetingDetailSchema.parse(detail)).toEqual(detail);
+  });
+
+  it("requires both keys", () => {
+    expect(() => meetingDetailSchema.parse({ meeting })).toThrow();
+    expect(() => meetingDetailSchema.parse({ tasks: [] })).toThrow();
   });
 });
 

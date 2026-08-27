@@ -1337,7 +1337,13 @@ export type SearchResults = z.infer<typeof searchResultsSchema>;
 const attendeeIdentityFields = {
   contactId: z.uuid().nullable(),
   userId: z.uuid().nullable(),
-  guestName: z.string().min(1).nullable(),
+  // Trimmed BEFORE .min(1), the same order folderNameSchema uses: a
+  // whitespace-only guest name is a 400 here rather than a nameless attendee
+  // row that satisfies both this schema and the exactly-one CHECK (which only
+  // counts non-nulls, and "   " is not null). The stored value is the trimmed
+  // one -- api: services/meetings.ts trims again for a direct service caller
+  // that bypasses this gate.
+  guestName: z.string().trim().min(1).nullable(),
 };
 
 // This predicate and the meeting_attendees_exactly_one DB CHECK
@@ -1432,12 +1438,35 @@ export const meetingSchema = z.object({
   // Always carried, never a separate fetch: a meeting without its attendees
   // is not a meeting, and the rail's LIST rows render an attendee summary
   // (spec's Web section), so there is no read path that wants the bare row.
-  // Task 3 extends this shape with the follow-up tasks the meeting produced,
-  // rather than widening it here for a collection nothing yet writes.
+  // The follow-up tasks themselves ride the DETAIL payload below, not this
+  // shape.
   attendees: z.array(meetingAttendeeSchema),
+  // How many follow-up tasks this meeting produced -- a count on every
+  // meeting, the full tasks only on meetingDetailSchema, which is the split
+  // mailThreadSchema/mailThreadDetailSchema already draws (a list row renders
+  // a number, a detail view renders the things). The rail's list shows
+  // "title, when, attendee summary, task count" (spec's Web section), so a
+  // page of rows must not pay for every task's full shape.
+  //
+  // Derived at read time from events.meeting_id (api: services/meetings.ts),
+  // never a stored column: the meeting-to-task link already exists as an
+  // event, and a second copy of it would be a second source of truth.
+  taskCount: z.number().int().nonnegative(),
   archivedAt: z.iso.datetime().nullable(), ...timestamps,
 });
 export type Meeting = z.infer<typeof meetingSchema>;
+
+// GET /api/meetings/:id. The meeting plus the follow-up tasks it produced
+// (Task 3's POST /api/meetings/:id/tasks writes them; this shape reads them
+// back), a sibling of `meeting` rather than a field inside it for the same
+// reason mailThreadDetailSchema keeps `messages` beside `thread`: `meeting`
+// stays exactly the row shape every other meeting-returning path answers
+// with, and the collection only a detail view needs stays out of it.
+export const meetingDetailSchema = z.object({
+  meeting: meetingSchema,
+  tasks: z.array(taskSchema),
+});
+export type MeetingDetail = z.infer<typeof meetingDetailSchema>;
 
 // ownerUserId is absent on purpose: the owner is the actor, stamped
 // server-side, the same rule notes' authorUserId and mail accounts' userId

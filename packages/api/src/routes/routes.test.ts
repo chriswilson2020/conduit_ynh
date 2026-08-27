@@ -9,6 +9,7 @@ import {
   errorResponseSchema, listResponseSchema, searchResultsSchema,
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
+  meetingSchema, meetingDetailSchema,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
@@ -1636,6 +1637,193 @@ describe("search route", () => {
     expect(response.statusCode).toBe(200);
     const body = searchResultsSchema.parse(response.json());
     expect(body.tasks.map((t) => t.id)).toContain(task.id);
+    await a.close();
+  });
+});
+
+async function makeMeeting(a: Awaited<ReturnType<typeof app>>, payload: Record<string, unknown>) {
+  const response = await a.inject({ method: "POST", url: "/api/meetings", headers: authHeaders, payload });
+  return meetingSchema.parse(response.json());
+}
+
+describe("meetings routes", () => {
+  const occurredAt = new Date("2026-08-20T09:00:00.000Z").toISOString();
+  const unknownId = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+
+  async function makeCompany(a: Awaited<ReturnType<typeof app>>) {
+    const response = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    return companySchema.parse(response.json());
+  }
+
+  it("creates a meeting and returns 201 with a contract-shaped body", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+
+    const response = await a.inject({
+      method: "POST", url: "/api/meetings", headers: authHeaders,
+      payload: {
+        title: "Kickoff", occurredAt, durationMinutes: 45, companyId: company.id,
+        notes: "<p>Agreed the scope</p><script>alert(1)</script>",
+        attendees: [{ guestName: "Their lawyer" }],
+      },
+    });
+    expect(response.statusCode).toBe(201);
+    const body = meetingSchema.parse(response.json());
+    expect(body.companyId).toBe(company.id);
+    expect(body.notes).toBe("<p>Agreed the scope</p>");
+    expect(body.attendees.map((x) => x.guestName)).toEqual(["Their lawyer"]);
+    expect(body.taskCount).toBe(0);
+    await a.close();
+  });
+
+  // The reachability rule reaches the client as a 400 (the zod refine), never
+  // as a 500 from the meetings_has_link CHECK.
+  it("returns 400 validation for a meeting linked to nothing", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/meetings", headers: authHeaders,
+      payload: { title: "Nowhere", occurredAt },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  // The patch shape carries no such refine (a patch cannot see the stored
+  // row), so the same rule arrives from the service as a 409 -- still not the
+  // CHECK's 500.
+  it("returns 409 conflict for a patch that empties the last link", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    const meeting = await makeMeeting(a, { title: "Kickoff", occurredAt, companyId: company.id });
+
+    const response = await a.inject({
+      method: "PATCH", url: `/api/meetings/${meeting.id}`, headers: authHeaders,
+      payload: { companyId: null },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+
+    const renamed = await a.inject({
+      method: "PATCH", url: `/api/meetings/${meeting.id}`, headers: authHeaders,
+      payload: { title: "Kickoff II", attendees: [{ guestName: "Their lawyer" }] },
+    });
+    expect(renamed.statusCode).toBe(200);
+    const patched = meetingSchema.parse(renamed.json());
+    expect(patched.title).toBe("Kickoff II");
+    expect(patched.attendees).toHaveLength(1);
+    await a.close();
+  });
+
+  it("returns 409 conflict when the same contact is listed twice", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    const contact = await a.inject({
+      method: "POST", url: "/api/contacts", headers: authHeaders, payload: { firstName: "Dana" },
+    });
+    const contactId = contactSchema.parse(contact.json()).id;
+
+    const response = await a.inject({
+      method: "POST", url: "/api/meetings", headers: authHeaders,
+      payload: {
+        title: "Kickoff", occurredAt, companyId: company.id,
+        attendees: [{ contactId }, { contactId }],
+      },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  it("lists a meeting under a contact who only attended it, and honours the archived tri-state", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    const contact = await a.inject({
+      method: "POST", url: "/api/contacts", headers: authHeaders, payload: { firstName: "Dana" },
+    });
+    const contactId = contactSchema.parse(contact.json()).id;
+    const meeting = await makeMeeting(a, {
+      title: "Kickoff", occurredAt, companyId: company.id, attendees: [{ contactId }],
+    });
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/meetings?contact_id=${contactId}`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listResponseSchema(meetingSchema).parse(listed.json()).items.map((m) => m.id))
+      .toEqual([meeting.id]);
+
+    await a.inject({ method: "POST", url: `/api/meetings/${meeting.id}/archive`, headers: authHeaders });
+    // "false" is a literal string on the wire, and it must not read as truthy.
+    const live = await a.inject({ method: "GET", url: "/api/meetings?archived=false", headers: authHeaders });
+    expect(listResponseSchema(meetingSchema).parse(live.json()).items).toHaveLength(0);
+    const archived = await a.inject({ method: "GET", url: "/api/meetings?archived=true", headers: authHeaders });
+    expect(listResponseSchema(meetingSchema).parse(archived.json()).items.map((m) => m.id))
+      .toEqual([meeting.id]);
+
+    const restored = await a.inject({
+      method: "POST", url: `/api/meetings/${meeting.id}/unarchive`, headers: authHeaders,
+    });
+    expect(restored.statusCode).toBe(200);
+    expect(meetingSchema.parse(restored.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  // Meetings page by (occurred_at, id): a cursor minted by a created_at list
+  // must be rejected here rather than silently paging from a timestamp that
+  // means something else.
+  it("returns 400 for a cursor belonging to another ordering", async () => {
+    const a = await app();
+    const foreign = Buffer.from(
+      JSON.stringify({ createdAt: occurredAt, id: unknownId }), "utf8",
+    ).toString("base64url");
+
+    const response = await a.inject({
+      method: "GET", url: `/api/meetings?cursor=${foreign}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).message).toBe("invalid cursor");
+    await a.close();
+  });
+
+  it("answers the detail payload and 404s an unknown id", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    const meeting = await makeMeeting(a, { title: "Kickoff", occurredAt, companyId: company.id });
+
+    const response = await a.inject({
+      method: "GET", url: `/api/meetings/${meeting.id}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(200);
+    const detail = meetingDetailSchema.parse(response.json());
+    expect(detail.meeting.id).toBe(meeting.id);
+    expect(detail.tasks).toEqual([]);
+
+    const missing = await a.inject({
+      method: "GET", url: `/api/meetings/${unknownId}`, headers: authHeaders,
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(missing.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  it("returns 401 without an identity header on every meetings route", async () => {
+    const a = await app();
+    const calls = [
+      { method: "GET" as const, url: "/api/meetings" },
+      { method: "POST" as const, url: "/api/meetings" },
+      { method: "GET" as const, url: `/api/meetings/${unknownId}` },
+      { method: "PATCH" as const, url: `/api/meetings/${unknownId}` },
+      { method: "POST" as const, url: `/api/meetings/${unknownId}/archive` },
+      { method: "POST" as const, url: `/api/meetings/${unknownId}/unarchive` },
+    ];
+    for (const call of calls) {
+      const response = await a.inject({ ...call, payload: {} });
+      expect(response.statusCode).toBe(401);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
+    }
     await a.close();
   });
 });

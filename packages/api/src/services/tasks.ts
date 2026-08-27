@@ -41,7 +41,11 @@ function publishTaskHint(task: Task, extraAssigneeIds: (string | null)[] = []): 
   publish({ keys });
 }
 
-function toTask(row: TaskRow): Task {
+// Exported so meetings.ts's detail payload renders the follow-up tasks a
+// meeting produced through the SAME row-to-wire mapper every other task
+// surface uses -- a second copy would be a second place for a new task field
+// to be forgotten.
+export function toTask(row: TaskRow): Task {
   return {
     id: row.id, title: row.title, description: row.description,
     type: row.type as TaskType, status: row.status as TaskStatus,
