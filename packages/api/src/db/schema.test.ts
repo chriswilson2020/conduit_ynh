@@ -19,9 +19,9 @@ import { createProject } from "../services/projects.js";
 import { listThreads } from "../services/mail-threads.js";
 import { createDatabase, migrationsFolder, type DatabaseHandle } from "./client.js";
 import {
-  users, companies, contacts, pipelines, stages, deals, projects,
+  users, companies, contacts, pipelines, stages, deals, projects, events,
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
-  mailThreadHides, emailTemplates,
+  mailThreadHides, emailTemplates, meetings, meetingAttendees,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -920,5 +920,283 @@ describe("mail thread hides schema (0007)", () => {
     // generous because the DB and test clocks are separate.
     expect(row!.hiddenAt.getTime()).toBeGreaterThanOrEqual(before - 5000);
     expect(row!.hiddenAt.getTime()).toBeLessThanOrEqual(after + 5000);
+  });
+});
+
+describe("meetings schema (0008)", () => {
+  const occurredAt = new Date("2026-08-20T09:00:00.000Z");
+
+  /** One company-linked meeting on the shared test database. */
+  async function seedMeeting(overrides: Partial<typeof meetings.$inferInsert> = {}): Promise<string> {
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const [meeting] = await handle.db.insert(meetings).values({
+      title: "Kickoff", occurredAt, ownerUserId: userId, companyId: company.id, ...overrides,
+    }).returning();
+    return meeting!.id;
+  }
+
+  // The 0004-0007 drill, one migration on: a real database migrated only
+  // through 0007 (neither meetings table, neither new events column, the
+  // pre-0008 verb CHECK), populated while genuinely in that state, THEN
+  // migrated forward. Runs against its own scratch database, never the
+  // shared conduit_test one.
+  //
+  // The event is seeded through RAW SQL naming only pre-0008 columns, the
+  // 0005/0006/0007 technique: 0008 adds meeting_id/mail_thread_id to events,
+  // so drizzle -- which lists every column of the live table object in its
+  // generated INSERT -- would name two columns the pre-0008 table does not
+  // have and Postgres would reject the statement outright. companies/users
+  // are byte-identical between 0007 and 0008, so they insert through
+  // schema.ts as usual.
+  it("applies migration 0008 on top of a real database migrated only through 0007 -- both new tables arrive, a pre-existing event survives with NULL meeting_id/mail_thread_id, and the widened verb CHECK accepts 'met'", async () => {
+    await withPreMigrationDatabase("0008", async (scratch) => {
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const [company] = await scratch.db.insert(companies).values({ name: "Acme" }).returning();
+      const [event] = await scratch.db.execute<{ id: string }>(sql`
+        INSERT INTO events (verb, actor_user_id, company_id, payload)
+        VALUES ('created', ${user!.id}, ${company!.id}, '{}'::jsonb)
+        RETURNING id
+      `);
+
+      // Pin the drill's own premise before upgrading (the 0006/0007
+      // pattern), on all three of this migration's fronts. Without these,
+      // every post-migrate assertion below would also pass against a
+      // database that had been fully migrated all along: the raw INSERT
+      // names no meeting_id, so NULL would prove nothing; and 'met' would
+      // insert cleanly under a CHECK that already listed it.
+      const [preTables] = await scratch.db.execute<{ meetings: boolean; attendees: boolean }>(sql`
+        SELECT
+          EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'meetings') AS meetings,
+          EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'meeting_attendees') AS attendees
+      `);
+      expect(preTables).toMatchObject({ meetings: false, attendees: false });
+
+      const [preColumns] = await scratch.db.execute<{ present: number }>(sql`
+        SELECT count(*)::int AS present FROM information_schema.columns
+        WHERE table_name = 'events' AND column_name IN ('meeting_id', 'mail_thread_id')
+      `);
+      expect(preColumns?.present).toBe(0);
+
+      await expect(scratch.db.execute(sql`
+        INSERT INTO events (verb, actor_user_id, company_id, payload)
+        VALUES ('met', ${user!.id}, ${company!.id}, '{}'::jsonb)
+      `)).rejects.toMatchObject({
+        cause: { message: expect.stringMatching(/events_verb_valid|check/i) },
+      });
+
+      // Upgrade: apply the real, full migrations folder. 0008 is the only
+      // pending migration (0000-0007 are already recorded as applied).
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const [postTables] = await scratch.db.execute<{ meetings: boolean; attendees: boolean }>(sql`
+        SELECT
+          EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'meetings') AS meetings,
+          EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'meeting_attendees') AS attendees
+      `);
+      expect(postTables).toMatchObject({ meetings: true, attendees: true });
+
+      // The pre-existing event survived the upgrade untouched, and its two
+      // new columns came back NULL -- 0008 backfills nothing (see the
+      // migration's own closing comment: historical mail deliberately does
+      // not become timeline entries).
+      const [rereadEvent] = await scratch.db.select().from(events).where(eq(events.id, event!.id));
+      expect(rereadEvent).toMatchObject({
+        id: event!.id, verb: "created", companyId: company!.id, meetingId: null, mailThreadId: null,
+      });
+
+      // The new tables work against that pre-existing (pre-migration)
+      // company and user, not just rows created after the upgrade.
+      const [meeting] = await scratch.db.insert(meetings).values({
+        title: "Kickoff", occurredAt, ownerUserId: user!.id, companyId: company!.id,
+      }).returning();
+      const [attendee] = await scratch.db.insert(meetingAttendees).values({
+        meetingId: meeting!.id, guestName: "Their lawyer",
+      }).returning();
+      expect(meeting).toMatchObject({ companyId: company!.id, ownerUserId: user!.id, archivedAt: null });
+      expect(attendee).toMatchObject({ contactId: null, userId: null, guestName: "Their lawyer" });
+
+      // The widened CHECK: 'met' now inserts (carrying the meeting pointer),
+      // while a verb outside the enum is still rejected -- the widening did
+      // not turn the constraint into a rubber stamp.
+      const [metEvent] = await scratch.db.insert(events).values({
+        verb: "met", actorUserId: user!.id, companyId: company!.id, meetingId: meeting!.id, payload: {},
+      }).returning();
+      expect(metEvent).toMatchObject({ verb: "met", meetingId: meeting!.id, mailThreadId: null });
+      await expect(scratch.db.insert(events).values({
+        verb: "convened", actorUserId: user!.id, companyId: company!.id, payload: {},
+      })).rejects.toMatchObject({
+        cause: { message: expect.stringMatching(/events_verb_valid|check/i) },
+      });
+
+      // 0008's two hand-written partial unique indexes arrived with it, ON A
+      // DATABASE THIS TEST MIGRATED FROM THE FILES -- the 0005 drill's
+      // assertion, for the same reason: they exist in no snapshot, so only a
+      // from-the-files migration proves the .sql file still carries them.
+      const indexes = await scratch.db.execute<{ indexname: string; indexdef: string }>(
+        sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'meeting_attendees'`,
+      );
+      for (const [name, column] of [
+        ["meeting_attendees_meeting_contact_unique", "contact_id"],
+        ["meeting_attendees_meeting_user_unique", "user_id"],
+      ]) {
+        const index = indexes.find((row) => row.indexname === name);
+        expect(index?.indexdef).toMatch(/UNIQUE/i);
+        expect(index?.indexdef).toMatch(new RegExp(`WHERE.*${column} IS NOT NULL`, "i"));
+      }
+    });
+  }, 30000);
+
+  // The reachability CHECK (spec's Decisions table), and the deliberate
+  // difference from notes/files: meetings follow the EVENTS multi-FK model,
+  // so SEVERAL links at once are valid -- only the empty set is not.
+  it("enforces meetings_has_link: no link at all is rejected, one link is enough, and several at once are valid", async () => {
+    await expect(handle.db.insert(meetings).values({
+      title: "Unreachable", occurredAt, ownerUserId: userId,
+    })).rejects.toMatchObject({
+      cause: { message: expect.stringMatching(/meetings_has_link|check/i) },
+    });
+
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const [oneLink] = await handle.db.insert(meetings).values({
+      title: "Intro call", occurredAt, ownerUserId: userId, companyId: company.id,
+    }).returning();
+    expect(oneLink).toMatchObject({ companyId: company.id, contactId: null });
+
+    // A deal meeting carrying its company too -- the case notes'
+    // exactly-one CHECK would reject and this one must not.
+    const contact = await createContact(handle.db, userId, { firstName: "Bob", companyId: company.id });
+    const pipeline = await createPipeline(handle.db, userId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, userId, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      handle.db, userId, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+    );
+    const project = await createProject(handle.db, userId, { name: "Rollout" });
+    const [everyLink] = await handle.db.insert(meetings).values({
+      title: "Quarterly review", occurredAt, ownerUserId: userId,
+      companyId: company.id, contactId: contact.id, dealId: deal.id, projectId: project.id,
+    }).returning();
+    expect(everyLink).toMatchObject({
+      companyId: company.id, contactId: contact.id, dealId: deal.id, projectId: project.id,
+    });
+  });
+
+  // notes_exactly_one_entity's pattern over the attendee's three identity
+  // columns, and the twin of meetingAttendeeSchema's superRefine in
+  // @conduit/shared.
+  it("enforces meeting_attendees_exactly_one: each of the three attendee kinds inserts, zero and two are rejected", async () => {
+    const meetingId = await seedMeeting();
+    const contact = await createContact(handle.db, userId, { firstName: "Bob" });
+
+    const [asContact] = await handle.db.insert(meetingAttendees)
+      .values({ meetingId, contactId: contact.id }).returning();
+    const [asUser] = await handle.db.insert(meetingAttendees)
+      .values({ meetingId, userId }).returning();
+    const [asGuest] = await handle.db.insert(meetingAttendees)
+      .values({ meetingId, guestName: "Their lawyer" }).returning();
+    expect(asContact).toMatchObject({ contactId: contact.id, userId: null, guestName: null });
+    expect(asUser).toMatchObject({ contactId: null, userId, guestName: null });
+    expect(asGuest).toMatchObject({ contactId: null, userId: null, guestName: "Their lawyer" });
+
+    await expect(handle.db.insert(meetingAttendees).values({ meetingId })).rejects.toMatchObject({
+      cause: { message: expect.stringMatching(/meeting_attendees_exactly_one|check/i) },
+    });
+    await expect(handle.db.insert(meetingAttendees).values({
+      meetingId, contactId: contact.id, guestName: "Bob again",
+    })).rejects.toMatchObject({
+      cause: { message: expect.stringMatching(/meeting_attendees_exactly_one|check/i) },
+    });
+  });
+
+  // The two hand-written partial unique indexes, and the third one that
+  // deliberately does not exist: a repeated guest NAME is a valid attendee
+  // list, since guest_name is free text and two people can share a name.
+  it("dedupes a contact and a user per meeting, never a guest name, and never across meetings", async () => {
+    const meetingId = await seedMeeting();
+    const otherMeetingId = await seedMeeting({ title: "Follow-up" });
+    const contact = await createContact(handle.db, userId, { firstName: "Bob" });
+
+    await handle.db.insert(meetingAttendees).values({ meetingId, contactId: contact.id });
+    await expect(
+      handle.db.insert(meetingAttendees).values({ meetingId, contactId: contact.id }),
+    ).rejects.toMatchObject({ cause: { code: "23505" } });
+
+    await handle.db.insert(meetingAttendees).values({ meetingId, userId });
+    await expect(
+      handle.db.insert(meetingAttendees).values({ meetingId, userId }),
+    ).rejects.toMatchObject({ cause: { code: "23505" } });
+
+    // Two guests of the same name on ONE meeting: accepted, deliberately.
+    await handle.db.insert(meetingAttendees).values({ meetingId, guestName: "Chris" });
+    const [secondChris] = await handle.db.insert(meetingAttendees)
+      .values({ meetingId, guestName: "Chris" }).returning();
+    expect(secondChris).toMatchObject({ guestName: "Chris" });
+
+    // The indexes are per MEETING, not global: the same contact and the same
+    // user attend the next meeting too.
+    const [again] = await handle.db.insert(meetingAttendees)
+      .values({ meetingId: otherMeetingId, contactId: contact.id }).returning();
+    expect(again).toMatchObject({ meetingId: otherMeetingId, contactId: contact.id });
+    await handle.db.insert(meetingAttendees).values({ meetingId: otherMeetingId, userId });
+  });
+
+  // Every FK on both new tables, the bare `cause: { code }` style the 0005
+  // block uses (an FK violation's message is verbose and less stable to
+  // match against than its code).
+  it("enforces every foreign key on meetings and meeting_attendees", async () => {
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    await expect(handle.db.insert(meetings).values({
+      title: "Ghost owner", occurredAt, ownerUserId: randomUUID(), companyId: company.id,
+    })).rejects.toMatchObject({ cause: { code: "23503" } });
+    await expect(handle.db.insert(meetings).values({
+      title: "Ghost company", occurredAt, ownerUserId: userId, companyId: randomUUID(),
+    })).rejects.toMatchObject({ cause: { code: "23503" } });
+
+    const meetingId = await seedMeeting();
+    await expect(handle.db.insert(meetingAttendees).values({
+      meetingId: randomUUID(), guestName: "Nobody's guest",
+    })).rejects.toMatchObject({ cause: { code: "23503" } });
+    await expect(handle.db.insert(meetingAttendees).values({
+      meetingId, contactId: randomUUID(),
+    })).rejects.toMatchObject({ cause: { code: "23503" } });
+    await expect(handle.db.insert(meetingAttendees).values({
+      meetingId, userId: randomUUID(),
+    })).rejects.toMatchObject({ cause: { code: "23503" } });
+  });
+
+  // events' two new pointer columns: NULL on an ordinary event (no default,
+  // nothing backfilled), real FKs when set. mail_thread_id is a pointer and
+  // never content -- what a mail event may carry in `payload` is Task 4's
+  // rule, enforced there; what the COLUMN can hold is this.
+  it("adds events.meeting_id/mail_thread_id as nullable, FK-checked pointers", async () => {
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const [plain] = await handle.db.insert(events)
+      .values({ verb: "created", actorUserId: userId, companyId: company.id, payload: {} }).returning();
+    expect(plain).toMatchObject({ meetingId: null, mailThreadId: null });
+
+    const meetingId = await seedMeeting();
+    const [thread] = await handle.db.insert(mailThreads)
+      .values({ subject: "Re: Kickoff", lastMessageAt: new Date() }).returning();
+    const [pointed] = await handle.db.insert(events).values({
+      verb: "mail_received", actorUserId: userId, companyId: company.id,
+      mailThreadId: thread!.id, payload: {},
+    }).returning();
+    expect(pointed).toMatchObject({ verb: "mail_received", mailThreadId: thread!.id, meetingId: null });
+
+    await expect(handle.db.insert(events).values({
+      verb: "met", actorUserId: userId, companyId: company.id, meetingId: randomUUID(), payload: {},
+    })).rejects.toMatchObject({ cause: { code: "23503" } });
+    await expect(handle.db.insert(events).values({
+      verb: "mail_sent", actorUserId: userId, companyId: company.id,
+      mailThreadId: randomUUID(), payload: {},
+    })).rejects.toMatchObject({ cause: { code: "23503" } });
+
+    // Both pointers on one row are legal at the schema level; nothing in
+    // Phase 5 writes such a row (a meeting entry and a mail entry are
+    // different events), so this pins the column shape, not a use case.
+    const [both] = await handle.db.insert(events).values({
+      verb: "met", actorUserId: userId, companyId: company.id,
+      meetingId, mailThreadId: thread!.id, payload: {},
+    }).returning();
+    expect(both).toMatchObject({ meetingId, mailThreadId: thread!.id });
   });
 });

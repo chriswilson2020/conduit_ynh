@@ -57,6 +57,13 @@
       "when": 1787327775907,
       "tag": "0007_overjoyed_titania",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1787819267559,
+      "tag": "0008_long_strong_guy",
+      "breakpoints": true
     }
   ]
 }

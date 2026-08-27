@@ -9,6 +9,14 @@ function toEvent(row: EventRow): Event {
     id: row.id, verb: row.verb as Event["verb"], actorUserId: row.actorUserId,
     companyId: row.companyId, contactId: row.contactId, dealId: row.dealId,
     taskId: row.taskId, projectId: row.projectId,
+    // Phase 5's two pointers, passed straight through. No row carries a
+    // mailThreadId until Task 4's ingest emission exists, and that task owns
+    // the read-time rule that comes with it: a row whose thread the viewer
+    // may not see (4.2 visibility composed with 4.3 hides) is dropped from
+    // the result entirely, before the limit -- never surfaced with its
+    // pointer, never stubbed. Nothing may start emitting mail events without
+    // that filter landing in the same change.
+    meetingId: row.meetingId, mailThreadId: row.mailThreadId,
     payload: row.payload as Record<string, unknown>,
     createdAt: row.createdAt.toISOString(),
   };

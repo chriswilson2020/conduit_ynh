@@ -34,6 +34,17 @@ const VERB_BADGE: Record<Event["verb"], string> = {
   completed: "D",
   dependency_added: "P",
   dependency_removed: "M",
+  // Phase 5's three verbs, at the letters the spec assigns them (met = M,
+  // mail_received = R, mail_sent = T). Two of the three COLLIDE with badges
+  // above -- M is already dependency_removed's and R is already unarchived's
+  // -- so the uniqueness the comment at the head of this map claims no longer
+  // holds. Recorded rather than silently reassigned: this map is exhaustively
+  // typed against eventVerbSchema, so Task 1 must fill these in to compile,
+  // but the badge letters are the spec's own and rendering these three rows
+  // (link targets, the derived mail subject) is Task 5's.
+  met: "M",
+  mail_received: "R",
+  mail_sent: "T",
 };
 
 /**

@@ -62,6 +62,12 @@ import {
   bulkThreadSkipReasonSchema,
   BULK_THREAD_ACTION_CAP,
   MOVE_ACTION_THREAD_CAP,
+  meetingSchema,
+  meetingAttendeeSchema,
+  meetingAttendeeInputSchema,
+  meetingCreateInputSchema,
+  meetingUpdateInputSchema,
+  meetingListFiltersSchema,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -430,15 +436,22 @@ describe("eventVerbSchema", () => {
     }
   });
 
+  it("accepts the Phase 5 verbs", () => {
+    for (const verb of ["met", "mail_sent", "mail_received"]) {
+      expect(eventVerbSchema.parse(verb)).toBe(verb);
+    }
+  });
+
   it("rejects an unknown verb", () =>
     expect(() => eventVerbSchema.parse("deleted")).toThrow());
 });
 
-describe("eventSchema taskId/projectId", () => {
+describe("eventSchema taskId/projectId/meetingId/mailThreadId", () => {
   it("round-trips an event carrying both a taskId and a projectId", () => {
     const value = {
       id: uuid1, verb: "shifted" as const, actorUserId: uuid1,
       companyId: null, contactId: null, dealId: null, taskId: uuid2, projectId: uuid1,
+      meetingId: null, mailThreadId: null,
       payload: {}, createdAt: new Date().toISOString(),
     };
     expect(eventSchema.parse(value)).toEqual(value);
@@ -448,9 +461,29 @@ describe("eventSchema taskId/projectId", () => {
     const value = {
       id: uuid1, verb: "created" as const, actorUserId: uuid1,
       companyId: uuid2, contactId: null, dealId: null, taskId: null, projectId: null,
+      meetingId: null, mailThreadId: null,
       payload: {}, createdAt: new Date().toISOString(),
     };
     expect(eventSchema.parse(value)).toEqual(value);
+  });
+
+  // Phase 5's two pointers. Both are REQUIRED keys (nullable, not optional):
+  // an event serialized without them is a producer that has not been updated,
+  // and it should fail loudly here rather than reach a client as an entry
+  // that silently cannot link back to its meeting or thread.
+  it("round-trips a meeting event's meetingId and a mail event's mailThreadId, and requires both keys", () => {
+    const base = {
+      id: uuid1, actorUserId: uuid1,
+      companyId: uuid2, contactId: null, dealId: null, taskId: null, projectId: null,
+      payload: {}, createdAt: new Date().toISOString(),
+    };
+    const met = { ...base, verb: "met" as const, meetingId: uuid2, mailThreadId: null };
+    expect(eventSchema.parse(met)).toEqual(met);
+    const mail = { ...base, verb: "mail_received" as const, meetingId: null, mailThreadId: uuid2 };
+    expect(eventSchema.parse(mail)).toEqual(mail);
+
+    expect(() => eventSchema.parse({ ...base, verb: "created", mailThreadId: null })).toThrow();
+    expect(() => eventSchema.parse({ ...base, verb: "created", meetingId: null })).toThrow();
   });
 });
 
@@ -1519,5 +1552,154 @@ describe("emailTemplateSchema and createEmailTemplateInputSchema", () => {
   it("accepts a create input with subject omitted (defaults to '' at the DB)", () => {
     const input = { name: "Follow-up", bodyHtml: "<p>Hi</p>" };
     expect(createEmailTemplateInputSchema.parse(input)).toEqual(input);
+  });
+});
+
+describe("meetingAttendeeSchema and meetingAttendeeInputSchema", () => {
+  // The twin of the meeting_attendees_exactly_one DB CHECK (api:
+  // db/schema.ts). Both halves are asserted here because the pair only
+  // protects anything while it agrees: a shape this schema accepts and the
+  // CHECK rejects is a 500 where a 400 belongs.
+  it("accepts each of the three attendee kinds and rejects zero or two", () => {
+    const row = { id: uuid1, meetingId: uuid2 };
+    for (const identity of [{ contactId: uuid1 }, { userId: uuid1 }, { guestName: "Their lawyer" }]) {
+      const value = { ...row, contactId: null, userId: null, guestName: null, ...identity };
+      expect(meetingAttendeeSchema.parse(value)).toEqual(value);
+      expect(meetingAttendeeInputSchema.parse(identity)).toEqual(identity);
+    }
+
+    expect(() => meetingAttendeeSchema.parse({ ...row, contactId: null, userId: null, guestName: null })).toThrow();
+    expect(() => meetingAttendeeSchema.parse({
+      ...row, contactId: uuid1, userId: uuid1, guestName: null,
+    })).toThrow();
+    expect(() => meetingAttendeeInputSchema.parse({})).toThrow();
+    expect(() => meetingAttendeeInputSchema.parse({ contactId: uuid1, guestName: "Bob again" })).toThrow();
+  });
+
+  // The input shape treats an explicit null exactly as an absent key -- the
+  // predicate counts `!= null` -- so a client that clears a picker by
+  // sending null rather than omitting the field gets the same answer.
+  it("treats an explicit null identity field as absent", () => {
+    expect(meetingAttendeeInputSchema.parse({ contactId: uuid1, userId: null, guestName: null }))
+      .toEqual({ contactId: uuid1, userId: null, guestName: null });
+    expect(() => meetingAttendeeInputSchema.parse({ contactId: null, userId: null, guestName: null })).toThrow();
+  });
+
+  it("rejects a blank guest name", () =>
+    expect(() => meetingAttendeeInputSchema.parse({ guestName: "" })).toThrow());
+});
+
+describe("meetingSchema", () => {
+  const now = new Date().toISOString();
+  const meeting = {
+    id: uuid1, title: "Kickoff", occurredAt: now, durationMinutes: 45,
+    notes: "<p>Agreed the scope</p>", ownerUserId: uuid2,
+    companyId: uuid2, contactId: null, dealId: null, projectId: null,
+    attendees: [{ id: uuid2, meetingId: uuid1, contactId: uuid1, userId: null, guestName: null }],
+    archivedAt: null, createdAt: now, updatedAt: now,
+  };
+
+  it("round-trips a meeting with its attendees", () => {
+    expect(meetingSchema.parse(meeting)).toEqual(meeting);
+  });
+
+  it("accepts a null duration and null notes -- neither is required to log a meeting", () => {
+    const sparse = { ...meeting, durationMinutes: null, notes: null, attendees: [] };
+    expect(meetingSchema.parse(sparse)).toEqual(sparse);
+  });
+
+  // A zero-length meeting is not a meeting, and a negative one is nonsense.
+  // The DB column carries no matching CHECK (see meetingSchema's comment):
+  // this schema is the only gate, so it is pinned here.
+  it("rejects a zero, negative or fractional duration", () => {
+    for (const durationMinutes of [0, -30, 1.5]) {
+      expect(() => meetingSchema.parse({ ...meeting, durationMinutes })).toThrow();
+    }
+  });
+
+  // The rail's list rows render an attendee summary, so the collection is
+  // part of every meeting read, never a separate fetch.
+  it("requires the attendees array to be present", () => {
+    const { attendees: _attendees, ...withoutAttendees } = meeting;
+    expect(() => meetingSchema.parse(withoutAttendees)).toThrow();
+  });
+});
+
+describe("meetingCreateInputSchema and meetingUpdateInputSchema", () => {
+  const now = new Date().toISOString();
+  const base = { title: "Kickoff", occurredAt: now };
+
+  // The twin of the meetings_has_link DB CHECK (api: db/schema.ts) -- the
+  // spec's reachability decision, caught here at the API boundary so an
+  // unlinked meeting is a 400 rather than a CHECK violation.
+  it("rejects a meeting linked to nothing", () =>
+    expect(() => meetingCreateInputSchema.parse(base)).toThrow());
+
+  it("accepts any single link", () => {
+    for (const link of [
+      { companyId: uuid1 }, { contactId: uuid1 }, { dealId: uuid1 }, { projectId: uuid1 },
+    ]) {
+      expect(meetingCreateInputSchema.parse({ ...base, ...link })).toEqual({ ...base, ...link });
+    }
+  });
+
+  // AT LEAST one, never EXACTLY one: the events multi-FK model, not notes'
+  // exactly-one -- a deal meeting carries its company too and must appear on
+  // both records. createNoteInputSchema's own "rejects two entities" test is
+  // the contrast this pins against.
+  it("accepts several links at once, including all four", () => {
+    const input = {
+      ...base, companyId: uuid1, contactId: uuid2, dealId: uuid1, projectId: uuid2,
+      durationMinutes: 30, notes: "<p>Notes</p>",
+      attendees: [{ contactId: uuid1 }, { guestName: "Their lawyer" }],
+    };
+    expect(meetingCreateInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects an attendee entry that names two kinds at once", () =>
+    expect(() => meetingCreateInputSchema.parse({
+      ...base, companyId: uuid1, attendees: [{ contactId: uuid1, userId: uuid2 }],
+    })).toThrow());
+
+  // Everything optional, including the fields create requires: a patch that
+  // only renames a meeting is a valid patch.
+  it("accepts a patch touching one field, and an empty patch", () => {
+    expect(meetingUpdateInputSchema.parse({ title: "Renamed" })).toEqual({ title: "Renamed" });
+    expect(meetingUpdateInputSchema.parse({})).toEqual({});
+  });
+
+  // The deliberate asymmetry (see meetingUpdateInputSchema's comment): the
+  // at-least-one-link refine does NOT ride the patch shape, because a patch
+  // sees one snapshot and never the row's persisted counterpart -- clearing
+  // companyId on a meeting that also carries a dealId is legitimate. The
+  // meetings_has_link CHECK is the backstop for the case that genuinely
+  // empties the last link.
+  it("does not re-assert at-least-one-link on a patch (a patch cannot see the stored row)", () => {
+    const clearing = { companyId: null, contactId: null, dealId: null, projectId: null };
+    expect(meetingUpdateInputSchema.parse(clearing)).toEqual(clearing);
+  });
+
+  // An empty attendees array is meaningful on a patch -- "replace the set
+  // with nothing" -- and must survive parsing rather than being stripped.
+  it("keeps an empty attendees array on a patch (replace-with-empty)", () => {
+    expect(meetingUpdateInputSchema.parse({ attendees: [] })).toEqual({ attendees: [] });
+  });
+});
+
+describe("meetingListFiltersSchema", () => {
+  it("accepts every filter at once and none at all", () => {
+    const filters = {
+      companyId: uuid1, contactId: uuid2, dealId: uuid1, projectId: uuid2,
+      archived: true, cursor: "abc", limit: 20,
+    };
+    expect(meetingListFiltersSchema.parse(filters)).toEqual(filters);
+    expect(meetingListFiltersSchema.parse({})).toEqual({});
+  });
+
+  // `archived` is a plain boolean HERE (the route owns the wire tri-state) --
+  // the same division of labour threadListFiltersSchema documents.
+  it("rejects a string archived flag and an over-cap limit", () => {
+    expect(() => meetingListFiltersSchema.parse({ archived: "true" })).toThrow();
+    expect(() => meetingListFiltersSchema.parse({ limit: 101 })).toThrow();
   });
 });

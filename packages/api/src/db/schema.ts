@@ -287,11 +287,37 @@ export const events = pgTable("events", {
   dealId: uuid("deal_id").references(() => deals.id),
   taskId: uuid("task_id").references(() => tasks.id),
   projectId: uuid("project_id").references(() => projects.id),
+  // Phase 5's two pointer columns, both forward references (meetings is
+  // declared at the foot of this file, mail_threads in the mail block below),
+  // hence the explicit AnyPgColumn return types -- same reason as
+  // pipelines.projectId above: TypeScript can't infer a forward-declared
+  // column's type.
+  //
+  // meeting_id: the 'met'/'archived'/'unarchived' entries a meeting emits
+  // carry it so the timeline row links back to the meeting it describes,
+  // alongside the meeting's own record FKs in the columns above (the same
+  // dual-stamp deals/tasks already use to land one event on several
+  // timelines).
+  meetingId: uuid("meeting_id").references((): AnyPgColumn => meetings.id),
+  // mail_thread_id is a POINTER AND NOTHING ELSE (Phase 5 spec, mail-privacy
+  // decision). A mail event stores no subject, snippet or address anywhere --
+  // not here, not in `payload` -- because a timeline entry is readable by
+  // every user of the CRM while a thread is not: the subject is rendered at
+  // READ time from mail_threads.subject through Phase 4.2's record-visible
+  // predicate composed with Phase 4.3's not-hidden predicate, and a thread
+  // the viewer may not see contributes no row at all (Task 4). Storing any
+  // fragment of the message here would leak it past both predicates.
+  mailThreadId: uuid("mail_thread_id").references((): AnyPgColumn => mailThreads.id),
   payload: jsonb("payload").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [check(
+  // Phase 5 adds 'met' (a meeting was logged) plus 'mail_sent'/'mail_received'
+  // (one per thread per direction per calendar day, Task 4's throttle).
+  // Meeting archive/unarchive reuse the existing 'archived'/'unarchived'
+  // verbs rather than adding meeting-specific ones, the way task reopening
+  // reuses 'reopened'.
   "events_verb_valid",
-  sql`verb IN ('created','updated','archived','unarchived','note_added','file_attached','stage_changed','won','lost','reopened','shifted','completed','dependency_added','dependency_removed')`,
+  sql`verb IN ('created','updated','archived','unarchived','note_added','file_attached','stage_changed','won','lost','reopened','shifted','completed','dependency_added','dependency_removed','met','mail_sent','mail_received')`,
 )]);
 export type EventRow = typeof events.$inferSelect;
 
@@ -585,3 +611,103 @@ export const emailTemplates = pgTable("email_templates", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 export type EmailTemplateRow = typeof emailTemplates.$inferSelect;
+
+// --- Meetings (Phase 5) --------------------------------------------------
+
+// A logged meeting: what happened (or is arranged -- occurred_at is free in
+// both directions, since noting a meeting you have just had and one you have
+// just arranged are the same act, Phase 5 spec), who was there
+// (meeting_attendees below), and which records it belongs to.
+//
+// The four record FKs follow the EVENTS multi-FK model, deliberately NOT
+// notes'/files' exactly-one CHECK (`exactlyOne` above): a meeting about a
+// deal legitimately carries that deal's company too, and it must appear on
+// both records' Meetings tabs, the same way a deal event carries both dealId
+// and companyId so it lands on both timelines. Any subset of the four may be
+// set -- except the empty one, see the CHECK below.
+export const meetings = pgTable("meetings", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  title: text("title").notNull(),
+  // The meeting's own moment, never a row-creation artifact -- no defaultNow()
+  // here (same reasoning as mail_messages.sent_at and
+  // mail_account_folders.last_discovered_at): the app supplies it, defaulting
+  // to now only in the UI's form.
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  // NULL is honest, not missing data: not every logged meeting has a known
+  // length (spec's data model).
+  durationMinutes: integer("duration_minutes"),
+  // Rich-text HTML, sanitized on write by services/meetings.ts (Task 2)
+  // through the system's ONE shared sanitizer profile -- sanitizeMailHtml in
+  // services/mail-content.ts, which email_templates.body_html already reuses
+  // (see mail-templates.ts's sanitizeBody: "one shared sanitizer profile").
+  // notes.body is NOT that precedent despite the Phase 5 spec's wording: it
+  // is plain text, stored raw and rendered as text (web: rail/notes.tsx's
+  // whitespace-pre-wrap <p>), so it passes through no sanitizer at all.
+  // This column is never a raw-HTML sink.
+  notes: text("notes"),
+  // NOT NULL, unlike companies/contacts/deals/projects' nullable
+  // owner_user_id: a meeting is logged BY somebody (the actor, stamped
+  // server-side), the way notes.author_user_id and files.uploader_user_id are.
+  ownerUserId: uuid("owner_user_id").notNull().references(() => users.id),
+  companyId: uuid("company_id").references(() => companies.id),
+  contactId: uuid("contact_id").references(() => contacts.id),
+  dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  // REACHABILITY (Phase 5 spec's Decisions table). v0.9.0 ships no top-level
+  // meetings list -- meetings are read through a record's Meetings rail tab
+  // and that record's timeline, both of which are FK lookups -- so a meeting
+  // linked to nothing would be unreachable from the moment it saved: no
+  // screen could ever show it again, and nothing but a manual SQL query could
+  // find it. The UI surfaces this as a required field; this CHECK is the
+  // backstop for every other write path (same "Zod schemas are the primary
+  // gate, the CHECK is the backstop" split as contacts.emails and
+  // projects.color above), and its twin lives on
+  // meetingCreateInputSchema (@conduit/shared) as a superRefine.
+  //
+  // Spelled with num_nonnulls to read as one family with notes'/files'
+  // `exactlyOne` (num_nonnulls(...) = 1) above -- at-least-one and
+  // exactly-one are then visibly the same rule at two different counts,
+  // rather than one written as arithmetic and the other as a chain of ORs.
+  check("meetings_has_link", sql`num_nonnulls(company_id, contact_id, deal_id, project_id) >= 1`),
+]);
+export type MeetingRow = typeof meetings.$inferSelect;
+
+// One row per attendee of one meeting, in one of three mutually exclusive
+// forms (spec's Attendees decision): a linked CRM contact, a Conduit user, or
+// a free-text guest name for someone who is in neither ("and their lawyer").
+// A contact row is a REAL link -- listMeetings' contactId filter matches a
+// meeting whose contact_id is C OR which has an attendee row for C (Task 2),
+// which is what makes the meeting appear on that contact's own record.
+//
+// No created_at, unlike almost every other table in this file: attendees are
+// replaced as a SET on every update (spec: "attendees replaced as a set on
+// update"), so a per-row timestamp would record the last time the list was
+// edited, not when anyone attended anything -- the meeting's own occurred_at
+// is the moment that matters, and mail_folder_state is the file's precedent
+// for a table that carries no history worth keeping.
+//
+// The two partial UNIQUE indexes that stop the same contact or the same user
+// being added twice to one meeting are hand-written in
+// drizzle/0008_*.sql rather than declared here, matching this file's standing
+// convention for every index (see the mail block's comment above) and
+// 0004's mail_accounts_user_email_active_unique precedent specifically -- a
+// semantic constraint expressed as a partial unique index, kept with the rest
+// of its migration's non-generatable SQL.
+export const meetingAttendees = pgTable("meeting_attendees", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  meetingId: uuid("meeting_id").notNull().references(() => meetings.id),
+  contactId: uuid("contact_id").references(() => contacts.id),
+  userId: uuid("user_id").references(() => users.id),
+  guestName: text("guest_name"),
+}, (t) => [
+  // notes_exactly_one_entity's pattern (`exactlyOne` above), over this
+  // table's three identity columns: an attendee is exactly one of contact,
+  // user or guest -- never two, never none. Its twin lives on
+  // meetingAttendeeSchema (@conduit/shared) as a superRefine.
+  check("meeting_attendees_exactly_one", sql`num_nonnulls(contact_id, user_id, guest_name) = 1`),
+]);
+export type MeetingAttendeeRow = typeof meetingAttendees.$inferSelect;

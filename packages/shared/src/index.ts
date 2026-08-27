@@ -113,10 +113,17 @@ export type FileMeta = z.infer<typeof fileMetaSchema>;
 // adds shifted/completed/dependency_added/dependency_removed -- task
 // reopening reuses the existing "reopened" verb rather than adding a
 // task-specific one.
+// Phase 5 adds "met" (a meeting was logged) and the two mail verbs, one per
+// thread per direction per calendar day (api: mail-ingest.ts's throttle).
+// Meeting archive/unarchive reuse "archived"/"unarchived" rather than adding
+// meeting-specific verbs, the same way task reopening reuses "reopened".
+// Kept in the same order as the events_verb_valid DB CHECK (api:
+// db/schema.ts), which schema.test.ts pins member-for-member.
 export const eventVerbSchema = z.enum([
   "created", "updated", "archived", "unarchived", "note_added", "file_attached",
   "stage_changed", "won", "lost", "reopened",
   "shifted", "completed", "dependency_added", "dependency_removed",
+  "met", "mail_sent", "mail_received",
 ]);
 // taskId/projectId were deferred in P3.2 (the schema.ts columns existed but
 // nothing read/wrote them through this shape yet); Task 3 widens this now
@@ -128,6 +135,20 @@ export const eventSchema = z.object({
   id: z.uuid(), verb: eventVerbSchema, actorUserId: z.uuid(),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
   taskId: z.uuid().nullable(), projectId: z.uuid().nullable(),
+  // Phase 5's two pointers, both nullable because most events have neither.
+  // meetingId links a "met"/"archived"/"unarchived" meeting entry back to its
+  // meeting, beside the meeting's own record links in the columns above.
+  meetingId: z.uuid().nullable(),
+  // mailThreadId is the WHOLE of what a mail event stores about the mail
+  // (spec's mail-privacy decision): no subject, snippet or address is ever
+  // written -- not here and not in `payload` -- because an event row is
+  // readable by every user of the CRM while a thread is not. The subject a
+  // client renders is derived at READ time from mail_threads.subject through
+  // Phase 4.2's visibility predicate composed with 4.3's hide predicate, and
+  // a row whose thread the viewer may not see is dropped from the response
+  // entirely rather than stubbed (api: timeline.ts, Task 4 -- which adds the
+  // derived `mailSubject` field for that rendered value).
+  mailThreadId: z.uuid().nullable(),
   payload: z.record(z.string(), z.unknown()), createdAt: z.iso.datetime(),
 });
 export type Event = z.infer<typeof eventSchema>;
@@ -1303,3 +1324,154 @@ export const searchResultsSchema = z.object({
   })),
 });
 export type SearchResults = z.infer<typeof searchResultsSchema>;
+
+// --- Meetings (Phase 5) --------------------------------------------------
+
+// The three mutually exclusive ways to name one attendee (spec's Attendees
+// decision): a linked CRM contact, a Conduit user, or a free-text guest for
+// someone in neither ("and their lawyer"). One field record, two schemas --
+// the stored row below and the input shape it is derived into -- so a fourth
+// kind of attendee could never arrive on one and not the other.
+const attendeeIdentityFields = {
+  contactId: z.uuid().nullable(),
+  userId: z.uuid().nullable(),
+  guestName: z.string().min(1).nullable(),
+};
+
+// This predicate and the meeting_attendees_exactly_one DB CHECK
+// (num_nonnulls(contact_id, user_id, guest_name) = 1, api: db/schema.ts) are
+// ONE RULE WRITTEN IN TWO PLACES -- the same relationship exactlyOneEntity
+// above has with notes_exactly_one_entity. Changing either without the other
+// splits the contract: the API would start accepting shapes the database
+// rejects (a 500 where a 400 belongs) or refusing rows the database would
+// happily store. `!= null` covers undefined too, so this reads identically on
+// the stored row (three nullable fields) and on the input shape (the same
+// three, optional).
+const attendeeExactlyOne = (
+  v: { contactId?: string | null; userId?: string | null; guestName?: string | null },
+) => [v.contactId, v.userId, v.guestName].filter((x) => x != null).length === 1;
+
+const attendeeExactlyOneMessage =
+  "exactly one of contactId, userId or guestName identifies an attendee";
+
+export const meetingAttendeeSchema = z
+  .object({ id: z.uuid(), meetingId: z.uuid(), ...attendeeIdentityFields })
+  .superRefine((v, ctx) => {
+    if (!attendeeExactlyOne(v)) ctx.addIssue({ code: "custom", message: attendeeExactlyOneMessage });
+  });
+export type MeetingAttendee = z.infer<typeof meetingAttendeeSchema>;
+
+// What a caller sends per attendee: the same three fields, each optional
+// (naming a contact means sending contactId alone, not the other two as
+// explicit nulls). meetingId comes from the meeting being written and `id` is
+// server-side, so both are absent here -- attendees are replaced as a SET on
+// update (spec), never patched row by row, so a client never needs to name an
+// existing attendee row's id.
+export const meetingAttendeeInputSchema = z
+  .object(attendeeIdentityFields).partial()
+  .superRefine((v, ctx) => {
+    if (!attendeeExactlyOne(v)) ctx.addIssue({ code: "custom", message: attendeeExactlyOneMessage });
+  });
+export type MeetingAttendeeInput = z.infer<typeof meetingAttendeeInputSchema>;
+
+// This predicate and the meetings_has_link DB CHECK
+// (num_nonnulls(company_id, contact_id, deal_id, project_id) >= 1, api:
+// db/schema.ts) are likewise ONE RULE IN TWO PLACES -- the spec's
+// reachability decision, which exists because v0.9.0 ships no top-level
+// meetings list: a meeting linked to nothing could never be reached again
+// from any screen. AT LEAST one, not exactly one (the events multi-FK model,
+// not notes' exactly-one): a deal meeting legitimately carries its company
+// too, and appears on both records.
+const meetingAtLeastOneLink = (
+  v: { companyId?: string | null; contactId?: string | null; dealId?: string | null; projectId?: string | null },
+) => [v.companyId, v.contactId, v.dealId, v.projectId].some((x) => x != null);
+
+export const meetingSchema = z.object({
+  id: z.uuid(), title: z.string().min(1),
+  // Past OR future: logging a meeting just had and noting one just arranged
+  // are the same act (spec). No ordering constraint against createdAt.
+  occurredAt: z.iso.datetime(),
+  // Positive, and NULL for the honest "nobody recorded how long it ran"
+  // (spec). The DB column carries no matching CHECK -- deliberately, since
+  // the spec's data model lists none: this schema is the gate, the way
+  // contacts.emails' format is zod-only (see that column's comment in api:
+  // db/schema.ts), rather than the belt-and-braces pattern
+  // projects.color/tasks.progress_pct use.
+  durationMinutes: z.number().int().positive().nullable(),
+  // Rich-text HTML, sanitized server-side on write (api: services/meetings.ts,
+  // Task 2). "" is not a value: an empty note is NULL.
+  notes: nullableString,
+  ownerUserId: z.uuid(),
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(),
+  dealId: z.uuid().nullable(), projectId: z.uuid().nullable(),
+  // Always carried, never a separate fetch: a meeting without its attendees
+  // is not a meeting, and the rail's LIST rows render an attendee summary
+  // (spec's Web section), so there is no read path that wants the bare row.
+  // Task 3 extends this shape with the follow-up tasks the meeting produced,
+  // rather than widening it here for a collection nothing yet writes.
+  attendees: z.array(meetingAttendeeSchema),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type Meeting = z.infer<typeof meetingSchema>;
+
+// ownerUserId is absent on purpose: the owner is the actor, stamped
+// server-side, the same rule notes' authorUserId and mail accounts' userId
+// follow -- never a caller-supplied field.
+const meetingInputShape = z.object({
+  title: z.string().min(1),
+  occurredAt: z.iso.datetime(),
+  durationMinutes: z.number().int().positive().nullable().optional(),
+  notes: nullableString.optional(),
+  companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
+  dealId: z.uuid().nullable().optional(), projectId: z.uuid().nullable().optional(),
+  // Absent means "no attendees" on create and "leave the set alone" on
+  // update; present replaces the whole set, including with [] (api:
+  // services/meetings.ts, Task 2).
+  attendees: z.array(meetingAttendeeInputSchema).optional(),
+});
+
+export const meetingCreateInputSchema = meetingInputShape.superRefine((v, ctx) => {
+  if (!meetingAtLeastOneLink(v)) {
+    ctx.addIssue({
+      code: "custom",
+      message: "at least one of companyId, contactId, dealId or projectId is required",
+    });
+  }
+});
+export type MeetingCreateInput = z.infer<typeof meetingCreateInputSchema>;
+
+// The at-least-one-link refine deliberately does NOT ride the patch shape,
+// for the same reason taskDatesPaired documents on its own update schema: a
+// partial update sees one snapshot, never the row's persisted counterpart.
+// A patch clearing companyId on a meeting that also carries a dealId is
+// legitimate and must not be rejected, while a patch that genuinely empties
+// the last link can only be caught against the stored row -- which is what
+// meetings_has_link does, as the backstop it exists to be. Task 2's
+// updateMeeting therefore re-asserts the rule against the merged row and
+// surfaces the failure as a 4xx rather than letting the CHECK raise a 500.
+export const meetingUpdateInputSchema = meetingInputShape.partial();
+export type MeetingUpdateInput = z.infer<typeof meetingUpdateInputSchema>;
+
+// Query-side filter contract for GET /api/meetings, the Meetings rail tab's
+// shape -- the same division of labour as threadListFiltersSchema above: the
+// route maps its querystring onto this, so `archived` is a plain boolean
+// here, not the wire's "true"/"false"/absent tri-state (that coercion is the
+// route's job, per routes/companies.ts's listQuerySchema comment on why
+// z.coerce.boolean() cannot be used for it).
+//
+// The four record filters are NOT mutually exclusive in shape, but a caller
+// sends exactly one in practice (one rail, one record). contactId is the one
+// that is not a plain FK match: it also matches meetings where that contact
+// is an ATTENDEE (api: services/meetings.ts's listMeetings, Task 2), which is
+// what makes contact attendance a real link (spec).
+export const meetingListFiltersSchema = z.object({
+  companyId: z.uuid().optional(), contactId: z.uuid().optional(),
+  dealId: z.uuid().optional(), projectId: z.uuid().optional(),
+  // true = ONLY archived meetings, absent/false = only live ones -- the house
+  // semantics every archived list uses (api: services/companies.ts's
+  // listCompanies).
+  archived: z.boolean().optional(),
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(100).optional(),
+});
+export type MeetingListFilters = z.infer<typeof meetingListFiltersSchema>;
