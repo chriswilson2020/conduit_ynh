@@ -92,6 +92,15 @@ export interface NamedUser {
  * Sites that always hold a user (a row rendered FROM the users list) pass the
  * empty string: their fallback is unreachable, which is exactly what an empty
  * one says.
+ *
+ * FIVE SITES DELIBERATELY DO NOT USE THIS, and a sweep that "finishes the job"
+ * by routing them through it changes visible text on any deployment where LDAP
+ * supplies full names. They render the LOGIN, not the display name, each via
+ * `new Map(users.map((u) => [u.id, u.username]))`: the rail's Timeline, Notes
+ * and Files tabs, and the Owner column on the companies and contacts list
+ * pages. Whether this app should show logins or display names in those places
+ * is a real question with a visible answer -- it is recorded as a post-v0.9.1
+ * backlog item, not settled here.
  */
 export function userLabel<F extends string | undefined>(
   user: NamedUser | null | undefined, fallback: F,
@@ -194,6 +203,13 @@ export function advanceCursorPages<T extends { id: string }>(
  * asked of the same four link ids. One builder rather than two schemes: a
  * hand-rolled `a|b|c|d` beside this one is a second answer to the same
  * question, and the two drift the moment a fifth link appears.
+ *
+ * INTERNAL AND BUILD-UNSTABLE. Compare it only against another string this
+ * same function produced in the same session. Never persist it (localStorage,
+ * a URL, a cache key meant to outlive a reload) and never compare it against a
+ * key some other builder made: its exact shape is an implementation detail,
+ * and it is now the answer to two different questions in three components,
+ * which is precisely when someone reaches for it as a durable id.
  */
 export function identityKey(values: Record<string, string | number | boolean | undefined>): string {
   const entries = Object.entries(values)
