@@ -1675,12 +1675,32 @@ test.describe.serial("Mail journey", () => {
     // filled in beforeAll, so her timeline carries an "updated emails" entry
     // -- ordinary CRM activity, which B can and should see. The boundaries
     // are what keep the third assertion about mail rather than about the
-    // word inside "emails".
+    // word inside "emails". The recorded backlog item asked for a bare
+    // /mail/, which would have failed on every run for exactly that reason.
+    // Case-insensitive because a placeholder is as likely to open with a
+    // capital: the boundaries already exclude "Emails", so the `i` costs
+    // nothing and closes "Mail activity you cannot see".
     await expect(bPage.getByTestId("timeline-entry").filter({ hasText: timelineSubject }))
       .toHaveCount(0);
     await expect(bPage.getByTestId("timeline").getByTestId("timeline-thread-link")).toHaveCount(0);
-    await expect(bPage.getByTestId("timeline-entry").filter({ hasText: /\bmail\b/ }))
+    await expect(bPage.getByTestId("timeline-entry").filter({ hasText: /\bmail\b/i }))
       .toHaveCount(0);
+    // 4. AND NOTHING ELSE IS THERE AT ALL. The three above are shape-specific:
+    //    a placeholder carrying no subject, no link and no mail-ish word --
+    //    "Private activity", "1 hidden item", an empty row -- walks past all
+    //    of them. Today that shape cannot exist, because timeline.tsx renders
+    //    every entry through summarize(), whose only mail arms produce the
+    //    wording assertion 3 catches; but that is a fact about one call site,
+    //    not a property of the API, and this is the leg that proves a private
+    //    mailbox stays private. B's view of this contact is deterministic:
+    //    the contact's own "created" row and the "updated emails" row from
+    //    beforeAll. Counting them closes the class outright.
+    //
+    //    WHEN THIS FAILS AT 3: do not raise the number to make it pass. A new
+    //    entry on B's timeline is either an ordinary CRM event the fixture
+    //    now produces -- in which case say which, here -- or it is the leak
+    //    this assertion exists to catch.
+    await expect(bPage.getByTestId("timeline-entry")).toHaveCount(2);
   });
 
   test("opens the link panel's contact picker on the conversation", async () => {

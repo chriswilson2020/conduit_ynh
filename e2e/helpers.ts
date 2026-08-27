@@ -50,6 +50,19 @@ import type { Locator } from "@playwright/test";
  * The page comes from the locator rather than from a parameter, because the
  * one thing a caller could get wrong here is typing into one page's editor
  * with another page's keyboard -- e2e/mail.spec.ts drives two of them.
+ *
+ * TWO LIMITS, both deliberate. `toContainText` reads the DOM, not the
+ * ProseMirror model: the browser writes the DOM first and the model catches
+ * up in readDOMChange, so there is a sub-frame window where this passes and
+ * getHTML() has not. The send/submit that follows every call closes it. And
+ * `text` must be SINGLE-LINE PLAIN ASCII: toContainText normalises
+ * whitespace, and StarterKit's input rules would turn a leading "- ", "1. "
+ * or "# " into a list or heading, so the DOM would diverge from `text` and
+ * fail here at a line that looks like an app bug.
+ *
+ * The prevention matters more than the detection: toHaveAttribute auto-waits,
+ * so an editor whose view has not attached yet is WAITED IN rather than
+ * merely caught.
  */
 export async function typeIntoEditor(editor: Locator, text: string): Promise<void> {
   await expect(editor).toHaveAttribute("contenteditable", "true");

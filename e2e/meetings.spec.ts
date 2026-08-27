@@ -216,7 +216,10 @@ test.describe.serial("Meetings journey", () => {
     // invitation rather than reporting the person just added...
     await expect(form.getByTestId("meeting-add-user")).toContainText("Add a colleague...");
     // ...and the OPTION LIST IS GONE, which the trigger assertion above does
-    // not say: that one gates the trigger's own re-render, while the options
+    // not say -- and cannot: OwnerSelect is rendered with value={null} and a
+    // fixed unassignedLabel, so its trigger has read "Add a colleague..."
+    // since the form first painted. That line states the picker's contract
+    // (a picker, not a field); it waits for nothing. The options meanwhile
     // live in a Radix portal (ui/select.tsx's SelectContent, role="listbox")
     // that unmounts on its own schedule. Nothing configures an exit
     // animation and CI has burned no retries here, so this is stated rather
