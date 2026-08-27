@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { and, eq } from "drizzle-orm";
 import { eventVerbSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
@@ -98,6 +99,32 @@ describe("timeline service", () => {
     await archiveMeeting(handle.db, actorId, meeting.id);
     const afterArchive = await listEvents(handle.db, { contactId: dana.id });
     expect(afterArchive.items.map((e) => e.verb)).toEqual(["archived", "met", "created"]);
+  });
+
+  // The widening carries the MEETING to an attendee's record, not everything
+  // the meeting spawned. Task 3 will stamp meeting_id onto a follow-up task's
+  // own `created` event (services/meetings.ts's taskCreatedFromMeeting reads
+  // exactly that row), and on such a row meeting_id is provenance, not
+  // subject: the task reaches timelines through its own links, and an attendee
+  // seeing task activity she is not on is noise. Written by hand here because
+  // Task 3 does not exist yet -- the same technique meetings.test.ts uses to
+  // pin the task count.
+  it("does not carry a meeting's follow-up task events onto an attendee's timeline", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const dana = await createContact(handle.db, actorId, { firstName: "Dana" });
+    const meeting = await createMeeting(handle.db, actorId, {
+      title: "Kickoff", occurredAt: new Date().toISOString(), companyId: company.id,
+      attendees: [{ contactId: dana.id }],
+    });
+    const task = await createTask(handle.db, actorId, { title: "Follow up", companyId: company.id });
+    await handle.db.update(events).set({ meetingId: meeting.id })
+      .where(and(eq(events.taskId, task.id), eq(events.verb, "created")));
+
+    const attended = await listEvents(handle.db, { contactId: dana.id });
+    expect(attended.items.map((e) => e.verb)).toEqual(["met", "created"]);
+    // The one `created` row here is Dana's own, not the task's.
+    expect(attended.items[1]?.contactId).toBe(dana.id);
+    expect(attended.items.some((e) => e.taskId === task.id)).toBe(false);
   });
 
   it("does not double-count a contact who is both the meeting's link and an attendee", async () => {

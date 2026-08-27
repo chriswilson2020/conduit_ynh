@@ -1717,7 +1717,11 @@ describe("meetings routes", () => {
     await a.close();
   });
 
-  it("returns 409 conflict when the same contact is listed twice", async () => {
+  // Both of a meeting write's 409s, side by side, because they are the same
+  // status and the client has to tell them apart: a duplicate attendee is one
+  // row of the attendee list to fix, the emptied last link is a different
+  // section of the form. Branching on the CODE, never on the prose.
+  it("returns 409 duplicate_attendee when the same contact is listed twice, distinct from the conflict code", async () => {
     const a = await app();
     const company = await makeCompany(a);
     const contact = await a.inject({
@@ -1733,7 +1737,22 @@ describe("meetings routes", () => {
       },
     });
     expect(response.statusCode).toBe(409);
-    expect(errorResponseSchema.parse(response.json()).error).toBe("conflict");
+    expect(errorResponseSchema.parse(response.json()).error).toBe("duplicate_attendee");
+
+    const meeting = await makeMeeting(a, { title: "Kickoff", occurredAt, companyId: company.id });
+    const onPatch = await a.inject({
+      method: "PATCH", url: `/api/meetings/${meeting.id}`, headers: authHeaders,
+      payload: { attendees: [{ contactId }, { contactId }] },
+    });
+    expect(onPatch.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(onPatch.json()).error).toBe("duplicate_attendee");
+
+    const emptied = await a.inject({
+      method: "PATCH", url: `/api/meetings/${meeting.id}`, headers: authHeaders,
+      payload: { companyId: null },
+    });
+    expect(emptied.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(emptied.json()).error).toBe("conflict");
     await a.close();
   });
 

@@ -469,6 +469,81 @@ describe("meetings service", () => {
     expect(counts.get(meeting.id)).toBe(1);
     expect(counts.get(other.id)).toBe(0);
     expect((await getMeeting(handle.db, meeting.id)).tasks).toHaveLength(1);
+
+    // COUNT(DISTINCT task_id), not COUNT(*): a SECOND creation row naming the
+    // same task is still one follow-up task. Nothing writes such a row today
+    // (createTask emits one `created` per task), which is exactly why the
+    // DISTINCT needs pinning -- count(*) passes every other assertion here.
+    await handle.db.insert(events).values({
+      verb: "created", actorUserId: actorId, companyId: company.id,
+      taskId: task.id, meetingId: meeting.id, payload: {},
+    });
+    expect((await getMeeting(handle.db, meeting.id)).meeting.taskCount).toBe(1);
+    expect((await listMeetings(handle.db, { companyId: company.id })).items
+      .find((m) => m.id === meeting.id)?.taskCount).toBe(1);
+  });
+
+  // The "one pass" claim is the file's headline hydration rule, and prose is
+  // all that holds it: a `Promise.all(rows.map(getMeeting))` rewrite passes
+  // every other test here unchanged. Counting db.select() calls pins it --
+  // three per page (the page itself, its attendees, its task counts),
+  // CONSTANT as the page grows. mail-move.test.ts's Proxy is the technique.
+  it("issues the same number of queries for a page of ten meetings as for a page of one", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const dana = await createContact(handle.db, actorId, { firstName: "Dana" });
+    for (let i = 0; i < 10; i++) {
+      await createMeeting(handle.db, actorId, {
+        title: `Meeting ${i}`, occurredAt: daysAgo(i + 1), companyId: company.id,
+        attendees: [{ contactId: dana.id }, { guestName: "Their lawyer" }],
+      });
+    }
+
+    let selects = 0;
+    const counting = new Proxy(handle.db, {
+      get(target, property, receiver: unknown) {
+        if (property === "select") {
+          return (...args: unknown[]) => {
+            selects += 1;
+            return (Reflect.get(target, property, receiver) as (...a: unknown[]) => unknown)
+              .apply(target, args);
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as typeof handle.db;
+
+    const one = await listMeetings(counting, { limit: 1 });
+    const afterOne = selects;
+    selects = 0;
+    const ten = await listMeetings(counting, { limit: 10 });
+
+    expect(one.items).toHaveLength(1);
+    expect(ten.items).toHaveLength(10);
+    expect(afterOne).toBe(3);
+    expect(selects).toBe(3);
+    // The rows really were hydrated, so the count above is not three queries
+    // that quietly returned nothing.
+    expect(ten.items.every((m) => m.attendees.length === 2)).toBe(true);
+  });
+
+  // createMeeting sorts the rows its INSERT ... RETURNING handed back so they
+  // match loadAttendees' ORDER BY id. Without the sort the two paths agree
+  // only by accident of insertion order, and an assertion over a Set (or over
+  // lengths) would not notice.
+  it("returns attendees in the same order create and get both use", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const people = [];
+    for (const name of ["Dana", "Sam", "Ada", "Grace"]) {
+      people.push(await createContact(handle.db, actorId, { firstName: name }));
+    }
+    const created = await createMeeting(handle.db, actorId, {
+      title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id,
+      attendees: people.map((c) => ({ contactId: c.id })),
+    });
+
+    const fetched = await getMeeting(handle.db, created.id);
+    expect(created.attendees).toEqual(fetched.meeting.attendees);
+    expect((await listMeetings(handle.db, {})).items[0]?.attendees).toEqual(created.attendees);
   });
 
   it("hydrates every list row's attendees in one pass", async () => {

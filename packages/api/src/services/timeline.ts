@@ -1,4 +1,4 @@
-import { and, desc, eq, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
 import type { Event } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { events, meetingAttendees, type EventRow } from "../db/schema.js";
@@ -48,8 +48,31 @@ export async function listEvents(
   // the read-time one in listMeetings -- that could drift apart. This is the
   // same rule, expressed the same way, in both places.
   //
-  // events.meeting_id is NULL on every non-meeting row, so the EXISTS is
-  // never true for them and no other verb's behaviour changes.
+  // WHICH ROWS THE ARM REACHES: the meeting's OWN lifecycle rows, and only
+  // those -- `task_id IS NULL` is what says so. events.meeting_id is NULL on
+  // every note/file/stage-change row, so those never matched anyway; the
+  // exception is the follow-up task Task 3 creates from a meeting, whose
+  // `created` event carries BOTH task_id and meeting_id (services/meetings.ts's
+  // taskCreatedFromMeeting reads exactly that pair). On such a row meeting_id
+  // is PROVENANCE, not subject: the row is about the task, which reaches
+  // timelines through its own links, and an attendee seeing task activity she
+  // is not on is noise rather than the meeting she attended. So the widening
+  // carries the meeting to her record; it does not carry everything the
+  // meeting spawned.
+  //
+  // `IN`, NOT A CORRELATED `EXISTS`, and that is a MEASURED choice rather
+  // than a stylistic one: a correlated subquery referencing the outer row is
+  // not parallel-safe, so it downgrades this scan to serial on the one table
+  // in this schema with no record-FK indexes. Measured at 300,005 events /
+  // 50,000 meetings / 150,000 attendees (warm, top-level Execution Time):
+  // EXISTS 162.7ms serial vs IN 44.8ms with two parallel workers, identical
+  // rows out of both. `IN` inside an `OR` has no NULL trap here -- a NULL
+  // meeting_id yields NULL, which is not true, which is what the EXISTS did
+  // too. Do not fold it back.
+  //
+  // (listMeetings' own attendance arm correlates on meetings.id and cannot be
+  // written this way; it needs nothing -- 312 buffers / 2.9ms at 20k
+  // meetings.)
   //
   // TASK 4 MUST PRESERVE THIS ARM when it rewrites this function for the mail
   // pointer: the mail filtering is an additional predicate over the same
@@ -61,7 +84,10 @@ export async function listEvents(
     // cursor's below.
     where.push(or(
       eq(events.contactId, opts.contactId),
-      sql`EXISTS (SELECT 1 FROM ${meetingAttendees} WHERE ${meetingAttendees.meetingId} = ${events.meetingId} AND ${meetingAttendees.contactId} = ${opts.contactId})`,
+      and(
+        sql`${events.meetingId} IN (SELECT ${meetingAttendees.meetingId} FROM ${meetingAttendees} WHERE ${meetingAttendees.contactId} = ${opts.contactId})`,
+        isNull(events.taskId),
+      ),
     )!);
   }
   if (opts.dealId) where.push(eq(events.dealId, opts.dealId));

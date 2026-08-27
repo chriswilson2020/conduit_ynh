@@ -9,7 +9,7 @@ import {
   companies, contacts, deals, projects, users, events, meetings, meetingAttendees, tasks,
   type MeetingRow, type MeetingAttendeeRow,
 } from "../db/schema.js";
-import { NotFoundError, ArchivedError, ConflictError } from "./errors.js";
+import { NotFoundError, ArchivedError, ConflictError, DuplicateAttendeeError } from "./errors.js";
 import { sanitizeMailHtml } from "./mail-content.js";
 import { decodeOccurredAtCursor, encodeCursor } from "./pagination.js";
 import { toTask } from "./tasks.js";
@@ -35,9 +35,11 @@ import { publish } from "./sse.js";
  */
 
 /** Invalidation keys every meeting mutator publishes after its transaction
- * commits. `events` rides along because every one of them writes a timeline
- * entry too. Meetings are not searchable in v0.9.0, so no `search` key --
- * unlike companies.ts's hint. */
+ * commits. `events` rides along for create/archive/unarchive, which each write
+ * a timeline entry; updateMeeting writes none (see its header) and publishes
+ * the key anyway rather than carrying a second hint shape -- a client refetch
+ * of an unchanged timeline, not a missed one. Meetings are not searchable in
+ * v0.9.0, so no `search` key -- unlike companies.ts's hint. */
 function publishMeetingHint(id: string): void {
   publish({ keys: [["meetings"], ["meeting", id], ["events"]] });
 }
@@ -110,9 +112,12 @@ const taskCreatedFromMeeting = and(eq(events.verb, "created"), isNotNull(events.
  * says the meeting produced the task, and archiving one does not un-create
  * it, so this number and the detail payload's task list stay the same set.
  *
- * MEASURE THIS when Task 3 starts writing the rows it reads: events.meeting_id
- * carries no index (Task 1's DONE block), on the table Task 4 is about to add
- * mail rows to.
+ * MEASURED, and indexed for it: this runs on every list page, and the cost was
+ * never "once Task 3 writes rows" -- scanning 300k events to return nothing
+ * costs the same as scanning them to return five. events_meeting_id_idx
+ * (drizzle/0008, partial on meeting_id IS NOT NULL) took a page's count from
+ * 42.7ms / 4,243 buffers to 0.120ms / 103; that migration's comment carries
+ * the full figures.
  */
 async function loadTaskCounts(db: Database, meetingIds: string[]): Promise<Map<string, number>> {
   const byMeeting = new Map<string, number>();
@@ -130,7 +135,9 @@ async function loadTaskCounts(db: Database, meetingIds: string[]): Promise<Map<s
 }
 
 /** The follow-up tasks one meeting produced, under taskCreatedFromMeeting's
- * criterion. Oldest first, which is the order they were added in. */
+ * criterion. Oldest first, which is the order they were added in. Served by
+ * the same events_meeting_id_idx as the count above: 39.6ms / 4,258 buffers
+ * without it, 0.046ms / 19 with (drizzle/0008 carries the methodology). */
 async function loadMeetingTasks(db: Database, meetingId: string): Promise<Task[]> {
   const rows = await db.select().from(tasks)
     .where(sql`EXISTS (SELECT 1 FROM ${events} WHERE ${events.taskId} = ${tasks.id} AND ${events.meetingId} = ${meetingId} AND ${taskCreatedFromMeeting})`)
@@ -274,7 +281,10 @@ const DUPLICATE_ATTENDEE_MESSAGE =
  * contact or user added twice to one meeting. Guests are deliberately not
  * deduped (free text: two people can share a first name), so only these two
  * can fire. 409 rather than a 400 for mail-accounts.ts's reason: the
- * submission was well-formed, it is the stored set it conflicts with.
+ * submission was well-formed, it is the stored set it conflicts with -- and
+ * DuplicateAttendeeError rather than a bare ConflictError so the route answers
+ * `duplicate_attendee`, tellable from the other 409 a meeting write can raise
+ * (a patch that would empty the last record link) without parsing prose.
  *
  * The DB is the detector rather than a pre-pass over the input, because it is
  * also the only thing that can catch two concurrent writers adding the same
@@ -283,7 +293,7 @@ const DUPLICATE_ATTENDEE_MESSAGE =
  * back with the transaction.
  */
 function rethrowAttendeeConflict(err: unknown, meetingId: string): never {
-  if (isUniqueViolation(err)) throw new ConflictError("meeting", meetingId, DUPLICATE_ATTENDEE_MESSAGE);
+  if (isUniqueViolation(err)) throw new DuplicateAttendeeError("meeting", meetingId, DUPLICATE_ATTENDEE_MESSAGE);
   throw err;
 }
 
@@ -472,6 +482,16 @@ export async function updateMeeting(
   let updated: MeetingRow;
   try {
     updated = await db.transaction(async (tx) => {
+      // THIS UPDATE MUST STAY THE FIRST STATEMENT IN THIS TRANSACTION. Its row
+      // lock on the meeting is what serialises two concurrent attendee
+      // replacements: without it, both transactions delete the set they each
+      // read and then insert their own, and the results UNION instead of one
+      // replacing the other (proved by experiment during the quality review --
+      // four attendees where two were asked for). No index would catch the
+      // survivors either, since guests are deliberately not deduped. It always
+      // runs because `values` is seeded with updatedAt, so there is no patch
+      // shape that reaches the attendee block below with nothing to update.
+      //
       // archived_at IS NULL in the WHERE makes the guard atomic, exactly as
       // companies.ts's updateCompany does: a concurrent archive between the
       // mustGet above and this UPDATE yields zero rows here instead of

@@ -2,7 +2,8 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { User } from "@conduit/shared";
 import {
-  NotFoundError, ArchivedError, ConflictError, MailKeyMissingError, MailCredentialDecryptError,
+  NotFoundError, ArchivedError, ConflictError, DuplicateAttendeeError,
+  MailKeyMissingError, MailCredentialDecryptError,
   AttachmentTooLargeError, SmtpSendError,
 } from "../services/errors.js";
 import { decodeCursor } from "../services/pagination.js";
@@ -54,6 +55,15 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
   }
   if (error instanceof ArchivedError) {
     void reply.code(409).send({ error: "archived", message: error.message });
+    return;
+  }
+  // Before the ConflictError arm below, which it extends: a duplicate attendee
+  // is a 409 like any other conflict, but with its own code, because the
+  // client's remedy is a specific row of the attendee list rather than a
+  // refetch (see the class's own comment). Ordering matters -- the generic arm
+  // would otherwise swallow it.
+  if (error instanceof DuplicateAttendeeError) {
+    void reply.code(409).send({ error: "duplicate_attendee", message: error.message });
     return;
   }
   if (error instanceof ConflictError) {

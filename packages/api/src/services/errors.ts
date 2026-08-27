@@ -22,6 +22,25 @@ export class ConflictError extends Error {
   }
 }
 
+// Raised by meetings.ts when meeting_attendees' partial unique indexes reject
+// a contact or user added twice to one meeting (Postgres 23505, remapped).
+//
+// A SUBCLASS purely so the route layer can answer a distinct machine-readable
+// code -- MailCredentialDecryptError's precedent, a class that exists to make
+// one 409 tellable from another. Both this and a plain ConflictError are the
+// same HTTP status and the same "your submission conflicts with stored state"
+// shape, but the caller's remedy differs: a duplicate attendee is one ROW in
+// the form to remove, while the other 409 a meeting write can raise (the
+// patch that would empty the last record link) is about a different section
+// of it entirely. A client branching on English prose is a client that breaks
+// when the prose is reworded.
+//
+// Extending ConflictError rather than Error keeps every existing
+// `instanceof ConflictError` site -- mapDomainError's fallback included --
+// true of it, so an unhandled path degrades to the generic 409 rather than a
+// 500.
+export class DuplicateAttendeeError extends ConflictError {}
+
 // Raised by mail-crypto's loadMailKey when $data_dir/mail.key is absent -- an
 // operator-fixable deployment gap (install/upgrade is supposed to generate
 // it; see the Phase 4 spec's "Key handling" section), not a bug. Distinct

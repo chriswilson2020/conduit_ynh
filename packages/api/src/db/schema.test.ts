@@ -1028,7 +1028,7 @@ describe("meetings schema (0008)", () => {
         cause: { message: expect.stringMatching(/events_verb_valid|check/i) },
       });
 
-      // 0008's three hand-written indexes arrived with it, ON A DATABASE THIS
+      // 0008's four hand-written indexes arrived with it, ON A DATABASE THIS
       // TEST MIGRATED FROM THE FILES -- the 0005 drill's assertion, for the
       // same reason: they exist in no snapshot, so only a from-the-files
       // migration proves the .sql file still carries them.
@@ -1062,6 +1062,22 @@ describe("meetings schema (0008)", () => {
       expect(hydration?.indexdef).toMatch(/\(meeting_id\)/i);
       expect(hydration?.indexdef).not.toMatch(/UNIQUE/i);
       expect(hydration?.indexdef).not.toMatch(/WHERE/i);
+
+      // The fourth hand-written index (quality-review ruling), on the OTHER
+      // table this migration touches: the follow-up-task link both
+      // listMeetings' per-page count and the detail payload's task list read
+      // out of `events`, which carries no other index at all. PARTIAL is the
+      // half worth asserting -- every non-meeting row has meeting_id NULL, so
+      // a non-partial version would index the whole of the fastest-growing
+      // table to serve rows that are a sixth of it (measured 50,005 of
+      // 300,005 in the migration's own note).
+      const eventsIndexes = await scratch.db.execute<{ indexname: string; indexdef: string }>(
+        sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'events'`,
+      );
+      const meetingIdIndex = eventsIndexes.find((row) => row.indexname === "events_meeting_id_idx");
+      expect(meetingIdIndex?.indexdef).toMatch(/\(meeting_id\)/i);
+      expect(meetingIdIndex?.indexdef).toMatch(/WHERE.*meeting_id IS NOT NULL/i);
+      expect(meetingIdIndex?.indexdef).not.toMatch(/UNIQUE/i);
     });
   }, 30000);
 
