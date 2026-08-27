@@ -1,1 +1,14 @@
 @import "tailwindcss";
+
+/*
+ * The breakpoint that separates this app's two interaction models, declared
+ * here so it is written down on the CSS side rather than inherited silently
+ * from a framework default. The value is Tailwind's own `md` default, so this
+ * declaration changes nothing that renders today; it exists so that
+ * MOBILE_BREAKPOINT in src/lib.ts -- which use-is-mobile.ts turns into a
+ * matchMedia query -- has something to be pinned against.
+ * use-is-mobile.test.ts reads this file and fails if the two drift apart.
+ */
+@theme {
+  --breakpoint-md: 48rem;
+}

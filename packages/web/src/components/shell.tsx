@@ -1,6 +1,9 @@
 import type { ReactNode } from "react";
 import { Link, useRouterState } from "@tanstack/react-router";
+import { clsx } from "clsx";
 import { useUnreadMailCount } from "../queries";
+import { useIsMobile } from "../use-is-mobile";
+import { BottomNav, MobileSearch } from "./bottom-nav";
 import { GlobalSearch } from "./search";
 import { useSseInvalidation } from "./sse";
 
@@ -31,6 +34,21 @@ export function Shell({ children }: { children: ReactNode }) {
   // flight, which reads the same as zero: no badge until there is a number.
   const { data: unreadMail = 0 } = useUnreadMailCount();
 
+  // The first of the phase's three sanctioned useIsMobile() sites, and the
+  // clearest: below the breakpoint the navigation is not the sidebar re-laid
+  // out, it is a different control -- a five-slot bar with a sheet behind it.
+  //
+  // A JS branch rather than `md:` visibility classes, and the two halves are
+  // therefore MUTUALLY EXCLUSIVE IN THE DOM rather than one of them merely
+  // hidden. That is what keeps `unread-badge` and `search-input` single
+  // elements on the page: the mail journeys address the badge by testid and
+  // would hit a strict-mode violation against two copies of it.
+  //
+  // Above the breakpoint every branch below resolves to exactly what this file
+  // rendered before this phase, down to the class strings -- the phase must
+  // not alter the desktop shell, and `false && ...` renders no node at all.
+  const isMobile = useIsMobile();
+
   // The Settings entry links at one of its two tabs but must stay highlighted
   // on both, and activeProps only knows about the link's own target -- so its
   // active state is computed from the path instead.
@@ -45,50 +63,74 @@ export function Shell({ children }: { children: ReactNode }) {
 
   return (
     <div data-testid="shell" className="flex min-h-screen bg-slate-50">
-      <aside className="flex w-56 shrink-0 flex-col bg-slate-900 text-white">
-        <div className="px-4 py-5 text-lg font-semibold tracking-tight">Conduit</div>
-        <nav className="flex flex-col gap-1 px-2">
-          <Link to="/mail" className={navMailLinkClass} activeProps={{ className: activeNavMailLinkClass }}>
-            Inbox
-            {unreadMail > 0 && (
-              <span
-                data-testid="unread-badge"
-                className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-900"
-              >
-                {unreadMail}
-              </span>
-            )}
-          </Link>
-          <Link to="/companies" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
-            Companies
-          </Link>
-          <Link to="/contacts" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
-            Contacts
-          </Link>
-          <Link to="/pipelines" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
-            Pipelines
-          </Link>
-          <Link to="/projects" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
-            Projects
-          </Link>
-          <Link to="/my-tasks" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
-            My Tasks
-          </Link>
-          <Link to="/gantt" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
-            Gantt
-          </Link>
-          <Link to="/settings/mail" className={inSettings ? activeNavLinkClass : navLinkClass}>
-            Settings
-          </Link>
-        </nav>
-      </aside>
+      {!isMobile && (
+        <aside className="flex w-56 shrink-0 flex-col bg-slate-900 text-white">
+          <div className="px-4 py-5 text-lg font-semibold tracking-tight">Conduit</div>
+          <nav className="flex flex-col gap-1 px-2">
+            <Link to="/mail" className={navMailLinkClass} activeProps={{ className: activeNavMailLinkClass }}>
+              Inbox
+              {unreadMail > 0 && (
+                <span
+                  data-testid="unread-badge"
+                  className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-900"
+                >
+                  {unreadMail}
+                </span>
+              )}
+            </Link>
+            <Link to="/companies" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+              Companies
+            </Link>
+            <Link to="/contacts" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+              Contacts
+            </Link>
+            <Link to="/pipelines" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+              Pipelines
+            </Link>
+            <Link to="/projects" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+              Projects
+            </Link>
+            <Link to="/my-tasks" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+              My Tasks
+            </Link>
+            <Link to="/gantt" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+              Gantt
+            </Link>
+            <Link to="/settings/mail" className={inSettings ? activeNavLinkClass : navLinkClass}>
+              Settings
+            </Link>
+          </nav>
+        </aside>
+      )}
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex items-center gap-4 border-b border-slate-200 bg-white px-6 py-3">
-          <div className="max-w-md flex-1">
-            <GlobalSearch />
-          </div>
+          {isMobile ? (
+            <>
+              <span className="flex-1 text-lg font-semibold tracking-tight text-slate-900">Conduit</span>
+              <MobileSearch />
+            </>
+          ) : (
+            <div className="max-w-md flex-1">
+              <GlobalSearch />
+            </div>
+          )}
         </header>
-        <main className="flex-1 overflow-auto px-6 py-6">{children}</main>
+        {/*
+          The bottom bar is `fixed`, so it overlays the end of a scrolled page;
+          the extra bottom padding below the breakpoint is what keeps the last
+          row of a list out from under it. Spelled as a calc so the reserved
+          space grows with the home-indicator inset the bar itself pads for,
+          rather than assuming a fixed one.
+        */}
+        <main
+          className={clsx(
+            "flex-1 overflow-auto px-6 py-6",
+            isMobile && "pb-[calc(6rem_+_env(safe-area-inset-bottom))]",
+          )}
+        >
+          {children}
+        </main>
+        {isMobile && <BottomNav unreadMail={unreadMail} />}
       </div>
     </div>
   );

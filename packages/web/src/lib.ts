@@ -273,3 +273,37 @@ export function flattenCursorPages<T extends { id: string }>(state: CursorPages<
   }
   return out;
 }
+
+/**
+ * The ONE width at which this app switches between its two interaction
+ * models, as a CSS length. Everything that needs to know what "mobile" means
+ * reads it from here: the `@theme` block in styles.css binds Tailwind's `md`
+ * variant to it (so `md:` utilities and this constant are the same edge), and
+ * use-is-mobile.ts builds its matchMedia query from it. use-is-mobile.test.ts
+ * pins the two together, so a change to either side that forgets the other
+ * fails a test rather than shipping a UI whose CSS and JS disagree about which
+ * half of the app the user is in.
+ *
+ * The value is Tailwind's own `md` default -- 48rem, i.e. 768px at the browser
+ * default root size -- and is deliberately spelled in the same unit Tailwind
+ * uses rather than in px, so redeclaring it in styles.css changes nothing at
+ * all for the 32 breakpoint utilities already in this package.
+ *
+ * Chosen for where the two interaction models actually belong, which is not
+ * simply "phone vs not":
+ *
+ *  - Every phone in PORTRAIT (430px at the widest current handset) is below
+ *    it, which is the case the phone UI is designed for.
+ *  - A tablet in portrait (768px) is at or above it and keeps the sidebar,
+ *    which it has width for.
+ *  - A large phone in LANDSCAPE (844px and up) is above it and also keeps the
+ *    sidebar. That is deliberate, not an oversight: in landscape the scarce
+ *    axis is HEIGHT (393px on a 14 Pro), and the sidebar spends width while a
+ *    bottom tab bar would spend the axis there is none of.
+ *
+ * `rem` in a media query resolves against the browser's INITIAL font size, not
+ * the root element's, and matchMedia evaluates it by the same rule -- so the
+ * CSS half and the JS half agree at every user font-size setting, which a px
+ * constant paired with rem breakpoints would not.
+ */
+export const MOBILE_BREAKPOINT = "48rem";
