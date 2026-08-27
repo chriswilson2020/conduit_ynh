@@ -32,6 +32,7 @@ import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "../components/ui/dialog";
 import { Input } from "../components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
+import { CHECKBOX_LABEL } from "../components/ui/touch";
 
 /**
  * Poll interval for GET /api/mail/accounts, and the ONLY place in the app
@@ -697,8 +698,7 @@ function AccountForm({
         <Input value={state.username} onChange={(e) => set("username", e.target.value)} autoComplete="username" />
       </Field>
 
-      {/* The label is the touch target, not the 13px box inside it. */}
-      <label className="flex items-center gap-2 text-sm text-slate-600 max-md:min-h-11">
+      <label className={CHECKBOX_LABEL}>
         <input
           type="checkbox"
           checked={state.smtpDiffers}

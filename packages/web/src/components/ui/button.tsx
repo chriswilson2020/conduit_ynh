@@ -29,7 +29,14 @@ export function Button({ variant = "default", type = "button", className, ...pro
         // with their own px/py/text-xs (the meeting form's chips, the link
         // panel's) still clear the floor on a phone, because nothing here or
         // in those callers sets a height for the floor to argue with.
-        "inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium max-md:min-h-11",
+        //
+        // BOTH AXES, not just the height. A button whose whole label is one
+        // glyph is as narrow as that glyph: the task drawer's close was 34.7
+        // wide by 44 tall, and below the breakpoint that drawer is
+        // full-screen -- no outside to click, no Escape key -- so it is the
+        // ONLY way out of the surface Task 5 opens from a Gantt bar.
+        "inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium",
+        "max-md:min-h-11 max-md:min-w-11",
         "transition-colors disabled:cursor-not-allowed disabled:opacity-50",
         variantClasses[variant],
         className,

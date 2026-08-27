@@ -4,6 +4,7 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Dialog, DialogContent, DialogTrigger } from "./ui/dialog";
 import { Table, TableHead, TableBody, TableRow, TableHeaderCell, TableCell } from "./ui/table";
+import { CHECKBOX_LABEL } from "./ui/touch";
 
 export interface EntityTableColumn<T> {
   key: string;
@@ -83,8 +84,7 @@ export function EntityTable<T extends { id: string }>({
           aria-label="Filter"
           className="max-w-xs max-md:max-w-none"
         />
-        {/* The label is the touch target, not the 13px box inside it. */}
-        <label className="flex items-center gap-2 text-sm text-slate-600 max-md:min-h-11">
+        <label className={CHECKBOX_LABEL}>
           <input
             type="checkbox"
             checked={archived}

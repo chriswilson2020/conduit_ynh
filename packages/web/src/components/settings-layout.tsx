@@ -6,8 +6,10 @@ import { Link } from "@tanstack/react-router";
 // a base plus an "active" fragment.
 // These are tab triggers in everything but their implementation, so they take
 // the same 44px floor below the breakpoint that ui/tabs.tsx gives the real
-// ones. inline-flex because a Link is inline: a min-height on an inline box
-// does nothing at all.
+// ones. The min-height bites because these Links are children of a flex row
+// and so are already blockified -- and the flex is here for the OTHER half:
+// an anchor does not centre its own text in a box taller than its line, the
+// way a <button> does.
 const tabClass =
   "border-b-2 border-transparent px-3 py-2 text-sm font-medium text-slate-500 hover:text-slate-900 max-md:inline-flex max-md:min-h-11 max-md:items-center";
 const activeTabClass =

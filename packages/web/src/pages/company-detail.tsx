@@ -19,6 +19,7 @@ import { Rail } from "../components/rail/rail";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
+import { CHECKBOX_LABEL } from "../components/ui/touch";
 
 function buildCompanyPatch(name: string, value: string): UpdateCompanyInput {
   const trimmed = value.trim();
@@ -244,8 +245,7 @@ export function CompanyDetailPage() {
           <div className="mb-2 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-900">Pipelines</h2>
             <div className="flex items-center gap-3">
-              {/* The label is the touch target, not the 13px box inside it. */}
-              <label className="flex items-center gap-2 text-sm text-slate-600 max-md:min-h-11">
+              <label className={CHECKBOX_LABEL}>
                 <input
                   type="checkbox"
                   data-testid="show-archived-pipelines"

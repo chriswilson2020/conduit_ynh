@@ -10,6 +10,7 @@ import {
 } from "../../queries";
 import { EntityPicker, KIND_LABEL } from "../entity-picker";
 import { Button } from "../ui/button";
+import { CHIP_REMOVE_TOUCH } from "../ui/touch";
 
 export interface LinkPanelProps {
   thread: MailThread;
@@ -76,7 +77,7 @@ export function LinkPanel({ thread, dealSuggestions }: LinkPanelProps) {
               <button
                 type="button"
                 aria-label={`Unlink ${KIND_LABEL[kind].toLowerCase()}`}
-                className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
+                className={`text-slate-400 hover:text-slate-900 ${CHIP_REMOVE_TOUCH}`}
                 onClick={() => clearLink.mutate({ threadId: thread.id, kind })}
               >
                 {"\u00D7"}

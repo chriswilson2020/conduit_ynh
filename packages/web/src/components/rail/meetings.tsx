@@ -42,6 +42,7 @@ import {
   type MeetingFormDraft,
   type RecordLinks,
 } from "./meetings-lib";
+import { CHECKBOX_LABEL, CHIP_REMOVE_TOUCH } from "../ui/touch";
 
 export interface MeetingsProps extends RecordLinks {
   /**
@@ -164,8 +165,7 @@ function MeetingList({
         <Button data-testid="log-meeting" onClick={() => setFormOpen((open) => !open)}>
           {formOpen ? "Cancel" : "Log a meeting"}
         </Button>
-        {/* The label is the touch target, not the 13px box inside it. */}
-        <label className="flex items-center gap-2 text-sm text-slate-600 max-md:min-h-11">
+        <label className={CHECKBOX_LABEL}>
           <input
             type="checkbox"
             data-testid="show-archived-meetings"
@@ -392,12 +392,7 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
               <button
                 type="button"
                 aria-label={`Remove ${attendeeDraftLabel(attendee)}`}
-                // A bare glyph is a ~10px target. The chip cannot grow to 44px
-                // without becoming a button-sized box, so the tap area is
-                // widened instead of the chip: negative margin keeps the
-                // painted glyph where it was and lets the hit box overhang the
-                // chip's padding.
-                className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
+                className={`text-slate-400 hover:text-slate-900 ${CHIP_REMOVE_TOUCH}`}
                 onClick={() => removeAttendee(index)}
               >
                 {"\u00D7"}

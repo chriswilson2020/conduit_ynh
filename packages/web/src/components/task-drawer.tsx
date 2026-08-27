@@ -207,7 +207,7 @@ function TaskDrawerBody({ taskId }: { taskId: string }) {
         <div className="flex items-center justify-between">
           <DialogTitle>Task not found</DialogTitle>
           <DialogClose asChild>
-            <Button variant="ghost">{"\u2715"}</Button>
+            <Button variant="ghost" aria-label="Close">{"\u2715"}</Button>
           </DialogClose>
         </div>
         <p role="alert" className="text-sm text-red-600">
@@ -300,7 +300,10 @@ function TaskDrawerBody({ taskId }: { taskId: string }) {
             disabled={archived}
             className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 disabled:cursor-not-allowed disabled:bg-slate-50 max-md:min-h-11"
           />
-          <span className="text-slate-400">{"\u2192"}</span>
+          {/* Decorative, and only meaningful while the two fields share a
+              line -- once the row wraps it is an arrow pointing at nothing.
+              Both inputs keep their aria-labels, so nothing is lost. */}
+          <span className="text-slate-400 max-md:hidden">{"\u2192"}</span>
           <input
             type="date"
             aria-label="Due date"

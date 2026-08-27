@@ -30,6 +30,7 @@ import { Button } from "../ui/button";
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog";
 import { Input } from "../ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
+import { CHIP_REMOVE_TOUCH } from "../ui/touch";
 
 /**
  * Everything a caller can pre-fill. Every field is optional: the inbox opens
@@ -391,7 +392,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
               // chip only leaves the file off THIS message -- the original
               // keeps its own attachment either way.
               aria-label={`Do not attach ${attachment.filename}`}
-              className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
+              className={`text-slate-400 hover:text-slate-900 ${CHIP_REMOVE_TOUCH}`}
               onClick={() => setForwarded((current) => current.filter((entry) => entry.id !== attachment.id))}
             >
               {"\u00D7"}
@@ -412,7 +413,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
               // it was filed against, and stays on that record's Files rail
               // whether the message is ever sent or not.
               aria-label={`Do not attach ${file.originalName}`}
-              className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
+              className={`text-slate-400 hover:text-slate-900 ${CHIP_REMOVE_TOUCH}`}
               onClick={() => setAttachments((current) => current.filter((entry) => entry.id !== file.id))}
             >
               {"\u00D7"}
@@ -600,7 +601,7 @@ function RecipientField({
               <button
                 type="button"
                 aria-label={`Remove ${recipient.address}`}
-                className="text-slate-400 hover:text-slate-900 max-md:-my-2 max-md:-mr-2 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
+                className={`text-slate-400 hover:text-slate-900 ${CHIP_REMOVE_TOUCH}`}
                 onClick={() => onChange(recipients.filter((entry) => entry.address !== recipient.address))}
               >
                 {"\u00D7"}

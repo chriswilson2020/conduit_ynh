@@ -104,10 +104,14 @@ const EDITOR_CLASS = "min-h-[8rem] w-full px-3 py-2 text-sm text-slate-900 focus
 // These are the clearest ICON BUTTONS in the app -- a single letter or a
 // bullet each, 24x24 and 19x24 at rest -- and this editor is inside three
 // surfaces a phone has to be able to use: the composer (a full-screen sheet),
-// the meeting form, and both settings pages. The floor is `max-md:` for the
-// usual reason, and inline-flex with it because min-height on its own would
-// leave the glyph sitting at the top of a 44px box.
-const TOOLBAR_BUTTON_TOUCH = "max-md:inline-flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center";
+// the meeting form, and both settings pages.
+//
+// BOTH AXES, because the label is one glyph and the height alone would leave
+// a 19px-wide target. No flex with it: a <button> centres its own content
+// whatever its display is, which is why the picker rows and the deal
+// suggestions were floored with the bare utilities too. (A non-button that
+// needs the same floor does need the centring -- see ui/select.tsx.)
+const TOOLBAR_BUTTON_TOUCH = "max-md:min-h-11 max-md:min-w-11";
 const toolbarButtonClass =
   `rounded px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-50 ${TOOLBAR_BUTTON_TOUCH}`;
 const activeToolbarButtonClass =

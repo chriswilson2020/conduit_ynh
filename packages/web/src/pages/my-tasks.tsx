@@ -222,8 +222,10 @@ function TaskRow({
 
       The break is forced by the title's flex-basis rather than by a wrapper
       element, because a wrapper would restructure the desktop row as well.
-      2rem is the checkbox and its gap, so the title fills the rest of line one
-      exactly and everything after it is pushed to line two.
+      The subtracted 2rem stands in for the checkbox and its gap, which
+      measure 25px together (13 + 12) -- rounded UP deliberately, since the
+      basis only has to be too wide to leave room for the next item, and a
+      value that undershot would let the project name back onto line one.
     */
     <li
       data-testid={`task-row-${task.id}`}

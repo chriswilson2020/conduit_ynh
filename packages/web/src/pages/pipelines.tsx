@@ -7,6 +7,7 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
+import { CHECKBOX_LABEL } from "../components/ui/touch";
 
 // No dedicated company Select entry maps to "global" -- Radix reserves the
 // empty string, so this sentinel plays the same role NO_COMPANY/UNASSIGNED
@@ -58,8 +59,7 @@ export function PipelinesPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-slate-900">Pipelines</h1>
         <div className="flex items-center gap-3">
-          {/* The label is the touch target, not the 13px box inside it. */}
-          <label className="flex items-center gap-2 text-sm text-slate-600 max-md:min-h-11">
+          <label className={CHECKBOX_LABEL}>
             <input type="checkbox" checked={archived} onChange={(event) => setArchived(event.target.checked)} />
             Archived
           </label>

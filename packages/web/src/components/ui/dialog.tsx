@@ -8,6 +8,19 @@ export const DialogClose = RadixDialog.Close;
 
 type ContentProps = ComponentPropsWithoutRef<typeof RadixDialog.Content>;
 
+/** Which edges a sheet is pinned to. See SHAPES for what each one means. */
+type SheetShape = "bottom" | "full";
+
+/**
+ * What a sheet is made of once you take away WHERE it is pinned: a column that
+ * scrolls its body rather than the page, on white, over the home-indicator
+ * inset. The two sheet entries in SHAPES differed by exactly one line before this
+ * was named, and the "complete class string" rule below is about the PIN --
+ * which edges a surface is fixed to -- not about retyping its chrome.
+ */
+const SHEET_CHROME =
+  "flex flex-col overflow-hidden bg-white pb-[env(safe-area-inset-bottom)] shadow-xl focus:outline-none";
+
 /**
  * WHERE A MODAL SURFACE IS PINNED -- the only thing that separates the four of
  * them. Everything else (the portal, the scrim, the focus trap, Escape and
@@ -78,18 +91,12 @@ const SHAPES = {
    * Pinned to the bottom edge and capped, so the page behind stays partly
    * visible -- right for a short list of choices.
    */
-  sheetBottom: clsx(
-    "fixed inset-x-0 bottom-0 max-h-[85vh] rounded-t-xl",
-    "flex flex-col overflow-hidden bg-white pb-[env(safe-area-inset-bottom)] shadow-xl focus:outline-none",
-  ),
+  sheetBottom: clsx("fixed inset-x-0 bottom-0 max-h-[85vh] rounded-t-xl", SHEET_CHROME),
   /**
    * Edge to edge, for a surface that needs the screen: global search opens its
    * own result list underneath the input, and a capped sheet would scroll it.
    */
-  sheetFull: clsx(
-    "fixed inset-0",
-    "flex flex-col overflow-hidden bg-white pb-[env(safe-area-inset-bottom)] shadow-xl focus:outline-none",
-  ),
+  sheetFull: clsx("fixed inset-0", SHEET_CHROME),
 } as const;
 
 /**
@@ -188,8 +195,19 @@ export function DrawerContent(props: ContentProps) {
  * element and Radix otherwise points at an id that is not there. It is set
  * before the spread so a caller that does have one still wins.
  */
-export function SheetContent({ shape, ...rest }: { shape: "bottom" | "full" } & ContentProps) {
-  return <Overlaid shape={shape === "full" ? "sheetFull" : "sheetBottom"} aria-describedby={undefined} {...rest} />;
+/**
+ * A Record rather than a ternary, so a third sheet shape is a TYPE ERROR here
+ * rather than a silent fallback to the bottom sheet. Adding one means editing
+ * the union, the SHAPES table and this map, and the compiler now insists on
+ * the third.
+ */
+const SHEET_SHAPES: Record<SheetShape, "sheetBottom" | "sheetFull"> = {
+  bottom: "sheetBottom",
+  full: "sheetFull",
+};
+
+export function SheetContent({ shape, ...rest }: { shape: SheetShape } & ContentProps) {
+  return <Overlaid shape={SHEET_SHAPES[shape]} aria-describedby={undefined} {...rest} />;
 }
 
 /**
@@ -200,10 +218,30 @@ export function SheetContent({ shape, ...rest }: { shape: "bottom" | "full" } & 
  * Without a button here, opening a sheet would be the one dead end the phase's
  * definition of done forbids.
  */
-export function SheetHeader({ title, closeTestId }: { title: string; closeTestId?: string }) {
+export function SheetHeader({
+  title,
+  closeTestId,
+  leading,
+}: {
+  title: string;
+  /**
+   * Required, not optional. A Close that no test can address is a Close
+   * nobody proves still works, and on a full-shape sheet it is the only exit
+   * there is.
+   */
+  closeTestId: string;
+  /**
+   * Anything that belongs before the title -- a Back control, most obviously.
+   * Task 3's drill-in stack needs one at every level, and without a slot here
+   * it would have to hand-roll the whole header and then remember the Title
+   * and the Close on its own.
+   */
+  leading?: ReactNode;
+}) {
   return (
-    <div className="flex items-center justify-between gap-2 border-b border-slate-200 px-4 py-3">
-      <RadixDialog.Title className="text-base font-semibold text-slate-900">{title}</RadixDialog.Title>
+    <div className="flex items-center gap-2 border-b border-slate-200 px-4 py-3">
+      {leading}
+      <RadixDialog.Title className="flex-1 text-base font-semibold text-slate-900">{title}</RadixDialog.Title>
       <RadixDialog.Close
         data-testid={closeTestId}
         className="flex min-h-11 min-w-11 items-center justify-center rounded-md px-3 text-sm font-medium text-slate-600 hover:bg-slate-100"
