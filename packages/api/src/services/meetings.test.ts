@@ -6,7 +6,7 @@ import { events, meetingAttendees } from "../db/schema.js";
 import {
   createMeeting, getMeeting, updateMeeting, archiveMeeting, unarchiveMeeting, listMeetings,
 } from "./meetings.js";
-import { createCompany } from "./companies.js";
+import { createCompany, archiveCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
 import { createPipeline, createStage } from "./pipelines.js";
 import { createDeal } from "./deals.js";
@@ -62,7 +62,10 @@ describe("meetings service", () => {
     expect(met[0]?.companyId).toBe(company.id);
     expect(met[0]?.dealId).toBe(deal.id);
     expect(met[0]?.contactId).toBeNull();
-    expect(met[0]?.payload).toEqual({});
+    // The timeline renders exclusively from the payload (web:
+    // rail/timeline.tsx's summarize), and event rows are append-only history:
+    // a row written without its render data renders blank forever.
+    expect(met[0]?.payload).toEqual({ title: "Kickoff" });
   });
 
   // The zod refine is the gate for this rule (a 400 at the route, pinned in
@@ -308,6 +311,10 @@ describe("meetings service", () => {
       .where(and(eq(events.meetingId, meeting.id), eq(events.verb, "archived")));
     expect(archivedEvents).toHaveLength(1);
     expect(archivedEvents[0]?.companyId).toBe(company.id);
+    // The title rides archive/unarchive too, unlike every other record type's
+    // archive event: "a meeting was archived" lands on a record that may hold
+    // dozens of them, so without it the reader cannot tell which.
+    expect(archivedEvents[0]?.payload).toEqual({ title: "Kickoff" });
 
     const restored = await unarchiveMeeting(handle.db, actorId, meeting.id);
     expect(restored.archivedAt).toBeNull();
@@ -316,6 +323,99 @@ describe("meetings service", () => {
     const unarchivedEvents = await handle.db.select().from(events)
       .where(and(eq(events.meetingId, meeting.id), eq(events.verb, "unarchived")));
     expect(unarchivedEvents).toHaveLength(1);
+    expect(unarchivedEvents[0]?.payload).toEqual({ title: "Kickoff" });
+  });
+
+  // The ruling, pinned: a meeting emits exactly three verbs (`met` on create,
+  // then archived/unarchived), and an EDIT emits nothing. Without this test a
+  // future change adding an `updated` event -- timeline noise for a
+  // correction to an entry already in the story -- passes the whole suite.
+  it("writes no event when a meeting is edited", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const meeting = await createMeeting(handle.db, actorId,
+      { title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id });
+
+    await updateMeeting(handle.db, actorId, meeting.id, {
+      title: "Kickoff II", durationMinutes: 60, notes: "<p>Rescheduled</p>",
+      attendees: [{ guestName: "Their lawyer" }],
+    });
+
+    const all = await handle.db.select().from(events).where(eq(events.meetingId, meeting.id));
+    expect(all.map((e) => e.verb)).toEqual(["met"]);
+  });
+
+  // The existence checks are deals.ts's rule, NOT notes.ts's: archiving a
+  // record hides it from default listings, it does not stop a meeting that
+  // HAPPENED with that company from being logged afterwards. Tightening
+  // assertLinkedRecordsExist to notes.ts's archived-blocking shape would
+  // otherwise pass every other test in this file.
+  it("logs a meeting against an archived company", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    await archiveCompany(handle.db, actorId, company.id);
+    const meeting = await createMeeting(handle.db, actorId,
+      { title: "Post-archive debrief", occurredAt: daysAgo(1), companyId: company.id });
+    expect(meeting.companyId).toBe(company.id);
+    expect((await listMeetings(handle.db, { companyId: company.id })).items).toHaveLength(1);
+  });
+
+  // The user-side partial unique, the twin of the contact one above.
+  it("rejects the same user twice on one meeting as a ConflictError", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    await expect(createMeeting(handle.db, actorId, {
+      title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id,
+      attendees: [{ userId: actorId }, { userId: actorId }],
+    })).rejects.toBeInstanceOf(ConflictError);
+
+    const meeting = await createMeeting(handle.db, actorId,
+      { title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id });
+    await expect(updateMeeting(handle.db, actorId, meeting.id, {
+      attendees: [{ userId: actorId }, { userId: actorId }],
+    })).rejects.toBeInstanceOf(ConflictError);
+  });
+
+  // The widening is one arm of a WHERE that also carries the archived arm and
+  // the keyset, so it has to compose with both -- and it must not multiply
+  // rows for a contact who is BOTH the link and an attendee.
+  it("composes the contact widening with the archived arm, the cursor, and a both-linked-and-attendee row", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const contact = await createContact(handle.db, actorId, { firstName: "Dana" });
+
+    const live = [];
+    for (const days of [1, 2, 3]) {
+      live.push(await createMeeting(handle.db, actorId, {
+        title: `Attended ${days}`, occurredAt: daysAgo(days), companyId: company.id,
+        attendees: [{ contactId: contact.id }],
+      }));
+    }
+    const filed = await createMeeting(handle.db, actorId, {
+      title: "Filed away", occurredAt: daysAgo(4), companyId: company.id,
+      attendees: [{ contactId: contact.id }],
+    });
+    await archiveMeeting(handle.db, actorId, filed.id);
+
+    // x archived: the arm applies to attendee-matched rows like any other.
+    expect((await listMeetings(handle.db, { contactId: contact.id })).items.map((m) => m.id))
+      .toEqual(live.map((m) => m.id));
+    expect((await listMeetings(handle.db, { contactId: contact.id, archived: true })).items.map((m) => m.id))
+      .toEqual([filed.id]);
+
+    // x cursor: paging across attendee-matched rows keeps the occurredAt order
+    // and loses none of them.
+    const page1 = await listMeetings(handle.db, { contactId: contact.id, limit: 2 });
+    expect(page1.items.map((m) => m.id)).toEqual([live[0]!.id, live[1]!.id]);
+    const page2 = await listMeetings(handle.db, { contactId: contact.id, limit: 2, cursor: page1.nextCursor! });
+    expect(page2.items.map((m) => m.id)).toEqual([live[2]!.id]);
+    expect(page2.nextCursor).toBeNull();
+
+    // Both the link AND an attendee: the OR is one predicate over meetings,
+    // not a join, so this is one row and not two.
+    const both = await createMeeting(handle.db, actorId, {
+      title: "Linked and attending", occurredAt: daysAgo(0), contactId: contact.id,
+      attendees: [{ contactId: contact.id }],
+    });
+    const widened = await listMeetings(handle.db, { contactId: contact.id });
+    expect(widened.items.filter((m) => m.id === both.id)).toHaveLength(1);
+    expect(widened.items).toHaveLength(4);
   });
 
   it("answers the detail payload with the meeting and the tasks it produced", async () => {

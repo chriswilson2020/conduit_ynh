@@ -288,21 +288,39 @@ function rethrowAttendeeConflict(err: unknown, meetingId: string): never {
 }
 
 /**
- * The four record FKs an event copies off the meeting, so the entry lands on
- * exactly the timelines the meeting itself claims.
+ * Everything an events row copies off a meeting: its four record FKs, the
+ * meeting pointer, and the payload the timeline renders from.
  *
- * No dual-stamp, unlike notes.ts/deals.ts (which infer a deal's company
+ * LINKS. No dual-stamp, unlike notes.ts/deals.ts (which infer a deal's company
  * because a note names exactly ONE target): a meeting names every record it
  * belongs to -- the log form requires at least one and offers all four -- so
  * there is nothing to infer. It also keeps the two surfaces consistent: a
  * deal-only meeting is on the deal's Meetings tab and the deal's timeline and
  * on neither of the company's, because listMeetings' company filter is a
  * plain FK match on the same four columns.
+ *
+ * PAYLOAD. The title, on all three verbs a meeting emits, because the web
+ * timeline renders EXCLUSIVELY from the payload and every other content verb
+ * stamps what it needs there -- notes.ts's {noteId, preview}, files.ts's
+ * {fileId, originalName}, deals.ts's {fromName, toName} ("so this never needs
+ * a second round trip to resolve a name"). Event rows are append-only
+ * history: a row written without its render data renders blank forever, and
+ * no later fix can repair the rows already stored.
+ *
+ * `archived`/`unarchived` carry it too, not just `met`, even though those
+ * verbs stamp an empty payload for every other record type. The reason is
+ * that only here is the subject ambiguous: a company's archive entry sits on
+ * that company's own timeline, while "a meeting was archived" lands on a
+ * record that may have dozens of meetings, and the reader cannot tell which
+ * one without exactly the round trip the idiom forbids. Nothing beyond the
+ * title goes in -- the notes stay in the meeting, where the record's
+ * Meetings tab reads them.
  */
-function eventLinks(row: MeetingRow) {
+function meetingEventValues(row: MeetingRow) {
   return {
     companyId: row.companyId, contactId: row.contactId,
     dealId: row.dealId, projectId: row.projectId, meetingId: row.id,
+    payload: { title: row.title },
   };
 }
 
@@ -349,7 +367,7 @@ export async function createMeeting(db: Database, actorId: string, input: Meetin
         .returning();
 
       await tx.insert(events).values({
-        verb: "met", actorUserId: actorId, ...eventLinks(row), payload: {},
+        verb: "met", actorUserId: actorId, ...meetingEventValues(row),
       });
       // Sorted by id to match loadAttendees' ordering, so one meeting reads
       // identically whether it came back from this insert or from a later
@@ -515,11 +533,12 @@ async function setArchived(db: Database, actorId: string, id: string, archived: 
       return { row: recheck, wrote: false };
     }
     // The existing archived/unarchived verbs, carrying the meeting's own
-    // record FKs plus meetingId (eventLinks) so the entry lands on the same
-    // timelines its `met` entry did and links back to the same meeting.
+    // record FKs, meetingId and title (meetingEventValues) so the entry lands
+    // on the same timelines its `met` entry did, links back to the same
+    // meeting, and says WHICH meeting was filed away.
     await tx.insert(events).values({
       verb: archived ? "archived" : "unarchived", actorUserId: actorId,
-      ...eventLinks(updated), payload: {},
+      ...meetingEventValues(updated),
     });
     return { row: updated, wrote: true };
   });

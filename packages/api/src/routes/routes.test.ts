@@ -1809,6 +1809,31 @@ describe("meetings routes", () => {
     await a.close();
   });
 
+  it("returns 409 archived for a patch on an archived meeting, and 404 for archive/unarchive of an unknown id", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    const meeting = await makeMeeting(a, { title: "Kickoff", occurredAt, companyId: company.id });
+    await a.inject({ method: "POST", url: `/api/meetings/${meeting.id}/archive`, headers: authHeaders });
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/meetings/${meeting.id}`, headers: authHeaders,
+      payload: { title: "Kickoff II" },
+    });
+    expect(patched.statusCode).toBe(409);
+    // `archived` and `conflict` are distinct 409 bodies the client branches
+    // on: an archived row needs unarchiving first, a conflict needs a refetch.
+    expect(errorResponseSchema.parse(patched.json()).error).toBe("archived");
+
+    for (const action of ["archive", "unarchive"]) {
+      const response = await a.inject({
+        method: "POST", url: `/api/meetings/${unknownId}/${action}`, headers: authHeaders,
+      });
+      expect(response.statusCode).toBe(404);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    }
+    await a.close();
+  });
+
   it("returns 401 without an identity header on every meetings route", async () => {
     const a = await app();
     const calls = [

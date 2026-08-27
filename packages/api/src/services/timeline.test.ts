@@ -11,6 +11,7 @@ import { createDeal } from "./deals.js";
 import { createPipeline, createStage } from "./pipelines.js";
 import { createProject } from "./projects.js";
 import { createTask } from "./tasks.js";
+import { createMeeting, archiveMeeting } from "./meetings.js";
 
 const handle = openTestDatabase();
 let actorId: string;
@@ -62,6 +63,52 @@ describe("timeline service", () => {
     expect(result.items).toHaveLength(2);
     expect(result.items.every((e) => e.contactId === p.id)).toBe(true);
     expect(result.items.some((e) => e.companyId !== null)).toBe(false);
+  });
+
+  // The read-time twin of listMeetings' contact widening (services/
+  // meetings.ts): a meeting logged on a company with C attending belongs on
+  // C's timeline as well as on C's Meetings tab, and one `met` ROW serves
+  // both -- no fan-out, so the company's own timeline still shows exactly one
+  // entry however many people attended.
+  it("widens a contact's timeline to meetings they only attended, without duplicating the company's entry", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const dana = await createContact(handle.db, actorId, { firstName: "Dana" });
+    const unrelated = await createContact(handle.db, actorId, { firstName: "Unrelated" });
+    const meeting = await createMeeting(handle.db, actorId, {
+      title: "Kickoff", occurredAt: new Date().toISOString(), companyId: company.id,
+      attendees: [{ contactId: dana.id }, { guestName: "Their lawyer" }],
+    });
+
+    const attended = await listEvents(handle.db, { contactId: dana.id });
+    expect(attended.items.map((e) => e.verb)).toEqual(["met", "created"]);
+    expect(attended.items[0]?.meetingId).toBe(meeting.id);
+    expect(attended.items[0]?.payload).toEqual({ title: "Kickoff" });
+    // The meeting names the company, not Dana -- only attendance put it here.
+    expect(attended.items[0]?.contactId).toBeNull();
+
+    // A contact who neither attended nor is linked sees only their own row.
+    const outsider = await listEvents(handle.db, { contactId: unrelated.id });
+    expect(outsider.items.map((e) => e.verb)).toEqual(["created"]);
+
+    // One row per meeting, not one per attendee.
+    const onCompany = await listEvents(handle.db, { companyId: company.id });
+    expect(onCompany.items.filter((e) => e.verb === "met")).toHaveLength(1);
+
+    // The archive entry reaches the same widened timeline, for the same reason.
+    await archiveMeeting(handle.db, actorId, meeting.id);
+    const afterArchive = await listEvents(handle.db, { contactId: dana.id });
+    expect(afterArchive.items.map((e) => e.verb)).toEqual(["archived", "met", "created"]);
+  });
+
+  it("does not double-count a contact who is both the meeting's link and an attendee", async () => {
+    const dana = await createContact(handle.db, actorId, { firstName: "Dana" });
+    await createMeeting(handle.db, actorId, {
+      title: "Kickoff", occurredAt: new Date().toISOString(), contactId: dana.id,
+      attendees: [{ contactId: dana.id }],
+    });
+
+    const result = await listEvents(handle.db, { contactId: dana.id });
+    expect(result.items.filter((e) => e.verb === "met")).toHaveLength(1);
   });
 
   it("filtering by dealId returns a deal's own events, including the company-scoped created event", async () => {
