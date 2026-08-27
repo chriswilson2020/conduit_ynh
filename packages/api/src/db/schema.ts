@@ -298,6 +298,17 @@ export const events = pgTable("events", {
   // alongside the meeting's own record FKs in the columns above (the same
   // dual-stamp deals/tasks already use to land one event on several
   // timelines).
+  //
+  // A FOURTH row kind carries it, for a different reason: the 'created' event
+  // of a task made from a meeting (Phase 5 Task 3, stamped by createTask's
+  // origin parameter). There the meeting is PROVENANCE, not subject -- the row
+  // is about the task, which reaches timelines through its own record links --
+  // and that distinction is load-bearing at read time: timeline.ts's
+  // attendance widening matches meeting_id AND task_id IS NULL, so a
+  // provenance row never reaches an attendee-only contact's timeline, while a
+  // client rendering that row still links back to the meeting through this
+  // same column. services/meetings.ts's taskCreatedFromMeeting reads exactly
+  // the meeting_id + task_id + 'created' triple.
   meetingId: uuid("meeting_id").references((): AnyPgColumn => meetings.id),
   // mail_thread_id is a POINTER AND NOTHING ELSE (Phase 5 spec, mail-privacy
   // decision). A mail event stores no subject, snippet or address anywhere --

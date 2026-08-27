@@ -139,7 +139,13 @@ export const eventSchema = z.object({
   taskId: z.uuid().nullable(), projectId: z.uuid().nullable(),
   // Phase 5's two pointers, both nullable because most events have neither.
   // meetingId links a "met"/"archived"/"unarchived" meeting entry back to its
-  // meeting, beside the meeting's own record links in the columns above.
+  // meeting, beside the meeting's own record links in the columns above -- and
+  // it rides one FOURTH kind of row: the "created" entry of a follow-up task
+  // (api: services/tasks.ts's origin parameter), where it records the meeting
+  // the task came FROM rather than what the entry is about. A client renders
+  // that row's own wording and links to the meeting through this field; the
+  // meeting's title is not in the payload, because a task's creation event
+  // carries no render data for any task.
   meetingId: z.uuid().nullable(),
   // mailThreadId is the WHOLE of what a mail event stores about the mail
   // (spec's mail-privacy decision): no subject, snippet or address is ever

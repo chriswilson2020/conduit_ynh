@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import { and, eq } from "drizzle-orm";
+import type { SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { events, meetingAttendees } from "../db/schema.js";
@@ -14,6 +15,7 @@ import { createDeal } from "./deals.js";
 import { createProject, archiveProject } from "./projects.js";
 import { createTask, updateTask, archiveTask, listTasks } from "./tasks.js";
 import { listEvents } from "./timeline.js";
+import { subscribe } from "./sse.js";
 import { NotFoundError, ArchivedError, ConflictError } from "./errors.js";
 
 const handle = openTestDatabase();
@@ -731,6 +733,37 @@ describe("follow-up tasks from a meeting", () => {
     const after = await getMeeting(handle.db, meeting.id);
     expect(after.tasks.map((t) => t.id)).toEqual([one.id, two.id]);
     expect(after.meeting.taskCount).toBe(2);
+  });
+
+  // The ONE thing that refreshes the meeting a client is already looking at:
+  // createTask publishes the TASK's keys, which reach no meeting query, so
+  // without this publish the rail's taskCount and the detail payload's task
+  // list both sit stale until something else happens to invalidate them. Task 5
+  // builds against this exact key set (recorded as a contract in the plan's
+  // Task 3 DONE block), and deleting the publish leaves every other test in
+  // this file and in routes.test.ts green -- which is why the contract is
+  // pinned here rather than left to prose. Subscribed inside the test rather
+  // than in beforeEach (mail-folders.test.ts's harness) because this is the one
+  // test in the file that reads hints.
+  it("publishes the meeting's own invalidation keys, not just the task's", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const meeting = await createMeeting(handle.db, actorId,
+      { title: "Kickoff", occurredAt: daysAgo(1), companyId: company.id });
+
+    const hints: SseHint[] = [];
+    const unsubscribe = subscribe((hint) => { hints.push(hint); });
+    let task;
+    try {
+      task = await createMeetingTask(handle.db, actorId, meeting.id, { title: "Send the deck" });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(hints).toContainEqual({ keys: [["meetings"], ["meeting", meeting.id], ["events"]] });
+    // Both publishes happen: the meeting hint is an addition to createTask's
+    // own, not a replacement for it.
+    expect(hints.some((hint) => hint.keys.some((key) => key[0] === "task" && key[1] === task.id)))
+      .toBe(true);
   });
 
   // Composed with the read-time widening (services/timeline.ts): attendance

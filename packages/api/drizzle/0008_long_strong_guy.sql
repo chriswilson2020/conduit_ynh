@@ -118,11 +118,16 @@ CREATE INDEX "meeting_attendees_meeting_id_idx" ON "meeting_attendees" USING btr
 -- table.
 --
 -- PARTIAL on meeting_id IS NOT NULL, and it is the shape of the data that
--- makes that worth stating: only a meeting's own three verbs ever set the
--- column, so the index holds 50,005 of the 300,005 rows -- 1,552 kB against a
--- 33 MB table -- and every note/file/stage-change row stays out of it
--- entirely. mail_accounts_user_email_active_unique (0004) is the precedent
--- for a partial index shipped this way.
+-- makes that worth stating. FOUR row kinds set the column: a meeting's own
+-- 'met'/'archived'/'unarchived' entries, plus the 'created' row of every
+-- follow-up task a meeting produces (Task 3, where the meeting is provenance
+-- rather than subject). On the dataset above that is 110,005 of the 300,005
+-- rows -- 2,528 kB against a 35 MB table -- and every note/file/stage-change
+-- row stays out of it entirely. (The pre-Task-3 measurement of the same
+-- dataset, with no follow-up rows in existence, put 50,005 rows and 1,552 kB
+-- here; the figures in this paragraph and the RE-MEASURED block above are the
+-- authoritative ones.) mail_accounts_user_email_active_unique (0004) is the
+-- precedent for a partial index shipped this way.
 --
 -- NOT the timeline's contact-attendance arm (services/timeline.ts). That one
 -- ORs an attendee lookup with an unindexed contact_id equality over the whole

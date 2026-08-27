@@ -152,7 +152,15 @@ function fieldChanged(a: unknown, b: unknown): boolean {
  * record, and services/meetings.ts's createMeetingTask is the only caller
  * that passes one. Deliberately an object rather than a bare `meetingId`
  * string, so a second kind of origin (a mail thread, say) is a field here
- * instead of a fifth positional parameter.
+ * instead of a fifth positional parameter. (A second kind should arrive as a
+ * discriminated union rather than two optional fields, which would permit
+ * both-or-neither.)
+ *
+ * PRECONDITION: the caller has already established that the meeting exists.
+ * An unknown id reaches Postgres as a foreign-key violation inside this
+ * function's transaction -- a 500 naming a constraint, not the 404 it should
+ * be. Unreachable through createMeetingTask, whose mustGet runs first, but
+ * this interface is exported and the next caller inherits the obligation.
  *
  * It exists because the provenance has to ride createTask's OWN event insert.
  * services/meetings.ts's taskCreatedFromMeeting reads `verb = 'created' AND

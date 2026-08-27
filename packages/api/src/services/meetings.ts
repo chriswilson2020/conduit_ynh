@@ -592,12 +592,18 @@ export const unarchiveMeeting = (db: Database, a: string, id: string) => setArch
  * a 404: an archived meeting still exists and is still readable, it has just
  * been filed away, and filing it away means it does not sprout new work.
  * Unarchive it and the same request works -- exactly what the code updateMeeting
- * answers for a patch on an archived meeting tells a client. Read-then-write,
- * with no lock spanning the two (a concurrent archive between them yields a
- * task from a just-archived meeting): the same shape tasks.ts's
- * assertProjectActive already has for an archived project, and closing it
- * would mean holding a transaction across createTask's own -- the second
- * creation path this function exists to avoid.
+ * answers for a patch on an archived meeting tells a client.
+ *
+ * Read-then-write, with no lock spanning the two: a concurrent archive between
+ * them yields a task from a just-archived meeting. Same harm class as tasks.ts's
+ * assertProjectActive, and benign for the same reason -- the task is real,
+ * well-formed and reachable, and archiving a meeting is not an attempt to
+ * reject work already in flight -- but a WIDER window than that one:
+ * assertProjectActive's gap is a few statements, while this spans the whole of
+ * createTask, lockSiblingGroup included, and that advisory lock waits as long
+ * as another writer holds the sibling group. Closing it would mean holding a
+ * transaction across createTask's own -- the second creation path this
+ * function exists to avoid.
  */
 export async function createMeetingTask(
   db: Database, actorId: string, meetingId: string, input: CreateTaskInput,
