@@ -149,9 +149,12 @@ export const GanttBar = memo(function GanttBar({
         {!isParentSummary && <span className="truncate">{task.title}</span>}
       </div>
       {/* The two resize strips and the dependency handle go away entirely
-         below the breakpoint: they paint nothing a reader needs, they are
-         1.5 and 2 CSS pixels wide against a 44px touch floor, and each one
-         starts a gesture that commits a schedule change. */}
+         below the breakpoint: they paint nothing a reader needs, they are 6
+         and 8 CSS pixels wide against a 44px touch floor, and each one
+         starts a gesture that commits a schedule change. (An earlier version
+         of this comment read the utility names as pixel counts and said 1.5
+         and 2, which is out by the spacing scale's factor of four and
+         contradicted the arithmetic further down this same file.) */}
       <div
         className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize max-md:hidden"
         onPointerDown={(e) => onPointerDown(e, task, "resize-start")}

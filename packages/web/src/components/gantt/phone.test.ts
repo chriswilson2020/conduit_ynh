@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { withoutComments } from "../../test/source";
 import {
@@ -39,12 +39,32 @@ const barSource = withoutComments(readFileSync(new URL("./bar.tsx", import.meta.
 const timescaleSource = withoutComments(readFileSync(new URL("./timescale.tsx", import.meta.url), "utf8"));
 
 /**
+ * Every non-test source in this directory, comment-stripped, as [name,
+ * source] pairs -- so the guards that enforce a PHASE-WIDE rule count over
+ * the phase's whole surface here rather than over the one file that happens
+ * to break it today.
+ */
+const ganttSources: [string, string][] = readdirSync(new URL("./", import.meta.url))
+  .filter((name) => /\.tsx?$/.test(name) && !/\.test\.tsx?$/.test(name))
+  .sort()
+  .map((name) => [name, withoutComments(readFileSync(new URL(name, import.meta.url), "utf8"))]);
+
+/**
  * The opening tag of the element whose attributes contain `marker`.
  *
  * Scoped to the ELEMENT, not the file, which is the lesson Task 2's quality
  * review paid for: four of its eleven guards passed the mutation they
  * advertised because they were file-scoped, and bar.tsx holds four separate
  * pointer zones whose class strings must differ from each other.
+ *
+ * IT INHERITS THAT ROUND'S OTHER LESSON AS A LIVE HAZARD: the slice ends at
+ * the first `>` after the marker, and an arrow function in a later attribute
+ * contains one -- both tap layers carry `onClick={() => ...}`. Today every
+ * subject spells `className` before any such attribute, so the slice always
+ * reaches it. Reorder them and `classesOf` below returns an EMPTY list, at
+ * which point positive assertions fail with a confusing message and negative
+ * ones pass while guarding nothing. If you move a `className`, run the
+ * mutations in this file's DONE block rather than trusting the green.
  */
 function openingTagAround(source: string, marker: string): string {
   const at = source.indexOf(marker);
@@ -214,6 +234,32 @@ describe("the tap targets that replace them", () => {
     }
   });
 
+  it("is rendered AFTER the bars, or a tap on a bar would do nothing", () => {
+    // The layers are transparent, so which one takes a tap is decided purely
+    // by paint order, and the bar root would win if it came later: on a phone
+    // the visually obvious target -- the bar itself -- would then be the one
+    // part of the row that opens nothing. It costs the desk something too,
+    // since the dependency drag's hit test walks up from whatever is under
+    // the pointer to find a `data-task-id`, and these layers carry none.
+    const bars = chartSource.indexOf("<GanttBar");
+    const taps = chartSource.indexOf("data-testid={`gantt-tap-");
+    expect(bars).toBeGreaterThan(-1);
+    expect(taps).toBeGreaterThan(bars);
+  });
+
+  it("gives the sidebar row a containing block, or every label tap covers the whole sidebar", () => {
+    // The label span is positioned against its nearest POSITIONED ancestor.
+    // Without one on the row, that is the sticky sidebar box, so all N spans
+    // stretch over the entire sidebar, stacked -- and the last one, painting
+    // above the rest, takes every tap. Tapping any task's name would open the
+    // LAST task's drawer: precisely the wrong-drawer-one-tap-away outcome
+    // Amendment 6 accepted this design for avoiding. Scoped to the phone,
+    // because at a desk this row has never been positioned.
+    const row = openingTagAround(chartSource, "title={row.task.title}");
+    const tokens = [...row.matchAll(/"([^"]*)"/g)].flatMap((m) => (m[1] ?? "").split(/\s+/));
+    expect(tokens).toContain("max-md:relative");
+  });
+
   it("opens the same task drawer the keyboard already opened", () => {
     // The no-capability-gap claim rests on this being the EXISTING path, not
     // a second one: onOpenTask is what Enter on a bar has always called.
@@ -247,10 +293,24 @@ describe("Remove slack on a phone", () => {
 });
 
 describe("the two imperative breakpoint reads", () => {
-  it("are the only ones, and both build their query from the shared helper", () => {
+  it("are the only ones IN THE WHOLE DIRECTORY, and both build their query from the shared helper", () => {
     // Spec Amendments 1 and 4 permit exactly these: the key handler and the
     // opening scroll. A third would be a decision someone has to argue for.
-    expect(chartSource.match(/window\.matchMedia\(/g) ?? []).toHaveLength(2);
+    //
+    // COUNTED OVER EVERY FILE HERE, not over chart.tsx, because the rule is
+    // the phase's and not this file's: an earlier version of this guard
+    // counted chart.tsx alone, and a render-time read added to
+    // timescale.tsx's today line passed the entire suite. A read at RENDER
+    // time is worse than a third read, not better -- it never re-runs when
+    // the viewport crosses the breakpoint, so it renders a stale answer for
+    // as long as the component stays mounted, which is the exact bug
+    // subscribing exists to prevent.
+    const byFile = new Map<string, number>();
+    for (const [name, source] of ganttSources) {
+      const hits = (source.match(/window\.matchMedia\(/g) ?? []).length;
+      if (hits > 0) byFile.set(name, hits);
+    }
+    expect(Object.fromEntries(byFile)).toEqual({ "chart.tsx": 2 });
     expect(chartSource.match(/window\.matchMedia\(mobileMediaQuery\(\)\)\.matches/g) ?? []).toHaveLength(2);
   });
 
@@ -258,11 +318,11 @@ describe("the two imperative breakpoint reads", () => {
     // The spec rules out a differently-named hook over the hook's own parts
     // -- that would pass the three-site cap by spelling while evading the
     // rule it enforces. Nothing under this directory may subscribe at all.
-    for (const source of [chartSource, barSource]) {
-      expect(source).not.toContain("useIsMobile");
-      expect(source).not.toContain("subscribeToMediaQuery");
-      expect(source).not.toContain("readIsMobile");
-      expect(source).not.toContain("useSyncExternalStore");
+    for (const [name, source] of ganttSources) {
+      expect(source, name).not.toContain("useIsMobile");
+      expect(source, name).not.toContain("subscribeToMediaQuery");
+      expect(source, name).not.toContain("readIsMobile");
+      expect(source, name).not.toContain("useSyncExternalStore");
     }
   });
 
@@ -278,6 +338,52 @@ describe("the two imperative breakpoint reads", () => {
     expect(enter).toBeGreaterThan(-1);
     expect(read).toBeGreaterThan(enter);
     expect(commits).toBeGreaterThan(read);
+  });
+});
+
+describe("the opening scroll", () => {
+  /** The effect's own body: from the `use*Effect(` that encloses the grid
+   * read to the end of its dependency array. */
+  function scrollEffect(): { hook: string; body: string } {
+    const at = chartSource.indexOf("const grid = gridRef.current;");
+    expect(at, "the opening scroll effect moved").toBeGreaterThan(-1);
+    const before = chartSource.slice(0, at);
+    const layout = before.lastIndexOf("useLayoutEffect(");
+    const plain = before.lastIndexOf("useEffect(");
+    const start = Math.max(layout, plain);
+    return {
+      hook: layout > plain ? "useLayoutEffect" : "useEffect",
+      body: chartSource.slice(start, chartSource.indexOf("}, [taskRows", start)),
+    };
+  }
+
+  it("scrolls the PHONE, and reads the breakpoint the right way round", () => {
+    // One character decides which half of the app this touches. Without the
+    // negation the desktop chart scrolls itself on mount and the phone stays
+    // at 0 -- a hard-requirement violation that changes nothing a type
+    // checker or a read-COUNT guard can see, since there are still exactly
+    // two reads and they still go through the shared query.
+    expect(scrollEffect().body).toContain("if (!window.matchMedia(mobileMediaQuery()).matches) return;");
+  });
+
+  it("runs before the browser paints", () => {
+    // A passive effect would land the offset AFTER the first paint, i.e. as
+    // the visible jump from an empty chart to a scrolled one that using a
+    // layout effect is the whole point of avoiding.
+    expect(scrollEffect().hook).toBe("useLayoutEffect");
+  });
+
+  it("cannot spend its one slot per zoom before it knows there is a bar", () => {
+    // Claiming the slot first and then finding an empty list leaves a chart
+    // that will never scroll again at that zoom. Order, not presence, is the
+    // property -- so this asserts the order.
+    const body = scrollEffect().body;
+    const built = body.indexOf("bars.push(");
+    const bailed = body.indexOf("if (bars.length === 0) return;");
+    const claimed = body.indexOf("appliedScrollZoomRef.current = pxPerDay;");
+    expect(built).toBeGreaterThan(-1);
+    expect(bailed).toBeGreaterThan(built);
+    expect(claimed).toBeGreaterThan(bailed);
   });
 });
 

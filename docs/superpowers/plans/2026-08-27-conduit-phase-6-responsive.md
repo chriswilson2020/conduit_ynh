@@ -1029,6 +1029,88 @@ Above the breakpoint, unchanged: drag-to-reschedule, dependency editing, the com
 > (`index-CBvyyNUj`, 30.85 kB -- the today line's class already existed in the
 > bundle, so nothing was added to it).
 
+> **THE QUALITY ROUND (with fixes), and what it found was the guard file, not
+> the feature.** The implementation came through both earlier rounds intact --
+> the reviewer re-derived both round-two corrections, confirmed the clamp
+> always lands inside the scroller by construction and that
+> `SIDEBAR_WIDTH_CSS`'s interpolation makes drift impossible. Then it ran
+> mutations against the FULL 392-test web suite and **five survived**, one of
+> them a silent violation of the phase's hard requirement. All five now fail;
+> each was re-run against the whole web package, not just this directory.
+>
+> | Mutation that survived | What it would have shipped | Now |
+> |---|---|---|
+> | tap layers rendered BEFORE the bars | the bar root paints above the layer, so on a phone a tap on the BAR -- the obvious target -- does nothing, and only empty row space opens the drawer; at a desk the dependency drag's hit test lands on an element with no `data-task-id` | **red** |
+> | `max-md:relative` deleted from the sidebar row | every label span positions against the sticky sidebar instead of its row, so all N stretch over the whole sidebar and the last one takes every tap: **tapping any task's name opens the LAST task's drawer** | **red** |
+> | a render-time `matchMedia` read added to `timescale.tsx` | the read guard counted `chart.tsx` only, and the hook-disguise loop covered two of the four files | **red** |
+> | the mount read's `!` dropped | **the DESKTOP chart scrolls on mount and the phone stays at 0** -- a hard-requirement violation that leaves the read count at two and every other guard green | **red** |
+> | `useLayoutEffect` -> `useEffect` | the offset lands after paint, i.e. as the visible jump the layout effect exists to avoid | **red** |
+>
+> The read guards now count over **every non-test source in this directory**
+> (`ganttSources`), because the rule is the phase's and not one file's. Worth
+> writing down beyond this task: **a render-time read is worse than an extra
+> read**, not better -- it never re-runs on a breakpoint crossing, so it holds
+> a stale answer for as long as the component stays mounted, which is the bug
+> subscribing exists to prevent.
+>
+> **THE ORDERING DEFECT IN THE OPENING SCROLL, fixed -- and what I could not
+> reproduce.** The effect claimed `appliedScrollZoomRef` BEFORE building
+> `bars`, and guarded on `taskRows.length` instead, which is not the same test:
+> a row whose task is missing either date contributes no bar. `bars` is built
+> first now, an empty list returns before the slot is spent, and the row-count
+> guard is gone -- it was dead, since no rows means the component has already
+> returned its empty state. **The reviewer's concrete scenario I could NOT
+> reach, and the DONE block should say so rather than claim a measurement it
+> does not have:** `ganttPayload` filters on `isNotNull` for both dates, and
+> `useShiftTask`'s optimistic patch only ever writes two strings, so a row
+> without dates cannot reach this component. Measured on an all-undated
+> project at 375px: the chart renders `gantt-empty` ("No dated tasks yet") and
+> **no grid at all**, so the effect returns on `grid === null` and no slot is
+> spent. The ordering was still wrong and is still worth fixing -- it was one
+> payload change away from being reachable, and it cost nothing to make safe.
+>
+> **Two comments corrected.** `bar.tsx` said the resize strips are "1.5 and 2
+> CSS pixels": those are utility names, and at this project's spacing scale
+> they are **6 and 8** -- which the arithmetic further down the same file
+> already said, so the file contradicted itself. And the Sidebar memo claim was
+> false in general: the page builds `openTask` as a plain function declaration
+> while its three siblings are `useCallback`s, so `Sidebar` re-renders on every
+> page render, **including every drawer open and close**. The claim holds for
+> the case it was written for and the only hot one -- a drag frame re-renders
+> the chart from its own state without re-rendering the page -- and the comment
+> now says exactly that. Wrapping the page's two handlers would make it general
+> and is a one-line change in `gantt.tsx`, a file outside this task.
+>
+> **RECORDED, NOT FIXED (carried at the coordinator's direction):**
+>
+> - **The Remove-slack guard is vacuous in one direction.** That `Button`
+>   carries no `className`, so `classesOf` returns `[]` and "does not carry
+>   `max-md:hidden`" holds however the button is hidden. Demonstrated: putting
+>   `max-md:hidden` on the wrapping toolbar div hides the compact button AND
+>   the zoom control at phone widths, with the whole web suite green.
+> - **`openingTagAround` inherits Task 2's attribute-order fragility.** It ends
+>   its slice at the first `>` after the marker, and both tap layers' `onClick`
+>   arrow contains one. Today every subject spells `className` before any such
+>   attribute; reorder them and `classesOf` silently returns `[]`, so positive
+>   assertions fail opaquely and negative ones pass vacuously. The hazard is
+>   now written in the helper's own doc comment.
+> - **Nested vertical scroll, unmeasured.** Above about 19 rows
+>   (`GRID_MAX_HEIGHT` 640 / `ROW_HEIGHT` 32) the grid gains its own vertical
+>   overflow, so a vertical swipe inside it scrolls the grid rather than the
+>   page -- a scroll trap on a long project. This task's fixtures were three
+>   and twenty rows; nobody has measured the trap itself.
+> - **The tap layers are built, not skipped, at desktop, and are not
+>   memoised** -- 200 rows means 200 elements and 200 closures rebuilt per
+>   animation frame during a desktop drag, for something `display: none`.
+>   Hoisting them into a memoised component would make it zero per frame.
+>
+> **Round three: +5 tests (1824 -> 1829)**, typecheck clean on five projects,
+> build clean with no CSS warning, stylesheet hash unmoved (`index-CBvyyNUj`).
+> Desktop re-verified after the reordering: `scrollLeft: 0`, sidebar 240, every
+> tap layer `display: none`, the today line still `pointer-events: auto`, and a
+> point on a bar still resolves through the move overlay to an element whose
+> `data-task-id` is that bar's -- the dependency drag's hit test intact.
+
 ### Task 6: Phone-viewport e2e + release prep (v0.10.0)
 
 **Files:** `e2e/mobile.spec.ts` (new), three package.jsons, `manifest.toml`, server lockfile.

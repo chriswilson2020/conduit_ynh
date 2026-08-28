@@ -263,9 +263,19 @@ const Sidebar = memo(function Sidebar({
 }: {
   rows: ChartRow[];
   taskCount: number;
-  /** Phone only -- what a tap on a task's NAME opens. Its identity changes
-   * only when the PAGE re-renders (a navigation), never on a drag frame, so
-   * it does not cost this component its memoisation. */
+  /** Phone only -- what a tap on a task's NAME opens.
+   *
+   * A NOTE ON WHAT THIS COSTS, because an earlier version of this comment
+   * overstated it. The page builds this handler as a plain function
+   * declaration, so its identity changes on every render of the page -- which
+   * includes every drawer open and close, since those are `?task=` changes.
+   * Each of those re-renders this component and its N rows, which is what
+   * memoising it was meant to avoid. What the memo still buys is the case it
+   * was written for and the only hot one: a DRAG frame re-renders the chart
+   * from its own state without re-rendering the page, so this prop keeps its
+   * identity and the sidebar bails out, exactly as its three sibling
+   * callbacks do. Wrapping the page's two handlers would make the claim
+   * general; that is a change to a file this task does not own. */
   onOpenTask: (taskId: string) => void;
   onGroupCompacted: (result: ShiftResult) => void;
   onGroupCompactEmpty: () => void;
@@ -507,10 +517,18 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
   // rather than as a visible jump after it.
   useLayoutEffect(() => {
     const grid = gridRef.current;
-    if (grid === null || taskRows.length === 0) return;
+    if (grid === null) return;
     if (appliedScrollZoomRef.current === pxPerDay) return;
-    if (!window.matchMedia(mobileMediaQuery()).matches) return;
-    appliedScrollZoomRef.current = pxPerDay;
+    // THE ORDER OF THE NEXT THREE STEPS IS THE POINT. Build the list first,
+    // give up if it is empty, and only then spend the one slot this zoom
+    // gets. An earlier version claimed the slot BEFORE building the list and
+    // guarded on the row count instead, which is not the same test: a row
+    // whose task is missing either date contributes no bar, so a chart could
+    // burn its only chance to scroll on an empty list and then never scroll
+    // again at that zoom -- landing exactly on the blank first paint this
+    // effect exists to prevent, reached from the other side. That row-count
+    // guard was also dead: no rows means no grid at all, because the
+    // component returns its empty state well above here.
     const bars: { startDay: number; dueDay: number }[] = [];
     for (const row of taskRows) {
       if (row.task.startDate === null || row.task.dueDate === null) continue;
@@ -519,6 +537,9 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
         dueDay: isoToDayIndex(row.task.dueDate, rangeStartMs),
       });
     }
+    if (bars.length === 0) return;
+    if (!window.matchMedia(mobileMediaQuery()).matches) return;
+    appliedScrollZoomRef.current = pxPerDay;
     grid.scrollLeft = initialScrollLeft(bars, isoToDayIndex(todayLocalIso(), rangeStartMs), pxPerDay);
   }, [taskRows, pxPerDay, rangeStartMs]);
 
