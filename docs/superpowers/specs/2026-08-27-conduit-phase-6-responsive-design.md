@@ -141,6 +141,35 @@ if a touch drag is not supported it should not appear to start one.
    insets reaches 44px but overlaps 6px into each neighbouring row at the 32px row pitch;
    expect mis-taps at boundaries and say what you did about them.
 
+4. **Amendment 1 extends to a mount-time read, on the same reasoning.** Task 5's gate
+   measurement found the chart shows NO BARS at first paint on a phone: `RANGE_PAD_DAYS` is
+   14, so day 0 is a fortnight before the earliest task, and with the visible band the
+   phone has, bars fall outside it at `scrollLeft: 0`. "Technically read-only" would have
+   shipped as technically blank. A one-shot `window.matchMedia(mobileMediaQuery()).matches`
+   read at mount, to set an initial scroll position, is permitted for the same reason the
+   key-handler read is: no subscription, no re-render, no second component tree, breakpoint
+   still single-sourced. The exclusion is unchanged — **no differently-named hook over
+   `subscribeToMediaQuery`/`readIsMobile`**. Scrolling at all widths is rejected: that is a
+   desktop change.
+
+5. **Remove slack stays reachable on a phone — and the earlier pre-ruling was wrong to list
+   it as a pointer path.** It is a click plus a `window.confirm`, both phone-native, so
+   hiding it would have created this phase's FIRST real capability exception, which the
+   Definition of done forbids. Ruling: the **per-project** compact button stays visible
+   below the breakpoint (it is already a floored `Button`); only the **per-group** one is
+   hidden, because it measures 81x19 and at a narrowed sidebar its header row leaves the
+   project name rendering as a single letter. The same sweep remains reachable from that
+   project's own Gantt page, which `project-detail.tsx` links to. The Definition of done's
+   "no stated capability exception" therefore still holds.
+
+6. **The Gantt's phone tap target is the ROW, at 32px, and that is a deliberate exception to
+   the 44px floor.** A 44px layer built with negative insets does not improve aim — at a
+   32px row pitch it only formalises that the later sibling wins a 6px overlap band, which
+   puts a wrong-task drawer one tap away. A full-row target instead removes the horizontal
+   precision problem entirely, which is what actually defeats a 6.4px-wide same-day bar,
+   and it makes the sidebar half tappable without panning at all. Recorded here so it is
+   acknowledged rather than discovered in review.
+
 ## Out of scope (deferred, not rejected)
 
 Installing to the home screen (PWA/manifest/service worker); offline support; push
