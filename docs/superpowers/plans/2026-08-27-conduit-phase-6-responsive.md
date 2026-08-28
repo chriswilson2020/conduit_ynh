@@ -716,6 +716,8 @@ Above the breakpoint the board is untouched — including its drag-and-drop. ~8 
 - **`composer-suggestion` is 36px** — recipient-autocomplete rows, under the phone floor. Task 2 residue that no task owned.
 - **The phone list row (`<TableRow onClick>`) has no role, no accessible name and no tab stop**, and below the breakpoint loses row semantics too, so a screen-reader user on the companies list gets an unstructured run of label/value lines with no way to open a company. Pre-existing (those rows were keyboard-inert at desktop before the phase); fixing it adds desktop tab stops, so it needs its own decision.
 - **In the 768-1023px band** `isMobile` is true while several surfaces' CSS is `lg:`-gated, so e.g. the funnel row wraps and gives the stage name a 693px line where the single-line form fits comfortably. A direct consequence of this plan's own "gate your CSS at `md:`" instruction — compliant, cosmetic, worth knowing.
+- **The record rail's tab spill is FONT-STACK DEPENDENT, so nothing may assert it.** Task 2 measured the five tabs at 349px intrinsic against a 342px box at 390px, and Task 6 reproduced that exactly in Chrome on macOS. On CI's Ubuntu runner the same five labels measure narrower and the strip FITS with nothing to scroll — a red run is how this was found. `max-md:overflow-x-auto` is therefore insurance that pays out on some font stacks and not others, which is the right shape for it; but a test may only assert the mechanism (the strip is its own scroll container), never the spill or a scrollLeft that follows from it. Which way Chris's own handset falls is decided by iOS's system font.
+- **The browser pane cannot settle any question about focus EVENTS.** `document.hasFocus()` is false in it, and Blink defers focus events for a page that does not have focus: `element.focus()` moves `document.activeElement` and fires nothing, so Radix's roving focus never activates a tab and any scroll-into-view that focus would have caused never happens. That is why Task 2's reviewer could not settle the arrow-key question there, and it sits beside the pane's other known blind spot (a CDP viewport change updates `matches` without dispatching `change`). Playwright is where a focus question gets an answer.
 
 ### Task 5: The Gantt, read-only on a phone
 
@@ -1143,6 +1145,169 @@ Reuse the suite's conventions: `runId` + per-attempt `${runId}x${testInfo.retry}
 **Four facts from Task 1's quality review, each of which would otherwise cost you a CI cycle:** `nav-pipelines`/`nav-projects`/`nav-gantt`/`nav-settings` exist ONLY while the More sheet is open (Radix does not `forceMount`) — open `bottom-nav-more` first. Set the phone viewport at CONTEXT CREATION via a device descriptor, never mid-test: the CDP resize path updates `matches` without dispatching `change`, so the hook never sees it. Do NOT write a journey that crosses the breakpoint with a sheet open — the branch unmounts the bar, the portal goes with it, a typed query is lost and focus drops to `<body>` (Radix's cleanups DO run, so it is a UX consequence rather than a stuck page). And the search sheet's dismissal is currently covered only by a source-reading guard; a real click-through journey is worth having.
 
 Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regenerate the server lockfile (diff must be versions-only), push, confirm CI green on the FINAL tip, and prepare `release-notes-v0.10.0.md` + `release-sequence-v0.10.0.md` in the session scratchpad. **The sequence must reuse v0.9.1's corrected shape** — the digest step greps `[0-9a-f]{64}` (not the word `sha256sum`), the published asset is downloaded and re-hashed as a non-optional cross-check, the hand-written notes are put on the release explicitly, and the close-out covers the branch, the worktree and pulling `main` in the primary checkout. Do NOT merge, tag, or touch the manifest sha — the coordinator gates the release, and for this phase the gate waits for Chris to try it on his actual phone.
+
+> **DONE.** As built:
+>
+> - **THE FILE: `e2e/mobile.spec.ts`, 20 tests in five serial groups, and the
+>   72 that existed are untouched -- 72 -> 92.** No source file was changed by
+>   this task: every surface the journeys drive was given a phone-only testid by
+>   the task that built it, so the definition of done turned out to be
+>   assertable without a single new hook into the app.
+> - **THE VIEWPORT, and the one place the instruction could not be followed
+>   literally.** File-level `test.use`, no `projects` array, exactly as
+>   required. But `devices["iPhone 13"]` carries `defaultBrowserType: "webkit"`,
+>   and `browserName` is a fixture that simply forwards it
+>   (`playwright/lib/index.js:192-193`) -- so a whole spread would have moved
+>   this FILE onto WebKit, which the e2e job does not install (`npx playwright
+>   install chromium`, and only chromium). The run would have died on a missing
+>   executable. The descriptor is therefore spread MINUS that one key, which
+>   keeps the 390x664 viewport, `isMobile`, `hasTouch`, the device pixel ratio
+>   and the iOS user agent, and leaves the worker options identical to every
+>   other file's so nothing restarts a worker for nothing.
+> - **THE GEOMETRY WAS MEASURED, at 390x664 in a browser against a build of this
+>   branch on the dev server, before a line of it was asserted.** The chart's
+>   grid is a 390x638 box over 1208x740 of content, so 22 rows really do overflow
+>   it; the opening scroll lands at `scrollLeft: 498`, which is day 17
+>   (today) x 30px minus the 12px lead-in, exactly as `initialScrollLeft`
+>   computes it; the first bar sits at (110, 263) 90x22, so `toBeInViewport()`
+>   has something to be true about; both tap layers compute `display: block`;
+>   `compact-button` is 116.5x44; the drawer's close is 44x44; the account form
+>   is a 390x664 sheet with `max-height: none` (the caller's `max-h-[85vh]` IS
+>   overridden) and all eight fields; `thead` is `display: none` on the
+>   companies list and the cells carry Name/Owner/Updated themselves; a
+>   stage-less pipeline renders `board` with one `DndLiveRegion` and no
+>   `stage-view`, and two stages later it renders `stage-view` with **zero** of
+>   each. Every one of those is an assertion in the file.
+> - **THE ONE MEASUREMENT THAT SAVED A CI CYCLE, and it is not the obvious one.**
+>   With the page at rest, `gantt-label-tap-<last>` sits at viewport y 637-668
+>   against a bottom bar occupying 619-664. Playwright reveals an element with
+>   the SMALLEST scroll that works, so it would have left the row flush with the
+>   viewport's bottom edge, under the bar, and the click would have been
+>   reported as intercepted. `<main>`'s 6rem reservation is the fix: taking the
+>   PAGE to its own end first puts that reservation between the chart and the
+>   bar (measured after: the row lands at 536-567, and `elementFromPoint` at its
+>   centre returns the tap layer itself), and the grid's remaining internal
+>   scroll is then Playwright's to do safely.
+> - **TWO ASSERTIONS DID COST A CYCLE, and both were the same mistake: a number
+>   where the claim was a capability.** CI run 33146942529 was green on 90 and
+>   red on these two.
+>   - **The rail strip's spill is a FONT-METRIC ACCIDENT.** At 390px in Chrome on
+>     macOS the five tab labels measure 349px inside a 342px box, so Meetings
+>     hangs 7px over -- Task 2's 375px measurement reproduced. On the Ubuntu
+>     runner the same five labels measure narrower, the strip FITS, and
+>     `scrollWidth - clientWidth` is 0. Asserting the spill, or a `scrollLeft`
+>     that could only follow from it, pinned the runner's font stack. What is
+>     asserted now is the mechanism, which no font can move: below the breakpoint
+>     the strip is its own horizontal scroll container (`overflow-x: auto`), so
+>     wherever a spill appears it scrolls the strip and never the page. **This is
+>     a phase-level finding, recorded above:** the strip is insurance, not a
+>     permanent state, and on Chris's own handset the system font decides which.
+>   - **"Nothing to compact" was simply false.** `compactSchedule` pulls every
+>     MOVABLE task to the project's floor -- with no project start date, the
+>     earliest start among its own dated tasks -- whether or not it has a
+>     predecessor, so the task the previous test had pushed into next week came
+>     back and the note read "1 task compacted". The assertion matches either
+>     sentence now, because either one means the confirm was accepted and the
+>     sweep ran; an unhandled dialog, which Playwright auto-dismisses, leaves the
+>     note empty. Amendment 5's claim is reachability, and that is what is
+>     asserted.
+> - **THE SIX JOURNEYS, and what each is actually for.**
+>   1. **The bar and the More sheet** (3 tests): all four primary destinations,
+>      each reporting `aria-current="page"`; the four overflow destinations,
+>      absent until `bottom-nav-more` is open and each closing the sheet behind
+>      it, with More reporting `aria-current="true"` for a destination inside it;
+>      and the search sheet driven end to end -- it opens focused on
+>      `search-input` rather than on Close, and taking a result dismisses it,
+>      which until now was covered only by a source-reading guard.
+>   2. **A company, its list and its rail** (2 tests): the list is cards
+>      (`thead` hidden, each cell carrying its own label) and the shell has no
+>      `<aside>`; the create dialog carries `dialog-close`; and the rail's five
+>      tabs are walked by ARROW KEY to the last one, which activates and is in
+>      the viewport when it gets there. That last one is the question Task 2's
+>      reviewer could not settle -- see the environment finding above for why it
+>      could not be settled from a browser pane.
+>   3. **The kanban** (3 tests): a stage-less pipeline is the desktop branch and
+>      says so; two stages later `board`, `column-<id>` and `DndLiveRegion` are
+>      genuinely gone; a deal is created in the stage on screen, moved with
+>      `move-<id>` -> `move-to-<id>`, and found under the other stage's picker
+>      button, with the current stage never offered as a target. Both focus
+>      contracts are pinned because nothing else re-checks them: the `h1` after a
+>      move (the trigger left with its card) and the trigger after a Close.
+>   4. **The Gantt** (5 tests): a 22-row fixture seeded over the API; the opening
+>      scroll proved with `toBeInViewport()` rather than `toBeVisible()`; both
+>      tap layers present; the bottom bar hit-testable over its Mail tab (the
+>      tap-theft regression, which nothing else re-checks); four arrows and two
+>      Shift+arrows changing no date and rendering no transform while **Enter
+>      still opens the drawer**; a reschedule driven from `gantt-label-tap-<id>`
+>      through `field-dates` with the bar's `title` following; the last of the 22
+>      rows reached below the chart's own fold; and Remove slack tapped with a
+>      dialog handler.
+>   5. **Meetings** (2 tests): logged from the rail with a guest and TipTap notes
+>      through `typeIntoEditor`, read back, and a follow-up task added.
+>   6. **The inbox** (5 tests): its own IMAP fixture and its own account, added
+>      through the settings form AT THIS VIEWPORT (the app's longest form, and
+>      nothing else in the suite renders it below the breakpoint); all three
+>      panes asserted at all three levels; the heading taking focus on every
+>      transition, including the folders->threads case where Back and Folders are
+>      the same relabelled node; a reply sent from the conversation level; and a
+>      deep link landing straight on it.
+> - **THE ONE JOURNEY ASSERTION THAT IS A SUBSTITUTE, said plainly.** Task 3
+>   asked for "open a thread from page two, Back, count the rows" -- the property
+>   the hide-don't-unmount decision rests on. The thread list's default page is
+>   **50** (`services/mail-threads.ts`'s `DEFAULT_LIMIT`), not 25, so reaching
+>   page two needs 51 seeded threads: a minute of IMAP APPENDs and a much longer
+>   first sync, for one assertion. What the file does instead is stamp an
+>   attribute on the live `thread-list` NODE, drill in, reply, come back, and
+>   assert the attribute survived -- an unmount and remount would have replaced
+>   that element. That proves the mechanism the accumulator depends on; it does
+>   NOT prove the accumulator's own state, and the file says so where it does it.
+> - **The mail fixture is deliberately its own.** It archives whatever live
+>   accounts it finds first (a second account on the same mailbox ingests every
+>   message twice into the same thread, which is the one thing run-id scoping
+>   cannot fix), then seeds a two-message References chain and adds an account.
+>   The IMAP/SMTP coordinates are DUPLICATED from `mail.spec.ts` rather than
+>   lifted into `helpers.ts`, because moving a constant out of that file would
+>   have changed it and the hard requirement is that it does not change.
+> - **Release prep, prepared and NOT executed.** 0.10.0 across the three
+>   package.jsons and `0.10.0~ynh1` in the manifest; the server lockfile
+>   regenerated on the dev server and inspected -- three lines, all versions.
+>   The manifest's `url`/`sha256` deliberately still point at v0.9.1: that
+>   tarball exists and v0.10.0's does not. `release-notes-v0.10.0.md` and
+>   `release-sequence-v0.10.0.md` are in the session scratchpad; the sequence
+>   reuses v0.9.1's four corrections verbatim and its step 7 is rewritten as a
+>   PHONE walkthrough, because for this phase the gate is Chris's handset and
+>   not a green pipeline.
+> - **Suite: 1829 unit + 36 skipped (unchanged -- this task added no unit test,
+>   and had no lib to test), typecheck clean on five projects, `npm run build`
+>   clean with no CSS warning and the stylesheet hash unmoved
+>   (`index-CBvyyNUj`, 30.85 kB), e2e 72 -> 92 with the 72 untouched.**
+>   Proved in CI on **run 33147238771** (tip b07ef4d): both jobs green, **e2e 92
+>   passed in 55.4s with no flaky line**, so no retry was burned, and test 1865
+>   passed across 51 files (the 1829 plus the 36 MAIL_IT integration tests CI
+>   provisions mail servers for). A commit cannot name the run of the commit
+>   that contains it, so the run covering the FINAL tip is cited in
+>   `release-sequence-v0.10.0.md` rather than here.
+>
+> **RECORDED, NOT FIXED.**
+>
+> - **The desktop half of each phone-only rule is asserted by the unit guards,
+>   not here.** A journey cannot cross the breakpoint mid-test (the hook would
+>   never see it), so this file can say `gantt-label-tap-<id>` is visible at
+>   390px and cannot say it is hidden at 1280. `gantt/phone.test.ts` and
+>   `ui/ui.test.ts` are what hold that half, over source rather than over a DOM.
+> - **No journey drives a Radix Select on a phone.** The move sheet, the stage
+>   picker and the folder rail are all plain buttons; the composer's From select,
+>   the drawer's type/status/assignee and the meeting form's colleague picker are
+>   driven at a desk by other specs and are untouched here. If one of those
+>   portals turns out to behave differently under touch emulation, this suite
+>   will not be what finds it.
+> - **The Gantt fixture is 22 identical-shaped bars.** It is enough to make the
+>   grid overflow and enough to put a bar under today, and it is not a realistic
+>   schedule: no dependencies, no summary rows, no done tasks. The dependency
+>   ARROW at a phone viewport is therefore still unexercised by e2e.
+> - **The 22 tasks are seeded over the API.** `tasks.spec.ts` creates its three
+>   through the UI and this file does not; the trade is stated in the test and is
+>   about runtime, not about coverage, since the journey itself is all UI.
 
 ---
 

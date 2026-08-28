@@ -198,7 +198,7 @@ test.describe.serial("Phone navigation and the record rail", () => {
     await expect(page.getByTestId("search-sheet")).toHaveCount(0);
   });
 
-  test("reads the record rail, including the tab that starts off screen", async ({ page }) => {
+  test("reads the record rail, including the tab at the end of the strip", async ({ page }) => {
     await page.goto(`/companies/${companyId}`);
 
     const rail = page.getByTestId("rail");
@@ -224,7 +224,7 @@ test.describe.serial("Phone navigation and the record rail", () => {
     const strip = rail.getByRole("tablist");
     await expect(strip).toHaveCSS("overflow-x", "auto");
 
-    // ARROW-KEY TO THE CLIPPED TAB. Task 2 could not settle from a browser
+    // ARROW-KEY TO THE LAST TAB. Task 2 could not settle from a browser
     // pane whether keyboard navigation reaches it -- that pane reported
     // `document.hasFocus()` false throughout, and Blink defers focus EVENTS
     // for an unfocused page, so Radix's automatic activation never ran there
