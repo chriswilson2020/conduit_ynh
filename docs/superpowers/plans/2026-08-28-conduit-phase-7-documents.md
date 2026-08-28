@@ -19,7 +19,9 @@
 These are the house rules this repo has accumulated. Violating one is how the last six
 phases produced their review findings.
 
-- **Migrations are generated, never hand-written and never pushed.** `npx drizzle-kit generate` after editing `packages/api/src/db/schema.ts`. **NEVER run `drizzle-kit push`.** An unshipped migration may be edited in place (keep the journal timestamp, hand-edit the snapshot, converge `conduit_test` with psql); a shipped one never.
+- **Migrations are generated, never hand-written and never pushed.** `npx drizzle-kit generate` after editing `packages/api/src/db/schema.ts`. **NEVER run `drizzle-kit push`.** A shipped migration is never touched.
+- **Revising an UNSHIPPED migration: regenerate it, do not hand-edit it.** Earlier phases hand-edited the SQL and then hand-edited the snapshot to match. Task 2 established that regenerating is both safer and less work — drizzle writes the snapshot itself, so a 4,000-line JSON file cannot drift from the SQL — provided you then restore the journal's original `when` and `tag` so the filename and ordering do not move. Verify the journal diff is empty afterwards.
+- **After revising an unshipped migration, `conduit_test` must be DROPPED and recreated.** The migrator skips by timestamp, so an already-applied 0009 is never re-applied no matter what its contents now say, and your tests will run against the old shape while the file on disk says something else. This is the failure mode that makes a hand-edited migration look like it worked.
 - **Server work goes through the dev checkout:** `CONDUIT_REMOTE_DIR=/home/chris/conduit-phase4 ./scripts/remote.sh '<cmd>'`. Pass that variable **explicitly on every call** — the default points at a different checkout and a previous session overwrote it.
 - **Vitest runs from the repo root.** The root global setup migrates Postgres before any project's tests, so the suite needs a database.
 - **ASCII only** in source and tests. **Targeted `git add`** — never `git add -A`.
@@ -1365,6 +1367,21 @@ export async function issueQuote(db, config, actorId, input): Promise<DocumentDt
 Run: `npx vitest run packages/api/src/services/documents.test.ts`
 Expected: PASS locally with render tests skipped if you have no binary; run them on the
 server to prove them for real, exactly as in Task 1 Step 5.
+
+- [ ] **Step 5a: Gate the input BEFORE anything spawns — Task 2 left this deliberately**
+
+`money.ts` bounds `qtyMilli` and `taxRateBp` to the int4 range its columns can hold, so
+the SV-1 failure (compute, render, then die on the insert) cannot happen for magnitude.
+It does NOT enforce the business bounds: `qty_milli >= 0` and
+`tax_rate_bp BETWEEN 0 AND 10000` exist only as CHECK constraints, and `money.ts` keeps a
+wider domain on purpose — `divideRoundHalfUp` has a negative branch for a future credit
+note.
+
+**So a negative quantity, or a 150% tax rate, still computes, still renders a PDF, and
+then dies on the insert as a 23514 instead of a 22003.** Same defect, different error
+code. The repo's split is "Zod is the gate, the CHECK is the backstop", and this task
+owns the gate: validate every line item against the same bounds the constraints enforce,
+and reject before the render is spawned.
 
 - [ ] **Step 5b: Make the merge contract a contract, not a coincidence**
 
