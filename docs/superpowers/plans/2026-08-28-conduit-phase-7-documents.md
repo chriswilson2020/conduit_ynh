@@ -1253,6 +1253,21 @@ Run: `npx vitest run packages/api/src/services/documents.test.ts`
 Expected: PASS locally with render tests skipped if you have no binary; run them on the
 server to prove them for real, exactly as in Task 1 Step 5.
 
+- [ ] **Step 5b: Make the merge contract a contract, not a coincidence**
+
+`schema.test.ts`'s `SEEDED_FIELDS` equality compares the seeded template's tokens
+against a literal list sitting beside it in the same file. **Nothing connects either
+side to `buildContext`.** Supply `document.subTotal` for the template's
+`{{document.subtotal}}` and that test stays green while the PDF prints a blank where a
+total should be — which is the single most expensive kind of bug in this phase, because
+it is invisible until someone reads a quote.
+
+Add the test that closes it: assert the key set `buildContext` actually produces against
+the same token list the template is checked against. `org.*` and `document.*` keys must
+match exactly; the line-scope keys are checked against a line object. Extra context keys
+are harmless (the requirement is "at least"), missing ones are not — so assert
+containment in that direction and say so in the test's name.
+
 - [ ] **Step 6: Add the routes**
 
 `packages/api/src/routes/documents.ts`: `POST /api/deals/:dealId/documents` (issue),
@@ -1294,6 +1309,19 @@ with the table retained above it. Prove or refute that with a measurement.
 `document-form.tsx` imports `documentTotals` from `@conduit/shared` — the SAME function
 the server stores with. Do not recompute totals in the component; a second
 implementation is a second answer.
+
+**`documentTotals` THROWS on a non-integer or unsafe input — it does not return NaN.**
+That is deliberate (Task 2 made it strict so a bad value cannot reach a `bigint` column
+silently), and it makes this the most likely way this task ships a visible bug: a user
+half-way through typing a quantity gives you `""` or `1.5`, the component calls straight
+through, and the throw happens inside render and takes the whole form down through the
+error boundary.
+
+Parse and validate at the input boundary, before the call: text to integer units, and a
+field that is empty or mid-edit contributes a zero line rather than an exception. The
+running total must degrade to a partial figure while someone types, never to a blank
+screen. Test the half-typed states explicitly — `""`, `"."`, `"1."`, `"-"`, `"1e5"` —
+because they are what a real keyboard produces and none of them is an integer.
 
 - [ ] **Step 3: Add the Documents section to the deal**
 
