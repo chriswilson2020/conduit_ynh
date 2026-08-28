@@ -464,6 +464,18 @@ The move must go through the **existing** deal-move service path — never a sec
 
 Above the breakpoint the board is untouched — including its drag-and-drop. ~8 tests.
 
+---
+
+## Phase-level findings (carried out of Phase 6, for the release notes and the backlog)
+
+- **Every state-driven `Dialog` in this app restores focus to nothing on close.** Radix's `onCloseAutoFocus` focuses `context.triggerRef.current`, which only `<DialogTrigger>` sets — so a dialog opened from state leaves `activeElement` on `<body>`. Task 4's reviewer isolated the cause live (a harness built from this repo's own `ui/dialog.tsx` and Radix build: an otherwise identical dialog WITH a trigger restores correctly). Exactly four callers: `composer.tsx:97`, `task-drawer.tsx:46`, `settings-mail.tsx:137`, `settings-templates.tsx:61`. **Pre-existing and desktop-visible, so out of bounds for this phase** — it belongs with the composer's opening-focus item already deferred past v0.10.0. Task 4 handled both exits explicitly for its own sheet; the other four are untouched.
+- **The composer opens focused on `dialog-close` at a phone viewport**, because it is the only `DialogContent` caller with no `autoFocus`'d field. The coordinator's ruling to redirect focus was WITHDRAWN in Task 3: the first tabbable on desktop is the From `SelectTrigger`, so both compose and reply would change desktop, and phone-scoping needs a fourth `useIsMobile()` site the spec caps at three. Deferred past v0.10.0.
+- **A cold deep link to a missing thread renders nothing** — `conversation-gone` is the WARM case only (a pane already open when a refetch meets a 404); a cold link returns null from `Conversation`'s `data === undefined` guard before the error branch speaks. On a phone that is a screen holding only Back and Compose. Cause is in `conversation.tsx`; not patched from the page.
+- **`/mail?thread=` with an EMPTY value** passes route validation, reads as a selection, and produces the same empty screen. Normalising it in `validateSearch` would change desktop rendering.
+- **`composer-suggestion` is 36px** — recipient-autocomplete rows, under the phone floor. Task 2 residue that no task owned.
+- **The phone list row (`<TableRow onClick>`) has no role, no accessible name and no tab stop**, and below the breakpoint loses row semantics too, so a screen-reader user on the companies list gets an unstructured run of label/value lines with no way to open a company. Pre-existing (those rows were keyboard-inert at desktop before the phase); fixing it adds desktop tab stops, so it needs its own decision.
+- **In the 768-1023px band** `isMobile` is true while several surfaces' CSS is `lg:`-gated, so e.g. the funnel row wraps and gives the stage name a 693px line where the single-line form fits comfortably. A direct consequence of this plan's own "gate your CSS at `md:`" instruction — compliant, cosmetic, worth knowing.
+
 ### Task 5: The Gantt, read-only on a phone
 
 **Files:** `packages/web/src/components/gantt/*`.
