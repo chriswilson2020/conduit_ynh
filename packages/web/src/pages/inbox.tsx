@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { clsx } from "clsx";
 import type { BulkThreadActionKind } from "@conduit/shared";
@@ -343,6 +343,12 @@ export function InboxPage() {
 
   const openFolders = useCallback(() => setFoldersOpen(true), []);
 
+  // The two focus targets the effect below chooses between. One ref for the
+  // leading control even though it is two different buttons, because only one
+  // of them is ever rendered.
+  const leadingRef = useRef<HTMLButtonElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+
   /**
    * ONE Back, from either neighbour, always landing on the thread list.
    *
@@ -367,29 +373,56 @@ export function InboxPage() {
   }, [navigate]);
 
   /**
-   * Each level is a screen of its own, so arriving at one starts at its top.
+   * ARRIVING AT A LEVEL: start at its top, AND put focus somewhere real.
    *
-   * Without this, opening a conversation from a row far down a long list
-   * leaves the window scrolled to wherever that row was and drops the reader
-   * into the middle of the thread. The document is what scrolls here, not
-   * <main>: the root is `flex min-h-screen` and a flex container's intrinsic
-   * height counts its growing child's max-content contribution, so <main>
-   * only ever behaves as a scroll container while its content fits (measured
-   * again on this page: at 375x812 with a conversation open the document is
-   * 2304 tall against an 812 client, and main's scrollHeight equals its own
-   * height).
+   * The scroll half is the obvious one. Without it, opening a conversation
+   * from a row far down a long list leaves the window scrolled to wherever
+   * that row was and drops the reader into the middle of the thread. The
+   * document is what scrolls here, not <main>: the root is `flex
+   * min-h-screen` and a flex container's intrinsic height counts its growing
+   * child's max-content contribution, so <main> only ever behaves as a scroll
+   * container while its content fits (measured again on this page: at 375x812
+   * with a conversation open the document is 2304 tall against an 812
+   * client, and main's scrollHeight equals its own height).
    *
-   * It applies to Back as well as to the two forward moves, which is a trade:
-   * returning to the thread list loses the reader's place in it. Restoring
-   * that place means remembering an offset per level -- state parallel to the
-   * URL, which this surface is deliberately built without -- and the browser
-   * cannot restore it for us either, since the document's height changed
-   * underneath the position while the pane was hidden. Predictable beats
-   * nearly-right here.
+   * THE FOCUS HALF IS THE PRICE OF HIDING PANES RATHER THAN UNMOUNTING THEM,
+   * and it was measured, not guessed: hiding the subtree that contains the
+   * focused element drops focus to <body>. Focus the filter bar, drill into a
+   * conversation, and `document.activeElement` was BODY -- on every drill-in,
+   * and again on a Back that leaves the leading control unrendered (the
+   * no-rail case). A keyboard or screen-reader user was put back at the top
+   * of the document with nothing announced, on a surface whose whole point is
+   * that it changed screens.
+   *
+   * So focus moves deliberately: to the new level's leading control when
+   * there is one, and otherwise to the heading, which is made focusable with
+   * tabIndex -1 rather than inventing a control that exists only to be
+   * focused. The leading control is also why this must be deliberate rather
+   * than left alone: with a rail, Back and Folders are the SAME element
+   * relabelled, so a focus that merely stayed put would sit on a button that
+   * silently became a different button.
+   *
+   * Keyed on the LEVEL alone. Keying on the leading control's kind as well
+   * would cover one more case (the rail appearing or vanishing without a
+   * level change) at the cost of a focus jump on every phone visit to this
+   * page, because the rail is absent for the render before the accounts
+   * query resolves -- focus would land on the heading and then hop to the
+   * Folders button a moment later. The uncovered case is an account being
+   * archived in another tab while this one sits on the thread list, which is
+   * a focus loss nobody will meet; the jump would be met every time.
+   *
+   * The scroll applies to Back as well as to the two forward moves, which is
+   * a trade: returning to the thread list loses the reader's place in it.
+   * Restoring that place means remembering an offset per level -- state
+   * parallel to the URL, which this surface is deliberately built without --
+   * and the browser cannot restore it for us either, since the document's
+   * height changed underneath the position while the pane was hidden.
+   * Predictable beats nearly-right here.
    */
   useEffect(() => {
     if (!isMobile) return;
     window.scrollTo({ top: 0 });
+    (leadingRef.current ?? headingRef.current)?.focus();
   }, [isMobile, view.level]);
 
   return (
@@ -418,11 +451,22 @@ export function InboxPage() {
             // desktop journey cannot see them at all.
             data-testid={view.leading.kind === "back" ? "inbox-back" : "inbox-folders"}
             onClick={view.leading.kind === "back" ? backToThreads : openFolders}
+            ref={leadingRef}
           >
             {view.leading.label}
           </Button>
         )}
-        <h1 className="text-xl font-semibold text-slate-900">{view.title}</h1>
+        {/* tabIndex only below the breakpoint, so the desktop heading keeps
+            exactly the attributes it always had. -1 makes it a target for the
+            level effect's focus() without putting a heading into anyone's tab
+            order. */}
+        <h1
+          ref={headingRef}
+          tabIndex={isMobile ? -1 : undefined}
+          className="text-xl font-semibold text-slate-900"
+        >
+          {view.title}
+        </h1>
         <Button data-testid="compose-button" onClick={() => setComposeOpen(true)}>
           Compose
         </Button>
@@ -451,10 +495,15 @@ export function InboxPage() {
           Displayed or not, every pane here stays mounted, keeps its state and
           keeps receiving exactly the invalidations it does at a desk.
 
-          `display: none` is also the right kind of hidden: an off-screen pane
-          leaves the accessibility tree and the tab order with it, so a screen
-          reader on the conversation screen is not also reading the list
-          behind it.
+          `display: none` takes the off-screen pane out of the accessibility
+          tree and the tab order with it, which is right -- a screen reader on
+          the conversation screen must not also be reading the list behind it
+          -- BUT IT IS NOT FREE, and the cost is easy to miss because it is
+          invisible on a pointer. If the focused element was in the pane being
+          hidden, focus falls to <body>: measured here, focus `filter-unread`,
+          drill in, and activeElement is BODY. That is why the level effect
+          above moves focus deliberately rather than trusting the browser, and
+          why this decision is a trade rather than a clean win.
 
           The class strings are the ones that shipped. Only the threads pane
           spells its display utility through a ternary, because it is the one
@@ -576,9 +625,20 @@ export function InboxPage() {
 
         {/* The placeholder below is a DESKTOP state: on the phone this pane is
             shown only at the conversation level, which by construction is a
-            level with a thread. The `conversation-gone` branch inside
-            Conversation is the one that can be reached there, and it is not a
-            dead end -- Back is in the heading row above it. */}
+            level with a thread.
+
+            WHAT A PHONE ACTUALLY MEETS WHEN THE THREAD IS GONE, measured
+            rather than assumed, because the obvious answer is wrong.
+            `conversation-gone` is the WARM case -- a pane that was already
+            open when an ordinary refetch met the 404. A COLD deep link to a
+            missing thread renders NOTHING at all: Conversation's own
+            `data === undefined` guard returns null before the error branch
+            has anything to say, so this div is empty at both 375 and 1280.
+            On a phone that is a screen holding only Back and Compose. Not a
+            dead end -- Back is in the heading row above -- but a poor screen,
+            and the cause is in components/mail/conversation.tsx rather than
+            here. Recorded as a phase-level finding, not patched from this
+            file. */}
         <div className={clsx("min-w-0 lg:overflow-y-auto", !view.panes.conversation && "hidden")}>
           {selectedId === undefined ? (
             <p className="rounded-md border border-dashed border-slate-200 px-4 py-8 text-center text-sm text-slate-400">

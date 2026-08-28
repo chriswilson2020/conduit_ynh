@@ -192,6 +192,15 @@ function BulkButton({
  * unconditionally and stays empty until there is something to say. That is also
  * why the dismiss button lives inside it: removing the region to hide a message
  * would take the announcer with it.
+ *
+ * ONE LIMIT OF THAT, below the breakpoint (Phase 6): this region renders
+ * inside the inbox's THREADS pane, and the phone stack hides the panes it is
+ * not showing. An outcome that lands while the reader has drilled into a
+ * conversation is therefore not announced -- the text itself survives (the
+ * page owns it, not this component) and is read on return, but the live
+ * region was display:none at the moment it filled. Every gesture that can
+ * start a bulk action lives on the threads level, so this needs a mid-flight
+ * drill-in to reach at all.
  */
 export function BulkResult({
   outcome, onDismiss,

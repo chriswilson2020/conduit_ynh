@@ -104,7 +104,7 @@ Pure-lib tests where logic appears; otherwise this task is proven by Task 6's e2
 > - **INHERITED 2, `ui/input.tsx`'s 38px:** fixed as `max-md:min-h-11`, and `ui/ui.test.ts` asserts for every primitive both that the floor is there AND that it is not unscoped, since an unscoped one is the mutation that breaks the hard requirement.
 > - **INHERITED 3, `viewport-fit=cover`: DECIDED AGAINST.** Without it the layout viewport already stops short of the notch and the home indicator, the browser reserves those strips itself, and every `env(safe-area-inset-*)` is 0px -- so Task 1's reservation is correct and the terms are inert. Adding it moves the layout viewport out under the hardware on ALL FOUR edges, so the header, `<main>`, the bar, the sheets, the drawer's right edge and -- in landscape, which is above the breakpoint and still renders the sidebar -- the sidebar's left edge would each need their own inset. That is a landscape audit on hardware this loop cannot test, bought for no visible gain. The reasoning lives in `shell.tsx` beside the reservation that depends on it, with a pointer from `index.html`, and `use-is-mobile.test.ts` now pins the meta so the day someone adds it they are told which three comments stop being true.
 > - **The nav guard, rescoped as warned.** `nav-lib.test.ts` slices `shell.tsx` between `<aside` and `</aside>` before scraping, with sentinel assertions so a sidebar that stops being one aside block fails loudly instead of silently guarding an empty string. Mutation-verified BOTH ways: a link added to the header now passes (it used to fail with a diff that explained nothing), and renaming a sidebar label still fails.
-> - **Tests: +12 on the 1745 baseline -> 1757** unit + 36 skipped, green; typecheck clean on five projects; `npm run build` clean with **no CSS warning**; no e2e file touched. Eleven of the twelve are `ui/ui.test.ts` (the one skeleton, no parallel sheet file, the props pass-through, the phone dialog's way out, what a caller may tune, the floor on five primitives, the scrolling strip); the twelfth is the viewport-meta pin. Five mutations were run and all behaved: the unscoped floor, the deleted phone Close, `viewport-fit=cover`, the renamed sidebar label (all red) and the header link (green).
+> - **Tests: +12 on the 1745 baseline -> 1757** unit + 36 skipped, green (**and the quality round below added three more, so the commit this task actually hands on carries 1760** -- this line was written before that round and Task 3's spec review caught the stale arithmetic; anyone computing a delta from here should start at 1760); typecheck clean on five projects; `npm run build` clean with **no CSS warning**; no e2e file touched. Eleven of the twelve are `ui/ui.test.ts` (the one skeleton, no parallel sheet file, the props pass-through, the phone dialog's way out, what a caller may tune, the floor on five primitives, the scrolling strip); the twelfth is the viewport-meta pin. Five mutations were run and all behaved: the unscoped floor, the deleted phone Close, `viewport-fit=cover`, the renamed sidebar label (all red) and the header link (green).
 >
 > **THE QUALITY ROUND, which found the sweep's worst bug in its own primitive.** `ui/button.tsx` took `max-md:min-h-11` and no `max-md:min-w-11`, so a button whose whole label is a glyph stayed as narrow as the glyph. The task drawer's close measured **34.7 x 44** -- and below the breakpoint that drawer is full-screen, so it was the ONLY exit from the surface Task 5 opens from a Gantt bar. The floor is now on both axes (44x44 measured; 34.7x36 at 1280 AND at 1000, i.e. exactly what it always was), and the same button in the drawer's "Task not found" state, which had no `aria-label` at all, has one.
 >
@@ -155,6 +155,197 @@ Watch for: the accumulator/`pages.key` guards Phase 5 and v0.9.1 touched; the co
 - The `EntityTableColumn.render` cell assumes exactly two children; anything else gets spread by `justify-between`.
 
 **QUALIFIED BY TASK 2 — read this before using the numbers above.** `<main class="flex-1 overflow-auto">` does NOT cap the page. The root is `flex min-h-screen`, so its height is indefinite, and a flex container's intrinsic height counts a `flex-grow` child's max-content contribution — an `overflow:auto` child does not shrink it. `<main>` therefore behaves as a scroll container only while its content FITS; past that the document scrolls and `<main>` grows with it (measured at 375x812 on the companies list: `main` 1089 tall, scrollHeight equal to its height, document 1158 against an 812 client). **So the budget above is a budget for a pane that fits, not a hard frame.** A phone pane wanting its own internal scroll must be given a definite height by something — do not assume `h-full` inside `<main>` bounds you. This is pre-existing at every width (1280x800 gives an 826px document), so FIXING it would move the desktop's scroll container and is out of bounds for this phase; work within it or report.
+
+> **DONE** (commits ba5f680 + this spec-review round; spec review
+> compliant-with-issues -- NO correctness defect. It verified the hard
+> requirement live at 1280 through a tunnel, upheld the hide-don't-unmount
+> decision on all three counts, and found the one mechanism that could have
+> falsified it -- Load-more being an IntersectionObserver rather than a button
+> -- and confirmed it is not. Its findings were an unacknowledged focus cost,
+> a comment asserting a branch that does not fire, and a dead cross-task API
+> carrying a false comment; all three are fixed below). As built:
+>
+> - **THE STACK'S SHAPE: three screens, with the THREAD LIST AS THE HUB rather
+>   than as the middle of a strict line.** folders <-> threads <-> conversation,
+>   one at a time. The hub is where the Mail tab lands (an inbox that opened on
+>   a folder list would cost every visit a tap), and both neighbours are one
+>   control away in each direction: `inbox-folders` goes out to the rail,
+>   `inbox-back` returns from either side. Every level has a leading control
+>   except the hub, which the bottom bar itself always reaches -- which is how
+>   "no surface is a dead end" is satisfied here.
+> - **WHERE THE STATE LIVES: the URL, plus exactly one boolean.** The
+>   conversation level is DERIVED from `?thread=`, so opening a thread IS the
+>   navigation to its screen -- no second gesture to keep in step, and a deep
+>   link lands on the right screen with no effect to fix it up. Only the folder
+>   screen needed state (`foldersOpen`), because nothing in the URL implies it.
+>   `pages/inbox-lib.ts`'s `inboxStackView` turns the pair into level, title,
+>   leading control and which panes, and returns the UNCHANGED DESKTOP VIEW for
+>   every input above the breakpoint -- so the phase's hard requirement is an
+>   assertion in the unit suite rather than a hope. A deep-linked thread beats a
+>   folder screen left open (the only way to hold both is arriving from global
+>   search or a record's Mail tab, and a link that landed on a folder list would
+>   be a broken link); Back clears both.
+> - **THE LOAD-BEARING DECISION: the stack HIDES panes, it does not unmount
+>   them.** The same three panes render in the same grid; only `display`
+>   changes. Unmounting the list to show a conversation would have thrown away
+>   the accumulated "Load more" pages, dropped its query observer so an SSE
+>   invalidation arriving while the reader is in a conversation refetches
+>   nothing, and left the page holding `rows` the unmount never retracted -- a
+>   bulk bar counting rows no longer listed. Verified live at 375 with a
+>   36-thread fixture: **36 rows before opening a thread, 36 while it is open,
+>   36 after Back**, with "Load more" correctly gone.
+> - **THE COST OF THAT, MEASURED AND PAID (the spec review's main finding).**
+>   Hiding the subtree holding the focused element drops focus to `<body>`:
+>   focus `filter-unread`, drill into a conversation, and `activeElement` was
+>   BODY -- on every drill-in, and again on a Back that leaves the leading
+>   control unrendered. This was the THIRD instance of the class in this phase
+>   (Task 1's search sheet opening on Close, Task 2's `dialog-close` hazard).
+>   The level effect now moves focus deliberately: to the new level's leading
+>   control where there is one, otherwise to the heading, made focusable with
+>   `tabIndex -1` rather than by inventing a control. **Measured after, all
+>   four transitions plus the no-rail case:** threads->conversation
+>   `inbox-back`; conversation->threads (Back) `inbox-folders`;
+>   threads->folders `inbox-back`; folders->threads (folder pick)
+>   `inbox-folders`; Back with no rail `H1:Inbox` with `tabindex="-1"`. Every
+>   one was BODY before. The effect keys on the LEVEL alone, deliberately:
+>   keying on the leading control's kind as well would cover the rail
+>   appearing or vanishing without a level change, at the cost of a focus jump
+>   on every phone visit (the rail is absent for the render before the accounts
+>   query resolves, so focus would land on the heading and hop to the Folders
+>   button a moment later). The uncovered case is an account archived in
+>   another tab; the jump would be met every time.
+> - **A one-line additive change to `ui/button.tsx`:** `ref` is declared on
+>   `ButtonProps`, because it lives on React's `ClassAttributes` and extending
+>   `ButtonHTMLAttributes` alone leaves it a type error. Nothing else was
+>   needed -- React 19 hands a function component `ref` as an ordinary prop, so
+>   it already travelled in the existing spread. No class string, no rendering,
+>   no `ui/ui.test.ts` guard is affected.
+> - **THE 44px FLOOR ON THE MAIL PANES, which Task 2 deliberately left -- and
+>   the handoff's geometry was wrong.** Measured before: folder rows **28**
+>   (not the "~36" the handoff carried), the select-all label **24**, the
+>   attachment chip **24**. Thread rows (98.5) and message headers (54-70) were
+>   already over the floor. **The most important correction is the row
+>   checkbox: its short axis is its WIDTH, 32px, not its height** -- the
+>   handoff's "rows are ~36px" framing would have led to flooring the height
+>   (already 98.5, so a no-op) and leaving a 32px target on the gesture that
+>   starts a bulk selection. Fixed with a min-width, so the painted checkbox
+>   does not move and the row starts 12px further in (293 -> 281). `LinkPanel`'s
+>   unlink glyphs were checked for the warned-about overhang and do NOT have
+>   one: 44x44 at x=258, right edge 302, inside the panel's 24..351 box -- the
+>   stack changes `display`, not padding, so the interaction never arises. The
+>   `bulk-result-dismiss` glyph took a plain 44x44 floor rather than
+>   `ui/touch.ts`'s chip-remove idiom, whose negative margins would have
+>   overhung its 4px container and reached past the pane edge.
+> - **NO MODAL WAS ADDED, deliberately, and that is the answer to the "pick one
+>   of the two full-screen phone forms" question.** The levels are the PAGE --
+>   no portal, no scrim, no focus trap. A sheet for the folder rail would mean
+>   either two `folder-sidebar` elements in the DOM (the strict-mode hazard
+>   Task 1's JS branch exists to avoid) or a branch that moves the rail,
+>   churning `useMailFolders`/`useUnreadMailCountsByFolder` observers on every
+>   open and close; it would also mix a sheet's Close with a stack's Back.
+>   **`SheetHeader`'s `leading` slot is therefore unused**, and its doc comment
+>   -- which claimed "Task 3's drill-in stack needs one at every level" -- now
+>   says so instead of asserting a caller that does not exist. The slot is kept
+>   as a reasonable API for a sheet-based drill-in somebody may still want.
+> - **NO HEIGHT WAS SET BELOW THE BREAKPOINT.** The `lg` cap stays a desktop
+>   rule and was not mirrored; the document scrolls, which it already did at
+>   that width. A unit guard fails a second viewport-unit rule in this file,
+>   and says in its own comment that it would not catch a height expressed some
+>   other way.
+> - **Desktop re-measured at 1280x800 and identical**, before and after both
+>   rounds: 224x800 aside; `<main>` exactly `flex-1 overflow-auto px-6 py-6`;
+>   the grid class string and box (248,139) 1008x624; panes 176/384/416 at
+>   x=248/440/840 with byte-identical class strings; the heading row with
+>   **exactly two children**; **the `h1` carrying only `class` and no
+>   `tabindex`**; `activeElement` BODY (focus is not stolen at a desk); folder
+>   row 176x28, select-all 384x24, checkbox 32x98.5, thread row 350x98.5,
+>   filter 74.1x38, attachment 200.5x24; document 1280x800, no scroll. A
+>   110-line DOM skeleton dump differs from the pre-phase one only by inert
+>   `max-md:` utilities, and the built CSS hash never changed
+>   (`index-BMpU6pHC.css`) because every utility used already existed. **Also
+>   checked at 900x800**, between `md` and `lg`: sidebar present, no stack
+>   controls, three panes stacked, folder rows still 28 -- that band is
+>   untouched.
+> - **Tests: +13 on the 1760 baseline -> 1773** unit + 36 skipped, green;
+>   typecheck clean on five projects; `npm run build` clean with no CSS
+>   warning; **no e2e file touched, 72 -> 72**. All thirteen are
+>   `pages/inbox-lib.test.ts`: ten over `inboxStackView` (the desktop pin over
+>   an 8-input matrix, exactly-one-pane, all-three-panes-reached,
+>   every-level-has-an-exit, the deep-link precedence, the no-rail case) and
+>   three source guards over `inbox.tsx` (the grid literal, no phone
+>   viewport-height frame, each mail pane rendered exactly once). **Four
+>   mutations run, all died:** a phone viewport-height rule on the grid, a
+>   duplicated `<ThreadList>`, flipped level precedence, and a removed desktop
+>   guard. Absence assertions run over comment-stripped source, following
+>   `ui/ui.test.ts`'s tripwire.
+>
+> **THE COMPOSER'S PHONE FOCUS -- RULING WITHDRAWN, BACKLOG FOR AFTER v0.10.0.**
+> Measured: at 375 the composer opens with `activeElement` on `dialog-close`;
+> at 1280 it opens on `composer-account`. The coordinator's first ruling
+> assumed the desktop already focused `composer-to` and that scoping the fix
+> would therefore be desktop-inert; the spec review measured that the first
+> tabbable descendant on desktop is the From `SelectTrigger`
+> (`composer.tsx:279`), which precedes `composer-to` and renders whenever
+> there is at least one sendable account -- so desktop compose AND desktop
+> reply both open on `composer-account`, and the premise was false for both
+> cases. Phone-scoping it would need a width branch inside `composer.tsx`, a
+> **FOURTH `useIsMobile()` site** where the spec names three "so a fourth is a
+> deliberate addition rather than a drift". Not sanctioned for a focus
+> nicety. `composer.tsx` is untouched. It is not a dead end -- the Close works
+> and the fields are one tap away -- but it is the same shape as the bug Task 1
+> fixed for the search sheet, and it wants a `DialogContent`-level answer
+> rather than a per-caller patch.
+>
+> **RECORDED, NOT FIXED.**
+>
+> - **A cold deep link to a MISSING thread renders an empty pane**, at 375 and
+>   at 1280 alike: an empty pane div, API 404, `conversation-gone` ABSENT. That
+>   testid is the WARM case only -- a pane already open when an ordinary
+>   refetch meets the 404 -- because `Conversation`'s `data === undefined`
+>   guard returns null before the error branch has anything to say. On a phone
+>   that is a whole screen holding only Back and Compose. Not a dead end, but a
+>   poor screen; the cause is pre-existing in
+>   `components/mail/conversation.tsx` and was not patched from the page.
+>   `inbox.tsx`'s comment, which previously asserted the opposite, now says
+>   what actually happens.
+> - **`composer-suggestion` (`composer.tsx:632`) is 36px** -- the
+>   recipient-autocomplete rows, under the floor on a phone. Task 2 residue
+>   that nothing in the plan caught. Task 6 or a follow-up.
+> - **`BulkResult`'s always-mounted `role="status"` sits INSIDE the threads
+>   pane**, so an outcome landing while the reader has drilled into a
+>   conversation is not announced -- the text itself survives (the page owns
+>   it) and is read on return, but the region was `display: none` when it
+>   filled. Every gesture that starts a bulk action is on the threads level, so
+>   it needs a mid-flight drill-in to reach. Noted in `bulk-bar.tsx`.
+> - **The scroll-to-top effect keys on `view.level`**, so a global-search
+>   navigation from one conversation to ANOTHER stays at the same level and
+>   does not reset the scroll; it also fires on mount and on a breakpoint
+>   crossing. Both cosmetic.
+> - **The `replace` on `?thread=` is kept at both widths**, so a system Back
+>   gesture from an open conversation leaves the inbox rather than closing the
+>   conversation -- identical to the desktop's behaviour today, and the reason
+>   `inbox-back` is on screen at every level that has somewhere to go.
+>
+> **HANDOFFS. Task 4:** nothing here blocks you; the pattern worth copying is a
+> `*-lib.ts` whose view function returns the unchanged DESKTOP shape for
+> `isMobile: false`, with a unit test pinning it -- it turns the hard
+> requirement into an assertion. Also prefer a mutually-exclusive display
+> ternary over appending a hidden utility to a class string that already
+> carries one: two utilities setting the same property is a precedence
+> question you do not need to have. And if you hide rather than unmount
+> anything, budget for the focus move -- it is not optional. **Task 6:** new
+> testids `inbox-back` and `inbox-folders`, which exist ONLY below the
+> breakpoint (a JS branch, not a hidden element), so no desktop journey can
+> see them. **`thread-list`, `folder-sidebar` and `conversation` are in the
+> DOM at EVERY level**, `display: none` when off screen -- assert
+> `toBeVisible()`/`toBeHidden()`, never `toHaveCount(0)`. `/mail?thread=<id>`
+> lands directly on the conversation level. The composer opens focused on
+> `dialog-close` at a phone viewport, so a journey that types immediately
+> types into nothing -- focus the field first. Two asserts worth having: focus
+> after a drill-in (it is the finding this round fixed and nothing but e2e
+> re-checks it), and that the accumulated list survives a round trip through a
+> conversation (open a thread from page two, Back, count the rows) -- that is
+> the property the whole design rests on.
 
 ### Task 4: The kanban stage view
 

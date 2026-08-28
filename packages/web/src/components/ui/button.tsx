@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes } from "react";
+import type { ButtonHTMLAttributes, Ref } from "react";
 import { clsx } from "clsx";
 
 export type ButtonVariant = "default" | "outline" | "danger" | "ghost";
@@ -12,6 +12,17 @@ const variantClasses: Record<ButtonVariant, string> = {
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
+  /**
+   * Declared explicitly because `ref` lives on React's ClassAttributes, not on
+   * ButtonHTMLAttributes, so extending the latter alone leaves it a type
+   * error. Nothing else is needed: React 19 hands a function component `ref`
+   * as an ordinary prop, so it travels to the element in the spread below.
+   *
+   * The caller that wanted it is the inbox's phone stack, which must move
+   * focus deliberately when a drill-in hides the subtree the focused element
+   * was in -- see pages/inbox.tsx.
+   */
+  ref?: Ref<HTMLButtonElement>;
 }
 
 // A native <button> with no explicit `type` defaults to "submit" inside a

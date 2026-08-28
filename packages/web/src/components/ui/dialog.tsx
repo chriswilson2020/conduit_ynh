@@ -232,9 +232,18 @@ export function SheetHeader({
   closeTestId: string;
   /**
    * Anything that belongs before the title -- a Back control, most obviously.
-   * Task 3's drill-in stack needs one at every level, and without a slot here
-   * it would have to hand-roll the whole header and then remember the Title
-   * and the Close on its own.
+   * Without a slot here, a sheet that needs one would have to hand-roll the
+   * whole header and then remember the Title and the Close on its own.
+   *
+   * NO CALLER TODAY, and the reason is worth writing down rather than
+   * leaving as a puzzle. This was added for Task 3's inbox drill-in on the
+   * assumption that its levels would be sheets; they are not. That stack is
+   * the PAGE -- the same three panes of the desktop grid, shown one at a
+   * time -- so its Back lives in the page's own heading row, with no portal,
+   * no scrim and no focus trap, and the folder rail stays a single element
+   * in the DOM instead of one copy per width. The slot is kept because it is
+   * a reasonable API for the sheet-based drill-in somebody may still want,
+   * not because anything is using it.
    */
   leading?: ReactNode;
 }) {
