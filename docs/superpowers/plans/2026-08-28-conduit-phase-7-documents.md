@@ -801,9 +801,13 @@ the per-line rates.
   `schema.test.ts`, in both directions. A field the template uses that nobody supplies is
   a silent blank on a printed page (unknown fields resolve to `""` and never throw); a
   field on the list the template stopped using is a context key built for nothing.
-- **The CSS is flat with no nested at-rules**, because a literal `{{` in a stylesheet
-  would be eaten as a merge field. The test asserts every `{{` in the body is one of the
-  25 tokens.
+- **No literal `{{` appears in the CSS**, because it would be eaten as a merge field.
+  The stylesheet DOES nest one at-rule (`@page { @bottom-center { ... } }`) and is safe
+  because of the space between its opening braces; the test asserts every `{{` in the
+  body is one of the 26 tokens, which catches an opening pair and nothing else. An
+  earlier draft of this bullet said the CSS was flat, and the migration's own comment
+  claimed the test also caught a closing `}}` -- it does not, and a `}}` is inert
+  anyway. Both are corrected.
 - **The logo is deliberately ABSENT.** `org_profile.logo_file_id` exists and the merge
   context carries `org.logoDataUri`, but the merge language has no conditional, so
   `<img src="{{org.logoDataUri}}">` would render `<img src="">` on every quote raised
@@ -896,15 +900,15 @@ rendered en-GB. `board-lib.test.ts`'s helper used to build its expectation with
 
 Two things measured while writing it. **The exactness boundary is real but far out**: the
 first cents value whose formatting disagrees with the exact decimal is
-**7,036,874,417,766,401** (2^46 units; it prints ...664.02 for ...664.01), identical in
-en-GB, nl-NL, en-US and de-DE because the loss happens in the divide before Intl sees the
-number. That is BELOW `money.ts`'s own ceiling, so the formatter refuses at it rather
-than leaving a sliver where a total is storable but not exactly printable. **And a
-limitation that is not new**: the divide is by 100 while the decimal places come from the
-currency, so a zero-decimal currency like JPY reads 1,100,000 back as 11,000 yen. That is
-Conduit's stored model since `deals.value_cents`, unchanged from the five sites this
-replaced, and a column problem rather than a formatting one -- pinned by a test so it
-stays visible.
+**7,036,874,417,766,401** (2^46 units; a `cents / 100` divide prints ...664.02 for
+...664.01), identical in en-GB, nl-NL, en-US and de-DE because the loss happens before
+Intl sees the number. **This round REFUSED amounts above it, which review round 2 records
+as a regression** -- the fix is a BigInt decimal string rather than a ceiling; see F2
+below. **And a limitation that is not new**: the divide by 100 and the currency's own
+digit count only agree for currencies with a hundredth, so JPY reads 1,100,000 back as
+11,000 yen. That is Conduit's stored model since `deals.value_cents`, unchanged from the
+five sites this replaced, and a column problem rather than a formatting one -- pinned by
+a test so it stays visible.
 
 **O-8: `money.ts`'s safe-integer guard was one-sided, and now the columns hold the other
 half.** It refused to PRODUCE a total past 2^53 but nothing refused to STORE one arriving
@@ -935,6 +939,104 @@ original `when` and `tag` restored afterwards, so the file name and timestamp ar
 unchanged and the journal diff is empty. `conduit_test` was dropped and recreated so the
 migrator would apply the new file from scratch; the migrator skips by timestamp, so an
 edited-in-place 0009 would otherwise never have reached it.
+
+##### TASK 2 REVIEW ROUND 2 — a regression I introduced, and four guards that guarded nothing
+
+**F2: converging the five sites turned an approximation into a crash, and the ceiling is
+gone rather than widened.** `MAX_EXACT_CENTS` refused anything above 2^46 major units,
+but `deals.value_cents` accepts any safe integer -- about 1.97e15 cents of API-legal
+values that now THREW where the code they replaced merely printed an approximate figure.
+It did not need one absurd deal either: `board-lib.ts` sums a stage's cents into a plain
+number, so two deals of 5e15 are each under the ceiling and their sum is not. There is no
+error boundary anywhere in `packages/web`, so that unmounted the application rather than
+degrading a label.
+
+The exactness now comes from the STRING, not from a limit. The decimal is built out of
+the integer with BigInt -- no divide by 100 in double precision anywhere -- and handed to
+`Intl.NumberFormat.prototype.format`, which takes a string exactly under Intl V3.
+
+**What was verified about string formatting, since it decides whether this is safe.**
+CI and the server both run Node 24 (`.github/workflows/test.yml` pins `node-version: "24"`;
+the server measured `v24.19.0`). On that runtime `format("1234567890123456789.99")` comes
+back with every digit intact, and `format("70368744177664.01")` -- the first value the old
+divide got wrong -- is now exact.
+
+For browsers, the app sets no `browserslist` and no vite `build.target`, so it inherits
+vite's `baseline-widely-available` default, which reaches back to Firefox 104; Intl V3
+string arguments landed in Firefox 116, Chrome 106 and Safari 15.4. **So there is a band
+inside the build target that predates the feature, and it degrades rather than breaking**:
+pre-V3 `format` coerces its argument with `ToNumber`, which turns the string into exactly
+the double the old code passed. Measured rather than assumed -- on the server,
+`format(Number("70368744177664.01"))` and `format(7036874417766401 / 100)` produce the
+identical string, so the worst case is byte-for-byte the previous behaviour. **No
+graceful-degradation branch is needed; the coercion IS the graceful degradation.**
+
+The function now never throws for any input at all. A non-safe-integer -- NaN, Infinity, a
+fraction -- takes the old `cents / 100` path and prints what it always printed, because
+refusing it would put the crash back into display code for the one input class that is
+already a symptom of something else. The documents path gets the same benefit: a quote
+total between 7.03e15 and 9.00e15 used to compute, store, pass both CHECKs and then be
+unprintable.
+
+The JPY limitation stays pinned and is now explicit rather than incidental: two decimal
+places always go IN, and the currency decides how many come out.
+
+**Not fixed, and worth a decision later:** `stageValueLabel` still sums raw cents in a
+plain number, so a stage whose deals exceed 2^53 in total shows an approximate figure. It
+no longer crashes, and it was approximate before this phase too, so it is left alone
+rather than quietly widened here.
+
+**F1: the two representability CHECKs were effectively untested**, and three mutations
+survived them green -- deleting the `line_total_cents` clause, deleting the `tax_cents`
+clause, and narrowing every bound from `...991` to `...990`. The cause was one
+out-of-range column per table, with `tax_cents` and `line_total_cents` never driven.
+
+Each clause now gets its own case, with exactly ONE column out of range and the other two
+still satisfying `documents_totals_consistent`, so the rejection can only have come from
+the clause under test -- **asserted by constraint NAME**, because a bare 23514 cannot tell
+the two constraints apart. The `tax_cents` clause is genuinely not redundant: the
+reviewer's `subtotal = -...991, tax = 2 x ...991, total = ...991` satisfies both survivors
+and the consistency CHECK.
+
+**And the accepting side, which nothing asserted at all.**
+`documentTotals([{ qtyMilli: 1000, unitPriceCents: 9007199254740991 }])` legitimately
+emits exactly `...991`, so the narrowing mutation would have rejected a quote that had
+already rendered and shipped green. Every bound is now pinned from both directions.
+**All three mutations re-run and all three now fail.**
+
+**F4: the negative int4 edge.** Deleting `value < INT4_MIN ||` from `exactInt4` left all
+23 money tests green -- SV-1's failure in the one direction SV-1's fix never tested, and
+the direction a credit note rides. int4 is asymmetric, so neither bound implies the other;
+both ends of both columns are now pinned, and the mutation fails two tests.
+
+**F5: `MONEY_LOCALE`'s VALUE is pinned**, not merely "some locale that is not
+comma-decimal". Changing it to `en-US` passed all 17 test files; it now fails one.
+
+**F3 and F8: the comment O-6 corrected was still wrong, and the bullet above it was never
+touched.** The migration claimed the test catches a future edit that closes two at-rules
+together. It does not -- `color: #888;}}` produces no `{{` to count, and an unmatched
+`}}` is inert to a Mustache-shaped parser anyway. The guard is load-bearing for an
+OPENING pair, which is the case that is not harmless, and the comment now says that and
+says what it does not cover. The DONE block's "the CSS is flat with no nested at-rules"
+bullet -- the exact claim O-6 recorded as false -- is corrected too, along with its "25
+tokens" (26 is right).
+
+**F7: nothing rendered the seeded template, and now something does.**
+`packages/api/src/services/documents-seed.test.ts` reads the template out of the migration,
+strips every merge construct and renders it, gated on the binary the way
+`documents-render.test.ts`'s real half is -- so CI runs it on every push.
+
+**It deliberately does not merge.** Task 3 owns the resolver and its block syntax is
+already ruled to change, so a stand-in here would be a second implementation that goes
+stale by design. Stripping is correct under any of those languages for the one context
+this file cares about, and leaves exactly the stylesheet and markup, which is what was
+unguarded. Beyond `%PDF-`, it asserts the empty quote is ONE page and that the MediaBox is
+A4 (595.28 x 841.89pt) -- `@page { size: A4 }` being the line a careless edit changes
+silently, and one that is only wrong once it is on paper. Mutating it to `Letter` fails
+the test at 612pt. **A FILLED render belongs in Task 4, beside the real `buildContext`.**
+
+Minor, confirmed: `deal-detail.tsx:183`'s surviving `/ 100` is an edit value feeding
+`parseDecimal`, not a display path, and is left alone.
 
 ---
 

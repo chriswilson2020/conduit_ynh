@@ -69,6 +69,20 @@ describe("lineTotalCents", () => {
       .toThrow(/qtyMilli must fit a 32-bit integer column/);
   });
 
+  // BOTH ENDS OF int4, because the lower one is the end a credit note rides and
+  // the end SV-1's fix never exercised: deleting `value < INT4_MIN ||` from
+  // exactInt4 left every other test in this file green. int4 is asymmetric
+  // (-2^31 .. 2^31-1), so the two bounds are different numbers and neither
+  // implies the other.
+  it("accepts a quantity at the bottom of the int4 column", () => {
+    expect(lineTotalCents({ qtyMilli: -2_147_483_648, unitPriceCents: 1 })).toBe(-2_147_484);
+  });
+
+  it("refuses a quantity one step below the int4 column", () => {
+    expect(() => lineTotalCents({ qtyMilli: -2_147_483_649, unitPriceCents: 1 }))
+      .toThrow(/qtyMilli must fit a 32-bit integer column/);
+  });
+
   // The reproduction, in the units a user would type: 3,000,000 of something.
   // Before this bound it computed a correct running total, passed
   // documentTotals, rendered the PDF, and failed on INSERT with
@@ -101,6 +115,11 @@ describe("taxCents", () => {
   // the CHECK narrows it further to 0..10000, which is the input schema's job.
   it("refuses a rate past the int4 column", () => {
     expect(() => taxCents(10_000, 2_147_483_648)).toThrow(/rateBp must fit a 32-bit integer column/);
+  });
+
+  it("refuses a rate below the int4 column, and accepts its floor", () => {
+    expect(taxCents(0, -2_147_483_648)).toBe(0);
+    expect(() => taxCents(10_000, -2_147_483_649)).toThrow(/rateBp must fit a 32-bit integer column/);
   });
 });
 

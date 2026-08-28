@@ -118,11 +118,16 @@ CREATE INDEX "documents_deal_idx" ON "documents" ("deal_id");--> statement-break
 -- 2. No literal {{ may appear in the CSS -- it would be parsed as a merge
 --    field and substituted away. The stylesheet DOES contain one nested
 --    at-rule (@page { @bottom-center { ... } }), and what keeps it safe is the
---    whitespace between the braces, not the absence of nesting: `{ @` and
---    `} }` are not `{{`. That is what schema.test.ts enforces -- it counts
---    every `{{` in the body and requires each to be one of the known tokens --
---    so a future edit that closes two at-rules up against each other fails
---    there rather than printing a mangled page.
+--    space between its OPENING braces: `{ @` is not `{{`. schema.test.ts
+--    enforces exactly that -- it counts every `{{` in the body and requires
+--    each to be one of the known tokens -- so an edit that opened two at-rules
+--    up against each other would fail there.
+--
+--    IT DOES NOT GUARD THE CLOSING BRACES, and an earlier draft of this
+--    comment claimed it did. Writing `color: #888;}}` keeps the test green,
+--    because `}}` produces no `{{` to count -- and it is harmless anyway, since
+--    an unmatched `}}` is inert to a Mustache-shaped parser. The assertion is
+--    load-bearing for the case that is NOT harmless, which is an opening pair.
 --
 -- 3. class="pre" is white-space: pre-line, and it is on every multi-line
 --    field. org.address_lines and companies.address are newline-separated

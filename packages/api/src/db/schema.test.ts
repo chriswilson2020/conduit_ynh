@@ -1558,21 +1558,90 @@ describe("documents schema (0009)", () => {
   });
 
   // The other half of money.ts's one-sided guard: documentTotals refuses to
-  // PRODUCE a total past 2^53, and this refuses to STORE one arriving by any
+  // PRODUCE a total past 2^53, and these refuse to STORE one arriving by any
   // other path, where drizzle's mode:"number" would read it back as the nearest
   // double without complaint.
-  it("refuses stored amounts past the safe integer range on both document tables", async () => {
+  //
+  // BOTH SIDES OF EVERY BOUND, and one out-of-range column per case. An earlier
+  // version drove each table with a single over-range column and asserted only
+  // the 23514, and three mutations survived it green: deleting the
+  // line_total_cents clause, deleting the tax_cents clause, and narrowing every
+  // bound from ...991 to ...990. The narrowing is the one that would have hurt --
+  // documentTotals legitimately emits exactly 9007199254740991, so an off-by-one
+  // would have rejected a quote that had already been rendered.
+  const SAFE = 9_007_199_254_740_991;
+  const PAST = 9_007_199_254_740_992;
+
+  it("accepts stored amounts at the exact edges of the safe integer range", async () => {
     const parents = await seedDocumentParents();
-    const past = 9_007_199_254_740_992;
-    await expect(handle.db.insert(documents).values(documentValues(parents, {
-      subtotalCents: past, taxCents: 0, totalCents: past,
-    }))).rejects.toMatchObject({ cause: { code: "23514" } });
+    // The ceiling row is exactly what
+    // documentTotals([{ qtyMilli: 1000, unitPriceCents: SAFE }]) emits, which is
+    // why this edge has to be ACCEPTED rather than merely nearly rejected.
+    const rows: Partial<typeof documents.$inferInsert>[] = [
+      { subtotalCents: SAFE, taxCents: 0, totalCents: SAFE },
+      { subtotalCents: 0, taxCents: SAFE, totalCents: SAFE },
+      { subtotalCents: -SAFE, taxCents: 0, totalCents: -SAFE },
+      { subtotalCents: 0, taxCents: -SAFE, totalCents: -SAFE },
+    ];
+    for (const [index, overrides] of rows.entries()) {
+      const [row] = await handle.db.insert(documents)
+        .values(documentValues(parents, { number: `QUO-2026-100${index}`, ...overrides }))
+        .returning();
+      expect(row).toMatchObject(overrides);
+    }
+
+    const [document] = await handle.db.insert(documents)
+      .values(documentValues(parents, { number: "QUO-2026-2000" })).returning();
+    const [line] = await handle.db.insert(documentLineItems).values({
+      documentId: document!.id, position: 1, description: "Widget",
+      qtyMilli: 1000, unitPriceCents: SAFE, lineTotalCents: SAFE,
+    }).returning();
+    expect(line).toMatchObject({ unitPriceCents: SAFE, lineTotalCents: SAFE });
+    // line_total_cents carries no sign CHECK, so its floor is reachable and has
+    // to be pinned too or a narrowing of it survives.
+    const [floorLine] = await handle.db.insert(documentLineItems).values({
+      documentId: document!.id, position: 2, description: "Credit",
+      qtyMilli: 0, unitPriceCents: 0, lineTotalCents: -SAFE,
+    }).returning();
+    expect(floorLine).toMatchObject({ lineTotalCents: -SAFE });
+  });
+
+  it("refuses stored amounts past the safe integer range, one clause at a time", async () => {
+    const parents = await seedDocumentParents();
+    // Each row puts exactly ONE column out of range while keeping the other two
+    // in range AND satisfying documents_totals_consistent, so the rejection can
+    // only have come from the clause under test -- asserted BY NAME, since a
+    // bare 23514 cannot tell the two constraints apart and the consistency one
+    // would fire on a naively-built row.
+    const rows: Partial<typeof documents.$inferInsert>[] = [
+      { subtotalCents: 2 * SAFE, taxCents: -SAFE, totalCents: SAFE },
+      { subtotalCents: -SAFE, taxCents: 2 * SAFE, totalCents: SAFE },
+      { subtotalCents: SAFE, taxCents: SAFE, totalCents: 2 * SAFE },
+    ];
+    for (const overrides of rows) {
+      await expect(handle.db.insert(documents).values(documentValues(parents, overrides)))
+        .rejects.toMatchObject({
+          cause: { code: "23514", message: expect.stringContaining("documents_totals_representable") },
+        });
+    }
 
     const [document] = await handle.db.insert(documents).values(documentValues(parents)).returning();
-    await expect(handle.db.insert(documentLineItems).values({
-      documentId: document!.id, position: 1, description: "Widget",
-      qtyMilli: 1000, unitPriceCents: past, lineTotalCents: 1,
-    })).rejects.toMatchObject({ cause: { code: "23514" } });
+    const lines: Partial<typeof documentLineItems.$inferInsert>[] = [
+      { unitPriceCents: PAST },
+      { lineTotalCents: PAST },
+      { lineTotalCents: -PAST },
+    ];
+    for (const overrides of lines) {
+      await expect(handle.db.insert(documentLineItems).values({
+        documentId: document!.id, position: 1, description: "Widget",
+        qtyMilli: 1000, unitPriceCents: 1, lineTotalCents: 1, ...overrides,
+      })).rejects.toMatchObject({
+        cause: {
+          code: "23514",
+          message: expect.stringContaining("document_line_items_amounts_representable"),
+        },
+      });
+    }
   });
 
   it("enforces every foreign key on documents, document_line_items and org_profile", async () => {

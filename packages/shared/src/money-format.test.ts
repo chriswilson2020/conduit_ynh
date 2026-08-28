@@ -18,6 +18,13 @@ describe("formatMoneyCents", () => {
     expect(formatted.startsWith("-")).toBe(true);
   });
 
+  // THE VALUE ITSELF, not merely "some locale". A silent change here moves every
+  // money figure in the app, on both sides of a quote, and nothing else would
+  // notice: the separator assertions below pass for en-US too.
+  it("pins the shared locale to en-GB", () => {
+    expect(MONEY_LOCALE).toBe("en-GB");
+  });
+
   // THE POINT OF THE MODULE. Under the old `undefined` locale this same call
   // returned a different string on a Dutch browser than on a British one, so a
   // quote form's running total and the PDF beside it disagreed about the same
@@ -28,31 +35,46 @@ describe("formatMoneyCents", () => {
     expect(formatMoneyCents(1_100_000, "EUR")).not.toContain("11.000,00");
   });
 
-  // CONDUIT'S MONEY MODEL IS 100 MINOR UNITS PER MAJOR, EVERYWHERE, and has
-  // been since deals.value_cents in Phase 2: the divide is by 100 and the
-  // decimal places then come from the currency itself. For a currency with no
-  // minor unit those two facts disagree, and this pins what actually happens
-  // rather than pretending otherwise -- 1,100,000 stored reads as 11,000 yen,
-  // not 1,100,000. That is a limitation of the stored model, identical to the
-  // one the five call sites this replaced already had, and NOT something a
-  // formatter can fix; a zero-decimal currency needs the columns to change.
-  it("divides by 100 and leaves the decimal places to the currency", () => {
+  // CONDUIT'S MONEY MODEL IS 100 MINOR UNITS PER MAJOR, EVERYWHERE, and has been
+  // since deals.value_cents in Phase 2: two decimal places always go in, and the
+  // currency decides how many come out. For a currency with no minor unit those
+  // disagree, and this pins what actually happens rather than pretending
+  // otherwise -- 1,100,000 stored reads as 11,000 yen, not 1,100,000. A
+  // limitation of the columns, identical to the one the five call sites this
+  // replaced already had, and not something a formatter can fix.
+  it("puts two decimal places in and lets the currency decide how many come out", () => {
     const formatted = formatMoneyCents(1_100_000, "JPY");
     expect(formatted).toContain("11,000");
     expect(formatted).not.toContain(".");
   });
 
-  it("rejects a non-integer", () => {
-    expect(() => formatMoneyCents(12.5, "EUR")).toThrow(/safe integer/);
-    expect(() => formatMoneyCents(Number.NaN, "EUR")).toThrow(/safe integer/);
+  // EXACTNESS AT EVERY MAGNITUDE, which is what the BigInt decimal buys. The
+  // first two are the values a `cents / 100` divide gets wrong: 7,036,874,417,766,401
+  // is the smallest integer whose double quotient formats as ...664.02 for an
+  // exact ...664.01 (measured; identical in en-GB, nl-NL, en-US and de-DE,
+  // because the loss happens before Intl sees the number). An earlier version of
+  // this module REFUSED both, which is the regression these replace.
+  it("is exact past the point a double divide stops being", () => {
+    expect(formatMoneyCents(7_036_874_417_766_401, "EUR")).toContain("70,368,744,177,664.01");
+    expect(formatMoneyCents(-7_036_874_417_766_401, "EUR")).toContain("70,368,744,177,664.01");
+    // The top of what deals.value_cents accepts (z.number().int().safe()), which
+    // the old ceiling put ~1.97e15 cents below the line.
+    expect(formatMoneyCents(9_007_199_254_740_991, "EUR")).toContain("90,071,992,547,409.91");
+    expect(formatMoneyCents(7_036_874_417_766_400, "EUR")).toContain("70,368,744,177,664.00");
   });
 
-  // The measured boundary: 7,036,874,417,766,401 is the first value whose
-  // formatting disagrees with the exact decimal, so the domain stops one below
-  // it rather than at Number.MAX_SAFE_INTEGER, which money.ts would allow.
-  it("formats the largest exactly-formattable amount and refuses the first one past it", () => {
-    expect(formatMoneyCents(7_036_874_417_766_400, "EUR")).toContain("70,368,744,177,664.00");
-    expect(() => formatMoneyCents(7_036_874_417_766_401, "EUR")).toThrow(/cannot be formatted exactly/);
-    expect(() => formatMoneyCents(-7_036_874_417_766_401, "EUR")).toThrow(/cannot be formatted exactly/);
+  // NO INPUT MAKES THIS THROW. There is no error boundary in packages/web, so a
+  // throw in a label unmounts the app; the previous version's ceiling turned two
+  // summed deals -- board-lib.ts adds a stage's cents in a plain number -- into
+  // exactly that. A value outside the safe-integer range falls back to the
+  // approximation the five replaced call sites always produced.
+  it("never throws, whatever it is handed", () => {
+    for (const value of [
+      Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY,
+      12.5, 1e300, -1e300, 2 ** 53, 5e15 + 5e15,
+    ]) {
+      expect(() => formatMoneyCents(value, "EUR")).not.toThrow();
+    }
+    expect(formatMoneyCents(Number.NaN, "EUR")).toContain("NaN");
   });
 });
