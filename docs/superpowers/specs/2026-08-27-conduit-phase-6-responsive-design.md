@@ -104,6 +104,43 @@ editing dependencies are desktop-only interactions, and **tapping a bar opens th
 drawer**, where both are editable. The chart must not silently ignore a drag attempt —
 if a touch drag is not supported it should not appear to start one.
 
+## Amendments (coordinator, during execution)
+
+1. **The three-site cap governs REACTIVE RENDER BRANCHING, not every read of the
+   breakpoint.** Task 4's quality review established that the Gantt cannot satisfy the
+   `md:`-CSS-only instruction: CSS can disable the pointer paths (verified in a browser —
+   `max-md:pointer-events-none` on the move overlay, `max-md:hidden` on the resize strips
+   and dependency handle), but **no CSS property stops a key event**, and the chart's
+   `onKeyDown` commits real schedule changes (Arrow moves, Shift+Arrow resizes). Because
+   the breakpoint is width-based this also bites a narrowed desktop window and a tablet
+   with a keyboard — and `e2e/tasks.spec.ts` drives the Gantt by keyboard ONLY.
+
+   **Ruling: an imperative `window.matchMedia(mobileMediaQuery()).matches` read INSIDE the
+   key handler is permitted and is not a fourth site.** The rule exists for the reason the
+   Mechanism section gives — "two component trees to maintain, and a first-paint flash on
+   every page" — and a one-shot read at event time creates neither: no subscription, no
+   re-render, no second tree. The breakpoint stays single-sourced through
+   `mobileMediaQuery()`. **Explicitly ruled OUT: a differently-named hook over
+   `subscribeToMediaQuery`/`readIsMobile`**, which would pass the guard by spelling while
+   evading the rule. `useIsMobile()` itself remains closed at three sites.
+
+2. **The Gantt's phone problem is geometry, not read-only-ness — and Task 5 must answer it
+   before building.** Measured: the chart's sidebar is `sticky left-0, width: 240,
+   flexShrink: 0`, so at 375px it takes 240 and leaves **135px of timeline** (about 4.5 day
+   columns). Bars are 22px tall (8px on summary rows) against the phase's 44px floor, and a
+   same-day bar is 6.4px wide at week zoom. Every dimension is an inline JS-computed style,
+   so `max-md:` cannot rescale any of it. **A technically-read-only 135px chart is not
+   obviously the deliverable**, and neither is a tap target 6.4px wide. Task 5 reports its
+   assessment and its proposed geometry BEFORE implementing; if the honest answer is that
+   the chart cannot be made useful at 375px and the phone should get the task-list fallback
+   the brainstorm offered as an alternative, that is a finding to bring back, not a failure.
+
+3. **There is no tap-to-open on a Gantt bar today** (no `onClick` anywhere under
+   `components/gantt/`), so the drawer path — which carries the whole no-capability-gap
+   claim — is an ADDITION, not a re-use. A `hidden max-md:block` tap layer with negative
+   insets reaches 44px but overlaps 6px into each neighbouring row at the 32px row pitch;
+   expect mis-taps at boundaries and say what you did about them.
+
 ## Out of scope (deferred, not rejected)
 
 Installing to the home screen (PWA/manifest/service worker); offline support; push
