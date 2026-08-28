@@ -96,25 +96,39 @@ Two properties are requirements, not defaults:
      1 does not reach attachments on every version — 61.1's `Attachment.__init__` binds
      the DEFAULT fetcher as a default argument, so the document's fetcher never arrives
      and the file is read with no fetcher call recorded at all;
-  3. **the finished PDF refused if it embeds any file**, which is the only one of the
-     three that is a statement about the output rather than a mechanism, and so the only
-     one that would survive a future WeasyPrint growing a new route to the filesystem.
+  3. **the finished PDF refused if it embeds any file**, the only one of the three that
+     is a statement about the output rather than a mechanism, and so the only one that
+     would survive a future WeasyPrint growing a new route to the filesystem. It looks
+     for `/EF` and `/Filespec`, NOT `/EmbeddedFiles` — the latter is a catalog name tree
+     that `<link rel=attachment>` registers in and `<a rel=attachment>` does not, so it
+     misses half the vector. It lives in TypeScript rather than in the render script,
+     because as Python it was reachable only through a subprocess behind the other two
+     controls and nothing ever fed it the payload that exposed the wrong needle.
 
-  A blocked URL fails the render rather than degrading quietly — at that point either
-  the document is an attack or Task 3's sanitiser has a hole, and both deserve an alarm.
-  The proxy variables stay as a cheap second barrier for http(s), explicitly not as the
-  control. Tested per scheme — `file://` through four elements, `http://`, `ftp://`,
-  `jar:` — on both 57.2 and 61.1, because "tested one scheme and generalised" is exactly
-  how the earlier drafts survived. Task 3's sanitiser still strips remote URLs: that is
-  the braces to this belt.
+  A blocked resource fails the render rather than degrading quietly — at that point
+  either the document is an attack or Task 3's sanitiser has a hole, and both deserve an
+  alarm. The proxy variables stay as a cheap second barrier for http(s), explicitly not
+  as the control. Tested per scheme on both 57.2 and 61.1 — `file://` through five
+  elements, `http://`, `ftp://`, `jar:` — because "tested one scheme and generalised" is
+  exactly how the earlier drafts survived. Task 3's sanitiser still strips remote URLs:
+  that is the braces to this belt.
+
+  **Reads are asserted by atime, not by watching a loopback server.** The proxy
+  variables stop an http request before it could arrive, so a "no request reached my
+  server" assertion is vacuous — a fetcher mutated to read the file anyway passed every
+  one of them. atime sees an `open` by any code path.
 
   **The transferable lesson, since Task 3 faces the same shape of problem:** every claim
   in this bullet that was wrong was wrong because it named a MECHANISM and tested that.
-  The two that held were properties — "nothing was fetched", "the file is not in the
-  output" — observed directly.
-- **A timeout, an output cap and an input cap.** A render that hangs, is fed an
-  implausible document, or produces one, fails cleanly and leaves no `files` row and no
-  number allocated.
+  The ones that held were properties — "the file was never opened", "the file is not in
+  the output" — observed directly, and each confirmed by a mutant that fails them.
+- **A timeout, an output cap and — the one that actually bounds cost — an INPUT cap.**
+  A render that hangs, is fed an implausible document, or produces one, fails cleanly
+  and leaves no `files` row and no number allocated. **The timeout cannot bound memory**,
+  because the expensive documents are the ones fast enough to survive it: a 256KB table
+  renders in 9.8s, inside any sane timeout, and costs 251MB on a server with no swap.
+  The input cap is 128KB, which holds a render to ~157MB and is what makes the declared
+  `ram.runtime` and Task 4's concurrency limit true.
 
 **This is the phase's deployment risk and it must be proved first.** WeasyPrint is an
 apt dependency in `manifest.toml`; it is the first release since v0.6.0 whose upgrade is

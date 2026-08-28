@@ -229,7 +229,7 @@ describe("renderPdf failure paths", () => {
 
   it("applies a default input cap, which is the bound on what a render costs", async () => {
     // 128KB. Not a formality: on the server a table-shaped document of this size
-    // costs 4.9s and 157MB, and 1MB of the same shape costs 41s and 816MB.
+    // costs 5.2s and 157MB, and 1MB of the same shape costs 40s and 816MB.
     const error = await renderPdf("x".repeat(300_000)).catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(RenderError);

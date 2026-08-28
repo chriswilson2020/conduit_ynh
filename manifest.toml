@@ -23,12 +23,17 @@ ldap = "not_relevant"
 sso = true
 disk = "2G"
 ram.build = "50M"
-# 400M for the Node API as before, plus 300M for renders. A render is a separate
-# Python process, not memory the API already had: measured on the Debian 12 target
-# at 66-67MB peak RSS for a one-page quote and 97MB for a 435KB, 40-page document.
-# 300M is three of those at a rounded-up 100MB ceiling, and three is the number
-# Task 4's concurrency limit has to match -- until it exists, nothing bounds this.
-ram.runtime = "700M"
+# 400M for the Node API as before, plus 500M for renders. A render is a separate
+# Python process, not memory the API already had, and what bounds its cost is the
+# input cap rather than the timeout: at documents-render.ts's 128KB cap the worst
+# shape measured on the Debian 12 target (a long bordered table, which is what a
+# quote is) peaks at 157MB. 500M is three of those plus slack.
+#
+# THREE is the concurrency limit Task 4 has to enforce, and this number is only true
+# if it does. Advisory either way -- YunoHost sets no cgroup from it and does not
+# evaluate it at install -- so the real protection is the input cap plus that limit,
+# and this is the honest declaration of what the two of them add up to.
+ram.runtime = "900M"
 
 [install]
 

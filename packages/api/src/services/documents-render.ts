@@ -43,16 +43,17 @@ const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
  * both lay out much more cheaply and would have set this cap far too high:
  *
  *   input     time     peak RSS
- *   2.4 KB    0.6 s     67 MB     (the one-page quote the tests render)
- *   32 KB     1.7 s     87 MB
- *   64 KB     2.6 s    110 MB
- *   128 KB    4.9 s    157 MB     <- the cap
- *   256 KB   10.0 s    251 MB
- *   1 MB     41.4 s    816 MB
- *   2 MB     89.4 s   1566 MB
+ *   2.4 KB    0.6 s     67 MB     (the one-page quote the tests render, 16,776 out)
+ *   32 KB     1.6 s     87 MB
+ *   64 KB     2.8 s    110 MB
+ *   128 KB    5.2 s    157 MB     <- the cap
+ *   256 KB    9.8 s    251 MB
+ *   1 MB     39.7 s    816 MB
+ *   2 MB     86.5 s   1565 MB
  *
- * For contrast, 2MB of prose is 16.3s and 245MB: at equal size the shape decides, by
- * a factor of six.
+ * For contrast, 2MB of PROSE is 15.9s and 245MB: at equal size the shape decides, by
+ * a factor of six. Single runs on an otherwise idle server; the times move a few per
+ * cent between runs and the RSS figures barely at all.
  *
  * **The timeout cannot bound memory, because the expensive documents are the ones
  * fast enough to survive it.** At a 2MB cap, 256KB of table finishes in 10s -- well
@@ -149,6 +150,11 @@ for element in document.etree_element.iter():
     rel = element.get('rel')
     if rel and 'attachment' in rel.lower().split():
         blocked_attachments.append(str(element.tag))
+
+if blocked_attachments:
+    sys.stderr.write(
+        'conduit-blocked-attachment: ' + ' | '.join(blocked_attachments) + '\\n')
+    sys.exit(3)
 
 document.write_pdf(sys.stdout.buffer)
 

@@ -280,19 +280,32 @@ correction is legible rather than silently patched.
    only because it compresses object streams, so a raw byte search missed it. Search
    inflated streams, or render with `uncompressed_pdf=True`, before concluding.)
 
-   **So the renderer has three controls, and the third is deliberately untested.**
-   (1) the `data:`-only fetcher; (2) `rel=attachment` deleted from the parsed tree
-   before rendering, which is upstream of whichever fetcher a version uses and covers
-   `<a rel=attachment>` as well as `<link>`; (3) the finished PDF is refused if it
-   contains embedded files at all. Only (3) is a statement about the output rather than
-   a mechanism, which is why it is there — and no test can reach it while (2) closes the
-   only route HTML has. That is recorded in the code comment rather than left for a
-   reviewer to find.
+   **So the renderer has three controls.** (1) the `data:`-only fetcher; (2)
+   `rel=attachment` refused outright, upstream of whichever fetcher a version uses, and
+   covering `<a rel=attachment>` as well as `<link>`; (3) `pdfEmbedsFiles`, on the bytes
+   that come back.
+
+   **Control 3's needle was WRONG, and a quality reviewer found it.** It looked for
+   `/EmbeddedFiles`, which `<link rel=attachment>` registers in the catalog's name tree
+   — but `<a rel=attachment>` embeds through an ANNOTATION file-spec that never appears
+   there, so the check called that PDF clean with the secret sitting in it. The needle
+   is now `/EF` or `/Filespec`, present for both routes and absent from a branded quote
+   with or without a `data:` logo. **Proved on 61.1** by pushing a temporary mutation
+   with control 2 removed (CI run `33203020172`): both attachment payloads were caught
+   by control 3, failing with `rendered PDF embeds a file`.
+
+   **Control 3 also MOVED from the Python into TypeScript**, and that is the structural
+   lesson: as a Python function it was reachable only through a subprocess behind two
+   controls that short-circuit first, so nothing ever fed it the payload that would have
+   exposed the bad needle. As an exported `pdfEmbedsFiles(pdf: Buffer)` it has six unit
+   tests over plain bytes — including one for the second-stream scan bug, and one using
+   the bare CLI to produce a real annotation-route PDF.
 
    **The lesson worth carrying into Task 3:** the previous suite tested exactly one
    scheme and generalised to "fetches nothing". Anything asserting a no-network or
-   no-read property must be parametrised over schemes — and asserted as a property,
-   because the mechanism moves between versions.
+   no-read property must be parametrised over schemes, asserted as a property (the
+   mechanism moves between versions), and **checked against a mutant** — three of this
+   task's assertions turned out to prove nothing at all until that was done.
 2. **Step 4's `renderPdf` resolved a zero-byte "PDF".** A child that exits 0 having
    written nothing returned `Buffer.concat([])`, which would have put an empty file in a
    deal's Files with no error raised anywhere. The shipped version treats a stdout that
@@ -301,35 +314,62 @@ correction is legible rather than silently patched.
    the absence of.
 3. **Step 2's test file would have skipped every failure path** on any machine without
    the binary, which is backwards for code whose whole job is failing well. The shipped
-   tests are in two halves: **nine** stub-driven tests shadow `python3` on `PATH` with a
-   shell script and run EVERYWHERE (non-zero exit with stderr, a child that exits before
-   reading a 500KB stdin, a timeout firing mid-chunk with a marker file proving the child
-   was killed, the size cap, exit-0-with-no-PDF, exit-0-with-garbage, ENOENT, the
-   PDF passthrough, and the availability probe).
+   tests are in three parts: **nine** stub-driven tests shadow `python3` on `PATH` and
+   run EVERYWHERE; six unit tests drive `pdfEmbedsFiles` over plain bytes; the rest are
+   gated on the binary.
+
+   **THREE of those assertions were vacuous, and only mutation testing said so.**
+   (a) `expect(hits).toEqual([])` against a loopback server proved nothing, because
+   `NO_NETWORK_ENV` stops the request before it could arrive — a fetcher mutated to
+   record the URL and then read it anyway stayed green. The suite now watches **atime**,
+   which sees an `open` by any code path; a fresh file is backdated a day first, so
+   `relatime` is guaranteed to report the read and the delta is a day rather than a
+   rounding error. Re-running that mutation now fails three tests. (b) The kill
+   assertion checked its marker at ~1s against a 3s sleep, so the marker was absent
+   either way and deleting `child.kill("SIGKILL")` left four tests green; the sleep is
+   now 700ms and the check at 1200ms, **after** it would have fired, and the mutation
+   now fails. (c) A carve-out in the fetcher's allowlist also went undetected; atime
+   catches those too.
 4. **The gate is NOT the MAIL_IT pattern the spec names.** `MAIL_IT` is an explicit
    opt-in, so a broken fixture fails loudly; this one probes, so a packaging change that
    stopped delivering WeasyPrint would turn the real half into silent skips with CI still
    green. A `runIf(process.env.CI)` test asserts the binary is present whenever CI runs.
 5. **Import specifiers are `.js`, not `.ts`** — NodeNext, and the repo convention.
 
-**Measured, so later tasks stop guessing.** All figures from the server (Debian 12,
-WeasyPrint 57.2) running the SHIPPED script, not a stripped-down one — the embedded-file
-backstop costs about 30ms of the total, which is why an earlier draft of this paragraph
-said 570-580ms. A one-page quote (A4, `@page` margins, a running footer, a `data:` logo,
-8 line items, totals, terms) renders in **600-680ms to ~14,002 bytes** (**629-680ms /
-~12,460 bytes** on CI's 61.1) at **66-67MB peak RSS**. A 435KB, 40-page document costs
-**3.7s, 97MB RSS, 120KB out**.
+**Measured, and the first two attempts at these numbers were both wrong.** All figures
+from the server (Debian 12, WeasyPrint 57.2) running the SHIPPED script, against the
+exact document the test file renders. The one-page quote (A4, `@page` margins, a running
+footer, a `data:` logo, 8 line items, totals, terms) is **0.6s to 16,776 bytes at 66.5MB
+peak RSS** — an earlier draft said 14,002 bytes because it measured a different, simpler
+document, and the test's own log on the server had been printing ~16,772 the whole time.
+On CI's 61.1 the same page is ~12,460 bytes.
 
+**Cost is set by the SHAPE of the document, not just its size**, which is why an earlier
+draft's 435KB figure was 2x low: it used repeated prose, and a quote is a table.
+
+| input | table-shaped | prose |
+|---|---|---|
+| 32 KB | 1.6s / 87MB | — |
+| 64 KB | 2.8s / 110MB | — |
+| **128 KB** | **5.2s / 157MB** | — |
+| 256 KB | 9.8s / 251MB | — |
+| 1 MB | 39.7s / 816MB | — |
+| 2 MB | 86.5s / 1565MB | 15.9s / 245MB |
+
+- The **128KB input cap** is what actually bounds a render, and it replaced a 2MB one
+  that was unsafe. **The timeout cannot bound memory, because the expensive documents
+  are the ones fast enough to survive it**: at 2MB, a 256KB table finishes in 9.8s —
+  well inside the 20s ceiling — and costs 251MB. The cap holds a render to ~157MB.
+- **A logo above ~64KB will not fit**, since it arrives inlined as a `data:` URI at 4/3
+  of its stored size. **Task 5's upload has to bound it**, or the failure is a quote
+  that cannot be raised.
 - The **20s timeout** is ~30x the one-page render and bounds how long Task 4's
   transaction holds its row lock, so it should not grow.
-- The **25MB output cap** is not a tuned limit but a bound on what is accumulated in
-  memory from a runaway stream; anything near it would hit the timeout first.
-- The **2MB input cap** is new (nothing bounded input before) and IS tuned: 435KB of HTML
-  costs 3.7s, so 2MB is roughly where the timeout would bite anyway — this makes that
-  failure immediate instead of costing 20s and 100MB first.
-- `ram.runtime` went 400M -> **700M**: a render is a separate Python process, and 300M is
-  three at a rounded 100MB ceiling. **Three is a number Task 4's concurrency limit has to
-  match; until that limit exists, nothing bounds this at all.**
+- The **25MB output cap** is not tuned; it bounds what is accumulated in memory from a
+  runaway stream.
+- `ram.runtime` went 400M -> **900M** = 400M (Node) + 3 x 157MB. **See Task 4's own
+  section for the concurrency limit this depends on** — it is recorded there rather than
+  only here, because that is where it gets implemented.
 
 **The render is NOT reproducible, and Task 4 must not assume it is.** Three runs of the
 identical input on the identical version gave 6899, 6899 and **6898** bytes. The
@@ -840,6 +880,25 @@ git commit -m "feat(api): the document sanitiser profile, and merge-field resolu
 ---
 
 ### Task 4: Issuing a quote — one transaction, and the immutability proof
+
+> **TWO THINGS TASK 1 MEASURED THAT THIS TASK HAS TO HONOUR.** Both live here rather
+> than only in Task 1's retrospective, because this is where they get implemented.
+>
+> **1. Concurrency must be limited to THREE renders.** `manifest.toml` declares
+> `ram.runtime = "900M"` on the arithmetic 400M (Node) + 3 x 157MB (a render at the
+> 128KB input cap, worst shape measured), and that declaration is only true if
+> something enforces the three. Nothing does yet: `documents-render.ts` exports no
+> bound and the transaction in this task is what will run them. The server is 3819MB
+> with **no swap**, so exceeding it is an OOM kill rather than a slowdown.
+> `ram.runtime` cannot save you -- YunoHost sets no cgroup from it and does not
+> evaluate it at install, so it is documentation. **The input cap is the lever that
+> makes any concurrency number achievable**; if you raise one, recompute the other.
+>
+> **2. The immutability test must compare STORED bytes and must never re-render.**
+> Three renders of identical input on one WeasyPrint gave 6899, 6899 and 6898 bytes.
+> A re-render-and-diff test would fail for reasons that have nothing to do with
+> immutability -- which is the same fact the spec's "re-rendering is not offered"
+> decision already rests on.
 
 **Files:**
 - Create: `packages/api/src/services/documents-number.ts`, `documents-number.test.ts`
