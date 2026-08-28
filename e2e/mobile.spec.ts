@@ -6,13 +6,29 @@ import { typeIntoEditor } from "./helpers.js";
 /**
  * Phase 6's phone journeys, at a phone viewport.
  *
- * These ARE the phase's definition of done expressed as tests -- "every
- * capability the app offers is reachable on a phone, and no surface is a dead
- * end" -- so the five groups below carry the six journeys the spec names:
- * navigate by the bottom bar AND the More sheet; look up a company and read
- * its rail; move a deal between stages with the Move action; open a Gantt
- * bar's task drawer and change its dates; log a meeting and add a follow-up
- * task; read a mail thread through the drill-in stack and reply.
+ * WHAT THIS FILE IS, AND WHAT IT IS NOT -- because the difference matters to
+ * anyone reading a green run. It carries the six journeys the spec's Testing
+ * section names: navigate by the bottom bar AND the More sheet; look up a
+ * company and read its rail; move a deal between stages with the Move action;
+ * open a Gantt bar's task drawer and change its dates; log a meeting and add a
+ * follow-up task; read a mail thread through the drill-in stack and reply.
+ *
+ * That list is a SUBSET of the spec's Definition of done, not the whole of it.
+ * The definition is "every capability the app offers is reachable on a phone,
+ * and no surface is a dead end"; the six journeys are the surfaces where the
+ * INTERACTION MODEL CHANGED -- the three `useIsMobile()` sites, the two
+ * gestures that were replaced (drag -> Move, drag -> drawer), and the record
+ * rail the sweep had to fix. THE SUBSET RULE IS THAT: a capability whose phone
+ * form is the desktop form re-laid out by CSS is covered by the desktop suite
+ * plus the unit guards over those utilities, and is not re-driven here.
+ *
+ * So these have NO phone coverage and a green run says nothing about them:
+ * creating or editing a contact, inline field editing, My Tasks, composing a
+ * NEW mail (as opposed to replying), bulk selection and its actions, Show
+ * earlier / Load more, linking a record to a thread, renaming a stage, and the
+ * funnel. Every one of them was measured by Tasks 2-5 in a browser at a phone
+ * width; none of them is asserted by a journey. Read a failure here as a real
+ * one and a pass as covering exactly the list above.
  *
  * THE HARD REQUIREMENT IS THAT THE OTHER 72 TESTS DO NOT MOVE. This file adds
  * a viewport; it adds no project, changes no config value and touches no other
@@ -198,7 +214,7 @@ test.describe.serial("Phone navigation and the record rail", () => {
     await expect(page.getByTestId("search-sheet")).toHaveCount(0);
   });
 
-  test("reads the record rail, including the tab at the end of the strip", async ({ page }) => {
+  test("reads the record rail, reaching its last tab by keyboard", async ({ page }) => {
     await page.goto(`/companies/${companyId}`);
 
     const rail = page.getByTestId("rail");
@@ -397,6 +413,8 @@ test.describe.serial("Phone Gantt", () => {
   /** Task ids in the order the chart rows them (by start date, then title). */
   const taskIds: string[] = [];
   let firstTitle = "";
+  /** The successor in the dependency journey; the first task is its predecessor. */
+  let secondTitle = "";
   let lastTitle = "";
   let firstStart = "";
   let firstDue = "";
@@ -445,6 +463,7 @@ test.describe.serial("Phone Gantt", () => {
         firstStart = startDate;
         firstDue = dueDate;
       }
+      if (index === 1) secondTitle = title;
       if (index === ROW_COUNT - 1) lastTitle = title;
     }
     expect(taskIds).toHaveLength(ROW_COUNT);
@@ -486,6 +505,59 @@ test.describe.serial("Phone Gantt", () => {
     expect(whatIsUnderTheMailTab).toBe("the bar");
   });
 
+  test("zooms and pans, which is the whole of what the chart offers here", async ({ page }) => {
+    // "Read-only PAN AND ZOOM" is the brainstorm's decision for this surface,
+    // and read-only is only half of it. At 390px the sidebar leaves roughly
+    // 250px of timeline -- about eight day-columns -- so panning is not a
+    // convenience here, it is how the chart is read at all, and the zoom
+    // control is how a month is seen without doing it.
+    await page.goto(`/projects/${projectId}/gantt`);
+    const firstId = taskIds[0] as string;
+    const bar = page.getByTestId(`gantt-bar-${firstId}`);
+    await expect(bar).toBeInViewport();
+
+    const dayBox = await bar.boundingBox();
+    expect(dayBox).not.toBeNull();
+    const dayWidth = dayBox?.width ?? 0;
+
+    // THE ZOOM IS ASSERTED BY ITS EFFECT ON THE CHART, not by a class on the
+    // button it was pressed with: week columns are 12.857px against day's 30,
+    // so the same task's bar has to get narrower. A pressed-looking button
+    // over an unchanged chart is exactly the failure this shape catches.
+    const zoom = page.getByTestId("gantt-zoom");
+    await expect(zoom.getByRole("button", { name: "Week", exact: true })).toBeVisible();
+    await zoom.getByRole("button", { name: "Week", exact: true }).click();
+    await expect
+      .poll(async () => (await bar.boundingBox())?.width ?? Number.POSITIVE_INFINITY)
+      .toBeLessThan(dayWidth);
+    // The opening scroll re-applies on a zoom CHANGE (an offset in day-zoom
+    // pixels means nothing after a switch to week), so the bar is back on
+    // screen at the new scale rather than left wherever the old pixels pointed.
+    await expect(bar).toBeInViewport();
+
+    await zoom.getByRole("button", { name: "Day", exact: true }).click();
+    await expect
+      .poll(async () => (await bar.boundingBox())?.width ?? 0)
+      .toBe(dayWidth);
+
+    // THE PAN, driven over the chart rather than by writing to a scroll
+    // property, and asserted through the app's own testid rather than through
+    // a Tailwind class on a box Task 5 gave no testid to. A wheel is the
+    // closest primitive Playwright has to the finger drag a phone actually
+    // uses on a native scroller; what both deliver to the grid is the same
+    // scroll. Panning right takes the bar off screen, and panning back brings
+    // it home -- which also pins the guarantee Task 5 stated and nothing
+    // tested: at an UNCHANGED zoom, nothing re-applies the opening offset and
+    // yanks the view out from under a thumb.
+    const box = await bar.boundingBox();
+    expect(box).not.toBeNull();
+    await page.mouse.move((box?.x ?? 0) + (box?.width ?? 0) / 2, (box?.y ?? 0) + (box?.height ?? 0) / 2);
+    await page.mouse.wheel(400, 0);
+    await expect(bar).not.toBeInViewport();
+    await page.mouse.wheel(-400, 0);
+    await expect(bar).toBeInViewport();
+  });
+
   test("refuses keyboard rescheduling but still opens the drawer on Enter", async ({ page }) => {
     await page.goto(`/projects/${projectId}/gantt`);
     const firstId = taskIds[0] as string;
@@ -497,7 +569,15 @@ test.describe.serial("Phone Gantt", () => {
     // key event -- so the handler reads the breakpoint itself (Amendment 1).
     // Arrows and Shift+arrows are the two gestures that commit real schedule
     // changes at a desk.
+    //
+    // THE FOCUS IS ASSERTED, not merely requested. `page.keyboard.press` goes
+    // to whatever the DOCUMENT has focused, so a `focus()` that silently did
+    // not land would send all six presses to `<body>` -- and the negative half
+    // of this test, "no date changed", would then pass for the wrong reason
+    // and pass forever. (The Enter at the end keeps it from being wholly
+    // vacuous, but only because Enter is asserted positively.)
     await bar.focus();
+    await expect(bar).toBeFocused();
     for (const key of ["ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight", "Shift+ArrowLeft", "Shift+ArrowUp"]) {
       await page.keyboard.press(key);
     }
@@ -561,6 +641,72 @@ test.describe.serial("Phone Gantt", () => {
     await expect(drawer).toBeHidden();
     await expect(page.getByTestId(`gantt-bar-${firstId}`))
       .toHaveAttribute("title", `${firstTitle}: ${rescheduledStart} to ${rescheduledDue}`);
+  });
+
+  test("adds a dependency from the drawer, the other half of the read-only trade", async ({ page }) => {
+    // THE PHASE'S CENTRAL CLAIM IS HALF-PROVED WITHOUT THIS TEST. `bar.tsx`
+    // does not render the dependency handle below the breakpoint, and the spec
+    // absorbs that removal with one sentence: rescheduling and dependencies are
+    // "both also in the task drawer", so a read-only chart plus tap-to-drawer
+    // removes no capability at all. The reschedule half is the test above. This
+    // is the other half, and until it existed the no-capability-exception claim
+    // rested on a path nothing exercised.
+    //
+    // IT IS ALSO THIS FILE'S ONLY RADIX SELECT. Every other phone control the
+    // journeys drive is a plain button, and `select.tsx` documents a real trap
+    // in exactly this shape: `position="item-aligned"` computes the popup's
+    // place from the SELECTED item, and this picker is pinned at no selection,
+    // which is the case that left `user-picker.tsx` unplaced and moved that one
+    // caller to "popper". The same primitive, inside a 390x664 full-screen
+    // sheet, is where that trap would surface again -- so the popup's placement
+    // is asserted, not assumed.
+    const successorId = taskIds[1] as string;
+    await page.goto(`/projects/${projectId}/gantt`);
+    await page.getByTestId(`gantt-label-tap-${successorId}`).click();
+    const drawer = page.getByTestId("task-drawer");
+    await expect(drawer).toBeVisible();
+    await expect(page.getByRole("heading", { name: secondTitle })).toBeVisible();
+
+    // Scoped to the section: the drawer also carries Type, Status and Assignee
+    // selects, so an unscoped combobox query is ambiguous (tasks.spec.ts scopes
+    // it the same way at a desk).
+    const depSection = page.locator('[data-testid="task-drawer"] section', { hasText: "Dependencies" });
+    await expect(page.getByTestId("dependency-list")).toContainText("No dependencies");
+    await depSection.getByRole("combobox").click();
+
+    const listbox = page.getByRole("listbox");
+    await expect(listbox).toBeVisible();
+    // THE ASSERTION THE TRAP WOULD FAIL. An unplaced popup is still "visible"
+    // to Playwright -- it has a box and it is not display:none -- so only
+    // viewport intersection can tell a positioned list from one Radix left
+    // wherever the document happened to put it.
+    await expect(listbox).toBeInViewport();
+
+    const option = page.getByRole("option", { name: firstTitle, exact: true });
+    await expect(option).toBeInViewport();
+    // A menu item is one of the four things the phase names for the 44px
+    // floor, and this list is the only place a phone journey meets one.
+    const optionBox = await option.boundingBox();
+    expect(optionBox).not.toBeNull();
+    expect(optionBox?.height ?? 0).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+    await option.click();
+
+    // The picker commits to its trigger, and Add is what sends it -- two
+    // controls, so a journey that only opened the list would prove nothing
+    // about the mutation.
+    await expect(listbox).toHaveCount(0);
+    await expect(depSection.getByRole("combobox")).toContainText(firstTitle);
+    await depSection.getByRole("button", { name: "Add", exact: true }).click();
+    await expect(page.getByTestId("dependency-list")).toContainText(firstTitle);
+    await expect(page.getByTestId("dependency-list")).not.toContainText("No dependencies");
+
+    // Closed before the chart is touched again -- the drawer is a Radix Dialog
+    // and everything behind it is inert while it is open -- and then the chart
+    // itself is the confirmation that the edge really landed, rather than the
+    // drawer reporting on its own request.
+    await drawer.getByRole("button", { name: "Close" }).click();
+    await expect(drawer).toBeHidden();
+    await expect(page.getByTestId(`gantt-arrow-${taskIds[0] as string}-${successorId}`)).toBeVisible();
   });
 
   test("reaches the last of twenty-two rows, and Remove slack with it", async ({ page }) => {
@@ -852,6 +998,15 @@ test.describe.serial("Phone inbox drill-in stack", () => {
     // below, ingesting every message twice into the same thread and doubling
     // the conversation this journey counts. Archiving stops its sync and
     // leaves its threads alone.
+    //
+    // THIS IS ONLY SAFE BECAUSE CI RUNS `workers: 1`. It archives every live
+    // account the dev user has, not merely this file's own, so at the default
+    // worker count locally it would race e2e/mail.spec.ts and archive the
+    // account that spec is mid-journey with. The suite is CI-only for this
+    // project and the config pins one worker there for an unrelated reason
+    // (see playwright.config.ts's dnd-kit note), so the two files never
+    // overlap -- but anyone raising that number has to give this block an
+    // account filter first.
     const listed = await page.request.get("/api/mail/accounts");
     expect(listed.ok()).toBe(true);
     const { own } = await listed.json() as {
@@ -971,6 +1126,55 @@ test.describe.serial("Phone inbox drill-in stack", () => {
     await expect(heading(page)).toHaveText("Inbox");
     await expect(heading(page)).toBeFocused();
     await expectLevel(page, "threads");
+  });
+
+  test("picks a folder, which is what the folder screen is for", async ({ page }) => {
+    // THE LINE THIS TEST EXISTS FOR is `setFoldersOpen(false)` inside
+    // `chooseFolder` (pages/inbox.tsx). Nothing else reaches it:
+    // `inbox-lib.test.ts` takes `foldersOpen` as an INPUT, so it can say what
+    // the view looks like with the flag set and cannot say who clears it, and
+    // the drill-out test above leaves the folder screen by Back rather than by
+    // choosing anything. Delete that one line and a phone user taps a folder
+    // and stays on the folder rail while the list changes underneath, out of
+    // sight -- with the whole suite green. The spec names the folder picker as
+    // one of the things that must not become desktop-only, so this is the tap
+    // that says it did not.
+    await page.goto("/mail");
+    await expect(threadRow(page)).toBeVisible();
+
+    await page.getByTestId("inbox-folders").click();
+    await expectLevel(page, "folders");
+    // "All mail" is the resting view -- no folder filter at all -- and the rail
+    // says so with the same marker it will move to the folder chosen below.
+    await expect(page.getByTestId("folder-view-all")).toHaveAttribute("aria-current", "true");
+
+    const inboxFolder = page.getByTestId("folder-INBOX");
+    await expect(inboxFolder).toBeVisible();
+    await inboxFolder.click();
+
+    // THE NAVIGATION HALF: choosing is also leaving. The level is back at the
+    // thread list, its leading control points forward again, and the folder
+    // rail is off screen.
+    await expect(heading(page)).toHaveText("Inbox");
+    await expect(page.getByTestId("inbox-folders")).toBeVisible();
+    await expectLevel(page, "threads");
+
+    // THE FOLDER HALF: the list on screen is the chosen folder's. The thread
+    // this journey seeded lives in INBOX, so it survives the filter -- and the
+    // rail, reopened, has moved its current marker off "All mail" and onto the
+    // row that was tapped, from the same `folder` state the query is built
+    // from.
+    await expect(threadRow(page)).toHaveCount(1);
+    await page.getByTestId("inbox-folders").click();
+    await expectLevel(page, "folders");
+    await expect(page.getByTestId("folder-INBOX")).toHaveAttribute("aria-current", "true");
+    await expect(page.getByTestId("folder-view-all")).not.toHaveAttribute("aria-current", "true");
+
+    // Back to the unfiltered view the same way, so the level and the marker are
+    // shown to move in both directions rather than once.
+    await page.getByTestId("folder-view-all").click();
+    await expectLevel(page, "threads");
+    await expect(threadRow(page)).toHaveCount(1);
   });
 
   test("opens the conversation, replies from it, and comes back to the same list", async ({ page }) => {

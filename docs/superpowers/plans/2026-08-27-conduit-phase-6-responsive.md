@@ -1148,8 +1148,8 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 
 > **DONE.** As built:
 >
-> - **THE FILE: `e2e/mobile.spec.ts`, 20 tests in five serial groups, and the
->   72 that existed are untouched -- 72 -> 92.** No source file was changed by
+> - **THE FILE: `e2e/mobile.spec.ts`, 23 tests in five serial groups, and the
+>   72 that existed are untouched -- 72 -> 95.** No source file was changed by
 >   this task: every surface the journeys drive was given a phone-only testid by
 >   the task that built it, so the definition of done turned out to be
 >   assertable without a single new hook into the app.
@@ -1177,7 +1177,24 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 >   companies list and the cells carry Name/Owner/Updated themselves; a
 >   stage-less pipeline renders `board` with one `DndLiveRegion` and no
 >   `stage-view`, and two stages later it renders `stage-view` with **zero** of
->   each. Every one of those is an assertion in the file.
+>   each.
+>
+>   **BE PRECISE ABOUT WHICH OF THOSE THE FILE ACTUALLY ASSERTS, because an
+>   earlier version of this block said "every one of them" and that was false.**
+>   Asserted: the grid's overflow (through the last row being out of the
+>   viewport and still reachable), the opening scroll (`toBeInViewport()` on the
+>   first bar), both tap layers' visibility, the drawer's close on BOTH axes
+>   against the 44px floor, `compact-button`'s HEIGHT against that floor,
+>   `thead` hidden with a per-cell label visible beside it, and the
+>   board/stage-view/`column-`/`DndLiveRegion` counts on either side of the
+>   first stage. **Measured but NOT asserted, and therefore context rather than
+>   coverage:** the account form's `390x664` box and its `max-height: none` --
+>   the most interesting number in the list, since it is what stops the app's
+>   longest form being clipped at 85vh, and nothing re-checks it;
+>   `compact-button`'s 116.5px WIDTH (only its height is asserted); the
+>   stage-less pipeline's `DndLiveRegion` count of ONE (the file asserts the
+>   zero after the stages exist, not the one before); and the exact pixel
+>   positions above, which informed the assertions without being them.
 > - **THE ONE MEASUREMENT THAT SAVED A CI CYCLE, and it is not the obvious one.**
 >   With the page at rest, `gantt-label-tap-<last>` sits at viewport y 637-668
 >   against a bottom bar occupying 619-664. Playwright reveals an element with
@@ -1233,24 +1250,58 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 >      button, with the current stage never offered as a target. Both focus
 >      contracts are pinned because nothing else re-checks them: the `h1` after a
 >      move (the trigger left with its card) and the trigger after a Close.
->   4. **The Gantt** (5 tests): a 22-row fixture seeded over the API; the opening
+>   4. **The Gantt** (7 tests): a 22-row fixture seeded over the API; the opening
 >      scroll proved with `toBeInViewport()` rather than `toBeVisible()`; both
 >      tap layers present; the bottom bar hit-testable over its Mail tab (the
->      tap-theft regression, which nothing else re-checks); four arrows and two
->      Shift+arrows changing no date and rendering no transform while **Enter
->      still opens the drawer**; a reschedule driven from `gantt-label-tap-<id>`
->      through `field-dates` with the bar's `title` following; the last of the 22
->      rows reached below the chart's own fold; and Remove slack tapped with a
->      dialog handler.
+>      tap-theft regression, which nothing else re-checks); **zoom and pan, which
+>      is the other half of the brainstorm's decision for this surface** -- the
+>      zoom asserted by the bar getting NARROWER rather than by a class on the
+>      button pressed, and the pan by a wheel over the chart taking that bar out
+>      of the viewport and bringing it back, which also pins Task 5's untested
+>      guarantee that nothing re-applies the opening offset at an unchanged
+>      zoom; four arrows and two Shift+arrows changing no date and rendering no
+>      transform while **Enter still opens the drawer**; a reschedule driven from
+>      `gantt-label-tap-<id>` through `field-dates` with the bar's `title`
+>      following; **a DEPENDENCY added through the drawer's picker** (see the
+>      next bullet, which is the important one); the last of the 22 rows reached
+>      below the chart's own fold; and Remove slack tapped with a dialog handler.
 >   5. **Meetings** (2 tests): logged from the rail with a guest and TipTap notes
 >      through `typeIntoEditor`, read back, and a follow-up task added.
->   6. **The inbox** (5 tests): its own IMAP fixture and its own account, added
+>   6. **The inbox** (6 tests): its own IMAP fixture and its own account, added
 >      through the settings form AT THIS VIEWPORT (the app's longest form, and
 >      nothing else in the suite renders it below the breakpoint); all three
 >      panes asserted at all three levels; the heading taking focus on every
 >      transition, including the folders->threads case where Back and Folders are
->      the same relabelled node; a reply sent from the conversation level; and a
->      deep link landing straight on it.
+>      the same relabelled node; **a folder TAPPED**, which is the folder
+>      screen's whole purpose and was reachable by nothing else -- `chooseFolder`
+>      clears `foldersOpen` itself, `inbox-lib.test.ts` takes that flag as an
+>      INPUT so it cannot say who clears it, and the drill-out test leaves by
+>      Back; delete that one line and a phone user taps a folder and stays on the
+>      rail with the whole suite green; a reply sent from the conversation level;
+>      and a deep link landing straight on it.
+> - **THE DEPENDENCY PATH, WHICH IS WHERE THE PHASE'S WHOLE CLAIM LIVES -- and
+>   it holds, measured rather than assumed.** `bar.tsx` does not render the
+>   dependency handle below the breakpoint, and the spec absorbs that removal
+>   with one sentence: rescheduling and dependencies are "both also in the task
+>   drawer". The reschedule half was proved end to end by Task 5 and by this
+>   file; the dependency half was proved by neither until the spec review said
+>   so. It is also this file's ONLY Radix Select, and `select.tsx` documents a
+>   real trap in exactly this shape -- `position="item-aligned"` computes the
+>   popup's place from the SELECTED item, and this picker is pinned at no
+>   selection, which is the case that left `user-picker.tsx` unplaced.
+>
+>   **Measured at 390x664 on a live build, with 21 candidates in the list:** the
+>   popup's wrapper is `position: fixed` at (24, 424), the listbox is 286x220 at
+>   (24, 434) -- bottom edge 654 against a 664 viewport, so it is placed and
+>   fully on screen -- and each option is 44px tall, which meets the floor a
+>   menu item is named for. Choosing one commits to the trigger, `Add` sends it,
+>   `dependency-list` goes from "No dependencies" to the task plus its Remove,
+>   and the chart behind draws `gantt-arrow-<pred>-<succ>`. **So there is no
+>   capability exception and the trap did not bite** -- item-aligned positioning
+>   fails when there is NO item to position against, and `user-picker.tsx` can
+>   legitimately offer an empty list where this picker, on any project with two
+>   tasks, cannot. The degenerate case (a one-task project, so no candidate at
+>   all) is untested and is equally degenerate at a desk.
 > - **THE ONE JOURNEY ASSERTION THAT IS A SUBSTITUTE, said plainly.** Task 3
 >   asked for "open a thread from page two, Back, count the rows" -- the property
 >   the hide-don't-unmount decision rests on. The thread list's default page is
@@ -1280,13 +1331,15 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 > - **Suite: 1829 unit + 36 skipped (unchanged -- this task added no unit test,
 >   and had no lib to test), typecheck clean on five projects, `npm run build`
 >   clean with no CSS warning and the stylesheet hash unmoved
->   (`index-CBvyyNUj`, 30.85 kB), e2e 72 -> 92 with the 72 untouched.**
->   Proved in CI on **run 33147238771** (tip b07ef4d): both jobs green, **e2e 92
->   passed in 55.4s with no flaky line**, so no retry was burned, and test 1865
->   passed across 51 files (the 1829 plus the 36 MAIL_IT integration tests CI
->   provisions mail servers for). A commit cannot name the run of the commit
->   that contains it, so the run covering the FINAL tip is cited in
->   `release-sequence-v0.10.0.md` rather than here.
+>   (`index-CBvyyNUj`, 30.85 kB), e2e 72 -> 95 with the 72 untouched.**
+>   The 20-test form of this file was proved in CI on **run 33147238771** (tip
+>   b07ef4d): both jobs green, e2e 92 passed in 55.4s with no flaky line, and
+>   test 1865 passed across 51 files (the 1829 plus the 36 MAIL_IT integration
+>   tests CI provisions mail servers for). The spec review's four additional
+>   tests came after it. A commit cannot name the run of the commit that
+>   contains it, so **the run covering the FINAL tip -- and therefore the 95 --
+>   is cited in `release-sequence-v0.10.0.md`**, which is untracked and can
+>   name it.
 >
 > **RECORDED, NOT FIXED.**
 >
@@ -1295,16 +1348,20 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 >   never see it), so this file can say `gantt-label-tap-<id>` is visible at
 >   390px and cannot say it is hidden at 1280. `gantt/phone.test.ts` and
 >   `ui/ui.test.ts` are what hold that half, over source rather than over a DOM.
-> - **No journey drives a Radix Select on a phone.** The move sheet, the stage
->   picker and the folder rail are all plain buttons; the composer's From select,
->   the drawer's type/status/assignee and the meeting form's colleague picker are
->   driven at a desk by other specs and are untouched here. If one of those
->   portals turns out to behave differently under touch emulation, this suite
->   will not be what finds it.
-> - **The Gantt fixture is 22 identical-shaped bars.** It is enough to make the
->   grid overflow and enough to put a bar under today, and it is not a realistic
->   schedule: no dependencies, no summary rows, no done tasks. The dependency
->   ARROW at a phone viewport is therefore still unexercised by e2e.
+> - **ONE Radix Select is driven on a phone, and it is the drawer's dependency
+>   picker.** That one is measured and asserted (above). The others are not: the
+>   composer's From select, the drawer's type/status/assignee, the meeting
+>   form's colleague picker and the inbox's account filter are all driven at a
+>   desk by other specs and never at this width. They share the primitive, so
+>   the positioning finding transfers; the empty-list case that primitive
+>   actually fails on does not, and `user-picker.tsx` is the caller that can
+>   reach it.
+> - **The Gantt fixture is 22 identical-shaped bars**, and it is not a realistic
+>   schedule: no summary rows, no done tasks, and exactly one dependency, added
+>   by the journey itself rather than seeded. It is enough to make the grid
+>   overflow, enough to put a bar under today, and enough to draw one arrow. A
+>   chart with overlapping arrows, group headers and frozen in-progress rows is
+>   still unexercised at this width.
 > - **The 22 tasks are seeded over the API.** `tasks.spec.ts` creates its three
 >   through the UI and this file does not; the trade is stated in the test and is
 >   about runtime, not about coverage, since the journey itself is all UI.
