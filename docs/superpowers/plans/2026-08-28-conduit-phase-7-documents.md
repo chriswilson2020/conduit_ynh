@@ -1035,6 +1035,24 @@ A4 (595.28 x 841.89pt) -- `@page { size: A4 }` being the line a careless edit ch
 silently, and one that is only wrong once it is on paper. Mutating it to `Letter` fails
 the test at 612pt. **A FILLED render belongs in Task 4, beside the real `buildContext`.**
 
+**AND IT WENT RED ON CI FIRST, on the exact trap Task 1's retrospective records.** Run
+`33213343537` failed both render assertions. WeasyPrint **61.1** (the Ubuntu 24.04 runner)
+compresses object streams by default while **57.2** (the Debian 12 server) does not, so
+the page tree is plain text here and invisible there -- which is the same reason
+`/EmbeddedFiles` once looked absent on 61.1, written down in this plan, read during this
+task, and walked into anyway. The reader now inflates every Flate stream before searching,
+mirroring `pdfEmbedsFiles`'s loop (already proved against 61.1 by Task 1's mutation run),
+and page count comes from the page tree's own `/Count` rather than from counting page
+objects.
+
+**A THIRD TEST PINS THE READER ITSELF, and it needs no renderer at all**: a hand-built PDF
+whose page tree exists ONLY inside a compressed object stream, with the raw bytes asserted
+not to contain `/MediaBox` first. Without it the parser would only ever be exercised
+against the uncompressed output of the one WeasyPrint on the development server -- and the
+version that matters is the other one. The lesson is Task 1's own, one level up: a
+version-specific representation is not a property, and the property here is "the page tree
+says A4", not "the bytes contain `/MediaBox`".
+
 Minor, confirmed: `deal-detail.tsx:183`'s surviving `/ 100` is an edit value feeding
 `parseDecimal`, not a display path, and is left alone.
 
