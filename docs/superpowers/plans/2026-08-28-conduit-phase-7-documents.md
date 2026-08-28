@@ -1372,9 +1372,11 @@ server to prove them for real, exactly as in Task 1 Step 5.
 
 `money.ts` bounds `qtyMilli` and `taxRateBp` to the int4 range its columns can hold, so
 the SV-1 failure (compute, render, then die on the insert) cannot happen for magnitude.
-It does NOT enforce the business bounds: `qty_milli >= 0` and
-`tax_rate_bp BETWEEN 0 AND 10000` exist only as CHECK constraints, and `money.ts` keeps a
-wider domain on purpose — `divideRoundHalfUp` has a negative branch for a future credit
+It does NOT enforce the business bounds. THREE constraints are gates this task owns, not
+two — `qty_milli >= 0`, `unit_price_cents >= 0` and `tax_rate_bp BETWEEN 0 AND 10000` —
+and the quality review reproduced all three end to end on a real database as 23514s
+raised AFTER a successful render. `money.ts` keeps a wider domain than all of them on
+purpose — `divideRoundHalfUp` has a negative branch for a future credit
 note.
 
 **So a negative quantity, or a 150% tax rate, still computes, still renders a PDF, and
