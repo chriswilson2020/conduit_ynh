@@ -132,8 +132,15 @@ export const GanttBar = memo(function GanttBar({
       )}
       style={{ left, width, top: barTop, height: barHeight, transform, backgroundColor }}
     >
+      {/* Below the breakpoint the chart is read-only (the phase spec's Gantt
+         section), so this overlay stops taking pointers -- but it is NOT
+         display:none like the three zones below it, because it is also what
+         paints the bar's title. Neutralising the pointers rather than the
+         element is the difference between a read-only bar and a blank one.
+         A tap still opens the task: chart.tsx renders a phone-only layer
+         over the whole row for that. */}
       <div
-        className="absolute inset-0 flex cursor-grab items-center overflow-hidden px-1.5 active:cursor-grabbing"
+        className="absolute inset-0 flex cursor-grab items-center overflow-hidden px-1.5 active:cursor-grabbing max-md:pointer-events-none"
         onPointerDown={(e) => onPointerDown(e, task, "move")}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -141,15 +148,19 @@ export const GanttBar = memo(function GanttBar({
       >
         {!isParentSummary && <span className="truncate">{task.title}</span>}
       </div>
+      {/* The two resize strips and the dependency handle go away entirely
+         below the breakpoint: they paint nothing a reader needs, they are
+         1.5 and 2 CSS pixels wide against a 44px touch floor, and each one
+         starts a gesture that commits a schedule change. */}
       <div
-        className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize"
+        className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize max-md:hidden"
         onPointerDown={(e) => onPointerDown(e, task, "resize-start")}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerCancel}
       />
       <div
-        className="absolute inset-y-0 right-0 w-1.5 cursor-ew-resize"
+        className="absolute inset-y-0 right-0 w-1.5 cursor-ew-resize max-md:hidden"
         onPointerDown={(e) => onPointerDown(e, task, "resize-end")}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -170,7 +181,7 @@ export const GanttBar = memo(function GanttBar({
          mode. */}
       <div
         data-testid={`gantt-bar-${task.id}-dep-handle`}
-        className="absolute top-1/2 h-2 w-2 -translate-y-1/2 cursor-crosshair rounded-full border border-white bg-slate-500 opacity-0 hover:opacity-100 focus-visible:opacity-100"
+        className="absolute top-1/2 h-2 w-2 -translate-y-1/2 cursor-crosshair rounded-full border border-white bg-slate-500 opacity-0 hover:opacity-100 focus-visible:opacity-100 max-md:hidden"
         style={{ right: -10 }}
         onPointerDown={(e) => onPointerDown(e, task, "dependency")}
         onPointerMove={onPointerMove}

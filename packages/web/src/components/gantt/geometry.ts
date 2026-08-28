@@ -19,6 +19,32 @@ export const HEADER_HEIGHT = 36;
 export const SIDEBAR_WIDTH = 240;
 export const GRID_MAX_HEIGHT = 640;
 
+/**
+ * The sidebar's width as CHART.TSX WRITES IT, which is a CSS expression
+ * rather than the number above.
+ *
+ * Every other dimension in this file feeds date arithmetic (day indices,
+ * bar left/width, arrow endpoints) and so has to be a JavaScript number at
+ * render time. The sidebar's width feeds NONE of it -- it is a pure layout
+ * offset, used only for the sidebar's own box and for the flex row's total
+ * width -- which is what makes it the one constant a stylesheet can take
+ * over. Written as a custom property with this constant as the FALLBACK, so
+ * the desktop value still lives here and cannot drift from the phone
+ * override: anything that does not set the property gets exactly the 240
+ * above, and the phone sets it from a breakpoint variant in chart.tsx.
+ *
+ * Built by interpolation rather than typed out, so the fallback and the
+ * constant are the same value by construction and not by a test's vigilance
+ * (a test pins it anyway, because the two USE SITES could still drift).
+ */
+export const SIDEBAR_WIDTH_CSS = `var(--gantt-sidebar-width, ${SIDEBAR_WIDTH}px)`;
+
+/**
+ * How far LEFT of the target day the phone's opening scroll stops, so the
+ * first bar does not start flush against the sidebar's edge.
+ */
+export const SCROLL_LEAD_IN_PX = 12;
+
 export const DAY_MS = 24 * 60 * 60 * 1000;
 export const DAY_ZOOM_PX_PER_DAY = 30;
 // Week zoom: a fixed-width column per week (not "7 day-columns squeezed
@@ -227,4 +253,46 @@ export function accumulateNudge(state: NudgeState | null, action: NudgeKeyAction
       offsetDays,
     },
   };
+}
+
+/**
+ * Where a phone's chart should be scrolled to when it opens (Amendment 4).
+ *
+ * THE PROBLEM THIS SOLVES, measured at 375px before it existed: computeRange
+ * starts the window RANGE_PAD_DAYS before the earliest task, and the phone
+ * has a fraction of the desktop's visible timeline, so at scrollLeft 0 the
+ * whole visible band was padding and the chart opened with no bars in it at
+ * all. A chart that is read-only is a deliverable; a chart that is blank is
+ * not.
+ *
+ * THE RULE: today, clamped into the span of the work. Each of the three
+ * cases is a real chart someone will open --
+ *
+ *   - work already under way (today between the first and last bar): opens on
+ *     today, which is what a phone glance is for;
+ *   - work entirely in the future (today before every bar): opens on the
+ *     first bar rather than on today, so the view holds the schedule instead
+ *     of the empty run-up to it;
+ *   - work entirely in the past (today after every bar): opens on the last
+ *     bar rather than on today, so the view holds the tail of the work
+ *     instead of empty grid after it.
+ *
+ * The clamp is what makes all three land on a day that has a bar near it,
+ * which is the property the blank-first-paint bug was the absence of.
+ *
+ * `startDays` is every dated bar's START day index; an empty list means there
+ * is nothing to scroll to and the caller keeps its 0. The result is a pixel
+ * offset for the caller to assign to a scroll container, which clamps it to
+ * its own scrollable range itself, so this never needs the viewport's width.
+ */
+export function initialScrollLeft(startDays: number[], todayDay: number, pxPerDay: number): number {
+  let first: number | null = null;
+  let last: number | null = null;
+  for (const day of startDays) {
+    if (first === null || day < first) first = day;
+    if (last === null || day > last) last = day;
+  }
+  if (first === null || last === null) return 0;
+  const day = Math.min(Math.max(todayDay, first), last);
+  return Math.max(0, day * pxPerDay - SCROLL_LEAD_IN_PX);
 }

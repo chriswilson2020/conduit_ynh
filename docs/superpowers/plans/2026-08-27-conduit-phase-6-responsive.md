@@ -731,6 +731,223 @@ Below the breakpoint the chart renders **read-only with pan and zoom**, and **ta
 
 Above the breakpoint, unchanged: drag-to-reschedule, dependency editing, the compactor. ~6 tests.
 
+> **DONE.** Every number below was measured in a browser at 375x812 against a
+> build of this branch on the dev server, not reasoned about. The gate
+> Amendment 2 required came first and produced spec Amendments 4-6; this block
+> records what was built under them.
+>
+> **THE GATE'S OWN CORRECTION, because it changes the size of the problem.**
+> Amendment 2 computed 375 - 240 = 135px of timeline. `<main>` carries `px-6`,
+> so the grid's client width is **325**, and the sidebar left **85px** -- 2.8
+> day columns, not 4.5. And the chart did not merely open cramped: `computeRange`
+> starts the window `RANGE_PAD_DAYS` (14) before the earliest task, so at
+> `scrollLeft: 0` **no bar was on screen at all**. On the original three-task
+> data the bars sat at `offsetLeft: 420` and were visible only for `scrollLeft`
+> between roughly 335 and 480. "Technically read-only" was shipping as
+> technically blank.
+>
+> **THE GEOMETRY, and the one idea the whole task rests on.** Amendment 2 said
+> every dimension is an inline JS-computed style, so `max-md:` cannot rescale
+> any of it. True of all but one: **`SIDEBAR_WIDTH` feeds no date arithmetic**
+> -- unlike `ROW_HEIGHT` and `pxPerDay`, which feed `rowTop`, bar left/width
+> and the SVG arrow endpoints -- so it is the one constant a stylesheet can
+> take over. It is now `SIDEBAR_WIDTH_CSS`, built in `geometry.ts` by
+> interpolation as `var(--gantt-sidebar-width, 240px)`, so the desktop value
+> and the fallback are the same value BY CONSTRUCTION rather than by a test's
+> vigilance. The phone override is a Tailwind arbitrary-property variant on the
+> grid box, `max-md:[--gantt-sidebar-width:8rem]` -- so no hand-written media
+> query exists and the breakpoint stays single-sourced through Tailwind's own
+> variant. Measured: sidebar 240 -> 128, timeline **85px -> 247px**, 8.2 day
+> columns at day zoom and 19.2 days at week zoom.
+>
+> Three more classes ride on the same box, all layout, all `max-md:`:
+> `max-md:-mx-6` gives back the page's side padding (48px of a 375px screen),
+> `max-md:rounded-none max-md:border-x-0` because a rounded border pushed to
+> the screen edge reads as a rendering fault, and `max-md:isolate` -- see the
+> tap theft below.
+>
+> **THE TAP THEFT, which was a bug and not a cosmetic one.** Task 1's handoff
+> warned the Gantt's sticky elements carry `z-20`/`z-30` and are not portalled,
+> so they can paint over the bottom bar. Measured at 375px, it was worse than
+> painting: `document.elementFromPoint` over the bar's **Mail** tab returned a
+> Gantt sidebar row, i.e. **the bottom navigation was untappable on this page**.
+> `max-md:isolate` on the grid box confines those z-indices to it; the bar keeps
+> its deliberate absence of a z-index and wins on DOM order. Probe before:
+> `"flex items-center truncate border-b border-slate-100 text-xs text-slate-700 px-2"`.
+> Probe after: `bottom-nav`. Desktop is `isolation: auto`, as it always was.
+>
+> **PER AMENDMENT 1 (the key handler).** One `window.matchMedia(mobileMediaQuery()).matches`
+> read inside `handleBarKeyDown`, placed after the Enter branch and after the
+> modifier/direction guards, before `preventDefault`. Two consequences worth
+> stating: **Enter still opens the drawer**, which is the phone's whole way in;
+> and the refusal returns WITHOUT `preventDefault`, unlike every other refusal
+> in that handler, so an arrow key keeps its default action -- which inside a
+> scrolling grid is exactly the pan this chart is supposed to have. Measured at
+> 375px on a focused bar: four ArrowRights, a Shift+ArrowLeft and a Shift+ArrowUp
+> left the title at `Call Ada: 2026-08-27 to 2026-08-28` with `transform: none`,
+> and Enter then opened the drawer. At 1280px, three ArrowRights still render a
+> live `matrix(1, 0, 0, 1, 90, 0)` preview and commit as one shift (`2026-08-21
+> to 2026-08-23` -> `2026-08-24 to 2026-08-26`) -- the path `e2e/tasks.spec.ts:234-269`
+> drives.
+>
+> **PER AMENDMENT 4 (the opening scroll), and the target choice.** A second
+> imperative read, in a LAYOUT effect so the offset is in place before the
+> first paint rather than as a jump after it. **The target is today, clamped
+> into the span of the work** (`initialScrollLeft`, pure and tested), and the
+> clamp is the whole point -- it is what makes all three real cases land on a
+> day that has a bar near it:
+>
+> | The chart someone opens | Where it opens | Why not today |
+> |---|---|---|
+> | work under way (today between first and last bar) | today | -- |
+> | work entirely in the future | the FIRST bar | today is the empty run-up |
+> | work entirely in the past | the LAST bar | today is empty grid after the end |
+>
+> The coordinator's instinct was the earliest task's start. That is right for
+> two of the three cases and wrong for the commonest one: on a six-month project
+> a phone would open on work that finished in March, with today a hundred and
+> fifty columns away. Clamping keeps the "skip the fortnight of padding"
+> property that instinct was after while opening on the day a phone glance is
+> actually for. Measured: `scrollLeft: 708` on load = day 24 (today) x 30px
+> minus the 12px lead-in, exactly. It re-applies **once per zoom value**, not
+> once per mount, because an offset in day-zoom pixels is meaningless after a
+> switch to week (297 = 24 x 12.857 - 12, measured) -- and never twice for the
+> same one, so a refetch or an SSE update cannot yank the view out from under a
+> thumb mid-pan. Desktop: `scrollLeft: 0`, untouched.
+>
+> **PER AMENDMENT 5 (Remove slack).** The per-project `compact-button` stays --
+> measured **116.5 x 44** at 375px on `/projects/$id/gantt`, over the floor,
+> because it is already a `Button`. Only the per-group one carries
+> `max-md:hidden`; it was **81.3 x 19.3** and was never floored by Task 2's
+> sweep (it is hand-rolled in `chart.tsx`), and at a 128px sidebar its 28px
+> header row renders the project name as a single letter. Both are visible at
+> 1280.
+>
+> **PER AMENDMENT 6 (the tap target), and the mis-tap answer.** Two
+> `hidden max-md:block` layers per task row, both `aria-hidden` and both calling
+> the SAME `onOpenTask` that Enter has always called -- the no-capability-gap
+> claim rests on the existing path, not a second one:
+>
+> - `gantt-tap-<taskId>` spans the full chart width at the row's own `top`, 32px
+>   tall (1530 x 32 measured on the fixture).
+> - `gantt-label-tap-<taskId>` covers the task's NAME in the sidebar (127 x 31).
+>   This is the half that needs no panning at all: the sidebar is sticky, so
+>   every task's name is on screen whatever the timeline is scrolled to.
+>
+> **There is no mis-tap band, because there is no overlap.** Amendment 3
+> expected 44px layers with negative insets overlapping 6px into each
+> neighbour; Amendment 6 accepted the argument against them, and what shipped
+> has neither. The 44px floor is not met vertically (32px, the row pitch) and
+> that is the recorded exception. What it buys, measured on the worst bar in the
+> chart -- the same-day milestone, **15px wide at day zoom and 12.9px at week
+> zoom** -- is that a hit test at the bar's centre, at the far LEFT of its row,
+> at the far RIGHT of its row, and on its name in the sidebar all four return
+> that same task's layer.
+>
+> **THE DRAWER PATH, END TO END AT 375px, because the phase's whole
+> no-capability-gap claim is this path.** Tapped the 15px same-day bar (the
+> element `elementFromPoint` says a finger lands on) -> drawer opened at
+> `/gantt?task=f28e9eca...` titled "Fixture same-day milestone", full-screen
+> 375x812. **Dates:** set 2026-09-02/2026-09-02 to 2026-09-04/2026-09-07, Save
+> enabled on edit, committed -- the bar behind the drawer became
+> `Fixture same-day milestone: 2026-09-04 to 2026-09-07` and grew from 15px to
+> 90px, and the drawer's own Activity gained "chris updated startDate, dueDate".
+> **Dependencies:** added "Call Ada" as a predecessor; `dependency-list` went
+> from "No dependencies" to the task plus its Remove, and the chart drew
+> `gantt-arrow-89a444f0-...-f28e9eca-...`. **The exit:** Task 2's fix
+> re-verified rather than trusted -- the drawer's close is **44 x 44**, and it
+> returned to `/gantt` with the drawer unmounted.
+>
+> **A DRAG CANNOT APPEAR TO START.** The three pre-ruled classes are in place
+> and verified by computed style at 375px: the move overlay is
+> `pointer-events: none` (NOT hidden -- it still paints the title), and the two
+> resize strips and the dependency handle are `display: none`. What a tap lands
+> on over a bar is the row's tap layer, which has no pointer handlers at all, so
+> no gesture is tracked, no `setPointerCapture` is taken and nothing can move
+> under a finger and snap back. At 1280 the overlay is `pointer-events: auto`
+> and all three zones are `block`.
+>
+> **DESKTOP, MEASURED AT 1280x900 AFTER THE CHANGE:** sidebar 240 (the
+> fallback), inner flex row 1770 (240 + 1530, the same total as before),
+> `isolation: auto`, margins 0, 1px side borders, 6px radius, `scrollLeft: 0`,
+> both compact buttons `block`, every tap layer `display: none`, the sidebar
+> rows `position: static`, and the element under a bar's centre is still the
+> move overlay. **No e2e file was touched.**
+>
+> **Tests: +20 on the 1801 baseline -> 1821** unit + 36 skipped, green on the
+> server; typecheck clean on five projects; `npm run build` clean **with no CSS
+> warning** (the stylesheet went 30.52 -> 30.85 kB, `index-4ov9J3ir` ->
+> `index-CBvyyNUj`, which is the six new utilities and not a dead-rule leak:
+> `--gantt-sidebar-width:8rem` and `isolation:isolate` each appear exactly once
+> in the built CSS). Seven of the twenty are `initialScrollLeft`'s cases; the
+> rest are source guards in the new `gantt/phone.test.ts`.
+>
+> **ELEVEN MUTATIONS RUN, TEN RED AND THE ELEVENTH GREEN ON PURPOSE.** The
+> guards were verified against the breakages they advertise rather than
+> asserted to work: the move overlay left live; the move overlay hidden instead
+> of neutralised; a resize strip left live; the dependency handle left live;
+> the keyboard read moved ABOVE the Enter branch (which would stop a phone
+> opening the drawer at all); the sidebar's box pinned back to a fixed 240; the
+> stacking context deleted; the per-project compact button hidden too; the chart
+> row's tap layer stripped of its variant; a third imperative read added. All
+> ten failed the suite. The eleventh is the **tripwire** Tasks 1 and 4 both hit:
+> a comment that spells `max-md:hidden` and `useIsMobile` in prose -- it stays
+> GREEN, because both subjects are comment-stripped ONCE at the top of the file.
+> That single strip also protects the element-scoping helper, which finds the
+> nearest element start before its marker and would otherwise treat a comment
+> mentioning any tag as an element.
+>
+> **A DEFECT IN THE MUTATION HARNESS ITSELF, worth recording** because it
+> produced four minutes of false confidence: one mutation deleted a class by
+> replacing it with the empty string, so its REVERT replaced the empty string --
+> which matches at index 0 -- and silently corrupted `chart.tsx`, after which
+> every later mutation "failed" for the wrong reason. Four verdicts were
+> re-run against a repaired tree. The harness now refuses a mutation whose
+> either side is empty.
+>
+> **CARRIED, MEASURED AND DELIBERATELY NOT FIXED:**
+>
+> - **Focus goes to `<body>` when the drawer closes**, confirmed on this path at
+>   375px. It is the phase-level Radix finding (four state-driven `Dialog`
+>   callers with no trigger to restore to, `task-drawer.tsx:46` among them),
+>   pre-existing and desktop-visible, and explicitly out of bounds for this
+>   phase.
+> - **The sidebar clips long titles without an ellipsis.** `truncate` is on a
+>   flex row whose text is an anonymous flex item, so the text is cut at the
+>   border rather than ending in a marker. Pre-existing at 240px (the same
+>   happens to a long title at a desk) and merely more frequent at 128px, so
+>   fixing it is a desktop change.
+> - **The label tap is 31px, not 32** -- `border-box` plus the row's bottom
+>   border. One pixel, named so it is not rediscovered as a bug.
+> - **A phone still has no way to see a dependency ARROW's direction** other
+>   than reading it off the chart; the drawer lists predecessors, which is the
+>   capability. Nothing is lost, but the two are not the same view.
+>
+> **HANDOFFS. Task 6:** new phone-only testids, one pair per task row --
+> `gantt-tap-<taskId>` (the chart row) and `gantt-label-tap-<taskId>` (the name
+> in the sidebar). Both are `display: none` at a desk, so a desktop journey
+> cannot see them and a phone journey can rely on them; `gantt-bar-<taskId>`,
+> `gantt-group-<id>`, `gantt-arrow-<pred>-<succ>`, `compact-button`,
+> `compact-button-<projectId>` and `gantt-zoom` are unchanged at both widths.
+> Three things that will otherwise cost a CI cycle. **(1)** The opening scroll
+> means a phone journey does NOT start at `scrollLeft: 0`, so a fixture whose
+> tasks are all in the past or all in the future opens somewhere specific --
+> assert on the drawer, never on a pixel offset. **(2)** Driving the drawer's
+> **Add dependency** picker needs Radix's own idiom: opening it leaves focus on
+> the trigger, and a synthetic click on the option does not commit -- Playwright
+> real input is fine, but if a journey ever reaches for `evaluate`, the item
+> commits on ITS OWN Enter after `item.focus()`. **(3)** `window.confirm` gates
+> both Remove-slack buttons, and the per-project one is now reachable at a phone
+> viewport, so a journey that taps it needs a dialog handler. Worth pinning
+> because nothing else re-checks them: that the bottom bar is hit-testable on
+> `/gantt` (the tap-theft regression), and that six arrow presses on a focused
+> bar change no dates at a phone viewport while Enter opens the drawer.
+> **Everyone:** the sidebar's width is the only Gantt constant a stylesheet can
+> take over -- `ROW_HEIGHT` and `pxPerDay` feed `rowTop` and the SVG arrow
+> endpoints, and an SVG path cannot hold a `calc()`, so a phone-specific row
+> height would mean re-deriving every arrow coordinate. That is why the row
+> pitch, and therefore the 32px tap target, is what it is.
+
 ### Task 6: Phone-viewport e2e + release prep (v0.10.0)
 
 **Files:** `e2e/mobile.spec.ts` (new), three package.jsons, `manifest.toml`, server lockfile.

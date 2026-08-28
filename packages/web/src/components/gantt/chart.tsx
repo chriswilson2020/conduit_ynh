@@ -5,9 +5,11 @@ import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerE
 import { clsx } from "clsx";
 import { Link } from "@tanstack/react-router";
 import type { GanttTask, ShiftResult, TaskDependency } from "@conduit/shared";
+import { todayLocalIso } from "../../lib";
 import { useAddDependency, useCompactSchedule, useGantt, useShiftTask } from "../../queries";
 import type { GanttTarget } from "../../queries";
 import { Button } from "../ui/button";
+import { mobileMediaQuery } from "../../use-is-mobile";
 import { GanttBar } from "./bar";
 import { GanttArrows } from "./arrows";
 import type { PendingConnector } from "./arrows";
@@ -15,8 +17,9 @@ import { GanttTimescale, GanttTodayLine, GanttWeekendLayer } from "./timescale";
 import type { Zoom } from "./geometry";
 import {
   DAY_ZOOM_PX_PER_DAY, DEFAULT_PROJECT_COLOR, GRID_MAX_HEIGHT, GROUP_HEADER_HEIGHT,
-  HEADER_HEIGHT, ROW_HEIGHT, SIDEBAR_WIDTH, WEEK_ZOOM_PX_PER_DAY,
-  accumulateNudge, applyOffsetDays, clampOffsetDays, computeRange, dayIndexToIso, isoToDayIndex,
+  HEADER_HEIGHT, ROW_HEIGHT, SIDEBAR_WIDTH_CSS, WEEK_ZOOM_PX_PER_DAY,
+  accumulateNudge, applyOffsetDays, clampOffsetDays, computeRange, dayIndexToIso,
+  initialScrollLeft, isoToDayIndex,
 } from "./geometry";
 import type { DragMode, NudgeState } from "./geometry";
 
@@ -95,6 +98,34 @@ const NUDGE_DEBOUNCE_MS = 200;
  * Together these mean at most one shiftTask call per task is ever in flight,
  * and its optimistic snapshot/rollback can't be clobbered by a sibling call
  * for the same task racing it.
+ *
+ * BELOW THE BREAKPOINT (Phase 6) -- the same chart, read-only, with pan and
+ * zoom, and a tap on a row opens the task drawer, where dates AND
+ * dependencies are both editable. So nothing the chart can do at a desk
+ * becomes unreachable from a phone; it is reached by a different gesture.
+ * Four separate mechanisms carry that, and which one applies is decided by
+ * what CSS can and cannot do:
+ *
+ *   - The pointer paths are CLASSES, in bar.tsx: the move overlay stops
+ *     taking pointers (it still paints the title), and the two resize strips
+ *     and the dependency handle are not rendered at all. So a touch drag
+ *     cannot even begin, which is the point -- a bar that follows a finger
+ *     and then snaps back is worse than one that never moved.
+ *   - The KEY handler cannot be a class -- no CSS property stops a key event
+ *     -- so handleBarKeyDown reads the breakpoint imperatively, once, at the
+ *     moment a key arrives. Spec Amendment 1.
+ *   - The OPENING SCROLL cannot be a class either, for the same kind of
+ *     reason, and is read the same way at mount. Spec Amendment 4.
+ *   - Everything else is layout, and therefore classes: the sidebar's width
+ *     (via a custom property, since an inline JavaScript number cannot be
+ *     re-scaled by a variant), the grid's stacking context, and the tap
+ *     layers themselves.
+ *
+ * Those two imperative reads are the whole of the JavaScript this chart
+ * spends on the breakpoint. Neither subscribes, re-renders or builds a second
+ * component tree, which is what the phase's three-site cap on useIsMobile()
+ * exists to prevent; both build their query from mobileMediaQuery(), so there
+ * is still exactly one definition of where the breakpoint is.
  */
 
 const EMPTY_TASKS: GanttTask[] = [];
@@ -213,7 +244,7 @@ const GanttGroupCompactButton = memo(function GanttGroupCompactButton({
       data-testid={`compact-button-${projectId}`}
       onClick={handleClick}
       disabled={compactSchedule.isPending}
-      className="ml-auto shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[10px] font-medium text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+      className="ml-auto shrink-0 rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[10px] font-medium text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50 max-md:hidden"
     >
       Remove slack
     </button>
@@ -228,16 +259,20 @@ const GanttGroupCompactButton = memo(function GanttGroupCompactButton({
 // are themselves stable (useCallback in GanttChart), so passing them down
 // doesn't defeat this memoisation.
 const Sidebar = memo(function Sidebar({
-  rows, taskCount, onGroupCompacted, onGroupCompactEmpty, onGroupCompactError,
+  rows, taskCount, onOpenTask, onGroupCompacted, onGroupCompactEmpty, onGroupCompactError,
 }: {
   rows: ChartRow[];
   taskCount: number;
+  /** Phone only -- what a tap on a task's NAME opens. Its identity changes
+   * only when the PAGE re-renders (a navigation), never on a drag frame, so
+   * it does not cost this component its memoisation. */
+  onOpenTask: (taskId: string) => void;
   onGroupCompacted: (result: ShiftResult) => void;
   onGroupCompactEmpty: () => void;
   onGroupCompactError: (err: unknown) => void;
 }) {
   return (
-    <div className="sticky left-0 z-20 border-r border-slate-200 bg-white" style={{ width: SIDEBAR_WIDTH, flexShrink: 0 }}>
+    <div className="sticky left-0 z-20 border-r border-slate-200 bg-white" style={{ width: SIDEBAR_WIDTH_CSS, flexShrink: 0 }}>
       <div
         className="sticky top-0 z-30 flex items-center border-b border-slate-200 bg-white px-2 text-xs font-semibold text-slate-500"
         style={{ height: HEADER_HEIGHT }}
@@ -274,7 +309,7 @@ const Sidebar = memo(function Sidebar({
         <div
           key={row.key}
           className={clsx(
-            "flex items-center truncate border-b border-slate-100 text-xs text-slate-700",
+            "flex items-center truncate border-b border-slate-100 text-xs text-slate-700 max-md:relative",
             row.isChild ? "pl-6 pr-2" : "px-2",
             row.task.status === "done" && "text-slate-400 line-through",
           )}
@@ -282,6 +317,21 @@ const Sidebar = memo(function Sidebar({
           title={row.task.title}
         >
           {row.task.title}
+          {/* The task's NAME as a tap target, phone only. This is the half of
+             the pair that needs no panning at all: the sidebar is sticky, so
+             a task's name is on screen whatever the timeline is scrolled to,
+             and this covers the row it labels. Absent at a desk, where it
+             would put a click on a row that has never had one -- the
+             positioning it needs is scoped to the phone for the same reason.
+             Hidden from assistive technology because the bar it duplicates is
+             already a focusable button with a label and an Enter binding;
+             this exists for a thumb, and nothing is reachable only here. */}
+          <span
+            data-testid={`gantt-label-tap-${row.task.id}`}
+            aria-hidden="true"
+            className="absolute inset-0 hidden max-md:block"
+            onClick={() => onOpenTask(row.task.id)}
+          />
         </div>
       )))}
     </div>
@@ -360,6 +410,16 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
   // updated together by beginCommit/endCommit.
   const [committingIds, setCommittingIds] = useState<Set<string>>(() => new Set());
 
+  // The scrolling grid box, so the phone's opening scroll can be set on it
+  // (see the layout effect below). Nothing else reads it.
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  // Which pixels-per-day value that opening scroll has already been applied
+  // for. Not a boolean, because a zoom change makes a scroll offset in the
+  // old scale meaningless (day 14 is 420px at day zoom and 180px at week
+  // zoom), so the target is re-applied once per zoom -- and never again for
+  // the same one, which is what keeps a refetch or an SSE update from
+  // yanking the view out from under a thumb mid-pan.
+  const appliedScrollZoomRef = useRef<number | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const hoveredTargetRef = useRef<string | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -421,6 +481,36 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
       setDragVisual(null);
     }
   }, [taskById]);
+
+  // THE PHONE'S OPENING SCROLL (spec Amendment 4). Measured before this
+  // existed: computeRange starts the window a fortnight before the earliest
+  // task, and a phone has a fraction of the desktop's visible timeline, so
+  // the chart opened on padding with no bar in it at all -- read-only
+  // shipping as blank. geometry.ts's initialScrollLeft picks the day; this
+  // applies it.
+  //
+  // The width is read IMPERATIVELY, once, at the moment it is needed, which
+  // the spec's Amendment 4 permits for the same reason Amendment 1 permits
+  // it in the key handler below: it opens no subscription, triggers no
+  // re-render and creates no second component tree, and the query still
+  // comes from the one place the breakpoint is defined. Desktop is left
+  // exactly where it was -- scrolling at every width would be a desktop
+  // change, which this phase may not make.
+  //
+  // A LAYOUT effect, so the offset is in place before the browser paints
+  // rather than as a visible jump after it.
+  useLayoutEffect(() => {
+    const grid = gridRef.current;
+    if (grid === null || taskRows.length === 0) return;
+    if (appliedScrollZoomRef.current === pxPerDay) return;
+    if (!window.matchMedia(mobileMediaQuery()).matches) return;
+    appliedScrollZoomRef.current = pxPerDay;
+    const startDays: number[] = [];
+    for (const row of taskRows) {
+      if (row.task.startDate !== null) startDays.push(isoToDayIndex(row.task.startDate, rangeStartMs));
+    }
+    grid.scrollLeft = initialScrollLeft(startDays, isoToDayIndex(todayLocalIso(), rangeStartMs), pxPerDay);
+  }, [taskRows, pxPerDay, rangeStartMs]);
 
   const triggerFlash = useCallback((ids: string[], kind: "shifted" | "compacted" | "empty" = "shifted") => {
     if (flashTimeoutRef.current !== null) window.clearTimeout(flashTimeoutRef.current);
@@ -792,6 +882,25 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
     // left alone (no preventDefault) rather than swallowed, in case a future
     // feature wants row-to-row vertical navigation.
     if (isVertical && !e.shiftKey) return;
+    // BELOW THE BREAKPOINT THE CHART IS READ-ONLY, and this is the one place
+    // CSS cannot enforce that: no CSS property stops a key event, and every
+    // branch past this line commits a real schedule change (Arrow moves,
+    // Shift+Arrow resizes). Because the breakpoint is width-based this also
+    // covers a narrowed desktop window and a tablet with a keyboard.
+    //
+    // An imperative one-shot read, permitted by the spec's Amendment 1 and
+    // deliberately NOT the hook: reading here opens no subscription, causes
+    // no re-render and builds no second component tree, which is what the
+    // three-site cap exists to prevent. The query comes from the same
+    // function the hook builds its own from, so CSS and this cannot disagree
+    // about where the breakpoint is.
+    //
+    // Returned WITHOUT preventDefault, unlike every other refusal above, so
+    // the arrow key keeps its default action -- which inside a scrolling
+    // grid is exactly the pan the phone chart is supposed to have. Enter is
+    // handled well above this and still opens the drawer, which is where a
+    // phone reschedules.
+    if (window.matchMedia(mobileMediaQuery()).matches) return;
     // A commit already in flight for this task ignores further nudges until
     // it resolves -- see this file's doc comment.
     if (inFlightTaskIdsRef.current.has(task.id)) return;
@@ -903,11 +1012,40 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
         </div>
       )}
 
-      <div className="relative overflow-auto rounded-md border border-slate-200" style={{ maxHeight: GRID_MAX_HEIGHT }}>
-        <div className="flex" style={{ width: SIDEBAR_WIDTH + chartWidth }}>
+      {/* Four phone-only changes ride on this element, all of them layout,
+         all of them scoped to below the breakpoint:
+
+         1. A STACKING CONTEXT. Measured at 375px before it was here: this
+            grid's own sticky sidebar and header carry z-indices and are not
+            portalled, so they outranked the bottom navigation bar -- which
+            has no z-index by design, so that portalled overlays land above
+            it by DOM order. The bar was not merely painted over: a hit test
+            over its Mail tab returned a Gantt row, i.e. the navigation was
+            untappable on this page. Confining those z-indices to this box
+            puts the bar back on top without giving it a z-index of its own.
+         2. THE PAGE'S SIDE PADDING, GIVEN BACK. main carries 24px each side,
+            which is 48px of a 375px screen spent on margin around a chart
+            that has too little width already.
+         3. SQUARE, BORDERLESS SIDES, because a rounded border pushed to the
+            screen edge reads as a rendering fault rather than a card.
+         4. THE SIDEBAR'S WIDTH, as a custom property this box declares and
+            geometry.ts's SIDEBAR_WIDTH_CSS reads. That is the whole trick
+            that makes this chart fit a phone: 240px of a 325px-wide grid
+            left 85px of timeline -- 2.8 day columns -- and it could not be
+            re-scaled by a breakpoint variant, because it was an inline
+            JavaScript number. As a custom property the stylesheet can take
+            it over, and the desktop value stays the fallback in geometry.ts.
+            Measured after: 245px of timeline, 8.2 day columns. */}
+      <div
+        ref={gridRef}
+        className="relative overflow-auto rounded-md border border-slate-200 max-md:isolate max-md:-mx-6 max-md:rounded-none max-md:border-x-0 max-md:[--gantt-sidebar-width:8rem]"
+        style={{ maxHeight: GRID_MAX_HEIGHT }}
+      >
+        <div className="flex" style={{ width: `calc(${SIDEBAR_WIDTH_CSS} + ${chartWidth}px)` }}>
           <Sidebar
             rows={rows}
             taskCount={taskRows.length}
+            onOpenTask={onOpenTask}
             onGroupCompacted={handleGroupCompacted}
             onGroupCompactEmpty={handleGroupCompactEmpty}
             onGroupCompactError={handleGroupCompactError}
@@ -945,6 +1083,37 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
                   />
                 );
               })}
+              {/* THE PHONE'S TAP TARGET, and it is the ROW, not the bar (spec
+                 Amendment 6). A bar is 22px tall and, for a same-day task at
+                 week zoom, 6.4px wide; the row it sits in is the full width
+                 of the chart. Growing the bar's own box with negative insets
+                 would reach the 44px floor and buy nothing, because at a
+                 32px row pitch it only decides which of two overlapping
+                 layers wins a 6px band -- it does not improve anyone's aim,
+                 and it puts the WRONG task's drawer one tap away. A
+                 full-width row target removes the horizontal precision
+                 problem outright, which is the thing that actually defeats a
+                 6.4px bar, and leaves the vertical at the 32px row pitch --
+                 a deliberate, recorded exception to the phase's 44px floor.
+
+                 Rendered after the bars so it takes the tap rather than the
+                 bar's own move overlay, which keeps its title text and only
+                 gives up its pointers below the breakpoint. Absent at a
+                 desk, where a click on a bar has never opened anything and
+                 a drag is the whole interaction. Hidden from assistive
+                 technology for the same reason as its sidebar twin: the bar
+                 is already a focusable button, and Enter on it opens the
+                 same drawer. */}
+              {taskRows.map((row) => (
+                <div
+                  key={`tap-${row.task.id}`}
+                  data-testid={`gantt-tap-${row.task.id}`}
+                  aria-hidden="true"
+                  className="absolute left-0 hidden max-md:block"
+                  style={{ top: rowTop.get(row.task.id) ?? 0, height: ROW_HEIGHT, width: chartWidth }}
+                  onClick={() => onOpenTask(row.task.id)}
+                />
+              ))}
               <GanttArrows
                 dependencies={dependencies}
                 taskById={taskById}
