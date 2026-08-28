@@ -403,8 +403,12 @@ function Column({
  * journeys count `[data-testid^="column-"]` and address `card-<id>` at the page
  * level, and a display:none copy is still in the DOM to be counted.
  *
- * WHAT UNMOUNTING COSTS INSTEAD is a focus move, and it is paid below rather
- * than skipped: see the move handler.
+ * BE PRECISE ABOUT WHAT THAT COSTS, because it is easy to write down as more
+ * than it is. Choosing the branch costs nothing at all: it happens once, on a
+ * width change, with focus wherever it was in the shell. The focus move paid
+ * for below is a cost of the MOVE, not of the branch -- a card leaving this
+ * stage takes its own controls with it at any width, and the inbox would have
+ * had the same problem if it unmounted a thread row.
  */
 function StageView({
   stage,
