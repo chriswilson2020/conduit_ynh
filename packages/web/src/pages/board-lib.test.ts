@@ -57,6 +57,13 @@ describe("boardStageView above the breakpoint", () => {
    * shared frozen object, so a future edit that builds a per-call desktop view
    * fails here even if it happens to build an equal one -- and it is that
    * sharing the freeze test below depends on.
+   *
+   * BE CLEAR ABOUT WHAT THE EIGHTEEN BUY HERE, since it is less than it looks:
+   * the function returns on its FIRST LINE for `isMobile: false`, so all
+   * eighteen cases exercise one `return` and the identity check is what makes
+   * this strong. The breadth earns its keep in the phone half, where the
+   * fallback, the picker and the target filter actually branch -- see
+   * "holds its invariants over the whole cross-product" below.
    */
   it("returns the unchanged board for every input", () => {
     // The cross-product IS this assertion's value, so its size is pinned too:
@@ -149,6 +156,46 @@ describe("boardStageView below the breakpoint", () => {
       if (view.stage !== null) reached.add(view.stage.id);
     }
     expect([...reached].sort()).toEqual(STAGES.map((stage) => stage.id).sort());
+  });
+
+  /**
+   * THE SAME EIGHTEEN, RUN THROUGH THE HALF THAT ACTUALLY BRANCHES.
+   *
+   * A quality review made the fair point that the desktop pin's cross-product
+   * proves less than it looks: `boardStageView` returns DESKTOP_VIEW on its
+   * FIRST LINE, so all eighteen desktop cases exercise one `return`, and what
+   * makes that assertion strong is the identity check, not the breadth. The
+   * breadth belongs here instead -- the phone half is where the fallback, the
+   * picker and the target filter all actually run, and it had been eight
+   * hand-picked cases.
+   *
+   * Stated as PROPERTIES rather than expected values, because eighteen
+   * hand-written expectations would be the same sample in a longer form.
+   */
+  it("holds its invariants over the whole cross-product", () => {
+    for (const combination of COMBINATIONS) {
+      const view = boardStageView({ isMobile: true, ...combination });
+      const { stages, archived } = combination;
+
+      // The picker is the caller's own array, by reference -- the identity
+      // decision the page's memo depends on.
+      expect(view.picker).toBe(stages);
+
+      // A stage is shown exactly when there is one to show, and it is always
+      // one of the pipeline's own.
+      expect(view.stage === null).toBe(stages.length === 0);
+      if (view.stage !== null) expect(stages).toContain(view.stage);
+
+      // Nowhere to move is exactly: no stage, an archived board, or a
+      // pipeline with a single stage.
+      const nowhere = stages.length <= 1 || archived;
+      expect(view.moveTargets).toHaveLength(nowhere ? 0 : stages.length - 1);
+
+      // A target list never offers the stage the card is already in, and
+      // never reorders the pipeline.
+      expect(view.moveTargets).not.toContain(view.stage);
+      expect(view.moveTargets).toEqual(stages.filter((s) => s !== view.stage && !nowhere));
+    }
   });
 });
 
@@ -295,13 +342,29 @@ describe("the desktop board in pages/board.tsx", () => {
    * is shaped identically at `pages/inbox.tsx`'s own call and is unguarded
    * there, so this closes it for one file rather than for the phase.
    *
-   * What it cannot see, like every source guard in this package: a rename
-   * applied consistently on both sides, a value routed through a local, or the
-   * props spread from an object.
+   * THE ELEMENT IS COUNTED, not just found. `indexOf` takes the FIRST
+   * `<StageView`, so a quality review walked past this guard by adding a
+   * mis-wired second one AFTER the real element -- the first still spelled
+   * everything correctly and the assertions passed. (A second one BEFORE it was
+   * already caught, which is exactly the asymmetry that makes "found" the wrong
+   * test.) One element, checked; two is a failure whatever either says.
+   *
+   * WHAT IT STILL CANNOT SEE, and the last one is a property of this package's
+   * shared stripper rather than of this test:
+   * - a rename applied consistently on both sides;
+   * - a value routed through a local, or the props spread from an object;
+   * - **the correct spellings kept alive in a TRAILING `//` comment** while the
+   *   real props are swapped. `withoutComments` deliberately strips only
+   *   comments that BEGIN a line (a `//` inside a string is usually a URL, and
+   *   the looser form threw away real code -- test/source.ts carries that
+   *   history). The consequence is that these guards match TEXT, not code, and
+   *   a trailing comment is text. Demonstrated by a reviewer; recorded rather
+   *   than chased, because the fix is a parser and the evasion requires someone
+   *   deliberately writing the right answer beside the wrong one.
    */
   it("wires the stage view's same-typed props to the right halves of the view", () => {
+    expect(code.match(/<StageView\b/g)).toHaveLength(1);
     const at = code.indexOf("<StageView");
-    expect(at).toBeGreaterThan(-1);
     const element = code.slice(at, code.indexOf("/>", at));
     expect(element).toContain("stage={stageView.stage}");
     expect(element).toContain("picker={stageView.picker}");

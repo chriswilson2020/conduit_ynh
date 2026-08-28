@@ -580,17 +580,98 @@ Above the breakpoint the board is untouched — including its drag-and-drop. ~8 
 >   three-sites guard. **Seven mutations run, all died:** the gate inverted
 >   (typecheck), the props swapped, `isMobile` negated, the desktop column
 >   class edited, a hand-rolled second move path, the rot boundary loosened to
->   `>=`, and a fourth `useIsMobile()` site.
+>   `>=`, and a fourth `useIsMobile()` site. **The quality round added one more
+>   -> 1801** (the phone-half cross-product; the element count folded into the
+>   existing sibling-prop guard) and ran two
+>   further mutations, both of which died: a mis-wired second `<StageView>`
+>   placed AFTER the real one, and a second `useIsMobile()` call inside
+>   `shell.tsx`.
+>
+> **FROM THE QUALITY ROUND** (it called `board-lib.ts` "the strongest unit file
+> the phase has produced" -- 8 behaviour mutants, all 8 died -- verified the
+> move path independently down to the server's matching both-null branch and
+> the shared `lockSiblingGroup`/`midpoint`, and singled out the close handler's
+> `isConnected` check as "the case most implementations miss". Its findings
+> were two more false claims, a state bug, a cost estimate that was wrong by
+> enough to have changed a decision, and two guard gaps):
+>
+> - **AN API GAP, FOUND BY DISBELIEVING A COMMENT.** `board-lib.ts` claimed an
+>   archived pipeline's move would be refused by the server "anyway". **False,
+>   and verified so:** `moveDeal` (services/deals.ts) checks the DEAL's
+>   `archivedAt`, its status and the target stage's `pipelineId` -- it never
+>   loads the pipeline row, and `archivePipeline` does not cascade `archivedAt`
+>   onto deals. `createDeal`, `createStage` and `updateStage` all DO gate on the
+>   pipeline; `moveDeal` alone does not, and no test covers it (only an archived
+>   DEAL, at `deals.test.ts:330`). So `POST /api/deals/<id>/move` on an archived
+>   pipeline **succeeds**. The UI decision to offer no targets is unchanged and
+>   still right -- it matches the desktop, whose drag sensors are simply absent
+>   -- but the UI is the only thing enforcing it. **Backlog item, not fixed
+>   here.**
+> - **THE FALLBACK'S NAMED CAUSES DID NOT EXIST.** It said a stage could be
+>   "deleted or renamed away in another tab". There is no stage-delete endpoint
+>   at all (`routes/pipelines.ts` has POST/PATCH/reorder and no DELETE;
+>   `deals.ts` states the rule outright), and a rename changes `name` while the
+>   lookup is by `id`. The fallback stays -- it is correct defensive code and
+>   the initial-null path is the common one -- but it now names causes that are
+>   real.
+> - **THE MOVE SHEET COULD RE-OPEN BY ITSELF, and now cannot.** `open` derives
+>   from the live list, but `movingDealId` was cleared only by a dismissal or a
+>   completed move. So: open the sheet on deal D, a colleague moves D away over
+>   SSE (the sheet closes, focus correctly goes to the h1) -- and the id
+>   survives. The colleague moves D back and the sheet re-opened with no user
+>   action, taking focus to its first target. The same event the `isConnected`
+>   check was praised for handling: it covered the focus half and not the state
+>   half. An effect now clears the id when the deal leaves the list. **Verified
+>   live at 375px against a real server:** open on Globex, move it out
+>   out-of-band (sheet closed, `activeElement` the `h1`), move it back (card
+>   returns, `sheetReopened: 0`, focus still on the `h1`).
+> - **THE LIVE REGION IS RETRACTED ON FAILURE NOW, because the cost estimate
+>   that decided otherwise was wrong.** The previous round justified leaving it
+>   as needing the mutation's outcome "threaded down into the component"; the
+>   failure callback already lives on the page beside the error banner, and the
+>   whole change is one parameter on `onMove`. **Verified live with a delayed
+>   forced 409:** the line reads "Moved Initech migration to Qualified." with
+>   the card gone (3 cards), then empties with the card back (4 cards) and the
+>   banner carrying the message. A wrong cost estimate is worth recording
+>   separately from the behaviour it produced.
+> - **TWO GUARD GAPS CLOSED, both mutation-verified.** The sibling-prop guard
+>   used `indexOf`, so a mis-wired SECOND `<StageView>` placed AFTER the real
+>   one walked straight past it (one placed BEFORE was already caught -- that
+>   asymmetry is what makes "found" the wrong test); it now counts the element
+>   and fails at two. The three-sites guard counted FILES, so a second
+>   `useIsMobile()` call inside `shell.tsx` left the suite green under a test
+>   named "at exactly the three sites"; it now pushes one entry per call. Both
+>   evasions were re-run and both now fail. **One evasion is recorded rather
+>   than closed:** the correct spellings kept alive in a TRAILING `//` comment
+>   while the real props are swapped. `withoutComments` strips only comments
+>   that BEGIN a line -- deliberately, per `test/source.ts`'s own history -- so
+>   these guards match TEXT, not code. The fix is a parser; the evasion needs
+>   someone writing the right answer beside the wrong one.
+> - **THE PHONE HALF NOW GETS THE CROSS-PRODUCT TOO.** Fair point from the
+>   review: the desktop pin's eighteen cases all exercise one `return` on the
+>   function's first line, so the identity assertion is what makes it strong,
+>   not the breadth. The same eighteen now run through `isMobile: true` as
+>   PROPERTY assertions -- picker identity, a stage shown exactly when there is
+>   one, target count, the current stage never offered, pipeline order
+>   preserved -- which is the half where the fallback, the picker and the filter
+>   actually branch.
 >
 > **RECORDED, NOT FIXED.**
 >
-> - **The `role="status"` line is optimistic and is never retracted.** It is
->   written when the mutation is dispatched, exactly as the card's
->   disappearance is, so a server refusal leaves "Moved X to Y." standing above
->   a card that is back. The failure does speak (the page's error banner, via
->   the per-call `onError`) and the card's return is itself visible, so this is
->   a roughness rather than a silence; retracting it means threading the
->   mutation's outcome down into the component.
+> - **The picker is not sticky**, and on a busy stage that is the real cost of
+>   this surface -- rated by the review as a larger real-use problem than the
+>   picker-scroll item below. 200 deals is roughly 12,000px of list, so `New
+>   deal` and `+ Stage` sit at the bottom of it and switching stages means
+>   scrolling all the way back. `sticky top-0` with a background plus `-mx-6
+>   px-6` to bleed `<main>`'s padding is the fix; it wants measuring on a real
+>   long list rather than adding at the end of a review round. **The source
+>   comment deliberately does NOT spell those class names**, and this one can
+>   only afford to because Tailwind's scan is rooted at `packages/web` and does
+>   not reach `docs/`: naming them in the source emitted a real, dead `.-mx-6`
+>   rule into the built stylesheet (Task 1's hazard, caught here by the built
+>   CSS growing 50 bytes and its hash moving).
+> - **An archived pipeline reached mid-sheet** leaves the targets empty, so the
+>   sheet body renders nothing and Close is the only exit. Degrades acceptably.
 > - **The `useMemo` on `stageView` buys nothing today**, and its comment now
 >   says so rather than claiming otherwise. No card is `React.memo`'d and the
 >   callbacks the cards receive are fresh identities every render, so memoising
@@ -603,7 +684,8 @@ Above the breakpoint the board is untouched — including its drag-and-drop. ~8 
 > - **The picker does not scroll the chosen stage into view.** Unreachable
 >   today (it opens on the first stage and the DOM node persists across picks),
 >   but a pipeline with many stages plus a future restored selection would meet
->   it. Same class as the record rail's tab strip, which Task 2 left as is.
+>   it. Milder than it reads, per the quality round: `StageHeader` names the
+>   current stage directly above the list, so the redundancy saves it.
 >
 > **HANDOFFS. Task 5:** the Radix focus finding above is yours too -- your
 > Gantt->drawer path ends in a drawer whose closer is its only exit, and

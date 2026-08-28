@@ -106,9 +106,22 @@ const DESKTOP_VIEW: BoardStageView<never> = Object.freeze({
  * offering the stages in some other sequence would be describing a different
  * board from the one the desk shows.
  *
- * An archived pipeline offers NONE. Its board is read-only at a desk (the drag
- * sensors are disabled, `services/deals.ts` refuses the move anyway), so a
- * phone that offered the action would be offering a button that 403s.
+ * An archived pipeline offers NONE, because its board is read-only at a desk:
+ * `useKanbanBoard` is given an empty sensor list, so no drag can start.
+ * Matching that is the whole reason -- a phone that could move a deal on a
+ * board a desk cannot would be the phase changing behaviour rather than
+ * relaying it.
+ *
+ * BE CAREFUL WHAT YOU CLAIM ABOUT THE SERVER HERE, because an earlier version
+ * of this comment said the API "refuses the move anyway" and that is FALSE.
+ * `moveDeal` (services/deals.ts) checks the DEAL's `archivedAt`, its status and
+ * the target stage's `pipelineId`; it never loads the pipeline row, and
+ * archiving a pipeline does not cascade `archivedAt` onto its deals. So
+ * `POST /api/deals/<id>/move` on an archived pipeline SUCCEEDS -- unlike
+ * `createDeal`, `createStage` and `updateStage`, which all do gate on the
+ * pipeline. The UI decision above is unchanged and still right, but it is the
+ * only thing enforcing it: the control would have worked, not 403'd. Recorded
+ * as an API gap for the backlog rather than fixed from here.
  */
 export function stageMoveTargets<T extends StageLike>(
   stages: readonly T[],
@@ -122,15 +135,23 @@ export function stageMoveTargets<T extends StageLike>(
 /**
  * What the board shows, at either width.
  *
- * THE FALLBACK IS THE INTERESTING PART. The chosen stage is component state --
- * see the page for why it is not in the URL -- so it can name a stage that is
- * no longer there: a stage deleted or renamed away in another tab, or simply
- * the null the page starts with before anything has been picked. Rather than
- * making the page defend against that, an unresolvable choice falls back to the
- * FIRST stage, which is the pipeline's own entry point and the stage a board
- * opens on. Only a pipeline with no stages at all yields no stage view; there
- * is nothing to show and the board's own empty state (an "+ Stage" tile and
- * nothing else) is the honest screen.
+ * THE FALLBACK IS THE INTERESTING PART, and it is worth naming the causes that
+ * EXIST rather than the ones that sound plausible. An earlier version of this
+ * comment said a stage could be "deleted or renamed away in another tab";
+ * neither is real. There is no stage-delete endpoint at all (routes/pipelines.ts
+ * has POST/PATCH/reorder and no DELETE -- services/deals.ts states the rule
+ * outright: pipelines and stages are archive-only, never hard-deleted), and a
+ * rename changes `name` while the lookup below is by `id`, so it cannot make a
+ * choice unresolvable.
+ *
+ * What DOES reach the fallback: the null the page starts with, before anything
+ * has been picked -- which is every first render of this page and so the common
+ * path, not the exotic one. Beyond that it is defensive: an id held across a
+ * route change to a different pipeline, or a future stage-removal feature. The
+ * fallback is the FIRST stage, which is the pipeline's own entry point and
+ * where a board opens. Only a pipeline with no stages at all yields no stage
+ * view; there is nothing to show, and the board's own empty state (a "+ Stage"
+ * tile and nothing else) is the honest screen.
  */
 export function boardStageView<T extends StageLike>(input: BoardStageViewInput<T>): BoardStageView<T> {
   if (!input.isMobile) return DESKTOP_VIEW;

@@ -112,11 +112,16 @@ describe("the hook's call sites", () => {
 
   it("is called at exactly the three sites the spec names", () => {
     const src = new URL("./", import.meta.url);
+    // ONE ENTRY PER CALL, not per file. The first version of this pushed a
+    // filename once however many times the file called the hook, so a SECOND
+    // call added inside shell.tsx left the suite green under a test named "at
+    // exactly the three sites" and a DONE block claiming the set was closed.
+    // The spec counts sites; so does this.
     const callers: string[] = [];
     for (const file of walk(src)) {
-      if (withoutComments(readFileSync(file, "utf8")).includes("useIsMobile(")) {
-        callers.push(file.pathname.split("/src/")[1] ?? file.pathname);
-      }
+      const name = file.pathname.split("/src/")[1] ?? file.pathname;
+      const hits = withoutComments(readFileSync(file, "utf8")).match(/useIsMobile\(/g) ?? [];
+      for (const _hit of hits) callers.push(name);
     }
     expect(callers.sort()).toEqual(["components/shell.tsx", "pages/board.tsx", "pages/inbox.tsx"]);
   });

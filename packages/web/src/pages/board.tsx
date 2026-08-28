@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, RefObject } from "react";
 import { DndContext, DragOverlay } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
@@ -213,9 +213,25 @@ export function BoardPage() {
    * the optimistic move back first. Without it a failure would be a card that
    * silently reappeared, which at a desk is at least visible as a snap-back
    * mid-gesture and on a phone is nothing at all.
+   *
+   * `onFailed` is how the stage view unsays what it said. Its live region
+   * announces the move optimistically, as the card's own disappearance is, and
+   * an earlier version of this code left that line standing over a card the
+   * server had refused and put back -- justified in a comment as needing the
+   * mutation's outcome "threaded down into the component", which was simply
+   * wrong: the callback that owns the failure is already right here, and the
+   * whole of it is this parameter.
    */
-  function handleMoveDealToStage(deal: Deal, target: Stage) {
-    moveDeal.mutate({ id: deal.id, pipelineId, stageId: target.id }, { onError: reportError });
+  function handleMoveDealToStage(deal: Deal, target: Stage, onFailed: () => void) {
+    moveDeal.mutate(
+      { id: deal.id, pipelineId, stageId: target.id },
+      {
+        onError: (error) => {
+          onFailed();
+          reportError(error);
+        },
+      },
+    );
   }
 
   const columns = (
@@ -460,7 +476,9 @@ function StageView({
   archived: boolean;
   headingRef: RefObject<HTMLHeadingElement | null>;
   onPick: (stageId: string) => void;
-  onMove: (deal: Deal, target: Stage) => void;
+  /** The third argument retracts the live region if the server refuses; see
+   * the page's handler and this component's own handleMove. */
+  onMove: (deal: Deal, target: Stage, onFailed: () => void) => void;
 }) {
   const [movingDealId, setMovingDealId] = useState<string | null>(null);
   const [moveResult, setMoveResult] = useState<string | null>(null);
@@ -481,6 +499,26 @@ function StageView({
   // that leaves this stage (a move, an SSE update, a win in another tab) takes
   // the sheet with it instead of stranding it over a card that is gone.
   const movingDeal = deals.find((deal) => deal.id === movingDealId) ?? null;
+
+  /**
+   * ...AND THE ID GOES WITH IT, which the derivation above does not do on its
+   * own. Closing the sheet that way is only half the job: `movingDealId` is
+   * cleared by a dismissal and by a completed move, not by the deal
+   * disappearing, so it OUTLIVES the sheet. If the deal then comes back -- a
+   * colleague moving it out and back over SSE, or an optimistic move this page
+   * rolls back on a 409 -- `movingDeal` resolves again, `open` flips to true,
+   * and a sheet re-opens that nobody asked for and takes focus to its first
+   * target with it.
+   *
+   * This is the same event the close handler's `isConnected` check is for; that
+   * check handles the focus half and this handles the state half. An effect
+   * rather than a derivation because clearing it IS a state change: the sheet
+   * is controlled, so React never calls onOpenChange for a close that came from
+   * the data rather than from the user.
+   */
+  useEffect(() => {
+    if (movingDealId !== null && movingDeal === null) setMovingDealId(null);
+  }, [movingDealId, movingDeal]);
 
   function pickStage(stageId: string) {
     // The result line describes a move out of the stage being left; carrying it
@@ -509,19 +547,20 @@ function StageView({
    * The h1 is not what ANNOUNCES the move -- it says the pipeline's name. The
    * live region does, which is why both exist.
    *
-   * THE LIVE REGION IS OPTIMISTIC AND IS NEVER RETRACTED. It is written the
-   * moment the mutation is dispatched, exactly as the card's own disappearance
-   * is, and a server refusal rolls the card back without unwriting the line --
-   * so a failed move leaves "Moved X to Y." standing above a card that is still
-   * there. The failure does speak (the page's error banner, via the per-call
-   * onError), and the card being back is itself visible, so this is a
-   * roughness rather than a silence. Retracting it means threading the
-   * mutation's outcome down into this component, which is a bigger change than
-   * the defect warrants; recorded rather than done.
+   * THE LIVE REGION IS OPTIMISTIC AND IS RETRACTED IF THE SERVER REFUSES. It
+   * is written the moment the mutation is dispatched, exactly as the card's
+   * own disappearance is; the third argument below clears it again from the
+   * page's existing onError, so a refused move does not leave "Moved X to Y."
+   * standing over a card that has been put back.
+   *
+   * A previous round left it standing and justified that as needing the
+   * mutation's outcome threaded down here. That estimate was wrong -- the
+   * failure callback already lives on the page, beside the error banner -- and
+   * it is recorded because a cost estimate is what decided the behaviour.
    */
   function handleMove(target: Stage) {
     if (movingDeal === null) return;
-    onMove(movingDeal, target);
+    onMove(movingDeal, target, () => setMoveResult(null));
     setMoveResult(`Moved ${movingDeal.title} to ${target.name}.`);
     setMovingDealId(null);
     movedRef.current = true;
@@ -535,7 +574,29 @@ function StageView({
           seeing every column at once. shrink-0 on the buttons is what makes the
           container actually scrollable; without it a flex item is still free to
           be squeezed towards its min-content width (the same pairing
-          ui/tabs.tsx documents for the record rail's strip). */}
+          ui/tabs.tsx documents for the record rail's strip).
+
+          IT DOES NOT STICK TO THE TOP, AND ON A BUSY STAGE THAT IS THE REAL
+          COST OF THIS SURFACE. A quality review put the number on it: 200
+          deals is roughly 12,000px of list, so "New deal" and "+ Stage" sit at
+          the bottom of it and switching stages means scrolling all the way
+          back up. The remedy is to pin this strip to the top of the scroll
+          region with an opaque background, and to widen it by negative
+          horizontal margins with matching padding so it bleeds <main>'s
+          gutter and the list does not slide past its edges.
+
+          THE UTILITY NAMES ARE DELIBERATELY NOT SPELLED IN THIS PARAGRAPH.
+          Tailwind v4 scans source as plain text and cannot tell a comment from
+          code, so naming them here would emit real rules for a fix that has
+          not been made -- Task 1 hit exactly this and the constraint is
+          recorded in styles.css. Measured on this very comment: an earlier
+          draft that named them grew the built stylesheet by one dead rule.
+
+          Recorded rather than done: it is a layout change with a
+          scroll-container question behind it (<main> only bounds its content
+          while that content fits, which pages/inbox.tsx's height budget covers
+          at length), and it wants measuring on a real long list rather than
+          adding at the end of a review round. */}
       {/* `role="group"`, not `role="tablist"` or `role="radiogroup"`: both of
           those promise arrow-key navigation between their members, and
           claiming a keyboard contract nothing implements leaves a keyboard
@@ -565,9 +626,20 @@ function StageView({
         ))}
       </div>
 
-      {/* Always mounted, so a screen reader is watching the region before it
-          fills -- components/mail/bulk-bar.tsx's BulkResult, same reasoning.
-          Empty it has no line box and so no height; only the flex gap. */}
+      {/* Always mounted AND never display:none, so a screen reader is watching
+          this region before it fills.
+
+          NOT "the same reasoning as BulkResult", which is what this comment
+          used to say and is now the opposite of the truth: this phase
+          RETRACTED half of that rationale three files away. `bulk-bar.tsx`
+          records that its own `empty:hidden` makes the region display:none
+          until it fills, and a display:none element is not in the
+          accessibility tree either -- so "always mounted" was a claim about
+          the DOM and not about the tree a reader watches. The remedy its
+          comment names is a zero-size region without `empty:hidden`, which is
+          exactly the shape here: an empty <p> has no line box and so no
+          height, costing only the flex gap. Cite it as the fix, not as the
+          precedent. */}
       <p data-testid="stage-move-result" role="status" aria-live="polite" className="text-xs text-slate-500">
         {moveResult}
       </p>
