@@ -675,6 +675,152 @@ git add packages/shared/src/money.ts packages/shared/src/money.test.ts packages/
 git commit -m "feat(shared,api): integer money arithmetic, and the tables a quote is stored in"
 ```
 
+#### TASK 2 DONE — seven divergences, and three things Tasks 3-5 must honour
+
+Commit `b017173`. CI run **33206274811**, tip `b017173`, both jobs green: **1930 tests,
+0 skipped**. On the server: 1892 passed / 38 skipped. Migration is
+`packages/api/drizzle/0009_calm_rhodey.sql`; it creates five tables, drops nothing, and
+alters nothing existing.
+
+The steps above are left as written so the corrections are legible.
+
+1. **`packages/shared` needed one line, and it is not the one Step 3 implies.** The
+   package's `exports` map has `"."` and nothing else, so a sibling module is invisible
+   to api and web until `index.ts` re-exports it -- `fractional.js`'s `export { midpoint }`
+   is the precedent and the only route there is. No `package.json` or tsconfig change.
+   Vitest aliases `@conduit/shared` to `src/index.ts`, but **web does not**: it resolves
+   through `dist`, so the barrel is what Task 5 will actually import. Verified by
+   importing the BUILT package on the server (`packages/shared/dist/money.js` exists,
+   `documentTotals` resolves and computes), not by reading the config.
+
+2. **The arithmetic is BigInt internally, and the plan's version is wrong by a cent.**
+   `Math.trunc((qtyMilli * unitPriceCents + 500) / 1000)` forms the product in double
+   precision, and the product leaves the safe range long before either factor does: at
+   `qtyMilli` 3603500 and `unitPriceCents` 9999999903 it returns 36034999650460 for an
+   exact 36034999650461. Every input and every result is also checked to be a safe
+   integer and a violation THROWS -- load-bearing rather than defensive, because the
+   totals land in `bigint` columns read through drizzle's `mode: "number"`, whose range
+   stops at 2^53 while Postgres's stops at 2^63, so an unchecked total would be stored
+   as the nearest double and accepted silently. **The float version was pushed as a
+   temporary mutation and fails exactly four of the nineteen tests.**
+
+   **THE CONTRACT THIS PUTS ON TASK 5:** the form must parse its text into integer units
+   and reject what does not parse BEFORE calling `documentTotals`. A half-typed field is
+   a validation error to show, not a total to render -- `documentTotals` throws on NaN
+   rather than rendering `NaN` into a running total.
+
+3. **`uniqueIndex` and `index` are not used, and Step 5's import instruction is wrong on
+   all four counts.** `boolean` and `primaryKey` were already imported; `index` and
+   `uniqueIndex` are imported by nothing in this file and used by no table in the
+   codebase. This schema declares unique CONSTRAINTS (`unique("name").on(...)`, the
+   mail block's pattern) and hand-writes plain indexes in the migration (0004's header,
+   0008's five). Both conventions are followed; `documents_deal_idx` is the one
+   hand-written index, and the drill asserts it from a from-the-files migration because
+   it exists in no drizzle snapshot.
+
+4. **`org_profile` is a pinned integer primary key plus one CHECK.** The plan's
+   boolean-column-plus-unique-index-plus-CHECK does enforce one row -- but with four
+   moving parts where two suffice, and it leaves a `defaultRandom()` uuid nobody can
+   predict, so every reader must find the row before updating it and the upsert has to
+   conflict on a NON-KEY column. Pinned at 1: read is `WHERE id = 1`, create-or-update
+   is `ON CONFLICT (id) DO UPDATE`. Both halves are tested and both were mutation-checked
+   (dropping the CHECK fails the test); the PK stops a second row at id 1, the CHECK
+   stops one at any other id. The only non-uuid key in the file, and that is the point:
+   a uuid is for a row you will have many of.
+
+5. **`documents.number` stays globally unique, and it forbids nothing.** Numbering is per
+   `(type, year)` but the formatted string already contains both, so two numbers can only
+   collide if two types share a prefix -- and if a future type ever were given a colliding
+   prefix, a global unique rejects the second document loudly at issue instead of minting
+   a duplicate. It also matches how a number is used: nobody quoting "QUO-2026-0001" back
+   at you says which column it came from.
+
+6. **`document_line_items.position` is an INTEGER, and that is the right answer here.**
+   Fractional `positionText` exists so a drag-and-drop reorder writes one row instead of
+   renumbering siblings, and it buys that with a `COLLATE "C"` pin and unbounded key
+   growth. Line items are inserted once inside the issuing transaction and never
+   reordered -- there is no drag to optimise -- so 1..n is denser, directly meaningful
+   ("line 3") and needs no collation. The UNIQUE on `(document_id, position)` is what
+   makes the ordering total, and it doubles as the FK index.
+
+7. **Four constraints the plan did not have**, all house-style consistency rather than
+   invention: `documents_currency_format` (deals has the identical CHECK, and a document
+   copies its deal's currency), `documents_totals_consistent`
+   (`total = subtotal + tax`, the backstop for the exact defect the spec names as this
+   feature's classic one -- mutation-checked), and the `type IN ('quote')` CHECK repeated
+   on `document_number_sequences` and `document_templates` (a typo'd type would otherwise
+   start a private numbering series in silence). **No `ON DELETE CASCADE` on line items**:
+   there is not one `onDelete` clause anywhere in this schema, a document is never
+   deleted, and NO ACTION means a stray DELETE fails loudly rather than quietly taking
+   the priced lines of an issued quote with it.
+
+8. **`documents` grows `recipient_contact_name`.** The spec's column list says "name and
+   address as text", but the same spec has the form default its recipient from the deal's
+   company AND contact, and a quote prints both ("Acme Ltd, FAO Jane Smith"). With two
+   columns the contact has to be smuggled into one of them and the row stops recording
+   what was on the page. Checked against a real `companies` row while doing it:
+   **`companies` carries no VAT or registration number at all**, so a document cannot
+   snapshot the RECIPIENT's VAT number. Harmless for a quote; it is a blocker for the
+   invoice type the spec defers, and that is where it should be solved.
+
+**THE SEEDED TEMPLATE WAS RENDERED BEFORE IT WAS COMMITTED**, on the server against
+WeasyPrint 57.2 through the shipped `renderPdf`: merged with a filled org profile and 8
+line items it is 3,816 bytes of HTML and a **16,003-byte two-page PDF**; merged with an
+entirely empty context it still renders (9,995 bytes). The running footer reads "Page 1
+of 2" and the newline-separated addresses break across lines.
+
+- **It is multi-line SQL, not the plan's single 1.5KB line.** Postgres string literals
+  may contain newlines and drizzle's migrator splits only on `--> statement-breakpoint`.
+  A template nobody can diff is a template nobody reviews.
+- **`class="pre"` (`white-space: pre-line`) is on every multi-line field.**
+  `org.address_lines` and `companies.address` are newline-separated free text, and merge
+  substitution HTML-escapes but does not turn a newline into a `<br>` -- without it a
+  three-line address prints as one run-on line. This is a real defect the plan's template
+  had.
+- **Its 25 merge tokens are asserted as an EQUALITY** against the list in
+  `schema.test.ts`, in both directions. A field the template uses that nobody supplies is
+  a silent blank on a printed page (unknown fields resolve to `""` and never throw); a
+  field on the list the template stopped using is a context key built for nothing.
+- **The CSS is flat with no nested at-rules**, because a literal `{{` in a stylesheet
+  would be eaten as a merge field. The test asserts every `{{` in the body is one of the
+  25 tokens.
+- **The logo is deliberately ABSENT.** `org_profile.logo_file_id` exists and the merge
+  context carries `org.logoDataUri`, but the merge language has no conditional, so
+  `<img src="{{org.logoDataUri}}">` would render `<img src="">` on every quote raised
+  from an install with no logo. A missing logo is a plain letterhead; a broken image is
+  an ugly PDF for everyone. **The cheapest fix is Task 4 supplying a transparent 1x1
+  `data:` URI when no logo is set**, after which the slot can move into the default.
+- **The footer carries page numbers and no merge field**, because a `{{...}}` inside a
+  CSS string would be HTML-escaped, which is not CSS escaping.
+
+**THREE THINGS THE NEXT TASKS INHERIT.**
+
+1. **`truncateAll()` destroys the seeded template.** It empties every table in the
+   `public` schema, read from the catalogue, so on the shared `conduit_test` database the
+   seeded row is gone before any test body runs. **Task 4's service tests must seed their
+   own quote template** -- including the immutability test, whose
+   `update(documentTemplates)` would otherwise update zero rows and prove nothing. The
+   seed is observable only in the from-the-files scratch database, which is where the
+   0009 drill checks it.
+2. **Task 4's `buildContext` must supply exactly these keys**, or the default template
+   prints blanks: `org.{name,addressLines,email,phone,website,bankDetails,vatNumber,registrationNumber}`
+   and `document.{number,issueDate,validUntilDate,recipientName,recipientContactName,recipientAddress,subtotal,tax,total,notes,terms}`,
+   plus `description,qty,unitPrice,lineTotal` per line. `recipientContactName` is the new
+   column; `subtotal`/`tax`/`total` are FORMATTED strings, and nothing in `money.ts`
+   formats -- web currently does it with `Intl.NumberFormat` and a float divide
+   (`deal-detail.tsx:174`), which is fine for display but is a second answer if the PDF
+   uses a different one. **Pick one and put it where both can reach it.**
+3. **Nothing bounds the number of line items, and the natural bound is arithmetic, not a
+   guess.** The database cannot express "at most N rows per document" without a trigger,
+   so it belongs in Task 4's input schema. The budget is the 128KB render input cap minus
+   the merged template (2.7KB seeded, but a user may edit it) minus the inlined logo
+   (32KB stored is ~43KB as a `data:` URI), leaving ~82KB. A rendered line costs about
+   120 bytes of markup plus its description, so **a description cap is the other half of
+   the bound** -- without one, a single line item can exhaust the budget alone. At a
+   500-character description that is roughly 130 lines. Whatever the pair is, it must
+   reject BEFORE the render rather than surfacing as `RenderError: input too large`, and
+   if the input cap moves, both move.
+
 ---
 
 ### Task 3: Templates — the sanitiser profile and merge resolution
