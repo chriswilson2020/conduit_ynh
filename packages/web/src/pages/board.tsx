@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { FormEvent, RefObject } from "react";
 import { DndContext, DragOverlay } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
@@ -11,14 +11,16 @@ import {
 } from "../queries";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
-import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
+import {
+  Dialog, DialogContent, DialogTitle, DialogTrigger, SheetBody, SheetContent, SheetHeader,
+} from "../components/ui/dialog";
 import { Funnel } from "../components/funnel";
 import {
   KanbanEmptyPlaceholder, kanbanSortableItems, useKanbanBoard, useKanbanCardSortable, useKanbanColumnDroppable,
 } from "../components/kanban-core";
 import { parseDecimal, userLabel } from "../lib";
-
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
+import { useIsMobile } from "../use-is-mobile";
+import { boardStageView, dealRot, stageValueLabel } from "./board-lib";
 
 export function BoardPage() {
   const navigate = useNavigate();
@@ -83,6 +85,58 @@ export function BoardPage() {
 
   const archived = pipelineData !== undefined && pipelineData.pipeline.archivedAt !== null;
 
+  const isMobile = useIsMobile();
+
+  /**
+   * WHICH STAGE THE PHONE IS LOOKING AT, AND WHY IT IS NOT IN THE URL.
+   *
+   * The inbox's equivalent state -- which conversation is open -- lives in
+   * `?thread=`, and Task 3 leaned on that rather than shadowing it. That does
+   * not transfer, and the reason is not merely that this route has no search
+   * schema (one could be added in a line). It is that `?thread=<id>` MEANS THE
+   * SAME THING AT BOTH WIDTHS: at a desk it selects the conversation in the
+   * third pane, on a phone it selects the screen. A `?stage=` here would mean
+   * something at one width and nothing at the other -- the desktop board shows
+   * every stage at once and has nothing to do with it -- so the same URL would
+   * describe two different screens depending on the window it was opened in,
+   * and only one of the two would ever write it. A link is worth less than
+   * that costs.
+   *
+   * WHAT IS GIVEN UP, deliberately and measurably. "Opening a card IS the
+   * navigation" is not re-earned: tapping a card leaves for /deals/<id>, and
+   * coming back re-mounts this page with the picker on the pipeline's first
+   * stage rather than on the one that was being worked. That is a lost place
+   * in a list, not a broken link, and it is the price of not inventing a URL
+   * parameter that half the app disagrees about. Someone who finds it grating
+   * in real use should say so -- the remedy is a search schema and this
+   * paragraph rewritten, not a quiet second store of state.
+   */
+  const [chosenStageId, setChosenStageId] = useState<string | null>(null);
+
+  /**
+   * Where focus goes when a move unmounts the control that was focused -- the
+   * same target and the same reasoning as pages/inbox.tsx's, so a phone user
+   * meets one rule on both surfaces rather than two. See the stage view's own
+   * comment for what makes the move a focus event at all.
+   */
+  const headingRef = useRef<HTMLHeadingElement>(null);
+
+  /**
+   * The phone's stage view: which stage is on screen, what the picker offers,
+   * and where a card can go. Pure and tested as such -- pages/board-lib.ts
+   * carries the reasoning, including why `stage === null` is exactly "render
+   * the board that was always here".
+   *
+   * MEMOISED ON PURPOSE. `moveTargets` is an array, and the stage view hands
+   * the same one to every card in the list; rebuilding it per render would
+   * hand every card a fresh prop for nothing. Above the breakpoint the
+   * function returns one shared frozen object, so the memo is inert there.
+   */
+  const stageView = useMemo(
+    () => boardStageView({ isMobile, stages: pipelineData?.stages ?? [], chosenStageId, archived }),
+    [isMobile, pipelineData, chosenStageId, archived],
+  );
+
   const { activeId, suppressCardClickRef, sensors, dndProps } = useKanbanBoard({
     itemsByColumn,
     onMove: (params) => {
@@ -122,6 +176,30 @@ export function BoardPage() {
   }
   function handleUnarchivePipeline() {
     unarchivePipeline.mutate(pipelineId, { onError: reportError });
+  }
+
+  /**
+   * The phone's "Move to..." -- THE SAME MUTATION THE DRAG USES, deliberately.
+   *
+   * `useMoveDeal` is instantiated once on this page and both widths call it, so
+   * the optimistic reposition, the rollback, the 409 refetch, the server's
+   * position compaction and the SSE hint that follows are all the behaviour
+   * they already were. A second path would have had to reproduce every one of
+   * them and would have drifted from the first the day either changed.
+   *
+   * NEITHER NEIGHBOUR IS NAMED, which is moveDealInputSchema's "both omitted"
+   * case: append at the tail of the target stage. That is the same landing spot
+   * a desktop drag into a column's blank space produces, and it is the only
+   * honest answer here -- the phone is not showing the target stage, so there
+   * is no position in it the user could be said to have chosen.
+   *
+   * The per-call onError is additive: the mutation's own onError still rolls
+   * the optimistic move back first. Without it a failure would be a card that
+   * silently reappeared, which at a desk is at least visible as a snap-back
+   * mid-gesture and on a phone is nothing at all.
+   */
+  function handleMoveDealToStage(deal: Deal, target: Stage) {
+    moveDeal.mutate({ id: deal.id, pipelineId, stageId: target.id }, { onError: reportError });
   }
 
   const columns = (
@@ -165,7 +243,17 @@ export function BoardPage() {
           <Link to="/pipelines" className="text-xs font-medium text-slate-500 hover:text-slate-700">
             {"\u2190"} Pipelines
           </Link>
-          <h1 className="text-xl font-semibold text-slate-900">{pipeline.name}</h1>
+          {/* tabIndex only below the breakpoint, so the desktop heading keeps
+              exactly the attributes it always had. -1 makes it a target for
+              the stage view's post-move focus() without putting a heading into
+              anyone's tab order. Same shape as pages/inbox.tsx's. */}
+          <h1
+            ref={headingRef}
+            tabIndex={isMobile ? -1 : undefined}
+            className="text-xl font-semibold text-slate-900"
+          >
+            {pipeline.name}
+          </h1>
         </div>
         {!archived && (
           <Button data-testid="archive-pipeline-button" variant="danger" onClick={handleArchivePipeline}>
@@ -192,8 +280,32 @@ export function BoardPage() {
         </Button>
       </div>
 
+      {/* THE BRANCH, and the seam the inbox had to guard with a source reader
+          is tied by the compiler here instead: StageView takes a NON-NULL
+          stage, so inverting this test does not compile. `stage` is null for
+          every input above the breakpoint (board-lib's DESKTOP_VIEW, pinned by
+          a test over the cross-product), so the desktop reaches the same
+          DndContext it always did, and the two are mutually exclusive IN THE
+          DOM rather than one being hidden -- which matters beyond tidiness:
+          pipeline.spec.ts counts `[data-testid^="column-"]` and looks up
+          `card-<id>` at the page level, and a hidden second copy of either
+          would be counted and would violate Playwright's strict mode. */}
       {view === "funnel" ? (
         <Funnel pipelineId={pipelineId} />
+      ) : stageView.stage !== null ? (
+        <StageView
+          stage={stageView.stage}
+          picker={stageView.picker}
+          moveTargets={stageView.moveTargets}
+          dealsByStage={grouped}
+          companyMap={companyMap}
+          userInitials={userInitials}
+          pipelineId={pipelineId}
+          archived={archived}
+          headingRef={headingRef}
+          onPick={setChosenStageId}
+          onMove={handleMoveDealToStage}
+        />
       ) : (
         <DndContext sensors={sensors} {...dndProps}>
           {columns}
@@ -235,19 +347,10 @@ function Column({
   const { setNodeRef } = useKanbanColumnDroppable(stage.id, readOnly);
   const dealIds = deals.map((deal) => deal.id);
   const sortableItems = kanbanSortableItems(stage.id, dealIds);
-  const valueSum = deals.reduce((sum, deal) => sum + (deal.valueCents ?? 0), 0);
-  const currencies = new Set(deals.map((deal) => deal.currency));
-  // A single Conduit instance has one DEFAULT_CURRENCY (see the Phase 2
-  // design's currency decision), so a mixed-currency column is unreachable
-  // through this board's own "New deal" dialog today -- but updateDeal's
-  // currency field is directly PATCHable via the API regardless, and a
-  // future per-deal currency picker would make it reachable through the UI
-  // too. Summing raw cents across currencies would silently misreport the
-  // total (100 EUR + 100 USD is not "200"), so this falls back to a literal
-  // "mixed" label instead of a wrong number.
-  const formattedSum = currencies.size > 1
-    ? "mixed"
-    : new Intl.NumberFormat(undefined, { style: "currency", currency: deals[0]?.currency ?? "EUR" }).format(valueSum / 100);
+  // The mixed-currency rule this line used to carry inline now lives in
+  // board-lib beside the stage view, which needed the same label. Same
+  // computation, one copy, and a unit test on it.
+  const formattedSum = stageValueLabel(deals);
 
   return (
     <div data-testid={`column-${stage.id}`} className="flex w-72 shrink-0 flex-col gap-2 rounded-lg bg-slate-100 p-2">
@@ -273,6 +376,334 @@ function Column({
   );
 }
 
+/**
+ * THE BOARD BELOW THE BREAKPOINT: one stage at a time.
+ *
+ * A kanban column is a horizontal thing and a phone has room for one, so this
+ * is not the board re-laid-out -- it is the third and last of the three sites
+ * the phase's spec allows a different INTERACTION MODEL. What replaces the drag
+ * is "Move to...", which is what the gesture was for.
+ *
+ * NOTHING THE DESK CAN DO IS MISSING HERE, which is the phase's definition of
+ * done and is the reason this component is longer than a list would need to be:
+ * the picker reaches every stage, the header renames one and shows its count
+ * and value, "New deal" creates in the stage on screen, "+ Stage" adds another,
+ * a card opens its deal, and "Move" moves it. The only desktop gesture with no
+ * phone equivalent is REORDERING WITHIN a stage, which is a position and not a
+ * capability -- the server orders by position and the phone appends at the
+ * tail, exactly as a drag into a column's blank space does.
+ *
+ * IT UNMOUNTS THE DESKTOP BOARD RATHER THAN HIDING IT, the opposite of what the
+ * inbox stack chose, and the reason the two differ is worth stating so neither
+ * looks like an oversight. The inbox hides because its panes hold accumulated
+ * "Load more" pages and live query observers that an unmount would throw away.
+ * Nothing here does: every card on this page is drawn from the ONE
+ * useDeals(pipelineId) query the page itself owns, so an unmounted column
+ * costs nothing to rebuild. And hiding would be actively wrong -- the desktop
+ * journeys count `[data-testid^="column-"]` and address `card-<id>` at the page
+ * level, and a display:none copy is still in the DOM to be counted.
+ *
+ * WHAT UNMOUNTING COSTS INSTEAD is a focus move, and it is paid below rather
+ * than skipped: see the move handler.
+ */
+function StageView({
+  stage,
+  picker,
+  moveTargets,
+  dealsByStage,
+  companyMap,
+  userInitials,
+  pipelineId,
+  archived,
+  headingRef,
+  onPick,
+  onMove,
+}: {
+  /** NON-NULL on purpose: this is what makes the page's branch a type error to
+   * invert, rather than a phone-only defect nothing but an e2e run would see. */
+  stage: Stage;
+  picker: readonly Stage[];
+  moveTargets: readonly Stage[];
+  dealsByStage: Map<string, Deal[]>;
+  companyMap: Map<string, string>;
+  userInitials: Map<string, string>;
+  pipelineId: string;
+  archived: boolean;
+  headingRef: RefObject<HTMLHeadingElement | null>;
+  onPick: (stageId: string) => void;
+  onMove: (deal: Deal, target: Stage) => void;
+}) {
+  const [movingDealId, setMovingDealId] = useState<string | null>(null);
+  const [moveResult, setMoveResult] = useState<string | null>(null);
+  // Whether the sheet is closing because a move was made, rather than because
+  // the user dismissed it -- read once by the close handler below.
+  const movedRef = useRef(false);
+  // The list of targets, so the sheet can open on the first of them rather than
+  // on its own Close. See the sheet's onOpenAutoFocus.
+  const targetsRef = useRef<HTMLDivElement>(null);
+  // The Move button the sheet was opened from, so it can be given focus back.
+  // Kept as the ELEMENT rather than an id because that is what the close
+  // handler needs, and because `isConnected` on it answers the one question
+  // that decides where focus goes -- see onCloseAutoFocus.
+  const triggerRef = useRef<HTMLElement | null>(null);
+
+  const deals = dealsByStage.get(stage.id) ?? [];
+  // Resolved from the CURRENT list rather than held as an object, so a deal
+  // that leaves this stage (a move, an SSE update, a win in another tab) takes
+  // the sheet with it instead of stranding it over a card that is gone.
+  const movingDeal = deals.find((deal) => deal.id === movingDealId) ?? null;
+
+  function pickStage(stageId: string) {
+    // The result line describes a move out of the stage being left; carrying it
+    // to the next stage would read as a claim about that one.
+    setMoveResult(null);
+    onPick(stageId);
+  }
+
+  function requestMove(dealId: string, trigger: HTMLElement) {
+    triggerRef.current = trigger;
+    setMovingDealId(dealId);
+  }
+
+  /**
+   * THE MOVE, AND THE FOCUS IT COSTS.
+   *
+   * The card the user tapped Move on is in THIS stage and every target is
+   * another one, so a successful move always unmounts the control focus would
+   * otherwise return to. Dropping focus on <body> there is the same class of
+   * defect this phase has now met four times (the search sheet opening on
+   * Close, the task drawer's only exit, the inbox's drill-in), so the close
+   * handler below sends it to the page's h1 instead -- the target
+   * pages/inbox.tsx settled on, so the two phone surfaces do not disagree about
+   * where focus goes when a screen changes under it.
+   *
+   * The h1 is not what ANNOUNCES the move -- it says the pipeline's name. The
+   * live region does, which is why both exist. It is stated optimistically, as
+   * the card's own disappearance is: the mutation rolls back and the page's
+   * error banner speaks if the server refuses.
+   */
+  function handleMove(target: Stage) {
+    if (movingDeal === null) return;
+    onMove(movingDeal, target);
+    setMoveResult(`Moved ${movingDeal.title} to ${target.name}.`);
+    setMovingDealId(null);
+    movedRef.current = true;
+  }
+
+  return (
+    <div data-testid="stage-view" className="flex flex-col gap-3">
+      {/* The picker scrolls rather than wrapping, so the strip is one line
+          whatever a pipeline's stage count is, and each button carries its
+          stage's deal count -- which is also the summary a phone loses by not
+          seeing every column at once. shrink-0 on the buttons is what makes the
+          container actually scrollable; without it a flex item is still free to
+          be squeezed towards its min-content width (the same pairing
+          ui/tabs.tsx documents for the record rail's strip). */}
+      <div data-testid="stage-picker" className="flex gap-2 overflow-x-auto pb-1">
+        {picker.map((option) => (
+          <Button
+            key={option.id}
+            data-testid={`stage-pick-${option.id}`}
+            variant={option.id === stage.id ? "default" : "outline"}
+            aria-pressed={option.id === stage.id}
+            onClick={() => pickStage(option.id)}
+            className="shrink-0"
+          >
+            {option.name}
+            <span className="ml-2 text-xs opacity-70">{(dealsByStage.get(option.id) ?? []).length}</span>
+          </Button>
+        ))}
+      </div>
+
+      {/* Always mounted, so a screen reader is watching the region before it
+          fills -- components/mail/bulk-bar.tsx's BulkResult, same reasoning.
+          Empty it has no line box and so no height; only the flex gap. */}
+      <p data-testid="stage-move-result" role="status" aria-live="polite" className="text-xs text-slate-500">
+        {moveResult}
+      </p>
+
+      <div className="flex flex-col gap-2 rounded-lg bg-slate-100 p-2">
+        <StageHeader
+          stage={stage}
+          pipelineId={pipelineId}
+          readOnly={archived}
+          count={deals.length}
+          valueLabel={stageValueLabel(deals)}
+        />
+        <div className="flex flex-col gap-2">
+          {deals.map((deal) => (
+            <StageDealCard
+              key={deal.id}
+              deal={deal}
+              stage={stage}
+              companyName={deal.companyId ? companyMap.get(deal.companyId) : undefined}
+              ownerInitial={deal.ownerUserId ? userInitials.get(deal.ownerUserId) : undefined}
+              // No targets means nowhere to go: an archived pipeline (read-only
+              // at a desk too) or a pipeline with a single stage. A control
+              // that could only fail is worse than no control.
+              canMove={moveTargets.length > 0}
+              onRequestMove={requestMove}
+            />
+          ))}
+          {deals.length === 0 && (
+            <p className="rounded-md border border-dashed border-slate-300 px-2 py-4 text-center text-xs text-slate-400">
+              No deals
+            </p>
+          )}
+        </div>
+        {!archived && <NewDealButton pipelineId={pipelineId} stageId={stage.id} />}
+      </div>
+
+      {!archived && <AddStageTile pipelineId={pipelineId} />}
+
+      {/* A bottom sheet, which ui/dialog.tsx's SHAPES table describes as the
+          right shape for a short list of choices -- the page behind stays
+          partly visible, so the card being moved is still there to look at. */}
+      <Dialog
+        open={movingDeal !== null}
+        onOpenChange={(open) => {
+          if (!open) setMovingDealId(null);
+        }}
+      >
+        <SheetContent
+          shape="bottom"
+          data-testid="move-sheet"
+          /* OPEN ON THE FIRST STAGE, not on Close. Radix focuses the first
+             tabbable descendant, which is SheetHeader's Close -- a sheet whose
+             whole purpose is picking a stage would announce "Close, button",
+             the same defect Task 1 fixed for the search sheet and the reason
+             ui/dialog.tsx forwards this hatch at all. (Marking the first target
+             `autoFocus` is the other idiom that file names, and it works too;
+             this one says what it means and does not depend on React's commit
+             order relative to Radix's FocusScope.) */
+          onOpenAutoFocus={(event) => {
+            const first = targetsRef.current?.querySelector<HTMLButtonElement>("button");
+            if (first == null) return;
+            event.preventDefault();
+            first.focus();
+          }}
+          /* BOTH EXITS ARE HANDLED HERE, because Radix handles NEITHER for a
+             dialog opened the way this one is.
+
+             Measured rather than assumed: dismissing this sheet with Close --
+             no move, the trigger still in the DOM and still focusable -- left
+             `document.activeElement` on <body>. The cause is that
+             DialogContentModal's own onCloseAutoFocus focuses
+             `context.triggerRef.current`, which is set by <DialogTrigger>; this
+             sheet is one page-level dialog driven by state, because the trigger
+             is a different button on every card, so that ref is null and Radix
+             focuses nothing at all. Every state-driven Dialog in this app has
+             the same hole -- the composer, the task drawer and the two settings
+             dialogs -- which is pre-existing and desktop-visible, so it is a
+             finding rather than something to fix from this page.
+
+             So: the trigger back on a dismissal, the heading after a move (when
+             the trigger has gone with its card). `isConnected` is the test
+             rather than the flag alone, because an SSE update or another tab
+             can retire that card while the sheet is open. */
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            const moved = movedRef.current;
+            movedRef.current = false;
+            const trigger = triggerRef.current;
+            triggerRef.current = null;
+            if (!moved && trigger !== null && trigger.isConnected) trigger.focus();
+            else headingRef.current?.focus();
+          }}
+        >
+          <SheetHeader
+            title={movingDeal === null ? "Move" : `Move ${movingDeal.title}`}
+            closeTestId="move-sheet-close"
+          />
+          <SheetBody>
+            <div ref={targetsRef} className="flex flex-col gap-2">
+              {moveTargets.map((target) => (
+                <Button
+                  key={target.id}
+                  data-testid={`move-to-${target.id}`}
+                  variant="outline"
+                  className="w-full justify-start"
+                  onClick={() => handleMove(target)}
+                >
+                  {target.name}
+                </Button>
+              ))}
+            </div>
+          </SheetBody>
+        </SheetContent>
+      </Dialog>
+    </div>
+  );
+}
+
+/**
+ * A deal on the phone's stage list: the same card content the desktop draws,
+ * with the tap target and the Move action a column card does not need.
+ *
+ * TWO CONTROLS, NOT ONE. The desktop card is a single click target because a
+ * drag and a click are told apart by movement; here "open it" and "move it" are
+ * two taps in the same place, so they are two elements. The body is the button
+ * rather than the wrapper so the Move control is not nested inside it.
+ */
+function StageDealCard({
+  deal,
+  stage,
+  companyName,
+  ownerInitial,
+  canMove,
+  onRequestMove,
+}: {
+  deal: Deal;
+  stage: Stage;
+  companyName?: string;
+  ownerInitial?: string;
+  canMove: boolean;
+  onRequestMove: (dealId: string, trigger: HTMLElement) => void;
+}) {
+  const navigate = useNavigate();
+  const rot = dealRot(deal.updatedAt, stage.rotDays, Date.now());
+
+  return (
+    <div
+      // The SAME testid the desktop card carries. The two are mutually
+      // exclusive in the DOM (see the page's branch), so this is one element at
+      // either width and a journey addressing a card need not know which half
+      // of the app it is in.
+      data-testid={`card-${deal.id}`}
+      className="flex items-start gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 shadow-sm"
+    >
+      <button
+        type="button"
+        onClick={() => void navigate({ to: "/deals/$dealId", params: { dealId: deal.id } })}
+        className="flex min-h-11 min-w-0 flex-1 flex-col gap-1 text-left"
+      >
+        <DealCardContent
+          deal={deal}
+          companyName={companyName}
+          ownerInitial={ownerInitial}
+          rotten={rot.rotten}
+          rotTitle={rot.title}
+        />
+      </button>
+      {canMove && (
+        <Button
+          data-testid={`move-${deal.id}`}
+          variant="outline"
+          // A list of buttons all reading "Move, button" says nothing about
+          // which card each belongs to. The visible word stays the first word
+          // of the accessible name, so a voice-control user saying "Move" still
+          // matches (WCAG's label-in-name).
+          aria-label={`Move ${deal.title}`}
+          className="shrink-0"
+          onClick={(event) => onRequestMove(deal.id, event.currentTarget)}
+        >
+          Move
+        </Button>
+      )}
+    </div>
+  );
+}
+
 function DealCard({
   deal,
   stage,
@@ -291,9 +722,9 @@ function DealCard({
   const navigate = useNavigate();
   const { attributes, listeners, setNodeRef, style } = useKanbanCardSortable(deal.id, deal.stageId, readOnly);
 
-  const daysSinceUpdate = Math.floor((Date.now() - new Date(deal.updatedAt).getTime()) / MS_PER_DAY);
-  const rotten = stage.rotDays != null && daysSinceUpdate > stage.rotDays;
-  const rotTitle = `No activity for ${daysSinceUpdate} days (stage rots after ${stage.rotDays} days)`;
+  // Same rule, same strings as before -- moved to board-lib because the phone's
+  // card needs the identical marker and a second copy would drift.
+  const rot = dealRot(deal.updatedAt, stage.rotDays, Date.now());
 
   // Cards navigate to the deal detail page on a plain click. See
   // suppressCardClickRef's doc comment in kanban-core's useKanbanBoard for
@@ -315,7 +746,7 @@ function DealCard({
       {...attributes}
       {...listeners}
     >
-      <DealCardContent deal={deal} companyName={companyName} ownerInitial={ownerInitial} rotten={rotten} rotTitle={rotTitle} />
+      <DealCardContent deal={deal} companyName={companyName} ownerInitial={ownerInitial} rotten={rot.rotten} rotTitle={rot.title} />
     </div>
   );
 }
@@ -408,7 +839,14 @@ function StageHeader({
             setDraft(stage.name);
             setEditing(true);
           }}
-          className="block w-full truncate text-left text-sm font-semibold text-slate-900 disabled:cursor-default"
+          // Renaming a stage is a capability, and below the breakpoint this
+          // 20px-tall button is the only way to reach it -- measured at 303 x 20
+          // in the stage view, under the phase's 44px floor. The phone form is a
+          // centring flex row rather than a bare min-height, or the label would
+          // sit pinned to the top of a taller box (ui/select.tsx's SelectItem,
+          // same shape). `max-md:` only: the desktop column header keeps the
+          // dense row it has had since Phase 2.
+          className="block w-full truncate text-left text-sm font-semibold text-slate-900 disabled:cursor-default max-md:flex max-md:min-h-11 max-md:items-center"
         >
           {stage.name}
         </button>
@@ -440,9 +878,13 @@ function AddStageTile({ pipelineId }: { pipelineId: string }) {
     );
   }
 
+  // The `max-md:` widths are for the phone's stage view, where this is a row at
+  // the foot of the page rather than a tile at the end of a row of columns. The
+  // desktop board does not render below the breakpoint at all (see the page's
+  // branch), so they are the stage view's rule wherever they are written.
   if (!adding) {
     return (
-      <div className="w-72 shrink-0">
+      <div className="w-72 shrink-0 max-md:w-full">
         <Button variant="outline" onClick={() => setAdding(true)}>
           {"+"} Stage
         </Button>
@@ -451,7 +893,7 @@ function AddStageTile({ pipelineId }: { pipelineId: string }) {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="flex w-72 shrink-0 flex-col gap-2 rounded-lg bg-slate-100 p-2">
+    <form onSubmit={handleSubmit} className="flex w-72 shrink-0 flex-col gap-2 rounded-lg bg-slate-100 p-2 max-md:w-full">
       <Input
         autoFocus
         value={name}

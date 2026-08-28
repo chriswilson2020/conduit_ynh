@@ -56,16 +56,38 @@ export function Funnel({ pipelineId }: { pipelineId: string }) {
           : (valueCents / maxValueCents) * 100;
 
         return (
+          /* THE ROW WRAPS BELOW THE BREAKPOINT, because its four columns do not
+             fit and the one that gives way is the bar.
+
+             Measured at 375px before this: the three fixed columns (160 + 48 +
+             112) plus padding and gaps come to 368px inside <main>'s 327px
+             content box, so the flex-1 track was squeezed to ZERO and the value
+             column was pushed out of the box entirely -- a funnel with no bars
+             and no numbers, which is the whole of what a funnel is. The page
+             did not scroll sideways to reveal it either; <main>'s own
+             overflow-auto absorbed the spill, so it simply was not there.
+
+             The stage name takes its own line and the bar keeps the second one,
+             which is the arrangement that gives the track the most width: the
+             names are short and the comparison between stages is the point. The
+             count loses its fixed 48px too -- a right-aligned integer needs no
+             column -- so the track ends up around 150px rather than 50px. All
+             three are `max-md:`, so the desk keeps the single-line row it has
+             had since Phase 2. The board's own kanban does not render at this
+             width at all (see pages/board.tsx), so this and the stage view are
+             the two things a phone sees of a pipeline. */
           <div
             key={stage.id}
             data-testid={`funnel-row-${stage.id}`}
-            className="flex items-center gap-3 rounded-md border border-slate-200 bg-white px-3 py-2"
+            className="flex items-center gap-3 rounded-md border border-slate-200 bg-white px-3 py-2 max-md:flex-wrap"
           >
-            <span className="w-40 shrink-0 truncate text-sm font-medium text-slate-900">{stage.name}</span>
+            <span className="w-40 shrink-0 truncate text-sm font-medium text-slate-900 max-md:w-full">
+              {stage.name}
+            </span>
             <div className="h-5 flex-1 rounded bg-slate-100">
               <div className="h-5 rounded bg-slate-700" style={{ width: `${widthPct}%` }} />
             </div>
-            <span className="w-12 shrink-0 text-right text-xs text-slate-500">{count}</span>
+            <span className="w-12 shrink-0 text-right text-xs text-slate-500 max-md:w-auto">{count}</span>
             <span className="w-28 shrink-0 text-right text-xs font-medium text-slate-700">
               {formatValue(valueCents)}
             </span>

@@ -1,5 +1,6 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import { withoutComments } from "./test/source";
 import { MOBILE_BREAKPOINT } from "./lib";
 import { mobileMediaQuery, readIsMobile, subscribeToMediaQuery } from "./use-is-mobile";
 import type { MediaQueryListLike } from "./use-is-mobile";
@@ -72,6 +73,52 @@ describe("the viewport meta", () => {
     const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
     const meta = /<meta name="viewport" content="([^"]*)"/.exec(html);
     expect(meta?.[1]).toBe("width=device-width, initial-scale=1.0");
+  });
+});
+
+/**
+ * THE THREE SITES, closed now that the third one exists.
+ *
+ * The phase's spec names them -- the shell's navigation, the inbox's drill-in
+ * stack and the kanban's stage view -- and says so explicitly "so a fourth is a
+ * deliberate addition rather than a drift". Everything else is Tailwind's `md:`
+ * variant, which costs no JavaScript, no re-render and no second component
+ * tree. Until Task 4 the set was still being filled in and this could not be
+ * asserted; it can now, and drift is the failure mode a rule stated only in
+ * prose actually has (Task 3's own round measured a fourth site being reached
+ * for, and declined it, on nothing but a reading of that sentence).
+ *
+ * WHAT THIS IS NOT: a veto. A fourth site may well be right one day. It obliges
+ * whoever adds it to change this list in the same commit, which is exactly the
+ * "deliberate addition" the spec asks for.
+ *
+ * It matches a SPELLING, like every source guard in this package: a component
+ * that took `isMobile` as a PROP from one of these three would not appear here,
+ * and neither would a re-export under another name.
+ */
+describe("the hook's call sites", () => {
+  /** Every .ts/.tsx under packages/web/src that is neither a test nor the
+   * module that defines the hook. */
+  function walk(dir: URL): URL[] {
+    const out: URL[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) out.push(...walk(new URL(`${entry.name}/`, dir)));
+      else if (/\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) && entry.name !== "use-is-mobile.ts") {
+        out.push(new URL(entry.name, dir));
+      }
+    }
+    return out;
+  }
+
+  it("is called at exactly the three sites the spec names", () => {
+    const src = new URL("./", import.meta.url);
+    const callers: string[] = [];
+    for (const file of walk(src)) {
+      if (withoutComments(readFileSync(file, "utf8")).includes("useIsMobile(")) {
+        callers.push(file.pathname.split("/src/")[1] ?? file.pathname);
+      }
+    }
+    expect(callers.sort()).toEqual(["components/shell.tsx", "pages/board.tsx", "pages/inbox.tsx"]);
   });
 });
 
