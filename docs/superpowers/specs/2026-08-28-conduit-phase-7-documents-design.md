@@ -170,8 +170,27 @@ is not the same as "unfiltered". Concretely it must ALLOW `<style>` blocks and `
 attributes, tables and their layout properties, page-level CSS (`@page`, margins,
 running headers) and `<img>` with `data:` sources; and it must STRIP script in every
 form (elements, `on*` handlers, `javascript:` URLs), embedded and object elements, and
-any remote URL in any attribute — the last of which is what enforces the no-network
-property above rather than trusting the renderer's flags alone. The profile is
+**every URL in every attribute except `data:` and a bare `#fragment`** — in CSS `url()`,
+`@import` and `@font-face src` as well as in attributes — plus `rel=attachment` on both
+`<link>` and `<a>`.
+
+**That sentence originally read "any remote URL", and it was wrong in the way that
+matters.** `file:` is not remote, and `file:` is the scheme that actually worked against
+this codebase: Task 1's review recovered a 32-byte mode-600 key byte-for-byte through
+`<link rel="attachment" href="file:///...">`. An implementer who reads "remote" and
+implements it literally rebuilds the hole. The rule is an allowlist of `data:`, not a
+denylist of remote schemes.
+
+Two consequences worth stating rather than discovering. `mailto:` and `tel:` are refused
+by that allowlist — a deliberate, deferred capability loss taken for minimality, since
+Task 3 proved no `href` of any scheme is ever fetched. And the sanitiser is the **only**
+control for an `href`: an href is never fetched, so the renderer has no opinion about it,
+but WeasyPrint writes it into the PDF as a link annotation.
+
+This is what enforces the no-network property at the input rather than trusting the
+renderer's flags alone — subject to the caveat that anything consuming this module's
+output WITHOUT the renderer's own fetcher (an in-browser template preview, above all)
+does not inherit the renderer's half of the guarantee. The profile is
 unit-tested against each of those cases.
 
 **An unknown merge field renders as empty and never throws.** A typo in a template is a
