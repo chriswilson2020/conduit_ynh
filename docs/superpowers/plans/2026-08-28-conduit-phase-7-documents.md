@@ -313,17 +313,19 @@ correction is legible rather than silently patched.
 5. **Import specifiers are `.js`, not `.ts`** — NodeNext, and the repo convention.
 
 **Measured, so later tasks stop guessing.** All figures from the server (Debian 12,
-WeasyPrint 57.2) unless marked. A one-page quote (A4, `@page` margins, a running footer,
-a `data:` logo, 8 line items, totals, terms) renders in **570-580ms to ~14,005 bytes**
-(**665-738ms / 12,457 bytes** on CI's 61.1) at **66.5MB peak RSS**. A 435KB, 40-page
-document costs **3.9s, 97MB RSS, 120KB out**.
+WeasyPrint 57.2) running the SHIPPED script, not a stripped-down one — the embedded-file
+backstop costs about 30ms of the total, which is why an earlier draft of this paragraph
+said 570-580ms. A one-page quote (A4, `@page` margins, a running footer, a `data:` logo,
+8 line items, totals, terms) renders in **600-680ms to ~14,002 bytes** (**629-680ms /
+~12,460 bytes** on CI's 61.1) at **66-67MB peak RSS**. A 435KB, 40-page document costs
+**3.7s, 97MB RSS, 120KB out**.
 
-- The **20s timeout** is 34x the one-page render and bounds how long Task 4's transaction
-  holds its row lock, so it should not grow.
+- The **20s timeout** is ~30x the one-page render and bounds how long Task 4's
+  transaction holds its row lock, so it should not grow.
 - The **25MB output cap** is not a tuned limit but a bound on what is accumulated in
   memory from a runaway stream; anything near it would hit the timeout first.
 - The **2MB input cap** is new (nothing bounded input before) and IS tuned: 435KB of HTML
-  costs 3.9s, so 2MB is roughly where the timeout would bite anyway — this makes that
+  costs 3.7s, so 2MB is roughly where the timeout would bite anyway — this makes that
   failure immediate instead of costing 20s and 100MB first.
 - `ram.runtime` went 400M -> **700M**: a render is a separate Python process, and 300M is
   three at a rounded 100MB ceiling. **Three is a number Task 4's concurrency limit has to

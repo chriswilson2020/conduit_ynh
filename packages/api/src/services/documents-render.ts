@@ -15,10 +15,11 @@ export interface RenderOptions {
 }
 
 /**
- * 20s, which is 34x the measurement rather than a guess at one. Measured on the
- * server's WeasyPrint 57.2: a one-page quote with a logo, eight line items and a
- * page-level stylesheet takes 570-580ms end to end, most of it the Python
- * interpreter starting. A 435KB, 40-page document takes 3.9s.
+ * 20s, which is about 30x the measurement rather than a guess at one. Measured on
+ * the server's WeasyPrint 57.2, running the script below rather than a stripped-down
+ * version of it: a one-page quote with a logo, eight line items and a page-level
+ * stylesheet takes 600-680ms end to end, most of it the Python interpreter starting.
+ * A 435KB, 40-page document takes 3.7s.
  *
  * The cap is therefore the ceiling on a pathological render, not a budget for a
  * normal one. It also bounds how long the issuing transaction holds its row lock
@@ -27,7 +28,7 @@ export interface RenderOptions {
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 /**
- * 25MB of OUTPUT, against a measured 14,005 bytes for that one-page quote and
+ * 25MB of OUTPUT, against a measured 14,002 bytes for that one-page quote and
  * 120KB for the 40-page one. Three orders of magnitude of headroom: this exists to
  * stop an unbounded stream being accumulated in memory, not to reject a large but
  * legitimate document.
@@ -37,7 +38,7 @@ const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
 /**
  * 2MB of INPUT, and this one is not headroom -- it is chosen to bite at roughly the
  * same document size the timeout does. The realistic quote above is 1.8KB of HTML;
- * 435KB of HTML costs 3.9s and 97MB of RSS, so 2MB is about where a render would
+ * 435KB of HTML costs 3.7s and 97MB of RSS, so 2MB is about where a render would
  * approach the 20s ceiling anyway. Rejecting it here makes that failure immediate
  * and free instead of costing 20 seconds and 100+MB first.
  *
