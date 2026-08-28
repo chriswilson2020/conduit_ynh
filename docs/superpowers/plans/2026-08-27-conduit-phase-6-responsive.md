@@ -353,6 +353,14 @@ Watch for: the accumulator/`pages.key` guards Phase 5 and v0.9.1 touched; the co
 
 Below the breakpoint: a **stage picker**, the chosen stage's deals as a list, and **"Move to..."** on each card offering the other stages. This is the third and LAST `useIsMobile()` site. Deal creation stays available; the funnel/summary stays legible or collapses behind a disclosure.
 
+**FROM TASK 3's QUALITY REVIEW — what transfers from the inbox pattern and what does NOT:**
+- **Transferable:** a pure view function that returns the UNCHANGED desktop value for `isMobile: false`, plus a test pinning that over the full input cross-product. That turns the hard requirement into an assertion.
+- **NOT transferable — the inbox's selection lives in the URL; yours cannot.** `/pipelines/$pipelineId` has no search schema, so the chosen stage is component state: no free deep link, and "opening a card IS the navigation" has to be re-earned or given up deliberately. Say which you chose.
+- **Return-value identity is asymmetric in the inbox's function** (desktop returns one shared object, mobile a fresh one per call). If `board-lib` returns the move-target ARRAY, memoise it or key on primitives, or every memoised card re-renders on every render.
+- **Breakpoint alignment:** `useIsMobile` is `md` (48rem) but the inbox grid is `lg:`-gated, so 768-1023px is single-column but not "mobile" — no stack controls, no `max-md:` floors. Gate your CSS at `md:` to line up with `isMobile`; mixing `md` JS with `lg` CSS is what leaves that 256px band behind.
+- **If you hide rather than unmount, budget the focus move** — and pick the SAME target the inbox settles on, so the two surfaces do not disagree.
+- **The seam nothing tests:** in the inbox, changing which pane a level gates on left all 341 web tests green. If you copy the pattern, either guard the level->pane wiring or accept that Task 6's e2e is the only thing that will catch an inversion.
+
 The move must go through the **existing** deal-move service path — never a second one — so the compactor, SSE and optimistic-update behaviour are unchanged. `board-lib.ts` holds the move-target list (pure, tested: the current stage is excluded, order matches the pipeline, an archived pipeline offers none).
 
 Above the breakpoint the board is untouched — including its drag-and-drop. ~8 tests.
@@ -378,6 +386,13 @@ Above the breakpoint, unchanged: drag-to-reschedule, dependency editing, the com
 The journeys, at a phone viewport via Playwright device emulation — these ARE the definition of done expressed as tests: navigate via the bottom bar AND the More sheet; look up a company and read its rail; read a mail thread through the drill-in stack and reply; move a deal between stages via the Move action; open a Gantt bar's task drawer and change its dates; log a meeting and add a follow-up task.
 
 Reuse the suite's conventions: `runId` + per-attempt `${runId}x${testInfo.retry}` fixtures, loaded sentinels rather than bare absences, `typeIntoEditor` from `e2e/helpers.ts` for any rich-text field. **The existing 72 desktop tests must pass unchanged.**
+
+**From Task 3's quality review — five things about driving the stack:**
+- `inbox-back` is the testid at TWO levels (folders and conversation), so it does not identify the level. Pin the level with the `h1` text or with pane visibility.
+- Use auto-retrying `expect(locator).toBeFocused()`. The focus move is a passive effect; a one-shot `page.evaluate(() => document.activeElement)` right after a click reads the pre-effect value.
+- `toBeVisible()`/`toBeHidden()`, never `toHaveCount(0)` — with ONE exception: the `conversation` testid genuinely has count 0 at the folders and threads levels, because `<Conversation>` renders only when `?thread=` is set. The always-in-the-DOM rule applies to the pane `div`, not that testid.
+- **Assert all three panes' visibility at each of the three levels**, not just the pane you are driving — a level->pane inversion is untested anywhere else, so your e2e is the only thing that will catch it.
+- Do not build a fixture that can produce `?thread=` with an EMPTY value: it passes route validation, reads as a selection, and renders a whole phone screen holding only Back and Compose.
 
 **From Task 2's quality review:** `dialog-close` is reliable and genuinely desktop-invisible (measured `height: 0` and unfocusable at 1280). Two asserts worth adding: the rail's **Meetings** tab reachable after ARROW-KEY focus (Task 2's reviewer could not settle this — the browser pane reported the document unfocused throughout, and Radix Tabs does not call `scrollIntoView` itself), and a real click-through of the search sheet's dismissal. And if you add a `data-testid` to any `DialogContent`, **put `className` first** or Task 2's caller guard silently stops applying to it.
 
