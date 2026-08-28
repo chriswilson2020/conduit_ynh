@@ -499,7 +499,20 @@ function StageView({
           container actually scrollable; without it a flex item is still free to
           be squeezed towards its min-content width (the same pairing
           ui/tabs.tsx documents for the record rail's strip). */}
-      <div data-testid="stage-picker" className="flex gap-2 overflow-x-auto pb-1">
+      {/* `role="group"`, not `role="tablist"` or `role="radiogroup"`: both of
+          those promise arrow-key navigation between their members, and
+          claiming a keyboard contract nothing implements leaves a keyboard
+          user pressing arrows at controls that do not respond
+          (components/mail/bulk-bar.tsx makes the same call for the same
+          reason). A group promises nothing but a name, which is what these
+          five buttons were missing -- without it a screen reader meets them as
+          five unrelated toggles. */}
+      <div
+        data-testid="stage-picker"
+        role="group"
+        aria-label="Stages"
+        className="flex gap-2 overflow-x-auto pb-1"
+      >
         {picker.map((option) => (
           <Button
             key={option.id}
