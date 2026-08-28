@@ -832,6 +832,41 @@ Both halves are pure functions. Everything about this task is unit-testable with
 database, and it should be tested to exhaustion — it is the layer that turns
 user-authored HTML into something a renderer is handed.
 
+#### COORDINATOR RULING — the block form generalises beyond `lines`
+
+Task 2 found that the seeded template cannot include the org logo at all. The merge
+language as specified has no conditional, so `<img src="{{org.logoDataUri}}">` renders
+`<img src="">` on every install that has not uploaded one — a broken image on every
+quote by default. Task 2 dropped the logo from the seed rather than ship that, and
+proposed Task 4 supply a transparent 1x1 placeholder.
+
+**Ruling: generalise the block instead.** `mergeTemplate` already parses
+`{{#lines}}...{{/lines}}`; extend that same parser so `{{#path}}...{{/path}}` renders its
+body when the value at `path` is non-empty and renders nothing when it is empty or
+unknown, with `lines` remaining the repeated case. That is Mustache's own semantics, so
+it will not surprise anyone, and it is a small generalisation of code this task writes
+regardless.
+
+The 1x1 placeholder was rejected because it treats one symptom: **every optional field
+has this problem**, not just the logo. `valid_until_date`, `vat_number`,
+`registration_number`, `bank_details` and the recipient's second address line are all
+routinely empty, and each currently renders its surrounding markup — an empty "VAT:"
+label, a bare heading over nothing. A conditional block fixes the class; a placeholder
+image fixes one instance and leaves the rest.
+
+Requirements:
+- `{{#path}}...{{/path}}` and its inverse `{{^path}}...{{/path}}` (render when EMPTY),
+  which is what lets a template say "VAT number, or nothing at all".
+- Empty means empty string, and an unknown path is empty — consistent with the existing
+  rule that an unknown scalar renders as empty and never throws.
+- Blocks do not nest in the first cut. If a template nests them, the behaviour must be
+  defined and tested rather than accidental — a regex-based parser will do something,
+  and what it does must be written down.
+- The seeded template is then updated to wrap the logo and every optional field, and
+  re-rendered on the server to confirm both the with-logo and without-logo cases.
+
+
+
 - [ ] **Step 1: Write the failing tests**
 
 `packages/api/src/services/documents-template.test.ts`:
