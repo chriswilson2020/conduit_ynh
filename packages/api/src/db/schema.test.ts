@@ -19,9 +19,10 @@ import { createProject } from "../services/projects.js";
 import { listThreads } from "../services/mail-threads.js";
 import { createDatabase, migrationsFolder, type DatabaseHandle } from "./client.js";
 import {
-  users, companies, contacts, pipelines, stages, deals, projects, events,
+  users, companies, contacts, pipelines, stages, deals, projects, events, files,
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
   mailThreadHides, emailTemplates, meetings, meetingAttendees,
+  orgProfile, documents, documentLineItems, documentNumberSequences, documentTemplates,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -1245,5 +1246,283 @@ describe("meetings schema (0008)", () => {
       meetingId, mailThreadId: thread!.id, payload: {},
     }).returning();
     expect(both).toMatchObject({ meetingId, mailThreadId: thread!.id });
+  });
+});
+
+describe("documents schema (0009)", () => {
+  // EVERY merge field the seeded default template is allowed to contain, and
+  // the list Task 3's resolver and Task 4's context are written against. The
+  // assertion below is an EQUALITY, not a subset, in both directions: a
+  // template referencing a field nobody supplies renders a silent blank on a
+  // printed quote (unknown fields resolve to "" and never throw), and a field
+  // listed here that the template stopped using is a context key built for
+  // nothing. Either way the migration and this list have to move together.
+  const SEEDED_FIELDS = [
+    "{{#lines}}", "{{/lines}}",
+    "{{description}}", "{{qty}}", "{{unitPrice}}", "{{lineTotal}}",
+    "{{org.name}}", "{{org.addressLines}}", "{{org.email}}", "{{org.phone}}",
+    "{{org.website}}", "{{org.bankDetails}}", "{{org.vatNumber}}", "{{org.registrationNumber}}",
+    "{{document.number}}", "{{document.issueDate}}", "{{document.validUntilDate}}",
+    "{{document.recipientName}}", "{{document.recipientContactName}}", "{{document.recipientAddress}}",
+    "{{document.subtotal}}", "{{document.tax}}", "{{document.total}}",
+    "{{document.notes}}", "{{document.terms}}",
+  ].sort();
+
+  /** A deal and a files row -- the two NOT NULL foreign keys a document needs. */
+  async function seedDocumentParents(): Promise<{ dealId: string; fileId: string }> {
+    const pipeline = await createPipeline(handle.db, userId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, userId, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      handle.db, userId, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+    );
+    const [file] = await handle.db.insert(files).values({
+      originalName: "QUO-2026-0001.pdf", mime: "application/pdf", sizeBytes: 16_003,
+      sha256: "a".repeat(64), uploaderUserId: userId, dealId: deal.id,
+    }).returning();
+    return { dealId: deal.id, fileId: file!.id };
+  }
+
+  function documentValues(
+    parents: { dealId: string; fileId: string },
+    overrides: Partial<typeof documents.$inferInsert> = {},
+  ) {
+    return {
+      number: "QUO-2026-0001", type: "quote", dealId: parents.dealId, fileId: parents.fileId,
+      currency: "EUR", issueDate: "2026-08-28", recipientName: "Acme",
+      subtotalCents: 11_000, taxCents: 2100, totalCents: 13_100,
+      issuedByUserId: userId, ...overrides,
+    } satisfies typeof documents.$inferInsert;
+  }
+
+  // The 0004-0008 drill, one migration on. Also the ONLY place the seeded
+  // template can be observed at all: truncateAll() empties every table in the
+  // public schema before each test, so on the shared conduit_test database
+  // the seeded row is gone by the time any test body runs. Task 4's service
+  // tests inherit that -- they must seed their own quote template rather than
+  // expecting the migration's, and this comment exists because "the default
+  // template is missing" is otherwise a puzzling failure to meet.
+  it("applies migration 0009 on top of a real database migrated only through 0008 -- five new tables arrive, the default quote template is seeded, documents(deal_id) is indexed, and a pre-existing deal can be quoted", async () => {
+    await withPreMigrationDatabase("0009", async (scratch) => {
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const company = await createCompany(scratch.db, user!.id, { name: "Acme" });
+      const pipeline = await createPipeline(scratch.db, user!.id, { name: "Sales", scope: "global" });
+      const stage = await createStage(scratch.db, user!.id, pipeline.id, { name: "New" });
+      const deal = await createDeal(
+        scratch.db, user!.id,
+        { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id, companyId: company.id },
+        "EUR",
+      );
+
+      // Pin the drill's premise before upgrading (the 0006-0008 pattern):
+      // without this, every post-migrate assertion below would also pass
+      // against a database that had been fully migrated all along.
+      const [preTables] = await scratch.db.execute<{ present: number }>(sql`
+        SELECT count(*)::int AS present FROM information_schema.tables
+        WHERE table_name IN ('org_profile', 'documents', 'document_line_items',
+                             'document_number_sequences', 'document_templates')
+      `);
+      expect(preTables?.present).toBe(0);
+
+      // Upgrade: apply the real, full migrations folder. 0009 is the only
+      // pending migration (0000-0008 are already recorded as applied).
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const [postTables] = await scratch.db.execute<{ present: number }>(sql`
+        SELECT count(*)::int AS present FROM information_schema.tables
+        WHERE table_name IN ('org_profile', 'documents', 'document_line_items',
+                             'document_number_sequences', 'document_templates')
+      `);
+      expect(postTables?.present).toBe(5);
+
+      // THE SEED. A broken one is invisible until somebody raises a quote and
+      // gets an ugly PDF weeks later, so it is checked here rather than
+      // trusted: exactly one row, of the right type, whose merge fields are
+      // exactly the set above and whose page-layout CSS survived the SQL
+      // literal intact.
+      const templates = await scratch.db.select().from(documentTemplates);
+      expect(templates).toHaveLength(1);
+      const body = templates[0]!.bodyHtml;
+      expect(templates[0]!.type).toBe("quote");
+      expect([...new Set(body.match(/\{\{[^}]*\}\}/g) ?? [])].sort()).toEqual(SEEDED_FIELDS);
+      // Every {{ in the file is one of those tokens -- a CSS rule that
+      // accidentally put two braces together would be eaten as a merge field.
+      expect(body.match(/\{\{/g) ?? []).toHaveLength(body.match(/\{\{[^}]*\}\}/g)!.length);
+      // The two properties the document sanitiser profile exists to allow,
+      // and the one that keeps a newline-separated address from printing as a
+      // single run-on line.
+      expect(body).toContain("@page");
+      expect(body).toContain("white-space: pre-line");
+      // Rendered on the server (WeasyPrint 57.2) before it was committed:
+      // this template merged with a filled org profile and 8 line items is
+      // 3,816 bytes of HTML and a 16,003-byte two-page PDF, and merged with
+      // an entirely empty context it still renders (9,995 bytes).
+
+      // The hand-written index, ON A DATABASE THIS TEST MIGRATED FROM THE
+      // FILES -- 0005's and 0008's reason: it exists in no drizzle snapshot,
+      // so only a from-the-files migration proves the .sql file still carries
+      // it. Asserted NOT unique and NOT partial: a deal has many documents
+      // and every one of them must be found.
+      const indexes = await scratch.db.execute<{ indexname: string; indexdef: string }>(
+        sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'documents'`,
+      );
+      const dealIndex = indexes.find((row) => row.indexname === "documents_deal_idx");
+      expect(dealIndex?.indexdef).toMatch(/\(deal_id\)/i);
+      expect(dealIndex?.indexdef).not.toMatch(/UNIQUE/i);
+      expect(dealIndex?.indexdef).not.toMatch(/WHERE/i);
+
+      // The new tables work against the PRE-EXISTING deal, not just rows
+      // created after the upgrade -- which is the whole point of quoting from
+      // a deal somebody has been working since before v1.0.0.
+      const [file] = await scratch.db.insert(files).values({
+        originalName: "QUO-2026-0001.pdf", mime: "application/pdf", sizeBytes: 16_003,
+        sha256: "b".repeat(64), uploaderUserId: user!.id, dealId: deal.id,
+      }).returning();
+      const [document] = await scratch.db.insert(documents).values({
+        number: "QUO-2026-0001", type: "quote", dealId: deal.id, fileId: file!.id,
+        currency: "EUR", issueDate: "2026-08-28",
+        recipientName: "Acme", recipientContactName: "Jane Smith", recipientAddress: "2 Low St",
+        subtotalCents: 11_000, taxCents: 2100, totalCents: 13_100, issuedByUserId: user!.id,
+      }).returning();
+      expect(document).toMatchObject({ dealId: deal.id, fileId: file!.id, validUntilDate: null });
+
+      const [line] = await scratch.db.insert(documentLineItems).values({
+        documentId: document!.id, position: 1, description: "Widget",
+        qtyMilli: 2000, unitPriceCents: 5000, lineTotalCents: 10_000,
+      }).returning();
+      expect(line).toMatchObject({ position: 1, taxRateBp: 0 });
+
+      const [profile] = await scratch.db.insert(orgProfile).values({ name: "Listerdale" }).returning();
+      expect(profile).toMatchObject({ id: 1, vatNumber: "", logoFileId: null });
+    });
+  }, 30000);
+
+  // The singleton, which is the claim the whole org_profile design rests on:
+  // "one row" has to be enforced by the database, not by everybody
+  // remembering to upsert. Both halves are tested because either alone is
+  // insufficient -- the primary key stops a second row at id 1, the CHECK
+  // stops one at any other id, and dropping either leaves a hole.
+  it("enforces one org_profile row: the default id collides, and any other id is refused", async () => {
+    const [first] = await handle.db.insert(orgProfile).values({ name: "Listerdale" }).returning();
+    expect(first?.id).toBe(1);
+
+    await expect(handle.db.insert(orgProfile).values({ name: "Second" }))
+      .rejects.toMatchObject({ cause: { code: "23505" } });
+    await expect(handle.db.insert(orgProfile).values({ id: 2, name: "Second" }))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+
+    // And the shape that makes the pinned key worth having: create-or-update
+    // in one statement, with no prior read to find the row.
+    await handle.db.insert(orgProfile).values({ id: 1, name: "Renamed" })
+      .onConflictDoUpdate({ target: orgProfile.id, set: { name: "Renamed" } });
+    const rows = await handle.db.select().from(orgProfile);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: 1, name: "Renamed" });
+  });
+
+  it("enforces a globally unique document number", async () => {
+    const parents = await seedDocumentParents();
+    await handle.db.insert(documents).values(documentValues(parents));
+    await expect(handle.db.insert(documents).values(documentValues(parents)))
+      .rejects.toMatchObject({ cause: { code: "23505" } });
+    // A different number on the same deal is ordinary: raising a corrected
+    // quote is raising another quote (spec's immutability decision).
+    const [second] = await handle.db.insert(documents)
+      .values(documentValues(parents, { number: "QUO-2026-0002" })).returning();
+    expect(second).toMatchObject({ number: "QUO-2026-0002", dealId: parents.dealId });
+  });
+
+  it("enforces documents_type_valid, documents_currency_format and documents_totals_consistent", async () => {
+    const parents = await seedDocumentParents();
+    await expect(handle.db.insert(documents).values(documentValues(parents, { type: "invoice" })))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+    await expect(handle.db.insert(documents).values(documentValues(parents, { currency: "eur" })))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+    // The totals identity: a total that is not subtotal + tax is the defect
+    // this backstop exists for, and it is one an off-by-one-cent arithmetic
+    // bug would produce.
+    await expect(handle.db.insert(documents).values(documentValues(parents, { totalCents: 13_101 })))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+  });
+
+  it("enforces one line per position per document, and the three line-item CHECKs", async () => {
+    const parents = await seedDocumentParents();
+    const [document] = await handle.db.insert(documents).values(documentValues(parents)).returning();
+    const line = {
+      documentId: document!.id, position: 1, description: "Widget",
+      qtyMilli: 2000, unitPriceCents: 5000, taxRateBp: 2100, lineTotalCents: 10_000,
+    };
+    await handle.db.insert(documentLineItems).values(line);
+
+    await expect(handle.db.insert(documentLineItems).values(line))
+      .rejects.toMatchObject({ cause: { code: "23505" } });
+    // The next position on the same document is fine, and so is position 1 on
+    // a different one -- the constraint is per document, not global.
+    await handle.db.insert(documentLineItems).values({ ...line, position: 2 });
+    const [other] = await handle.db.insert(documents)
+      .values(documentValues(parents, { number: "QUO-2026-0002" })).returning();
+    await handle.db.insert(documentLineItems).values({ ...line, documentId: other!.id });
+
+    for (const bad of [
+      { qtyMilli: -1 }, { unitPriceCents: -1 }, { taxRateBp: -1 }, { taxRateBp: 10_001 },
+    ]) {
+      await expect(handle.db.insert(documentLineItems).values({ ...line, position: 9, ...bad }))
+        .rejects.toMatchObject({ cause: { code: "23514" } });
+    }
+  });
+
+  // The numbering table's whole reason for being a table (spec: nextval() is
+  // non-transactional and a failed render would burn the number). This pins
+  // the allocation statement Task 4 issues, against the composite key.
+  it("allocates consecutive numbers per (type, year) through ON CONFLICT DO UPDATE, and rolls back with its transaction", async () => {
+    const allocate = async (db: typeof handle.db, year: number): Promise<number> => {
+      const [row] = await db.insert(documentNumberSequences)
+        .values({ type: "quote", year, lastValue: 1 })
+        .onConflictDoUpdate({
+          target: [documentNumberSequences.type, documentNumberSequences.year],
+          set: { lastValue: sql`${documentNumberSequences.lastValue} + 1` },
+        })
+        .returning({ lastValue: documentNumberSequences.lastValue });
+      return row!.lastValue;
+    };
+
+    expect(await allocate(handle.db, 2026)).toBe(1);
+    expect(await allocate(handle.db, 2026)).toBe(2);
+    // A different year is a different counter: the numbering resets each
+    // January rather than running on.
+    expect(await allocate(handle.db, 2027)).toBe(1);
+
+    // THE PROPERTY A SEQUENCE COULD NOT GIVE: an allocation inside a
+    // transaction that fails leaves no number spent, so the next quote takes
+    // the one the failed render was holding.
+    await expect(handle.db.transaction(async (tx) => {
+      expect(await allocate(tx as typeof handle.db, 2026)).toBe(3);
+      throw new Error("render failed");
+    })).rejects.toThrow("render failed");
+    expect(await allocate(handle.db, 2026)).toBe(3);
+
+    await expect(handle.db.insert(documentNumberSequences).values({ type: "invoice", year: 2026 }))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+  });
+
+  it("allows one template per type and rejects an unknown type", async () => {
+    await handle.db.insert(documentTemplates).values({ type: "quote", bodyHtml: "<p>a</p>" });
+    await expect(handle.db.insert(documentTemplates).values({ type: "quote", bodyHtml: "<p>b</p>" }))
+      .rejects.toMatchObject({ cause: { code: "23505" } });
+    await expect(handle.db.insert(documentTemplates).values({ type: "proposal", bodyHtml: "<p>c</p>" }))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+  });
+
+  it("enforces every foreign key on documents, document_line_items and org_profile", async () => {
+    const parents = await seedDocumentParents();
+    for (const bad of [{ dealId: randomUUID() }, { fileId: randomUUID() }, { issuedByUserId: randomUUID() }]) {
+      await expect(handle.db.insert(documents).values(documentValues(parents, bad)))
+        .rejects.toMatchObject({ cause: { code: "23503" } });
+    }
+    await expect(handle.db.insert(documentLineItems).values({
+      documentId: randomUUID(), position: 1, description: "Widget",
+      qtyMilli: 1000, unitPriceCents: 1, lineTotalCents: 1,
+    })).rejects.toMatchObject({ cause: { code: "23503" } });
+    await expect(handle.db.insert(orgProfile).values({ logoFileId: randomUUID() }))
+      .rejects.toMatchObject({ cause: { code: "23503" } });
   });
 });

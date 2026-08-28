@@ -1,6 +1,12 @@
 import { z } from "zod";
 
 export { midpoint } from "./fractional.js";
+// The package exports "." and nothing else (package.json), so a sibling module is
+// reachable from api and web only by being re-exported here -- fractional.js's line
+// above is the precedent, and money.js needs it for the same reason: the quote
+// form's running total and the stored total must be the same function.
+export { lineTotalCents, taxCents, documentTotals } from "./money.js";
+export type { LineInput, DocumentTotals } from "./money.js";
 
 export const userSchema = z.object({
   id: z.uuid(),
