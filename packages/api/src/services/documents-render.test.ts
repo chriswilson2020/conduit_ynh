@@ -298,6 +298,7 @@ describe("renderPdf and the schemes it will fetch", () => {
   const hits: string[] = [];
   let origin = "";
   let secretPath = "";
+  let secretCssPath = "";
   const SECRET = "conduit-secret-marker-9f3a";
 
   beforeAll(async () => {
@@ -313,6 +314,12 @@ describe("renderPdf and the schemes it will fetch", () => {
     origin = typeof address === "object" && address !== null
       ? `http://127.0.0.1:${String(address.port)}`
       : "";
+    // A local stylesheet that reaches back out over http. Whether it was READ is
+    // then observable as a request, without depending on anything reaching the PDF:
+    // a hit on /from-local-css.png can only happen if the file:// CSS was fetched
+    // AND parsed. That makes "the file was never opened" a positive observation.
+    secretCssPath = join(stubDir, "probe.css");
+    writeFileSync(secretCssPath, `body { background-image: url("${origin}/from-local-css.png"); }\n`);
   });
 
   afterAll(async () => {
@@ -321,19 +328,15 @@ describe("renderPdf and the schemes it will fetch", () => {
 
   const blocked = (): { name: string; html: () => string }[] => [
     {
-      name: "file:// as an attachment, the exfiltration the CLI allowed",
-      html: () => `<html><body><link rel="attachment" href="file://${secretPath}"></body></html>`,
-    },
-    {
       name: "file:// as an image",
       html: () => `<html><body><img src="file://${secretPath}"></body></html>`,
     },
     {
-      name: "file:// as a stylesheet",
-      html: () => `<html><head><link rel="stylesheet" href="file://${secretPath}"></head><body>x</body></html>`,
+      name: "file:// as a stylesheet that would phone home if it were read",
+      html: () => `<html><head><link rel="stylesheet" href="file://${secretCssPath}"></head><body>x</body></html>`,
     },
     {
-      name: "http://, which the proxy variables alone would also have stopped",
+      name: "http:// as an image",
       html: () => `<html><body><img src="${origin}/probe.png"></body></html>`,
     },
     {
@@ -353,10 +356,37 @@ describe("renderPdf and the schemes it will fetch", () => {
 
       expect(error).toBeInstanceOf(RenderError);
       expect((error as RenderError).message).toBe("document referenced a blocked URL");
-      // No PDF is produced at all, so there is nothing for a caller to store.
+      // No PDF is produced at all, so there is nothing for a caller to store -- and
+      // for the stylesheet case, no hit here also proves the file was never opened.
       expect(hits).toEqual([]);
     });
   }
+
+  itReal("never lets a file:// attachment reach the PDF, on either version", async () => {
+    // THE ONE VERSION-CONDITIONAL CASE, and it is asserted as the property rather
+    // than the mechanism because the two versions differ.
+    //
+    // On the server's 57.2 this is the exfiltration that forced this whole module to
+    // stop using the CLI: WeasyPrint fetches the target and writes it into the PDF's
+    // /EmbeddedFiles, so the fetcher sees it and the render is refused. On CI's 61.1
+    // the fetcher is never called for this element at all and the render simply
+    // succeeds with nothing embedded. Why 61.1 differs is not established here; only
+    // that it does. Either way the file must not come out the other side, so that is
+    // what is asserted.
+    hits.length = 0;
+    const result = await renderPdf(
+      `<html><body><link rel="attachment" href="file://${secretPath}"></body></html>`,
+    ).catch((e: unknown) => e);
+
+    if (result instanceof RenderError) {
+      expect(result.message).toBe("document referenced a blocked URL");
+    } else {
+      const pdf = result as Buffer;
+      expect(pdf.includes("/EmbeddedFiles")).toBe(false);
+      expect(pdfContains(pdf, SECRET)).toBe(false);
+    }
+    expect(hits).toEqual([]);
+  });
 
   itReal("renders a data: image, which is the one scheme a document may use", async () => {
     const pdf = await renderPdf(`<html><body><img src="${LOGO_PNG}"></body></html>`);
@@ -368,37 +398,56 @@ describe("renderPdf and the schemes it will fetch", () => {
     // base_url is None, so a relative URL resolves to nothing and the fetcher is
     // never reached. This is the one case that degrades quietly, and it is the
     // harmless one: nothing was read and nothing was fetched.
+    hits.length = 0;
     const pdf = await renderPdf(`<html><body><img src="../../etc/passwd"></body></html>`);
 
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(hits).toEqual([]);
   });
 
-  itReal("a bare weasyprint CLI DOES embed a local file, which is why we do not use it", async () => {
-    // The characterisation half, and the reason this module spawns Python with a
-    // url_fetcher instead of the `weasyprint` binary. Run under the same proxy
-    // environment renderPdf uses, to show those variables do nothing for file://.
-    const html = `<html><body><link rel="attachment" href="file://${secretPath}"></body></html>`;
+  // ---- the other direction: what the bare CLI does, and why it is not used ----
+
+  /** Feed HTML to the `weasyprint` CLI with a plain environment. Returns its stdout. */
+  async function bareCli(html: string): Promise<Buffer> {
+    const env = { ...process.env };
+    for (const key of ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ftp_proxy"]) {
+      delete env[key];
+    }
     const chunks: Buffer[] = [];
-    const code = await new Promise<number | null>((resolve) => {
+    await new Promise<void>((resolve) => {
       const child = spawn("weasyprint", ["-", "-"], {
         stdio: ["pipe", "pipe", "ignore"],
-        env: {
-          ...process.env,
-          http_proxy: "http://127.0.0.1:9",
-          https_proxy: "http://127.0.0.1:9",
-          no_proxy: "",
-        },
+        env,
       });
       child.stdout.on("data", (c: Buffer) => chunks.push(c));
-      child.on("error", () => { resolve(null); });
-      child.on("close", (c) => { resolve(c); });
+      child.on("error", () => { resolve(); });
+      child.on("close", () => { resolve(); });
       child.stdin.on("error", () => { /* the child may not read it all */ });
       child.stdin.end(html, "utf8");
     });
-    const pdf = Buffer.concat(chunks);
+    return Buffer.concat(chunks);
+  }
 
-    expect(code).toBe(0);
-    expect(pdf.includes("/EmbeddedFiles")).toBe(true);
-    expect(pdfContains(pdf, SECRET)).toBe(true);
+  itReal("a bare CLI fetches an absolute http:// URL with no base URL set", async () => {
+    // Omitting --base-url leaves only RELATIVE references unresolvable. This is the
+    // evidence for that, and for why the proxy variables were ever added.
+    hits.length = 0;
+    await bareCli(`<html><body><img src="${origin}/probe.png"></body></html>`);
+
+    expect(hits).toContain("/probe.png");
+  });
+
+  itReal("a bare CLI reads local files, which no proxy setting can prevent", async () => {
+    // The finding that broke the previous design, stated so it holds on any version:
+    // the CLI opens a file:// stylesheet, and the request the CSS then makes is the
+    // proof it was read and parsed. file:// goes to urllib's FileHandler and never
+    // consults a proxy, so this is exactly what the environment variables cannot
+    // reach -- and it is why the renderer is invoked through its API with a fetcher.
+    hits.length = 0;
+    await bareCli(
+      `<html><head><link rel="stylesheet" href="file://${secretCssPath}"></head><body>x</body></html>`,
+    );
+
+    expect(hits).toContain("/from-local-css.png");
   });
 });

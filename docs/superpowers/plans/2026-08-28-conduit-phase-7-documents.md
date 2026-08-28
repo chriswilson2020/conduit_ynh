@@ -269,9 +269,19 @@ correction is legible rather than silently patched.
    the loopback server); `ftp://`; `jar:`. A relative reference still renders without the
    asset, because `base_url=None` means the fetcher is never reached at all.
 
+   **The attachment vector is VERSION-CONDITIONAL, and the vulnerable version is the
+   one the server runs.** On 57.2 `<link rel=attachment href="file://...">` reaches the
+   fetcher and the target lands in `/EmbeddedFiles`; on CI's 61.1 the fetcher is never
+   called for that element and the render simply succeeds with nothing embedded. Why
+   61.1 differs was not established — only that it does, found by a red CI run against a
+   test that asserted the 57.2 mechanism. That test now asserts the PROPERTY (the file
+   never reaches the PDF) rather than the mechanism, which is what holds on both. The
+   `img` and `stylesheet` file:// vectors exist on both versions and are refused on both.
+
    **The lesson worth carrying into Task 3:** the previous suite tested exactly one
    scheme and generalised to "fetches nothing". Anything asserting a no-network or
-   no-read property must be parametrised over schemes.
+   no-read property must be parametrised over schemes — and asserted as a property,
+   because the mechanism moves between versions.
 2. **Step 4's `renderPdf` resolved a zero-byte "PDF".** A child that exits 0 having
    written nothing returned `Buffer.concat([])`, which would have put an empty file in a
    deal's Files with no error raised anywhere. The shipped version treats a stdout that
