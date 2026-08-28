@@ -91,14 +91,33 @@ const REL_ATTACHMENT = /(^|\s)attachment(\s|$)/i;
  * than a URL: a pure fragment (`#terms`), which names a place inside this very
  * document and can reach nothing, and nothing at all.
  *
+ * `position` narrows it further, and the narrowing is deliberate rather than a side
+ * effect of "exactly `data:` everywhere". A "fetch" position is one the renderer
+ * resolves -- an `img src`, a CSS `url()`, an `@import` -- and there a `data:` URI is
+ * the whole point, since that is how the org's logo arrives. A "link" position is an
+ * `href`, which is never fetched at all: WeasyPrint writes it into the PDF as a link
+ * annotation. `data:` buys nothing there and `<a href="data:text/html,...">` would
+ * ride out of here into a `/URI` annotation, so a link may be a fragment and nothing
+ * else.
+ *
+ * `mailto:` AND `tel:` ARE REFUSED, AND THAT IS A CAPABILITY LOSS RATHER THAN A
+ * DANGER. No href of any scheme reaches the renderer's fetcher -- both are inert
+ * `/URI` annotations -- so the reason is allowlist minimality, not exploitability: a
+ * quote that links the issuer's email address is a plausible thing to want, and it is
+ * DEFERRED, not rejected. Restoring it is two entries in the check below, scoped to
+ * this "link" position so it cannot widen a fetch.
+ *
  * Whitespace is trimmed only at the ENDS. A value like "data\n:text/html,x" is
  * refused rather than repaired, because deciding what a consumer would make of an
  * interior control character is exactly the guess this function must not make.
  */
-function isPermittedUrl(value: string): boolean {
+type UrlPosition = "fetch" | "link";
+
+function isPermittedUrl(value: string, position: UrlPosition = "fetch"): boolean {
   const trimmed = value.replace(/^[\x00-\x20]+/, "").replace(/[\x00-\x20]+$/, "");
   if (trimmed === "") return false;
   if (trimmed.startsWith("#")) return true;
+  if (position === "link") return false;
   return /^data:/i.test(trimmed);
 }
 
@@ -194,8 +213,16 @@ function readString(css: string, at: number): Read {
   while (i < css.length) {
     const c = css[i]!;
     if (c === quote) { i += 1; break; }
-    // An unescaped newline ends a bad string, the way a CSS tokenizer ends one.
-    if (c === "\n") break;
+    // A bad-string ends here, the way a CSS tokenizer ends one -- AND ALL THREE OF
+    // THESE COUNT, which the first version of this function got wrong. CSS Syntax 3
+    // preprocesses CR, FF and CRLF each into a single LF before tokenizing, so a bare
+    // CR terminates a string exactly as a newline does. Breaking on "\n" alone meant
+    // a string opened before a CR swallowed everything after it as string content,
+    // and a `url(file:///etc/passwd)` sitting in there was copied out untouched --
+    // proved by feeding this function's own output to a recording fetcher on the
+    // server, which then asked for the file. The renderer's data:-only fetcher was
+    // what stopped it, which is precisely the dependency this module exists to remove.
+    if (c === "\n" || c === "\r" || c === "\f") break;
     if (c === "\\") {
       const after = css[i + 1];
       if (after === "\n") { i += 2; continue; }
@@ -282,6 +309,15 @@ function skipTrivia(css: string, at: number): number {
  * `content:` value, say -- is not fetched by anything, so it is left alone: the
  * property claimed here is that no url() and no @import in the output names anything
  * but a `data:` URI, not that the word "http" never appears.
+ *
+ * THE PROPERTY IS ONLY AS TRUE AS THE TOKENIZER AGREES WITH tinycss2, and the first
+ * version of this scanner did not: it ended a string at "\n" alone, where CSS ends
+ * one at CR and FF as well, so a string opened before a bare CR swallowed the rest of
+ * the stylesheet as content and a live `url()` inside it was copied out. A reviewer
+ * measured that survivor being FETCHED. It is only the renderer's `data:`-only
+ * fetcher that stopped the shipped path -- and depending on that flag is the thing
+ * this module exists not to do. Any future divergence from the tokenizer is the same
+ * bug, so changes here belong next to a case in the test file's HIDDEN table.
  */
 function sanitizeCss(css: string): string {
   let out = "";
@@ -391,7 +427,11 @@ export function sanitizeDocumentHtml(html: string): string {
         for (const [name, value] of Object.entries(attribs)) {
           const lower = name.toLowerCase();
           if (lower === "rel" && REL_ATTACHMENT.test(value)) continue;
-          if (URL_ATTRIBUTES.has(lower) && !isPermittedUrl(value)) continue;
+          // An href is a link and every other URL attribute is a fetch. Keyed on the
+          // attribute rather than on the tag, because `href` is only ever on an `a`
+          // in this profile and a tag test would be a second thing to keep in step.
+          const position: UrlPosition = lower === "href" ? "link" : "fetch";
+          if (URL_ATTRIBUTES.has(lower) && !isPermittedUrl(value, position)) continue;
           if (lower === "style") {
             const css = sanitizeCss(value);
             if (css.trim() !== "") kept[name] = css;
@@ -450,20 +490,39 @@ export class TemplateError extends Error {
 }
 
 /**
- * The merged output cap, and the one thing in this module that throws.
+ * THREE BOUNDS, AND THE FIRST TWO ARE THE ONES THAT MATTER. Together they are
+ * everything in this module that throws, and `TemplateError` is what all three throw
+ * -- Task 4's route is written against that being true.
  *
- * Blocks nest, so expansion is not linear in the template: seven `{{#lines}}` blocks
- * inside each other over eight line items is two million rows, built in the API
- * process long before renderPdf's 128KB input cap could refuse any of it. The cap is
- * checked as the output is appended, so a runaway template stops at half a megabyte
- * instead of at whatever the heap allows.
+ * Blocks nest, so expansion is not linear in the template. A 240-character template
+ * with twelve `{{#lines}}` inside each other, against an ordinary twenty-line quote,
+ * is 4.1e15 iterations; `render` is synchronous, so it takes the whole event loop
+ * down, not one request. Templates are user-editable, which makes that a route.
  *
- * It is four times renderPdf's input cap on purpose: anything between the two is a
- * document that was never going to render, and hitting this is a template that is
- * broken rather than a field that is blank. Blanks never throw -- that rule is what
- * the unknown-field behaviour is for -- but a template that cannot terminate is not
- * a blank.
+ * MERGE_MAX_STEPS is the bound that actually holds, because it counts WORK -- a node
+ * visited or a block expanded -- rather than characters produced. The output cap
+ * alone did not: it is only reached by a node that EMITS, and a nest whose innermost
+ * body emits nothing never touches it.
+ *
+ * Measured on the server, all with twenty line items and a body that emits nothing:
+ * depths 6, 9, 12 and 20 now stop in 50-79ms, and a body holding one unknown field
+ * stops in 288-329ms (the same steps, more lookup per step). The seeded template
+ * merges in 1,612 steps at 130 line items -- the largest quote that can render at
+ * all -- and 148 at eight, so a million is nearly three orders of magnitude of
+ * headroom and the abort is still a third of a second at its slowest.
+ *
+ * MERGE_MAX_DEPTH bounds the RECURSION, which is a different failure: `render`
+ * descends once per nesting level, and a few thousand levels is a RangeError out of
+ * the JavaScript stack, which no `TemplateError` contract would survive. 32 is far
+ * past anything a page needs.
+ *
+ * MERGE_MAX_OUTPUT_CHARS stays as the memory bound, at four times renderPdf's 128KB
+ * input cap: anything between the two was never going to render anyway. Blanks never
+ * throw -- that rule is what the unknown-field behaviour is for -- but a template
+ * that cannot terminate is not a blank.
  */
+export const MERGE_MAX_STEPS = 1_000_000;
+export const MERGE_MAX_DEPTH = 32;
 export const MERGE_MAX_OUTPUT_CHARS = 512 * 1024;
 
 type Node =
@@ -498,13 +557,49 @@ const TAG = /^\s*([#^/]?)\s*([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)\s*$/;
  *   a mismatched one   dropped, which leaves its block unclosed, which is the case
  *                      above.
  *   anything that is
- *   not a tag at all   left exactly as it was found, so `{{ oops }}` shows up on the
- *                      page where the author can see it.
+ *   not a tag at all   left exactly as it was found -- `{{ }}`, `{{1a}}`, `{{{a}}}`
+ *                      and `{{__proto__}}` all print, so the author can see them.
+ *                      `{{ oops }}` is NOT one of these: surrounding whitespace is
+ *                      tolerated, so it is a tag for an unknown path and renders
+ *                      blank, which is Mustache's behaviour and the right one.
  *
  * It is also linear: a lazy quantifier plus a backreference over a 128KB template is
  * a rescan from every `{{` in the file.
  */
+function cssRegions(template: string): { from: number; to: number }[] {
+  const regions: { from: number; to: number }[] = [];
+  const lower = template.toLowerCase();
+  const open = /<style\b[^>]*>/gi;
+  for (;;) {
+    const match = open.exec(template);
+    if (match === null) break;
+    const from = match.index + match[0].length;
+    const close = lower.indexOf("</style", from);
+    const to = close === -1 ? template.length : close;
+    regions.push({ from, to });
+    open.lastIndex = to;
+  }
+  return regions;
+}
+
 function parse(template: string): Node[] {
+  // WHAT IS INSIDE A <style> BLOCK IS NOT MERGED AT ALL, and that is a refusal rather
+  // than an omission. HTML escaping is escaping for one context and CSS is another
+  // one, so every direction is wrong there: a value with a quote in it becomes
+  // `&quot;`, which CSS does not decode; a value ENDING IN A BACKSLASH escapes the
+  // closing quote of the string it landed in and swallows the rest of the stylesheet,
+  // faithfully to CSS; and a value can put a `url()` somewhere only the sanitiser
+  // would catch. Leaving the tokens alone means none of that is reachable, and the
+  // author sees their `{{...}}` sitting in the stylesheet rather than a silent
+  // half-broken rule. The seeded template has no field in its CSS and a test says so.
+  //
+  // The region scan is the raw-text rule htmlparser2 uses: a `<style ...>` runs to the
+  // first `</style`. It can only err by treating a field as CSS when it is not (a
+  // literal `<style>` inside an attribute value would do it), which leaves a token
+  // unrendered -- the harmless direction.
+  const css = cssRegions(template);
+  const inCss = (at: number): boolean => css.some((r) => at >= r.from && at < r.to);
+
   const root: Node[] = [];
   const open: { path: string; inverted: boolean; body: Node[] }[] = [];
   const current = (): Node[] => open.length === 0 ? root : open[open.length - 1]!.body;
@@ -522,7 +617,7 @@ function parse(template: string): Node[] {
     if (end === -1) break;
 
     const tag = TAG.exec(template.slice(start + 2, end));
-    if (tag === null) { i = start + 2; continue; }
+    if (tag === null || inCss(start)) { i = start + 2; continue; }
     const [, sigil, path] = tag as unknown as [string, string, string];
 
     flush(start);
@@ -563,8 +658,12 @@ function hasOwn(bag: object, key: string): boolean {
  * Resolve a dotted path against the scope stack, innermost first.
  *
  * Own properties only. `{{constructor}}` has to be a blank on a page, not
- * "function Object() { [native code] }", and `{{__proto__.x}}` has to be nothing at
- * all -- a template is user input that reaches this with no schema in between.
+ * "function Object() { [native code] }", and `{{org.__proto__.x}}` has to be nothing
+ * at all -- a template is user input that reaches this with no schema in between.
+ *
+ * `{{__proto__}}` never gets here: TAG requires a path to start with a letter, so it
+ * is not a tag and prints as literal text. An earlier version of this comment claimed
+ * it was blank, which was wrong about which mechanism handled it.
  */
 function lookup(scopes: unknown[], path: string): unknown {
   const [head, ...rest] = path.split(".") as [string, ...string[]];
@@ -614,7 +713,31 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
-interface Sink { parts: string[]; length: number }
+interface Sink { parts: string[]; length: number; steps: number }
+
+/**
+ * Spend one step of the work budget.
+ *
+ * COUNTING OUTPUT CHARACTERS DOES NOT BOUND THIS, AND A REVIEWER MEASURED THAT.
+ * MERGE_MAX_OUTPUT_CHARS is only reached by a node that EMITS, so a nest of blocks
+ * whose innermost body emits nothing -- an empty body, or one holding only an unknown
+ * field, which appends "" -- ran `lines.length ** depth` times with `length` stuck at
+ * zero. Twelve nested blocks over twenty line items is 4.1e15 iterations from a
+ * 240-character template, and `render` is synchronous, so that is the whole Node
+ * event loop rather than one request.
+ *
+ * So the budget is on WORK, not on output: one step per node visited and one per
+ * block expansion, which is the only counter that both cases increment.
+ */
+function spend(sink: Sink): void {
+  sink.steps += 1;
+  if (sink.steps > MERGE_MAX_STEPS) {
+    throw new TemplateError(
+      `merging did more than ${String(MERGE_MAX_STEPS)} steps; ` +
+        "a block is probably nested inside itself",
+    );
+  }
+}
 
 function emit(sink: Sink, text: string): void {
   sink.length += text.length;
@@ -627,8 +750,19 @@ function emit(sink: Sink, text: string): void {
   sink.parts.push(text);
 }
 
-function render(nodes: Node[], scopes: unknown[], sink: Sink): void {
+function render(nodes: Node[], scopes: unknown[], sink: Sink, depth: number): void {
+  // `render` recurses once per nesting level, so without this a template nested a few
+  // thousand deep is a RangeError out of the JavaScript stack rather than a
+  // TemplateError -- measured, and a 156KB template gets there. Task 4's route is
+  // written against "TemplateError is the only throw", so this is what makes that
+  // sentence true. Nothing legitimate nests past a handful: the seeded template's
+  // deepest point is one block inside a table.
+  if (depth > MERGE_MAX_DEPTH) {
+    throw new TemplateError(`blocks are nested more than ${String(MERGE_MAX_DEPTH)} deep`);
+  }
+
   for (const node of nodes) {
+    spend(sink);
     if (node.kind === "text") {
       emit(sink, node.text);
       continue;
@@ -641,16 +775,31 @@ function render(nodes: Node[], scopes: unknown[], sink: Sink): void {
 
     const value = lookup(scopes, node.path);
     if (node.inverted) {
-      if (isEmpty(value)) render(node.body, scopes, sink);
+      if (isEmpty(value)) {
+        spend(sink);
+        render(node.body, scopes, sink, depth + 1);
+      }
       continue;
     }
     if (isEmpty(value)) continue;
     if (Array.isArray(value)) {
-      for (const item of value) render(node.body, [...scopes, item], sink);
+      // One step per item BEFORE descending. WHAT TERMINATES THE MERGE IS THE NODE
+      // COUNT, not this: an expansion that visits no nodes only happens at the
+      // innermost level, so leaving this out costs a factor of the array length
+      // rather than a bound. Mutation-checked and it fails NO test, exactly like the
+      // rel=attachment strip -- what it buys is the constant: without it a 130-line
+      // quote could do 1.3e8 iterations inside the same one-million-step budget,
+      // which is seconds of blocked event loop rather than a third of a second.
+      for (const item of value) {
+        spend(sink);
+        render(node.body, [...scopes, item], sink, depth + 1);
+      }
     } else if (isBag(value)) {
-      render(node.body, [...scopes, value], sink);
+      spend(sink);
+      render(node.body, [...scopes, value], sink, depth + 1);
     } else {
-      render(node.body, scopes, sink);
+      spend(sink);
+      render(node.body, scopes, sink, depth + 1);
     }
   }
 }
@@ -675,8 +824,8 @@ function render(nodes: Node[], scopes: unknown[], sink: Sink): void {
  * due. The single exception is MERGE_MAX_OUTPUT_CHARS -- see its comment.
  */
 export function mergeTemplate(template: string, context: MergeContext): string {
-  const sink: Sink = { parts: [], length: 0 };
-  render(parse(template), [context], sink);
+  const sink: Sink = { parts: [], length: 0, steps: 0 };
+  render(parse(template), [context], sink, 0);
   return sink.parts.join("");
 }
 
@@ -684,11 +833,12 @@ export function mergeTemplate(template: string, context: MergeContext): string {
  * Merge, then sanitise. THE ORDER IS THE POINT OF THIS FUNCTION EXISTING.
  *
  * Substituted values are HTML-escaped, which is escaping for ONE context. A value
- * that lands inside a `style` attribute or a `<style>` block is in a different one,
- * where `<` and `&` are not what matters and `url(` is -- so escaping cannot help
- * there, and only a sanitiser looking at the FINISHED document can. Sanitising the
- * template first and merging into it afterwards would hand the renderer a `file://`
- * URL that nothing had ever looked at.
+ * that lands inside a `style` ATTRIBUTE is in a different one, where `<` and `&` are
+ * not what matters and `url(` is -- so escaping cannot help there, and only a
+ * sanitiser looking at the FINISHED document can. Sanitising the template first and
+ * merging into it afterwards would hand the renderer a `file://` URL that nothing had
+ * ever looked at. That attribute is the ONE CSS context a value can still reach:
+ * mergeTemplate does not substitute inside a `<style>` block at all (see parse).
  *
  * The other direction is covered too: because values are escaped on the way in, a
  * company name of `<table>` cannot restructure the page, and one containing

@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { pdfText } from "../test/pdf.js";
 import { renderPdf, weasyprintAvailable } from "./documents-render.js";
 import {
+  MERGE_MAX_DEPTH,
   MERGE_MAX_OUTPUT_CHARS,
+  MERGE_MAX_STEPS,
   TemplateError,
   mergeTemplate,
   prepareDocumentHtml,
@@ -255,6 +257,18 @@ describe("sanitizeDocumentHtml refuses every scheme but data:, in every attribut
     expect(sanitizeDocumentHtml('<img alt="logo">')).toBe("");
   });
 
+  it("refuses data: on an href, which is a link rather than a fetch", () => {
+    // Narrowed deliberately rather than left as a side effect of "exactly data:
+    // everywhere". An href is never fetched -- it becomes a /URI annotation in the
+    // PDF -- so data: buys a template nothing there and would ride out into the
+    // finished document. A fetch position still takes it, because that is how the
+    // logo arrives.
+    expect(sanitizeDocumentHtml('<a href="data:text/html,<script>x</script>">y</a>'))
+      .not.toContain("data:");
+    expect(sanitizeDocumentHtml('<a href="#terms">Terms</a>')).toContain('href="#terms"');
+    expect(sanitizeDocumentHtml(`<img src="${LOGO_PNG}" alt="">`)).toContain("data:image/png");
+  });
+
   it("refuses rel=attachment on a <link> and on an <a>", () => {
     // THE VECTOR THAT LEAKED THE KEY. The renderer refuses it too (control 2), and
     // has to, because on WeasyPrint 61.1 an attachment never reaches the document's
@@ -295,6 +309,16 @@ describe("sanitizeDocumentHtml sees through CSS that hides a URL", () => {
     { name: "a url inside a nested at-rule", css: "@media print { body { background: url(file:///etc/passwd); } }" },
     { name: "a url inside @page", css: "@page { background: url(file:///etc/passwd); }" },
     { name: "two urls in one declaration", css: "body { background: url(data:x), url(file:///etc/passwd); }" },
+    // THE STRING SHAPES, WHICH THE FIRST VERSION OF THIS TABLE HAD NONE OF. CSS
+    // preprocesses CR, FF and CRLF each into a single LF, so each of these ends a
+    // bad-string exactly where a newline would -- and a reader that only knew about
+    // "\n" copied everything after the CR out as string content, url() and all. That
+    // survivor was measured being FETCHED by the renderer on the server.
+    { name: "a url after a bad-string ended by a bare CR", css: "p{content:'x\r} p{background:url(file:///etc/passwd)} p{a:'}" },
+    { name: "a url after a bad-string ended by a form feed", css: "p{content:'x\f} p{background:url(file:///etc/passwd)} p{a:'}" },
+    { name: "a url after a bad-string ended by CRLF", css: "p{content:'x\r\n} p{background:url(file:///etc/passwd)} p{a:'}" },
+    { name: "a url after a bad-string in double quotes", css: 'p{content:"x\r} p{background:url(file:///etc/passwd)} p{a:"}' },
+    { name: "a url after an unterminated string at end of line", css: "p{content:'x\n} p{background:url(file:///etc/passwd)} p{a:'}" },
   ];
 
   for (const { name, css } of HIDDEN) {
@@ -599,23 +623,88 @@ describe("mergeTemplate and blocks inside blocks", () => {
     expect(out).toBe("(WidgetSprocket)(WidgetSprocket)");
   });
 
-  it("refuses a template that expands past the output cap instead of eating the heap", () => {
-    // The reason the cap exists: seven nested lines blocks over eight lines is 2
-    // million rows before renderPdf ever gets a chance to refuse the input, and the
-    // API process would be dead by then.
-    const lines = Array.from({ length: 8 }, (_, i) => ({
-      description: `Line ${String(i)}`, qty: "1", unitPrice: "1.00", taxRate: "21%", lineTotal: "1.00",
-    }));
+  /**
+   * THE BOUND IS ON WORK, NOT ON OUTPUT, AND A REVIEWER IS WHY.
+   *
+   * The output cap alone did not terminate: it is only reached by a node that EMITS,
+   * so a nest whose innermost body emits nothing ran `lines.length ** depth` times
+   * with the character count stuck at zero. Measured before the fix, with twenty line
+   * items: depth 7 took 30 seconds and did not throw, depth 12 was 4.1e15 iterations
+   * from a 240-character template. `mergeTemplate` is synchronous, so that is the
+   * whole event loop, and templates are user-editable.
+   *
+   * The first version of this test put `{{description}}` in the body, which emits,
+   * which is why it always hit the cap and proved nothing about the case that
+   * mattered. Every shape below has a body that produces NOTHING.
+   *
+   * Each is given a tight timeout, which catches a bound that got LOOSE. It does not
+   * catch one that is gone: `mergeTemplate` is synchronous, so vitest's timer cannot
+   * fire until it returns, and removing the budget hangs the run instead of failing
+   * it -- measured, killed at 120s. That is the argument for the bound living in the
+   * module rather than in a test's patience.
+   */
+  const TWENTY_LINES = Array.from({ length: 20 }, (_, i) => ({
+    description: `Line ${String(i)}`, qty: "1", unitPrice: "1.00", taxRate: "21%", lineTotal: "1.00",
+  }));
+
+  const NON_EMITTING: { name: string; body: string; depth: number }[] = [
+    { name: "an empty body", body: "", depth: 12 },
+    { name: "a body holding only an unknown field", body: "{{nope.nope}}", depth: 9 },
+    { name: "a body holding only an empty field", body: "{{org.vatNumber}}", depth: 9 },
+    { name: "a body holding only a block that never renders", body: "{{#org.vatNumber}}x{{/org.vatNumber}}", depth: 8 },
+  ];
+
+  for (const { name, body, depth } of NON_EMITTING) {
+    it(`stops a nest of ${String(depth)} blocks with ${name}, which emits nothing to count`, () => {
+      const nested = "{{#lines}}".repeat(depth) + body + "{{/lines}}".repeat(depth);
+
+      expect(() => mergeTemplate(nested, { ...CONTEXT, lines: TWENTY_LINES }))
+        .toThrow(TemplateError);
+    }, 2000);
+  }
+
+  it("stops a nest whose body DOES emit, which is what the output cap is for", () => {
     const nested = "{{#lines}}".repeat(7) + "{{description}}" + "{{/lines}}".repeat(7);
 
-    expect(() => mergeTemplate(nested, { ...CONTEXT, lines }))
+    expect(() => mergeTemplate(nested, { ...CONTEXT, lines: TWENTY_LINES }))
       .toThrow(TemplateError);
+  }, 2000);
+
+  it("throws a TemplateError rather than a RangeError when a template nests thousands deep", () => {
+    // `render` descends once per level, so without a depth bound this is the
+    // JavaScript stack failing, which is not something Task 4's route can be written
+    // against. 20,000 levels is a 400KB template and was measured hitting it.
+    const deep = "{{#lines}}".repeat(20_000) + "x" + "{{/lines}}".repeat(20_000);
+    const error = ((): unknown => {
+      try { mergeTemplate(deep, CONTEXT); return null; } catch (e: unknown) { return e; }
+    })();
+
+    expect(error).toBeInstanceOf(TemplateError);
+    expect(error).not.toBeInstanceOf(RangeError);
+    expect((error as TemplateError).message).toContain("nested");
+  }, 5000);
+
+  it("does not bite a real document, which is the other half of a bound", () => {
+    // 130 line items is the ceiling Task 2's budget arithmetic gives at a 500-char
+    // description, so this is the largest quote that can render at all. A bound that
+    // stopped it would be a bug of the opposite kind.
+    const lines = Array.from({ length: 130 }, (_, i) => ({
+      description: `Consultancy, phase ${String(i)}`,
+      qty: "2", unitPrice: "1,250.00", taxRate: "21%", lineTotal: "2,500.00",
+    }));
+    const template = "<table>{{#lines}}<tr><td>{{description}}</td><td>{{lineTotal}}</td></tr>{{/lines}}</table>" +
+      "{{#org.vatNumber}}VAT {{org.vatNumber}}{{/org.vatNumber}}{{^org.vatNumber}}-{{/org.vatNumber}}";
+
+    expect(() => mergeTemplate(template, { ...CONTEXT, lines })).not.toThrow();
   });
 
-  it("has a cap far above any real document", () => {
-    // A one-page quote is about 4KB merged. The cap is not a document-size limit --
-    // renderPdf's 128KB input cap is -- it is a runaway-expansion limit.
+  it("has bounds far above any real document, and one on the stack", () => {
+    // None of these is a document-size limit -- renderPdf's 128KB input cap is that.
+    // They are runaway-expansion limits: the seeded template measured 1,612 steps at
+    // 130 line items, which is the largest quote that can render at all.
     expect(MERGE_MAX_OUTPUT_CHARS).toBeGreaterThan(128 * 1024);
+    expect(MERGE_MAX_STEPS).toBeGreaterThan(100_000);
+    expect(MERGE_MAX_DEPTH).toBeGreaterThan(8);
   });
 });
 
@@ -695,50 +784,70 @@ describe("prepareDocumentHtml merges first and sanitises last", () => {
    * looked at.
    */
   it("catches a URL a value smuggled into a CSS context, which escaping cannot", () => {
-    const template = "<style>body { background: {{document.notes}} }</style>";
-    const evil = withDocument({ notes: "url(file:///etc/passwd)" });
+    // THE SHARP CASE, and it is sharp because HTML escaping LOOKS like it should have
+    // covered it. The style attribute is the one CSS context a merged value still
+    // reaches (a <style> block is not merged at all), and a value landing inside a
+    // url() gets its quote escaped to `&quot;` -- which the HTML parser hands back to
+    // the CSS parser as a real quote. So the escape does not contain the value; it
+    // travels through the attribute and closes the url() from the inside.
+    const template = '<div style="background: url(data:image/png;base64,{{document.notes}})">x</div>';
+    const evil = withDocument({ notes: 'x")} body{background:url(file:///etc/passwd)} p{a:("' });
 
     expect(prepareDocumentHtml(template, evil)).not.toContain("etc/passwd");
 
     // The other order, spelled out: merging into an already-sanitised template leaves
-    // the URL sitting in the stylesheet with nothing left to look at it. This
-    // assertion is the mutation test for the order -- swapping the two calls in
+    // the URL sitting in the document with nothing left to look at it. This assertion
+    // is the mutation test for the order -- swapping the two calls in
     // prepareDocumentHtml makes the case above look exactly like this one.
     expect(mergeTemplate(sanitizeDocumentHtml(template), evil)).toContain("etc/passwd");
   });
 
-  it("escapes a value into a <style> block as HTML, which is not CSS escaping", () => {
-    // What the escaper actually does in a CSS context, recorded rather than implied:
-    // it produces `&quot;`, which CSS does not decode, so the declaration is broken
-    // rather than dangerous. A merge field inside CSS is a bad idea for this reason
-    // and the seeded template has none -- documents-seed.test.ts asserts that.
+  it("keeps a style attribute whose value arrived by merge, URL removed and the rest intact", () => {
+    // What actually happens in the shipped order, because an earlier note claimed the
+    // attribute was destroyed and that was only true of an UNMERGED template. Task 5
+    // documents this surface, so it has to be right: the attribute survives with the
+    // merged value in it, and the CSS scanner -- not the destruction of the attribute
+    // -- is what takes the URL out.
     const html = prepareDocumentHtml(
-      '<style>body::after { content: {{document.notes}} }</style>',
-      withDocument({ notes: '"x"' }),
+      '<div style="color: {{document.notes}}">x</div>',
+      withDocument({ notes: "red" }),
     );
 
-    expect(html).toContain("&quot;x&quot;");
+    expect(html).toContain("color:red");
   });
 
-  it("catches the same URL smuggled into a style ATTRIBUTE", () => {
-    // The other CSS context, and the one the task's own wording names first.
-    const html = prepareDocumentHtml(
-      '<div style="background: {{document.notes}}">x</div>',
-      withDocument({ notes: "url(file:///etc/passwd)" }),
-    );
-
-    expect(html).not.toContain("etc/passwd");
-  });
-
-  it("destroys a style ATTRIBUTE that still holds a merge field", () => {
-    // Only reachable in the wrong order, and worth knowing before somebody relies on
-    // it: sanitize-html parses a style attribute with postcss, `{{` is not CSS, the
-    // parse fails and the whole attribute goes. That context is closed by
-    // construction -- unlike a <style> block, where the braces sail through.
+  it("drops a style attribute that STILL holds a merge field, which only the wrong order produces", () => {
+    // parseStyleAttributes defaults to true, so postcss parses the value even though
+    // allowedStyles is unset (allowedStyles only decides whether the parsed tree is
+    // filtered -- it is the filter that is off here, not the parse). `{{` is not CSS,
+    // the parse fails, the attribute goes. Fail-closed, and unreachable through
+    // prepareDocumentHtml, where the value has already been substituted.
     expect(sanitizeDocumentHtml('<div style="color: {{document.notes}}">x</div>'))
       .toBe("<div>x</div>");
-    expect(sanitizeDocumentHtml("<style>body { color: {{document.notes}} }</style>"))
-      .toContain("{{document.notes}}");
+  });
+
+  it("does not substitute inside a <style> block at all", () => {
+    // The refusal, and three reasons in one test. HTML escaping is not CSS escaping,
+    // so a quote becomes `&quot;` which CSS does not decode; a value ending in a
+    // BACKSLASH escapes the closing quote of the string it landed in and swallows the
+    // rest of the stylesheet, faithfully to CSS; and a url() in a value would be
+    // caught only by the sanitiser. None of it is reachable if the field is never
+    // substituted there.
+    const template = "<style>body::after { content: '{{document.notes}}'; }</style><p>{{document.notes}}</p>";
+    const html = prepareDocumentHtml(template, withDocument({ notes: "back\\" }));
+
+    expect(html).toContain("'{{document.notes}}'");
+    expect(html).toContain("<p>back\\</p>");
+    // The stylesheet still ends where it should: nothing was swallowed.
+    expect(html).toContain("}</style>");
+  });
+
+  it("leaves the field alone whatever the style tag looks like", () => {
+    for (const open of ["<style>", "<STYLE>", '<style type="text/css">', "<style\n>"]) {
+      const html = mergeTemplate(`${open}a{b:{{org.name}}}</style>{{org.name}}`, CONTEXT);
+      expect(html).toContain("{{org.name}}");
+      expect(html).toContain("Listerdale");
+    }
   });
 
   it("leaves an ordinary quote looking like itself", () => {
