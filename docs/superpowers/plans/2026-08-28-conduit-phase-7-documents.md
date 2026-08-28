@@ -701,8 +701,24 @@ The steps above are left as written so the corrections are legible.
    integer and a violation THROWS -- load-bearing rather than defensive, because the
    totals land in `bigint` columns read through drizzle's `mode: "number"`, whose range
    stops at 2^53 while Postgres's stops at 2^63, so an unchecked total would be stored
-   as the nearest double and accepted silently. **The float version was pushed as a
-   temporary mutation and fails exactly four of the nineteen tests.**
+   as the nearest double and accepted silently.
+
+   **THE MUTATION COUNTS, RE-MEASURED, because the first note gave one that does not
+   reproduce.** It said "fails exactly four of the nineteen tests", which was the
+   result of a PARTIAL mutation -- only `lineTotalCents` replaced by the plan's
+   unguarded double version, with `taxCents` and `documentTotals` still guarded --
+   against the 19-test file of that round. Against the 23-test file this round, all
+   three variants measured on the server:
+
+   | mutation | fails |
+   |---|---|
+   | the plan's Step 3 verbatim (double divide, NO guards) | **9 of 23** |
+   | the divide alone in double precision, both guards retained | **1 of 23** |
+   | `lineTotalCents` alone, unguarded (the first round's mutation) | 6 of 23 |
+
+   The one that fails under the divide-only mutation is "is exact when the
+   intermediate product passes 2^53", which is the assertion the BigInt rewrite
+   exists for; the other eight under the verbatim mutation are the guards.
 
    **THE CONTRACT THIS PUTS ON TASK 5:** the form must parse its text into integer units
    and reject what does not parse BEFORE calling `documentTotals`. A half-typed field is
@@ -764,10 +780,12 @@ The steps above are left as written so the corrections are legible.
    invoice type the spec defers, and that is where it should be solved.
 
 **THE SEEDED TEMPLATE WAS RENDERED BEFORE IT WAS COMMITTED**, on the server against
-WeasyPrint 57.2 through the shipped `renderPdf`: merged with a filled org profile and 8
-line items it is 3,816 bytes of HTML and a **16,003-byte two-page PDF**; merged with an
-entirely empty context it still renders (9,995 bytes). The running footer reads "Page 1
-of 2" and the newline-separated addresses break across lines.
+WeasyPrint 57.2 through the shipped `renderPdf`, and again after the review round added
+the tax column: merged with a filled org profile and 8 line items at mixed 21%/9% rates
+it is 4,090 bytes of HTML and a **16,493-byte two-page PDF**; merged with an entirely
+empty context it still renders (10,106 bytes). The running footer reads "Page 1 of 2",
+the newline-separated addresses break across lines, and the decoded page text carries
+the per-line rates.
 
 - **It is multi-line SQL, not the plan's single 1.5KB line.** Postgres string literals
   may contain newlines and drizzle's migrator splits only on `--> statement-breakpoint`.
@@ -777,7 +795,7 @@ of 2" and the newline-separated addresses break across lines.
   substitution HTML-escapes but does not turn a newline into a `<br>` -- without it a
   three-line address prints as one run-on line. This is a real defect the plan's template
   had.
-- **Its 25 merge tokens are asserted as an EQUALITY** against the list in
+- **Its 26 merge tokens are asserted as an EQUALITY** against the list in
   `schema.test.ts`, in both directions. A field the template uses that nobody supplies is
   a silent blank on a printed page (unknown fields resolve to `""` and never throw); a
   field on the list the template stopped using is a context key built for nothing.
@@ -805,11 +823,15 @@ of 2" and the newline-separated addresses break across lines.
 2. **Task 4's `buildContext` must supply exactly these keys**, or the default template
    prints blanks: `org.{name,addressLines,email,phone,website,bankDetails,vatNumber,registrationNumber}`
    and `document.{number,issueDate,validUntilDate,recipientName,recipientContactName,recipientAddress,subtotal,tax,total,notes,terms}`,
-   plus `description,qty,unitPrice,lineTotal` per line. `recipientContactName` is the new
-   column; `subtotal`/`tax`/`total` are FORMATTED strings, and nothing in `money.ts`
-   formats -- web currently does it with `Intl.NumberFormat` and a float divide
-   (`deal-detail.tsx:174`), which is fine for display but is a second answer if the PDF
-   uses a different one. **Pick one and put it where both can reach it.**
+   plus `description,qty,unitPrice,taxRate,lineTotal` per line. `recipientContactName`
+   and `taxRate` are the two the review round added.
+
+   `subtotal`/`tax`/`total` are FORMATTED strings, and **`formatMoneyCents` in
+   `@conduit/shared` is now the one answer** -- see the review round below. `qty` and
+   `taxRate` are NOT covered by it and still have no home: thousandths to "1.5" and
+   basis points to "21%" are two more formatters Task 4 has to write, and they belong
+   beside `formatMoneyCents` rather than inline in `buildContext`, for exactly the
+   reason that one exists.
 3. **Nothing bounds the number of line items, and the natural bound is arithmetic, not a
    guess.** The database cannot express "at most N rows per document" without a trigger,
    so it belongs in Task 4's input schema. The budget is the 128KB render input cap minus
@@ -820,6 +842,97 @@ of 2" and the newline-separated addresses break across lines.
    500-character description that is roughly 130 lines. Whatever the pair is, it must
    reject BEFORE the render rather than surfacing as `RenderError: input too large`, and
    if the input cap moves, both move.
+
+##### TASK 2 REVIEW ROUND 1 — one real violation, and six smaller ones
+
+All seven divergences above were adjudicated justified. Seven fixes landed on top; the
+migration is still `0009_calm_rhodey.sql`.
+
+**SV-1: the accepted domain and the storable domain were not the same, and it failed
+AFTER the render.** `qty_milli` is `integer`, so a line caps at 2,147,483.647 units --
+but `money.ts` only required a safe integer, which is 4.2 MILLION times wider. A
+3,000,000-unit line therefore computed a correct running total in the form, passed
+`documentTotals`, RENDERED THE PDF, and then died on the `INSERT` with `integer out of
+range` (22003), inside the issuing transaction and after the subprocess had run: an
+opaque 500 for a value the form had just called fine.
+
+**Bounded in `money.ts` rather than widening the column, and the reasoning is not only
+"2.1 million units is enough".** drizzle's `numeric()` yields a STRING unless it is
+given an explicit `mode` (checked in `numeric.d.ts`: no mode is the string builder), so
+widening would put a decimal string into arithmetic whose whole claim is that no
+fractional number ever enters it -- the `numeric` would have to be parsed back to
+thousandths at every boundary, which is the drift the units exist to prevent. The int4
+range is a real limit honestly enforced; `numeric(12,3)` would be a wider limit enforced
+by a conversion.
+
+`tax_rate_bp` had the identical shape and is fixed with it -- also int4, also capable of
+surviving the arithmetic and failing at the insert. The two are enforced by one
+`exactInt4()`, and `schema.test.ts` now asserts both columns are still `integer` (with
+`unit_price_cents` asserted `bigint` beside them as the contrast, since there the
+safe-integer check is correctly the narrower side). Widening either column without
+widening the arithmetic fails that test.
+
+**The CHECK-level bounds are deliberately NOT pulled into `money.ts`**: `qty_milli >= 0`
+and `tax_rate_bp BETWEEN 0 AND 10000` are business rules for Task 4's input schema, the
+same "Zod is the primary gate, the CHECK is the backstop" split the schema comments
+describe -- and this file keeps a wider domain there on purpose, because
+`divideRoundHalfUp`'s negative branch exists so a future credit note rounds correctly.
+**Task 4 still has to gate them, or the same after-the-render failure returns as a 23514
+instead of a 22003.**
+
+**O-4: `formatMoneyCents` in `@conduit/shared`, and all five web sites converged.**
+Precision was never the problem; `undefined` was, since it means the VIEWER'S BROWSER
+LOCALE. `MONEY_LOCALE` is the single knob and the parameter DEFAULTS to it rather than
+being required at each call -- the failure being prevented is two call sites disagreeing,
+and a default cannot be typed differently in six places.
+
+**All five sites are converged, plus the one test helper**, because a half-converged
+formatter is the same bug moved: the deal page would render Dutch while the quote form
+rendered en-GB. `board-lib.test.ts`'s helper used to build its expectation with
+`undefined` specifically to avoid pinning the machine's locale; it now pins
+`MONEY_LOCALE`, and its comment says why that inverted.
+
+Two things measured while writing it. **The exactness boundary is real but far out**: the
+first cents value whose formatting disagrees with the exact decimal is
+**7,036,874,417,766,401** (2^46 units; it prints ...664.02 for ...664.01), identical in
+en-GB, nl-NL, en-US and de-DE because the loss happens in the divide before Intl sees the
+number. That is BELOW `money.ts`'s own ceiling, so the formatter refuses at it rather
+than leaving a sliver where a total is storable but not exactly printable. **And a
+limitation that is not new**: the divide is by 100 while the decimal places come from the
+currency, so a zero-decimal currency like JPY reads 1,100,000 back as 11,000 yen. That is
+Conduit's stored model since `deals.value_cents`, unchanged from the five sites this
+replaced, and a column problem rather than a formatting one -- pinned by a test so it
+stays visible.
+
+**O-8: `money.ts`'s safe-integer guard was one-sided, and now the columns hold the other
+half.** It refused to PRODUCE a total past 2^53 but nothing refused to STORE one arriving
+by another path -- psql, an import, a future service that skipped the shared arithmetic --
+where `mode: "number"` would read it back as the nearest double. `documents_totals_representable`
+covers subtotal, tax and total; `document_line_items_amounts_representable` covers
+`unit_price_cents` and `line_total_cents` for the same reason.
+
+**O-7: the line table prints each line's tax rate.** `tax_rate_bp` is per line, so a quote
+mixing 21% and 9% work showed one blended figure the recipient could not take apart. The
+table is now Description / Qty / Unit price / Tax / Amount, and `{{taxRate}}` is the 26th
+merge token. Re-rendered on the server with mixed rates; figures above.
+
+**O-6: a false comment in the migration.** It claimed the CSS was "flat, with no nested
+at-rules crowding two braces together" while line 139 is `@page { @bottom-center { ... } }`.
+The template is safe for a different reason -- the whitespace between the braces -- and
+the comment now says that, and names the test that actually enforces it.
+
+**O-5: an inverted dependency, noted at the test.** `schema.test.ts`'s template test
+depends on the seeded row being GONE, which is the opposite of the warning above it. If
+`truncateAll` is ever taught to preserve seed rows its first insert starts colliding, so
+the test now asserts the table is empty first and says why at the point of failure.
+
+**Migration mechanics, since 0009 changed after being generated.** It was REGENERATED
+rather than hand-edited -- the two new CHECKs are drizzle-generated, so regenerating keeps
+the snapshot exact instead of hand-editing 4,000 lines of JSON -- with the journal's
+original `when` and `tag` restored afterwards, so the file name and timestamp are
+unchanged and the journal diff is empty. `conduit_test` was dropped and recreated so the
+migrator would apply the new file from scratch; the migrator skips by timestamp, so an
+edited-in-place 0009 would otherwise never have reached it.
 
 ---
 

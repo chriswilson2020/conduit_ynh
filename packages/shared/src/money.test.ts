@@ -50,8 +50,32 @@ describe("lineTotalCents", () => {
   // total between the two would be stored as the nearest double and accepted
   // silently, so it is refused here instead.
   it("refuses a line total past the safe integer range", () => {
-    expect(() => lineTotalCents({ qtyMilli: 9_007_199_254_740_991, unitPriceCents: 1_000_000 }))
+    // Both factors are individually legal -- 1,000 units at a price that is a
+    // safe integer -- and it is their PRODUCT, divided back down, that is not.
+    expect(() => lineTotalCents({ qtyMilli: 1_000_000, unitPriceCents: 9_007_199_254_740_991 }))
       .toThrow(/safe integer range/);
+  });
+
+  // qty_milli is an int4 column. A safe integer is 4.2 MILLION times wider, and
+  // that gap is not a rounding curiosity: it is a line that renders a PDF and
+  // then dies on the INSERT.
+  it("accepts a quantity at the top of the int4 column", () => {
+    // 2,147,483.647 units at one cent each.
+    expect(lineTotalCents({ qtyMilli: 2_147_483_647, unitPriceCents: 1 })).toBe(2_147_484);
+  });
+
+  it("refuses a quantity one step past the int4 column", () => {
+    expect(() => lineTotalCents({ qtyMilli: 2_147_483_648, unitPriceCents: 1 }))
+      .toThrow(/qtyMilli must fit a 32-bit integer column/);
+  });
+
+  // The reproduction, in the units a user would type: 3,000,000 of something.
+  // Before this bound it computed a correct running total, passed
+  // documentTotals, rendered the PDF, and failed on INSERT with
+  // `integer out of range` -- after the subprocess had run.
+  it("refuses a three-million-unit line before anything can spawn a renderer", () => {
+    expect(() => lineTotalCents({ qtyMilli: 3_000_000_000, unitPriceCents: 5000 }))
+      .toThrow(/qtyMilli must fit a 32-bit integer column/);
   });
 });
 
@@ -71,6 +95,12 @@ describe("taxCents", () => {
 
   it("rejects a fractional rate", () => {
     expect(() => taxCents(10_000, 21.5)).toThrow(/rateBp/);
+  });
+
+  // tax_rate_bp is int4 too, and has the same shape of failure as qty_milli --
+  // the CHECK narrows it further to 0..10000, which is the input schema's job.
+  it("refuses a rate past the int4 column", () => {
+    expect(() => taxCents(10_000, 2_147_483_648)).toThrow(/rateBp must fit a 32-bit integer column/);
   });
 });
 

@@ -10,7 +10,8 @@ CREATE TABLE "document_line_items" (
 	CONSTRAINT "document_line_items_document_position_unique" UNIQUE("document_id","position"),
 	CONSTRAINT "document_line_items_qty_nonneg" CHECK (qty_milli >= 0),
 	CONSTRAINT "document_line_items_price_nonneg" CHECK (unit_price_cents >= 0),
-	CONSTRAINT "document_line_items_tax_range" CHECK (tax_rate_bp BETWEEN 0 AND 10000)
+	CONSTRAINT "document_line_items_tax_range" CHECK (tax_rate_bp BETWEEN 0 AND 10000),
+	CONSTRAINT "document_line_items_amounts_representable" CHECK (unit_price_cents <= 9007199254740991 AND line_total_cents BETWEEN -9007199254740991 AND 9007199254740991)
 );
 --> statement-breakpoint
 CREATE TABLE "document_number_sequences" (
@@ -52,7 +53,10 @@ CREATE TABLE "documents" (
 	CONSTRAINT "documents_number_unique" UNIQUE("number"),
 	CONSTRAINT "documents_type_valid" CHECK (type IN ('quote')),
 	CONSTRAINT "documents_currency_format" CHECK (currency ~ '^[A-Z]{3}$'),
-	CONSTRAINT "documents_totals_consistent" CHECK (total_cents = subtotal_cents + tax_cents)
+	CONSTRAINT "documents_totals_consistent" CHECK (total_cents = subtotal_cents + tax_cents),
+	CONSTRAINT "documents_totals_representable" CHECK (subtotal_cents BETWEEN -9007199254740991 AND 9007199254740991
+        AND tax_cents BETWEEN -9007199254740991 AND 9007199254740991
+        AND total_cents BETWEEN -9007199254740991 AND 9007199254740991)
 );
 --> statement-breakpoint
 CREATE TABLE "org_profile" (
@@ -106,20 +110,31 @@ CREATE INDEX "documents_deal_idx" ON "documents" ("deal_id");--> statement-break
 --
 -- 1. Every {{...}} must be a field the merge resolver knows: org.*,
 --    document.*, or -- only inside {{#lines}}...{{/lines}} -- description,
---    qty, unitPrice, lineTotal. An unknown field renders as empty rather than
---    throwing, so a typo here is a silent blank on a page, not a failure
---    anyone would notice. schema.test.ts's "documents schema (0009)" block
---    reads this row back and checks every token against that list.
+--    qty, unitPrice, taxRate, lineTotal. An unknown field renders as empty
+--    rather than throwing, so a typo here is a silent blank on a page, not a
+--    failure anyone would notice. schema.test.ts's "documents schema (0009)"
+--    block reads this row back and checks every token against that list.
 --
--- 2. The CSS must never contain a literal {{ -- it would be parsed as a merge
---    field and substituted away. That is why the rules below are flat, with
---    no nested at-rules crowding two braces together.
+-- 2. No literal {{ may appear in the CSS -- it would be parsed as a merge
+--    field and substituted away. The stylesheet DOES contain one nested
+--    at-rule (@page { @bottom-center { ... } }), and what keeps it safe is the
+--    whitespace between the braces, not the absence of nesting: `{ @` and
+--    `} }` are not `{{`. That is what schema.test.ts enforces -- it counts
+--    every `{{` in the body and requires each to be one of the known tokens --
+--    so a future edit that closes two at-rules up against each other fails
+--    there rather than printing a mangled page.
 --
 -- 3. class="pre" is white-space: pre-line, and it is on every multi-line
 --    field. org.address_lines and companies.address are newline-separated
 --    free text, and merge substitution HTML-escapes but does not turn a
 --    newline into a <br> -- without this class a three-line address prints as
 --    one run-on line.
+--
+-- THE TAX RATE IS A COLUMN IN THE LINE TABLE, not just an input to the
+-- blended total. tax_rate_bp is per line, so a quote mixing 21% and 9% work
+-- shows one summed tax figure that the recipient cannot take apart. Printing
+-- each line's own rate is what makes the total reconstructible, and it costs a
+-- column on a page that has room for it.
 --
 -- WHAT IS DELIBERATELY ABSENT: the logo. org_profile.logo_file_id exists and
 -- the merge context carries org.logoDataUri, but the merge language has no
@@ -149,6 +164,7 @@ table.lines { width: 100%; border-collapse: collapse; margin-top: 9mm; }
 table.lines th { text-align: left; font-size: 8.5pt; text-transform: uppercase; color: #666; border-bottom: 0.4mm solid #111; padding: 0 0 1.5mm; }
 table.lines th.right { text-align: right; }
 table.lines td { padding: 2mm 0; border-bottom: 0.2mm solid #ddd; vertical-align: top; }
+table.lines td.right { padding-left: 4mm; }
 table.totals { margin-top: 5mm; margin-left: auto; }
 table.totals td { padding: 1mm 0 1mm 10mm; }
 table.totals tr.grand td { border-top: 0.4mm solid #111; font-size: 12pt; padding-top: 2mm; }
@@ -174,8 +190,8 @@ table.totals tr.grand td { border-top: 0.4mm solid #111; font-size: 12pt; paddin
 <div class="pre">{{document.recipientAddress}}</div>
 </div>
 <table class="lines">
-<thead><tr><th>Description</th><th class="right">Qty</th><th class="right">Unit price</th><th class="right">Amount</th></tr></thead>
-<tbody>{{#lines}}<tr><td class="pre">{{description}}</td><td class="right">{{qty}}</td><td class="right">{{unitPrice}}</td><td class="right">{{lineTotal}}</td></tr>{{/lines}}</tbody>
+<thead><tr><th>Description</th><th class="right">Qty</th><th class="right">Unit price</th><th class="right">Tax</th><th class="right">Amount</th></tr></thead>
+<tbody>{{#lines}}<tr><td class="pre">{{description}}</td><td class="right">{{qty}}</td><td class="right">{{unitPrice}}</td><td class="right">{{taxRate}}</td><td class="right">{{lineTotal}}</td></tr>{{/lines}}</tbody>
 </table>
 <table class="totals">
 <tr><td class="label">Subtotal</td><td class="right">{{document.subtotal}}</td></tr>

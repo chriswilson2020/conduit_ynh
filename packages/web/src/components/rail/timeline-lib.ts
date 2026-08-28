@@ -1,4 +1,5 @@
 import type { Event } from "@conduit/shared";
+import { formatMoneyCents } from "@conduit/shared";
 import { subjectLabel } from "../mail/mail-lib";
 
 /**
@@ -139,7 +140,7 @@ export function summarize(event: Event): string {
       const valueCents = event.payload.valueCents;
       const currency = event.payload.currency;
       if (typeof valueCents === "number" && typeof currency === "string") {
-        const formatted = new Intl.NumberFormat(undefined, { style: "currency", currency }).format(valueCents / 100);
+        const formatted = formatMoneyCents(valueCents, currency);
         return `won ${formatted}`;
       }
       return "won";

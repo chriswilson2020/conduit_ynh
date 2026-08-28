@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { formatMoneyCents } from "@conduit/shared";
 import { useDeals, useFunnel, usePipeline } from "../queries";
 
 /**
@@ -33,7 +34,7 @@ export function Funnel({ pipelineId }: { pipelineId: string }) {
   const mixed = currencies.size > 1;
   const currency = openDeals[0]?.currency ?? "EUR";
   const formatValue = (valueCents: number) =>
-    mixed ? "mixed" : new Intl.NumberFormat(undefined, { style: "currency", currency }).format(valueCents / 100);
+    mixed ? "mixed" : formatMoneyCents(valueCents, currency);
 
   if (!pipelineData) return null;
   const { stages } = pipelineData;

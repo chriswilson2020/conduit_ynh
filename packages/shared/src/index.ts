@@ -7,6 +7,10 @@ export { midpoint } from "./fractional.js";
 // form's running total and the stored total must be the same function.
 export { lineTotalCents, taxCents, documentTotals } from "./money.js";
 export type { LineInput, DocumentTotals } from "./money.js";
+// Formatting is a separate module from the arithmetic, and reaches web the same
+// way: the one locale every money figure in the app is rendered in, so the
+// quote form and the PDF beside it cannot disagree.
+export { formatMoneyCents, MONEY_LOCALE } from "./money-format.js";
 
 export const userSchema = z.object({
   id: z.uuid(),

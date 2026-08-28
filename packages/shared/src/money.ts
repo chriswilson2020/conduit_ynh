@@ -51,6 +51,39 @@ function exact(name: string, value: number): bigint {
   return BigInt(value);
 }
 
+// Postgres int4, which is the type of document_line_items.qty_milli and
+// .tax_rate_bp. schema.test.ts asserts both columns are still `integer`, so
+// widening one without widening the other fails there rather than here.
+const INT4_MIN = -2_147_483_648;
+const INT4_MAX = 2_147_483_647;
+
+/**
+ * The same check against a narrower column. THE ACCEPTED DOMAIN AND THE STORABLE
+ * DOMAIN HAVE TO BE THE SAME, and for `qty_milli` they were not: a safe integer is
+ * 4.2 million times wider than an int4, so a 3,000,000-unit line used to compute a
+ * correct running total in the form, pass documentTotals, RENDER THE PDF, and only
+ * then die on the INSERT with `integer out of range` -- inside the issuing
+ * transaction, after the subprocess had already run, as an opaque 500 for a value
+ * the form had just told the user was fine. Rejecting here is rejecting before
+ * anything spawns.
+ *
+ * This is the inverse of the asymmetry on `unit_price_cents`, where the column is
+ * int8 and the safe-integer check above is correctly the narrower of the two.
+ *
+ * NOT the CHECK-constraint bounds (qty_milli >= 0, tax_rate_bp BETWEEN 0 AND 10000).
+ * Those are business rules and belong to the input schema, the same "Zod is the
+ * primary gate, the CHECK is the backstop" split the schema comments describe --
+ * and this file deliberately keeps a wider domain there, since divideRoundHalfUp's
+ * negative branch exists so a future credit note rounds correctly.
+ */
+function exactInt4(name: string, value: number): bigint {
+  const result = exact(name, value);
+  if (value < INT4_MIN || value > INT4_MAX) {
+    throw new Error(`money: ${name} must fit a 32-bit integer column, got ${String(value)}`);
+  }
+  return result;
+}
+
 /** The same check on the way out -- see the header: bigint columns outrun `number`. */
 function toNumber(name: string, value: bigint): number {
   const result = Number(value);
@@ -75,13 +108,13 @@ function divideRoundHalfUp(value: bigint, divisor: bigint): bigint {
 
 /** What one line costs before tax: quantity x unit price, rounded to the cent. */
 export function lineTotalCents(line: LineInput): number {
-  const product = exact("qtyMilli", line.qtyMilli) * exact("unitPriceCents", line.unitPriceCents);
+  const product = exactInt4("qtyMilli", line.qtyMilli) * exact("unitPriceCents", line.unitPriceCents);
   return toNumber("lineTotalCents", divideRoundHalfUp(product, 1000n));
 }
 
 /** Tax on one line total at a basis-point rate, rounded to the cent. */
 export function taxCents(lineTotal: number, rateBp: number): number {
-  const product = exact("lineTotal", lineTotal) * exact("rateBp", rateBp);
+  const product = exact("lineTotal", lineTotal) * exactInt4("rateBp", rateBp);
   return toNumber("taxCents", divideRoundHalfUp(product, 10_000n));
 }
 

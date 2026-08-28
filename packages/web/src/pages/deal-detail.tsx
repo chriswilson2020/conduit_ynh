@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { FormEvent } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import type { UpdateDealInput } from "@conduit/shared";
+import { formatMoneyCents } from "@conduit/shared";
 import { ApiError } from "../api";
 import { parseDecimal } from "../lib";
 import {
@@ -171,7 +172,7 @@ export function DealDetailPage() {
 
   const archived = deal.archivedAt !== null;
   const formattedValue = deal.valueCents != null
-    ? new Intl.NumberFormat(undefined, { style: "currency", currency: deal.currency }).format(deal.valueCents / 100)
+    ? formatMoneyCents(deal.valueCents, deal.currency)
     : null;
 
   const fields: FieldCardField[] = [

@@ -1,5 +1,5 @@
 {
-  "id": "d0854c61-2ad7-4f09-a78b-b45b965517e5",
+  "id": "47701931-c6bd-4f7f-9926-e7eb592ce572",
   "prevId": "28952118-9bec-45b5-97c8-8aa2bc56fba9",
   "version": "7",
   "dialect": "postgresql",
@@ -522,6 +522,10 @@
         "document_line_items_tax_range": {
           "name": "document_line_items_tax_range",
           "value": "tax_rate_bp BETWEEN 0 AND 10000"
+        },
+        "document_line_items_amounts_representable": {
+          "name": "document_line_items_amounts_representable",
+          "value": "unit_price_cents <= 9007199254740991 AND line_total_cents BETWEEN -9007199254740991 AND 9007199254740991"
         }
       },
       "isRLSEnabled": false
@@ -807,6 +811,10 @@
         "documents_totals_consistent": {
           "name": "documents_totals_consistent",
           "value": "total_cents = subtotal_cents + tax_cents"
+        },
+        "documents_totals_representable": {
+          "name": "documents_totals_representable",
+          "value": "subtotal_cents BETWEEN -9007199254740991 AND 9007199254740991\n        AND tax_cents BETWEEN -9007199254740991 AND 9007199254740991\n        AND total_cents BETWEEN -9007199254740991 AND 9007199254740991"
         }
       },
       "isRLSEnabled": false

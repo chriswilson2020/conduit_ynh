@@ -1,3 +1,5 @@
+import { formatMoneyCents } from "@conduit/shared";
+
 /**
  * The deals board's phone stage view, plus the two board rules both widths
  * share once the phone stops rendering columns.
@@ -180,10 +182,7 @@ export function stageValueLabel(deals: readonly DealValueLike[]): string {
   const currencies = new Set(deals.map((deal) => deal.currency));
   if (currencies.size > 1) return "mixed";
   const valueSum = deals.reduce((sum, deal) => sum + (deal.valueCents ?? 0), 0);
-  return new Intl.NumberFormat(undefined, {
-    style: "currency",
-    currency: deals[0]?.currency ?? "EUR",
-  }).format(valueSum / 100);
+  return formatMoneyCents(valueSum, deals[0]?.currency ?? "EUR");
 }
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;

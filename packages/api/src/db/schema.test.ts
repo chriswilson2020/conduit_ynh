@@ -1259,7 +1259,7 @@ describe("documents schema (0009)", () => {
   // nothing. Either way the migration and this list have to move together.
   const SEEDED_FIELDS = [
     "{{#lines}}", "{{/lines}}",
-    "{{description}}", "{{qty}}", "{{unitPrice}}", "{{lineTotal}}",
+    "{{description}}", "{{qty}}", "{{unitPrice}}", "{{taxRate}}", "{{lineTotal}}",
     "{{org.name}}", "{{org.addressLines}}", "{{org.email}}", "{{org.phone}}",
     "{{org.website}}", "{{org.bankDetails}}", "{{org.vatNumber}}", "{{org.registrationNumber}}",
     "{{document.number}}", "{{document.issueDate}}", "{{document.validUntilDate}}",
@@ -1352,10 +1352,11 @@ describe("documents schema (0009)", () => {
       // single run-on line.
       expect(body).toContain("@page");
       expect(body).toContain("white-space: pre-line");
-      // Rendered on the server (WeasyPrint 57.2) before it was committed:
-      // this template merged with a filled org profile and 8 line items is
-      // 3,816 bytes of HTML and a 16,003-byte two-page PDF, and merged with
-      // an entirely empty context it still renders (9,995 bytes).
+      // Rendered on the server (WeasyPrint 57.2) before it was committed, and
+      // again after the tax column was added: merged with a filled org profile
+      // and 8 line items at mixed 21%/9% rates it is 4,090 bytes of HTML and a
+      // 16,493-byte two-page PDF, and merged with an entirely empty context it
+      // still renders (10,106 bytes).
 
       // The hand-written index, ON A DATABASE THIS TEST MIGRATED FROM THE
       // FILES -- 0005's and 0008's reason: it exists in no drizzle snapshot,
@@ -1504,12 +1505,74 @@ describe("documents schema (0009)", () => {
       .rejects.toMatchObject({ cause: { code: "23514" } });
   });
 
+  // THIS TEST DEPENDS ON THE SEEDED TEMPLATE BEING GONE, which is the exact
+  // opposite of the dependency the drill above warns about: truncateAll() empties
+  // document_templates like every other public table, so the first insert here
+  // finds an empty table. If truncateAll is ever taught to preserve seed rows --
+  // a plausible optimisation, since re-seeding by hand is the only reason Task 4
+  // has to know about any of this -- this insert starts colliding with the
+  // migration's own row and fails with 23505 in a file that has nothing to do
+  // with seeding. The explicit emptiness assertion below is there to say so at
+  // the point of failure rather than leaving a puzzling unique violation.
   it("allows one template per type and rejects an unknown type", async () => {
+    expect(await handle.db.select().from(documentTemplates)).toHaveLength(0);
     await handle.db.insert(documentTemplates).values({ type: "quote", bodyHtml: "<p>a</p>" });
     await expect(handle.db.insert(documentTemplates).values({ type: "quote", bodyHtml: "<p>b</p>" }))
       .rejects.toMatchObject({ cause: { code: "23505" } });
     await expect(handle.db.insert(documentTemplates).values({ type: "proposal", bodyHtml: "<p>c</p>" }))
       .rejects.toMatchObject({ cause: { code: "23514" } });
+  });
+
+  // THE TRIPWIRE FOR money.ts's int4 BOUND. exactInt4() refuses a qtyMilli or a
+  // rateBp outside the int4 range, and the only reason that number is right is
+  // that these two columns are `integer`. Widening either without widening the
+  // arithmetic (or the reverse) recreates the defect the pair was added for: a
+  // quantity the form accepts, documentTotals computes, the renderer spends a
+  // subprocess on, and the INSERT then rejects with `integer out of range`.
+  // unit_price_cents is asserted alongside as the CONTRAST -- it is bigint, so
+  // there the safe-integer check is correctly the narrower of the two domains.
+  it("keeps qty_milli and tax_rate_bp int4, which is what money.ts's bound is derived from", async () => {
+    const columns = await handle.db.execute<{ column_name: string; data_type: string }>(sql`
+      SELECT column_name, data_type FROM information_schema.columns
+      WHERE table_name = 'document_line_items'
+        AND column_name IN ('qty_milli', 'tax_rate_bp', 'unit_price_cents')
+    `);
+    const byName = new Map(columns.map((row) => [row.column_name, row.data_type]));
+    expect(byName.get("qty_milli")).toBe("integer");
+    expect(byName.get("tax_rate_bp")).toBe("integer");
+    expect(byName.get("unit_price_cents")).toBe("bigint");
+
+    // And the boundary itself, through the column rather than through the
+    // function: int4's ceiling stores, one past it does not.
+    const parents = await seedDocumentParents();
+    const [document] = await handle.db.insert(documents).values(documentValues(parents)).returning();
+    const line = {
+      documentId: document!.id, description: "Widget", unitPriceCents: 1, lineTotalCents: 1,
+    };
+    const [stored] = await handle.db.insert(documentLineItems)
+      .values({ ...line, position: 1, qtyMilli: 2_147_483_647 }).returning();
+    expect(stored?.qtyMilli).toBe(2_147_483_647);
+    await expect(handle.db.insert(documentLineItems)
+      .values({ ...line, position: 2, qtyMilli: 2_147_483_648 }))
+      .rejects.toMatchObject({ cause: { code: "22003" } });
+  });
+
+  // The other half of money.ts's one-sided guard: documentTotals refuses to
+  // PRODUCE a total past 2^53, and this refuses to STORE one arriving by any
+  // other path, where drizzle's mode:"number" would read it back as the nearest
+  // double without complaint.
+  it("refuses stored amounts past the safe integer range on both document tables", async () => {
+    const parents = await seedDocumentParents();
+    const past = 9_007_199_254_740_992;
+    await expect(handle.db.insert(documents).values(documentValues(parents, {
+      subtotalCents: past, taxCents: 0, totalCents: past,
+    }))).rejects.toMatchObject({ cause: { code: "23514" } });
+
+    const [document] = await handle.db.insert(documents).values(documentValues(parents)).returning();
+    await expect(handle.db.insert(documentLineItems).values({
+      documentId: document!.id, position: 1, description: "Widget",
+      qtyMilli: 1000, unitPriceCents: past, lineTotalCents: 1,
+    })).rejects.toMatchObject({ cause: { code: "23514" } });
   });
 
   it("enforces every foreign key on documents, document_line_items and org_profile", async () => {

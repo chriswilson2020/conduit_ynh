@@ -848,6 +848,19 @@ export const documents = pgTable("documents", {
   // CHECK in its own migration, exactly as each phase has widened
   // events_verb_valid.
   check("documents_totals_consistent", sql`total_cents = subtotal_cents + tax_cents`),
+  // THE OTHER HALF OF A GUARD money.ts ONLY HAS ONE SIDE OF. documentTotals()
+  // refuses to PRODUCE a total past Number.MAX_SAFE_INTEGER, because these are
+  // bigint columns read through drizzle's `mode: "number"` and a larger value
+  // would come back as the nearest double. Nothing stopped one arriving by
+  // another path -- a psql session, an import, a future service that skipped the
+  // shared arithmetic -- and being silently misread on the way out. Postgres
+  // reaches 2^63; this pins the columns to the range the reader can represent.
+  check(
+    "documents_totals_representable",
+    sql`subtotal_cents BETWEEN -9007199254740991 AND 9007199254740991
+        AND tax_cents BETWEEN -9007199254740991 AND 9007199254740991
+        AND total_cents BETWEEN -9007199254740991 AND 9007199254740991`,
+  ),
 ]);
 export type DocumentRow = typeof documents.$inferSelect;
 
@@ -894,6 +907,12 @@ export const documentLineItems = pgTable("document_line_items", {
   check("document_line_items_qty_nonneg", sql`qty_milli >= 0`),
   check("document_line_items_price_nonneg", sql`unit_price_cents >= 0`),
   check("document_line_items_tax_range", sql`tax_rate_bp BETWEEN 0 AND 10000`),
+  // documents_totals_representable's twin, on this table's two bigint columns,
+  // for the same reason: `mode: "number"` stops at 2^53 and Postgres does not.
+  check(
+    "document_line_items_amounts_representable",
+    sql`unit_price_cents <= 9007199254740991 AND line_total_cents BETWEEN -9007199254740991 AND 9007199254740991`,
+  ),
 ]);
 export type DocumentLineItemRow = typeof documentLineItems.$inferSelect;
 
