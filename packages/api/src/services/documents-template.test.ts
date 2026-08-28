@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { pdfText } from "../test/pdf.js";
 import { renderPdf, weasyprintAvailable } from "./documents-render.js";
 import {
   MERGE_MAX_OUTPUT_CHARS,
@@ -768,6 +769,11 @@ describe("prepareDocumentHtml merges first and sanitises last", () => {
  *
  * Measured on the server (WeasyPrint 57.2): the anchor case exits 0 with
  * `/URI (file:///...)` in the PDF, and the CSS case exits 2.
+ *
+ * BOTH ASSERTIONS GO THROUGH `pdfText`, and the first version of this file did not --
+ * CI failed on it. 61.1 compresses object streams, so the `/URI` was invisible to a
+ * raw byte search on the runner and plain text on the server. The negative assertion
+ * is the one that mattered: it would have passed VACUOUSLY on 61.1 forever.
  */
 describe("the renderer and the sanitiser cover different halves", () => {
   itReal("does not stop a file:// anchor href, and the sanitiser does", async () => {
@@ -776,10 +782,10 @@ describe("the renderer and the sanitiser cover different halves", () => {
 
     // No RenderError: the renderer had no opinion about it at all.
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
-    expect(pdf.toString("latin1")).toContain("file:///etc/hostname");
+    expect(pdfText(pdf)).toContain("file:///etc/hostname");
 
     const cleaned = await renderPdf(sanitizeDocumentHtml(evil));
-    expect(cleaned.toString("latin1")).not.toContain("file:///etc/hostname");
+    expect(pdfText(cleaned)).not.toContain("file:///etc/hostname");
   }, 30_000);
 
   itReal("does stop a file:// in CSS, so there the sanitiser is the second control", async () => {

@@ -1371,7 +1371,8 @@ describe("documents schema (0009)", () => {
       // Rendered on the server (WeasyPrint 57.2) through the shipped renderPdf,
       // most recently after Task 3 wrapped the logo and every optional field in
       // conditional blocks: with a logo and everything filled in, 4,073 chars of
-      // merged HTML and a 16,640-byte two-page PDF; with no logo and nothing
+      // merged HTML and a two-page PDF of 16,640 bytes -- 16,641 on the next run,
+      // because the renderer is not byte-reproducible (Task 1); with no logo and nothing
       // optional filled in, 3,445 chars and a 14,383-byte one-page PDF carrying
       // no image XObject at all. documents-seed.test.ts is where those two
       // renders happen on every push, and it prints the figures.

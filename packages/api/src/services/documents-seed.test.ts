@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { deflateSync, inflateSync } from "node:zlib";
+import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { migrationsFolder } from "../db/client.js";
+import { pageCount, pdfHasImage, pdfText } from "../test/pdf.js";
 import { pdfEmbedsFiles, renderPdf, weasyprintAvailable } from "./documents-render.js";
 import { prepareDocumentHtml, type MergeContext } from "./documents-template.js";
 
@@ -92,52 +93,6 @@ const WITH_LOGO: MergeContext = {
   },
   lines: WITHOUT_LOGO.lines,
 };
-
-/**
- * The PDF's bytes plus every Flate stream in it, inflated.
- *
- * A RAW BYTE SEARCH IS NOT ENOUGH AND CI IS WHERE THAT SHOWS. WeasyPrint 61.1
- * (Ubuntu 24.04, which is what the runner has) compresses object streams by
- * default while 57.2 (the Debian 12 server) does not, so the page tree is plain
- * text locally and invisible on CI -- the first version of this file passed here
- * and failed there, which is the same trap Task 1's retrospective records for
- * `/EmbeddedFiles`. The loop mirrors `pdfEmbedsFiles`, including resuming past
- * the whole `endstream` keyword rather than one byte into it, and that loop is
- * already proved against 61.1 by Task 1's mutation run.
- */
-function pdfText(pdf: Buffer): string {
-  const parts = [pdf.toString("latin1")];
-  let from = 0;
-  for (;;) {
-    const start = pdf.indexOf("stream", from);
-    if (start === -1) break;
-    const end = pdf.indexOf("endstream", start);
-    if (end === -1) break;
-    let body = start + "stream".length;
-    if (pdf[body] === 0x0d) body += 1;
-    if (pdf[body] === 0x0a) body += 1;
-    try {
-      parts.push(inflateSync(pdf.subarray(body, end)).toString("latin1"));
-    } catch {
-      // Not a Flate stream, or not a stream at all. Keep looking.
-    }
-    from = end + "endstream".length;
-  }
-  return parts.join("\n");
-}
-
-/** Pages, from the page tree's own count rather than by counting page objects. */
-function pageCount(pdf: Buffer): number {
-  const counts = (pdfText(pdf).match(/\/Count\s+(\d+)/g) ?? []).map((m) => Number(/\d+/.exec(m)![0]));
-  // An intermediate node carries its own subtree's count, so the root's is the
-  // largest -- true whatever shape the producer gives the tree.
-  return counts.length === 0 ? 0 : Math.max(...counts);
-}
-
-/** An image XObject, which is what a `data:` logo becomes and nothing else here does. */
-function hasImage(pdf: Buffer): boolean {
-  return /\/Subtype\s*\/Image/.test(pdfText(pdf));
-}
 
 describe("the seeded quote template", () => {
   it("resolves every merge construct in it, whichever fields are filled in", () => {
@@ -266,8 +221,8 @@ describe("the seeded quote template", () => {
 
     expect(without.subarray(0, 5).toString("ascii")).toBe("%PDF-");
     expect(withLogo.subarray(0, 5).toString("ascii")).toBe("%PDF-");
-    expect(hasImage(without)).toBe(false);
-    expect(hasImage(withLogo)).toBe(true);
+    expect(pdfHasImage(without)).toBe(false);
+    expect(pdfHasImage(withLogo)).toBe(true);
     // A logo is not an attachment, and control 3 must not think it is.
     expect(pdfEmbedsFiles(withLogo)).toBe(false);
   }, 60_000);
