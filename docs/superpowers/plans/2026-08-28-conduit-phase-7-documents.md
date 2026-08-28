@@ -25,6 +25,7 @@ phases produced their review findings.
 - **Server work goes through the dev checkout:** `CONDUIT_REMOTE_DIR=/home/chris/conduit-phase4 ./scripts/remote.sh '<cmd>'`. Pass that variable **explicitly on every call** — the default points at a different checkout and a previous session overwrote it.
 - **Vitest runs from the repo root.** The root global setup migrates Postgres before any project's tests, so the suite needs a database.
 - **ASCII only** in source and tests. **Targeted `git add`** — never `git add -A`.
+- **A version-specific REPRESENTATION is not a property, and this has now cost two CI rounds in two different tasks.** WeasyPrint 61.1 (CI) compresses PDF object streams; 57.2 (the server) does not. So a raw byte scan for `/EmbeddedFiles` finds it on one and not the other, and a page tree that is plain text on one is invisible on the other. Task 1 hit it, recorded it, and Task 2 read that record and walked into the same trap anyway. **Assert the property, never the encoding**: inflate every Flate stream before scanning, or better, build a fixture that exhibits the mechanism and needs no renderer at all — Task 2's hand-built PDF whose page tree exists only inside a compressed object stream pins the reader on every machine, at any version.
 - **Comments must be true.** Three commits in Phase 6 existed only to correct comments that read utility names as pixel counts or claimed memoisation that did not hold. If you write a number in a comment, measure it.
 - Conventional commits, signed `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 
