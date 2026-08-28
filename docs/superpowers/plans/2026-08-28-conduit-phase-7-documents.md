@@ -1294,6 +1294,217 @@ git add packages/api/src/services/documents-template.ts packages/api/src/service
 git commit -m "feat(api): the document sanitiser profile, and merge-field resolution"
 ```
 
+#### TASK 3 DONE — a scanner instead of a regex, and the spec's strip-list is wrong
+
+Commits `f951e32`, `551428a`, `1b0ee8d`. CI run **33217909751**, tip `1b0ee8d`, both
+jobs green: **2160 tests, 0 skipped**. On the server: 2122 passed / 38 skipped.
+`documents-template.test.ts` is 203 unit tests plus 2 gated on the binary; the seed's
+own file grew 6.
+
+The steps above are left as written so the corrections are legible.
+
+**1. A HAND-WRITTEN SCANNER, NOT THE PLAN'S TWO REGEXES, and the reason is that a
+regex has no answer rather than a wrong one.** Generalising
+`{{#lines}}([\s\S]*?){{/lines}}` to arbitrary paths needs a backreference, and the
+lazy quantifier then decides three questions nobody asked it: a block inside a block
+stops at the FIRST closer, leaving the inner tags on the printed page as literal
+text; an unclosed block matches nothing, so both its tags print; a `{{/other}}` inside
+a `{{#path}}` prints too. Each of those is an artefact of the quantifier. The scanner
+makes each one a decision, and each decision is tested:
+
+| input | what happens | why that one |
+|---|---|---|
+| `{{#a}}..{{#b}}..{{/b}}..{{/a}}` | nests properly; closers match by depth | falls out of a scanner and costs nothing |
+| `{{#a}}x` (never closed) | the block is IGNORED, `x` renders as ordinary content | the alternative -- treating the rest of the template as the body -- DELETES the rest of the quote whenever the value is empty, silently |
+| `{{/a}}` with nothing open | dropped | |
+| `{{#a}}x{{/b}}` | `{{/b}}` dropped, so `a` is unclosed, so the row above | |
+| `{{ oops }}`, `{{1a}}`, `{{{a}}}` | emitted verbatim | visible feedback on the page for whoever is editing the template |
+| `{{#lines}}` inside `{{#lines}}` | n^2 rows: `lines` is not a field of a line, so the inner block resolves it from the root again | defined, tested, and BOUNDED (below) |
+
+It is also linear, rather than a rescan from every `{{` in a 128KB template.
+
+**Two things the scanner gained that the plan's version did not have.** Inside
+`{{#lines}}` the plan looked ONLY at the line's own fields, so `{{document.number}}` on
+a line row rendered blank; there is a scope stack now, innermost first, which is
+Mustache's rule. And lookups are own-property only: `{{constructor}}` is a blank rather
+than `function Object()`. The FIELD form never showed that (a field only ever emits a
+string) -- the BLOCK form does, and `{{#constructor}}x{{/constructor}}` is the test that
+fails when the check is removed.
+
+**MERGE_MAX_OUTPUT_CHARS = 512KB, and it is the one thing in the module that throws.**
+Blocks nest, so expansion is not linear in the template: seven `{{#lines}}` inside each
+other over eight line items is two million rows, built in the API process long before
+renderPdf's 128KB input cap could refuse any of it. The cap is checked as the output is
+appended, so a runaway template stops at half a megabyte instead of at whatever the
+heap allows. Everything else here renders a blank and never throws.
+
+**2. THE SPEC'S STRIP-LIST IS WRONG AND THIS PROFILE DOES NOT IMPLEMENT IT.** The spec
+says "any remote URL in any attribute". `file:` is not remote, and `file:` is the one
+that has actually been used against this codebase. So the rule is inverted into an
+ALLOWLIST: exactly `data:`, plus a bare fragment (`#terms`, which names a place inside
+this document and can reach nothing). Everything else goes -- `file:`, `http:`,
+`https:`, `ftp:`, `jar:`, `//host`, `/etc/passwd`, `logo.png`, `javascript:`,
+`vbscript:`, `blob:`, `filesystem:`, a UNC path, and **`mailto:` and `tel:`, which the
+plan's Step 3 allowed**. Each is a test, in each of seven positions.
+
+**3. THE MATRIX: WHAT THE RENDERER ALSO CATCHES, AND WHAT ONLY THIS CATCHES.** Measured
+on the server through the shipped `renderPdf` (WeasyPrint 57.2), not reasoned about.
+
+| vector | renderer | sanitiser | measured |
+|---|---|---|---|
+| `file:`/`http:`/`ftp:`/`jar:` in `img src` or `link rel=stylesheet` | control 1 blocks, render FAILS | strips | Task 1's per-scheme suite |
+| `url()` in a `<style>` block or a `style` attribute | control 1 blocks, render FAILS | strips | exit 2, file never opened |
+| `@import`, both `url(...)` and a bare string | control 1 blocks, render FAILS | strips | exit 2 |
+| `@font-face { src: url(file://...) }` | control 1 blocks, render FAILS | strips | exit 2 |
+| CSS-escaped `\75 rl(...)` and `@\69 mport` | control 1 blocks, render FAILS | strips, because it decodes escapes | exit 2 -- tinycss2 decodes them, so they are URLs and not text |
+| `rel=attachment` on `<link>` and `<a>` | controls 2 and 3 | strips (the tag is not allowed, `rel` is not allowed) | Task 1's mutation run |
+| **`<a href="file:///...">`** | **NOTHING. Renders, exits 0** | **the only control** | the PDF comes back with `/URI (file:///etc/hostname)` in it and the file is never opened: an href is not fetched, it is written into the PDF as a link annotation |
+| **`<a href="http://...">`** | **NOTHING. Renders, exits 0** | **the only control** | same, `/URI (http://example.test/x)` -- a live tracking link inside a quote you emailed a customer |
+| **protocol-relative `//host/x.png`, and any relative URL** | renders, fetches nothing (base_url is None); the asset is silently missing | **the only control** | 838-byte PDF, nothing blocked |
+| **`<script>`, `on*`, `javascript:`** | irrelevant, there is no JS engine | **the only control** | matters the moment a template is previewed in a browser, which is Task 5's surface |
+| `image-set("file://..." 1x)` | renders, fetches nothing on 57.2 | NOT covered: a bare string outside `@import` is not treated as a URL | 2,895-byte PDF, file never opened. If a later version does fetch it, control 1 refuses it |
+
+The rows in bold are the answer to "why does this module exist when the renderer has
+three controls": **the renderer's controls are about what it FETCHES, and an href is
+never fetched.** Two of them are pinned by tests in `documents-template.test.ts` that
+render on the real binary and assert both halves -- the renderer has no opinion, the
+sanitiser removes it.
+
+**4. sanitize-html DOES NOT FILTER CSS AT ALL, in either position, and the plan's
+options say otherwise in three places.** All three measured against 2.17.7:
+
+- The contents of an allowed `<style>` element are emitted **verbatim**, in every
+  configuration. `nonTextTags` has nothing to do with it -- the plan's comment
+  ("sanitize-html drops the text of non-text tags unless they are named here") is false
+  for an ALLOWED tag, and overriding that list would only have dropped the library's own
+  mutation-XSS mitigations for `xmp` and `textarea`. It is left alone.
+- `allowedStyles: {}` does not filter a `style` attribute, it DISABLES filtering:
+  `filterCss` returns the tree untouched when no rule matches. The plan's profile would
+  have passed `style="background:url(file:///etc/passwd)"` straight through.
+- `allowVulnerableTags: false` with `style` in `allowedTags` prints a console warning on
+  every single call. It is true here, with a comment saying what the warning is about
+  and why it does not apply to a document rendered offline.
+
+So the CSS is sanitised here, by a scanner that decodes escapes -- because
+`\75 rl("file:///etc/passwd")` and `@\69 mport` both FETCHED on the server, so a regex
+over the raw text is not a control. Two subtleties are load-bearing and both are
+tested: a comment is replaced by a SPACE rather than deleted (`url/**/(x)` is not a url
+token, and deleting the comment would make it one), and every removal leaves a space
+behind (a deletion joins the text on either side of it, which is how a `<` and a
+`/style>` could become `</style>` and end the element early when the output is parsed
+again).
+
+**5. THE ESCAPING ORDER: MERGE FIRST, SANITISE LAST, and `prepareDocumentHtml` is the
+only call Task 4 should make.** Both directions are tested, and one of the tests is a
+mutation test for the order itself:
+
+- Values are HTML-escaped on substitution, including `'` -- which the plan's escaper
+  missed, and `<img alt='{{x}}'>` is legal HTML that it broke out of. Escaping is what
+  stops a company name of `<style>@page{size:Letter}</style>` restyling the document,
+  because the sanitiser would have ALLOWED that: it is exactly what a template is
+  permitted to contain.
+- HTML escaping is escaping for ONE context. A value landing inside a `<style>` block is
+  in another one, where `<` and `&` are not what matters and `url(` is. Sanitising the
+  template first and merging into it afterwards leaves a `file://` URL in the stylesheet
+  that nothing ever looked at -- and the test asserts exactly that about the wrong
+  order, so swapping the two calls makes the right-order test fail.
+- A merge field in a style ATTRIBUTE is destroyed outright by sanitize-html's postcss
+  parse (`{{` is not CSS), which closes that context by construction but silently.
+  **The seeded template has no merge field in either CSS position**, and there is now a
+  test that says so.
+
+**6. THE RE-SEED.** Every optional field is wrapped: the logo, the valid-until row, the
+contact name, the recipient address, the notes, the terms, the bank details, the VAT
+number, the registration number and each of the org's contact lines. The line table
+gets a `{{^lines}}` empty state. **54 merge tokens**, up from 26, still asserted as an
+equality in `schema.test.ts` -- where the optional ones are now a named list, because
+"this field owes the template a conditional" is the contract that moved.
+
+Rendered on the server through the shipped `renderPdf`, in both states:
+
+| state | merged HTML | PDF on 57.2 (server) | PDF on 61.1 (CI) | image XObject |
+|---|---|---|---|---|
+| no logo, nothing optional filled in | 3,445 chars | 14,383 bytes, 1 page | 10,982 bytes, 1 page | **none** |
+| everything filled in | 4,073 chars | 16,640 bytes, 2 pages | 12,813 bytes, 2 pages | one |
+
+16,640 was 16,641 on the next run: the renderer is not byte-reproducible, which Task 1
+measured and Task 4's immutability test depends on. The no-logo case has no `<img>` at
+all, no "Valid until" row, no "VAT" and no "Company registration" -- asserted on the
+merged HTML and again on the PDF, where an image XObject either exists or does not.
+**`documents-seed.test.ts` now MERGES** rather than stripping merge constructs with a
+regex; the reason it did not is that Task 3 owned the resolver, and Task 3 has landed.
+
+**Migration mechanics: `drizzle-kit generate` reports "No schema changes".** The edit is
+to hand-written seed data, not to generated DDL, so there is nothing for drizzle to
+regenerate and the journal and the snapshot are untouched -- the diff is one `.sql`
+file. `conduit_test` was dropped and recreated anyway, because the migrator skips by
+timestamp and the tests would otherwise have run against the old template while the
+file on disk said something else.
+
+**7. MUTATION-CHECKED, because three of Task 1's assertions proved nothing until
+somebody did.** Every mutation run against the suite on the server:
+
+| mutation | fails |
+|---|---|
+| the `<style>` block CSS pass removed | **91 of 203** |
+| the `style` attribute CSS pass removed | 19 |
+| the attribute URL allowlist removed (leaving sanitize-html's own scheme list) | 6 |
+| CSS hex escapes not decoded | 1 |
+| a removed url token leaves nothing behind instead of a space | 1 |
+| `url` must be followed IMMEDIATELY by `(` (the strict grammar) | 1 |
+| `exclusiveFilter` removed, so an `<img>` with no src survives | 1 |
+| sanitise before merge | 1 |
+| `'` not escaped | 1 |
+| the own-property check dropped from `lookup` | 1 |
+| whitespace-only no longer counts as empty | 1 |
+| an unclosed block becomes a section | 1 |
+| the output cap removed | 1 |
+| no outer scope from inside a line | 3 |
+
+**And one that is REDUNDANT AND SAYS SO.** Removing the `rel=attachment` strip fails
+nothing, because `rel` is not in the allowed attributes; allowing `rel` on `<a>` while
+keeping the strip fails nothing either. Removing BOTH reopens the vector and fails one
+test. That is what redundancy looks like from a test suite, and the strip earns its
+place because "allow `rel` so links can carry `noopener`" is an ordinary-looking edit.
+Recorded at the constant rather than left for the next person to rediscover.
+
+**8. AND IT WENT RED ON CI ON THE TRAP THIS PLAN RECORDS TWICE.** Run `33217280123`
+failed one assertion: `/URI (file:///etc/hostname)` is plain text in 57.2's output and
+lives inside a compressed object stream on 61.1, so the raw byte search found it on the
+server and not on the runner. **The negative half of that same test is the one that
+mattered** -- `not.toContain` over raw bytes would have passed VACUOUSLY on 61.1 for as
+long as it existed. The inflate-every-stream loop had already been written twice
+(`pdfEmbedsFiles` ships it, `documents-seed.test.ts` had a copy), so rather than add a
+third it moved to `packages/api/src/test/pdf.ts` as `pdfText`/`pageCount`/`pdfHasImage`,
+still pinned by the hand-built PDF whose page tree exists only inside a compressed
+object stream -- which needs no renderer of any version to prove.
+
+**WHAT TASKS 4 AND 5 INHERIT.**
+
+1. **Call `prepareDocumentHtml(template, context)`.** It is merge-then-sanitise in one
+   place, so the order cannot be got wrong at a call site. Sanitising again when a
+   template is SAVED is harmless -- the profile is idempotent and there is a test -- but
+   it is not the control.
+2. **`MergeContext` now needs `org.logoDataUri`**, which the seed uses. Every other key
+   is Task 2's list unchanged. A missing key is a blank, never a throw.
+3. **`mergeTemplate` throws `TemplateError` past 512K characters**, and that is its only
+   throw. Task 4's route should turn it into an error about the TEMPLATE rather than a
+   500 -- it happens before the render, so no document number is spent either way.
+4. **The profile refuses `mailto:` and `tel:`.** Task 5's merge-field documentation page
+   should say that a template's links can only be fragments or `data:`, and that the
+   org's email prints as text.
+5. **Merge fields do not belong in CSS**, in either position, and the same page should
+   say so: in a `<style>` block they are escaped as HTML, which is not CSS escaping, and
+   in a `style` attribute the whole attribute is dropped.
+6. **`{{^lines}}` means a quote with no lines renders "No line items."** rather than an
+   empty table. Task 4 should still require at least one line in its input schema; the
+   empty state is for the template's benefit, not a supported document.
+
+**OPEN, and it belongs to Task 6.** Task 1's note that the `e2e` job does not install
+WeasyPrint is unchanged. Everything in this task now runs on both versions on every
+push -- the two gated tests and the seed's two states render on the runner's 61.1 -- so
+the 57.2/61.1 gap is closed for this module, but not for the phase.
+
 ---
 
 ### Task 4: Issuing a quote — one transaction, and the immutability proof
