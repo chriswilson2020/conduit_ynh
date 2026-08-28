@@ -197,16 +197,18 @@ Then install it on the server and prove a real PDF:
 CONDUIT_REMOTE_DIR=/home/chris/conduit-phase4 ./scripts/remote.sh 'cd /home/chris/conduit-phase4 && npx vitest run packages/api/src/services/documents-render.test.ts'
 ```
 
-Expected on the server: 3 passed, 0 skipped. **If the binary is absent there, say so and
-stop for a ruling** — you may not `sudo apt install`; Chris holds sudo deliberately.
+Expected on the server: the render tests SKIP cleanly while the stub-driven failure-path
+tests still run. **If the binary is absent there, say so and stop for a ruling** — you
+may not `sudo apt install`; Chris holds sudo deliberately.
 
 - [ ] **Step 6: Declare the dependency in the manifest**
 
-`manifest.toml`, in the resources section, alongside the existing ones:
+`manifest.toml` ALREADY HAS a `[resources.apt]` block (`packages = "postgresql"`). A
+second one is a duplicate-key TOML error. **Edit the existing line**, and name munkres
+first — see the spec's Context for the 508MB vs 89MB measurement:
 
 ```toml
-[resources.apt]
-packages = "weasyprint"
+packages = "postgresql, python3-munkres, weasyprint"
 ```
 
 Verify you have not broken the manifest: `python3 -c "import tomllib,pathlib; tomllib.loads(pathlib.Path('manifest.toml').read_text()); print('manifest parses')"`
@@ -232,6 +234,52 @@ git commit -m "feat(api,packaging): render HTML to PDF through WeasyPrint, and d
 State: the server's binary name and version; whether the render tests passed there; the
 CI run id proving they pass on Ubuntu; and anything about the apt package that surprised
 you. Do not start Task 2 until this is reported.
+
+#### TASK 1 DONE — and four things in the steps above are now WRONG
+
+Commits `bb5880c`, `3b95519`. CI run **33191112378**, tip `3b95519`, both jobs green:
+52 files, **1881 tests, 0 skipped** (CI installs the binary). On the server: 1839 passed
+/ 42 skipped.
+
+Read these before trusting the code above; the steps are left as written so the
+correction is legible rather than silently patched.
+
+1. **The `--base-url` comment in Step 4 is FALSE and the shipped code does not say it.**
+   A base URL governs only what RELATIVE references resolve against; an absolute
+   `http://` URL needs no base and is fetched. Disproved empirically with a loopback
+   server that records requests: bare `weasyprint` with no `--base-url` fetched both an
+   `<img>` and a `<link rel=stylesheet>`. Debian's package `Recommends: ca-certificates`,
+   which is the same tell. The no-network property is now enforced by the child's
+   environment — `http_proxy`/`https_proxy`/`ftp_proxy` at a closed loopback port with
+   `no_proxy` emptied, which urllib's opener reads — and is proved in BOTH directions.
+2. **Step 4's `renderPdf` resolved a zero-byte "PDF".** A child that exits 0 having
+   written nothing returned `Buffer.concat([])`, which would have put an empty file in a
+   deal's Files with no error raised anywhere. The shipped version treats a stdout that
+   does not begin `%PDF-` as a failed render. Its `fail()` also clears its own timeout
+   rather than relying on the `close` event — the one event a timeout exists to survive
+   the absence of.
+3. **Step 2's test file would have skipped every failure path** on any machine without
+   the binary, which is backwards for code whose whole job is failing well. The shipped
+   tests are in two halves: seven stub-driven tests shadow `weasyprint` on `PATH` with a
+   shell script and run EVERYWHERE (non-zero exit with stderr, a child that exits before
+   reading a 2MB stdin, a timeout firing mid-chunk with a marker file proving the child
+   was killed, the size cap, exit-0-with-no-PDF, exit-0-with-garbage, ENOENT).
+4. **Import specifiers are `.js`, not `.ts`** — NodeNext, and the repo convention.
+
+**Measured, so later tasks stop guessing.** A one-page quote (A4, `@page` margins, a
+running footer, a `data:` logo, 8 line items, totals, terms) renders in **665-738ms to
+12457 bytes**, byte-identical across runs — a free early signal for the immutability
+claim in Task 4. The 20s timeout is 27x that and also bounds how long Task 4's
+transaction holds its row lock, so it should not grow. The 25MB cap is not a tuned limit
+but a bound on what is accumulated in memory from a runaway stream; anything near it
+would hit the timeout first.
+
+**Open, for Task 6 and the release.** CI proves the path on WeasyPrint **61.1** (Ubuntu
+24.04); the server will run **57.2** (Debian 12 bookworm) and nothing has yet rendered a
+byte on 57.2. Both are post-53 (pydyf + Pango, no cairo), so there is no architectural
+difference, but the gap is unclosed until Chris installs and the render tests are run
+there. **The `e2e` CI job does not install WeasyPrint** — Task 6's journey spec needs
+that step added or it will fail on a runner with no binary.
 
 ---
 

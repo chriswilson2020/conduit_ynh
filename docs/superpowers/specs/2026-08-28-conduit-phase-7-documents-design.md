@@ -3,8 +3,16 @@
 ## Context
 
 The roadmap has carried this since 18 August, where it was the original "Phase 5":
-merge-field templates rendered to PDF via WeasyPrint, chosen at roughly 40MB of apt
-dependency rather than shipping Chromium. It is the last capability that makes someone
+merge-field templates rendered to PDF via WeasyPrint, chosen over shipping Chromium.
+
+**The "roughly 40MB" the original design cited is wrong, and Task 1 measured the real
+figures on the server.** `apt-get install weasyprint` on Debian 12 pulls 69 packages and
+**508MB installed**, because `python3-fonttools` depends on the alternative
+`python3-scipy | python3-munkres` and apt takes the first, which drags `g++`, `g++-12`,
+`libboost1.74-dev` and `libopenblas-dev` onto a CRM server. Naming the second alternative
+explicitly gives the same renderer in 39 packages and **89MB**, with no C++ toolchain.
+The install is therefore `python3-munkres weasyprint`, and the order of those two words
+is load-bearing. It is the last capability that makes someone
 leave Conduit to finish a job: the CRM knows the deal, the company and the contact, and
 then you go and write the quote somewhere else.
 
@@ -57,11 +65,19 @@ Node process changes.
 
 Two properties are requirements, not defaults:
 
-- **No network access during render.** Every asset — the logo above all — is inlined as
-  a `data:` URI before the HTML reaches WeasyPrint. A template that references a remote
-  URL renders without it rather than fetching it. This is what makes rendering a pure
-  function of stored data, and it removes SSRF from a feature whose input is
-  user-authored HTML.
+- **No network access during render, enforced in the child's environment.** Every asset
+  — the logo above all — is inlined as a `data:` URI before the HTML reaches WeasyPrint.
+  **An earlier draft of this spec claimed omitting `--base-url` was what prevented
+  fetches; Task 1 disproved that empirically** with a loopback server that records who
+  asks it for anything: a base URL only governs what RELATIVE references resolve
+  against, and a bare `weasyprint` with none set happily fetched both an `<img>` and a
+  `<link rel=stylesheet>`. The property is instead enforced by pointing the child's
+  `http_proxy`/`https_proxy`/`ftp_proxy` at a closed loopback port with `no_proxy`
+  emptied — WeasyPrint's fetcher is urllib, whose opener reads exactly those — so a
+  smuggled remote URL is refused instantly and the page renders without the asset. This
+  is what makes rendering a pure function of stored data, and it removes SSRF from a
+  feature whose input is user-authored HTML. Task 3's sanitiser still strips remote URLs:
+  that is the braces to this belt, not a substitute for it.
 - **A timeout and an output cap.** A render that hangs or produces an implausible file
   fails cleanly, leaves no `files` row and no number allocated.
 
