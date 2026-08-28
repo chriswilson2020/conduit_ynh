@@ -185,6 +185,18 @@ This is a settings singleton plus a logo upload, and it is small — but it is a
 found by reading the schema rather than assumed away, and every other part of the phase
 depends on it.
 
+**The logo upload must enforce a size limit, and Task 1's measurements set it.** The
+logo reaches the renderer inlined as a `data:` URI at 4/3 of its stored size, and the
+render input is capped at 128KB — a cap chosen because a TABLE-shaped document (which is
+exactly what a quote is) costs about six times what prose costs at equal size: 128KB of
+table is 5.2s and 157MB, while 2MB of table was 86s and 1.5GB. The timeout cannot bound
+that, because the expensive documents are the ones fast enough to survive it. So a
+stored logo much above 64KB cannot render at all, and the template and line items must
+fit alongside it. **Task 5 bounds the upload well below that** — 32KB is the working
+figure, leaving the document itself three quarters of the budget — and rejects an
+oversized logo at upload time with a clear message, rather than letting it surface as a
+failed render weeks later when someone raises a quote.
+
 ## The work, surface by surface
 
 ### Data model (migration 0009)
