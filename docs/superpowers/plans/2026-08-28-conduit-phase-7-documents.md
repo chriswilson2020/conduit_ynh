@@ -1318,8 +1318,8 @@ makes each one a decision, and each decision is tested:
 | `{{#a}}x` (never closed) | the block is IGNORED, `x` renders as ordinary content | the alternative -- treating the rest of the template as the body -- DELETES the rest of the quote whenever the value is empty, silently |
 | `{{/a}}` with nothing open | dropped | |
 | `{{#a}}x{{/b}}` | `{{/b}}` dropped, so `a` is unclosed, so the row above | |
-| `{{ oops }}`, `{{1a}}`, `{{{a}}}` | emitted verbatim | visible feedback on the page for whoever is editing the template |
-| `{{#lines}}` inside `{{#lines}}` | n^2 rows: `lines` is not a field of a line, so the inner block resolves it from the root again | defined, tested, and BOUNDED (below) |
+| `{{ }}`, `{{1a}}`, `{{{a}}}`, `{{__proto__}}` | emitted verbatim | visible feedback on the page for whoever is editing the template. **`{{ oops }}` is NOT one of these** -- surrounding whitespace is tolerated, so it is a tag for an unknown path and renders blank, which is Mustache's behaviour. An earlier draft of this row said otherwise |
+| `{{#lines}}` inside `{{#lines}}` | n^2 rows: `lines` is not a field of a line, so the inner block resolves it from the root again | defined, tested, and bounded by MERGE_MAX_STEPS -- **which is NOT what the first version of this task shipped; see review round 1** |
 
 It is also linear, rather than a rescan from every `{{` in a 128KB template.
 
@@ -1331,21 +1331,32 @@ than `function Object()`. The FIELD form never showed that (a field only ever em
 string) -- the BLOCK form does, and `{{#constructor}}x{{/constructor}}` is the test that
 fails when the check is removed.
 
-**MERGE_MAX_OUTPUT_CHARS = 512KB, and it is the one thing in the module that throws.**
-Blocks nest, so expansion is not linear in the template: seven `{{#lines}}` inside each
-other over eight line items is two million rows, built in the API process long before
-renderPdf's 128KB input cap could refuse any of it. The cap is checked as the output is
-appended, so a runaway template stops at half a megabyte instead of at whatever the
-heap allows. Everything else here renders a blank and never throws.
+**THREE BOUNDS, AND THIS PARAGRAPH ORIGINALLY CLAIMED ONE, WHICH DID NOT TERMINATE.**
+Blocks nest, so expansion is not linear in the template. The shipped version of this
+task bounded the merge on OUTPUT CHARACTERS alone, and a reviewer showed that bounds
+nothing: the cap is only reached by a node that EMITS, so a nest whose innermost body
+emits nothing runs `lines.length ** depth` times with the count stuck at zero. The
+bound is now on WORK -- a node visited or a block expanded -- plus a recursion depth
+limit, plus the original memory cap. All three throw `TemplateError`. See review
+round 1 for the measurements.
 
-**2. THE SPEC'S STRIP-LIST IS WRONG AND THIS PROFILE DOES NOT IMPLEMENT IT.** The spec
-says "any remote URL in any attribute". `file:` is not remote, and `file:` is the one
-that has actually been used against this codebase. So the rule is inverted into an
+**2. THE SPEC'S STRIP-LIST WAS WRONG AND THIS PROFILE DOES NOT IMPLEMENT IT.** The spec
+said "any remote URL in any attribute". `file:` is not remote, and `file:` is the one
+that has actually been used against this codebase. **The coordinator has since
+corrected the spec itself** (`655691a`) to say every URL in every attribute except
+`data:` and a bare fragment, so this divergence is now the spec. The rule is an
 ALLOWLIST: exactly `data:`, plus a bare fragment (`#terms`, which names a place inside
 this document and can reach nothing). Everything else goes -- `file:`, `http:`,
 `https:`, `ftp:`, `jar:`, `//host`, `/etc/passwd`, `logo.png`, `javascript:`,
 `vbscript:`, `blob:`, `filesystem:`, a UNC path, and **`mailto:` and `tel:`, which the
 plan's Step 3 allowed**. Each is a test, in each of seven positions.
+
+**`mailto:` AND `tel:` ARE A DEFERRED CAPABILITY, NOT A DANGER, and the review round
+settled which.** No href of any scheme reaches the renderer's fetcher -- every one of
+them is an inert `/URI` annotation -- so the reason they are refused is allowlist
+minimality and nothing else. A quote that links the issuer's email address is a
+plausible thing to want. Restoring it is two entries in `isPermittedUrl`, scoped to
+its `"link"` position so it cannot widen a fetch.
 
 **3. THE MATRIX: WHAT THE RENDERER ALSO CATCHES, AND WHAT ONLY THIS CATCHES.** Measured
 on the server through the shipped `renderPdf` (WeasyPrint 57.2), not reasoned about.
@@ -1408,9 +1419,13 @@ mutation test for the order itself:
   template first and merging into it afterwards leaves a `file://` URL in the stylesheet
   that nothing ever looked at -- and the test asserts exactly that about the wrong
   order, so swapping the two calls makes the right-order test fail.
-- A merge field in a style ATTRIBUTE is destroyed outright by sanitize-html's postcss
-  parse (`{{` is not CSS), which closes that context by construction but silently.
-  **The seeded template has no merge field in either CSS position**, and there is now a
+- ~~A merge field in a style ATTRIBUTE is destroyed outright by sanitize-html's postcss
+  parse, which closes that context by construction.~~ **WRONG ON BOTH HALVES, corrected
+  in review round 1.** The destruction only happens to an UNMERGED template, which is
+  the wrong order; through `prepareDocumentHtml` the value is substituted first and the
+  attribute survives carrying it. That attribute is now the ONLY CSS context a value
+  can reach, because merge fields inside a `<style>` block are no longer substituted at
+  all. **The seeded template has no merge field in either CSS position**, and there is a
   test that says so.
 
 **6. THE RE-SEED.** Every optional field is wrapped: the logo, the valid-until row, the
@@ -1487,15 +1502,20 @@ object stream -- which needs no renderer of any version to prove.
    it is not the control.
 2. **`MergeContext` now needs `org.logoDataUri`**, which the seed uses. Every other key
    is Task 2's list unchanged. A missing key is a blank, never a throw.
-3. **`mergeTemplate` throws `TemplateError` past 512K characters**, and that is its only
-   throw. Task 4's route should turn it into an error about the TEMPLATE rather than a
-   500 -- it happens before the render, so no document number is spent either way.
+3. **`mergeTemplate` throws `TemplateError` and nothing else**, from any of three
+   bounds: 1,000,000 steps of work, 32 levels of nesting, 512K characters of output.
+   (The original version of this line said the character cap was the only one, which
+   was both incomplete and, for a deep template, false -- it was a `RangeError`.) Task
+   4's route should turn it into an error about the TEMPLATE rather than a 500 -- it
+   happens before the render, so no document number is spent either way.
 4. **The profile refuses `mailto:` and `tel:`.** Task 5's merge-field documentation page
    should say that a template's links can only be fragments or `data:`, and that the
    org's email prints as text.
-5. **Merge fields do not belong in CSS**, in either position, and the same page should
-   say so: in a `<style>` block they are escaped as HTML, which is not CSS escaping, and
-   in a `style` attribute the whole attribute is dropped.
+5. **Merge fields are NOT SUBSTITUTED inside a `<style>` block at all** -- the token is
+   left where it stands -- and the documentation page should say that rather than
+   describing what the escaping would have done. In a `style` ATTRIBUTE they are
+   substituted, the attribute survives, and any URL in the value is removed by the CSS
+   scanner.
 6. **`{{^lines}}` means a quote with no lines renders "No line items."** rather than an
    empty table. Task 4 should still require at least one line in its input schema; the
    empty state is for the template's benefit, not a supported document.
@@ -1504,6 +1524,162 @@ object stream -- which needs no renderer of any version to prove.
 WeasyPrint is unchanged. Everything in this task now runs on both versions on every
 push -- the two gated tests and the seed's two states render on the runner's 61.1 -- so
 the 57.2/61.1 gap is closed for this module, but not for the phase.
+
+##### TASK 3 REVIEW ROUND 1 — a merge that did not terminate, and a tokenizer I only half agreed with
+
+Commit `10cd768`. CI run **33221772496**, tip `10cd768`, both jobs green: **2173 tests,
+0 skipped**. On the server: 2135 passed / 38 skipped.
+
+The review could not break the refusal matrix -- 26 URL forms across 13 positions
+re-derived independently, every evasion refused -- and confirmed the scope stack, the
+own-property lookup, the `rel=attachment` redundancy, the three library claims against
+2.17.7, structural attacks on `STYLE_ELEMENT`, 30+ malformed-template shapes and both
+re-seed renders. What it broke was the merge's termination and my agreement with the
+CSS tokenizer.
+
+**S2: THE MERGE DID NOT TERMINATE, AND THE CAP I SHIPPED BOUNDED NOTHING.**
+`MERGE_MAX_OUTPUT_CHARS` is checked in `emit`, and `emit` is only reached by a node
+that produces characters. A section whose body emits nothing -- an empty body, or one
+holding only an unknown field, since `emit(sink, "")` adds zero -- never touches it, so
+the loop ran `lines.length ** depth` times with the counter at zero. `mergeTemplate` is
+synchronous, so that is the whole Node event loop, from a template a user can save.
+The reviewer measured, with twenty line items: depth 6 at 1.5s and no throw, depth 7 at
+30s and no throw, depth 12 at 4.1e15 iterations from a **240-character template**.
+
+**My own cap test is why it survived**: it put `{{description}}` in the body, so it
+always emitted and always hit the cap. The mutation that "proved" the cap only ever
+exercised the emitting case.
+
+**The bound is now on WORK -- a node visited or a block expanded -- not on output.**
+Re-measured on the server against the fix, twenty line items throughout:
+
+| body | depth | before | after |
+|---|---|---|---|
+| empty | 6 | 1.5s, no throw | **78ms, TemplateError** |
+| empty | 7 | 30s, no throw | **51ms** |
+| empty | 9 | -- | **50ms** |
+| empty | 12 | ~10^4 hours, no throw | **52ms** |
+| empty | 20 | -- | **69ms** |
+| one unknown field | 9 | 31s, no throw | **288ms** |
+| one unknown field | 12 | -- | **329ms** |
+| `{{description}}` | 7 | output cap | **19ms**, output cap at 53,853 steps |
+
+And the other direction, which a bound needs just as much: **the seeded template merges
+in 1,612 steps at 130 line items** -- the largest quote that can render at all -- and
+148 steps at eight. The cap is 1,000,000.
+
+**S3: it threw a `RangeError`, not a `TemplateError`.** `render` recurses once per
+nesting level, so a template nested thousands deep failed out of the JavaScript stack.
+The DONE block handed Task 4 "TemplateError past 512K characters, and that is its only
+throw", and a route written to that contract turns this into a 500. `MERGE_MAX_DEPTH`
+is 32; the 20,000-deep case now stops in 11ms after 66 steps with a `TemplateError`
+naming the nesting, and the test asserts it is not a `RangeError`.
+
+**S1: MY STRING READER DISAGREED WITH tinycss2, AND A LIVE `url()` WALKED OUT.**
+`readString` ended a string at `"\n"`. CSS Syntax 3 preprocesses CR, FF and CRLF each
+into a single LF before tokenizing, so a real tokenizer ends a bad-string at a bare CR
+too -- and mine copied everything after the CR out as string content:
+
+```
+<style>p{content:'x<CR>} p{background:url(file:///etc/passwd)} p{a:'}</style>
+```
+
+The reviewer fed my own output to a recording fetcher on the server and WeasyPrint
+asked for the file. **It was contained only by the renderer's `data:`-only fetcher** --
+which is precisely the dependency this module exists to remove, and which does not
+exist in Task 5's in-browser template preview, where the same payload is a live
+outbound request from the operator's browser. It falsified the invariant stated at
+`sanitizeCss` and the header's claim about not resting on a renderer flag.
+
+Fixed by breaking on `\n`, `\r` and `\f`. **The `HIDDEN` table had no case where a URL
+hid inside a CSS STRING** -- thirteen cases on escapes, comments and at-rules, and none
+on the shape that got through. Five string shapes added (bare CR, FF, CRLF, double
+quotes, end-of-line); reverting the fix fails three of them.
+
+**THE SMALLER FIVE.**
+
+- **O1: `data:` on an `<a href>` is now refused, deliberately.** It was permitted as a
+  side effect of "exactly `data:` everywhere", and `<a href="data:text/html,...">` rode
+  out into a `/URI` annotation. `isPermittedUrl` now takes a position: a "fetch" (an
+  `img src`, a CSS `url()`, an `@import`) may be `data:`, because that is how the logo
+  arrives; a "link" may be a fragment and nothing else, because an href is never
+  fetched and `data:` buys it nothing.
+- **O2: the DONE block's claim that a merge field in a `style` attribute is destroyed
+  was wrong on mechanism and on consequence**, and Task 5 was told to write its
+  documentation from it. `parseStyleAttributes` defaults to true, so postcss parses the
+  value even with `allowedStyles` unset -- the filter is off, not the parse -- and the
+  destruction only happens to an UNMERGED template. Through `prepareDocumentHtml` the
+  value is substituted first and **the attribute survives with it**. Corrected in place
+  above, and the test that asserted the wrong thing now asserts both halves.
+- **O3: a merged value ending in a backslash swallowed the rest of the stylesheet**,
+  faithfully to CSS: the backslash escapes the closing quote of the string it landed
+  in. Rather than document that, **merge fields inside a `<style>` block are no longer
+  substituted at all.** The token is left where it stands. It kills the whole class --
+  the backslash, the `&quot;` that CSS does not decode, and a `url()` only the sanitiser
+  would have caught -- and it makes the advice Task 5 has to publish one sentence long.
+  The region scan is htmlparser2's own raw-text rule (a `<style ...>` runs to the first
+  `</style`), and it can only err by treating a field as CSS when it is not, which
+  leaves a token unrendered rather than a value unchecked.
+- **O4 and O5: two comments that were wrong about which mechanism handled a case.**
+  `{{ oops }}` renders blank, not verbatim -- `TAG` tolerates surrounding whitespace,
+  which is Mustache's behaviour and correct. `{{__proto__}}` prints as literal text
+  because `TAG` requires a leading letter, not because `lookup` refused it;
+  `{{org.__proto__.x}}` is the one `lookup` handles. Both corrected.
+
+**THE ORDER TEST NEEDED A REAL PAYLOAD, and finding one made the argument better.**
+With `<style>` blocks no longer merged, the old demonstration was gone -- and the
+obvious replacement, a bare `url(file://...)` merged into a `style` attribute, does not
+survive the wrong order either, because sanitising an unmerged template destroys that
+attribute. The payload that does survive is sharper, and it is the case where HTML
+escaping looks like it should have been enough:
+
+```
+template: <div style="background: url(data:image/png;base64,{{document.notes}})">
+value:    x")} body{background:url(file:///etc/passwd)} p{a:("
+```
+
+The value's quote is escaped to `&quot;` -- and the HTML parser hands `&quot;` back to
+the CSS parser as a real quote, so the escape travels through the attribute and closes
+the `url()` from the inside. Measured, wrong order:
+
+```
+<div style="background:url(&quot;data:image/png;base64,x&quot;)}
+ body{background:url(file:///etc/passwd)} p{a:(&quot;&quot;)">x</div>
+```
+
+Right order: `<div>x</div>`.
+
+**MUTATIONS FOR THE FIXES**, all run on the server:
+
+| mutation | result |
+|---|---|
+| CSS string ends only at `\n` | 3 of 216 fail |
+| the work budget removed | **the run HANGS** (killed at 120s) |
+| the depth cap removed | 1 fails |
+| `data:` allowed on an href again | 1 fails |
+| `<style>` blocks merged again | 2 fail |
+| expansions counted, nodes not | (not run: the node count is what terminates) |
+| **expansions NOT counted, nodes still counted** | **0 fail -- see below** |
+
+Two of those need saying plainly. **The work budget's mutation hangs rather than
+fails**, because `mergeTemplate` is synchronous and vitest's timer cannot fire until it
+returns -- which is the argument for the bound living in the module rather than in a
+test's patience, and the test comments now say so instead of claiming a timeout catches
+it. And **counting expansions as well as nodes fails no test**: node counting alone
+terminates, since an expansion that visits no nodes can only happen at the innermost
+level. What the per-item count buys is the constant -- without it a 130-line quote
+could do 1.3e8 iterations inside the same one-million-step budget, seconds of blocked
+event loop rather than a third of a second. Recorded at the line, like the
+`rel=attachment` redundancy above it.
+
+**WHAT CHANGED FOR TASKS 4 AND 5**, on top of the inheritance list in the DONE block:
+
+1. `mergeTemplate` throws `TemplateError` from three bounds, and never a `RangeError`.
+2. A template's links may be fragments only -- not `data:`, not `mailto:`, not `tel:`.
+   The `mailto:`/`tel:` refusal is a deferred capability with a two-line restore path,
+   not a hazard; the note is at `isPermittedUrl`.
+3. Merge fields in a `<style>` block are left unsubstituted. In a `style` attribute
+   they are substituted and the attribute survives.
 
 ---
 
