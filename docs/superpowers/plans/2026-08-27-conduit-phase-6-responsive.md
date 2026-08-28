@@ -1037,6 +1037,18 @@ The journeys, at a phone viewport via Playwright device emulation — these ARE 
 
 Reuse the suite's conventions: `runId` + per-attempt `${runId}x${testInfo.retry}` fixtures, loaded sentinels rather than bare absences, `typeIntoEditor` from `e2e/helpers.ts` for any rich-text field. **The existing 72 desktop tests must pass unchanged.**
 
+**READ ALL FIVE DONE BLOCKS, not just this section.** This section predates Tasks 4 and 5 and was never updated: Tasks 1-3's facts are inlined here, but **Task 4's and Task 5's Task-6 handoffs exist only inside their own DONE blocks** — the stage-view testids, the `@fastify/static` restart fact, and all three Gantt cautions.
+
+**CONTRADICTION, resolved here.** This section says "`toBeVisible()`/`toBeHidden()`, never `toHaveCount(0)` — with ONE exception". Task 4's DONE block records a SECOND: `column-<id>`, `board` and `DndLiveRegion` are genuinely absent below the breakpoint, so `toHaveCount(0)` is right for those. **The rule is: assert absence only where the element is genuinely not rendered** (the `conversation` testid at non-conversation levels; the kanban's desktop-only testids below the breakpoint). Everything hidden by CSS — the inbox panes, both Gantt tap layers at desktop — is `toBeHidden()`.
+
+**From Task 5's quality review — six things about driving the Gantt:**
+- **Drive the drawer from `gantt-label-tap-<id>`, not `gantt-tap-<id>`.** The row layer is `width: chartWidth` (1530px on the fixture) against a ~247px timeline; `locator.click()` clicks the centre of its VISIBLE INTERSECTION, which can fall inside the sticky sidebar's 128px band and be reported as intercepted. The label tap is 127x31, lives in the sticky sidebar, and is on screen at every scroll position. If you must drive the row layer, pass `{ position: { x: 20, y: 16 } }`.
+- **`toBeVisible()` on a bar proves nothing about the opening scroll** — Playwright's visibility does not require viewport intersection, and `tasks.spec.ts:229` already asserts it at desktop. To prove Amendment 4, the assertion is **`toBeInViewport()`**.
+- **Set the phone viewport with file-level `test.use({ ...devices["iPhone 13"] })` in `e2e/mobile.spec.ts`, NOT a `projects` array.** The config has no `projects` today; adding one re-homes the existing 72 tests, which the hard requirement forbids. File-level `test.use` still applies at context creation.
+- Both tap layers are `aria-hidden="true"` — reachable by `getByTestId` only; `getByRole`/`getByText` will not see them.
+- `window.confirm` fires on BOTH compact paths; Playwright auto-dismisses, so an unhandled dialog makes Remove-slack a silent no-op. The per-project button exists only on `/projects/$id/gantt`, not on `/gantt`.
+- The drawer is a Radix `Dialog`: the chart behind is inert while it is open, and focus lands on `<body>` after close (a phase-level finding). Close it before touching the chart again; do not chain a focus assertion off the close. Consider a **>19-row fixture** — above 640/32 rows the grid gains its own vertical scroll, which is the one phone geometry nobody has measured.
+
 **From Task 3's quality review — five things about driving the stack:**
 - `inbox-back` is the testid at TWO levels (folders and conversation), so it does not identify the level. Pin the level with the `h1` text or with pane visibility.
 - Use auto-retrying `expect(locator).toBeFocused()`. The focus move is a passive effect; a one-shot `page.evaluate(() => document.activeElement)` right after a click reads the pre-effect value.
