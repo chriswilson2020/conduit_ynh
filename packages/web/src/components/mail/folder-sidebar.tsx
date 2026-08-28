@@ -196,7 +196,13 @@ const FolderButton = memo(function FolderButton({
       disabled={disabled}
       onClick={() => onSelect(accountId, folder)}
       className={clsx(
-        "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm disabled:opacity-50",
+        // 28px at a desk, measured, and the whole folder rail is a full screen
+        // of its own below the breakpoint (pages/inbox.tsx's drill-in stack) --
+        // so these rows are the entire target on that screen and the 44px
+        // floor belongs on them. Scoped, like every floor in this phase: an
+        // unscoped one would grow the desktop rail. The row is already a
+        // centring flex line, so the label does not move within the taller box.
+        "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm disabled:opacity-50 max-md:min-h-11",
         active ? "bg-slate-200 font-medium text-slate-900" : "text-slate-600 hover:bg-slate-100",
       )}
     >

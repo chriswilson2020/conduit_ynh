@@ -204,7 +204,13 @@ export function ThreadList({
         </p>
       )}
       {selectable && threads.length > 0 && (
-        <label className="flex items-center gap-2 px-3 py-1 text-xs text-slate-500">
+        // 24px at a desk, measured. The TARGET is the label, not the 16px box
+        // inside it -- a native checkbox cannot be resized without replacing
+        // it, and the label already carries the click through. Not
+        // ui/touch.ts's CHECKBOX_LABEL: that constant carries its own padding
+        // and type scale for the "Archived" toggles, and this row is a
+        // different one (px-3, text-xs, slate-500) that only shares the floor.
+        <label className="flex items-center gap-2 px-3 py-1 text-xs text-slate-500 max-md:min-h-11">
           <TriStateCheckbox
             testId="thread-select-all"
             checked={allSelected}
@@ -325,7 +331,15 @@ const ThreadRow = memo(function ThreadRow({
         // being visible and tappable everywhere.
         <label
           className={clsx(
-            "flex shrink-0 items-center self-stretch pl-3 pr-1 transition-opacity",
+            // THE SHORT AXIS HERE IS THE WIDTH. `self-stretch` already makes
+            // this label as tall as the row (98.5px, measured), but it was
+            // 32px WIDE -- 12 + 16 + 4 -- so the thing under a thumb was well
+            // under the floor on the one gesture that turns a reading list
+            // into a bulk selection. The floor is a min-width rather than
+            // extra padding so the painted checkbox stays exactly where it
+            // is; what grows is the empty half of the hit box, and the row
+            // beside it starts 12px further in on a phone.
+            "flex shrink-0 items-center self-stretch pl-3 pr-1 transition-opacity max-md:min-w-11",
             checked || anySelected
               ? "opacity-100"
               : "opacity-40 focus-within:opacity-100 group-hover:opacity-100",

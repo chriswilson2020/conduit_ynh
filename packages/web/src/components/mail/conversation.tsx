@@ -574,13 +574,20 @@ const Message = memo(function Message({
 
 /** A download link to the authenticated attachment route -- the same
  * same-origin, cookie-authenticated route the body's inline images use, but
- * its `download` half (Content-Disposition: attachment). */
+ * its `download` half (Content-Disposition: attachment).
+ *
+ * 24px tall at a desk, measured, so it takes the phase's floor below the
+ * breakpoint like every other control. A min-height, not the chip-remove
+ * idiom in ui/touch.ts: that one grows a hit box OUTWARD with negative
+ * margins because the chip it sits in must not move, whereas this chip IS the
+ * control and may simply be bigger. It is already a centring inline flex row,
+ * so the filename and size stay put within the taller pill. */
 function AttachmentChip({ attachment }: { attachment: MailAttachment }) {
   return (
     <a
       data-testid={`attachment-${attachment.id}`}
       href={apiUrl(`/mail/attachments/${attachment.id}`)}
-      className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700 hover:bg-slate-200"
+      className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700 hover:bg-slate-200 max-md:min-h-11"
     >
       {attachment.filename}
       <span className="text-slate-400">{humanSize(attachment.sizeBytes)}</span>

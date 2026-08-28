@@ -228,12 +228,20 @@ export function BulkResult({
               </>
             )}
           </div>
+          {/* The floor on both axes, because the whole label is one glyph:
+              this measured 17 x 20 before, which is the same shape of bug the
+              phase already found in the task drawer's close. NOT the
+              chip-remove idiom from ui/touch.ts -- that one overhangs its
+              container's padding with negative margins, and this button's
+              container has 4px of padding to overhang, so the hit box would
+              reach past the pane's own edge. A plain box, centred, is what
+              this needs. */}
           <button
             type="button"
             data-testid="bulk-result-dismiss"
             aria-label="Dismiss"
             onClick={onDismiss}
-            className="shrink-0 rounded px-1 text-sm text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+            className="shrink-0 rounded px-1 text-sm text-slate-400 hover:bg-slate-100 hover:text-slate-600 max-md:flex max-md:min-h-11 max-md:min-w-11 max-md:items-center max-md:justify-center"
           >
             {"\u00D7"}
           </button>
