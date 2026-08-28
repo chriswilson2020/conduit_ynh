@@ -79,6 +79,19 @@ jobs:
       # service containers are created before the workspace is checked out.
       - name: Start Dovecot
         run: .github/scripts/start-dovecot.sh
+      # The gate on packages/api/src/services/documents-render.test.ts: without the
+      # binary its render half skips, so this step is what makes CI the place the
+      # PDF path is actually proved. The package list matches manifest.toml's
+      # resources.apt (minus postgresql, which is a service container here) so CI
+      # exercises the same dependency resolution the server will -- see that file
+      # for why python3-munkres is named. DEBIAN_FRONTEND because an apt-get that
+      # tries to prompt on a runner hangs until the job's timeout rather than
+      # failing (the e2e job's Playwright step carries the scar).
+      - name: Install WeasyPrint
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-munkres weasyprint
+          weasyprint --version
       - name: Install dependencies
         run: npm ci
       # Protocol-level, not TCP-level: `docker run -p` publishes through a

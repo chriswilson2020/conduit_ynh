@@ -58,8 +58,23 @@ ram.runtime = "400M"
     main.url = "/"
     main.auth_header = true
 
+    # weasyprint renders quote PDFs (packages/api/src/services/documents-render.ts).
+    #
+    # python3-munkres is here for its side effect on the dependency solver, and it is
+    # not a typo. weasyprint depends on python3-fonttools, whose dependency is the
+    # alternative "python3-scipy | python3-munkres". apt takes the first alternative
+    # unless a later one is already coming, and python3-scipy drags in python3-pythran,
+    # which hard-depends on g++ and libboost-dev: measured on the Debian 12 target,
+    # `apt-get install weasyprint` alone is 69 packages, 80MB of downloads and 508MB
+    # installed, versus 39 packages, 18MB and 89MB when munkres is named alongside it.
+    # Neither package is ever imported by anything WeasyPrint does here; this only
+    # decides which of them satisfies the alternative.
+    #
+    # No font package is listed because one is already guaranteed: weasyprint pulls in
+    # fontconfig, and fontconfig-config depends on "fonts-dejavu-core | ..." -- so a
+    # host that has WeasyPrint has at least DejaVu for sans-serif to resolve to.
     [resources.apt]
-    packages = "postgresql"
+    packages = "postgresql, python3-munkres, weasyprint"
 
     [resources.database]
     type = "postgresql"
