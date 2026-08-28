@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { test, expect, devices } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
 import { ImapFlow } from "imapflow";
@@ -31,9 +32,17 @@ import { typeIntoEditor } from "./helpers.js";
  * one and a pass as covering exactly the list above.
  *
  * THE HARD REQUIREMENT IS THAT THE OTHER 72 TESTS DO NOT MOVE. This file adds
- * a viewport; it adds no project, changes no config value and touches no other
- * spec. Everything a phone journey needs was given a phone-only testid by the
- * task that built the surface, so nothing here needed a source change either.
+ * a viewport; it adds no project, changes no config value and EDITS no other
+ * spec file. Everything a phone journey needs was given a phone-only testid by
+ * the task that built the surface, so nothing here needed a source change
+ * either.
+ *
+ * It is not, however, hermetic, and the difference is worth stating rather
+ * than glossing: the inbox group archives every live mail account the dev user
+ * owns before adding its own, which is server state e2e/mail.spec.ts also
+ * owns. That is safe here because the two files never overlap in time -- see
+ * the guard at the top of that group, which refuses to run rather than trust a
+ * convention.
  *
  * WHY test.use AND NOT A `projects` ARRAY. playwright.config.ts has no
  * `projects` today, so every existing test is homed on the implicit default
@@ -89,10 +98,22 @@ const TOUCH_FLOOR_PX = 44;
 const { defaultBrowserType: _webkitByDefault, ...IPHONE_13 } = devices["iPhone 13"];
 test.use(IPHONE_13);
 
-/** A row/card/option id, read back off the testid the app rendered it with. */
+/**
+ * A row/card/option id, read back off the testid the app rendered it with.
+ *
+ * Two small pieces of care the other specs' versions do without. The attribute
+ * is CHECKED rather than cast: a locator that resolved to an element with no
+ * `data-testid` would otherwise throw inside `String.replace` with a message
+ * about null, several steps from the locator that was actually wrong. And the
+ * prefix is stripped from the FRONT only -- `replace` takes the first match
+ * anywhere, so a prefix that recurred inside an id would cut the wrong piece
+ * out and hand back something that looks like an id and is not.
+ */
 async function idOf(locator: Locator, prefix: string): Promise<string> {
   const testId = await locator.getAttribute("data-testid");
-  return (testId as string).replace(prefix, "");
+  if (testId === null) throw new Error(`expected a data-testid starting "${prefix}", found none`);
+  if (!testId.startsWith(prefix)) throw new Error(`data-testid "${testId}" does not start "${prefix}"`);
+  return testId.slice(prefix.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +281,11 @@ test.describe.serial("Phone navigation and the record rail", () => {
     }
     await expect(page.getByTestId("meetings-tab")).toBeFocused();
     await expect(page.getByTestId("meetings")).toBeVisible();
+    // The bare form, which is ratio > 0 -- "on screen at all", not "fully".
+    // The strict form would be wrong to ask for: on a font stack where the
+    // strip does spill, this tab is the few pixels that hang over, and being
+    // partly clipped is the state the scroll container exists to rescue rather
+    // than a failure.
     await expect(page.getByTestId("meetings-tab")).toBeInViewport();
   });
 });
@@ -410,7 +436,20 @@ test.describe.serial("Phone Gantt", () => {
   let attemptId = "";
   let projectName = "";
   let projectId = "";
-  /** Task ids in the order the chart rows them (by start date, then title). */
+  /**
+   * Task ids in the order the chart rows them, which for this fixture is
+   * CREATION ORDER.
+   *
+   * Not "by start date, then title", which an earlier version of this comment
+   * said and which is wrong in a way that matters: `ganttPayload`
+   * (api: services/scheduling.ts) orders by project, then by
+   * `COALESCE(parent.position, own.position)`, then by whether the row is a
+   * parent, then by position -- so it is POSITION order, and these tasks are
+   * created one after another with no parents, which makes position and
+   * creation order the same thing here. Every index into this array below is
+   * correct because of that, not because of the dates, and a fixture whose
+   * tasks were created out of date order would still row in creation order.
+   */
   const taskIds: string[] = [];
   let firstTitle = "";
   /** The successor in the dependency journey; the first task is its predecessor. */
@@ -420,6 +459,36 @@ test.describe.serial("Phone Gantt", () => {
   let firstDue = "";
   let rescheduledStart = "";
   let rescheduledDue = "";
+
+  /**
+   * The chart's own scroll box, and why it is reached this way.
+   *
+   * Task 5 gave that box no `data-testid`, and addressing it by its Tailwind
+   * classes would break the day one utility is reordered -- so it is found
+   * from a testid the app does render, by walking up to the nearest scrolling
+   * ancestor. `<main>` is also `overflow-auto`, so "nearest" is what keeps
+   * this off it; the two assertions every caller makes -- that the box
+   * overflows on BOTH axes -- are also the check that we did not land on
+   * `<main>`, which at this width overflows on neither.
+   */
+  async function chartScrollBox(page: Page, taskId: string): Promise<{
+    scrollLeft: number; scrollWidth: number; clientWidth: number;
+    scrollHeight: number; clientHeight: number;
+  }> {
+    return page.getByTestId(`gantt-tap-${taskId}`).evaluate((node) => {
+      let el: HTMLElement | null = node.parentElement;
+      while (el !== null) {
+        const overflowY = getComputedStyle(el).overflowY;
+        if (overflowY === "auto" || overflowY === "scroll") break;
+        el = el.parentElement;
+      }
+      if (el === null) throw new Error("no scrolling ancestor above the chart's tap layer");
+      return {
+        scrollLeft: el.scrollLeft, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth,
+        scrollHeight: el.scrollHeight, clientHeight: el.clientHeight,
+      };
+    });
+  }
 
   /** An ISO day `offset` days from today, in UTC -- which is the runner's own
    * zone, so it is also the day the chart calls today. */
@@ -541,19 +610,52 @@ test.describe.serial("Phone Gantt", () => {
       .toBe(dayWidth);
 
     // THE PAN, driven over the chart rather than by writing to a scroll
-    // property, and asserted through the app's own testid rather than through
-    // a Tailwind class on a box Task 5 gave no testid to. A wheel is the
-    // closest primitive Playwright has to the finger drag a phone actually
-    // uses on a native scroller; what both deliver to the grid is the same
-    // scroll. Panning right takes the bar off screen, and panning back brings
-    // it home -- which also pins the guarantee Task 5 stated and nothing
-    // tested: at an UNCHANGED zoom, nothing re-applies the opening offset and
-    // yanks the view out from under a thumb.
+    // property. A wheel is the closest primitive Playwright has to the finger
+    // drag a phone uses on a native scroller; what both deliver to the grid is
+    // the same scroll.
     const box = await bar.boundingBox();
     expect(box).not.toBeNull();
     await page.mouse.move((box?.x ?? 0) + (box?.width ?? 0) / 2, (box?.y ?? 0) + (box?.height ?? 0) / 2);
     await page.mouse.wheel(400, 0);
     await expect(bar).not.toBeInViewport();
+    const panned = await chartScrollBox(page, firstId);
+    expect(panned.scrollWidth).toBeGreaterThan(panned.clientWidth);
+    expect(panned.scrollLeft).toBeGreaterThan(0);
+
+    // NOW PROVOKE THE THING THE OPENING SCROLL IS GUARDED AGAINST, because the
+    // pan alone does not reach it. Task 5 states a guarantee -- at an UNCHANGED
+    // zoom, nothing re-applies the opening offset and yanks the view out from
+    // under a thumb -- and `appliedScrollZoomRef` is the whole of what delivers
+    // it. A wheel triggers no React render at all, so a version of this test
+    // that only panned left that ref unreached: deleting it kept the group
+    // green, which is how this paragraph came to be rewritten.
+    //
+    // The layout effect's deps are `[taskRows, pxPerDay, rangeStartMs]`, so
+    // what actually re-runs it at unchanged zoom is a REFETCH handing back a
+    // new `taskRows` array. `useInvalidateTask` invalidates `["gantt"]`, so any
+    // task mutation is one -- and PROGRESS is the mutation to use here, because
+    // it moves no date and therefore cannot move `rangeStartMs` and make the
+    // re-run legitimate. This is the SSE-update-mid-pan case in miniature.
+    const midId = taskIds[5] as string;
+    await page.getByTestId(`gantt-label-tap-${midId}`).click();
+    const drawer = page.getByTestId("task-drawer");
+    await expect(drawer).toBeVisible();
+    const progress = page.getByTestId("field-progressPct").locator("input");
+    await progress.fill("40");
+    await progress.blur();
+    // Wait for the refetch to have LANDED rather than for a moment to pass:
+    // the drawer's own input reads back from the refetched task, so a value
+    // that survives a re-read is the invalidation having gone round.
+    await expect(progress).toHaveValue("40");
+    await drawer.getByRole("button", { name: "Close" }).click();
+    await expect(drawer).toBeHidden();
+
+    // The view is exactly where the thumb left it.
+    const afterRefetch = await chartScrollBox(page, firstId);
+    expect(afterRefetch.scrollLeft).toBe(panned.scrollLeft);
+    await expect(bar).not.toBeInViewport();
+
+    await page.mouse.move((box?.x ?? 0) + (box?.width ?? 0) / 2, (box?.y ?? 0) + (box?.height ?? 0) / 2);
     await page.mouse.wheel(-400, 0);
     await expect(bar).toBeInViewport();
   });
@@ -588,6 +690,12 @@ test.describe.serial("Phone Gantt", () => {
     // assertion would pass on the first poll and never see the commit that
     // landed after it. One second is five debounce windows.
     await page.waitForTimeout(1_000);
+    // The title is the assertion that carries this: it is the committed state,
+    // read back from the task. The transform is a smaller, separate claim --
+    // that no live drag PREVIEW was rendered either, so the refusal happened at
+    // the key handler rather than at the commit, and a phone never saw the bar
+    // move at all. Weak on its own (an unmoved bar has no transform anyway),
+    // worth keeping only beside the title.
     await expect(bar).toHaveCSS("transform", "none");
     await expect(bar).toHaveAttribute("title", restingTitle);
 
@@ -680,9 +788,20 @@ test.describe.serial("Phone Gantt", () => {
     // to Playwright -- it has a box and it is not display:none -- so only
     // viewport intersection can tell a positioned list from one Radix left
     // wherever the document happened to put it.
-    await expect(listbox).toBeInViewport();
+    //
+    // `ratio: 1`, NOT the bare form. `toBeInViewport()` defaults to ratio > 0,
+    // which is ANY intersection: a popup hanging almost entirely off the
+    // bottom of a phone would satisfy it on one row of pixels, and the claim
+    // being made here -- and in the release notes -- is that the whole list is
+    // on screen. Measured at this viewport: 286x220 at (24, 434), bottom edge
+    // 654 against 664, so the strict form is true today with room to spare.
+    await expect(listbox).toBeInViewport({ ratio: 1 });
 
     const option = page.getByRole("option", { name: firstTitle, exact: true });
+    // The bare form here, deliberately: an option lives inside the list's own
+    // scrolling viewport, so "fully on screen" is not a property any single
+    // item can be promised. What matters is that it is reachable, and its
+    // height -- which is the phase's own floor -- is asserted below.
     await expect(option).toBeInViewport();
     // A menu item is one of the four things the phase names for the 44px
     // floor, and this list is the only place a phone journey meets one.
@@ -713,11 +832,20 @@ test.describe.serial("Phone Gantt", () => {
     await page.goto(`/projects/${projectId}/gantt`);
     await expect(page.getByTestId("gantt")).toBeVisible();
 
-    // Twenty-two rows at a 32px pitch is 704px against the grid's 640px cap,
-    // so the last row is below the chart's own fold -- the nested vertical
-    // scroll nobody had measured. It is still reachable: the tap layer lives
-    // in the sticky sidebar, and scrolling to it is an ordinary gesture.
+    // THE NESTED SCROLL IS ASSERTED ON THE GRID ITSELF, not inferred from the
+    // page. Twenty-two rows at a 32px pitch is 704px against the grid's 640px
+    // cap, so the chart gains a second vertical scroll axis inside the page's
+    // -- the geometry Task 5 left unmeasured. An earlier version of this test
+    // asserted only that the last row was out of the VIEWPORT, which follows
+    // from the page being taller than 664 whether or not the grid clips
+    // anything: raising GRID_MAX_HEIGHT to 4000 removed the nested scroller
+    // outright and the test stayed green. These two lines are what close that.
     const lastId = taskIds[ROW_COUNT - 1] as string;
+    const grid = await chartScrollBox(page, lastId);
+    expect(grid.scrollHeight).toBeGreaterThan(grid.clientHeight);
+    expect(grid.scrollWidth).toBeGreaterThan(grid.clientWidth);
+
+    // And it is still off screen on arrival, which is the reachability half.
     const lastTap = page.getByTestId(`gantt-label-tap-${lastId}`);
     await expect(lastTap).not.toBeInViewport();
 
@@ -764,6 +892,15 @@ test.describe.serial("Phone Gantt", () => {
     // REACHABLE from a phone. The note carries one of two sentences and both
     // of them mean the confirm was accepted and the request ran; an unhandled
     // dialog, which Playwright auto-dismisses, would leave it empty.
+    //
+    // A NARROW WINDOW, and worth knowing rather than discovering: chart.tsx
+    // clears this note 1000ms after it appears, and the assertion polls from
+    // the moment of the click. It has caught it every run so far -- CI's log
+    // showed five consecutive polls inside the window -- but a runner that
+    // stalled for a second between the mutation resolving and the next poll
+    // would fail here with "expected /compact/, received ''", which reads like
+    // the sweep not running rather than like the note having already gone.
+    // Anyone who sees that should suspect the window before the feature.
     await expect(page.getByTestId("cascade-note")).toContainText(/compact/);
   });
 });
@@ -880,6 +1017,24 @@ const SMTP_PORT = Number(process.env.E2E_MAIL_SMTP_PORT ?? 1025);
 const MAIL_USERNAME = process.env.E2E_MAIL_USERNAME ?? "conduit@test.local";
 const MAIL_PASSWORD = process.env.E2E_MAIL_PASSWORD ?? "testpass";
 
+/**
+ * The six env names above, exactly as e2e/mail.spec.ts spells them.
+ *
+ * WHY A GUARD AND NOT A SHARED CONSTANT. The two files read the same six
+ * variables and mail.spec.ts must not be edited this phase, so they are
+ * duplicated -- and duplication here drifts SILENTLY, which is the part that
+ * earns a guard. Every read has a `?? default`, and the defaults are the same
+ * values CI sets: rename `E2E_MAIL_IMAP_PORT` in one file and this one falls
+ * back to 993, which is what CI would have given it anyway, so nothing fails
+ * until somebody points the suite at a mailbox that is not on the default
+ * ports. The guard reads the other spec's source and fails the moment the two
+ * lists stop agreeing.
+ */
+const SHARED_MAIL_ENV = [
+  "E2E_MAIL_IMAP_HOST", "E2E_MAIL_IMAP_PORT", "E2E_MAIL_SMTP_HOST",
+  "E2E_MAIL_SMTP_PORT", "E2E_MAIL_USERNAME", "E2E_MAIL_PASSWORD",
+] as const;
+
 test.describe.serial("Phone inbox drill-in stack", () => {
   /**
    * The first sync pass has to ingest whatever else is in the mailbox as well
@@ -984,6 +1139,18 @@ test.describe.serial("Phone inbox drill-in stack", () => {
     else await expect(page.getByTestId("conversation")).toHaveCount(0);
   }
 
+  test("reads the same mail fixture e2e/mail.spec.ts does", async () => {
+    // See SHARED_MAIL_ENV: the constants are duplicated because mail.spec.ts
+    // may not be edited, and the duplication is invisible when it breaks. This
+    // compares the names, not the values -- the values are the CI job's to
+    // set, and both files agree on their defaults by construction if they
+    // agree on the names.
+    const other = readFileSync(new URL("./mail.spec.ts", import.meta.url), "utf8");
+    for (const name of SHARED_MAIL_ENV) {
+      expect(other, `${name} is no longer read by e2e/mail.spec.ts`).toContain(`process.env.${name}`);
+    }
+  });
+
   test("seeds the mailbox and adds the account, from the phone", async ({ page }, testInfo) => {
     attemptId = `${runId}x${testInfo.retry}`;
     senderAddress = `pat-${attemptId}@example.com`;
@@ -999,21 +1166,32 @@ test.describe.serial("Phone inbox drill-in stack", () => {
     // the conversation this journey counts. Archiving stops its sync and
     // leaves its threads alone.
     //
-    // THIS IS ONLY SAFE BECAUSE CI RUNS `workers: 1`. It archives every live
-    // account the dev user has, not merely this file's own, so at the default
-    // worker count locally it would race e2e/mail.spec.ts and archive the
-    // account that spec is mid-journey with. The suite is CI-only for this
-    // project and the config pins one worker there for an unrelated reason
-    // (see playwright.config.ts's dnd-kit note), so the two files never
-    // overlap -- but anyone raising that number has to give this block an
-    // account filter first.
+    // THIS IS ONLY SAFE WHILE NOTHING ELSE IS RUNNING, and it is guarded rather
+    // than merely commented. The loop archives every live account the dev user
+    // has, not only this file's own -- and it HAS to, because the account it
+    // most needs to stop is exactly e2e/mail.spec.ts's, pointed at this same
+    // mailbox. A label or address filter would therefore not contain the
+    // hazard, it would defeat the block. What contains it is refusing to run
+    // concurrently at all: CI pins `workers: 1` for an unrelated reason (see
+    // playwright.config.ts's dnd-kit note) and the suite is CI-only for this
+    // project, so the two files never overlap today. The check below turns the
+    // day somebody raises that number from a silent race -- mail.spec.ts's
+    // account archived mid-journey, failing somewhere else entirely -- into a
+    // refusal that says what to do.
     const listed = await page.request.get("/api/mail/accounts");
     expect(listed.ok()).toBe(true);
     const { own } = await listed.json() as {
       own: { id: string; archivedAt: string | null; visibility: "private" | "shared" }[];
     };
-    for (const account of own) {
-      if (account.archivedAt !== null) continue;
+    const liveAccounts = own.filter((account) => account.archivedAt === null);
+    if (liveAccounts.length > 0 && testInfo.config.workers !== 1) {
+      throw new Error(
+        `This group archives every live mail account (${liveAccounts.length} found) because a `
+        + "second account on the same mailbox double-ingests every message. That races "
+        + "e2e/mail.spec.ts at more than one worker. Re-run with --workers=1.",
+      );
+    }
+    for (const account of liveAccounts) {
       // Archiving does not clear visibility and the account PATCH refuses
       // archived rows, so a shared account has to be made private first or it
       // can never be made private again.

@@ -715,7 +715,7 @@ Above the breakpoint the board is untouched — including its drag-and-drop. ~8 
 - **`/mail?thread=` with an EMPTY value** passes route validation, reads as a selection, and produces the same empty screen. Normalising it in `validateSearch` would change desktop rendering.
 - **`composer-suggestion` is 36px** — recipient-autocomplete rows, under the phone floor. Task 2 residue that no task owned.
 - **The phone list row (`<TableRow onClick>`) has no role, no accessible name and no tab stop**, and below the breakpoint loses row semantics too, so a screen-reader user on the companies list gets an unstructured run of label/value lines with no way to open a company. Pre-existing (those rows were keyboard-inert at desktop before the phase); fixing it adds desktop tab stops, so it needs its own decision.
-- **In the 768-1023px band** `isMobile` is true while several surfaces' CSS is `lg:`-gated, so e.g. the funnel row wraps and gives the stage name a 693px line where the single-line form fits comfortably. A direct consequence of this plan's own "gate your CSS at `md:`" instruction — compliant, cosmetic, worth knowing.
+- **In the 768-1023px band you get the DESKTOP shell over already-narrow layouts — and an earlier version of this finding had it exactly backwards, which is why it is spelled out here.** `mobileMediaQuery()` is `not all and (min-width: 48rem)`, so `isMobile` is FALSE from 768px up, and `shell.tsx` renders its `<aside>` when `!isMobile`: at 900px you get the dark sidebar and no bottom bar. Meanwhile every `lg:`-gated layout has already gone narrow at 1024px, so the inbox's three panes are stacked in one column and the detail pages have dropped their rail under the content — measured by Task 3 at 900x800 ("sidebar present, no stack controls, three panes stacked, folder rows still 28"). Every `max-md:` rule is off there too, so no 44px floors and the entity tables are still tables. The old wording claimed the opposite (phone navigation over wide layouts) and illustrated it with a funnel wrap that cannot happen in that band at all — `funnel.tsx`'s wrap is `max-md:flex-wrap`, i.e. below 768. **This plan's Task 4 guidance states the rule correctly and always did**; this bullet is what disagreed with it. Cosmetic, compliant, and the honest consequence of one breakpoint rather than two.
 - **The record rail's tab spill is FONT-STACK DEPENDENT, so nothing may assert it.** Task 2 measured the five tabs at 349px intrinsic against a 342px box at 390px, and Task 6 reproduced that exactly in Chrome on macOS. On CI's Ubuntu runner the same five labels measure narrower and the strip FITS with nothing to scroll — a red run is how this was found. `max-md:overflow-x-auto` is therefore insurance that pays out on some font stacks and not others, which is the right shape for it; but a test may only assert the mechanism (the strip is its own scroll container), never the spill or a scrollLeft that follows from it. Which way Chris's own handset falls is decided by iOS's system font.
 - **The browser pane cannot settle any question about focus EVENTS.** `document.hasFocus()` is false in it, and Blink defers focus events for a page that does not have focus: `element.focus()` moves `document.activeElement` and fires nothing, so Radix's roving focus never activates a tab and any scroll-into-view that focus would have caused never happens. That is why Task 2's reviewer could not settle the arrow-key question there, and it sits beside the pane's other known blind spot (a CDP viewport change updates `matches` without dispatching `change`). Playwright is where a focus question gets an answer.
 
@@ -1148,8 +1148,8 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 
 > **DONE.** As built:
 >
-> - **THE FILE: `e2e/mobile.spec.ts`, 23 tests in five serial groups, and the
->   72 that existed are untouched -- 72 -> 95.** No source file was changed by
+> - **THE FILE: `e2e/mobile.spec.ts`, 24 tests in five serial groups, and the
+>   72 that existed are untouched -- 72 -> 96.** No source file was changed by
 >   this task: every surface the journeys drive was given a phone-only testid by
 >   the task that built it, so the definition of done turned out to be
 >   assertable without a single new hook into the app.
@@ -1181,20 +1181,25 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 >
 >   **BE PRECISE ABOUT WHICH OF THOSE THE FILE ACTUALLY ASSERTS, because an
 >   earlier version of this block said "every one of them" and that was false.**
->   Asserted: the grid's overflow (through the last row being out of the
->   viewport and still reachable), the opening scroll (`toBeInViewport()` on the
->   first bar), both tap layers' visibility, the drawer's close on BOTH axes
->   against the 44px floor, `compact-button`'s HEIGHT against that floor,
->   `thead` hidden with a per-cell label visible beside it, and the
->   board/stage-view/`column-`/`DndLiveRegion` counts on either side of the
->   first stage. **Measured but NOT asserted, and therefore context rather than
->   coverage:** the account form's `390x664` box and its `max-height: none` --
->   the most interesting number in the list, since it is what stops the app's
->   longest form being clipped at 85vh, and nothing re-checks it;
->   `compact-button`'s 116.5px WIDTH (only its height is asserted); the
->   stage-less pipeline's `DndLiveRegion` count of ONE (the file asserts the
->   zero after the stages exist, not the one before); and the exact pixel
->   positions above, which informed the assertions without being them.
+>   **Asserted:** the grid's own overflow on BOTH axes, read off the chart's
+>   scroll box rather than inferred from the page (a later round found the
+>   inferred form vacuous -- see below); the opening scroll (`toBeInViewport()`
+>   on the first bar); both tap layers' visibility; the drawer's close on both
+>   axes against the 44px floor; `compact-button`'s HEIGHT against that floor;
+>   `thead` hidden with a per-cell label visible beside it; `board` and
+>   `stage-view` on BOTH sides of the first stage; and `column-` and
+>   `DndLiveRegion` **only after** it.
+>
+>   **Measured but NOT asserted, and therefore context rather than coverage:**
+>   the account form's `390x664` box and its `max-height: none` -- the most
+>   interesting number in the list, since it is what stops the app's longest
+>   form being clipped at 85vh, and nothing re-checks it; `compact-button`'s
+>   116.5px WIDTH (only its height is asserted); the stage-less pipeline's
+>   `DndLiveRegion` count of ONE and its `column-` count of zero (the file
+>   asserts those only after the stages exist); and the exact pixel positions
+>   above, which informed the assertions without being them. An earlier version
+>   of this paragraph said all four of that group were asserted "on either
+>   side", which the file contradicts -- two of them are one-sided.
 > - **THE ONE MEASUREMENT THAT SAVED A CI CYCLE, and it is not the obvious one.**
 >   With the page at rest, `gantt-label-tap-<last>` sits at viewport y 637-668
 >   against a bottom bar occupying 619-664. Playwright reveals an element with
@@ -1239,10 +1244,19 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 >   2. **A company, its list and its rail** (2 tests): the list is cards
 >      (`thead` hidden, each cell carrying its own label) and the shell has no
 >      `<aside>`; the create dialog carries `dialog-close`; and the rail's five
->      tabs are walked by ARROW KEY to the last one, which activates and is in
->      the viewport when it gets there. That last one is the question Task 2's
->      reviewer could not settle -- see the environment finding above for why it
->      could not be settled from a browser pane.
+>      tabs are walked by ARROW KEY to the last one, which activates -- the
+>      question Task 2's reviewer could not settle from a browser pane (see the
+>      environment finding above for why).
+>
+>      **BE HONEST ABOUT WHAT THE VIEWPORT HALF OF THAT IS WORTH ON THIS
+>      RUNNER: nothing.** `toBeInViewport()` on the Meetings tab is real
+>      coverage only where the strip actually spills, and by this task's own
+>      font-metric finding it does not spill on CI's Ubuntu -- so there every
+>      tab intersects the viewport whether or not Radix scrolled anything, and
+>      that assertion cannot fail. It earns its place on a font stack where the
+>      strip is clipped, which is the case a phone is likelier to be in than
+>      the runner. The ACTIVATION assertions beside it are what carry this test
+>      everywhere.
 >   3. **The kanban** (3 tests): a stage-less pipeline is the desktop branch and
 >      says so; two stages later `board`, `column-<id>` and `DndLiveRegion` are
 >      genuinely gone; a deal is created in the stage on screen, moved with
@@ -1257,17 +1271,17 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 >      is the other half of the brainstorm's decision for this surface** -- the
 >      zoom asserted by the bar getting NARROWER rather than by a class on the
 >      button pressed, and the pan by a wheel over the chart taking that bar out
->      of the viewport and bringing it back, which also pins Task 5's untested
->      guarantee that nothing re-applies the opening offset at an unchanged
->      zoom; four arrows and two Shift+arrows changing no date and rendering no
->      transform while **Enter still opens the drawer**; a reschedule driven from
->      `gantt-label-tap-<id>` through `field-dates` with the bar's `title`
->      following; **a DEPENDENCY added through the drawer's picker** (see the
->      next bullet, which is the important one); the last of the 22 rows reached
->      below the chart's own fold; and Remove slack tapped with a dialog handler.
+>      of the viewport and bringing it back; four arrows and two Shift+arrows
+>      changing no date and rendering no transform while **Enter still opens the
+>      drawer**; a reschedule driven from `gantt-label-tap-<id>` through
+>      `field-dates` with the bar's `title` following; **a DEPENDENCY added
+>      through the drawer's picker** (see the bullet below, which is the
+>      important one); the last of the 22 rows reached below the chart's own
+>      fold, with that fold asserted on the grid's own scroll box; and Remove
+>      slack tapped with a dialog handler.
 >   5. **Meetings** (2 tests): logged from the rail with a guest and TipTap notes
 >      through `typeIntoEditor`, read back, and a follow-up task added.
->   6. **The inbox** (6 tests): its own IMAP fixture and its own account, added
+>   6. **The inbox** (7 tests): its own IMAP fixture and its own account, added
 >      through the settings form AT THIS VIEWPORT (the app's longest form, and
 >      nothing else in the suite renders it below the breakpoint); all three
 >      panes asserted at all three levels; the heading taking focus on every
@@ -1331,15 +1345,68 @@ Release prep: bump 0.10.0 (three package.jsons + manifest `0.10.0~ynh1`), regene
 > - **Suite: 1829 unit + 36 skipped (unchanged -- this task added no unit test,
 >   and had no lib to test), typecheck clean on five projects, `npm run build`
 >   clean with no CSS warning and the stylesheet hash unmoved
->   (`index-CBvyyNUj`, 30.85 kB), e2e 72 -> 95 with the 72 untouched.**
+>   (`index-CBvyyNUj`, 30.85 kB), e2e 72 -> 96 with the 72 untouched.**
 >   The 20-test form of this file was proved in CI on **run 33147238771** (tip
 >   b07ef4d): both jobs green, e2e 92 passed in 55.4s with no flaky line, and
 >   test 1865 passed across 51 files (the 1829 plus the 36 MAIL_IT integration
 >   tests CI provisions mail servers for). The spec review's four additional
 >   tests came after it. A commit cannot name the run of the commit that
->   contains it, so **the run covering the FINAL tip -- and therefore the 95 --
+>   contains it, so **the run covering the FINAL tip -- and therefore the 96 --
 >   is cited in `release-sequence-v0.10.0.md`**, which is untracked and can
 >   name it.
+>
+> **THE QUALITY ROUND, and what it found was two claims rather than two bugs.**
+> The file held where it counts: five deliberate defects -- including both of
+> the newest tests and the phase's own worst bug -- each caught for the right
+> reason with the right error, no vacuous negatives, and 23/23 across nine
+> isolated runs with retries off, which settles that the zero-retry result is
+> structure rather than luck. What it broke were two comments that outran their
+> assertions, and both are now true rather than softened:
+>
+> - **THE PAN DID NOT PIN WHAT IT SAID IT PINNED.** Its comment claimed the two
+>   wheels proved Task 5's guarantee -- that nothing re-applies the opening
+>   offset at an unchanged zoom -- and deleting `chart.tsx:521`, the
+>   `appliedScrollZoomRef` guard that is the whole of that guarantee, left the
+>   Gantt group at 7/7. The reason is exact: a wheel triggers no React render,
+>   and the layout effect's deps are `[taskRows, pxPerDay, rangeStartMs]`, so
+>   the guard is never REACHED in the window a pan observes. Made true rather
+>   than dropped, because the guarantee is real and was tested nowhere: the
+>   test now provokes a REFETCH between the two wheels -- a progress edit from
+>   the drawer, chosen because `useInvalidateTask` invalidates `["gantt"]` while
+>   progress moves no date and so cannot move `rangeStartMs` and make the re-run
+>   legitimate -- and asserts the chart's `scrollLeft` is exactly where the pan
+>   left it. That is the SSE-update-mid-pan case in miniature. **Re-run against
+>   the fix, the same deletion now fails it.**
+> - **THE LAST-ROW TEST ASSERTED THE PAGE'S FOLD, NOT THE GRID'S.**
+>   `GRID_MAX_HEIGHT = 640 -> 4000` removes the nested scroller outright and the
+>   test stayed at 7/7, because `not.toBeInViewport()` follows from the page
+>   being taller than the viewport whether or not the grid clips anything, and
+>   the manual `scrollTo` reveals the row either way. So the nested vertical
+>   scroll was still the geometry nobody had measured. It is now read off the
+>   chart's own scroll box (`scrollHeight > clientHeight`, and `scrollWidth >
+>   clientWidth` beside it, which doubles as the check that the helper did not
+>   walk up to `<main>`). **Re-run against the fix, the same mutation now fails
+>   it.**
+> - **Also this round:** `toBeInViewport()` is `ratio > 0`, i.e. ANY
+>   intersection, so the dependency popup's "fully on screen" claim is now
+>   `{ ratio: 1 }` where that is what is meant and stays bare where it is not
+>   (an option inside a scrolling list, and a tab that is SUPPOSED to be partly
+>   clipped on a spilling font stack); the comment naming the chart's row order
+>   said "by start date, then title" where `ganttPayload` orders by POSITION,
+>   which is creation order for this fixture -- every index into `taskIds` was
+>   correct BECAUSE the comment was wrong, the worst version of that class; the
+>   file header's "touches no other spec" is now "edits no other spec file",
+>   since the inbox group does touch state `mail.spec.ts` owns; and that
+>   group's archive loop is now GUARDED rather than merely commented -- it
+>   refuses to run at more than one worker, because a label or address filter
+>   would not contain the hazard, it would defeat the block (the account it
+>   most needs to stop is exactly `mail.spec.ts`'s, on the same mailbox).
+> - **One optional taken:** a source guard that reads `mail.spec.ts` and fails
+>   if it stops reading any of the six `E2E_MAIL_*` variables this file
+>   duplicates. Worth it because that duplication drifts SILENTLY -- every read
+>   has a `?? default` and the defaults are the values CI sets, so a rename in
+>   one file changes nothing until somebody points the suite at a mailbox that
+>   is not on the default ports.
 >
 > **RECORDED, NOT FIXED.**
 >
