@@ -413,12 +413,18 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
   // The scrolling grid box, so the phone's opening scroll can be set on it
   // (see the layout effect below). Nothing else reads it.
   const gridRef = useRef<HTMLDivElement | null>(null);
-  // Which pixels-per-day value that opening scroll has already been applied
-  // for. Not a boolean, because a zoom change makes a scroll offset in the
-  // old scale meaningless (day 14 is 420px at day zoom and 180px at week
-  // zoom), so the target is re-applied once per zoom -- and never again for
-  // the same one, which is what keeps a refetch or an SSE update from
-  // yanking the view out from under a thumb mid-pan.
+  // Which pixels-per-day value that opening scroll was last applied for.
+  // Not a boolean, because a zoom change makes a scroll offset in the old
+  // scale meaningless (day 14 is 420px at day zoom and 180px at week zoom),
+  // so the target is re-applied whenever the zoom CHANGES. It holds one
+  // value, not a set, so day -> week -> day re-applies on the way back --
+  // deliberate (each switch is a fresh request to see the schedule at that
+  // scale, and after one you are looking at a different set of columns
+  // anyway) and worth stating, because an earlier version of this comment
+  // claimed "once per zoom value, never twice for the same one", which is
+  // not what one slot can promise. What it does guarantee is the property
+  // that matters: no refetch, SSE update or re-render at an UNCHANGED zoom
+  // can yank the view out from under a thumb mid-pan.
   const appliedScrollZoomRef = useRef<number | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const hoveredTargetRef = useRef<string | null>(null);
@@ -505,11 +511,15 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
     if (appliedScrollZoomRef.current === pxPerDay) return;
     if (!window.matchMedia(mobileMediaQuery()).matches) return;
     appliedScrollZoomRef.current = pxPerDay;
-    const startDays: number[] = [];
+    const bars: { startDay: number; dueDay: number }[] = [];
     for (const row of taskRows) {
-      if (row.task.startDate !== null) startDays.push(isoToDayIndex(row.task.startDate, rangeStartMs));
+      if (row.task.startDate === null || row.task.dueDate === null) continue;
+      bars.push({
+        startDay: isoToDayIndex(row.task.startDate, rangeStartMs),
+        dueDay: isoToDayIndex(row.task.dueDate, rangeStartMs),
+      });
     }
-    grid.scrollLeft = initialScrollLeft(startDays, isoToDayIndex(todayLocalIso(), rangeStartMs), pxPerDay);
+    grid.scrollLeft = initialScrollLeft(bars, isoToDayIndex(todayLocalIso(), rangeStartMs), pxPerDay);
   }, [taskRows, pxPerDay, rangeStartMs]);
 
   const triggerFlash = useCallback((ids: string[], kind: "shifted" | "compacted" | "empty" = "shifted") => {
@@ -1035,7 +1045,8 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
             re-scaled by a breakpoint variant, because it was an inline
             JavaScript number. As a custom property the stylesheet can take
             it over, and the desktop value stays the fallback in geometry.ts.
-            Measured after: 245px of timeline, 8.2 day columns. */}
+            Measured after: 247px of timeline, 8.2 day columns -- 247 rather
+            than 245 because point 3 takes the side borders off too. */}
       <div
         ref={gridRef}
         className="relative overflow-auto rounded-md border border-slate-200 max-md:isolate max-md:-mx-6 max-md:rounded-none max-md:border-x-0 max-md:[--gantt-sidebar-width:8rem]"

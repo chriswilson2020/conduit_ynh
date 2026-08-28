@@ -809,11 +809,11 @@ Above the breakpoint, unchanged: drag-to-reschedule, dependency editing, the com
 > fifty columns away. Clamping keeps the "skip the fortnight of padding"
 > property that instinct was after while opening on the day a phone glance is
 > actually for. Measured: `scrollLeft: 708` on load = day 24 (today) x 30px
-> minus the 12px lead-in, exactly. It re-applies **once per zoom value**, not
-> once per mount, because an offset in day-zoom pixels is meaningless after a
-> switch to week (297 = 24 x 12.857 - 12, measured) -- and never twice for the
-> same one, so a refetch or an SSE update cannot yank the view out from under a
-> thumb mid-pan. Desktop: `scrollLeft: 0`, untouched.
+> minus the 12px lead-in, exactly. It re-applies **whenever the zoom
+> CHANGES**, not once per mount, because an offset in day-zoom pixels is
+> meaningless after a switch to week (297 = 24 x 12.857 - 12, measured). What
+> it guarantees is that nothing at an UNCHANGED zoom -- a refetch, an SSE
+> update, any re-render -- can yank the view out from under a thumb mid-pan. Desktop: `scrollLeft: 0`, untouched.
 >
 > **PER AMENDMENT 5 (Remove slack).** The per-project `compact-button` stays --
 > measured **116.5 x 44** at 375px on `/projects/$id/gantt`, over the floor,
@@ -839,7 +839,7 @@ Above the breakpoint, unchanged: drag-to-reschedule, dependency editing, the com
 > neighbour; Amendment 6 accepted the argument against them, and what shipped
 > has neither. The 44px floor is not met vertically (32px, the row pitch) and
 > that is the recorded exception. What it buys, measured on the worst bar in the
-> chart -- the same-day milestone, **15px wide at day zoom and 12.9px at week
+> chart -- the same-day milestone, **15px wide at day zoom and 6.42px at week
 > zoom** -- is that a hit test at the bar's centre, at the far LEFT of its row,
 > at the far RIGHT of its row, and on its name in the sidebar all four return
 > that same task's layer.
@@ -947,6 +947,87 @@ Above the breakpoint, unchanged: drag-to-reschedule, dependency editing, the com
 > endpoints, and an SVG path cannot hold a `calc()`, so a phone-specific row
 > height would mean re-deriving every arrow coordinate. That is why the row
 > pitch, and therefore the 32px tap target, is what it is.
+
+> **THE SPEC ROUND (compliant-with-issues), and it found a guard that protected
+> the phone half of a rule and not the desktop half.** Every geometry number
+> above survived independent measurement -- the 85 -> 247px, the 116.5x44
+> button, the 127x31 label, both `scrollLeft` values, all four hit tests, and
+> the CSS delta proven to be six real utilities by rebuilding the base in a
+> scratch checkout and diffing the stylesheets. It also found the tap theft was
+> WORSE than recorded here: pre-fix, a tap on the Mail tab did not merely do
+> nothing, it returned `gantt-label-tap-<taskId>` -- it would have opened a task
+> drawer. Five things were not right.
+>
+> - **THE GUARD BUG, and it is the one worth reading.** `phone.test.ts`
+>   asserted `toContain("hidden")` against the element's whole opening TAG --
+>   which contains `aria-hidden="true"`, **so the assertion passed on the
+>   attribute**. Deleting the base `hidden` class from both tap layers left all
+>   three assertions green. What that ships is a full-width, click-handling
+>   rectangle over every row of the DESKTOP chart, rendered after the bars:
+>   drag-to-reschedule, resize and dependency-dragging all dead. Nothing else in
+>   the repo would have caught it -- **the suite has no pointer-drag coverage of
+>   the Gantt at any viewport**, which is worth knowing well beyond this task.
+>   Every class assertion now runs over a parsed class LIST (`classesOf`), which
+>   an attribute cannot satisfy and which also tells `hidden` from
+>   `max-md:hidden` -- a distinction a substring match cannot make either. The
+>   review's exact mutation, re-run against the fix: `AssertionError:
+>   gantt-tap-: expected [ Array(3) ] to include 'hidden'`. Each pointer zone
+>   and both tap layers now also assert the ABSENCE of the unscoped class, so
+>   the same hole cannot open from the other side.
+> - **The clamp took its upper bound from the STARTS, not the spans.** Its own
+>   docstring, this block and the commit message all said "the span of the
+>   work"; the code said "the span of the starts". Measured on an ordinary
+>   mid-project chart -- every task begun, one still running -- "today is after
+>   every start" was true while the work was still going on, so the phone opened
+>   on the last START: **3048 is where it opens now (today, day 102 x 30 - 12);
+>   1308 is where it opened before, exactly 1740px and 58 days behind, with the
+>   today line off screen.** That is the "opens on work that finished in March"
+>   failure the clamp was argued into existence to prevent, reached from the
+>   other end. `initialScrollLeft` now takes both of each bar's ends and bounds
+>   by the latest DUE. The seven original unit tests could not catch it because
+>   the function was never given a due date; there are now nine, two of them the
+>   mid-project case and a long-bar case where the last task to start is not the
+>   last to finish.
+> - **The "no mis-tap band by construction" claim had a 1px exception.**
+>   `gantt-today-line` is an ordinary div at `z-20`, painted above the tap
+>   layers, so its single column of pixels took the tap and opened nothing --
+>   and the opening scroll parks it a lead-in's width from the sidebar edge,
+>   i.e. exactly where a thumb goes first. It is now untappable below the
+>   breakpoint only (`max-md:pointer-events-none`); at a desk it lies over the
+>   bars' own drag zones, where passing pointers through to them would change
+>   what a click on it does. Measured after: a tap on the line returns
+>   `gantt-tap-<taskId>`, and at 1280 the line is still `pointer-events: auto`.
+> - **Two recorded measurements were wrong and are corrected above.** The
+>   same-day milestone at week zoom is **6.42px**, not 12.9 -- 12.9 is
+>   `WEEK_ZOOM_PX_PER_DAY` itself, and the bar measured had been rescheduled to
+>   three days by this task's OWN drawer test minutes earlier, so the narrowest
+>   bar on screen was a one-day bar. Re-measured on a restored same-day task:
+>   15px at day zoom, **6.42px** at week, with all four hit tests still landing
+>   on its row layer. And `chart.tsx`'s comment said 245px of timeline where
+>   this block and the commit message said 247: 247 is right, because the side
+>   borders come off with the corners.
+> - **"Once per zoom value, never twice for the same one" was false** --
+>   `appliedScrollZoomRef` holds one number, not a set, so day -> week -> day
+>   re-applies. The behaviour is deliberate (each switch is a fresh request to
+>   see the schedule at that scale, and after one you are looking at a different
+>   set of columns anyway); the claim was not something one slot can promise.
+>   Both the source comment and the paragraph above now say what it does.
+>
+> **Five more mutations run, all five red:** each tap layer stripped of its base
+> class (the review's own, individually AND together), a resize strip given the
+> unscoped class instead of the scoped one, the today line made untappable at
+> every width, and the clamp's upper bound taken from the starts again.
+>
+> **RECORDED, NOT FIXED (for the phase findings).** Amendment 5's fallback route
+> is itself under the touch floor: the link to a project's own Gantt page
+> (`project-detail.tsx:198-204`) is a plain `<Link>` at `py-1.5 text-sm`, about
+> 34px, which `Button`'s floor does not cover. The capability is reachable; the
+> target is short. Task 2 residue that no task owned.
+>
+> **Round two: +3 tests (1821 -> 1824)**, typecheck clean on five projects,
+> build clean with no CSS warning and **the stylesheet hash unmoved**
+> (`index-CBvyyNUj`, 30.85 kB -- the today line's class already existed in the
+> bundle, so nothing was added to it).
 
 ### Task 6: Phone-viewport e2e + release prep (v0.10.0)
 

@@ -268,31 +268,42 @@ export function accumulateNudge(state: NudgeState | null, action: NudgeKeyAction
  * THE RULE: today, clamped into the span of the work. Each of the three
  * cases is a real chart someone will open --
  *
- *   - work already under way (today between the first and last bar): opens on
- *     today, which is what a phone glance is for;
+ *   - work already under way (today inside the span): opens on today, which
+ *     is what a phone glance is for;
  *   - work entirely in the future (today before every bar): opens on the
- *     first bar rather than on today, so the view holds the schedule instead
- *     of the empty run-up to it;
- *   - work entirely in the past (today after every bar): opens on the last
- *     bar rather than on today, so the view holds the tail of the work
+ *     EARLIEST START rather than on today, so the view holds the schedule
+ *     instead of the empty run-up to it;
+ *   - work entirely finished (today after every bar has ENDED): opens on the
+ *     LATEST DUE rather than on today, so the view holds the tail of the work
  *     instead of empty grid after it.
  *
  * The clamp is what makes all three land on a day that has a bar near it,
  * which is the property the blank-first-paint bug was the absence of.
  *
- * `startDays` is every dated bar's START day index; an empty list means there
- * is nothing to scroll to and the caller keeps its 0. The result is a pixel
- * offset for the caller to assign to a scroll container, which clamps it to
- * its own scrollable range itself, so this never needs the viewport's width.
+ * THE UPPER BOUND IS THE LATEST DUE DATE, NOT THE LATEST START, and the
+ * difference is not academic: this took an earlier version's bounds from the
+ * start days alone, and on an ordinary mid-project chart -- every task begun,
+ * one still running -- "today is after every START" was true while the work
+ * was still going on, so it opened 58 days and roughly 1740px behind today
+ * with the today line off screen. That is exactly the failure this function's
+ * clamp exists to prevent, arrived at from the other side. A bar's span is
+ * both its ends; only one of them can be the upper bound.
+ *
+ * An empty list means there is nothing to scroll to and the caller keeps its
+ * 0. The result is a pixel offset for the caller to assign to a scroll
+ * container, which clamps it to its own scrollable range itself, so this
+ * never needs the viewport's width.
  */
-export function initialScrollLeft(startDays: number[], todayDay: number, pxPerDay: number): number {
-  let first: number | null = null;
-  let last: number | null = null;
-  for (const day of startDays) {
-    if (first === null || day < first) first = day;
-    if (last === null || day > last) last = day;
+export function initialScrollLeft(
+  bars: { startDay: number; dueDay: number }[], todayDay: number, pxPerDay: number,
+): number {
+  let earliestStart: number | null = null;
+  let latestDue: number | null = null;
+  for (const bar of bars) {
+    if (earliestStart === null || bar.startDay < earliestStart) earliestStart = bar.startDay;
+    if (latestDue === null || bar.dueDay > latestDue) latestDue = bar.dueDay;
   }
-  if (first === null || last === null) return 0;
-  const day = Math.min(Math.max(todayDay, first), last);
+  if (earliestStart === null || latestDue === null) return 0;
+  const day = Math.min(Math.max(todayDay, earliestStart), latestDue);
   return Math.max(0, day * pxPerDay - SCROLL_LEAD_IN_PX);
 }

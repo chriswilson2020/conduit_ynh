@@ -133,5 +133,20 @@ export const GanttTodayLine = memo(function GanttTodayLine({ rangeStartMs, total
   // midnight boundary; today's own calendar-day string doesn't.
   const idx = isoToDayIndex(todayLocalIso(), rangeStartMs);
   if (idx < 0 || idx >= totalDays) return null;
-  return <div data-testid="gantt-today-line" className="absolute top-0 z-20 w-px bg-red-500" style={{ left: idx * pxPerDay, height: bodyHeight }} />;
+  // The one element that can steal a tap from the phone chart's row targets:
+  // it is painted above them and, being an ordinary div, hit-tests like one,
+  // so the single column of pixels it occupies would open nothing when
+  // tapped. That is a 1px exception to "the whole row is the target", and it
+  // sits exactly where a thumb goes first, because the phone's opening scroll
+  // parks this line a lead-in's width from the sidebar's edge. Made
+  // untappable below the breakpoint only: at a desk this line lies over the
+  // bars' own drag zones, and passing pointers through to them there would
+  // change what a click on it does.
+  return (
+    <div
+      data-testid="gantt-today-line"
+      className="absolute top-0 z-20 w-px bg-red-500 max-md:pointer-events-none"
+      style={{ left: idx * pxPerDay, height: bodyHeight }}
+    />
+  );
 });
