@@ -100,6 +100,13 @@ export function InboxPage() {
     () => (accounts?.own ?? []).filter((account) => account.archivedAt === null),
     [accounts],
   );
+  // "There is a folder rail to show", which is exactly FolderSidebar's own
+  // null condition (accounts.length === 0), read off the same array that is
+  // passed to it -- so the two cannot drift apart. Two things below depend on
+  // it: whether the stack offers a way into the folder screen at all, and the
+  // cleanup that stops `foldersOpen` outliving the rail.
+  const hasFolderRail = ownActive.length > 0;
+
   const filterAccounts = [
     ...ownActive.map((account) => ({ id: account.id, label: account.label, email: account.email })),
     ...(accounts?.others ?? []),
@@ -121,10 +128,21 @@ export function InboxPage() {
   // unarchived -- the same shape as the cursor bug in thread-list, benign only
   // because the id is still meaningful. Guarded on `accounts` being loaded so
   // the first render (no accounts yet) does not clear a legitimate choice.
+  //
+  // THE FOLDER SCREEN'S LATCH IS CLEANED UP HERE TOO, because it is the same
+  // bug in a second place: `foldersOpen` is a latch that can outlive its
+  // condition. Tap Folders on a phone, have the last own account archived in
+  // another tab, and the level silently drops to the thread list (the view
+  // needs a rail to show the folder screen) while the flag stays true --
+  // un-archive that account and the user is thrown onto the folder screen
+  // without having touched anything. Derived state is not an option for this
+  // one, since the whole point of the flag is that nothing else implies it, so
+  // the cleanup is what there is.
   useEffect(() => {
-    if (accounts === undefined || accountChoice === ALL_ACCOUNTS || accountStillOffered) return;
-    setAccountChoice(ALL_ACCOUNTS);
-  }, [accounts, accountChoice, accountStillOffered]);
+    if (accounts === undefined) return;
+    if (accountChoice !== ALL_ACCOUNTS && !accountStillOffered) setAccountChoice(ALL_ACCOUNTS);
+    if (!hasFolderRail) setFoldersOpen(false);
+  }, [accounts, accountChoice, accountStillOffered, hasFolderRail]);
 
   // Assumed true until the accounts actually arrive: "add a mail account"
   // must not flash on screen while the list is still loading.
@@ -317,11 +335,18 @@ export function InboxPage() {
     setAccountChoice(choiceAccountId ?? ALL_ACCOUNTS);
     // Picking a folder is what the phone's folder screen is FOR, so it also
     // leaves it -- a picker that stayed open after a pick would answer the
-    // gesture with the same list. Unconditional, not gated on the breakpoint:
-    // above it this flag is always false already, React bails out of a write
-    // that changes nothing, and gating it would put `isMobile` in this
-    // callback's dependencies -- which is exactly the identity churn the
-    // comment above says every memoised folder button depends on avoiding.
+    // gesture with the same list.
+    //
+    // Unconditional, not gated on the breakpoint. NOT because the flag is
+    // always false above it -- it is not, and saying so was wrong: open the
+    // folder screen on a phone, widen the window past the breakpoint, and
+    // clicking a folder in the desktop rail reaches this line with the flag
+    // still true, which is a real write and a real re-render. It is gated on
+    // nothing because gating it would put `isMobile` in this callback's
+    // dependencies, and the comment above says why that identity must not
+    // move: it is a prop of every memoised folder button. The write is
+    // correct at both widths anyway (above the breakpoint the flag is not
+    // read), and where it changes nothing React bails out.
     setFoldersOpen(false);
   }, []);
 
@@ -338,15 +363,13 @@ export function InboxPage() {
     // The rail renders nothing without an own, non-archived account, so this
     // is what stops the folder screen being an empty room on an install that
     // has not added a mailbox yet.
-    hasFolderRail: ownActive.length > 0,
+    hasFolderRail,
   });
 
   const openFolders = useCallback(() => setFoldersOpen(true), []);
 
-  // The two focus targets the effect below chooses between. One ref for the
-  // leading control even though it is two different buttons, because only one
-  // of them is ever rendered.
-  const leadingRef = useRef<HTMLButtonElement>(null);
+  // Where focus goes on every level change -- see the effect below for why it
+  // is the heading and not the leading control.
   const headingRef = useRef<HTMLHeadingElement>(null);
 
   /**
@@ -394,13 +417,25 @@ export function InboxPage() {
    * of the document with nothing announced, on a surface whose whole point is
    * that it changed screens.
    *
-   * So focus moves deliberately: to the new level's leading control when
-   * there is one, and otherwise to the heading, which is made focusable with
-   * tabIndex -1 rather than inventing a control that exists only to be
-   * focused. The leading control is also why this must be deliberate rather
-   * than left alone: with a rail, Back and Folders are the SAME element
-   * relabelled, so a focus that merely stayed put would sit on a button that
-   * silently became a different button.
+   * SO FOCUS MOVES TO THE HEADING, ALWAYS -- made focusable with tabIndex -1
+   * rather than by inventing a control that exists only to be focused.
+   *
+   * The obvious alternative, focusing the new level's leading control, was
+   * built first and does not work, for a reason worth recording because it is
+   * invisible from the outside. With a rail, Back and Folders are the SAME
+   * Button relabelled: React reconciles it in place, so it is the same DOM
+   * node before and after, and calling focus() on the element that already
+   * has focus does nothing at all -- no event, no re-announcement. The one
+   * case that most needed a deliberate move (one control silently becoming a
+   * different control) is precisely the case that approach could not fix, and
+   * measuring activeElement afterwards could not tell the difference between
+   * "moved here" and "never left".
+   *
+   * The heading is better on every axis besides. It genuinely moves, so it is
+   * announced; it announces the DESTINATION ("Conversation, heading level 1")
+   * rather than the exit ("Back, button"); and it costs a keyboard user
+   * nothing, since the heading sits between the two buttons and Back is one
+   * Shift+Tab away.
    *
    * Keyed on the LEVEL alone. Keying on the leading control's kind as well
    * would cover one more case (the rail appearing or vanishing without a
@@ -422,7 +457,7 @@ export function InboxPage() {
   useEffect(() => {
     if (!isMobile) return;
     window.scrollTo({ top: 0 });
-    (leadingRef.current ?? headingRef.current)?.focus();
+    headingRef.current?.focus();
   }, [isMobile, view.level]);
 
   return (
@@ -451,7 +486,6 @@ export function InboxPage() {
             // desktop journey cannot see them at all.
             data-testid={view.leading.kind === "back" ? "inbox-back" : "inbox-folders"}
             onClick={view.leading.kind === "back" ? backToThreads : openFolders}
-            ref={leadingRef}
           >
             {view.leading.label}
           </Button>

@@ -1,5 +1,6 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import { withoutComments } from "../../test/source";
 
 /**
  * What components/ui promises below the breakpoint, guarded the only way a
@@ -34,20 +35,6 @@ function walk(dir: URL): URL[] {
   return out;
 }
 
-/**
- * Source with its comments removed.
- *
- * Every assertion below that says a spelling is ABSENT has to run over this,
- * because the comment discipline in this codebase means the utilities being
- * guarded get NAMED in prose all the time -- and a guard that turns the suite
- * red because someone explained a class in a comment, with a diff that says
- * only "unexpectedly matched", is worse than no guard. Line comments are
- * matched only where they begin a line, which is this codebase's style and
- * avoids eating a `//` inside a string.
- */
-function withoutComments(source: string): string {
-  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
-}
 
 /**
  * One exported component's source, from its `export function <Name>` to the

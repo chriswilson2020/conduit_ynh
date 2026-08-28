@@ -1,11 +1,21 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import { withoutComments } from "../test/source";
 import { INBOX_LEVELS, inboxStackView, type InboxLevel, type InboxStackInput } from "./inbox-lib";
 
 /** The inputs that are not the one under test, so each case says only what it
  * is about. */
 const PHONE: InboxStackInput = {
   isMobile: true, threadId: null, foldersOpen: false, hasFolderRail: true,
+};
+
+/** Which component each level's pane is the one that renders. The source
+ * guards below use it in both directions: once each, and each behind its own
+ * gate. */
+const PANE_COMPONENT: Readonly<Record<InboxLevel, string>> = {
+  folders: "<FolderSidebar",
+  threads: "<ThreadList",
+  conversation: "<Conversation",
 };
 
 /** Every combination of the two inputs the stack reads, for the properties
@@ -35,6 +45,23 @@ describe("inboxStackView above the breakpoint", () => {
       expect(view.title).toBe("Inbox");
       expect(view.panes).toEqual({ folders: true, threads: true, conversation: true });
     }
+  });
+
+  /**
+   * The desktop view is ONE shared object handed to every caller, so a write
+   * through it is not a local mistake -- it changes what every subsequent
+   * desktop render gets. `readonly` stops the innocent path and nothing else:
+   * one cast, and dropping a pane from the desktop grid forever is a single
+   * assignment. Frozen, that assignment throws (these modules are strict),
+   * which is proportionate for the one constant whose whole job is being the
+   * phase's hard requirement expressed as a value.
+   */
+  it("hands out a desktop view that cannot be written through", () => {
+    const view = inboxStackView({ isMobile: false, threadId: null, foldersOpen: false, hasFolderRail: true });
+    expect(() => { (view.panes as Record<string, boolean>).conversation = false; }).toThrow(TypeError);
+    expect(() => { (view as { title: string }).title = "Mail"; }).toThrow(TypeError);
+    expect(inboxStackView({ isMobile: false, threadId: null, foldersOpen: false, hasFolderRail: true }).panes)
+      .toEqual({ folders: true, threads: true, conversation: true });
   });
 });
 
@@ -136,8 +163,12 @@ describe("inboxStackView below the breakpoint", () => {
  * to turn an absence assertion red (ui/ui.test.ts's tripwire, same reason).
  */
 describe("the desktop frame in pages/inbox.tsx", () => {
-  const source = readFileSync(new URL("./inbox.tsx", import.meta.url), "utf8");
-  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  // test/source's stripper, not a local one. The version that used to live
+  // here matched from ANY `//` to end of line, and a reviewer defeated it by
+  // hiding a second <ThreadList> behind an `<a href="https://...">` -- the
+  // "rendered exactly once" guard below stayed green because everything after
+  // `https:` had been thrown away. That file carries the full reasoning.
+  const code = withoutComments(readFileSync(new URL("./inbox.tsx", import.meta.url), "utf8"));
 
   it("still carries the three-column grid the desktop has always had", () => {
     expect(code).toContain("lg:grid-cols-[minmax(0,11rem)_minmax(0,24rem)_minmax(0,1fr)]");
@@ -165,8 +196,32 @@ describe("the desktop frame in pages/inbox.tsx", () => {
    * component under another name.
    */
   it("renders each mail pane exactly once", () => {
-    for (const pane of ["<FolderSidebar", "<ThreadList", "<Conversation"]) {
+    for (const pane of Object.values(PANE_COMPONENT)) {
       expect(code.split(pane)).toHaveLength(2);
+    }
+  });
+
+  /**
+   * THE SEAM BETWEEN THE TESTED FUNCTION AND THE UNTESTED JSX, and the one
+   * place a phone-only defect could ship in silence.
+   *
+   * inboxStackView is exhaustively tested and the guard above counts elements,
+   * but until this test nothing said WHICH gate wrapped WHICH pane. Swapping
+   * the folders div's `view.panes.folders` for `view.panes.conversation` left
+   * the entire web suite green -- a phone showing the folder rail while you
+   * read a conversation, shipping unnoticed until Task 6's e2e.
+   *
+   * So: walk the gates in source order, check the sequence is one per level in
+   * grid order, and check each gate's region holds its own component. Matches
+   * a SPELLING like everything else here -- a pane moved into a child
+   * component, or a gate written some other way, is invisible to it.
+   */
+  it("gates each pane on its own level", () => {
+    const gates = [...code.matchAll(/view\.panes\.(folders|threads|conversation)/g)];
+    expect(gates.map((gate) => gate[1])).toEqual([...INBOX_LEVELS]);
+    for (const [i, gate] of gates.entries()) {
+      const region = code.slice(gate.index, gates[i + 1]?.index ?? code.length);
+      expect(region).toContain(PANE_COMPONENT[gate[1] as InboxLevel]);
     }
   });
 });

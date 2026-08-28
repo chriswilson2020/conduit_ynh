@@ -156,23 +156,34 @@ Watch for: the accumulator/`pages.key` guards Phase 5 and v0.9.1 touched; the co
 
 **QUALIFIED BY TASK 2 — read this before using the numbers above.** `<main class="flex-1 overflow-auto">` does NOT cap the page. The root is `flex min-h-screen`, so its height is indefinite, and a flex container's intrinsic height counts a `flex-grow` child's max-content contribution — an `overflow:auto` child does not shrink it. `<main>` therefore behaves as a scroll container only while its content FITS; past that the document scrolls and `<main>` grows with it (measured at 375x812 on the companies list: `main` 1089 tall, scrollHeight equal to its height, document 1158 against an 812 client). **So the budget above is a budget for a pane that fits, not a hard frame.** A phone pane wanting its own internal scroll must be given a definite height by something — do not assume `h-full` inside `<main>` bounds you. This is pre-existing at every width (1280x800 gives an 826px document), so FIXING it would move the desktop's scroll container and is out of bounds for this phase; work within it or report.
 
-> **DONE** (commits ba5f680 + this spec-review round; spec review
-> compliant-with-issues -- NO correctness defect. It verified the hard
-> requirement live at 1280 through a tunnel, upheld the hide-don't-unmount
-> decision on all three counts, and found the one mechanism that could have
-> falsified it -- Load-more being an IntersectionObserver rather than a button
-> -- and confirmed it is not. Its findings were an unacknowledged focus cost,
-> a comment asserting a branch that does not fire, and a dead cross-task API
-> carrying a false comment; all three are fixed below). As built:
+> **DONE** (commits ba5f680 + the spec-review round + this quality round; spec
+> review compliant-with-issues, quality review with-fixes -- NO correctness
+> defect in either. The spec round verified the hard requirement live at 1280
+> through a tunnel, upheld the hide-don't-unmount decision on all three counts,
+> and found the one mechanism that could have falsified it -- Load-more being
+> an IntersectionObserver rather than a button -- and confirmed it is not; its
+> findings were an unacknowledged focus cost, a comment asserting a branch that
+> does not fire, and a dead cross-task API carrying a false comment. The
+> quality round confirmed the state machine is total over all 16 combinations,
+> that the matrix test is a real cross-product rather than a sample, that
+> `hasFolderRail` cannot desync from the rail's own null condition, and that
+> the hidden-pane cost is bounded (Conversation only mounts when `selectedId`
+> is set, so there is no invisible refetch at the folders level); its findings
+> were an EVADABLE comment stripper, an untied level-to-pane seam, a focus
+> target that could not fire for the case it named, and four smaller things.
+> All are fixed below). As built:
 >
 > - **THE STACK'S SHAPE: three screens, with the THREAD LIST AS THE HUB rather
 >   than as the middle of a strict line.** folders <-> threads <-> conversation,
 >   one at a time. The hub is where the Mail tab lands (an inbox that opened on
 >   a folder list would cost every visit a tap), and both neighbours are one
 >   control away in each direction: `inbox-folders` goes out to the rail,
->   `inbox-back` returns from either side. Every level has a leading control
->   except the hub, which the bottom bar itself always reaches -- which is how
->   "no surface is a dead end" is satisfied here.
+>   `inbox-back` returns from either side. What satisfies "no surface is a dead
+>   end" is that **every level has a way BACK** -- not that every level has a
+>   leading control, which an earlier version of this block said and which is
+>   not the distinction: the hub HAS a leading control, it just points forward.
+>   The hub needs no way back because it is the screen the bottom bar itself
+>   always reaches, and it is the only level that can be without one.
 > - **WHERE THE STATE LIVES: the URL, plus exactly one boolean.** The
 >   conversation level is DERIVED from `?thread=`, so opening a thread IS the
 >   navigation to its screen -- no second gesture to keep in step, and a deep
@@ -194,32 +205,41 @@ Watch for: the accumulator/`pages.key` guards Phase 5 and v0.9.1 touched; the co
 >   bulk bar counting rows no longer listed. Verified live at 375 with a
 >   36-thread fixture: **36 rows before opening a thread, 36 while it is open,
 >   36 after Back**, with "Load more" correctly gone.
-> - **THE COST OF THAT, MEASURED AND PAID (the spec review's main finding).**
->   Hiding the subtree holding the focused element drops focus to `<body>`:
->   focus `filter-unread`, drill into a conversation, and `activeElement` was
->   BODY -- on every drill-in, and again on a Back that leaves the leading
->   control unrendered. This was the THIRD instance of the class in this phase
->   (Task 1's search sheet opening on Close, Task 2's `dialog-close` hazard).
->   The level effect now moves focus deliberately: to the new level's leading
->   control where there is one, otherwise to the heading, made focusable with
->   `tabIndex -1` rather than by inventing a control. **Measured after, all
->   four transitions plus the no-rail case:** threads->conversation
->   `inbox-back`; conversation->threads (Back) `inbox-folders`;
->   threads->folders `inbox-back`; folders->threads (folder pick)
->   `inbox-folders`; Back with no rail `H1:Inbox` with `tabindex="-1"`. Every
->   one was BODY before. The effect keys on the LEVEL alone, deliberately:
->   keying on the leading control's kind as well would cover the rail
->   appearing or vanishing without a level change, at the cost of a focus jump
->   on every phone visit (the rail is absent for the render before the accounts
->   query resolves, so focus would land on the heading and hop to the Folders
->   button a moment later). The uncovered case is an account archived in
->   another tab; the jump would be met every time.
-> - **A one-line additive change to `ui/button.tsx`:** `ref` is declared on
->   `ButtonProps`, because it lives on React's `ClassAttributes` and extending
->   `ButtonHTMLAttributes` alone leaves it a type error. Nothing else was
->   needed -- React 19 hands a function component `ref` as an ordinary prop, so
->   it already travelled in the existing spread. No class string, no rendering,
->   no `ui/ui.test.ts` guard is affected.
+> - **THE COST OF THAT, MEASURED AND PAID (the spec review's main finding, then
+>   corrected by the quality round).** Hiding the subtree holding the focused
+>   element drops focus to `<body>`: focus `filter-unread`, drill into a
+>   conversation, and `activeElement` was BODY -- on every drill-in, and again
+>   on a Back that leaves the leading control unrendered. This was the THIRD
+>   instance of the class in this phase (Task 1's search sheet opening on
+>   Close, Task 2's `dialog-close` hazard).
+> - **FOCUS GOES TO THE HEADING, ALWAYS -- the first fix went to the leading
+>   control and DID NOT WORK, which is worth recording because it is invisible
+>   from outside.** With a rail, Back and Folders are the SAME Button
+>   relabelled: React reconciles it in place, so `leadingRef.current` is the
+>   same DOM node across folders->threads, and `focus()` on the element that
+>   already has focus does nothing -- no event, no re-announcement. The case
+>   that most needed a deliberate move was precisely the one that approach
+>   could not fix, and measuring `activeElement` afterwards could not tell
+>   "moved here" from "never left". **Measured directly:** park focus on
+>   `inbox-back` at the folders level, click it, and
+>   `relabelledButton === theNodeFocusedBefore` is **true** while its label is
+>   now "Folders". The heading is better on every axis: it genuinely moves
+>   (`focusStayedOnIt: false`), it announces the DESTINATION ("Conversation,
+>   heading level 1") rather than the exit ("Back, button"), and it costs a
+>   keyboard user nothing since the heading sits between the two buttons.
+>   `leadingRef`, the `??` fallback and the whole `ButtonProps.ref` addition
+>   are deleted -- `ui/button.tsx` is byte-identical to its pre-Task-3 state.
+>   **Re-measured, all five transitions:** threads->conversation, Back to
+>   threads, threads->folders, folders->threads (the relabel case, with focus
+>   parked on the control), and Back with no rail -- every one lands on the
+>   `h1` carrying the destination's own name ("Conversation" / "Inbox" /
+>   "Folders"), `tabindex="-1"`. Every one was BODY before the fix. The effect
+>   keys on the LEVEL alone, deliberately: keying on the leading control's kind
+>   as well would cover the rail appearing or vanishing without a level change,
+>   at the cost of a focus jump on every phone visit (the rail is absent for
+>   the render before the accounts query resolves, so focus would land on the
+>   heading and hop a moment later). The uncovered case is now handled by the
+>   latch cleanup below instead.
 > - **THE 44px FLOOR ON THE MAIL PANES, which Task 2 deliberately left -- and
 >   the handoff's geometry was wrong.** Measured before: folder rows **28**
 >   (not the "~36" the handoff carried), the select-all label **24**, the
@@ -266,6 +286,42 @@ Watch for: the accumulator/`pages.key` guards Phase 5 and v0.9.1 touched; the co
 >   checked at 900x800**, between `md` and `lg`: sidebar present, no stack
 >   controls, three panes stacked, folder rows still 28 -- that band is
 >   untouched.
+> - **THE COMMENT STRIPPER WAS EVADABLE, AND `withoutComments` IS NOW SHARED.**
+>   The version in this task's test file stripped from ANY `//` to end of line,
+>   including inside a string: the reviewer hid a genuine second
+>   `<ThreadList>` behind `<a href="https://conduit.example/help">` on one line
+>   and the "rendered exactly once" guard stayed GREEN, because everything
+>   after `https:` had been thrown away. The same trick hides a banned utility
+>   from an absence assertion, and a URL before a guarded literal produces a
+>   spurious red. Fixed to `ui/ui.test.ts`'s whole-line form -- **and, because
+>   this was the third consecutive round in which a source guard was found
+>   silently not guarding, the function is extracted to
+>   `packages/web/src/test/source.ts`** and imported by both files, so the
+>   fourth author cannot write a fifth variant. **Mutation-verified in both
+>   directions:** loose stripper + the evasion = green (the hole reproduced);
+>   strict stripper + the same evasion = red.
+> - **THE LEVEL-TO-PANE SEAM IS TIED.** Inverting the folders div's gate to
+>   `view.panes.conversation` left all 341 web tests green -- a phone showing
+>   the folder rail while you read a conversation, shipping until Task 6's
+>   e2e. A new guard walks the gates in source order, pins the sequence to one
+>   per level in grid order, and checks each gate's region holds its own
+>   component. **The inversion now fails it**, and the guard's comment says
+>   what it cannot see (a pane moved into a child component, or a gate written
+>   some other way).
+> - **`ALL_PANES` and `DESKTOP_VIEW` are FROZEN.** `readonly` stops the
+>   innocent path and nothing else: one cast, and
+>   `(view.panes as Record<string, boolean>).conversation = false` drops a pane
+>   from every subsequent desktop render -- the exact outcome the module exists
+>   to prevent. These are ES modules, so the write now throws. A test pins it
+>   and dies when the freeze is removed. Proportionate for this one constant
+>   and not applied elsewhere in the file.
+> - **`foldersOpen` no longer outlives its rail.** It was a latch: tap Folders,
+>   have the last own account archived in another tab (the level silently drops
+>   to the thread list, the button vanishes, the flag stays true), un-archive
+>   it, and the user is thrown onto the folder screen without touching
+>   anything. Folded into the effect that already cleans up a stranded
+>   `accountChoice`, keyed on the same `hasFolderRail` the view is given -- so
+>   the cleanup and the gate cannot disagree about what "there is a rail" means.
 > - **Tests: +13 on the 1760 baseline -> 1773** unit + 36 skipped, green;
 >   typecheck clean on five projects; `npm run build` clean with no CSS
 >   warning; **no e2e file touched, 72 -> 72**. All thirteen are
@@ -277,7 +333,10 @@ Watch for: the accumulator/`pages.key` guards Phase 5 and v0.9.1 touched; the co
 >   mutations run, all died:** a phone viewport-height rule on the grid, a
 >   duplicated `<ThreadList>`, flipped level precedence, and a removed desktop
 >   guard. Absence assertions run over comment-stripped source, following
->   `ui/ui.test.ts`'s tripwire.
+>   `ui/ui.test.ts`'s tripwire. **The quality round added two more -> 1775**
+>   (the level-to-pane gate and the freeze), and ran three further mutations,
+>   all of which died: the stripper loosened, the level-to-pane inversion, and
+>   the freeze removed.
 >
 > **THE COMPOSER'S PHONE FOCUS -- RULING WITHDRAWN, BACKLOG FOR AFTER v0.10.0.**
 > Measured: at 375 the composer opens with `activeElement` on `dialog-close`;
@@ -296,7 +355,47 @@ Watch for: the accumulator/`pages.key` guards Phase 5 and v0.9.1 touched; the co
 > fixed for the search sheet, and it wants a `DialogContent`-level answer
 > rather than a per-caller patch.
 >
+> **THREE COMMENT CLAIMS THAT OVERSTATED, CORRECTED.** `inbox-lib.ts` said the
+> grid stops being three panes below the breakpoint; it stopped at `lg`
+> (1024px), not `md` (768px), and `inbox.tsx` stated the accurate version, so
+> the two contradicted -- the file now separates the CSS stacking (below 1024,
+> pre-existing, not ours) from what this module adds (below 768, one pane shown
+> at a time), and says the 768-1024 band is what it always was. `inbox.tsx`'s
+> `chooseFolder` said the folder flag "is always false already" above the
+> breakpoint; it is not -- open the folder screen on a phone, widen past 768,
+> click a folder in the desktop rail, and that line runs with the flag true.
+> The write is still unconditional, for the identity-stability reason, and the
+> comment now gives that reason instead of a false one. And **the
+> `empty:hidden` contradiction in `bulk-bar.tsx` is resolved rather than left
+> standing**: the horn picked is that the PRE-EXISTING desktop rationale was
+> overstated -- a `display:none` element is not in the accessibility tree, so
+> "always mounted" was a claim about the DOM and not about the tree a screen
+> reader watches, and the region is absent until the instant it fills at every
+> width. What survives is smaller and real (the node, its id and its role never
+> change, so nothing is inserted at announce time and the dismiss button cannot
+> take the announcer with it), and the remedy if a reader is ever seen missing
+> it is to drop `empty:hidden` for a zero-size region. **The phone case is
+> still worse and is a different thing:** with `empty:hidden` alone the region
+> at least enters the tree at the moment it fills; inside a hidden pane it is
+> out of the tree when it fills AND stays out until the reader navigates back,
+> so there is no moment at which it could announce.
+>
 > **RECORDED, NOT FIXED.**
+>
+> - **`/mail?thread=` with an EMPTY value passes route validation** (`typeof ""
+>   === "string"`), reads as a selection, and puts the stack on the
+>   conversation level. Measured: the pane renders
+>   `<div class="min-w-0 lg:overflow-y-auto"></div>` and the thread list is
+>   `display: none`, so a phone gets a whole screen holding only Back and
+>   Compose. Pre-existing as an empty pane at a desk; the stack promotes it to
+>   a full screen. It belongs with the `conversation.tsx` follow-up below
+>   rather than in `validateSearch`, since normalising it there would change
+>   desktop rendering.
+> - **The heading shifts on cold load**: the row has two children and then
+>   three as `hasFolderRail` resolves, because the rail is absent for the
+>   render before the accounts query returns. Same root cause the focus comment
+>   already names, and the reason first arrival focuses the heading rather than
+>   a control.
 >
 > - **A cold deep link to a MISSING thread renders an empty pane**, at 375 and
 >   at 1280 alike: an empty pane div, API 404, `conversation-gone` ABSENT. That

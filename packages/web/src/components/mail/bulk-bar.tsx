@@ -193,14 +193,30 @@ function BulkButton({
  * why the dismiss button lives inside it: removing the region to hide a message
  * would take the announcer with it.
  *
- * ONE LIMIT OF THAT, below the breakpoint (Phase 6): this region renders
- * inside the inbox's THREADS pane, and the phone stack hides the panes it is
- * not showing. An outcome that lands while the reader has drilled into a
- * conversation is therefore not announced -- the text itself survives (the
- * page owns it, not this component) and is read on return, but the live
- * region was display:none at the moment it filled. Every gesture that can
- * start a bulk action lives on the threads level, so this needs a mid-flight
- * drill-in to reach at all.
+ * "ALWAYS MOUNTED" IS A CLAIM ABOUT THE DOM, NOT ABOUT THE ACCESSIBILITY
+ * TREE, and the paragraph above overstated it until a Phase 6 review put the
+ * two side by side. `empty:hidden` is `display: none` while the region has no
+ * children, and a display:none element is not in the accessibility tree at
+ * all -- so at EVERY width, this region is absent from that tree until the
+ * instant it fills, which is the very situation the snapshot argument is
+ * about. Picking the horn honestly: the original rationale is WEAKER than it
+ * was written to be. What survives of it is real but smaller -- the node, its
+ * id and its role never change, so nothing new is inserted at announce time
+ * and the dismiss button still cannot take the announcer away with it -- and
+ * the shape of the fix, if a screen reader is ever observed missing this, is
+ * to drop `empty:hidden` for a zero-size region rather than to move the
+ * region.
+ *
+ * THE PHONE CASE IS STILL WORSE, and is a different thing rather than the
+ * same thing restated (Phase 6). This region renders inside the inbox's
+ * THREADS pane, and the drill-in stack gives the panes it is not showing
+ * `display: none`. With `empty:hidden` alone the region at least enters the
+ * tree at the moment it fills; hidden inside a hidden pane it is out of the
+ * tree when it fills AND stays out until the reader navigates back, so there
+ * is no moment at which it could announce. The text itself survives -- the
+ * page owns the outcome, not this component -- and is read on return. Every
+ * gesture that can start a bulk action lives on the threads level, so
+ * reaching this at all takes a drill-in while a request is in flight.
  */
 export function BulkResult({
   outcome, onDismiss,
