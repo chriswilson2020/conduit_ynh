@@ -460,9 +460,168 @@ Below the breakpoint: a **stage picker**, the chosen stage's deals as a list, an
 - **If you hide rather than unmount, budget the focus move** — and pick the SAME target the inbox settles on, so the two surfaces do not disagree.
 - **The seam nothing tests:** in the inbox, changing which pane a level gates on left all 341 web tests green. If you copy the pattern, either guard the level->pane wiring or accept that Task 6's e2e is the only thing that will catch an inversion.
 
-The move must go through the **existing** deal-move service path — never a second one — so the compactor, SSE and optimistic-update behaviour are unchanged. `board-lib.ts` holds the move-target list (pure, tested: the current stage is excluded, order matches the pipeline, an archived pipeline offers none).
+The move must go through the **existing** deal-move service path — never a second one — so SSE and optimistic-update behaviour are unchanged. (**CORRECTED:** this sentence used to say "the compactor". There is no deal position compactor anywhere in the tree — the only `compact*` is `compactSchedule` in `services/scheduling.ts`, the Gantt's Remove-slack. The wording was this plan's, and Task 4 inherited it into a source comment; both are fixed.) `board-lib.ts` holds the move-target list (pure, tested: the current stage is excluded, order matches the pipeline, an archived pipeline offers none).
 
 Above the breakpoint the board is untouched — including its drag-and-drop. ~8 tests.
+
+> **DONE** (commits 616b1e7 + 2d4b5de + 0b4fc69 + this spec-review round;
+> spec review compliant-with-issues, NO correctness defect. The reviewer
+> verified the hard requirement by MEASUREMENT rather than by reading -- it
+> rendered the branch's own compiled CSS in Chromium at 375/767/768/1280 and
+> confirmed the JS branch and the `max-md:` CSS turn over at the SAME pixel in
+> both directions -- reproduced the funnel and rename numbers independently,
+> and established the Radix focus finding live by building a harness from this
+> repo's own `ui/dialog.tsx` and Radix build, isolating the cause by contrast
+> with a triggered dialog. Its findings were one seam the type system does not
+> cover and three comments that claimed more than was true). As built:
+>
+> - **THE SHAPE: a stage picker, one stage's deals as a list, "Move to..." per
+>   card.** The picker is a horizontally-scrolling `role="group"` /
+>   `aria-label="Stages"` strip of buttons, one per stage, each carrying that
+>   stage's deal count and `aria-pressed` from the SAME rule that picks its
+>   colour. Under it a `role="status"` line, then the stage's own block: the
+>   existing `StageHeader` (rename, count, value), the cards, `New deal`; then
+>   `+ Stage`. **Nothing the desk can do is missing** -- the only desktop
+>   gesture with no phone equivalent is REORDERING WITHIN a stage, which is a
+>   position and not a capability.
+> - **WHERE THE STATE LIVES: component state, and the deep link is GIVEN UP
+>   deliberately.** The reasoning is in `board.tsx` and the load-bearing half is
+>   this: the same URL would describe two different screens depending on the
+>   window it was opened in, since the desktop board shows every stage at once
+>   and would ignore a `?stage=` only one width ever writes. (The reviewer
+>   judged the argument sound but slightly over-pressed -- a mobile-only search
+>   param the desktop ignores is a common benign pattern -- so read the
+>   URL-means-two-things half as the reason and the rest as support.) **The
+>   stated cost:** "opening a card IS the navigation" is NOT re-earned; tapping
+>   a card leaves for `/deals/<id>` and coming back re-mounts the picker on the
+>   pipeline's first stage. A lost place in a list, not a broken link. The
+>   remedy if it grates in use is a search schema and that paragraph rewritten,
+>   not a quiet second store of state.
+> - **IT UNMOUNTS THE DESKTOP BOARD RATHER THAN HIDING IT -- the opposite of
+>   Task 3's ruling, and the reason the two differ is recorded so neither looks
+>   like an oversight.** The inbox hides because its panes hold accumulated
+>   "Load more" pages and live query observers an unmount would throw away.
+>   Nothing here does: every card comes from the ONE `useDeals(pipelineId)`
+>   query the page owns. And hiding would be actively WRONG here --
+>   `pipeline.spec.ts` counts `[data-testid^="column-"]` and addresses
+>   `card-<id>` at page level, and a `display:none` copy is still counted and
+>   still a strict-mode violation.
+> - **ONE MOVE PATH, verified end to end.** `useMoveDeal` is instantiated once
+>   and called by both the drag and the sheet, with neither neighbour named
+>   (`moveDealInputSchema`'s append-at-the-tail). Verified against a live
+>   server: a deal moved into a stage holding one deal at `"a0"` landed at
+>   `"a1"` -- `midpoint("a0", null)` -- and produced the SAME `stage_changed`
+>   event the drag produces. A per-call `onError` is additive on top of the
+>   mutation's own rollback.
+> - **THE FOCUS, both exits, because Radix handles NEITHER for a dialog opened
+>   this way.** Measured: dismissing the sheet with Close left `activeElement`
+>   on `<body>` with the trigger still in the DOM. `DialogContentModal`'s own
+>   `onCloseAutoFocus` focuses `context.triggerRef.current`, which only
+>   `<DialogTrigger>` sets; this is one page-level dialog driven by state
+>   because the trigger is a different button on every card. Handled
+>   explicitly: the trigger back on a dismissal (`isConnected`-checked, so an
+>   SSE retirement mid-sheet falls through), the page `h1` after a move -- the
+>   inbox's target, `tabIndex={-1}` below the breakpoint only, so the desktop
+>   heading keeps exactly the attributes it had. The sheet also opens on the
+>   first stage rather than on its own Close. **This became the phase-level
+>   finding above**, which is where it now lives.
+> - **TWO THINGS MEASURED ON THE PHONE AND FIXED RATHER THAN LEFT.** The
+>   **funnel** spilled: its three fixed columns (160 + 48 + 112) plus padding
+>   came to 368px inside a 327px content box at 375px, so the flex-1 track was
+>   squeezed to ZERO and the value column was pushed out of the box. **Be
+>   accurate about where that overflow went** -- the DOCUMENT did not scroll
+>   sideways but `<main>` did (`scrollWidth` 393 against `clientWidth` 375,
+>   `overflow-x: auto`, and setting `scrollLeft` revealed the value column in
+>   full), so the numbers were reachable by a sideways scroll nothing
+>   signalled: worse than plainly absent for being deniable, not absent. The
+>   row now wraps below the breakpoint (name on its own line, track ~157px; the
+>   reviewer measured 158.2px independently). And the **stage rename button**
+>   was 303x20, under the phase's 44px floor, and it is the only way to reach
+>   that capability on a phone.
+> - **THE THREE `useIsMobile()` SITES ARE NOW CLOSED AS A SET.** A guard in
+>   `use-is-mobile.test.ts` walks `packages/web/src` and asserts the callers are
+>   exactly `components/shell.tsx`, `pages/board.tsx`, `pages/inbox.tsx`. It
+>   could only be written once the third site existed. Not a veto -- it obliges
+>   a fourth to be argued for in the same commit, which is what the spec asks.
+> - **THE SEAM: the type system covers the gate and STOPS THERE, and that limit
+>   is now written down and guarded.** Inverting the branch IS a type error --
+>   `StageView` takes a non-null stage, so the else-branch's `null` has nowhere
+>   to go (TS2322, mutation run) -- and that is a better tool than a source
+>   guard WHERE THE GATE'S VALUE IS THE PAYLOAD. It does not generalise: the
+>   reviewer showed that swapping `picker` and `moveTargets`, same-typed
+>   SIBLING PROPS, typechecks clean and passed all 367 web tests, giving an
+>   archived pipeline no picker at all and a Move sheet offering the stage the
+>   card is already in -- exactly the class `inbox-lib.test.ts` guards for its
+>   level-to-pane wiring. A source guard now pins both props and the `isMobile`
+>   argument's spelling; **both demonstrated mutations were re-run and both now
+>   fail it** (the props swap, and `isMobile: !isMobile`, which gives the
+>   desktop a stage view and a phone the board). The `isMobile` hole is shaped
+>   identically at `inbox.tsx:359` and is unguarded there, so this closes it
+>   for one file rather than for the phase.
+> - **THE CROSS-PRODUCT IS NOW A REAL ONE.** The desktop pin's `COMBINATIONS`
+>   was eight hand-picked shapes of the eighteen the three inputs allow, while
+>   every comment around it said "the cross-product". It is now GENERATED --
+>   3 pipeline shapes x 3 stage choices x 2 archived flags = 18 -- with its own
+>   length pinned, and the assertion is by IDENTITY (every desktop call returns
+>   the one shared frozen object).
+> - **Desktop re-measured at 1280x800, identical before and after:** 224px
+>   aside with its class string; `<main>` exactly `flex-1 overflow-auto px-6
+>   py-6`; the board row's class string and 1008px box; five 288px columns at
+>   the same 304px pitch; the card's class string and 272x62 box; the `h1`
+>   carrying only `class` and **no `tabindex`**; one `DndLiveRegion`;
+>   `activeElement` BODY; document 1280x800, no scroll; the funnel row still
+>   160/626/48/112 on one line at 38px. **Also checked at 800px** (sidebar,
+>   five columns, no stage view, rename still 20px) **and at 767px** (stage
+>   view, bottom bar, rename 44px).
+> - **Tests: +25 on the 1775 baseline -> 1800** unit + 36 skipped, green;
+>   typecheck clean on five projects; `npm run build` clean with no CSS
+>   warning; **no e2e file touched, 72 -> 72 unchanged**, confirmed green in CI
+>   on the final tip. Twenty-four are `pages/board-lib.test.ts` and one is the
+>   three-sites guard. **Seven mutations run, all died:** the gate inverted
+>   (typecheck), the props swapped, `isMobile` negated, the desktop column
+>   class edited, a hand-rolled second move path, the rot boundary loosened to
+>   `>=`, and a fourth `useIsMobile()` site.
+>
+> **RECORDED, NOT FIXED.**
+>
+> - **The `role="status"` line is optimistic and is never retracted.** It is
+>   written when the mutation is dispatched, exactly as the card's
+>   disappearance is, so a server refusal leaves "Moved X to Y." standing above
+>   a card that is back. The failure does speak (the page's error banner, via
+>   the per-call `onError`) and the card's return is itself visible, so this is
+>   a roughness rather than a silence; retracting it means threading the
+>   mutation's outcome down into the component.
+> - **The `useMemo` on `stageView` buys nothing today**, and its comment now
+>   says so rather than claiming otherwise. No card is `React.memo`'d and the
+>   callbacks the cards receive are fresh identities every render, so memoising
+>   one array changes nothing a profiler would find. Kept because it is correct
+>   and is the shape that keeps working if a card ever is memoised.
+> - **A phone with no stages at all falls to the DESKTOP branch**
+>   (`stage === null`), which at that width renders an empty board row holding
+>   only `+ Stage`. That is the honest empty state and it works, but it means
+>   `data-testid="board"` can exist at a phone viewport in exactly that case.
+> - **The picker does not scroll the chosen stage into view.** Unreachable
+>   today (it opens on the first stage and the DOM node persists across picks),
+>   but a pipeline with many stages plus a future restored selection would meet
+>   it. Same class as the record rail's tab strip, which Task 2 left as is.
+>
+> **HANDOFFS. Task 5:** the Radix focus finding above is yours too -- your
+> Gantt->drawer path ends in a drawer whose closer is its only exit, and
+> `task-drawer.tsx` is one of the four callers with no restore. `useIsMobile()`
+> is closed at three and enforced, so the Gantt's read-only mode must be `md:`
+> CSS, not a fourth site. **Task 6:** new phone-only testids `stage-view`,
+> `stage-picker`, `stage-pick-<stageId>`, `stage-move-result`,
+> `move-<dealId>`, `move-sheet`, `move-sheet-close`, `move-to-<stageId>`;
+> `card-<dealId>` is REUSED at both widths and is one element at either. Unlike
+> the inbox's panes, `column-<id>`, `board` and `DndLiveRegion` are genuinely
+> ABSENT below the breakpoint -- `toHaveCount(0)` is right there. Worth
+> pinning, because nothing but e2e re-checks it: focus on the `h1` after a
+> move, and focus back on the trigger after a Close. The sheet opens focused on
+> its first target, so a journey may act immediately. Two environment facts:
+> the browser pane's CDP resize updates `matches` without dispatching `change`
+> (set the viewport at context creation), and **`@fastify/static` caches** -- a
+> rebuilt `dist` needs a server restart or every asset 404s into the SPA
+> fallback.
 
 ---
 

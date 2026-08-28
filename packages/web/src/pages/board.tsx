@@ -127,10 +127,16 @@ export function BoardPage() {
    * carries the reasoning, including why `stage === null` is exactly "render
    * the board that was always here".
    *
-   * MEMOISED ON PURPOSE. `moveTargets` is an array, and the stage view hands
-   * the same one to every card in the list; rebuilding it per render would
-   * hand every card a fresh prop for nothing. Above the breakpoint the
-   * function returns one shared frozen object, so the memo is inert there.
+   * MEMOISED, AND HONEST ABOUT WHAT THAT BUYS TODAY: not much. The reason
+   * originally written here -- that a fresh `moveTargets` array would re-render
+   * every memoised card -- is not true of this page as it stands. No card is
+   * wrapped in React.memo, and the callbacks the cards receive (`onMove`,
+   * `onRequestMove`) are fresh function identities on every render anyway, so
+   * memoising this one array changes nothing a profiler would find. It stays
+   * because it is correct, costs a comparison of four values, and is the shape
+   * that keeps working if a card ever is memoised -- not because it is doing
+   * work now. Above the breakpoint the function returns one shared frozen
+   * object, so the memo is doubly inert there.
    */
   const stageView = useMemo(
     () => boardStageView({ isMobile, stages: pipelineData?.stages ?? [], chosenStageId, archived }),
@@ -182,16 +188,26 @@ export function BoardPage() {
    * The phone's "Move to..." -- THE SAME MUTATION THE DRAG USES, deliberately.
    *
    * `useMoveDeal` is instantiated once on this page and both widths call it, so
-   * the optimistic reposition, the rollback, the 409 refetch, the server's
-   * position compaction and the SSE hint that follows are all the behaviour
-   * they already were. A second path would have had to reproduce every one of
-   * them and would have drifted from the first the day either changed.
+   * the optimistic reposition, the rollback, the 409 refetch, the server's own
+   * `lockSiblingGroup` + `midpoint` positioning and the SSE hint that follows
+   * are all the behaviour they already were. A second path would have had to
+   * reproduce every one of them and would have drifted from the first the day
+   * either changed.
+   *
+   * (An earlier version of this paragraph said "the server's position
+   * compaction". THERE IS NO DEAL POSITION COMPACTOR anywhere in this tree --
+   * the only `compact*` is `compactSchedule` in services/scheduling.ts, which
+   * is the Gantt's Remove-slack and has nothing to do with deals. The wording
+   * was inherited from the plan's own task paragraph, which is being corrected
+   * with it.)
    *
    * NEITHER NEIGHBOUR IS NAMED, which is moveDealInputSchema's "both omitted"
    * case: append at the tail of the target stage. That is the same landing spot
    * a desktop drag into a column's blank space produces, and it is the only
    * honest answer here -- the phone is not showing the target stage, so there
-   * is no position in it the user could be said to have chosen.
+   * is no position in it the user could be said to have chosen. Verified
+   * end to end: a deal moved into a stage holding one deal at "a0" landed at
+   * "a1", which is `midpoint("a0", null)`.
    *
    * The per-call onError is additive: the mutation's own onError still rolls
    * the optimistic move back first. Without it a failure would be a card that
@@ -280,16 +296,25 @@ export function BoardPage() {
         </Button>
       </div>
 
-      {/* THE BRANCH, and the seam the inbox had to guard with a source reader
-          is tied by the compiler here instead: StageView takes a NON-NULL
-          stage, so inverting this test does not compile. `stage` is null for
-          every input above the breakpoint (board-lib's DESKTOP_VIEW, pinned by
-          a test over the cross-product), so the desktop reaches the same
+      {/* THE BRANCH. Inverting THIS TEST is a type error, not a silent phone
+          bug: StageView takes a NON-NULL stage, so the else-branch's `null`
+          has nowhere to go (TS2322, run as a mutation). `stage` is null for
+          every input above the breakpoint (board-lib's DESKTOP_VIEW, pinned
+          over the full 18-case cross-product), so the desktop reaches the same
           DndContext it always did, and the two are mutually exclusive IN THE
           DOM rather than one being hidden -- which matters beyond tidiness:
           pipeline.spec.ts counts `[data-testid^="column-"]` and looks up
           `card-<id>` at the page level, and a hidden second copy of either
-          would be counted and would violate Playwright's strict mode. */}
+          would be counted and would violate Playwright's strict mode.
+
+          THAT ARGUMENT COVERS THE GATE AND STOPS THERE, which is worth saying
+          because it reads like it covers more. `picker` and `moveTargets`
+          below are the same type, so swapping them typechecks and passes every
+          test -- an archived pipeline would lose its picker entirely and the
+          Move sheet would offer the stage the card is already in. A source
+          guard in board-lib.test.ts holds that, the way inbox-lib.test.ts
+          holds its level-to-pane wiring. Use the compiler where the gate's
+          value IS the payload; use a guard for same-typed siblings. */}
       {view === "funnel" ? (
         <Funnel pipelineId={pipelineId} />
       ) : stageView.stage !== null ? (
@@ -482,9 +507,17 @@ function StageView({
    * where focus goes when a screen changes under it.
    *
    * The h1 is not what ANNOUNCES the move -- it says the pipeline's name. The
-   * live region does, which is why both exist. It is stated optimistically, as
-   * the card's own disappearance is: the mutation rolls back and the page's
-   * error banner speaks if the server refuses.
+   * live region does, which is why both exist.
+   *
+   * THE LIVE REGION IS OPTIMISTIC AND IS NEVER RETRACTED. It is written the
+   * moment the mutation is dispatched, exactly as the card's own disappearance
+   * is, and a server refusal rolls the card back without unwriting the line --
+   * so a failed move leaves "Moved X to Y." standing above a card that is still
+   * there. The failure does speak (the page's error banner, via the per-call
+   * onError), and the card being back is itself visible, so this is a
+   * roughness rather than a silence. Retracting it means threading the
+   * mutation's outcome down into this component, which is a bigger change than
+   * the defect warrants; recorded rather than done.
    */
   function handleMove(target: Stage) {
     if (movingDeal === null) return;

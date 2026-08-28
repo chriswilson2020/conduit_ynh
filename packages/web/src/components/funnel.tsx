@@ -62,10 +62,17 @@ export function Funnel({ pipelineId }: { pipelineId: string }) {
              Measured at 375px before this: the three fixed columns (160 + 48 +
              112) plus padding and gaps come to 368px inside <main>'s 327px
              content box, so the flex-1 track was squeezed to ZERO and the value
-             column was pushed out of the box entirely -- a funnel with no bars
-             and no numbers, which is the whole of what a funnel is. The page
-             did not scroll sideways to reveal it either; <main>'s own
-             overflow-auto absorbed the spill, so it simply was not there.
+             column was pushed out of the box -- a funnel with no bars, which is
+             the whole of what a funnel is.
+
+             BE ACCURATE ABOUT WHERE THE OVERFLOW WENT, because an earlier
+             version of this paragraph was not and a reviewer measured it: the
+             DOCUMENT did not scroll sideways, but <main> did. It reported
+             scrollWidth 393 against clientWidth 375 with overflow-x auto, and
+             setting its scrollLeft revealed the value column in full. So the
+             numbers were reachable by a sideways scroll of the content region
+             that nothing on the page signalled -- worse than plainly absent for
+             being deniable, but not absent.
 
              The stage name takes its own line and the bar keeps the second one,
              which is the arrangement that gives the track the most width: the

@@ -12,7 +12,9 @@
  * check), and the phase's hard requirement -- the DESKTOP must not change --
  * becomes an assertion rather than a hope: `boardStageView` with
  * `isMobile: false` returns DESKTOP_VIEW for every other input, and a test pins
- * that over the cross-product.
+ * that over the FULL cross-product of the other three -- all eighteen cases,
+ * generated rather than listed, because a hand-picked list described as a
+ * cross-product is a sample dressed as a proof.
  *
  * WHAT `null` MEANS IN THIS MODULE, because the page's whole branch hangs off
  * it: `view.stage === null` is "there is no stage view here", which is every

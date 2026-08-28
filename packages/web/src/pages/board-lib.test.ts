@@ -19,23 +19,32 @@ const PHONE: BoardStageViewInput<StageLike> = {
 
 type Pipeline = Omit<BoardStageViewInput<StageLike>, "isMobile">;
 
-/**
- * Every shape of the three inputs the view reads. The pipeline shapes are the
- * three that behave differently -- several stages, exactly one (nowhere to
- * move), and none at all (nothing to show).
- */
 const BASE: Pipeline = { stages: STAGES, chosenStageId: null, archived: false };
 
-const COMBINATIONS: readonly Pipeline[] = [
-  BASE,
-  { stages: STAGES, chosenStageId: "qualified", archived: false },
-  { stages: STAGES, chosenStageId: "gone", archived: false },
-  { stages: STAGES, chosenStageId: "qualified", archived: true },
-  { stages: [LEAD], chosenStageId: null, archived: false },
-  { stages: [LEAD], chosenStageId: "lead", archived: true },
-  { stages: [], chosenStageId: null, archived: false },
-  { stages: [], chosenStageId: "lead", archived: true },
-];
+/**
+ * THE REAL CROSS-PRODUCT of the three inputs, BUILT rather than listed --
+ * 3 x 3 x 2 = 18 -- because the desktop pin below is the phase's hard
+ * requirement and "18 hand-picked shapes" is a sample dressed as a proof.
+ *
+ * An earlier version of this file listed eight of the eighteen and every
+ * comment around it still said "the cross-product"; a spec reviewer counted.
+ * Generating it removes the gap between what the tests do and what they are
+ * described as doing, and it costs nothing: the three axes are each small and
+ * each is the axis that matters.
+ *
+ * The three pipeline shapes are the three that behave differently -- several
+ * stages, exactly one (nowhere to move), and none at all (nothing to show).
+ * The three choices are the three a chosen stage id can be: unset, a stage
+ * that is there, and one that is not.
+ */
+const PIPELINE_SHAPES: readonly (readonly StageLike[])[] = [STAGES, [LEAD], []];
+const STAGE_CHOICES: readonly (string | null)[] = [null, "qualified", "gone"];
+
+const COMBINATIONS: readonly Pipeline[] = PIPELINE_SHAPES.flatMap((stages) =>
+  STAGE_CHOICES.flatMap((chosenStageId) =>
+    [false, true].map((archived) => ({ stages, chosenStageId, archived })),
+  ),
+);
 
 describe("boardStageView above the breakpoint", () => {
   /**
@@ -50,6 +59,10 @@ describe("boardStageView above the breakpoint", () => {
    * sharing the freeze test below depends on.
    */
   it("returns the unchanged board for every input", () => {
+    // The cross-product IS this assertion's value, so its size is pinned too:
+    // dropping an axis to two values would leave every case below still green
+    // over a quietly smaller space.
+    expect(COMBINATIONS).toHaveLength(18);
     const first = boardStageView({ isMobile: false, ...BASE });
     for (const combination of COMBINATIONS) {
       const view = boardStageView({ isMobile: false, ...combination });
@@ -257,5 +270,42 @@ describe("the desktop board in pages/board.tsx", () => {
     expect(code.split("useMoveDeal(")).toHaveLength(2);
     expect(code.match(/moveDeal\.mutate\(/g)).toHaveLength(2);
     expect(code).not.toMatch(/\b(fetch|postJson)\(/);
+  });
+
+  /**
+   * WHERE THE TYPE ERROR STOPS, AND WHY THIS EXISTS ANYWAY.
+   *
+   * Inverting the gate itself IS a type error -- `StageView` takes a non-null
+   * stage, so `stageView.stage === null ? <StageView stage={stageView.stage}>`
+   * does not compile (TS2322, run). That is a genuinely better tool than a
+   * source guard WHERE THE GATE'S VALUE IS THE PAYLOAD, because it cannot be
+   * bypassed and needs no maintenance.
+   *
+   * It does not generalise, and a spec reviewer showed exactly where it stops:
+   * `picker` and `moveTargets` are SAME-TYPED SIBLING PROPS -- both
+   * `readonly Stage[]` -- so the compiler is indifferent to which is which.
+   * Swapping them typechecks and passed every web test: an archived pipeline
+   * would get no stage picker at all (its move targets are empty), and the
+   * Move sheet would offer the stage the card is already in. That is the same
+   * class pages/inbox-lib.test.ts guards for its level-to-pane wiring, and it
+   * is why the type-error argument does not retire the source guard here.
+   *
+   * The `isMobile` argument is pinned for the same reason: `!isMobile` gives
+   * the desktop a stage view and a phone the board, and typechecks. That hole
+   * is shaped identically at `pages/inbox.tsx`'s own call and is unguarded
+   * there, so this closes it for one file rather than for the phase.
+   *
+   * What it cannot see, like every source guard in this package: a rename
+   * applied consistently on both sides, a value routed through a local, or the
+   * props spread from an object.
+   */
+  it("wires the stage view's same-typed props to the right halves of the view", () => {
+    const at = code.indexOf("<StageView");
+    expect(at).toBeGreaterThan(-1);
+    const element = code.slice(at, code.indexOf("/>", at));
+    expect(element).toContain("stage={stageView.stage}");
+    expect(element).toContain("picker={stageView.picker}");
+    expect(element).toContain("moveTargets={stageView.moveTargets}");
+    expect(code).toContain("boardStageView({ isMobile, ");
   });
 });
