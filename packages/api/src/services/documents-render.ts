@@ -14,20 +14,24 @@ export interface RenderOptions {
 }
 
 /**
- * 20s. Measured against the binary CI installs: a one-page quote with a logo, a
- * table of line items and a page-level stylesheet renders in well under a second
- * (documents-render.test.ts asserts the shape of that page, and the CI job's
- * timing is the evidence for this number). The cap is therefore not a budget for
- * the normal case; it is the ceiling on a pathological one, and it also bounds
- * how long the issuing transaction holds its row lock on the number sequence.
+ * 20s, which is 27x the measurement rather than a guess at one. A one-page quote
+ * with a logo, eight line items and a page-level stylesheet took 738ms end to end
+ * on WeasyPrint 61.1 in CI -- most of it the Python interpreter starting, which a
+ * longer document does not pay twice. documents-render.test.ts renders that page
+ * and prints the figure, so the number above stays checkable.
+ *
+ * The cap is therefore the ceiling on a pathological render, not a budget for a
+ * normal one. It also bounds how long the issuing transaction holds its row lock
+ * on the number sequence, which is why it is not larger still.
  */
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 /**
- * 25MB. A one-page quote is a few tens of kilobytes plus whatever the logo weighs,
- * so this is three orders of magnitude of headroom rather than a tuned limit. It
- * exists to stop an unbounded stream being accumulated in memory, not to reject
- * large-but-legitimate documents.
+ * 25MB, against a measured 12,457 bytes for that same one-page quote -- so this is
+ * three orders of magnitude of headroom rather than a tuned limit. It exists to
+ * stop an unbounded stream being accumulated in memory, not to reject a large but
+ * legitimate document, and a document big enough to approach it would hit the
+ * timeout long first.
  */
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
 
@@ -55,8 +59,9 @@ const PDF_MAGIC = "%PDF-";
  * to a closed loopback port is refused immediately rather than hanging, so the
  * failure costs the render no time.
  *
- * documents-render.test.ts proves this in both directions: that a bare `weasyprint`
- * DOES fetch an absolute URL with no base URL set, and that `renderPdf` does not.
+ * documents-render.test.ts proves this in both directions against a loopback server
+ * that records who asks it for anything: a bare `weasyprint` DOES fetch an absolute
+ * URL with no base URL set (confirmed on 61.1 in CI), and `renderPdf` does not.
  */
 const NO_NETWORK_ENV = {
   http_proxy: "http://127.0.0.1:9",
