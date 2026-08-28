@@ -207,14 +207,22 @@ test.describe.serial("Phone navigation and the record rail", () => {
 
     // WHY THIS TAB IS WORTH A TEST AT ALL. The five labels are five
     // unbreakable words, so a trigger cannot shrink below its text and the
-    // strip cannot fit: measured on the live app at this width, its content is
-    // 349px inside a 342px box, and the last tab is the 7px that hangs over.
-    // Below 360px the same spill used to scroll the whole page and take
+    // strip can run past its box: measured at 390px in Chrome on macOS, its
+    // content is 349px inside a 342px box and Meetings is the 7px that hangs
+    // over. Below 360px that spill used to scroll the whole PAGE and take
     // Meetings off screen entirely, which is what made it a phase concern.
+    //
+    // WHETHER IT SPILLS AT ALL IS A FONT-METRIC ACCIDENT, and this file learned
+    // that from a red CI run rather than by reasoning: on the Ubuntu runner the
+    // same five labels measure narrower and the strip FITS at 390px with
+    // nothing to scroll, so asserting the overflow -- or a scrollLeft that
+    // could only follow from it -- pins the runner's font stack and not
+    // anything about Conduit. The mechanism is not an accident and is what is
+    // asserted instead: below the breakpoint the strip is its own horizontal
+    // scroll container, so wherever a spill does appear it scrolls the strip
+    // and never the page.
     const strip = rail.getByRole("tablist");
-    const overflowPx = await strip.evaluate((el) => el.scrollWidth - el.clientWidth);
-    expect(overflowPx).toBeGreaterThan(0);
-    expect(await strip.evaluate((el) => el.scrollLeft)).toBe(0);
+    await expect(strip).toHaveCSS("overflow-x", "auto");
 
     // ARROW-KEY TO THE CLIPPED TAB. Task 2 could not settle from a browser
     // pane whether keyboard navigation reaches it -- that pane reported
@@ -223,9 +231,8 @@ test.describe.serial("Phone navigation and the record rail", () => {
     // and neither did any scroll it might have caused. Under Playwright the
     // page really has focus, so this is where the question gets an answer.
     //
-    // The claim asserted is the phase's own: the tab is REACHABLE. Whether the
-    // browser's focus handling also scrolls the strip is deliberately not
-    // claimed here; the swipe below is what pins the strip's own scrollability.
+    // The claim asserted is the phase's own: the last tab is REACHABLE, it
+    // activates, and it is on the screen when it gets there.
     //
     // ONE PRESS AT A TIME, waiting for each. Radix moves the tab stop inside a
     // setTimeout, so a second arrow dispatched before the first has landed is
@@ -237,15 +244,7 @@ test.describe.serial("Phone navigation and the record rail", () => {
     }
     await expect(page.getByTestId("meetings-tab")).toBeFocused();
     await expect(page.getByTestId("meetings")).toBeVisible();
-
-    // And the tail really is one swipe away rather than lost: the strip is its
-    // own scroll container, so revealing the clipped tab moves the strip and
-    // not the page -- which is the whole of what Task 2 traded the visible
-    // 7px spill for.
-    await page.getByTestId("meetings-tab").scrollIntoViewIfNeeded();
-    await expect
-      .poll(async () => strip.evaluate((el) => el.scrollLeft))
-      .toBeGreaterThan(0);
+    await expect(page.getByTestId("meetings-tab")).toBeInViewport();
   });
 });
 
@@ -606,10 +605,20 @@ test.describe.serial("Phone Gantt", () => {
     // rendered nothing and passed a weaker assertion.
     page.once("dialog", (dialog) => void dialog.accept());
     await compact.click();
-    // These tasks have no dependencies, so there is nothing to pull -- which
-    // is the outcome that proves the sweep RAN rather than that a dismissed
-    // confirm cancelled it.
-    await expect(page.getByTestId("cascade-note")).toContainText("Nothing to compact");
+
+    // WHICH OUTCOME IT REPORTS IS NOT WORTH PINNING, and the first version of
+    // this test pinned it wrongly. "These tasks have no dependencies, so there
+    // is nothing to pull" was false, and CI said so: compactSchedule pulls
+    // every movable task to the project's floor -- with no project start date,
+    // the earliest start among its own dated tasks -- whether or not it has a
+    // predecessor. So the task the previous test pushed into next week came
+    // back, and the note read "1 task compacted".
+    //
+    // What this journey claims is Amendment 5's claim, that the sweep is
+    // REACHABLE from a phone. The note carries one of two sentences and both
+    // of them mean the confirm was accepted and the request ran; an unhandled
+    // dialog, which Playwright auto-dismisses, would leave it empty.
+    await expect(page.getByTestId("cascade-note")).toContainText(/compact/);
   });
 });
 
