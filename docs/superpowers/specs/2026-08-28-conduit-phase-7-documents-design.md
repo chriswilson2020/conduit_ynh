@@ -11,8 +11,13 @@ figures on the server.** `apt-get install weasyprint` on Debian 12 pulls 69 pack
 `python3-scipy | python3-munkres` and apt takes the first, which drags `g++`, `g++-12`,
 `libboost1.74-dev` and `libopenblas-dev` onto a CRM server. Naming the second alternative
 explicitly gives the same renderer in 39 packages and **89MB**, with no C++ toolchain.
-The install is therefore `python3-munkres weasyprint`, and the order of those two words
-is load-bearing. It is the last capability that makes someone
+The install is therefore `python3-munkres weasyprint`. **Co-presence in the install set
+is what matters, not word order** — an earlier draft of this paragraph said the order was
+load-bearing, and all four orderings measure 39 packages. YunoHost never runs that
+command line anyway: `AptDependenciesAppResource` splits `packages` on commas and
+generates a `${app}-ynh-deps` metapackage, so both names simply have to appear in it.
+
+It is the last capability that makes someone
 leave Conduit to finish a job: the CRM knows the deal, the company and the contact, and
 then you go and write the quote somewhere else.
 
@@ -65,21 +70,35 @@ Node process changes.
 
 Two properties are requirements, not defaults:
 
-- **No network access during render, enforced in the child's environment.** Every asset
-  — the logo above all — is inlined as a `data:` URI before the HTML reaches WeasyPrint.
-  **An earlier draft of this spec claimed omitting `--base-url` was what prevented
-  fetches; Task 1 disproved that empirically** with a loopback server that records who
-  asks it for anything: a base URL only governs what RELATIVE references resolve
-  against, and a bare `weasyprint` with none set happily fetched both an `<img>` and a
-  `<link rel=stylesheet>`. The property is instead enforced by pointing the child's
-  `http_proxy`/`https_proxy`/`ftp_proxy` at a closed loopback port with `no_proxy`
-  emptied — WeasyPrint's fetcher is urllib, whose opener reads exactly those — so a
-  smuggled remote URL is refused instantly and the page renders without the asset. This
-  is what makes rendering a pure function of stored data, and it removes SSRF from a
-  feature whose input is user-authored HTML. Task 3's sanitiser still strips remote URLs:
-  that is the braces to this belt, not a substitute for it.
-- **A timeout and an output cap.** A render that hangs or produces an implausible file
-  fails cleanly, leaves no `files` row and no number allocated.
+- **The renderer fetches nothing but `data:`, enforced by a URL fetcher — and the API
+  is invoked, not the CLI, because that is the only way to say so.** Every asset — the
+  logo above all — is inlined as a `data:` URI before the HTML reaches WeasyPrint.
+
+  **Two earlier drafts of this bullet were wrong, and both were disproved on the target
+  rather than argued about.** The first claimed omitting `--base-url` prevented fetches:
+  a base URL only governs what RELATIVE references resolve against, and a bare
+  `weasyprint` with none set fetched both an `<img>` and a `<link rel=stylesheet>` from a
+  loopback server that records who asks it for anything. The second claimed the child's
+  proxy variables were sufficient: they are not, because `file://` never consults a
+  proxy. `default_url_fetcher` hands every absolute URI to `urllib.urlopen`, whose opener
+  carries `FileHandler`, and WeasyPrint embeds `<link rel=attachment>` targets into the
+  PDF's `/EmbeddedFiles`. Under the shipped proxy settings, `file:///etc/passwd` exited 0
+  and came back out of the PDF byte for byte — which on a real deployment is
+  `$DATA_DIR/mail.key`, readable by the user the API runs as, and with it every stored
+  IMAP and SMTP password.
+
+  The property is therefore enforced where it can be: `documents-render.ts` spawns
+  `python3` with WeasyPrint's API and a **`url_fetcher` that allowlists `data:` and
+  raises on every other scheme**, and a blocked URL fails the render rather than
+  degrading quietly — at that point either the document is an attack or Task 3's
+  sanitiser has a hole, and both deserve an alarm. The proxy variables stay as a cheap
+  second barrier for http(s), explicitly not as the control. Tested per scheme —
+  `file://` through three elements, `http://`, `ftp://`, `jar:` — on both 57.2 and 61.1,
+  because "tested one scheme and generalised" is exactly how the previous draft survived.
+  Task 3's sanitiser still strips remote URLs: that is the braces to this belt.
+- **A timeout, an output cap and an input cap.** A render that hangs, is fed an
+  implausible document, or produces one, fails cleanly and leaves no `files` row and no
+  number allocated.
 
 **This is the phase's deployment risk and it must be proved first.** WeasyPrint is an
 apt dependency in `manifest.toml`; it is the first release since v0.6.0 whose upgrade is
@@ -196,14 +215,25 @@ by jurisdiction; credit notes; payment tracking; revisions and versioning beyond
   rounding at the half-cent), merge-field resolution including unknown and nested
   fields, the sanitiser profile, and number formatting.
 - **Integration tests** for the render subprocess and the numbering allocation under
-  concurrency, skipped when the WeasyPrint binary is absent — the same pattern as the 36
-  `MAIL_IT` tests, so a developer without the binary still gets a green suite and CI
-  still proves it.
+  concurrency, skipped when WeasyPrint is absent, so a developer without it still gets a
+  green suite and CI still proves the path. **This is deliberately NOT quite the 36
+  `MAIL_IT` tests' pattern**, which is an explicit opt-in and so fails loudly on a broken
+  fixture: an auto-probing gate would skip silently if a packaging change stopped
+  delivering the binary, and CI would stay green through it. The render suite therefore
+  also asserts the binary is PRESENT whenever `CI` is set.
+- **The renderer's scheme allowlist is tested per scheme**, never one-and-generalised:
+  `file://` through several elements, `http://` against a loopback server that records
+  requests, and at least one exotic scheme.
 - **e2e** for the journey: fill a quote on a deal, generate it, find it on the record,
   download it and confirm it is a PDF. Plus the phone viewport for the line-item editor.
 - **The immutability claim gets its own test**, because it is the one users would never
   forgive being wrong: raise a quote, then rename the company, edit the deal's value and
   edit the template, and assert the stored document and its PDF are byte-identical.
+  **It must compare the STORED bytes across those edits and must never re-render.**
+  Task 1 measured three renders of identical input on one version at 6899, 6899 and 6898
+  bytes: the renderer is not reproducible, so a re-render-and-diff test would fail for
+  reasons that have nothing to do with immutability — which is the same fact the "not
+  offered" decision above already rests on.
 - Suite baseline at start: 1829 unit + 36 integration skipped + 96 e2e, green.
 
 ## Rollout

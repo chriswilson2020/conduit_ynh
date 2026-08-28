@@ -1,24 +1,27 @@
 import { spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inflateSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { renderPdf, RenderError, weasyprintAvailable } from "./documents-render.js";
 
 /**
  * This file is in two halves, and the split is deliberate.
  *
- * The STUB half shadows `weasyprint` on PATH with a shell script that behaves the
- * way a real one would when it goes wrong, and it runs everywhere -- including on
- * a machine with no WeasyPrint installed, which is where the failure paths would
- * otherwise never be executed at all. Node resolves a bare command name against
- * `env.PATH` at spawn time, and renderPdf builds the child's env from
- * `process.env`, so prepending a directory here is enough to intercept it.
+ * The STUB half shadows `python3` on PATH with a shell script that behaves the way a
+ * real renderer would when it goes wrong, and it runs everywhere -- including on a
+ * machine with no WeasyPrint, which is where the failure paths would otherwise never
+ * be executed at all. Node resolves a bare command name against `env.PATH` at spawn
+ * time and renderPdf builds the child's env from `process.env`, so prepending a
+ * directory here is enough to intercept it. Nine tests below do that.
  *
- * The REAL half needs the binary and is gated on it, the same way the 36 MAIL_IT
- * tests are gated on their containers: a developer without WeasyPrint still gets a
- * green suite, and CI (which installs it) still proves the render path.
+ * The REAL half needs WeasyPrint and is gated on it, so a developer without it still
+ * gets a green suite. That gate is NOT the MAIL_IT pattern, which is an explicit
+ * opt-in: this one probes, so it would skip silently if a packaging change ever
+ * stopped delivering the binary. "is installed here" below is what makes that loud
+ * in CI instead.
  */
 
 const HAVE_WEASYPRINT = await weasyprintAvailable();
@@ -30,10 +33,10 @@ let stubDir: string;
 let markerPath: string;
 const originalPath = process.env.PATH ?? "";
 
-/** Write an executable `weasyprint` into a fresh directory and return that directory. */
+/** Write an executable `python3` into a fresh directory and return that directory. */
 function stub(body: string): string {
   const dir = mkdtempSync(join(stubDir, "bin-"));
-  const file = join(dir, "weasyprint");
+  const file = join(dir, "python3");
   writeFileSync(file, `#!/bin/sh\n${body}\n`);
   chmodSync(file, 0o755);
   return dir;
@@ -67,21 +70,22 @@ describe("renderPdf failure paths", () => {
       await renderPdf("<html></html>").catch((e: unknown) => e));
 
     expect(error).toBeInstanceOf(RenderError);
-    expect((error as RenderError).message).toBe("weasyprint exited 3");
+    expect((error as RenderError).message).toBe("renderer exited 3");
     expect((error as RenderError).detail).toContain("Fatal: no font found");
   });
 
   it("survives a child that exits before reading a large stdin", async () => {
     // The write is still in flight when the pipe goes away, which is an EPIPE on
     // stdin. It must not surface as an unhandled 'error' event, and the rejection
-    // must be the child's real reason rather than the broken pipe.
+    // must be the child's real reason rather than the broken pipe. 500KB is well
+    // past the 64KB pipe buffer and well inside the input cap.
     const dir = stub("echo 'bad input' >&2\nexit 4");
-    const big = `<html><body>${"x".repeat(2_000_000)}</body></html>`;
+    const big = `<html><body>${"x".repeat(500_000)}</body></html>`;
     const error = await onPath(dir, async () =>
       await renderPdf(big).catch((e: unknown) => e));
 
     expect(error).toBeInstanceOf(RenderError);
-    expect((error as RenderError).message).toBe("weasyprint exited 4");
+    expect((error as RenderError).message).toBe("renderer exited 4");
     expect((error as RenderError).detail).toContain("bad input");
   });
 
@@ -124,7 +128,7 @@ describe("renderPdf failure paths", () => {
       await renderPdf("<html></html>").catch((e: unknown) => e));
 
     expect(error).toBeInstanceOf(RenderError);
-    expect((error as RenderError).message).toBe("weasyprint produced no PDF");
+    expect((error as RenderError).message).toBe("renderer produced no PDF");
     expect((error as RenderError).detail).toContain("0 bytes");
   });
 
@@ -134,16 +138,16 @@ describe("renderPdf failure paths", () => {
       await renderPdf("<html></html>").catch((e: unknown) => e));
 
     expect(error).toBeInstanceOf(RenderError);
-    expect((error as RenderError).message).toBe("weasyprint produced no PDF");
+    expect((error as RenderError).message).toBe("renderer produced no PDF");
   });
 
-  it("reports a binary that is not there at all", async () => {
+  it("reports an interpreter that is not there at all", async () => {
     const empty = mkdtempSync(join(stubDir, "empty-"));
     const error = await onPath(empty, async () =>
       await renderPdf("<html></html>").catch((e: unknown) => e), true);
 
     expect(error).toBeInstanceOf(RenderError);
-    expect((error as RenderError).message).toBe("could not start weasyprint");
+    expect((error as RenderError).message).toBe("could not start the renderer");
   });
 
   it("returns what an exit-0 child wrote when it is a PDF", async () => {
@@ -152,10 +156,21 @@ describe("renderPdf failure paths", () => {
 
     expect(pdf.toString("ascii")).toBe("%PDF-1.7 stub");
   });
+
+  it("refuses oversized input without spawning anything", async () => {
+    // Rejected before the spawn, so it holds even where no renderer exists --
+    // note there is no stub on PATH for this one.
+    const error = await renderPdf("x".repeat(4096), { maxInputBytes: 1024 })
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(RenderError);
+    expect((error as RenderError).message).toBe("document is too large to render");
+    expect((error as RenderError).detail).toContain("4096 bytes of HTML");
+  });
 });
 
 describe("weasyprintAvailable", () => {
-  it("reports availability without throwing when the binary is absent", async () => {
+  it("reports availability without throwing when there is no interpreter", async () => {
     const empty = mkdtempSync(join(stubDir, "empty-avail-"));
     const present = await onPath(empty, async () => await weasyprintAvailable(), true);
 
@@ -165,9 +180,16 @@ describe("weasyprintAvailable", () => {
   it("resolves to a boolean either way", async () => {
     await expect(weasyprintAvailable()).resolves.toBeTypeOf("boolean");
   });
+
+  // The other half of an auto-probing gate. Without this, apt failing to deliver
+  // WeasyPrint would turn the whole real half below into silent skips and CI would
+  // stay green through a broken deployment.
+  it.runIf(Boolean(process.env.CI))("is installed here, because CI must prove the render", () => {
+    expect(HAVE_WEASYPRINT).toBe(true);
+  });
 });
 
-// -------------------------------------------------------- the real binary
+// -------------------------------------------------------- the real renderer
 
 /** A 1x1 PNG, scaled by CSS. Stands in for the org profile's logo. */
 const LOGO_PNG =
@@ -200,7 +222,7 @@ tfoot td { font-weight: bold; border-top: 2px solid #333; }
 </body></html>`;
 }
 
-describe("renderPdf against the real binary", () => {
+describe("renderPdf against the real renderer", () => {
   itReal("returns a PDF for ordinary HTML", async () => {
     const pdf = await renderPdf("<html><body><h1>Quote</h1></body></html>");
     // %PDF- is the format's magic number; every conforming file starts with it.
@@ -213,9 +235,10 @@ describe("renderPdf against the real binary", () => {
     const pdf = await renderPdf(quoteHtml());
     const elapsed = Date.now() - started;
 
-    // Printed because DEFAULT_TIMEOUT_MS and DEFAULT_MAX_BYTES in
-    // documents-render.ts claim to be calibrated against a real page: this line
-    // in the CI log is that measurement.
+    // Printed because the caps in documents-render.ts claim to be calibrated
+    // against a real page: this line in the log is that measurement. The byte
+    // count is version-dependent (14,005 on 57.2, 12,457 on 61.1) and varies by
+    // a byte between runs, so nothing asserts an exact size.
     console.log(`[render] one-page quote: ${String(pdf.length)} bytes in ${String(elapsed)} ms`);
 
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
@@ -236,19 +259,50 @@ describe("renderPdf against the real binary", () => {
   });
 });
 
-// ------------------------------------------------------------- the network
+// ------------------------------------------------------------- the schemes
+
+/** Search a PDF for a marker, including inside its Flate-compressed streams. */
+function pdfContains(pdf: Buffer, marker: string): boolean {
+  if (pdf.includes(marker)) return true;
+  let from = 0;
+  for (;;) {
+    const start = pdf.indexOf("stream", from);
+    if (start === -1) return false;
+    const end = pdf.indexOf("endstream", start);
+    if (end === -1) return false;
+    let body = start + "stream".length;
+    if (pdf[body] === 0x0d) body += 1;
+    if (pdf[body] === 0x0a) body += 1;
+    try {
+      if (inflateSync(pdf.subarray(body, end)).includes(marker)) return true;
+    } catch {
+      // Not a Flate stream, or not a stream at all. Keep looking.
+    }
+    // Past the whole "endstream" keyword, not one byte into it: resuming at end+1
+    // makes the next search match the "stream" inside it, whose paired "endstream"
+    // is the FOLLOWING object's -- which silently skips every other stream.
+    from = end + "endstream".length;
+  }
+}
 
 /**
- * The no-network property, proved in both directions against a loopback server
- * that records what asked it for anything.
+ * The no-network claim, tested as what it actually is: a claim about SCHEMES.
+ *
+ * An earlier version of this suite tested http://127.0.0.1 alone and generalised to
+ * "fetches nothing", which is how a working file:// exfiltration survived it. Every
+ * scheme below is therefore its own case, and the http one still watches a loopback
+ * server so that "no request arrived" is observed rather than inferred.
  */
-describe("renderPdf and the network", () => {
+describe("renderPdf and the schemes it will fetch", () => {
   let server: Server;
-  let hits: string[] = [];
+  const hits: string[] = [];
   let origin = "";
+  let secretPath = "";
+  const SECRET = "conduit-secret-marker-9f3a";
 
   beforeAll(async () => {
-    hits = [];
+    secretPath = join(stubDir, "pretend-mail.key");
+    writeFileSync(secretPath, `${SECRET}\n`, { mode: 0o600 });
     server = createServer((req, res) => {
       hits.push(req.url ?? "");
       res.writeHead(200, { "content-type": "image/png" });
@@ -265,36 +319,86 @@ describe("renderPdf and the network", () => {
     await new Promise<void>((resolve) => { server.close(() => { resolve(); }); });
   });
 
-  const remoteHtml = (): string =>
-    `<html><head><link rel="stylesheet" href="${origin}/remote.css"></head>` +
-    `<body><img src="${origin}/remote.png" alt=""></body></html>`;
+  const blocked = (): { name: string; html: () => string }[] => [
+    {
+      name: "file:// as an attachment, the exfiltration the CLI allowed",
+      html: () => `<html><body><link rel="attachment" href="file://${secretPath}"></body></html>`,
+    },
+    {
+      name: "file:// as an image",
+      html: () => `<html><body><img src="file://${secretPath}"></body></html>`,
+    },
+    {
+      name: "file:// as a stylesheet",
+      html: () => `<html><head><link rel="stylesheet" href="file://${secretPath}"></head><body>x</body></html>`,
+    },
+    {
+      name: "http://, which the proxy variables alone would also have stopped",
+      html: () => `<html><body><img src="${origin}/probe.png"></body></html>`,
+    },
+    {
+      name: "ftp://, a scheme urllib supports and nothing here wants",
+      html: () => `<html><body><img src="ftp://127.0.0.1/x.png"></body></html>`,
+    },
+    {
+      name: "jar:file://, the exotic one",
+      html: () => `<html><body><img src="jar:file://${secretPath}!/x"></body></html>`,
+    },
+  ];
 
-  itReal("a bare weasyprint DOES fetch an absolute URL with no base URL set", async () => {
-    // The characterisation half. Omitting --base-url only leaves RELATIVE
-    // references unresolvable; this is the evidence that it does nothing about
-    // absolute ones, and therefore that NO_NETWORK_ENV is load-bearing rather
-    // than decorative.
-    hits.length = 0;
-    const env = { ...process.env };
-    for (const key of ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]) {
-      delete env[key];
-    }
-    await new Promise<void>((resolve) => {
-      const child = spawn("weasyprint", ["-", "-"], { stdio: ["pipe", "ignore", "ignore"], env });
-      child.on("close", () => { resolve(); });
-      child.on("error", () => { resolve(); });
-      child.stdin.on("error", () => { /* the child may not read it all */ });
-      child.stdin.end(remoteHtml(), "utf8");
+  for (const scheme of blocked()) {
+    itReal(`refuses to render a document referencing ${scheme.name}`, async () => {
+      hits.length = 0;
+      const error = await renderPdf(scheme.html()).catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(RenderError);
+      expect((error as RenderError).message).toBe("document referenced a blocked URL");
+      // No PDF is produced at all, so there is nothing for a caller to store.
+      expect(hits).toEqual([]);
     });
+  }
 
-    expect(hits.length).toBeGreaterThan(0);
-  });
-
-  itReal("renderPdf fetches nothing, and still produces a PDF", async () => {
-    hits.length = 0;
-    const pdf = await renderPdf(remoteHtml());
+  itReal("renders a data: image, which is the one scheme a document may use", async () => {
+    const pdf = await renderPdf(`<html><body><img src="${LOGO_PNG}"></body></html>`);
 
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
-    expect(hits).toEqual([]);
+  });
+
+  itReal("renders without a relative reference rather than failing on it", async () => {
+    // base_url is None, so a relative URL resolves to nothing and the fetcher is
+    // never reached. This is the one case that degrades quietly, and it is the
+    // harmless one: nothing was read and nothing was fetched.
+    const pdf = await renderPdf(`<html><body><img src="../../etc/passwd"></body></html>`);
+
+    expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+  });
+
+  itReal("a bare weasyprint CLI DOES embed a local file, which is why we do not use it", async () => {
+    // The characterisation half, and the reason this module spawns Python with a
+    // url_fetcher instead of the `weasyprint` binary. Run under the same proxy
+    // environment renderPdf uses, to show those variables do nothing for file://.
+    const html = `<html><body><link rel="attachment" href="file://${secretPath}"></body></html>`;
+    const chunks: Buffer[] = [];
+    const code = await new Promise<number | null>((resolve) => {
+      const child = spawn("weasyprint", ["-", "-"], {
+        stdio: ["pipe", "pipe", "ignore"],
+        env: {
+          ...process.env,
+          http_proxy: "http://127.0.0.1:9",
+          https_proxy: "http://127.0.0.1:9",
+          no_proxy: "",
+        },
+      });
+      child.stdout.on("data", (c: Buffer) => chunks.push(c));
+      child.on("error", () => { resolve(null); });
+      child.on("close", (c) => { resolve(c); });
+      child.stdin.on("error", () => { /* the child may not read it all */ });
+      child.stdin.end(html, "utf8");
+    });
+    const pdf = Buffer.concat(chunks);
+
+    expect(code).toBe(0);
+    expect(pdf.includes("/EmbeddedFiles")).toBe(true);
+    expect(pdfContains(pdf, SECRET)).toBe(true);
   });
 });

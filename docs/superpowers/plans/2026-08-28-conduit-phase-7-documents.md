@@ -244,14 +244,34 @@ Commits `bb5880c`, `3b95519`. CI run **33191112378**, tip `3b95519`, both jobs g
 Read these before trusting the code above; the steps are left as written so the
 correction is legible rather than silently patched.
 
-1. **The `--base-url` comment in Step 4 is FALSE and the shipped code does not say it.**
-   A base URL governs only what RELATIVE references resolve against; an absolute
-   `http://` URL needs no base and is fetched. Disproved empirically with a loopback
-   server that records requests: bare `weasyprint` with no `--base-url` fetched both an
-   `<img>` and a `<link rel=stylesheet>`. Debian's package `Recommends: ca-certificates`,
-   which is the same tell. The no-network property is now enforced by the child's
-   environment — `http_proxy`/`https_proxy`/`ftp_proxy` at a closed loopback port with
-   `no_proxy` emptied, which urllib's opener reads — and is proved in BOTH directions.
+1. **Step 4 spawns the WRONG PROGRAM, and this took two rounds to get right.** The
+   `--base-url` comment is false: a base URL governs only what RELATIVE references
+   resolve against, and an absolute `http://` URL needs no base and is fetched — proved
+   with a loopback server that records requests. But the first fix, pointing the child's
+   proxy variables at a closed port, was **also insufficient, and a spec reviewer broke
+   it with a working exploit on the server**: `file://` never consults a proxy.
+   `default_url_fetcher` hands every absolute URI to `urllib.urlopen`, whose opener
+   carries `FileHandler`, and 57.2's fetcher has an explicit `file://` branch before it.
+   WeasyPrint embeds `<link rel=attachment>` targets into `/EmbeddedFiles`, so under the
+   shipped proxy settings `<link rel="attachment" href="file:///etc/passwd">` exited 0
+   and the file came back out of the PDF byte for byte. On a deployment that is
+   `$DATA_DIR/mail.key` (`config.ts:81`, created 600 `conduit:conduit` by
+   `scripts/install:33-35`, readable by the user the API runs as) and with it every
+   stored IMAP and SMTP password — reachable by putting one line in a template, raising
+   a quote and downloading it through Task 4's ordinary `GET /api/files/:id`.
+
+   **The CLI cannot be made safe: it has no flag to restrict schemes.** The shipped code
+   therefore spawns `python3 -c` with WeasyPrint's API and a `url_fetcher` that
+   allowlists `data:` and raises on everything else, and a blocked URL FAILS the render
+   rather than degrading quietly. The proxy variables stay as a cheap second barrier and
+   are documented as not being the control. Verified per scheme on 57.2 and 61.1:
+   `file://` through `link rel=attachment`, `img` and `stylesheet`; `http://` (watched on
+   the loopback server); `ftp://`; `jar:`. A relative reference still renders without the
+   asset, because `base_url=None` means the fetcher is never reached at all.
+
+   **The lesson worth carrying into Task 3:** the previous suite tested exactly one
+   scheme and generalised to "fetches nothing". Anything asserting a no-network or
+   no-read property must be parametrised over schemes.
 2. **Step 4's `renderPdf` resolved a zero-byte "PDF".** A child that exits 0 having
    written nothing returned `Buffer.concat([])`, which would have put an empty file in a
    deal's Files with no error raised anywhere. The shipped version treats a stdout that
@@ -260,19 +280,47 @@ correction is legible rather than silently patched.
    the absence of.
 3. **Step 2's test file would have skipped every failure path** on any machine without
    the binary, which is backwards for code whose whole job is failing well. The shipped
-   tests are in two halves: seven stub-driven tests shadow `weasyprint` on `PATH` with a
+   tests are in two halves: **nine** stub-driven tests shadow `python3` on `PATH` with a
    shell script and run EVERYWHERE (non-zero exit with stderr, a child that exits before
-   reading a 2MB stdin, a timeout firing mid-chunk with a marker file proving the child
-   was killed, the size cap, exit-0-with-no-PDF, exit-0-with-garbage, ENOENT).
-4. **Import specifiers are `.js`, not `.ts`** — NodeNext, and the repo convention.
+   reading a 500KB stdin, a timeout firing mid-chunk with a marker file proving the child
+   was killed, the size cap, exit-0-with-no-PDF, exit-0-with-garbage, ENOENT, the
+   PDF passthrough, and the availability probe).
+4. **The gate is NOT the MAIL_IT pattern the spec names.** `MAIL_IT` is an explicit
+   opt-in, so a broken fixture fails loudly; this one probes, so a packaging change that
+   stopped delivering WeasyPrint would turn the real half into silent skips with CI still
+   green. A `runIf(process.env.CI)` test asserts the binary is present whenever CI runs.
+5. **Import specifiers are `.js`, not `.ts`** — NodeNext, and the repo convention.
 
-**Measured, so later tasks stop guessing.** A one-page quote (A4, `@page` margins, a
-running footer, a `data:` logo, 8 line items, totals, terms) renders in **665-738ms to
-12457 bytes**, byte-identical across runs — a free early signal for the immutability
-claim in Task 4. The 20s timeout is 27x that and also bounds how long Task 4's
-transaction holds its row lock, so it should not grow. The 25MB cap is not a tuned limit
-but a bound on what is accumulated in memory from a runaway stream; anything near it
-would hit the timeout first.
+**Measured, so later tasks stop guessing.** All figures from the server (Debian 12,
+WeasyPrint 57.2) unless marked. A one-page quote (A4, `@page` margins, a running footer,
+a `data:` logo, 8 line items, totals, terms) renders in **570-580ms to ~14,005 bytes**
+(**665-738ms / 12,457 bytes** on CI's 61.1) at **66.5MB peak RSS**. A 435KB, 40-page
+document costs **3.9s, 97MB RSS, 120KB out**.
+
+- The **20s timeout** is 34x the one-page render and bounds how long Task 4's transaction
+  holds its row lock, so it should not grow.
+- The **25MB output cap** is not a tuned limit but a bound on what is accumulated in
+  memory from a runaway stream; anything near it would hit the timeout first.
+- The **2MB input cap** is new (nothing bounded input before) and IS tuned: 435KB of HTML
+  costs 3.9s, so 2MB is roughly where the timeout would bite anyway — this makes that
+  failure immediate instead of costing 20s and 100MB first.
+- `ram.runtime` went 400M -> **700M**: a render is a separate Python process, and 300M is
+  three at a rounded 100MB ceiling. **Three is a number Task 4's concurrency limit has to
+  match; until that limit exists, nothing bounds this at all.**
+
+**The render is NOT reproducible, and Task 4 must not assume it is.** Three runs of the
+identical input on the identical version gave 6899, 6899 and **6898** bytes. The
+immutability test must therefore compare the STORED bytes across the edits it makes — it
+must never re-render and diff, which would fail for reasons that have nothing to do with
+immutability.
+
+**Reproducing the apt figures** (the count line sits ~138 lines above the tail, and a
+non-root `-s` run prints no size summary at all, so grep for it):
+
+```bash
+CONDUIT_REMOTE_DIR=/home/chris/conduit-phase4 ./scripts/remote.sh \
+  'apt-get -s install weasyprint | grep "upgraded,"; apt-get -s install python3-munkres weasyprint | grep "upgraded,"'
+```
 
 **Open, for Task 6 and the release.** CI proves the path on WeasyPrint **61.1** (Ubuntu
 24.04); the server will run **57.2** (Debian 12 bookworm) and nothing has yet rendered a

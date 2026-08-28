@@ -23,7 +23,12 @@ ldap = "not_relevant"
 sso = true
 disk = "2G"
 ram.build = "50M"
-ram.runtime = "400M"
+# 400M for the Node API as before, plus 300M for renders. A render is a separate
+# Python process, not memory the API already had: measured on the Debian 12 target
+# at 66.5MB peak RSS for a one-page quote and 97MB for a 435KB, 40-page document.
+# 300M is three of those at a rounded-up 100MB ceiling, and three is the number
+# Task 4's concurrency limit has to match -- until it exists, nothing bounds this.
+ram.runtime = "700M"
 
 [install]
 

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 
-/** A render that failed for any reason: spawn, timeout, non-zero exit, or size cap. */
+/** A render that failed for any reason: spawn, timeout, non-zero exit, or a cap. */
 export class RenderError extends Error {
   constructor(message: string, readonly detail: string = "") {
     super(message);
@@ -11,14 +11,14 @@ export class RenderError extends Error {
 export interface RenderOptions {
   timeoutMs?: number;
   maxBytes?: number;
+  maxInputBytes?: number;
 }
 
 /**
- * 20s, which is 27x the measurement rather than a guess at one. A one-page quote
- * with a logo, eight line items and a page-level stylesheet took 738ms end to end
- * on WeasyPrint 61.1 in CI -- most of it the Python interpreter starting, which a
- * longer document does not pay twice. documents-render.test.ts renders that page
- * and prints the figure, so the number above stays checkable.
+ * 20s, which is 34x the measurement rather than a guess at one. Measured on the
+ * server's WeasyPrint 57.2: a one-page quote with a logo, eight line items and a
+ * page-level stylesheet takes 570-580ms end to end, most of it the Python
+ * interpreter starting. A 435KB, 40-page document takes 3.9s.
  *
  * The cap is therefore the ceiling on a pathological render, not a budget for a
  * normal one. It also bounds how long the issuing transaction holds its row lock
@@ -27,13 +27,24 @@ export interface RenderOptions {
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 /**
- * 25MB, against a measured 12,457 bytes for that same one-page quote -- so this is
- * three orders of magnitude of headroom rather than a tuned limit. It exists to
+ * 25MB of OUTPUT, against a measured 14,005 bytes for that one-page quote and
+ * 120KB for the 40-page one. Three orders of magnitude of headroom: this exists to
  * stop an unbounded stream being accumulated in memory, not to reject a large but
- * legitimate document, and a document big enough to approach it would hit the
- * timeout long first.
+ * legitimate document.
  */
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
+
+/**
+ * 2MB of INPUT, and this one is not headroom -- it is chosen to bite at roughly the
+ * same document size the timeout does. The realistic quote above is 1.8KB of HTML;
+ * 435KB of HTML costs 3.9s and 97MB of RSS, so 2MB is about where a render would
+ * approach the 20s ceiling anyway. Rejecting it here makes that failure immediate
+ * and free instead of costing 20 seconds and 100+MB first.
+ *
+ * It is a real limit rather than a formality because templates are user-editable
+ * and a merged document is template plus data plus an inlined logo.
+ */
+const DEFAULT_MAX_INPUT_BYTES = 2 * 1024 * 1024;
 
 /** Enough stderr to diagnose a failure, bounded so a chatty child cannot balloon it. */
 const STDERR_CAP_BYTES = 8 * 1024;
@@ -42,26 +53,82 @@ const STDERR_CAP_BYTES = 8 * 1024;
 const PDF_MAGIC = "%PDF-";
 
 /**
- * The child's environment, and the mechanism that makes rendering touch no network.
+ * The renderer, and the reason this module spawns Python rather than the `weasyprint`
+ * CLI.
  *
- * `--base-url` being absent is NOT that mechanism, which is the trap this constant
- * exists to avoid. A base URL is only what RELATIVE references resolve against;
- * an absolute `http://...` in the document needs nothing to resolve against and is
- * fetched regardless. WeasyPrint's fetcher is urllib, and `urlopen` builds its
- * opener with a `ProxyHandler` that reads exactly these variables, so pointing them
- * at a closed loopback port makes every http(s) fetch fail at connect instead of
- * reaching the network. A document that slipped a remote URL past the sanitiser
- * therefore renders without that asset rather than fetching it -- which is the
- * belt to the sanitiser's braces, and what removes SSRF from a feature whose input
- * is user-authored HTML.
+ * WeasyPrint's `default_url_fetcher` hands every absolute URI to `urllib.urlopen`,
+ * whose opener carries `FileHandler` alongside the HTTP ones -- and 57.2's fetcher
+ * has an explicit `file://` branch before it, so local file access is a supported
+ * path, not an oversight. WeasyPrint also embeds `<link rel=attachment>` targets
+ * into the PDF's /EmbeddedFiles dictionary. Demonstrated on the server against this
+ * module's previous CLI invocation: `<link rel="attachment" href="file:///etc/passwd">`
+ * exited 0 and returned a PDF from which the file was recovered byte for byte. On a
+ * deployment that is the AES key at $DATA_DIR/mail.key -- readable by the `conduit`
+ * user the API runs as -- and with it every stored IMAP and SMTP password.
  *
- * Port 9 is the discard service, which nothing on this host listens on; a connect
- * to a closed loopback port is refused immediately rather than hanging, so the
- * failure costs the render no time.
+ * The CLI offers no way to restrict schemes. The API does: `url_fetcher` replaces the
+ * default outright, so a scheme that is not `data:` is never fetched by anything.
+ * That is the control. It is verified on 57.2 (the server) and 61.1 (CI) against
+ * file:// through three different elements, http://, ftp:// and jar:.
  *
- * documents-render.test.ts proves this in both directions against a loopback server
- * that records who asks it for anything: a bare `weasyprint` DOES fetch an absolute
- * URL with no base URL set (confirmed on 61.1 in CI), and `renderPdf` does not.
+ * A blocked URL EXITS NON-ZERO rather than rendering without the asset. By the time
+ * HTML reaches this module, documents-template.ts has stripped every non-`data:` URL,
+ * so one arriving here means either an attack or a hole in that sanitiser -- exactly
+ * the moment to fail the render, spend no document number, and leave a line in the
+ * log, rather than quietly hand back a plausible-looking quote.
+ *
+ * Kept inline rather than in a checked-in .py file so there is no second artifact for
+ * the release tarball to omit and no runtime path to resolve: it ships as part of the
+ * compiled JavaScript or not at all.
+ */
+const RENDER_SCRIPT = `
+import io
+import sys
+import weasyprint
+from weasyprint.urls import default_url_fetcher
+
+blocked = []
+
+
+def fetcher(url, timeout=10, ssl_context=None):
+    if url.startswith('data:'):
+        return default_url_fetcher(url, timeout, ssl_context)
+    blocked.append(url[:120])
+    raise ValueError('conduit: blocked non-data URL')
+
+
+document = weasyprint.HTML(
+    string=sys.stdin.buffer.read().decode('utf-8'),
+    base_url=None,
+    url_fetcher=fetcher,
+)
+buffer = io.BytesIO()
+document.write_pdf(buffer)
+if blocked:
+    sys.stderr.write('conduit-blocked-url: ' + ' | '.join(blocked) + '\\n')
+    sys.exit(2)
+sys.stdout.buffer.write(buffer.getvalue())
+`;
+
+/**
+ * A cheap second barrier, and NOT the one that matters -- recorded plainly because
+ * an earlier version of this file claimed it was.
+ *
+ * WeasyPrint's fetcher is urllib, and `urlopen` builds its opener with a
+ * `ProxyHandler` that reads exactly these variables, so pointing them at a closed
+ * loopback port makes an http(s) fetch fail at connect. What that does NOT cover is
+ * every other scheme: `file://` goes to `FileHandler` and never consults a proxy at
+ * all, which is how the exfiltration above worked underneath these very settings.
+ * RENDER_SCRIPT's allowlist is the control; this only narrows what a future edit to
+ * that script could reach by accident.
+ *
+ * Lowercase `http_proxy` is the one that counts (`getproxies_environment` ignores the
+ * uppercase form when REQUEST_METHOD is set, per CVE-2016-1000110); the uppercase
+ * pair is here for anything else in the child that reads them. `no_proxy` is emptied
+ * to override an inherited `no_proxy=*`, not because empty differs from absent.
+ *
+ * Port 9 is the discard service, which nothing here listens on; a connect to a closed
+ * loopback port is refused immediately rather than hanging.
  */
 const NO_NETWORK_ENV = {
   http_proxy: "http://127.0.0.1:9",
@@ -74,18 +141,27 @@ const NO_NETWORK_ENV = {
 } as const;
 
 /**
- * WeasyPrint reads HTML from stdin and writes PDF to stdout when both paths are "-".
+ * Render HTML to a PDF, reading nothing but the string it is given.
  *
- * Rejects with a RenderError for every failure, and never resolves with anything
- * that is not a PDF: a child that exits 0 having written nothing (or having written
- * something else) is a failed render, not an empty document.
+ * Rejects with a RenderError for every failure, and never resolves with anything that
+ * is not a PDF: a child that exits 0 having written nothing (or something else) is a
+ * failed render, not an empty document.
  */
 export async function renderPdf(html: string, options: RenderOptions = {}): Promise<Buffer> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+  const maxInputBytes = options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES;
+
+  const inputBytes = Buffer.byteLength(html, "utf8");
+  if (inputBytes > maxInputBytes) {
+    throw new RenderError(
+      "document is too large to render",
+      `${String(inputBytes)} bytes of HTML, limit ${String(maxInputBytes)}`,
+    );
+  }
 
   return await new Promise<Buffer>((resolve, reject) => {
-    const child = spawn("weasyprint", ["-", "-"], {
+    const child = spawn("python3", ["-c", RENDER_SCRIPT], {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...NO_NETWORK_ENV },
     });
@@ -124,20 +200,25 @@ export async function renderPdf(html: string, options: RenderOptions = {}): Prom
       errSize += chunk.length;
       err.push(chunk);
     });
-    child.on("error", (e) => { fail("could not start weasyprint", e.message); });
+    child.on("error", (e) => { fail("could not start the renderer", e.message); });
     child.on("close", (code) => {
       clearTimeout(timer);
       if (settled) return;
       settled = true;
+      const stderr = detail();
+      if (stderr.includes("conduit-blocked-url:")) {
+        reject(new RenderError("document referenced a blocked URL", stderr));
+        return;
+      }
       if (code !== 0) {
-        reject(new RenderError(`weasyprint exited ${String(code)}`, detail()));
+        reject(new RenderError(`renderer exited ${String(code)}`, stderr));
         return;
       }
       const pdf = Buffer.concat(out);
       if (pdf.subarray(0, PDF_MAGIC.length).toString("ascii") !== PDF_MAGIC) {
         reject(new RenderError(
-          "weasyprint produced no PDF",
-          `${String(pdf.length)} bytes on stdout; ${detail()}`,
+          "renderer produced no PDF",
+          `${String(pdf.length)} bytes on stdout; ${stderr}`,
         ));
         return;
       }
@@ -152,10 +233,16 @@ export async function renderPdf(html: string, options: RenderOptions = {}): Prom
   });
 }
 
-/** Whether the binary is present. Never throws -- the tests gate on it. */
+/**
+ * Whether a render can run here. Never throws -- the tests gate on it.
+ *
+ * Probes `python3 -c "import weasyprint"` rather than the `weasyprint` executable,
+ * because that is what renderPdf actually spawns: a PATH whose python3 cannot import
+ * the module would pass a CLI check and then fail every render.
+ */
 export async function weasyprintAvailable(): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
-    const child = spawn("weasyprint", ["--version"], { stdio: "ignore" });
+    const child = spawn("python3", ["-c", "import weasyprint"], { stdio: "ignore" });
     child.on("error", () => { resolve(false); });
     child.on("close", (code) => { resolve(code === 0); });
   });
