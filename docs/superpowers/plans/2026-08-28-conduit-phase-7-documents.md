@@ -269,14 +269,25 @@ correction is legible rather than silently patched.
    the loopback server); `ftp://`; `jar:`. A relative reference still renders without the
    asset, because `base_url=None` means the fetcher is never reached at all.
 
-   **The attachment vector is VERSION-CONDITIONAL, and the vulnerable version is the
-   one the server runs.** On 57.2 `<link rel=attachment href="file://...">` reaches the
-   fetcher and the target lands in `/EmbeddedFiles`; on CI's 61.1 the fetcher is never
-   called for that element and the render simply succeeds with nothing embedded. Why
-   61.1 differs was not established — only that it does, found by a red CI run against a
-   test that asserted the 57.2 mechanism. That test now asserts the PROPERTY (the file
-   never reaches the PDF) rather than the mechanism, which is what holds on both. The
-   `img` and `stylesheet` file:// vectors exist on both versions and are refused on both.
+   **The fetcher alone was STILL not enough, and a red CI run is what said so.** On
+   61.1 the attachment case rendered happily with the secret inside it. The reason,
+   established by a diagnostic run on the runner rather than guessed:
+   `Attachment.__init__` binds `url_fetcher=default_url_fetcher` **as a default
+   argument**, so the fetcher passed to `HTML(...)` never reaches an attachment — the
+   diagnostic printed `FETCHER-CALLS []` alongside the file's contents in the output.
+   57.2 does route attachments through the document's fetcher, so 57.2 was covered by
+   accident. (The first red run also misled: `/EmbeddedFiles` looked absent on 61.1
+   only because it compresses object streams, so a raw byte search missed it. Search
+   inflated streams, or render with `uncompressed_pdf=True`, before concluding.)
+
+   **So the renderer has three controls, and the third is deliberately untested.**
+   (1) the `data:`-only fetcher; (2) `rel=attachment` deleted from the parsed tree
+   before rendering, which is upstream of whichever fetcher a version uses and covers
+   `<a rel=attachment>` as well as `<link>`; (3) the finished PDF is refused if it
+   contains embedded files at all. Only (3) is a statement about the output rather than
+   a mechanism, which is why it is there — and no test can reach it while (2) closes the
+   only route HTML has. That is recorded in the code comment rather than left for a
+   reviewer to find.
 
    **The lesson worth carrying into Task 3:** the previous suite tested exactly one
    scheme and generalised to "fetches nothing". Anything asserting a no-network or

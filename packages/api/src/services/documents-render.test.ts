@@ -362,30 +362,35 @@ describe("renderPdf and the schemes it will fetch", () => {
     });
   }
 
-  itReal("never lets a file:// attachment reach the PDF, on either version", async () => {
-    // THE ONE VERSION-CONDITIONAL CASE, and it is asserted as the property rather
-    // than the mechanism because the two versions differ.
+  itReal("refuses a file:// attachment, which the fetcher alone did not stop", async () => {
+    // The case that needed a second control, and it is worth knowing why.
     //
-    // On the server's 57.2 this is the exfiltration that forced this whole module to
-    // stop using the CLI: WeasyPrint fetches the target and writes it into the PDF's
-    // /EmbeddedFiles, so the fetcher sees it and the render is refused. On CI's 61.1
-    // the fetcher is never called for this element at all and the render simply
-    // succeeds with nothing embedded. Why 61.1 differs is not established here; only
-    // that it does. Either way the file must not come out the other side, so that is
-    // what is asserted.
+    // 57.2 routes attachments through the document's url_fetcher, so control 1 caught
+    // this. 61.1 does not: `Attachment.__init__` binds `url_fetcher=default_url_fetcher`
+    // as a DEFAULT ARGUMENT, so the fetcher passed to `HTML(...)` never arrives, and a
+    // CI run proved the file was read and embedded with the fetcher recording no calls
+    // at all. Deleting `rel=attachment` from the parsed tree is what makes this refuse
+    // on both, and asserting the strict rejection here is what would notice if that
+    // strip were ever removed -- an assertion tolerant of "or renders cleanly" would
+    // have passed on 57.2 and hidden the 61.1 hole.
     hits.length = 0;
-    const result = await renderPdf(
+    const error = await renderPdf(
       `<html><body><link rel="attachment" href="file://${secretPath}"></body></html>`,
     ).catch((e: unknown) => e);
 
-    if (result instanceof RenderError) {
-      expect(result.message).toBe("document referenced a blocked URL");
-    } else {
-      const pdf = result as Buffer;
-      expect(pdf.includes("/EmbeddedFiles")).toBe(false);
-      expect(pdfContains(pdf, SECRET)).toBe(false);
-    }
+    expect(error).toBeInstanceOf(RenderError);
+    expect((error as RenderError).message).toBe("document referenced a blocked URL");
+    expect((error as RenderError).detail).toContain("rel=attachment");
     expect(hits).toEqual([]);
+  });
+
+  itReal("refuses an <a rel=attachment>, not only a <link>", async () => {
+    const error = await renderPdf(
+      `<html><body><a rel="noopener attachment" href="file://${secretPath}">x</a></body></html>`,
+    ).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(RenderError);
+    expect((error as RenderError).message).toBe("document referenced a blocked URL");
   });
 
   itReal("renders a data: image, which is the one scheme a document may use", async () => {
@@ -396,12 +401,14 @@ describe("renderPdf and the schemes it will fetch", () => {
 
   itReal("renders without a relative reference rather than failing on it", async () => {
     // base_url is None, so a relative URL resolves to nothing and the fetcher is
-    // never reached. This is the one case that degrades quietly, and it is the
-    // harmless one: nothing was read and nothing was fetched.
+    // never reached. This is the one case that degrades quietly, so it is also the
+    // one worth checking the OUTPUT of: the reference names a real file next to the
+    // rendering process, and neither its contents nor a request for it appear.
     hits.length = 0;
-    const pdf = await renderPdf(`<html><body><img src="../../etc/passwd"></body></html>`);
+    const pdf = await renderPdf(`<html><body><img src="pretend-mail.key"></body></html>`);
 
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(pdfContains(pdf, SECRET)).toBe(false);
     expect(hits).toEqual([]);
   });
 

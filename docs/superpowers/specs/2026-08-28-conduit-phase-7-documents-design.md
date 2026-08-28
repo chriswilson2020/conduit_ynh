@@ -87,15 +87,31 @@ Two properties are requirements, not defaults:
   `$DATA_DIR/mail.key`, readable by the user the API runs as, and with it every stored
   IMAP and SMTP password.
 
-  The property is therefore enforced where it can be: `documents-render.ts` spawns
-  `python3` with WeasyPrint's API and a **`url_fetcher` that allowlists `data:` and
-  raises on every other scheme**, and a blocked URL fails the render rather than
-  degrading quietly — at that point either the document is an attack or Task 3's
-  sanitiser has a hole, and both deserve an alarm. The proxy variables stay as a cheap
-  second barrier for http(s), explicitly not as the control. Tested per scheme —
-  `file://` through three elements, `http://`, `ftp://`, `jar:` — on both 57.2 and 61.1,
-  because "tested one scheme and generalised" is exactly how the previous draft survived.
-  Task 3's sanitiser still strips remote URLs: that is the braces to this belt.
+  The property is therefore enforced where it can be, and it takes **three** controls
+  rather than one — the third and fourth drafts of this bullet both had to be corrected
+  by evidence too. `documents-render.ts` spawns `python3` with WeasyPrint's API and:
+
+  1. a **`url_fetcher` that allowlists `data:`** and raises on every other scheme;
+  2. **`rel=attachment` deleted from the parsed tree** before rendering, because control
+     1 does not reach attachments on every version — 61.1's `Attachment.__init__` binds
+     the DEFAULT fetcher as a default argument, so the document's fetcher never arrives
+     and the file is read with no fetcher call recorded at all;
+  3. **the finished PDF refused if it embeds any file**, which is the only one of the
+     three that is a statement about the output rather than a mechanism, and so the only
+     one that would survive a future WeasyPrint growing a new route to the filesystem.
+
+  A blocked URL fails the render rather than degrading quietly — at that point either
+  the document is an attack or Task 3's sanitiser has a hole, and both deserve an alarm.
+  The proxy variables stay as a cheap second barrier for http(s), explicitly not as the
+  control. Tested per scheme — `file://` through four elements, `http://`, `ftp://`,
+  `jar:` — on both 57.2 and 61.1, because "tested one scheme and generalised" is exactly
+  how the earlier drafts survived. Task 3's sanitiser still strips remote URLs: that is
+  the braces to this belt.
+
+  **The transferable lesson, since Task 3 faces the same shape of problem:** every claim
+  in this bullet that was wrong was wrong because it named a MECHANISM and tested that.
+  The two that held were properties — "nothing was fetched", "the file is not in the
+  output" — observed directly.
 - **A timeout, an output cap and an input cap.** A render that hangs, is fed an
   implausible document, or produces one, fails cleanly and leaves no `files` row and no
   number allocated.

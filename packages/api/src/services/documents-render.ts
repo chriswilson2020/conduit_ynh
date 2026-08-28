@@ -54,22 +54,35 @@ const PDF_MAGIC = "%PDF-";
 
 /**
  * The renderer, and the reason this module spawns Python rather than the `weasyprint`
- * CLI.
+ * CLI. It has THREE controls, because one was not enough and two were not either.
  *
- * WeasyPrint's `default_url_fetcher` hands every absolute URI to `urllib.urlopen`,
- * whose opener carries `FileHandler` alongside the HTTP ones -- and 57.2's fetcher
- * has an explicit `file://` branch before it, so local file access is a supported
- * path, not an oversight. WeasyPrint also embeds `<link rel=attachment>` targets
- * into the PDF's /EmbeddedFiles dictionary. Demonstrated on the server against this
- * module's previous CLI invocation: `<link rel="attachment" href="file:///etc/passwd">`
- * exited 0 and returned a PDF from which the file was recovered byte for byte. On a
- * deployment that is the AES key at $DATA_DIR/mail.key -- readable by the `conduit`
- * user the API runs as -- and with it every stored IMAP and SMTP password.
+ * The threat is a local file read, not just SSRF. `default_url_fetcher` hands every
+ * absolute URI to `urllib.urlopen`, whose opener carries `FileHandler` alongside the
+ * HTTP ones, and WeasyPrint writes `<link rel=attachment>` targets into the PDF's
+ * /EmbeddedFiles. Demonstrated on the server against this module's earlier CLI
+ * invocation: `<link rel="attachment" href="file:///etc/passwd">` exited 0 and the
+ * file came back out of the PDF byte for byte. On a deployment the interesting file
+ * is $DATA_DIR/mail.key -- readable by the `conduit` user the API runs as, and with
+ * it every stored IMAP and SMTP password.
  *
- * The CLI offers no way to restrict schemes. The API does: `url_fetcher` replaces the
- * default outright, so a scheme that is not `data:` is never fetched by anything.
- * That is the control. It is verified on 57.2 (the server) and 61.1 (CI) against
- * file:// through three different elements, http://, ftp:// and jar:.
+ * 1. A `url_fetcher` that allowlists `data:` and raises otherwise. The CLI has no
+ *    flag for this; the API does, and it replaces the default outright. This covers
+ *    images, stylesheets and fonts, on both versions.
+ *
+ * 2. `rel=attachment` is deleted from the parsed tree before rendering, because
+ *    control 1 does NOT reach attachments on every version. Established by a CI run
+ *    rather than assumed: 57.2 routes attachments through the document's fetcher,
+ *    but on 61.1 `Attachment.__init__` binds `url_fetcher=default_url_fetcher` as a
+ *    default argument, so the one passed to `HTML(...)` never arrives and the file
+ *    was read with the fetcher recording no calls at all. Stripping the attribute
+ *    removes the vector upstream of whichever fetcher a version happens to use.
+ *
+ * 3. The finished PDF is refused if it contains embedded files at all. This is the
+ *    only control that is a statement about the OUTPUT rather than about a mechanism,
+ *    so it is the one that would survive a future WeasyPrint growing a new route to
+ *    the filesystem. **No test reaches it**, because control 2 closes the only route
+ *    HTML currently has -- that is a deliberate backstop, not dead code, and this
+ *    comment is the honest record that it is unexercised.
  *
  * A blocked URL EXITS NON-ZERO rather than rendering without the asset. By the time
  * HTML reaches this module, documents-template.ts has stripped every non-`data:` URL,
@@ -83,7 +96,10 @@ const PDF_MAGIC = "%PDF-";
  */
 const RENDER_SCRIPT = `
 import io
+import re
 import sys
+import zlib
+
 import weasyprint
 from weasyprint.urls import default_url_fetcher
 
@@ -97,17 +113,44 @@ def fetcher(url, timeout=10, ssl_context=None):
     raise ValueError('conduit: blocked non-data URL')
 
 
+def has_embedded_files(raw):
+    if b'/EmbeddedFiles' in raw:
+        return True
+    for match in re.finditer(rb'stream\\r?\\n', raw):
+        start = match.end()
+        end = raw.find(b'endstream', start)
+        if end == -1:
+            continue
+        try:
+            if b'/EmbeddedFiles' in zlib.decompress(raw[start:end]):
+                return True
+        except zlib.error:
+            pass
+    return False
+
+
 document = weasyprint.HTML(
     string=sys.stdin.buffer.read().decode('utf-8'),
     base_url=None,
     url_fetcher=fetcher,
 )
+
+for element in document.etree_element.iter():
+    rel = element.get('rel')
+    if rel and 'attachment' in rel.lower().split():
+        del element.attrib['rel']
+        blocked.append('rel=attachment on <%s>' % element.tag)
+
 buffer = io.BytesIO()
 document.write_pdf(buffer)
+pdf = buffer.getvalue()
 if blocked:
     sys.stderr.write('conduit-blocked-url: ' + ' | '.join(blocked) + '\\n')
     sys.exit(2)
-sys.stdout.buffer.write(buffer.getvalue())
+if has_embedded_files(pdf):
+    sys.stderr.write('conduit-blocked-url: PDF contains embedded files\\n')
+    sys.exit(2)
+sys.stdout.buffer.write(pdf)
 `;
 
 /**
