@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { migrationsFolder } from "../db/client.js";
-import { renderPdf, weasyprintAvailable } from "./documents-render.js";
+import { pdfEmbedsFiles, renderPdf, weasyprintAvailable } from "./documents-render.js";
+import { prepareDocumentHtml, type MergeContext } from "./documents-template.js";
 
 /**
  * DOES THE SEEDED QUOTE TEMPLATE ACTUALLY RENDER?
@@ -15,13 +16,18 @@ import { renderPdf, weasyprintAvailable } from "./documents-render.js";
  * is the same "a mechanism was tested, a property was not" shape Task 1's
  * retrospective warns about. This is that property.
  *
- * WHAT IT DELIBERATELY DOES NOT DO IS MERGE. Task 3 owns the resolver, and the
- * coordinator has already ruled its block syntax will change ({{#path}}/{{^path}}),
- * so a stand-in here would be a second implementation that goes stale by design.
- * Stripping every merge construct instead is correct under any of those languages
- * for the one context this file cares about -- an install where nothing has been
- * filled in -- and leaves exactly the stylesheet and the markup, which is what is
- * unguarded. A FILLED render belongs in Task 4, beside the real buildContext.
+ * IT NOW MERGES, WHICH IT DELIBERATELY DID NOT BEFORE. Task 2 left this stripping
+ * merge constructs with a regex rather than resolving them, because Task 3 owned the
+ * resolver and the coordinator had already ruled its block syntax would change -- a
+ * stand-in would have gone stale by design. Task 3 has landed, so the real resolver
+ * and the real sanitiser run here, in the same order Task 4 will call them
+ * (prepareDocumentHtml: merge, then sanitise).
+ *
+ * THE TWO STATES ARE THE POINT. The seeded template wraps the logo and every
+ * optional field in {{#...}} blocks, and the case that matters is the install that
+ * filled in none of them: no empty <img>, no "VAT" standing over a blank. That is
+ * asserted on the merged HTML and again on the PDF, where an image XObject either
+ * exists or does not.
  *
  * Gated on the binary the way documents-render.test.ts's real half is, and CI
  * installs WeasyPrint, so the assertions below run there on every push.
@@ -38,12 +44,54 @@ function seededTemplate(): string {
   return match[1].replaceAll("''", "'");
 }
 
-/** Every merge construct removed: blocks first, then scalars. */
-function withoutMergeFields(template: string): string {
-  return template
-    .replace(/\{\{#[\w.]+\}\}[\s\S]*?\{\{\/[\w.]+\}\}/g, "")
-    .replace(/\{\{[^}]*\}\}/g, "");
-}
+/** A 1x1 PNG, scaled by the template's own .logo rule. Stands in for a real logo. */
+const LOGO_PNG =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4" +
+  "2mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/** Every key Task 2's DONE block promises the context will carry, all empty. */
+const EMPTY_CONTEXT: MergeContext = {
+  org: {
+    name: "", addressLines: "", email: "", phone: "", website: "", bankDetails: "",
+    vatNumber: "", registrationNumber: "", logoDataUri: "",
+  },
+  document: {
+    number: "", issueDate: "", validUntilDate: "", recipientName: "",
+    recipientContactName: "", recipientAddress: "", subtotal: "", tax: "", total: "",
+    notes: "", terms: "",
+  },
+  lines: [],
+};
+
+/** A real quote with nothing optional filled in: no logo, no VAT, no valid-until. */
+const WITHOUT_LOGO: MergeContext = {
+  org: { ...EMPTY_CONTEXT.org, name: "Listerdale Life Sciences", addressLines: "1 High St\n1015 CJ Amsterdam" },
+  document: {
+    ...EMPTY_CONTEXT.document,
+    number: "QUO-2026-0001", issueDate: "2026-08-28", recipientName: "Acme Manufacturing BV",
+    subtotal: "20,000.00", tax: "4,200.00", total: "24,200.00",
+  },
+  lines: Array.from({ length: 8 }, (_, i) => ({
+    description: `Consultancy, phase ${String(i + 1)}`,
+    qty: "2", unitPrice: "1,250.00", taxRate: "21%", lineTotal: "2,500.00",
+  })),
+};
+
+/** The same quote from an install that filled everything in. */
+const WITH_LOGO: MergeContext = {
+  org: {
+    ...WITHOUT_LOGO.org, logoDataUri: LOGO_PNG, email: "hello@listerdale.test",
+    phone: "+31 20 123 4567", website: "listerdale.test",
+    bankDetails: "NL00 BANK 0123 4567 89", vatNumber: "NL001234567B01",
+    registrationNumber: "12345678",
+  },
+  document: {
+    ...WITHOUT_LOGO.document, validUntilDate: "2026-09-27",
+    recipientContactName: "Jane Smith", recipientAddress: "2 Low St\n1016 AB Amsterdam",
+    notes: "Thank you for the enquiry.", terms: "Payment within 30 days.",
+  },
+  lines: WITHOUT_LOGO.lines,
+};
 
 /**
  * The PDF's bytes plus every Flate stream in it, inflated.
@@ -86,9 +134,72 @@ function pageCount(pdf: Buffer): number {
   return counts.length === 0 ? 0 : Math.max(...counts);
 }
 
+/** An image XObject, which is what a `data:` logo becomes and nothing else here does. */
+function hasImage(pdf: Buffer): boolean {
+  return /\/Subtype\s*\/Image/.test(pdfText(pdf));
+}
+
 describe("the seeded quote template", () => {
-  it("has no merge construct left after stripping, so the render below is the CSS and markup alone", () => {
-    expect(withoutMergeFields(seededTemplate())).not.toContain("{{");
+  it("resolves every merge construct in it, whichever fields are filled in", () => {
+    // Not "the regex found no {{" -- the real resolver ran and left nothing behind,
+    // which is a different claim and the one that matters: a token the resolver does
+    // not recognise stays on the page as literal text.
+    for (const context of [EMPTY_CONTEXT, WITHOUT_LOGO, WITH_LOGO]) {
+      expect(prepareDocumentHtml(seededTemplate(), context)).not.toContain("{{");
+    }
+  });
+
+  it("has no merge field inside its CSS, where HTML escaping is the wrong escaping", () => {
+    // A `{{...}}` in a stylesheet is substituted with &quot; and &amp; where CSS
+    // wants neither, and the sanitiser destroys a style ATTRIBUTE that still holds
+    // one. Neither is a security hole -- prepareDocumentHtml sanitises after merging,
+    // so a URL smuggled through a value is still caught -- but both are silently
+    // broken CSS, so the seed keeps its merge fields out of both positions.
+    const template = seededTemplate();
+    const styleBlock = /<style>([\s\S]*?)<\/style>/.exec(template)?.[1] ?? "";
+
+    expect(styleBlock).not.toContain("{{");
+    expect(template).not.toMatch(/style="[^"]*\{\{/);
+  });
+
+  it("keeps the page-layout CSS through the sanitiser", () => {
+    // The document profile exists to allow exactly this, and the seed is what uses
+    // it: an @page rule with a nested at-rule inside it, and pre-line whitespace.
+    const html = prepareDocumentHtml(seededTemplate(), WITH_LOGO);
+
+    expect(html).toContain("@page");
+    expect(html).toContain("@bottom-center");
+    expect(html).toContain("white-space: pre-line");
+  });
+
+  it("prints no empty image and no orphaned label when nothing optional is filled in", () => {
+    const html = prepareDocumentHtml(seededTemplate(), WITHOUT_LOGO);
+
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("Valid until");
+    expect(html).not.toContain("VAT");
+    expect(html).not.toContain("Company registration");
+    // ...while the quote itself is still a quote.
+    expect(html).toContain("Quote QUO-2026-0001");
+    expect(html).toContain("Acme Manufacturing BV");
+    expect(html).toContain("24,200.00");
+  });
+
+  it("prints all of it when the install has filled everything in", () => {
+    const html = prepareDocumentHtml(seededTemplate(), WITH_LOGO);
+
+    expect(html).toContain(`<img src="${LOGO_PNG}"`);
+    expect(html).toContain("Valid until");
+    expect(html).toContain("VAT NL001234567B01");
+    expect(html).toContain("Company registration 12345678");
+    expect(html).toContain("Jane Smith");
+  });
+
+  it("says so rather than printing an empty table when a quote has no lines", () => {
+    const html = prepareDocumentHtml(seededTemplate(), EMPTY_CONTEXT);
+
+    expect(html).toContain("No line items.");
+    expect(html).not.toContain("<tr><td class=\"pre\">");
   });
 
   // THE READER, PROVED AGAINST THE THING THAT BROKE IT, and provable without a
@@ -113,7 +224,8 @@ describe("the seeded quote template", () => {
   });
 
   itReal("renders to a PDF on an install where nothing has been filled in", async () => {
-    const pdf = await renderPdf(withoutMergeFields(seededTemplate()));
+    const html = prepareDocumentHtml(seededTemplate(), EMPTY_CONTEXT);
+    const pdf = await renderPdf(html);
 
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
     // An empty quote is one page. More would mean the stylesheet had started
@@ -126,11 +238,37 @@ describe("the seeded quote template", () => {
   // wrong in a way nobody notices until it is on paper. A4 is 210x297mm, which is
   // 595.28 x 841.89 PostScript points; Letter is 612 x 792.
   itReal("puts the page on A4, which is what the @page rule is for", async () => {
-    const pdf = await renderPdf(withoutMergeFields(seededTemplate()));
+    const pdf = await renderPdf(prepareDocumentHtml(seededTemplate(), EMPTY_CONTEXT));
     const mediaBox = /\/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]/.exec(pdfText(pdf));
 
     expect(mediaBox, "no /MediaBox found, even after inflating object streams").not.toBeNull();
     expect(Number(mediaBox![1])).toBeCloseTo(595.28, 1);
     expect(Number(mediaBox![2])).toBeCloseTo(841.89, 1);
   });
+
+  /**
+   * BOTH STATES, ON THE REAL RENDERER, and the assertion is about the PDF rather
+   * than about the HTML that went in: an image XObject is either in the file or it
+   * is not, whatever the markup looked like. Without a logo there must be none --
+   * that is "no broken image on a quote" stated where it is true.
+   */
+  itReal("renders with a logo and without, and only one of them carries an image", async () => {
+    const withoutHtml = prepareDocumentHtml(seededTemplate(), WITHOUT_LOGO);
+    const withHtml = prepareDocumentHtml(seededTemplate(), WITH_LOGO);
+    const without = await renderPdf(withoutHtml);
+    const withLogo = await renderPdf(withHtml);
+
+    // Printed because the input cap in documents-render.ts is calibrated against a
+    // real merged quote: these two lines are that measurement, on whichever
+    // WeasyPrint is running. The sizes move between versions, so nothing asserts one.
+    console.log(`[seed] no logo:   ${String(withoutHtml.length)} chars of HTML -> ${String(without.length)} bytes, ${String(pageCount(without))} page(s)`);
+    console.log(`[seed] with logo: ${String(withHtml.length)} chars of HTML -> ${String(withLogo.length)} bytes, ${String(pageCount(withLogo))} page(s)`);
+
+    expect(without.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(withLogo.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(hasImage(without)).toBe(false);
+    expect(hasImage(withLogo)).toBe(true);
+    // A logo is not an attachment, and control 3 must not think it is.
+    expect(pdfEmbedsFiles(withLogo)).toBe(false);
+  }, 60_000);
 });

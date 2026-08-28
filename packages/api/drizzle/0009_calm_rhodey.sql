@@ -115,6 +115,16 @@ CREATE INDEX "documents_deal_idx" ON "documents" ("deal_id");--> statement-break
 --    failure anyone would notice. schema.test.ts's "documents schema (0009)"
 --    block reads this row back and checks every token against that list.
 --
+--    THE BLOCK FORMS ARE {{#path}}...{{/path}} (render the body when the value
+--    is not empty) AND {{^path}}...{{/path}} (render it when it IS empty), with
+--    lines being the one repeated case. Every optional field below is wrapped in
+--    one, and that is not decoration: without it an install that never filled in
+--    a VAT number prints the word "VAT" over a blank on every quote it raises,
+--    and one that never uploaded a logo prints a broken <img src="">. A closer
+--    matches its own opener by depth, so blocks may be nested; an unclosed
+--    block is IGNORED and its body renders as ordinary content, which is why a
+--    missing {{/...}} costs a label rather than the rest of the page.
+--
 -- 2. No literal {{ may appear in the CSS -- it would be parsed as a merge
 --    field and substituted away. The stylesheet DOES contain one nested
 --    at-rule (@page { @bottom-center { ... } }), and what keeps it safe is the
@@ -141,15 +151,20 @@ CREATE INDEX "documents_deal_idx" ON "documents" ("deal_id");--> statement-break
 -- each line's own rate is what makes the total reconstructible, and it costs a
 -- column on a page that has room for it.
 --
--- WHAT IS DELIBERATELY ABSENT: the logo. org_profile.logo_file_id exists and
--- the merge context carries org.logoDataUri, but the merge language has no
--- conditional, so <img src="{{org.logoDataUri}}"> on an install with no logo
--- uploaded would render an <img src=""> on every quote. A missing logo is a
--- plain letterhead; a broken image is an ugly PDF for everyone who never
--- uploads one. Adding the slot needs an empty-safe form first -- the cheapest
--- being a transparent 1x1 data: URI supplied by the context when no logo is
--- set -- and until then it is one line for a user to add in Settings, where
--- the merge fields are listed on the page.
+-- THE LOGO IS HERE, AND IT IS WHY THE BLOCK FORM EXISTS. An earlier draft of
+-- this template left the slot out entirely, because <img src="{{org.logoDataUri}}">
+-- on an install that never uploaded one renders <img src=""> -- a broken image
+-- on every quote by default. The coordinator's ruling generalised the block
+-- form rather than supplying a transparent 1x1 placeholder, on the grounds that
+-- every optional field has the same shape and a placeholder fixes one of them.
+-- So the logo, the valid-until row, the contact name, the notes, the terms, the
+-- bank details, the VAT number and the registration number are each wrapped,
+-- and an install with none of them filled in renders a plain letterhead with no
+-- empty images and no labels standing over blanks.
+--
+-- The sanitiser is the belt to that braces: an <img> whose src does not survive
+-- is dropped entirely rather than left as an alt string, so a template that
+-- hard-codes the slot without a block still cannot print a broken image.
 --
 -- The footer carries page numbers and no merge field, also deliberately: a
 -- {{...}} inside a CSS string would be escaped as HTML, which is not CSS
@@ -161,6 +176,8 @@ body { font-family: sans-serif; font-size: 10.5pt; line-height: 1.45; color: #11
 h1 { font-size: 20pt; margin: 6mm 0 3mm; }
 .pre { white-space: pre-line; }
 .muted { color: #666; }
+.logo { margin-bottom: 4mm; }
+.logo img { max-height: 18mm; max-width: 60mm; }
 .right { text-align: right; }
 .label { font-size: 8.5pt; text-transform: uppercase; color: #666; }
 .party { margin-top: 7mm; }
@@ -177,26 +194,27 @@ table.totals tr.grand td { border-top: 0.4mm solid #111; font-size: 12pt; paddin
 .foot div { margin-top: 2mm; }
 </style>
 <div>
+{{#org.logoDataUri}}<div class="logo"><img src="{{org.logoDataUri}}" alt=""></div>{{/org.logoDataUri}}
 <div><strong>{{org.name}}</strong></div>
-<div class="pre">{{org.addressLines}}</div>
-<div>{{org.email}}</div>
-<div>{{org.phone}}</div>
-<div>{{org.website}}</div>
+{{#org.addressLines}}<div class="pre">{{org.addressLines}}</div>{{/org.addressLines}}
+{{#org.email}}<div>{{org.email}}</div>{{/org.email}}
+{{#org.phone}}<div>{{org.phone}}</div>{{/org.phone}}
+{{#org.website}}<div>{{org.website}}</div>{{/org.website}}
 </div>
 <h1>Quote {{document.number}}</h1>
 <table class="meta">
 <tr><td class="label">Issued</td><td>{{document.issueDate}}</td></tr>
-<tr><td class="label">Valid until</td><td>{{document.validUntilDate}}</td></tr>
+{{#document.validUntilDate}}<tr><td class="label">Valid until</td><td>{{document.validUntilDate}}</td></tr>{{/document.validUntilDate}}
 </table>
 <div class="party">
 <div class="label">To</div>
 <div><strong>{{document.recipientName}}</strong></div>
-<div>{{document.recipientContactName}}</div>
-<div class="pre">{{document.recipientAddress}}</div>
+{{#document.recipientContactName}}<div>{{document.recipientContactName}}</div>{{/document.recipientContactName}}
+{{#document.recipientAddress}}<div class="pre">{{document.recipientAddress}}</div>{{/document.recipientAddress}}
 </div>
 <table class="lines">
 <thead><tr><th>Description</th><th class="right">Qty</th><th class="right">Unit price</th><th class="right">Tax</th><th class="right">Amount</th></tr></thead>
-<tbody>{{#lines}}<tr><td class="pre">{{description}}</td><td class="right">{{qty}}</td><td class="right">{{unitPrice}}</td><td class="right">{{taxRate}}</td><td class="right">{{lineTotal}}</td></tr>{{/lines}}</tbody>
+<tbody>{{#lines}}<tr><td class="pre">{{description}}</td><td class="right">{{qty}}</td><td class="right">{{unitPrice}}</td><td class="right">{{taxRate}}</td><td class="right">{{lineTotal}}</td></tr>{{/lines}}{{^lines}}<tr><td class="muted" colspan="5">No line items.</td></tr>{{/lines}}</tbody>
 </table>
 <table class="totals">
 <tr><td class="label">Subtotal</td><td class="right">{{document.subtotal}}</td></tr>
@@ -204,9 +222,9 @@ table.totals tr.grand td { border-top: 0.4mm solid #111; font-size: 12pt; paddin
 <tr class="grand"><td><strong>Total</strong></td><td class="right"><strong>{{document.total}}</strong></td></tr>
 </table>
 <div class="foot">
-<div class="pre">{{document.notes}}</div>
-<div class="pre muted">{{document.terms}}</div>
-<div class="pre muted">{{org.bankDetails}}</div>
-<div class="muted">VAT {{org.vatNumber}}</div>
-<div class="muted">Company registration {{org.registrationNumber}}</div>
+{{#document.notes}}<div class="pre">{{document.notes}}</div>{{/document.notes}}
+{{#document.terms}}<div class="pre muted">{{document.terms}}</div>{{/document.terms}}
+{{#org.bankDetails}}<div class="pre muted">{{org.bankDetails}}</div>{{/org.bankDetails}}
+{{#org.vatNumber}}<div class="muted">VAT {{org.vatNumber}}</div>{{/org.vatNumber}}
+{{#org.registrationNumber}}<div class="muted">Company registration {{org.registrationNumber}}</div>{{/org.registrationNumber}}
 </div>');

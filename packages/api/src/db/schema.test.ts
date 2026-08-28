@@ -1257,15 +1257,31 @@ describe("documents schema (0009)", () => {
   // printed quote (unknown fields resolve to "" and never throw), and a field
   // listed here that the template stopped using is a context key built for
   // nothing. Either way the migration and this list have to move together.
+  //
+  // THE OPTIONAL ONES ARE LISTED SEPARATELY BECAUSE THE TEMPLATE OWES THEM A
+  // CONDITIONAL. Each of these is empty on a real install -- nobody fills in a
+  // registration number to raise one quote -- and each of them sits behind
+  // markup that would otherwise print: a label over a blank, or an <img src="">.
+  // Task 3's ruling generalised the block form for exactly this, so the seed
+  // wraps every one of them and this list is what says so. A field that moves
+  // between the two groups changes the rendered page for every install that
+  // left it empty.
+  const SEEDED_OPTIONAL = [
+    "org.logoDataUri", "org.addressLines", "org.email", "org.phone", "org.website",
+    "org.bankDetails", "org.vatNumber", "org.registrationNumber",
+    "document.validUntilDate", "document.recipientContactName", "document.recipientAddress",
+    "document.notes", "document.terms",
+  ];
   const SEEDED_FIELDS = [
-    "{{#lines}}", "{{/lines}}",
+    // The repeated block, and its inverse for a quote with no priced lines.
+    "{{#lines}}", "{{^lines}}", "{{/lines}}",
     "{{description}}", "{{qty}}", "{{unitPrice}}", "{{taxRate}}", "{{lineTotal}}",
-    "{{org.name}}", "{{org.addressLines}}", "{{org.email}}", "{{org.phone}}",
-    "{{org.website}}", "{{org.bankDetails}}", "{{org.vatNumber}}", "{{org.registrationNumber}}",
-    "{{document.number}}", "{{document.issueDate}}", "{{document.validUntilDate}}",
-    "{{document.recipientName}}", "{{document.recipientContactName}}", "{{document.recipientAddress}}",
+    // Always printed: the issuer's name, the number, the date and the totals.
+    "{{org.name}}",
+    "{{document.number}}", "{{document.issueDate}}", "{{document.recipientName}}",
     "{{document.subtotal}}", "{{document.tax}}", "{{document.total}}",
-    "{{document.notes}}", "{{document.terms}}",
+    // Each optional field appears three times: the block, the value, the closer.
+    ...SEEDED_OPTIONAL.flatMap((path) => [`{{#${path}}}`, `{{${path}}}`, `{{/${path}}}`]),
   ].sort();
 
   /** A deal and a files row -- the two NOT NULL foreign keys a document needs. */
@@ -1352,11 +1368,13 @@ describe("documents schema (0009)", () => {
       // single run-on line.
       expect(body).toContain("@page");
       expect(body).toContain("white-space: pre-line");
-      // Rendered on the server (WeasyPrint 57.2) before it was committed, and
-      // again after the tax column was added: merged with a filled org profile
-      // and 8 line items at mixed 21%/9% rates it is 4,090 bytes of HTML and a
-      // 16,493-byte two-page PDF, and merged with an entirely empty context it
-      // still renders (10,106 bytes).
+      // Rendered on the server (WeasyPrint 57.2) through the shipped renderPdf,
+      // most recently after Task 3 wrapped the logo and every optional field in
+      // conditional blocks: with a logo and everything filled in, 4,073 chars of
+      // merged HTML and a 16,640-byte two-page PDF; with no logo and nothing
+      // optional filled in, 3,445 chars and a 14,383-byte one-page PDF carrying
+      // no image XObject at all. documents-seed.test.ts is where those two
+      // renders happen on every push, and it prints the figures.
 
       // The hand-written index, ON A DATABASE THIS TEST MIGRATED FROM THE
       // FILES -- 0005's and 0008's reason: it exists in no drizzle snapshot,
