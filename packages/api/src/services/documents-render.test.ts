@@ -1,37 +1,87 @@
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type Server } from "node:http";
+import {
+  chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inflateSync } from "node:zlib";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { renderPdf, RenderError, weasyprintAvailable } from "./documents-render.js";
+import { deflateSync } from "node:zlib";
+import { afterAll, describe, expect, it } from "vitest";
+import {
+  pdfEmbedsFiles, renderPdf, RenderError, weasyprintAvailable,
+} from "./documents-render.js";
 
 /**
- * This file is in two halves, and the split is deliberate.
+ * This file is in three parts.
  *
- * The STUB half shadows `python3` on PATH with a shell script that behaves the way a
- * real renderer would when it goes wrong, and it runs everywhere -- including on a
+ * The STUB part shadows `python3` on PATH with a shell script that behaves the way a
+ * real renderer would when it goes wrong, and runs everywhere -- including on a
  * machine with no WeasyPrint, which is where the failure paths would otherwise never
  * be executed at all. Node resolves a bare command name against `env.PATH` at spawn
  * time and renderPdf builds the child's env from `process.env`, so prepending a
  * directory here is enough to intercept it. Nine tests below do that.
  *
- * The REAL half needs WeasyPrint and is gated on it, so a developer without it still
+ * The BACKSTOP part tests `pdfEmbedsFiles` directly on bytes. It is a pure function
+ * and most of its cases need no renderer at all -- which is the point: an earlier
+ * version of this control lived inside the Python and was reachable only through a
+ * subprocess behind two controls that short-circuit first, so its needle was wrong
+ * for a year of nobody noticing. (It was wrong for about an hour, in fact, but only
+ * because a reviewer went looking with a payload the suite never sent.)
+ *
+ * The REAL part needs WeasyPrint and is gated on it, so a developer without it still
  * gets a green suite. That gate is NOT the MAIL_IT pattern, which is an explicit
  * opt-in: this one probes, so it would skip silently if a packaging change ever
- * stopped delivering the binary. "is installed here" below is what makes that loud
- * in CI instead.
+ * stopped delivering the binary. The `runIf(CI)` tests are what make that loud.
  */
 
+const stubDir = mkdtempSync(join(tmpdir(), "conduit-render-"));
 const HAVE_WEASYPRINT = await weasyprintAvailable();
 const itReal = HAVE_WEASYPRINT ? it : it.skip;
 
-// ---------------------------------------------------------------- stub harness
+/**
+ * Push a file's atime a day into the past, leaving mtime alone.
+ *
+ * Two reasons, and the first is what made an earlier version of this file skip every
+ * read test on the server. A freshly written file has atime == mtime == now, so the
+ * atime a read then writes lands in the same millisecond and `atimeMs` does not
+ * visibly move. Backdating makes the delta a day rather than a rounding error.
+ * Second, `relatime` -- the usual default -- only refreshes atime when it is no later
+ * than mtime, which this guarantees rather than assumes.
+ */
+function backdateAtime(path: string): void {
+  const mtime = statSync(path).mtime;
+  utimesSync(path, new Date(Date.now() - 86_400_000), mtime);
+}
 
-let stubDir: string;
-let markerPath: string;
+/**
+ * Whether reading a file visibly advances its atime here.
+ *
+ * This is the suite's only honest way to see a read: it catches an `open` by ANY code
+ * path, where watching a loopback server catches only an http fetch that got past the
+ * proxy variables -- and those variables stop the request before it could arrive, so
+ * an assertion built on them proves nothing at all. That mistake is why this exists.
+ *
+ * `relatime` (the usual default) updates atime when the old atime is no later than
+ * mtime, which is true for a file just written -- so every read test below writes a
+ * FRESH file first. A `noatime` mount would silently defeat all of it, hence the
+ * self-test rather than an assumption.
+ */
+const ATIME_WORKS = ((): boolean => {
+  const probe = join(stubDir, "atime-self-test");
+  writeFileSync(probe, "probe");
+  backdateAtime(probe);
+  const before = statSync(probe).atimeMs;
+  readFileSync(probe);
+  return statSync(probe).atimeMs > before;
+})();
+const itReads = HAVE_WEASYPRINT && ATIME_WORKS ? it : it.skip;
+
 const originalPath = process.env.PATH ?? "";
+const markerPath = join(stubDir, "the-child-survived");
+
+afterAll(() => {
+  rmSync(stubDir, { recursive: true, force: true });
+});
 
 /** Write an executable `python3` into a fresh directory and return that directory. */
 function stub(body: string): string {
@@ -52,62 +102,60 @@ async function onPath<T>(dir: string, fn: () => Promise<T>, replace = false): Pr
   }
 }
 
-beforeAll(() => {
-  stubDir = mkdtempSync(join(tmpdir(), "conduit-render-"));
-  markerPath = join(stubDir, "the-child-survived");
-});
-
-afterAll(() => {
-  rmSync(stubDir, { recursive: true, force: true });
-});
+/** A fresh file with known contents, so relatime will report the next read. */
+function freshSecret(name: string): { path: string; atime: number } {
+  const path = join(stubDir, `${name}-${String(Date.now())}`);
+  writeFileSync(path, "conduit-secret-marker-9f3a\n", { mode: 0o600 });
+  backdateAtime(path);
+  return { path, atime: statSync(path).atimeMs };
+}
 
 // ------------------------------------------------------------- failure paths
 
 describe("renderPdf failure paths", () => {
   it("reports a non-zero exit and carries the child's stderr", async () => {
-    const dir = stub("echo 'Fatal: no font found' >&2\nexit 3");
+    const dir = stub("echo 'Fatal: no font found' >&2\nexit 5");
     const error = await onPath(dir, async () =>
       await renderPdf("<html></html>").catch((e: unknown) => e));
 
     expect(error).toBeInstanceOf(RenderError);
-    expect((error as RenderError).message).toBe("renderer exited 3");
+    expect((error as RenderError).message).toBe("renderer exited 5");
     expect((error as RenderError).detail).toContain("Fatal: no font found");
   });
 
   it("survives a child that exits before reading a large stdin", async () => {
     // The write is still in flight when the pipe goes away, which is an EPIPE on
     // stdin. It must not surface as an unhandled 'error' event, and the rejection
-    // must be the child's real reason rather than the broken pipe. 500KB is well
-    // past the 64KB pipe buffer and well inside the input cap.
-    const dir = stub("echo 'bad input' >&2\nexit 4");
-    const big = `<html><body>${"x".repeat(500_000)}</body></html>`;
+    // must be the child's real reason rather than the broken pipe. 100KB is well
+    // past the 64KB pipe buffer and inside the 128KB input cap.
+    const dir = stub("echo 'bad input' >&2\nexit 5");
+    const big = `<html><body>${"x".repeat(100_000)}</body></html>`;
     const error = await onPath(dir, async () =>
       await renderPdf(big).catch((e: unknown) => e));
 
     expect(error).toBeInstanceOf(RenderError);
-    expect((error as RenderError).message).toBe("renderer exited 4");
+    expect((error as RenderError).message).toBe("renderer exited 5");
     expect((error as RenderError).detail).toContain("bad input");
   });
 
-  it("times out mid-chunk and kills the child rather than waiting for it", async () => {
-    // Output has already started when the timer fires, which is the case that
-    // distinguishes "settled" bookkeeping that works from bookkeeping that
-    // double-settles or leaves the process running.
+  it("times out, and the child is dead rather than merely abandoned", async () => {
+    // The stub touches its marker 700ms in. The timeout fires at 150ms, and the
+    // marker is checked at 1200ms -- AFTER the sleep would have completed, which is
+    // the only arrangement in which the file's absence is evidence of anything. An
+    // earlier version checked at 1s against a 3s sleep, so it passed whether or not
+    // the child was ever killed; deleting the SIGKILL left it green.
     const dir = stub(
-      `printf '%s' '%PDF-1.7 partial'\nsleep 3\ntouch '${markerPath}'`,
+      `printf '%s' '%PDF-1.7 partial'\nsleep 0.7\ntouch '${markerPath}'`,
     );
     const started = Date.now();
     const error = await onPath(dir, async () =>
-      await renderPdf("<html></html>", { timeoutMs: 250 }).catch((e: unknown) => e));
+      await renderPdf("<html></html>", { timeoutMs: 150 }).catch((e: unknown) => e));
 
     expect(error).toBeInstanceOf(RenderError);
     expect((error as RenderError).message).toBe("render timed out");
-    expect(Date.now() - started).toBeLessThan(2000);
+    expect(Date.now() - started).toBeLessThan(1000);
 
-    // The stub touches its marker only after a 3s sleep. Wait well past the
-    // rejection but well short of that, and the file's absence is the evidence
-    // that the child was actually killed and not merely abandoned.
-    await new Promise((r) => setTimeout(r, 750));
+    await new Promise((r) => setTimeout(r, 1200));
     expect(existsSync(markerPath)).toBe(false);
   });
 
@@ -150,11 +198,22 @@ describe("renderPdf failure paths", () => {
     expect((error as RenderError).message).toBe("could not start the renderer");
   });
 
-  it("returns what an exit-0 child wrote when it is a PDF", async () => {
-    const dir = stub("printf '%s' '%PDF-1.7 stub'\nexit 0");
-    const pdf = await onPath(dir, async () => await renderPdf("<html></html>"));
+  it("maps the renderer's refusal exit codes by status, not by stderr text", async () => {
+    // 2 is a blocked URL and 3 a blocked attachment. Matching a marker string
+    // instead would let any child that merely PRINTED one claim the same outcome.
+    for (const code of [2, 3]) {
+      const dir = stub(`echo 'conduit-blocked-whatever' >&2\nexit ${String(code)}`);
+      const error = await onPath(dir, async () =>
+        await renderPdf("<html></html>").catch((e: unknown) => e));
 
-    expect(pdf.toString("ascii")).toBe("%PDF-1.7 stub");
+      expect(error).toBeInstanceOf(RenderError);
+      expect((error as RenderError).message).toBe("document referenced a blocked resource");
+    }
+
+    // ...and a child that prints the marker while exiting 0 is not a refusal.
+    const liar = stub("echo 'conduit-blocked-url: nope' >&2\nprintf '%s' '%PDF-1.7 ok'\nexit 0");
+    const pdf = await onPath(liar, async () => await renderPdf("<html></html>"));
+    expect(pdf.toString("ascii")).toBe("%PDF-1.7 ok");
   });
 
   it("refuses oversized input without spawning anything", async () => {
@@ -166,6 +225,16 @@ describe("renderPdf failure paths", () => {
     expect(error).toBeInstanceOf(RenderError);
     expect((error as RenderError).message).toBe("document is too large to render");
     expect((error as RenderError).detail).toContain("4096 bytes of HTML");
+  });
+
+  it("applies a default input cap, which is the bound on what a render costs", async () => {
+    // 128KB. Not a formality: on the server a table-shaped document of this size
+    // costs 4.9s and 157MB, and 1MB of the same shape costs 41s and 816MB.
+    const error = await renderPdf("x".repeat(300_000)).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(RenderError);
+    expect((error as RenderError).message).toBe("document is too large to render");
+    expect((error as RenderError).detail).toContain("limit 131072");
   });
 });
 
@@ -181,11 +250,73 @@ describe("weasyprintAvailable", () => {
     await expect(weasyprintAvailable()).resolves.toBeTypeOf("boolean");
   });
 
-  // The other half of an auto-probing gate. Without this, apt failing to deliver
-  // WeasyPrint would turn the whole real half below into silent skips and CI would
-  // stay green through a broken deployment.
+  // The other half of an auto-probing gate. Without these, apt failing to deliver
+  // WeasyPrint -- or a noatime mount -- would turn the tests that matter into silent
+  // skips and CI would stay green through it.
   it.runIf(Boolean(process.env.CI))("is installed here, because CI must prove the render", () => {
     expect(HAVE_WEASYPRINT).toBe(true);
+  });
+
+  it.runIf(Boolean(process.env.CI))("can see reads via atime here", () => {
+    expect(ATIME_WORKS).toBe(true);
+  });
+});
+
+// ------------------------------------------------------------- the backstop
+
+/** Wrap bytes as a Flate-compressed PDF stream object, the way a real PDF does. */
+function flateStream(content: string): Buffer {
+  return Buffer.concat([
+    Buffer.from("4 0 obj\n<< /Filter /FlateDecode >>\nstream\n"),
+    deflateSync(Buffer.from(content)),
+    Buffer.from("\nendstream\nendobj\n"),
+  ]);
+}
+
+describe("pdfEmbedsFiles", () => {
+  it("finds a file-spec in plain bytes", () => {
+    expect(pdfEmbedsFiles(Buffer.from("%PDF-1.7\n<< /Type /Filespec /F (x) >>"))).toBe(true);
+  });
+
+  it("finds an /EF entry in plain bytes", () => {
+    expect(pdfEmbedsFiles(Buffer.from("%PDF-1.7\n<< /EF << /F 5 0 R >> >>"))).toBe(true);
+  });
+
+  it("finds one inside a compressed object stream", () => {
+    // 61.1 compresses by default, which is why a raw byte search once made an
+    // embedded file look absent when it was very much present.
+    const pdf = Buffer.concat([Buffer.from("%PDF-1.7\n"), flateStream("<< /EF 3 0 R >>")]);
+
+    expect(pdf.includes("/EF")).toBe(false);
+    expect(pdfEmbedsFiles(pdf)).toBe(true);
+  });
+
+  it("finds one in the SECOND stream, not just the first", () => {
+    // The scan used to resume one byte into "endstream", so the next search matched
+    // the "stream" inside it and paired it with the FOLLOWING object's "endstream" --
+    // silently skipping every other stream in the file.
+    const pdf = Buffer.concat([
+      Buffer.from("%PDF-1.7\n"),
+      flateStream("nothing interesting here at all"),
+      flateStream("<< /Filespec 9 0 R >>"),
+    ]);
+
+    expect(pdfEmbedsFiles(pdf)).toBe(true);
+  });
+
+  it("says no to a PDF with compressed streams and no file-spec", () => {
+    const pdf = Buffer.concat([
+      Buffer.from("%PDF-1.7\n"),
+      flateStream("BT /F1 12 Tf (Quote QUO-2026-0001) Tj ET"),
+      flateStream("<< /Type /Page /Contents 4 0 R >>"),
+    ]);
+
+    expect(pdfEmbedsFiles(pdf)).toBe(false);
+  });
+
+  it("says no to bytes that are not a PDF at all", () => {
+    expect(pdfEmbedsFiles(Buffer.from("not a pdf"))).toBe(false);
+    expect(pdfEmbedsFiles(Buffer.alloc(0))).toBe(false);
   });
 });
 
@@ -235,17 +366,23 @@ describe("renderPdf against the real renderer", () => {
     const pdf = await renderPdf(quoteHtml());
     const elapsed = Date.now() - started;
 
-    // Printed because the caps in documents-render.ts claim to be calibrated
-    // against a real page: this line in the log is that measurement. The byte
-    // count is version-dependent (14,005 on 57.2, 12,457 on 61.1) and varies by
-    // a byte between runs, so nothing asserts an exact size.
+    // Printed because the caps in documents-render.ts claim to be calibrated against
+    // a real page: this line in the log is that measurement. The size is version
+    // dependent (~16.8KB on 57.2, ~12.5KB on 61.1) and moves by a byte or two between
+    // runs, so nothing asserts an exact figure.
     console.log(`[render] one-page quote: ${String(pdf.length)} bytes in ${String(elapsed)} ms`);
 
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
-    // A tenth of the 25MB cap and half the 20s timeout: bounds that fail if a
-    // realistic page ever stops being comfortably inside either default.
     expect(pdf.length).toBeLessThan(2.5 * 1024 * 1024);
     expect(elapsed).toBeLessThan(10_000);
+  });
+
+  itReal("does not mistake a legitimate branded quote for one with an attachment", () => {
+    // The false-positive half of the backstop: /EF and /Filespec must be absent from
+    // a real document, data: logo and all, or control 3 would refuse every render.
+    return renderPdf(quoteHtml()).then((pdf) => {
+      expect(pdfEmbedsFiles(pdf)).toBe(false);
+    });
   });
 
   itReal("rejects HTML that would take longer than the timeout", async () => {
@@ -261,136 +398,105 @@ describe("renderPdf against the real renderer", () => {
 
 // ------------------------------------------------------------- the schemes
 
-/** Search a PDF for a marker, including inside its Flate-compressed streams. */
-function pdfContains(pdf: Buffer, marker: string): boolean {
-  if (pdf.includes(marker)) return true;
-  let from = 0;
-  for (;;) {
-    const start = pdf.indexOf("stream", from);
-    if (start === -1) return false;
-    const end = pdf.indexOf("endstream", start);
-    if (end === -1) return false;
-    let body = start + "stream".length;
-    if (pdf[body] === 0x0d) body += 1;
-    if (pdf[body] === 0x0a) body += 1;
-    try {
-      if (inflateSync(pdf.subarray(body, end)).includes(marker)) return true;
-    } catch {
-      // Not a Flate stream, or not a stream at all. Keep looking.
-    }
-    // Past the whole "endstream" keyword, not one byte into it: resuming at end+1
-    // makes the next search match the "stream" inside it, whose paired "endstream"
-    // is the FOLLOWING object's -- which silently skips every other stream.
-    from = end + "endstream".length;
+/** Feed HTML to the `weasyprint` CLI with a plain environment. Returns its stdout. */
+async function bareCli(html: string): Promise<Buffer> {
+  const env = { ...process.env };
+  for (const key of ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ftp_proxy"]) {
+    delete env[key];
   }
+  const chunks: Buffer[] = [];
+  await new Promise<void>((resolve) => {
+    const child = spawn("weasyprint", ["-", "-"], { stdio: ["pipe", "pipe", "ignore"], env });
+    child.stdout.on("data", (c: Buffer) => chunks.push(c));
+    child.on("error", () => { resolve(); });
+    child.on("close", () => { resolve(); });
+    child.stdin.on("error", () => { /* the child may not read it all */ });
+    child.stdin.end(html, "utf8");
+  });
+  return Buffer.concat(chunks);
 }
 
 /**
- * The no-network claim, tested as what it actually is: a claim about SCHEMES.
+ * The no-read property, tested as what it actually is: a claim about SCHEMES, and
+ * asserted by whether the file was OPENED rather than by whether anything leaked.
  *
- * An earlier version of this suite tested http://127.0.0.1 alone and generalised to
- * "fetches nothing", which is how a working file:// exfiltration survived it. Every
- * scheme below is therefore its own case, and the http one still watches a loopback
- * server so that "no request arrived" is observed rather than inferred.
+ * Two earlier versions of this suite were vacuous. The first tested http://127.0.0.1
+ * alone and generalised to "fetches nothing", which is how a working file:// exfil
+ * survived it. The second watched a loopback server -- but NO_NETWORK_ENV stops the
+ * request before it could arrive, so a fetcher mutated to allow everything still
+ * recorded zero hits and every assertion stayed green. atime sees the open itself.
  */
-describe("renderPdf and the schemes it will fetch", () => {
-  let server: Server;
-  const hits: string[] = [];
-  let origin = "";
-  let secretPath = "";
-  let secretCssPath = "";
-  const SECRET = "conduit-secret-marker-9f3a";
-
-  beforeAll(async () => {
-    secretPath = join(stubDir, "pretend-mail.key");
-    writeFileSync(secretPath, `${SECRET}\n`, { mode: 0o600 });
-    server = createServer((req, res) => {
-      hits.push(req.url ?? "");
-      res.writeHead(200, { "content-type": "image/png" });
-      res.end(Buffer.from(LOGO_PNG.split(",")[1] ?? "", "base64"));
-    });
-    await new Promise<void>((resolve) => { server.listen(0, "127.0.0.1", resolve); });
-    const address = server.address();
-    origin = typeof address === "object" && address !== null
-      ? `http://127.0.0.1:${String(address.port)}`
-      : "";
-    // A local stylesheet that reaches back out over http. Whether it was READ is
-    // then observable as a request, without depending on anything reaching the PDF:
-    // a hit on /from-local-css.png can only happen if the file:// CSS was fetched
-    // AND parsed. That makes "the file was never opened" a positive observation.
-    secretCssPath = join(stubDir, "probe.css");
-    writeFileSync(secretCssPath, `body { background-image: url("${origin}/from-local-css.png"); }\n`);
-  });
-
-  afterAll(async () => {
-    await new Promise<void>((resolve) => { server.close(() => { resolve(); }); });
-  });
-
-  const blocked = (): { name: string; html: () => string }[] => [
+describe("renderPdf and the schemes it will read", () => {
+  const cases: { name: string; html: (p: string) => string }[] = [
     {
       name: "file:// as an image",
-      html: () => `<html><body><img src="file://${secretPath}"></body></html>`,
+      html: (p) => `<html><body><img src="file://${p}"></body></html>`,
     },
     {
-      name: "file:// as a stylesheet that would phone home if it were read",
-      html: () => `<html><head><link rel="stylesheet" href="file://${secretCssPath}"></head><body>x</body></html>`,
+      name: "file:// as a stylesheet",
+      html: (p) => `<html><head><link rel="stylesheet" href="file://${p}"></head><body>x</body></html>`,
     },
     {
-      name: "http:// as an image",
-      html: () => `<html><body><img src="${origin}/probe.png"></body></html>`,
+      name: "file:// inside an @import",
+      html: (p) => `<html><head><style>@import url("file://${p}");</style></head><body>x</body></html>`,
     },
     {
-      name: "ftp://, a scheme urllib supports and nothing here wants",
-      html: () => `<html><body><img src="ftp://127.0.0.1/x.png"></body></html>`,
+      name: "file:// inside a CSS url()",
+      html: (p) => `<html><body style="background-image:url('file://${p}')">x</body></html>`,
+    },
+    {
+      name: "file:// as a <link rel=attachment>",
+      html: (p) => `<html><body><link rel="attachment" href="file://${p}"></body></html>`,
+    },
+    {
+      name: "file:// as an <a rel=attachment>, which the fetcher never sees",
+      html: (p) => `<html><body><a rel="noopener attachment" href="file://${p}">x</a></body></html>`,
     },
     {
       name: "jar:file://, the exotic one",
-      html: () => `<html><body><img src="jar:file://${secretPath}!/x"></body></html>`,
+      html: (p) => `<html><body><img src="jar:file://${p}!/x"></body></html>`,
     },
   ];
 
-  for (const scheme of blocked()) {
-    itReal(`refuses to render a document referencing ${scheme.name}`, async () => {
-      hits.length = 0;
-      const error = await renderPdf(scheme.html()).catch((e: unknown) => e);
+  for (const scheme of cases) {
+    itReads(`refuses ${scheme.name}, and never opens the file`, async () => {
+      const secret = freshSecret("mail.key");
+      const error = await renderPdf(scheme.html(secret.path)).catch((e: unknown) => e);
 
       expect(error).toBeInstanceOf(RenderError);
-      expect((error as RenderError).message).toBe("document referenced a blocked URL");
-      // No PDF is produced at all, so there is nothing for a caller to store -- and
-      // for the stylesheet case, no hit here also proves the file was never opened.
-      expect(hits).toEqual([]);
+      expect((error as RenderError).message).toBe("document referenced a blocked resource");
+      // The load-bearing assertion. A fetcher that recorded the URL and then read it
+      // anyway would satisfy everything above and fail here.
+      expect(statSync(secret.path).atimeMs).toBe(secret.atime);
     });
   }
 
-  itReal("refuses a file:// attachment, which the fetcher alone did not stop", async () => {
-    // The case that needed a second control, and it is worth knowing why.
-    //
-    // 57.2 routes attachments through the document's url_fetcher, so control 1 caught
-    // this. 61.1 does not: `Attachment.__init__` binds `url_fetcher=default_url_fetcher`
-    // as a DEFAULT ARGUMENT, so the fetcher passed to `HTML(...)` never arrives, and a
-    // CI run proved the file was read and embedded with the fetcher recording no calls
-    // at all. Deleting `rel=attachment` from the parsed tree is what makes this refuse
-    // on both, and asserting the strict rejection here is what would notice if that
-    // strip were ever removed -- an assertion tolerant of "or renders cleanly" would
-    // have passed on 57.2 and hidden the 61.1 hole.
-    hits.length = 0;
-    const error = await renderPdf(
-      `<html><body><link rel="attachment" href="file://${secretPath}"></body></html>`,
-    ).catch((e: unknown) => e);
+  itReads("does not open a file named by a relative reference either", async () => {
+    // base_url is None, so a relative URL resolves to nothing and the fetcher is
+    // never reached. This is the one case that renders rather than refusing, which
+    // makes checking the file itself the only way to know nothing happened.
+    const secret = freshSecret("relative.key");
+    const pdf = await renderPdf(`<html><body><img src="${secret.path}"></body></html>`);
 
-    expect(error).toBeInstanceOf(RenderError);
-    expect((error as RenderError).message).toBe("document referenced a blocked URL");
-    expect((error as RenderError).detail).toContain("rel=attachment");
-    expect(hits).toEqual([]);
+    expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(pdfEmbedsFiles(pdf)).toBe(false);
+    expect(statSync(secret.path).atimeMs).toBe(secret.atime);
   });
 
-  itReal("refuses an <a rel=attachment>, not only a <link>", async () => {
-    const error = await renderPdf(
-      `<html><body><a rel="noopener attachment" href="file://${secretPath}">x</a></body></html>`,
-    ).catch((e: unknown) => e);
+  itReal("refuses an ftp:// URL", async () => {
+    const error = await renderPdf(`<html><body><img src="ftp://127.0.0.1/x.png"></body></html>`)
+      .catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(RenderError);
-    expect((error as RenderError).message).toBe("document referenced a blocked URL");
+    expect((error as RenderError).message).toBe("document referenced a blocked resource");
+  });
+
+  itReal("refuses an http:// URL", async () => {
+    const error = await renderPdf(`<html><body><img src="http://127.0.0.1:9/x.png"></body></html>`)
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(RenderError);
+    expect((error as RenderError).message).toBe("document referenced a blocked resource");
   });
 
   itReal("renders a data: image, which is the one scheme a document may use", async () => {
@@ -399,62 +505,30 @@ describe("renderPdf and the schemes it will fetch", () => {
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
   });
 
-  itReal("renders without a relative reference rather than failing on it", async () => {
-    // base_url is None, so a relative URL resolves to nothing and the fetcher is
-    // never reached. This is the one case that degrades quietly, so it is also the
-    // one worth checking the OUTPUT of: the reference names a real file next to the
-    // rendering process, and neither its contents nor a request for it appear.
-    hits.length = 0;
-    const pdf = await renderPdf(`<html><body><img src="pretend-mail.key"></body></html>`);
-
-    expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
-    expect(pdfContains(pdf, SECRET)).toBe(false);
-    expect(hits).toEqual([]);
-  });
-
   // ---- the other direction: what the bare CLI does, and why it is not used ----
 
-  /** Feed HTML to the `weasyprint` CLI with a plain environment. Returns its stdout. */
-  async function bareCli(html: string): Promise<Buffer> {
-    const env = { ...process.env };
-    for (const key of ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ftp_proxy"]) {
-      delete env[key];
-    }
-    const chunks: Buffer[] = [];
-    await new Promise<void>((resolve) => {
-      const child = spawn("weasyprint", ["-", "-"], {
-        stdio: ["pipe", "pipe", "ignore"],
-        env,
-      });
-      child.stdout.on("data", (c: Buffer) => chunks.push(c));
-      child.on("error", () => { resolve(); });
-      child.on("close", () => { resolve(); });
-      child.stdin.on("error", () => { /* the child may not read it all */ });
-      child.stdin.end(html, "utf8");
-    });
-    return Buffer.concat(chunks);
-  }
+  itReads("a bare CLI opens local files, which no proxy setting can prevent", async () => {
+    // The finding that broke the previous design. file:// goes to urllib's
+    // FileHandler and never consults a proxy, so this is exactly what the environment
+    // variables cannot reach -- and it is why the renderer is invoked through its API.
+    const secret = freshSecret("bare.key");
+    await bareCli(`<html><body><img src="file://${secret.path}"></body></html>`);
 
-  itReal("a bare CLI fetches an absolute http:// URL with no base URL set", async () => {
-    // Omitting --base-url leaves only RELATIVE references unresolvable. This is the
-    // evidence for that, and for why the proxy variables were ever added.
-    hits.length = 0;
-    await bareCli(`<html><body><img src="${origin}/probe.png"></body></html>`);
-
-    expect(hits).toContain("/probe.png");
+    expect(statSync(secret.path).atimeMs).toBeGreaterThan(secret.atime);
   });
 
-  itReal("a bare CLI reads local files, which no proxy setting can prevent", async () => {
-    // The finding that broke the previous design, stated so it holds on any version:
-    // the CLI opens a file:// stylesheet, and the request the CSS then makes is the
-    // proof it was read and parsed. file:// goes to urllib's FileHandler and never
-    // consults a proxy, so this is exactly what the environment variables cannot
-    // reach -- and it is why the renderer is invoked through its API with a fetcher.
-    hits.length = 0;
-    await bareCli(
-      `<html><head><link rel="stylesheet" href="file://${secretCssPath}"></head><body>x</body></html>`,
+  itReal("a bare CLI embeds a local file with NO /EmbeddedFiles anywhere", async () => {
+    // The payload that falsified the backstop's original needle, kept as the fixture
+    // that proves the new one. `<a rel=attachment>` embeds through an annotation
+    // file-spec, so the catalog's /EmbeddedFiles name tree never mentions it -- and a
+    // check looking for that name called this PDF clean while the secret sat in it.
+    const secret = freshSecret("annot.key");
+    const pdf = await bareCli(
+      `<html><body><a rel="attachment" href="file://${secret.path}">x</a></body></html>`,
     );
 
-    expect(hits).toContain("/from-local-css.png");
+    expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(pdf.includes("/EmbeddedFiles")).toBe(false);
+    expect(pdfEmbedsFiles(pdf)).toBe(true);
   });
 });
