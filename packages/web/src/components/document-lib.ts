@@ -152,6 +152,16 @@ export interface DraftQuote {
   readonly validUntilDate: string;
   readonly recipientName: string;
   readonly recipientContactName: string;
+  /**
+   * v1.1.0's snapshot field. It defaults from the contact's salutation and is
+   * editable before issuing like every other recipient field -- and once issued
+   * it is frozen on the documents row, so editing the contact's title next year
+   * cannot rewrite a quote sent last year. PRONOUNS ARE DELIBERATELY NOT HERE:
+   * a quote's greeting takes the salutation and has no use for them, and
+   * freezing a personal detail into an artifact that is downloaded and emailed
+   * should need a reason.
+   */
+  readonly recipientSalutation: string;
   readonly recipientAddress: string;
   readonly notes: string;
   readonly terms: string;
@@ -224,6 +234,14 @@ export function contentBudget(draft: DraftQuote): BudgetState {
   const used = documentContentBytes({
     recipientName: draft.recipientName,
     recipientContactName: draft.recipientContactName,
+    // EVERY FIELD THE SERVER'S GATE COUNTS, and this one is easy to omit
+    // because documentContentBytes takes it OPTIONALLY: leaving it out is not
+    // a type error, it is a form that under-reports by up to 64 bytes against
+    // a budget the server measures with the same function. The guard is
+    // derived rather than written out -- contentBudget's test walks the keys
+    // of DOCUMENT_FIELD_CAPS, which is exactly the set of capped text fields a
+    // quote carries, and charges each one in turn.
+    recipientSalutation: draft.recipientSalutation,
     recipientAddress: draft.recipientAddress,
     notes: draft.notes,
     terms: draft.terms,
@@ -244,16 +262,28 @@ export function contentBudget(draft: DraftQuote): BudgetState {
  * A key missing from here falls back to the RAW WIRE NAME, so the failure mode
  * is a user reading "Line 1 qtyMilli: ..." rather than anything breaking.
  *
- * THE TEST THAT KEEPS THIS COMPLETE DRIVES THE REAL SCHEMA, one deliberately
- * bad draft per field, and asserts the sentence begins with the label. An
- * earlier version of this comment claimed such a test existed when it did not,
- * and deleting seven of these eleven entries left the whole suite green.
+ * TWO TESTS KEEP IT COMPLETE, AND IT TOOK BOTH.
+ *
+ * The first drives the real schema with one deliberately bad draft per field
+ * and asserts the sentence begins with the label. It caught the seven entries
+ * an earlier round deleted -- but it is a HAND-WRITTEN CASE LIST, so it could
+ * not catch a field being ADDED: v1.1.0 put `recipientSalutation` into
+ * issueQuoteInputSchema and that test stayed green while the form was ready to
+ * print the wire name at somebody.
+ *
+ * So the second is derived: it walks `issueQuoteInputSchema.shape` and
+ * `documentLineInputSchema.shape` and requires an entry here for every key.
+ * `lines` is the one exclusion, and it is a real one rather than a hole --
+ * describeLinesIssue answers for the whole set, and that test names it.
+ *
+ * Exported for those tests, which is the only reason it is not file-local.
  */
-const FIELD_LABELS: Record<string, string> = {
+export const FIELD_LABELS: Record<string, string> = {
   issueDate: "Issue date",
   validUntilDate: "Valid-until date",
   recipientName: "Recipient",
   recipientContactName: "Contact name",
+  recipientSalutation: "Salutation",
   recipientAddress: "Address",
   notes: "Notes",
   terms: "Terms",
@@ -413,6 +443,13 @@ export function buildIssueQuoteInput(draft: DraftQuote): BuildResult {
     validUntilDate: draft.validUntilDate === "" ? null : draft.validUntilDate,
     recipientName: draft.recipientName.trim(),
     recipientContactName: draft.recipientContactName.trim(),
+    // TRIMMED HERE AND NOT ON THE CONTACT, and the two are different fields
+    // doing different jobs. The contact's salutation must survive exactly as
+    // typed -- that is what "Other..." is for. This is the printed line of a
+    // letter, sitting between two other trimmed name fields, and the template
+    // sets it beside the recipient's name: a trailing space typed into this box
+    // becomes a visible double space on a PDF nobody can reissue.
+    recipientSalutation: draft.recipientSalutation.trim(),
     recipientAddress: draft.recipientAddress,
     notes: draft.notes,
     terms: draft.terms,

@@ -180,9 +180,56 @@ export function Shell({ children }: { children: ReactNode }) {
           assertion in use-is-mobile.test.ts that pins the meta all stop being
           true in the same commit.
         */}
+        {/*
+          `max-md:overflow-clip` IS WHAT LETS A PHONE PAGE HAVE A STICKY STRIP
+          AT ALL, and it is spelled in the variant-prefixed form the code uses
+          rather than as a bare utility. Tailwind v4 scans this comment as plain
+          text: the bare form was written here first, appeared in the built
+          stylesheet as a rule nothing renders, and moved the build's hash. That
+          is the fourth time this repo has paid for the trap and the first that
+          lib.test.ts's guard could not catch, since it only reads
+          variant-prefixed tokens.
+
+          MEASURED, because the obvious reading of this element is wrong. On a
+          phone <main> never scrolls: the root is `min-h-screen` and this is a
+          `flex-1` item with `min-height: auto`, so it always grows to its own
+          content and the DOCUMENT is what scrolls -- at 390x664 on a 25-deal
+          board, main was 2684 tall with a 2684 scroll height and a scrollTop
+          stuck at 0, while the document scrolled 2089. But `overflow: auto`
+          establishes a scroll container whether or not it ever scrolls, and a
+          sticky descendant sticks to the NEAREST one. So `sticky top-0` on the
+          board's stage picker was completely inert -- measured at -1751px, off
+          the top of the screen, with the strip's whole purpose defeated.
+
+          THE THREE WAYS OUT WERE MEASURED AGAINST EACH OTHER. `visible` fixes
+          sticky and re-opens the defect Phase 6 closed: of fifteen phone pages
+          swept, the deal detail was the one whose content was wider than this
+          box (403 against 390, from its Win/Lose/Archive row), and with
+          `visible` the PAGE itself scrolled sideways (404 against 390).
+          Bounding the shell with a viewport height
+          would make this a real scroller, but `100vh` is the LARGE viewport on
+          iOS and the bottom of every phone page would sit under the browser
+          toolbar with no document scroll left to reveal it -- on hardware this
+          loop cannot test. `clip` clips exactly as `auto` did AND establishes
+          no scroll container, so the picker sticks to the viewport (measured
+          pinned at top 0 with the document at 2089) and nothing scrolls
+          sideways.
+
+          The one thing `clip` costs is that a too-wide child is cut rather than
+          swipe-revealed. That was true of exactly one page and it is now true
+          of none: pages/deal-detail.tsx's action row wraps below the
+          breakpoint, which takes that page's own scroll width back to 390
+          against 390, so all fifteen fit. A future
+          child that does not fit will be clipped instead of scrollable, which
+          is the correct phone posture -- a page that scrolls sideways is the
+          bug -- but it is a silent one, so it is written down here.
+
+          Desktop keeps `overflow-auto` untouched, per the `max-md:`-over-a-
+          desktop-string convention in ui/dialog.tsx.
+        */}
         <main
           className={clsx(
-            "flex-1 overflow-auto px-6 py-6",
+            "flex-1 overflow-auto px-6 py-6 max-md:overflow-clip",
             isMobile && "pb-[calc(6rem_+_env(safe-area-inset-bottom))]",
           )}
         >

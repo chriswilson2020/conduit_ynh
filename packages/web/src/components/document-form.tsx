@@ -263,6 +263,7 @@ export function DocumentForm({
   currency,
   defaultRecipientName,
   defaultRecipientContactName,
+  defaultRecipientSalutation,
   defaultRecipientAddress,
   onIssued,
   onCancel,
@@ -272,6 +273,8 @@ export function DocumentForm({
   currency: string;
   defaultRecipientName: string;
   defaultRecipientContactName: string;
+  /** The linked contact's salutation, picked up exactly as the name above is. */
+  defaultRecipientSalutation: string;
   defaultRecipientAddress: string;
   onIssued: (document: DocumentRecord) => void;
   onCancel: () => void;
@@ -285,6 +288,7 @@ export function DocumentForm({
     validUntilDate: "",
     recipientName: defaultRecipientName,
     recipientContactName: defaultRecipientContactName,
+    recipientSalutation: defaultRecipientSalutation,
     recipientAddress: defaultRecipientAddress,
     notes: "",
     terms: "",
@@ -373,7 +377,13 @@ export function DocumentForm({
       <DialogTitle>New quote</DialogTitle>
 
       <div className="grid gap-3 md:grid-cols-2">
-        <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+        {/*
+          THE COMPANY SPANS THE ROW, so the pair below it reads as the one thing
+          it is: the person this quote is addressed to, title and name together.
+          v1.1.0 added a fourth box to a block that packed a two-column grid
+          exactly, and the alternative was a hole beside it.
+        */}
+        <label className="flex flex-col gap-1 text-xs font-medium text-slate-600 md:col-span-2">
           Recipient
           <Input
             autoFocus
@@ -382,6 +392,25 @@ export function DocumentForm({
             disabled={pending}
             data-testid="quote-recipient-name"
             onChange={(event) => patch({ recipientName: event.target.value })}
+          />
+        </label>
+        {/*
+          DEFAULTED FROM THE CONTACT AND EDITABLE BEFORE ISSUING, like every
+          other field in this block -- and then FROZEN. An issued quote never
+          changes, so the value is copied onto the documents row at issue rather
+          than joined to the contact: editing a title next year must not rewrite
+          a quote sent last year. A plain box rather than the contact page's
+          picker, because this is not the contact's record; it is the line that
+          will be printed on this document.
+        */}
+        <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+          Salutation
+          <Input
+            value={draft.recipientSalutation}
+            maxLength={DOCUMENT_FIELD_CAPS.recipientSalutation}
+            disabled={pending}
+            data-testid="quote-recipient-salutation"
+            onChange={(event) => patch({ recipientSalutation: event.target.value })}
           />
         </label>
         <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">

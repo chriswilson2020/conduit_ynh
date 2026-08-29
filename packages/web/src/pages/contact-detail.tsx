@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
+import { CONTACT_FIELD_CAPS } from "@conduit/shared";
 import type { UpdateContactInput } from "@conduit/shared";
 import { ApiError } from "../api";
 import {
@@ -9,6 +10,8 @@ import {
   useUnarchiveContact,
   useUpdateContact,
 } from "../queries";
+import { PresetOrOtherField } from "../components/contact-fields";
+import { PRONOUN_PRESETS, SALUTATION_PRESETS } from "../components/contact-fields-lib";
 import { FieldCard, type FieldCardField } from "../components/field-card";
 import { OwnerSelect } from "../components/owner-select";
 import { Rail } from "../components/rail/rail";
@@ -90,6 +93,23 @@ export function ContactDetailPage() {
   function handleOwnerChange(userId: string | null) {
     if (!contact) return;
     updateContact.mutate({ id: contact.id, patch: { ownerUserId: userId } }, { onError: reportError });
+  }
+
+  /**
+   * v1.1.0's two pickers, and the patch is sent VERBATIM.
+   *
+   * `handleSave` above trims, because a first name with a trailing space is a
+   * typo. These two do not, and that is the feature: the whole point of
+   * "Other..." is that a value the preset list never anticipated arrives at the
+   * column as the person typed it, and a trim is the mildest of the ways a
+   * picker can quietly rewrite somebody. contact-fields-lib.ts's typedValue is
+   * the only thing between the box and this call, and all it does is turn an
+   * empty box into null -- which is the API's "no value", since
+   * cappedNullableString carries min(1) and would refuse "".
+   */
+  function handlePresetField(patch: UpdateContactInput) {
+    if (!contact) return;
+    updateContact.mutate({ id: contact.id, patch }, { onError: reportError });
   }
 
   function handleArchive() {
@@ -187,6 +207,36 @@ export function ContactDetailPage() {
           onUnarchive={handleUnarchive}
           savingField={savingField}
           errors={fieldErrors}
+        />
+
+        {/*
+          BOTH OPTIONAL, BOTH EMPTY BY DEFAULT, AND NEITHER EVER INFERRED --
+          not from the name above them, not from each other, not from anything.
+          A contact with a salutation and no pronouns shows no pronouns, here or
+          on the list or on a quote, and the absence is asserted in
+          contact-fields-lib.test.ts rather than left to be noticed.
+
+          Their own rows rather than entries in the FieldCard above, because
+          that card edits through a text input and these edit through a picker
+          -- the same reason Company and Owner are rows of their own.
+        */}
+        <PresetOrOtherField
+          label="Salutation"
+          name="salutation"
+          value={contact.salutation}
+          presets={SALUTATION_PRESETS}
+          maxLength={CONTACT_FIELD_CAPS.salutation}
+          disabled={archived}
+          onCommit={(next) => handlePresetField({ salutation: next })}
+        />
+        <PresetOrOtherField
+          label="Pronouns"
+          name="pronouns"
+          value={contact.pronouns}
+          presets={PRONOUN_PRESETS}
+          maxLength={CONTACT_FIELD_CAPS.pronouns}
+          disabled={archived}
+          onCommit={(next) => handlePresetField({ pronouns: next })}
         />
 
         <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">

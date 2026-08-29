@@ -1675,6 +1675,30 @@ const UNSTORABLE_TEXT = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\
  * is not tidiness: `documentText(250).min(1)` type-checks, returns a fresh schema and
  * silently drops the refinement, so a description containing a NUL sails through and
  * fails the INSERT exactly as before. Every bound has to be inside the one expression.
+ *
+ * IT ATTACHES NO FIELD-NAMING MESSAGE, AND THAT IS A DECISION RATHER THAN AN OMISSION.
+ * `cappedNullableString` above DOES name its field ("a salutation may be at most 64
+ * characters"), so the two halves of v1.1.0 look inconsistent; they are not, and the
+ * difference is which layer the person reading the refusal is standing in front of.
+ *
+ * A contact is edited through pages/contact-detail.tsx, which puts `ApiError.message`
+ * -- the route's 400, which is `issues[0].message` verbatim -- straight into its
+ * banner. The schema's own words ARE what the operator reads there, so they have to
+ * name the field.
+ *
+ * A quote is not. components/document-form.tsx runs THIS schema client-side before it
+ * posts, and renders its issues through `describeIssue`, which reads the issue PATH
+ * and writes its own sentence -- discarding `issue.message` outright for every
+ * too_big and too_small. A message added here would therefore be invisible on the
+ * only path an operator takes, and would create a SECOND list of human names for
+ * these fields to keep in step with that function's FIELD_LABELS. This release had
+ * just finished removing one such pair elsewhere in this file.
+ *
+ * So: all seven of issueQuoteInputSchema's fields keep Zod's own English, and the
+ * naming is `describeIssue`'s job alone -- held there by a test that walks this
+ * schema's shape, so the layer that does the naming cannot silently gain a hole. The
+ * residual reader is a direct API caller, who gets "Too big: expected string to have
+ * <=64 characters" with a `path` of ["recipientSalutation"] beside it in the issue.
  */
 function documentText(max: number, min = 0) {
   return z.string().min(min).max(max).refine((value) => !UNSTORABLE_TEXT.test(value), {

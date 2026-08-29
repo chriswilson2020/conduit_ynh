@@ -95,9 +95,20 @@ export function Files({ companyId, contactId, dealId, projectId }: FilesProps) {
       <ul className="flex flex-col gap-2">
         {sorted.map((file) => (
           <li key={file.id} className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm">
+            {/*
+              THE DOWNLOAD LINK HAS NEVER HAD THE 44px FLOOR, and it is the only
+              way to get a file back out of the rail. Measured at 390x664 before
+              this line: 64.5 x 17px for a nine-character filename -- an inline
+              box one line of text tall, which is under half the platform
+              minimum. BOTH AXES, because the width is content: 64.5px is what
+              "fixture.txt" happens to measure, and a file called "a.pdf" would
+              be narrower than the floor on its own. inline-flex rather than
+              block so the target is the size of the name and not of the whole
+              row, matching the deal page's own download link.
+            */}
             <a
               href={apiUrl(`/files/${file.id}/download`)}
-              className="font-medium text-slate-900 underline hover:text-slate-700"
+              className="inline-flex items-center font-medium text-slate-900 underline hover:text-slate-700 max-md:min-h-11 max-md:min-w-11"
             >
               {file.originalName}
             </a>

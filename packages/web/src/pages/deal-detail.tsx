@@ -221,7 +221,18 @@ export function DealDetailPage() {
           </Link>
         </div>
 
-        <div className="mb-4 flex items-center justify-between gap-4">
+        {/*
+          WRAPS BELOW THE BREAKPOINT, AND IT IS NOT COSMETIC. Measured at 390px:
+          the title, the status pill and the Win/Lose/Archive group are 403px of
+          row against a 390px box, and this was the ONE phone page in the app
+          whose content did not fit -- which components/shell.tsx used to hide
+          by letting <main> scroll sideways, and can no longer, now that main
+          clips below the breakpoint so the board's stage picker can stick.
+          Wrapping drops the action group onto its own line, which takes this
+          page's scroll width to 390 against 390 -- nothing over the edge. See
+          that comment for the rest of the measurements.
+        */}
+        <div className="mb-4 flex items-center justify-between gap-4 max-md:flex-wrap">
           <div className="flex items-center gap-3">
             <h1 className="text-xl font-semibold text-slate-900">{deal.title}</h1>
             <span
@@ -335,6 +346,10 @@ export function DealDetailPage() {
               ? ""
               : `${linkedContact.firstName} ${linkedContact.lastName ?? ""}`.trim()
           }
+          // Picked up exactly as the name beside it is, and EMPTY WHEN THE
+          // CONTACT HAS NONE -- no guess from the name, and none from anything
+          // else. A quote for a contact without a salutation carries none.
+          contactSalutation={linkedContact?.salutation ?? ""}
           companyAddress={linkedCompany?.address ?? ""}
         />
       </div>
@@ -362,10 +377,11 @@ export function DealDetailPage() {
  * than an omission: a quote already issued never changes, and a corrected quote
  * is a new quote with a new number.
  */
-function DocumentsSection({ deal, companyName, contactName, companyAddress }: {
+function DocumentsSection({ deal, companyName, contactName, contactSalutation, companyAddress }: {
   deal: Deal;
   companyName: string;
   contactName: string;
+  contactSalutation: string;
   companyAddress: string;
 }) {
   const { data: documents = [], isLoading, error } = useDealDocuments(deal.id);
@@ -400,6 +416,7 @@ function DocumentsSection({ deal, companyName, contactName, companyAddress }: {
                 currency={deal.currency}
                 defaultRecipientName={companyName}
                 defaultRecipientContactName={contactName}
+                defaultRecipientSalutation={contactSalutation}
                 defaultRecipientAddress={companyAddress}
                 onIssued={() => setFormOpen(false)}
                 onCancel={() => setFormOpen(false)}

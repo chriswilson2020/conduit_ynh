@@ -1,11 +1,11 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
 import {
-  DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES,
-  documentTotals, issueQuoteInputSchema,
+  DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_FIELD_CAPS, DOCUMENT_MAX_DESCRIPTION_CHARS,
+  DOCUMENT_MAX_LINES, documentLineInputSchema, documentTotals, issueQuoteInputSchema,
 } from "@conduit/shared";
 import {
-  QTY_SPEC, TAX_RATE_SPEC, UNIT_PRICE_SPEC,
+  FIELD_LABELS, QTY_SPEC, TAX_RATE_SPEC, UNIT_PRICE_SPEC,
   buildIssueQuoteInput, contentBudget, describeIssue, parseUnits, runningTotals, unitsOrZero,
 } from "./document-lib";
 import type { DraftLine, DraftQuote } from "./document-lib";
@@ -31,6 +31,7 @@ const FULL_DRAFT = {
   validUntilDate: null,
   recipientName: "Acme Ltd",
   recipientContactName: "",
+  recipientSalutation: "",
   recipientAddress: "",
   notes: "",
   terms: "",
@@ -43,6 +44,7 @@ function draft(over: Partial<DraftQuote> = {}): DraftQuote {
     validUntilDate: "",
     recipientName: "Acme Ltd",
     recipientContactName: "",
+    recipientSalutation: "",
     recipientAddress: "",
     notes: "",
     terms: "",
@@ -265,6 +267,35 @@ describe("contentBudget", () => {
     expect(state.remaining).toBeLessThan(0);
     expect(state.used).toBeGreaterThan(contentBudget(ascii).used);
   });
+
+  /**
+   * EVERY CAPPED FIELD IS CHARGED, AND THE LIST IS DERIVED RATHER THAN WRITTEN
+   * OUT HERE.
+   *
+   * `documentContentBytes` takes each of them OPTIONALLY, so a field left out
+   * of contentBudget's call is not a type error -- it is a form that quietly
+   * under-reports against a server gate computing the same figure from the same
+   * function. v1.1.0 shipped exactly that hole for `recipientSalutation`, worth
+   * up to 64 bytes, and nothing failed.
+   *
+   * DOCUMENT_FIELD_CAPS is the right list to walk because it IS the set of
+   * capped free-text fields a quote carries, so a seventh added there without a
+   * line in contentBudget fails here. Each is charged in turn with a value only
+   * that field could contribute, and the delta is asserted exactly.
+   */
+  it("charges every capped text field the schema has", () => {
+    // Every capped field EMPTY, so each delta below is that field's alone.
+    const empty = draft({ recipientName: "" });
+    const base = contentBudget(empty).used;
+    const filler = "z".repeat(16);
+    for (const field of Object.keys(DOCUMENT_FIELD_CAPS)) {
+      // The cast is what lets a derived key index a typed literal, and it is
+      // safe because a key that is NOT one of DraftQuote's own fields charges
+      // nothing and fails the exact delta below.
+      const over = { ...empty, [field]: filler } as DraftQuote;
+      expect(contentBudget(over).used - base, `${field} is not charged to the budget`).toBe(16);
+    }
+  });
 });
 
 describe("buildIssueQuoteInput", () => {
@@ -281,6 +312,35 @@ describe("buildIssueQuoteInput", () => {
     ]);
     expect(result.input.issueDate).toBe("2026-08-29");
     expect(result.input.validUntilDate).toBe("2026-09-30");
+  });
+
+  /**
+   * THE SALUTATION REACHES THE WIRE, AND IT IS TRIMMED HERE AND NOT ON THE
+   * CONTACT.
+   *
+   * The two are different fields doing different jobs. A contact's salutation
+   * must survive exactly as typed -- that is what "Other..." is for, and
+   * contact-fields-lib.test.ts pins it. This one is the line a template prints
+   * beside the recipient's name, between two other trimmed name fields, so a
+   * stray space becomes a visible double space on a PDF that can never be
+   * reissued. Both halves are asserted, because a future tidy-up that made them
+   * agree would break one of them.
+   */
+  it("carries the salutation, trimmed like the two name fields beside it", () => {
+    const result = buildIssueQuoteInput(draft({ recipientSalutation: "  Dr  " }));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.input.recipientSalutation).toBe("Dr");
+
+    const empty = buildIssueQuoteInput(draft({ recipientSalutation: "" }));
+    expect(empty.ok).toBe(true);
+    if (empty.ok) expect(empty.input.recipientSalutation).toBe("");
+
+    // A value the contact record accepts is a value this form accepts: the two
+    // caps are pinned to each other in @conduit/shared for exactly this.
+    const longest = buildIssueQuoteInput(draft({
+      recipientSalutation: "x".repeat(DOCUMENT_FIELD_CAPS.recipientSalutation),
+    }));
+    expect(longest.ok).toBe(true);
   });
 
   it("sends no valid-until date rather than an empty string when the field is blank", () => {
@@ -488,6 +548,7 @@ describe("the schema's own refusals, through describeIssue", () => {
       ["Valid-until date", draft({ validUntilDate: "13-13-13" })],
       ["Recipient", draft({ recipientName: "" })],
       ["Contact name", draft({ recipientContactName: "x".repeat(201) })],
+      ["Salutation", draft({ recipientSalutation: "x".repeat(65) })],
       ["Address", draft({ recipientAddress: "x".repeat(2001) })],
       ["Notes", draft({ notes: "x".repeat(5001) })],
       ["Terms", draft({ terms: "x".repeat(5001) })],
@@ -500,6 +561,40 @@ describe("the schema's own refusals, through describeIssue", () => {
       expect(result.problems.some((p) => p.startsWith(label)), `${label}: ${result.problems.join(" | ")}`)
         .toBe(true);
     }
+  });
+
+  /**
+   * THE CASE LIST ABOVE COULD NOT CATCH A FIELD BEING ADDED, WHICH IS HOW
+   * v1.1.0 GOT HERE.
+   *
+   * It is hand-written, so it caught the seven entries a previous round deleted
+   * and said nothing at all when `recipientSalutation` joined
+   * issueQuoteInputSchema with no label -- the form was one over-long
+   * salutation away from printing the wire name at somebody, and the whole
+   * suite was green. This walks the SCHEMA instead, so the next field fails
+   * here on the day it is added.
+   *
+   * `lines` is excluded and the exclusion is real rather than a hole:
+   * describeIssue routes a `lines` path with no index to describeLinesIssue,
+   * which answers for the whole set in its own words. The assertion below says
+   * so, so removing that branch without removing this exclusion is visible.
+   *
+   * What it cannot see: a label that is present but WRONG. The case list above
+   * is what reads the sentences back.
+   */
+  it("has a label for every field the schema can name", () => {
+    const whole = Object.keys(issueQuoteInputSchema.shape);
+    const perLine = Object.keys(documentLineInputSchema.shape);
+    expect(whole).toContain("lines");
+    expect(whole.length).toBeGreaterThan(1);
+    expect(perLine.length).toBeGreaterThan(1);
+    for (const key of [...whole.filter((k) => k !== "lines"), ...perLine]) {
+      expect(FIELD_LABELS[key], `no label for ${key}`).toBeDefined();
+    }
+    // The one exclusion, and what covers it instead.
+    expect(FIELD_LABELS.lines).toBeUndefined();
+    expect(describeIssue({ path: ["lines"], message: "x", code: "too_small" }))
+      .toBe("A quote needs at least one line item.");
   });
 
   /**

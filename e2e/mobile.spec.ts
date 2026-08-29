@@ -466,10 +466,16 @@ test.describe.serial("Phone Gantt", () => {
    * Task 5 gave that box no `data-testid`, and addressing it by its Tailwind
    * classes would break the day one utility is reordered -- so it is found
    * from a testid the app does render, by walking up to the nearest scrolling
-   * ancestor. `<main>` is also `overflow-auto`, so "nearest" is what keeps
-   * this off it; the two assertions every caller makes -- that the box
-   * overflows on BOTH axes -- are also the check that we did not land on
-   * `<main>`, which at this width overflows on neither.
+   * ancestor.
+   *
+   * THE WALK CAN NO LONGER LAND ON `<main>` AT ALL, which is a v1.1.0 change
+   * and the reason this paragraph was rewritten. It used to say `<main>` was
+   * also `overflow-auto` and that "nearest" was what kept this off it; below
+   * the breakpoint `<main>` is now `overflow: clip`, which this loop does not
+   * accept, so a chart box that stopped matching would walk past it to the
+   * root rather than stopping one element short. The two assertions every
+   * caller makes -- that the box overflows on BOTH axes -- still catch that,
+   * as they always did.
    */
   async function chartScrollBox(page: Page, taskId: string): Promise<{
     scrollLeft: number; scrollWidth: number; clientWidth: number;
