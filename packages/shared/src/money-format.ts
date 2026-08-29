@@ -11,7 +11,9 @@
 // So the locale is a value this package owns rather than a property of whoever is
 // looking. MONEY_LOCALE is the single knob; the parameter defaults to it rather
 // than being required at each call, because the failure being prevented is two
-// call sites disagreeing, and a default cannot be typed differently in six places.
+// call sites disagreeing, and a default cannot be typed differently at one call site
+// from another. (Deliberately uncounted: it said "six places" and there are nine
+// calls across seven files, which is exactly the kind of number that drifts.)
 //
 // THIS FUNCTION NEVER THROWS, and that is a hard rule rather than a preference.
 // It is display code with no error boundary anywhere in packages/web to catch it

@@ -260,8 +260,9 @@ describe("overridableClass", () => {
    * class, so both were emitted at equal specificity -- and Tailwind sorts
    * `max-w-*` alphabetically rather than by size, putting `.max-w-md` after
    * `.max-w-2xl` and `.max-w-3xl`. Measured at 1280 before the fix: a dialog
-   * asking for `max-w-3xl` computed 448px, and all four callers that passed a
-   * width had been inert since the utility was introduced.
+   * asking for `max-w-3xl` computed 448px. Three of the four callers that pass a
+   * width had been inert since the utility was introduced; the quote form is the
+   * fourth and was born inert.
    *
    * Nothing here can see a stylesheet. What it CAN guarantee is that the
    * conflict is never created, which is the property the fix rests on: when the

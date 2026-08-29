@@ -21,7 +21,7 @@ import {
  * machine with no WeasyPrint, which is where the failure paths would otherwise never
  * be executed at all. Node resolves a bare command name against `env.PATH` at spawn
  * time and renderPdf builds the child's env from `process.env`, so prepending a
- * directory here is enough to intercept it. Nine tests below do that.
+ * directory here is enough to intercept it. Fifteen tests below do that.
  *
  * The BACKSTOP part tests `pdfEmbedsFiles` directly on bytes. It is a pure function
  * and most of its cases need no renderer at all -- which is the point: an earlier
@@ -223,7 +223,11 @@ describe("renderPdf failure paths", () => {
 
   it("applies a default input cap, which is the bound on what a render costs", async () => {
     // 128KB. Not a formality: on the server a table-shaped document of this size
-    // costs 5.2s and 157MB, and 1MB of the same shape costs 40s and 816MB.
+    // costs 7.3s and 238MB, and 332MB in the worst shape a quote can take. The
+    // authoritative table is in documents-render.ts beside the constant; this comment
+    // used to carry a superseded pair (5.2s / 157MB) whose 2.1x understatement is the
+    // whole reason the concurrency cap and ram.runtime were redesigned, so restating
+    // it here was worse than saying nothing.
     const error = await renderPdf("x".repeat(300_000)).catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(RenderError);
@@ -263,9 +267,12 @@ describe("renderPdf concurrency", () => {
     // The bound is what keeps manifest.toml's ram.runtime true on a server with no
     // swap, where exceeding it is an OOM kill rather than a slowdown.
     //
-    // BOTH ASSERTIONS ARE LOAD-BEARING, in opposite directions: <= 3 fails if the
-    // limiter is removed (six children would run at once), and >= 2 fails if it is
-    // tightened to one, which would otherwise look like a very well behaved bound.
+    // BOTH ASSERTIONS ARE LOAD-BEARING, in opposite directions: the ceiling fails if
+    // the limiter is removed (six children would run at once), and the floor of 2
+    // fails if it is tightened to one, which would otherwise look like a very well
+    // behaved bound. The ceiling is spelled as RENDER_MAX_CONCURRENCY rather than as
+    // a literal, so lowering the cap cannot leave this description behind -- which is
+    // exactly what happened when it went from 3 to 2.
     const runDir = join(stubDir, "conc-run");
     const observed = join(stubDir, "conc-observed");
     writeFileSync(observed, "");
@@ -432,7 +439,7 @@ describe("renderPdf concurrency", () => {
     expect(maxObserved(observed)).toBe(RENDER_MAX_CONCURRENCY);
   }, 30_000);
 
-  it("declares the same three renders manifest.toml budgets for", () => {
+  it("declares the same renders manifest.toml budgets for", () => {
     // ram.runtime = 400M (Node) + RENDER_MAX_CONCURRENCY x 332MB (a render at the
     // 128KB input cap, in the worst SHAPE rather than the friendliest -- a table of
     // minimal rows costs 332MB where the same bytes as prose cost 84MB). The manifest

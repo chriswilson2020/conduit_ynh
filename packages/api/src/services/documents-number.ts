@@ -44,9 +44,15 @@ export function formatDocumentNumber(type: string, year: number, value: number):
  * **IT DOES NOT SERIALISE ISSUING, and an earlier version of this comment claimed it
  * did.** The year comes from the caller's issue date, so two quotes dated in
  * different years take different rows and different locks and proceed side by side --
- * measured, six across six years reaching renderPdf's three-slot limit with three
- * transactions queued behind it. The concurrency limit in documents-render.ts is
+ * measured, and asserted permanently in documents.test.ts: two quotes in different
+ * years render concurrently and two in the same year do not. Enough of them saturate
+ * renderPdf's cap and the rest queue. The concurrency limit in documents-render.ts is
  * therefore reachable from this path and not merely a backstop for other callers.
+ *
+ * The figure this sentence used to carry -- six across six years reaching a
+ * three-slot limit with three queued -- was measured when RENDER_MAX_CONCURRENCY was
+ * 3. It is 2. The same superseded sentence lived in documents-render.ts and was
+ * corrected there first, which is how this copy survived a file-scoped sweep.
  *
  * The lock hold is bounded by renderPdf's queue timeout plus its render timeout
  * (10s + 20s), which is only true because the queue wait itself is bounded; without

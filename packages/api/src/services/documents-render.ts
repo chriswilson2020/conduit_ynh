@@ -95,8 +95,8 @@ const DEFAULT_MAX_INPUT_BYTES = 128 * 1024;
  * budget is an OOM kill rather than a slowdown.
  *
  * Two rather than three, and the declaration raised to 1100M: 400 + 2 x 332 = 1,064M.
- * The alternative was to keep three and declare 1400M, which is a third of the
- * machine for a feature one person uses at a time. Concurrency is only reached at all
+ * The alternative was to keep three and declare the 1,396M computed above, which is
+ * more than a third of the machine for a feature one person uses at a time. Concurrency is only reached at all
  * when two quotes are dated in different years, or when something other than issuing
  * renders; the issuing path's own row lock serialises everything else.
  *
@@ -393,8 +393,8 @@ export function pdfEmbedsFiles(pdf: Buffer): boolean {
  * is not a PDF: a child that exits 0 having written nothing (or something else) is a
  * failed render, not an empty document.
  *
- * At most RENDER_MAX_CONCURRENCY of these run at once, process-wide; a fourth waits
- * up to RENDER_QUEUE_TIMEOUT_MS and then rejects with a RenderBusyError. See those
+ * At most RENDER_MAX_CONCURRENCY of these run at once, process-wide; the next one
+ * waits up to RENDER_QUEUE_TIMEOUT_MS and then rejects with a RenderBusyError. See those
  * two constants for the memory arithmetic they keep true and the bound they put on a
  * caller's transaction.
  */

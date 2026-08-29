@@ -201,11 +201,13 @@ describe("the seeded quote template", () => {
    * is not, whatever the markup looked like. Without a logo there must be none --
    * that is "no broken image on a quote" stated where it is true.
    */
-  it("merges at the largest size that can render, well inside the work budget", () => {
-    // The headroom assertion, against the REAL template rather than a stand-in: 130
-    // line items is the ceiling Task 2's budget arithmetic gives at a 500-character
-    // description, and this context measures 1,656 steps there against a 1,000,000
-    // cap (192 at eight lines). An earlier version of this guard lived in
+  it("merges a 130-line context well inside the work budget", () => {
+    // The headroom assertion, against the REAL template rather than a stand-in: this
+    // context measures 1,656 steps at 130 line items against a 1,000,000 cap (192 at
+    // eight lines). 130 is NOT the product's ceiling -- DOCUMENT_MAX_LINES is 60, and
+    // an earlier version of this comment called 130 "the largest quote that can
+    // render at all", which stopped being true when the constants were re-measured.
+    // It is kept because a step budget is worth stressing past the product's cap. An earlier version of this guard lived in
     // documents-template.ts's suite against an ad-hoc 787-step template, which was
     // half the true figure.
     const many: MergeContext = {

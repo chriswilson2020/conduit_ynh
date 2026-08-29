@@ -53,10 +53,15 @@ import { Textarea } from "./ui/textarea";
  * comment still has to be the measured one, and an arithmetic check on a pair of
  * them is nearly free.
  *
- * THE SAME OVERFLOW WAS SHIPPING AT A DESK and nobody had measured there. The
+ * THE SAME ROW WAS OVERFLOWING AT A DESK and nobody had measured there. The
  * dialog hard-coded `max-w-md` into its own shape, which beat every caller's
  * width in the base layer, so this form opened at 448px on a 1280px screen and
- * overflowed by exactly the amount above with its Remove button off-screen. That
+ * overflowed by 83px with its Remove button off-screen. NOT "the same amount as
+ * above", which is what this said: 142px is the overflow against the 340px box
+ * inside a 390px sheet, and a 448px dialog leaves 400px of content after `p-6`.
+ * Same row, same 482px min-content, two different containers, two different
+ * overflows -- and a pair of numbers that cannot both be right is the check that
+ * costs nothing. That
  * is fixed in ui/dialog.tsx now -- see overridableClass in src/lib.ts.
  *
  * ONE DOM, TWO LAYOUTS, which is the convention ui/table.tsx and

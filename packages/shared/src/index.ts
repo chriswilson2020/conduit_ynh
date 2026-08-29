@@ -1671,8 +1671,10 @@ export function orgProfileBytes(profile: {
  * and nothing would say so: every rejected upload would look like a user's mistake.
  *
  * 32KB of image is the figure the spec names. It reaches the renderer inlined at 4/3
- * of its size against a 128KB input cap, so it leaves the document itself roughly
- * three quarters of the budget.
+ * of its size -- 43,691 bytes against a 131,072-byte input cap, which is 33.3% of it
+ * -- so it leaves the document itself TWO THIRDS of the budget. (An earlier version
+ * of this sentence said three quarters, which is the same arithmetic rounded in the
+ * flattering direction.)
  *
  * `org_profile_logo_size` CHECKs the same character count, and a test asserts the
  * constraint's literal equals this constant so the two cannot drift.

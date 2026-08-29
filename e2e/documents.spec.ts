@@ -42,8 +42,9 @@ import type { Locator, Page } from "@playwright/test";
  * default is 30s, and one legitimate submit here can consume all of it on its
  * own: `renderPdf` bounds a render at 20s and the wait for a render slot at a
  * further 10s, so a saturated renderer is entitled to take 30s before it
- * answers 503. These tests each perform two of those, either side of about
- * thirty form actions. Scoped to this file -- `test.describe.configure` at the
+ * answers 503. Each test that raises a quote performs one of those, either side of
+ * up to thirty form actions -- and the desktop group's longest test fills four line
+ * items before it submits. Scoped to this file -- `test.describe.configure` at the
  * top level configures the enclosing scope and nothing else -- so none of the
  * suite's other 96 tests gains a second of slack.
  */
@@ -193,7 +194,9 @@ async function boxOf(locator: Locator): Promise<{ x: number; y: number; width: n
  * has no DOM, and the guard that does exist reads the CALLERS' source strings,
  * which survive every mutation that makes those strings do nothing. That gap is
  * what let `ui/dialog.tsx` hard-code `max-w-md` into the shape and silently beat
- * four callers' widths for two phases: Tailwind sorts `max-w-*` ALPHABETICALLY,
+ * every caller's width -- the three that predate this phase inert since the
+ * utility was introduced, and the quote form born inert as a fourth. Tailwind
+ * sorts `max-w-*` ALPHABETICALLY,
  * so `.max-w-md` is emitted after `.max-w-2xl` and `.max-w-3xl` and wins at
  * equal specificity, and class order in the attribute decides nothing. The quote
  * form therefore opened at 448px on a 1280px screen with 83px of table overflow
@@ -475,8 +478,8 @@ test.describe.serial("Raising a quote from a deal", () => {
 
   test("opens each dialog as wide as its caller asked", async () => {
     // THE GUARD THIS REPO HAS NEVER HAD. See dialogWidth: a caller's width class
-    // was inert for two phases and every test in the suite stayed green, because
-    // nothing anywhere measured a box. Three callers are read rather than one --
+    // was inert since the utility was introduced and every test in the suite stayed
+    // green, because nothing anywhere measured a box. Three callers are read rather than one --
     // two at max-w-3xl and one at max-w-2xl -- because two dialogs of the SAME
     // width cannot tell "the caller's class decided" from "the default happens to
     // be 768px now". 672 and 768 in one run can.
@@ -571,6 +574,12 @@ test.describe("The line-item editor on a phone", () => {
     // Scoped to the form: `toBeHidden` on a locator that resolves to more than
     // one element is a strict-mode violation, and the page behind the sheet is
     // free to grow a table of its own.
+    //
+    // COUNT FIRST, BECAUSE toBeHidden PASSES ON A MISSING ELEMENT. The claim is that
+    // the head EXISTS and is hidden by CSS -- one DOM restyled, not a second tree
+    // rendered -- and a form that had stopped rendering its column headings
+    // altogether would satisfy toBeHidden alone.
+    await expect(form.locator("thead")).toHaveCount(1);
     await expect(form.locator("thead")).toBeHidden();
     const row = page.getByTestId("quote-line-0");
     for (const label of ["Description", "Qty", "Unit price", "Tax %", "Line total"]) {
@@ -627,7 +636,16 @@ test.describe("The line-item editor on a phone", () => {
     const dialog = page.locator('[role="dialog"]');
     const totals = page.getByTestId("quote-totals");
     await expect(totals).toBeInViewport();
-    await dialog.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+    // ASSERT THAT IT ACTUALLY SCROLLED. Setting scrollTop on an element that does not
+    // overflow is a silent no-op, and three toBeInViewport checks against an
+    // unscrolled dialog are one check written three times. The first of them is still
+    // the user-visible half -- at scrollTop 0 the total is far below the fold in the
+    // document's own flow and is only on screen because it is sticky.
+    const scrolled = await dialog.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+      return element.scrollTop;
+    });
+    expect(scrolled).toBeGreaterThan(0);
     await expect(totals).toBeInViewport();
     await dialog.evaluate((element) => { element.scrollTop = 0; });
     await expect(totals).toBeInViewport();
@@ -671,19 +689,29 @@ test.describe("The line-item editor on a phone", () => {
    * no warning. That was proved through the module. This proves it through the editor
    * a person actually uses, which is the only place the round trip really happens.
    */
-  test("the issuer profile and the quote template are usable on a phone", async ({ page }) => {
+  test("the issuer profile takes touch targets and the quote template survives a save", async ({ page }) => {
     await page.goto("/settings/org");
     const profile = page.getByTestId("org-settings");
     await expect(profile).toBeVisible();
     await expect(profile.getByText("Loading...", { exact: true })).toHaveCount(0);
 
-    // All three settings destinations stay reachable at this width -- the tab row
-    // scrolls rather than clipping, and each tab takes the touch floor.
+    // All three settings destinations stay reachable at this width. Two claims, and
+    // the second one is the one a height check cannot make: every tab takes the touch
+    // floor, AND the row is reachable by scrolling rather than by clipping -- so the
+    // last tab's right edge is inside the row's SCROLL width even when it is outside
+    // the visible box. A row that clipped would fail the second and pass the first.
     const nav = page.getByTestId("settings-nav");
     for (const name of ["Mail accounts", "Templates", "Organisation"]) {
       const tab = await boxOf(nav.getByRole("link", { name, exact: true }));
       expect(tab.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
     }
+    const navScroll = await nav.evaluate((element) => ({
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth,
+      overflowX: getComputedStyle(element).overflowX,
+    }));
+    expect(navScroll.overflowX).toBe("auto");
+    expect(navScroll.scrollWidth).toBeGreaterThanOrEqual(navScroll.clientWidth);
     for (const testId of ["org-name", "org-vat", "org-email"]) {
       const box = await boxOf(page.getByTestId(testId));
       expect(box.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
@@ -715,13 +743,19 @@ test.describe("The line-item editor on a phone", () => {
     //
     // THIS STEP IS DESTRUCTIVE WHEN IT FAILS, which is worth knowing before it does.
     // The save is a real PUT: if the round trip is NOT a fixed point, the damaged
-    // template is what the database now holds, and every later run reads it back and
-    // fails too. Harmless in CI, where the database is new each run and the seed is
-    // intact -- and locally it is the same re-seed that a `truncateAll()` from the
-    // unit suite already requires (replay the INSERT at the end of
-    // packages/api/drizzle/0009_calm_rhodey.sql). Proved by doing exactly that: the
-    // mutation that restores Task 4's S2 bug fails this assertion AND leaves the
-    // logo-less template behind.
+    // template is what the database now holds. Harmless in CI, where the database is
+    // new each run and 0009 re-seeds it -- and the same property is proved
+    // non-destructively in routes.test.ts, so a green CI does not depend on this one.
+    //
+    // WHAT A SECOND LOCAL RUN LOOKS LIKE, because the failure moves and that is
+    // confusing: run 1 fails on the comparison below, and run 2 fails EARLIER, on the
+    // `toHaveValue` regex waiting for the letterhead token -- the template no longer
+    // contains it, so the wait times out and reads like a seeding problem rather than
+    // a sanitiser one. Both mean the same thing. Re-seed by replaying the INSERT at
+    // the end of packages/api/drizzle/0009_calm_rhodey.sql, which is the same repair
+    // a `truncateAll()` from the unit suite already needs.
+    //
+    // The restore below makes the SUCCEEDING path leave nothing behind either.
     await page.getByTestId("document-template-save").click();
     await expect(page.getByTestId("document-template-saved")).toBeVisible();
     await expect(page.getByTestId("document-template-error")).toHaveCount(0);
@@ -731,5 +765,16 @@ test.describe("The line-item editor on a phone", () => {
     // the reloaded query and compares exactly, so a slow response cannot pass this by
     // arriving after the comparison.
     await expect(editor).toHaveValue(before);
+
+    // PUT THE ORIGINAL BACK. On the success path this is a no-op by definition -- the
+    // bytes are the ones just read -- so it costs one request and buys the guarantee
+    // that a passing run never leaves the shared template in a state it did not find
+    // it in. It cannot repair a FAILING run: the assertions above stop the test
+    // before this line, which is deliberate, since a test that tidied away the
+    // evidence of a real sanitiser regression would be worse than one that does not.
+    const restore = await page.request.put("/api/document-templates/quote", {
+      data: { bodyHtml: before },
+    });
+    expect(restore.ok(), "restoring the quote template").toBe(true);
   });
 });

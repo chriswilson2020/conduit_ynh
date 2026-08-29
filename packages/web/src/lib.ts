@@ -325,8 +325,10 @@ export const MOBILE_BREAKPOINT = "48rem";
  * appear in the attribute. Tailwind sorts `max-w-*` ALPHABETICALLY rather than
  * by size, so `.max-w-md` lands after `.max-w-2xl` and `.max-w-3xl` and beats
  * them both. Measured before this fix: a dialog carrying `max-w-3xl` computed
- * `max-width: 448px` at 1280, and all four callers that passed a width were
- * inert.
+ * `max-width: 448px` at 1280, and every caller that passed a width was inert --
+ * the three that predate Phase 7 (the composer, mail settings, email templates)
+ * had been inert since the utility was introduced, and the quote form made a
+ * fourth the moment it was written.
  *
  * The fix is not to fight the cascade but to stop creating the conflict: the
  * component omits the utility from its own string and calls this, which returns

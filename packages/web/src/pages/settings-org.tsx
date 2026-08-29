@@ -45,7 +45,9 @@ const EMPTY: OrgProfileInput = {
  * somebody has to have done: the logo reaches the renderer inlined at 4/3 of
  * its stored size against a 128KB input cap, so a stored logo much above 64KB
  * cannot render at all, and the template and the line items have to fit beside
- * it. 32KB leaves the document itself three quarters of the budget.
+ * it. 32KB inlines to 43,691 bytes of a 131,072-byte cap, so it leaves the
+ * document itself two thirds of the budget -- not the three quarters an earlier
+ * version of this comment claimed, which is the same division rounded kindly.
  *
  * `saveOrgProfile` enforces the same bound server-side and is the control; this
  * is the message.

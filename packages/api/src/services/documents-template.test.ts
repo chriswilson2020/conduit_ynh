@@ -813,9 +813,14 @@ describe("mergeTemplate and blocks inside blocks", () => {
   }, 5000);
 
   it("does not bite a document shaped like a real one, which is the other half of a bound", () => {
-    // 130 line items is the ceiling Task 2's budget arithmetic gives at a 500-char
-    // description, so this is the largest quote that can render at all. A bound that
-    // stopped it would be a bug of the opposite kind. The SEEDED template at that
+    // 130 line items at a 500-character description was once documented as the
+    // largest quote that can render at all. IT IS NOT: DOCUMENT_MAX_LINES is 60 and
+    // DOCUMENT_MAX_DESCRIPTION_CHARS is 250, because 130 x 500 was re-measured
+    // against the real template and does not fit the renderer's input cap (see
+    // documents-template.ts's MERGE_MAX_STEPS comment, which says so in capitals).
+    // The 130 below is deliberately kept: it is a step-budget stress input well past
+    // anything the product will accept, and a bound that stopped it would be a bug of
+    // the opposite kind. The SEEDED template at that
     // size is asserted in documents-seed.test.ts, against the real thing: 1,656 steps
     // with every field filled in, against a 1,000,000 cap.
     const lines = Array.from({ length: 130 }, (_, i) => ({

@@ -168,8 +168,11 @@ describe("the modal skeleton", () => {
    * quote form were inert at every width. The previous version of this comment
    * recorded that accurately and deferred the fix as a desktop change; Phase 7
    * hit it head-on, because the quote form's six columns overflowed a 448px
-   * dialog by 143px and put its Remove button off-screen -- the same failure
-   * the phone layout exists to avoid.
+   * dialog by 83px and put its Remove button off-screen -- the same failure the
+   * phone layout exists to avoid. (83, not 143: `p-6` leaves 400px of content
+   * inside a 448px dialog, against a 482px min-content row. 143 was the PHONE
+   * figure, measured against the 340px box inside a 390px sheet, and the two
+   * cannot be the same number because the containers are not.)
    *
    * THE FIX IS THE ABSENCE OF A CONFLICT, NOT A CASCADE ARGUMENT, which is why
    * the first assertion below is a NEGATIVE one. The shape no longer spells any
@@ -214,9 +217,11 @@ describe("the modal skeleton", () => {
     // dialog in the app loses its card width.
     expect(dialog).toContain('overridableClass(DIALOG_DEFAULT_MAX_WIDTH, "max-w-", className)');
 
-    // THE DEFAULT'S VALUE, PINNED. Nine callers pass no width at all and get
-    // this one; changing it to `max-w-xs` shrinks every one of them from 448px
-    // to 320px, and nothing else in this repo would have noticed.
+    // THE DEFAULT'S VALUE, PINNED. Eight of the twelve DialogContent callers pass
+    // no width at all and get this one; changing it to `max-w-xs` shrinks every
+    // one of them from 448px to 320px, and nothing else in this repo would have
+    // noticed. (Nine was wrong by one: four callers DO pass a width -- the
+    // composer, the quote form, mail settings and email templates.)
     expect(dialog).toContain('const DIALOG_DEFAULT_MAX_WIDTH = "max-w-md";');
 
     const tunable = /^(max-w-|max-h-|overflow-|md:)/;

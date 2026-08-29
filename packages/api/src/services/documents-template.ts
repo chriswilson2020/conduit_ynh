@@ -933,9 +933,12 @@ function render(nodes: Node[], scopes: unknown[], sink: Sink, depth: number): vo
       // COUNT, not this: an expansion that visits no nodes only happens at the
       // innermost level, so leaving this out costs a factor of the array length
       // rather than a bound. Mutation-checked and it fails NO test, exactly like the
-      // rel=attachment strip -- what it buys is the constant: without it a 130-line
-      // quote could do 1.3e8 iterations inside the same one-million-step budget,
-      // which is seconds of blocked event loop rather than a third of a second.
+      // rel=attachment strip -- what it buys is the constant: without it a quote at
+      // the 130-line ceiling this was written against could do 1.3e8 iterations
+      // inside the same one-million-step budget, which is seconds of blocked event
+      // loop rather than a third of a second. DOCUMENT_MAX_LINES is 60 now, so the
+      // real figure is smaller and the argument is unchanged; the 1.3e8 is left as
+      // the number that was actually computed rather than replaced by a guess.
       for (const item of value) {
         spend(sink);
         render(node.body, [...scopes, item], sink, depth + 1);

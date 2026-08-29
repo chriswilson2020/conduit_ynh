@@ -323,8 +323,9 @@ describe("two quotes at once", () => {
   // in documents-number.ts claimed it serialised issuing outright. It does not: the
   // year comes from the CALLER's issue date, so quotes dated in different years take
   // different rows, different locks, and render side by side -- which is how the
-  // issuing path reaches renderPdf's three-slot queue while holding a row lock, an
-  // open transaction and a pooled connection.
+  // issuing path reaches renderPdf's queue while holding a row lock, an open
+  // transaction and a pooled connection. (Not a "three-slot" queue: the cap is
+  // RENDER_MAX_CONCURRENCY, which is 2.)
   //
   // Two at a time rather than six because openTestDatabase's pool is max: 2, so two
   // is every transaction this harness can have open at once. Two is enough: the
@@ -804,8 +805,11 @@ describe("buildContext", () => {
     // SV-1's regression, and the reason the constants above are what they are. The
     // old pair (130 lines x 500 characters) was documented as sized against the
     // renderer's 128KB input cap and was not: 130 x 500 ASCII with every optional
-    // field maxed and a maxed logo merges to 145,679 bytes, and the same quote in
-    // accented text to 210,679. A UI built against those constants would have offered
+    // field maxed and a maxed logo merges to 151,139 bytes, and the same quote in
+    // accented text to 216,139. (An earlier version of this comment said 145,679 and
+    // 210,679, measured with narrower money strings -- same conclusion, different
+    // premise. shared/src/index.ts carries the authoritative pair and demotes the
+    // old one; this copy was left behind.) A UI built against those constants would have offered
     // a quote the server refuses -- at roughly half the advertised count for a Dutch
     // or French one, which is the case this test is written in.
     const maxedLogo = `data:image/png;base64,${"A".repeat(MAX_LOGO_DATA_URI_CHARS - 22)}`;

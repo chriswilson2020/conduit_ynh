@@ -34,7 +34,12 @@ import { getOrgProfile, OrgProfileInputError, saveOrgProfile } from "../services
  */
 
 /**
- * The four failures this surface owns, none of which should reach the 5xx handler.
+ * The failures this surface owns, none of which should reach the 5xx handler.
+ *
+ * Deliberately uncounted. It was "four" when Task 4 wrote it and there are seven arms
+ * now -- the two 503s and the input-cap 413 arrived in later rounds -- and a count in
+ * a comment beside a list that grows is a number waiting to go stale. The table test
+ * over the arms is what keeps them all covered.
  *
  * Falls through to mapDomainError for the ordinary ones (an unknown deal is a 404,
  * an archived deal a 409), which is also what re-throws anything genuinely

@@ -121,7 +121,15 @@ describe("formatTaxRateBp", () => {
 
   it("keeps the resolution a basis point actually has", () => {
     // 1bp is 0.01%, so two fraction digits is the whole domain rather than a
-    // rounding choice. 750bp through a double divide is 0.075000000000000005.
+    // rounding choice -- and the divide route does not land on it exactly: 2137/100
+    // is 21.370000000000000995 and 1/100 is 0.010000000000000000208, which is why the
+    // decimal is built out of the integer with BigInt instead.
+    //
+    // An earlier version of this comment said "750bp through a double divide is
+    // 0.075000000000000005", and both halves were wrong: 750/10000 evaluates to
+    // 0.074999999999999997224 (printing as "0.075"), the cited literal is a
+    // DIFFERENT double (0.075000000000000011102), and this function divides by 100
+    // rather than 10000 anyway -- 750/100 is exactly 7.5. Measured in node.
     expect(formatTaxRateBp(750)).toBe("7.5%");
     expect(formatTaxRateBp(1)).toBe("0.01%");
     expect(formatTaxRateBp(2137)).toBe("21.37%");
