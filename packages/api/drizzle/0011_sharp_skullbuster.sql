@@ -31,16 +31,41 @@ ALTER TABLE "contacts" ADD CONSTRAINT "contacts_pronouns_length" CHECK (char_len
 -- while the row still stores both -- deliberate, and the reason the form defaults the
 -- two together.
 --
+-- AND IT MUST NOT MAKE A TEMPLATE UNSAVEABLE, which is the 16384 below. The rewrite
+-- GROWS the body by 99 bytes per occurrence, and saveDocumentTemplate refuses a body
+-- over MAX_TEMPLATE_BYTES (16 * 1024) -- so a template sitting within 99 bytes of
+-- that cap would come out the other side of this migration unsaveable, including a
+-- PUT of the byte-identical body a GET had just returned, which is the round-trip
+-- invariant shared/src/index.ts writes down. The symptom would be "I can no longer
+-- save my own letterhead" with nothing pointing at an upgrade weeks earlier. Such a
+-- template is left alone instead, exactly like a customised recipient line.
+--
+-- octet_length is Buffer.byteLength's counterpart, which is what that check measures,
+-- and what the column holds is already the sanitised form saveDocumentTemplate
+-- measured -- so the two are comparing the same bytes.
+--
+-- The subquery form is what lets the amended body be measured before it is stored;
+-- `amended <> body_html` also replaces a `position(...) > 0` guard, and is exact when
+-- the recipient line appears more than once.
+--
 -- No `;` and no `'` inside either literal, so nothing here can be mistaken for a
 -- statement end or needs doubling. Both strings are read back out of this file by
 -- test/seed-template.ts, which is how documents.test.ts and documents-seed.test.ts
 -- see the template a fresh install actually has.
-UPDATE "document_templates"
-SET "body_html" = replace(
+UPDATE "document_templates" AS t
+SET "body_html" = amendment.amended,
+    "updated_at" = now()
+FROM (
+  SELECT
+    "id",
+    replace(
       "body_html",
       '{{#document.recipientContactName}}<div>{{document.recipientContactName}}</div>{{/document.recipientContactName}}',
       '{{#document.recipientContactName}}<div>{{#document.recipientSalutation}}{{document.recipientSalutation}} {{/document.recipientSalutation}}{{document.recipientContactName}}</div>{{/document.recipientContactName}}'
-    ),
-    "updated_at" = now()
-WHERE "type" = 'quote'
-  AND position('{{#document.recipientContactName}}<div>{{document.recipientContactName}}</div>{{/document.recipientContactName}}' in "body_html") > 0;
+    ) AS amended
+  FROM "document_templates"
+  WHERE "type" = 'quote'
+) AS amendment
+WHERE t."id" = amendment."id"
+  AND amendment.amended <> t."body_html"
+  AND octet_length(amendment.amended) <= 16384;

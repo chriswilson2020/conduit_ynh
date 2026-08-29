@@ -213,7 +213,8 @@ export interface TemplateContext {
    * pronouns has corrected them for the next message, and nothing stored disagrees.
    *
    * NEITHER IS EVER INFERRED -- not from the name, not from each other. An absent
-   * value leaves its placeholder literal, exactly as an absent name does.
+   * value renders as NOTHING, which is where these two part company with the name
+   * fields; see BLANK_MEANS_BLANK.
    */
   contactSalutation?: string | null;
   contactPronouns?: string | null;
@@ -221,25 +222,24 @@ export interface TemplateContext {
   userName?: string | null;
 }
 
-/** `{{contact.name}}`, `{{contact.salutation}}`, `{{contact.pronouns}}`,
- * `{{company.name}}` and `{{user.name}}`. Written as one alternation of whole paths
- * rather than `(contact|company|user)\.(name|salutation|pronouns)`, which would also
- * match `{{company.pronouns}}` -- a placeholder nothing supplies, silently left
- * literal in a sent email. */
-const PLACEHOLDER =
-  /\{\{\s*(contact\.name|contact\.salutation|contact\.pronouns|company\.name|user\.name)\s*\}\}/g;
-
 /** Text-node escaping for a value being spliced into markup. Ampersand
  * first, or it would double-escape the entities the others produce. */
 function escapeHtmlText(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Every placeholder path, and the context key that fills it. A path missing from
- * here resolves to undefined and is therefore left literal, which is the same
- * outcome as an empty value -- so adding a path to PLACEHOLDER without adding it
- * here is a placeholder that never fills, not a crash. */
-const PLACEHOLDER_KEYS: Record<string, keyof TemplateContext> = {
+/**
+ * EVERY PLACEHOLDER PATH, AND THE CONTEXT KEY THAT FILLS IT. This is the only list:
+ * PLACEHOLDER below is built from these keys, so a path cannot be in the regex and
+ * missing from the lookup, or the reverse. Two hand-written lists that had to agree
+ * was the first shape of this, with nothing asserting that they did.
+ *
+ * Exported because Settings -> Templates documents these paths on the page, and that
+ * page is the only place anybody will look. Rendering the list from this object is
+ * what keeps the documentation and the substitution from drifting -- a path
+ * documented there and misspelt is an unfilled placeholder in a sent email.
+ */
+export const PLACEHOLDER_KEYS: Record<string, keyof TemplateContext> = {
   "contact.name": "contactName",
   "contact.salutation": "contactSalutation",
   "contact.pronouns": "contactPronouns",
@@ -247,11 +247,55 @@ const PLACEHOLDER_KEYS: Record<string, keyof TemplateContext> = {
   "user.name": "userName",
 };
 
+/**
+ * THE TWO PATHS WHERE ABSENT MEANS EMPTY RATHER THAN VISIBLE, and the one place this
+ * module deliberately departs from Phase 4's rule.
+ *
+ * That rule -- an unresolved placeholder is left literal for the user to fill -- was
+ * written for `{{contact.name}}`, which is essentially always present, so one
+ * surviving into the editor means somebody forgot something. Salutation and pronouns
+ * are NORMALLY EMPTY: every contact created before v1.1.0 has neither, so the same
+ * rule would put `Dear {{contact.salutation}} Alice,` in front of the user on most
+ * sends, to be deleted by hand every time. A field that costs a deletion per message
+ * is worse than no field at all.
+ *
+ * The name fields keep the old rule, because a missing name really is a mistake worth
+ * surfacing. (v1.1.0 coordinator ruling; the spec said "renders as nothing" for all
+ * of them and was wrong about the names.)
+ */
+const BLANK_MEANS_BLANK: ReadonlySet<string> = new Set(["contact.salutation", "contact.pronouns"]);
+
+/**
+ * The placeholders, built from PLACEHOLDER_KEYS so the two cannot disagree, plus ONE
+ * OPTIONAL FOLLOWING SPACE.
+ *
+ * That trailing group is what makes an empty salutation read correctly. `Dear
+ * {{contact.salutation}} {{contact.name}},` with nothing to fill the first would
+ * otherwise leave `Dear  Alice,` with a doubled space -- the quote template solves
+ * the same problem by nesting the field inside a `{{#...}}` block, which this
+ * language does not have. So a BLANK_MEANS_BLANK path resolving to nothing takes a
+ * single following space with it, and every other outcome puts the space back
+ * untouched.
+ *
+ * ONE SPACE, AND NOT WHITESPACE COLLAPSING. A newline, a tab, a `&nbsp;` and a second
+ * space are all left exactly as the template's author wrote them: this fixes the one
+ * layout a missing salutation breaks, and is not a formatter.
+ */
+const PLACEHOLDER = new RegExp(
+  `\\{\\{\\s*(${Object.keys(PLACEHOLDER_KEYS)
+    .map((path) => path.replaceAll(".", "\\."))
+    .join("|")})\\s*\\}\\}( ?)`,
+  "g",
+);
+
 function substitute(input: string, context: TemplateContext, escape: (value: string) => string): string {
-  return input.replace(PLACEHOLDER, (match, path: string) => {
+  return input.replace(PLACEHOLDER, (match, path: string, trailingSpace: string) => {
     const key = PLACEHOLDER_KEYS[path];
     const value = key === undefined ? undefined : context[key];
-    return value != null && value.trim() !== "" ? escape(value) : match;
+    if (value != null && value.trim() !== "") return escape(value) + trailingSpace;
+    // `match` carries the trailing space with it, so a name placeholder left literal
+    // leaves the line exactly as it was written.
+    return BLANK_MEANS_BLANK.has(path) ? "" : match;
   });
 }
 
@@ -259,11 +303,13 @@ function substitute(input: string, context: TemplateContext, escape: (value: str
  * Substitutes every path in PLACEHOLDER_KEYS -- `{{contact.name}}`,
  * `{{contact.salutation}}`, `{{contact.pronouns}}`, `{{company.name}}` and
  * `{{user.name}}` -- from the given context into PLAIN TEXT (the subject line,
- * where a salutation is the likely one). A placeholder with
- * nothing to fill it is LEFT LITERAL (spec: "unresolved placeholders are left
- * visible for the user to fill"), never replaced with an empty string -- an
- * email that silently reads "Hi ," is worse than one that visibly still needs
- * a name.
+ * where a salutation is the likely one).
+ *
+ * AN UNFILLED NAME IS LEFT LITERAL (spec: "unresolved placeholders are left visible
+ * for the user to fill"), never replaced with an empty string -- an email that
+ * silently reads "Hi ," is worse than one that visibly still needs a name. AN
+ * UNFILLED SALUTATION OR SET OF PRONOUNS RENDERS AS NOTHING, taking one following
+ * space with it. See BLANK_MEANS_BLANK for why the two differ.
  */
 export function substitutePlaceholders(input: string, context: TemplateContext): string {
   return substitute(input, context, (value) => value);

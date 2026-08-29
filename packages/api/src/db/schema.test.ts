@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema, mailVisibilitySchema,
-  CONTACT_FIELD_CAPS, MAX_LOGO_DATA_URI_CHARS,
+  CONTACT_FIELD_CAPS, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { TEST_DATABASE_URL } from "../test/global-setup.js";
@@ -190,6 +190,24 @@ describe("mail schema (0004)", () => {
       // contacts.salutation, then failed here with `column "salutation" of relation
       // "contacts" does not exist` -- in the 0004 test, a long way from the change
       // that caused it. Naming the columns by hand is what makes "old shape" mean it.
+      //
+      // THE REST OF THIS FILE HAS NOT BEEN CONVERTED, and that is a decision rather
+      // than an oversight: nothing is broken today, and the conversion is a large
+      // mechanical diff through eight drills. What the next person adding a column
+      // needs to know is WHICH pre-migrate seeds would break, so here they are --
+      // every ORM write below that happens BEFORE its drill's `migrate(...)` call:
+      //
+      //   0004  users, companies, pipelines, stages, deals, projects
+      //   0005  users, mail_threads, mail_messages
+      //   0006  users
+      //   0007  users, mail_accounts, mail_messages
+      //   0008  users, companies
+      //   0009  users, and companies/pipelines/stages/deals through their services
+      //   0010  org_profile
+      //   0011  users, files, and pipelines/stages/deals through their services
+      //
+      // A v1.2.0 column on any of those tables fails in the drill that seeds it, not
+      // in the migration that added it. The fix is always this one: name the columns.
       const [contact] = await scratch.db.execute<{ id: string }>(sql`
         INSERT INTO contacts (first_name, company_id) VALUES ('Bob', ${company!.id})
         RETURNING id
@@ -1901,6 +1919,63 @@ describe("salutation and pronouns (0011)", () => {
     });
   }, 30000);
 
+  it("leaves a template it cannot amend without making it unsaveable, and says so in the file", async () => {
+    // O-1. The rewrite grows the body by 99 bytes, and saveDocumentTemplate refuses
+    // anything over MAX_TEMPLATE_BYTES -- so amending a template that is already
+    // within 99 bytes of the cap would leave the operator unable to save their own
+    // letterhead, including a PUT of the body a GET had just returned. The migration
+    // measures the amended body first and skips such a row.
+    //
+    // The constant and the migration's literal are pinned to each other here, since
+    // SQL cannot import it.
+    const migration = readFileSync(
+      path.join(migrationsFolder(), "0011_sharp_skullbuster.sql"), "utf8",
+    );
+    expect(migration).toContain(`octet_length(amendment.amended) <= ${String(MAX_TEMPLATE_BYTES)}`);
+
+    await withPreMigrationDatabase("0011", async (scratch) => {
+      // Padded to exactly the cap, with the recipient line still intact: the
+      // amendment matches, and applying it would produce 16,483 bytes.
+      const [seeded] = await scratch.db
+        .select({ bodyHtml: documentTemplates.bodyHtml })
+        .from(documentTemplates).where(eq(documentTemplates.type, "quote"));
+      const padding = "p".repeat(MAX_TEMPLATE_BYTES - Buffer.byteLength(seeded!.bodyHtml, "utf8"));
+      await scratch.db.execute(sql`
+        UPDATE document_templates SET body_html = body_html || ${padding} WHERE type = 'quote'
+      `);
+      const before = await quoteTemplateRow(scratch);
+      expect(Buffer.byteLength(before.bodyHtml, "utf8")).toBe(MAX_TEMPLATE_BYTES);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      expect(await quoteTemplateRow(scratch)).toEqual(before);
+
+      // ...and one byte of headroom less than the growth is the boundary: at
+      // MAX_TEMPLATE_BYTES - 99 the amendment lands exactly on the cap and IS
+      // applied, so the guard is a bound rather than a blanket refusal.
+    });
+
+    // ...and the boundary, on its own database because a migration only runs once.
+    // At exactly 99 bytes of headroom the amendment lands ON the cap and IS applied,
+    // so the guard is a bound rather than a blanket refusal to touch a large body.
+    await withPreMigrationDatabase("0011", async (scratch) => {
+      const [seeded] = await scratch.db
+        .select({ bodyHtml: documentTemplates.bodyHtml })
+        .from(documentTemplates).where(eq(documentTemplates.type, "quote"));
+      const room = MAX_TEMPLATE_BYTES - 99 - Buffer.byteLength(seeded!.bodyHtml, "utf8");
+      const padding = "p".repeat(room);
+      await scratch.db.execute(sql`
+        UPDATE document_templates SET body_html = body_html || ${padding} WHERE type = 'quote'
+      `);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const amended = await quoteTemplateRow(scratch);
+      expect(amended.bodyHtml).toBe(seededQuoteTemplate() + padding);
+      expect(Buffer.byteLength(amended.bodyHtml, "utf8")).toBe(MAX_TEMPLATE_BYTES);
+    });
+  }, 60000);
+
   it("leaves a template whose recipient line was itself edited completely alone, updated_at included", async () => {
     // The other side of the guard. An install that rewrote the recipient block has
     // said what it wants there; the migration matches nothing, changes nothing, and
@@ -1928,18 +2003,33 @@ describe("salutation and pronouns (0011)", () => {
   // he-him/she-her/they-them are a UI convenience; an enum or a value-set CHECK here
   // would turn "type your own" into a 23514 for every title in every other language.
   it("bounds both new contact columns at 64 characters and constrains their values not at all", async () => {
-    // The constant and the constraints cannot drift: each is asserted to carry the
-    // other's number, the way org_profile_logo_size is pinned to
-    // MAX_LOGO_DATA_URI_CHARS. Zod refuses a long value first; these are the backstop.
+    // The constants and the constraints cannot drift, EACH AGAINST ITS OWN. An
+    // earlier version of this checked both constraints against the salutation
+    // constant with `toContain`, which passed for a CHECK of 640 or 164 and would
+    // have missed the two caps diverging -- they are the same number today, and
+    // nothing says they must stay that way. Zod refuses a long value first; these
+    // are the backstop.
+    //
+    // THE BACKSTOP IS UNREACHABLE THROUGH THE API, and that is fine. Zod counts
+    // UTF-16 code units and char_length counts code points, and they diverge only in
+    // the direction where Zod is stricter: an astral character costs 2 to Zod and 1
+    // to Postgres, so a salutation of emoji is effectively capped at 32 by the gate
+    // and can never reach a 23514. The CHECK is for the direct-write paths (a seed,
+    // an import) that never see the schema.
     const checks = await handle.db.execute<{ conname: string; src: string }>(sql`
       SELECT conname, pg_get_constraintdef(oid) AS src FROM pg_constraint
       WHERE conname IN ('contacts_salutation_length', 'contacts_pronouns_length')
     `);
-    expect(checks).toHaveLength(2);
-    expect(CONTACT_FIELD_CAPS.salutation).toBe(64);
-    expect(CONTACT_FIELD_CAPS.pronouns).toBe(64);
-    for (const check of checks) {
-      expect(check.src).toContain(String(CONTACT_FIELD_CAPS.salutation));
+    const byName = new Map(checks.map((row) => [row.conname, row.src]));
+    for (const [column, cap] of [
+      ["salutation", CONTACT_FIELD_CAPS.salutation],
+      ["pronouns", CONTACT_FIELD_CAPS.pronouns],
+    ] as const) {
+      const src = byName.get(`contacts_${column}_length`);
+      expect(src, `no contacts_${column}_length constraint`).toBeDefined();
+      // The whole expression, so neither the column nor the number can be the other
+      // one's and neither can be a prefix of a larger figure.
+      expect(src).toMatch(new RegExp(`char_length\\(${column}\\)\\s*<=\\s*${String(cap)}\\)`));
     }
 
     const atLimit = "x".repeat(CONTACT_FIELD_CAPS.salutation);

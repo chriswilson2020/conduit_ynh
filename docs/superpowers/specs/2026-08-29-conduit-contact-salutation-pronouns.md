@@ -32,6 +32,16 @@ and a first name says nothing about either. A CRM that guesses will guess wrong 
 real person, in a letter, in front of a customer. The templates already render an unknown
 merge field as empty and never throw, so a blank simply produces a shorter greeting.
 
+**Coordinator ruling, v1.1.0 Task 1 review.** "Renders as nothing" holds for these two
+fields and NOT for `{{contact.name}}`, `{{company.name}}` and `{{user.name}}`, which
+keep Phase 4's rule of staying visible when unfilled. The names are essentially always
+present, so a visible placeholder there means somebody forgot something; salutation and
+pronouns are normally empty, so the same rule would put `Dear {{contact.salutation}}
+Alice,` in front of the user on most sends. An emptied salutation or pronoun placeholder
+also consumes one immediately-following space, so `Dear {{contact.salutation}}
+{{contact.name}},` reads `Dear Alice,` rather than `Dear  Alice,` -- the quote template
+gets the same effect from block nesting, which the mail merge language does not have.
+
 ## Data model (migration 0011)
 
 Two nullable text columns on `contacts`. Note 0010 was taken by v1.0.1 (the logo column widening), so this is **0011**:
@@ -104,7 +114,9 @@ whatsoever.
   existing company-rename case and is the reason `recipient_salutation` is a column.
 - **e2e** for setting both on a contact, seeing the salutation in the list, and a quote
   carrying it.
-- Baseline: 2347 unit + 105 e2e, green.
+- Baseline: 2374 unit + 105 e2e, green. (Was written here as 2347, a transposition of
+  the plan's figure; Task 3 is checked against this line, so it is corrected rather
+  than left to be discovered at the end of the release.)
 
 ## Rollout
 

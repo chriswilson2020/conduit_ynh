@@ -35,6 +35,7 @@ import {
   MAIL_CONNECTION_MESSAGE,
   parseAddressToken,
   parseRecipientInput,
+  PLACEHOLDER_KEYS,
   resolveRecipients,
   sendFailureMessage,
   signatureBlock,
@@ -309,26 +310,75 @@ describe("substitutePlaceholders", () => {
 
   // THE RULE, AS AN ABSENCE. Neither field is ever inferred -- not from the name,
   // not from the other one. A contact with a salutation and no pronouns fills the
-  // one placeholder and leaves the other visibly unfilled, which is what a person
-  // reading their own draft needs to see.
+  // one and renders nothing for the other.
   it("infers neither field from the other, nor from the name", () => {
     expect(substitutePlaceholders(
       "{{contact.salutation}}|{{contact.pronouns}}",
       { contactName: "Alice Jansen", contactSalutation: "Mr" },
-    )).toBe("Mr|{{contact.pronouns}}");
+    )).toBe("Mr|");
     expect(substitutePlaceholders(
       "{{contact.salutation}}|{{contact.pronouns}}",
       { contactName: "Alice Jansen" },
-    )).toBe("{{contact.salutation}}|{{contact.pronouns}}");
+    )).toBe("|");
   });
 
-  // The paths are whole, not a product of two alternations: {{company.pronouns}}
-  // would otherwise match, resolve to nothing and be left literal in a sent email.
-  it("does not invent paths by crossing the prefixes with the field names", () => {
+  /**
+   * THE TWO NEW FIELDS DELIBERATELY DIFFER FROM THE NAME FIELDS, and this is the
+   * test that says so out loud.
+   *
+   * Phase 4's rule leaves an unresolved placeholder visible because a missing
+   * `{{contact.name}}` means somebody forgot something. Salutation and pronouns are
+   * normally empty -- every contact from before v1.1.0 has neither -- so leaving
+   * them visible would put `Dear {{contact.salutation}} Alice,` in front of the user
+   * on most sends. Blank means blank for these two, and the name fields are checked
+   * alongside so the departure stays deliberate rather than spreading.
+   */
+  it("renders an absent salutation or set of pronouns as nothing, while an absent name is still left literal", () => {
+    const context = { contactName: "Alice", companyName: "Acme", userName: "Chris" };
+    expect(substitutePlaceholders("Dear {{contact.salutation}} {{contact.name}},", context))
+      .toBe("Dear Alice,");
+    expect(substitutePlaceholders("Alice ({{contact.pronouns}}) at {{company.name}}", context))
+      .toBe("Alice () at Acme");
+    // ...and the names keep the old rule.
+    expect(substitutePlaceholders("Hi {{contact.name}} at {{company.name}} - {{user.name}}", {}))
+      .toBe("Hi {{contact.name}} at {{company.name}} - {{user.name}}");
+  });
+
+  // THE SPACE, WHICH IS THE WHOLE REASON BLANK CANNOT JUST MEAN "". Substituting
+  // nothing for the salutation in "Dear {{contact.salutation}} Alice," leaves a
+  // doubled space; one following space goes with it.
+  it("consumes exactly one following space when a blank-means-blank field renders as nothing", () => {
+    const filled = { contactSalutation: "Dr", contactName: "Alice" };
+    expect(substitutePlaceholders("Dear {{contact.salutation}} {{contact.name}},", filled))
+      .toBe("Dear Dr Alice,");
+    // ONE space, not whitespace collapsing: a second space, a newline and a tab are
+    // the author's layout and survive untouched.
+    expect(substitutePlaceholders("Dear {{contact.salutation}}  Alice,", {})).toBe("Dear  Alice,");
+    expect(substitutePlaceholders("{{contact.salutation}}\nAlice", {})).toBe("\nAlice");
+    // Nothing following it at all is not a special case.
+    expect(substitutePlaceholders("Alice {{contact.pronouns}}", {})).toBe("Alice ");
+    // The HTML path behaves identically -- the space handling is in the shared
+    // substitution, not in either wrapper.
+    expect(substitutePlaceholdersHtml("<p>Dear {{contact.salutation}} Alice</p>", {}))
+      .toBe("<p>Dear Alice</p>");
+  });
+
+  // The paths are whole, and there is only ONE list of them: PLACEHOLDER is built
+  // from PLACEHOLDER_KEYS, so a path the lookup does not know cannot be matched in
+  // the first place. {{company.pronouns}} is the shape that would exist if the regex
+  // crossed the prefixes with the field names.
+  it("matches only the paths PLACEHOLDER_KEYS declares", () => {
     expect(substitutePlaceholders(
-      "{{company.pronouns}} {{user.salutation}}",
+      "{{company.pronouns}} {{user.salutation}} {{deal.title}}",
       { contactSalutation: "Dr", contactPronouns: "she/her", companyName: "Acme", userName: "Chris" },
-    )).toBe("{{company.pronouns}} {{user.salutation}}");
+    )).toBe("{{company.pronouns}} {{user.salutation}} {{deal.title}}");
+    // Every declared path resolves, which is the other direction of the same claim.
+    for (const path of Object.keys(PLACEHOLDER_KEYS)) {
+      expect(substitutePlaceholders(`[{{${path}}}]`, {
+        contactName: "Alice", contactSalutation: "Dr", contactPronouns: "she/her",
+        companyName: "Acme", userName: "Chris",
+      })).not.toContain("{{");
+    }
   });
 
   it("tolerates whitespace inside the braces", () => {

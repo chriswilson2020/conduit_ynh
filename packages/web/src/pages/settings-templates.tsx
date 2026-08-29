@@ -11,7 +11,7 @@ import {
   useUnarchiveMailTemplate,
   useUpdateMailTemplate,
 } from "../queries";
-import { htmlIsBlank } from "../components/mail/mail-lib";
+import { htmlIsBlank, PLACEHOLDER_KEYS } from "../components/mail/mail-lib";
 import { RichTextEditor } from "../components/mail/rich-text";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
@@ -111,6 +111,14 @@ const ROOT_FIELDS: readonly [string, string][] = [
   ["document.notes", "The notes typed on the quote"],
   ["document.terms", "The terms typed on the quote"],
 ];
+
+/** "{{a}}, {{b}} and {{c}}" -- the mail merge fields as a sentence fragment, so the
+ * paragraph below can be written from PLACEHOLDER_KEYS rather than beside it. */
+function mergeFieldSentence(paths: readonly string[]): string {
+  const tokens = paths.map((path) => `{{${path}}}`);
+  const last = tokens.at(-1) ?? "";
+  return tokens.length < 2 ? last : `${tokens.slice(0, -1).join(", ")} and ${last}`;
+}
 
 const LINE_FIELDS: readonly [string, string][] = [
   ["description", "The line's description"],
@@ -377,10 +385,17 @@ function TemplateForm({ template, onClose }: { template?: EmailTemplate; onClose
           ariaLabel="Template body"
           testId="template-body"
         />
+        {/* RENDERED FROM THE SUBSTITUTION'S OWN LIST, not typed out beside it. This
+            paragraph is the only place anybody will look for the merge fields, and a
+            path documented here that the code does not substitute is an unfilled
+            placeholder in a sent email -- so it is derived rather than maintained.
+            The quote half of this page (ROOT_FIELDS above) cannot do the same: those
+            keys live in the API's buildContext, which this bundle cannot import. */}
         <p className="text-xs font-normal text-slate-400">
-          {"{{contact.name}}"}, {"{{contact.salutation}}"}, {"{{contact.pronouns}}"},{" "}
-          {"{{company.name}}"} and {"{{user.name}}"} are filled in from the contact as it
-          stands when the template is used; anything else is left as written.
+          {mergeFieldSentence(Object.keys(PLACEHOLDER_KEYS))} are filled in from the
+          contact as it stands when the template is used; anything else is left as
+          written. An unfilled salutation or set of pronouns disappears; an unfilled
+          name stays visible, so you can see what is missing.
         </p>
       </div>
 

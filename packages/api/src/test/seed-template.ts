@@ -20,10 +20,23 @@ import { migrationsFolder } from "../db/client.js";
  */
 const TEMPLATE_MIGRATIONS = ["0009_calm_rhodey.sql", "0011_sharp_skullbuster.sql"];
 
-/** `replace("body_html", '<from>', '<to>')` as 0011 writes it. Neither literal may
+/**
+ * `replace("body_html", '<from>', '<to>')` as 0011 writes it. Neither literal may
  * contain a `'` -- the migration says so at the statement, and the non-greedy match
- * here is why it matters. */
-const REWRITE = /replace\(\s*"body_html",\s*'([\s\S]*?)',\s*'([\s\S]*?)'\s*\)/g;
+ * here is why it matters.
+ *
+ * THE LOOKBEHIND IS NOT DECORATION: without it `regexp_replace("body_html", ...)`
+ * matches too, and its first argument is a pattern rather than a literal, so the
+ * reader would apply a rewrite the database does not perform. Requiring a
+ * non-identifier character before `replace` excludes it.
+ */
+const REWRITE = /(?<![A-Za-z0-9_])replace\(\s*"body_html",\s*'([\s\S]*?)',\s*'([\s\S]*?)'\s*\)/g;
+
+/** Every `replace(` in a file, whatever its arguments -- counted so a shape this
+ * reader does NOT understand is loud rather than silently half-applied. The case in
+ * mind is `replace(replace("body_html", ...), ...)`: REWRITE finds the inner call
+ * only, and applying half a rewrite would leave the derived template subtly wrong. */
+const ANY_REPLACE = /(?<![A-Za-z0-9_])replace\s*\(/g;
 
 /**
  * The seeded quote template as a fresh install has it, read out of the migrations
@@ -54,7 +67,21 @@ export function seededQuoteTemplate(): string {
       continue;
     }
     const before: string = body;
-    for (const [, from, to] of sql.matchAll(REWRITE)) {
+    const rewrites = [...sql.matchAll(REWRITE)];
+    // Every `replace(` in the file has to be one this reader understood. A nested
+    // pair, or one written some other way, would otherwise be applied in part and
+    // leave the derived template quietly disagreeing with the database.
+    const replaceCalls = (sql.match(ANY_REPLACE) ?? []).length;
+    if (replaceCalls !== rewrites.length) {
+      throw new Error(
+        `${file} contains ${String(replaceCalls)} replace(...) call(s) but `
+        + `${String(rewrites.length)} this reader understands. It rewrites the quote `
+        + "template in a shape seed-template.ts cannot follow (nested calls, or a "
+        + "function other than replace); teach REWRITE that shape, or the file-derived "
+        + "template will disagree with what a migrated database actually holds",
+      );
+    }
+    for (const [, from, to] of rewrites) {
       if (from === undefined || to === undefined) continue;
       body = body.replaceAll(from.replaceAll("''", "'"), to.replaceAll("''", "'"));
     }
