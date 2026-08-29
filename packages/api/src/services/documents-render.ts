@@ -115,10 +115,17 @@ const DEFAULT_MAX_INPUT_BYTES = 128 * 1024;
  * **THE ISSUING PATH DOES REACH THE QUEUE, and an earlier version of this comment
  * said it did not.** The claim was that the number sequence's row lock already
  * serialises quotes to one at a time -- true only for one (type, year), and the year
- * comes from the CALLER's issue date. Measured from the children: two quotes in
- * different years render concurrently, and six across six years reach exactly three
- * with three transactions waiting, each holding its row lock and a pooled connection
- * while it waits.
+ * comes from the CALLER's issue date. Measured from the children, and asserted
+ * permanently in documents.test.ts: two quotes in different years render
+ * concurrently, two quotes in the same year do not. Anything past the cap waits, and
+ * each waiter holds its row lock and a pooled connection while it does.
+ *
+ * The figure this paragraph used to carry -- "six across six years reach exactly
+ * three, with three transactions waiting" -- was measured when the cap was 3, and it
+ * survived round 2 lowering the cap to 2. A measurement is only true at the constant
+ * it was taken at, so the sentence above names neither number and points at the
+ * tests, which are parametrised on RENDER_MAX_CONCURRENCY and cannot go stale the
+ * same way.
  *
  * That is why the wait is bounded. Without RENDER_QUEUE_TIMEOUT_MS the queue wait
  * precedes the render timeout and is itself unbounded, so "the transaction's lock
@@ -131,7 +138,7 @@ const DEFAULT_MAX_INPUT_BYTES = 128 * 1024;
 export const RENDER_MAX_CONCURRENCY = 2;
 
 /**
- * How long a render will wait for one of the three slots before giving up.
+ * How long a render will wait for a slot before giving up.
  *
  * 10s is about fifteen one-page quotes' worth of queue and half the render timeout.
  * It is not tuned against load, because there is none to measure: it exists to make
@@ -150,7 +157,7 @@ let rendersInFlight = 0;
 const rendersWaiting: RenderWaiter[] = [];
 
 /**
- * Take a render slot, waiting up to `timeoutMs` if all three are busy. FIFO, so a
+ * Take a render slot, waiting up to `timeoutMs` if every slot is busy. FIFO, so a
  * queued render cannot be starved by a steady arrival of new ones.
  *
  * A timed-out waiter removes ITSELF from the queue rather than being skipped later:

@@ -167,6 +167,17 @@ async function downloadQuote(page: Page, number: string): Promise<string> {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/**
+ * How far the PAGE scrolls sideways, which on a phone should be not at all.
+ *
+ * Distinct from the table's own `overflow-x-auto` box: that one is allowed to scroll
+ * by design and is asserted not to need to, while the whole page scrolling sideways
+ * is the screen-wide version of the same defect and is never intended.
+ */
+async function pageOverflow(page: Page): Promise<number> {
+  return await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+}
+
 /** An element's box, or a failure that names the element rather than a null. */
 async function boxOf(locator: Locator): Promise<{ x: number; y: number; width: number; height: number }> {
   const box = await locator.boundingBox();
@@ -210,18 +221,32 @@ async function dialogWidth(page: Page): Promise<{ width: string; maxWidth: strin
 
 test.describe.serial("Raising a quote from a deal", () => {
   const runId = Date.now().toString(36);
-  const orgName = `Listerdale ${runId}`;
-  const companyName = `Quoteco ${runId}`;
-  const renamedCompany = `Quoteco Holdings ${runId}`;
-  const companyAddress = `12 Market Street\nUtrecht\nNL`;
-  const dealTitle = `Rollout ${runId}`;
+  const companyAddress = "12 Market Street\nUtrecht\nNL";
+
+  // `${runId}x${retry}`, the suite's convention, and the reason is the same one
+  // e2e/mobile.spec.ts gives: nothing empties the database between attempts, and
+  // several assertions below are whole-list or absence statements -- "this row does
+  // not mention the new name", "this deal has exactly two documents" -- which a
+  // previous attempt's identically-named rows would break for good. A serial group
+  // re-runs from the top on a retry, so beforeAll is the one place guaranteed to run
+  // again with the new index.
+  let attemptId = "";
+  let orgName = "";
+  let companyName = "";
+  let renamedCompany = "";
+  let dealTitle = "";
 
   let page: Page;
   let fixture: Fixture;
   let firstNumber = "";
   let firstDigest = "";
 
-  test.beforeAll(async ({ browser }) => {
+  test.beforeAll(async ({ browser }, testInfo) => {
+    attemptId = `${runId}x${String(testInfo.retry)}`;
+    orgName = `Listerdale ${attemptId}`;
+    companyName = `Quoteco ${attemptId}`;
+    renamedCompany = `Quoteco Holdings ${attemptId}`;
+    dealTitle = `Rollout ${attemptId}`;
     page = await browser.newPage();
     fixture = await seedDeal(page, companyName, companyAddress, dealTitle);
   });
@@ -263,7 +288,7 @@ test.describe.serial("Raising a quote from a deal", () => {
     if (await removeLogo.count() > 0) await removeLogo.click();
     await expect(page.getByTestId("org-logo-empty")).toBeVisible();
     await page.getByTestId("org-logo-input").setInputFiles({
-      name: `logo-${runId}.png`,
+      name: `logo-${attemptId}.png`,
       mimeType: "image/png",
       buffer: Buffer.from(LOGO_PNG_BASE64, "base64"),
     });
@@ -614,5 +639,97 @@ test.describe("The line-item editor on a phone", () => {
     expect(number).toMatch(/^QUO-\d{4}-\d{4}$/);
     await expect(page.getByTestId(`document-total-${number}`)).toHaveText(PHONE_TOTAL);
     await downloadQuote(page, number);
+
+    // THE DOCUMENTS SECTION IS A SURFACE THIS PHASE ADDS, so it meets the same
+    // standard rather than merely rendering. The row stacks below the breakpoint --
+    // the number and date above, the total and Download below, instead of one line
+    // that would put the link past the edge -- and Download is the only way to reach
+    // the artifact from here, so it carries the floor.
+    const documentRow = page.getByTestId(`document-${number}`);
+    const numberBox = await boxOf(documentRow.getByText(number, { exact: true }));
+    const downloadBox = await boxOf(page.getByTestId(`document-download-${number}`));
+    expect(downloadBox.y).toBeGreaterThanOrEqual(numberBox.y + numberBox.height - 1);
+    expect(downloadBox.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+    expect(await pageOverflow(page)).toBeLessThanOrEqual(1);
+  });
+
+  /**
+   * THE OTHER TWO SURFACES THIS PHASE ADDS, and neither had a phone test.
+   *
+   * The spec's Definition of done says "every surface this phase adds works on a
+   * phone, because v0.10.0 made that the standard for the whole app rather than a
+   * phase's ambition". The phase adds four: the quote form, the deal's Documents
+   * section, Settings -> Organisation and the quote template editor. The first two
+   * are above. These are the other two, and until this test the template editor had
+   * never been driven at ANY width by anything.
+   *
+   * The template half is worth more than its phone assertions. GET then PUT must be
+   * byte-identical, or opening the template and saving it destroys the letterhead --
+   * which is exactly what happened in Task 4's review round 2 (S2), where
+   * `isPermittedUrl` refused the merge token in the logo's `src`, dropped the
+   * attribute, and took the whole `<img>` with it: 38 characters shorter, no logo and
+   * no warning. That was proved through the module. This proves it through the editor
+   * a person actually uses, which is the only place the round trip really happens.
+   */
+  test("the issuer profile and the quote template are usable on a phone", async ({ page }) => {
+    await page.goto("/settings/org");
+    const profile = page.getByTestId("org-settings");
+    await expect(profile).toBeVisible();
+    await expect(profile.getByText("Loading...", { exact: true })).toHaveCount(0);
+
+    // All three settings destinations stay reachable at this width -- the tab row
+    // scrolls rather than clipping, and each tab takes the touch floor.
+    const nav = page.getByTestId("settings-nav");
+    for (const name of ["Mail accounts", "Templates", "Organisation"]) {
+      const tab = await boxOf(nav.getByRole("link", { name, exact: true }));
+      expect(tab.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+    }
+    for (const testId of ["org-name", "org-vat", "org-email"]) {
+      const box = await boxOf(page.getByTestId(testId));
+      expect(box.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+    }
+    // The logo picker is a styled <label> wrapping an sr-only input, so the input's
+    // own box says nothing about what a thumb can hit -- the label is the target.
+    const picker = await boxOf(page.getByText("Choose an image", { exact: true }));
+    expect(picker.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+    const saveBox = await boxOf(page.getByTestId("org-save"));
+    expect(saveBox.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+    expect(await pageOverflow(page)).toBeLessThanOrEqual(1);
+
+    await page.goto("/settings/templates");
+    await expect(page.getByTestId("document-template-settings")).toBeVisible();
+    const editor = page.getByTestId("document-template-body");
+    await expect(editor).toBeVisible();
+    // THE WAIT IS THE ASSERTION. The textarea renders empty and fills in when the
+    // query resolves, so `toBeVisible` is satisfied by a blank box -- reading it a
+    // moment too early gave an empty string, and a round-trip of "" against "" would
+    // have passed while proving nothing. Waiting on the letterhead token is waiting
+    // for the real template AND naming the one thing whose loss is silent.
+    await expect(editor).toHaveValue(/\{\{org\.logoDataUri\}\}/);
+    const before = await editor.inputValue();
+    expect(before.length).toBeGreaterThan(1000);
+    expect(await pageOverflow(page)).toBeLessThanOrEqual(1);
+
+    // Saved back untouched and read off the server again. Anything the sanitiser
+    // does on the way through shows up here as a difference.
+    //
+    // THIS STEP IS DESTRUCTIVE WHEN IT FAILS, which is worth knowing before it does.
+    // The save is a real PUT: if the round trip is NOT a fixed point, the damaged
+    // template is what the database now holds, and every later run reads it back and
+    // fails too. Harmless in CI, where the database is new each run and the seed is
+    // intact -- and locally it is the same re-seed that a `truncateAll()` from the
+    // unit suite already requires (replay the INSERT at the end of
+    // packages/api/drizzle/0009_calm_rhodey.sql). Proved by doing exactly that: the
+    // mutation that restores Task 4's S2 bug fails this assertion AND leaves the
+    // logo-less template behind.
+    await page.getByTestId("document-template-save").click();
+    await expect(page.getByTestId("document-template-saved")).toBeVisible();
+    await expect(page.getByTestId("document-template-error")).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByTestId("document-template-settings")).toBeVisible();
+    // toHaveValue rather than a bare read, for the same reason as above: it waits for
+    // the reloaded query and compares exactly, so a slow response cannot pass this by
+    // arriving after the comparison.
+    await expect(editor).toHaveValue(before);
   });
 });

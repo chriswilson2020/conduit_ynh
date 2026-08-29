@@ -305,9 +305,9 @@ describe("renderPdf concurrency", () => {
   }, 20_000);
 
   it("keeps the input cap ahead of the queue: an oversized document is refused, not queued", async () => {
-    // Otherwise a document that can never render would occupy one of three slots for
-    // as long as the queue ahead of it takes. Proved by holding all three slots with
-    // sleeping children and showing the oversized call still returns immediately.
+    // Otherwise a document that can never render would occupy a slot for as long as
+    // the queue ahead of it takes. Proved by holding every slot with sleeping
+    // children and showing the oversized call still returns immediately.
     const runDir = join(stubDir, "cap-run");
     const observed = join(stubDir, "cap-observed");
     writeFileSync(observed, "");
@@ -336,12 +336,19 @@ describe("renderPdf concurrency", () => {
     // with "DFE": the grants were in order and the writes were not.
     //
     // So the grants are separated instead of the observations. The stub takes
-    // "<id>:<seconds>" on stdin, logs the id and sleeps: three holders occupy the
-    // slots for 0.3s, 0.9s and 1.5s, and each queued render runs for 0.1s. Only one
-    // slot ever comes free at a time, so D is granted at ~0.3s, E at ~0.4s (when D
-    // finishes) and F at ~0.5s -- 100ms apart, against process start-up jitter of a
-    // few milliseconds. A stack would answer F, E, D and starve D under a steady
-    // arrival rate.
+    // "<id>:<seconds>" on stdin, logs the id and sleeps. Three holders are submitted
+    // ahead of D, E and F, with staggered sleeps, and each queued render runs for
+    // 0.1s. The point of the stagger is that ONLY ONE SLOT EVER COMES FREE AT A TIME,
+    // whatever the cap is: the holders' sleeps differ by more than a queued render
+    // costs, so D, E and F are granted about 100ms apart -- the length of one of
+    // them -- against process start-up jitter of a few milliseconds. A stack would
+    // answer F, E, D and starve D under a steady arrival rate.
+    //
+    // The wall-clock times this comment used to name (D at ~0.3s, E at ~0.4s, F at
+    // ~0.5s) assumed three slots and three holders that all start at once. At a cap
+    // of 2 the third holder is itself the first waiter, so every absolute figure
+    // moved; the 100ms separation and the arrival order did not, and they are what
+    // the assertion below reads.
     const order = join(stubDir, "fifo-order");
     writeFileSync(order, "");
     const dir = stub([
@@ -354,16 +361,16 @@ describe("renderPdf concurrency", () => {
     ].join("\n"));
 
     await onPath(dir, async () => {
-      // The three holders are created first, so they take the three slots
-      // synchronously before any of D, E or F asks.
+      // The holders are submitted first, so they hold every slot -- and, past the
+      // cap, the front of the queue -- before any of D, E or F asks.
       const submitted = ["H:0.3", "H:0.9", "H:1.5", "D:0.1", "E:0.1", "F:0.1"];
       await Promise.all(submitted.map(async (payload) => await renderPdf(payload)));
     });
 
     const log = readFileSync(order, "utf8");
     expect(log).toHaveLength(6);
-    // The holders' own three writes race each other and are not a property; the
-    // three that WAITED are.
+    // The holders' own writes race each other and are not a property; the order of
+    // the three that WAITED is.
     expect(log.replace(/H/g, "")).toBe("DEF");
   }, 20_000);
 
@@ -371,7 +378,7 @@ describe("renderPdf concurrency", () => {
     // WITHOUT THIS THE QUEUE WAIT IS UNBOUNDED, and the issuing transaction holds its
     // number-sequence row lock and a pooled connection across it. Ten pooled
     // connections and ten distinct years would stall every other request in the API
-    // behind three renders. The wait is now bounded, so the lock hold is bounded by
+    // behind however many renders the cap allows. The wait is now bounded, so the lock hold is bounded by
     // the queue timeout plus the render timeout rather than by nothing.
     const dir = stub("sleep 3\nprintf '%s' '%PDF-1.7 ok'");
     await onPath(dir, async () => {
@@ -397,8 +404,8 @@ describe("renderPdf concurrency", () => {
     // The failure this prevents is permanent and silent: if a waiter that gave up
     // stayed in the queue, releaseRenderSlot would hand it a slot nobody is holding,
     // the in-flight count would never come back down, and the process would render
-    // one fewer document at a time for the rest of its life. Three timeouts, then
-    // three concurrent renders must still be possible.
+    // one fewer document at a time for the rest of its life. A full complement of
+    // timeouts, then a full complement of concurrent renders must still be possible.
     const slow = stub("sleep 1\nprintf '%s' '%PDF-1.7 ok'");
     await onPath(slow, async () => {
       const holding = Array.from(
