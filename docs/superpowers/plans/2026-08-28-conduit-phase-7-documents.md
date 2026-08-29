@@ -3362,6 +3362,91 @@ smoke/crm/pipeline/tasks/meetings alongside — one run of that set also caught
 which the real config carries `retries: 2` for. 2309 passed / 38 skipped on the
 server, typecheck clean, build clean, stylesheet hash unmoved at `index-B1M2buov`.
 
+##### FINAL REVIEW ROUND — a promise about a surface nobody opened, a safety check that does not run, and fourteen stale numbers
+
+Commits `ac42633`, and the artifacts. **No defect in the shipped code**: the
+version bump consistent across four files, the manifest correctly staged, CI
+honestly reported, the 96 unchanged including the runtime half. Everything below
+is prose, shell, or an assertion narrower than its own comment.
+
+**M1: THE NOTES PROMISED AN ATTACHMENT PICKER THAT DOES NOT EXIST**, and it is
+SV-5's failure mode exactly -- a plausible sentence about a surface nobody
+opened. "The mail composer's attachment picker reaches it" is wrong three ways:
+the only attachment control (`composer.tsx:373-381`) UPLOADS FROM DISK, nothing
+under `components/mail/` enumerates a record's existing files, and the upload
+becomes a SECOND `files` row on the deal -- the component's own comment says so.
+And `attachmentTarget(seed?.links)` returns null with no record links, so the
+control is disabled outright from `/mail`. The notes now say what is true:
+download the PDF and attach it, and know that it files a second copy.
+
+**M2: A SAFETY CHECK THAT DOES NOT RUN, ONE LINE BEFORE A DESTRUCTIVE PUSH.** I
+wrote that `git branch -d` "refuses unless the branch is fully merged into what
+you are on". **It does not, when the branch has an upstream** -- and this one
+does. Reproduced in a scratch repo: a branch not merged into HEAD, deleted with
+**rc=0** and only a warning, "merged to refs/remotes/origin/... but not yet
+merged to HEAD". The next line is `git push origin --delete`. On a sequence
+resumed after an interruption where step 1 never landed, both copies of unmerged
+work would go on the strength of a check that never ran. Replaced with
+`git merge-base --is-ancestor <branch> origin/main`, which does hold.
+
+That is the second time in two rounds that a justification I wrote for a correct
+step was wrong. The ordering was right both times; the reason was not, and a
+reason nobody can rely on is worse than no reason at all.
+
+**M3: FOUR STALE NUMBERS IN THE REVIEW, FOURTEEN IN THE TREE.** A numeric sweep
+found ten more. The instructive one: `documents-number.ts` carried the SAME
+"six across six years reach exactly three" sentence that I had already corrected
+in `documents-render.ts` -- **my sweep was file-scoped when the sentence had
+travelled**, which is the identical mistake the previous round made with the
+concurrency comments and a lesson that clearly needed learning twice. Grep the
+CLAIM across the tree, not the file the claim was found in.
+
+Also: a superseded 5.2s/157MB cost pair restated as current, two files calling
+130 x 500 "the largest quote that can render at all" against a 60 x 250 cap,
+"nine callers" that is eight of twelve by enumeration, "nine tests" that is
+fifteen, a 143px overflow that is the PHONE figure quoted for the DESK (83px,
+and `document-form.tsx` made the same conflation), a double-divide example that
+is neither what the expression evaluates to nor a number the function computes,
+"three quarters of the budget" that is 66.7%, and "1400M" one line under the
+1,396M it is meant to be.
+
+**R2: FOUR ASSERTIONS NARROWER THAN THEIR OWN COMMENTS.** None vacuous; all now
+match. The tab row is asserted to SCROLL rather than clip; the sticky-total check
+asserts the dialog actually scrolled (scrollTop on a non-overflowing element is a
+silent no-op, which would have made three checks into one); `thead` is COUNTED
+before being asserted hidden, because `toBeHidden` passes on an element that is
+not rendered at all; and the phone test's name says what it proves.
+
+**R1: THE DESTRUCTIVE TEST SHIPS, AND PUTS THE TEMPLATE BACK.** The restore is a
+no-op on the success path by definition -- the bytes are the ones just read -- so
+its only job is that a passing run leaves the shared row as it found it. It
+deliberately does not run on the FAILING path: a test that tidied away the
+evidence of a real sanitiser regression would be worse than one that does not.
+Demonstrated by running the file twice back to back, with the template
+byte-intact at 3,616 and the letterhead token still at offset 1,374 afterwards.
+
+**WHAT THE SWEEP CONFIRMED, which is worth as much as what it found**: the whole
+re-measured RSS table's internal arithmetic, 400 + 2 x 332 = 1,064 against the
+declared 1100M, every line of the four-item quote arithmetic including the
+10.5 -> 11 half-cent, the 96 count by enumeration, the 70-byte PNG, the
+38-character `<img>` serialisation, and both release artifacts' apt figures,
+400M -> 1100M, logo message string and 96 + 9 = 105. **The numbers that decide
+anything were right; the prose around them had drifted.**
+
+**R3 and R4, cheap and real.** `gh run list`'s default table has NO head-sha
+column, so step 0's "compare the head sha" could only ever have compared titles;
+it uses `--json headSha,conclusion,databaseId` now, and step 1 says what to do if
+main's CI is red (the merge is already pushed by then -- fix forward or revert;
+the tag is still the only irreversible step). In the notes: migrations are NOT
+the unusual part and saying so was scaremongering -- **verified by counting the
+drizzle directory at each tag**: v0.6.0 shipped six, v0.7.0/v0.8.0/v0.9.0 each
+added one to reach nine, and only v0.10.0 added none. The apt package and the
+memory declaration are what make this release different. The logo message's
+"slightly over" band is ONE BYTE, not a range. And "no href of any kind is ever
+fetched" is false of the RENDERER -- WeasyPrint fetches `rel=attachment` hrefs,
+which is precisely why controls 2 and 3 exist; it is true only of a sanitised
+document, so the sentence no longer leans on it.
+
 ---
 
 ## The intermittent unit failure — a name, and a mechanism
