@@ -2931,8 +2931,164 @@ this round. Build clean with no CSS warning at each; the server reproduces the s
 2. **`overridableClass` is the pattern for any future shape default a caller may
    replace.** Only `max-w-` uses it; `max-h-` and `overflow-` never conflicted, because
    the shape spells neither at base.
-3. **The e2e journey should assert a NAMED refusal**, not just that submission failed --
-   "Invalid input" passed every test that existed while telling a user nothing.
+3. **The e2e journey should assert a NAMED refusal**, not just that submission
+   failed -- a refusal that named no field passed every test that existed while
+   telling a user nothing.
+4. **THE GUARD THIS REPO STILL DOES NOT HAVE: a computed-style assertion that a
+   caller's dialog width takes effect.** Nothing here checks that any caller's
+   class does anything, which is what let the 448px bug live through two phases;
+   the unit suite has no DOM, so it needs e2e. One `expect(page.locator(...))`
+   on a dialog's box width would close it.
+5. **TWO MORE DESKTOP-VISIBLE CHANGES BELONG IN THE v1.0.0 NOTES**, beside the
+   three wider dialogs. The money-locale convergence (Task 2's O-4) reaches four
+   PRE-EXISTING surfaces -- `funnel.tsx`, `rail/timeline-lib.ts`, `board-lib.ts`
+   and `deal-detail.tsx` -- so on a Dutch browser the board's stage totals go
+   from "EUR 11.000,00" to "EUR 11,000.00"; that is the intended fix (one locale
+   for the app and the PDF alike) but it is a visible change to pages this phase
+   did not otherwise touch. And the settings nav's first tab was renamed from
+   "Email templates" to "Templates", because the document template editor now
+   lives beside the mail ones.
+
+##### QUALITY REVIEW ROUND — a blocking regression I introduced, and five guards that guarded nothing
+
+Commit `045c8e1`. CI run **33242326503**, tip `045c8e1`, both jobs green: **2347 tests, 0 skipped**.
+On the server: 2309 passed / 38 skipped.
+
+The round was run entirely on the dev server and in a browser, no CI. The base64
+decoder and signature table from the previous round were called the best-verified
+code in the diff -- 80,000 random cases against `Buffer` with zero mismatches,
+every padding shape, whitespace and base64url refused before decoding, and
+PNG-as-JPEG, SVG-as-PNG, a bad-sixth-byte GIF and a RIFF-that-is-AVI all refused
+with no legitimate type failing.
+
+**P1 (BLOCKING): FIXING THE WIDTH BUG INTRODUCED AN EDGE-TO-EDGE DIALOG, and
+this one is mine.** `max-w-3xl` is 48rem, which is 768px, which is exactly
+`MOBILE_BREAKPOINT`. At a 768px viewport the `md:` side applies, so the desktop
+CARD renders -- and with `w-full` it measured `{w:768, left:0, right:768}`, its
+8px radius clipped against both edges and no scrim visible either side. The band
+is 768 to about 800px: an iPad in portrait, exactly. **The hard-coded `max-w-md`
+had made this unreachable; removing it is what exposed it**, and it reached the
+mail composer too, which is a Phase 4 surface.
+
+The width is now the viewport minus 2rem, with the phone sheet taking its full
+width back below the breakpoint. Measured across the band:
+
+| viewport | dialog | gutters | radius | table overflow |
+|---|---|---|---|---|
+| 767 | 767 (full-bleed sheet) | 0 | 0px, correct | 0 |
+| **768** | **736** | **16 each** | 8px | 0 |
+| 800 | 768 | 16 each | 8px | 0 |
+| 1280 | 768 | 256 each | 8px | 0, Remove on screen |
+
+**P2, P3, P8, P10, P11: FIVE ONE-LINE MUTATIONS THAT LEFT 435/435 GREEN.** Each
+now fails:
+
+| mutation | was | now fails |
+|---|---|---|
+| P2: drop `, className` from DialogContent's clsx | 0 | **1** |
+| P3: default `max-w-md` -> `max-w-xs` | 0 | **1** |
+| P8: delete seven of eleven FIELD_LABELS | 0 | **4** |
+| P10: re-hardcode a `maxLength` literal | 0 | **1** |
+| P5: numeric bounds described as characters | -- | **2** |
+| P6: array bounds handed back as raw Zod | -- | **1** |
+| P7: the line number discarded | -- | **1** |
+
+P2 is the one worth naming: deleting three characters discarded every width,
+height cap and scroll region all four callers pass -- mail settings became a
+full-viewport dialog with no maximum height -- and no unit test *or* e2e journey
+noticed, because the existing guard reads the CALLERS' source strings, which
+survive. It traces the value now: DialogContent composes `className` in, and
+Overlaid puts it on the Radix element. Both halves, because either alone can be cut.
+
+**P11: A CLASS NAME WAS STILL REACHING THE STYLESHEET FROM PROSE**, which is the
+trap this repo has now paid for three times. A variant-prefixed width existed
+only in a doc comment and a test literal, and was compiled into the build.
+
+**So there is a guard for the trap itself now**, and the rule it enforces is the
+narrow correct one rather than "never name a class in a comment": **a
+variant-prefixed class named in a comment must also appear in real code
+somewhere in this tree.** If it does, Tailwind was going to emit it anyway and
+the comment is free; if it does not, the comment is the only reason it is in the
+stylesheet. Bare words like `flex` are out of scope because prose cannot be told
+from code for those.
+
+**IT CAUGHT ONE I HAD JUST WRITTEN.** Three offenders on its first run: the
+variant-prefixed width in my own new comment about overridableClass, plus two
+pre-existing ones -- a blanket inset shorthand in `ui/dialog.tsx` and a display
+utility in `ui/table.tsx`. All three reworded to describe rather than spell.
+Stylesheet 33.02 kB -> **32.96 kB**, hash `index-udY9Lgg8` -> `index-B1M2buov`.
+
+**P4: THE DISPUTED FACT, SETTLED BY ENUMERATION -- AND MY OWN RATIONALE WAS
+WRONG.** All 27 failure paths of `issueQuoteInputSchema` were run against zod
+4.4.3: every field, both dates, all four line fields, both array bounds, both
+custom refinements, six wrong-type cases. **The literal string "Invalid input" is
+emitted for NONE of them.** What Zod actually says is `Too small: expected string
+to have >=1 characters`, `Too big: expected array to have <=60 items`, `Invalid
+ISO date`, and `Invalid input: expected string, received undefined`.
+
+So the quality reviewer is right and the spec reviewer's reported string is not
+reproducible from this schema. **The fix stands either way** -- naming the field
+is right whatever the raw text was -- but the reason written into five code sites
+and four plan lines was false and is corrected: the messages were descriptive,
+and what they never did was name a field. **Both `not.toContain("Invalid input")`
+assertions were vacuous** (an array `toContain` is exact-element matching, and no
+message is ever exactly that string); they now assert the real Zod string and
+that it mentions no field name, which fails if describeIssue is bypassed.
+
+Three consequences of the same enumeration:
+
+- **P5:** size bounds now read their unit from `origin`. Written as "characters"
+  for everything, a negative quantity said *"Line 1 quantity is shorter than the
+  0 characters required"* -- nonsense about a number, unreachable today only
+  because `parseUnits` refuses a minus sign first.
+- **P6:** three of the five shapes reaching the no-index `lines` arm are Zod's
+  English about a JSON array, not self-describing sentences. My comment claimed
+  all five were. The two array bounds and the type failure get written sentences;
+  the two custom refinements keep theirs.
+- **P7:** `["lines", N]` with no leaf -- a line that is not an object -- was
+  throwing away the line number it was holding.
+
+**P9: A REPEAT REFUSAL ANNOUNCED NOTHING.** Measured with a MutationObserver: a
+second identical submit with focus already on the region produced **0 DOM
+mutations and 0 focus events** -- `role="alert"` cannot re-fire without a DOM
+change, and `.focus()` on the focused element does nothing. Keying the region on
+an attempt counter remounts it, so re-measured: the region node and the alert
+node inside it are both replaced, focus lands on the new region, and it is on
+screen. The region also has a name now (`role="group"` plus a label); focus was
+landing on an unnamed div.
+
+**P12: THE MIN-CONTENT PAIR DID NOT ADD UP, THREE VERSIONS RUNNING.** 481 - 340
+is 141, not the 143 recorded. Re-measured: **482 and 142**, which do. The three
+input widths reproduce to the tenth of a pixel in all three passes, so the
+conclusion never moved -- but an arithmetic check on a pair of numbers in a
+comment is nearly free and would have caught it at the first writing.
+
+**P13: 47,320 AND 60,920 WERE EACH 205 BYTES TOO HIGH, in four source places.**
+The arithmetic is one line and now is: eight text fields cap at 3,400 characters
+and the logo column at 43,715, so ASCII is **47,115** and an `&` in every text
+position costs five bytes rather than one for **60,715**. The old pair implied a
+43,920-character logo, 205 more than the column can hold. Task 2/4's numbers, but
+in this phase's diff.
+
+**R1/R2, recorded at the code rather than left for the next person.**
+`overridableClass` matches whole classes, so a width behind a responsive variant
+is not seen as an override -- and worse, a variant rule is emitted after the
+`max-md` block, so such a class would cap the PHONE sheet too. "max-md beats
+whatever the caller chose" is true against BASE utilities only. An important
+marker is likewise unmatched, which is the same shape as the bug this mechanism
+fixes with the winner reversed. No caller does either today.
+
+**WHAT IS NOT UNIT-TESTABLE HERE, said plainly.** P1 and P9 are layout and
+live-region behaviour; this repo has no DOM in its unit suite, so both were
+verified in a browser and neither has a guard. **The guard the repo is still
+missing is a computed-style assertion that a caller's width takes effect** --
+that is what would have caught the original 448px bug on its own, and it needs
+e2e, which is Task 6's. Recorded there.
+
+**THE INTERMITTENT MAIL-SYNC FAILURE APPEARED IN THE FINAL RUN** -- the
+exponential-backoff case, wedging at the 5000ms timeout, which is the documented
+signature. **Established as not mine by stashing every change and reproducing it
+on the pristine tree.**
 
 ---
 
