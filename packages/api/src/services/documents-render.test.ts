@@ -1,14 +1,15 @@
 import { spawn } from "node:child_process";
 import {
-  chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync,
+  existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
+import { withPythonStub, writePythonStub } from "../test/python-stub.js";
 import {
-  pdfEmbedsFiles, renderPdf, RenderError, weasyprintAvailable,
+  pdfEmbedsFiles, renderPdf, RenderError, RENDER_MAX_CONCURRENCY, weasyprintAvailable,
 } from "./documents-render.js";
 
 /**
@@ -76,30 +77,22 @@ const ATIME_WORKS = ((): boolean => {
 })();
 const itReads = HAVE_WEASYPRINT && ATIME_WORKS ? it : it.skip;
 
-const originalPath = process.env.PATH ?? "";
 const markerPath = join(stubDir, "the-child-survived");
 
 afterAll(() => {
   rmSync(stubDir, { recursive: true, force: true });
 });
 
-/** Write an executable `python3` into a fresh directory and return that directory. */
+/** Write an executable `python3` into a fresh directory and return that directory.
+ * The mechanism moved to test/python-stub.ts when documents.test.ts needed the same
+ * interception to test the issuing transaction's failure paths without a binary. */
 function stub(body: string): string {
-  const dir = mkdtempSync(join(stubDir, "bin-"));
-  const file = join(dir, "python3");
-  writeFileSync(file, `#!/bin/sh\n${body}\n`);
-  chmodSync(file, 0o755);
-  return dir;
+  return writePythonStub(stubDir, body);
 }
 
 /** Run `fn` with `dir` at the front of PATH, or as the whole of PATH when replacing. */
 async function onPath<T>(dir: string, fn: () => Promise<T>, replace = false): Promise<T> {
-  process.env.PATH = replace ? dir : `${dir}:${originalPath}`;
-  try {
-    return await fn();
-  } finally {
-    process.env.PATH = originalPath;
-  }
+  return await withPythonStub(dir, fn, replace);
 }
 
 /** A fresh file with known contents, so relatime will report the next read. */
@@ -235,6 +228,118 @@ describe("renderPdf failure paths", () => {
     expect(error).toBeInstanceOf(RenderError);
     expect((error as RenderError).message).toBe("document is too large to render");
     expect((error as RenderError).detail).toContain("limit 131072");
+  });
+});
+
+// ------------------------------------------------------- the concurrency bound
+
+describe("renderPdf concurrency", () => {
+  /**
+   * A stub that records how many copies of itself were running when it started.
+   *
+   * Each invocation drops a file named for its own pid into `runDir`, counts what is
+   * in there, appends that count to `observed`, sleeps, and tidies up. The maximum
+   * over `observed` is the highest concurrency the process ever actually reached --
+   * measured from the children themselves rather than from a counter inside the
+   * module under test, which would only ever agree with itself.
+   */
+  function concurrencyStub(runDir: string, observed: string, sleepSeconds: string): string {
+    return stub([
+      `mkdir -p '${runDir}'`,
+      `: > '${runDir}'/$$`,
+      `ls '${runDir}' | wc -l >> '${observed}'`,
+      `sleep ${sleepSeconds}`,
+      `rm -f '${runDir}'/$$`,
+      "printf '%s' '%PDF-1.7 ok'",
+    ].join("\n"));
+  }
+
+  function maxObserved(observed: string): number {
+    return Math.max(...readFileSync(observed, "utf8").trim().split("\n").map(Number));
+  }
+
+  it("runs at most RENDER_MAX_CONCURRENCY renders at once, and really does overlap them", async () => {
+    // The bound is what keeps manifest.toml's ram.runtime true on a server with no
+    // swap, where exceeding it is an OOM kill rather than a slowdown.
+    //
+    // BOTH ASSERTIONS ARE LOAD-BEARING, in opposite directions: <= 3 fails if the
+    // limiter is removed (six children would run at once), and >= 2 fails if it is
+    // tightened to one, which would otherwise look like a very well behaved bound.
+    const runDir = join(stubDir, "conc-run");
+    const observed = join(stubDir, "conc-observed");
+    writeFileSync(observed, "");
+    const dir = concurrencyStub(runDir, observed, "0.5");
+
+    const pdfs = await onPath(dir, async () =>
+      await Promise.all(Array.from({ length: 6 }, async () => await renderPdf("<html></html>"))));
+
+    expect(pdfs).toHaveLength(6);
+    for (const pdf of pdfs) expect(pdf.toString("ascii")).toBe("%PDF-1.7 ok");
+    expect(maxObserved(observed)).toBeLessThanOrEqual(RENDER_MAX_CONCURRENCY);
+    expect(maxObserved(observed)).toBeGreaterThanOrEqual(2);
+  }, 20_000);
+
+  it("gives the slot back when a render fails, rather than wedging the process", async () => {
+    // Three failures with no release would leave every later render waiting for a
+    // slot that is never coming -- a hang, not an error, and the kind that survives
+    // a test suite because a hang looks like a slow machine. The race below turns it
+    // into a named failure instead of a timeout.
+    const failing = stub("echo 'boom' >&2\nexit 5");
+    await onPath(failing, async () => {
+      const attempts = Array.from(
+        { length: RENDER_MAX_CONCURRENCY + 1 },
+        async () => await renderPdf("<html></html>").catch((e: unknown) => e),
+      );
+      for (const settled of await Promise.all(attempts)) {
+        expect(settled).toBeInstanceOf(RenderError);
+      }
+    });
+
+    const working = stub("printf '%s' '%PDF-1.7 ok'");
+    const outcome = await onPath(working, async () => await Promise.race([
+      renderPdf("<html></html>").then(() => "rendered"),
+      new Promise<string>((r) => setTimeout(() => { r("still waiting for a render slot"); }, 3000)),
+    ]));
+    expect(outcome).toBe("rendered");
+  }, 20_000);
+
+  it("keeps the input cap ahead of the queue: an oversized document is refused, not queued", async () => {
+    // Otherwise a document that can never render would occupy one of three slots for
+    // as long as the queue ahead of it takes. Proved by holding all three slots with
+    // sleeping children and showing the oversized call still returns immediately.
+    const runDir = join(stubDir, "cap-run");
+    const observed = join(stubDir, "cap-observed");
+    writeFileSync(observed, "");
+    const dir = concurrencyStub(runDir, observed, "1");
+
+    await onPath(dir, async () => {
+      const busy = Array.from(
+        { length: RENDER_MAX_CONCURRENCY },
+        async () => await renderPdf("<html></html>"),
+      );
+      const started = Date.now();
+      const error = await renderPdf("x".repeat(4096), { maxInputBytes: 1024 })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(RenderError);
+      expect((error as RenderError).message).toBe("document is too large to render");
+      expect(Date.now() - started).toBeLessThan(500);
+      await Promise.all(busy);
+    });
+  }, 20_000);
+
+  it("declares the same three renders manifest.toml budgets for", () => {
+    // ram.runtime = 400M (Node) + RENDER_MAX_CONCURRENCY x 157MB (a render at the
+    // 128KB input cap, worst shape measured on the server). The manifest cannot
+    // enforce anything -- YunoHost sets no cgroup from it -- so this is what stops
+    // the two drifting apart in the only direction that matters: the code growing a
+    // budget the declaration never heard about.
+    const manifest = readFileSync(
+      join(import.meta.dirname, "..", "..", "..", "..", "manifest.toml"), "utf8",
+    );
+    const declared = /^ram\.runtime = "(\d+)M"$/m.exec(manifest);
+    expect(declared?.[1]).toBeDefined();
+    expect(400 + RENDER_MAX_CONCURRENCY * 157).toBeLessThanOrEqual(Number(declared?.[1]));
+    expect(RENDER_MAX_CONCURRENCY).toBe(3);
   });
 });
 

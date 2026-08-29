@@ -18,6 +18,7 @@ import { registerTaskRoutes } from "./tasks.js";
 import { registerGanttRoutes } from "./gantt.js";
 import { registerMailRoutes } from "./mail.js";
 import { registerMeetingRoutes } from "./meetings.js";
+import { registerDocumentRoutes } from "./documents.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -73,7 +74,8 @@ export interface CrmRouteDeps {
 /**
  * Wires the hardened CRM/PM services (plus the plain user listing) into HTTP:
  * companies, contacts, notes, files, events, search, pipelines/deals (Phase
- * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), and meetings (Phase 5).
+ * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5), and
+ * documents plus the issuer profile (Phase 7).
  * Registered after /api/health and /api/me and before the not-found/SPA branch,
  * so it inherits the same onRequest auth hook without having to repeat it.
  *
@@ -104,4 +106,5 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerGanttRoutes(app, deps);
   registerMailRoutes(app, deps);
   registerMeetingRoutes(app, deps);
+  registerDocumentRoutes(app, deps);
 }

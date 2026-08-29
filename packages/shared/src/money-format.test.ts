@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatMoneyCents, MONEY_LOCALE } from "./money-format.js";
+import { formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE } from "./money-format.js";
 
 // The currency SYMBOLS are deliberately not asserted: they are non-ASCII, this
 // repo's sources are ASCII-only, and the symbol is not what was ever in doubt.
@@ -76,5 +76,60 @@ describe("formatMoneyCents", () => {
       expect(() => formatMoneyCents(value, "EUR")).not.toThrow();
     }
     expect(formatMoneyCents(Number.NaN, "EUR")).toContain("NaN");
+  });
+});
+
+// The other two columns of a quote's line table. They live here rather than inline
+// in the API's buildContext for the reason formatMoneyCents does: the running total
+// in the form and the printed page must agree, and a formatter written twice is two
+// answers waiting to diverge.
+describe("formatQtyMilli", () => {
+  it("prints thousandths as a decimal, trimming what a quantity does not need", () => {
+    expect(formatQtyMilli(1500)).toBe("1.5");
+    expect(formatQtyMilli(2000)).toBe("2");
+    expect(formatQtyMilli(0)).toBe("0");
+    expect(formatQtyMilli(1)).toBe("0.001");
+    expect(formatQtyMilli(1250)).toBe("1.25");
+  });
+
+  it("groups in the shared locale rather than the environment's", () => {
+    expect(formatQtyMilli(1_234_500)).toBe("1,234.5");
+    expect(formatQtyMilli(1_234_500, "nl-NL")).toBe("1.234,5");
+  });
+
+  it("is exact to the thousandth at the top of the int4 column", () => {
+    // qty_milli is an integer column, so this is the largest quantity a line can
+    // hold. 2147483647/1000 is not representable as a double, which is why the
+    // decimal is built from the integer rather than divided out of it.
+    expect(formatQtyMilli(2_147_483_647)).toBe("2,147,483.647");
+  });
+
+  it("never throws, whatever it is handed", () => {
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, 1.5, 2 ** 53]) {
+      expect(() => formatQtyMilli(value)).not.toThrow();
+    }
+  });
+});
+
+describe("formatTaxRateBp", () => {
+  it("prints basis points as a percentage", () => {
+    expect(formatTaxRateBp(2100)).toBe("21%");
+    expect(formatTaxRateBp(900)).toBe("9%");
+    expect(formatTaxRateBp(0)).toBe("0%");
+    expect(formatTaxRateBp(10_000)).toBe("100%");
+  });
+
+  it("keeps the resolution a basis point actually has", () => {
+    // 1bp is 0.01%, so two fraction digits is the whole domain rather than a
+    // rounding choice. 750bp through a double divide is 0.075000000000000005.
+    expect(formatTaxRateBp(750)).toBe("7.5%");
+    expect(formatTaxRateBp(1)).toBe("0.01%");
+    expect(formatTaxRateBp(2137)).toBe("21.37%");
+  });
+
+  it("never throws, whatever it is handed", () => {
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, 0.5, 2 ** 53]) {
+      expect(() => formatTaxRateBp(value)).not.toThrow();
+    }
   });
 });

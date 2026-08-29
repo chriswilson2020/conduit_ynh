@@ -5,12 +5,13 @@ export { midpoint } from "./fractional.js";
 // reachable from api and web only by being re-exported here -- fractional.js's line
 // above is the precedent, and money.js needs it for the same reason: the quote
 // form's running total and the stored total must be the same function.
+import { documentTotals as computeDocumentTotals } from "./money.js";
 export { lineTotalCents, taxCents, documentTotals } from "./money.js";
 export type { LineInput, DocumentTotals } from "./money.js";
 // Formatting is a separate module from the arithmetic, and reaches web the same
 // way: the one locale every money figure in the app is rendered in, so the
 // quote form and the PDF beside it cannot disagree.
-export { formatMoneyCents, MONEY_LOCALE } from "./money-format.js";
+export { formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE } from "./money-format.js";
 
 export const userSchema = z.object({
   id: z.uuid(),
@@ -1591,3 +1592,188 @@ export const meetingTaskCreateInputSchema = taskInputShape
     message: "startDate and dueDate must both be set (with startDate <= dueDate) or both omitted",
   });
 export type MeetingTaskCreateInput = z.infer<typeof meetingTaskCreateInputSchema>;
+
+/* ========================================================================== *
+ *  DOCUMENTS (Phase 7)
+ * ========================================================================== */
+
+/** The one document type v1.0.0 ships. `documents_type_valid` CHECKs the same set. */
+export const documentTypeSchema = z.enum(["quote"]);
+export type DocumentType = z.infer<typeof documentTypeSchema>;
+
+/**
+ * The issuer: your own company, as printed at the top of a quote. A singleton, so
+ * there is no id on the wire -- `org_profile` is pinned at id 1 and a caller has no
+ * business naming it.
+ *
+ * Every text field defaults to "" rather than being nullable, matching the columns:
+ * an install that has filled in nothing is an ordinary state, not missing data, and
+ * the seeded template wraps each of these in a conditional so an empty one prints
+ * neither a label nor a blank.
+ */
+export const orgProfileSchema = z.object({
+  name: z.string(),
+  addressLines: z.string(),
+  vatNumber: z.string(),
+  registrationNumber: z.string(),
+  email: z.string(),
+  phone: z.string(),
+  website: z.string(),
+  bankDetails: z.string(),
+  logoFileId: z.uuid().nullable(),
+  updatedAt: z.iso.datetime(),
+});
+export type OrgProfile = z.infer<typeof orgProfileSchema>;
+
+/**
+ * PUT /api/org-profile's body. A total replacement rather than a patch: it is one
+ * form with nine fields and no concurrent editors, so "send me the form" is both the
+ * simplest contract and the one where clearing a field is expressible.
+ *
+ * The field lengths are the only bound the columns do not carry (they are `text`),
+ * and they exist because every one of these prints on the page: an address of a
+ * megabyte is a quote that cannot render, discovered at issue time rather than here.
+ */
+export const orgProfileInputSchema = z.object({
+  name: z.string().max(200),
+  addressLines: z.string().max(2000),
+  vatNumber: z.string().max(100),
+  registrationNumber: z.string().max(100),
+  email: z.string().max(200),
+  phone: z.string().max(100),
+  website: z.string().max(200),
+  bankDetails: z.string().max(500),
+  logoFileId: z.uuid().nullable(),
+});
+export type OrgProfileInput = z.infer<typeof orgProfileInputSchema>;
+
+/**
+ * One priced line of an issued document, frozen at issue in money.ts's units:
+ * quantity in THOUSANDTHS, price in CENTS, tax in BASIS POINTS.
+ */
+export const documentLineItemSchema = z.object({
+  id: z.uuid(),
+  position: z.number().int().positive(),
+  description: z.string(),
+  qtyMilli: z.number().int(),
+  unitPriceCents: z.number().int().safe(),
+  taxRateBp: z.number().int(),
+  lineTotalCents: z.number().int().safe(),
+});
+export type DocumentLineItem = z.infer<typeof documentLineItemSchema>;
+
+/**
+ * An issued document, with its lines. NAMED `DocumentRecord` rather than `Document`
+ * on purpose: `Document` is a DOM global, and a type by that name imported into
+ * packages/web shadows it in every file that takes the import.
+ *
+ * There is no update shape anywhere below, and that is the phase's central claim
+ * rather than an omission: an issued quote never changes.
+ */
+export const documentSchema = z.object({
+  id: z.uuid(),
+  number: z.string().min(1),
+  type: documentTypeSchema,
+  dealId: z.uuid(),
+  fileId: z.uuid(),
+  currency: currencyCodeSchema,
+  issueDate: z.iso.date(),
+  validUntilDate: z.iso.date().nullable(),
+  recipientName: z.string(),
+  recipientContactName: z.string(),
+  recipientAddress: z.string(),
+  subtotalCents: z.number().int().safe(),
+  taxCents: z.number().int().safe(),
+  totalCents: z.number().int().safe(),
+  notes: z.string(),
+  terms: z.string(),
+  issuedByUserId: z.uuid(),
+  createdAt: z.iso.datetime(),
+  lines: z.array(documentLineItemSchema),
+});
+export type DocumentRecord = z.infer<typeof documentSchema>;
+
+/**
+ * THE BOUND ON A DOCUMENT'S SIZE, AND IT IS A PAIR RATHER THAN A NUMBER.
+ *
+ * renderPdf caps its INPUT at 128KB, which is what actually bounds a render's cost
+ * (Task 1 measured a table-shaped 128KB at 5.2s and 157MB, and 256KB at 251MB on a
+ * server with no swap). The budget left for line items is that cap minus the merged
+ * template (2.7KB seeded, but a user may edit it) minus an inlined logo (32KB stored
+ * arrives as ~43KB of base64), so roughly 82KB. A rendered line costs about 120
+ * bytes of markup plus its description, which at 500 characters is ~130 lines.
+ *
+ * NEITHER HALF WORKS ALONE: without a description cap a single line exhausts the
+ * budget by itself, and without a line cap 10,000 empty descriptions do. If the
+ * render input cap ever moves, both of these move with it.
+ *
+ * They are a GATE, not a guarantee -- the template is user-editable, so a big enough
+ * template still meets renderPdf's cap. That failure is reported as a document too
+ * large to render rather than as a 500; this pair is what keeps an ordinary quote
+ * from reaching it.
+ */
+export const DOCUMENT_MAX_LINES = 130;
+export const DOCUMENT_MAX_DESCRIPTION_CHARS = 500;
+
+/**
+ * One line of a quote as submitted. **THE THREE BOUNDS HERE ARE THE THREE CHECK
+ * CONSTRAINTS ON `document_line_items`**, restated where they can be enforced before
+ * anything spawns: `qty_milli >= 0`, `unit_price_cents >= 0` and `tax_rate_bp BETWEEN
+ * 0 AND 10000`.
+ *
+ * money.ts deliberately keeps a WIDER domain than all three -- `divideRoundHalfUp`
+ * has a negative branch so a future credit note rounds correctly -- so a negative
+ * quantity or a 150% tax rate computes a total, renders a PDF and only then dies on
+ * the INSERT as a 23514: an opaque 500, after a subprocess has already run, for a
+ * value the form said was fine. All three were reproduced end to end in exactly that
+ * shape. The repo's split is "Zod is the primary gate, the CHECK is the backstop",
+ * and this is the gate.
+ *
+ * The upper bounds are the storable ones: int4 for `qty_milli`, and
+ * Number.MAX_SAFE_INTEGER for `unit_price_cents`, which is both what drizzle's
+ * `mode: "number"` can read back and what `document_line_items_amounts_representable`
+ * allows.
+ */
+export const documentLineInputSchema = z.object({
+  description: z.string().min(1).max(DOCUMENT_MAX_DESCRIPTION_CHARS),
+  qtyMilli: z.number().int().min(0).max(2_147_483_647),
+  unitPriceCents: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  taxRateBp: z.number().int().min(0).max(10_000),
+});
+export type DocumentLineInput = z.infer<typeof documentLineInputSchema>;
+
+/**
+ * Body of POST /api/deals/:dealId/documents. The deal is the route param and the
+ * currency is copied from that deal, so neither appears here: a document whose
+ * currency disagreed with its deal's would be a record of two different amounts.
+ *
+ * THE superRefine IS THE FOURTH FAILURE PATH, and it is not one of the three CHECKs.
+ * Every field above can be individually in range while the ARITHMETIC over them is
+ * not: 130 lines of 2,147,483.647 units at MAX_SAFE_INTEGER cents each overflows the
+ * representable range, and `documentTotals` throws a plain Error saying so. Left
+ * ungated that is a 500 from a service call; here it is a 400 with a message, and it
+ * costs one pass of the same arithmetic the service is about to run anyway. It
+ * happens before the render either way -- no number is spent, nothing spawns -- so
+ * this is about what the caller is told, not about what is wasted.
+ */
+export const issueQuoteInputSchema = z.object({
+  issueDate: z.iso.date(),
+  validUntilDate: z.iso.date().nullable().optional(),
+  recipientName: z.string().min(1).max(200),
+  recipientContactName: z.string().max(200).optional(),
+  recipientAddress: z.string().max(2000).optional(),
+  notes: z.string().max(5000).optional(),
+  terms: z.string().max(5000).optional(),
+  lines: z.array(documentLineInputSchema).min(1).max(DOCUMENT_MAX_LINES),
+}).superRefine((value, ctx) => {
+  try {
+    computeDocumentTotals(value.lines);
+  } catch {
+    ctx.addIssue({
+      code: "custom",
+      path: ["lines"],
+      message: "these line items total more than a document can represent",
+    });
+  }
+});
+export type IssueQuoteInput = z.infer<typeof issueQuoteInputSchema>;

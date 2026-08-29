@@ -1,9 +1,7 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
-import { migrationsFolder } from "../db/client.js";
 import { pageCount, pdfHasImage, pdfText } from "../test/pdf.js";
+import { seededQuoteTemplate } from "../test/seed-template.js";
 import { pdfEmbedsFiles, renderPdf, weasyprintAvailable } from "./documents-render.js";
 import { prepareDocumentHtml, type MergeContext } from "./documents-template.js";
 
@@ -37,13 +35,9 @@ import { prepareDocumentHtml, type MergeContext } from "./documents-template.js"
 const HAVE_WEASYPRINT = await weasyprintAvailable();
 const itReal = HAVE_WEASYPRINT ? it : it.skip;
 
-/** The seeded body_html, read out of the migration that inserts it. */
-function seededTemplate(): string {
-  const sql = readFileSync(join(migrationsFolder(), "0009_calm_rhodey.sql"), "utf8");
-  const match = /VALUES \('quote', '([\s\S]*)'\);\s*$/.exec(sql);
-  if (match?.[1] === undefined) throw new Error("could not find the seeded quote template in 0009");
-  return match[1].replaceAll("''", "'");
-}
+/** The seeded body_html, read out of the migration that inserts it. Shared with
+ * documents.test.ts, which checks the same tokens against buildContext's key set. */
+const seededTemplate = seededQuoteTemplate;
 
 /** A 1x1 PNG, scaled by the template's own .logo rule. Stands in for a real logo. */
 const LOGO_PNG =

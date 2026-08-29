@@ -70,6 +70,65 @@ const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
  */
 const DEFAULT_MAX_INPUT_BYTES = 128 * 1024;
 
+/**
+ * THREE CONCURRENT RENDERS, AND THIS IS THE THING THAT MAKES `ram.runtime` TRUE.
+ *
+ * `manifest.toml` declares 900M on the arithmetic 400M (Node) + 3 x 157MB (a render
+ * at the input cap above, in the worst shape measured). That declaration was
+ * documentation until this constant existed: YunoHost sets no cgroup from
+ * `ram.runtime` and does not evaluate it at install, so nothing outside this process
+ * enforces it. The server is 3819MB with NO SWAP, where exceeding it is an OOM kill
+ * rather than a slowdown.
+ *
+ * **The input cap is the lever; this is the multiplier. Move either and recompute the
+ * other**, and the manifest with them -- documents-render.test.ts asserts the three
+ * still agree.
+ *
+ * IT LIVES IN renderPdf RATHER THAN IN THE ISSUING TRANSACTION because the budget is
+ * a property of this process, not of quotes: a template preview, a second document
+ * type, or a batch re-issue would each need the same bound, and a limit a caller has
+ * to remember to apply is a limit that holds until somebody adds a call site.
+ *
+ * Waiting for a slot costs nothing on the issuing path today, because the number
+ * sequence's row lock already serialises quotes of one type and year to one at a
+ * time -- so this is the backstop for every other caller, and for the New Year's Eve
+ * case where two years' sequences are live at once.
+ *
+ * The queue is unbounded, which is safe because something else already bounds it: an
+ * issuing caller holds a database connection while it waits, and the pool tops out at
+ * ten. Each waiter holds at most one 128KB string.
+ */
+export const RENDER_MAX_CONCURRENCY = 3;
+
+let rendersInFlight = 0;
+const rendersWaiting: (() => void)[] = [];
+
+/**
+ * Take a render slot, waiting if all three are busy. FIFO, so a queued render cannot
+ * be starved by a steady arrival of new ones.
+ */
+async function acquireRenderSlot(): Promise<void> {
+  if (rendersInFlight < RENDER_MAX_CONCURRENCY) {
+    rendersInFlight += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => rendersWaiting.push(resolve));
+}
+
+/**
+ * Give the slot back -- to the next waiter if there is one, which is why the counter
+ * is left alone in that branch: the slot is handed over rather than freed and
+ * re-taken, so no third caller can slip in between the two halves.
+ */
+function releaseRenderSlot(): void {
+  const next = rendersWaiting.shift();
+  if (next === undefined) {
+    rendersInFlight -= 1;
+    return;
+  }
+  next();
+}
+
 /** Enough stderr to diagnose a failure, bounded so a chatty child cannot balloon it. */
 const STDERR_CAP_BYTES = 8 * 1024;
 
@@ -247,6 +306,9 @@ export function pdfEmbedsFiles(pdf: Buffer): boolean {
  * Rejects with a RenderError for every failure, and never resolves with anything that
  * is not a PDF: a child that exits 0 having written nothing (or something else) is a
  * failed render, not an empty document.
+ *
+ * At most RENDER_MAX_CONCURRENCY of these run at once, process-wide; a fourth waits.
+ * See that constant for the memory arithmetic it keeps true.
  */
 export async function renderPdf(html: string, options: RenderOptions = {}): Promise<Buffer> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -261,6 +323,21 @@ export async function renderPdf(html: string, options: RenderOptions = {}): Prom
     );
   }
 
+  // After the input cap, before the spawn: a document that is too large is refused
+  // outright rather than queued for a slot it would only waste.
+  await acquireRenderSlot();
+  try {
+    return await spawnRender(html, { timeoutMs, maxBytes });
+  } finally {
+    releaseRenderSlot();
+  }
+}
+
+/** The subprocess itself. Split out so the slot's try/finally cannot grow a path
+ * that leaks one. */
+async function spawnRender(
+  html: string, { timeoutMs, maxBytes }: { timeoutMs: number; maxBytes: number },
+): Promise<Buffer> {
   return await new Promise<Buffer>((resolve, reject) => {
     const child = spawn("python3", ["-c", RENDER_SCRIPT], {
       stdio: ["pipe", "pipe", "pipe"],

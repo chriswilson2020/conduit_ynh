@@ -88,3 +88,63 @@ export function formatMoneyCents(cents: number, currency: string, locale: string
   if (!Number.isSafeInteger(cents)) return format.format(cents / 100);
   return format.format(exactDecimal(cents));
 }
+
+/**
+ * The exact decimal for an integer number of THOUSANDTHS, e.g. 1500 -> "1.5".
+ *
+ * Trailing zeros are trimmed because a quantity is not money: "2" reads as a count
+ * where "2.000" reads as a measurement, and the money columns beside it on the page
+ * are already carrying two fixed decimal places.
+ */
+function exactMilliDecimal(milli: number): `${number}` {
+  const value = BigInt(milli);
+  const negative = value < 0n;
+  const absolute = negative ? -value : value;
+  const units = absolute / 1000n;
+  const fraction = (absolute % 1000n).toString().padStart(3, "0").replace(/0+$/, "");
+  const decimal = `${negative ? "-" : ""}${units.toString()}${fraction === "" ? "" : `.${fraction}`}`;
+  return decimal as `${number}`;
+}
+
+/**
+ * Format a quantity in thousandths, e.g. 1500 -> "1.5", 2000 -> "2".
+ *
+ * HERE RATHER THAN INLINE IN buildContext for the same reason formatMoneyCents
+ * exists: the quote form's quantity column and the rendered PDF's have to read the
+ * same, and two call sites each dividing by 1000 are two call sites that can
+ * disagree about grouping and about the locale.
+ *
+ * Exact by the same route as the money above -- the decimal is built out of the
+ * integer with BigInt and handed to Intl as a STRING, so no thousandth is lost to a
+ * divide. `qty_milli` is an int4, so the largest quantity a line can hold is
+ * 2,147,483.647.
+ *
+ * NEVER THROWS, like everything else in this file; see the header.
+ */
+export function formatQtyMilli(qtyMilli: number, locale: string = MONEY_LOCALE): string {
+  const format = new Intl.NumberFormat(locale, { maximumFractionDigits: 3 });
+  if (!Number.isSafeInteger(qtyMilli)) return format.format(qtyMilli / 1000);
+  return format.format(exactMilliDecimal(qtyMilli));
+}
+
+/**
+ * Format a tax rate in basis points, e.g. 2100 -> "21%", 750 -> "7.5%".
+ *
+ * Intl's percent style multiplies by 100, so what is handed to it is the RATE (0.21),
+ * built exactly from the integer for the same reason as above: bp/10000 in double
+ * precision is not exact for most rates, and a quote printing "20.999999%" is a
+ * defect the customer sees before we do.
+ *
+ * Two fraction digits, which is exactly the resolution a basis point has (1bp is
+ * 0.01%). `tax_rate_bp` is CHECKed to 0..10000, so the printable range is 0%..100%.
+ */
+export function formatTaxRateBp(taxRateBp: number, locale: string = MONEY_LOCALE): string {
+  const format = new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 2 });
+  if (!Number.isSafeInteger(taxRateBp)) return format.format(taxRateBp / 10_000);
+  const value = BigInt(taxRateBp);
+  const negative = value < 0n;
+  const absolute = negative ? -value : value;
+  const units = absolute / 10_000n;
+  const fraction = (absolute % 10_000n).toString().padStart(4, "0");
+  return format.format(`${negative ? "-" : ""}${units.toString()}.${fraction}` as `${number}`);
+}

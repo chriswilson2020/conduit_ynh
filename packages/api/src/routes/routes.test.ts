@@ -9,15 +9,17 @@ import {
   errorResponseSchema, listResponseSchema, searchResultsSchema,
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
-  meetingSchema, meetingDetailSchema,
+  meetingSchema, meetingDetailSchema, documentSchema, orgProfileSchema,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
+import { withPythonStub, writePythonStub } from "../test/python-stub.js";
+import { seededQuoteTemplate } from "../test/seed-template.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
 import { listFiles } from "../services/files.js";
 import { listEvents } from "../services/timeline.js";
 import { resolveUser } from "../users.js";
 import { todayDateOnly, addDays } from "../services/scheduling.js";
-import { files } from "../db/schema.js";
+import { documentTemplates, files } from "../db/schema.js";
 import type { Config } from "../config.js";
 
 const handle = openTestDatabase();
@@ -1944,6 +1946,223 @@ describe("meetings routes", () => {
       { method: "POST" as const, url: `/api/meetings/${unknownId}/archive` },
       { method: "POST" as const, url: `/api/meetings/${unknownId}/unarchive` },
       { method: "POST" as const, url: `/api/meetings/${unknownId}/tasks` },
+    ];
+    for (const call of calls) {
+      const response = await a.inject({ ...call, payload: {} });
+      expect(response.statusCode).toBe(401);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
+    }
+    await a.close();
+  });
+});
+
+describe("documents routes", () => {
+  const unknownId = "3f2504e0-4f89-41d3-9a0c-0305e82c3302";
+
+  /**
+   * These run WITHOUT WEASYPRINT, on a stub `python3` (test/python-stub.ts) that
+   * emits eight random bytes behind a `%PDF-` header. What this file is testing is
+   * the HTTP surface -- status codes, body shapes, which failures are 4xx -- and
+   * gating that on a binary would mean the refusal paths never run on a developer
+   * machine at all. The real renderer is exercised in services/documents.test.ts.
+   */
+  const VARYING_PDF = [
+    "printf '%s' '%PDF-1.7 conduit-stub-'",
+    "od -An -N8 -tx1 /dev/urandom | tr -d ' \\n'",
+  ].join("\n");
+
+  /** truncateAll() empties document_templates too, so every test seeds its own. */
+  async function seedTemplate(bodyHtml = seededQuoteTemplate()): Promise<void> {
+    await handle.db.insert(documentTemplates).values({ type: "quote", bodyHtml });
+  }
+
+  async function makeQuotableDeal(a: Awaited<ReturnType<typeof app>>) {
+    const pipeline = await makePipeline(a);
+    const stage = await makeStage(a, pipeline.id, "New");
+    return await makeDeal(a, pipeline.id, stage.id);
+  }
+
+  function quotePayload(overrides: Record<string, unknown> = {}) {
+    return {
+      issueDate: "2026-08-28",
+      validUntilDate: "2026-09-27",
+      recipientName: "Acme Manufacturing BV",
+      recipientContactName: "Jane Smith",
+      recipientAddress: "2 Low Street",
+      notes: "", terms: "",
+      lines: [{ description: "Widget", qtyMilli: 2000, unitPriceCents: 5000, taxRateBp: 2100 }],
+      ...overrides,
+    };
+  }
+
+  it("raises a quote on a deal, lists it, and serves the PDF through the existing files route", async () => {
+    await seedTemplate();
+    const a = await app();
+    const deal = await makeQuotableDeal(a);
+
+    const created = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/deals/${deal.id}/documents`,
+        headers: authHeaders, payload: quotePayload(),
+      }));
+    expect(created.statusCode).toBe(201);
+    const document = documentSchema.parse(created.json());
+    expect(document.number).toBe("QUO-2026-0001");
+    expect(document.totalCents).toBe(12_100);
+    expect(document.lines).toHaveLength(1);
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/deals/${deal.id}/documents`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(documentSchema).parse(listed.json())).toEqual([document]);
+
+    // NO SECOND DOWNLOAD PATH. The PDF is an ordinary files row on the deal, so it
+    // comes back through the route that already existed.
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${document.fileId}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.headers["content-type"]).toContain("application/pdf");
+    expect(download.rawPayload.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(download.headers["content-disposition"]).toContain("QUO-2026-0001.pdf");
+    await a.close();
+  });
+
+  it("answers 400 for each bound the CHECK constraints would otherwise raise after a render", async () => {
+    // The three gates, at the HTTP surface: a client sees a validation error, not a
+    // 500 raised once a subprocess had already run.
+    await seedTemplate();
+    const a = await app();
+    const deal = await makeQuotableDeal(a);
+    const bad = [
+      { description: "Refund", qtyMilli: -1000, unitPriceCents: 5000, taxRateBp: 2100 },
+      { description: "Credit", qtyMilli: 1000, unitPriceCents: -5000, taxRateBp: 2100 },
+      { description: "Widget", qtyMilli: 1000, unitPriceCents: 5000, taxRateBp: 15_000 },
+    ];
+    for (const line of bad) {
+      const response = await a.inject({
+        method: "POST", url: `/api/deals/${deal.id}/documents`,
+        headers: authHeaders, payload: quotePayload({ lines: [line] }),
+      });
+      expect(response.statusCode).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    }
+    // Nothing was issued and no number was spent.
+    const listed = await a.inject({
+      method: "GET", url: `/api/deals/${deal.id}/documents`, headers: authHeaders,
+    });
+    expect(listed.json()).toEqual([]);
+    await a.close();
+  });
+
+  it("turns a failed render into a 422 rather than a 500, and spends no number", async () => {
+    await seedTemplate();
+    const a = await app();
+    const deal = await makeQuotableDeal(a);
+
+    const failed = await withPythonStub(
+      writePythonStub(dataDir, "echo 'Fatal: no fonts' >&2\nexit 5"),
+      async () => await a.inject({
+        method: "POST", url: `/api/deals/${deal.id}/documents`,
+        headers: authHeaders, payload: quotePayload(),
+      }),
+    );
+    expect(failed.statusCode).toBe(422);
+    const body = errorResponseSchema.parse(failed.json());
+    expect(body.error).toBe("render_failed");
+    // The child's stderr can name server paths, so it stays in the log: the message
+    // is this codebase's own short phrase.
+    expect(body.message).toBe("renderer exited 5");
+    expect(body.message).not.toContain("no fonts");
+
+    const recovered = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/deals/${deal.id}/documents`,
+        headers: authHeaders, payload: quotePayload(),
+      }));
+    expect(documentSchema.parse(recovered.json()).number).toBe("QUO-2026-0001");
+    await a.close();
+  });
+
+  it("answers 422 for a template that cannot terminate, and 409 for one that is missing", async () => {
+    const a = await app();
+    const deal = await makeQuotableDeal(a);
+
+    const missing = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/documents`,
+      headers: authHeaders, payload: quotePayload(),
+    });
+    expect(missing.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(missing.json()).error).toBe("template_missing");
+
+    await seedTemplate(`${"{{#lines}}".repeat(40)}x${"{{/lines}}".repeat(40)}`);
+    const looping = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/documents`,
+      headers: authHeaders, payload: quotePayload(),
+    });
+    expect(looping.statusCode).toBe(422);
+    expect(errorResponseSchema.parse(looping.json()).error).toBe("template_error");
+    await a.close();
+  });
+
+  it("404s an unknown deal and 409s an archived one", async () => {
+    await seedTemplate();
+    const a = await app();
+    const deal = await makeQuotableDeal(a);
+
+    const unknown = await a.inject({
+      method: "POST", url: `/api/deals/${unknownId}/documents`,
+      headers: authHeaders, payload: quotePayload(),
+    });
+    expect(unknown.statusCode).toBe(404);
+
+    await a.inject({ method: "POST", url: `/api/deals/${deal.id}/archive`, headers: authHeaders });
+    const archived = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/documents`,
+      headers: authHeaders, payload: quotePayload(),
+    });
+    expect(archived.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(archived.json()).error).toBe("archived");
+    await a.close();
+  });
+
+  it("reads and writes the issuer profile, which starts empty rather than absent", async () => {
+    const a = await app();
+    const empty = await a.inject({ method: "GET", url: "/api/org-profile", headers: authHeaders });
+    expect(empty.statusCode).toBe(200);
+    expect(orgProfileSchema.parse(empty.json())).toMatchObject({ name: "", logoFileId: null });
+
+    const saved = await a.inject({
+      method: "PUT", url: "/api/org-profile", headers: authHeaders,
+      payload: {
+        name: "Listerdale Life Sciences", addressLines: "1 High St",
+        vatNumber: "NL001234567B01", registrationNumber: "12345678",
+        email: "hello@listerdale.test", phone: "+31 20 123 4567",
+        website: "listerdale.test", bankDetails: "NL00 BANK 0123 4567 89",
+        logoFileId: null,
+      },
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(orgProfileSchema.parse(saved.json()).name).toBe("Listerdale Life Sciences");
+
+    const reread = await a.inject({ method: "GET", url: "/api/org-profile", headers: authHeaders });
+    expect(orgProfileSchema.parse(reread.json()).vatNumber).toBe("NL001234567B01");
+
+    const invalid = await a.inject({
+      method: "PUT", url: "/api/org-profile", headers: authHeaders, payload: { name: "Only a name" },
+    });
+    expect(invalid.statusCode).toBe(400);
+    await a.close();
+  });
+
+  it("returns 401 without an identity header on every documents route", async () => {
+    const a = await app();
+    const calls = [
+      { method: "GET" as const, url: `/api/deals/${unknownId}/documents` },
+      { method: "POST" as const, url: `/api/deals/${unknownId}/documents` },
+      { method: "GET" as const, url: "/api/org-profile" },
+      { method: "PUT" as const, url: "/api/org-profile" },
     ];
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });
