@@ -2708,6 +2708,232 @@ git add packages/web/src
 git commit -m "feat(web): raise a quote from a deal, with a line editor that works on a phone"
 ```
 
+#### TASK 5 DONE — the phone layout held, and the DESK was the broken one
+
+Commits `ba3a391`, `812b428`. CI run **33238930334**, tip `812b428`, both jobs
+green: **2338 tests, 0 skipped**. On the server: 2300 passed / 38 skipped.
+
+The steps above are left as written so the corrections are legible.
+
+**1. THE 390px MEASUREMENT, AND THE HALF OF THE EXPECTED ANSWER IT REFUTED.** The form
+opens in a dialog, which at 390px is full-bleed with 24px of padding: 342px inside,
+340px in the table's own scroll box. Every figure is against that.
+
+| layout | fits | per line item |
+|---|---|---|
+| a real four-column table row | **no -- 481px min-content, 143px of overflow** | 52px, inputs 84.1 / 26 / 36.6 / 26 |
+| one field per line, label above | yes | **418px** -- 63% of a 664px viewport, 1.6 visible |
+| **shipped: description full width, the three money fields sharing a line** | yes, 0 overflow | **230px**, 2.9 visible, narrowest input 96.7 x 44 |
+
+Stacked cards below the breakpoint: proved. **One field per line: refuted.** A
+description needs the full width; a quantity, a price and a tax rate are three to six
+characters each and putting them on three lines of their own takes a card from 230px to
+418px for nothing.
+
+**MY FIRST FIGURES WERE MEASURED IN THE WRONG CONTAINER** -- a page-padded div at
+356px, which is not where this form lives -- and said 469/113. Re-measured in the
+dialog they were 501/161, and the spec review's re-measurement says **481/143**, which
+is what the code now records. The three input widths reproduce to the tenth of a pixel
+in all three passes, so the conclusion never moved; the min-content total did, twice,
+which is the whole argument for measuring in the container rather than near it.
+
+**NO FOURTH `useIsMobile` SITE.** The phone gets the same fields, in the same order,
+with the same handlers, re-laid-out; the one place the interaction model does differ is
+the dialog becoming a sheet, which `ui/dialog.tsx` already owns.
+
+**2. THE PARSE BOUNDARY, AND WHY IT IS NOT OPTIONAL.** `documentTotals` throws on a
+non-integer and there is no error boundary anywhere in `packages/web/src`. Proved by
+mutation rather than argued: with the parse removed, typing **`1.115` into a unit
+price** -- an ordinary price, not a malformed one -- emptied `document.body`, with
+`money: unitPriceCents must be a safe integer, got 111.5` in the console.
+
+`document-lib.ts` shifts digits as a STRING and reads them with BigInt. **A float
+multiply does not land on an integer**: measured, `1.001 * 1000` is 1000.9999999999999,
+`8.87 * 100` is 886.9999999999999, `17.17 * 100` is 1717.0000000000002. Rounding them
+would swap the crash for the off-by-one-cent defect the spec names as this feature's
+classic one.
+
+**A NUMBER IN A COMMENT HAS TO BE MEASURED, AND ONE OF MINE WAS NOT.** The first
+version cited `1.115 * 1000` as 1114.99...; it is exactly 1115, and the test asserting
+otherwise is what caught it. The three above are the measured ones.
+
+Five mutations, on the server: a `Number()`-based parse fails **10 of 28**, no ceiling
+2, decimals rounded instead of refused 2, the arithmetic called without its guard 2, a
+half-typed field contributing NaN 3.
+
+**3. GET -> PUT IS BYTE-IDENTICAL THROUGH THE EDITOR**, driven in a browser over a
+stubbed API serving the real seeded template: **3,616 bytes at every hop** -- into the
+textarea, out to the PUT body, back into the field after saving -- zero differing bytes.
+Normalising newlines to CRLF breaks it to 3,674. The spec review padded it with leading
+and trailing whitespace and it is still identical, so `f(f(x)) = f(x) = x`.
+
+**A TRIM WOULD NOT HAVE BEEN CAUGHT BY MY OWN TEST** and I said so before the review
+did: this template starts with `<` and ends with `>`, so `trim()` is a no-op on it.
+
+**THE RICH-TEXT CONTROL WOULD HAVE BROKEN IT OUTRIGHT.** Passing the seeded template
+through a DOM -- what a document-model editor does on the first keystroke -- takes it to
+3,644 bytes, and the first difference is at byte 1400: `<img ... />` comes back as
+`<img ...>`. That is exactly the byte Task 4's review round changed to make the template
+a fixed point of its own sanitiser, so a rich-text editor would have fought that fix
+forever. Hence a plain textarea, and hence no in-browser preview: a preview renders the
+template's CSS WITHOUT the renderer's `data:`-only fetcher, which is the dependency
+Task 3 exists to remove.
+
+**4. THE LOGO'S BOUND, AT AND PAST THE LIMIT.** 32,768 bytes accepted; 32,769 refused
+with `a logo must be 32768 bytes or less; this one is 32769`; 65,536 refused by the
+character cap; SVG refused by the type allowlist. **Both refusal paths matter**: at one
+byte over, the URI is still inside `MAX_LOGO_DATA_URI_CHARS` because the two sizes
+differ only in base64 padding, so the decoded-size arithmetic is the only thing that can
+separate them -- the trap Task 4 named.
+
+---
+
+##### SPEC REVIEW ROUND — four findings, and the desktop was the one that mattered
+
+The review drove the real app: built on the server, production `dist` over a tunnel,
+four quotes raised end to end, PDFs read. **The phone work verified essentially
+exactly** -- 230.0px per card, zero overflow, 96.7x44 narrowest input, 2.89 visible, the
+running total on screen at all eight sampled scroll positions through a 3,014px form,
+mid-list deletion renumbering with exact arithmetic, and all 50 interactive targets >=
+44px in both axes with nothing occluded. The parse boundary survived a 21-value paste
+battery, an IME composition session, a 400-digit number and 200 synchronous changes with
+no paint between.
+
+**SV-1: THE DESKTOP DIALOG WAS 448px AND EVERY CALLER'S WIDTH WAS DEAD.** `ui/dialog.tsx`
+hard-coded `max-w-md` into the shape. Tailwind sorts `max-w-*` ALPHABETICALLY rather
+than by size, so `.max-w-md` is emitted after `.max-w-2xl` and `.max-w-3xl` and wins at
+equal specificity -- class order in the attribute is irrelevant. So the quote form
+opened at 448px on a 1280px screen and **the four-column table I had just proved
+unusable at 390px is what shipped to the desk**: measured, `clientWidth` 398 against
+`scrollWidth` 481, 83px of overflow, inputs at 84.1 / 26 / 36.6 / 26, and the Remove
+button at x=906 against a box ending at 840 -- **off screen**. Removing a line item at
+1280px required scrolling the table sideways first.
+
+My comment at `deal-detail.tsx` claiming the caller widened the dialog was therefore
+false, which the Conventions forbid outright.
+
+**PRE-EXISTING, NOT INVENTED HERE** -- `composer.tsx`, `settings-mail.tsx` and
+`settings-templates.tsx` had passed inert widths since the utility was introduced, and
+Phase 6's own guard comment recorded the defect accurately and deferred it as a desktop
+change. **The reviewer's claim that that comment "asserts the opposite of the truth" is
+the one thing in this round I do not accept**: it states the 448px measurement and names
+the three inert callers. What was wrong was the test's NAME ("lets callers tune...") and
+the fact that nothing failed when the tuning did nothing.
+
+**THE FIX IS THE ABSENCE OF A CONFLICT, NOT A CASCADE ARGUMENT.** The shape no longer
+spells any base `max-w-`; `DialogContent` applies the default through `overridableClass`
+(`src/lib.ts`) only when the caller has set none, so exactly one class of that family is
+ever emitted and stylesheet order has nothing left to decide. `max-md:max-w-none` is
+deliberately not treated as an override and must not be -- it has to keep beating
+whatever the caller chose, and does, because every `max-md` rule is emitted after the
+whole base layer.
+
+Measured at 1280 after the fix:
+
+| caller | before | after |
+|---|---|---|
+| `settings-mail.tsx` (`max-w-2xl`) | 448px | **672px** |
+| `deal-detail.tsx` quote form (`max-w-3xl`) | 448px, 83px table overflow, Remove off screen | **768px, 0 overflow, Remove on screen** |
+
+**THE CONSEQUENCE, STATED RATHER THAN DISCOVERED: three other dialogs got wider too**
+(mail settings, email templates, the mail composer). That is a desktop change, and it is
+a FIX to a long-standing bug rather than a regression -- v0.10.0's "do not alter the
+desktop" was about not breaking it. Both dialogs verified at 1280 afterwards.
+
+**AND THE GUARD NOW ASSERTS THE CLASS TAKES EFFECT.** It only ever checked that a
+caller's class STARTED WITH one of four prefixes -- never that it did anything. It now
+also asserts the shape spells no base `max-w-` at all. **Restoring `max-w-md` to the
+shape fails it**: `expected [ 'max-w-md' ] to deeply equal []`, alongside the same
+mutation reproducing all of the reviewer's numbers in the browser. Four unit tests on
+`overridableClass` cover the default, the override, the variant-prefixed non-override
+and a name that merely contains the family.
+
+**SV-2: EVERY SCHEMA-LEVEL REFUSAL SAID "Invalid input".** `buildIssueQuoteInput` mapped
+`parsed.error.issues` to `issue.message` and threw `issue.path` away -- and the path is
+the only part that says which box. This is the primary journey, not an edge:
+`deal-detail.tsx` defaults the recipient from the deal's linked company, so **any deal
+without one opens with an empty Recipient**, and with two valid lines and a total on
+screen the entire feedback was `["Invalid input"]`.
+
+`describeIssue` uses the path. Measured in the browser, same scenario: **"Recipient is
+required."** Size failures get a purpose-written sentence (`Notes is longer than the
+5000 characters allowed.`, `Line 2 description is longer than the 250 characters
+allowed.`); custom refinements keep their own good sentence and gain the field
+(`Issue date: the date must fall in a four-digit year`); a `lines` path with NO index is
+a claim about the whole set -- the budget, an unrepresentable total -- and is left
+alone. **That last arm had to come before the field arm and did not**, so the budget
+message came out as `lines: this quote needs ... bytes`; its test caught it.
+
+**SV-3: A REFUSED SUBMIT WAS INVISIBLE.** Measured at 390x664, scrolled to the top with
+focus in the auto-focused Recipient field -- where every phone user starts -- a real
+Return set the state and returned: `scrollTop 0, problems box top 1200, viewport 664,
+onScreen false, focus BODY`. **536px below the fold with nothing on screen changing.**
+Both kinds of refusal now share one region that is scrolled into view and FOCUSED
+(`tabIndex={-1}`) -- focus rather than scroll alone because a screen reader is in the
+same position, and because it puts the next Tab at the top of the problem list.
+Re-measured: top 626 in a 664px viewport, `document.activeElement` is the region. It
+covers the server's 413 and both 503s, which were as far below the fold as the local
+ones. Failing inputs gained `aria-invalid` and an `aria-describedby` pointing at a
+message that is only rendered when it exists.
+
+**SV-4: THE LOGO'S MIME CHECK WAS A DECLARED-TYPE CHECK.** `logoDataUriProblem` matched
+the `data:` prefix and nothing sniffed the payload, and in a browser that prefix comes
+from `File.type`, which is derived from the EXTENSION. So an SVG renamed to `.png`
+arrived as `data:image/png;base64,<svg>`, was stored, and **WeasyPrint drew it as vector
+art in the PDF** -- the spec's exclusion of SVG enforced only against a file honest
+enough to admit what it was.
+
+**Not exploitable**: the reviewer built an SVG carrying `file://` and loopback
+references and the quote was refused with `document referenced a blocked resource`,
+canary atime unchanged, no number spent. Task 3's fetcher held. This is the layer in
+front of it doing its own job.
+
+`logoDataUriProblem` now decodes the first twelve bytes -- **by hand, because neither
+`atob` nor `Buffer` is available in both places this module runs**, the same constraint
+that keeps the size check to arithmetic -- and requires a signature matching the
+declared type. Fixing it IN SHARED fixes both boundaries at once, since the client and
+`saveOrgProfile` call the same function. The api fixture `logoOfBytes` now emits a real
+signature per type with filler after, so decoded lengths and both size bounds are
+unchanged.
+
+**THE SMALLER ONES.**
+
+- **`key={problem}` produced duplicate React keys** -- two `<li key="Invalid input">`
+  siblings. Keyed by index, which is right here because the list is rebuilt wholesale
+  and never reordered; a test asserts two different fields still produce two different
+  sentences, which is what makes the index safe rather than merely quiet.
+- **The form restated the schema's caps as `maxLength` while the commit message claimed
+  it restated no bounds.** They agreed and nothing kept them agreeing. `DOCUMENT_FIELD_CAPS`
+  and `ORG_PROFILE_FIELD_CAPS` are exported from shared and used by BOTH the schema and
+  the forms, so the claim is now true rather than corrected.
+- **`settings-org.tsx` re-seeded the whole form on any refetch**, despite its comment
+  saying it seeded once -- the effect depends on `profile`, a fresh object each time the
+  query resolves. Harmless only through TanStack's structural sharing, which hands back
+  the same object when the bytes have not changed; it would have bitten exactly when
+  someone else had edited the profile, which is when clobbering an in-progress edit is
+  worst. A ref makes the comment true.
+- **`todayLocalIso` already existed in `src/lib.ts`** and I had written a second local-date
+  implementation beside it. Reused.
+- One comment corrected before the first commit: it claimed the documents list took its
+  44px floor "the way the rail's own download link applies it", and **the rail's link has
+  no floor at all** (`components/rail/files.tsx`). That gap is a Phase 6 surface and is
+  left alone rather than widened into.
+
+**THE STYLESHEET HASH MOVED TWICE, BOTH DELIBERATELY**: `index-CBvyyNUj` (30.85 kB) ->
+`index-Bjr1PtnV` (32.58 kB) for the new utilities, -> `index-udY9Lgg8` (33.02 kB) for
+this round. Build clean with no CSS warning at each; the server reproduces the same hash.
+
+**WHAT TASK 6 INHERITS.**
+
+1. **Three dialogs are wider at a desk than in v0.10.0** -- mail settings and email
+   templates at 672px, the mail composer at 768px. No e2e asserts a dialog width today,
+   but the release notes should say it, because it is a visible desktop change.
+2. **`overridableClass` is the pattern for any future shape default a caller may
+   replace.** Only `max-w-` uses it; `max-h-` and `overflow-` never conflicted, because
+   the shape spells neither at base.
+3. **The e2e journey should assert a NAMED refusal**, not just that submission failed --
+   "Invalid input" passed every test that existed while telling a user nothing.
+
 ---
 
 ### Task 6: e2e, and the v1.0.0 release
