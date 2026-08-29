@@ -2434,7 +2434,20 @@ consecutive runs, `1 failed | 1828 passed`), Phase 7 Task 1, and now Phase 7 Tas
 which finally caught one — **`mail-sync.test.ts`, a backoff case**, passing alone and on
 re-run with CI green throughout.
 
-**Hypothesis, from reading the code rather than another run.** `waitFor`
+**FALSIFIED by Task 4, which reproduced it.** vitest's default 5000ms `testTimeout`
+always fires before `waitFor`'s own 10s deadline, so that label can never appear and the
+hypothesis below is wrong. Nor is it a slowdown: the case normally costs 180-240ms, about
+4% of the budget, and instead of running slowly it **wedges**. Twelve runs on an idle
+server failed 1; twelve against a second concurrent vitest process failed 8 — so
+contention amplifies a real race rather than being its cause, which is why an
+uncontended experiment could keep coming back clean. **Next suspect, untested:**
+`ManualClock.wait(ms <= 0)` resolving without registering a pending entry, so a
+`waitFor(() => clock.pendingCount() > 0)` waits for something that has already happened
+and never will again. The original hypothesis is left below because the reasoning that
+produced it is still the right shape, and because a falsified hypothesis someone can see
+is worth more than a deleted one.
+
+**Original hypothesis, from reading the code rather than another run — WRONG.** `waitFor`
 (`packages/api/src/services/mail-sync.test.ts:453`) polls its predicate every 5ms against
 a **10-second wall-clock deadline** and throws `timed out waiting for <label>`. That
 shape fails under CPU starvation while the code under test is entirely correct, and it

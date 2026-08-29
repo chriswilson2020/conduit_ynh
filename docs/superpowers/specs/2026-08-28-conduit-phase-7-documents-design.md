@@ -221,7 +221,22 @@ failed render weeks later when someone raises a quote.
 ### Data model (migration 0009)
 
 - **`org_profile`** — a single row: display name, address lines, VAT and registration
-  numbers, email, phone, website, bank details, optional logo file id.
+  numbers, email, phone, website, bank details, and the logo **as a `data:` URI in a text
+  column on this row** — NOT a `files` reference.
+
+  **Corrected by Task 4, which found the logo unstorable as specified.** `files` carries
+  `files_exactly_one_entity`, a CHECK requiring every row to belong to exactly one
+  company, contact, deal or project. An issuer's logo belongs to none of them, so there
+  was no legal `files` row for `logo_file_id` to point at. The two ways out were widening
+  that CHECK to permit an orphan, or taking the logo out of `files` entirely.
+
+  **Ruling: out of `files`.** The constraint is right — it says a file belongs to a
+  record, which is what the Files tab means — and the logo is configuration rather than a
+  record attachment; stored in `files` it would appear on no record's tab, which is
+  exactly what the CHECK exists to prevent. Storing the `data:` URI directly also removes
+  a read-and-encode step at render time, since the renderer accepts nothing else, and the
+  32KB upload bound makes a blob store pointless for one small image. What is given up is
+  sha256 dedup and streaming, neither of which means anything for a single logo.
 - **`documents`** — number (unique), type, deal FK, currency, issue date, valid-until
   date, the recipient snapshot (name and address as text), subtotal/tax/total in cents,
   frozen notes and terms, the generated PDF's file id, who raised it, when.
