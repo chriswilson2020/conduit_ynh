@@ -9,7 +9,8 @@ import { deflateSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
 import {
-  pdfEmbedsFiles, renderPdf, RenderError, RENDER_MAX_CONCURRENCY, weasyprintAvailable,
+  pdfEmbedsFiles, renderPdf, RenderBusyError, RenderError, RENDER_MAX_CONCURRENCY,
+  RENDER_QUEUE_TIMEOUT_MS, weasyprintAvailable,
 } from "./documents-render.js";
 
 /**
@@ -327,6 +328,103 @@ describe("renderPdf concurrency", () => {
     });
   }, 20_000);
 
+  it("grants queued slots in arrival order, so a steady stream cannot starve a waiter", async () => {
+    // FIFO WAS ONLY EVER A COMMENT, and the first version of this test was wrong
+    // about how to see it. It started six renders, let three queue, and read the
+    // order their children appended to a log -- which measures which PROCESS won a
+    // start-up race, not which caller was granted a slot. It failed two runs in five
+    // with "DFE": the grants were in order and the writes were not.
+    //
+    // So the grants are separated instead of the observations. The stub takes
+    // "<id>:<seconds>" on stdin, logs the id and sleeps: three holders occupy the
+    // slots for 0.3s, 0.9s and 1.5s, and each queued render runs for 0.1s. Only one
+    // slot ever comes free at a time, so D is granted at ~0.3s, E at ~0.4s (when D
+    // finishes) and F at ~0.5s -- 100ms apart, against process start-up jitter of a
+    // few milliseconds. A stack would answer F, E, D and starve D under a steady
+    // arrival rate.
+    const order = join(stubDir, "fifo-order");
+    writeFileSync(order, "");
+    const dir = stub([
+      "read line",
+      'id="${line%%:*}"',
+      'seconds="${line#*:}"',
+      `printf '%s' "$id" >> '${order}'`,
+      'sleep "$seconds"',
+      "printf '%s' '%PDF-1.7 ok'",
+    ].join("\n"));
+
+    await onPath(dir, async () => {
+      // The three holders are created first, so they take the three slots
+      // synchronously before any of D, E or F asks.
+      const submitted = ["H:0.3", "H:0.9", "H:1.5", "D:0.1", "E:0.1", "F:0.1"];
+      await Promise.all(submitted.map(async (payload) => await renderPdf(payload)));
+    });
+
+    const log = readFileSync(order, "utf8");
+    expect(log).toHaveLength(6);
+    // The holders' own three writes race each other and are not a property; the
+    // three that WAITED are.
+    expect(log.replace(/H/g, "")).toBe("DEF");
+  }, 20_000);
+
+  it("gives up on a slot rather than waiting forever, which is what bounds a caller's transaction", async () => {
+    // WITHOUT THIS THE QUEUE WAIT IS UNBOUNDED, and the issuing transaction holds its
+    // number-sequence row lock and a pooled connection across it. Ten pooled
+    // connections and ten distinct years would stall every other request in the API
+    // behind three renders. The wait is now bounded, so the lock hold is bounded by
+    // the queue timeout plus the render timeout rather than by nothing.
+    const dir = stub("sleep 3\nprintf '%s' '%PDF-1.7 ok'");
+    await onPath(dir, async () => {
+      const holding = Array.from(
+        { length: RENDER_MAX_CONCURRENCY },
+        async () => await renderPdf("<html></html>"),
+      );
+      const started = Date.now();
+      const error = await renderPdf("<html></html>", { queueTimeoutMs: 200 })
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(RenderBusyError);
+      expect(error).toBeInstanceOf(RenderError);
+      expect((error as RenderError).message).toBe("the renderer is busy");
+      expect((error as RenderError).detail).toContain("200ms");
+      // It gave up on time rather than waiting out the renders ahead of it.
+      expect(Date.now() - started).toBeLessThan(2000);
+      await Promise.all(holding);
+    });
+  }, 20_000);
+
+  it("returns a timed-out waiter's place rather than leaking the slot it never took", async () => {
+    // The failure this prevents is permanent and silent: if a waiter that gave up
+    // stayed in the queue, releaseRenderSlot would hand it a slot nobody is holding,
+    // the in-flight count would never come back down, and the process would render
+    // one fewer document at a time for the rest of its life. Three timeouts, then
+    // three concurrent renders must still be possible.
+    const slow = stub("sleep 1\nprintf '%s' '%PDF-1.7 ok'");
+    await onPath(slow, async () => {
+      const holding = Array.from(
+        { length: RENDER_MAX_CONCURRENCY },
+        async () => await renderPdf("<html></html>"),
+      );
+      const abandoned = Array.from(
+        { length: RENDER_MAX_CONCURRENCY },
+        async () => await renderPdf("<html></html>", { queueTimeoutMs: 100 }).catch((e: unknown) => e),
+      );
+      for (const settled of await Promise.all(abandoned)) {
+        expect(settled).toBeInstanceOf(RenderBusyError);
+      }
+      await Promise.all(holding);
+    });
+
+    const runDir = join(stubDir, "leak-run");
+    const observed = join(stubDir, "leak-observed");
+    writeFileSync(observed, "");
+    const dir = concurrencyStub(runDir, observed, "0.5");
+    await onPath(dir, async () => {
+      await Promise.all(Array.from({ length: 3 }, async () => await renderPdf("<html></html>")));
+    });
+    expect(maxObserved(observed)).toBe(RENDER_MAX_CONCURRENCY);
+  }, 30_000);
+
   it("declares the same three renders manifest.toml budgets for", () => {
     // ram.runtime = 400M (Node) + RENDER_MAX_CONCURRENCY x 157MB (a render at the
     // 128KB input cap, worst shape measured on the server). The manifest cannot
@@ -340,6 +438,10 @@ describe("renderPdf concurrency", () => {
     expect(declared?.[1]).toBeDefined();
     expect(400 + RENDER_MAX_CONCURRENCY * 157).toBeLessThanOrEqual(Number(declared?.[1]));
     expect(RENDER_MAX_CONCURRENCY).toBe(3);
+    // The other half of the pair: the issuing transaction's lock hold is bounded by
+    // the queue timeout plus the render timeout, and only a finite queue timeout
+    // makes that sentence true.
+    expect(RENDER_QUEUE_TIMEOUT_MS).toBe(10_000);
   });
 });
 

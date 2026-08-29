@@ -1,38 +1,19 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Readable } from "node:stream";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { eq, sql } from "drizzle-orm";
-import type { OrgProfileInput } from "@conduit/shared";
+import { sql } from "drizzle-orm";
+import { MAX_LOGO_BYTES, MAX_LOGO_DATA_URI_CHARS, type OrgProfileInput } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
-import { resolveUser } from "../users.js";
-import { files, orgProfile } from "../db/schema.js";
-import { createCompany } from "./companies.js";
-import { saveBlob } from "./blobs.js";
-import { NotFoundError } from "./errors.js";
-import {
-  getOrgProfile, LogoRejectedError, MAX_LOGO_BYTES, orgLogoDataUri, saveOrgProfile,
-} from "./org-profile.js";
+import { orgProfile } from "../db/schema.js";
+import { getOrgProfile, OrgProfileInputError, saveOrgProfile } from "./org-profile.js";
 
 const handle = openTestDatabase();
-const tmp = mkdtempSync(join(tmpdir(), "conduit-org-"));
 
-let dataDir: string;
-let actorId: string;
-let companyId: string;
+beforeEach(async () => { await truncateAll(handle); });
+afterAll(async () => { await handle.close(); });
 
-beforeEach(async () => {
-  await truncateAll(handle);
-  dataDir = mkdtempSync(join(tmp, "data-"));
-  actorId = (await resolveUser(handle.db, { username: "chris", email: null, fullName: null })).id;
-  companyId = (await createCompany(handle.db, actorId, { name: "Acme" })).id;
-});
-
-afterAll(async () => {
-  await handle.close();
-  rmSync(tmp, { recursive: true, force: true });
-});
+/** A base64 data: URI whose DECODED length is exactly `bytes`. */
+function logoOfBytes(bytes: number, mime = "image/png"): string {
+  return `data:${mime};base64,${Buffer.alloc(bytes, 7).toString("base64")}`;
+}
 
 function profileInput(overrides: Partial<OrgProfileInput> = {}): OrgProfileInput {
   return {
@@ -44,29 +25,9 @@ function profileInput(overrides: Partial<OrgProfileInput> = {}): OrgProfileInput
     phone: "+31 20 123 4567",
     website: "listerdale.test",
     bankDetails: "NL00 BANK 0123 4567 89",
-    logoFileId: null,
+    logoDataUri: "",
     ...overrides,
   };
-}
-
-/**
- * A stored file standing in for an uploaded logo.
- *
- * ATTACHED TO A COMPANY, WHICH IS A FINDING RATHER THAN A CHOICE.
- * `files_exactly_one_entity` requires every file to belong to exactly one company,
- * contact, deal or project, and an issuer's logo belongs to none of them. Nothing in
- * this task can store one without pointing it at an unrelated record; the upload that
- * is supposed to create it is Task 5's.
- */
-async function seedFile(
-  { mime = "image/png", bytes = 70 }: { mime?: string; bytes?: number } = {},
-): Promise<string> {
-  const content = Buffer.alloc(bytes, 7);
-  const { sha256, sizeBytes } = await saveBlob(dataDir, Readable.from([content]));
-  const [row] = await handle.db.insert(files).values({
-    originalName: "logo.png", mime, sizeBytes, sha256, uploaderUserId: actorId, companyId,
-  }).returning();
-  return row!.id;
 }
 
 describe("getOrgProfile", () => {
@@ -77,7 +38,7 @@ describe("getOrgProfile", () => {
     // be branching on nothing.
     expect(await getOrgProfile(handle.db)).toMatchObject({
       name: "", addressLines: "", vatNumber: "", registrationNumber: "",
-      email: "", phone: "", website: "", bankDetails: "", logoFileId: null,
+      email: "", phone: "", website: "", bankDetails: "", logoDataUri: "",
     });
   });
 });
@@ -107,54 +68,77 @@ describe("saveOrgProfile", () => {
     )).rejects.toMatchObject({ cause: { constraint_name: "org_profile_singleton" } });
   });
 
-  it("accepts a logo inside the budget and records it", async () => {
-    const logoFileId = await seedFile();
-    const saved = await saveOrgProfile(handle.db, profileInput({ logoFileId }));
-    expect(saved.logoFileId).toBe(logoFileId);
-  });
-
-  it("refuses a logo bigger than a render can carry", async () => {
-    // A logo reaches the renderer inlined as a data: URI at 4/3 of its stored size,
-    // against a 128KB input cap -- so this is refused where the REFERENCE is stored,
-    // not left to surface weeks later as a quote that will not render.
-    const logoFileId = await seedFile({ bytes: MAX_LOGO_BYTES + 1 });
-    await expect(saveOrgProfile(handle.db, profileInput({ logoFileId })))
-      .rejects.toBeInstanceOf(LogoRejectedError);
+  it("refuses a field longer than the page can carry", async () => {
+    await expect(saveOrgProfile(handle.db, profileInput({ addressLines: "x".repeat(2001) })))
+      .rejects.toBeInstanceOf(OrgProfileInputError);
     expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
-  });
-
-  it("refuses a logo that is not an image at all", async () => {
-    const logoFileId = await seedFile({ mime: "application/pdf" });
-    await expect(saveOrgProfile(handle.db, profileInput({ logoFileId })))
-      .rejects.toBeInstanceOf(LogoRejectedError);
-  });
-
-  it("refuses a logo file id that names nothing", async () => {
-    await expect(saveOrgProfile(handle.db, profileInput({
-      logoFileId: "00000000-0000-4000-8000-000000000000",
-    }))).rejects.toBeInstanceOf(NotFoundError);
   });
 });
 
-describe("orgLogoDataUri", () => {
-  it("is empty when no logo is set, which is what the template's conditional reads", async () => {
-    // NOT a transparent 1x1 placeholder. Task 3's re-seed wraps the logo in
+describe("the logo, which is bytes rather than a file reference", () => {
+  // IT WAS A FILES FK AND THAT COULD NEVER HAVE WORKED. files_exactly_one_entity
+  // requires every file to belong to exactly one company, contact, deal or project,
+  // and an issuer's logo belongs to none of them -- so there was no legal row for
+  // the reference to name, and both suites had to attach their test logo to an
+  // unrelated company to get an id at all. The bytes live on the profile now.
+  it("stores a logo of exactly MAX_LOGO_BYTES and hands it straight back", async () => {
+    const logoDataUri = logoOfBytes(MAX_LOGO_BYTES);
+    const saved = await saveOrgProfile(handle.db, profileInput({ logoDataUri }));
+    expect(saved.logoDataUri).toBe(logoDataUri);
+    expect(saved.logoDataUri.length).toBeLessThanOrEqual(MAX_LOGO_DATA_URI_CHARS);
+  });
+
+  // THE TWO BOUNDS ARE NOT THE SAME NUMBER AND NEITHER IMPLIES THE OTHER. This test
+  // was written expecting the over-sized URI to be longer than the column allows,
+  // and it is not: base64 rounds to 4 characters per 3 bytes, so a 32,768-byte
+  // image and a 32,769-byte one produce the SAME 43,692 characters and differ only
+  // in their padding. Both fit `org_profile_logo_size` comfortably.
+  //
+  // So the CHECK cannot see this, and the decoded-size arithmetic in
+  // logoDataUriProblem is the only thing that can. Going the other way -- reusing
+  // MAX_LOGO_BYTES as the character bound -- would have refused a legal 24KB image
+  // while every message still said 32KB.
+  it("refuses one byte more by the DECODED size, which the column bound cannot see", async () => {
+    const atLimit = logoOfBytes(MAX_LOGO_BYTES);
+    const overByOne = logoOfBytes(MAX_LOGO_BYTES + 1);
+    expect(overByOne.length).toBe(atLimit.length);
+    expect(overByOne.length).toBeLessThanOrEqual(MAX_LOGO_DATA_URI_CHARS);
+
+    const error = await saveOrgProfile(handle.db, profileInput({ logoDataUri: overByOne }))
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(OrgProfileInputError);
+    // The size it reports is the decoded one, not the string's length.
+    expect((error as Error).message).toContain(String(MAX_LOGO_BYTES + 1));
+    expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
+  });
+
+  it("refuses a logo that is not an inline image", async () => {
+    for (const bad of [
+      "https://example.test/logo.png",
+      "file:///etc/passwd",
+      "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",
+      "data:text/html;base64,PGgxPmhpPC9oMT4=",
+      "data:image/png;base64,not valid base64",
+      "logo.png",
+    ]) {
+      await expect(saveOrgProfile(handle.db, profileInput({ logoDataUri: bad })))
+        .rejects.toBeInstanceOf(OrgProfileInputError);
+    }
+    expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
+  });
+
+  it("accepts every image type the renderer can draw", async () => {
+    for (const mime of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
+      const logoDataUri = logoOfBytes(24, mime);
+      expect((await saveOrgProfile(handle.db, profileInput({ logoDataUri }))).logoDataUri)
+        .toBe(logoDataUri);
+    }
+  });
+
+  it("treats an empty string as no logo, which is what the template's conditional reads", async () => {
+    // NOT a transparent 1x1 placeholder. The seeded template wraps the logo in
     // {{#org.logoDataUri}}, so empty means no <img> is emitted at all -- a plain
     // letterhead rather than an invisible image occupying a box.
-    expect(await orgLogoDataUri(handle.db, dataDir, null)).toBe("");
-  });
-
-  it("inlines the stored bytes as a data: URI, which is the one scheme the renderer allows", async () => {
-    const logoFileId = await seedFile();
-    const uri = await orgLogoDataUri(handle.db, dataDir, logoFileId);
-    expect(uri.startsWith("data:image/png;base64,")).toBe(true);
-    expect(Buffer.from(uri.slice("data:image/png;base64,".length), "base64"))
-      .toEqual(Buffer.alloc(70, 7));
-  });
-
-  it("degrades to no logo rather than no quote when the file row has gone", async () => {
-    const logoFileId = await seedFile();
-    await handle.db.delete(files).where(eq(files.id, logoFileId));
-    expect(await orgLogoDataUri(handle.db, dataDir, logoFileId)).toBe("");
+    expect((await saveOrgProfile(handle.db, profileInput({ logoDataUri: "" }))).logoDataUri).toBe("");
   });
 });

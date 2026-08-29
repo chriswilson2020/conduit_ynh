@@ -1,5 +1,5 @@
 {
-  "id": "47701931-c6bd-4f7f-9926-e7eb592ce572",
+  "id": "437729e9-d6e3-400c-9341-1f3b500e2fd5",
   "prevId": "28952118-9bec-45b5-97c8-8aa2bc56fba9",
   "version": "7",
   "dialect": "postgresql",
@@ -2539,11 +2539,12 @@
           "notNull": true,
           "default": "''"
         },
-        "logo_file_id": {
-          "name": "logo_file_id",
-          "type": "uuid",
+        "logo_data_uri": {
+          "name": "logo_data_uri",
+          "type": "text",
           "primaryKey": false,
-          "notNull": false
+          "notNull": true,
+          "default": "''"
         },
         "updated_at": {
           "name": "updated_at",
@@ -2554,21 +2555,7 @@
         }
       },
       "indexes": {},
-      "foreignKeys": {
-        "org_profile_logo_file_id_files_id_fk": {
-          "name": "org_profile_logo_file_id_files_id_fk",
-          "tableFrom": "org_profile",
-          "tableTo": "files",
-          "columnsFrom": [
-            "logo_file_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        }
-      },
+      "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
@@ -2576,6 +2563,14 @@
         "org_profile_singleton": {
           "name": "org_profile_singleton",
           "value": "id = 1"
+        },
+        "org_profile_logo_size": {
+          "name": "org_profile_logo_size",
+          "value": "char_length(\"org_profile\".\"logo_data_uri\") <= 43715"
+        },
+        "org_profile_logo_shape": {
+          "name": "org_profile_logo_shape",
+          "value": "\"org_profile\".\"logo_data_uri\" = '' OR \"org_profile\".\"logo_data_uri\" ~ '^data:image/(png|jpeg|gif|webp)\\073base64,[A-Za-z0-9+/]+={0,2}$'"
         }
       },
       "isRLSEnabled": false

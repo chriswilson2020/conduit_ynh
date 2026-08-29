@@ -69,16 +69,17 @@ CREATE TABLE "org_profile" (
 	"phone" text DEFAULT '' NOT NULL,
 	"website" text DEFAULT '' NOT NULL,
 	"bank_details" text DEFAULT '' NOT NULL,
-	"logo_file_id" uuid,
+	"logo_data_uri" text DEFAULT '' NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "org_profile_singleton" CHECK (id = 1)
+	CONSTRAINT "org_profile_singleton" CHECK (id = 1),
+	CONSTRAINT "org_profile_logo_size" CHECK (char_length("org_profile"."logo_data_uri") <= 43715),
+	CONSTRAINT "org_profile_logo_shape" CHECK ("org_profile"."logo_data_uri" = '' OR "org_profile"."logo_data_uri" ~ '^data:image/(png|jpeg|gif|webp)\073base64,[A-Za-z0-9+/]+={0,2}$')
 );
 --> statement-breakpoint
 ALTER TABLE "document_line_items" ADD CONSTRAINT "document_line_items_document_id_documents_id_fk" FOREIGN KEY ("document_id") REFERENCES "public"."documents"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "documents" ADD CONSTRAINT "documents_deal_id_deals_id_fk" FOREIGN KEY ("deal_id") REFERENCES "public"."deals"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "documents" ADD CONSTRAINT "documents_file_id_files_id_fk" FOREIGN KEY ("file_id") REFERENCES "public"."files"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "documents" ADD CONSTRAINT "documents_issued_by_user_id_users_id_fk" FOREIGN KEY ("issued_by_user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "org_profile" ADD CONSTRAINT "org_profile_logo_file_id_files_id_fk" FOREIGN KEY ("logo_file_id") REFERENCES "public"."files"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 -- THE ONE HAND-WRITTEN INDEX THIS MIGRATION NEEDS, kept here rather than in
 -- schema.ts for the reason the mail block records (0004's header, and 0008's
 -- four attendee indexes): drizzle's index() builder is used by no table in

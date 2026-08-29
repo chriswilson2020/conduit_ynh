@@ -9,10 +9,25 @@ export class RenderError extends Error {
   }
 }
 
+/**
+ * Raised when no render slot came free in time. A SUBCLASS so the route can answer
+ * 503 rather than 422: nothing about the document was wrong, the process was simply
+ * saturated, and retrying is the correct client behaviour. Extending RenderError
+ * keeps every `instanceof RenderError` site true of it, so an unhandled path degrades
+ * to the generic refusal rather than a 500.
+ */
+export class RenderBusyError extends RenderError {
+  constructor(message: string, detail = "") {
+    super(message, detail);
+    this.name = "RenderBusyError";
+  }
+}
+
 export interface RenderOptions {
   timeoutMs?: number;
   maxBytes?: number;
   maxInputBytes?: number;
+  queueTimeoutMs?: number;
 }
 
 /**
@@ -89,30 +104,73 @@ const DEFAULT_MAX_INPUT_BYTES = 128 * 1024;
  * type, or a batch re-issue would each need the same bound, and a limit a caller has
  * to remember to apply is a limit that holds until somebody adds a call site.
  *
- * Waiting for a slot costs nothing on the issuing path today, because the number
- * sequence's row lock already serialises quotes of one type and year to one at a
- * time -- so this is the backstop for every other caller, and for the New Year's Eve
- * case where two years' sequences are live at once.
+ * **THE ISSUING PATH DOES REACH THE QUEUE, and an earlier version of this comment
+ * said it did not.** The claim was that the number sequence's row lock already
+ * serialises quotes to one at a time -- true only for one (type, year), and the year
+ * comes from the CALLER's issue date. Measured from the children: two quotes in
+ * different years render concurrently, and six across six years reach exactly three
+ * with three transactions waiting, each holding its row lock and a pooled connection
+ * while it waits.
  *
- * The queue is unbounded, which is safe because something else already bounds it: an
- * issuing caller holds a database connection while it waits, and the pool tops out at
- * ten. Each waiter holds at most one 128KB string.
+ * That is why the wait is bounded. Without RENDER_QUEUE_TIMEOUT_MS the queue wait
+ * precedes the render timeout and is itself unbounded, so "the transaction's lock
+ * hold is bounded by the render timeout" would be false: with ten pooled connections
+ * and ten distinct years, ten transactions could sit on the queue indefinitely and
+ * stall every other request in the API. With it, the worst lock hold is the queue
+ * timeout plus the render timeout, and a saturated renderer answers 503 rather than
+ * hanging.
  */
 export const RENDER_MAX_CONCURRENCY = 3;
 
+/**
+ * How long a render will wait for one of the three slots before giving up.
+ *
+ * 10s is about fifteen one-page quotes' worth of queue and half the render timeout.
+ * It is not tuned against load, because there is none to measure: it exists to make
+ * the bound on the issuing transaction's lock hold FINITE (10s + 20s), which is the
+ * property, rather than to pick the optimum queue depth.
+ */
+export const RENDER_QUEUE_TIMEOUT_MS = 10_000;
+
+interface RenderWaiter {
+  /** Settled already -- by a granted slot or by the timeout. Never granted twice. */
+  done: boolean;
+  grant: () => void;
+}
+
 let rendersInFlight = 0;
-const rendersWaiting: (() => void)[] = [];
+const rendersWaiting: RenderWaiter[] = [];
 
 /**
- * Take a render slot, waiting if all three are busy. FIFO, so a queued render cannot
- * be starved by a steady arrival of new ones.
+ * Take a render slot, waiting up to `timeoutMs` if all three are busy. FIFO, so a
+ * queued render cannot be starved by a steady arrival of new ones.
+ *
+ * A timed-out waiter removes ITSELF from the queue rather than being skipped later:
+ * leaving it there would make releaseRenderSlot hand the slot to a caller that is no
+ * longer listening, and the count would never come back down. The `done` flag is the
+ * belt to that braces -- the two paths are both synchronous, so they cannot
+ * interleave, but a leaked slot is permanent and silent.
  */
-async function acquireRenderSlot(): Promise<void> {
+async function acquireRenderSlot(timeoutMs: number): Promise<void> {
   if (rendersInFlight < RENDER_MAX_CONCURRENCY) {
     rendersInFlight += 1;
     return;
   }
-  await new Promise<void>((resolve) => rendersWaiting.push(resolve));
+  await new Promise<void>((resolve, reject) => {
+    const waiter: RenderWaiter = { done: false, grant: () => { /* replaced below */ } };
+    const timer = setTimeout(() => {
+      if (waiter.done) return;
+      waiter.done = true;
+      const at = rendersWaiting.indexOf(waiter);
+      if (at !== -1) rendersWaiting.splice(at, 1);
+      reject(new RenderBusyError(
+        "the renderer is busy",
+        `waited ${String(timeoutMs)}ms for one of ${String(RENDER_MAX_CONCURRENCY)} slots`,
+      ));
+    }, timeoutMs);
+    waiter.grant = () => { clearTimeout(timer); resolve(); };
+    rendersWaiting.push(waiter);
+  });
 }
 
 /**
@@ -121,12 +179,17 @@ async function acquireRenderSlot(): Promise<void> {
  * re-taken, so no third caller can slip in between the two halves.
  */
 function releaseRenderSlot(): void {
-  const next = rendersWaiting.shift();
-  if (next === undefined) {
-    rendersInFlight -= 1;
+  for (;;) {
+    const next = rendersWaiting.shift();
+    if (next === undefined) {
+      rendersInFlight -= 1;
+      return;
+    }
+    if (next.done) continue;
+    next.done = true;
+    next.grant();
     return;
   }
-  next();
 }
 
 /** Enough stderr to diagnose a failure, bounded so a chatty child cannot balloon it. */
@@ -307,13 +370,16 @@ export function pdfEmbedsFiles(pdf: Buffer): boolean {
  * is not a PDF: a child that exits 0 having written nothing (or something else) is a
  * failed render, not an empty document.
  *
- * At most RENDER_MAX_CONCURRENCY of these run at once, process-wide; a fourth waits.
- * See that constant for the memory arithmetic it keeps true.
+ * At most RENDER_MAX_CONCURRENCY of these run at once, process-wide; a fourth waits
+ * up to RENDER_QUEUE_TIMEOUT_MS and then rejects with a RenderBusyError. See those
+ * two constants for the memory arithmetic they keep true and the bound they put on a
+ * caller's transaction.
  */
 export async function renderPdf(html: string, options: RenderOptions = {}): Promise<Buffer> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
   const maxInputBytes = options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES;
+  const queueTimeoutMs = options.queueTimeoutMs ?? RENDER_QUEUE_TIMEOUT_MS;
 
   const inputBytes = Buffer.byteLength(html, "utf8");
   if (inputBytes > maxInputBytes) {
@@ -325,7 +391,7 @@ export async function renderPdf(html: string, options: RenderOptions = {}): Prom
 
   // After the input cap, before the spawn: a document that is too large is refused
   // outright rather than queued for a slot it would only waste.
-  await acquireRenderSlot();
+  await acquireRenderSlot(queueTimeoutMs);
   try {
     return await spawnRender(html, { timeoutMs, maxBytes });
   } finally {

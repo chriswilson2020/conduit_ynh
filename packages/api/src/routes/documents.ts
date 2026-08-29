@@ -1,13 +1,17 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { issueQuoteInputSchema, orgProfileInputSchema } from "@conduit/shared";
+import { z } from "zod";
+import {
+  documentTemplateInputSchema, documentTypeSchema, issueQuoteInputSchema, orgProfileInputSchema,
+} from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
 import { requireUser, mapDomainError, parseOrReject, idParamSchema } from "./helpers.js";
-import { RenderError } from "../services/documents-render.js";
+import { RenderBusyError, RenderError } from "../services/documents-render.js";
 import { TemplateError } from "../services/documents-template.js";
 import {
-  DocumentInputError, DocumentTemplateMissingError, issueQuote, listDocuments,
+  DocumentInputError, DocumentTemplateMissingError, getDocumentTemplate, issueQuote,
+  listDocuments, saveDocumentTemplate,
 } from "../services/documents.js";
-import { getOrgProfile, LogoRejectedError, saveOrgProfile } from "../services/org-profile.js";
+import { getOrgProfile, OrgProfileInputError, saveOrgProfile } from "../services/org-profile.js";
 
 /**
  * Raising a quote, listing what has been raised, and the issuer profile that gets
@@ -37,10 +41,10 @@ import { getOrgProfile, LogoRejectedError, saveOrgProfile } from "../services/or
  * unexpected so app.ts decides what a 5xx body looks like.
  */
 function mapDocumentError(reply: FastifyReply, error: unknown): void {
-  // The input gate. The route already parsed the same schema, so this is the service
-  // refusing a caller that reached it another way -- but the shape a client sees has
-  // to be the same either way.
-  if (error instanceof DocumentInputError || error instanceof LogoRejectedError) {
+  // The input gates, quote and profile alike. The route already parsed the same
+  // schema, so these are the services refusing a caller that reached them another
+  // way -- but the shape a client sees has to be the same either way.
+  if (error instanceof DocumentInputError || error instanceof OrgProfileInputError) {
     void reply.code(400).send({ error: "validation", message: error.message });
     return;
   }
@@ -59,6 +63,13 @@ function mapDocumentError(reply: FastifyReply, error: unknown): void {
     void reply.code(422).send({ error: "template_error", message: error.message });
     return;
   }
+  // Before the RenderError arm it extends: nothing about the document was wrong, the
+  // renderer was saturated, and 503 is the status that tells a client to retry. The
+  // generic arm would otherwise call a busy server's answer an unprocessable one.
+  if (error instanceof RenderBusyError) {
+    void reply.code(503).send({ error: "renderer_busy", message: error.message });
+    return;
+  }
   if (error instanceof RenderError) {
     // 413 with the same code files.ts answers for an over-cap upload: one refusal
     // shape for "that is too big", however the size arrived.
@@ -75,6 +86,10 @@ function mapDocumentError(reply: FastifyReply, error: unknown): void {
   }
   mapDomainError(reply, error);
 }
+
+/** The document type in a path. Validated rather than trusted, so an unknown one is
+ * the uniform 400 instead of a CHECK violation from the upsert. */
+const typeParamSchema = z.object({ type: documentTypeSchema });
 
 export function registerDocumentRoutes(app: FastifyInstance, { db, dataDir }: CrmRouteDeps): void {
   app.get("/api/deals/:id/documents", async (request, reply) => {
@@ -97,6 +112,34 @@ export function registerDocumentRoutes(app: FastifyInstance, { db, dataDir }: Cr
       // the client fetches it by fileId through the download route above.
       const document = await issueQuote(db, { dataDir }, user.id, params.id, input);
       return await reply.code(201).send(document);
+    } catch (error) {
+      mapDocumentError(reply, error);
+    }
+  });
+
+  // THE TEMPLATE EDITOR'S API. `document_templates` was read in one place and written
+  // nowhere outside tests, so the Settings panel the spec requires had no server to
+  // call and `documentTemplateWarnings` -- exported for exactly that editor -- had
+  // nothing calling it. Only mail templates had routes.
+  //
+  // Keyed by TYPE rather than by id: there is one row per type by unique constraint,
+  // the type is what the URL means to a reader, and it saves the client a lookup to
+  // find an id it can already derive.
+  app.get("/api/document-templates/:type", async (request, reply) => {
+    if (requireUser(request, reply) === null) return;
+    const params = parseOrReject(typeParamSchema, request.params, reply);
+    if (params === undefined) return;
+    return await getDocumentTemplate(db, params.type);
+  });
+
+  app.put("/api/document-templates/:type", async (request, reply) => {
+    if (requireUser(request, reply) === null) return;
+    const params = parseOrReject(typeParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(documentTemplateInputSchema, request.body, reply);
+    if (input === undefined) return;
+    try {
+      return await saveDocumentTemplate(db, params.type, input);
     } catch (error) {
       mapDocumentError(reply, error);
     }

@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema, mailVisibilitySchema,
+  MAX_LOGO_DATA_URI_CHARS,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { TEST_DATABASE_URL } from "../test/global-setup.js";
@@ -1413,7 +1414,7 @@ describe("documents schema (0009)", () => {
       expect(line).toMatchObject({ position: 1, taxRateBp: 0 });
 
       const [profile] = await scratch.db.insert(orgProfile).values({ name: "Listerdale" }).returning();
-      expect(profile).toMatchObject({ id: 1, vatNumber: "", logoFileId: null });
+      expect(profile).toMatchObject({ id: 1, vatNumber: "", logoDataUri: "" });
     });
   }, 30000);
 
@@ -1664,7 +1665,7 @@ describe("documents schema (0009)", () => {
     }
   });
 
-  it("enforces every foreign key on documents, document_line_items and org_profile", async () => {
+  it("enforces every foreign key on documents and document_line_items", async () => {
     const parents = await seedDocumentParents();
     for (const bad of [{ dealId: randomUUID() }, { fileId: randomUUID() }, { issuedByUserId: randomUUID() }]) {
       await expect(handle.db.insert(documents).values(documentValues(parents, bad)))
@@ -1674,7 +1675,61 @@ describe("documents schema (0009)", () => {
       documentId: randomUUID(), position: 1, description: "Widget",
       qtyMilli: 1000, unitPriceCents: 1, lineTotalCents: 1,
     })).rejects.toMatchObject({ cause: { code: "23503" } });
-    await expect(handle.db.insert(orgProfile).values({ logoFileId: randomUUID() }))
-      .rejects.toMatchObject({ cause: { code: "23503" } });
+    // org_profile carries no foreign key at all any more. It had one --
+    // logo_file_id -> files.id -- and it was unsatisfiable: every files row must
+    // belong to exactly one company, contact, deal or project
+    // (files_exactly_one_entity), and an issuer's logo belongs to none of them,
+    // so nothing legal could ever have been stored in it. The logo is the bytes
+    // now; the two CHECKs below are what bound them.
+  });
+
+  // THE LOGO'S TWO BOUNDS, AND THEY ARE DIFFERENT NUMBERS. MAX_LOGO_BYTES bounds
+  // the image; the column holds base64 at 4/3 of that plus a prefix. Reusing the
+  // first as the second would silently shrink the permitted logo by a quarter,
+  // and every rejected upload would look like the user's mistake.
+  it("bounds the logo column by the base64 length of a MAX_LOGO_BYTES image, not by MAX_LOGO_BYTES", async () => {
+    const [check] = await handle.db.execute<{ src: string }>(sql`
+      SELECT pg_get_constraintdef(oid) AS src FROM pg_constraint
+      WHERE conname = 'org_profile_logo_size'
+    `);
+    // The constant and the constraint cannot drift: one is asserted to be in the
+    // other. 43715 = 4 * ceil(32768/3) + len('data:image/jpeg;base64,').
+    expect(MAX_LOGO_DATA_URI_CHARS).toBe(43_715);
+    expect(check?.src).toContain(String(MAX_LOGO_DATA_URI_CHARS));
+
+    const prefix = "data:image/png;base64,";
+    const atLimit = prefix + "A".repeat(MAX_LOGO_DATA_URI_CHARS - prefix.length);
+    await expect(handle.db.insert(orgProfile).values({ logoDataUri: `${atLimit}A` }))
+      .rejects.toMatchObject({ cause: { constraint_name: "org_profile_logo_size" } });
+
+    await handle.db.delete(orgProfile);
+    const [stored] = await handle.db.insert(orgProfile).values({ logoDataUri: atLimit }).returning();
+    expect(stored?.logoDataUri.length).toBe(MAX_LOGO_DATA_URI_CHARS);
+  });
+
+  // The shape CHECK, whose regex has to smuggle its own semicolon past
+  // drizzle-kit's statement splitter (see schema.ts). If the escape were wrong
+  // the constraint would accept everything, silently.
+  it("refuses anything in the logo column that is not an inline base64 image", async () => {
+    for (const bad of [
+      "file:///etc/passwd",
+      "https://example.test/logo.png",
+      "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",
+      "data:text/html;base64,PGgxPmhpPC9oMT4=",
+      "data:image/png;base64,not base64 at all",
+      "data:image/png,AAAA",
+    ]) {
+      await expect(handle.db.insert(orgProfile).values({ logoDataUri: bad }))
+        .rejects.toMatchObject({ cause: { constraint_name: "org_profile_logo_shape" } });
+    }
+    // ...and the four types that are allowed, plus the empty absence.
+    for (const good of [
+      "", "data:image/png;base64,AAAA", "data:image/jpeg;base64,AAA=",
+      "data:image/gif;base64,AA==", "data:image/webp;base64,AAAA",
+    ]) {
+      await handle.db.delete(orgProfile);
+      const [row] = await handle.db.insert(orgProfile).values({ logoDataUri: good }).returning();
+      expect(row?.logoDataUri).toBe(good);
+    }
   });
 });

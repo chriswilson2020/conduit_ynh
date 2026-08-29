@@ -25,8 +25,7 @@ export function seededQuoteTemplate(): string {
 }
 
 /**
- * Every merge token the seeded template names, as paths: `{{#org.email}}`,
- * `{{org.email}}` and `{{/org.email}}` all reduce to `org.email`.
+ * Every merge path the seeded template names, SPLIT BY THE SCOPE IT IS RESOLVED IN.
  *
  * This is the list `buildContext` is checked against. `schema.test.ts` separately
  * asserts the template's raw token set equals a literal list written out beside it --
@@ -35,12 +34,39 @@ export function seededQuoteTemplate(): string {
  * supplying `document.subTotal` for `{{document.subtotal}}` leaves every test green
  * and prints a blank where a total should be. Reading the paths out of the template
  * itself is what closes that.
+ *
+ * THE SPLIT MATTERS, and a flat list quietly loses it. Inside `{{#lines}}` a bare
+ * `{{qty}}` resolves against the line; at the top level the same token resolves
+ * against the root and renders empty. A test that pooled both would count `{{qty}}`
+ * as supplied wherever it appeared, and a template that moved a line field out of its
+ * block would keep passing while printing a blank.
+ *
+ * `{{#lines}}` and `{{^lines}}` themselves are root paths -- the block is a field of
+ * the root context -- and their closers are not counted twice.
  */
-export function seededTemplatePaths(): string[] {
+export interface SeededTemplatePaths {
+  /** Resolved against the root context: `org.*`, `document.*` and `lines` itself. */
+  root: string[];
+  /** Resolved against one line, inside `{{#lines}}`: `description`, `qty`, ... */
+  line: string[];
+}
+
+export function seededTemplatePaths(): SeededTemplatePaths {
   const template = seededQuoteTemplate();
-  const paths = new Set<string>();
-  for (const [, path] of template.matchAll(/\{\{[#^/]?([A-Za-z][A-Za-z0-9_.]*)\}\}/g)) {
-    if (path !== undefined) paths.add(path);
+  const root = new Set<string>();
+  const line = new Set<string>();
+  let depth = 0;
+  for (const match of template.matchAll(/\{\{([#^/]?)([A-Za-z][A-Za-z0-9_.]*)\}\}/g)) {
+    const [, sigil, path] = match;
+    if (path === undefined) continue;
+    // The `lines` block's own tokens belong to the scope OUTSIDE it, which is why
+    // the depth moves after an opener is classified and before a closer is.
+    if (sigil === "/") {
+      if (path === "lines") depth -= 1;
+      continue;
+    }
+    (depth > 0 ? line : root).add(path);
+    if ((sigil === "#" || sigil === "^") && path === "lines") depth += 1;
   }
-  return [...paths].sort();
+  return { root: [...root].sort(), line: [...line].sort() };
 }

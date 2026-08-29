@@ -10,6 +10,8 @@ import {
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, documentSchema, orgProfileSchema,
+  documentTemplateSchema, DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES,
+  MAX_TEMPLATE_CHARS,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
@@ -2131,7 +2133,7 @@ describe("documents routes", () => {
     const a = await app();
     const empty = await a.inject({ method: "GET", url: "/api/org-profile", headers: authHeaders });
     expect(empty.statusCode).toBe(200);
-    expect(orgProfileSchema.parse(empty.json())).toMatchObject({ name: "", logoFileId: null });
+    expect(orgProfileSchema.parse(empty.json())).toMatchObject({ name: "", logoDataUri: "" });
 
     const saved = await a.inject({
       method: "PUT", url: "/api/org-profile", headers: authHeaders,
@@ -2140,7 +2142,7 @@ describe("documents routes", () => {
         vatNumber: "NL001234567B01", registrationNumber: "12345678",
         email: "hello@listerdale.test", phone: "+31 20 123 4567",
         website: "listerdale.test", bankDetails: "NL00 BANK 0123 4567 89",
-        logoFileId: null,
+        logoDataUri: "",
       },
     });
     expect(saved.statusCode).toBe(200);
@@ -2156,6 +2158,140 @@ describe("documents routes", () => {
     await a.close();
   });
 
+  it("refuses a quote that is over the render budget with a 400, before anything spawns", async () => {
+    // The budget, at the HTTP surface. Every field is inside its own cap and the
+    // total is not, which no per-field bound can express -- and the client gets a
+    // sentence about the budget rather than a 413 naming a byte count from a
+    // subprocess it never asked about.
+    await seedTemplate();
+    const a = await app();
+    const deal = await makeQuotableDeal(a);
+    const cjk = "\u6771";
+    const response = await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/documents`, headers: authHeaders,
+      payload: quotePayload({
+        recipientAddress: cjk.repeat(2000), notes: cjk.repeat(5000), terms: cjk.repeat(5000),
+        lines: Array.from({ length: DOCUMENT_MAX_LINES }, () => ({
+          description: cjk.repeat(DOCUMENT_MAX_DESCRIPTION_CHARS),
+          qtyMilli: 1000, unitPriceCents: 100, taxRateBp: 0,
+        })),
+      }),
+    });
+    expect(response.statusCode).toBe(400);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("validation");
+    expect(body.message).toContain("a document may use");
+    await a.close();
+  });
+
+  it("answers 413 when a template outruns the renderer's input cap, which the gate cannot see", async () => {
+    // THE NAMED EXCEPTION TO THE BUDGET'S CONSERVATISM. The gate counts a value once;
+    // a template that prints `{{document.notes}}` forty times prints it forty times.
+    // That is why renderPdf's input cap stays as the backstop, and this is the shape
+    // that reaches it.
+    //
+    // FORTY, NOT TWO HUNDRED, and the difference is which refusal you get: at 200 the
+    // merge produces a million characters and mergeTemplate's own 512K output bound
+    // throws first, so the answer is a 422 template_error. Between 128KB and 512K the
+    // merge succeeds and the RENDERER refuses it, which is the case under test here.
+    // Both are 4xx and neither spends a number.
+    await seedTemplate(`<p>${"{{document.notes}}".repeat(40)}</p>`);
+    const a = await app();
+    const deal = await makeQuotableDeal(a);
+    const response = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/deals/${deal.id}/documents`, headers: authHeaders,
+        payload: quotePayload({ notes: "n".repeat(5000) }),
+      }));
+
+    expect(response.statusCode).toBe(413);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("too_large");
+    expect(body.message).toBe("document is too large to render");
+    // Refused before the spawn, so no number was spent and there is nothing to list.
+    const listed = await a.inject({
+      method: "GET", url: `/api/deals/${deal.id}/documents`, headers: authHeaders,
+    });
+    expect(listed.json()).toEqual([]);
+    await a.close();
+  });
+
+  it("reads and writes the quote template, with the warnings the editor needs", async () => {
+    // THE TEMPLATE EDITOR HAD NO API AT ALL. document_templates was read in one place
+    // and written nowhere outside tests, and `documentTemplateWarnings` was exported
+    // for a Settings panel that had no server to call.
+    const a = await app();
+    const seeded = await a.inject({
+      method: "GET", url: "/api/document-templates/quote", headers: authHeaders,
+    });
+    expect(seeded.statusCode).toBe(200);
+    // truncateAll empties the table, so an install whose template was deleted reads
+    // as an empty body a PUT can replace rather than as a 404 with nothing to edit.
+    expect(documentTemplateSchema.parse(seeded.json())).toMatchObject({ type: "quote", bodyHtml: "" });
+
+    const saved = await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: "<p>{{document.number}}</p><style>p{color:#333}</style>" },
+    });
+    expect(saved.statusCode).toBe(200);
+    const body = documentTemplateSchema.parse(saved.json());
+    expect(body.bodyHtml).toContain("{{document.number}}");
+    expect(body.warnings).toEqual([]);
+
+    // A merge field inside a <style> block is left unresolved -- one of the three
+    // things this module does silently, and exactly what the editor has to say.
+    const warned = await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: "<style>p{color:{{org.brandColour}}}</style><p>x</p>" },
+    });
+    expect(documentTemplateSchema.parse(warned.json()).warnings.length).toBeGreaterThan(0);
+
+    // ...and the saved body is what a quote is then raised from.
+    const deal = await makeQuotableDeal(a);
+    await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: "<p>{{document.number}} for {{document.recipientName}}</p>" },
+    });
+    const issued = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/deals/${deal.id}/documents`,
+        headers: authHeaders, payload: quotePayload(),
+      }));
+    expect(documentSchema.parse(issued.json()).number).toBe("QUO-2026-0001");
+    await a.close();
+  });
+
+  it("refuses a template that is empty, unknown-typed, or larger than its share of the render budget", async () => {
+    const a = await app();
+    const tooBig = await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: "x".repeat(MAX_TEMPLATE_CHARS + 1) },
+    });
+    expect(tooBig.statusCode).toBe(400);
+
+    const empty = await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: "" },
+    });
+    expect(empty.statusCode).toBe(400);
+
+    // Sanitises to nothing: well-formed, and not a template.
+    const stripped = await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: "<script>alert(1)</script>" },
+    });
+    expect(stripped.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(stripped.json()).message).toContain("sanitised");
+
+    // An unknown type is the uniform 400 rather than a CHECK violation out of the
+    // upsert, which is what validating the path parameter buys.
+    const unknownType = await a.inject({
+      method: "GET", url: "/api/document-templates/invoice", headers: authHeaders,
+    });
+    expect(unknownType.statusCode).toBe(400);
+    await a.close();
+  });
+
   it("returns 401 without an identity header on every documents route", async () => {
     const a = await app();
     const calls = [
@@ -2163,6 +2299,8 @@ describe("documents routes", () => {
       { method: "POST" as const, url: `/api/deals/${unknownId}/documents` },
       { method: "GET" as const, url: "/api/org-profile" },
       { method: "PUT" as const, url: "/api/org-profile" },
+      { method: "GET" as const, url: "/api/document-templates/quote" },
+      { method: "PUT" as const, url: "/api/document-templates/quote" },
     ];
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });

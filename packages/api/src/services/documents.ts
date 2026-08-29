@@ -1,8 +1,10 @@
 import { Readable } from "node:stream";
 import { asc, desc, eq, inArray } from "drizzle-orm";
 import {
-  documentTotals, formatMoneyCents, formatQtyMilli, formatTaxRateBp, issueQuoteInputSchema,
-  lineTotalCents, type DocumentRecord, type IssueQuoteInput, type OrgProfile,
+  documentTemplateInputSchema, documentTotals, formatMoneyCents, formatQtyMilli,
+  formatTaxRateBp, issueQuoteInputSchema, lineTotalCents,
+  type DocumentRecord, type DocumentTemplate, type DocumentTemplateInput,
+  type IssueQuoteInput, type OrgProfile,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
@@ -11,8 +13,10 @@ import {
 } from "../db/schema.js";
 import { allocateNumber } from "./documents-number.js";
 import { renderPdf } from "./documents-render.js";
-import { prepareDocumentHtml, type MergeContext } from "./documents-template.js";
-import { getOrgProfile, orgLogoDataUri } from "./org-profile.js";
+import {
+  documentTemplateWarnings, prepareDocumentHtml, sanitizeDocumentHtml, type MergeContext,
+} from "./documents-template.js";
+import { getOrgProfile } from "./org-profile.js";
 import { saveBlob } from "./blobs.js";
 import { attachFile } from "./files.js";
 import { ArchivedError, NotFoundError } from "./errors.js";
@@ -92,7 +96,6 @@ function toDocumentRecord(row: DocumentRow, lines: DocumentLineItemRow[]): Docum
 /** Everything the template is allowed to print, before any of it is a string. */
 export interface QuoteContextInput {
   org: OrgProfile;
-  logoDataUri: string;
   currency: string;
   number: string;
   issueDate: string;
@@ -143,7 +146,7 @@ export function buildContext(input: QuoteContextInput): MergeContext {
       bankDetails: input.org.bankDetails,
       vatNumber: input.org.vatNumber,
       registrationNumber: input.org.registrationNumber,
-      logoDataUri: input.logoDataUri,
+      logoDataUri: input.org.logoDataUri,
     },
     document: {
       number: input.number,
@@ -226,12 +229,13 @@ export async function issueQuote(
       .from(documentTemplates).where(eq(documentTemplates.type, "quote"));
     if (template === undefined) throw new DocumentTemplateMissingError("quote");
 
+    // The logo arrives with the row: it is a data: URI column, not a file this
+    // transaction has to open (see org-profile.ts).
     const org = await getOrgProfile(tx);
-    const logoDataUri = await orgLogoDataUri(tx, deps.dataDir, org.logoFileId);
 
     const number = await allocateNumber(tx, "quote", year);
     const html = prepareDocumentHtml(template.bodyHtml, buildContext({
-      org, logoDataUri, currency: deal.currency, number,
+      org, currency: deal.currency, number,
       issueDate: quote.issueDate,
       validUntilDate: quote.validUntilDate ?? null,
       recipientName: quote.recipientName,
@@ -284,6 +288,74 @@ export async function issueQuote(
 
   publish({ keys: [["documents", dealId], ["files"], ["events"]] });
   return record;
+}
+
+/**
+ * The editable template for a document type, with what the merge language will do to
+ * it silently.
+ *
+ * SEEDED BY MIGRATION 0009, so the row is there before anyone opens Settings -- but
+ * it can be deleted, and a service that answered a 404 would make an editor with
+ * nothing to edit and no way to create one. An absent row reads as the empty body a
+ * PUT can then replace, which is the same shape getOrgProfile uses and for the same
+ * reason.
+ */
+export async function getDocumentTemplate(db: Database, type: string): Promise<DocumentTemplate> {
+  const [row] = await db.select().from(documentTemplates)
+    .where(eq(documentTemplates.type, type));
+  if (row === undefined) {
+    return {
+      type: type as DocumentTemplate["type"], bodyHtml: "", warnings: [],
+      updatedAt: new Date(0).toISOString(),
+    };
+  }
+  return {
+    type: row.type as DocumentTemplate["type"],
+    bodyHtml: row.bodyHtml,
+    warnings: documentTemplateWarnings(row.bodyHtml),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * Replace a type's template.
+ *
+ * SANITISED ON SAVE, and that is belt rather than braces: `prepareDocumentHtml`
+ * sanitises AFTER merging, which is the order that matters and the only one that can
+ * see a merged value. Sanitising here as well means what Settings shows back is what
+ * will be used, so a stripped `<script>` is visible at the moment somebody pastes it
+ * rather than silently absent from a PDF weeks later. The profile is idempotent, so
+ * the second pass at issue time changes nothing.
+ *
+ * A body that sanitises away to nothing is refused rather than stored, mirroring
+ * mail-templates.ts: the row exists so a quote renders, and a template that renders
+ * as a blank page with a number on it is not one.
+ */
+export async function saveDocumentTemplate(
+  db: Database, type: string, input: DocumentTemplateInput,
+): Promise<DocumentTemplate> {
+  const parsed = documentTemplateInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new DocumentInputError(parsed.error.issues[0]?.message ?? "invalid template");
+  }
+  const bodyHtml = sanitizeDocumentHtml(parsed.data.bodyHtml);
+  if (bodyHtml.trim() === "") {
+    throw new DocumentInputError(
+      "the template is empty once sanitised; it contained no markup the document profile keeps",
+    );
+  }
+  const updatedAt = new Date();
+  const [row] = await db.insert(documentTemplates).values({ type, bodyHtml, updatedAt })
+    .onConflictDoUpdate({ target: documentTemplates.type, set: { bodyHtml, updatedAt } })
+    .returning();
+  if (row === undefined) throw new Error("template upsert returned no row");
+  publish({ keys: [["document-templates"]] });
+  return {
+    type: row.type as DocumentTemplate["type"],
+    bodyHtml: row.bodyHtml,
+    warnings: documentTemplateWarnings(row.bodyHtml),
+    updatedAt: row.updatedAt.toISOString(),
+  };
 }
 
 /**

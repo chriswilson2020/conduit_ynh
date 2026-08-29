@@ -766,16 +766,45 @@ export const orgProfile = pgTable("org_profile", {
   phone: text("phone").notNull().default(""),
   website: text("website").notNull().default(""),
   bankDetails: text("bank_details").notNull().default(""),
-  // Nullable, unlike every text field above: "no logo" is a real state, and
-  // an empty-string file id would be a lie rather than an absence. The upload
-  // that populates it has to bound the file size -- a logo reaches the
-  // renderer inlined as a data: URI at 4/3 of its stored bytes, against a
-  // 128KB render input cap (Task 1's measurements), so an unbounded logo is a
-  // quote that cannot be raised at all.
-  logoFileId: uuid("logo_file_id").references(() => files.id),
+  // THE LOGO IS THE BYTES, NOT A FILE REFERENCE, and the first version of this
+  // column was a uuid FK to files that could never be satisfied.
+  // files_exactly_one_entity requires every file to belong to exactly one
+  // company, contact, deal or project, and an issuer's logo belongs to none of
+  // them -- so there was no legal row for that FK to point at, and the only way
+  // to store a logo was to attach it to an unrelated record. Coordinator ruling
+  // after Task 4's review: the logo lives here, as the data: URI that is
+  // already the only form the renderer will accept.
+  //
+  // '' is the absence, matching every text field above rather than the FK's
+  // nullability: the seeded template wraps the logo in {{#org.logoDataUri}},
+  // so empty means no <img> is emitted at all.
+  //
+  // TWO CHECKS, because this column feeds a subprocess with a hard input cap.
+  // The length bound is the base64 of a 32KB image plus the longest permitted
+  // prefix -- 4 * ceil(32768/3) = 43692 characters plus 23 for
+  // "data:image/jpeg;base64," -- so an oversized logo is refused here as well
+  // as by orgProfileInputSchema, which is the usual "Zod is the gate, the
+  // CHECK is the backstop" split. The shape bound keeps anything that is not
+  // an inline image out of a src attribute; the renderer allowlists exactly
+  // data: and nothing else, so a URL of any other scheme would fail every
+  // render rather than fetch anything, but a column that can only hold what
+  // the page can print is worth more than a comment saying so.
+  logoDataUri: text("logo_data_uri").notNull().default(""),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-}, () => [
+}, (t) => [
   check("org_profile_singleton", sql`id = 1`),
+  check("org_profile_logo_size", sql`char_length(${t.logoDataUri}) <= 43715`),
+  // THE `\073` IS A SEMICOLON, AND IT HAS TO BE ONE. drizzle-kit's generator
+  // splits a CHECK expression on `;` without regard for string literals, so
+  // writing the character directly produced a migration truncated mid-regex --
+  // `~ '^data:image/(png|jpeg|gif|webp)` with no closing quote and no closing
+  // paren, which is a syntax error rather than a weakened constraint. Postgres
+  // reads `\073` as the octal escape for ';', so the regex is the intended one
+  // and nothing in the generated SQL can be mistaken for a statement end.
+  check(
+    "org_profile_logo_shape",
+    sql`${t.logoDataUri} = '' OR ${t.logoDataUri} ~ '^data:image/(png|jpeg|gif|webp)\\073base64,[A-Za-z0-9+/]+={0,2}$'`,
+  ),
 ]);
 export type OrgProfileRow = typeof orgProfile.$inferSelect;
 
