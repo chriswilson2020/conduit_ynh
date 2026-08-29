@@ -26,7 +26,7 @@ import { Textarea } from "./ui/textarea";
  * which at 390px is full-bleed with 24px of padding: 342px inside, and 340px in
  * the table's own scroll box. Every figure below is against that 340px.
  *
- *   a real four-column table row      needs 481px: 143px of overflow, with the
+ *   a real four-column table row      needs 482px: 142px of overflow, with the
  *                                     description input down to 84.1px and the
  *                                     quantity and tax inputs to 26px each
  *   one field per line, label above   fits, at 418px per line item -- 63% of a
@@ -43,10 +43,15 @@ import { Textarea } from "./ui/textarea";
  * both axes -- measured at 96.7px and 104.7px wide by 44px tall, against the
  * 26px the four-column table squeezed them to.
  *
- * THE 481/143 FIGURES ARE THE SPEC REVIEW'S RE-MEASUREMENT, and they replace the
- * 501/161 this file shipped with. The three input widths reproduce to the tenth
- * of a pixel either way, so the conclusion never moved; the min-content total
- * did, and a number in a comment has to be the measured one.
+ * THE MIN-CONTENT FIGURE HAS NOW BEEN MEASURED THREE TIMES AND WRITTEN DOWN
+ * WRONG TWICE. It shipped as 501/161 (measured in a page-padded container, not
+ * this one), was corrected to 481/143 by the spec review, and 481 - 340 is 141
+ * rather than 143 -- the pair did not add up, which is what the quality review
+ * caught. Re-measured against the shipped row at 340px of available width, it is
+ * 482 and 142, and those two do. The three input widths reproduce to the tenth
+ * of a pixel in every pass, so the conclusion never moved once; a number in a
+ * comment still has to be the measured one, and an arithmetic check on a pair of
+ * them is nearly free.
  *
  * THE SAME OVERFLOW WAS SHIPPING AT A DESK and nobody had measured there. The
  * dialog hard-coded `max-w-md` into its own shape, which beat every caller's
@@ -283,6 +288,21 @@ export function DocumentForm({
   const [problems, setProblems] = useState<readonly string[]>([]);
   const issueQuote = useIssueQuote();
   const problemsRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * How many times this form has been submitted, and it exists for the SECOND
+   * refusal rather than the first.
+   *
+   * A repeat refusal is the case that quietly does nothing. Measured with a
+   * MutationObserver: submitting the same invalid form twice, with focus already
+   * on the summary, produced ZERO DOM mutations and ZERO focus events the second
+   * time -- `role="alert"` cannot re-announce without a DOM change, and calling
+   * `.focus()` on the already-focused element fires nothing. So a user who fixed
+   * the wrong field and tried again got silence.
+   *
+   * Keying the region on this counter remounts it per attempt, which is a real
+   * DOM change for the live region to announce and a real focus move to make.
+   */
+  const [attempt, setAttempt] = useState(0);
 
   /**
    * A REFUSAL HAS TO ARRIVE WHERE THE PERSON IS LOOKING.
@@ -312,7 +332,7 @@ export function DocumentForm({
     if (box === null) return;
     box.scrollIntoView({ block: "nearest" });
     box.focus({ preventScroll: true });
-  }, [refusal, problems, issueQuote.error]);
+  }, [refusal, attempt]);
 
   const totals = useMemo(() => runningTotals(draft.lines), [draft.lines]);
   const budget = useMemo(() => contentBudget(draft), [draft]);
@@ -330,6 +350,7 @@ export function DocumentForm({
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
+    setAttempt((n) => n + 1);
     const built = buildIssueQuoteInput(draft);
     if (!built.ok) {
       setProblems(built.problems);
@@ -537,8 +558,16 @@ export function DocumentForm({
       */}
       {refusal && (
         <div
+          // REMOUNTED PER ATTEMPT so a repeat refusal is a DOM change rather
+          // than a no-op. See `attempt`.
+          key={attempt}
           ref={problemsRef}
           tabIndex={-1}
+          // A NAME, because focus lands here and a bare div announces nothing
+          // but "group". `role="group"` is what makes the label be read at all;
+          // the alerts inside it stay the live region.
+          role="group"
+          aria-label="Why this quote was not issued"
           data-testid="quote-refusal"
           className="rounded-md border border-red-200 bg-red-50 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-red-400"
         >

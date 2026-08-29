@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
 import {
-  DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, documentTotals,
+  DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES,
+  documentTotals, issueQuoteInputSchema,
 } from "@conduit/shared";
 import {
   QTY_SPEC, TAX_RATE_SPEC, UNIT_PRICE_SPEC,
@@ -22,6 +24,18 @@ function maxedDraft(fill: string): DraftQuote {
     terms: fill.repeat(5000),
   });
 }
+
+/** The same draft as `draft()`, in the shape the schema parses. */
+const FULL_DRAFT = {
+  issueDate: "2026-08-29",
+  validUntilDate: null,
+  recipientName: "Acme Ltd",
+  recipientContactName: "",
+  recipientAddress: "",
+  notes: "",
+  terms: "",
+  lines: [{ description: "Consultancy", qtyMilli: 1000, unitPriceCents: 10000, taxRateBp: 2100 }],
+};
 
 function draft(over: Partial<DraftQuote> = {}): DraftQuote {
   return {
@@ -357,16 +371,21 @@ describe("describeIssue", () => {
    * showing, the entire feedback was ["Invalid input"].
    */
   it("names the field a bare Zod message would not", () => {
-    expect(describeIssue({ path: ["recipientName"], message: "Invalid input", code: "too_small", minimum: 1 }))
-      .toBe("Recipient is required.");
-    expect(describeIssue({ path: ["notes"], message: "Invalid input", code: "too_big", maximum: 5000 }))
-      .toBe("Notes is longer than the 5000 characters allowed.");
+    expect(describeIssue({
+      path: ["recipientName"], message: "Too small: expected string to have >=1 characters",
+      code: "too_small", origin: "string", minimum: 1,
+    })).toBe("Recipient is required.");
+    expect(describeIssue({
+      path: ["notes"], message: "Too big: expected string to have <=5000 characters",
+      code: "too_big", origin: "string", maximum: 5000,
+    })).toBe("Notes is over the maximum of 5000 characters.");
   });
 
   it("names the line and the field for a line-scoped issue", () => {
     expect(describeIssue({
-      path: ["lines", 1, "description"], message: "Invalid input", code: "too_big", maximum: 250,
-    })).toBe("Line 2 description is longer than the 250 characters allowed.");
+      path: ["lines", 1, "description"], message: "Too big: expected string to have <=250 characters",
+      code: "too_big", origin: "string", maximum: 250,
+    })).toBe("Line 2 description is over the maximum of 250 characters.");
   });
 
   /**
@@ -397,11 +416,14 @@ describe("describeIssue", () => {
    */
   it("gives every field its own sentence, so a list of them is readable", () => {
     const issues = [
-      { path: ["recipientName"], message: "Invalid input", code: "too_small", minimum: 1 },
-      { path: ["issueDate"], message: "Invalid input", code: "invalid_format" },
+      {
+        path: ["recipientName"], message: "Too small: expected string to have >=1 characters",
+        code: "too_small", origin: "string", minimum: 1,
+      },
+      { path: ["issueDate"], message: "Invalid ISO date", code: "invalid_format", origin: "string" },
     ];
     const described = issues.map((issue) => describeIssue(issue));
-    expect(described).toEqual(["Recipient is required.", "Issue date: Invalid input"]);
+    expect(described).toEqual(["Recipient is required.", "Issue date: Invalid ISO date"]);
     expect(new Set(described).size).toBe(2);
   });
 });
@@ -417,22 +439,151 @@ describe("the schema's own refusals, through describeIssue", () => {
     expect(emptyRecipient.ok).toBe(false);
     if (!emptyRecipient.ok) expect(emptyRecipient.problems).toEqual(["Recipient is required."]);
 
-    const badDate = buildIssueQuoteInput(draft({ issueDate: "0000-01-01" }));
-    expect(badDate.ok).toBe(false);
-    if (!badDate.ok) {
-      expect(badDate.problems.join(" ")).toContain("Issue date");
-      expect(badDate.problems.join(" ")).not.toBe("Invalid input");
-    }
-
     const longNotes = buildIssueQuoteInput(draft({ notes: "x".repeat(5001) }));
     expect(longNotes.ok).toBe(false);
     if (!longNotes.ok) {
-      expect(longNotes.problems).toEqual(["Notes is longer than the 5000 characters allowed."]);
+      expect(longNotes.problems).toEqual(["Notes is over the maximum of 5000 characters."]);
     }
+  });
 
-    // And nothing anywhere is the bare Zod default any more.
-    for (const result of [emptyRecipient, badDate, longNotes]) {
-      if (!result.ok) expect(result.problems).not.toContain("Invalid input");
+  /**
+   * WHAT ZOD ACTUALLY SAYS, MEASURED, because two reviews disagreed about it and
+   * the assertions that were supposed to settle it could not.
+   *
+   * The previous pair here were `not.toContain("Invalid input")` over an ARRAY,
+   * which asserts no element is exactly that string. Enumerating all 27 failure
+   * paths of this schema against zod 4.4.3 shows it never emits that literal for
+   * any of them -- so both assertions were vacuous, passing whether or not the
+   * path was being used at all.
+   *
+   * These assert the real strings instead: the raw Zod message names no field,
+   * and the described one does. Delete the describeIssue call and this fails.
+   */
+  it("replaces Zod's own English, which names no field, with a sentence that does", () => {
+    const rawEmptyRecipient = issueQuoteInputSchema.safeParse({
+      ...FULL_DRAFT, recipientName: "",
+    });
+    expect(rawEmptyRecipient.success).toBe(false);
+    if (rawEmptyRecipient.success) return;
+    // This is what a user was shown before, verbatim from zod 4.4.3.
+    expect(rawEmptyRecipient.error.issues[0]?.message)
+      .toBe("Too small: expected string to have >=1 characters");
+    // ...and it mentions no field name at all, which was the actual defect.
+    expect(rawEmptyRecipient.error.issues[0]?.message.toLowerCase()).not.toContain("recipient");
+
+    const described = buildIssueQuoteInput(draft({ recipientName: "" }));
+    expect(described.ok).toBe(false);
+    if (!described.ok) expect(described.problems[0]).toBe("Recipient is required.");
+  });
+
+  /**
+   * P8's guard: EVERY FIELD THE SCHEMA CAN NAME HAS A LABEL. Deleting seven of
+   * the eleven FIELD_LABELS entries left the whole suite green, while users read
+   * "Line 1 qtyMilli: ...". One deliberately bad draft per field, driven through
+   * the real schema.
+   */
+  it("labels every field the schema can complain about", () => {
+    const cases: [string, DraftQuote][] = [
+      ["Issue date", draft({ issueDate: "not-a-date" })],
+      ["Valid-until date", draft({ validUntilDate: "13-13-13" })],
+      ["Recipient", draft({ recipientName: "" })],
+      ["Contact name", draft({ recipientContactName: "x".repeat(201) })],
+      ["Address", draft({ recipientAddress: "x".repeat(2001) })],
+      ["Notes", draft({ notes: "x".repeat(5001) })],
+      ["Terms", draft({ terms: "x".repeat(5001) })],
+      ["Line 1 description", draft({ lines: [line({ description: "x".repeat(251) })] })],
+    ];
+    for (const [label, bad] of cases) {
+      const result = buildIssueQuoteInput(bad);
+      expect(result.ok, label).toBe(false);
+      if (result.ok) continue;
+      expect(result.problems.some((p) => p.startsWith(label)), `${label}: ${result.problems.join(" | ")}`)
+        .toBe(true);
     }
+  });
+
+  /**
+   * The three line-item money fields cannot be reached through the form's own
+   * draft (parseUnits refuses their bad values first), so they are checked at
+   * describeIssue with the shapes the schema really produces for them --
+   * measured, including `origin`, which is what decides the unit.
+   */
+  it("labels the money fields, and counts numbers as numbers", () => {
+    expect(describeIssue({
+      path: ["lines", 0, "qtyMilli"], message: "Too small: expected number to be >=0",
+      code: "too_small", origin: "number", minimum: 0,
+    })).toBe("Line 1 quantity is below the minimum of 0.");
+    expect(describeIssue({
+      path: ["lines", 0, "unitPriceCents"], message: "x", code: "too_small", origin: "number", minimum: 0,
+    })).toBe("Line 1 unit price is below the minimum of 0.");
+    expect(describeIssue({
+      path: ["lines", 0, "taxRateBp"], message: "x", code: "too_big", origin: "number", maximum: 10000,
+    })).toBe("Line 1 tax rate is over the maximum of 10000.");
+  });
+
+  /**
+   * P5: a numeric bound rendered as "characters" read "Line 1 quantity is
+   * shorter than the 0 characters required" -- nonsense about a number, and
+   * unreachable today only because parseUnits refuses a minus sign first.
+   */
+  it("does not call a number's bound a character count", () => {
+    const numeric = describeIssue({
+      path: ["lines", 0, "qtyMilli"], message: "x", code: "too_small", origin: "number", minimum: 0,
+    });
+    expect(numeric).not.toContain("characters");
+    const text = describeIssue({
+      path: ["notes"], message: "x", code: "too_big", origin: "string", maximum: 5000,
+    });
+    expect(text).toContain("characters");
+    const array = describeIssue({
+      path: ["lines"], message: "x", code: "too_big", origin: "array", maximum: 60,
+    });
+    expect(array).toContain("line items");
+  });
+
+  /**
+   * P6: three of the five shapes that reach the no-index `lines` arm are Zod's
+   * own English about a JSON array. Only the two custom refinements were ever
+   * self-describing, which is what the comment there used to claim of all five.
+   */
+  it("writes its own sentence for the array bounds, and keeps the custom ones", () => {
+    expect(describeIssue({
+      path: ["lines"], message: "Too small: expected array to have >=1 items",
+      code: "too_small", origin: "array", minimum: 1,
+    })).toBe("A quote needs at least one line item.");
+    expect(describeIssue({
+      path: ["lines"], message: "Too big: expected array to have <=60 items",
+      code: "too_big", origin: "array", maximum: 60,
+    })).toBe("A quote may have at most 60 line items.");
+    expect(describeIssue({
+      path: ["lines"], message: "Invalid input: expected array, received string", code: "invalid_type",
+    })).toBe("The line items are missing.");
+
+    const budget = "this quote needs 136168 bytes of the 66688 a document may use";
+    expect(describeIssue({ path: ["lines"], message: budget, code: "custom" })).toBe(budget);
+  });
+
+  /**
+   * P7: a whole LINE that is not an object at all gives `["lines", 0]` with no
+   * leaf, and the line number it is holding was being thrown away.
+   */
+  it("keeps the line number when the issue is about a whole line", () => {
+    expect(describeIssue({
+      path: ["lines", 2], message: "Invalid input: expected object, received string", code: "invalid_type",
+    })).toBe("Line 3: Invalid input: expected object, received string");
+  });
+});
+
+describe("the quote form's caps come from the schema", () => {
+  /**
+   * P10's guard. DOCUMENT_FIELD_CAPS exists so the form cannot restate the
+   * schema's bounds -- and nothing stopped somebody typing the number back in,
+   * which is exactly the mistake it was introduced to prevent. A source read,
+   * because there is no DOM here to measure a rendered attribute with.
+   */
+  it("spells no maxLength as a literal number", () => {
+    const form = readFileSync(new URL("./document-form.tsx", import.meta.url), "utf8");
+    expect(form).toMatch(/maxLength=\{/);
+    expect([...form.matchAll(/maxLength=\{(\d+)\}/g)].map((m) => m[1])).toEqual([]);
   });
 });

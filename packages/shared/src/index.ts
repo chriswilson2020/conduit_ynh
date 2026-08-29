@@ -1858,7 +1858,7 @@ export const orgProfileInputSchema = z.object({
   if (problem !== null) ctx.addIssue({ code: "custom", path: ["logoDataUri"], message: problem });
   // THE RESERVE HAS TO BE ENFORCED SOMEWHERE OR IT IS A WISH. A quote's budget is the
   // render cap minus a template allowance minus what an issuer may cost, and nothing
-  // bounded the issuer at all: a maxed profile is 47,320 bytes in ASCII and 60,920
+  // bounded the issuer at all: a maxed profile is 47,115 bytes in ASCII and 60,715
   // with an `&` in every text field, because an ampersand escapes to five. The logo
   // and the text compete for the same reserve, which is why they are counted together
   // rather than separately.
@@ -1941,7 +1941,7 @@ export type DocumentRecord = z.infer<typeof documentSchema>;
  * characters and 2,211 bytes:
  *
  *   the template against an all-empty context        2,211 B
- *   a maxed org profile INCLUDING a maxed logo      +47,320 B
+ *   a maxed org profile INCLUDING a maxed logo      +47,115 B
  *   maxed notes/terms/address/names (ASCII)         +12,486 B
  *   one more line item, shortest money strings         +139 B
  *   one more line item, widest money strings           +186 B
@@ -1976,10 +1976,18 @@ export const MAX_TEMPLATE_BYTES = 16 * 1024;
 /**
  * What a quote reserves for its issuer: the logo plus the eight text fields, escaped.
  *
- * 48,000 was chosen from a measurement of a maxed ASCII profile (47,320) and was
+ * 48,000 was chosen from a measurement of a maxed ASCII profile (47,115) and was
  * simply hoped for: nothing bounded the profile, and the same fields full of `&`
- * measure 60,920. `orgProfileInputSchema` now enforces it, so the reserve is a fact
+ * measure 60,715. `orgProfileInputSchema` now enforces it, so the reserve is a fact
  * about what can be stored rather than an assumption about what people type.
+ *
+ * THOSE TWO FIGURES READ 47,320 AND 60,920 UNTIL PHASE 7'S QUALITY REVIEW, each
+ * exactly 205 too high, in three places. The arithmetic is checkable in one
+ * line and now is: the eight text fields cap at 3,400 characters and the logo
+ * column at MAX_LOGO_DATA_URI_CHARS (43,715), so ASCII is 3,400 + 43,715 =
+ * 47,115, and an `&` in every text position costs five bytes rather than one
+ * for 17,000 + 43,715 = 60,715. The old pair implied a 43,920-character logo,
+ * which is 205 more than the column can hold.
  */
 export const ORG_PROFILE_RESERVE_BYTES = 48_000;
 
@@ -2014,7 +2022,7 @@ export const DOCUMENT_LINE_MARKUP_BYTES = 186;
  *   - `"` costs one byte in text position and SIX in an attribute (`&quot;`), and
  *     this charges one. A 330-character template using each field once, filled with
  *     quote-heavy content, predicts 37,000 and merges to 165,735.
- *   - the issuer's reserve was not enforced, so a profile could cost 60,920 of the
+ *   - the issuer's reserve was not enforced, so a profile could cost 60,715 of the
  *     48,000 reserved for it. It is enforced now, which closes that one.
  *   - `MAX_TEMPLATE_BYTES` counted characters, so a CJK template cost three times its
  *     allowance. It counts bytes now, which closes that one too.

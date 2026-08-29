@@ -8,7 +8,7 @@ import { clsx } from "clsx";
  * columns and cannot be read there at all.
  *
  * Restyling ONE DOM was chosen over rendering a table and a card list side by
- * side under `md:hidden`/`hidden md:block`, for the same reason shell.tsx
+ * side, each hidden at the other's width, for the same reason shell.tsx
  * branches in JS rather than in CSS: two rendered copies means two elements
  * carrying every `row-<id>` testid, and e2e/crm.spec.ts addresses those by
  * testid and would hit a Playwright strict-mode violation. One DOM, two

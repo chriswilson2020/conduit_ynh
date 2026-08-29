@@ -337,9 +337,17 @@ export const MOBILE_BREAKPOINT = "48rem";
  * `family` is a class-name PREFIX matched against whole classes, so `max-w-`
  * matches `max-w-3xl` and does NOT match `max-md:max-w-none` -- which is the
  * behaviour a phone override depends on, since that one has to keep beating
- * whatever the caller chose. A variant-prefixed class like `md:max-w-lg` is
- * likewise not treated as an override here; it needs none, because a variant
- * rule is emitted after the whole base layer and already wins.
+ * whatever the caller chose. A class carrying a responsive variant prefix is
+ * likewise not treated as an override here.
+ *
+ * NO CLASS NAME IS SPELLED IN THIS PARAGRAPH THAT THE CODE DOES NOT ALSO USE,
+ * and that is a rule rather than a stylistic choice. Tailwind v4 scans source
+ * as PLAIN TEXT and does not know a comment from code, so a class named only in
+ * prose is compiled into the stylesheet: an example written here cost 0.06 kB
+ * of rules nothing renders and moved the build's hash, which is the third time
+ * this repo has paid for the same trap. lib.test.ts builds its variant-prefixed
+ * example from parts at runtime for the same reason, and there is a guard over
+ * every comment in this tree that now enforces it.
  */
 export function overridableClass(fallback: string, family: string, className?: string): string {
   if (className === undefined) return fallback;

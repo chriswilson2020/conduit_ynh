@@ -241,9 +241,13 @@ export function contentBudget(draft: DraftQuote): BudgetState {
  * WHAT EACH SCHEMA PATH IS CALLED ON THE PAGE SOMEBODY IS LOOKING AT.
  *
  * The keys are the wire field names; the values are what the form labels them.
- * A key missing from here falls back to the raw path, which is ugly but never
- * wrong -- and the test asserts every field the schema can complain about is
- * present, so it does not silently drift.
+ * A key missing from here falls back to the RAW WIRE NAME, so the failure mode
+ * is a user reading "Line 1 qtyMilli: ..." rather than anything breaking.
+ *
+ * THE TEST THAT KEEPS THIS COMPLETE DRIVES THE REAL SCHEMA, one deliberately
+ * bad draft per field, and asserts the sentence begins with the label. An
+ * earlier version of this comment claimed such a test existed when it did not,
+ * and deleting seven of these eleven entries left the whole suite green.
  */
 const FIELD_LABELS: Record<string, string> = {
   issueDate: "Issue date",
@@ -264,56 +268,98 @@ export interface SchemaIssue {
   readonly path: readonly PropertyKey[];
   readonly message: string;
   readonly code?: string;
+  /** "string", "number" or "array" on a size failure -- what the bound counts. */
+  readonly origin?: string;
   readonly maximum?: unknown;
   readonly minimum?: unknown;
+}
+
+/** How a size bound reads, which depends on WHAT IS BEING COUNTED. */
+function amount(origin: string | undefined, bound: unknown): string {
+  const n = String(bound);
+  if (origin === "string") return `${n} characters`;
+  if (origin === "array") return `${n} items`;
+  return n;
+}
+
+/**
+ * The whole-quote failures, whose path is `lines` with no index.
+ *
+ * THREE OF THE FIVE SHAPES THAT REACH THIS ARM ARE ZOD'S OWN ENGLISH, which an
+ * earlier version of this file did not know: it passed everything here straight
+ * through on the grounds that the message "says so on its own", and that is true
+ * only of the two CUSTOM refinements (the budget and the unrepresentable total).
+ * The array bounds and the type failure read "Too small: expected array to have
+ * >=1 items", which is a sentence about a JSON payload, not about a quote.
+ */
+function describeLinesIssue(issue: SchemaIssue): string {
+  if (issue.code === "too_small") return "A quote needs at least one line item.";
+  if (issue.code === "too_big") {
+    return `A quote may have at most ${String(issue.maximum)} line items.`;
+  }
+  if (issue.code === "invalid_type") return "The line items are missing.";
+  // The two custom refinements, which already say what they mean.
+  return issue.message;
 }
 
 /**
  * One schema issue as a sentence that names the box it is about.
  *
  * THE PATH IS THE WHOLE POINT, and throwing it away is what this function was
- * written to stop. `issue.message` alone is "Invalid input" for every length and
- * type failure Zod raises -- so an empty Recipient, which is the DEFAULT STATE
- * of any deal with no linked company, produced exactly that and nothing else:
- * two valid lines, a total on screen, and "Invalid input" as the entire
- * explanation. The per-field parse above deliberately reports first so somebody
- * gets a sentence about the box they are looking at; this is the same courtesy
- * for every field that parse does not cover.
+ * written to stop. `issue.message` alone is Zod's own English about a JSON
+ * value: an empty Recipient -- which is the DEFAULT STATE of any deal with no
+ * linked company -- produced "Too small: expected string to have >=1
+ * characters", and that was the entire feedback beside two valid lines and a
+ * total on screen. The per-field parse above deliberately reports first so
+ * somebody gets a sentence about the box they are looking at; this is the same
+ * courtesy for every field that parse does not cover.
  *
- * Size failures get a purpose-written sentence because Zod's own are unreadable
- * to anyone who did not write the schema. Everything else keeps the schema's
- * message, which for the custom refinements (the budget, the four-digit year,
- * the unstorable character, the unrepresentable total) is already a good one --
- * it just never said which field it meant.
+ * MEASURED, NOT ASSUMED, because two reviews disagreed about it. Every failure
+ * path of issueQuoteInputSchema was enumerated against zod 4.4.3 -- 27 of them,
+ * covering every field, both dates, all four line fields, the array bounds, both
+ * custom refinements and six wrong-type cases. **The literal string "Invalid
+ * input" is emitted for NONE of them.** What Zod actually produces is "Too
+ * small: expected string to have >=1 characters", "Too big: expected array to
+ * have <=60 items", "Invalid ISO date", and "Invalid input: expected string,
+ * received undefined" -- descriptive, and none of them naming a field. An
+ * earlier version of this comment, and four lines of the plan, said every
+ * refusal read "Invalid input"; that was wrong about the string and right about
+ * the consequence, and the code now says which.
+ *
+ * Size failures get a purpose-written sentence because Zod's are unreadable to
+ * anyone who did not write the schema. Everything else keeps the schema's
+ * message, which for the custom refinements is already a good one -- it just
+ * never said which field it meant.
  */
 export function describeIssue(issue: SchemaIssue): string {
   const [head, index, leaf] = issue.path;
   let display = "";
   if (head === "lines") {
-    // A specific line's field. `lines` with NO index is a claim about the whole
-    // SET -- the budget, or a total that cannot be represented -- whose message
-    // says so on its own, and prefixing it with a field name makes it worse.
-    //
-    // THIS ARM HAS TO COME BEFORE THE FIELD ARM rather than be folded into its
-    // condition. Written as `head === "lines" && typeof index === "number"` the
-    // set-scoped case fell through to the field arm and came out labelled
-    // "lines: this quote needs ... bytes", which is the budget message with a
-    // wire field name stapled to it. Its test caught that.
-    const field = typeof index === "number" && leaf !== undefined
-      ? FIELD_LABELS[String(leaf)] ?? String(leaf)
-      : "";
-    display = field === "" ? "" : `Line ${String(Number(index) + 1)} ${field}`;
+    // `lines` with NO index is a claim about the whole SET; with an index but no
+    // leaf it is a claim about one whole LINE (a line that is not an object at
+    // all), and the line number is worth keeping rather than discarding.
+    if (typeof index !== "number") return describeLinesIssue(issue);
+    const field = leaf === undefined ? "" : FIELD_LABELS[String(leaf)] ?? String(leaf);
+    display = field === "" ? `Line ${String(index + 1)}` : `Line ${String(index + 1)} ${field}`;
   } else if (head !== undefined) {
     display = FIELD_LABELS[String(head)] ?? String(head);
   }
 
   if (display === "") return issue.message;
-  if (issue.code === "too_small" && issue.minimum === 1) return `${display} is required.`;
+  if (issue.code === "too_small" && issue.minimum === 1 && issue.origin === "string") {
+    return `${display} is required.`;
+  }
+  // THE UNIT COMES FROM `origin`, NOT FROM AN ASSUMPTION THAT EVERYTHING IS
+  // TEXT. Written as "characters" for every bound, a negative quantity read
+  // "Line 1 quantity is shorter than the 0 characters required" -- nonsense
+  // about a number. Unreachable today only because parseUnits refuses a minus
+  // sign before the schema ever sees it, which is exactly the kind of accident
+  // that stops being true when a bound moves.
   if (issue.code === "too_small") {
-    return `${display} is shorter than the ${String(issue.minimum)} characters required.`;
+    return `${display} is below the minimum of ${amount(issue.origin, issue.minimum)}.`;
   }
   if (issue.code === "too_big") {
-    return `${display} is longer than the ${String(issue.maximum)} characters allowed.`;
+    return `${display} is over the maximum of ${amount(issue.origin, issue.maximum)}.`;
   }
   return `${display}: ${issue.message}`;
 }

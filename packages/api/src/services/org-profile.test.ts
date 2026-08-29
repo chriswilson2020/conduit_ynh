@@ -188,7 +188,7 @@ describe("the logo, which is bytes rather than a file reference", () => {
   it("refuses a profile that would eat more than a quote reserves for its issuer", async () => {
     // THE RESERVE WAS A WISH UNTIL THIS EXISTED. A quote's content budget is the
     // render cap minus a template allowance minus what an issuer may cost -- and
-    // nothing bounded the issuer, so the 48,000 reserved for it could be 60,920: an
+    // nothing bounded the issuer, so the 48,000 reserved for it could be 60,715: an
     // `&` escapes to `&amp;`, five bytes for one, and there are 3,400 characters of
     // text fields beside a 43,715-character logo.
     const nearlyMaxedLogo = logoOfBytes(MAX_LOGO_BYTES);

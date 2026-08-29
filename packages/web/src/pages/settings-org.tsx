@@ -130,7 +130,7 @@ export function SettingsOrgPage() {
 
   // The reserve counts the logo and the eight text fields TOGETHER, because
   // they compete for the same share of the render budget -- a maxed ASCII
-  // profile is 47,320 bytes and the same fields full of ampersands are 60,920,
+  // profile is 47,115 bytes and the same fields full of ampersands are 60,715,
   // which is why the server enforces this rather than hoping for it.
   const used = orgProfileBytes(form);
   const over = used > ORG_PROFILE_RESERVE_BYTES;

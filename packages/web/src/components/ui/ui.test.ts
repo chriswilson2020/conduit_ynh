@@ -214,6 +214,11 @@ describe("the modal skeleton", () => {
     // dialog in the app loses its card width.
     expect(dialog).toContain('overridableClass(DIALOG_DEFAULT_MAX_WIDTH, "max-w-", className)');
 
+    // THE DEFAULT'S VALUE, PINNED. Nine callers pass no width at all and get
+    // this one; changing it to `max-w-xs` shrinks every one of them from 448px
+    // to 320px, and nothing else in this repo would have noticed.
+    expect(dialog).toContain('const DIALOG_DEFAULT_MAX_WIDTH = "max-w-md";');
+
     const tunable = /^(max-w-|max-h-|overflow-|md:)/;
     const offenders: string[] = [];
     for (const file of walk(SRC)) {
@@ -225,6 +230,31 @@ describe("the modal skeleton", () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  /**
+   * THE CALLER'S CLASS HAS TO REACH THE ELEMENT, and until this existed nothing
+   * checked that it did.
+   *
+   * Deleting `, className` from DialogContent's clsx call discards every width,
+   * height cap and scroll region all four callers pass -- mail settings becomes
+   * a full-viewport-width dialog with no maximum height and no scrolling -- and
+   * the whole suite stayed green, e2e included. The guard above survives it too,
+   * because it reads the callers' source strings, which are still there; what
+   * changed was whether anything consumed them.
+   *
+   * This traces the value instead: DialogContent composes `className` in, and
+   * Overlaid puts its own `className` parameter on the Content element. Both
+   * halves, because either one alone can be cut.
+   */
+  it("forwards a caller's className all the way to the rendered element", () => {
+    const dialog = here("dialog.tsx");
+    const content = component("dialog.tsx", "DialogContent");
+    // The caller's class is composed into what is handed down...
+    expect(content).toMatch(/className=\{clsx\([\s\S]*?,\s*className\)\}/);
+    // ...and Overlaid is what puts a className on the Radix element.
+    const overlaid = dialog.slice(dialog.indexOf("function Overlaid("), dialog.indexOf("export function DialogContent"));
+    expect(overlaid).toMatch(/RadixDialog\.Content className=\{clsx\(SHAPES\[shape\], className\)\}/);
   });
 });
 

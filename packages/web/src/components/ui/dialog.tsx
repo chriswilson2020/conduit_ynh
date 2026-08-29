@@ -47,12 +47,14 @@ const SHEET_CHROME =
  * hoping every property came back.
  *
  * The overrides are written property-for-property -- `max-md:left-0` against
- * `left-1/2`, never a blanket `max-md:inset-0`. BE CLEAR ABOUT WHY, because
- * the obvious reason is wrong and was believed here for a round: Tailwind does
- * order the inset shorthand before the longhands, but only WITHIN the base
- * utility layer. Every `max-md` rule is emitted after that layer ends, in a
- * single media block of its own, so a blanket `max-md:inset-0` would in fact
- * have beaten `left-1/2`. The property-for-property form is kept because it is
+ * `left-1/2`, never a blanket inset shorthand behind the same variant. BE CLEAR
+ * ABOUT WHY, because the obvious reason is wrong and was believed here for a
+ * round: Tailwind does order the inset shorthand before the longhands, but only
+ * WITHIN the base utility layer. Every `max-md` rule is emitted after that layer
+ * ends, in a single media block of its own, so the blanket form would in fact
+ * have beaten `left-1/2`. (The shorthand is described rather than spelled: a
+ * class named only in prose is compiled into the stylesheet -- see the
+ * Tailwind-in-prose guard in lib.test.ts.) The property-for-property form is kept because it is
  * the one that does not depend on knowing that -- it stays correct if the
  * shape gains a `md:` sibling, if a caller passes its own variant class, or if
  * a future Tailwind emits variants differently. It is defensive, not required.
@@ -68,9 +70,28 @@ const SHAPES = {
     // NO `max-w-` HERE. The default lives in DialogContent and is applied only
     // when the caller sets none -- see overridableClass in src/lib.ts for why a
     // hard-coded one here silently beat every caller's.
-    "fixed left-1/2 top-1/2 w-full -translate-x-1/2 -translate-y-1/2",
+    //
+    // THE WIDTH LEAVES A GUTTER, AND THAT IS NOT COSMETIC. A caller's cap and
+    // the viewport can be the SAME NUMBER: the widest cap in this app is
+    // `max-w-3xl`, which is 48rem, which is exactly MOBILE_BREAKPOINT. At a
+    // 768px viewport the `md:` side of the breakpoint is the one that applies,
+    // so the desktop CARD renders -- and a full-width one then measured
+    // {w:768, left:0, right:768}, edge to edge, its 8px corner radius clipped
+    // against both sides with no scrim visible either. The band is 768px up to
+    // about 800px, which is an iPad in portrait exactly.
+    //
+    // The hard-coded `max-w-md` used to make this unreachable by accident;
+    // removing it is what exposed it. A width of the viewport minus 2rem caps
+    // the card at 1rem each side, and the caller's `max-width` still decides
+    // once there is room for it -- at 1280 the quote form is 768px wide because
+    // its own cap is the smaller of the two, and at 768 it is 736px.
+    "fixed left-1/2 top-1/2 w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2",
     "rounded-lg bg-white p-6 shadow-lg focus:outline-none",
-    "max-md:bottom-0 max-md:left-0 max-md:right-0 max-md:top-0 max-md:max-h-none max-md:max-w-none",
+    // The phone sheet is edge to edge on purpose, so it takes its full width
+    // back. Without this the gutter above would follow it below the breakpoint
+    // and leave a 358px sheet on a 390px screen.
+    "max-md:bottom-0 max-md:left-0 max-md:right-0 max-md:top-0 max-md:w-full",
+    "max-md:max-h-none max-md:max-w-none",
     "max-md:translate-x-0 max-md:translate-y-0 max-md:overflow-y-auto max-md:rounded-none",
   ),
   /**
@@ -157,7 +178,28 @@ function Overlaid({
  * will open focused here. Give it one, or pass `onOpenAutoFocus` (the whole of
  * Radix's Content props are forwarded) and focus what the dialog is for.
  */
-/** The desktop card's width when a caller does not choose one. */
+/**
+ * The desktop card's width when a caller does not choose one.
+ *
+ * TWO THINGS A CALLER CAN STILL DO THAT WOULD SURPRISE THEM, neither of which
+ * anything does today, both written down rather than left for the next person
+ * to rediscover the way the 448px bug was rediscovered.
+ *
+ * A WIDTH BEHIND A RESPONSIVE VARIANT IS NOT SEEN AS AN OVERRIDE by
+ * overridableClass -- it matches whole classes, and a variant-prefixed one does
+ * not begin with `max-w-`. So the default would be emitted alongside it. Worse,
+ * a variant-prefixed rule is emitted AFTER the `max-md` block, so such a class
+ * would also cap the PHONE sheet: `max-md:max-w-none` does not beat it, and a
+ * sheet between the small breakpoint and 767px would sit at the caller's cap
+ * instead of filling the screen. "max-md beats whatever the caller chose" is
+ * true against BASE utilities only.
+ *
+ * AND AN IMPORTANT MARKER IS SILENTLY IGNORED. A caller writing the bang form
+ * of a width class is not matched either, so the default is emitted too -- and
+ * that is the same shape as the bug this whole mechanism exists to fix, just
+ * with the winner reversed. If either becomes a real requirement, widen the
+ * family match rather than adding a second exception here.
+ */
 const DIALOG_DEFAULT_MAX_WIDTH = "max-w-md";
 
 export function DialogContent({ children, className, ...rest }: ContentProps) {
