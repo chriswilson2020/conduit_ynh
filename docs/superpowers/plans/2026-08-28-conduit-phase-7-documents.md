@@ -2193,7 +2193,9 @@ The queue is reachable from the issuing path, which is why the wait is now bound
 
 Measured from the CHILDREN, not from a counter inside the module: each stub records
 how many copies of itself were running when it started. Six renders at once reach
-exactly 3. **Removing the acquire fails it; tightening it to 1 fails it too**, which
+exactly 3 (**2 as of round 2**, which re-measured the RSS this rests on: a render at
+the cap costs 332MB in the worst shape, not the 157MB the arithmetic assumed).
+**Removing the acquire fails it; tightening it to 1 fails it too**, which
 is why the test asserts a floor as well as a ceiling -- "never more than three" is
 satisfied by a bound of one, and that would be a different bug. A fourth test asserts
 `400 + 3 x 157 <= manifest.toml`'s declared `ram.runtime`, so the code and the
@@ -2363,8 +2365,8 @@ five to one, and one assuming quotes were expensive would over-count.
 
 **The constants are now 60 lines x 250 characters**, which is what survives the worst
 case the review named: every optional field maxed, a maxed logo, and ACCENTED text
-throughout. That merges to ~113KB. A permanent test builds exactly that quote and
-asserts it fits, so the pair can never drift from the renderer again.
+throughout. That merges to ~113KB (115,519 with the widest money strings, re-measured
+in round 2). A permanent test builds exactly that quote and asserts it fits.
 
 **AND A BYTE BUDGET, BECAUSE CHARACTER COUNTS CANNOT BOUND BYTES.** Sizing the
 constants for the true worst character (a 3-byte CJK glyph, or a 5-byte `&`) would
@@ -2375,11 +2377,11 @@ allowance minus a 48KB issuer reserve). A quote inside every field cap and over 
 total is refused by the GATE with a sentence about the budget, not by a 413 naming a
 byte count. Task 5's editor computes the same function to show what is left.
 
-**Its conservatism has one named exception and the 413 stays for it**: the gate counts
-a value once, and a template printing `{{document.notes}}` forty times prints it
-forty times. There is a route test for that shape -- and it is a 413 only between
-128KB and 512K, because above that `mergeTemplate`'s own output bound throws first
-and the answer is a 422.
+~~**Its conservatism has one named exception and the 413 stays for it**~~: **round 2
+found four more, and the conclusion is that the prediction is not the check.** The
+authoritative bound is now the MEASURED merged size, taken before the spawn; this
+budget is a cheap early rejection so the form can refuse a quote in the form. See
+review round 2.
 
 **SV-2: A FOURTH POST-RENDER 500, GATED IN ONE LINE.** `z.iso.date()` accepts
 `0000-01-01` and **Postgres has no year zero**, so that quote computed, allocated a
@@ -2489,6 +2491,157 @@ response carries the warnings.
 | the queue timeout made effectively unbounded | 3 |
 | the year floor removed | 1 |
 | the queue served LIFO | 1 |
+
+##### TASK 4 REVIEW ROUND 2 — the gate was a prediction, and predictions were the bug
+
+Commit `415797d`. The round defeated the byte gate four ways and found a defect that
+would have broken Task 5 on contact. **The fix was not a fifth attempt at predicting;
+it was to stop predicting.**
+
+**THE STRUCTURAL CHANGE, in the order it had to happen.**
+
+**1. A BLOCK NESTED INSIDE ITSELF IS REFUSED, at merge and at template PUT.**
+`{{#lines}}` inside `{{#lines}}` re-resolves `lines` from the root, so the body runs
+once per line PER LEVEL. Task 3 tested that as "n^2, and that is the DEFINED answer
+rather than an accidental one" -- true, and beside the point. A **114-character**
+template plus an ordinary **47-line** quote (11% of the gate's budget) merged to
+130,346 bytes -- UNDER the renderer's cap, so nothing refused it -- and cost **9.65s
+and 353MB** as 2,209 table rows. Bounding that by size was never going to work,
+because the cost is not measured in bytes.
+
+There is one collection on a quote and nesting it has no use, so the mechanism goes
+rather than its symptom. With it goes the only way for merged size to stop tracking
+input size, which is what makes a measurement of the merged output a sound bound.
+Three of Task 3's tests asserted the old behaviour and now assert the refusal.
+
+**2. THE AUTHORITATIVE CHECK IS THE MEASURED MERGED SIZE**, taken in `issueQuote`
+after the merge and before the spawn. Exact, one `Buffer.byteLength`, immune to every
+prediction error -- and one layer above `renderPdf`'s identical cap, so it can say
+which part was too big: *"this quote merges to 200,007 bytes, over the 131,072 a
+document may render. Its template is 727 bytes, its logo 0, and its own content
+5,276."* It rolls back like a failed render: no number spent, nothing spawned.
+
+**3. THE INPUT GATE IS DEMOTED TO WHAT IT IS** -- a cheap early rejection so the form
+can refuse a quote in the form -- and the comment says so. S4's attribute arithmetic
+and the repeated-field case are approximation quality now, not correctness.
+
+**THE FOUR DEFEATS, and what happened to each.**
+
+- **S4** `"` costs 1 byte in text position and **6 in an attribute**, and the gate
+  charges 1. Reproduced: a template putting every field in a `title` attribute is
+  charged 27,000 quotes at one byte each and merges to far more. Now caught by the
+  measured check, with a test. (A first version of that test used `data-*`
+  attributes, which the profile strips -- so it measured a document the sanitiser had
+  already emptied. `title` is in the allowlist.)
+- **S6** the issuer reserve was a wish: a maxed profile is 47,320 bytes in ASCII and
+  **60,920** with `&` in the eight text fields, and nothing bounded it.
+  `orgProfileInputSchema` now enforces `ORG_PROFILE_RESERVE_BYTES`, counting the logo
+  and the text together because they compete for the same reserve. And
+  `MAX_TEMPLATE_CHARS` became **`MAX_TEMPLATE_BYTES`**, because 16,384 characters of
+  CJK is 48,410 bytes.
+- **S5** PUT validated length BEFORE sanitising, and the sanitiser GROWS a body --
+  16,384 characters of raw `"` in a single-quoted attribute store as 97,546, 5.95x.
+  Sanitise, then measure. The Zod cap is now deliberately loose (4x) and documented as
+  the cheap early rejection.
+- **S1** is the one above.
+
+**S2 -- THE SAVE THAT DESTROYED THE LOGO, AND THE LAYERING THAT CAUSED IT.**
+`isPermittedUrl("{{org.logoDataUri}}")` refused the merge token as a URL, which
+dropped the `src`, which made `exclusiveFilter` drop the whole `<img>`. GET the seeded
+template and PUT it back and it came out 38 characters shorter with no logo, no
+warning -- **exactly what Task 5's editor does the first time somebody opens and saves
+the template**, after which every quote prints no letterhead.
+
+Template-time sanitisation was judging an UNMERGED token. A `{{...}}` in a URL
+position is not a URL yet, and the merged output is sanitised again afterwards, which
+is where the real check has always been. A bare token is now a permitted placeholder
+at template time -- deliberately the WHOLE value only, so `file:///{{x}}` stays
+refused even though the merged pass would catch it too.
+
+**GET -> PUT is now byte-identical for the shipped template, and that is the property
+a save needs**: `f(x) = x`, not `f(f(x)) = f(x)`. It took one more change to get
+there: sanitize-html re-serialises `<img>` as `<img />`, so the seeded template now
+carries the self-closing form and is a fixed point of its own sanitiser. 3,616 in,
+3,616 out, image intact.
+
+**S3 -- A NUL RENDERED A PDF AND THEN 500ED.** `{"description": "a\u0000b"}` is legal
+JSON, passes every bound, is charged one byte, survives merge and sanitise, allocates
+a number, **spawns python3 and renders**, writes the blob, and fails the INSERT with
+`22021` -- a fourth SQLSTATE in the class the gate claims to have eliminated. Every
+user-supplied string now goes through `documentText`, which refuses a NUL and an
+unpaired surrogate.
+
+**AND THE FIX HAD THE SAME BUG THE CODE DID.** The first version wrote
+`documentText(250).min(1)`, which type-checks, returns a fresh schema and **silently
+drops the refinement** -- so the description still reached the INSERT. `min` is a
+parameter now. The test caught it, which is the only reason this is a footnote.
+
+**No catch-all for post-render database failures, and that is a decision.** A residual
+one means the gate has a hole, and a 500 with a logged stack is the right signal for
+that; a tidy 4xx would make the next hole invisible.
+
+**THE RENDER TABLE WAS WRONG AND THE CONCURRENCY ARITHMETIC FOLLOWED IT DOWN.**
+Re-measured through the shipped `renderPdf` on the server, with the child's peak RSS
+sampled from /proc every 50ms:
+
+| input | shape | time | peak RSS | rows |
+|---|---|---|---|---|
+| 32 KB | table | 2.2 s | 102 MB | ~330 |
+| 64 KB | table | 4.0 s | 148 MB | ~660 |
+| **128 KB** | **table** | **7.3 s** | **238 MB** | 1,300 |
+| 256 KB | table | 15.4 s | 416 MB | 2,600 |
+| 128 KB | prose | 1.8 s | 84 MB | 0 |
+| **128 KB** | **dense (19-byte rows)** | **10.0 s** | **332 MB** | 6,897 |
+
+The shipped comment said 128KB was 5.2s and 157MB. It is 7.3s and 238MB for a
+quote-shaped table, and **332MB for a table of minimal rows** -- the same bytes as
+prose cost 84MB, so the ROW COUNT drives the cost, not the byte count, and S1's 353MB
+turns out not to be exceptional at all.
+
+**So `RENDER_MAX_CONCURRENCY` is 2, not 3, and `ram.runtime` is 1100M, not 900M.**
+400 + 2 x 332 = 1,064M. Keeping three would be 1,396M -- a third of a 3819MB machine
+with no swap, where overshooting is an OOM kill. The test asserts the arithmetic
+against the manifest's literal.
+
+**S11 -- THE LOCK WAIT IS BOUNDED NOW, not just recorded.** The lock HOLD was ~10s+20s;
+nothing bounded the WAIT, with no `lock_timeout`, no `statement_timeout`, no Fastify
+`requestTimeout` and a pool of ten. The issuing transaction sets
+`SET LOCAL lock_timeout = '45s'`, and 55P03 maps to **503 `busy`** -- retrying is
+right, and nothing was spent because the timeout fires before the number is allocated.
+
+**THE SMALLER ONES.**
+
+- **S7** `DOCUMENT_LINE_MARKUP_BYTES` was "145 measured" and was neither, and setting
+  it to **0 left all 2,274 tests green**. A row's cost is a RANGE -- 139 bytes with
+  the shortest money strings, **186** with the widest a quote can carry -- so a single
+  figure is meaningless without saying what was in the row. It is 186, and a test
+  measures both ends and requires the constant to sit at or above the top.
+- **S8** the 503 arm had no test. `mapDocumentError` is exported and there is a table
+  test over all ten arms plus the lock timeout, the re-throw, and the rule that
+  `RenderError.detail` never reaches the wire.
+- **S9/S10** the `splice` and the `done` check are one mechanism with two halves and
+  neither is individually testable -- deleting either survives, deleting both leaks a
+  slot per timeout permanently. Recorded at the code, as the `rel=attachment`
+  redundancy was.
+- **Comment numbers**, all re-measured and all now stating their method: the empty
+  context is 2,211 BYTES and 2,205 characters (both qualifications matter); a line is
+  139-186 depending on its money strings; 130 x 500 maxed is 151,139 ASCII and 216,139
+  accented with the widest money strings, where the earlier 145,679/210,679 used
+  narrower ones -- same conclusion, different premise, and the difference is exactly
+  why a per-line figure has to say what was in the row. `MERGE_MAX_STEPS`'s "130 line
+  items, the largest quote that can render at all" is corrected to 60.
+
+**MUTATIONS FOR THIS ROUND**, all on the server:
+
+| mutation | fails |
+|---|---|
+| the merge-token placeholder allowance removed (S2 restored) | 3 |
+| the post-merge measured check disabled | 3 |
+| a block nested inside itself allowed again | 2 |
+| the unstorable-text refusal removed | 2 |
+| `DOCUMENT_LINE_MARKUP_BYTES` set to 0 | 1 |
+| the 503 arm deleted | 1 |
+| the template measured before sanitising instead of after | 1 |
 
 ---
 
