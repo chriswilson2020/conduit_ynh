@@ -2064,6 +2064,252 @@ git add packages/api/src/services/documents-number.ts packages/api/src/services/
 git commit -m "feat(api): issue a quote in one transaction, and prove it never changes after"
 ```
 
+#### TASK 4 DONE — the failure paths run without the binary, and the plan's fourth failure no longer exists
+
+Commit `8e232b6`. CI run **33227608626**, tip `8e232b6`, both jobs green: **2257 tests,
+0 skipped**. On the server: 2219 passed / 38 skipped. No migration; nothing in
+`schema.ts` or `drizzle/` was touched.
+
+The steps above are left as written so the corrections are legible.
+
+**1. THE TRANSACTION'S FINAL ORDER, which is one step longer than Step 4's sketch.**
+Read the deal, read the template, read the issuer profile and inline its logo,
+**then** allocate the number, merge, render, write the blob, insert the file, insert
+the document and its lines.
+
+The three reads moved AHEAD of the allocation deliberately. The `ON CONFLICT` takes a
+row lock held to commit, and there is no reason to read three more rows inside it; the
+lock now covers the merge, the render and the inserts, about a second of which
+~600-700ms is the render. Everything that can fail with the caller's fault attached --
+the input gate, an unknown or archived deal, a missing template -- fails before the
+allocation, so those cases spend no number and never reach a subprocess. Each is
+asserted by a marker file the stub renderer touches: its ABSENCE is the assertion,
+because "the request was refused" and "the request was refused in time" are different
+claims and only one of them is the design.
+
+**Rollback is proved three ways, and two of them need no binary.** A render that exits
+5 leaves no sequence row, no `files` row, no document, and the next quote is
+`QUO-2026-0001` rather than 0002 -- which is exactly what `nextval()` could not have
+given. A template that busts `mergeTemplate`'s depth bound rolls the allocation back
+before the spawn. And the blob's orphan is pinned rather than tolerated in silence: a
+colliding number makes the INSERT fail with the PDF already written, and the test
+asserts the store grew by one file while the database gained nothing that refers to
+it.
+
+**2. `attachFile` IS REUSED, WITH ONE HONEST COST.** It is the only place a `files`
+row is created, it stamps the `file_attached` timeline entry, and it re-checks the
+deal -- so `issueQuote` calls it with `tx` (drizzle turns its inner transaction into a
+savepoint). The cost is that its `publish()` fires before the OUTER transaction
+commits, so a rollback leaves one spurious SSE invalidation behind. Clients refetch
+and see nothing, which is why this was preferred to a second file-insert path that
+would drift from the first.
+
+**No new `events` verb.** `file_attached` already puts "QUO-2026-0001.pdf" on the
+deal's timeline, and a `document_issued` verb would mean widening
+`events_verb_valid` in a migration for a second entry about the same act.
+
+**3. THE GATE IS IN `@conduit/shared` AND IS ENFORCED TWICE.** `issueQuoteInputSchema`
+bounds all three CHECK constraints -- `qty_milli >= 0`, `unit_price_cents >= 0`,
+`tax_rate_bp BETWEEN 0 AND 10000` -- plus the int4 ceiling `money.ts` already knew
+about, a 1-130 line count and a 500-character description (Task 2's budget
+arithmetic, both halves, since neither bounds anything alone).
+
+It lives in shared rather than in the route because Task 5's form needs the same
+bounds, and it is re-parsed inside `issueQuote` because the route is not the only
+caller: a direct service call is exactly how the three 23514s were reproduced.
+Removing the service-side parse fails **7 tests**; the route-side parse alone would
+have left every one of them green.
+
+**THE FOURTH FAILURE PATH THE PLAN NAMES DOES NOT EXIST ANY MORE, and the real one is
+next door.** The hand-off warned that a total between 7,036,874,417,766,401 and 2^53-1
+"throws in `formatMoneyCents`". It did, one round ago; Task 2's review round 2 (F2)
+removed that ceiling and rebuilt the decimal with BigInt, and the function now cannot
+throw for any input. Verified against the code rather than the prose, and pinned: a
+quote whose total is exactly 7,036,874,417,766,401 is issued, stored and formatted
+exactly.
+
+The failure that IS real is one line up. Every field can be in range while the
+ARITHMETIC over them is not -- 130 lines of 2,147,483.647 units at `MAX_SAFE_INTEGER`
+cents pass all three CHECKs and both representability constraints, and
+`documentTotals` throws a plain `Error`. That is now a `superRefine` on the same
+schema, so it is a 400 with a sentence rather than a 500. It costs one extra pass of
+the arithmetic the service was about to run anyway, and it happens before the render
+either way -- so this was about what the caller is told, not about what is wasted.
+
+**4. THE MERGE CONTRACT IS NOW A CONTRACT, and the connection runs through the
+template rather than through a list.** `schema.test.ts` compares the seeded template's
+tokens to a literal list beside it; `test/seed-template.ts` reads the merge PATHS out
+of the migration itself, and `documents.test.ts` asserts `buildContext`'s actual key
+set contains every one of them. Containment, not equality, and in that direction: an
+extra context key prints nothing, a missing one prints a blank on a page nobody
+notices until a customer reads it.
+
+Renaming `document.subtotal` to `document.subTotal` -- the exact defect the plan
+names -- **fails 3 tests**. Before this task it failed none.
+
+The third of those three is the one worth keeping: it merges the REAL seeded template
+through the real resolver with a filled context and looks for the values themselves
+("QUO-2026-0001", "11,000.00", "21%"), because a complete key set and a template that
+prints nothing are compatible states. The anti-vacuity guard matters too -- the path
+reader is asserted to find more than 20 paths including `document.subtotal`, or the
+containment check would pass against an empty list.
+
+**5. MOST OF THIS SUITE RUNS WITHOUT WEASYPRINT, AND THE IMMUTABILITY TEST IS THE
+REASON, not a convenience.** A stub `python3` on PATH (Task 1's mechanism, moved to
+`test/python-stub.ts` now that two files want it) emits `%PDF-` followed by **eight
+random bytes per invocation**.
+
+With a constant-output stub, "the stored PDF is byte-identical after the world moves
+on" passes for code that re-renders on every read: the assertion would be about the
+stub. Varying bytes make it a claim -- identical bytes can only mean nothing
+re-rendered -- and they mirror reality, since the real renderer is not reproducible
+either (Task 1: 6899, 6899, 6898). The control for that control is its own test: two
+quotes of the same input must produce DIFFERENT stored bytes.
+
+**The three edits are asserted to have landed.** `truncateAll()` destroys the seeded
+template, so `update(documentTemplates)` written the obvious way updates zero rows and
+the "changed" template is the same template -- the test proves nothing while looking
+like the most important test in the repo. Every test in the file seeds its own
+template from the migration, and the immutability test checks `.returning()` has
+length 1 for all three edits.
+
+**Step 3's suggested failure template was not used.** `<style>@page { size: !!! }</style>`
+does not fail a render -- WeasyPrint ignores CSS it cannot parse -- so a stub that
+exits 5 is both deterministic and available on a machine with no binary.
+
+**6. CONCURRENCY IS BOUNDED AT THREE, INSIDE `renderPdf`.** `RENDER_MAX_CONCURRENCY`
+with a FIFO semaphore, acquired after the input cap (an oversized document is refused
+outright rather than queued for a slot it would waste) and released in a `finally`.
+
+It is in the renderer rather than in the issuing transaction because the budget is a
+property of the process, not of quotes: Task 5's template preview and any future
+document type need the same bound, and a limit a caller has to remember is a limit
+that holds until somebody adds a call site. On the issuing path it is never contended
+today -- the number sequence's row lock already serialises quotes of one type and year
+-- so it is the backstop for everything else and for the New Year's Eve case where two
+years' sequences are live.
+
+Measured from the CHILDREN, not from a counter inside the module: each stub records
+how many copies of itself were running when it started. Six renders at once reach
+exactly 3. **Removing the acquire fails it; tightening it to 1 fails it too**, which
+is why the test asserts a floor as well as a ceiling -- "never more than three" is
+satisfied by a bound of one, and that would be a different bug. A fourth test asserts
+`400 + 3 x 157 <= manifest.toml`'s declared `ram.runtime`, so the code and the
+declaration cannot drift apart.
+
+**7. THREE THINGS THE PLAN'S ROUTE SPEC HAD SLIGHTLY WRONG.** The download route is
+`GET /api/files/:id/download`, not `/api/files/:id` (still reused; no second path was
+written). The param is `:id` rather than `:dealId`, because eight `/api/deals/:id/*`
+routes already exist and find-my-way refuses two parameter names in one path position
+-- the URL is identical. And the currency is taken from the DEAL rather than from the
+submission, as `documents_currency_format`'s comment says it must be; Step 3's sketch
+put it in the input.
+
+**Four failures answer 4xx rather than 500**, each mapped in `routes/documents.ts` so
+`helpers.ts` stays general: the input gate and a rejected logo are 400 `validation`; a
+deleted template is 409 `template_missing`; `TemplateError` is 422 `template_error`;
+`RenderError` is 413 `too_large` for the input cap and 422 `render_failed` otherwise.
+**`RenderError.detail` never reaches the wire** -- it is the child's stderr and can
+name server paths -- so the message is this codebase's own short phrase, asserted as
+such.
+
+**8. THE LOGO HAS A CEILING AND A BLOCKER.** `MAX_LOGO_BYTES` is 32KB, enforced in
+`saveOrgProfile` where the REFERENCE is stored rather than only at Task 5's upload:
+`PUT /api/org-profile` takes a file id, files are immutable once stored, and the
+alternative is a logo accepted in Settings whose defect surfaces weeks later as a
+quote that will not render. The mime is checked too, and SVG is deliberately excluded
+-- it is a document format with its own URL-bearing elements, arriving inside a
+`data:` URI where neither the sanitiser nor the renderer's fetcher looks.
+
+**THE BLOCKER IS TASK 5'S AND IT IS REAL.** `files_exactly_one_entity` requires every
+`files` row to belong to exactly one company, contact, deal or project -- and an
+issuer's logo belongs to none of them. `org_profile.logo_file_id` references
+`files.id`, so there is no legal row for a logo to be. Both suites here attach their
+logo to a company to get a file id at all, and say so at the line. **Nothing in this
+task can fix it**: the options are widening the CHECK (0009 is unshipped, so it can be
+regenerated) or storing the logo outside `files`, and both are coordinator decisions.
+
+**The 1x1 transparent placeholder Task 2 suggested is NOT implemented, and should not
+be.** That note predates Task 3's re-seed, which wraps the logo in
+`{{#org.logoDataUri}}`; an empty string now means no `<img>` at all, which is a plain
+letterhead. A placeholder would put the element back.
+
+**9. THE TWO FORMATTERS TASK 2 LEFT HOMELESS LANDED BESIDE `formatMoneyCents`.**
+`formatQtyMilli` (1500 -> "1.5") and `formatTaxRateBp` (2100 -> "21%"), both exact
+from the integer via BigInt, both defaulting to `MONEY_LOCALE`, neither able to throw
+-- the same three rules that file already enforces, for the same reason: the form's
+quantity column and the printed page must not disagree. 2,147,483.647 is exact at the
+top of the int4 column, which a `/1000` divide is not.
+
+**10. THE FILLED RENDER TASK 2 DEFERRED NOW HAPPENS HERE.** Two gated tests take the
+real seeded template through the real `buildContext` and the real binary: a filled
+eight-line quote with a `data:` logo is **one page with an image XObject**, and the
+new-install case -- nothing filled in, no logo -- is **one page with none**. Both ran
+on the server's 57.2 and on CI's 61.1.
+
+**MUTATIONS, all run on the server.**
+
+| mutation | fails |
+|---|---|
+| `document.subtotal` renamed to `document.subTotal` | **3 of 32** |
+| the service-side input gate removed (route parse kept) | **7 of 32** |
+| the render slot never acquired | 1 |
+| `RENDER_MAX_CONCURRENCY` tightened to 1 | 2 |
+
+**WHAT TASK 5 INHERITS.**
+
+1. **`issueQuoteInputSchema`, `documentSchema`, `orgProfileSchema` and
+   `DOCUMENT_MAX_LINES`/`DOCUMENT_MAX_DESCRIPTION_CHARS` are in `@conduit/shared`.**
+   The form must parse its text into integer units and reject what does not parse
+   before calling `documentTotals` (Task 2's contract), and the schema is what says
+   what "in range" means on both sides.
+2. **The logo blocker above.** A logo upload has nowhere legal to put its `files` row.
+3. **`formatQtyMilli` and `formatTaxRateBp`** are exported from the barrel, so the
+   running total, the quantity column and the rate column are the same code as the
+   PDF's.
+4. **`GET /api/deals/:id/documents` returns newest first with lines in position
+   order; the PDF downloads from `GET /api/files/:fileId/download`.** There is no
+   update or delete route, and that is the phase's claim rather than an omission.
+5. **`documentTemplateWarnings` is still unused.** Task 3 exported it for the template
+   editor; nothing in this task had a surface for it.
+
+##### THE INTERMITTENT UNIT FAILURE — MEASURED, AND THE NAMED MECHANISM IS FALSIFIED
+
+The full suite failed once during this task, on `mail-sync.test.ts`'s
+exponential-backoff case -- the same test Task 3 round 2 saw. The server was free, so
+the experiment the plan asks for was run.
+
+**The hypothesis as written cannot be the mechanism.** It names `waitFor`'s 10-second
+wall-clock deadline and the `timed out waiting for` label. `vitest.config.ts` sets no
+`testTimeout`, so the default 5000ms fires first, always -- **that label is
+unreachable**, and every sighting's message is vitest's own `Test timed out in
+5000ms`. The plan's "fails with a label rather than an assertion, which is why the
+earlier sightings produced no useful name" is therefore wrong about the label, though
+right that the message is uninformative.
+
+**Nor is it a slowdown.** The test's normal cost is **180-240ms**, which is 4% of its
+budget. When it fails it exceeds 5000ms: a 25x blowout, not a margin being eaten. It
+wedges.
+
+**Measured, `mail-sync.test.ts` alone, twelve runs each:**
+
+| condition | failures |
+|---|---|
+| idle server | **1 of 12** |
+| a second vitest process on the same box | **8 of 12** |
+
+So contention is a strong amplifier -- and the contending load was another vitest,
+which is CPU *and* the shared `conduit_test` database at once, matching "another
+agent's work on the same box". But an idle box still loses one run in twelve, so
+contention is not required and there is a race underneath it. The test drives eight
+backoff cycles through `ManualClock.fire()`, and `wait(ms <= 0)` resolves without
+registering a pending entry -- so a `waitFor(() => clock.pendingCount() > 0)` that
+arrives after the loop has taken that fast path waits forever. That is a hypothesis
+from reading, not a measurement, and it is the shape worth testing next.
+
+**The advice not to raise the timeout stands, and is now stronger**: at 4% of budget,
+a longer timeout only makes the wedge take longer to report.
+
 ---
 
 ### Task 5: The UI — the deal's Documents section and the phone-first line editor
@@ -2174,6 +2420,14 @@ raised.
 ---
 
 ## The intermittent unit failure — a name, and a mechanism
+
+> **THE HYPOTHESIS BELOW WAS TESTED IN TASK 4 AND IS FALSIFIED AS STATED.** `waitFor`'s
+> 10-second deadline is unreachable -- vitest's default 5000ms `testTimeout` fires
+> first and no `vitest.config.ts` raises it -- so the `timed out waiting for` label
+> can never appear, and every sighting's message is vitest's own. Nor is it a
+> slowdown: the case costs 180-240ms normally, 4% of its budget. Twelve runs idle
+> failed once; twelve runs against a second vitest process failed eight times. The
+> section is left as written; the measurements are in Task 4's DONE block.
 
 Three sightings across two phases, all previously unnamed: Phase 6 Task 6 (two
 consecutive runs, `1 failed | 1828 passed`), Phase 7 Task 1, and now Phase 7 Task 3,
