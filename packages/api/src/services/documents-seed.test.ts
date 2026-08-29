@@ -207,6 +207,34 @@ describe("the seeded quote template", () => {
    * is not, whatever the markup looked like. Without a logo there must be none --
    * that is "no broken image on a quote" stated where it is true.
    */
+  it("merges at the largest size that can render, well inside the work budget", () => {
+    // The headroom assertion, against the REAL template rather than a stand-in: 130
+    // line items is the ceiling Task 2's budget arithmetic gives at a 500-character
+    // description, and this context measures 1,656 steps there against a 1,000,000
+    // cap (192 at eight lines). An earlier version of this guard lived in
+    // documents-template.ts's suite against an ad-hoc 787-step template, which was
+    // half the true figure.
+    const many: MergeContext = {
+      ...WITH_LOGO,
+      lines: Array.from({ length: 130 }, (_, i) => ({
+        description: `Consultancy, phase ${String(i + 1)}`,
+        qty: "2", unitPrice: "1,250.00", taxRate: "21%", lineTotal: "2,500.00",
+      })),
+    };
+
+    expect(() => prepareDocumentHtml(seededTemplate(), many)).not.toThrow();
+  });
+
+  it("keeps the footer from splitting across a page break", () => {
+    // The rule, asserted where a careless edit would drop it. What it prevents is the
+    // shape this template shipped with: at six line items the last three footer lines
+    // -- IBAN, VAT, registration -- were stranded alone on page two of every quote
+    // raised from a configured install. Tightening the spacing is what moved the
+    // break itself (see the page counts below); this keeps the block whole when a
+    // long quote does break. WeasyPrint implementing the rule is NOT asserted here.
+    expect(seededTemplate()).toContain("page-break-inside: avoid");
+  });
+
   itReal("renders with a logo and without, and only one of them carries an image", async () => {
     const withoutHtml = prepareDocumentHtml(seededTemplate(), WITHOUT_LOGO);
     const withHtml = prepareDocumentHtml(seededTemplate(), WITH_LOGO);
@@ -221,6 +249,11 @@ describe("the seeded quote template", () => {
 
     expect(without.subarray(0, 5).toString("ascii")).toBe("%PDF-");
     expect(withLogo.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    // ONE PAGE EACH, INCLUDING THE FILLED ONE, and only the empty case was asserted
+    // before: the shipped template put every filled eight-line quote onto two pages
+    // with nothing on the second but the bank and tax lines.
+    expect(pageCount(without)).toBe(1);
+    expect(pageCount(withLogo)).toBe(1);
     expect(pdfHasImage(without)).toBe(false);
     expect(pdfHasImage(withLogo)).toBe(true);
     // A logo is not an attachment, and control 3 must not think it is.

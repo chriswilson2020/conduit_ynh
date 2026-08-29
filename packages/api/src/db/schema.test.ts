@@ -1369,13 +1369,14 @@ describe("documents schema (0009)", () => {
       expect(body).toContain("@page");
       expect(body).toContain("white-space: pre-line");
       // Rendered on the server (WeasyPrint 57.2) through the shipped renderPdf,
-      // most recently after Task 3 wrapped the logo and every optional field in
-      // conditional blocks: with a logo and everything filled in, 4,073 chars of
-      // merged HTML and a two-page PDF of 16,640 bytes -- 16,641 on the next run,
-      // because the renderer is not byte-reproducible (Task 1); with no logo and nothing
-      // optional filled in, 3,445 chars and a 14,383-byte one-page PDF carrying
-      // no image XObject at all. documents-seed.test.ts is where those two
-      // renders happen on every push, and it prints the figures.
+      // most recently after the spacing was tightened to stop the footer stranding
+      // itself on page two: with a logo and everything filled in, 4,101 chars of
+      // merged HTML and a ONE-page 16,117-byte PDF; with no logo and nothing
+      // optional filled in, 3,473 chars and a 14,381-byte one-page PDF carrying no
+      // image XObject at all. Byte counts move by one or two between runs -- the
+      // renderer is not reproducible (Task 1) -- and page counts do not.
+      // documents-seed.test.ts is where those two renders happen on every push, and
+      // it prints the figures.
 
       // The hand-written index, ON A DATABASE THIS TEST MIGRATED FROM THE
       // FILES -- 0005's and 0008's reason: it exists in no drizzle snapshot,

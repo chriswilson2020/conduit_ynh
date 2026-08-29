@@ -57,12 +57,28 @@ const ALLOWED_ATTRIBUTES: Record<string, string[]> = {
  * cannot arrive, so this is the guard that holds if a later phase adds `poster` or
  * `background` for a legitimate reason: the URL rule applies to the attribute by
  * name, not to the one place somebody remembered to check.
+ *
+ * `srcset` is the one where this guard is NOT what decides. sanitize-html parses the
+ * candidate list itself and scheme-checks each URL in it, after this transform has
+ * seen the raw attribute value; both refuse a remote candidate, and the library's
+ * parser is the one that handles a multi-candidate list correctly.
  */
 const URL_ATTRIBUTES = new Set([
   "src", "href", "srcset", "imagesrcset", "background", "poster", "data", "action",
   "formaction", "cite", "longdesc", "usemap", "codebase", "classid", "archive",
   "profile", "manifest", "itemid", "ping", "dynsrc", "lowsrc", "xlink:href",
 ]);
+
+/**
+ * The attributes a `data:` URI may appear in: the ones a renderer FETCHES.
+ *
+ * Enumerated, so that the default for anything else is the restrictive position. It
+ * was the other way round -- `href` was the only "link" and everything else fell
+ * through to "fetch" -- which meant that adding, say, `xlink:href` to an element's
+ * allowlist would have granted `data:` on a link without anybody choosing that. The
+ * permissive branch is the one that should have to be named.
+ */
+const FETCH_ATTRIBUTES = new Set(["src", "srcset", "imagesrcset", "poster", "background"]);
 
 /**
  * `rel="noopener attachment"` counts. The value is a space-separated token list.
@@ -427,10 +443,11 @@ export function sanitizeDocumentHtml(html: string): string {
         for (const [name, value] of Object.entries(attribs)) {
           const lower = name.toLowerCase();
           if (lower === "rel" && REL_ATTACHMENT.test(value)) continue;
-          // An href is a link and every other URL attribute is a fetch. Keyed on the
-          // attribute rather than on the tag, because `href` is only ever on an `a`
-          // in this profile and a tag test would be a second thing to keep in step.
-          const position: UrlPosition = lower === "href" ? "link" : "fetch";
+          // Keyed on the attribute rather than on the tag, because `href` is only
+          // ever on an `a` in this profile and a tag test would be a second thing to
+          // keep in step. Anything not named as a fetch is a link, which is the
+          // narrower of the two.
+          const position: UrlPosition = FETCH_ATTRIBUTES.has(lower) ? "fetch" : "link";
           if (URL_ATTRIBUTES.has(lower) && !isPermittedUrl(value, position)) continue;
           if (lower === "style") {
             const css = sanitizeCss(value);
@@ -457,7 +474,11 @@ export function sanitizeDocumentHtml(html: string): string {
     // Fail closed. Nothing above can produce this -- every removal leaves a space --
     // but a stylesheet that closes its own element is worth losing rather than
     // shipping, because everything after it would be parsed as live markup.
-    if (/<\/style/i.test(safe)) return "";
+    //
+    // The terminator is part of the needle for the same reason it is part of
+    // endsRawText: `</styles>` is ordinary text to a parser, and matching it here
+    // deleted an entire legitimate stylesheet without a word.
+    if (/<\/style[\s/>]/i.test(safe)) return "";
     return `${open}${safe}${close}`;
   });
 }
@@ -505,11 +526,19 @@ export class TemplateError extends Error {
  * body emits nothing never touches it.
  *
  * Measured on the server, all with twenty line items and a body that emits nothing:
- * depths 6, 9, 12 and 20 now stop in 50-79ms, and a body holding one unknown field
- * stops in 288-329ms (the same steps, more lookup per step). The seeded template
- * merges in 1,612 steps at 130 line items -- the largest quote that can render at
- * all -- and 148 at eight, so a million is nearly three orders of magnitude of
- * headroom and the abort is still a third of a second at its slowest.
+ * depths 6, 9, 12 and 20 stop in 50-79ms, and a body holding one unknown field stops
+ * in 288-329ms.
+ *
+ * THAT 5x SWING AT THE SAME STEP COUNT WAS A HOLE, AND THIS COMMENT ONCE READ IT AS
+ * NOISE. A step must cost a bounded amount or counting steps bounds nothing: with the
+ * path split on every visit, three blocks over 130 line items took 31 seconds at
+ * 5,000 path segments and 139 at 20,000, each ending in a tidy TemplateError. The
+ * paths are split once at parse time now and the same matrix is 99ms, 94ms and 79ms
+ * -- flat in path length, which is the property.
+ *
+ * The seeded template with every field filled in merges in 1,656 steps at 130 line
+ * items -- the largest quote that can render at all -- and 192 at eight, so a million
+ * is nearly three orders of magnitude of headroom.
  *
  * MERGE_MAX_DEPTH bounds the RECURSION, which is a different failure: `render`
  * descends once per nesting level, and a few thousand levels is a RangeError out of
@@ -525,10 +554,19 @@ export const MERGE_MAX_STEPS = 1_000_000;
 export const MERGE_MAX_DEPTH = 32;
 export const MERGE_MAX_OUTPUT_CHARS = 512 * 1024;
 
+/**
+ * `segments` is the dotted path already split, and that is a BOUND rather than a
+ * micro-optimisation. `spend()` charges one step whatever a step costs, so anything
+ * linear inside a step is an unbounded multiplier on the budget: splitting the path
+ * on every visit made three nested blocks over 130 line items take 139 SECONDS of
+ * frozen event loop for a 40KB template -- and then reported a clean TemplateError,
+ * which is worse than the original runaway because it looks handled. Split once, at
+ * parse time, where the cost is linear in the template and paid exactly once.
+ */
 type Node =
   | { kind: "text"; text: string }
-  | { kind: "field"; path: string }
-  | { kind: "section"; path: string; inverted: boolean; body: Node[] };
+  | { kind: "field"; segments: string[] }
+  | { kind: "section"; path: string; segments: string[]; inverted: boolean; body: Node[] };
 
 /** `{{ #org.vatNumber }}` -- an optional sigil and a dotted path, nothing else. */
 const TAG = /^\s*([#^/]?)\s*([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)\s*$/;
@@ -566,23 +604,44 @@ const TAG = /^\s*([#^/]?)\s*([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)\s*$/;
  * It is also linear: a lazy quantifier plus a backreference over a 128KB template is
  * a rescan from every `{{` in the file.
  */
-function cssRegions(template: string): { from: number; to: number }[] {
-  const regions: { from: number; to: number }[] = [];
+/**
+ * `</style` is only an end tag when what follows it is `>`, `/` or whitespace.
+ *
+ * HTML's raw-text rule, and getting it wrong was a defect in BOTH directions rather
+ * than the harmless one an earlier comment here claimed. `</styles>` is ordinary text
+ * to the parser and was end-of-region to this scanner, so a merge field after it was
+ * substituted into live CSS; and the same needle in sanitizeDocumentHtml's fail-closed
+ * check deleted an entire legitimate stylesheet in silence.
+ */
+function endsRawText(template: string, at: number): boolean {
+  const after = template[at + "</style".length];
+  return after === ">" || after === "/" || (after !== undefined && /\s/.test(after));
+}
+
+function cssRegions(template: string): { from: number; to: number; terminated: boolean }[] {
+  const regions: { from: number; to: number; terminated: boolean }[] = [];
   const lower = template.toLowerCase();
   const open = /<style\b[^>]*>/gi;
   for (;;) {
     const match = open.exec(template);
     if (match === null) break;
     const from = match.index + match[0].length;
-    const close = lower.indexOf("</style", from);
+
+    let close = lower.indexOf("</style", from);
+    while (close !== -1 && !endsRawText(template, close)) {
+      close = lower.indexOf("</style", close + 1);
+    }
     const to = close === -1 ? template.length : close;
-    regions.push({ from, to });
+    regions.push({ from, to, terminated: close !== -1 });
     open.lastIndex = to;
   }
   return regions;
 }
 
-function parse(template: string): Node[] {
+interface Parsed { nodes: Node[]; warnings: string[] }
+
+function parse(template: string): Parsed {
+  const warnings: string[] = [];
   // WHAT IS INSIDE A <style> BLOCK IS NOT MERGED AT ALL, and that is a refusal rather
   // than an omission. HTML escaping is escaping for one context and CSS is another
   // one, so every direction is wrong there: a value with a quote in it becomes
@@ -593,15 +652,23 @@ function parse(template: string): Node[] {
   // author sees their `{{...}}` sitting in the stylesheet rather than a silent
   // half-broken rule. The seeded template has no field in its CSS and a test says so.
   //
-  // The region scan is the raw-text rule htmlparser2 uses: a `<style ...>` runs to the
-  // first `</style`. It can only err by treating a field as CSS when it is not (a
-  // literal `<style>` inside an attribute value would do it), which leaves a token
-  // unrendered -- the harmless direction.
+  // The region scan is htmlparser2's raw-text rule, `</style` plus a terminator (see
+  // endsRawText). It still errs where a literal `<style>` sits inside an attribute
+  // value, which treats a field as CSS when it is not and leaves the token
+  // unrendered. THAT direction is the harmless one; an earlier version of this
+  // comment claimed it was the only one available, and it was not -- ending the
+  // region at `</styles>` put a field back into live CSS. documentTemplateWarnings
+  // exists so neither direction is silent.
   const css = cssRegions(template);
   const inCss = (at: number): boolean => css.some((r) => at >= r.from && at < r.to);
+  for (const region of css) {
+    if (!region.terminated) {
+      warnings.push("a <style> element is never closed; every merge field after it is left unresolved");
+    }
+  }
 
   const root: Node[] = [];
-  const open: { path: string; inverted: boolean; body: Node[] }[] = [];
+  const open: { path: string; segments: string[]; inverted: boolean; body: Node[] }[] = [];
   const current = (): Node[] => open.length === 0 ? root : open[open.length - 1]!.body;
 
   let i = 0;
@@ -617,7 +684,13 @@ function parse(template: string): Node[] {
     if (end === -1) break;
 
     const tag = TAG.exec(template.slice(start + 2, end));
-    if (tag === null || inCss(start)) { i = start + 2; continue; }
+    if (tag === null || inCss(start)) {
+      if (tag !== null) {
+        warnings.push(`${template.slice(start, end + 2)} is inside a <style> block, where merge fields are not resolved`);
+      }
+      i = start + 2;
+      continue;
+    }
     const [, sigil, path] = tag as unknown as [string, string, string];
 
     flush(start);
@@ -625,25 +698,40 @@ function parse(template: string): Node[] {
     i = end + 2;
 
     if (sigil === "") {
-      current().push({ kind: "field", path });
+      current().push({ kind: "field", segments: path.split(".") });
     } else if (sigil === "/") {
       if (open.length > 0 && open[open.length - 1]!.path === path) {
         const frame = open.pop()!;
-        current().push({ kind: "section", path: frame.path, inverted: frame.inverted, body: frame.body });
+        current().push({
+          kind: "section", path: frame.path, segments: frame.segments,
+          inverted: frame.inverted, body: frame.body,
+        });
+      } else {
+        warnings.push(`{{/${path}}} closes nothing and is ignored`);
       }
     } else {
-      open.push({ path, inverted: sigil === "^", body: [] });
+      open.push({ path, segments: path.split("."), inverted: sigil === "^", body: [] });
     }
   }
   flush(template.length);
 
   // Unwind whatever was never closed, innermost first: the block is forgotten and
   // its body joins its parent.
+  //
+  // A LOOP, NOT A SPREAD, and the spread was a `RangeError` waiting in the one case
+  // this module promises is safe. `push(...frame.body)` passes every node as an
+  // argument, and V8 stops at about 124,000 of them: `"{{#lines}}" + "{{a}}x"
+  // repeated 62,153 times` -- a 364KB template with a missing closer -- threw
+  // "Maximum call stack size exceeded" out of the parser, before any of the three
+  // bounds could see it. S3 fixed exactly this failure class in `render` and left it
+  // here.
   while (open.length > 0) {
     const frame = open.pop()!;
-    current().push(...frame.body);
+    warnings.push(`{{#${frame.path}}} is never closed; its contents render as ordinary text`);
+    const parent = current();
+    for (const node of frame.body) parent.push(node);
   }
-  return root;
+  return { nodes: root, warnings };
 }
 
 function isBag(value: unknown): value is Record<string, unknown> {
@@ -665,8 +753,8 @@ function hasOwn(bag: object, key: string): boolean {
  * is not a tag and prints as literal text. An earlier version of this comment claimed
  * it was blank, which was wrong about which mechanism handled it.
  */
-function lookup(scopes: unknown[], path: string): unknown {
-  const [head, ...rest] = path.split(".") as [string, ...string[]];
+function lookup(scopes: unknown[], segments: string[]): unknown {
+  const head = segments[0]!;
 
   let value: unknown;
   let found = false;
@@ -680,7 +768,8 @@ function lookup(scopes: unknown[], path: string): unknown {
   }
   if (!found) return undefined;
 
-  for (const key of rest) {
+  for (let k = 1; k < segments.length; k += 1) {
+    const key = segments[k]!;
     if (!isBag(value) || !hasOwn(value, key)) return undefined;
     value = value[key];
   }
@@ -768,12 +857,12 @@ function render(nodes: Node[], scopes: unknown[], sink: Sink, depth: number): vo
       continue;
     }
     if (node.kind === "field") {
-      const value = lookup(scopes, node.path);
+      const value = lookup(scopes, node.segments);
       emit(sink, typeof value === "string" ? escapeHtml(value) : "");
       continue;
     }
 
-    const value = lookup(scopes, node.path);
+    const value = lookup(scopes, node.segments);
     if (node.inverted) {
       if (isEmpty(value)) {
         spend(sink);
@@ -825,8 +914,29 @@ function render(nodes: Node[], scopes: unknown[], sink: Sink, depth: number): vo
  */
 export function mergeTemplate(template: string, context: MergeContext): string {
   const sink: Sink = { parts: [], length: 0, steps: 0 };
-  render(parse(template), [context], sink, 0);
+  render(parse(template).nodes, [context], sink, 0);
   return sink.parts.join("");
+}
+
+/**
+ * Everything this module does SILENTLY to a template, said out loud, for the editor
+ * that Task 5 puts in Settings.
+ *
+ * Each of these is a template that renders without complaint and is not what its
+ * author meant. `{{org.brandColour}}` in a stylesheet -- a reasonable thing to want
+ * -- prints its own braces into the CSS; a `<style>` somebody never closed (including
+ * one inside an HTML comment) swallows every merge field after it; an unclosed block
+ * quietly stops being a block. None of them can throw, because a template being
+ * edited is half-written by definition, and none of them should be invisible either.
+ *
+ * A narrow allowance for CSS fields is NOT implemented and is worth a decision rather
+ * than a patch: substituting a value into CSS safely means CSS escaping and a value
+ * shape to check it against (a colour, a length), which is a validated-field feature
+ * rather than a merge feature. Until somebody wants it, this says why nothing
+ * happened.
+ */
+export function documentTemplateWarnings(template: string): string[] {
+  return parse(template).warnings;
 }
 
 /**

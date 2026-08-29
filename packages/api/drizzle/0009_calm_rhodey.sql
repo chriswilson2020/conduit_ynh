@@ -172,26 +172,26 @@ CREATE INDEX "documents_deal_idx" ON "documents" ("deal_id");--> statement-break
 INSERT INTO "document_templates" ("type", "body_html") VALUES ('quote', '<style>
 @page { size: A4; margin: 18mm 16mm 24mm; }
 @page { @bottom-center { content: "Page " counter(page) " of " counter(pages); font-family: sans-serif; font-size: 8pt; color: #888; } }
-body { font-family: sans-serif; font-size: 10.5pt; line-height: 1.45; color: #111; }
-h1 { font-size: 20pt; margin: 6mm 0 3mm; }
+body { font-family: sans-serif; font-size: 10.5pt; line-height: 1.4; color: #111; }
+h1 { font-size: 18pt; margin: 5mm 0 3mm; }
 .pre { white-space: pre-line; }
 .muted { color: #666; }
-.logo { margin-bottom: 4mm; }
-.logo img { max-height: 18mm; max-width: 60mm; }
+.logo { margin-bottom: 3mm; }
+.logo img { max-height: 14mm; max-width: 60mm; }
 .right { text-align: right; }
 .label { font-size: 8.5pt; text-transform: uppercase; color: #666; }
-.party { margin-top: 7mm; }
+.party { margin-top: 6mm; }
 table.meta td { padding: 0 6mm 0 0; }
-table.lines { width: 100%; border-collapse: collapse; margin-top: 9mm; }
+table.lines { width: 100%; border-collapse: collapse; margin-top: 7mm; }
 table.lines th { text-align: left; font-size: 8.5pt; text-transform: uppercase; color: #666; border-bottom: 0.4mm solid #111; padding: 0 0 1.5mm; }
 table.lines th.right { text-align: right; }
-table.lines td { padding: 2mm 0; border-bottom: 0.2mm solid #ddd; vertical-align: top; }
+table.lines td { padding: 1.6mm 0; border-bottom: 0.2mm solid #ddd; vertical-align: top; }
 table.lines td.right { padding-left: 4mm; }
-table.totals { margin-top: 5mm; margin-left: auto; }
+table.totals { margin-top: 4mm; margin-left: auto; }
 table.totals td { padding: 1mm 0 1mm 10mm; }
 table.totals tr.grand td { border-top: 0.4mm solid #111; font-size: 12pt; padding-top: 2mm; }
-.foot { margin-top: 12mm; font-size: 9pt; }
-.foot div { margin-top: 2mm; }
+.foot { margin-top: 7mm; font-size: 9pt; page-break-inside: avoid; }
+.foot div { margin-top: 1.5mm; }
 </style>
 <div>
 {{#org.logoDataUri}}<div class="logo"><img src="{{org.logoDataUri}}" alt=""></div>{{/org.logoDataUri}}

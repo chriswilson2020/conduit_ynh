@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { pdfText } from "../test/pdf.js";
 import { renderPdf, weasyprintAvailable } from "./documents-render.js";
 import {
+  documentTemplateWarnings,
   MERGE_MAX_DEPTH,
   MERGE_MAX_OUTPUT_CHARS,
   MERGE_MAX_STEPS,
@@ -648,6 +649,13 @@ describe("mergeTemplate and blocks inside blocks", () => {
   }));
 
   const NON_EMITTING: { name: string; body: string; depth: number }[] = [
+    // DEPTH 5 IS HERE TO MAKE A MISSING BUDGET FAIL RATHER THAN HANG. Every other
+    // row is astronomically over budget, so with the budget removed they run for
+    // hours and take the CI job's 20-minute timeout with them, unattributed. Depth 5
+    // over twenty lines is 3.2e6 expansions: over the budget, so it throws here, and
+    // 72ms without it, so the mutation fails `toThrow` by name.
+    { name: "an empty body", body: "", depth: 5 },
+    { name: "an empty body", body: "", depth: 6 },
     { name: "an empty body", body: "", depth: 12 },
     { name: "a body holding only an unknown field", body: "{{nope.nope}}", depth: 9 },
     { name: "a body holding only an empty field", body: "{{org.vatNumber}}", depth: 9 },
@@ -663,12 +671,53 @@ describe("mergeTemplate and blocks inside blocks", () => {
     }, 2000);
   }
 
+  /**
+   * A STEP MUST COST A BOUNDED AMOUNT, OR COUNTING STEPS BOUNDS NOTHING.
+   *
+   * `lookup` split the dotted path on every visit, so the work in one step was linear
+   * in the path's length and a 1,000,000-step budget bought an unbounded amount of
+   * it. Three blocks over 130 line items, measured before the fix: a 5,000-segment
+   * path took 31 seconds and a 20,000-segment one -- a 39KB template -- took 139,
+   * each ending in a clean TemplateError, which is worse than the original runaway
+   * because it looks handled. `body_html` has no length CHECK, so a 1MB template
+   * extrapolated to about 55 minutes.
+   *
+   * The path is split once at parse time now, and the same three cases measure 99ms,
+   * 94ms and 79ms -- flat in path length. The timeout is what fails if that
+   * regresses.
+   */
+  for (const segments of [1, 5_000, 20_000]) {
+    it(`spends a bounded amount per step on a ${String(segments)}-segment path`, () => {
+      const path = ["org", ...Array.from({ length: segments - 1 }, () => "x")].join(".");
+      const nested = "{{#lines}}".repeat(3) + `{{${path}}}` + "{{/lines}}".repeat(3);
+      // 130 lines, three deep: 2.2e6 expansions, so the budget stops it either way.
+      // What the timeout is watching is how long those million steps TAKE.
+      const lines = Array.from({ length: 130 }, () => TWENTY_LINES[0]!);
+
+      expect(() => mergeTemplate(nested, { ...CONTEXT, lines })).toThrow(TemplateError);
+    }, 2000);
+  }
+
   it("stops a nest whose body DOES emit, which is what the output cap is for", () => {
     const nested = "{{#lines}}".repeat(7) + "{{description}}" + "{{/lines}}".repeat(7);
 
     expect(() => mergeTemplate(nested, { ...CONTEXT, lines: TWENTY_LINES }))
       .toThrow(TemplateError);
   }, 2000);
+
+  it("parses an unclosed block with 124,306 nodes in it without a RangeError", () => {
+    // The spread in the parser's unwind passed every node as a call argument, and V8
+    // stops at about 124,000 of them. The shape is the plainest typo this module
+    // claims to handle -- a block somebody forgot to close -- in a 364KB template,
+    // and it threw out of the parser before any of the three bounds could see it.
+    const template = "{{#lines}}" + "{{a}}x".repeat(62_153);
+    const error = ((): unknown => {
+      try { mergeTemplate(template, CONTEXT); return null; } catch (e: unknown) { return e; }
+    })();
+
+    expect(error).toBeNull();
+    expect(mergeTemplate(template, CONTEXT)).toBe("x".repeat(62_153));
+  }, 10_000);
 
   it("throws a TemplateError rather than a RangeError when a template nests thousands deep", () => {
     // `render` descends once per level, so without a depth bound this is the
@@ -684,10 +733,12 @@ describe("mergeTemplate and blocks inside blocks", () => {
     expect((error as TemplateError).message).toContain("nested");
   }, 5000);
 
-  it("does not bite a real document, which is the other half of a bound", () => {
+  it("does not bite a document shaped like a real one, which is the other half of a bound", () => {
     // 130 line items is the ceiling Task 2's budget arithmetic gives at a 500-char
     // description, so this is the largest quote that can render at all. A bound that
-    // stopped it would be a bug of the opposite kind.
+    // stopped it would be a bug of the opposite kind. The SEEDED template at that
+    // size is asserted in documents-seed.test.ts, against the real thing: 1,656 steps
+    // with every field filled in, against a 1,000,000 cap.
     const lines = Array.from({ length: 130 }, (_, i) => ({
       description: `Consultancy, phase ${String(i)}`,
       qty: "2", unitPrice: "1,250.00", taxRate: "21%", lineTotal: "2,500.00",
@@ -700,8 +751,10 @@ describe("mergeTemplate and blocks inside blocks", () => {
 
   it("has bounds far above any real document, and one on the stack", () => {
     // None of these is a document-size limit -- renderPdf's 128KB input cap is that.
-    // They are runaway-expansion limits: the seeded template measured 1,612 steps at
-    // 130 line items, which is the largest quote that can render at all.
+    // They are runaway-expansion limits. The headroom is asserted against the REAL
+    // seeded template in documents-seed.test.ts, which is the only place that has it;
+    // an earlier version of this test used an ad-hoc 787-step stand-in and guarded
+    // half the true figure.
     expect(MERGE_MAX_OUTPUT_CHARS).toBeGreaterThan(128 * 1024);
     expect(MERGE_MAX_STEPS).toBeGreaterThan(100_000);
     expect(MERGE_MAX_DEPTH).toBeGreaterThan(8);
@@ -747,6 +800,49 @@ describe("mergeTemplate and a template somebody typed wrong", () => {
   });
 });
 
+// --------------------------------------------------------------- what is silent
+
+/**
+ * EVERYTHING THIS MODULE DOES QUIETLY, SAID OUT LOUD.
+ *
+ * Each of these renders without complaint and is not what the author meant, and
+ * `{{org.brandColour}}` in a stylesheet is the one somebody will actually write. The
+ * warnings are for Task 5's editor: they cannot throw, because a template being
+ * edited is half-written by definition.
+ */
+describe("documentTemplateWarnings", () => {
+  it("says nothing about a template that is fine", () => {
+    expect(documentTemplateWarnings(
+      "<style>@page { size: A4; }</style><h1>{{document.number}}</h1>" +
+        "{{#lines}}{{description}}{{/lines}}{{^lines}}none{{/lines}}",
+    )).toEqual([]);
+  });
+
+  it("names a merge field left unresolved inside a <style> block", () => {
+    const warnings = documentTemplateWarnings("<style>body { color: {{org.brandColour}} }</style>");
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("{{org.brandColour}}");
+    expect(warnings[0]).toContain("<style>");
+  });
+
+  it("names an unclosed <style>, which swallows every field after it", () => {
+    // Including one inside an HTML comment, which is where this is least obvious.
+    const warnings = documentTemplateWarnings("<!-- <style> --><p>{{org.name}}</p>");
+
+    expect(warnings.some((w) => w.includes("never closed"))).toBe(true);
+  });
+
+  it("names an unclosed block and a closer that closes nothing", () => {
+    expect(documentTemplateWarnings("{{#org.vatNumber}}VAT")[0]).toContain("{{#org.vatNumber}}");
+    expect(documentTemplateWarnings("{{/lines}}")[0]).toContain("{{/lines}}");
+  });
+
+  it("says nothing about a typo, because a blank is the defined answer there", () => {
+    expect(documentTemplateWarnings("{{document.nope}} {{ oops }}")).toEqual([]);
+  });
+});
+
 // ------------------------------------------------------------------ the order
 
 describe("prepareDocumentHtml merges first and sanitises last", () => {
@@ -784,12 +880,21 @@ describe("prepareDocumentHtml merges first and sanitises last", () => {
    * looked at.
    */
   it("catches a URL a value smuggled into a CSS context, which escaping cannot", () => {
-    // THE SHARP CASE, and it is sharp because HTML escaping LOOKS like it should have
-    // covered it. The style attribute is the one CSS context a merged value still
-    // reaches (a <style> block is not merged at all), and a value landing inside a
-    // url() gets its quote escaped to `&quot;` -- which the HTML parser hands back to
-    // the CSS parser as a real quote. So the escape does not contain the value; it
-    // travels through the attribute and closes the url() from the inside.
+    // THE ORDER MUTATION DETECTOR, and its claim is narrower than it looks. What is
+    // proved: `&quot;` IS handed back to the CSS parser as a real quote, so the
+    // escape does not contain the value -- it travels through the attribute and
+    // closes the url() from the inside -- and the wrong order leaves
+    // `url(file:///etc/passwd)` sitting in the finished document where nothing has
+    // looked at it.
+    //
+    // What is NOT proved, and was claimed here before a reviewer measured it: that
+    // the survivor gets FETCHED. It does not on 57.2 -- the injected declaration is
+    // not live -- and in the shipped order the attribute disappears because postcss
+    // fails to parse the braces, not because sanitizeCss removed the URL (it removes
+    // it too, first). No payload has yet been found where the wrong order produces an
+    // actual fetch: surviving template-time sanitisation means hiding behind `data:`,
+    // and getting out of a `data:` url() needs a quote break that leaves the CSS
+    // invalid. The test earns its place as an order detector, not as an exploit.
     const template = '<div style="background: url(data:image/png;base64,{{document.notes}})">x</div>';
     const evil = withDocument({ notes: 'x")} body{background:url(file:///etc/passwd)} p{a:("' });
 
@@ -848,6 +953,33 @@ describe("prepareDocumentHtml merges first and sanitises last", () => {
       expect(html).toContain("{{org.name}}");
       expect(html).toContain("Listerdale");
     }
+  });
+
+  it("ends a style region only where HTML ends one, which is not at </styles>", () => {
+    // `</styles>` is TEXT to a parser, so everything after it is still CSS. Ending
+    // the region there put the field back into a live stylesheet -- the direction an
+    // earlier comment called impossible.
+    for (const fake of ["</styles>", "</stylex", "</style-a>"]) {
+      const merged = mergeTemplate(`<style>a{b:c}${fake} body{color:{{org.name}}}</style>`, CONTEXT);
+      expect(merged).toContain("{{org.name}}");
+      expect(merged).not.toContain("Listerdale");
+    }
+
+    // ...and the real end tag still ends it, in each of its three spellings.
+    for (const real of ["</style>", "</style ", "</style/"]) {
+      const merged = mergeTemplate(`<style>a{b:c}${real} {{org.name}}`, CONTEXT);
+      expect(merged).toContain("Listerdale");
+    }
+  });
+
+  it("does not delete a whole stylesheet over a </styles> sitting in its text", () => {
+    // The other half of the same mistake: the fail-closed check in
+    // sanitizeDocumentHtml used the same loose needle, so one such token anywhere in
+    // a stylesheet silently took the entire <style> element with it.
+    const html = sanitizeDocumentHtml('<style>a{content:"</styles>"} p{color:#111}</style>');
+
+    expect(html).toContain("color:#111");
+    expect(html).toContain("<style>");
   });
 
   it("leaves an ordinary quote looking like itself", () => {
