@@ -1,6 +1,7 @@
 import type { ComponentPropsWithoutRef, ReactNode } from "react";
 import * as RadixDialog from "@radix-ui/react-dialog";
 import { clsx } from "clsx";
+import { overridableClass } from "../../lib";
 
 export const Dialog = RadixDialog.Root;
 export const DialogTrigger = RadixDialog.Trigger;
@@ -64,7 +65,10 @@ const SHAPES = {
    * viewport under it and takes the fields with it.
    */
   dialog: clsx(
-    "fixed left-1/2 top-1/2 w-full max-w-md -translate-x-1/2 -translate-y-1/2",
+    // NO `max-w-` HERE. The default lives in DialogContent and is applied only
+    // when the caller sets none -- see overridableClass in src/lib.ts for why a
+    // hard-coded one here silently beat every caller's.
+    "fixed left-1/2 top-1/2 w-full -translate-x-1/2 -translate-y-1/2",
     "rounded-lg bg-white p-6 shadow-lg focus:outline-none",
     "max-md:bottom-0 max-md:left-0 max-md:right-0 max-md:top-0 max-md:max-h-none max-md:max-w-none",
     "max-md:translate-x-0 max-md:translate-y-0 max-md:overflow-y-auto max-md:rounded-none",
@@ -153,9 +157,16 @@ function Overlaid({
  * will open focused here. Give it one, or pass `onOpenAutoFocus` (the whole of
  * Radix's Content props are forwarded) and focus what the dialog is for.
  */
-export function DialogContent({ children, ...rest }: ContentProps) {
+/** The desktop card's width when a caller does not choose one. */
+const DIALOG_DEFAULT_MAX_WIDTH = "max-w-md";
+
+export function DialogContent({ children, className, ...rest }: ContentProps) {
   return (
-    <Overlaid shape="dialog" {...rest}>
+    <Overlaid
+      shape="dialog"
+      className={clsx(overridableClass(DIALOG_DEFAULT_MAX_WIDTH, "max-w-", className), className)}
+      {...rest}
+    >
       <div className="mb-2 flex justify-end md:hidden">
         <RadixDialog.Close
           data-testid="dialog-close"

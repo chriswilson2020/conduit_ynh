@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import {
-  MAX_LOGO_BYTES, ORG_PROFILE_RESERVE_BYTES, logoDataUriProblem, orgProfileBytes,
+  MAX_LOGO_BYTES, ORG_PROFILE_FIELD_CAPS, ORG_PROFILE_RESERVE_BYTES,
+  logoDataUriProblem, orgProfileBytes,
 } from "@conduit/shared";
 import type { OrgProfileInput } from "@conduit/shared";
 import { useOrgProfile, useSaveOrgProfile } from "../queries";
@@ -64,12 +65,23 @@ export function SettingsOrgPage() {
   const [form, setForm] = useState<OrgProfileInput>(EMPTY);
   const [logoProblem, setLogoProblem] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const seeded = useRef(false);
 
-  // The server's row is the initial value, once. Not a controlled mirror of the
-  // query: re-seeding on every refetch would overwrite what somebody is typing,
-  // which is the bug the mail settings page's own form avoids the same way.
+  /**
+   * The server's row is the initial value, ONCE, and the ref is what makes that
+   * true rather than merely intended.
+   *
+   * The first version of this said the same thing with the same comment and did
+   * not do it: the effect depends on `profile`, which is a fresh object every
+   * time the query resolves, so any refetch -- a window refocus is enough --
+   * re-ran the body and overwrote the form. It was invisible because TanStack's
+   * structural sharing hands back the SAME object when the bytes have not
+   * changed, so it only bit when someone else had edited the profile, which is
+   * exactly when clobbering an in-progress edit is worst.
+   */
   useEffect(() => {
-    if (profile === undefined) return;
+    if (profile === undefined || seeded.current) return;
+    seeded.current = true;
     setForm({
       name: profile.name, addressLines: profile.addressLines, vatNumber: profile.vatNumber,
       registrationNumber: profile.registrationNumber, email: profile.email, phone: profile.phone,
@@ -142,7 +154,7 @@ export function SettingsOrgPage() {
           Name
           <Input
             value={form.name}
-            maxLength={200}
+            maxLength={ORG_PROFILE_FIELD_CAPS.name}
             disabled={pending}
             data-testid="org-name"
             onChange={(event) => patch({ name: event.target.value })}
@@ -153,7 +165,7 @@ export function SettingsOrgPage() {
           Address
           <Textarea
             value={form.addressLines}
-            maxLength={2000}
+            maxLength={ORG_PROFILE_FIELD_CAPS.addressLines}
             rows={4}
             disabled={pending}
             data-testid="org-address"
@@ -169,7 +181,7 @@ export function SettingsOrgPage() {
             VAT number
             <Input
               value={form.vatNumber}
-              maxLength={100}
+              maxLength={ORG_PROFILE_FIELD_CAPS.vatNumber}
               disabled={pending}
               data-testid="org-vat"
               onChange={(event) => patch({ vatNumber: event.target.value })}
@@ -179,7 +191,7 @@ export function SettingsOrgPage() {
             Registration number
             <Input
               value={form.registrationNumber}
-              maxLength={100}
+              maxLength={ORG_PROFILE_FIELD_CAPS.registrationNumber}
               disabled={pending}
               data-testid="org-registration"
               onChange={(event) => patch({ registrationNumber: event.target.value })}
@@ -189,7 +201,7 @@ export function SettingsOrgPage() {
             Email
             <Input
               value={form.email}
-              maxLength={200}
+              maxLength={ORG_PROFILE_FIELD_CAPS.email}
               disabled={pending}
               data-testid="org-email"
               onChange={(event) => patch({ email: event.target.value })}
@@ -199,7 +211,7 @@ export function SettingsOrgPage() {
             Phone
             <Input
               value={form.phone}
-              maxLength={100}
+              maxLength={ORG_PROFILE_FIELD_CAPS.phone}
               disabled={pending}
               data-testid="org-phone"
               onChange={(event) => patch({ phone: event.target.value })}
@@ -209,7 +221,7 @@ export function SettingsOrgPage() {
             Website
             <Input
               value={form.website}
-              maxLength={200}
+              maxLength={ORG_PROFILE_FIELD_CAPS.website}
               disabled={pending}
               data-testid="org-website"
               onChange={(event) => patch({ website: event.target.value })}
@@ -221,7 +233,7 @@ export function SettingsOrgPage() {
           Bank details
           <Textarea
             value={form.bankDetails}
-            maxLength={500}
+            maxLength={ORG_PROFILE_FIELD_CAPS.bankDetails}
             rows={3}
             disabled={pending}
             data-testid="org-bank"
@@ -248,8 +260,17 @@ export function SettingsOrgPage() {
               SVG IS NOT OFFERED, and that is a decision rather than an oversight
               of the accept list: it is a document format with its own
               URL-bearing elements, arriving inside a data: URI where neither the
-              document sanitiser nor the renderer's fetcher looks. The server's
-              mime check refuses it too.
+              document sanitiser nor the renderer's fetcher looks.
+
+              THIS ATTRIBUTE IS A CONVENIENCE, NOT A CONTROL, and an earlier
+              version of this comment claimed the server's mime check backed it
+              up -- which was true only of a file honest enough to declare what
+              it was. `accept` filters a file picker and nothing else, and the
+              type that reaches the data: URI comes from `File.type`, which the
+              browser derives from the EXTENSION. An SVG renamed to .png arrived
+              as `data:image/png`, passed every check, and was drawn as vector
+              art by a renderer that sniffs properly. logoDataUriProblem reads
+              the leading bytes now, here and in saveOrgProfile both.
             */}
             <label className="inline-flex min-h-11 cursor-pointer items-center rounded-md border border-slate-300 px-3 py-2 text-sm font-medium text-slate-900 hover:bg-slate-50">
               Choose an image

@@ -4,7 +4,7 @@ import {
 } from "@conduit/shared";
 import {
   QTY_SPEC, TAX_RATE_SPEC, UNIT_PRICE_SPEC,
-  buildIssueQuoteInput, contentBudget, parseUnits, runningTotals, unitsOrZero,
+  buildIssueQuoteInput, contentBudget, describeIssue, parseUnits, runningTotals, unitsOrZero,
 } from "./document-lib";
 import type { DraftLine, DraftQuote } from "./document-lib";
 
@@ -342,5 +342,97 @@ describe("buildIssueQuoteInput", () => {
     const huge = line({ qty: "2147483.647", unitPrice: "90071992547409.91" });
     expect(runningTotals([huge])).toBeNull();
     expect(buildIssueQuoteInput(draft({ lines: [huge] })).ok).toBe(false);
+  });
+});
+
+describe("describeIssue", () => {
+  /**
+   * THE DEFECT: `issue.message` is "Invalid input" for every size and type
+   * failure Zod raises, and the first version of this module mapped straight to
+   * it. The path -- the only part that says WHICH BOX -- was thrown away.
+   *
+   * This is the primary journey, not an edge. deal-detail.tsx defaults the
+   * recipient from the deal's linked company, so ANY deal without one opens with
+   * an empty Recipient; driven in a browser with two valid lines and a total
+   * showing, the entire feedback was ["Invalid input"].
+   */
+  it("names the field a bare Zod message would not", () => {
+    expect(describeIssue({ path: ["recipientName"], message: "Invalid input", code: "too_small", minimum: 1 }))
+      .toBe("Recipient is required.");
+    expect(describeIssue({ path: ["notes"], message: "Invalid input", code: "too_big", maximum: 5000 }))
+      .toBe("Notes is longer than the 5000 characters allowed.");
+  });
+
+  it("names the line and the field for a line-scoped issue", () => {
+    expect(describeIssue({
+      path: ["lines", 1, "description"], message: "Invalid input", code: "too_big", maximum: 250,
+    })).toBe("Line 2 description is longer than the 250 characters allowed.");
+  });
+
+  /**
+   * A custom refinement already writes a good sentence; it just never said which
+   * field it was about. So the message is KEPT and the field is prefixed.
+   */
+  it("keeps a custom refinement's sentence and says which field it is about", () => {
+    expect(describeIssue({
+      path: ["issueDate"], message: "the date must fall in a four-digit year", code: "custom",
+    })).toBe("Issue date: the date must fall in a four-digit year");
+  });
+
+  /**
+   * `lines` with NO index is a claim about the whole set -- the budget, or a
+   * total that cannot be represented -- and those messages say so on their own.
+   * Prefixing them with a field name would make them worse.
+   */
+  it("leaves a whole-form message alone", () => {
+    const budget = "this quote needs 70000 bytes of the 66688 a document may use";
+    expect(describeIssue({ path: ["lines"], message: budget, code: "custom" })).toBe(budget);
+    expect(describeIssue({ path: [], message: budget, code: "custom" })).toBe(budget);
+  });
+
+  /**
+   * THE SIGHTING THAT PRODUCED DUPLICATE REACT KEYS, kept as a test because the
+   * fix for it (keying by index) is only correct while this stays true: two
+   * different fields CAN still produce the same sentence.
+   */
+  it("gives every field its own sentence, so a list of them is readable", () => {
+    const issues = [
+      { path: ["recipientName"], message: "Invalid input", code: "too_small", minimum: 1 },
+      { path: ["issueDate"], message: "Invalid input", code: "invalid_format" },
+    ];
+    const described = issues.map((issue) => describeIssue(issue));
+    expect(described).toEqual(["Recipient is required.", "Issue date: Invalid input"]);
+    expect(new Set(described).size).toBe(2);
+  });
+});
+
+describe("the schema's own refusals, through describeIssue", () => {
+  /**
+   * END TO END rather than over hand-built issues: the real schema, refusing the
+   * real draft the form builds, read back as the sentences a person sees. This
+   * is the assertion that fails if a path stops being carried.
+   */
+  it("says which box is wrong for the states the per-field parse does not cover", () => {
+    const emptyRecipient = buildIssueQuoteInput(draft({ recipientName: "" }));
+    expect(emptyRecipient.ok).toBe(false);
+    if (!emptyRecipient.ok) expect(emptyRecipient.problems).toEqual(["Recipient is required."]);
+
+    const badDate = buildIssueQuoteInput(draft({ issueDate: "0000-01-01" }));
+    expect(badDate.ok).toBe(false);
+    if (!badDate.ok) {
+      expect(badDate.problems.join(" ")).toContain("Issue date");
+      expect(badDate.problems.join(" ")).not.toBe("Invalid input");
+    }
+
+    const longNotes = buildIssueQuoteInput(draft({ notes: "x".repeat(5001) }));
+    expect(longNotes.ok).toBe(false);
+    if (!longNotes.ok) {
+      expect(longNotes.problems).toEqual(["Notes is longer than the 5000 characters allowed."]);
+    }
+
+    // And nothing anywhere is the bare Zod default any more.
+    for (const result of [emptyRecipient, badDate, longNotes]) {
+      if (!result.ok) expect(result.problems).not.toContain("Invalid input");
+    }
   });
 });

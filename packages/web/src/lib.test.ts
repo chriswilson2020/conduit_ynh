@@ -8,6 +8,7 @@ import {
   humanSize,
   identityKey,
   mergeCursorPage,
+  overridableClass,
   parseDecimal,
   relativeTime,
   todayLocalIso,
@@ -247,5 +248,47 @@ describe("cursor page cursors", () => {
     pages = mergeCursorPage(pages, "a", "cursor-1", [row("2")], null);
     expect(cursorForKey(pages, "a")).toBe("cursor-1");
     expect(flattenCursorPages(pages).map((item) => item.id)).toEqual(["1", "2"]);
+  });
+});
+
+describe("overridableClass", () => {
+  /**
+   * THE DEFECT THIS FUNCTION WAS WRITTEN FOR, pinned as a test. ui/dialog.tsx
+   * used to spell `max-w-md` in its own shape and then append the caller's
+   * class, so both were emitted at equal specificity -- and Tailwind sorts
+   * `max-w-*` alphabetically rather than by size, putting `.max-w-md` after
+   * `.max-w-2xl` and `.max-w-3xl`. Measured at 1280 before the fix: a dialog
+   * asking for `max-w-3xl` computed 448px, and all four callers that passed a
+   * width had been inert since the utility was introduced.
+   *
+   * Nothing here can see a stylesheet. What it CAN guarantee is that the
+   * conflict is never created, which is the property the fix rests on: when the
+   * caller sets a class from the family, the default is not emitted at all.
+   */
+  it("yields the default only when the caller sets nothing from that family", () => {
+    expect(overridableClass("max-w-md", "max-w-", undefined)).toBe("max-w-md");
+    expect(overridableClass("max-w-md", "max-w-", "")).toBe("max-w-md");
+    expect(overridableClass("max-w-md", "max-w-", "overflow-y-auto")).toBe("max-w-md");
+  });
+
+  it("stands aside for a caller's own class from that family", () => {
+    expect(overridableClass("max-w-md", "max-w-", "max-w-3xl")).toBe("");
+    expect(overridableClass("max-w-md", "max-w-", "max-h-[85vh] max-w-2xl overflow-y-auto")).toBe("");
+  });
+
+  /**
+   * `max-md:max-w-none` MUST NOT COUNT AS AN OVERRIDE. It is the phone shape's
+   * own class and it has to keep beating whatever width the caller chose --
+   * which it does, because every `max-md` rule is emitted after the base layer.
+   * Treating it as an override would drop the desktop default and leave a
+   * dialog with no card width at a desk.
+   */
+  it("matches whole classes, so a variant-prefixed one is not an override", () => {
+    expect(overridableClass("max-w-md", "max-w-", "max-md:max-w-none")).toBe("max-w-md");
+    expect(overridableClass("max-w-md", "max-w-", "md:max-w-lg")).toBe("max-w-md");
+  });
+
+  it("is not fooled by a class that merely contains the family", () => {
+    expect(overridableClass("max-w-md", "max-w-", "not-max-w-lg")).toBe("max-w-md");
   });
 });

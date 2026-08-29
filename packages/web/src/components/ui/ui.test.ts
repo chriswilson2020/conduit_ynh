@@ -159,16 +159,29 @@ describe("the modal skeleton", () => {
    * wearing half a desktop card, and has to teach the shape a matching
    * override before it gets past here.
    *
-   * DO NOT READ THIS AS "the caller's cap applies at a desk", because two of
-   * the three do not. Tailwind sorts `max-w-*` alphabetically, not by size, so
-   * `.max-w-md` from the shape is emitted AFTER `.max-w-2xl` and `.max-w-3xl`
-   * and wins in the base layer: measured at 1280, a DialogContent carrying
-   * `max-w-3xl` computes `max-width: 448px`. The width caps on composer.tsx,
-   * settings-mail.tsx and settings-templates.tsx are inert at every width.
-   * That is PRE-EXISTING and deliberately not fixed by this phase -- widening
-   * three dialogs is a desktop change -- but nothing here should imply
-   * otherwise. The height caps are a different utility from the shape's and do
-   * apply at a desk.
+   * THE CALLER'S WIDTH CAP NOW APPLIES AT A DESK, and until Phase 7 it did
+   * not. Tailwind sorts `max-w-*` alphabetically rather than by size, so the
+   * `.max-w-md` the shape used to hard-code was emitted AFTER `.max-w-2xl` and
+   * `.max-w-3xl` and beat them in the base layer: measured at 1280, a
+   * DialogContent carrying `max-w-3xl` computed `max-width: 448px`, and the
+   * caps on composer.tsx, settings-mail.tsx, settings-templates.tsx and the
+   * quote form were inert at every width. The previous version of this comment
+   * recorded that accurately and deferred the fix as a desktop change; Phase 7
+   * hit it head-on, because the quote form's six columns overflowed a 448px
+   * dialog by 143px and put its Remove button off-screen -- the same failure
+   * the phone layout exists to avoid.
+   *
+   * THE FIX IS THE ABSENCE OF A CONFLICT, NOT A CASCADE ARGUMENT, which is why
+   * the first assertion below is a NEGATIVE one. The shape no longer spells any
+   * base `max-w-` at all; DialogContent supplies the default through
+   * overridableClass (src/lib.ts) only when the caller has set none, so exactly
+   * one class of that family is ever emitted and stylesheet order has nothing
+   * left to decide. Restore a hard-coded width to the shape and the first
+   * assertion fails.
+   *
+   * `max-md:max-w-none` is deliberately NOT caught by that check and must not
+   * be: it has to keep beating whatever the caller chose, and it does, because
+   * every `max-md` rule is emitted after the whole base layer.
    *
    * WHAT THIS GUARD CANNOT SEE, the same caveat nav-lib.test.ts's two source
    * readers carry: it matches a literal `className="..."` on the element. A
@@ -184,6 +197,22 @@ describe("the modal skeleton", () => {
     expect(shape).toContain("max-md:max-w-none");
     expect(shape).toContain("max-md:max-h-none");
     expect(shape).toContain("max-md:overflow-y-auto");
+
+    // THE ASSERTION THAT MAKES A CALLER'S WIDTH REAL. Every class the shape
+    // spells, with the `max-md:` overrides removed: none of what is left may
+    // be a `max-w-`, or it is emitted alongside the caller's and alphabetical
+    // order picks the winner. Written over the shape's own classes rather than
+    // over the whole file so the default in DialogContent -- which is applied
+    // only in the caller's absence -- is not mistaken for a conflict.
+    const shapeClasses = [...shape.matchAll(/"([^"]*)"/g)]
+      .flatMap((match) => (match[1] ?? "").split(/\s+/))
+      .filter(Boolean)
+      .filter((cls) => !cls.startsWith("max-md:"));
+    expect(shapeClasses.filter((cls) => cls.startsWith("max-w-"))).toEqual([]);
+
+    // And the default still reaches a caller that asks for nothing, or every
+    // dialog in the app loses its card width.
+    expect(dialog).toContain('overridableClass(DIALOG_DEFAULT_MAX_WIDTH, "max-w-", className)');
 
     const tunable = /^(max-w-|max-h-|overflow-|md:)/;
     const offenders: string[] = [];

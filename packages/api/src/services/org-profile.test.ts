@@ -13,9 +13,27 @@ const handle = openTestDatabase();
 beforeEach(async () => { await truncateAll(handle); });
 afterAll(async () => { await handle.close(); });
 
-/** A base64 data: URI whose DECODED length is exactly `bytes`. */
+/**
+ * A base64 data: URI whose DECODED length is exactly `bytes`.
+ *
+ * IT CARRIES A REAL SIGNATURE FOR ITS TYPE, because logoDataUriProblem sniffs the
+ * leading bytes now rather than believing the media type in the prefix -- a
+ * `data:image/png` whose payload is an SVG is exactly the case that check exists
+ * for. Filler still follows, so the decoded length is unchanged and the two size
+ * bounds below are measuring what they always were.
+ */
+const LOGO_MAGIC: Record<string, number[]> = {
+  "image/png": [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+  "image/jpeg": [0xff, 0xd8, 0xff],
+  "image/gif": [0x47, 0x49, 0x46, 0x38, 0x39, 0x61],
+  "image/webp": [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50],
+};
+
 function logoOfBytes(bytes: number, mime = "image/png"): string {
-  return `data:${mime};base64,${Buffer.alloc(bytes, 7).toString("base64")}`;
+  const magic = LOGO_MAGIC[mime] ?? [];
+  const payload = Buffer.alloc(bytes, 7);
+  Buffer.from(magic).copy(payload, 0, 0, Math.min(magic.length, bytes));
+  return `data:${mime};base64,${payload.toString("base64")}`;
 }
 
 function profileInput(overrides: Partial<OrgProfileInput> = {}): OrgProfileInput {
@@ -128,6 +146,35 @@ describe("the logo, which is bytes rather than a file reference", () => {
         .rejects.toBeInstanceOf(OrgProfileInputError);
     }
     expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
+  });
+
+  /**
+   * SVG BYTES WEARING A PNG LABEL, which is what an `image/svg+xml` prefix
+   * becomes the moment somebody renames the file: in a browser the media type
+   * comes from `File.type`, and that is derived from the EXTENSION. Before the
+   * signature check this was accepted, stored, and drawn as vector art in the
+   * PDF by a renderer that sniffs properly -- so the spec's exclusion of SVG was
+   * enforced only against a file honest enough to declare itself.
+   *
+   * It was never exploitable: an SVG carrying `file://` and loopback references
+   * was refused at render with `document referenced a blocked resource` and the
+   * canary's atime never moved. This is the layer in front doing its own job.
+   */
+  it("refuses a payload whose bytes disagree with the type it declares", async () => {
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>');
+    const disguised = `data:image/png;base64,${svg.toString("base64")}`;
+    // It passes every check the prefix regex and the size arithmetic can make.
+    expect(disguised).toMatch(/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/);
+
+    await expect(saveOrgProfile(handle.db, profileInput({ logoDataUri: disguised })))
+      .rejects.toBeInstanceOf(OrgProfileInputError);
+    expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
+
+    // ...and a genuine PNG of the same size is still fine, so what is being
+    // refused is the CONTENTS and not the length.
+    const honest = logoOfBytes(svg.length);
+    expect((await saveOrgProfile(handle.db, profileInput({ logoDataUri: honest }))).logoDataUri)
+      .toBe(honest);
   });
 
   it("accepts every image type the renderer can draw", async () => {

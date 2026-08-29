@@ -1683,6 +1683,69 @@ export const MAX_LOGO_DATA_URI_CHARS = Math.ceil(MAX_LOGO_BYTES / 3) * 4 + LONGE
 
 const LOGO_DATA_URI = /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
 
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/**
+ * The first `wanted` bytes of a base64 payload, decoded by hand.
+ *
+ * BY HAND BECAUSE NEITHER `atob` NOR `Buffer` IS AVAILABLE IN BOTH PLACES this
+ * module runs, which is the same constraint that keeps the size check to
+ * arithmetic. Only a dozen bytes are ever needed, so the cost is nil and the
+ * portability is total.
+ */
+function decodeBase64Prefix(base64: string, wanted: number): number[] {
+  const out: number[] = [];
+  let buffer = 0;
+  let bits = 0;
+  for (const character of base64) {
+    const value = BASE64_ALPHABET.indexOf(character);
+    if (value < 0) break;
+    buffer = (buffer << 6) | value;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((buffer >> bits) & 0xff);
+      if (out.length >= wanted) break;
+    }
+  }
+  return out;
+}
+
+function startsWithBytes(bytes: readonly number[], signature: readonly number[]): boolean {
+  return signature.every((byte, index) => bytes[index] === byte);
+}
+
+/**
+ * WHAT EACH DECLARED TYPE'S BYTES MUST ACTUALLY LOOK LIKE.
+ *
+ * A `data:` URI's media type is a CLAIM MADE BY WHOEVER BUILT IT, and in a
+ * browser it comes from `File.type`, which is derived from the file's extension
+ * rather than its contents. So `logo.svg` renamed to `logo.png` arrives as
+ * `data:image/png;base64,<svg...>`, matched the prefix regex, and was stored --
+ * and WeasyPrint, which sniffs properly, drew it as vector art on the quote.
+ * The spec excludes SVG on purpose (it is a document format with its own
+ * URL-bearing elements, arriving where neither the document sanitiser nor the
+ * renderer's fetcher looks inside it), and until this existed that exclusion
+ * was enforced only against a file honest enough to admit what it was.
+ *
+ * Not a vulnerability when it was found -- a spec reviewer built an SVG
+ * carrying `file://` and loopback references and the render was refused with
+ * `document referenced a blocked resource`, canary atime unchanged, no number
+ * spent. Task 3's fetcher held. This is the layer in front of it doing its own
+ * job rather than relying on that.
+ */
+const LOGO_SIGNATURES: Record<string, (bytes: readonly number[]) => boolean> = {
+  png: (b) => startsWithBytes(b, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  jpeg: (b) => startsWithBytes(b, [0xff, 0xd8, 0xff]),
+  // "GIF8" then "7a" or "9a".
+  gif: (b) => startsWithBytes(b, [0x47, 0x49, 0x46, 0x38])
+    && (b[4] === 0x37 || b[4] === 0x39) && b[5] === 0x61,
+  // "RIFF", four bytes of length, then "WEBP" -- so twelve bytes are needed,
+  // which is exactly what sixteen base64 characters carry.
+  webp: (b) => startsWithBytes(b, [0x52, 0x49, 0x46, 0x46])
+    && startsWithBytes(b.slice(8), [0x57, 0x45, 0x42, 0x50]),
+};
+
 /**
  * Why this string cannot be a logo, or null if it can. "" is a logo-less profile and
  * is always fine.
@@ -1695,6 +1758,12 @@ const LOGO_DATA_URI = /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0
  * SVG IS DELIBERATELY NOT ALLOWED. It is a document format with its own URL-bearing
  * elements, and it would arrive inside a `data:` URI where neither the document
  * sanitiser nor the renderer's fetcher looks inside it.
+ *
+ * AND THE TYPE IN THE URI IS NOT EVIDENCE OF ANYTHING, which is why the last check
+ * reads the bytes. In a browser that string comes from `File.type`, which is decided
+ * by the file's EXTENSION -- so an SVG renamed to .png declares `image/png`, passes
+ * every check above, and gets drawn as vector art by a renderer that sniffs properly.
+ * See LOGO_SIGNATURES.
  */
 export function logoDataUriProblem(uri: string): string | null {
   if (uri === "") return null;
@@ -1710,6 +1779,14 @@ export function logoDataUriProblem(uri: string): string | null {
   const bytes = (base64.length / 4) * 3 - padding;
   if (bytes > MAX_LOGO_BYTES) {
     return `a logo must be ${String(MAX_LOGO_BYTES)} bytes or less; this one is ${String(bytes)}`;
+  }
+  // The declared type has to be backed by the payload's own leading bytes.
+  // Sixteen base64 characters carry the twelve bytes the widest signature needs.
+  const declared = LOGO_DATA_URI.exec(uri)?.[1];
+  const signature = declared === undefined ? undefined : LOGO_SIGNATURES[declared];
+  if (signature === undefined || !signature(decodeBase64Prefix(base64.slice(0, 16), 12))) {
+    return `a logo's contents must really be a ${String(declared)} image;`
+      + " this file's data does not match the type it claims";
   }
   return null;
 }
@@ -1755,15 +1832,26 @@ export type OrgProfile = z.infer<typeof orgProfileSchema>;
  * The measured contribution of these fields to a render is in DOCUMENT_MAX_LINES's
  * comment, which is sized around them.
  */
+export const ORG_PROFILE_FIELD_CAPS = {
+  name: 200,
+  addressLines: 2000,
+  vatNumber: 100,
+  registrationNumber: 100,
+  email: 200,
+  phone: 100,
+  website: 200,
+  bankDetails: 500,
+} as const;
+
 export const orgProfileInputSchema = z.object({
-  name: documentText(200),
-  addressLines: documentText(2000),
-  vatNumber: documentText(100),
-  registrationNumber: documentText(100),
-  email: documentText(200),
-  phone: documentText(100),
-  website: documentText(200),
-  bankDetails: documentText(500),
+  name: documentText(ORG_PROFILE_FIELD_CAPS.name),
+  addressLines: documentText(ORG_PROFILE_FIELD_CAPS.addressLines),
+  vatNumber: documentText(ORG_PROFILE_FIELD_CAPS.vatNumber),
+  registrationNumber: documentText(ORG_PROFILE_FIELD_CAPS.registrationNumber),
+  email: documentText(ORG_PROFILE_FIELD_CAPS.email),
+  phone: documentText(ORG_PROFILE_FIELD_CAPS.phone),
+  website: documentText(ORG_PROFILE_FIELD_CAPS.website),
+  bankDetails: documentText(ORG_PROFILE_FIELD_CAPS.bankDetails),
   logoDataUri: z.string(),
 }).superRefine((value, ctx) => {
   const problem = logoDataUriProblem(value.logoDataUri);
@@ -2047,14 +2135,34 @@ export type DocumentLineInput = z.infer<typeof documentLineInputSchema>;
  * happens before the render either way -- no number is spent, nothing spawns -- so
  * this is about what the caller is told, not about what is wasted.
  */
+/**
+ * THE PER-FIELD CHARACTER CAPS, NAMED SO A FORM CAN DERIVE ITS OWN maxLength
+ * FROM THEM instead of restating the numbers.
+ *
+ * Task 5's first round spelled 200/200/2000/5000/5000 into the quote form's
+ * inputs by hand while its commit message claimed the form restated none of the
+ * schema's bounds. They agreed, and nothing whatsoever kept them agreeing: an
+ * edit here would have left the form silently truncating at the old figure, or
+ * accepting past a new one and getting a 400 for it. The description's cap lives
+ * in DOCUMENT_MAX_DESCRIPTION_CHARS above, which is already exported for the
+ * same reason.
+ */
+export const DOCUMENT_FIELD_CAPS = {
+  recipientName: 200,
+  recipientContactName: 200,
+  recipientAddress: 2000,
+  notes: 5000,
+  terms: 5000,
+} as const;
+
 export const issueQuoteInputSchema = z.object({
   issueDate: documentDateSchema,
   validUntilDate: documentDateSchema.nullable().optional(),
-  recipientName: documentText(200, 1),
-  recipientContactName: documentText(200).optional(),
-  recipientAddress: documentText(2000).optional(),
-  notes: documentText(5000).optional(),
-  terms: documentText(5000).optional(),
+  recipientName: documentText(DOCUMENT_FIELD_CAPS.recipientName, 1),
+  recipientContactName: documentText(DOCUMENT_FIELD_CAPS.recipientContactName).optional(),
+  recipientAddress: documentText(DOCUMENT_FIELD_CAPS.recipientAddress).optional(),
+  notes: documentText(DOCUMENT_FIELD_CAPS.notes).optional(),
+  terms: documentText(DOCUMENT_FIELD_CAPS.terms).optional(),
   lines: z.array(documentLineInputSchema).min(1).max(DOCUMENT_MAX_LINES),
 }).superRefine((value, ctx) => {
   try {

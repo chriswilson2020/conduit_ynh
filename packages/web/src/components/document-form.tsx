@@ -1,10 +1,11 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import {
-  DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, formatMoneyCents,
+  DOCUMENT_FIELD_CAPS, DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, formatMoneyCents,
 } from "@conduit/shared";
 import type { DocumentRecord } from "@conduit/shared";
 import { ApiError } from "../api";
+import { todayLocalIso } from "../lib";
 import { useIssueQuote } from "../queries";
 import {
   buildIssueQuoteInput, contentBudget, parseDraftLine, runningTotals,
@@ -25,8 +26,8 @@ import { Textarea } from "./ui/textarea";
  * which at 390px is full-bleed with 24px of padding: 342px inside, and 340px in
  * the table's own scroll box. Every figure below is against that 340px.
  *
- *   a real four-column table row      needs 501px: 161px of overflow, with the
- *                                     description input down to 84px and the
+ *   a real four-column table row      needs 481px: 143px of overflow, with the
+ *                                     description input down to 84.1px and the
  *                                     quantity and tax inputs to 26px each
  *   one field per line, label above   fits, at 418px per line item -- 63% of a
  *                                     664px viewport for ONE line, 1.6 visible
@@ -41,6 +42,17 @@ import { Textarea } from "./ui/textarea";
  * nothing. They share a line, and all three still clear the 44px touch floor in
  * both axes -- measured at 96.7px and 104.7px wide by 44px tall, against the
  * 26px the four-column table squeezed them to.
+ *
+ * THE 481/143 FIGURES ARE THE SPEC REVIEW'S RE-MEASUREMENT, and they replace the
+ * 501/161 this file shipped with. The three input widths reproduce to the tenth
+ * of a pixel either way, so the conclusion never moved; the min-content total
+ * did, and a number in a comment has to be the measured one.
+ *
+ * THE SAME OVERFLOW WAS SHIPPING AT A DESK and nobody had measured there. The
+ * dialog hard-coded `max-w-md` into its own shape, which beat every caller's
+ * width in the base layer, so this form opened at 448px on a 1280px screen and
+ * overflowed by exactly the amount above with its Remove button off-screen. That
+ * is fixed in ui/dialog.tsx now -- see overridableClass in src/lib.ts.
  *
  * ONE DOM, TWO LAYOUTS, which is the convention ui/table.tsx and
  * entity-table.tsx already set: this is a real table row at a desk and wraps
@@ -87,19 +99,27 @@ function blankLine(): DraftLine {
  * heading row is the thing that says how many columns there are.
  */
 function FieldCell({
-  label, width, parsed, children,
+  label, width, parsed, describedById, children,
 }: {
   label: string;
   width: string;
   parsed?: ParsedUnits;
+  /**
+   * The id the message under this field gets, so the control can point at it.
+   * Rendered ONLY while there is a message: `aria-describedby` naming an
+   * element that is not in the document is worse than none, because a screen
+   * reader reads nothing and no one can tell the difference from a working one.
+   */
+  describedById?: string;
   children: ReactNode;
 }) {
+  const invalid = parsed?.kind === "invalid";
   return (
     <TableCell className={`${CELL_STACK} ${width}`}>
       <span className={CELL_LABEL}>{label}</span>
       {children}
-      {parsed?.kind === "invalid" && (
-        <span role="alert" className="text-xs text-red-600">{parsed.message}</span>
+      {invalid && (
+        <span id={describedById} role="alert" className="text-xs text-red-600">{parsed.message}</span>
       )}
     </TableCell>
   );
@@ -141,7 +161,7 @@ function LineRow({
           onChange={(event) => onChange({ description: event.target.value })}
         />
       </FieldCell>
-      <FieldCell label="Qty" width="max-md:w-1/3 max-md:pl-0 max-md:pr-2" parsed={units.qty}>
+      <FieldCell label="Qty" width="max-md:w-1/3 max-md:pl-0 max-md:pr-2" parsed={units.qty} describedById={`quote-line-qty-problem-${String(index)}`}>
         <Input
           value={line.qty}
           // A numeric keypad, NOT type="number". A number input reports text it
@@ -153,26 +173,32 @@ function LineRow({
           disabled={disabled}
           aria-label={`Line ${position} quantity`}
           data-testid={`quote-line-qty-${String(index)}`}
+          aria-invalid={units.qty.kind === "invalid" || undefined}
+          aria-describedby={units.qty.kind === "invalid" ? `quote-line-qty-problem-${String(index)}` : undefined}
           onChange={(event) => onChange({ qty: event.target.value })}
         />
       </FieldCell>
-      <FieldCell label="Unit price" width="max-md:w-1/3 max-md:px-0 max-md:pr-2" parsed={units.unitPrice}>
+      <FieldCell label="Unit price" width="max-md:w-1/3 max-md:px-0 max-md:pr-2" parsed={units.unitPrice} describedById={`quote-line-price-problem-${String(index)}`}>
         <Input
           value={line.unitPrice}
           inputMode="decimal"
           disabled={disabled}
           aria-label={`Line ${position} unit price`}
           data-testid={`quote-line-price-${String(index)}`}
+          aria-invalid={units.unitPrice.kind === "invalid" || undefined}
+          aria-describedby={units.unitPrice.kind === "invalid" ? `quote-line-price-problem-${String(index)}` : undefined}
           onChange={(event) => onChange({ unitPrice: event.target.value })}
         />
       </FieldCell>
-      <FieldCell label="Tax %" width="max-md:w-1/3 max-md:px-0" parsed={units.taxRate}>
+      <FieldCell label="Tax %" width="max-md:w-1/3 max-md:px-0" parsed={units.taxRate} describedById={`quote-line-tax-problem-${String(index)}`}>
         <Input
           value={line.taxRate}
           inputMode="decimal"
           disabled={disabled}
           aria-label={`Line ${position} tax rate`}
           data-testid={`quote-line-tax-${String(index)}`}
+          aria-invalid={units.taxRate.kind === "invalid" || undefined}
+          aria-describedby={units.taxRate.kind === "invalid" ? `quote-line-tax-problem-${String(index)}` : undefined}
           onChange={(event) => onChange({ taxRate: event.target.value })}
         />
       </FieldCell>
@@ -241,9 +267,11 @@ export function DocumentForm({
   onCancel: () => void;
 }) {
   const [draft, setDraft] = useState<DraftQuote>(() => ({
-    // Today in the LOCAL calendar. toISOString would date a quote raised on a
-    // European evening to the previous day.
-    issueDate: new Date().toLocaleDateString("en-CA"),
+    // Today in the LOCAL calendar, from the one clock reader this app has.
+    // toISOString would date a quote raised on a European evening to the
+    // previous day; a second local-date implementation here would be a second
+    // answer to a question src/lib.ts already answers.
+    issueDate: todayLocalIso(),
     validUntilDate: "",
     recipientName: defaultRecipientName,
     recipientContactName: defaultRecipientContactName,
@@ -254,6 +282,37 @@ export function DocumentForm({
   }));
   const [problems, setProblems] = useState<readonly string[]>([]);
   const issueQuote = useIssueQuote();
+  const problemsRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * A REFUSAL HAS TO ARRIVE WHERE THE PERSON IS LOOKING.
+   *
+   * Measured at 390x664 before this existed: scrolled to the top with focus in
+   * the auto-focused Recipient field -- where every phone user starts, return
+   * key under their thumb -- pressing Return set the state and returned, and the
+   * problems box landed at y=1200 against a 664px viewport. 536px below the fold
+   * with NOTHING on screen changing, and focus left on the body. The form looked
+   * like it had ignored the key.
+   *
+   * So the summary is scrolled into view and FOCUSED. Focus rather than scroll
+   * alone because a screen reader is in exactly the same position as the sighted
+   * user here -- the alert is announced, but nothing moves the reading cursor to
+   * it -- and because it puts the next Tab at the top of the problem list rather
+   * than back wherever the submit left it. `tabIndex={-1}` makes the container
+   * focusable without adding it to the tab order.
+   *
+   * It covers the SERVER's refusals too, which land in the same place: the 413
+   * naming the merged size and both 503s are as far below the fold as the local
+   * ones, and were just as invisible.
+   */
+  const refusal = problems.length > 0 || issueQuote.isError;
+  useEffect(() => {
+    if (!refusal) return;
+    const box = problemsRef.current;
+    if (box === null) return;
+    box.scrollIntoView({ block: "nearest" });
+    box.focus({ preventScroll: true });
+  }, [refusal, problems, issueQuote.error]);
 
   const totals = useMemo(() => runningTotals(draft.lines), [draft.lines]);
   const budget = useMemo(() => contentBudget(draft), [draft]);
@@ -293,7 +352,7 @@ export function DocumentForm({
           <Input
             autoFocus
             value={draft.recipientName}
-            maxLength={200}
+            maxLength={DOCUMENT_FIELD_CAPS.recipientName}
             disabled={pending}
             data-testid="quote-recipient-name"
             onChange={(event) => patch({ recipientName: event.target.value })}
@@ -303,7 +362,7 @@ export function DocumentForm({
           For the attention of
           <Input
             value={draft.recipientContactName}
-            maxLength={200}
+            maxLength={DOCUMENT_FIELD_CAPS.recipientContactName}
             disabled={pending}
             data-testid="quote-recipient-contact"
             onChange={(event) => patch({ recipientContactName: event.target.value })}
@@ -313,7 +372,7 @@ export function DocumentForm({
           Address
           <Textarea
             value={draft.recipientAddress}
-            maxLength={2000}
+            maxLength={DOCUMENT_FIELD_CAPS.recipientAddress}
             rows={3}
             disabled={pending}
             data-testid="quote-recipient-address"
@@ -396,7 +455,7 @@ export function DocumentForm({
         Notes
         <Textarea
           value={draft.notes}
-          maxLength={5000}
+          maxLength={DOCUMENT_FIELD_CAPS.notes}
           rows={2}
           disabled={pending}
           data-testid="quote-notes"
@@ -407,7 +466,7 @@ export function DocumentForm({
         Terms
         <Textarea
           value={draft.terms}
-          maxLength={5000}
+          maxLength={DOCUMENT_FIELD_CAPS.terms}
           rows={2}
           disabled={pending}
           data-testid="quote-terms"
@@ -471,15 +530,36 @@ export function DocumentForm({
         </p>
       </div>
 
-      {problems.length > 0 && (
-        <ul role="alert" data-testid="quote-problems" className="flex flex-col gap-1 text-sm text-red-600">
-          {problems.map((problem) => <li key={problem}>{problem}</li>)}
-        </ul>
-      )}
-      {issueQuote.isError && (
-        <p role="alert" data-testid="quote-error" className="text-sm text-red-600">
-          {submitErrorText(issueQuote.error)}
-        </p>
+      {/*
+        ONE REGION FOR BOTH KINDS OF REFUSAL, because the effect above has to
+        have one thing to scroll to and focus, and because a person does not care
+        whether the form or the server turned them down.
+      */}
+      {refusal && (
+        <div
+          ref={problemsRef}
+          tabIndex={-1}
+          data-testid="quote-refusal"
+          className="rounded-md border border-red-200 bg-red-50 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-red-400"
+        >
+          {problems.length > 0 && (
+            <ul role="alert" data-testid="quote-problems" className="flex flex-col gap-1 text-sm text-red-600">
+              {/*
+                KEYED BY INDEX, NOT BY THE TEXT. Two fields failing the same way
+                produce the same sentence -- two `Invalid input`s was the actual
+                sighting -- and React then has duplicate keys and drops one of
+                them. The list is rebuilt wholesale on every submit and never
+                reordered, so the index is a stable key here.
+              */}
+              {problems.map((problem, index) => <li key={index}>{problem}</li>)}
+            </ul>
+          )}
+          {issueQuote.isError && (
+            <p role="alert" data-testid="quote-error" className="text-sm text-red-600">
+              {submitErrorText(issueQuote.error)}
+            </p>
+          )}
+        </div>
       )}
 
       <div className="flex justify-end gap-2 max-md:flex-col-reverse">

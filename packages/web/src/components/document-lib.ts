@@ -237,6 +237,87 @@ export function contentBudget(draft: DraftQuote): BudgetState {
   };
 }
 
+/**
+ * WHAT EACH SCHEMA PATH IS CALLED ON THE PAGE SOMEBODY IS LOOKING AT.
+ *
+ * The keys are the wire field names; the values are what the form labels them.
+ * A key missing from here falls back to the raw path, which is ugly but never
+ * wrong -- and the test asserts every field the schema can complain about is
+ * present, so it does not silently drift.
+ */
+const FIELD_LABELS: Record<string, string> = {
+  issueDate: "Issue date",
+  validUntilDate: "Valid-until date",
+  recipientName: "Recipient",
+  recipientContactName: "Contact name",
+  recipientAddress: "Address",
+  notes: "Notes",
+  terms: "Terms",
+  description: "description",
+  qtyMilli: "quantity",
+  unitPriceCents: "unit price",
+  taxRateBp: "tax rate",
+};
+
+/** The subset of a Zod issue this needs, so no zod type has to be imported. */
+export interface SchemaIssue {
+  readonly path: readonly PropertyKey[];
+  readonly message: string;
+  readonly code?: string;
+  readonly maximum?: unknown;
+  readonly minimum?: unknown;
+}
+
+/**
+ * One schema issue as a sentence that names the box it is about.
+ *
+ * THE PATH IS THE WHOLE POINT, and throwing it away is what this function was
+ * written to stop. `issue.message` alone is "Invalid input" for every length and
+ * type failure Zod raises -- so an empty Recipient, which is the DEFAULT STATE
+ * of any deal with no linked company, produced exactly that and nothing else:
+ * two valid lines, a total on screen, and "Invalid input" as the entire
+ * explanation. The per-field parse above deliberately reports first so somebody
+ * gets a sentence about the box they are looking at; this is the same courtesy
+ * for every field that parse does not cover.
+ *
+ * Size failures get a purpose-written sentence because Zod's own are unreadable
+ * to anyone who did not write the schema. Everything else keeps the schema's
+ * message, which for the custom refinements (the budget, the four-digit year,
+ * the unstorable character, the unrepresentable total) is already a good one --
+ * it just never said which field it meant.
+ */
+export function describeIssue(issue: SchemaIssue): string {
+  const [head, index, leaf] = issue.path;
+  let display = "";
+  if (head === "lines") {
+    // A specific line's field. `lines` with NO index is a claim about the whole
+    // SET -- the budget, or a total that cannot be represented -- whose message
+    // says so on its own, and prefixing it with a field name makes it worse.
+    //
+    // THIS ARM HAS TO COME BEFORE THE FIELD ARM rather than be folded into its
+    // condition. Written as `head === "lines" && typeof index === "number"` the
+    // set-scoped case fell through to the field arm and came out labelled
+    // "lines: this quote needs ... bytes", which is the budget message with a
+    // wire field name stapled to it. Its test caught that.
+    const field = typeof index === "number" && leaf !== undefined
+      ? FIELD_LABELS[String(leaf)] ?? String(leaf)
+      : "";
+    display = field === "" ? "" : `Line ${String(Number(index) + 1)} ${field}`;
+  } else if (head !== undefined) {
+    display = FIELD_LABELS[String(head)] ?? String(head);
+  }
+
+  if (display === "") return issue.message;
+  if (issue.code === "too_small" && issue.minimum === 1) return `${display} is required.`;
+  if (issue.code === "too_small") {
+    return `${display} is shorter than the ${String(issue.minimum)} characters required.`;
+  }
+  if (issue.code === "too_big") {
+    return `${display} is longer than the ${String(issue.maximum)} characters allowed.`;
+  }
+  return `${display}: ${issue.message}`;
+}
+
 export type BuildResult =
   | { readonly ok: true; readonly input: IssueQuoteInput }
   | { readonly ok: false; readonly problems: readonly string[] };
@@ -255,6 +336,10 @@ export type BuildResult =
  * second answer to the question of what a valid quote is, and the two would
  * drift; this way the only way the form and the server disagree is if the form
  * is running against a different build of the package.
+ *
+ * Its issues go through describeIssue rather than being read for their message,
+ * because the message alone is "Invalid input" for every size and type failure
+ * and the PATH is what says which box. See that function.
  */
 export function buildIssueQuoteInput(draft: DraftQuote): BuildResult {
   const problems: string[] = [];
@@ -288,7 +373,7 @@ export function buildIssueQuoteInput(draft: DraftQuote): BuildResult {
     lines,
   });
   if (!parsed.success) {
-    return { ok: false, problems: parsed.error.issues.map((issue) => issue.message) };
+    return { ok: false, problems: parsed.error.issues.map((issue) => describeIssue(issue)) };
   }
   return { ok: true, input: parsed.data };
 }
