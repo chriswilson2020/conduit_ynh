@@ -1515,7 +1515,8 @@ object stream -- which needs no renderer of any version to prove.
    left where it stands -- and the documentation page should say that rather than
    describing what the escaping would have done. In a `style` ATTRIBUTE they are
    substituted, the attribute survives, and any URL in the value is removed by the CSS
-   scanner.
+   scanner. **`documentTemplateWarnings(template)` is exported for the editor** and
+   names every case where this module does something silently; see round 2.
 6. **`{{^lines}}` means a quote with no lines renders "No line items."** rather than an
    empty table. Task 4 should still require at least one line in its input schema; the
    empty state is for the template's benefit, not a supported document.
@@ -1562,6 +1563,10 @@ Re-measured on the server against the fix, twenty line items throughout:
 | empty | 20 | -- | **69ms** |
 | one unknown field | 9 | 31s, no throw | **288ms** |
 | one unknown field | 12 | -- | **329ms** |
+
+**THE 5x SWING IN THE LAST TWO ROWS IS A HOLE, NOT NOISE, and round 2 is where that
+was noticed.** Identical step counts costing five times as much means the cost of a
+step was not bounded -- see round 2, finding 1.
 | `{{description}}` | 7 | output cap | **19ms**, output cap at 53,853 steps |
 
 And the other direction, which a bound needs just as much: **the seeded template merges
@@ -1675,11 +1680,148 @@ event loop rather than a third of a second. Recorded at the line, like the
 **WHAT CHANGED FOR TASKS 4 AND 5**, on top of the inheritance list in the DONE block:
 
 1. `mergeTemplate` throws `TemplateError` from three bounds, and never a `RangeError`.
+   **This was false when it was written** -- the parser still had one, from the spread
+   in its unwind; see round 2, finding 2.
 2. A template's links may be fragments only -- not `data:`, not `mailto:`, not `tel:`.
    The `mailto:`/`tel:` refusal is a deferred capability with a two-line restore path,
    not a hazard; the note is at `isPermittedUrl`.
 3. Merge fields in a `<style>` block are left unsubstituted. In a `style` attribute
    they are substituted and the attribute survives.
+
+##### TASK 3 REVIEW ROUND 2 — S2 again in different clothing, and a RangeError I fixed in one function and left in the other
+
+Commits `c534062`, `7f28dd2`. CI run **33225086394**, tip `7f28dd2`, both jobs green:
+**2188 tests, 0 skipped**. On the server: 2150 passed / 38 skipped.
+
+The security core held under everything the round could construct -- the file read
+tried through the `<style>` region hole, through both merge orders, through
+`image-set`, through six URL positions, against the real renderer: nothing reached a
+fetch. What it broke was, again, the claim that the merge is bounded.
+
+**1. THE BUDGET COUNTED STEPS, NOT WORK, AND ONE STEP HAD NO CEILING.** `lookup` ran
+`path.split(".")` on every field visit, so the cost of a step was linear in the path's
+length and a 1,000,000-step budget bought an unbounded amount of it. Three
+`{{#lines}}` around one field, 130 line items:
+
+| path segments | template | before | after |
+|---|---|---|---|
+| 1 | 70 B | 60 ms | **99 ms** |
+| 5,000 | 10 KB | **31 s** | **94 ms** |
+| 20,000 | 39 KB | **139 s** | **79 ms** |
+
+Flat in path length, which is the property. `body_html` is unbounded `text` with no
+length CHECK and renderPdf's 128KB cap applies to prepare's OUTPUT, so a 1MB template
+extrapolated to about 55 minutes of frozen event loop -- and it ended in a tidy
+`TemplateError`, which is worse than the original runaway because it looks handled.
+
+**THE EVIDENCE WAS IN MY OWN COMMENT AND I READ IT AS NOISE.** Round 1 recorded
+"depths 6, 9, 12 and 20 now stop in 50-79ms, and a body holding one unknown field
+stops in 288-329ms (the same steps, more lookup per step)". A 5x swing at an identical
+step count is exactly the shape of an unbounded per-step cost. The paths are split
+once at parse time now, into the node.
+
+**2. `parse()` THREW A RAW `RangeError`, FROM THE TYPO THIS MODULE PROMISES IS SAFE.**
+The unwind did `current().push(...frame.body)`, and V8 stops at about 124,000
+arguments: `"{{#lines}}" + "{{a}}x"` repeated 62,153 times -- a 364KB template with a
+missing closer -- threw "Maximum call stack size exceeded" out of the parser before
+any of the three bounds could see it. S3 fixed this exact failure class in `render`
+one round ago and left it here, which falsified round 1's "throws `TemplateError` from
+three bounds, and never a `RangeError`" -- the sentence Task 4's route is written
+against. It is a loop now, and the case merges in 52ms.
+
+**3. THE `<style>` REGION RULE ERRED IN THE DIRECTION I HAD WRITTEN OFF AS
+IMPOSSIBLE.** `cssRegions` ended a region at `indexOf("</style")`, but HTML ends raw
+text only at `</style` followed by `>`, `/` or whitespace. So `</styles>` was text to
+the parser and end-of-region here, and a merge field after it went back into live CSS.
+The same loose needle in `sanitizeDocumentHtml`'s fail-closed check meant one
+`</style`-prefixed token anywhere in a stylesheet silently deleted the ENTIRE `<style>`
+element. Both use `endsRawText` now, and the comment that called this direction
+unreachable is corrected in place.
+
+Not a file read -- the reviewer confirmed `url(file://)` is still removed and
+`image-set` stays inert -- but the module's design is not to rest on one layer, and
+there it did.
+
+**THE FOUR SMALLER ONES.**
+
+- **5: a missing budget hung CI rather than failing it**, because every depth in the
+  non-emitting table was astronomically over budget. Depth 5 and 6 are in the table
+  now: over budget with the bound, 72ms and 1.5s without it, so the mutation fails by
+  name. The same trap caught the per-step fix -- reverting it made three cases take
+  139s each and looked like a hang -- so those tests now assert ELAPSED TIME inside
+  the case ("a step must cost a bounded amount") rather than leaving it to a timeout
+  that cannot fire while synchronous code is running.
+- **6: the URL position defaulted to the permissive one.** `lower === "href" ? "link"
+  : "fetch"` meant every URL attribute except literal `href` got `data:` permission,
+  so adding `xlink:href` to an element's allowlist would have granted `data:` on a
+  link without anybody choosing it. `FETCH_ATTRIBUTES` is enumerated now and anything
+  unnamed is a link. Also corrected: the comment credited this guard for `srcset`,
+  where sanitize-html's own candidate-list parser is what handles the multi-candidate
+  case.
+- **7: EVERY FILLED QUOTE OF SIX LINES OR MORE SHIPPED A STRANDED PAGE.** Measured on
+  the seeded template as it stood: one page at 0, 2 and 4 line items, two pages from
+  six, with page two carrying nothing but the IBAN, VAT and registration lines. The
+  spacing is tightened (line-height, the logo box, the table padding, and `.foot`'s
+  12mm top margin down to 7mm) and `.foot` gets `page-break-inside: avoid`:
+
+  | line items | filled, before | filled, after | empty, after |
+  |---|---|---|---|
+  | 0-4 | 1 page | 1 page | 1 page |
+  | 6, 8 | **2 pages** | **1 page** | 1 page |
+  | 10-16 | 2 pages | 2 pages | 1 page |
+  | 20 | 2 pages | 2 pages | 2 pages |
+
+  A filled eight-line quote is 4,101 chars of merged HTML and a **one-page 16,117-byte
+  PDF** on 57.2 (12,521 on CI's 61.1); the no-logo case is 3,473 chars and 14,381
+  bytes. `documents-seed.test.ts` asserts the page count for BOTH now, where it
+  asserted only the empty one. What is NOT asserted is that WeasyPrint honours
+  `page-break-inside` -- the rule's presence in the seed is guarded, the page counts
+  are the evidence.
+- **4: the order test's comment claimed a fetch that does not happen.** `&quot;` IS
+  decoded and the `url()` IS closed from inside, but the injected declaration is not
+  live on 57.2, and in the shipped order the attribute disappears because postcss
+  fails to parse the braces -- `sanitizeCss` removes the URL first, but it is not what
+  removes the attribute. The test stays as an order-mutation detector and now says so.
+  Worth recording: **the reviewer could not construct any payload where the wrong
+  order produces a fetch**, because surviving template-time sanitisation means hiding
+  behind `data:`, and getting out of a `data:` url() needs a quote break that leaves
+  the CSS invalid.
+- **8: the step figures were not reproducible from any context in the suite.** They
+  were measured against a probe context that no test uses. The seeded template with
+  every field filled in is **1,656 steps at 130 line items and 192 at eight**, and the
+  headroom assertion moved to `documents-seed.test.ts` where the real template is --
+  it had been guarding an ad-hoc 787-step stand-in, half the true figure.
+
+**9: WHAT THE MODULE DOES SILENTLY NOW SAYS SO.** `documentTemplateWarnings(template)`
+is exported for Task 5's editor and names three things that render without complaint
+and are not what the author meant: a merge field inside a `<style>` block (which is
+left unresolved, and `{{org.brandColour}}` is a reasonable thing to write), a `<style>`
+that is never closed (including one inside an HTML comment, which swallows every field
+after it), and an unclosed block or a closer that closes nothing. It cannot throw --
+a template being edited is half-written by definition.
+
+**A narrow allowance for CSS fields is NOT implemented, and it is a decision rather
+than a patch.** Substituting into CSS safely needs CSS escaping AND a shape to check
+the value against -- a colour, a length -- which is a validated-field feature rather
+than a merge feature. The warning says what did not happen; the allowance is Task 5's
+to ask for.
+
+**MUTATIONS FOR THIS ROUND**, all on the server:
+
+| mutation | result |
+|---|---|
+| the path split back on every visit | 2 fail, named by the elapsed assertion (and it takes 139s to say so) |
+| the spread back in the parser's unwind | 1 fails |
+| `href` back in the fetch set | 1 fails |
+| the raw-text terminator ignored in the region scan | 1 fails |
+| the fail-closed needle without its terminator | 1 fails |
+| the unclosed-block warning removed | 1 fails |
+
+**One unrelated red run, recorded because the plan already carries its cousin.** The
+first full-suite run of this round failed `mail-sync.test.ts`'s exponential-backoff
+case; the file passes alone and the suite passed on re-run, and CI has been green
+throughout. That is another data point for the open finding in `db5d968` -- ten server
+runs, two conditions, no reproduction -- and not one of the three budgets it names.
 
 ---
 
