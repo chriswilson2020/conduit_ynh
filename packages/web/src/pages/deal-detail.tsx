@@ -1,15 +1,16 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
 import { Link, useParams } from "@tanstack/react-router";
-import type { UpdateDealInput } from "@conduit/shared";
+import type { Deal, UpdateDealInput } from "@conduit/shared";
 import { formatMoneyCents } from "@conduit/shared";
-import { ApiError } from "../api";
+import { ApiError, apiUrl } from "../api";
 import { parseDecimal } from "../lib";
 import {
   useArchiveDeal,
   useCompany,
   useContact,
   useDeal,
+  useDealDocuments,
   useLoseDeal,
   usePipeline,
   useReopenDeal,
@@ -17,6 +18,7 @@ import {
   useUpdateDeal,
   useWinDeal,
 } from "../queries";
+import { DocumentForm } from "../components/document-form";
 import { FieldCard, type FieldCardField } from "../components/field-card";
 import { OwnerSelect } from "../components/owner-select";
 import { Rail } from "../components/rail/rail";
@@ -325,10 +327,142 @@ export function DealDetailPage() {
             )}
           </div>
         </div>
+        <DocumentsSection
+          deal={deal}
+          companyName={linkedCompany?.name ?? ""}
+          contactName={
+            linkedContact === undefined
+              ? ""
+              : `${linkedContact.firstName} ${linkedContact.lastName ?? ""}`.trim()
+          }
+          companyAddress={linkedCompany?.address ?? ""}
+        />
       </div>
       <aside className="min-w-0 lg:w-1/3">
         <Rail dealId={dealId} />
       </aside>
+    </div>
+  );
+}
+
+/**
+ * THE DEAL'S DOCUMENTS SECTION: what has been raised, and the way to raise
+ * another.
+ *
+ * A section on the page rather than a tab in the rail, because the rail is
+ * SHARED by the company, contact, deal and project pages and a document belongs
+ * to a deal alone -- a sixth tab there would be empty on three of the four.
+ *
+ * The download is the existing `GET /api/files/:id/download`, reached exactly as
+ * the rail's Files tab reaches it. The PDF is an ordinary `files` row against
+ * the same deal, so it is already on that tab; there is deliberately no second
+ * download path here to keep in step with the first.
+ *
+ * There is no edit and no delete, and that is the phase's central claim rather
+ * than an omission: a quote already issued never changes, and a corrected quote
+ * is a new quote with a new number.
+ */
+function DocumentsSection({ deal, companyName, contactName, companyAddress }: {
+  deal: Deal;
+  companyName: string;
+  contactName: string;
+  companyAddress: string;
+}) {
+  const { data: documents = [], isLoading, error } = useDealDocuments(deal.id);
+  const [formOpen, setFormOpen] = useState(false);
+  const archived = deal.archivedAt !== null;
+
+  return (
+    <div data-testid="deal-documents" className="mt-4 rounded-lg border border-slate-200 bg-white">
+      <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+        <h2 className="text-sm font-semibold text-slate-900">Documents</h2>
+        <Dialog open={formOpen} onOpenChange={setFormOpen}>
+          <DialogTrigger asChild>
+            <Button data-testid="new-quote-button" disabled={archived}>New quote</Button>
+          </DialogTrigger>
+          {/*
+            An ordinary DialogContent, which ui/dialog.tsx already turns into a
+            full-screen sheet below the breakpoint -- pinned to all four edges
+            and scrolling its own content, because a dialog centred in the
+            LAYOUT viewport is the one thing that cannot work on a phone: the
+            on-screen keyboard shrinks the VISUAL viewport under it and takes
+            the fields with it. That is also what makes the form's sticky total
+            stick.
+
+            Wider than the default card at a desk, because six columns of line
+            items do not fit in a 28rem dialog; the cap is lifted below the
+            breakpoint by the shape itself.
+          */}
+          <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
+            {formOpen && (
+              <DocumentForm
+                dealId={deal.id}
+                currency={deal.currency}
+                defaultRecipientName={companyName}
+                defaultRecipientContactName={contactName}
+                defaultRecipientAddress={companyAddress}
+                onIssued={() => setFormOpen(false)}
+                onCancel={() => setFormOpen(false)}
+              />
+            )}
+          </DialogContent>
+        </Dialog>
+      </div>
+
+      <div className="px-4 py-3">
+        {isLoading && <p className="text-sm text-slate-400">Loading...</p>}
+        {error && (
+          <p role="alert" className="text-sm text-red-600">Could not load documents: {error.message}</p>
+        )}
+        {!isLoading && !error && documents.length === 0 && (
+          <p data-testid="documents-empty" className="text-sm text-slate-400">
+            No quotes yet. Raise one with New quote and it is stored on this deal as a PDF.
+          </p>
+        )}
+        <ul className="flex flex-col gap-2">
+          {documents.map((document) => (
+            <li
+              key={document.id}
+              data-testid={`document-${document.number}`}
+              className="flex items-center justify-between gap-3 rounded-md border border-slate-200 px-3 py-2 max-md:flex-col max-md:items-stretch"
+            >
+              <div className="min-w-0">
+                <p className="truncate text-sm font-medium text-slate-900">{document.number}</p>
+                <p className="truncate text-xs text-slate-400">
+                  {document.issueDate}
+                  {document.recipientName === "" ? "" : ` \u2014 ${document.recipientName}`}
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-3 max-md:justify-between">
+                <span data-testid={`document-total-${document.number}`} className="text-sm tabular-nums text-slate-900">
+                  {formatMoneyCents(document.totalCents, document.currency)}
+                </span>
+                {/*
+                  A plain anchor, not a Button: this is a navigation to a file
+                  the server streams, so it should be a link and not something
+                  that looks like one.
+
+                  The 44px floor is spelled out on it, and NOT copied from the
+                  rail's own download link -- that one is a bare underlined
+                  anchor with no floor at all (components/rail/files.tsx). Said
+                  plainly because the obvious comment to write here was "the
+                  same way the rail does it", which is false: this is the floor
+                  ui/button.tsx and ui/input.tsx carry, applied to an anchor
+                  that is neither. The rail's gap is a Phase 6 surface and is
+                  left alone rather than widened into by this task.
+                */}
+                <a
+                  href={apiUrl(`/files/${document.fileId}/download`)}
+                  data-testid={`document-download-${document.number}`}
+                  className="inline-flex items-center rounded-md px-3 py-2 text-sm font-medium text-slate-900 underline hover:bg-slate-50 max-md:min-h-11"
+                >
+                  Download
+                </a>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
     </div>
   );
 }

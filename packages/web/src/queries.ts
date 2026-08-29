@@ -4,6 +4,8 @@ import {
   companySchema,
   contactSchema,
   dealSchema,
+  documentSchema,
+  documentTemplateSchema,
   emailTemplateSchema,
   eventSchema,
   fileMetaSchema,
@@ -26,6 +28,7 @@ import {
   meetingSchema,
   midpoint,
   noteSchema,
+  orgProfileSchema,
   pipelineSchema,
   pipelineWithStagesSchema,
   projectSchema,
@@ -48,6 +51,11 @@ import {
   type CreateStageInput,
   type CreateTaskInput,
   type Deal,
+  type DocumentRecord,
+  type DocumentTemplate,
+  type DocumentTemplateInput,
+  type DocumentType,
+  type IssueQuoteInput,
   type FolderPatchInput,
   type GanttPayload,
   type MailAccountCreateInput,
@@ -62,6 +70,8 @@ import {
   type Meeting,
   type MeetingCreateInput,
   type MeetingTaskCreateInput,
+  type OrgProfile,
+  type OrgProfileInput,
   type Pipeline,
   type PipelineScope,
   type Project,
@@ -81,7 +91,7 @@ import {
   type UpdateTaskInput,
 } from "@conduit/shared";
 import {
-  ApiError, ResponseShapeError, deleteJson, deleteRequest, getJson, patchJson, postForm, postJson,
+  ApiError, ResponseShapeError, deleteJson, deleteRequest, getJson, patchJson, postForm, postJson, putJson,
 } from "./api";
 
 const companyListSchema = listResponseSchema(companySchema);
@@ -1905,5 +1915,111 @@ export function useCreateMeetingTask() {
       invalidateTask(task);
       invalidateMeeting(meetingId);
     },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------
+
+const documentListSchema = documentSchema.array();
+
+/**
+ * A deal's issued documents, newest first with each one's lines in position
+ * order -- the order the route returns them in, kept rather than re-sorted so
+ * the list reads the same here as it does anywhere else that consumes it.
+ *
+ * Unbounded, like the deal's Files and Notes tabs: a deal's quotes stay
+ * countable, and there is no cursor on this route to page with.
+ */
+export function useDealDocuments(dealId: string) {
+  return useQuery({
+    queryKey: ["documents", dealId],
+    queryFn: async () =>
+      parseWith(documentListSchema, await getJson<unknown>(`/deals/${dealId}/documents`), "documents list"),
+    enabled: dealId !== "",
+  });
+}
+
+/**
+ * Raise a quote. 201 answers with the document; the PDF is not in the body,
+ * because it is an ordinary `files` row and downloads through the existing
+ * route.
+ *
+ * THE FILES AND EVENTS KEYS ARE INVALIDATED TOO, and that is not
+ * over-invalidation. Issuing a quote writes a `files` row against the same
+ * deal and stamps a `file_attached` entry on its timeline, so the rail's Files
+ * and Timeline tabs are stale the instant this returns -- exactly as they are
+ * after an upload, which is why useUploadFile invalidates the same pair.
+ *
+ * There is deliberately no update or delete hook beside this one: an issued
+ * quote never changes, which is the phase's central claim rather than a
+ * missing feature.
+ */
+export function useIssueQuote() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ dealId, input }: { dealId: string; input: IssueQuoteInput }) =>
+      parseWith(documentSchema, await postJson<unknown>(`/deals/${dealId}/documents`, input), "document"),
+    onSuccess: (_document: DocumentRecord, { dealId }) => {
+      void queryClient.invalidateQueries({ queryKey: ["documents", dealId] });
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+    },
+  });
+}
+
+/**
+ * The issuer profile. Always 200 -- an install that has never opened Settings
+ * has an EMPTY profile rather than a missing one, so there is no 404 branch to
+ * write here or anywhere that reads it.
+ */
+export function useOrgProfile() {
+  return useQuery({
+    queryKey: ["org-profile"],
+    queryFn: async () => parseWith(orgProfileSchema, await getJson<unknown>("/org-profile"), "org profile"),
+  });
+}
+
+export function useSaveOrgProfile() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: OrgProfileInput) =>
+      parseWith(orgProfileSchema, await putJson<unknown>("/org-profile", input), "org profile"),
+    onSuccess: (profile: OrgProfile) => queryClient.setQueryData(["org-profile"], profile),
+  });
+}
+
+/**
+ * A document template, keyed by TYPE rather than by id: there is one row per
+ * type by unique constraint, and the type is what the URL means to a reader.
+ *
+ * `warnings` on the response is derived rather than stored -- what the merge
+ * language will do SILENTLY to this body. It is carried through to the editor
+ * because none of those things can throw and none of them should be invisible.
+ */
+export function useDocumentTemplate(type: DocumentType) {
+  return useQuery({
+    queryKey: ["document-template", type],
+    queryFn: async () =>
+      parseWith(documentTemplateSchema, await getJson<unknown>(`/document-templates/${type}`), "document template"),
+  });
+}
+
+export function useSaveDocumentTemplate() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ type, input }: { type: DocumentType; input: DocumentTemplateInput }) =>
+      parseWith(
+        documentTemplateSchema,
+        await putJson<unknown>(`/document-templates/${type}`, input),
+        "document template",
+      ),
+    // The response body is the SANITISED template, which is what a later quote
+    // will actually merge -- so it is written into the cache rather than
+    // refetched, and the editor shows what was stored rather than what was
+    // typed.
+    onSuccess: (template: DocumentTemplate) =>
+      queryClient.setQueryData(["document-template", template.type], template),
   });
 }

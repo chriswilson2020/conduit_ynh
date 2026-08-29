@@ -16,7 +16,7 @@ const activeTabClass =
   "border-b-2 border-slate-900 px-3 py-2 text-sm font-medium text-slate-900 max-md:inline-flex max-md:min-h-11 max-md:items-center";
 
 /**
- * The Settings area's frame: a title and the two-tab nav every settings page
+ * The Settings area's frame: a title and the tab nav every settings page
  * renders inside. Deliberately plain -- router Links styled as tabs rather
  * than Radix Tabs (components/ui/tabs.tsx), because these tabs ARE routes:
  * each has its own URL, back/forward works, and a bookmark lands on the right
@@ -27,12 +27,15 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
   return (
     <div className="flex flex-col gap-6">
       <h1 className="text-xl font-semibold text-slate-900">Settings</h1>
-      <nav data-testid="settings-nav" className="flex gap-1 border-b border-slate-200">
+      <nav data-testid="settings-nav" className="flex gap-1 overflow-x-auto border-b border-slate-200">
         <Link to="/settings/mail" className={tabClass} activeProps={{ className: activeTabClass }}>
           Mail accounts
         </Link>
         <Link to="/settings/templates" className={tabClass} activeProps={{ className: activeTabClass }}>
-          Email templates
+          Templates
+        </Link>
+        <Link to="/settings/org" className={tabClass} activeProps={{ className: activeTabClass }}>
+          Organisation
         </Link>
       </nav>
       {children}
