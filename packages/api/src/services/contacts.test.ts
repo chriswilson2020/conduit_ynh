@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import { eq } from "drizzle-orm";
+import { CONTACT_FIELD_CAPS, createContactInputSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { events } from "../db/schema.js";
@@ -36,6 +37,58 @@ describe("contacts service", () => {
     const evs = await handle.db.select().from(events).where(eq(events.contactId, c.id));
     const upd = evs.find((e) => e.verb === "updated");
     expect(upd?.payload).toEqual({ changed: ["lastName", "jobTitle"] });
+  });
+
+  // v1.1.0's two columns, through the service that is the only writer of them.
+  it("round-trips a salutation and a set of pronouns, including absent and longest", async () => {
+    const created = await createContact(handle.db, actorId, {
+      firstName: "Ada", salutation: "Dr", pronouns: "she/her",
+    });
+    expect(created).toMatchObject({ salutation: "Dr", pronouns: "she/her" });
+    expect(await getContact(handle.db, created.id)).toMatchObject({
+      salutation: "Dr", pronouns: "she/her",
+    });
+
+    // NEITHER IS INFERRED, AND ABSENT MEANS ABSENT. A contact created without them
+    // has null in both, and a contact given only one gains only that one -- no guess
+    // from the name, and none from the other field.
+    const bare = await createContact(handle.db, actorId, { firstName: "Ada", lastName: "Lovelace" });
+    expect(bare).toMatchObject({ salutation: null, pronouns: null });
+    const titled = await createContact(handle.db, actorId, { firstName: "Ada", salutation: "Mr" });
+    expect(titled).toMatchObject({ salutation: "Mr", pronouns: null });
+
+    // The longest value the schema permits stores, and clearing writes null back --
+    // the shape the detail form sends when somebody empties the field.
+    const longest = "x".repeat(CONTACT_FIELD_CAPS.salutation);
+    const maxed = await updateContact(handle.db, actorId, created.id, { salutation: longest });
+    expect(maxed.salutation).toBe(longest);
+    const cleared = await updateContact(handle.db, actorId, created.id, {
+      salutation: null, pronouns: null,
+    });
+    expect(cleared).toMatchObject({ salutation: null, pronouns: null });
+    const evs = await handle.db.select().from(events).where(eq(events.contactId, created.id));
+    expect(evs.filter((e) => e.verb === "updated").at(-1)?.payload)
+      .toEqual({ changed: ["salutation", "pronouns"] });
+  });
+
+  it("refuses a salutation or a set of pronouns longer than the cap, before the CHECK sees it", async () => {
+    // Zod is the gate and the CHECK is the backstop, so this is a parse failure
+    // naming the field rather than a 23514 from the database. The service does not
+    // parse (the route does), so the schema is exercised directly.
+    const past = "x".repeat(CONTACT_FIELD_CAPS.salutation + 1);
+    const salutation = createContactInputSchema.safeParse({ firstName: "Ada", salutation: past });
+    expect(salutation.success).toBe(false);
+    expect(salutation.error?.issues[0]?.message).toContain("salutation");
+    const pronouns = createContactInputSchema.safeParse({ firstName: "Ada", pronouns: past });
+    expect(pronouns.success).toBe(false);
+    expect(pronouns.error?.issues[0]?.message).toContain("pronouns");
+
+    // ...and nothing constrains the VALUE. Every one of these is a title or a set
+    // the picker does not offer, and each has to survive unchanged.
+    for (const value of ["Dhr", "Mevr", "Drs", "Ir", "Ing", "Rev", "Sir", "she/they", "hij/hem"]) {
+      expect(createContactInputSchema.safeParse({ firstName: "Ada", salutation: value }).success).toBe(true);
+      expect(createContactInputSchema.safeParse({ firstName: "Ada", pronouns: value }).success).toBe(true);
+    }
   });
 
   it("archive hides from the default list but getContact still returns it", async () => {

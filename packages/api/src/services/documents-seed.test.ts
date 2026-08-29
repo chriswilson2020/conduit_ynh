@@ -52,8 +52,8 @@ const EMPTY_CONTEXT: MergeContext = {
   },
   document: {
     number: "", issueDate: "", validUntilDate: "", recipientName: "",
-    recipientContactName: "", recipientAddress: "", subtotal: "", tax: "", total: "",
-    notes: "", terms: "",
+    recipientContactName: "", recipientSalutation: "", recipientAddress: "",
+    subtotal: "", tax: "", total: "", notes: "", terms: "",
   },
   lines: [],
 };
@@ -82,7 +82,8 @@ const WITH_LOGO: MergeContext = {
   },
   document: {
     ...WITHOUT_LOGO.document, validUntilDate: "2026-09-27",
-    recipientContactName: "Jane Smith", recipientAddress: "2 Low St\n1016 AB Amsterdam",
+    recipientContactName: "Jane Smith", recipientSalutation: "Dr",
+    recipientAddress: "2 Low St\n1016 AB Amsterdam",
     notes: "Thank you for the enquiry.", terms: "Payment within 30 days.",
   },
   lines: WITHOUT_LOGO.lines,
@@ -141,7 +142,29 @@ describe("the seeded quote template", () => {
     expect(html).toContain("Valid until");
     expect(html).toContain("VAT NL001234567B01");
     expect(html).toContain("Company registration 12345678");
-    expect(html).toContain("Jane Smith");
+    expect(html).toContain("<div>Dr Jane Smith</div>");
+  });
+
+  // THE OTHER THREE STATES OF THE RECIPIENT LINE, because the salutation sits in a
+  // block NESTED inside the contact name's and only one of the four combinations is
+  // exercised above. What each has to avoid is a stray space or an orphaned title:
+  // "Jane Smith" with a leading space is a visible defect on a printed quote, and a
+  // "Dr" standing alone over a company address is a worse one.
+  it("prints the recipient line correctly whichever of the salutation and the name is missing", () => {
+    const merged = (recipientSalutation: string, recipientContactName: string): string =>
+      prepareDocumentHtml(seededTemplate(), {
+        ...WITH_LOGO,
+        document: { ...WITH_LOGO.document, recipientSalutation, recipientContactName },
+      });
+
+    expect(merged("Dr", "Jane Smith")).toContain("<div>Dr Jane Smith</div>");
+    // No leading space where the salutation would have been: the space lives inside
+    // the block, not in front of it.
+    expect(merged("", "Jane Smith")).toContain("<div>Jane Smith</div>");
+    // A salutation with no name to qualify prints nothing at all -- see 0011. "Dr"
+    // appears nowhere else in this context, so its absence is the assertion.
+    expect(merged("Dr", "")).not.toContain("Dr");
+    expect(merged("", "")).not.toContain("<div></div>");
   });
 
   it("says so rather than printing an empty table when a quote has no lines", () => {

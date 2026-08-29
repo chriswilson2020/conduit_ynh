@@ -7,10 +7,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema, mailVisibilitySchema,
-  MAX_LOGO_DATA_URI_CHARS,
+  CONTACT_FIELD_CAPS, MAX_LOGO_DATA_URI_CHARS,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { TEST_DATABASE_URL } from "../test/global-setup.js";
+import { seededQuoteTemplate } from "../test/seed-template.js";
 import { resolveUser } from "../users.js";
 import { createCompany } from "../services/companies.js";
 import { createContact } from "../services/contacts.js";
@@ -182,8 +183,17 @@ describe("mail schema (0004)", () => {
       // the real schema.ts table objects describe this "old" shape exactly.
       const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
       const [company] = await scratch.db.insert(companies).values({ name: "Acme" }).returning();
-      const [contact] = await scratch.db.insert(contacts)
-        .values({ firstName: "Bob", companyId: company!.id }).returning();
+      // RAW SQL, AND EVERY DRILL THAT SEEDS A TABLE A LATER MIGRATION TOUCHES NEEDS
+      // IT. drizzle names every column of the CURRENT schema in an INSERT (the
+      // unspecified ones as DEFAULT) and again in RETURNING, so an ORM insert can
+      // only ever describe today's shape: this line worked until 0011 added
+      // contacts.salutation, then failed here with `column "salutation" of relation
+      // "contacts" does not exist` -- in the 0004 test, a long way from the change
+      // that caused it. Naming the columns by hand is what makes "old shape" mean it.
+      const [contact] = await scratch.db.execute<{ id: string }>(sql`
+        INSERT INTO contacts (first_name, company_id) VALUES ('Bob', ${company!.id})
+        RETURNING id
+      `);
       const [pipeline] = await scratch.db.insert(pipelines)
         .values({ name: "Sales", scope: "global", position: "a0" }).returning();
       const [stage] = await scratch.db.insert(stages)
@@ -1270,7 +1280,15 @@ describe("documents schema (0009)", () => {
   const SEEDED_OPTIONAL = [
     "org.logoDataUri", "org.addressLines", "org.email", "org.phone", "org.website",
     "org.bankDetails", "org.vatNumber", "org.registrationNumber",
-    "document.validUntilDate", "document.recipientContactName", "document.recipientAddress",
+    "document.validUntilDate", "document.recipientContactName",
+    // v1.1.0, and it arrives by an UPDATE in 0011 rather than in 0009's INSERT: the
+    // seed had shipped, so the template is amended in place. It is optional like
+    // every other one -- a contact with no salutation prints their name alone -- and
+    // it is nested INSIDE document.recipientContactName's block, which is legal (a
+    // closer matches its own opener by depth) and is why the token counts below still
+    // come out at three apiece.
+    "document.recipientSalutation",
+    "document.recipientAddress",
     "document.notes", "document.terms",
   ];
   const SEEDED_FIELDS = [
@@ -1370,12 +1388,14 @@ describe("documents schema (0009)", () => {
       expect(body).toContain("@page");
       expect(body).toContain("white-space: pre-line");
       // Rendered on the server (WeasyPrint 57.2) through the shipped renderPdf,
-      // most recently after the spacing was tightened to stop the footer stranding
-      // itself on page two: with a logo and everything filled in, 4,101 chars of
-      // merged HTML and a ONE-page 16,117-byte PDF; with no logo and nothing
-      // optional filled in, 3,473 chars and a 14,381-byte one-page PDF carrying no
-      // image XObject at all. Byte counts move by one or two between runs -- the
-      // renderer is not reproducible (Task 1) -- and page counts do not.
+      // most recently after v1.1.0 put a salutation on the recipient's line: with a
+      // logo and everything filled in, 4,104 chars of merged HTML and a ONE-page
+      // 16,124-byte PDF; with no logo and nothing optional filled in, 3,473 chars
+      // and a 14,379-byte one-page PDF carrying no image XObject at all. The filled
+      // figures were 4,101 and 16,117 before "Dr " joined the contact's name; the
+      // empty one has no contact name, so its character count did not move. Byte
+      // counts move by one or two between runs -- the renderer is not reproducible
+      // (Task 1) -- and page counts do not.
       // documents-seed.test.ts is where those two renders happen on every push, and
       // it prints the figures.
 
@@ -1767,5 +1787,189 @@ describe("documents schema (0009)", () => {
       const [row] = await handle.db.insert(orgProfile).values({ logoDataUri: good }).returning();
       expect(row?.logoDataUri).toBe(good);
     }
+  });
+});
+
+describe("salutation and pronouns (0011)", () => {
+  /** The line 0009 seeded, and the line 0011 rewrites it to. Written out here rather
+   * than read from the migration on purpose: this is the assertion, and a test that
+   * derived its expectation from the file under test would pass whatever that file
+   * said. seededQuoteTemplate() is the derived one, and the drills below check the two
+   * against each other. */
+  const OLD_LINE =
+    "{{#document.recipientContactName}}<div>{{document.recipientContactName}}</div>"
+    + "{{/document.recipientContactName}}";
+  const NEW_LINE =
+    "{{#document.recipientContactName}}<div>{{#document.recipientSalutation}}"
+    + "{{document.recipientSalutation}} {{/document.recipientSalutation}}"
+    + "{{document.recipientContactName}}</div>{{/document.recipientContactName}}";
+
+  /** A contact, and a document with all its NOT NULL parents, INSERTed as a pre-0011
+   * database can hold them: raw SQL for the two tables 0011 changes, so nothing here
+   * names a column that does not exist yet. */
+  async function seedPreUpgradeRows(scratch: DatabaseHandle): Promise<void> {
+    const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+    const pipeline = await createPipeline(scratch.db, user!.id, { name: "Sales", scope: "global" });
+    const stage = await createStage(scratch.db, user!.id, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      scratch.db, user!.id, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+    );
+    const [file] = await scratch.db.insert(files).values({
+      originalName: "QUO-2026-0001.pdf", mime: "application/pdf", sizeBytes: 16_003,
+      sha256: "c".repeat(64), uploaderUserId: user!.id, dealId: deal.id,
+    }).returning();
+    await scratch.db.execute(sql`
+      INSERT INTO contacts (first_name, last_name) VALUES ('Jane', 'Smith')
+    `);
+    await scratch.db.execute(sql`
+      INSERT INTO documents (number, type, deal_id, file_id, currency, issue_date,
+                             recipient_name, recipient_contact_name,
+                             subtotal_cents, tax_cents, total_cents, issued_by_user_id)
+      VALUES ('QUO-2026-0001', 'quote', ${deal.id}, ${file!.id}, 'EUR', '2026-08-28',
+              'Acme', 'Jane Smith', 11000, 2100, 13100, ${user!.id})
+    `);
+  }
+
+  async function quoteTemplateRow(
+    scratch: DatabaseHandle,
+  ): Promise<{ bodyHtml: string; updatedAt: Date }> {
+    const [row] = await scratch.db
+      .select({ bodyHtml: documentTemplates.bodyHtml, updatedAt: documentTemplates.updatedAt })
+      .from(documentTemplates).where(eq(documentTemplates.type, "quote"));
+    if (row === undefined) throw new Error("no quote template in the scratch database");
+    return row;
+  }
+
+  it("applies migration 0011 on top of a real database migrated only through 0010 -- an existing contact gains two empty columns, an existing document gains an empty salutation, and the seeded template starts printing it", async () => {
+    await withPreMigrationDatabase("0011", async (scratch) => {
+      await seedPreUpgradeRows(scratch);
+
+      // Pin the premise: without this every assertion below would also pass against
+      // a database that had been fully migrated all along (the 0006-0010 pattern).
+      const [pre] = await scratch.db.execute<{ present: number }>(sql`
+        SELECT count(*)::int AS present FROM information_schema.columns
+        WHERE (table_name, column_name) IN
+          (('contacts', 'salutation'), ('contacts', 'pronouns'),
+           ('documents', 'recipient_salutation'))
+      `);
+      expect(pre?.present).toBe(0);
+      expect((await quoteTemplateRow(scratch)).bodyHtml).toContain(OLD_LINE);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // NOTHING IS INFERRED, INCLUDING AT UPGRADE. A contact who existed before this
+      // release has no salutation and no pronouns -- not a guess from the name -- and
+      // a quote issued before it prints no salutation rather than acquiring one.
+      const [contact] = await scratch.db
+        .select({ salutation: contacts.salutation, pronouns: contacts.pronouns })
+        .from(contacts);
+      expect(contact).toEqual({ salutation: null, pronouns: null });
+      const [document] = await scratch.db
+        .select({ recipientSalutation: documents.recipientSalutation }).from(documents);
+      expect(document?.recipientSalutation).toBe("");
+
+      // THE SEED, AMENDED IN PLACE. An install that never touched the template gets
+      // the new line...
+      const body = (await quoteTemplateRow(scratch)).bodyHtml;
+      expect(body).not.toContain(OLD_LINE);
+      expect(body).toContain(NEW_LINE);
+      // ...and this is the assertion that stops the file-derived template and the
+      // real one from drifting apart. Every merge test in this repo reads the
+      // template out of the migrations (truncateAll() destroys the row, so the
+      // database is not available to them); if that reader ever stopped applying an
+      // amendment, those suites would go on testing a template no install has. This
+      // is the one place both are in hand at once.
+      expect(body).toBe(seededQuoteTemplate());
+    });
+  }, 30000);
+
+  it("amends a CUSTOMISED template in place, keeping every customisation", async () => {
+    // THE OPERATOR'S AFTERNOON. Settings -> Templates lets the template be edited,
+    // and a migration that assigned a fresh body would silently destroy a letterhead
+    // with no undo anywhere in the product. 0011 rewrites one line and touches
+    // nothing else, which is what this proves.
+    await withPreMigrationDatabase("0011", async (scratch) => {
+      const custom = "<div>Registered in Amsterdam. Quotes valid 30 days.</div>";
+      await scratch.db.execute(sql`
+        UPDATE document_templates SET body_html = body_html || ${custom} WHERE type = 'quote'
+      `);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const body = (await quoteTemplateRow(scratch)).bodyHtml;
+      expect(body).toBe(seededQuoteTemplate() + custom);
+    });
+  }, 30000);
+
+  it("leaves a template whose recipient line was itself edited completely alone, updated_at included", async () => {
+    // The other side of the guard. An install that rewrote the recipient block has
+    // said what it wants there; the migration matches nothing, changes nothing, and
+    // does not even restamp updated_at -- so Settings does not report an edit that
+    // never happened. That install adds {{document.recipientSalutation}} by hand, and
+    // the field list on the Settings page is where it is documented.
+    await withPreMigrationDatabase("0011", async (scratch) => {
+      await scratch.db.execute(sql`
+        UPDATE document_templates
+        SET body_html = replace(body_html, ${OLD_LINE}, '<p>FAO {{document.recipientContactName}}</p>')
+        WHERE type = 'quote'
+      `);
+      const before = await quoteTemplateRow(scratch);
+      expect(before.bodyHtml).not.toContain(OLD_LINE);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      expect(await quoteTemplateRow(scratch)).toEqual(before);
+    });
+  }, 30000);
+
+  // THE BOUND, AND WHAT IT DELIBERATELY DOES NOT BOUND. 64 characters each, enforced
+  // by the CHECKs as the backstop to CONTACT_FIELD_CAPS in @conduit/shared -- and no
+  // constraint whatsoever on the VALUE. The picker's Mr/Mrs/Ms/Mx/Dr/Prof and
+  // he-him/she-her/they-them are a UI convenience; an enum or a value-set CHECK here
+  // would turn "type your own" into a 23514 for every title in every other language.
+  it("bounds both new contact columns at 64 characters and constrains their values not at all", async () => {
+    // The constant and the constraints cannot drift: each is asserted to carry the
+    // other's number, the way org_profile_logo_size is pinned to
+    // MAX_LOGO_DATA_URI_CHARS. Zod refuses a long value first; these are the backstop.
+    const checks = await handle.db.execute<{ conname: string; src: string }>(sql`
+      SELECT conname, pg_get_constraintdef(oid) AS src FROM pg_constraint
+      WHERE conname IN ('contacts_salutation_length', 'contacts_pronouns_length')
+    `);
+    expect(checks).toHaveLength(2);
+    expect(CONTACT_FIELD_CAPS.salutation).toBe(64);
+    expect(CONTACT_FIELD_CAPS.pronouns).toBe(64);
+    for (const check of checks) {
+      expect(check.src).toContain(String(CONTACT_FIELD_CAPS.salutation));
+    }
+
+    const atLimit = "x".repeat(CONTACT_FIELD_CAPS.salutation);
+    const past = "x".repeat(CONTACT_FIELD_CAPS.salutation + 1);
+    const [longest] = await handle.db.insert(contacts)
+      .values({ firstName: "Jane", salutation: atLimit, pronouns: atLimit }).returning();
+    expect(longest).toMatchObject({ salutation: atLimit, pronouns: atLimit });
+    // One column over at a time, so the refusal can only have come from the
+    // constraint under test -- asserted BY NAME, since a bare 23514 cannot tell the
+    // two apart and a shared bound would pass either way round.
+    await expect(handle.db.insert(contacts).values({ firstName: "Jane", salutation: past }))
+      .rejects.toMatchObject({ cause: { constraint_name: "contacts_salutation_length" } });
+    await expect(handle.db.insert(contacts).values({ firstName: "Jane", pronouns: past }))
+      .rejects.toMatchObject({ cause: { constraint_name: "contacts_pronouns_length" } });
+
+    // Nothing here is a permitted-value list, so all of these store unchanged --
+    // including the accented one, which is a title this repo's ASCII source can only
+    // write as an escape and a Dutch or Spanish install types straight in.
+    for (const salutation of ["Mr", "Dhr", "Mevr", "Drs", "Ir", "Ing", "Rev", "Sir", "Se\u00f1or"]) {
+      const [row] = await handle.db.insert(contacts).values({ firstName: "Jane", salutation }).returning();
+      expect(row?.salutation).toBe(salutation);
+    }
+    for (const pronouns of ["he/him", "she/her", "they/them", "she/they", "hij/hem"]) {
+      const [row] = await handle.db.insert(contacts).values({ firstName: "Jane", pronouns }).returning();
+      expect(row?.pronouns).toBe(pronouns);
+    }
+
+    // Both nullable, and absent by default: a contact created without them has
+    // neither, which is the state every pre-v1.1.0 row is in.
+    const [bare] = await handle.db.insert(contacts).values({ firstName: "Jane" }).returning();
+    expect(bare).toMatchObject({ salutation: null, pronouns: null });
   });
 });

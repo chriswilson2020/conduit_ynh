@@ -202,11 +202,32 @@ export function dedupeRecipients(recipients: readonly ComposerRecipient[]): Comp
  */
 export interface TemplateContext {
   contactName?: string | null;
+  /**
+   * How this contact is addressed, and their pronouns, TAKEN LIVE FROM THE RECORD
+   * AT COMPOSE TIME.
+   *
+   * No snapshot and no new storage, which is the opposite of what a quote does with
+   * the same salutation (`documents.recipient_salutation`) and is right for the same
+   * reason: a quote is an artifact somebody keeps, so it freezes what it printed,
+   * while a message is composed and sent in the moment. A person who corrects their
+   * pronouns has corrected them for the next message, and nothing stored disagrees.
+   *
+   * NEITHER IS EVER INFERRED -- not from the name, not from each other. An absent
+   * value leaves its placeholder literal, exactly as an absent name does.
+   */
+  contactSalutation?: string | null;
+  contactPronouns?: string | null;
   companyName?: string | null;
   userName?: string | null;
 }
 
-const PLACEHOLDER = /\{\{\s*(contact|company|user)\.name\s*\}\}/g;
+/** `{{contact.name}}`, `{{contact.salutation}}`, `{{contact.pronouns}}`,
+ * `{{company.name}}` and `{{user.name}}`. Written as one alternation of whole paths
+ * rather than `(contact|company|user)\.(name|salutation|pronouns)`, which would also
+ * match `{{company.pronouns}}` -- a placeholder nothing supplies, silently left
+ * literal in a sent email. */
+const PLACEHOLDER =
+  /\{\{\s*(contact\.name|contact\.salutation|contact\.pronouns|company\.name|user\.name)\s*\}\}/g;
 
 /** Text-node escaping for a value being spliced into markup. Ampersand
  * first, or it would double-escape the entities the others produce. */
@@ -214,18 +235,31 @@ function escapeHtmlText(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Every placeholder path, and the context key that fills it. A path missing from
+ * here resolves to undefined and is therefore left literal, which is the same
+ * outcome as an empty value -- so adding a path to PLACEHOLDER without adding it
+ * here is a placeholder that never fills, not a crash. */
+const PLACEHOLDER_KEYS: Record<string, keyof TemplateContext> = {
+  "contact.name": "contactName",
+  "contact.salutation": "contactSalutation",
+  "contact.pronouns": "contactPronouns",
+  "company.name": "companyName",
+  "user.name": "userName",
+};
+
 function substitute(input: string, context: TemplateContext, escape: (value: string) => string): string {
-  return input.replace(PLACEHOLDER, (match, field: string) => {
-    const value = field === "contact" ? context.contactName
-      : field === "company" ? context.companyName
-        : context.userName;
+  return input.replace(PLACEHOLDER, (match, path: string) => {
+    const key = PLACEHOLDER_KEYS[path];
+    const value = key === undefined ? undefined : context[key];
     return value != null && value.trim() !== "" ? escape(value) : match;
   });
 }
 
 /**
- * Substitutes `{{contact.name}}`, `{{company.name}}` and `{{user.name}}` from
- * the given context into PLAIN TEXT (the subject line). A placeholder with
+ * Substitutes every path in PLACEHOLDER_KEYS -- `{{contact.name}}`,
+ * `{{contact.salutation}}`, `{{contact.pronouns}}`, `{{company.name}}` and
+ * `{{user.name}}` -- from the given context into PLAIN TEXT (the subject line,
+ * where a salutation is the likely one). A placeholder with
  * nothing to fill it is LEFT LITERAL (spec: "unresolved placeholders are left
  * visible for the user to fill"), never replaced with an empty string -- an
  * email that silently reads "Hi ," is worse than one that visibly still needs

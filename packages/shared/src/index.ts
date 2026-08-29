@@ -63,10 +63,39 @@ export type CreateCompanyInput = z.infer<typeof createCompanyInputSchema>;
 export const updateCompanyInputSchema = createCompanyInputSchema.partial();
 export type UpdateCompanyInput = z.infer<typeof updateCompanyInputSchema>;
 
+/**
+ * HOW LONG A SALUTATION OR A SET OF PRONOUNS MAY BE, named so a form can derive
+ * its own maxLength instead of restating the number (DOCUMENT_FIELD_CAPS exists
+ * for the same reason, after a round where the quote form spelled its caps out by
+ * hand and nothing kept them agreeing).
+ *
+ * 64 is generous for both -- "Dhr" is 3, "she/they" is 8, and the longest honorific
+ * anybody has proposed for this field is well inside it -- and it is what
+ * contacts_salutation_length and contacts_pronouns_length CHECK. This is the gate;
+ * those are the backstop.
+ *
+ * IT IS A LENGTH AND NOTHING ELSE. There is no enum and no permitted-value list
+ * anywhere in this codebase: the picker's presets are a UI convenience, and a title
+ * or a pronoun set in any language must be typable. See db/schema.ts's contacts.
+ */
+export const CONTACT_FIELD_CAPS = { salutation: 64, pronouns: 64 } as const;
+
+/** A nullable free-text field with a length cap. `min(1)` and the cap are inside the
+ * one expression on purpose -- `nullableString.max(n)` does not type-check against a
+ * nullable schema, and chaining after `.nullable()` silently drops the bound. */
+const cappedNullableString = (max: number, what: string) =>
+  z.string().min(1).max(max, `a ${what} may be at most ${String(max)} characters`).nullable();
+
 export const contactSchema = z.object({
   id: z.uuid(), firstName: z.string().min(1), lastName: nullableString,
   companyId: z.uuid().nullable(), emails: z.array(z.email()), phones: z.array(z.string().min(1)),
-  jobTitle: nullableString, ownerUserId: z.uuid().nullable(),
+  jobTitle: nullableString,
+  // Both optional, both free text, and NEITHER IS EVER INFERRED -- not from the
+  // name, not from each other, not from anything. A blank stays blank and renders
+  // as nothing. Stated here as well as in db/schema.ts because this is the shape
+  // every client sees, and a guess in a letter is wrong in front of a customer.
+  salutation: nullableString, pronouns: nullableString,
+  ownerUserId: z.uuid().nullable(),
   archivedAt: z.iso.datetime().nullable(), ...timestamps,
 });
 export type Contact = z.infer<typeof contactSchema>;
@@ -75,7 +104,10 @@ export const createContactInputSchema = z.object({
   firstName: z.string().min(1), lastName: nullableString.optional(),
   companyId: z.uuid().nullable().optional(),
   emails: z.array(z.email()).optional(), phones: z.array(z.string().min(1)).optional(),
-  jobTitle: nullableString.optional(), ownerUserId: z.uuid().nullable().optional(),
+  jobTitle: nullableString.optional(),
+  salutation: cappedNullableString(CONTACT_FIELD_CAPS.salutation, "salutation").optional(),
+  pronouns: cappedNullableString(CONTACT_FIELD_CAPS.pronouns, "set of pronouns").optional(),
+  ownerUserId: z.uuid().nullable().optional(),
 });
 export type CreateContactInput = z.infer<typeof createContactInputSchema>;
 export const updateContactInputSchema = createContactInputSchema.partial();
@@ -2260,6 +2292,9 @@ export const documentSchema = z.object({
   validUntilDate: z.iso.date().nullable(),
   recipientName: z.string(),
   recipientContactName: z.string(),
+  // Snapshot at issue, not read from the contact -- see documents.recipient_salutation
+  // in db/schema.ts. Pronouns are deliberately absent from this record.
+  recipientSalutation: z.string(),
   recipientAddress: z.string(),
   subtotalCents: z.number().int().safe(),
   taxCents: z.number().int().safe(),
@@ -2294,7 +2329,10 @@ export type DocumentRecord = z.infer<typeof documentSchema>;
  *
  *   the template against an all-empty context        2,211 B
  *   a maxed org profile INCLUDING a maxed logo      +47,115 B
- *   maxed notes/terms/address/names (ASCII)         +12,486 B
+ *   maxed notes/terms/address/names/salutation      +12,551 B
+ *     (ASCII; it was +12,486 before v1.1.0 taught
+ *      the template to print the salutation, which
+ *      is 64 characters and the space after it)
  *   one more line item, shortest money strings         +139 B
  *   one more line item, widest money strings           +186 B
  *   one more character of ASCII description              +1 B
@@ -2653,12 +2691,14 @@ export const DOCUMENT_MAX_DESCRIPTION_CHARS = 250;
 export function documentContentBytes(input: {
   recipientName?: string;
   recipientContactName?: string;
+  recipientSalutation?: string;
   recipientAddress?: string;
   notes?: string;
   terms?: string;
   lines: readonly { description: string }[];
 }): number {
   let total = escapedBytes(input.recipientName ?? "") + escapedBytes(input.recipientContactName ?? "")
+    + escapedBytes(input.recipientSalutation ?? "")
     + escapedBytes(input.recipientAddress ?? "") + escapedBytes(input.notes ?? "")
     + escapedBytes(input.terms ?? "");
   for (const line of input.lines) {
@@ -2743,6 +2783,10 @@ export type DocumentLineInput = z.infer<typeof documentLineInputSchema>;
 export const DOCUMENT_FIELD_CAPS = {
   recipientName: 200,
   recipientContactName: 200,
+  // The same 64 as CONTACT_FIELD_CAPS.salutation, because this field is filled by
+  // copying that one: a cap the contact record permits and the quote form refuses
+  // would break the defaulting the moment somebody used the length they were given.
+  recipientSalutation: CONTACT_FIELD_CAPS.salutation,
   recipientAddress: 2000,
   notes: 5000,
   terms: 5000,
@@ -2753,6 +2797,7 @@ export const issueQuoteInputSchema = z.object({
   validUntilDate: documentDateSchema.nullable().optional(),
   recipientName: documentText(DOCUMENT_FIELD_CAPS.recipientName, 1),
   recipientContactName: documentText(DOCUMENT_FIELD_CAPS.recipientContactName).optional(),
+  recipientSalutation: documentText(DOCUMENT_FIELD_CAPS.recipientSalutation).optional(),
   recipientAddress: documentText(DOCUMENT_FIELD_CAPS.recipientAddress).optional(),
   notes: documentText(DOCUMENT_FIELD_CAPS.notes).optional(),
   terms: documentText(DOCUMENT_FIELD_CAPS.terms).optional(),

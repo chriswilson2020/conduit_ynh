@@ -793,8 +793,9 @@ test.describe("The line-item editor on a phone", () => {
     // `toHaveValue` regex waiting for the letterhead token -- the template no longer
     // contains it, so the wait times out and reads like a seeding problem rather than
     // a sanitiser one. Both mean the same thing. Re-seed by replaying the INSERT at
-    // the end of packages/api/drizzle/0009_calm_rhodey.sql, which is the same repair
-    // a `truncateAll()` from the unit suite already needs.
+    // the end of packages/api/drizzle/0009_calm_rhodey.sql AND THEN 0011's UPDATE,
+    // which amends the recipient line -- 0009 alone restores a v1.0.x template. That
+    // is the same repair a `truncateAll()` from the unit suite already needs.
     //
     // The restore below makes the SUCCEEDING path leave nothing behind either.
     await page.getByTestId("document-template-save").click();

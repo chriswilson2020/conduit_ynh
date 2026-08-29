@@ -65,12 +65,32 @@ export const contacts = pgTable("contacts", {
   emails: text("emails").array().notNull().default([]),
   phones: text("phones").array().notNull().default([]),
   jobTitle: text("job_title"),
+  // HOW THIS PERSON IS ADDRESSED (v1.1.0). Both nullable, both FREE TEXT, and
+  // neither is ever inferred from the other or from the name -- a salutation of
+  // "Dr" says nothing about pronouns, and a first name says nothing about either.
+  //
+  // NO ENUM AND NO VALUE-SET CHECK, deliberately. The picker in the UI offers Mr,
+  // Mrs, Ms, Mx, Dr, Prof and he/him, she/her, they/them, but those six and those
+  // three are a convenience: Dhr, Mevr, Drs, Ir, Ing, Rev, Sir, she/they and a
+  // title in a language nobody here has thought of must all be typable. A
+  // constraint on the value set would turn "type your own" into a 23514.
+  //
+  // The length bound is the only thing checked, and the Zod input schema
+  // (createContactInputSchema) is the gate -- this is the backstop, the same
+  // split as contacts.emails' format validation.
+  salutation: text("salutation"),
+  pronouns: text("pronouns"),
   ownerUserId: uuid("owner_user_id").references(() => users.id),
   custom: jsonb("custom").notNull().default({}),
   archivedAt: timestamp("archived_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [
+  // 64 characters, which is CONTACT_FIELD_CAPS in @conduit/shared. Written as two
+  // constraints rather than one so a refusal names the column that was too long.
+  check("contacts_salutation_length", sql`char_length(salutation) <= 64`),
+  check("contacts_pronouns_length", sql`char_length(pronouns) <= 64`),
+]);
 export type ContactRow = typeof contacts.$inferSelect;
 
 // --- Pipelines, stages, deals (Phase 2) ---------------------------------
@@ -854,6 +874,21 @@ export const documents = pgTable("documents", {
   // matching recipient_address: a quote to a company with no named contact is
   // ordinary, not missing data.
   recipientContactName: text("recipient_contact_name").notNull().default(""),
+  // HOW THAT PERSON WAS ADDRESSED, SNAPSHOT AT ISSUE (v1.1.0), and this column
+  // is the whole reason the release has a data model rather than a template
+  // change. contacts.salutation is editable; a quote is not. Read live, a title
+  // corrected next year would silently rewrite the greeting on a quote sent last
+  // year -- the same failure recipient_name and recipient_address are copied to
+  // avoid. Defaulted to '' like both of them: a quote with no salutation on it is
+  // ordinary, and every row that existed before this column has one.
+  //
+  // PRONOUNS ARE DELIBERATELY NOT HERE. A quote's greeting takes the salutation
+  // and has no use for them, and freezing a personal detail into an immutable
+  // artifact that gets downloaded and emailed should need a reason. Mail templates
+  // read pronouns live from the contact instead (see mail-lib.ts), which is the
+  // right lifetime for them: a person who corrects their pronouns has corrected
+  // them for the next message, and no stored copy disagrees.
+  recipientSalutation: text("recipient_salutation").notNull().default(""),
   recipientAddress: text("recipient_address").notNull().default(""),
   // Integer cents, as deals.value_cents already is, computed by
   // @conduit/shared's documentTotals -- the same function the form's running

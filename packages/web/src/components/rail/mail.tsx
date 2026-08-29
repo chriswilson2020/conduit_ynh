@@ -53,7 +53,12 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
       // and so the composer's attach control is enabled (POST /api/files needs
       // a record to file the upload against).
       links: { companyId, contactId, dealId, projectId },
-      context: { contactName, companyName: company?.name },
+      context: {
+        contactName, companyName: company?.name,
+        // Straight off the record, unchanged and unguessed: a contact with no
+        // salutation supplies none, and the placeholder stays visible.
+        contactSalutation: contact?.salutation, contactPronouns: contact?.pronouns,
+      },
     });
   }
 

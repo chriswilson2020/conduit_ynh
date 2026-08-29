@@ -71,7 +71,9 @@ export interface ComposerSeed {
    * `links`: the caller already holds them, and an unresolved placeholder is
    * a supported outcome, not a failure.
    */
-  context?: Pick<TemplateContext, "contactName" | "companyName">;
+  context?: Pick<
+    TemplateContext, "contactName" | "contactSalutation" | "contactPronouns" | "companyName"
+  >;
 }
 
 export interface ComposerProps {
@@ -182,6 +184,10 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
 
   const context: TemplateContext = {
     contactName: seed?.context?.contactName,
+    // Live off the contact record the opener is holding, not stored anywhere: mail
+    // is composed and sent in the moment. See TemplateContext.
+    contactSalutation: seed?.context?.contactSalutation,
+    contactPronouns: seed?.context?.contactPronouns,
     companyName: seed?.context?.companyName,
     userName: userLabel(me, undefined),
   };

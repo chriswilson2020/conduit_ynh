@@ -3,9 +3,33 @@ import { join } from "node:path";
 import { migrationsFolder } from "../db/client.js";
 
 /**
- * The seeded quote template, read out of the migration that inserts it.
+ * The migrations that write the quote template's body, in the order they run.
  *
- * IT HAS TO BE READ FROM THE FILE RATHER THAN THE DATABASE. `truncateAll()` empties
+ * NOT A SINGLE FILE ANY MORE, and that is what this list exists to say: 0009 INSERTs
+ * the body, and every later migration that amends it does so with a guarded
+ * `replace(...)` rather than an overwrite, because the operator may have edited the
+ * template in Settings and a migration must not throw that away. So "the template a
+ * fresh install has" is 0009's literal with each later rewrite applied in turn --
+ * which is exactly what this function computes, and what a fresh install's database
+ * ends up holding.
+ *
+ * A migration that amends the body in some OTHER shape would be missed here silently,
+ * which is why schema.test.ts's migration drill asserts this function's output equals
+ * the body read back out of a really-migrated database. That assertion is what keeps
+ * the file-derived template and the real one from drifting apart.
+ */
+const TEMPLATE_MIGRATIONS = ["0009_calm_rhodey.sql", "0011_sharp_skullbuster.sql"];
+
+/** `replace("body_html", '<from>', '<to>')` as 0011 writes it. Neither literal may
+ * contain a `'` -- the migration says so at the statement, and the non-greedy match
+ * here is why it matters. */
+const REWRITE = /replace\(\s*"body_html",\s*'([\s\S]*?)',\s*'([\s\S]*?)'\s*\)/g;
+
+/**
+ * The seeded quote template as a fresh install has it, read out of the migrations
+ * that write it.
+ *
+ * IT HAS TO BE READ FROM THE FILES RATHER THAN THE DATABASE. `truncateAll()` empties
  * every table in the public schema before each test, so on the shared `conduit_test`
  * database the seeded row is gone by the time any test body runs -- a test that
  * expected to find it would silently be testing nothing, and one that UPDATEd it
@@ -18,10 +42,29 @@ import { migrationsFolder } from "../db/client.js";
  * that goes stale.
  */
 export function seededQuoteTemplate(): string {
-  const sql = readFileSync(join(migrationsFolder(), "0009_calm_rhodey.sql"), "utf8");
-  const match = /VALUES \('quote', '([\s\S]*)'\);\s*$/.exec(sql);
-  if (match?.[1] === undefined) throw new Error("could not find the seeded quote template in 0009");
-  return match[1].replaceAll("''", "'");
+  let body: string | null = null;
+  for (const file of TEMPLATE_MIGRATIONS) {
+    const sql = readFileSync(join(migrationsFolder(), file), "utf8");
+    if (body === null) {
+      const match = /VALUES \('quote', '([\s\S]*)'\);\s*$/.exec(sql);
+      if (match?.[1] === undefined) {
+        throw new Error(`could not find the seeded quote template in ${file}`);
+      }
+      body = match[1].replaceAll("''", "'");
+      continue;
+    }
+    const before: string = body;
+    for (const [, from, to] of sql.matchAll(REWRITE)) {
+      if (from === undefined || to === undefined) continue;
+      body = body.replaceAll(from.replaceAll("''", "'"), to.replaceAll("''", "'"));
+    }
+    // A migration listed here that changed nothing means its rewrite stopped matching
+    // -- the body moved on and the amendment is now a no-op the database will not
+    // apply either. Loud here rather than a blank on a printed quote.
+    if (body === before) throw new Error(`${file} rewrites nothing in the quote template`);
+  }
+  if (body === null) throw new Error("no migration seeds the quote template");
+  return body;
 }
 
 /**

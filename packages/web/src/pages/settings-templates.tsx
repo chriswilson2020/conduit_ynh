@@ -103,6 +103,7 @@ const ROOT_FIELDS: readonly [string, string][] = [
   ["document.validUntilDate", "The valid-until date, or empty"],
   ["document.recipientName", "Who the quote is for"],
   ["document.recipientContactName", "The named contact, or empty"],
+  ["document.recipientSalutation", "How that contact is addressed, or empty"],
   ["document.recipientAddress", "Their address, line breaks kept"],
   ["document.subtotal", "The subtotal, formatted"],
   ["document.tax", "The tax, formatted"],
@@ -377,8 +378,9 @@ function TemplateForm({ template, onClose }: { template?: EmailTemplate; onClose
           testId="template-body"
         />
         <p className="text-xs font-normal text-slate-400">
-          {"{{contact.name}}"}, {"{{company.name}}"} and {"{{user.name}}"} are filled in when the
-          template is used; anything else is left as written.
+          {"{{contact.name}}"}, {"{{contact.salutation}}"}, {"{{contact.pronouns}}"},{" "}
+          {"{{company.name}}"} and {"{{user.name}}"} are filled in from the contact as it
+          stands when the template is used; anything else is left as written.
         </p>
       </div>
 

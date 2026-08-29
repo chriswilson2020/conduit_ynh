@@ -297,10 +297,38 @@ describe("dedupeRecipients", () => {
 describe("substitutePlaceholders", () => {
   it("substitutes every supported placeholder", () => {
     const out = substitutePlaceholders(
-      "<p>Hi {{contact.name}} at {{company.name}}, - {{user.name}}</p>",
-      { contactName: "Alice", companyName: "Acme", userName: "Chris" },
+      "<p>Dear {{contact.salutation}} {{contact.name}} ({{contact.pronouns}}) at"
+      + " {{company.name}}, - {{user.name}}</p>",
+      {
+        contactName: "Alice", contactSalutation: "Dr", contactPronouns: "she/her",
+        companyName: "Acme", userName: "Chris",
+      },
     );
-    expect(out).toBe("<p>Hi Alice at Acme, - Chris</p>");
+    expect(out).toBe("<p>Dear Dr Alice (she/her) at Acme, - Chris</p>");
+  });
+
+  // THE RULE, AS AN ABSENCE. Neither field is ever inferred -- not from the name,
+  // not from the other one. A contact with a salutation and no pronouns fills the
+  // one placeholder and leaves the other visibly unfilled, which is what a person
+  // reading their own draft needs to see.
+  it("infers neither field from the other, nor from the name", () => {
+    expect(substitutePlaceholders(
+      "{{contact.salutation}}|{{contact.pronouns}}",
+      { contactName: "Alice Jansen", contactSalutation: "Mr" },
+    )).toBe("Mr|{{contact.pronouns}}");
+    expect(substitutePlaceholders(
+      "{{contact.salutation}}|{{contact.pronouns}}",
+      { contactName: "Alice Jansen" },
+    )).toBe("{{contact.salutation}}|{{contact.pronouns}}");
+  });
+
+  // The paths are whole, not a product of two alternations: {{company.pronouns}}
+  // would otherwise match, resolve to nothing and be left literal in a sent email.
+  it("does not invent paths by crossing the prefixes with the field names", () => {
+    expect(substitutePlaceholders(
+      "{{company.pronouns}} {{user.salutation}}",
+      { contactSalutation: "Dr", contactPronouns: "she/her", companyName: "Acme", userName: "Chris" },
+    )).toBe("{{company.pronouns}} {{user.salutation}}");
   });
 
   it("tolerates whitespace inside the braces", () => {
