@@ -70,6 +70,9 @@ import {
   meetingUpdateInputSchema,
   meetingListFiltersSchema,
   meetingAtLeastOneLink,
+  imageDataUriSize,
+  renderInputCost,
+  MAX_PIXELS_PER_PAYLOAD_BYTE,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -1769,5 +1772,299 @@ describe("meetingListFiltersSchema", () => {
   it("rejects a string archived flag and an over-cap limit", () => {
     expect(() => meetingListFiltersSchema.parse({ archived: "true" })).toThrow();
     expect(() => meetingListFiltersSchema.parse({ limit: 101 })).toThrow();
+  });
+});
+
+/**
+ * THE HEADER READER, TESTED PER FORMAT BECAUSE A PER-FORMAT READER IS A PER-FORMAT
+ * HOLE.
+ *
+ * `imageDataUriSize` is what turns "this file is 12KB" into "this picture is 100
+ * megapixels", and it is the only thing standing between a `data:` URI and half a
+ * gigabyte of decoded raster (measured; see MAX_LOGO_PIXELS). A format whose header
+ * it cannot read is a format an uploader can hide behind, so all four are here --
+ * and all three WEBP variants, since an encoder chooses between them and only one of
+ * them is the one everybody names.
+ */
+describe("imageDataUriSize", () => {
+  const b64 = (bytes: number[]): string => Buffer.from(bytes).toString("base64");
+  const be32 = (n: number): number[] =>
+    [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
+  const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  const RIFF = [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50];
+
+  it("reads a PNG's IHDR", () => {
+    const png = [...PNG_SIGNATURE,
+      0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, ...be32(2000), ...be32(1400)];
+    expect(imageDataUriSize(`data:image/png;base64,${b64(png)}`))
+      .toEqual({ width: 2000, height: 1400 });
+  });
+
+  it("reads a PNG width whose top bit is set as a positive number", () => {
+    // `|` would make this negative, and a negative width compares BELOW any pixel
+    // bound -- so the one arrangement that must never be waved through would be.
+    const png = [...PNG_SIGNATURE,
+      0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, ...be32(0x9000_0000), ...be32(4)];
+    expect(imageDataUriSize(`data:image/png;base64,${b64(png)}`)?.width).toBe(0x9000_0000);
+  });
+
+  it("walks a JPEG's markers past EXIF to the frame header, height first", () => {
+    // A 3000-byte APP1 in front of the SOF0, which is what a photo's EXIF looks
+    // like: a reader that assumed a fixed offset would read the middle of it.
+    const app1 = [0xff, 0xe1, 0x0b, 0xb8, ...Array.from({ length: 3000 - 2 }, () => 0x41)];
+    const sof = [0xff, 0xc0, 0x00, 0x11, 0x08, 0x05, 0x78, 0x07, 0xd0];
+    expect(imageDataUriSize(`data:image/jpeg;base64,${b64([0xff, 0xd8, ...app1, ...sof])}`))
+      .toEqual({ width: 2000, height: 1400 });
+  });
+
+  it("gives up on a JPEG whose scan starts before any frame header", () => {
+    const sos = [0xff, 0xda, 0x00, 0x08, 0, 0, 0, 0, 0, 0];
+    expect(imageDataUriSize(`data:image/jpeg;base64,${b64([0xff, 0xd8, ...sos])}`)).toBeNull();
+  });
+
+  /**
+   * THIS TEST USED TO PIN THE BUG.
+   *
+   * It read "reads a GIF's logical screen descriptor, which is little-endian" and
+   * asserted that the screen descriptor IS the image's size -- which is what the code
+   * did, and what Pillow does not do. A quality review built a valid GIF89a whose
+   * screen says 1x1 and whose first frame is 13000x13000: 51KB, inside the logo cap,
+   * ACCEPTED by `logoDataUriProblem`, charged ONE pixel, rendered at 703MB. So the fix
+   * had to change a passing test, and this is that change, named so nobody restores
+   * the old assertion thinking it was a simplification.
+   */
+  it("takes the LARGEST of a GIF's screen and its frame extents, not the screen alone", () => {
+    const le16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
+    const header = (w: number, h: number): number[] =>
+      [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, ...le16(w), ...le16(h), 0x00, 0x00, 0x00];
+    // A frame: descriptor, no local table, LZW minimum code size, one empty
+    // sub-block, then the block terminator.
+    const frame = (left: number, top: number, w: number, h: number): number[] =>
+      [0x2c, ...le16(left), ...le16(top), ...le16(w), ...le16(h), 0x00, 0x02, 0x00];
+    const TRAILER = 0x3b;
+
+    // The honest case is unchanged: screen and frame agree.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(2000, 1400), ...frame(0, 0, 2000, 1400), TRAILER,
+    ])}`)).toEqual({ width: 2000, height: 1400 });
+
+    // The bomb: a 1x1 screen and a frame far larger than it.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(1, 1), ...frame(0, 0, 13_000, 13_000), TRAILER,
+    ])}`)).toEqual({ width: 13_000, height: 13_000 });
+
+    // An offset frame counts from its own origin, and a LATER frame can be the
+    // biggest -- which is why the walk cannot stop at the first one.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(1, 1), ...frame(0, 0, 10, 10), ...frame(500, 400, 100, 100), TRAILER,
+    ])}`)).toEqual({ width: 600, height: 500 });
+
+    // A comment extension between the frames is skipped by its sub-block chain.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(1, 1), 0x21, 0xfe, 0x03, 0x61, 0x62, 0x63, 0x00,
+      ...frame(0, 0, 900, 800), TRAILER,
+    ])}`)).toEqual({ width: 900, height: 800 });
+
+    // AND A GIF THAT ENDS BEFORE ITS TRAILER IS UNREADABLE RATHER THAN
+    // OPTIMISTICALLY MEASURED. Returning the largest extent seen so far would be an
+    // undercharge, which is the whole class of defect this test exists for.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([...header(1, 1)])}`)).toBeNull();
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(1, 1), ...frame(0, 0, 13_000, 13_000),
+    ])}`)).toBeNull();
+  });
+
+  it("reads all three WEBP variants, not just the extended one", () => {
+    const vp8x = [...RIFF, 0x56, 0x50, 0x38, 0x58, 0x0a, 0, 0, 0, 0, 0, 0, 0,
+      0xcf, 0x07, 0, 0x77, 0x05, 0];
+    expect(imageDataUriSize(`data:image/webp;base64,${b64(vp8x)}`))
+      .toEqual({ width: 2000, height: 1400 });
+
+    // Lossy: a three-byte frame tag, the 0x9d012a key-frame start code, then 14-bit
+    // width and height. The start code is what says the header is where we think --
+    // and where we think is byte 23, not "somewhere after the fourcc".
+    const vp8 = [...RIFF, 0x56, 0x50, 0x38, 0x20, 0, 0, 0, 0,
+      0, 0, 0, 0x9d, 0x01, 0x2a, 0xd0, 0x07, 0x78, 0x05];
+    expect(imageDataUriSize(`data:image/webp;base64,${b64(vp8)}`))
+      .toEqual({ width: 2000, height: 1400 });
+
+    // Lossless: a 0x2f signature byte, then width-1 and height-1 packed 14 bits at
+    // a time, least significant first. 1999 = 0x7cf, 1399 = 0x577.
+    const packed = 0x7cf | (0x577 << 14);
+    const vp8l = [...RIFF, 0x56, 0x50, 0x38, 0x4c, 0, 0, 0, 0, 0x2f,
+      packed & 0xff, (packed >>> 8) & 0xff, (packed >>> 16) & 0xff, (packed >>> 24) & 0xff];
+    expect(imageDataUriSize(`data:image/webp;base64,${b64(vp8l)}`))
+      .toEqual({ width: 2000, height: 1400 });
+  });
+
+  it("says nothing rather than guessing when the header is absent or truncated", () => {
+    expect(imageDataUriSize(`data:image/png;base64,${b64(PNG_SIGNATURE)}`)).toBeNull();
+    expect(imageDataUriSize(`data:image/png;base64,${b64([...PNG_SIGNATURE, 0, 0, 0, 13])}`))
+      .toBeNull();
+    expect(imageDataUriSize("data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=")).toBeNull();
+    expect(imageDataUriSize("")).toBeNull();
+    // A zero-sided image is degenerate, and a zero is how "unreadable" is spelled.
+    const zero = [...PNG_SIGNATURE,
+      0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, ...be32(0), ...be32(10)];
+    expect(imageDataUriSize(`data:image/png;base64,${b64(zero)}`)).toBeNull();
+  });
+});
+
+/**
+ * THE SPLIT THE WHOLE OF v1.0.1's MEMORY ARITHMETIC RESTS ON.
+ *
+ * A byte inside a base64 payload cannot be a table row, and rows are what a render
+ * costs (87KB of them is 250MB; the same bytes as prose are 71MB). So the two halves
+ * are counted apart -- and the safety of that depends on the payload run stopping at
+ * the first character outside the alphabet, which is what the second test below is
+ * about.
+ */
+/** A PNG signature and IHDR of the given size, base64, with no pixels behind it. */
+function pngHeader(width: number, height: number): string {
+  return Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52,
+    (width >>> 24) & 0xff, (width >>> 16) & 0xff, (width >>> 8) & 0xff, width & 0xff,
+    (height >>> 24) & 0xff, (height >>> 16) & 0xff, (height >>> 8) & 0xff, height & 0xff,
+  ]).toString("base64");
+}
+
+describe("renderInputCost", () => {
+  it("charges a data: payload to the image half and everything else to the markup half", () => {
+    const html = `<img src="data:image/png;base64,${"A".repeat(400)}"><p>hello</p>`;
+    const cost = renderInputCost(html);
+    expect(cost.imageBytes).toBe(400);
+    expect(cost.images).toBe(1);
+    expect(cost.markupBytes).toBe(html.length - 400);
+    expect(cost.totalBytes).toBe(html.length);
+  });
+
+  /**
+   * THE PAYLOAD'S END HAS TO BE WRONG IN NEITHER DIRECTION, and the first version of
+   * this test only asserted one of them.
+   *
+   * Too LATE and a template hides table rows from the markup cap behind a `data:`
+   * prefix. Too EARLY and a bomb hides its own size: `base64.decodebytes` discards
+   * whitespace, so one space three characters in made a 100-megapixel image look like
+   * three bytes -- 24,768 pixels charged, 534MB rendered, every cap passed. The old
+   * comment framed the terminator as a safety property only, which is exactly how the
+   * undercharge went unnoticed.
+   */
+  it("ends the payload where the decoder does: past whitespace, and never past a tag", () => {
+    // Too late: a `<` is not in the alphabet and is not whitespace, so it stops the
+    // run and the rows stay charged to the markup half.
+    const rows = "<tr><td>x</td></tr>".repeat(50);
+    const html = `<img src="data:image/png;base64,AAAA">${rows}`;
+    const cost = renderInputCost(html);
+    expect(cost.imageBytes).toBe(4);
+    expect(cost.markupBytes).toBe(html.length - 4);
+
+    // Too early: the same PNG header with a space dropped into it is still one image
+    // of the size it really is, not a three-byte mystery.
+    const header = pngHeader(10_000, 10_000);
+    const spaced = `${header.slice(0, 3)} ${header.slice(3)}`;
+    const bomb = renderInputCost(`<img src="data:image/png;base64,${spaced}">`);
+    expect(bomb.imagePixels).toBe(100_000_000);
+    expect(bomb.unreadableImages).toBe(0);
+    expect(bomb.imageBytes).toBe(spaced.length);
+
+    // Newlines and runs of spaces too, which is how a payload gets wrapped by hand.
+    const wrapped = header.replace(/(.{8})/g, "$1\n  ");
+    expect(renderInputCost(`<img src="data:image/png;base64,${wrapped}">`).imagePixels)
+      .toBe(100_000_000);
+
+    // ...and the closing quote still ends it, so the whitespace rule cannot run on
+    // into the rest of the document.
+    const after = `<img src="data:image/png;base64,AA AA"> ${"<tr><td>y</td></tr>".repeat(20)}`;
+    expect(renderInputCost(after).imageBytes).toBe(5);
+  });
+
+  it("sums the pixels of every image, and charges the ones it cannot read the most they could be", () => {
+    const html = `<img src="data:image/png;base64,${pngHeader(2000, 1400)}">`
+      + `<img src="data:image/png;base64,${pngHeader(1000, 1000)}">`
+      + `<img src="data:image/gif;base64,AAAA">`;
+    const cost = renderInputCost(html);
+    expect(cost.images).toBe(3);
+    expect(cost.unreadableImages).toBe(1);
+    // The third is four characters that are not a GIF, so it is charged four
+    // characters' worth of the worst case rather than nothing. CHARGED, not
+    // refused: a `data:` token in somebody's notes must not fail their quote.
+    expect(cost.imagePixels)
+      .toBe(2000 * 1400 + 1_000_000 + 4 * MAX_PIXELS_PER_PAYLOAD_BYTE);
+  });
+
+  /**
+   * S1: THE SPEC REVIEW'S BYPASS TABLE, AS A TEST PER ROW.
+   *
+   * The scanner used to match `data:image/(png|jpeg|gif|webp);base64,` and read the
+   * DECLARED type. WeasyPrint and Pillow read neither -- they sniff the bytes -- so
+   * every spelling below carried the same 100-megapixel PNG, was charged zero
+   * pixels and zero image bytes, had its whole payload counted as cheap markup, and
+   * rendered at about 534MB while passing all three caps. The worst case that still
+   * passed was 658.5MB against a 1150M declaration.
+   *
+   * Each row is charged the real 100,000,000 now. The control at the bottom is the
+   * one thing that must NOT change: a canonical logo is still measured exactly.
+   */
+  it("cannot be walked past by respelling the mime type or the encoding", () => {
+    const png = pngHeader(10_000, 10_000);
+    const raw = Buffer.from(png, "base64");
+    const percent = [...raw].map((b) => `%${b.toString(16).padStart(2, "0")}`).join("");
+
+    const bypasses = {
+      "a mime that is not in the old list": `data:image/bmp;base64,${png}`,
+      "the same mime in capitals": `data:image/PNG;base64,${png}`,
+      "no mime at all": `data:;base64,${png}`,
+      "an extra parameter before the encoding": `data:image/png;charset=utf-8;base64,${png}`,
+      "percent-encoding instead of base64": `data:image/png,${percent}`,
+      "no mime and percent-encoding": `data:,${percent}`,
+    };
+    for (const [why, uri] of Object.entries(bypasses)) {
+      const cost = renderInputCost(`<img src="${uri}">`);
+      expect(cost.imagePixels, why).toBe(100_000_000);
+      expect(cost.unreadableImages, why).toBe(0);
+      expect(cost.imageBytes, why).toBeGreaterThan(0);
+    }
+
+    // In a CSS url() as well as an attribute: the scan reads bytes, not positions.
+    expect(renderInputCost(`<div style="background:url(data:image/bmp;base64,${png})">`).imagePixels)
+      .toBe(100_000_000);
+
+    // THE CONTROL. The canonical spelling was always measured and still is.
+    expect(renderInputCost(`<img src="data:image/png;base64,${png}">`).imagePixels)
+      .toBe(100_000_000);
+  });
+
+  it("leaves a data: token in ordinary prose too cheap to matter", () => {
+    // The other half of charging rather than refusing. Notes and terms are escaped
+    // user text that lands in the merged document, and somebody writing about a data
+    // URI must not have their quote refused. Whitespace ends the run, so prose can
+    // only ever produce a token.
+    const notes = "<p>The logo is inlined as a data:image/png;base64, string "
+      + "rather than a file, per data:,ok in the spec.</p>";
+    const cost = renderInputCost(notes);
+    expect(cost.unreadableImages).toBe(2);
+    // A sentence, not a payload: the run ends at the first punctuation, so this is a
+    // low single-digit percentage of the cap rather than anything that could refuse a
+    // quote. Asserted as a fraction of the cap rather than a literal, because the
+    // exact figure moves whenever the terminator rules do -- as they just did.
+    expect(cost.imagePixels).toBeLessThan(16_000_000 / 20);
+  });
+
+  it("charges a payload it cannot identify by its length, so a real one cannot hide", () => {
+    // A 2KB font, stylesheet or unsupported image format in a template: not
+    // identifiable, so charged 8,256 pixels a character and refused by the pixel
+    // cap. 1,938 characters is where that crosses 16,000,000.
+    const font = `<style>@font-face{src:url(data:font/woff2;base64,${"A".repeat(2000)})}</style>`;
+    const cost = renderInputCost(font);
+    expect(cost.unreadableImages).toBe(1);
+    expect(cost.imagePixels).toBe(2000 * MAX_PIXELS_PER_PAYLOAD_BYTE);
+    expect(cost.imagePixels).toBeGreaterThan(16_000_000);
+  });
+
+  it("counts UTF-8 bytes rather than characters for the markup half", () => {
+    // A character cap does not bound a render: the same argument MAX_TEMPLATE_BYTES
+    // exists for. One CJK character is three bytes and one string index.
+    const html = "<p>\u6f22\u5b57</p>";
+    expect(renderInputCost(html).markupBytes).toBe(html.length + 4);
   });
 });

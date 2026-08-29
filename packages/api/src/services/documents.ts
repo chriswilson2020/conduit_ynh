@@ -3,7 +3,8 @@ import { asc, desc, eq, inArray, sql } from "drizzle-orm";
 import {
   documentTemplateInputSchema, documentTotals, formatMoneyCents, formatQtyMilli,
   documentContentBytes, formatTaxRateBp, issueQuoteInputSchema, lineTotalCents,
-  MAX_TEMPLATE_BYTES, RENDER_INPUT_CAP_BYTES,
+  MAX_TEMPLATE_BYTES, renderInputCost, RENDER_IMAGE_CAP_BYTES, RENDER_IMAGE_PIXEL_CAP,
+  RENDER_MARKUP_CAP_BYTES,
   type DocumentRecord, type DocumentTemplate, type DocumentTemplateInput,
   type IssueQuoteInput, type OrgProfile,
 } from "@conduit/shared";
@@ -53,10 +54,15 @@ export class DocumentInputError extends Error {
  * can be wrong in at least four ways that were all demonstrated: a `"` costs one byte
  * in text and six in an attribute, the issuer's reserve was unenforced, a character
  * cap on the template did not bound its bytes, and a template may print a field more
- * than once. Measuring the merged output is exact, costs one `Buffer.byteLength`, and
+ * than once. Measuring the merged output is exact, costs one pass over the bytes, and
  * happens where the failure can still be attributed to a field -- one layer above
- * renderPdf's identical cap, which stays as the module's own guard for every other
+ * renderPdf's identical caps, which stay as the module's own guard for every other
  * caller.
+ *
+ * THERE ARE THREE OF THEM SINCE v1.0.1: markup bytes, inline image bytes, and the
+ * pixels those images decode to. The third is not derivable from the first two --
+ * 12,227 bytes of PNG can be 100 megapixels -- so a size check that counted only
+ * bytes would pass a document that costs 535MB to render.
  *
  * It fires after the number is allocated (the number is printed on the page, so the
  * merge needs it) and before anything spawns, so it rolls back exactly like a failed
@@ -284,14 +290,40 @@ export async function issueQuote(
       ...totals,
       lines,
     }));
-    const mergedBytes = Buffer.byteLength(html, "utf8");
-    if (mergedBytes > RENDER_INPUT_CAP_BYTES) {
+    // THE SAME THREE CAPS renderPdf ENFORCES, one layer up, where the failure can
+    // still be attributed to a field. Split the way they are because the answer to
+    // "what is too big" is different for each: shorten the text, use a smaller logo
+    // FILE, or use a logo with fewer PIXELS -- and the last of those is invisible in
+    // a byte count, which is why v1.0.0 could not have said it.
+    const cost = renderInputCost(html);
+    const provenance = "Its template is "
+      + `${String(Buffer.byteLength(template.bodyHtml, "utf8"))} bytes, its logo `
+      + `${String(org.logoDataUri.length)}, and its own content `
+      + `${String(documentContentBytes(quote))}`;
+    if (cost.markupBytes > RENDER_MARKUP_CAP_BYTES) {
       throw new DocumentTooLargeError(
-        `this quote merges to ${String(mergedBytes)} bytes, over the `
-        + `${String(RENDER_INPUT_CAP_BYTES)} a document may render. Its template is `
-        + `${String(Buffer.byteLength(template.bodyHtml, "utf8"))} bytes, its logo `
-        + `${String(org.logoDataUri.length)}, and its own content `
-        + `${String(documentContentBytes(quote))}; shorten whichever of those you can`,
+        `this quote merges to ${String(cost.markupBytes)} bytes of markup, over the `
+        + `${String(RENDER_MARKUP_CAP_BYTES)} a document may render. ${provenance}; `
+        + "shorten whichever of those you can",
+      );
+    }
+    if (cost.imageBytes > RENDER_IMAGE_CAP_BYTES) {
+      throw new DocumentTooLargeError(
+        `this quote carries ${String(cost.imageBytes)} bytes of inline image, over the `
+        + `${String(RENDER_IMAGE_CAP_BYTES)} a document may render. ${provenance}; `
+        + "use a smaller logo, or fewer images in the template",
+      );
+    }
+    if (cost.imagePixels > RENDER_IMAGE_PIXEL_CAP) {
+      throw new DocumentTooLargeError(
+        `this quote's ${String(cost.images)} inline image(s) decode to `
+        + `${String(cost.imagePixels)} pixels, over the `
+        + `${String(RENDER_IMAGE_PIXEL_CAP)} a document may render. A file's size does `
+        + "not say how large the picture inside it is; use one with fewer pixels"
+        + (cost.unreadableImages === 0 ? ""
+          : `. ${String(cost.unreadableImages)} of them are not a PNG, JPEG, GIF or `
+            + "WEBP at all, and something the renderer cannot be asked to identify is "
+            + "charged the most its bytes could decode to"),
       );
     }
     const pdf = await renderPdf(html);

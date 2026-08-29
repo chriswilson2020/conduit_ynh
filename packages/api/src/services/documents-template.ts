@@ -754,8 +754,12 @@ function parse(template: string): Parsed {
       // comfortably inside the 20s timeout. That is the "fast enough to survive the
       // timeout" shape the input cap exists to catch, arriving by a route the input
       // cap cannot see -- and re-measuring the cap showed 353MB is not even
-      // exceptional: a plain 128KB table of minimal rows costs 332MB, which is what
-      // the concurrency limit is now built on.
+      // exceptional: a plain 128KB table of minimal rows costs 345MB. (That figure
+      // read 332MB until v1.0.1 re-ran the same measurement. The cap it was taken at
+      // is gone too: the markup cap is 87,357 bytes now and costs 250MB, and the
+      // worst document the renderer will accept -- a full markup budget of rows with
+      // a logo at the pixel bound beside it -- is what the concurrency limit is
+      // built on. See documents-render.ts.)
       //
       // There is one collection on a quote. Nesting it has no legitimate use, so the
       // mechanism goes rather than its symptom -- and with it goes the only way for

@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import {
-  MAX_LOGO_BYTES, ORG_PROFILE_FIELD_CAPS, ORG_PROFILE_RESERVE_BYTES,
-  logoDataUriProblem, orgProfileBytes,
+  MAX_LOGO_BYTES, MAX_LOGO_PIXELS, ORG_PROFILE_FIELD_CAPS,
+  ORG_PROFILE_TEXT_RESERVE_BYTES, logoDataUriProblem, orgProfileTextBytes,
 } from "@conduit/shared";
 import type { OrgProfileInput } from "@conduit/shared";
 import { useOrgProfile, useSaveOrgProfile } from "../queries";
@@ -40,17 +40,23 @@ const EMPTY: OrgProfileInput = {
  * is therefore not a workaround: it is the storage format, and the renderer
  * accepts nothing else anyway.
  *
- * THE BOUND IS 32KB ON THE IMAGE, refused HERE with a sentence rather than
- * weeks later as a quote that will not render. The reasoning is arithmetic
- * somebody has to have done: the logo reaches the renderer inlined at 4/3 of
- * its stored size against a 128KB input cap, so a stored logo much above 64KB
- * cannot render at all, and the template and the line items have to fit beside
- * it. 32KB inlines to 43,691 bytes of a 131,072-byte cap, so it leaves the
- * document itself two thirds of the budget -- not the three quarters an earlier
- * version of this comment claimed, which is the same division rounded kindly.
+ * THE BOUND IS 300KB AND 16 MEGAPIXELS ON THE IMAGE, refused HERE with a
+ * sentence rather than weeks later as a quote that will not render.
  *
- * `saveOrgProfile` enforces the same bound server-side and is the control; this
- * is the message.
+ * IT WAS 32KB IN v1.0.0 AND THAT WAS TOO SMALL FOR A REAL LOGO. The arithmetic
+ * that produced it was sound for its time: the logo reaches the renderer
+ * inlined at 4/3 of its stored size against what was then a 131,072-byte input
+ * cap shared with the document's own text, so 32KB took a third of it and
+ * anything much larger left no room for the quote. v1.0.1 stopped making them
+ * share -- the image payload has its own allowance now -- so the file bound is
+ * 300KB and what limits it is the machine rather than the paragraph beside it.
+ *
+ * THE PIXEL BOUND IS THE ONE THE FILE SIZE CANNOT MAKE. A PNG's decoded raster
+ * is width x height x 4 whatever the file compressed to, so a 12KB file can be
+ * 10,000 x 10,000 and cost the renderer half a gigabyte.
+ *
+ * `saveOrgProfile` enforces the same bounds server-side and is the control;
+ * this is the message.
  */
 function readLogo(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -112,9 +118,12 @@ export function SettingsOrgPage() {
     }
     // The SHARED check, so the message here and the server's refusal are one
     // answer. It rejects on the DECODED size rather than the string length,
-    // which is the half that had to be right: a 32,768-byte image and a
-    // 32,769-byte one produce the same 43,692 base64 characters and differ only
-    // in padding, so a character count cannot tell them apart at all.
+    // which is the half that had to be right: a 307,200-byte image and a
+    // 307,201-byte one produce the same 409,600 base64 characters and differ
+    // only in padding, so a character count cannot tell them apart at all.
+    //
+    // It also refuses a picture with too many PIXELS, which is the half a size
+    // check cannot make at all: 12,227 bytes of PNG can be 10,000 x 10,000.
     const problem = logoDataUriProblem(uri);
     if (problem !== null) {
       setLogoProblem(problem);
@@ -130,12 +139,13 @@ export function SettingsOrgPage() {
     save.mutate(form, { onSuccess: () => setSaved(true) });
   }
 
-  // The reserve counts the logo and the eight text fields TOGETHER, because
-  // they compete for the same share of the render budget -- a maxed ASCII
-  // profile is 47,115 bytes and the same fields full of ampersands are 60,715,
-  // which is why the server enforces this rather than hoping for it.
-  const used = orgProfileBytes(form);
-  const over = used > ORG_PROFILE_RESERVE_BYTES;
+  // THE RESERVE IS THE TEXT ONLY SINCE v1.0.1, and that is the change: the logo
+  // used to be added into this same figure, so every byte of picture came out
+  // of the address. The eight fields cap at 3,400 characters, which is 3,400
+  // bytes of ASCII and 17,000 with an ampersand in every position (an `&`
+  // escapes to five), which is why the server enforces this rather than hoping.
+  const used = orgProfileTextBytes(form);
+  const over = used > ORG_PROFILE_TEXT_RESERVE_BYTES;
   const pending = save.isPending;
 
   return (
@@ -297,9 +307,10 @@ export function SettingsOrgPage() {
             )}
           </div>
           <p className="text-xs text-slate-400">
-            PNG, JPEG, GIF or WEBP, at most {MAX_LOGO_BYTES} bytes. The logo is inlined
-            into the PDF at four thirds of its stored size, so a larger one leaves no
-            room for the quote itself.
+            PNG, JPEG, GIF or WEBP, at most {MAX_LOGO_BYTES} bytes and{" "}
+            {MAX_LOGO_PIXELS} pixels (4000 x 4000, or any other pair that multiplies
+            to it). The picture's dimensions matter as much as the file's size: the
+            renderer decodes every pixel whatever the file compressed to.
           </p>
           {logoProblem !== null && (
             <p role="alert" data-testid="org-logo-problem" className="text-sm text-red-600">{logoProblem}</p>
@@ -311,8 +322,8 @@ export function SettingsOrgPage() {
           className={`text-xs ${over ? "font-medium text-red-600" : "text-slate-400"}`}
         >
           {over
-            ? `${String(used - ORG_PROFILE_RESERVE_BYTES)} bytes over the ${String(ORG_PROFILE_RESERVE_BYTES)} a quote reserves for its issuer.`
-            : `${String(used)} of ${String(ORG_PROFILE_RESERVE_BYTES)} bytes of a quote's issuer reserve.`}
+            ? `${String(used - ORG_PROFILE_TEXT_RESERVE_BYTES)} bytes over the ${String(ORG_PROFILE_TEXT_RESERVE_BYTES)} a quote reserves for these details.`
+            : `${String(used)} of ${String(ORG_PROFILE_TEXT_RESERVE_BYTES)} bytes of a quote's issuer reserve.`}
         </p>
 
         {save.isError && (

@@ -8,6 +8,7 @@ import { eq } from "drizzle-orm";
 import {
   documentContentBytes, DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_LINE_MARKUP_BYTES,
   DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, MAX_LOGO_DATA_URI_CHARS,
+  renderInputCost, RENDER_IMAGE_CAP_BYTES, RENDER_MARKUP_CAP_BYTES,
   type IssueQuoteInput,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -833,7 +834,16 @@ describe("buildContext", () => {
     });
 
     const merged = prepareDocumentHtml(seededQuoteTemplate(), buildContext(worst));
-    expect(Buffer.byteLength(merged, "utf8")).toBeLessThanOrEqual(128 * 1024);
+    // BOTH CAPS, SEPARATELY, which is the v1.0.1 shape of this assertion: the same
+    // worst-case quote used to be measured against one 131,072-byte figure that the
+    // logo was inside. A 300KB logo is 409,600 characters of that on its own, so a
+    // single total would now pass on the strength of an allowance the rows cannot
+    // use. What has to hold is that the MARKUP fits the markup cap with a maxed logo
+    // beside it -- and it does, with room, at 87,357.
+    const cost = renderInputCost(merged);
+    expect(cost.markupBytes).toBeLessThanOrEqual(RENDER_MARKUP_CAP_BYTES);
+    expect(cost.imageBytes).toBeLessThanOrEqual(RENDER_IMAGE_CAP_BYTES);
+    expect(cost.imageBytes).toBeGreaterThan(400_000);
     // ...and the gate agrees, so the two cannot part company: the same quote passes
     // the budget the form will show.
     expect(documentContentBytes({
