@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema, mailVisibilitySchema,
+  MAX_LOGO_DATA_URI_CHARS,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { TEST_DATABASE_URL } from "../test/global-setup.js";
@@ -19,9 +20,10 @@ import { createProject } from "../services/projects.js";
 import { listThreads } from "../services/mail-threads.js";
 import { createDatabase, migrationsFolder, type DatabaseHandle } from "./client.js";
 import {
-  users, companies, contacts, pipelines, stages, deals, projects, events,
+  users, companies, contacts, pipelines, stages, deals, projects, events, files,
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
   mailThreadHides, emailTemplates, meetings, meetingAttendees,
+  orgProfile, documents, documentLineItems, documentNumberSequences, documentTemplates,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -1245,5 +1247,489 @@ describe("meetings schema (0008)", () => {
       meetingId, mailThreadId: thread!.id, payload: {},
     }).returning();
     expect(both).toMatchObject({ meetingId, mailThreadId: thread!.id });
+  });
+});
+
+describe("documents schema (0009)", () => {
+  // EVERY merge field the seeded default template is allowed to contain, and
+  // the list Task 3's resolver and Task 4's context are written against. The
+  // assertion below is an EQUALITY, not a subset, in both directions: a
+  // template referencing a field nobody supplies renders a silent blank on a
+  // printed quote (unknown fields resolve to "" and never throw), and a field
+  // listed here that the template stopped using is a context key built for
+  // nothing. Either way the migration and this list have to move together.
+  //
+  // THE OPTIONAL ONES ARE LISTED SEPARATELY BECAUSE THE TEMPLATE OWES THEM A
+  // CONDITIONAL. Each of these is empty on a real install -- nobody fills in a
+  // registration number to raise one quote -- and each of them sits behind
+  // markup that would otherwise print: a label over a blank, or an <img src="">.
+  // Task 3's ruling generalised the block form for exactly this, so the seed
+  // wraps every one of them and this list is what says so. A field that moves
+  // between the two groups changes the rendered page for every install that
+  // left it empty.
+  const SEEDED_OPTIONAL = [
+    "org.logoDataUri", "org.addressLines", "org.email", "org.phone", "org.website",
+    "org.bankDetails", "org.vatNumber", "org.registrationNumber",
+    "document.validUntilDate", "document.recipientContactName", "document.recipientAddress",
+    "document.notes", "document.terms",
+  ];
+  const SEEDED_FIELDS = [
+    // The repeated block, and its inverse for a quote with no priced lines.
+    "{{#lines}}", "{{^lines}}", "{{/lines}}",
+    "{{description}}", "{{qty}}", "{{unitPrice}}", "{{taxRate}}", "{{lineTotal}}",
+    // Always printed: the issuer's name, the number, the date and the totals.
+    "{{org.name}}",
+    "{{document.number}}", "{{document.issueDate}}", "{{document.recipientName}}",
+    "{{document.subtotal}}", "{{document.tax}}", "{{document.total}}",
+    // Each optional field appears three times: the block, the value, the closer.
+    ...SEEDED_OPTIONAL.flatMap((path) => [`{{#${path}}}`, `{{${path}}}`, `{{/${path}}}`]),
+  ].sort();
+
+  /** A deal and a files row -- the two NOT NULL foreign keys a document needs. */
+  async function seedDocumentParents(): Promise<{ dealId: string; fileId: string }> {
+    const pipeline = await createPipeline(handle.db, userId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, userId, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      handle.db, userId, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+    );
+    const [file] = await handle.db.insert(files).values({
+      originalName: "QUO-2026-0001.pdf", mime: "application/pdf", sizeBytes: 16_003,
+      sha256: "a".repeat(64), uploaderUserId: userId, dealId: deal.id,
+    }).returning();
+    return { dealId: deal.id, fileId: file!.id };
+  }
+
+  function documentValues(
+    parents: { dealId: string; fileId: string },
+    overrides: Partial<typeof documents.$inferInsert> = {},
+  ) {
+    return {
+      number: "QUO-2026-0001", type: "quote", dealId: parents.dealId, fileId: parents.fileId,
+      currency: "EUR", issueDate: "2026-08-28", recipientName: "Acme",
+      subtotalCents: 11_000, taxCents: 2100, totalCents: 13_100,
+      issuedByUserId: userId, ...overrides,
+    } satisfies typeof documents.$inferInsert;
+  }
+
+  // The 0004-0008 drill, one migration on. Also the ONLY place the seeded
+  // template can be observed at all: truncateAll() empties every table in the
+  // public schema before each test, so on the shared conduit_test database
+  // the seeded row is gone by the time any test body runs. Task 4's service
+  // tests inherit that -- they must seed their own quote template rather than
+  // expecting the migration's, and this comment exists because "the default
+  // template is missing" is otherwise a puzzling failure to meet.
+  it("applies migration 0009 on top of a real database migrated only through 0008 -- five new tables arrive, the default quote template is seeded, documents(deal_id) is indexed, and a pre-existing deal can be quoted", async () => {
+    await withPreMigrationDatabase("0009", async (scratch) => {
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const company = await createCompany(scratch.db, user!.id, { name: "Acme" });
+      const pipeline = await createPipeline(scratch.db, user!.id, { name: "Sales", scope: "global" });
+      const stage = await createStage(scratch.db, user!.id, pipeline.id, { name: "New" });
+      const deal = await createDeal(
+        scratch.db, user!.id,
+        { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id, companyId: company.id },
+        "EUR",
+      );
+
+      // Pin the drill's premise before upgrading (the 0006-0008 pattern):
+      // without this, every post-migrate assertion below would also pass
+      // against a database that had been fully migrated all along.
+      const [preTables] = await scratch.db.execute<{ present: number }>(sql`
+        SELECT count(*)::int AS present FROM information_schema.tables
+        WHERE table_name IN ('org_profile', 'documents', 'document_line_items',
+                             'document_number_sequences', 'document_templates')
+      `);
+      expect(preTables?.present).toBe(0);
+
+      // Upgrade: apply the real, full migrations folder. 0009 is the only
+      // pending migration (0000-0008 are already recorded as applied).
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const [postTables] = await scratch.db.execute<{ present: number }>(sql`
+        SELECT count(*)::int AS present FROM information_schema.tables
+        WHERE table_name IN ('org_profile', 'documents', 'document_line_items',
+                             'document_number_sequences', 'document_templates')
+      `);
+      expect(postTables?.present).toBe(5);
+
+      // THE SEED. A broken one is invisible until somebody raises a quote and
+      // gets an ugly PDF weeks later, so it is checked here rather than
+      // trusted: exactly one row, of the right type, whose merge fields are
+      // exactly the set above and whose page-layout CSS survived the SQL
+      // literal intact.
+      const templates = await scratch.db.select().from(documentTemplates);
+      expect(templates).toHaveLength(1);
+      const body = templates[0]!.bodyHtml;
+      expect(templates[0]!.type).toBe("quote");
+      expect([...new Set(body.match(/\{\{[^}]*\}\}/g) ?? [])].sort()).toEqual(SEEDED_FIELDS);
+      // Every {{ in the file is one of those tokens -- a CSS rule that
+      // accidentally put two braces together would be eaten as a merge field.
+      expect(body.match(/\{\{/g) ?? []).toHaveLength(body.match(/\{\{[^}]*\}\}/g)!.length);
+      // The two properties the document sanitiser profile exists to allow,
+      // and the one that keeps a newline-separated address from printing as a
+      // single run-on line.
+      expect(body).toContain("@page");
+      expect(body).toContain("white-space: pre-line");
+      // Rendered on the server (WeasyPrint 57.2) through the shipped renderPdf,
+      // most recently after the spacing was tightened to stop the footer stranding
+      // itself on page two: with a logo and everything filled in, 4,101 chars of
+      // merged HTML and a ONE-page 16,117-byte PDF; with no logo and nothing
+      // optional filled in, 3,473 chars and a 14,381-byte one-page PDF carrying no
+      // image XObject at all. Byte counts move by one or two between runs -- the
+      // renderer is not reproducible (Task 1) -- and page counts do not.
+      // documents-seed.test.ts is where those two renders happen on every push, and
+      // it prints the figures.
+
+      // The hand-written index, ON A DATABASE THIS TEST MIGRATED FROM THE
+      // FILES -- 0005's and 0008's reason: it exists in no drizzle snapshot,
+      // so only a from-the-files migration proves the .sql file still carries
+      // it. Asserted NOT unique and NOT partial: a deal has many documents
+      // and every one of them must be found.
+      const indexes = await scratch.db.execute<{ indexname: string; indexdef: string }>(
+        sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'documents'`,
+      );
+      const dealIndex = indexes.find((row) => row.indexname === "documents_deal_idx");
+      expect(dealIndex?.indexdef).toMatch(/\(deal_id\)/i);
+      expect(dealIndex?.indexdef).not.toMatch(/UNIQUE/i);
+      expect(dealIndex?.indexdef).not.toMatch(/WHERE/i);
+
+      // The new tables work against the PRE-EXISTING deal, not just rows
+      // created after the upgrade -- which is the whole point of quoting from
+      // a deal somebody has been working since before v1.0.0.
+      const [file] = await scratch.db.insert(files).values({
+        originalName: "QUO-2026-0001.pdf", mime: "application/pdf", sizeBytes: 16_003,
+        sha256: "b".repeat(64), uploaderUserId: user!.id, dealId: deal.id,
+      }).returning();
+      const [document] = await scratch.db.insert(documents).values({
+        number: "QUO-2026-0001", type: "quote", dealId: deal.id, fileId: file!.id,
+        currency: "EUR", issueDate: "2026-08-28",
+        recipientName: "Acme", recipientContactName: "Jane Smith", recipientAddress: "2 Low St",
+        subtotalCents: 11_000, taxCents: 2100, totalCents: 13_100, issuedByUserId: user!.id,
+      }).returning();
+      expect(document).toMatchObject({ dealId: deal.id, fileId: file!.id, validUntilDate: null });
+
+      const [line] = await scratch.db.insert(documentLineItems).values({
+        documentId: document!.id, position: 1, description: "Widget",
+        qtyMilli: 2000, unitPriceCents: 5000, lineTotalCents: 10_000,
+      }).returning();
+      expect(line).toMatchObject({ position: 1, taxRateBp: 0 });
+
+      const [profile] = await scratch.db.insert(orgProfile).values({ name: "Listerdale" }).returning();
+      expect(profile).toMatchObject({ id: 1, vatNumber: "", logoDataUri: "" });
+    });
+  }, 30000);
+
+  // The singleton, which is the claim the whole org_profile design rests on:
+  // "one row" has to be enforced by the database, not by everybody
+  // remembering to upsert. Both halves are tested because either alone is
+  // insufficient -- the primary key stops a second row at id 1, the CHECK
+  // stops one at any other id, and dropping either leaves a hole.
+  it("enforces one org_profile row: the default id collides, and any other id is refused", async () => {
+    const [first] = await handle.db.insert(orgProfile).values({ name: "Listerdale" }).returning();
+    expect(first?.id).toBe(1);
+
+    await expect(handle.db.insert(orgProfile).values({ name: "Second" }))
+      .rejects.toMatchObject({ cause: { code: "23505" } });
+    await expect(handle.db.insert(orgProfile).values({ id: 2, name: "Second" }))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+
+    // And the shape that makes the pinned key worth having: create-or-update
+    // in one statement, with no prior read to find the row.
+    await handle.db.insert(orgProfile).values({ id: 1, name: "Renamed" })
+      .onConflictDoUpdate({ target: orgProfile.id, set: { name: "Renamed" } });
+    const rows = await handle.db.select().from(orgProfile);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: 1, name: "Renamed" });
+  });
+
+  it("enforces a globally unique document number", async () => {
+    const parents = await seedDocumentParents();
+    await handle.db.insert(documents).values(documentValues(parents));
+    await expect(handle.db.insert(documents).values(documentValues(parents)))
+      .rejects.toMatchObject({ cause: { code: "23505" } });
+    // A different number on the same deal is ordinary: raising a corrected
+    // quote is raising another quote (spec's immutability decision).
+    const [second] = await handle.db.insert(documents)
+      .values(documentValues(parents, { number: "QUO-2026-0002" })).returning();
+    expect(second).toMatchObject({ number: "QUO-2026-0002", dealId: parents.dealId });
+  });
+
+  it("enforces documents_type_valid, documents_currency_format and documents_totals_consistent", async () => {
+    const parents = await seedDocumentParents();
+    await expect(handle.db.insert(documents).values(documentValues(parents, { type: "invoice" })))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+    await expect(handle.db.insert(documents).values(documentValues(parents, { currency: "eur" })))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+    // The totals identity: a total that is not subtotal + tax is the defect
+    // this backstop exists for, and it is one an off-by-one-cent arithmetic
+    // bug would produce.
+    await expect(handle.db.insert(documents).values(documentValues(parents, { totalCents: 13_101 })))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+  });
+
+  it("enforces one line per position per document, and the three line-item CHECKs", async () => {
+    const parents = await seedDocumentParents();
+    const [document] = await handle.db.insert(documents).values(documentValues(parents)).returning();
+    const line = {
+      documentId: document!.id, position: 1, description: "Widget",
+      qtyMilli: 2000, unitPriceCents: 5000, taxRateBp: 2100, lineTotalCents: 10_000,
+    };
+    await handle.db.insert(documentLineItems).values(line);
+
+    await expect(handle.db.insert(documentLineItems).values(line))
+      .rejects.toMatchObject({ cause: { code: "23505" } });
+    // The next position on the same document is fine, and so is position 1 on
+    // a different one -- the constraint is per document, not global.
+    await handle.db.insert(documentLineItems).values({ ...line, position: 2 });
+    const [other] = await handle.db.insert(documents)
+      .values(documentValues(parents, { number: "QUO-2026-0002" })).returning();
+    await handle.db.insert(documentLineItems).values({ ...line, documentId: other!.id });
+
+    for (const bad of [
+      { qtyMilli: -1 }, { unitPriceCents: -1 }, { taxRateBp: -1 }, { taxRateBp: 10_001 },
+    ]) {
+      await expect(handle.db.insert(documentLineItems).values({ ...line, position: 9, ...bad }))
+        .rejects.toMatchObject({ cause: { code: "23514" } });
+    }
+  });
+
+  // The numbering table's whole reason for being a table (spec: nextval() is
+  // non-transactional and a failed render would burn the number). This pins
+  // the allocation statement Task 4 issues, against the composite key.
+  it("allocates consecutive numbers per (type, year) through ON CONFLICT DO UPDATE, and rolls back with its transaction", async () => {
+    const allocate = async (db: typeof handle.db, year: number): Promise<number> => {
+      const [row] = await db.insert(documentNumberSequences)
+        .values({ type: "quote", year, lastValue: 1 })
+        .onConflictDoUpdate({
+          target: [documentNumberSequences.type, documentNumberSequences.year],
+          set: { lastValue: sql`${documentNumberSequences.lastValue} + 1` },
+        })
+        .returning({ lastValue: documentNumberSequences.lastValue });
+      return row!.lastValue;
+    };
+
+    expect(await allocate(handle.db, 2026)).toBe(1);
+    expect(await allocate(handle.db, 2026)).toBe(2);
+    // A different year is a different counter: the numbering resets each
+    // January rather than running on.
+    expect(await allocate(handle.db, 2027)).toBe(1);
+
+    // THE PROPERTY A SEQUENCE COULD NOT GIVE: an allocation inside a
+    // transaction that fails leaves no number spent, so the next quote takes
+    // the one the failed render was holding.
+    await expect(handle.db.transaction(async (tx) => {
+      expect(await allocate(tx as typeof handle.db, 2026)).toBe(3);
+      throw new Error("render failed");
+    })).rejects.toThrow("render failed");
+    expect(await allocate(handle.db, 2026)).toBe(3);
+
+    await expect(handle.db.insert(documentNumberSequences).values({ type: "invoice", year: 2026 }))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+  });
+
+  // THIS TEST DEPENDS ON THE SEEDED TEMPLATE BEING GONE, which is the exact
+  // opposite of the dependency the drill above warns about: truncateAll() empties
+  // document_templates like every other public table, so the first insert here
+  // finds an empty table. If truncateAll is ever taught to preserve seed rows --
+  // a plausible optimisation, since re-seeding by hand is the only reason Task 4
+  // has to know about any of this -- this insert starts colliding with the
+  // migration's own row and fails with 23505 in a file that has nothing to do
+  // with seeding. The explicit emptiness assertion below is there to say so at
+  // the point of failure rather than leaving a puzzling unique violation.
+  it("allows one template per type and rejects an unknown type", async () => {
+    expect(await handle.db.select().from(documentTemplates)).toHaveLength(0);
+    await handle.db.insert(documentTemplates).values({ type: "quote", bodyHtml: "<p>a</p>" });
+    await expect(handle.db.insert(documentTemplates).values({ type: "quote", bodyHtml: "<p>b</p>" }))
+      .rejects.toMatchObject({ cause: { code: "23505" } });
+    await expect(handle.db.insert(documentTemplates).values({ type: "proposal", bodyHtml: "<p>c</p>" }))
+      .rejects.toMatchObject({ cause: { code: "23514" } });
+  });
+
+  // THE TRIPWIRE FOR money.ts's int4 BOUND. exactInt4() refuses a qtyMilli or a
+  // rateBp outside the int4 range, and the only reason that number is right is
+  // that these two columns are `integer`. Widening either without widening the
+  // arithmetic (or the reverse) recreates the defect the pair was added for: a
+  // quantity the form accepts, documentTotals computes, the renderer spends a
+  // subprocess on, and the INSERT then rejects with `integer out of range`.
+  // unit_price_cents is asserted alongside as the CONTRAST -- it is bigint, so
+  // there the safe-integer check is correctly the narrower of the two domains.
+  it("keeps qty_milli and tax_rate_bp int4, which is what money.ts's bound is derived from", async () => {
+    const columns = await handle.db.execute<{ column_name: string; data_type: string }>(sql`
+      SELECT column_name, data_type FROM information_schema.columns
+      WHERE table_name = 'document_line_items'
+        AND column_name IN ('qty_milli', 'tax_rate_bp', 'unit_price_cents')
+    `);
+    const byName = new Map(columns.map((row) => [row.column_name, row.data_type]));
+    expect(byName.get("qty_milli")).toBe("integer");
+    expect(byName.get("tax_rate_bp")).toBe("integer");
+    expect(byName.get("unit_price_cents")).toBe("bigint");
+
+    // And the boundary itself, through the column rather than through the
+    // function: int4's ceiling stores, one past it does not.
+    const parents = await seedDocumentParents();
+    const [document] = await handle.db.insert(documents).values(documentValues(parents)).returning();
+    const line = {
+      documentId: document!.id, description: "Widget", unitPriceCents: 1, lineTotalCents: 1,
+    };
+    const [stored] = await handle.db.insert(documentLineItems)
+      .values({ ...line, position: 1, qtyMilli: 2_147_483_647 }).returning();
+    expect(stored?.qtyMilli).toBe(2_147_483_647);
+    await expect(handle.db.insert(documentLineItems)
+      .values({ ...line, position: 2, qtyMilli: 2_147_483_648 }))
+      .rejects.toMatchObject({ cause: { code: "22003" } });
+  });
+
+  // The other half of money.ts's one-sided guard: documentTotals refuses to
+  // PRODUCE a total past 2^53, and these refuse to STORE one arriving by any
+  // other path, where drizzle's mode:"number" would read it back as the nearest
+  // double without complaint.
+  //
+  // BOTH SIDES OF EVERY BOUND, and one out-of-range column per case. An earlier
+  // version drove each table with a single over-range column and asserted only
+  // the 23514, and three mutations survived it green: deleting the
+  // line_total_cents clause, deleting the tax_cents clause, and narrowing every
+  // bound from ...991 to ...990. The narrowing is the one that would have hurt --
+  // documentTotals legitimately emits exactly 9007199254740991, so an off-by-one
+  // would have rejected a quote that had already been rendered.
+  const SAFE = 9_007_199_254_740_991;
+  const PAST = 9_007_199_254_740_992;
+
+  it("accepts stored amounts at the exact edges of the safe integer range", async () => {
+    const parents = await seedDocumentParents();
+    // The ceiling row is exactly what
+    // documentTotals([{ qtyMilli: 1000, unitPriceCents: SAFE }]) emits, which is
+    // why this edge has to be ACCEPTED rather than merely nearly rejected.
+    const rows: Partial<typeof documents.$inferInsert>[] = [
+      { subtotalCents: SAFE, taxCents: 0, totalCents: SAFE },
+      { subtotalCents: 0, taxCents: SAFE, totalCents: SAFE },
+      { subtotalCents: -SAFE, taxCents: 0, totalCents: -SAFE },
+      { subtotalCents: 0, taxCents: -SAFE, totalCents: -SAFE },
+    ];
+    for (const [index, overrides] of rows.entries()) {
+      const [row] = await handle.db.insert(documents)
+        .values(documentValues(parents, { number: `QUO-2026-100${index}`, ...overrides }))
+        .returning();
+      expect(row).toMatchObject(overrides);
+    }
+
+    const [document] = await handle.db.insert(documents)
+      .values(documentValues(parents, { number: "QUO-2026-2000" })).returning();
+    const [line] = await handle.db.insert(documentLineItems).values({
+      documentId: document!.id, position: 1, description: "Widget",
+      qtyMilli: 1000, unitPriceCents: SAFE, lineTotalCents: SAFE,
+    }).returning();
+    expect(line).toMatchObject({ unitPriceCents: SAFE, lineTotalCents: SAFE });
+    // line_total_cents carries no sign CHECK, so its floor is reachable and has
+    // to be pinned too or a narrowing of it survives.
+    const [floorLine] = await handle.db.insert(documentLineItems).values({
+      documentId: document!.id, position: 2, description: "Credit",
+      qtyMilli: 0, unitPriceCents: 0, lineTotalCents: -SAFE,
+    }).returning();
+    expect(floorLine).toMatchObject({ lineTotalCents: -SAFE });
+  });
+
+  it("refuses stored amounts past the safe integer range, one clause at a time", async () => {
+    const parents = await seedDocumentParents();
+    // Each row puts exactly ONE column out of range while keeping the other two
+    // in range AND satisfying documents_totals_consistent, so the rejection can
+    // only have come from the clause under test -- asserted BY NAME, since a
+    // bare 23514 cannot tell the two constraints apart and the consistency one
+    // would fire on a naively-built row.
+    const rows: Partial<typeof documents.$inferInsert>[] = [
+      { subtotalCents: 2 * SAFE, taxCents: -SAFE, totalCents: SAFE },
+      { subtotalCents: -SAFE, taxCents: 2 * SAFE, totalCents: SAFE },
+      { subtotalCents: SAFE, taxCents: SAFE, totalCents: 2 * SAFE },
+    ];
+    for (const overrides of rows) {
+      await expect(handle.db.insert(documents).values(documentValues(parents, overrides)))
+        .rejects.toMatchObject({
+          cause: { code: "23514", message: expect.stringContaining("documents_totals_representable") },
+        });
+    }
+
+    const [document] = await handle.db.insert(documents).values(documentValues(parents)).returning();
+    const lines: Partial<typeof documentLineItems.$inferInsert>[] = [
+      { unitPriceCents: PAST },
+      { lineTotalCents: PAST },
+      { lineTotalCents: -PAST },
+    ];
+    for (const overrides of lines) {
+      await expect(handle.db.insert(documentLineItems).values({
+        documentId: document!.id, position: 1, description: "Widget",
+        qtyMilli: 1000, unitPriceCents: 1, lineTotalCents: 1, ...overrides,
+      })).rejects.toMatchObject({
+        cause: {
+          code: "23514",
+          message: expect.stringContaining("document_line_items_amounts_representable"),
+        },
+      });
+    }
+  });
+
+  it("enforces every foreign key on documents and document_line_items", async () => {
+    const parents = await seedDocumentParents();
+    for (const bad of [{ dealId: randomUUID() }, { fileId: randomUUID() }, { issuedByUserId: randomUUID() }]) {
+      await expect(handle.db.insert(documents).values(documentValues(parents, bad)))
+        .rejects.toMatchObject({ cause: { code: "23503" } });
+    }
+    await expect(handle.db.insert(documentLineItems).values({
+      documentId: randomUUID(), position: 1, description: "Widget",
+      qtyMilli: 1000, unitPriceCents: 1, lineTotalCents: 1,
+    })).rejects.toMatchObject({ cause: { code: "23503" } });
+    // org_profile carries no foreign key at all any more. It had one --
+    // logo_file_id -> files.id -- and it was unsatisfiable: every files row must
+    // belong to exactly one company, contact, deal or project
+    // (files_exactly_one_entity), and an issuer's logo belongs to none of them,
+    // so nothing legal could ever have been stored in it. The logo is the bytes
+    // now; the two CHECKs below are what bound them.
+  });
+
+  // THE LOGO'S TWO BOUNDS, AND THEY ARE DIFFERENT NUMBERS. MAX_LOGO_BYTES bounds
+  // the image; the column holds base64 at 4/3 of that plus a prefix. Reusing the
+  // first as the second would silently shrink the permitted logo by a quarter,
+  // and every rejected upload would look like the user's mistake.
+  it("bounds the logo column by the base64 length of a MAX_LOGO_BYTES image, not by MAX_LOGO_BYTES", async () => {
+    const [check] = await handle.db.execute<{ src: string }>(sql`
+      SELECT pg_get_constraintdef(oid) AS src FROM pg_constraint
+      WHERE conname = 'org_profile_logo_size'
+    `);
+    // The constant and the constraint cannot drift: one is asserted to be in the
+    // other. 43715 = 4 * ceil(32768/3) + len('data:image/jpeg;base64,').
+    expect(MAX_LOGO_DATA_URI_CHARS).toBe(43_715);
+    expect(check?.src).toContain(String(MAX_LOGO_DATA_URI_CHARS));
+
+    const prefix = "data:image/png;base64,";
+    const atLimit = prefix + "A".repeat(MAX_LOGO_DATA_URI_CHARS - prefix.length);
+    await expect(handle.db.insert(orgProfile).values({ logoDataUri: `${atLimit}A` }))
+      .rejects.toMatchObject({ cause: { constraint_name: "org_profile_logo_size" } });
+
+    await handle.db.delete(orgProfile);
+    const [stored] = await handle.db.insert(orgProfile).values({ logoDataUri: atLimit }).returning();
+    expect(stored?.logoDataUri.length).toBe(MAX_LOGO_DATA_URI_CHARS);
+  });
+
+  // The shape CHECK, whose regex has to smuggle its own semicolon past
+  // drizzle-kit's statement splitter (see schema.ts). If the escape were wrong
+  // the constraint would accept everything, silently.
+  it("refuses anything in the logo column that is not an inline base64 image", async () => {
+    for (const bad of [
+      "file:///etc/passwd",
+      "https://example.test/logo.png",
+      "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",
+      "data:text/html;base64,PGgxPmhpPC9oMT4=",
+      "data:image/png;base64,not base64 at all",
+      "data:image/png,AAAA",
+    ]) {
+      await expect(handle.db.insert(orgProfile).values({ logoDataUri: bad }))
+        .rejects.toMatchObject({ cause: { constraint_name: "org_profile_logo_shape" } });
+    }
+    // ...and the four types that are allowed, plus the empty absence.
+    for (const good of [
+      "", "data:image/png;base64,AAAA", "data:image/jpeg;base64,AAA=",
+      "data:image/gif;base64,AA==", "data:image/webp;base64,AAAA",
+    ]) {
+      await handle.db.delete(orgProfile);
+      const [row] = await handle.db.insert(orgProfile).values({ logoDataUri: good }).returning();
+      expect(row?.logoDataUri).toBe(good);
+    }
   });
 });

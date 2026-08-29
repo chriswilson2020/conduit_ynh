@@ -314,3 +314,45 @@ export function flattenCursorPages<T extends { id: string }>(state: CursorPages<
  * constant paired with rem breakpoints would not.
  */
 export const MOBILE_BREAKPOINT = "48rem";
+
+/**
+ * A DEFAULT UTILITY CLASS THAT A CALLER CAN ACTUALLY REPLACE.
+ *
+ * THE PROBLEM THIS EXISTS FOR, and it shipped as a real defect for two phases.
+ * A component that hard-codes `max-w-md` and then appends a caller's
+ * `max-w-3xl` emits BOTH, at equal specificity -- and which one wins is decided
+ * by the order Tailwind writes them into the stylesheet, not by the order they
+ * appear in the attribute. Tailwind sorts `max-w-*` ALPHABETICALLY rather than
+ * by size, so `.max-w-md` lands after `.max-w-2xl` and `.max-w-3xl` and beats
+ * them both. Measured before this fix: a dialog carrying `max-w-3xl` computed
+ * `max-width: 448px` at 1280, and every caller that passed a width was inert --
+ * the three that predate Phase 7 (the composer, mail settings, email templates)
+ * had been inert since the utility was introduced, and the quote form made a
+ * fourth the moment it was written.
+ *
+ * The fix is not to fight the cascade but to stop creating the conflict: the
+ * component omits the utility from its own string and calls this, which returns
+ * the default ONLY when the caller has not set one from the same family. Then
+ * exactly one class of that family is ever emitted and there is nothing for the
+ * order to decide.
+ *
+ * `family` is a class-name PREFIX matched against whole classes, so `max-w-`
+ * matches `max-w-3xl` and does NOT match `max-md:max-w-none` -- which is the
+ * behaviour a phone override depends on, since that one has to keep beating
+ * whatever the caller chose. A class carrying a responsive variant prefix is
+ * likewise not treated as an override here.
+ *
+ * NO CLASS NAME IS SPELLED IN THIS PARAGRAPH THAT THE CODE DOES NOT ALSO USE,
+ * and that is a rule rather than a stylistic choice. Tailwind v4 scans source
+ * as PLAIN TEXT and does not know a comment from code, so a class named only in
+ * prose is compiled into the stylesheet: an example written here cost 0.06 kB
+ * of rules nothing renders and moved the build's hash, which is the third time
+ * this repo has paid for the same trap. lib.test.ts builds its variant-prefixed
+ * example from parts at runtime for the same reason, and there is a guard over
+ * every comment in this tree that now enforces it.
+ */
+export function overridableClass(fallback: string, family: string, className?: string): string {
+  if (className === undefined) return fallback;
+  const overridden = className.split(/\s+/).some((cls) => cls.startsWith(family));
+  return overridden ? "" : fallback;
+}

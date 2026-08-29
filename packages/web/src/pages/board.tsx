@@ -4,6 +4,7 @@ import { DndContext, DragOverlay } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import type { Deal, Stage } from "@conduit/shared";
+import { formatMoneyCents } from "@conduit/shared";
 import { ApiError } from "../api";
 import {
   useArchivePipeline, useCompanies, useCreateDeal, useCreateStage, useDeals, useMoveDeal, usePipeline,
@@ -891,7 +892,7 @@ function DealCardContent({
   rotTitle?: string;
 }) {
   const formattedValue = deal.valueCents != null
-    ? new Intl.NumberFormat(undefined, { style: "currency", currency: deal.currency }).format(deal.valueCents / 100)
+    ? formatMoneyCents(deal.valueCents, deal.currency)
     : null;
 
   return (

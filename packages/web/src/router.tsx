@@ -16,6 +16,7 @@ import { PipelinesPage } from "./pages/pipelines";
 import { ProjectsPage } from "./pages/projects";
 import { ProjectDetailPage } from "./pages/project-detail";
 import { SettingsMailPage } from "./pages/settings-mail";
+import { SettingsOrgPage } from "./pages/settings-org";
 import { SettingsTemplatesPage } from "./pages/settings-templates";
 import { TaskBoardPage } from "./pages/task-board";
 
@@ -154,7 +155,7 @@ const mailRoute = createRoute({
   component: InboxPage,
 });
 
-// Settings (Phase 4) is the app's first non-record area: two sibling routes
+// Settings (Phase 4) is the app's first non-record area: three sibling routes
 // under /settings, each rendering its own page inside the shared
 // SettingsLayout frame (components/settings-layout.tsx). The tabs there are
 // router Links rather than a Tabs component precisely because these are real
@@ -169,6 +170,14 @@ const settingsTemplatesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/templates",
   component: SettingsTemplatesPage,
+});
+
+// Phase 7's issuer profile: who a quote is FROM. A settings singleton rather
+// than a record, so it is a sibling route here like the other two.
+const settingsOrgRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/org",
+  component: SettingsOrgPage,
 });
 
 // Rendered by the router itself (not a route) whenever the URL matches no
@@ -219,6 +228,7 @@ const routeTree = rootRoute.addChildren([
   mailRoute,
   settingsMailRoute,
   settingsTemplatesRoute,
+  settingsOrgRoute,
 ]);
 
 // basePath() returns "/" both at a root install and during `vite dev` (see its

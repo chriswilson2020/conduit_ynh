@@ -80,7 +80,7 @@ async function toApiError(response: Response, fallbackMessage: string): Promise<
  * "company acme is archived" (not "PATCH /companies/... failed with 409")
  * plus a status/code they can branch on without parsing that message.
  */
-async function sendJson<T>(method: "POST" | "PATCH", path: string, body?: unknown): Promise<T> {
+async function sendJson<T>(method: "POST" | "PATCH" | "PUT", path: string, body?: unknown): Promise<T> {
   const response = await fetch(apiUrl(path), {
     method,
     headers: {
@@ -97,6 +97,13 @@ async function sendJson<T>(method: "POST" | "PATCH", path: string, body?: unknow
 
 export const postJson = <T>(path: string, body?: unknown) => sendJson<T>("POST", path, body);
 export const patchJson = <T>(path: string, body?: unknown) => sendJson<T>("PATCH", path, body);
+/**
+ * PUT, for the two Phase 7 settings singletons: the issuer profile and a
+ * document template. Both routes take the WHOLE form rather than a patch --
+ * there is one row, no concurrent editors, and clearing a field has to be
+ * expressible -- which is what makes PUT the verb rather than PATCH.
+ */
+export const putJson = <T>(path: string, body?: unknown) => sendJson<T>("PUT", path, body);
 
 /**
  * DELETE with no request or response body (e.g. removing a task dependency

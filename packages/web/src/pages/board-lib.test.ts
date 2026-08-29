@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import { MONEY_LOCALE } from "@conduit/shared";
 import { withoutComments } from "../test/source";
 import {
   boardStageView, dealRot, stageMoveTargets, stageValueLabel,
@@ -224,11 +225,14 @@ describe("stageMoveTargets", () => {
 });
 
 describe("stageValueLabel", () => {
-  /** Built the same way the function does but independently of it, so this
-   * pins the cents-to-units division and the currency style without pinning
-   * the machine's locale. */
+  /** Built independently of the function under test, so this still pins the
+   * cents-to-units division and the currency style rather than restating the
+   * implementation. It no longer avoids pinning the machine's locale: since
+   * Phase 7 the app formats money in ONE locale on both sides of a quote
+   * (@conduit/shared's MONEY_LOCALE), so a label that changed with the
+   * viewer's browser would be the defect rather than the portability. */
   const asEur = (units: number) =>
-    new Intl.NumberFormat(undefined, { style: "currency", currency: "EUR" }).format(units);
+    new Intl.NumberFormat(MONEY_LOCALE, { style: "currency", currency: "EUR" }).format(units);
 
   it("sums a stage's deals, in cents, in its own currency", () => {
     expect(stageValueLabel([

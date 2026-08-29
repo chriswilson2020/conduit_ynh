@@ -1,4 +1,6 @@
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import { withoutComments } from "./test/source";
 import {
   advanceCursorPages,
   cursorForKey,
@@ -8,6 +10,7 @@ import {
   humanSize,
   identityKey,
   mergeCursorPage,
+  overridableClass,
   parseDecimal,
   relativeTime,
   todayLocalIso,
@@ -247,5 +250,116 @@ describe("cursor page cursors", () => {
     pages = mergeCursorPage(pages, "a", "cursor-1", [row("2")], null);
     expect(cursorForKey(pages, "a")).toBe("cursor-1");
     expect(flattenCursorPages(pages).map((item) => item.id)).toEqual(["1", "2"]);
+  });
+});
+
+describe("overridableClass", () => {
+  /**
+   * THE DEFECT THIS FUNCTION WAS WRITTEN FOR, pinned as a test. ui/dialog.tsx
+   * used to spell `max-w-md` in its own shape and then append the caller's
+   * class, so both were emitted at equal specificity -- and Tailwind sorts
+   * `max-w-*` alphabetically rather than by size, putting `.max-w-md` after
+   * `.max-w-2xl` and `.max-w-3xl`. Measured at 1280 before the fix: a dialog
+   * asking for `max-w-3xl` computed 448px. Three of the four callers that pass a
+   * width had been inert since the utility was introduced; the quote form is the
+   * fourth and was born inert.
+   *
+   * Nothing here can see a stylesheet. What it CAN guarantee is that the
+   * conflict is never created, which is the property the fix rests on: when the
+   * caller sets a class from the family, the default is not emitted at all.
+   */
+  it("yields the default only when the caller sets nothing from that family", () => {
+    expect(overridableClass("max-w-md", "max-w-", undefined)).toBe("max-w-md");
+    expect(overridableClass("max-w-md", "max-w-", "")).toBe("max-w-md");
+    expect(overridableClass("max-w-md", "max-w-", "overflow-y-auto")).toBe("max-w-md");
+  });
+
+  it("stands aside for a caller's own class from that family", () => {
+    expect(overridableClass("max-w-md", "max-w-", "max-w-3xl")).toBe("");
+    expect(overridableClass("max-w-md", "max-w-", "max-h-[85vh] max-w-2xl overflow-y-auto")).toBe("");
+  });
+
+  /**
+   * `max-md:max-w-none` MUST NOT COUNT AS AN OVERRIDE. It is the phone shape's
+   * own class and it has to keep beating whatever width the caller chose --
+   * which it does, because every `max-md` rule is emitted after the base layer.
+   * Treating it as an override would drop the desktop default and leave a
+   * dialog with no card width at a desk.
+   */
+  it("matches whole classes, so a variant-prefixed one is not an override", () => {
+    expect(overridableClass("max-w-md", "max-w-", "max-md:max-w-none")).toBe("max-w-md");
+    // ASSEMBLED FROM PARTS, NOT WRITTEN OUT, and the reason is the trap this
+    // repo has now hit three times: Tailwind v4 scans source as plain text and
+    // compiles any class it finds, in a comment or a test literal alike. The
+    // spelled-out form of this token existed nowhere but here and in one doc
+    // comment, and it was in the shipped stylesheet -- 0.06 kB of rules nothing
+    // renders. Both halves below already appear in real code, so joining them
+    // here adds nothing to the build.
+    const variantPrefixed = ["md", "max-w-md"].join(":");
+    expect(overridableClass("max-w-md", "max-w-", variantPrefixed)).toBe("max-w-md");
+  });
+
+  it("is not fooled by a class that merely contains the family", () => {
+    expect(overridableClass("max-w-md", "max-w-", "not-max-w-lg")).toBe("max-w-md");
+  });
+});
+
+describe("the Tailwind-in-prose trap", () => {
+  /**
+   * THIS REPO HAS PAID FOR THE SAME MISTAKE THREE TIMES, so it is worth a guard
+   * rather than a fourth comment telling people not to make it.
+   *
+   * Tailwind v4 scans source as PLAIN TEXT and does not know a comment from
+   * code. A class name written in prose is therefore compiled into the
+   * stylesheet. Phase 6 spelled an abbreviated bracketed utility in a comment
+   * and lightningcss rejected the rule it generated, so every build from then on
+   * carried a warning that read like a real CSS bug. Phase 7 named a
+   * variant-prefixed width in a doc comment and a test literal, and shipped
+   * 0.06 kB of rules nothing renders -- proved by rebuilding without them, which
+   * moved the stylesheet's hash.
+   *
+   * THE RULE THIS ENFORCES is not "never name a class in a comment", which would
+   * be unusable -- ui/dialog.tsx's comments are largely about specific classes,
+   * and every one of them is a class that file also uses. It is the narrower
+   * and exactly right one: A VARIANT-PREFIXED CLASS NAMED IN A COMMENT MUST ALSO
+   * APPEAR IN REAL CODE SOMEWHERE IN THIS TREE. If it does, Tailwind was going
+   * to emit it anyway and the comment costs nothing; if it does not, the comment
+   * is the only reason it is in the stylesheet.
+   *
+   * Scoped to variant-prefixed classes because those are unambiguous. A bare
+   * word like `hidden` or `flex` in prose cannot be told apart from English.
+   */
+  const VARIANT = "(?:max-)?(?:sm|md|lg|xl|2xl|hover|focus|active|disabled|group-hover|peer-focus|dark|print)";
+  const CLASS_TOKEN = new RegExp(`\\b${VARIANT}:[a-z0-9][a-z0-9./%[\\]()_-]*`, "g");
+
+  function sources(dir: URL): URL[] {
+    const out: URL[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) out.push(...sources(new URL(`${entry.name}/`, dir)));
+      else if (entry.name.endsWith(".ts") || entry.name.endsWith(".tsx")) {
+        out.push(new URL(entry.name, dir));
+      }
+    }
+    return out;
+  }
+
+  it("names no variant-prefixed class in prose that the code does not also use", () => {
+    const files = sources(new URL("./", import.meta.url));
+    const inCode = new Set<string>();
+    const inProse = new Map<string, string>();
+
+    for (const file of files) {
+      const whole = readFileSync(file, "utf8");
+      const code = withoutComments(whole);
+      for (const match of code.matchAll(CLASS_TOKEN)) inCode.add(match[0]);
+      // Whatever the comments held that the code did not.
+      const codeTokens = new Set([...code.matchAll(CLASS_TOKEN)].map((m) => m[0]));
+      for (const match of whole.matchAll(CLASS_TOKEN)) {
+        if (!codeTokens.has(match[0])) inProse.set(match[0], file.pathname);
+      }
+    }
+
+    const onlyInProse = [...inProse].filter(([cls]) => !inCode.has(cls));
+    expect(onlyInProse.map(([cls, where]) => `${cls} (${where.split("/src/")[1] ?? where})`)).toEqual([]);
   });
 });

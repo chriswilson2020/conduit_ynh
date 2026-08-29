@@ -79,6 +79,19 @@ jobs:
       # service containers are created before the workspace is checked out.
       - name: Start Dovecot
         run: .github/scripts/start-dovecot.sh
+      # The gate on packages/api/src/services/documents-render.test.ts: without the
+      # binary its render half skips, so this step is what makes CI the place the
+      # PDF path is actually proved. The package list matches manifest.toml's
+      # resources.apt (minus postgresql, which is a service container here) so CI
+      # exercises the same dependency resolution the server will -- see that file
+      # for why python3-munkres is named. DEBIAN_FRONTEND because an apt-get that
+      # tries to prompt on a runner hangs until the job's timeout rather than
+      # failing (the e2e job's Playwright step carries the scar).
+      - name: Install WeasyPrint
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-munkres weasyprint
+          weasyprint --version
       - name: Install dependencies
         run: npm ci
       # Protocol-level, not TCP-level: `docker run -p` publishes through a
@@ -180,6 +193,24 @@ jobs:
           cache: npm
       - name: Start Dovecot
         run: .github/scripts/start-dovecot.sh
+      # The SAME step the `test` job runs, and for a different reason: there the
+      # binary un-skips the render suite, here it is what lets a quote be raised at
+      # all. e2e/documents.spec.ts drives the real issuing transaction, which spawns
+      # python3 with WeasyPrint's API -- on a runner without it every documents
+      # journey fails on a 422 from a renderer that is not there. Task 1 flagged
+      # this job as the gap and it stayed open until Task 6.
+      #
+      # python3-munkres is named for the reason manifest.toml names it: apt takes
+      # the FIRST alternative of python3-fonttools' `python3-scipy | python3-munkres`
+      # and drags a C++ toolchain in with it -- 69 packages and 508MB against 39 and
+      # 89MB. DEBIAN_FRONTEND because an apt-get that tries to prompt on a runner
+      # hangs until the job's timeout rather than failing (this job's Playwright step
+      # carries that scar).
+      - name: Install WeasyPrint
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-munkres weasyprint
+          weasyprint --version
       - name: Install dependencies
         run: npm ci
       # Browser binary only. NOT --with-deps: that shells out to apt-get, which

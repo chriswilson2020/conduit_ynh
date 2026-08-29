@@ -1,6 +1,17 @@
 import { z } from "zod";
 
 export { midpoint } from "./fractional.js";
+// The package exports "." and nothing else (package.json), so a sibling module is
+// reachable from api and web only by being re-exported here -- fractional.js's line
+// above is the precedent, and money.js needs it for the same reason: the quote
+// form's running total and the stored total must be the same function.
+import { documentTotals as computeDocumentTotals } from "./money.js";
+export { lineTotalCents, taxCents, documentTotals } from "./money.js";
+export type { LineInput, DocumentTotals } from "./money.js";
+// Formatting is a separate module from the arithmetic, and reaches web the same
+// way: the one locale every money figure in the app is rendered in, so the
+// quote form and the PDF beside it cannot disagree.
+export { formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE } from "./money-format.js";
 
 export const userSchema = z.object({
   id: z.uuid(),
@@ -1581,3 +1592,650 @@ export const meetingTaskCreateInputSchema = taskInputShape
     message: "startDate and dueDate must both be set (with startDate <= dueDate) or both omitted",
   });
 export type MeetingTaskCreateInput = z.infer<typeof meetingTaskCreateInputSchema>;
+
+/* ========================================================================== *
+ *  DOCUMENTS (Phase 7)
+ * ========================================================================== */
+
+/**
+ * A NUL, or half of a surrogate pair. Both are legal JSON and neither can be stored.
+ *
+ * **THIS WAS A FOURTH POST-RENDER 500.** `{"description": "a\u0000b"}` parses, passes
+ * every bound, is charged one byte, survives the merge and the sanitiser, allocates a
+ * number, SPAWNS python3 AND RENDERS, writes the blob, and then fails the INSERT with
+ * `22021 invalid byte sequence` -- unmapped, so a bare 500 and an orphan blob, for a
+ * value the form had called fine. It is the same shape as the three CHECK constraints
+ * Step 5a exists to gate, with a fourth SQLSTATE.
+ *
+ * Postgres `text` holds any character except U+0000; an unpaired surrogate is the
+ * other way to produce a byte sequence that is not valid UTF-8. Neither has any
+ * business on a quote.
+ */
+const UNSTORABLE_TEXT = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+
+/**
+ * A user-supplied string bounded in length and refused if a column could not hold it.
+ *
+ * `min` is a PARAMETER rather than something a caller chains on afterwards, and that
+ * is not tidiness: `documentText(250).min(1)` type-checks, returns a fresh schema and
+ * silently drops the refinement, so a description containing a NUL sails through and
+ * fails the INSERT exactly as before. Every bound has to be inside the one expression.
+ */
+function documentText(max: number, min = 0) {
+  return z.string().min(min).max(max).refine((value) => !UNSTORABLE_TEXT.test(value), {
+    message: "text may not contain a NUL or an unpaired surrogate",
+  });
+}
+
+/** The one document type v1.0.0 ships. `documents_type_valid` CHECKs the same set. */
+export const documentTypeSchema = z.enum(["quote"]);
+export type DocumentType = z.infer<typeof documentTypeSchema>;
+
+/**
+ * The UTF-8 cost of a value once it has been merged into a document, escaping
+ * included.
+ *
+ * `&` becomes `&amp;` and `<` and `>` become `&lt;`/`&gt;`, all measured against the
+ * shipped template. `"` and `'` cost ONE byte in text position -- escaped on the way
+ * in and re-serialised bare -- and SIX in an attribute, which this cannot know from
+ * the value alone. See DOCUMENT_CONTENT_BUDGET_BYTES for why that is an approximation
+ * error rather than a correctness one.
+ */
+function escapedBytes(value: string): number {
+  let bytes = new TextEncoder().encode(value).length;
+  for (const char of value) {
+    if (char === "&") bytes += 4;
+    else if (char === "<" || char === ">") bytes += 3;
+  }
+  return bytes;
+}
+
+/** What an issuer profile will cost a render: its text, escaped, plus its logo. */
+export function orgProfileBytes(profile: {
+  name: string; addressLines: string; vatNumber: string; registrationNumber: string;
+  email: string; phone: string; website: string; bankDetails: string; logoDataUri: string;
+}): number {
+  return escapedBytes(profile.name) + escapedBytes(profile.addressLines)
+    + escapedBytes(profile.vatNumber) + escapedBytes(profile.registrationNumber)
+    + escapedBytes(profile.email) + escapedBytes(profile.phone)
+    + escapedBytes(profile.website) + escapedBytes(profile.bankDetails)
+    + profile.logoDataUri.length;
+}
+
+/**
+ * THE LOGO'S TWO BOUNDS, AND THEY ARE NOT THE SAME NUMBER.
+ *
+ * `MAX_LOGO_BYTES` bounds the IMAGE. `MAX_LOGO_DATA_URI_CHARS` bounds the COLUMN,
+ * which holds base64 -- 4 characters per 3 bytes, plus the longest permitted prefix.
+ * Reusing the first as the second would silently shrink the permitted logo to 24KB
+ * and nothing would say so: every rejected upload would look like a user's mistake.
+ *
+ * 32KB of image is the figure the spec names. It reaches the renderer inlined at 4/3
+ * of its size -- 43,691 bytes against a 131,072-byte input cap, which is 33.3% of it
+ * -- so it leaves the document itself TWO THIRDS of the budget. (An earlier version
+ * of this sentence said three quarters, which is the same arithmetic rounded in the
+ * flattering direction.)
+ *
+ * `org_profile_logo_size` CHECKs the same character count, and a test asserts the
+ * constraint's literal equals this constant so the two cannot drift.
+ */
+export const MAX_LOGO_BYTES = 32 * 1024;
+const LONGEST_LOGO_PREFIX = "data:image/jpeg;base64,".length;
+export const MAX_LOGO_DATA_URI_CHARS = Math.ceil(MAX_LOGO_BYTES / 3) * 4 + LONGEST_LOGO_PREFIX;
+
+const LOGO_DATA_URI = /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/**
+ * The first `wanted` bytes of a base64 payload, decoded by hand.
+ *
+ * BY HAND BECAUSE NEITHER `atob` NOR `Buffer` IS AVAILABLE IN BOTH PLACES this
+ * module runs, which is the same constraint that keeps the size check to
+ * arithmetic. Only a dozen bytes are ever needed, so the cost is nil and the
+ * portability is total.
+ */
+function decodeBase64Prefix(base64: string, wanted: number): number[] {
+  const out: number[] = [];
+  let buffer = 0;
+  let bits = 0;
+  for (const character of base64) {
+    const value = BASE64_ALPHABET.indexOf(character);
+    if (value < 0) break;
+    buffer = (buffer << 6) | value;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((buffer >> bits) & 0xff);
+      if (out.length >= wanted) break;
+    }
+  }
+  return out;
+}
+
+function startsWithBytes(bytes: readonly number[], signature: readonly number[]): boolean {
+  return signature.every((byte, index) => bytes[index] === byte);
+}
+
+/**
+ * WHAT EACH DECLARED TYPE'S BYTES MUST ACTUALLY LOOK LIKE.
+ *
+ * A `data:` URI's media type is a CLAIM MADE BY WHOEVER BUILT IT, and in a
+ * browser it comes from `File.type`, which is derived from the file's extension
+ * rather than its contents. So `logo.svg` renamed to `logo.png` arrives as
+ * `data:image/png;base64,<svg...>`, matched the prefix regex, and was stored --
+ * and WeasyPrint, which sniffs properly, drew it as vector art on the quote.
+ * The spec excludes SVG on purpose (it is a document format with its own
+ * URL-bearing elements, arriving where neither the document sanitiser nor the
+ * renderer's fetcher looks inside it), and until this existed that exclusion
+ * was enforced only against a file honest enough to admit what it was.
+ *
+ * Not a vulnerability when it was found -- a spec reviewer built an SVG
+ * carrying `file://` and loopback references and the render was refused with
+ * `document referenced a blocked resource`, canary atime unchanged, no number
+ * spent. Task 3's fetcher held. This is the layer in front of it doing its own
+ * job rather than relying on that.
+ */
+const LOGO_SIGNATURES: Record<string, (bytes: readonly number[]) => boolean> = {
+  png: (b) => startsWithBytes(b, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  jpeg: (b) => startsWithBytes(b, [0xff, 0xd8, 0xff]),
+  // "GIF8" then "7a" or "9a".
+  gif: (b) => startsWithBytes(b, [0x47, 0x49, 0x46, 0x38])
+    && (b[4] === 0x37 || b[4] === 0x39) && b[5] === 0x61,
+  // "RIFF", four bytes of length, then "WEBP" -- so twelve bytes are needed,
+  // which is exactly what sixteen base64 characters carry.
+  webp: (b) => startsWithBytes(b, [0x52, 0x49, 0x46, 0x46])
+    && startsWithBytes(b.slice(8), [0x57, 0x45, 0x42, 0x50]),
+};
+
+/**
+ * Why this string cannot be a logo, or null if it can. "" is a logo-less profile and
+ * is always fine.
+ *
+ * A FUNCTION RATHER THAN A REGEX IN A SCHEMA, because the size bound is the half that
+ * matters and it is arithmetic: the decoded length is exactly `4/3` of the base64
+ * minus its padding, so it can be checked without decoding -- which matters because
+ * this runs in a browser and on a server and `atob` and `Buffer` are not both there.
+ *
+ * SVG IS DELIBERATELY NOT ALLOWED. It is a document format with its own URL-bearing
+ * elements, and it would arrive inside a `data:` URI where neither the document
+ * sanitiser nor the renderer's fetcher looks inside it.
+ *
+ * AND THE TYPE IN THE URI IS NOT EVIDENCE OF ANYTHING, which is why the last check
+ * reads the bytes. In a browser that string comes from `File.type`, which is decided
+ * by the file's EXTENSION -- so an SVG renamed to .png declares `image/png`, passes
+ * every check above, and gets drawn as vector art by a renderer that sniffs properly.
+ * See LOGO_SIGNATURES.
+ */
+export function logoDataUriProblem(uri: string): string | null {
+  if (uri === "") return null;
+  if (!LOGO_DATA_URI.test(uri)) {
+    return "a logo must be a base64 data: URI for a PNG, JPEG, GIF or WEBP image";
+  }
+  if (uri.length > MAX_LOGO_DATA_URI_CHARS) {
+    return `a logo must be ${String(MAX_LOGO_BYTES)} bytes or less`;
+  }
+  const base64 = uri.slice(uri.indexOf(",") + 1);
+  if (base64.length % 4 !== 0) return "the logo's base64 data is malformed";
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  const bytes = (base64.length / 4) * 3 - padding;
+  if (bytes > MAX_LOGO_BYTES) {
+    return `a logo must be ${String(MAX_LOGO_BYTES)} bytes or less; this one is ${String(bytes)}`;
+  }
+  // The declared type has to be backed by the payload's own leading bytes.
+  // Sixteen base64 characters carry the twelve bytes the widest signature needs.
+  const declared = LOGO_DATA_URI.exec(uri)?.[1];
+  const signature = declared === undefined ? undefined : LOGO_SIGNATURES[declared];
+  if (signature === undefined || !signature(decodeBase64Prefix(base64.slice(0, 16), 12))) {
+    return `a logo's contents must really be a ${String(declared)} image;`
+      + " this file's data does not match the type it claims";
+  }
+  return null;
+}
+
+/**
+ * The issuer: your own company, as printed at the top of a quote. A singleton, so
+ * there is no id on the wire -- `org_profile` is pinned at id 1 and a caller has no
+ * business naming it.
+ *
+ * Every field defaults to "" rather than being nullable, matching the columns: an
+ * install that has filled in nothing is an ordinary state, not missing data, and the
+ * seeded template wraps each of these in a conditional so an empty one prints neither
+ * a label nor a blank.
+ *
+ * THE LOGO IS THE BYTES, not a file id. It was a `files` reference until Task 4's
+ * review: `files_exactly_one_entity` requires every file to belong to exactly one
+ * company, contact, deal or project, and an issuer's logo belongs to none of them, so
+ * no legal row existed for that reference to name. It is stored as the `data:` URI
+ * the renderer will accept and nothing else.
+ */
+export const orgProfileSchema = z.object({
+  name: z.string(),
+  addressLines: z.string(),
+  vatNumber: z.string(),
+  registrationNumber: z.string(),
+  email: z.string(),
+  phone: z.string(),
+  website: z.string(),
+  bankDetails: z.string(),
+  logoDataUri: z.string(),
+  updatedAt: z.iso.datetime(),
+});
+export type OrgProfile = z.infer<typeof orgProfileSchema>;
+
+/**
+ * PUT /api/org-profile's body. A total replacement rather than a patch: it is one
+ * form with nine fields and no concurrent editors, so "send me the form" is both the
+ * simplest contract and the one where clearing a field is expressible.
+ *
+ * The field lengths are the only bound the columns do not carry (they are `text`),
+ * and they exist because every one of these prints on the page: an address of a
+ * megabyte is a quote that cannot render, discovered at issue time rather than here.
+ * The measured contribution of these fields to a render is in DOCUMENT_MAX_LINES's
+ * comment, which is sized around them.
+ */
+export const ORG_PROFILE_FIELD_CAPS = {
+  name: 200,
+  addressLines: 2000,
+  vatNumber: 100,
+  registrationNumber: 100,
+  email: 200,
+  phone: 100,
+  website: 200,
+  bankDetails: 500,
+} as const;
+
+export const orgProfileInputSchema = z.object({
+  name: documentText(ORG_PROFILE_FIELD_CAPS.name),
+  addressLines: documentText(ORG_PROFILE_FIELD_CAPS.addressLines),
+  vatNumber: documentText(ORG_PROFILE_FIELD_CAPS.vatNumber),
+  registrationNumber: documentText(ORG_PROFILE_FIELD_CAPS.registrationNumber),
+  email: documentText(ORG_PROFILE_FIELD_CAPS.email),
+  phone: documentText(ORG_PROFILE_FIELD_CAPS.phone),
+  website: documentText(ORG_PROFILE_FIELD_CAPS.website),
+  bankDetails: documentText(ORG_PROFILE_FIELD_CAPS.bankDetails),
+  logoDataUri: z.string(),
+}).superRefine((value, ctx) => {
+  const problem = logoDataUriProblem(value.logoDataUri);
+  if (problem !== null) ctx.addIssue({ code: "custom", path: ["logoDataUri"], message: problem });
+  // THE RESERVE HAS TO BE ENFORCED SOMEWHERE OR IT IS A WISH. A quote's budget is the
+  // render cap minus a template allowance minus what an issuer may cost, and nothing
+  // bounded the issuer at all: a maxed profile is 47,115 bytes in ASCII and 60,715
+  // with an `&` in every text field, because an ampersand escapes to five. The logo
+  // and the text compete for the same reserve, which is why they are counted together
+  // rather than separately.
+  const bytes = orgProfileBytes(value);
+  if (bytes > ORG_PROFILE_RESERVE_BYTES) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["logoDataUri"],
+      message: `this profile needs ${String(bytes)} bytes of the ${String(ORG_PROFILE_RESERVE_BYTES)}`
+        + " a quote reserves for its issuer; use a smaller logo or shorter details",
+    });
+  }
+});
+export type OrgProfileInput = z.infer<typeof orgProfileInputSchema>;
+
+/**
+ * One priced line of an issued document, frozen at issue in money.ts's units:
+ * quantity in THOUSANDTHS, price in CENTS, tax in BASIS POINTS.
+ */
+export const documentLineItemSchema = z.object({
+  id: z.uuid(),
+  position: z.number().int().positive(),
+  description: z.string(),
+  qtyMilli: z.number().int(),
+  unitPriceCents: z.number().int().safe(),
+  taxRateBp: z.number().int(),
+  lineTotalCents: z.number().int().safe(),
+});
+export type DocumentLineItem = z.infer<typeof documentLineItemSchema>;
+
+/**
+ * An issued document, with its lines. NAMED `DocumentRecord` rather than `Document`
+ * on purpose: `Document` is a DOM global, and a type by that name imported into
+ * packages/web shadows it in every file that takes the import.
+ *
+ * There is no update shape anywhere below, and that is the phase's central claim
+ * rather than an omission: an issued quote never changes.
+ */
+export const documentSchema = z.object({
+  id: z.uuid(),
+  number: z.string().min(1),
+  type: documentTypeSchema,
+  dealId: z.uuid(),
+  fileId: z.uuid(),
+  currency: currencyCodeSchema,
+  issueDate: z.iso.date(),
+  validUntilDate: z.iso.date().nullable(),
+  recipientName: z.string(),
+  recipientContactName: z.string(),
+  recipientAddress: z.string(),
+  subtotalCents: z.number().int().safe(),
+  taxCents: z.number().int().safe(),
+  totalCents: z.number().int().safe(),
+  notes: z.string(),
+  terms: z.string(),
+  issuedByUserId: z.uuid(),
+  createdAt: z.iso.datetime(),
+  lines: z.array(documentLineItemSchema),
+});
+export type DocumentRecord = z.infer<typeof documentSchema>;
+
+/**
+ * THE RENDER BUDGET. Every number below was MEASURED against the shipped template,
+ * `buildContext` and `prepareDocumentHtml`, because the first version of this comment
+ * was arithmetic and the arithmetic was wrong twice.
+ *
+ * What it got wrong: it costed a line at "about 120 bytes" (measured: 139 to 186,
+ * depending on the money strings the row prints -- a range the old note did not admit
+ * existed), and it subtracted only the template and the logo, never `notes` (5000),
+ * `terms` (5000), `recipientAddress` (2000) or the two 200-character names, all
+ * permitted by this same schema. So the advertised 130 x 500 was not deliverable:
+ * with every optional field maxed and a maxed logo it merges to 151,139 bytes in
+ * ASCII and 216,139 accented, against a 131,072 cap. (An earlier note here said
+ * 145,679 and 210,679, measured with narrower money strings -- same conclusion,
+ * different premise, and the difference is exactly why a per-line figure has to say
+ * what was in the row.)
+ *
+ * MEASURED, on the seeded template, every figure the merged AND SANITISED output in
+ * UTF-8 BYTES -- both qualifications matter, since the same document is 2,205
+ * characters and 2,211 bytes:
+ *
+ *   the template against an all-empty context        2,211 B
+ *   a maxed org profile INCLUDING a maxed logo      +47,115 B
+ *   maxed notes/terms/address/names (ASCII)         +12,486 B
+ *   one more line item, shortest money strings         +139 B
+ *   one more line item, widest money strings           +186 B
+ *   one more character of ASCII description              +1 B
+ *
+ * `&` costs 5 bytes and `<` and `>` cost 4, because substitution escapes them and
+ * the sanitiser leaves them escaped. `"` and `'` cost 1: they are escaped on the way
+ * in and re-serialised bare in text position. Measured, not assumed -- and it is why
+ * `documentContentBytes` counts escaped bytes rather than string length.
+ */
+
+/**
+ * renderPdf's input cap, restated here because the whole budget derives from it --
+ * and because THE AUTHORITATIVE CHECK IS NOT THIS FILE'S. `issueQuote` measures the
+ * merged, sanitised bytes after the merge and before the spawn; everything below
+ * PREDICTS that number from the inputs, and a prediction can be wrong.
+ */
+export const RENDER_INPUT_CAP_BYTES = 128 * 1024;
+
+/**
+ * What a user-edited template may cost, IN BYTES rather than characters. The shipped
+ * one is 3,616, so this is four and a half times it -- room to rework the letterhead,
+ * not room to paste a document in.
+ *
+ * BYTES, because a character cap does not bound a render: 16,384 characters of CJK is
+ * 48,410 bytes, three times the reserve this constant is supposed to be. Measured on
+ * PUT after the body has been sanitised, since the sanitiser can grow what it is
+ * given.
+ */
+export const MAX_TEMPLATE_BYTES = 16 * 1024;
+
+/**
+ * What a quote reserves for its issuer: the logo plus the eight text fields, escaped.
+ *
+ * 48,000 was chosen from a measurement of a maxed ASCII profile (47,115) and was
+ * simply hoped for: nothing bounded the profile, and the same fields full of `&`
+ * measure 60,715. `orgProfileInputSchema` now enforces it, so the reserve is a fact
+ * about what can be stored rather than an assumption about what people type.
+ *
+ * THOSE TWO FIGURES READ 47,320 AND 60,920 UNTIL PHASE 7'S QUALITY REVIEW, each
+ * exactly 205 too high, in three places. The arithmetic is checkable in one
+ * line and now is: the eight text fields cap at 3,400 characters and the logo
+ * column at MAX_LOGO_DATA_URI_CHARS (43,715), so ASCII is 3,400 + 43,715 =
+ * 47,115, and an `&` in every text position costs five bytes rather than one
+ * for 17,000 + 43,715 = 60,715. The old pair implied a 43,920-character logo,
+ * which is 205 more than the column can hold.
+ */
+export const ORG_PROFILE_RESERVE_BYTES = 48_000;
+
+/**
+ * A line's markup, without its description.
+ *
+ * MEASURED AT ITS LARGEST, not its smallest, AND THE FIGURE IS A RANGE. A row is 139
+ * bytes when the money strings are their shortest and 186 with the widest values a
+ * quote can carry -- the quantity, the unit price, the tax rate and the line total
+ * are all printed in it, so "the cost of a line" is meaningless without saying what
+ * was in it. Both ends measured against the shipped template through
+ * `prepareDocumentHtml`, in MONEY_LOCALE.
+ *
+ * 160 was documented as "145 measured" and was neither, and SETTING IT TO 0 LEFT
+ * EVERY TEST IN THE REPO GREEN. documents.test.ts now measures both ends and asserts
+ * this constant sits at or above the top of them, so an undercharge fails.
+ */
+export const DOCUMENT_LINE_MARKUP_BYTES = 186;
+
+/**
+ * What is left for the quote's own content once the template and the issuer have
+ * taken their reserves: 66,688 bytes.
+ *
+ * **THIS IS A PREDICTION AND IT IS NOT THE CHECK THAT DECIDES.** It exists so the
+ * form can refuse a quote in the form, with a message about a field, instead of the
+ * server refusing it after a merge. `issueQuote` measures the merged, sanitised bytes
+ * and that measurement is authoritative -- it is exact, it is taken before anything
+ * spawns, and it is immune to every way this arithmetic can be wrong. An earlier
+ * version of this comment called the prediction conservative with one named
+ * exception, and a review found four more:
+ *
+ *   - `"` costs one byte in text position and SIX in an attribute (`&quot;`), and
+ *     this charges one. A 330-character template using each field once, filled with
+ *     quote-heavy content, predicts 37,000 and merges to 165,735.
+ *   - the issuer's reserve was not enforced, so a profile could cost 60,715 of the
+ *     48,000 reserved for it. It is enforced now, which closes that one.
+ *   - `MAX_TEMPLATE_BYTES` counted characters, so a CJK template cost three times its
+ *     allowance. It counts bytes now, which closes that one too.
+ *   - a template may repeat a field; the prediction counts a value once and the page
+ *     prints it as often as the template asks.
+ *
+ * The first and the last are approximation quality now rather than correctness, and
+ * they are why the measured check exists rather than a sixth attempt at predicting.
+ * When the two disagree the measurement wins and the caller gets a 413 naming what
+ * was too big; the cost of the disagreement is a worse error message, not a bad
+ * document or a wasted render.
+ */
+export const DOCUMENT_CONTENT_BUDGET_BYTES =
+  RENDER_INPUT_CAP_BYTES - MAX_TEMPLATE_BYTES - ORG_PROFILE_RESERVE_BYTES;
+
+/**
+ * THE PER-FIELD CAPS, SET TO WHAT IS DELIVERABLE IN THE WORST CASE RATHER THAN THE
+ * BEST. 60 lines of 250 characters, with every optional field maxed, a maxed logo and
+ * ACCENTED text throughout -- two bytes per character -- merges to about 113KB, which
+ * fits. The same shape in ASCII is far under.
+ *
+ * Both halves are load-bearing, in opposite directions: without a description cap one
+ * line exhausts the budget, and without a line cap 10,000 empty descriptions do.
+ *
+ * A script that costs three or four bytes a character (CJK, emoji) is NOT deliverable
+ * at these maxima, and that is what `documentContentBytes` is for: it is exact for
+ * any script, so such a quote is refused by the gate with a sentence about the budget
+ * rather than by a 413 after a render. The caps are the ergonomic limit; the budget
+ * is the real one.
+ *
+ * If renderPdf's input cap moves, every constant above moves with it.
+ */
+export const DOCUMENT_MAX_LINES = 60;
+export const DOCUMENT_MAX_DESCRIPTION_CHARS = 250;
+
+/**
+ * What a submitted quote is PREDICTED to cost the renderer, in bytes.
+ *
+ * Exported so the form can show the remaining budget while somebody is typing, and so
+ * the form and the server's early rejection cannot disagree. It is not what decides
+ * whether a quote renders -- see DOCUMENT_CONTENT_BUDGET_BYTES.
+ */
+export function documentContentBytes(input: {
+  recipientName?: string;
+  recipientContactName?: string;
+  recipientAddress?: string;
+  notes?: string;
+  terms?: string;
+  lines: readonly { description: string }[];
+}): number {
+  let total = escapedBytes(input.recipientName ?? "") + escapedBytes(input.recipientContactName ?? "")
+    + escapedBytes(input.recipientAddress ?? "") + escapedBytes(input.notes ?? "")
+    + escapedBytes(input.terms ?? "");
+  for (const line of input.lines) {
+    total += DOCUMENT_LINE_MARKUP_BYTES + escapedBytes(line.description);
+  }
+  return total;
+}
+
+/**
+ * A date a document can carry, which is narrower than a well-formed one.
+ *
+ * `z.iso.date()` accepts `0000-01-01`, and POSTGRES HAS NO YEAR ZERO: that value
+ * computes its totals, allocates a number, RENDERS THE PDF, writes the blob, and then
+ * dies on the INSERT with `22008 date/time field value out of range` -- a bare Error
+ * that no domain mapping catches, so a 500 raised after a subprocess has already run,
+ * through the public route. The same shape as the three CHECK constraints Step 5a
+ * exists to gate, with a third error code.
+ *
+ * The floor is a four-digit year rather than 0001 because that is what everything
+ * downstream assumes: the number printed on the page is `QUO-<year>-0001`, and a year
+ * that is not four digits produces a number that sorts and reads wrong. The ceiling
+ * comes free -- `z.iso.date()` will not parse five digits.
+ */
+const documentDateSchema = z.iso.date().refine(
+  (value) => Number(value.slice(0, 4)) >= 1000,
+  { message: "the date must fall in a four-digit year" },
+);
+
+/**
+ * One line of a quote as submitted. **THE THREE BOUNDS HERE ARE THE THREE CHECK
+ * CONSTRAINTS ON `document_line_items`**, restated where they can be enforced before
+ * anything spawns: `qty_milli >= 0`, `unit_price_cents >= 0` and `tax_rate_bp BETWEEN
+ * 0 AND 10000`.
+ *
+ * money.ts deliberately keeps a WIDER domain than all three -- `divideRoundHalfUp`
+ * has a negative branch so a future credit note rounds correctly -- so a negative
+ * quantity or a 150% tax rate computes a total, renders a PDF and only then dies on
+ * the INSERT as a 23514: an opaque 500, after a subprocess has already run, for a
+ * value the form said was fine. All three were reproduced end to end in exactly that
+ * shape. The repo's split is "Zod is the primary gate, the CHECK is the backstop",
+ * and this is the gate.
+ *
+ * The upper bounds are the storable ones: int4 for `qty_milli`, and
+ * Number.MAX_SAFE_INTEGER for `unit_price_cents`, which is both what drizzle's
+ * `mode: "number"` can read back and what `document_line_items_amounts_representable`
+ * allows.
+ */
+export const documentLineInputSchema = z.object({
+  description: documentText(DOCUMENT_MAX_DESCRIPTION_CHARS, 1),
+  qtyMilli: z.number().int().min(0).max(2_147_483_647),
+  unitPriceCents: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  taxRateBp: z.number().int().min(0).max(10_000),
+});
+export type DocumentLineInput = z.infer<typeof documentLineInputSchema>;
+
+/**
+ * Body of POST /api/deals/:dealId/documents. The deal is the route param and the
+ * currency is copied from that deal, so neither appears here: a document whose
+ * currency disagreed with its deal's would be a record of two different amounts.
+ *
+ * THE superRefine IS THE FOURTH FAILURE PATH, and it is not one of the three CHECKs.
+ * Every field above can be individually in range while the ARITHMETIC over them is
+ * not: 130 lines of 2,147,483.647 units at MAX_SAFE_INTEGER cents each overflows the
+ * representable range, and `documentTotals` throws a plain Error saying so. Left
+ * ungated that is a 500 from a service call; here it is a 400 with a message, and it
+ * costs one pass of the same arithmetic the service is about to run anyway. It
+ * happens before the render either way -- no number is spent, nothing spawns -- so
+ * this is about what the caller is told, not about what is wasted.
+ */
+/**
+ * THE PER-FIELD CHARACTER CAPS, NAMED SO A FORM CAN DERIVE ITS OWN maxLength
+ * FROM THEM instead of restating the numbers.
+ *
+ * Task 5's first round spelled 200/200/2000/5000/5000 into the quote form's
+ * inputs by hand while its commit message claimed the form restated none of the
+ * schema's bounds. They agreed, and nothing whatsoever kept them agreeing: an
+ * edit here would have left the form silently truncating at the old figure, or
+ * accepting past a new one and getting a 400 for it. The description's cap lives
+ * in DOCUMENT_MAX_DESCRIPTION_CHARS above, which is already exported for the
+ * same reason.
+ */
+export const DOCUMENT_FIELD_CAPS = {
+  recipientName: 200,
+  recipientContactName: 200,
+  recipientAddress: 2000,
+  notes: 5000,
+  terms: 5000,
+} as const;
+
+export const issueQuoteInputSchema = z.object({
+  issueDate: documentDateSchema,
+  validUntilDate: documentDateSchema.nullable().optional(),
+  recipientName: documentText(DOCUMENT_FIELD_CAPS.recipientName, 1),
+  recipientContactName: documentText(DOCUMENT_FIELD_CAPS.recipientContactName).optional(),
+  recipientAddress: documentText(DOCUMENT_FIELD_CAPS.recipientAddress).optional(),
+  notes: documentText(DOCUMENT_FIELD_CAPS.notes).optional(),
+  terms: documentText(DOCUMENT_FIELD_CAPS.terms).optional(),
+  lines: z.array(documentLineInputSchema).min(1).max(DOCUMENT_MAX_LINES),
+}).superRefine((value, ctx) => {
+  try {
+    computeDocumentTotals(value.lines);
+  } catch {
+    ctx.addIssue({
+      code: "custom",
+      path: ["lines"],
+      message: "these line items total more than a document can represent",
+    });
+  }
+  // THE BUDGET, WHICH THE PER-FIELD CAPS CANNOT EXPRESS. Every field can be inside
+  // its own limit while the quote as a whole is too large to render -- a Japanese
+  // description costs three bytes a character, an `&` costs five -- and without this
+  // the refusal arrives as a 413 from renderPdf after the merge, naming a number the
+  // person filling in the form has no way to act on.
+  const bytes = documentContentBytes(value);
+  if (bytes > DOCUMENT_CONTENT_BUDGET_BYTES) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["lines"],
+      message: `this quote needs ${String(bytes)} bytes of the ${String(DOCUMENT_CONTENT_BUDGET_BYTES)}`
+        + " a document may use; shorten the notes, the terms or the line descriptions",
+    });
+  }
+});
+export type IssueQuoteInput = z.infer<typeof issueQuoteInputSchema>;
+
+/**
+ * One editable template per document type, as Settings reads and writes it.
+ *
+ * `warnings` is derived rather than stored: it is what `documentTemplateWarnings`
+ * says the merge language will do SILENTLY to this body -- a field inside a `<style>`
+ * block that will not be substituted, a `<style>` nobody closed, a block that never
+ * closes. None of them can throw (a template being edited is half-written by
+ * definition) and none of them should be invisible either, which is the whole reason
+ * that function was exported with nothing to call it.
+ */
+export const documentTemplateSchema = z.object({
+  type: documentTypeSchema,
+  bodyHtml: z.string(),
+  warnings: z.array(z.string()),
+  updatedAt: z.iso.datetime(),
+});
+export type DocumentTemplate = z.infer<typeof documentTemplateSchema>;
+
+/**
+ * PUT /api/document-templates/:type's body.
+ *
+ * THE CAP HERE IS DELIBERATELY LOOSE, AND THE REAL ONE IS ON THE STORED BODY. What
+ * bounds a render is MAX_TEMPLATE_BYTES measured AFTER sanitising, in
+ * `saveDocumentTemplate` -- because the sanitiser can grow what it is given (16,384
+ * characters of raw `"` inside a single-quoted attribute store as 97,546, 5.95x), so
+ * a length checked before it bounds nothing, and because a body that came back from
+ * GET must not be refused by PUT. This one only stops an absurd request body from
+ * being parsed and sanitised at all; four times the real allowance leaves room for a
+ * submission that sanitises down.
+ *
+ * `.min(1)` because an empty template is not a template: the row exists so a quote
+ * renders before anyone opens Settings, and a blank body would produce a blank page
+ * with a number on it.
+ */
+export const documentTemplateInputSchema = z.object({
+  bodyHtml: documentText(MAX_TEMPLATE_BYTES * 4, 1),
+});
+export type DocumentTemplateInput = z.infer<typeof documentTemplateInputSchema>;

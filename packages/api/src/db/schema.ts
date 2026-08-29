@@ -722,3 +722,262 @@ export const meetingAttendees = pgTable("meeting_attendees", {
   check("meeting_attendees_exactly_one", sql`num_nonnulls(contact_id, user_id, guest_name) = 1`),
 ]);
 export type MeetingAttendeeRow = typeof meetingAttendees.$inferSelect;
+
+// --- Documents: quotes (Phase 7) -----------------------------------------
+//
+// Five tables, all new, nothing existing changes. Indexes follow this file's
+// standing convention (see the mail block's note above): the ones that fall
+// out of a UNIQUE constraint are declared here, and the one plain lookup
+// index this migration needs -- documents(deal_id) -- is hand-written in
+// drizzle/0009_*.sql alongside that migration's other non-generatable SQL
+// (the seeded default template). drizzle's index() builder is still used by
+// no table in this codebase.
+
+// The ISSUER: your own company, as printed at the top of a quote. Conduit had
+// nowhere to record this before -- every other party in the schema is a
+// counterparty.
+//
+// A SINGLETON, spelled as a pinned primary key rather than a boolean column
+// plus a unique index plus a CHECK. Both enforce one row; this one does it
+// with two moving parts instead of four, and the difference is not only
+// tidiness. With a defaultRandom() uuid the row's key is unpredictable, so
+// every reader has to find the row before it can update it and the upsert has
+// to target a *non-key* unique column -- the kind of thing that gets written
+// correctly once and copied wrongly after. Pinned at 1, reading is
+// `WHERE id = 1` and creating-or-updating is `ON CONFLICT (id) DO UPDATE`,
+// both total and both obvious. The CHECK is what stops a second row: without
+// it the DEFAULT is merely a suggestion and `INSERT ... (id) VALUES (2)`
+// succeeds.
+//
+// The one deliberate divergence from this file's all-uuid habit, and it is
+// the point: a uuid is for a row you will have many of.
+export const orgProfile = pgTable("org_profile", {
+  id: integer("id").primaryKey().default(1),
+  name: text("name").notNull().default(""),
+  // Free text, newline-separated, exactly like companies.address -- there is
+  // no structured address anywhere in this schema and inventing one here
+  // would be a second answer. The seeded template renders it with
+  // `white-space: pre-line` so the newlines survive into the PDF; merge
+  // substitution HTML-escapes but does not translate them to <br>.
+  addressLines: text("address_lines").notNull().default(""),
+  vatNumber: text("vat_number").notNull().default(""),
+  registrationNumber: text("registration_number").notNull().default(""),
+  email: text("email").notNull().default(""),
+  phone: text("phone").notNull().default(""),
+  website: text("website").notNull().default(""),
+  bankDetails: text("bank_details").notNull().default(""),
+  // THE LOGO IS THE BYTES, NOT A FILE REFERENCE, and the first version of this
+  // column was a uuid FK to files that could never be satisfied.
+  // files_exactly_one_entity requires every file to belong to exactly one
+  // company, contact, deal or project, and an issuer's logo belongs to none of
+  // them -- so there was no legal row for that FK to point at, and the only way
+  // to store a logo was to attach it to an unrelated record. Coordinator ruling
+  // after Task 4's review: the logo lives here, as the data: URI that is
+  // already the only form the renderer will accept.
+  //
+  // '' is the absence, matching every text field above rather than the FK's
+  // nullability: the seeded template wraps the logo in {{#org.logoDataUri}},
+  // so empty means no <img> is emitted at all.
+  //
+  // TWO CHECKS, because this column feeds a subprocess with a hard input cap.
+  // The length bound is the base64 of a 32KB image plus the longest permitted
+  // prefix -- 4 * ceil(32768/3) = 43692 characters plus 23 for
+  // "data:image/jpeg;base64," -- so an oversized logo is refused here as well
+  // as by orgProfileInputSchema, which is the usual "Zod is the gate, the
+  // CHECK is the backstop" split. The shape bound keeps anything that is not
+  // an inline image out of a src attribute; the renderer allowlists exactly
+  // data: and nothing else, so a URL of any other scheme would fail every
+  // render rather than fetch anything, but a column that can only hold what
+  // the page can print is worth more than a comment saying so.
+  logoDataUri: text("logo_data_uri").notNull().default(""),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  check("org_profile_singleton", sql`id = 1`),
+  check("org_profile_logo_size", sql`char_length(${t.logoDataUri}) <= 43715`),
+  // THE `\073` IS A SEMICOLON, AND IT HAS TO BE ONE. drizzle-kit's generator
+  // splits a CHECK expression on `;` without regard for string literals, so
+  // writing the character directly produced a migration truncated mid-regex --
+  // `~ '^data:image/(png|jpeg|gif|webp)` with no closing quote and no closing
+  // paren, which is a syntax error rather than a weakened constraint. Postgres
+  // reads `\073` as the octal escape for ';', so the regex is the intended one
+  // and nothing in the generated SQL can be mistaken for a statement end.
+  check(
+    "org_profile_logo_shape",
+    sql`${t.logoDataUri} = '' OR ${t.logoDataUri} ~ '^data:image/(png|jpeg|gif|webp)\\073base64,[A-Za-z0-9+/]+={0,2}$'`,
+  ),
+]);
+export type OrgProfileRow = typeof orgProfile.$inferSelect;
+
+// An ISSUED document. There is no draft state and no update path: a row here
+// means a PDF exists, and nothing ever rewrites either (Phase 7 spec's
+// immutability decision). Hence no updated_at -- the column would only ever
+// record a bug.
+//
+// The recipient is SNAPSHOT, not joined. A company that is renamed or moves
+// office does not rewrite a quote somebody already has in their inbox, and
+// companies/contacts carry no history that could reconstruct what was
+// printed.
+export const documents = pgTable("documents", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  // Formatted per (type, year) as QUO-2026-0001, so the type prefix and the
+  // year are already inside the string. UNIQUE GLOBALLY rather than per
+  // (type, year), which sounds stricter than the numbering rule but forbids
+  // nothing the numbering rule allows: two numbers can only collide if their
+  // types share a prefix, and each type has its own. Global is also the
+  // constraint that matches how a number is used -- someone quoting
+  // "QUO-2026-0001" back at you never says which column it came from -- and
+  // if a future type were ever given a colliding prefix, this rejects the
+  // second document loudly at issue instead of minting a duplicate.
+  number: text("number").notNull(),
+  type: text("type").notNull(),
+  dealId: uuid("deal_id").notNull().references(() => deals.id),
+  // The rendered PDF, stored as an ordinary files row against the same deal,
+  // so it appears on the Files tab and downloads through the existing
+  // GET /api/files/:id with no second storage or download path.
+  fileId: uuid("file_id").notNull().references(() => files.id),
+  currency: char("currency", { length: 3 }).notNull(),
+  issueDate: date("issue_date").notNull(),
+  // Nullable: a quote with no expiry is a legitimate quote.
+  validUntilDate: date("valid_until_date"),
+  recipientName: text("recipient_name").notNull(),
+  // The PERSON the quote is addressed to, snapshot beside the company's name.
+  // Not in the spec's column list, which says "name and address as text" --
+  // but the same spec has the form default its recipient from "the deal's
+  // company AND contact", and a quote prints both ("Acme Ltd, FAO Jane
+  // Smith"). With only the two columns the contact would have to be smuggled
+  // into one of them, and the row would stop recording what was on the page,
+  // which is the job the spec gives it. Defaulted to '' rather than nullable,
+  // matching recipient_address: a quote to a company with no named contact is
+  // ordinary, not missing data.
+  recipientContactName: text("recipient_contact_name").notNull().default(""),
+  recipientAddress: text("recipient_address").notNull().default(""),
+  // Integer cents, as deals.value_cents already is, computed by
+  // @conduit/shared's documentTotals -- the same function the form's running
+  // total uses. NOT recomputed on read: a later change to the arithmetic can
+  // never restate an issued document.
+  subtotalCents: bigint("subtotal_cents", { mode: "number" }).notNull(),
+  taxCents: bigint("tax_cents", { mode: "number" }).notNull(),
+  totalCents: bigint("total_cents", { mode: "number" }).notNull(),
+  notes: text("notes").notNull().default(""),
+  terms: text("terms").notNull().default(""),
+  issuedByUserId: uuid("issued_by_user_id").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  unique("documents_number_unique").on(t.number),
+  check("documents_type_valid", sql`type IN ('quote')`),
+  // deals_currency_format's twin. A document's currency is copied from its
+  // deal and printed on the page; the same three-letter rule has to hold or
+  // the two records disagree about what the money is.
+  check("documents_currency_format", sql`currency ~ '^[A-Z]{3}$'`),
+  // The stored totals are the only totals anyone ever reads back, so the one
+  // relation between them is worth asserting where no write path can skip it.
+  // documentTotals() guarantees it by construction; this is the backstop for
+  // every other write path, the same split as contacts.emails and
+  // projects.color. A future discount or rounding column would alter this
+  // CHECK in its own migration, exactly as each phase has widened
+  // events_verb_valid.
+  check("documents_totals_consistent", sql`total_cents = subtotal_cents + tax_cents`),
+  // THE OTHER HALF OF A GUARD money.ts ONLY HAS ONE SIDE OF. documentTotals()
+  // refuses to PRODUCE a total past Number.MAX_SAFE_INTEGER, because these are
+  // bigint columns read through drizzle's `mode: "number"` and a larger value
+  // would come back as the nearest double. Nothing stopped one arriving by
+  // another path -- a psql session, an import, a future service that skipped the
+  // shared arithmetic -- and being silently misread on the way out. Postgres
+  // reaches 2^63; this pins the columns to the range the reader can represent.
+  check(
+    "documents_totals_representable",
+    sql`subtotal_cents BETWEEN -9007199254740991 AND 9007199254740991
+        AND tax_cents BETWEEN -9007199254740991 AND 9007199254740991
+        AND total_cents BETWEEN -9007199254740991 AND 9007199254740991`,
+  ),
+]);
+export type DocumentRow = typeof documents.$inferSelect;
+
+// Frozen at issue, in the units packages/shared/src/money.ts defines: quantity
+// in THOUSANDTHS, price in CENTS, tax in BASIS POINTS. The stored
+// line_total_cents is what was printed.
+//
+// Per-line TAX is deliberately not stored. It is a pure function of two
+// columns that are (taxCents(line_total_cents, tax_rate_bp)), and nothing
+// prints it -- the page shows line totals and one document-level tax figure,
+// and that figure IS stored -- so a column for it would be a second copy of a
+// derivable number on a row whose whole point is that it never changes.
+//
+// POSITION IS AN INTEGER, not the fractional positionText that pipelines,
+// stages, deals and tasks use. That is not an oversight, and it is the one
+// place this table diverges from the house ordering pattern: fractional
+// indexing exists so a drag-and-drop reorder writes ONE row instead of
+// renumbering its siblings, and it buys that at the cost of a collation pin
+// and unbounded key growth. Line items are inserted once, inside the
+// transaction that issues the document, and never reordered afterwards --
+// there is no drag to optimise, and 1..n is both denser and directly
+// meaningful ("line 3"). The UNIQUE below is what makes the ordering total:
+// without it two lines could share a position and the printed order would be
+// whatever the planner felt like.
+//
+// NO ON DELETE CASCADE, matching every other foreign key in this file (there
+// is not one onDelete clause in the schema). A document is never deleted, so
+// a cascade would be configuration that can only fire by accident; the
+// default NO ACTION means a stray DELETE fails loudly rather than quietly
+// taking the priced lines of an issued quote with it.
+export const documentLineItems = pgTable("document_line_items", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  documentId: uuid("document_id").notNull().references(() => documents.id),
+  position: integer("position").notNull(),
+  description: text("description").notNull(),
+  qtyMilli: integer("qty_milli").notNull(),
+  unitPriceCents: bigint("unit_price_cents", { mode: "number" }).notNull(),
+  taxRateBp: integer("tax_rate_bp").notNull().default(0),
+  lineTotalCents: bigint("line_total_cents", { mode: "number" }).notNull(),
+}, (t) => [
+  // Also the index that serves "every line of this document, in order" --
+  // document_id leads, so no separate foreign-key index is needed.
+  unique("document_line_items_document_position_unique").on(t.documentId, t.position),
+  check("document_line_items_qty_nonneg", sql`qty_milli >= 0`),
+  check("document_line_items_price_nonneg", sql`unit_price_cents >= 0`),
+  check("document_line_items_tax_range", sql`tax_rate_bp BETWEEN 0 AND 10000`),
+  // documents_totals_representable's twin, on this table's two bigint columns,
+  // for the same reason: `mode: "number"` stops at 2^53 and Postgres does not.
+  check(
+    "document_line_items_amounts_representable",
+    sql`unit_price_cents <= 9007199254740991 AND line_total_cents BETWEEN -9007199254740991 AND 9007199254740991`,
+  ),
+]);
+export type DocumentLineItemRow = typeof documentLineItems.$inferSelect;
+
+// A TABLE, not a Postgres SEQUENCE, and the difference is the point: nextval()
+// is explicitly non-transactional, so a render that failed after taking a
+// number would leave a permanent hole in the quote sequence -- and a hole
+// invites the question of what was in it. A row rolls back with its
+// transaction.
+//
+// Allocated with one INSERT ... ON CONFLICT DO UPDATE ... RETURNING, whose
+// row lock serialises two quotes of the same type in the same year. That is
+// the behaviour you want: consecutive numbers are consecutive.
+export const documentNumberSequences = pgTable("document_number_sequences", {
+  type: text("type").notNull(),
+  year: integer("year").notNull(),
+  lastValue: integer("last_value").notNull().default(0),
+}, (t) => [
+  primaryKey({ columns: [t.type, t.year] }),
+  // The same enum documents.type carries. A typo'd type here would silently
+  // start a private numbering series rather than failing.
+  check("document_number_sequences_type_valid", sql`type IN ('quote')`),
+]);
+export type DocumentNumberSequenceRow = typeof documentNumberSequences.$inferSelect;
+
+// One editable template per document type, seeded with a working default in
+// drizzle/0009_*.sql so a quote renders before anyone has opened Settings.
+// Edited with the same editor as email_templates but NOT sanitised with the
+// same profile: mail's exists to defang HTML written by strangers, and it
+// strips exactly the page-layout CSS a printed document is made of.
+export const documentTemplates = pgTable("document_templates", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  type: text("type").notNull(),
+  bodyHtml: text("body_html").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  unique("document_templates_type_unique").on(t.type),
+  check("document_templates_type_valid", sql`type IN ('quote')`),
+]);
+export type DocumentTemplateRow = typeof documentTemplates.$inferSelect;
