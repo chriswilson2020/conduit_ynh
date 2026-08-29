@@ -45,7 +45,18 @@ function header(mime: string, width: number, height: number): number[] {
         0xff, 0xc0, 0x00, 0x11, 0x08,
         (height >>> 8) & 0xff, height & 0xff, (width >>> 8) & 0xff, width & 0xff];
     case "image/gif":
-      return [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, ...le16(width), ...le16(height)];
+      // A COMPLETE GIF, not a header: its size is the largest of the logical screen
+      // and every FRAME extent, so the reader walks to the trailer and a fixture that
+      // stopped after ten bytes would read as unreadable. That walk is the fix for a
+      // 51KB GIF whose screen said 1x1 and whose frame was 13000x13000 -- accepted as
+      // a logo, charged one pixel, 703MB to render.
+      return [
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
+        ...le16(width), ...le16(height), 0x00, 0x00, 0x00, // the logical screen
+        0x2c, ...le16(0), ...le16(0), ...le16(width), ...le16(height), 0x00, // a frame
+        0x02, 0x00, // LZW minimum code size, then the block terminator
+        0x3b, // trailer
+      ];
     case "image/webp":
       // The extended form: "RIFF", size, "WEBP", "VP8X", chunk size, flags,
       // reserved, then canvas width-1 and height-1 as 24-bit little-endian.
@@ -248,6 +259,47 @@ describe("the logo, which is bytes rather than a file reference", () => {
 
     // 4000 x 4000 is exactly the bound and is stored, so what is refused above is
     // the pixel count and not the presence of a dimension check.
+    expect((await saveOrgProfile(handle.db, profileInput({ logoDataUri: fine }))).logoDataUri)
+      .toBe(fine);
+  });
+
+  /**
+   * THE ONE THAT CAME IN THROUGH THIS SURFACE, and it was accepted.
+   *
+   * A GIF's canvas is the largest of its logical screen and its frame extents, and
+   * Pillow expands to fit the frames. A valid GIF89a whose screen says 1x1 and whose
+   * only frame is 13000x13000 is 51KB -- inside the logo cap -- and every check here
+   * passed it: the signature is right, the size is right, and the dimension reader
+   * looked only at the screen and saw one pixel. Stored, it would have made EVERY
+   * quote a 703MB render.
+   */
+  it("refuses a GIF whose logical screen lies about the size of its frames", async () => {
+    const le16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
+    const bomb = Buffer.from([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
+      ...le16(1), ...le16(1), 0x00, 0x00, 0x00, // a one-pixel screen
+      0x2c, ...le16(0), ...le16(0), ...le16(13_000), ...le16(13_000), 0x00,
+      0x02, 0x00,
+      0x3b,
+    ]);
+    const logoDataUri = `data:image/gif;base64,${bomb.toString("base64")}`;
+
+    const error = await saveOrgProfile(handle.db, profileInput({ logoDataUri }))
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(OrgProfileInputError);
+    expect((error as Error).message).toContain("13000 x 13000");
+    expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
+
+    // The same GIF with an honest screen and a frame inside the bound is stored, so
+    // what is refused is the SIZE and not the format.
+    const honest = Buffer.from([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
+      ...le16(1), ...le16(1), 0x00, 0x00, 0x00,
+      0x2c, ...le16(0), ...le16(0), ...le16(1200), ...le16(800), 0x00,
+      0x02, 0x00,
+      0x3b,
+    ]);
+    const fine = `data:image/gif;base64,${honest.toString("base64")}`;
     expect((await saveOrgProfile(handle.db, profileInput({ logoDataUri: fine }))).logoDataUri)
       .toBe(fine);
   });

@@ -1822,10 +1822,56 @@ describe("imageDataUriSize", () => {
     expect(imageDataUriSize(`data:image/jpeg;base64,${b64([0xff, 0xd8, ...sos])}`)).toBeNull();
   });
 
-  it("reads a GIF's logical screen descriptor, which is little-endian", () => {
-    const gif = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0xd0, 0x07, 0x78, 0x05];
-    expect(imageDataUriSize(`data:image/gif;base64,${b64(gif)}`))
-      .toEqual({ width: 2000, height: 1400 });
+  /**
+   * THIS TEST USED TO PIN THE BUG.
+   *
+   * It read "reads a GIF's logical screen descriptor, which is little-endian" and
+   * asserted that the screen descriptor IS the image's size -- which is what the code
+   * did, and what Pillow does not do. A quality review built a valid GIF89a whose
+   * screen says 1x1 and whose first frame is 13000x13000: 51KB, inside the logo cap,
+   * ACCEPTED by `logoDataUriProblem`, charged ONE pixel, rendered at 703MB. So the fix
+   * had to change a passing test, and this is that change, named so nobody restores
+   * the old assertion thinking it was a simplification.
+   */
+  it("takes the LARGEST of a GIF's screen and its frame extents, not the screen alone", () => {
+    const le16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
+    const header = (w: number, h: number): number[] =>
+      [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, ...le16(w), ...le16(h), 0x00, 0x00, 0x00];
+    // A frame: descriptor, no local table, LZW minimum code size, one empty
+    // sub-block, then the block terminator.
+    const frame = (left: number, top: number, w: number, h: number): number[] =>
+      [0x2c, ...le16(left), ...le16(top), ...le16(w), ...le16(h), 0x00, 0x02, 0x00];
+    const TRAILER = 0x3b;
+
+    // The honest case is unchanged: screen and frame agree.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(2000, 1400), ...frame(0, 0, 2000, 1400), TRAILER,
+    ])}`)).toEqual({ width: 2000, height: 1400 });
+
+    // The bomb: a 1x1 screen and a frame far larger than it.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(1, 1), ...frame(0, 0, 13_000, 13_000), TRAILER,
+    ])}`)).toEqual({ width: 13_000, height: 13_000 });
+
+    // An offset frame counts from its own origin, and a LATER frame can be the
+    // biggest -- which is why the walk cannot stop at the first one.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(1, 1), ...frame(0, 0, 10, 10), ...frame(500, 400, 100, 100), TRAILER,
+    ])}`)).toEqual({ width: 600, height: 500 });
+
+    // A comment extension between the frames is skipped by its sub-block chain.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(1, 1), 0x21, 0xfe, 0x03, 0x61, 0x62, 0x63, 0x00,
+      ...frame(0, 0, 900, 800), TRAILER,
+    ])}`)).toEqual({ width: 900, height: 800 });
+
+    // AND A GIF THAT ENDS BEFORE ITS TRAILER IS UNREADABLE RATHER THAN
+    // OPTIMISTICALLY MEASURED. Returning the largest extent seen so far would be an
+    // undercharge, which is the whole class of defect this test exists for.
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([...header(1, 1)])}`)).toBeNull();
+    expect(imageDataUriSize(`data:image/gif;base64,${b64([
+      ...header(1, 1), ...frame(0, 0, 13_000, 13_000),
+    ])}`)).toBeNull();
   });
 
   it("reads all three WEBP variants, not just the extended one", () => {
@@ -1892,16 +1938,44 @@ describe("renderInputCost", () => {
     expect(cost.totalBytes).toBe(html.length);
   });
 
-  it("stops the payload at the first character outside the base64 alphabet", () => {
-    // THE ONE WAY THIS ACCOUNTING COULD BE ABUSED: if a `<` could be swallowed into
-    // an image payload, a template could hide table rows from the markup cap behind
-    // a data: prefix. It cannot -- the alphabet has no `<` in it -- and this is the
-    // assertion that says so rather than the comment.
+  /**
+   * THE PAYLOAD'S END HAS TO BE WRONG IN NEITHER DIRECTION, and the first version of
+   * this test only asserted one of them.
+   *
+   * Too LATE and a template hides table rows from the markup cap behind a `data:`
+   * prefix. Too EARLY and a bomb hides its own size: `base64.decodebytes` discards
+   * whitespace, so one space three characters in made a 100-megapixel image look like
+   * three bytes -- 24,768 pixels charged, 534MB rendered, every cap passed. The old
+   * comment framed the terminator as a safety property only, which is exactly how the
+   * undercharge went unnoticed.
+   */
+  it("ends the payload where the decoder does: past whitespace, and never past a tag", () => {
+    // Too late: a `<` is not in the alphabet and is not whitespace, so it stops the
+    // run and the rows stay charged to the markup half.
     const rows = "<tr><td>x</td></tr>".repeat(50);
     const html = `<img src="data:image/png;base64,AAAA">${rows}`;
     const cost = renderInputCost(html);
     expect(cost.imageBytes).toBe(4);
     expect(cost.markupBytes).toBe(html.length - 4);
+
+    // Too early: the same PNG header with a space dropped into it is still one image
+    // of the size it really is, not a three-byte mystery.
+    const header = pngHeader(10_000, 10_000);
+    const spaced = `${header.slice(0, 3)} ${header.slice(3)}`;
+    const bomb = renderInputCost(`<img src="data:image/png;base64,${spaced}">`);
+    expect(bomb.imagePixels).toBe(100_000_000);
+    expect(bomb.unreadableImages).toBe(0);
+    expect(bomb.imageBytes).toBe(spaced.length);
+
+    // Newlines and runs of spaces too, which is how a payload gets wrapped by hand.
+    const wrapped = header.replace(/(.{8})/g, "$1\n  ");
+    expect(renderInputCost(`<img src="data:image/png;base64,${wrapped}">`).imagePixels)
+      .toBe(100_000_000);
+
+    // ...and the closing quote still ends it, so the whitespace rule cannot run on
+    // into the rest of the document.
+    const after = `<img src="data:image/png;base64,AA AA"> ${"<tr><td>y</td></tr>".repeat(20)}`;
+    expect(renderInputCost(after).imageBytes).toBe(5);
   });
 
   it("sums the pixels of every image, and charges the ones it cannot read the most they could be", () => {
@@ -1969,8 +2043,11 @@ describe("renderInputCost", () => {
       + "rather than a file, per data:,ok in the spec.</p>";
     const cost = renderInputCost(notes);
     expect(cost.unreadableImages).toBe(2);
-    expect(cost.imagePixels).toBeLessThan(200_000);
-    expect(cost.imagePixels).toBeLessThan(16_000_000);
+    // A sentence, not a payload: the run ends at the first punctuation, so this is a
+    // low single-digit percentage of the cap rather than anything that could refuse a
+    // quote. Asserted as a fraction of the cap rather than a literal, because the
+    // exact figure moves whenever the terminator rules do -- as they just did.
+    expect(cost.imagePixels).toBeLessThan(16_000_000 / 20);
   });
 
   it("charges a payload it cannot identify by its length, so a real one cannot hide", () => {

@@ -285,6 +285,67 @@ const PDF_MAGIC = "%PDF-";
 const EXIT_BLOCKED_URL = 2;
 /** The renderer refused a `rel=attachment`, which never reaches the URL fetcher. */
 const EXIT_BLOCKED_ATTACHMENT = 3;
+/** The render asked for more memory than the child is allowed. */
+const EXIT_OUT_OF_MEMORY = 4;
+
+/**
+ * **512MB PER RENDER, ENFORCED BY THE KERNEL ON THE CHILD ITSELF, AND THIS IS THE
+ * ONLY BOUND HERE THAT DOES NOT DEPEND ON PREDICTING WHAT A DOCUMENT DECODES TO.**
+ *
+ * THREE REVIEW ROUNDS FOUND FOUR WAYS PAST THE ARITHMETIC, all of them the same
+ * shape: this module's reader disagreeing with what Pillow actually does.
+ *
+ *   round 1  `data:image/bmp;base64,<pngbytes>` and five more respellings   534MB
+ *   round 2  a 334-byte JPEG2000 that decodes to 36 megapixels          unbounded
+ *   round 3  a GIF whose logical screen says 1x1 and whose first frame
+ *            is 13000x13000 -- charged ONE pixel                           703MB
+ *   round 3  one space inside the base64, which the decoder ignores and
+ *            the scanner read as the end of the payload                    534MB
+ *
+ * There would have been a fifth. Pillow opens forty formats and this module was
+ * reimplementing its header parsing from the outside, which is a losing position by
+ * construction: every bound was a prediction, and a prediction only has to be wrong
+ * once. This is not a prediction. Whatever the document contains, the child cannot
+ * allocate past this, because the kernel will not let it.
+ *
+ * MEASURED, on the server, through this module's own renderPdf, sampling /proc every
+ * 25ms, with the limit in place:
+ *
+ *   document                                 RSS     VmData    outcome
+ *   a plain quote                             59MB     54MB    renders
+ *   a real 293KB 2000x1400 logo               79MB     74MB    renders
+ *   87,357 bytes of minimal table rows       252MB    249MB    renders
+ *   THE LEGITIMATE WORST CASE                340MB    335MB    renders
+ *   the GIF frame-extent bomb (round 3)       80MB      --     refused, clean
+ *   the whitespace bomb (round 3)            189MB      --     refused, clean
+ *
+ * 512MB is 1.53x the worst legitimate document measured, whose spread across runs is
+ * about 7%. It is deliberately not tighter: CI renders on WeasyPrint 61.1 against
+ * this server's 57.2, and a limit that fitted only one of them would be a limit that
+ * fails a release.
+ *
+ * **RLIMIT_DATA RATHER THAN RLIMIT_AS, AND THE DIFFERENCE IS WHAT `ram.runtime` CAN
+ * HONESTLY SAY.** Address space carries a 314MB floor here -- the interpreter, cairo,
+ * pango and the font stack -- of which about 59MB is ever resident, so an AS limit
+ * that cleared the same documents would be 900MB and `400 + 2 x 900` would declare
+ * 2.2GB of RAM for an app whose worst measured pair of renders is 1,080MB. RLIMIT_DATA
+ * bounds brk and private anonymous mappings, which since Linux 4.7 is where a decoded
+ * raster lives (Debian 12 runs 6.1; the oldest Debian YunoHost supports runs 5.10).
+ * What it does not bound is file-backed pages -- shared libraries and fonts -- which
+ * measured under 20MB resident and are shared between the children anyway.
+ *
+ * So `ram.runtime = 400 + RENDER_MAX_CONCURRENCY x 512 = 1,424M`, and
+ * documents-render.test.ts asserts the manifest's literal equals that arithmetic
+ * exactly. For the first time that declaration is a ceiling something enforces rather
+ * than a figure somebody hopes is still true.
+ *
+ * SET INSIDE THE CHILD, first thing, before `import weasyprint`. A shell wrapper
+ * (`sh -c 'ulimit -d N; exec python3 ...'`) would work too and is what every reviewer
+ * used to run these bombs safely, but it puts a shell between this module and the
+ * process it kills on a timeout, and the suite shadows `python3` on PATH. Setting it
+ * here covers the imports as well as the render.
+ */
+export const RENDER_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024;
 
 /**
  * The renderer, and the reason this module spawns Python rather than the `weasyprint`
@@ -348,7 +409,15 @@ const EXIT_BLOCKED_ATTACHMENT = 3;
  * and no runtime path to resolve.
  */
 const RENDER_SCRIPT = `
+import resource
 import sys
+
+# THE BUDGET, BEFORE ANYTHING THAT COULD SPEND IT. Both limits are set to the same
+# figure so nothing can raise it back afterwards, and it is in place before weasyprint
+# is imported -- so the interpreter, cairo, pango and the font stack are inside the
+# budget rather than beside it. See RENDER_MEMORY_LIMIT_BYTES.
+LIMIT = ${String(RENDER_MEMORY_LIMIT_BYTES)}
+resource.setrlimit(resource.RLIMIT_DATA, (LIMIT, LIMIT))
 
 import weasyprint
 from weasyprint.urls import default_url_fetcher
@@ -386,23 +455,31 @@ def fetcher(url, timeout=10, ssl_context=None):
     return {'string': data, 'mime_type': result.get('mime_type')}
 
 
-document = weasyprint.HTML(
-    string=sys.stdin.buffer.read().decode('utf-8'),
-    base_url=None,
-    url_fetcher=fetcher,
-)
+try:
+    document = weasyprint.HTML(
+        string=sys.stdin.buffer.read().decode('utf-8'),
+        base_url=None,
+        url_fetcher=fetcher,
+    )
 
-for element in document.etree_element.iter():
-    rel = element.get('rel')
-    if rel and 'attachment' in rel.lower().split():
-        blocked_attachments.append(str(element.tag))
+    for element in document.etree_element.iter():
+        rel = element.get('rel')
+        if rel and 'attachment' in rel.lower().split():
+            blocked_attachments.append(str(element.tag))
 
-if blocked_attachments:
-    sys.stderr.write(
-        'conduit-blocked-attachment: ' + ' | '.join(blocked_attachments) + '\\n')
-    sys.exit(3)
+    if blocked_attachments:
+        sys.stderr.write(
+            'conduit-blocked-attachment: ' + ' | '.join(blocked_attachments) + '\\n')
+        sys.exit(3)
 
-document.write_pdf(sys.stdout.buffer)
+    document.write_pdf(sys.stdout.buffer)
+except MemoryError:
+    # A DISTINCT EXIT CODE RATHER THAN A TRACEBACK, so the parent can say which of the
+    # bounds was hit in a sentence somebody can act on. Partial bytes may already be on
+    # stdout; a non-zero exit means the parent rejects rather than resolving, so they
+    # are never mistaken for a PDF.
+    sys.stderr.write('conduit-out-of-memory\\n')
+    sys.exit(4)
 
 if blocked_urls:
     sys.stderr.write('conduit-blocked-url: ' + ' | '.join(blocked_urls) + '\\n')
@@ -628,12 +705,29 @@ async function spawnRender(
       err.push(chunk);
     });
     child.on("error", (e) => { fail("could not start the renderer", e.message); });
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
       if (settled) return;
       settled = true;
       if (code === EXIT_BLOCKED_URL || code === EXIT_BLOCKED_ATTACHMENT) {
         reject(new RenderError("document referenced a blocked resource", detail()));
+        return;
+      }
+      // THE MEMORY CEILING, REPORTED AS ITSELF. Without this arm it is
+      // "renderer exited 4" with a traceback, which tells a user nothing about what
+      // to change. The route maps it to a 4xx naming the document, not a 500.
+      if (code === EXIT_OUT_OF_MEMORY) {
+        reject(new RenderError(
+          "document needed more memory than a render is allowed",
+          `${String(RENDER_MEMORY_LIMIT_BYTES)} bytes; ${detail()}`,
+        ));
+        return;
+      }
+      // A SIGNAL IS NOT AN EXIT CODE, and `code` is null when one arrives -- which is
+      // what a C-level allocation failure inside the image decoder looks like, as
+      // opposed to a MemoryError Python could raise. Naming it beats "exited null".
+      if (signal !== null) {
+        reject(new RenderError(`renderer was killed by ${signal}`, detail()));
         return;
       }
       if (code !== 0) {

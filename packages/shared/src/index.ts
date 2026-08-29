@@ -1732,6 +1732,12 @@ function decodeBase64Prefix(base64: string, wanted: number): number[] {
   let buffer = 0;
   let bits = 0;
   for (const character of base64) {
+    // WHITESPACE IS SKIPPED, NOT A TERMINATOR, BECAUSE THAT IS WHAT THE DECODER DOES.
+    // Python's `base64.decodebytes`, which is what `urlopen` hands a `data:` URI to,
+    // discards it. Stopping here instead meant a single space three characters in
+    // made a 100-megapixel bomb look like a 3-byte image: charged 24,768 pixels,
+    // rendered at 534MB. Found by a quality review, and it is the whole of that bug.
+    if (/\s/.test(character)) continue;
     const value = BASE64_ALPHABET.indexOf(character);
     if (value < 0) break;
     buffer = (buffer << 6) | value;
@@ -1806,13 +1812,71 @@ function at8(b: readonly number[], at: number): number {
   return b[at] ?? 0;
 }
 
-/** The logical screen descriptor: two little-endian 16-bit fields at byte 6. */
+/**
+ * A GIF'S REAL CANVAS, WHICH IS NOT ITS LOGICAL SCREEN DESCRIPTOR.
+ *
+ * **THIS READ THE SCREEN DESCRIPTOR AND NOTHING ELSE, AND THAT WAS A BYPASS THROUGH
+ * THE LOGO UPLOAD ITSELF.** A GIF's frames carry their own extents and Pillow expands
+ * the image to fit them. A valid GIF89a whose screen says 1x1 and whose first frame is
+ * 13000x13000 is 51KB -- inside the logo cap -- and it was ACCEPTED as a logo, charged
+ * ONE pixel by `renderInputCost`, and rendered at 703MB. One stored logo would have
+ * made every quote a 700MB render.
+ *
+ * So this walks the block stream and takes the largest of the screen and every frame's
+ * `left + width` by `top + height`. Walking means reading the whole file: extension
+ * blocks and image data are variable-length chains of sub-blocks, and a later frame
+ * can be the biggest one. If the walk runs out of bytes before the trailer it gives up
+ * rather than returning the largest SO FAR -- a truncated answer is an undercharge,
+ * which is exactly the class of bug this is.
+ */
 function gifSize(b: readonly number[]): ImageSize | null {
-  if (b.length < 10) return null;
-  return {
-    width: at8(b, 6) | (at8(b, 7) << 8),
-    height: at8(b, 8) | (at8(b, 9) << 8),
+  if (b.length < 13) return null;
+  let width = at8(b, 6) | (at8(b, 7) << 8);
+  let height = at8(b, 8) | (at8(b, 9) << 8);
+  // A global colour table, if the packed field says so: 3 bytes per entry, 2^(N+1)
+  // entries.
+  let at = 13 + ((at8(b, 10) & 0x80) === 0 ? 0 : 3 * (1 << ((at8(b, 10) & 0x07) + 1)));
+
+  /** Past a chain of length-prefixed sub-blocks, or -1 if it runs off the end. */
+  const skipSubBlocks = (from: number): number => {
+    let cursor = from;
+    for (;;) {
+      if (cursor >= b.length) return -1;
+      const size = at8(b, cursor);
+      if (size === 0) return cursor + 1;
+      cursor += 1 + size;
+    }
   };
+
+  for (;;) {
+    if (at >= b.length) return null;
+    const block = at8(b, at);
+    if (block === 0x3b) break; // the trailer: the file is complete, so is the answer
+    if (block === 0x21) {
+      // An extension: a label, then sub-blocks. Comment, graphic-control and
+      // application blocks all take this shape.
+      at = skipSubBlocks(at + 2);
+      if (at === -1) return null;
+      continue;
+    }
+    if (block === 0x2c) {
+      // An image descriptor: left, top, width, height, packed.
+      if (at + 10 > b.length) return null;
+      const left = at8(b, at + 1) | (at8(b, at + 2) << 8);
+      const top = at8(b, at + 3) | (at8(b, at + 4) << 8);
+      width = Math.max(width, left + (at8(b, at + 5) | (at8(b, at + 6) << 8)));
+      height = Math.max(height, top + (at8(b, at + 7) | (at8(b, at + 8) << 8)));
+      const packed = at8(b, at + 9);
+      const local = (packed & 0x80) === 0 ? 0 : 3 * (1 << ((packed & 0x07) + 1));
+      // The local colour table, the LZW minimum code size, then the image's own
+      // sub-blocks.
+      at = skipSubBlocks(at + 10 + local + 1);
+      if (at === -1) return null;
+      continue;
+    }
+    return null; // not a block introducer: malformed, and not ours to guess at
+  }
+  return { width, height };
 }
 
 /**
@@ -1885,7 +1949,16 @@ function webpSize(b: readonly number[]): ImageSize | null {
  * charged rather than trusted -- see MAX_PIXELS_PER_PAYLOAD_BYTE -- so running out of
  * window is safe in the direction that matters.
  */
-const DIMENSION_BYTES: Record<string, number> = { png: 24, gif: 10, webp: 30, jpeg: 65_536 };
+const DIMENSION_BYTES: Record<string, number> = {
+  png: 24,
+  webp: 30,
+  jpeg: 65_536,
+  // GIF IS THE WHOLE FILE, because its answer is a maximum over every frame and the
+  // biggest frame can be the last one. A window would mean either an undercharge (the
+  // largest extent so far) or a refusal of any GIF bigger than the window; reading it
+  // all is a few milliseconds on a payload the image cap already bounds.
+  gif: MAX_LOGO_BYTES,
+};
 
 const IMAGE_SIZE_READERS: Record<string, (b: readonly number[]) => ImageSize | null> = {
   png: pngSize, gif: gifSize, jpeg: jpegSize, webp: webpSize,
@@ -1946,8 +2019,14 @@ function decodePercentPrefix(text: string, wanted: number): number[] {
 
 /** The first `wanted` bytes of a payload, in whichever encoding it declares. */
 function payloadPrefix(payload: DataUriPayload, wanted: number): number[] {
+  // NOT SLICED TO `wanted * 4 / 3` CHARACTERS FIRST, which is what it used to do and
+  // which stopped being right the moment whitespace was allowed inside a payload: a
+  // wrapped base64 blob carries fewer than three bytes per four characters, so the
+  // slice cut the header short and a 10,000-pixel width read as 9,984. Both decoders
+  // already stop at `wanted` bytes, so handing them the whole payload costs nothing
+  // and cannot be off by an encoding's overhead.
   return payload.base64
-    ? decodeBase64Prefix(payload.text.slice(0, Math.ceil(wanted / 3) * 4), wanted)
+    ? decodeBase64Prefix(payload.text, wanted)
     : decodePercentPrefix(payload.text, wanted);
 }
 
@@ -2425,6 +2504,31 @@ export interface RenderInputCost {
 const EMBEDDED_DATA_URI = /data:[^\s"'`<>)]*/g;
 
 /**
+ * How much further a base64 payload runs once whitespace is allowed inside it.
+ *
+ * **THE RUN ENDING AT A SPACE WAS AN UNDERCHARGE VECTOR, NOT JUST AN ACCOUNTING
+ * DETAIL.** `base64.decodebytes` discards whitespace, so `...base64,AAA <the rest>` is
+ * one image to the renderer and was three bytes to this scanner: 24,768 pixels
+ * charged, 534MB rendered. The run therefore continues across whitespace and stops at
+ * the first character that is neither whitespace nor base64 -- which in a document is
+ * the closing quote, and in prose is the first punctuation mark, so a sentence
+ * mentioning `data:image/png;base64,` still costs a few hundred pixels rather than a
+ * refusal.
+ */
+const BASE64_CONTINUATION = /^[\sA-Za-z0-9+/=]+/;
+
+/**
+ * The whole of a `data:` URI starting at a match, whitespace inside a base64 payload
+ * included. See BASE64_CONTINUATION.
+ */
+function wholeDataUri(html: string, uri: string, at: number | undefined): string {
+  const payload = dataUriPayload(uri);
+  if (payload === null || !payload.base64 || at === undefined) return uri;
+  const more = BASE64_CONTINUATION.exec(html.slice(at + uri.length));
+  return more === null ? uri : uri + more[0];
+}
+
+/**
  * What a payload this cannot identify is CHARGED, per character: 8,256 pixels.
  *
  * **IT IS A PRE-FLIGHT ESTIMATE AND IT IS NOT WHAT MAKES THE PIXEL BOUND SOUND.**
@@ -2478,13 +2582,14 @@ export function renderInputCost(html: string): RenderInputCost {
   let images = 0;
   let unreadableImages = 0;
   for (const match of html.matchAll(EMBEDDED_DATA_URI)) {
-    const payload = dataUriPayload(match[0]);
+    const uri = wholeDataUri(html, match[0], match.index);
+    const payload = dataUriPayload(uri);
     // Not a data: URI: no comma, so nothing fetches it and nothing decodes it. Its
     // bytes stay charged to the markup half, where they already were.
     if (payload === null) continue;
     images += 1;
     imageBytes += payload.text.length;
-    const size = imageDataUriSize(match[0]);
+    const size = imageDataUriSize(uri);
     if (size === null) {
       unreadableImages += 1;
       imagePixels += payload.text.length * MAX_PIXELS_PER_PAYLOAD_BYTE;

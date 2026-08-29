@@ -13,7 +13,7 @@ import {
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
 import {
   pdfEmbedsFiles, renderPdf, RenderBusyError, RenderError, RENDER_MAX_CONCURRENCY,
-  RENDER_QUEUE_TIMEOUT_MS, weasyprintAvailable,
+  RENDER_MEMORY_LIMIT_BYTES, RENDER_QUEUE_TIMEOUT_MS, weasyprintAvailable,
 } from "./documents-render.js";
 
 /**
@@ -542,23 +542,27 @@ describe("renderPdf concurrency", () => {
   }, 30_000);
 
   it("declares the same renders manifest.toml budgets for", () => {
-    // ram.runtime = 400M (Node) + RENDER_MAX_CONCURRENCY x 353MB: a render at BOTH
-    // caps, in the worst SHAPE rather than the friendliest -- the markup cap full of
-    // minimal table rows (250MB) with a logo at the pixel bound beside it. The
-    // manifest cannot enforce anything -- YunoHost sets no cgroup from it -- so this
-    // is what stops the two drifting apart in the only direction that matters: the
-    // code growing a budget the declaration never heard about.
+    // ram.runtime = 400M (Node) + RENDER_MAX_CONCURRENCY x the limit each render is
+    // HELD TO, and this assertion is an equality rather than an inequality because
+    // the right-hand side is no longer a measurement.
     //
-    // The first version asserted against 157MB, which was a measurement of a
-    // friendlier document and 2.1x too low. The second asserted 332MB, from the
-    // dense-row shape at the old 128KB cap -- the right shape, and the same method
-    // re-run for v1.0.1 measures it at 345MB rather than 332MB.
+    // THREE VERSIONS OF IT WERE MEASUREMENTS AND ALL THREE WERE BEATEN. It asserted
+    // 157MB (a friendly document, 2.1x too low), then 332MB (the right shape, at a
+    // cap that no longer exists), then 353MB -- and a review round found a GIF whose
+    // logical screen lies about its size rendering at 703MB while the accounting
+    // charged it one pixel. A declaration derived from what documents were believed
+    // to cost is only as true as the belief. This one is derived from RLIMIT_DATA,
+    // which the kernel holds whatever the document turns out to contain.
     const manifest = readFileSync(
       join(import.meta.dirname, "..", "..", "..", "..", "manifest.toml"), "utf8",
     );
     const declared = /^ram\.runtime = "(\d+)M"$/m.exec(manifest);
     expect(declared?.[1]).toBeDefined();
-    expect(400 + RENDER_MAX_CONCURRENCY * 353).toBeLessThanOrEqual(Number(declared?.[1]));
+    const perRenderMb = RENDER_MEMORY_LIMIT_BYTES / (1024 * 1024);
+    expect(Number(declared?.[1])).toBe(400 + RENDER_MAX_CONCURRENCY * perRenderMb);
+    // And the limit clears the worst legitimate document with margin: 335MB of data
+    // measured on the server for a full markup budget of rows beside a 16Mpx logo.
+    expect(perRenderMb).toBeGreaterThan(335 * 1.25);
     expect(RENDER_MAX_CONCURRENCY).toBe(2);
     // The other half of the pair: the issuing transaction's lock hold is bounded by
     // the queue timeout plus the render timeout, and only a finite queue timeout
@@ -725,6 +729,31 @@ describe("pdfEmbedsFiles", () => {
 const LOGO_PNG =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4" +
   "2mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/**
+ * THE PAYLOAD A QUALITY REVIEW GOT PAST THE ACCOUNTING: a valid GIF89a whose logical
+ * screen says 1x1 and whose only frame is 13000x13000.
+ *
+ * Pillow expands the image to the frame extent, so this is 169 megapixels and 703MB
+ * unbounded, from 51KB. Every version of the size reader before v1.0.1's third round
+ * read the screen descriptor and charged it ONE pixel -- and it is under the logo cap,
+ * so it was a valid LOGO. Built here rather than pasted so the reader's fix and the
+ * renderer's limit can both be tested against the real thing.
+ */
+function frameExtentGif(): Buffer {
+  const le16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
+  const lzw: number[] = [];
+  for (let i = 0; i < 200; i += 1) lzw.push(255, ...Array.from({ length: 255 }, () => 0));
+  return Buffer.from([
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
+    ...le16(1), ...le16(1), // the logical screen: a lie
+    0xf0, 0x00, 0x00, // a global colour table of two entries follows
+    0x00, 0x00, 0x00, 0xff, 0xff, 0xff,
+    0x2c, ...le16(0), ...le16(0), ...le16(13_000), ...le16(13_000), 0x00, // the frame
+    0x02, ...lzw, 0x00, // LZW minimum code size, data, block terminator
+    0x3b, // trailer
+  ]);
+}
 
 /** As close to a real one-page quote as this task can get before Task 4 exists. */
 function quoteHtml(): string {
@@ -939,6 +968,64 @@ describe("renderPdf and the schemes it will read", () => {
     expect(drawn).toBeInstanceOf(RenderError);
     expect((drawn as RenderError).message).toBe("document referenced a blocked resource");
   });
+
+  /**
+   * THE BOUND THAT DOES NOT DEPEND ON THIS MODULE BEING RIGHT ABOUT ANYTHING.
+   *
+   * Three review rounds found four documents whose cost the accounting mis-predicted,
+   * each by a different disagreement with what Pillow does. This test is the answer to
+   * the fifth: the child sets RLIMIT_DATA on itself before it imports weasyprint, so a
+   * document that wants more than RENDER_MEMORY_LIMIT_BYTES dies whatever the
+   * accounting thought of it.
+   *
+   * IT IS DRIVEN WITH THE ACCOUNTING TURNED OFF (`maxImagePixels` lifted), because
+   * that is the only way to reach the limit deliberately -- with the caps in place
+   * this document is refused before the spawn, which is the outcome a user gets and is
+   * asserted separately above. What is proved here is the second line of defence, on
+   * the payload that got past the first one in round three.
+   */
+  itReal("holds a render to its memory limit, whatever the accounting predicted", async () => {
+    // The GIF whose logical screen says 1x1 and whose frame is 13000x13000: 169
+    // megapixels, charged one pixel by every version of the accounting before this
+    // one, and measured at 703MB unbounded.
+    const html = `<html><body><img src="data:image/gif;base64,${frameExtentGif().toString("base64")}"></body></html>`;
+
+    // The accounting sees it now -- 169 megapixels, not one -- and would refuse it.
+    expect(renderInputCost(html).imagePixels).toBe(169_000_000);
+
+    const error = await renderPdf(html, { maxImagePixels: 4e9 }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(RenderError);
+    expect((error as RenderError).message)
+      .toBe("document needed more memory than a render is allowed");
+    expect((error as RenderError).detail).toContain(String(RENDER_MEMORY_LIMIT_BYTES));
+
+    // AND THE LIMIT IS NOT SO TIGHT THAT IT REFUSES WORK. The same call with an
+    // ordinary document renders, so what failed above was the document's appetite and
+    // not the limit being set below the cost of rendering anything at all.
+    const ordinary = await renderPdf(`<html><body><h1>Quote</h1><img src="${LOGO_PNG}"></body></html>`);
+    expect(ordinary.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+  });
+
+  /**
+   * A RENDER THAT DIES ON THE MEMORY LIMIT MUST LEAVE THE PROCESS EXACTLY AS IT FOUND
+   * IT, and a leaked slot is invisible until the day nothing renders at all.
+   *
+   * The slot is released in renderPdf's `finally`, so this is really a test that the
+   * out-of-memory arm rejects rather than hanging -- which is what would leak it.
+   */
+  itReal("gives the slot back after a render dies on the memory limit", async () => {
+    const bomb = `<html><body><img src="data:image/gif;base64,${frameExtentGif().toString("base64")}"></body></html>`;
+    for (let i = 0; i < RENDER_MAX_CONCURRENCY + 1; i += 1) {
+      const error = await renderPdf(bomb, { maxImagePixels: 4e9 }).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(RenderError);
+    }
+    // Every slot is free: this would time out on the queue if any had leaked.
+    const pdfs = await Promise.all(Array.from(
+      { length: RENDER_MAX_CONCURRENCY },
+      async () => await renderPdf(`<html><body><p>after</p></body></html>`, { queueTimeoutMs: 2000 }),
+    ));
+    for (const pdf of pdfs) expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+  }, 120_000);
 
   // ---- the other direction: what the bare CLI does, and why it is not used ----
 

@@ -237,8 +237,9 @@ failed render weeks later when someone raises a quote.
 > **And a byte limit was never the bound that mattered.** A PNG's decoded raster is
 > width × height × 4 whatever the file compressed to: measured on the server through
 > the shipped `renderPdf`, a **12,227-byte** 1-bit PNG of 10,000 × 10,000 costs
-> **535MB**, and 20,625 bytes of 13,000 × 13,000 costs **864MB** — the second of which
-> fits inside `MAX_TEMPLATE_BYTES`, so v1.0.0's template editor could already reach it.
+> **535MB**, and 20,625 bytes of 13,000 × 13,000 costs **864MB** — the **first** of
+> which fits inside `MAX_TEMPLATE_BYTES` (12,227 against 16,384; the second does not),
+> so v1.0.0's template editor could already reach it.
 > v1.0.1 adds `MAX_LOGO_PIXELS` (16,000,000 — a 4000 × 4000 canvas), enforced at the
 > upload AND at the renderer, where it also covers template-embedded images and logos
 > stored before the gate existed. The numbers in the paragraph above are also stale as

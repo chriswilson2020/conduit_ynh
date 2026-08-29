@@ -23,34 +23,31 @@ ldap = "not_relevant"
 sso = true
 disk = "2G"
 ram.build = "50M"
-# 400M for the Node API as before, plus 750M for renders. A render is a separate
-# Python process, not memory the API already had, and what bounds its cost is the
-# input caps rather than the timeout.
+# 400M for the Node API, plus RENDER_MAX_CONCURRENCY renders at the limit each render
+# is now HELD TO BY THE KERNEL: 400 + 2 x 512 = 1,424M.
 #
-# RE-MEASURED FOR v1.0.1, THE SAME WAY AND ON THE SAME MACHINE: driven through the
-# shipped renderPdf on the Debian 12 target, with the child's peak RSS sampled from
-# /proc every 50ms. Two figures this comment carried have moved, and neither moved
-# because anything was edited to taste -- the dense-row worst case at the old 128KB
-# cap measures 345MB rather than the 332MB recorded, and 128KB of prose measures
-# 71MB rather than 84MB.
+# THIS NUMBER IS ENFORCED FOR THE FIRST TIME. Every previous version of it was an
+# estimate of what a render would use, and three review rounds in a row found a
+# document that beat the estimate -- a mime type respelt, a JPEG2000 that decodes to
+# 36 megapixels from 334 bytes, a GIF whose logical screen lies about its size, a
+# single space inside a base64 payload. Each was charged nothing by the accounting and
+# rendered at 534MB to 703MB against a declaration of 1,150M. The render child now
+# sets RLIMIT_DATA on itself before it imports anything, so a document that wants more
+# dies with a clean error instead of a number in this file being wrong.
 #
-# WHAT THIS RELEASE CHANGED IS THE SHAPE OF THE WORST CASE, NOT JUST ITS SIZE. The
-# markup cap is 87,357 bytes now (250MB of minimal table rows, measured), and a
-# `data:` image gets a separate 409,623-byte allowance that cannot contain a table
-# row. The worst document that can now be built is a full markup budget of rows with
-# a logo at the pixel bound beside it: 353MB, measured. The logo's file size is not
-# what decides that -- 12,227 bytes of PNG can be 100 megapixels and 535MB, which is
-# why there is a 16,000,000-pixel cap and why it is enforced at the renderer.
+# MEASURED, on this Debian 12 target, through the shipped renderPdf with /proc sampled
+# every 25ms: the worst legitimate document -- a full markup budget of minimal table
+# rows with a 16-megapixel logo beside it -- is 340MB resident and 335MB of data, and
+# renders. The two bombs above are refused at 80MB and 189MB. 512M is 1.53x the worst
+# legitimate figure, which is margin for CI's WeasyPrint 61.1 against this server's
+# 57.2 rather than slack.
 #
-# TWO is the concurrency limit documents-render.ts enforces, and this number is only
-# true if it does: 400 + 2 x 353 = 1,106M. It was 1100M against v1.0.0's worst case,
-# which the same method now puts at 345MB (400 + 2 x 345 = 1,090M, still true). Three
-# renders would be 1,459M -- a third of a 3819MB machine that has NO SWAP, where
-# overshooting is an OOM kill rather than a slowdown. Advisory either way -- YunoHost
-# sets no cgroup from it and does not evaluate it at install -- so the real protection
-# is the input caps plus that limit, and this is the honest declaration of what they
-# add up to. A test asserts the arithmetic against this literal.
-ram.runtime = "1150M"
+# RLIMIT_DATA bounds brk and anonymous mappings, which is where a decoded raster
+# lives; file-backed pages (shared libraries and fonts) sit outside it and measured
+# under 20MB resident, shared between the children. So this declaration is an upper
+# bound rather than an average, and documents-render.test.ts asserts the arithmetic
+# against this literal.
+ram.runtime = "1424M"
 
 [install]
 
