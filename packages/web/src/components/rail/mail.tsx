@@ -56,7 +56,8 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
       context: {
         contactName, companyName: company?.name,
         // Straight off the record, unchanged and unguessed: a contact with no
-        // salutation supplies none, and the placeholder stays visible.
+        // salutation supplies none, and the placeholder renders as nothing rather
+        // than staying visible the way an unfilled name does (see BLANK_MEANS_BLANK).
         contactSalutation: contact?.salutation, contactPronouns: contact?.pronouns,
       },
     });

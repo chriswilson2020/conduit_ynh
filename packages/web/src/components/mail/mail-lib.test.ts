@@ -35,6 +35,7 @@ import {
   MAIL_CONNECTION_MESSAGE,
   parseAddressToken,
   parseRecipientInput,
+  placeholderPattern,
   PLACEHOLDER_KEYS,
   resolveRecipients,
   sendFailureMessage,
@@ -355,12 +356,60 @@ describe("substitutePlaceholders", () => {
     // the author's layout and survive untouched.
     expect(substitutePlaceholders("Dear {{contact.salutation}}  Alice,", {})).toBe("Dear  Alice,");
     expect(substitutePlaceholders("{{contact.salutation}}\nAlice", {})).toBe("\nAlice");
+    expect(substitutePlaceholders("{{contact.salutation}}\tAlice", {})).toBe("\tAlice");
     // Nothing following it at all is not a special case.
     expect(substitutePlaceholders("Alice {{contact.pronouns}}", {})).toBe("Alice ");
     // The HTML path behaves identically -- the space handling is in the shared
     // substitution, not in either wrapper.
     expect(substitutePlaceholdersHtml("<p>Dear {{contact.salutation}} Alice</p>", {}))
       .toBe("<p>Dear Alice</p>");
+  });
+
+  /**
+   * U+00A0 IS THE SPACE THE PIPELINE ACTUALLY STORES, and an ASCII-only class missed
+   * it. `sanitizeMailHtml` decodes `&nbsp;`, `&#160;` and `&#x00a0;` into a literal
+   * non-breaking space and stores that, and it runs on every template save -- so a
+   * template typed with a non-breaking space between the salutation and the name came
+   * back out of the database matching nothing, and an empty salutation left exactly
+   * the doubled space the group exists to remove. Invisible in review, which is why
+   * this test spells the character as an escape.
+   */
+  it("consumes a stored non-breaking space as readily as an ASCII one", () => {
+    // Spelled as an escape because this repo's source is ASCII, and because a raw
+    // U+00A0 in a test is indistinguishable from a space in every review tool.
+    const NB = "\u00a0";
+    expect(substitutePlaceholders(`Dear {{contact.salutation}}${NB}Alice,`, {}))
+      .toBe("Dear Alice,");
+    expect(substitutePlaceholdersHtml(`<p>Dear {{contact.salutation}}${NB}Alice</p>`, {}))
+      .toBe("<p>Dear Alice</p>");
+    // ...and it is put back when the field IS filled, like any other trailing space.
+    expect(substitutePlaceholders(`Dear {{contact.salutation}}${NB}Alice,`, { contactSalutation: "Dr" }))
+      .toBe(`Dear Dr${NB}Alice,`);
+    // Still one character: a second non-breaking space is the author's layout.
+    expect(substitutePlaceholders(`Dear {{contact.salutation}}${NB}${NB}Alice,`, {}))
+      .toBe(`Dear ${NB}Alice,`);
+  });
+
+  /**
+   * THE ESCAPING, DRIVEN WITH PATHS THIS CODEBASE DOES NOT CONTAIN YET. Only `.`
+   * occurs in a key today, so no test of the real five can reach this -- and the
+   * failure it guards is not a wrong match but `new RegExp` THROWING AT MODULE
+   * EVALUATION, which in a module the composer, the inbox and Settings all import is
+   * a blank application rather than a local fault.
+   */
+  it("escapes every regex metacharacter a future placeholder path could contain", () => {
+    const hostile = ["a.b", "c(d", "e|f", "g[h", "i+j", "k*l", "m?n", "o^p", "q$r", "s\\t", "u{v"];
+    const pattern = placeholderPattern(hostile);
+    for (const path of hostile) {
+      // The path matches as a LITERAL. No space after the braces in the fixture: the
+      // pattern would consume one into the match, which is its job and not this
+      // test's subject.
+      expect(`x[{{${path}}}]y`.replace(pattern, "HIT")).toBe("x[HIT]y");
+    }
+    // ...and the metacharacters have no power: `c(d` must not match `cd`, and the
+    // alternation must not have swallowed a stray group.
+    expect("x[{{cd}}]y".replace(pattern, "HIT")).toBe("x[{{cd}}]y");
+    expect("x[{{a_b}}]y".replace(pattern, "HIT")).toBe("x[{{a_b}}]y");
   });
 
   // The paths are whole, and there is only ONE list of them: PLACEHOLDER is built

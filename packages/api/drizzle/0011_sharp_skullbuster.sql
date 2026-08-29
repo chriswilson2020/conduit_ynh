@@ -48,10 +48,11 @@ ALTER TABLE "contacts" ADD CONSTRAINT "contacts_pronouns_length" CHECK (char_len
 -- `amended <> body_html` also replaces a `position(...) > 0` guard, and is exact when
 -- the recipient line appears more than once.
 --
--- No `;` and no `'` inside either literal, so nothing here can be mistaken for a
--- statement end or needs doubling. Both strings are read back out of this file by
--- test/seed-template.ts, which is how documents.test.ts and documents-seed.test.ts
--- see the template a fresh install actually has.
+-- No `;` inside either literal, so nothing here can be mistaken for a statement end.
+-- Neither happens to contain a `'` either, though that is not a requirement: a quote
+-- doubles to `''` in the usual way and test/seed-template.ts undoubles it. Both
+-- strings are read back out of this file by that reader, which is how
+-- documents.test.ts and documents-seed.test.ts see the template a fresh install has.
 UPDATE "document_templates" AS t
 SET "body_html" = amendment.amended,
     "updated_at" = now()

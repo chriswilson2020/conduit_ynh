@@ -393,9 +393,23 @@ function TemplateForm({ template, onClose }: { template?: EmailTemplate; onClose
             keys live in the API's buildContext, which this bundle cannot import. */}
         <p className="text-xs font-normal text-slate-400">
           {mergeFieldSentence(Object.keys(PLACEHOLDER_KEYS))} are filled in from the
-          contact as it stands when the template is used; anything else is left as
-          written. An unfilled salutation or set of pronouns disappears; an unfilled
-          name stays visible, so you can see what is missing.
+          records as they stand when the template is used; anything else is left as
+          written. An unfilled name stays visible, so you can see what is missing.
+        </p>
+        {/* THE LIMITATION, SAID PLAINLY RATHER THAN DISCOVERED. An empty salutation
+            removes itself and one following space, which handles "Dear X Y" -- but
+            nothing removes brackets or a label written around it, so
+            "({{contact.pronouns}})" on a contact with none prints "()". Fixing that
+            needs conditional blocks, which the mail merge language does not have and
+            which is a feature rather than a fix (v1.1.0 coordinator ruling; it is on
+            the backlog). Documenting it is what turns a surprise into a choice. */}
+        <p className="text-xs font-normal text-slate-400">
+          An empty salutation or set of pronouns removes itself, and one space after
+          it, so <code>{"Dear {{contact.salutation}} {{contact.name}}"}</code> reads
+          &quot;Dear Alice&quot; for a contact with no salutation. Any brackets or
+          labels you write around one stay put:{" "}
+          <code>{"({{contact.pronouns}})"}</code> prints empty brackets when there are
+          no pronouns to put in them.
         </p>
       </div>
 

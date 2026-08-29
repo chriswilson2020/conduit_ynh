@@ -91,6 +91,38 @@ describe("contacts service", () => {
     }
   });
 
+  /**
+   * TEXT NO COLUMN CAN HOLD, ON BOTH ENDS OF THE PAIR.
+   *
+   * A NUL is legal JSON, passes `min(1)` and the 64-character cap, and then fails the
+   * INSERT with Postgres 22021 `invalid byte sequence` -- unmapped, so a bare 500 for
+   * a value every layer above called fine. An unpaired surrogate is the other way to
+   * build a string that is not valid UTF-8, and it was silently stored as U+FFFD: a
+   * value the user never typed, on a field whose entire point is that nothing is
+   * guessed.
+   *
+   * THIS IS ALSO WHAT KEEPS THE TWO ENDS OF THE RELEASE HONEST.
+   * `DOCUMENT_FIELD_CAPS.recipientSalutation` is deliberately set to
+   * `CONTACT_FIELD_CAPS.salutation` so a value the contact record accepts can always
+   * be copied onto a quote -- and `documentText` has refused both of these since
+   * Phase 7, so without the same refinement here `"Dr\u0000X"` was a clean 400 on the
+   * quote side and a 500 on the contact side. documents.test.ts covers the quote end
+   * of the same pair.
+   */
+  it("refuses a NUL or an unpaired surrogate in either field, naming which one", () => {
+    for (const [field, word] of [["salutation", "salutation"], ["pronouns", "pronouns"]] as const) {
+      for (const value of ["Dr\u0000X", "lone \ud800 surrogate", "trailing \udc00"]) {
+        const result = createContactInputSchema.safeParse({ firstName: "Ada", [field]: value });
+        expect(result.success, `${field} accepted ${JSON.stringify(value)}`).toBe(false);
+        expect(result.error?.issues[0]?.message).toContain(word);
+      }
+      // A well-formed astral pair is ordinary text and is NOT refused -- the check is
+      // about bytes Postgres cannot store, not about the Basic Multilingual Plane.
+      expect(createContactInputSchema
+        .safeParse({ firstName: "Ada", [field]: "\ud83c\udf3b" }).success).toBe(true);
+    }
+  });
+
   it("archive hides from the default list but getContact still returns it", async () => {
     const c = await createContact(handle.db, actorId, { firstName: "Ada" });
     await archiveContact(handle.db, actorId, c.id);

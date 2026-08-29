@@ -265,6 +265,14 @@ export const PLACEHOLDER_KEYS: Record<string, keyof TemplateContext> = {
  */
 const BLANK_MEANS_BLANK: ReadonlySet<string> = new Set(["contact.salutation", "contact.pronouns"]);
 
+/** Every character a regex gives a meaning to, so a path can be spliced into one as a
+ * literal. Only `.` occurs in a path today; the rest is here because the alternative
+ * failure is not a wrong match but a THROW FROM `new RegExp` AT MODULE EVALUATION --
+ * and this module is imported by the composer, the conversation view, the inbox and
+ * Settings, so an unescaped `(` in a future key is a blank application rather than a
+ * local fault. */
+const REGEX_SPECIAL = /[.*+?^${}()|[\]\\]/g;
+
 /**
  * The placeholders, built from PLACEHOLDER_KEYS so the two cannot disagree, plus ONE
  * OPTIONAL FOLLOWING SPACE.
@@ -277,16 +285,30 @@ const BLANK_MEANS_BLANK: ReadonlySet<string> = new Set(["contact.salutation", "c
  * single following space with it, and every other outcome puts the space back
  * untouched.
  *
- * ONE SPACE, AND NOT WHITESPACE COLLAPSING. A newline, a tab, a `&nbsp;` and a second
- * space are all left exactly as the template's author wrote them: this fixes the one
- * layout a missing salutation breaks, and is not a formatter.
+ * U+00A0 COUNTS AS THAT SPACE, AND THIS IS THE ONE THE ASCII CLASS MISSED.
+ * `sanitizeMailHtml` decodes `&nbsp;` (and `&#160;`, and `&#x00a0;`) into a literal
+ * non-breaking space and stores it, and it runs on every template save -- so a
+ * template written `Dear {{contact.salutation}}&nbsp;{{contact.name}},` comes back out
+ * of the database with a character an ASCII-space class does not match, and an empty
+ * salutation would leave exactly the doubled space this group exists to remove,
+ * invisibly. Measured through the real sanitizer, not assumed.
+ *
+ * ONE SPACE, AND NOT WHITESPACE COLLAPSING. A newline, a tab and a second space go
+ * through this substitution untouched, and the sanitizer preserves all three as well
+ * (measured) -- this fixes the one layout a missing salutation breaks, and is not a
+ * formatter. What the compose editor's own parser does to a run of spaces it is
+ * given is its business and is not a claim made here.
+ *
+ * Exported only so the escaping can be driven with paths this codebase does not
+ * contain yet -- the failure it guards against is a module that will not load, which
+ * no test of the current five keys can reach.
  */
-const PLACEHOLDER = new RegExp(
-  `\\{\\{\\s*(${Object.keys(PLACEHOLDER_KEYS)
-    .map((path) => path.replaceAll(".", "\\."))
-    .join("|")})\\s*\\}\\}( ?)`,
-  "g",
-);
+export function placeholderPattern(paths: readonly string[]): RegExp {
+  const alternation = paths.map((path) => path.replace(REGEX_SPECIAL, "\\$&")).join("|");
+  return new RegExp(`\\{\\{\\s*(${alternation})\\s*\\}\\}([ \\u00a0]?)`, "g");
+}
+
+const PLACEHOLDER = placeholderPattern(Object.keys(PLACEHOLDER_KEYS));
 
 function substitute(input: string, context: TemplateContext, escape: (value: string) => string): string {
   return input.replace(PLACEHOLDER, (match, path: string, trailingSpace: string) => {

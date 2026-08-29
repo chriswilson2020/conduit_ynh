@@ -577,8 +577,13 @@ describe("issueQuote input gate", () => {
       quoteInput({ lines: [{ description: "a\u0000b", qtyMilli: 1000, unitPriceCents: 1, taxRateBp: 0 }] }),
       quoteInput({ notes: "a\u0000b" }),
       quoteInput({ recipientName: "Acme\u0000" }),
+      // v1.1.0's field, on the same footing as the others -- it is merged into the
+      // page and stored on the row exactly as they are, and CONTACT_FIELD_CAPS's
+      // matching refusal is what keeps the contact end from being the softer one.
+      quoteInput({ recipientSalutation: "D\u0000r" }),
       // The other way to produce bytes that are not valid UTF-8.
       quoteInput({ terms: "lone \ud800 surrogate" }),
+      quoteInput({ recipientSalutation: "lone \ud800" }),
     ];
     for (const input of bad) {
       const error = await issueExpectingFailure(
