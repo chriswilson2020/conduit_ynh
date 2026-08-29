@@ -319,7 +319,11 @@ export async function issueQuote(
         `this quote's ${String(cost.images)} inline image(s) decode to `
         + `${String(cost.imagePixels)} pixels, over the `
         + `${String(RENDER_IMAGE_PIXEL_CAP)} a document may render. A file's size does `
-        + "not say how large the picture inside it is; use one with fewer pixels",
+        + "not say how large the picture inside it is; use one with fewer pixels"
+        + (cost.unreadableImages === 0 ? ""
+          : `. ${String(cost.unreadableImages)} of them are not a PNG, JPEG, GIF or `
+            + "WEBP at all, and something the renderer cannot be asked to identify is "
+            + "charged the most its bytes could decode to"),
       );
     }
     const pdf = await renderPdf(html);

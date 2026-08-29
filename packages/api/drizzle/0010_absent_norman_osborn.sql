@@ -7,5 +7,13 @@
 -- see is the picture's dimensions -- see MAX_LOGO_PIXELS -- which is checked at
 -- the upload and again at the renderer, where a 12KB file that decodes to 100
 -- megapixels is refused.
+--
+-- WHICH MEANS "EVERY EXISTING LOGO KEEPS WORKING" IS TRUE OF THIS MIGRATION AND
+-- NOT OF THE RELEASE. v1.0.0 had no pixel bound at all, so a logo stored under
+-- the old 32KB cap may be over the new 16,000,000-pixel one -- 2KB of 1-bit PNG
+-- is 4001 x 4000, and flat artwork does compress like that. Such a row is
+-- untouched here and will be refused the next time the profile is saved, and
+-- every quote raised against it fails to render with a message naming the pixel
+-- count. Unlikely, and recognisable rather than mysterious when it happens.
 ALTER TABLE "org_profile" DROP CONSTRAINT "org_profile_logo_size";--> statement-breakpoint
 ALTER TABLE "org_profile" ADD CONSTRAINT "org_profile_logo_size" CHECK (char_length("org_profile"."logo_data_uri") <= 409623);

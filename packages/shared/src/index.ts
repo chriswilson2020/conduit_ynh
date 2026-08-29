@@ -1880,6 +1880,10 @@ function webpSize(b: readonly number[]): ImageSize | null {
  * readable. Three of them are a fixed header; JPEG is a walk, and 64KB is past any
  * plausible pile of EXIF and thumbnails. A template-embedded image cannot exceed
  * MAX_TEMPLATE_BYTES of base64 anyway, so for that path this is the whole file.
+ *
+ * A JPEG whose frame header is past the window reads as unidentified, which is
+ * charged rather than trusted -- see MAX_PIXELS_PER_PAYLOAD_BYTE -- so running out of
+ * window is safe in the direction that matters.
  */
 const DIMENSION_BYTES: Record<string, number> = { png: 24, gif: 10, webp: 30, jpeg: 65_536 };
 
@@ -1887,25 +1891,100 @@ const IMAGE_SIZE_READERS: Record<string, (b: readonly number[]) => ImageSize | n
   png: pngSize, gif: gifSize, jpeg: jpegSize, webp: webpSize,
 };
 
+/** A `data:` URI split at its comma: what encoding the payload is in, and the payload. */
+interface DataUriPayload {
+  readonly text: string;
+  readonly base64: boolean;
+}
+
 /**
- * How large an image a `data:` URI decodes to, or null if its header does not say.
+ * The payload of a `data:` URI, or null if the string is not one.
  *
- * THE HEADER, NOT THE PAYLOAD: the same hand-rolled base64 prefix decoder the
- * signature check uses (see decodeBase64Prefix for why it is hand-rolled), reading
- * tens of bytes rather than hundreds of thousands. Nothing here decodes an image.
+ * **THE MEDIA TYPE IS NOT READ, AND THAT IS THE POINT OF THIS FUNCTION EXISTING.**
+ * RFC 2397 puts an optional type, optional parameters and an optional `;base64`
+ * between `data:` and the comma, all of them free text written by whoever built the
+ * URI -- so `data:image/bmp`, `data:image/PNG`, `data:;base64` and
+ * `data:image/png;charset=utf-8;base64` are four spellings of the same thing to a
+ * renderer, which sniffs the bytes. Only the ENCODING is taken from here, because
+ * only the encoding changes what the bytes are.
+ */
+function dataUriPayload(uri: string): DataUriPayload | null {
+  if (!uri.startsWith("data:")) return null;
+  const comma = uri.indexOf(",");
+  // No comma is not a data: URI at all -- `urlopen` raises on it, nothing is
+  // fetched, and it is prose that happens to start with "data:".
+  if (comma === -1) return null;
+  const parameters = uri.slice("data:".length, comma).toLowerCase().split(";");
+  return { text: uri.slice(comma + 1), base64: parameters.includes("base64") };
+}
+
+/**
+ * The first `wanted` bytes of a percent-encoded payload.
  *
- * A null is "this file's header does not say how big it is", which for the four types
- * allowed here means a file no image library could open either. `logoDataUriProblem`
- * treats it as a refusal, because a logo that cannot be drawn should be refused at
- * the upload rather than discovered as a blank space on a quote.
+ * The OTHER encoding a `data:` URI can use, and the one an attacker reaches for
+ * second: `data:image/png,%89PNG...` carries the same file with no base64 anywhere
+ * in it. Stops at a malformed escape rather than guessing, which costs nothing --
+ * the signature check downstream then fails and the payload is charged as unknown.
+ */
+function decodePercentPrefix(text: string, wanted: number): number[] {
+  const out: number[] = [];
+  for (let at = 0; at < text.length && out.length < wanted; at += 1) {
+    const character = text[at] ?? "";
+    if (character === "%") {
+      const hex = text.slice(at + 1, at + 3);
+      if (!/^[0-9a-f]{2}$/i.test(hex)) return out;
+      out.push(parseInt(hex, 16));
+      at += 2;
+      continue;
+    }
+    const code = character.codePointAt(0) ?? 0;
+    if (code > 0xff) return out;
+    out.push(code);
+  }
+  return out;
+}
+
+/** The first `wanted` bytes of a payload, in whichever encoding it declares. */
+function payloadPrefix(payload: DataUriPayload, wanted: number): number[] {
+  return payload.base64
+    ? decodeBase64Prefix(payload.text.slice(0, Math.ceil(wanted / 3) * 4), wanted)
+    : decodePercentPrefix(payload.text, wanted);
+}
+
+/** Which of the four formats these bytes ARE, by signature, or null for none of them. */
+function sniffImage(bytes: readonly number[]): string | null {
+  for (const [type, matches] of Object.entries(LOGO_SIGNATURES)) {
+    if (matches(bytes)) return type;
+  }
+  return null;
+}
+
+/**
+ * How large an image a `data:` URI decodes to, or null if its own bytes do not say.
+ *
+ * **SNIFFED, NOT DECLARED, AND THAT WAS A REAL BYPASS RATHER THAN A PRECAUTION.**
+ * This read the media type out of the URI and used the reader for that type. A spec
+ * reviewer changed one character -- `data:image/bmp;base64,` in front of PNG bytes --
+ * and the 100-megapixel bomb was charged zero pixels, because the reader for "bmp"
+ * does not exist and the URI no longer matched a regex that named four types. Pillow
+ * and WeasyPrint do not read that field at all: they sniff. So this sniffs, and the
+ * declared type is now only ever used by `logoDataUriProblem`, to insist that an
+ * UPLOAD says what it is.
+ *
+ * THE HEADER, NOT THE PAYLOAD: the same hand-rolled prefix decoders the signature
+ * check uses (see decodeBase64Prefix for why they are hand-rolled), reading tens of
+ * bytes rather than hundreds of thousands. Nothing here decodes an image.
+ *
+ * A null is "these bytes do not say how big the picture is", which covers a file that
+ * is not one of the four formats at all. `logoDataUriProblem` treats it as a refusal;
+ * `renderInputCost` charges it the most it could possibly cost.
  */
 export function imageDataUriSize(uri: string): ImageSize | null {
-  const declared = LOGO_DATA_URI.exec(uri)?.[1];
-  if (declared === undefined) return null;
-  const wanted = DIMENSION_BYTES[declared] ?? 0;
-  const base64 = uri.slice(uri.indexOf(",") + 1);
-  const bytes = decodeBase64Prefix(base64.slice(0, Math.ceil(wanted / 3) * 4), wanted);
-  const size = IMAGE_SIZE_READERS[declared]?.(bytes) ?? null;
+  const payload = dataUriPayload(uri);
+  if (payload === null) return null;
+  const kind = sniffImage(payloadPrefix(payload, 12));
+  if (kind === null) return null;
+  const size = IMAGE_SIZE_READERS[kind]?.(payloadPrefix(payload, DIMENSION_BYTES[kind] ?? 0)) ?? null;
   if (size === null || size.width < 1 || size.height < 1) return null;
   return size;
 }
@@ -2308,59 +2387,119 @@ export const RENDER_IMAGE_PIXEL_CAP = MAX_LOGO_PIXELS;
 export interface RenderInputCost {
   /** Every byte of it, UTF-8. */
   readonly totalBytes: number;
-  /** The base64 payloads of its `data:` images, which cannot contain markup. */
+  /** The payloads of its `data:` URIs, which cannot contain markup. */
   readonly imageBytes: number;
   /** Everything else: the tags, the text, the CSS -- where the rows live. */
   readonly markupBytes: number;
-  /** What those images decode to, summed, over the ones whose header says. */
+  /**
+   * What those payloads decode to, summed: exactly, where the bytes say, and
+   * MAX_PIXELS_PER_PAYLOAD_BYTE per character where they do not.
+   */
   readonly imagePixels: number;
-  /** How many `data:` images there are, readable header or not. */
+  /** How many `data:` URIs there are, identifiable or not. */
   readonly images: number;
+  /** How many of those could not be identified as one of the four formats. */
+  readonly unreadableImages: number;
 }
 
 /**
- * A data: image URI anywhere in a document, and the base64 run that follows it.
+ * ANY `data:` URI anywhere in a document, whatever it claims to be.
+ *
+ * **IT USED TO NAME THE FOUR TYPES AND THE BASE64 ENCODING, AND THAT WAS THE
+ * BYPASS.** `data:image/(png|jpeg|gif|webp);base64,` matched four canonical
+ * spellings; the renderer matches none, because it sniffs. Six one-character
+ * variations -- `image/bmp`, `image/PNG`, an empty type, an extra parameter,
+ * percent-encoding instead of base64 -- were each charged ZERO pixels and ZERO image
+ * bytes, and their whole payload was counted as cheap markup. Every one of them
+ * rendered the 100-megapixel bomb at ~534MB while passing all three caps. A
+ * recogniser narrower than the thing it is protecting is not a control.
  *
  * NOT ANCHORED, unlike LOGO_DATA_URI, because this one is looking INSIDE a page. The
- * run stops at the first character outside the base64 alphabet, which is what makes
- * the accounting safe: `"` ends the attribute, `<` opens the next tag, and neither is
- * in the alphabet. So a byte counted as image payload can never be a byte of markup,
- * and no amount of `data:image/png;base64,` written into a template can smuggle a
- * table row past the markup cap.
+ * run stops at the first character that cannot be in a URL there -- a quote, a
+ * bracket, whitespace, or an angle bracket -- and THAT is what keeps the markup
+ * accounting honest: a `<` always ends the run, so bytes charged to the image half
+ * can never be a table row. (The old comment argued this from the base64 alphabet.
+ * The alphabet is no longer what bounds the run; the terminator set is, and it
+ * contains `<` explicitly rather than incidentally.)
  */
-const EMBEDDED_IMAGE = /data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]*={0,2}/g;
+const EMBEDDED_DATA_URI = /data:[^\s"'`<>)]*/g;
+
+/**
+ * What a payload this cannot identify is CHARGED, per character: 8,256 pixels.
+ *
+ * **IT IS A PRE-FLIGHT ESTIMATE AND IT IS NOT WHAT MAKES THE PIXEL BOUND SOUND.**
+ * Saying otherwise would be the same mistake twice: the bound it comes from is
+ * DEFLATE's maximum expansion of 1032:1 (RFC 1951: a 258-byte match from the shortest
+ * possible code) times eight pixels per decompressed byte at one bit each, so 8,256 --
+ * and the worst 1-bit PNG built for these measurements reached 8,192, which is 99.2%
+ * of it. That is tight for every zlib-based format and MEANINGLESS for the rest:
+ * measured on the server, a **334-byte JPEG2000 decodes to 36 megapixels**, which is
+ * 107,784 pixels per byte and thirteen times this figure. Pillow opens forty formats.
+ *
+ * So what stops an unidentifiable payload is documents-render.ts's fetcher, which
+ * refuses to hand the renderer anything that is not a PNG, JPEG, GIF or WEBP by
+ * signature -- and this charge exists so that the large ones are refused EARLY, in a
+ * sentence about pixels, before a render slot and a document number are spent. A
+ * payload of about 1,938 characters exhausts the cap on its own: far more than a
+ * stray `data:` token in prose (whitespace ends the run), far less than a font
+ * somebody embedded in a template.
+ *
+ * Charged per CHARACTER of the payload as written, which over-charges base64 by 4/3,
+ * deliberately and in the safe direction.
+ */
+export const MAX_PIXELS_PER_PAYLOAD_BYTE = 8_256;
 
 /**
  * What a finished document will cost the renderer, measured on the bytes themselves.
  *
  * **THE MARKUP HALF AND THE IMAGE HALF ARE NOT INTERCHANGEABLE**, which is the whole
  * reason this exists rather than one `byteLength`: 128KB of table rows peaked at
- * 345MB and 128KB of prose at 71MB, and a base64 payload cannot be a table row at
- * all. See RENDER_MARKUP_CAP_BYTES.
+ * 345MB and 128KB of prose at 71MB, and a payload cannot be a table row at all --
+ * the run that carries it stops at the first `<`. See RENDER_MARKUP_CAP_BYTES.
  *
- * `imagePixels` counts only the images whose header could be read. An unreadable one
- * is charged its bytes and no pixels, which is safe for the two ways it can happen:
- * a logo goes through `logoDataUriProblem`, which refuses an unreadable header
- * outright, and a template-embedded image is at most MAX_TEMPLATE_BYTES of base64,
- * which is inside the window this reads. Anything left is a file Pillow cannot open
- * either -- and if it could, it would still meet its own 178,956,970-pixel refusal.
+ * **AND IT IS POSITION-BLIND ON PURPOSE.** It reads the raw bytes rather than parsing
+ * the page, so it cannot be walked past by putting an image somewhere the parser was
+ * not looking -- a CSS `url()`, an `xlink:href`, an attribute added to the
+ * sanitiser's allowlist next year. The cost of that choice is that a `data:` token in
+ * ordinary prose is charged as though it were an image, which is why an unidentified
+ * payload is charged what it COULD cost rather than refused outright: a short token
+ * costs a rounding error and a real payload cannot hide.
+ *
+ * `imagePixels` is exact for the four formats whose headers can be read and
+ * MAX_PIXELS_PER_PAYLOAD_BYTE per character for everything else, which is the
+ * fail-closed half. `unreadableImages` counts the second kind so a refusal can say
+ * which it was: "this is bigger than the cap" and "this might be, and nothing here
+ * can tell" are different sentences.
  */
 export function renderInputCost(html: string): RenderInputCost {
   const encoder = new TextEncoder();
   let imageBytes = 0;
   let imagePixels = 0;
   let images = 0;
-  for (const match of html.matchAll(EMBEDDED_IMAGE)) {
-    const uri = match[0];
+  let unreadableImages = 0;
+  for (const match of html.matchAll(EMBEDDED_DATA_URI)) {
+    const payload = dataUriPayload(match[0]);
+    // Not a data: URI: no comma, so nothing fetches it and nothing decodes it. Its
+    // bytes stay charged to the markup half, where they already were.
+    if (payload === null) continue;
     images += 1;
-    imageBytes += uri.length - (uri.indexOf(",") + 1);
-    const size = imageDataUriSize(uri);
-    if (size !== null) imagePixels += size.width * size.height;
+    imageBytes += payload.text.length;
+    const size = imageDataUriSize(match[0]);
+    if (size === null) {
+      unreadableImages += 1;
+      imagePixels += payload.text.length * MAX_PIXELS_PER_PAYLOAD_BYTE;
+    } else {
+      imagePixels += size.width * size.height;
+    }
   }
-  // The payloads are base64 and therefore one byte per character, so subtracting
+  // A payload is written in ASCII whichever encoding it uses -- base64's alphabet and
+  // percent-encoding's escapes are both one byte per character -- so subtracting
   // characters from a UTF-8 byte count is exact rather than approximately right.
   const totalBytes = encoder.encode(html).length;
-  return { totalBytes, imageBytes, markupBytes: totalBytes - imageBytes, imagePixels, images };
+  return {
+    totalBytes, imageBytes, markupBytes: totalBytes - imageBytes,
+    imagePixels, images, unreadableImages,
+  };
 }
 
 /**

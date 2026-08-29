@@ -131,6 +131,14 @@ const DEFAULT_MAX_IMAGE_BYTES = RENDER_IMAGE_CAP_BYTES;
  * bound lives in `logoDataUriProblem` and refuses this at the upload; this one is
  * what covers the template, and what covers a logo that was already stored before
  * the upload gate existed.
+ *
+ * **IT COVERS THE TEMPLATE ONLY BECAUSE `renderInputCost` MATCHES EVERY `data:` URI
+ * RATHER THAN FOUR SPELLINGS OF ONE, AND THE FIRST VERSION DID NOT.** A spec reviewer
+ * wrote `data:image/bmp;base64,` in front of the same PNG: charged zero pixels,
+ * counted as cheap markup, rendered at 534MB, past all three caps. Five more
+ * respellings did the same. That is why the scanner sniffs bytes now and why the
+ * fetcher above allowlists formats -- the two together are the bound, and neither is
+ * it alone.
  */
 const DEFAULT_MAX_IMAGE_PIXELS = RENDER_IMAGE_PIXEL_CAP;
 
@@ -295,6 +303,25 @@ const EXIT_BLOCKED_ATTACHMENT = 3;
  *    and it replaces the default outright. Covers images, stylesheets, fonts,
  *    `@import`, `url()`, SVG and `xlink:href`, on both versions.
  *
+ *    **AND, SINCE v1.0.1, ALLOWLISTING THE PAYLOAD'S FORMAT AS WELL AS THE SCHEME --
+ *    which is what makes the pixel bound sound rather than approximately sound.**
+ *    Pillow on this server opens forty formats, and it sniffs: a **334-byte
+ *    JPEG2000** decodes to 36 megapixels, which is **107,784 pixels per byte**.
+ *    `renderInputCost` charges an unidentifiable payload 8,256 pixels per byte -- the
+ *    most any DEFLATE-based format can reach -- so that one would have been charged
+ *    3.7M against a 16M cap and waved through. No per-byte arithmetic can bound a
+ *    wavelet codec, so the fix is not a bigger number: it is refusing to decode
+ *    anything that is not one of the four formats the pixel bound can actually read.
+ *    Sniffed here on the bytes, exactly as Pillow would, so there is no spelling of a
+ *    media type that changes the answer.
+ *
+ *    What this gives up is an embedded font or stylesheet in a document template.
+ *    Neither was ever a documented capability, the shipped template uses neither, and
+ *    a `data:` payload nothing can identify is precisely the case where what the
+ *    renderer would do with it is unknown. It also finishes the SVG exclusion the
+ *    spec asked for: `data:image/svg+xml` in a TEMPLATE was still drawn as vector art
+ *    until this, since only the logo upload checked signatures.
+ *
  * 2. `rel=attachment` refused outright, because control 1 does NOT reach attachments.
  *    Established by a CI run, not assumed: on 61.1 `Attachment.__init__` binds
  *    `url_fetcher=default_url_fetcher` as a DEFAULT ARGUMENT, so the one passed to
@@ -329,12 +356,34 @@ from weasyprint.urls import default_url_fetcher
 blocked_urls = []
 blocked_attachments = []
 
+IMAGE_SIGNATURES = (
+    b'\\x89PNG\\r\\n\\x1a\\n',
+    b'\\xff\\xd8\\xff',
+    b'GIF87a',
+    b'GIF89a',
+)
+
+
+def is_supported_image(data):
+    if not isinstance(data, bytes):
+        return False
+    if data.startswith(IMAGE_SIGNATURES):
+        return True
+    return data[:4] == b'RIFF' and data[8:12] == b'WEBP'
+
 
 def fetcher(url, timeout=10, ssl_context=None):
-    if url.startswith('data:'):
-        return default_url_fetcher(url, timeout, ssl_context)
-    blocked_urls.append(url[:120])
-    raise ValueError('conduit: blocked non-data URL')
+    if not url.startswith('data:'):
+        blocked_urls.append(url[:120])
+        raise ValueError('conduit: blocked non-data URL')
+    result = default_url_fetcher(url, timeout, ssl_context)
+    data = result.get('string')
+    if data is None:
+        data = result['file_obj'].read()
+    if not is_supported_image(data):
+        blocked_urls.append(url[:120])
+        raise ValueError('conduit: data: URI is not a PNG, JPEG, GIF or WEBP')
+    return {'string': data, 'mime_type': result.get('mime_type')}
 
 
 document = weasyprint.HTML(
@@ -508,10 +557,17 @@ export async function renderPdf(html: string, options: RenderOptions = {}): Prom
     );
   }
   if (cost.imagePixels > maxImagePixels) {
+    // The count of unidentified payloads is in the sentence because the two ways to
+    // reach this line need different fixes: a picture with too many pixels wants a
+    // smaller picture, and a payload nothing could identify wants removing. Without
+    // it, an embedded font reads as a mysteriously enormous image.
+    const unknown = cost.unreadableImages === 0 ? ""
+      : `; ${String(cost.unreadableImages)} of them could not be identified as a PNG, `
+        + "JPEG, GIF or WEBP and are charged what their bytes could decode to";
     throw new RenderError(
       "document is too large to render",
       `${String(cost.imagePixels)} pixels across ${String(cost.images)} inline image(s), `
-      + `limit ${String(maxImagePixels)}`,
+      + `limit ${String(maxImagePixels)}${unknown}`,
     );
   }
 

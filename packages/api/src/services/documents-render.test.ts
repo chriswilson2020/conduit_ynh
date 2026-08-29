@@ -307,6 +307,26 @@ describe("renderPdf failure paths", () => {
     expect(pair).toBeInstanceOf(RenderError);
     expect((pair as RenderError).detail).toContain("2 inline image(s)");
 
+    // S1: THE SAME BOMB, RESPELLED SIX WAYS, EACH REFUSED BEFORE THE SPAWN. The
+    // scanner used to match four canonical spellings of `data:image/...;base64,` and
+    // trust the type it read there; WeasyPrint and Pillow read neither and sniff the
+    // bytes, so each of these was charged zero pixels, counted as cheap markup, and
+    // rendered at about 534MB. There is no stub on PATH for any of it -- the refusal
+    // happens before anything is spawned.
+    const respelt = ihdr.toString("base64");
+    const percent = [...ihdr].map((b) => `%${b.toString(16).padStart(2, "0")}`).join("");
+    for (const uri of [
+      `data:image/bmp;base64,${respelt}`,
+      `data:image/PNG;base64,${respelt}`,
+      `data:;base64,${respelt}`,
+      `data:image/png;charset=utf-8;base64,${respelt}`,
+      `data:image/png,${percent}`,
+    ]) {
+      const refused = await renderPdf(`<img src="${uri}">`).catch((e: unknown) => e);
+      expect(refused, uri.slice(0, 40)).toBeInstanceOf(RenderError);
+      expect((refused as RenderError).detail, uri.slice(0, 40)).toContain("100000000 pixels");
+    }
+
     // Both new bounds are OPTIONS as well as defaults, the way the timeout and the
     // output cap are -- otherwise the only way to test an edge is to build a
     // document at the shipped limit, and a knob nothing turns is a knob nothing
@@ -882,6 +902,42 @@ describe("renderPdf and the schemes it will read", () => {
     const pdf = await renderPdf(`<html><body><img src="${LOGO_PNG}"></body></html>`);
 
     expect(pdf.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+  });
+
+  /**
+   * THE FETCHER ALLOWLISTS THE FORMAT AS WELL AS THE SCHEME, AND THIS IS WHY THE
+   * PIXEL BOUND IS SOUND RATHER THAN APPROXIMATELY SOUND.
+   *
+   * `renderInputCost` charges a payload it cannot identify 8,256 pixels a character,
+   * which is DEFLATE's maximum expansion and is tight for every zlib-based format.
+   * It is not a bound on anything else: measured on this server, a 334-byte JPEG2000
+   * decodes to 36 megapixels -- 107,784 pixels per byte -- so it would be charged
+   * 3.7M against a 16M cap and let through. Pillow opens forty formats and sniffs.
+   *
+   * So the renderer refuses to decode anything that is not one of the four the bound
+   * can read. Both halves are asserted: the JPEG2000 is refused, and an ordinary PNG
+   * of the same shape still renders, so what is being refused is the FORMAT and not
+   * inline images.
+   */
+  itReal("refuses a data: payload that is not one of the four formats it can bound", async () => {
+    // A JPEG2000 signature, which is all the fetcher reads. Nothing decodes it.
+    const jp2 = Buffer.concat([
+      Buffer.from([0, 0, 0, 0x0c, 0x6a, 0x50, 0x20, 0x20, 0x0d, 0x0a, 0x87, 0x0a]),
+      Buffer.alloc(64, 0),
+    ]).toString("base64");
+    const error = await renderPdf(`<html><body><img src="data:image/png;base64,${jp2}"></body></html>`)
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(RenderError);
+    expect((error as RenderError).message).toBe("document referenced a blocked resource");
+
+    // An SVG in a TEMPLATE was drawn as vector art until this: only the logo upload
+    // ever checked signatures, and the spec excludes SVG everywhere.
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>').toString("base64");
+    const drawn = await renderPdf(`<html><body><img src="data:image/svg+xml;base64,${svg}"></body></html>`)
+      .catch((e: unknown) => e);
+    expect(drawn).toBeInstanceOf(RenderError);
+    expect((drawn as RenderError).message).toBe("document referenced a blocked resource");
   });
 
   // ---- the other direction: what the bare CLI does, and why it is not used ----

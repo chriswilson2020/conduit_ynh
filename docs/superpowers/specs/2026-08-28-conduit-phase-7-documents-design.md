@@ -244,6 +244,19 @@ failed render weeks later when someone raises a quote.
 > stored before the gate existed. The numbers in the paragraph above are also stale as
 > measurements: re-run by the same method, 128KB of dense table rows is **11.2s and
 > 345MB**, not 5.2s and 157MB.
+>
+> **AND THE PIXEL BOUND NEEDED THE RENDERER'S HELP, WHICH THE SPEC REVIEW FOUND.** The
+> first version of it recognised `data:image/(png|jpeg|gif|webp);base64,` and trusted
+> the media type written there. WeasyPrint and Pillow trust neither — they sniff the
+> bytes — so `data:image/bmp;base64,` in front of the same PNG, or capitals, or an
+> empty type, or percent-encoding instead of base64, each charged **zero** pixels and
+> rendered the 100-megapixel bomb at 534MB. The scanner now matches every `data:` URI
+> and sniffs, and it cannot be a complete answer on its own: a **334-byte JPEG2000
+> decodes to 36 megapixels**, so no per-byte charge can bound what an unidentifiable
+> payload costs. The renderer's `url_fetcher` therefore allowlists the FORMAT as well
+> as the scheme, refusing to decode anything that is not one of the four the bound can
+> read — which also finishes this document's SVG exclusion, since an SVG embedded in a
+> template was still being drawn as vector art until it existed.
 
 ## The work, surface by surface
 

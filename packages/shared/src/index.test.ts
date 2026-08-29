@@ -72,6 +72,7 @@ import {
   meetingAtLeastOneLink,
   imageDataUriSize,
   renderInputCost,
+  MAX_PIXELS_PER_PAYLOAD_BYTE,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -1872,6 +1873,15 @@ describe("imageDataUriSize", () => {
  * the first character outside the alphabet, which is what the second test below is
  * about.
  */
+/** A PNG signature and IHDR of the given size, base64, with no pixels behind it. */
+function pngHeader(width: number, height: number): string {
+  return Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52,
+    (width >>> 24) & 0xff, (width >>> 16) & 0xff, (width >>> 8) & 0xff, width & 0xff,
+    (height >>> 24) & 0xff, (height >>> 16) & 0xff, (height >>> 8) & 0xff, height & 0xff,
+  ]).toString("base64");
+}
+
 describe("renderInputCost", () => {
   it("charges a data: payload to the image half and everything else to the markup half", () => {
     const html = `<img src="data:image/png;base64,${"A".repeat(400)}"><p>hello</p>`;
@@ -1894,18 +1904,84 @@ describe("renderInputCost", () => {
     expect(cost.markupBytes).toBe(html.length - 4);
   });
 
-  it("sums the pixels of every image and ignores the ones it cannot read", () => {
-    const ihdr = (w: number, h: number): string => Buffer.from([
-      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52,
-      (w >>> 24) & 0xff, (w >>> 16) & 0xff, (w >>> 8) & 0xff, w & 0xff,
-      (h >>> 24) & 0xff, (h >>> 16) & 0xff, (h >>> 8) & 0xff, h & 0xff,
-    ]).toString("base64");
-    const html = `<img src="data:image/png;base64,${ihdr(2000, 1400)}">`
-      + `<img src="data:image/png;base64,${ihdr(1000, 1000)}">`
+  it("sums the pixels of every image, and charges the ones it cannot read the most they could be", () => {
+    const html = `<img src="data:image/png;base64,${pngHeader(2000, 1400)}">`
+      + `<img src="data:image/png;base64,${pngHeader(1000, 1000)}">`
       + `<img src="data:image/gif;base64,AAAA">`;
     const cost = renderInputCost(html);
     expect(cost.images).toBe(3);
-    expect(cost.imagePixels).toBe(2000 * 1400 + 1_000_000);
+    expect(cost.unreadableImages).toBe(1);
+    // The third is four characters that are not a GIF, so it is charged four
+    // characters' worth of the worst case rather than nothing. CHARGED, not
+    // refused: a `data:` token in somebody's notes must not fail their quote.
+    expect(cost.imagePixels)
+      .toBe(2000 * 1400 + 1_000_000 + 4 * MAX_PIXELS_PER_PAYLOAD_BYTE);
+  });
+
+  /**
+   * S1: THE SPEC REVIEW'S BYPASS TABLE, AS A TEST PER ROW.
+   *
+   * The scanner used to match `data:image/(png|jpeg|gif|webp);base64,` and read the
+   * DECLARED type. WeasyPrint and Pillow read neither -- they sniff the bytes -- so
+   * every spelling below carried the same 100-megapixel PNG, was charged zero
+   * pixels and zero image bytes, had its whole payload counted as cheap markup, and
+   * rendered at about 534MB while passing all three caps. The worst case that still
+   * passed was 658.5MB against a 1150M declaration.
+   *
+   * Each row is charged the real 100,000,000 now. The control at the bottom is the
+   * one thing that must NOT change: a canonical logo is still measured exactly.
+   */
+  it("cannot be walked past by respelling the mime type or the encoding", () => {
+    const png = pngHeader(10_000, 10_000);
+    const raw = Buffer.from(png, "base64");
+    const percent = [...raw].map((b) => `%${b.toString(16).padStart(2, "0")}`).join("");
+
+    const bypasses = {
+      "a mime that is not in the old list": `data:image/bmp;base64,${png}`,
+      "the same mime in capitals": `data:image/PNG;base64,${png}`,
+      "no mime at all": `data:;base64,${png}`,
+      "an extra parameter before the encoding": `data:image/png;charset=utf-8;base64,${png}`,
+      "percent-encoding instead of base64": `data:image/png,${percent}`,
+      "no mime and percent-encoding": `data:,${percent}`,
+    };
+    for (const [why, uri] of Object.entries(bypasses)) {
+      const cost = renderInputCost(`<img src="${uri}">`);
+      expect(cost.imagePixels, why).toBe(100_000_000);
+      expect(cost.unreadableImages, why).toBe(0);
+      expect(cost.imageBytes, why).toBeGreaterThan(0);
+    }
+
+    // In a CSS url() as well as an attribute: the scan reads bytes, not positions.
+    expect(renderInputCost(`<div style="background:url(data:image/bmp;base64,${png})">`).imagePixels)
+      .toBe(100_000_000);
+
+    // THE CONTROL. The canonical spelling was always measured and still is.
+    expect(renderInputCost(`<img src="data:image/png;base64,${png}">`).imagePixels)
+      .toBe(100_000_000);
+  });
+
+  it("leaves a data: token in ordinary prose too cheap to matter", () => {
+    // The other half of charging rather than refusing. Notes and terms are escaped
+    // user text that lands in the merged document, and somebody writing about a data
+    // URI must not have their quote refused. Whitespace ends the run, so prose can
+    // only ever produce a token.
+    const notes = "<p>The logo is inlined as a data:image/png;base64, string "
+      + "rather than a file, per data:,ok in the spec.</p>";
+    const cost = renderInputCost(notes);
+    expect(cost.unreadableImages).toBe(2);
+    expect(cost.imagePixels).toBeLessThan(200_000);
+    expect(cost.imagePixels).toBeLessThan(16_000_000);
+  });
+
+  it("charges a payload it cannot identify by its length, so a real one cannot hide", () => {
+    // A 2KB font, stylesheet or unsupported image format in a template: not
+    // identifiable, so charged 8,256 pixels a character and refused by the pixel
+    // cap. 1,938 characters is where that crosses 16,000,000.
+    const font = `<style>@font-face{src:url(data:font/woff2;base64,${"A".repeat(2000)})}</style>`;
+    const cost = renderInputCost(font);
+    expect(cost.unreadableImages).toBe(1);
+    expect(cost.imagePixels).toBe(2000 * MAX_PIXELS_PER_PAYLOAD_BYTE);
+    expect(cost.imagePixels).toBeGreaterThan(16_000_000);
   });
 
   it("counts UTF-8 bytes rather than characters for the markup half", () => {
