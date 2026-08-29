@@ -2540,13 +2540,29 @@ function wholeDataUri(html: string, uri: string, at: number | undefined): string
  * measured on the server, a **334-byte JPEG2000 decodes to 36 megapixels**, which is
  * 107,784 pixels per byte and thirteen times this figure. Pillow opens forty formats.
  *
- * So what stops an unidentifiable payload is documents-render.ts's fetcher, which
- * refuses to hand the renderer anything that is not a PNG, JPEG, GIF or WEBP by
- * signature -- and this charge exists so that the large ones are refused EARLY, in a
- * sentence about pixels, before a render slot and a document number are spent. A
- * payload of about 1,938 characters exhausts the cap on its own: far more than a
- * stray `data:` token in prose (whitespace ends the run), far less than a font
- * somebody embedded in a template.
+ * documents-render.ts's fetcher catches MOST of what this cannot bound, by refusing
+ * to hand the renderer anything whose signature is not a PNG, JPEG, GIF or WEBP --
+ * and this charge exists so the large ones are refused EARLY, in a sentence about
+ * pixels, before a render slot and a document number are spent. A payload of about
+ * 1,938 characters exhausts the cap on its own: far more than a stray `data:` token
+ * in prose (whitespace ends the run), far less than a font somebody embedded in a
+ * template.
+ *
+ * **BUT "THE FETCHER STOPS IT" IS NOT TRUE OF EVERY UNIDENTIFIABLE PAYLOAD, AND AN
+ * EARLIER VERSION OF THIS COMMENT SAID IT WAS.** The fetcher sniffs the same four
+ * signatures, so a payload that BEGINS `GIF89a` passes it and can still be
+ * unidentifiable HERE: a 37-byte GIF whose screen descriptor says 8000x8000 but which
+ * fails `gifSize`'s trailer check is charged 37 x 8,256 = 305,472 pixels, and Pillow
+ * opens it at 64 megapixels and renders it, measured at 302MB. The kernel bound is
+ * what holds there -- 302MB is 59% of RENDER_MEMORY_LIMIT_BYTES -- and it is the only
+ * thing that does. Three larger variants of the same trick, including a GIF that is
+ * simply missing its trailer, die on that bound instead.
+ *
+ * The fix is small and is NOT in this release: `gifSize` should fall back to the
+ * screen descriptor's dimensions rather than null on those paths, which would charge
+ * all four variants 64 to 169 megapixels and refuse every one of them. It is recorded
+ * here and in v1.0.1's release notes rather than done at the end of a release, and it
+ * is v1.0.2's first item.
  *
  * Charged per CHARACTER of the payload as written, which over-charges base64 by 4/3,
  * deliberately and in the safe direction.

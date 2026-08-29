@@ -308,21 +308,40 @@ const EXIT_OUT_OF_MEMORY = 4;
  * once. This is not a prediction. Whatever the document contains, the child cannot
  * allocate past this, because the kernel will not let it.
  *
- * MEASURED, on the server, through this module's own renderPdf, sampling /proc every
- * 25ms, with the limit in place:
+ * MEASURED, on the server (WeasyPrint 57.2), through this module's own renderPdf,
+ * sampling /proc every 5ms, with the limit in place AND THE SHIPPED CAPS IN PLACE --
+ * which is the configuration that matters and the one an earlier version of this
+ * table did not name:
  *
  *   document                                 RSS     VmData    outcome
  *   a plain quote                             59MB     54MB    renders
  *   a real 293KB 2000x1400 logo               79MB     74MB    renders
  *   87,357 bytes of minimal table rows       252MB    249MB    renders
  *   THE LEGITIMATE WORST CASE                340MB    335MB    renders
- *   the GIF frame-extent bomb (round 3)       80MB      --     refused, clean
- *   the whitespace bomb (round 3)            189MB      --     refused, clean
+ *   the GIF frame-extent bomb (round 3)        0MB      --     refused, no child
+ *   the whitespace bomb (round 3)              0MB      --     refused, no child
  *
- * 512MB is 1.53x the worst legitimate document measured, whose spread across runs is
- * about 7%. It is deliberately not tighter: CI renders on WeasyPrint 61.1 against
- * this server's 57.2, and a limit that fitted only one of them would be a limit that
- * fails a release.
+ * **THE LAST TWO ROWS READ 80MB AND 189MB UNTIL THE FINAL REVIEW, AND BOTH WERE
+ * MEASURING A CONFIGURATION THIS MODULE DOES NOT SHIP.** With the caps in place both
+ * documents are refused by `renderInputCost` before `acquireRenderSlot`, so no child
+ * is ever spawned and the peak is zero -- 7ms and 0ms, not half a second. The only
+ * way to reach the limit deliberately is to lift `maxImagePixels`, and there the GIF
+ * bomb dies on the kernel bound at 80MB on three consecutive runs here; a reviewer
+ * measured 217MB for their own build of the same shape. The figure is a property of
+ * the payload's LZW data rather than of this limit, so it is quoted as a range and
+ * neither number is the headline. What is invariant is the outcome: refused.
+ *
+ * 512MB is 1.53x the worst legitimate QUOTE-SHAPED document. That qualification is
+ * load-bearing and an earlier version of this sentence lacked it: a template's
+ * `<style>` passes through verbatim, so a page-explosion shape (`@page{size:6mm 6mm}`)
+ * at the markup cap is a different worst case -- here it reaches 279MB and then hits
+ * the 20s render timeout without finishing, and a reviewer's build rendered it to
+ * completion at 414MB. On CI's WeasyPrint 61.1 the same shapes run up to 32% higher
+ * again, which puts the tightest margin measured at about 1.20x. **Nothing legitimate
+ * is refused on either version**, which is the claim that matters, and
+ * documents-render.test.ts asserts the margin against the worst case rather than
+ * against this prose. It is deliberately not tighter for exactly this reason: a limit
+ * fitted to one shape on one version is a limit that fails a release.
  *
  * **RLIMIT_DATA RATHER THAN RLIMIT_AS, AND THE DIFFERENCE IS WHAT `ram.runtime` CAN
  * HONESTLY SAY.** Address space carries a 314MB floor here -- the interpreter, cairo,
