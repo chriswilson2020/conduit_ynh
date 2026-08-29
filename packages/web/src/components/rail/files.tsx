@@ -102,13 +102,19 @@ export function Files({ companyId, contactId, dealId, projectId }: FilesProps) {
               box one line of text tall, which is under half the platform
               minimum. BOTH AXES, because the width is content: 64.5px is what
               "fixture.txt" happens to measure, and a file called "a.pdf" would
-              be narrower than the floor on its own. inline-flex rather than
-              block so the target is the size of the name and not of the whole
-              row, matching the deal page's own download link.
+              be narrower than the floor on its own.
+
+              EVERY PART OF THE FIX IS SCOPED, INCLUDING THE DISPLAY. A height
+              floor does nothing to an inline box, so the element has to become
+              a flex one for the floor to bite -- but unscoped that changed the
+              DESKTOP hit-box too, from 16.5px to 20px, for no reason anybody
+              asked for. The first round left it unscoped and the guard pinned
+              the mistake. Below the breakpoint it is a 44px flex target; above
+              it, it is the inline link it always was.
             */}
             <a
               href={apiUrl(`/files/${file.id}/download`)}
-              className="inline-flex items-center font-medium text-slate-900 underline hover:text-slate-700 max-md:min-h-11 max-md:min-w-11"
+              className="font-medium text-slate-900 underline hover:text-slate-700 max-md:inline-flex max-md:min-h-11 max-md:min-w-11 max-md:items-center"
             >
               {file.originalName}
             </a>

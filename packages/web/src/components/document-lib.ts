@@ -168,6 +168,66 @@ export interface DraftQuote {
   readonly lines: readonly DraftLine[];
 }
 
+/**
+ * The four recipient fields a deal can fill in for you, as they arrive.
+ *
+ * A DEAL'S COMPANY AND CONTACT ARE SEPARATE QUERIES, and they resolve after the
+ * page does. See reseedRecipients for what that costs and why it is not
+ * cosmetic here.
+ */
+export interface RecipientDefaults {
+  readonly recipientName: string;
+  readonly recipientContactName: string;
+  readonly recipientSalutation: string;
+  readonly recipientAddress: string;
+}
+
+export const RECIPIENT_DEFAULT_FIELDS = [
+  "recipientName", "recipientContactName", "recipientSalutation", "recipientAddress",
+] as const;
+
+/**
+ * WHAT TO ADOPT WHEN A DEFAULT ARRIVES LATE, WITHOUT CLOBBERING AN EDIT.
+ *
+ * THE BUG THIS EXISTS FOR IS THE WORST KIND THIS FEATURE CAN HAVE, because the
+ * artifact is IMMUTABLE. The form seeds its draft from props at mount, and a
+ * deal's company and contact are their own queries: opening "New quote" before
+ * they resolve gave a recipient with a blank salutation and a blank contact
+ * name, while the page's own Contact row rendered the name a second later.
+ * Issue in that window and the quote is frozen wrong for ever -- it cannot be
+ * corrected, only re-raised under a new number. `recipientContactName` had this
+ * before v1.1.0; the salutation makes it one field wider.
+ *
+ * A GATE ON THE BUTTON WAS THE OTHER OPTION AND IS WORSE. "Disabled until the
+ * data is here" reads the same as "disabled" when a query FAILS, and a deal
+ * whose company 404s would lose the ability to raise a quote at all with
+ * nothing on screen to say why. Seeding late costs nothing when the data is
+ * already there and fixes the window when it is not.
+ *
+ * THE UNTOUCHED TEST IS `current === previous`, not `current === ""`. A field
+ * the user has cleared on purpose is not the same as one nothing has filled
+ * yet, and a blank-means-adopt rule would refill a recipient somebody had just
+ * emptied. Comparing against the LAST SEEDED default is what tells those apart.
+ *
+ * Returns only the fields to change, so an unchanged draft keeps its identity
+ * and the form does not re-render for nothing.
+ */
+export function reseedRecipients(
+  current: RecipientDefaults,
+  previous: RecipientDefaults,
+  incoming: RecipientDefaults,
+): Partial<RecipientDefaults> {
+  // Mutable inside, readonly to the caller: RecipientDefaults' fields carry
+  // `readonly`, which Partial<> preserves.
+  const over: { -readonly [K in keyof RecipientDefaults]?: RecipientDefaults[K] } = {};
+  for (const field of RECIPIENT_DEFAULT_FIELDS) {
+    if (incoming[field] === previous[field]) continue;
+    if (current[field] !== previous[field]) continue;
+    over[field] = incoming[field];
+  }
+  return over;
+}
+
 export interface ParsedLine {
   readonly qty: ParsedUnits;
   readonly unitPrice: ParsedUnits;

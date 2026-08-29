@@ -1,4 +1,4 @@
-import type { InputHTMLAttributes } from "react";
+import type { ComponentPropsWithRef } from "react";
 import { clsx } from "clsx";
 
 // THE 44px FLOOR IS SCOPED TO BELOW THE BREAKPOINT, NOT UNSCOPED. This element
@@ -6,7 +6,12 @@ import { clsx } from "clsx";
 // box -- an unscoped floor would grow that too, which this phase may not do.
 // Every other interactive primitive in this directory carries the floor in the
 // same shape, and ui/ui.test.ts holds them all to it.
-export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElement>) {
+// `ComponentPropsWithRef` rather than `InputHTMLAttributes` so a caller can hold
+// a ref to the element. React 19 passes `ref` as an ordinary prop, so the spread
+// below already delivers it; only the TYPE had to admit it. One caller needs it
+// -- components/contact-fields.tsx, which has to take focus back from a Radix
+// Select that restores it to the trigger after the box has mounted.
+export function Input({ className, ...props }: ComponentPropsWithRef<"input">) {
   return (
     <input
       className={clsx(

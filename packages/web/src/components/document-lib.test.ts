@@ -1,14 +1,16 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import { withoutComments } from "../test/source";
 import {
   DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_FIELD_CAPS, DOCUMENT_MAX_DESCRIPTION_CHARS,
   DOCUMENT_MAX_LINES, documentLineInputSchema, documentTotals, issueQuoteInputSchema,
 } from "@conduit/shared";
 import {
-  FIELD_LABELS, QTY_SPEC, TAX_RATE_SPEC, UNIT_PRICE_SPEC,
-  buildIssueQuoteInput, contentBudget, describeIssue, parseUnits, runningTotals, unitsOrZero,
+  FIELD_LABELS, QTY_SPEC, RECIPIENT_DEFAULT_FIELDS, TAX_RATE_SPEC, UNIT_PRICE_SPEC,
+  buildIssueQuoteInput, contentBudget, describeIssue, parseUnits, reseedRecipients,
+  runningTotals, unitsOrZero,
 } from "./document-lib";
-import type { DraftLine, DraftQuote } from "./document-lib";
+import type { DraftLine, DraftQuote, RecipientDefaults } from "./document-lib";
 
 function line(over: Partial<DraftLine> = {}): DraftLine {
   return { id: "l1", description: "Consultancy", qty: "1", unitPrice: "100", taxRate: "21", ...over };
@@ -294,6 +296,101 @@ describe("contentBudget", () => {
       // nothing and fails the exact delta below.
       const over = { ...empty, [field]: filler } as DraftQuote;
       expect(contentBudget(over).used - base, `${field} is not charged to the budget`).toBe(16);
+    }
+  });
+});
+
+/**
+ * O2: A DEFAULT THAT ARRIVES LATE MUST STILL ARRIVE, AND MUST NOT CLOBBER.
+ *
+ * A deal's company and contact are separate queries. Opening "New quote" before
+ * they resolve seeded a blank salutation and a blank contact name into a draft
+ * that is never re-seeded -- and an issued quote is IMMUTABLE, so a quick click
+ * could freeze a blank onto an artifact that can only be replaced under a new
+ * number, never corrected.
+ */
+describe("reseedRecipients", () => {
+  const defaults = (over: Partial<RecipientDefaults> = {}): RecipientDefaults => ({
+    recipientName: "", recipientContactName: "", recipientSalutation: "",
+    recipientAddress: "", ...over,
+  });
+
+  it("adopts a default that arrives after the form opened", () => {
+    const empty = defaults();
+    const arrived = defaults({
+      recipientName: "Acme Ltd", recipientContactName: "Alice Lovelace",
+      recipientSalutation: "Prof", recipientAddress: "1 Test Way",
+    });
+    expect(reseedRecipients(empty, empty, arrived)).toEqual({
+      recipientName: "Acme Ltd", recipientContactName: "Alice Lovelace",
+      recipientSalutation: "Prof", recipientAddress: "1 Test Way",
+    });
+  });
+
+  /**
+   * THE UNTOUCHED TEST IS `current === previous`, NOT `current === ""`, and the
+   * difference is the whole of the correctness here. A field somebody CLEARED
+   * on purpose looks exactly like one nothing has filled yet, and a
+   * blank-means-adopt rule would refill a recipient they had just emptied.
+   */
+  it("leaves an edited field alone, including one deliberately cleared", () => {
+    const previous = defaults({ recipientSalutation: "Dr", recipientName: "Old Ltd" });
+    const current = defaults({ recipientSalutation: "Mx", recipientName: "" });
+    const incoming = defaults({ recipientSalutation: "Prof", recipientName: "New Ltd" });
+    expect(reseedRecipients(current, previous, incoming)).toEqual({});
+  });
+
+  it("changes nothing when the defaults have not moved", () => {
+    const same = defaults({ recipientSalutation: "Prof" });
+    const edited = defaults({ recipientSalutation: "Prof", recipientName: "Typed Ltd" });
+    expect(reseedRecipients(edited, same, same)).toEqual({});
+  });
+
+  /**
+   * ONE FIELD AT A TIME. A contact resolving while the operator is mid-word in
+   * the Recipient box must fill the salutation and leave the box alone -- the
+   * two arrive from two different queries and land in one effect.
+   */
+  it("adopts only the fields that moved", () => {
+    const previous = defaults();
+    const current = defaults({ recipientName: "Half-typed Ltd" });
+    const incoming = defaults({ recipientSalutation: "Prof", recipientContactName: "Alice" });
+    expect(reseedRecipients(current, previous, incoming))
+      .toEqual({ recipientSalutation: "Prof", recipientContactName: "Alice" });
+  });
+
+  /**
+   * AND THE FORM ACTUALLY CALLS IT, WITH THE PREVIOUS DEFAULTS.
+   *
+   * The function above is pure and fully covered, and that is exactly why this
+   * exists: a mutation that passed `incoming` as BOTH arguments turned the
+   * whole re-seed into a no-op and left every test here green, because nothing
+   * asserted the wiring. A source guard is the only unit-level check available
+   * -- packages/web has no testing-library -- and it matches a spelling, so a
+   * rename on both sides would satisfy it.
+   */
+  it("is wired into the form with the defaults it last applied", () => {
+    const form = withoutComments(
+      readFileSync(new URL("./document-form.tsx", import.meta.url), "utf8"),
+    );
+    expect(form).toContain("const previous = seededDefaults.current;");
+    expect(form).toContain("seededDefaults.current = incoming;");
+    expect(form).toContain("reseedRecipients(current, previous, incoming)");
+    // The effect has to watch all four, or a late default never arrives.
+    for (const field of RECIPIENT_DEFAULT_FIELDS) {
+      const prop = `default${field.charAt(0).toUpperCase()}${field.slice(1)}`;
+      expect(form.split(prop).length, prop).toBeGreaterThanOrEqual(4);
+    }
+  });
+
+  /** Every field the form seeds is covered, derived rather than listed twice. */
+  it("covers every recipient field the form seeds", () => {
+    expect([...RECIPIENT_DEFAULT_FIELDS].sort())
+      .toEqual(["recipientAddress", "recipientContactName", "recipientName", "recipientSalutation"]);
+    const empty = defaults();
+    for (const field of RECIPIENT_DEFAULT_FIELDS) {
+      const incoming = { ...empty, [field]: "late" } as RecipientDefaults;
+      expect(reseedRecipients(empty, empty, incoming), field).toEqual({ [field]: "late" });
     }
   });
 });

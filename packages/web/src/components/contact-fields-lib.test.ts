@@ -153,6 +153,41 @@ describe("a typed value, unchanged", () => {
   });
 });
 
+/**
+ * O5's RULING, PINNED: an empty-looking box is an empty box.
+ *
+ * A whitespace-only salutation clears `.min(1)`, so before this it STORED --
+ * and then read back into a box that looked empty and reached the contacts list
+ * as a leading run of spaces before the name, with nothing on screen to say
+ * why. "Store exactly what was typed" and "what you see is what is stored" are
+ * both promises this feature makes, and this is the one input where they
+ * disagreed. Emptiness is a question about the BOX.
+ */
+describe("a box holding only whitespace", () => {
+  it("clears the field, while a value with spaces around it keeps them", () => {
+    for (const blank of ["", " ", "   ", "\t", "\n", " \t "]) {
+      expect(typedValue(blank), JSON.stringify(blank)).toBeNull();
+    }
+    // Not a trim: a value with content keeps every space it was given.
+    expect(typedValue("  Prof  ")).toBe("  Prof  ");
+    expect(typedValue(" Dr")).toBe(" Dr");
+    expect(typedValue("Dr ")).toBe("Dr ");
+  });
+
+  /**
+   * AND FORMAT CHARACTERS ARE DELIBERATELY NOT POLICED. A stored U+200F can
+   * reorder the visible row and `trim` does not remove it -- but the same class
+   * holds U+200C, which is load-bearing in Persian and Indic names, and
+   * refusing it would break exactly the people whose titles this field exists
+   * to record. Recorded as a test so the decision is not re-litigated by
+   * accident.
+   */
+  it("stores a format character rather than guessing what it was for", () => {
+    expect(typedValue("\u200cDhr")).toBe("\u200cDhr");
+    expect(typedValue("\u200f")).toBe("\u200f");
+  });
+});
+
 describe("the contact list's name cell", () => {
   it("puts the salutation beside the name and nothing where there is none", () => {
     expect(nameWithSalutation({ salutation: "Dr", firstName: "Ada", lastName: "Lovelace" }))
@@ -264,6 +299,39 @@ describe("the pickers and the list, as written", () => {
     for (const preset of PRONOUN_PRESETS) {
       expect(lib.split(`"${preset}"`)).toHaveLength(2);
     }
+  });
+
+  /**
+   * THE FOCUS FIX, GUARDED IN THE UNIT SUITE AS A SPELLING.
+   *
+   * The rule itself is a browser fact and only e2e/crm.spec.ts can prove it --
+   * a Radix Select restores focus to its trigger AFTER the chosen option has
+   * rendered, so `autoFocus` on the revealed box was overwritten every time and
+   * the operator's typing became typeahead against the preset list. This is the
+   * cheap half: it fails the moment either piece of the remedy is deleted,
+   * without waiting for an e2e run.
+   *
+   * What it cannot see: a remedy that is present but broken -- an
+   * `onCloseAutoFocus` that forgets `preventDefault()`, or a ref pointed at the
+   * wrong element. The e2e assertion is what covers that.
+   */
+  it("takes focus back from the Select rather than relying on autoFocus", () => {
+    expect(picker).toContain("onCloseAutoFocus={takeFocusFromTheMenu}");
+    expect(picker).toContain("ref={otherRef}");
+    // autoFocus is what did not work; its return would be the regression.
+    expect(picker).not.toContain("autoFocus");
+
+    // SCOPED TO THE HANDLER, not the file. The first version of this assertion
+    // looked for `preventDefault` anywhere in the source and was satisfied by
+    // the Enter branch of handleKeyDown -- so deleting it from HERE, which is
+    // the half that declines Radix's restore and is the whole fix, left the
+    // suite green. Found by mutation.
+    const handler = picker.slice(
+      picker.indexOf("function takeFocusFromTheMenu"),
+      picker.indexOf("function commitTyped"),
+    );
+    expect(handler).toContain("event.preventDefault()");
+    expect(handler).toContain("otherRef.current?.focus()");
   });
 
   /**

@@ -53,14 +53,34 @@ export function SelectTrigger({
 export function SelectContent({
   children,
   position,
+  onCloseAutoFocus,
 }: {
   children: ReactNode;
   position?: "item-aligned" | "popper";
+  /**
+   * Radix's own, forwarded for the one caller that must survive it.
+   *
+   * A Select RESTORES FOCUS TO ITS TRIGGER when the menu closes, and it does so
+   * AFTER whatever the chosen value re-rendered has mounted -- so a field that
+   * reveals an input on one of its options cannot focus that input from
+   * `autoFocus` or from an effect: both run first and are overwritten. Measured
+   * on components/contact-fields.tsx, where the consequence was not cosmetic.
+   * Focus on a Radix trigger makes letter keys TYPEAHEAD, so an operator typing
+   * "Drs" into a box they believed was focused selected the preset "Dr" on the
+   * first keystroke, saved it, and had the box taken away mid-word.
+   *
+   * This hook is the documented way out: preventDefault() declines the restore
+   * and the caller puts focus where it belongs. Every other caller leaves it
+   * undefined and keeps Radix's behaviour, which is the right one for a plain
+   * field.
+   */
+  onCloseAutoFocus?: (event: Event) => void;
 }) {
   return (
     <RadixSelect.Portal>
       <RadixSelect.Content
         position={position}
+        onCloseAutoFocus={onCloseAutoFocus}
         sideOffset={position === "popper" ? 4 : undefined}
         className="overflow-hidden rounded-md border border-slate-200 bg-white shadow-md"
       >

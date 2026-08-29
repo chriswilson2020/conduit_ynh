@@ -8,9 +8,9 @@ import { ApiError } from "../api";
 import { todayLocalIso } from "../lib";
 import { useIssueQuote } from "../queries";
 import {
-  buildIssueQuoteInput, contentBudget, parseDraftLine, runningTotals,
+  buildIssueQuoteInput, contentBudget, parseDraftLine, reseedRecipients, runningTotals,
 } from "./document-lib";
-import type { DraftLine, DraftQuote, ParsedUnits } from "./document-lib";
+import type { DraftLine, DraftQuote, ParsedUnits, RecipientDefaults } from "./document-lib";
 import { Button } from "./ui/button";
 import { DialogTitle } from "./ui/dialog";
 import { Input } from "./ui/input";
@@ -294,6 +294,44 @@ export function DocumentForm({
     terms: "",
     lines: [blankLine()],
   }));
+  /**
+   * THE DEFAULTS ARRIVE LATE, AND THIS ADOPTS THEM WITHOUT CLOBBERING AN EDIT.
+   *
+   * The draft above is seeded once, at mount. A deal's company and contact are
+   * separate queries, so opening this form before they resolve gave a blank
+   * salutation and a blank "for the attention of" -- and an issued quote is
+   * IMMUTABLE, so a quick click could freeze a blank onto an artifact that can
+   * only be replaced under a new number, never corrected. See reseedRecipients
+   * for the whole argument, including why gating the button was rejected.
+   *
+   * The ref holds the defaults this form has already applied, so "the user has
+   * not touched it" is `current === previously seeded` rather than
+   * `current === ""` -- a field somebody cleared on purpose stays cleared.
+   */
+  const seededDefaults = useRef<RecipientDefaults>({
+    recipientName: defaultRecipientName,
+    recipientContactName: defaultRecipientContactName,
+    recipientSalutation: defaultRecipientSalutation,
+    recipientAddress: defaultRecipientAddress,
+  });
+  useEffect(() => {
+    const incoming: RecipientDefaults = {
+      recipientName: defaultRecipientName,
+      recipientContactName: defaultRecipientContactName,
+      recipientSalutation: defaultRecipientSalutation,
+      recipientAddress: defaultRecipientAddress,
+    };
+    const previous = seededDefaults.current;
+    seededDefaults.current = incoming;
+    setDraft((current) => {
+      const over = reseedRecipients(current, previous, incoming);
+      return Object.keys(over).length === 0 ? current : { ...current, ...over };
+    });
+  }, [
+    defaultRecipientName, defaultRecipientContactName,
+    defaultRecipientSalutation, defaultRecipientAddress,
+  ]);
+
   const [problems, setProblems] = useState<readonly string[]>([]);
   const issueQuote = useIssueQuote();
   const problemsRef = useRef<HTMLDivElement | null>(null);

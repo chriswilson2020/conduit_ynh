@@ -90,6 +90,53 @@ test.describe.serial("CRM journey", () => {
     await expect(page).toHaveURL(`/contacts/${contactId}`);
   });
 
+  /**
+   * THE "Other..." BOX TAKES THE CARET, AND THE TYPING GOES INTO IT.
+   *
+   * A FOCUS QUESTION ONLY PLAYWRIGHT CAN ANSWER, which is why this lives here
+   * rather than beside the picker's unit tests: packages/web has no
+   * testing-library, and the browser pane cannot settle focus events at all
+   * (Phase 6 recorded that -- `document.hasFocus()` is false in it and Blink
+   * defers focus events for an unfocused page).
+   *
+   * WHAT IT CAUGHT, so nobody deletes it as a tautology. A Radix Select
+   * restores focus to its TRIGGER when the menu closes, and it does so after
+   * the chosen option has re-rendered -- so the box mounted, took focus from
+   * `autoFocus`, and lost it again before anyone could type. Focus on a Radix
+   * trigger makes letter keys typeahead, so typing `Drs` into a box that looked
+   * ready selected the preset `Dr` on the FIRST keystroke, saved it, and
+   * unmounted the box mid-word. `p` saved `Prof`. The unit suite could not see
+   * any of it: the keystrokes never reached the functions under test.
+   *
+   * Hence both halves. `toBeFocused` is the mechanism; typing through
+   * `page.keyboard` -- which goes wherever the DOCUMENT has focus, not to a
+   * locator -- is the consequence, and it fails the same way a user does.
+   */
+  test("puts the caret in the Other... box, so a typed title is not eaten by typeahead", async () => {
+    await page.goto(`/contacts/${contactId}`);
+    await page.getByTestId("salutation").click();
+    await page.getByRole("option", { name: "Other..." }).click();
+
+    const box = page.getByTestId("salutation-other");
+    await expect(box).toBeFocused();
+
+    // Deliberately NOT box.fill(): that would focus the box itself and prove
+    // nothing. This is the keyboard, aimed at whatever really has focus.
+    await page.keyboard.type("Drs");
+    await expect(box).toHaveValue("Drs");
+    // Still open, and nothing saved yet -- the first keystroke used to commit.
+    await expect(page.getByTestId("salutation")).toHaveText(/Other/);
+
+    await page.keyboard.press("Enter");
+    await page.reload();
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Drs");
+
+    // And the list carries it beside the name, which is the other half of the
+    // round trip.
+    await page.goto("/contacts");
+    await expect(page.getByRole("cell", { name: `Drs ${contactName}` })).toBeVisible();
+  });
+
   test("adds a note to the contact", async () => {
     await page.goto(`/contacts/${contactId}`);
     await page.getByRole("tab", { name: "Notes" }).click();

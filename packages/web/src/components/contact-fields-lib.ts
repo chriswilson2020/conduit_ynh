@@ -102,16 +102,34 @@ export function chooseOption(option: string): OptionChoice {
  * NO TRIM, no case fix, no normalisation of any kind, and that is the whole
  * point of the "Other..." path rather than an omission: a picker that quietly
  * rewrites what somebody typed is no better than the picker that would not let
- * them type it. "Dhr", "Senor", "she/they" and "hij/hem" store as themselves.
+ * them type it. "Dhr", "Senor", "she/they", "hij/hem" and "  Prof  " with its
+ * spaces all store as themselves.
  *
- * THE EMPTY STRING BECOMES null, NEVER "". `cappedNullableString` in
+ * AN EMPTY BOX BECOMES null, NEVER "". `cappedNullableString` in
  * @conduit/shared carries `.min(1)`, so "" is a 400 and the field could not be
  * cleared at all if this sent it; null is the shape the column and the API both
  * mean by "no value", and services/contacts.test.ts already names this function
  * as the reason it tests null.
+ *
+ * A BOX HOLDING ONLY SPACES IS AN EMPTY BOX, and that is a deliberate ruling
+ * rather than a stray trim. It is the one place where "store exactly what was
+ * typed" and "what you see is what is stored" disagree: a whitespace-only
+ * salutation clears `.min(1)`, so it STORED, read back into a box that looked
+ * empty, and reached the contacts list as a leading run of spaces before the
+ * name. The operator has no way to tell that field from a cleared one, and no
+ * way to discover why the list is ragged. Emptiness is a question about the
+ * box, not about the value -- so an all-whitespace box clears the field, and
+ * every box with any content in it is stored byte for byte, spaces included.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO is police format characters. A stored
+ * U+200F can reorder the visible row and `trim` does not remove it, but the
+ * same class holds U+200C, which is load-bearing in Persian and Indic names --
+ * and refusing it would break exactly the people whose titles this field exists
+ * to record. A guess about which invisible characters somebody meant is the
+ * inference this feature is built to avoid.
  */
 export function typedValue(text: string): string | null {
-  return text === "" ? null : text;
+  return text.trim() === "" ? null : text;
 }
 
 /**

@@ -78,14 +78,22 @@ describe("the 44px floor on the two controls Phase 6 left under it", () => {
    *
    * BOTH AXES, because the width is content: 64.5px is what one nine-character
    * filename happens to measure and a shorter name would be under the floor on
-   * its own. The `inline-flex` is load-bearing rather than decorative -- an
-   * inline box ignores a height floor entirely -- so it is asserted too.
+   * its own.
+   *
+   * AND THE DISPLAY IS SCOPED TOO, which the first version of this test got
+   * wrong: it asserted a bare `inline-flex`, and so it PINNED a desktop
+   * regression rather than catching one -- the unscoped display took the
+   * desktop hit-box from 16.5px to 20px. The floor is load-bearing only
+   * together with the display (an inline box ignores a height floor entirely),
+   * so both are asserted, and both are asserted to carry the variant.
    */
   it("floors the rail's download link on both axes, below the breakpoint only", () => {
     const classes = classesBetween(read("./rail/files.tsx"), "/download`)}", "{file.originalName}");
-    expect(classes).toContain("inline-flex");
+    expect(classes).toContain("max-md:inline-flex");
+    expect(classes).toContain("max-md:items-center");
     expect(classes).toContain("max-md:min-h-11");
     expect(classes).toContain("max-md:min-w-11");
+    expect(classes).not.toContain("inline-flex");
     expect(classes).not.toContain("min-h-11");
     expect(classes).not.toContain("min-w-11");
   });

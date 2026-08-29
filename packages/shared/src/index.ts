@@ -1694,11 +1694,24 @@ const UNSTORABLE_TEXT = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\
  * these fields to keep in step with that function's FIELD_LABELS. This release had
  * just finished removing one such pair elsewhere in this file.
  *
+ * AND THE ASYMMETRY IS WEAKER THAN THAT, WHICH ARGUES THE SAME WAY. The length
+ * message is not merely invisible from the quote form -- it is UNREACHABLE from
+ * either form, because every capped control carries its cap as the input's own
+ * `maxLength`, on the quote side and on the contact side alike (DOCUMENT_FIELD_CAPS
+ * and CONTACT_FIELD_CAPS are exported so the forms derive them rather than restate
+ * them). So the claim that an operator reads the schema's words on the contact page
+ * is not demonstrable for a length either; what is demonstrable is that the contact
+ * page has no rewriting layer at all, so whatever DOES reach it arrives verbatim.
+ * Fewer messages, not more.
+ *
  * So: all seven of issueQuoteInputSchema's fields keep Zod's own English, and the
  * naming is `describeIssue`'s job alone -- held there by a test that walks this
  * schema's shape, so the layer that does the naming cannot silently gain a hole. The
- * residual reader is a direct API caller, who gets "Too big: expected string to have
- * <=64 characters" with a `path` of ["recipientSalutation"] beside it in the issue.
+ * residual reader is a direct API caller. `parseOrReject` sends `{error, message}`
+ * and NOTHING ELSE -- the issue's `path` never leaves the process -- so what that
+ * caller gets is "Too big: expected string to have <=64 characters" with no field
+ * named anywhere in the response. An earlier version of this paragraph said the path
+ * travelled beside it; that was true of the Zod issue and false of the HTTP body.
  */
 function documentText(max: number, min = 0) {
   return z.string().min(min).max(max).refine((value) => !UNSTORABLE_TEXT.test(value), {

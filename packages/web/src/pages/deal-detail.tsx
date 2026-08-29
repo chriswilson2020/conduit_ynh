@@ -283,7 +283,21 @@ export function DealDetailPage() {
 
         <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
           <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Expected close</span>
-          <div data-testid="field-expectedCloseDate" className="flex-1">
+          {/*
+            `min-w-0` BECAUSE A DATE INPUT WILL NOT SHRINK. A flex item defaults
+            to `min-width: auto`, which floors it at its content's min-content
+            width -- and Chromium's date control has an intrinsic one it will
+            not go below, so at 320px this wrapper ran 185 to 326 against a
+            320px box: 6px over, on the only page in the app that overflowed at
+            that width. It used to be swipe-reachable because <main> scrolled
+            sideways; components/shell.tsx now clips below the breakpoint so the
+            board's stage picker can stick, which turns a swipe into a cut.
+            `min-w-0` lets the item shrink and the input's own `max-w-xs` still
+            caps it at a desk. The phone standard is anchored at 390 and this
+            was never a violation of it -- it is the regression the clip would
+            otherwise have introduced.
+          */}
+          <div data-testid="field-expectedCloseDate" className="min-w-0 flex-1">
             <input
               type="date"
               value={deal.expectedCloseDate ?? ""}
