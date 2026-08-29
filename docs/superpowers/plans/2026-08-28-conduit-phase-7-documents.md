@@ -2173,6 +2173,38 @@ raised.
 
 ---
 
+## The intermittent unit failure — a name, and a mechanism
+
+Three sightings across two phases, all previously unnamed: Phase 6 Task 6 (two
+consecutive runs, `1 failed | 1828 passed`), Phase 7 Task 1, and now Phase 7 Task 3,
+which finally caught one — **`mail-sync.test.ts`, a backoff case**, passing alone and on
+re-run with CI green throughout.
+
+**Hypothesis, from reading the code rather than another run.** `waitFor`
+(`packages/api/src/services/mail-sync.test.ts:453`) polls its predicate every 5ms against
+a **10-second wall-clock deadline** and throws `timed out waiting for <label>`. That
+shape fails under CPU starvation while the code under test is entirely correct, and it
+fails with a label rather than an assertion — which is exactly why the earlier sightings
+produced no useful name to capture. There are twenty-odd `waitFor` call sites in that
+file, so the specific case that loses the race varies with which one is unlucky, and no
+two sightings need name the same test.
+
+**Why the earlier experiment came back clean.** The ten-run contended/quiet experiment
+recorded in the Phase 6 plan loaded **Postgres** — a dev server plus a request loop
+against three endpoints. That is I/O contention. This mechanism needs the vitest process
+itself starved of CPU: a concurrent `npm run build`, a second suite, or another agent's
+work on the same box. Every sighting so far has been during exactly that.
+
+**How to confirm cheaply**, for whichever task next has the server to itself: run the
+suite with the CPU saturated (N+2 busy loops) rather than the database busy, and see
+whether a `timed out waiting for` failure appears. A clean negative under CPU load would
+falsify this and is worth as much as a reproduction.
+
+**Do not "fix" it by raising the timeout** without confirming the mechanism first. If the
+hypothesis is right the honest fix is to make those waits deterministic — the file
+already has a `ManualClock`, and a deadline measured in wall-clock time inside a test
+that controls its own clock is the actual defect.
+
 ## Self-review against the spec
 
 | Spec requirement | Task |
