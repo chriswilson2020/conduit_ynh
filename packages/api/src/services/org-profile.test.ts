@@ -1,6 +1,9 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
-import { MAX_LOGO_BYTES, MAX_LOGO_DATA_URI_CHARS, type OrgProfileInput } from "@conduit/shared";
+import {
+  MAX_LOGO_BYTES, MAX_LOGO_DATA_URI_CHARS, ORG_PROFILE_RESERVE_BYTES, orgProfileBytes,
+  type OrgProfileInput,
+} from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { orgProfile } from "../db/schema.js";
 import { getOrgProfile, OrgProfileInputError, saveOrgProfile } from "./org-profile.js";
@@ -133,6 +136,37 @@ describe("the logo, which is bytes rather than a file reference", () => {
       expect((await saveOrgProfile(handle.db, profileInput({ logoDataUri }))).logoDataUri)
         .toBe(logoDataUri);
     }
+  });
+
+  it("refuses a profile that would eat more than a quote reserves for its issuer", async () => {
+    // THE RESERVE WAS A WISH UNTIL THIS EXISTED. A quote's content budget is the
+    // render cap minus a template allowance minus what an issuer may cost -- and
+    // nothing bounded the issuer, so the 48,000 reserved for it could be 60,920: an
+    // `&` escapes to `&amp;`, five bytes for one, and there are 3,400 characters of
+    // text fields beside a 43,715-character logo.
+    const nearlyMaxedLogo = logoOfBytes(MAX_LOGO_BYTES);
+    const withAmpersands = profileInput({
+      logoDataUri: nearlyMaxedLogo,
+      addressLines: "&".repeat(2000), bankDetails: "&".repeat(500),
+    });
+    expect(orgProfileBytes(withAmpersands)).toBeGreaterThan(ORG_PROFILE_RESERVE_BYTES);
+    const error = await saveOrgProfile(handle.db, withAmpersands).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(OrgProfileInputError);
+    expect((error as Error).message).toContain("reserves for its issuer");
+
+    // ...and the same profile in plain text, which is what the reserve was measured
+    // on, still fits.
+    const plain = profileInput({
+      logoDataUri: nearlyMaxedLogo,
+      addressLines: "A".repeat(2000), bankDetails: "B".repeat(500),
+    });
+    expect(orgProfileBytes(plain)).toBeLessThanOrEqual(ORG_PROFILE_RESERVE_BYTES);
+    expect((await saveOrgProfile(handle.db, plain)).addressLines).toHaveLength(2000);
+  });
+
+  it("refuses issuer text a column could not hold", async () => {
+    await expect(saveOrgProfile(handle.db, profileInput({ name: "Acme\u0000 BV" })))
+      .rejects.toBeInstanceOf(OrgProfileInputError);
   });
 
   it("treats an empty string as no logo, which is what the template's conditional reads", async () => {

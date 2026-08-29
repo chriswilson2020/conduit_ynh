@@ -8,8 +8,8 @@ import { requireUser, mapDomainError, parseOrReject, idParamSchema } from "./hel
 import { RenderBusyError, RenderError } from "../services/documents-render.js";
 import { TemplateError } from "../services/documents-template.js";
 import {
-  DocumentInputError, DocumentTemplateMissingError, getDocumentTemplate, issueQuote,
-  listDocuments, saveDocumentTemplate,
+  DocumentInputError, DocumentTemplateMissingError, DocumentTooLargeError,
+  getDocumentTemplate, issueQuote, listDocuments, saveDocumentTemplate,
 } from "../services/documents.js";
 import { getOrgProfile, OrgProfileInputError, saveOrgProfile } from "../services/org-profile.js";
 
@@ -40,7 +40,14 @@ import { getOrgProfile, OrgProfileInputError, saveOrgProfile } from "../services
  * an archived deal a 409), which is also what re-throws anything genuinely
  * unexpected so app.ts decides what a 5xx body looks like.
  */
-function mapDocumentError(reply: FastifyReply, error: unknown): void {
+/** A driver error carrying `code` on its `cause`, which is how postgres.js reports a
+ * SQLSTATE through drizzle. */
+function isPostgresError(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null
+    && (error as { cause?: { code?: unknown } }).cause?.code === code;
+}
+
+export function mapDocumentError(reply: FastifyReply, error: unknown): void {
   // The input gates, quote and profile alike. The route already parsed the same
   // schema, so these are the services refusing a caller that reached them another
   // way -- but the shape a client sees has to be the same either way.
@@ -68,6 +75,25 @@ function mapDocumentError(reply: FastifyReply, error: unknown): void {
   // generic arm would otherwise call a busy server's answer an unprocessable one.
   if (error instanceof RenderBusyError) {
     void reply.code(503).send({ error: "renderer_busy", message: error.message });
+    return;
+  }
+  // The authoritative size check, which runs one layer above renderPdf's identical
+  // cap and can therefore say what was too big. Same status and code as the renderer's
+  // own refusal: one shape for "that document is too large", whichever layer noticed.
+  if (error instanceof DocumentTooLargeError) {
+    void reply.code(413).send({ error: "too_large", message: error.message });
+    return;
+  }
+  // 55P03 -- lock_not_available. Two quotes of the same type and year serialise on one
+  // sequence row, and the issuing transaction sets a lock_timeout so a pile-up fails
+  // rather than occupying a pooled connection indefinitely. Retrying is exactly right,
+  // which is what 503 says; nothing was spent, because the timeout fires before the
+  // number is allocated.
+  if (isPostgresError(error, "55P03")) {
+    void reply.code(503).send({
+      error: "busy",
+      message: "another quote is being issued; try again in a moment",
+    });
     return;
   }
   if (error instanceof RenderError) {

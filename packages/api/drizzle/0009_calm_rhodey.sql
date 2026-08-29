@@ -195,7 +195,7 @@ table.totals tr.grand td { border-top: 0.4mm solid #111; font-size: 12pt; paddin
 .foot div { margin-top: 1.5mm; }
 </style>
 <div>
-{{#org.logoDataUri}}<div class="logo"><img src="{{org.logoDataUri}}" alt=""></div>{{/org.logoDataUri}}
+{{#org.logoDataUri}}<div class="logo"><img src="{{org.logoDataUri}}" alt="" /></div>{{/org.logoDataUri}}
 <div><strong>{{org.name}}</strong></div>
 {{#org.addressLines}}<div class="pre">{{org.addressLines}}</div>{{/org.addressLines}}
 {{#org.email}}<div>{{org.email}}</div>{{/org.email}}

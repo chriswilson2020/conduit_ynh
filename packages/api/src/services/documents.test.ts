@@ -6,8 +6,9 @@ import { Readable } from "node:stream";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
-  documentContentBytes, DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_MAX_DESCRIPTION_CHARS,
-  DOCUMENT_MAX_LINES, MAX_LOGO_DATA_URI_CHARS, type IssueQuoteInput,
+  documentContentBytes, DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_LINE_MARKUP_BYTES,
+  DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, MAX_LOGO_DATA_URI_CHARS,
+  type IssueQuoteInput,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
@@ -26,8 +27,8 @@ import { getOrgProfile, saveOrgProfile } from "./org-profile.js";
 import { prepareDocumentHtml } from "./documents-template.js";
 import { weasyprintAvailable } from "./documents-render.js";
 import {
-  buildContext, DocumentInputError, DocumentTemplateMissingError, issueQuote, listDocuments,
-  type QuoteContextInput,
+  buildContext, DocumentInputError, DocumentTemplateMissingError, DocumentTooLargeError,
+  issueQuote, listDocuments, type QuoteContextInput,
 } from "./documents.js";
 import { ArchivedError, NotFoundError } from "./errors.js";
 
@@ -560,6 +561,28 @@ describe("issueQuote input gate", () => {
     expect(documentContentBytes({ lines: [{ description: "\u6771\u6771\u6771\u6771" }] }) - plain).toBe(8);
   });
 
+  it("refuses text no column can hold, which used to render first and 500 after", async () => {
+    // A NUL is legal JSON, passes every bound, is charged one byte, survives the
+    // merge and the sanitiser, allocates a number, SPAWNS python3 AND RENDERS, writes
+    // the blob, and then fails the INSERT with 22021 -- unmapped, so a bare 500 and
+    // an orphan blob. The fourth SQLSTATE in the class the gate exists to eliminate.
+    const bad = [
+      quoteInput({ lines: [{ description: "a\u0000b", qtyMilli: 1000, unitPriceCents: 1, taxRateBp: 0 }] }),
+      quoteInput({ notes: "a\u0000b" }),
+      quoteInput({ recipientName: "Acme\u0000" }),
+      // The other way to produce bytes that are not valid UTF-8.
+      quoteInput({ terms: "lone \ud800 surrogate" }),
+    ];
+    for (const input of bad) {
+      const error = await issueExpectingFailure(
+        `touch '${spawnMarker}'\nprintf '%s' '%PDF-1.7 ok'`, input,
+      );
+      expect(error).toBeInstanceOf(DocumentInputError);
+      expect(existsSync(spawnMarker)).toBe(false);
+    }
+    expect(await handle.db.select().from(documents)).toHaveLength(0);
+  });
+
   it("accepts the largest total that still formats exactly, and stores it", async () => {
     // 7,036,874,417,766,401 is the first cents value whose formatting used to
     // disagree with the exact decimal, and an earlier round of money-format.ts
@@ -576,6 +599,90 @@ describe("issueQuote input gate", () => {
     expect(doc.totalCents).toBe(7_036_874_417_766_401);
     const [stored] = await listDocuments(handle.db, dealId);
     expect(stored?.totalCents).toBe(7_036_874_417_766_401);
+  });
+});
+
+// ------------------------------------ the size check that actually decides
+
+describe("the merged size, which is measured rather than predicted", () => {
+  /**
+   * THE INPUT GATE IS A PREDICTION AND THIS IS THE CHECK. `documentContentBytes`
+   * estimates a merged size from the submission and can be wrong: a `"` costs one
+   * byte in text position and six in an attribute, and a template may print a field
+   * more than once. Measuring the merged output is exact, costs one
+   * `Buffer.byteLength`, and happens before anything spawns.
+   */
+  it("refuses a quote the gate accepted, when the template turns it into too much", async () => {
+    // Under every field cap and inside the predicted budget; the template prints the
+    // notes forty times, so the page is not.
+    await seedQuoteTemplate(`<p>${"{{document.notes}}".repeat(40)}</p>`);
+    const input = quoteInput({ notes: "n".repeat(5000) });
+    expect(documentContentBytes(input)).toBeLessThan(DOCUMENT_CONTENT_BUDGET_BYTES);
+
+    const error = await issueExpectingFailure(
+      `touch '${spawnMarker}'\nprintf '%s' '%PDF-1.7 ok'`, input,
+    );
+    expect(error).toBeInstanceOf(DocumentTooLargeError);
+    // It says what was too big, which is the whole reason it is here and not one
+    // layer down inside renderPdf.
+    expect((error as Error).message).toContain("Its template is");
+    expect((error as Error).message).toContain("its logo");
+    // Refused BEFORE the spawn, and the number rolled back with it.
+    expect(existsSync(spawnMarker)).toBe(false);
+    expect(await handle.db.select().from(documentNumberSequences)).toHaveLength(0);
+  });
+
+  it("catches an attribute-position payload the gate under-charges by threefold", async () => {
+    // A `"` is escaped to `&quot;` on the way in and re-serialised BARE in text
+    // position, so it costs one byte there and six in an attribute. The gate cannot
+    // tell the two apart from the value alone, so it charges one -- and this template
+    // puts every field in an attribute.
+    // `title` on purpose: it is in the profile's allowed-attribute list, so it
+    // survives to be counted. `data-*` is not, and a first version of this test used
+    // it and measured a document the sanitiser had already emptied.
+    await seedQuoteTemplate(
+      '<div title="{{document.notes}}"><p title="{{document.terms}}"></p>'
+      + '<p title="{{document.recipientAddress}}"></p>'
+      + '{{#lines}}<span title="{{description}}">x</span>{{/lines}}</div>',
+    );
+    const input = quoteInput({
+      notes: '"'.repeat(5000), terms: '"'.repeat(5000), recipientAddress: '"'.repeat(2000),
+      lines: Array.from({ length: DOCUMENT_MAX_LINES }, () => ({
+        description: '"'.repeat(DOCUMENT_MAX_DESCRIPTION_CHARS),
+        qtyMilli: 1000, unitPriceCents: 1, taxRateBp: 0,
+      })),
+    });
+    // The gate is happy: it charges these 27,000 quotes one byte each.
+    expect(documentContentBytes(input)).toBeLessThan(DOCUMENT_CONTENT_BUDGET_BYTES);
+
+    const error = await issueExpectingFailure(
+      `touch '${spawnMarker}'\nprintf '%s' '%PDF-1.7 ok'`, input,
+    );
+    expect(error).toBeInstanceOf(DocumentTooLargeError);
+    expect(existsSync(spawnMarker)).toBe(false);
+  });
+
+  it("charges a line item at least what the largest one costs", async () => {
+    // DOCUMENT_LINE_MARKUP_BYTES was "145 measured" and was neither, and setting it
+    // to 0 left every test in the repo green. A row's cost is a RANGE, because the
+    // quantity, unit price, tax rate and line total are printed in it: this measures
+    // both ends against the shipped template and requires the constant to sit at or
+    // above the top, so an undercharge fails rather than passing quietly.
+    const base = (over: Partial<QuoteContextInput>) =>
+      Buffer.byteLength(
+        prepareDocumentHtml(seededQuoteTemplate(), buildContext(sampleContextInput(over))),
+        "utf8",
+      );
+    const small = { description: "", qtyMilli: 0, unitPriceCents: 0, taxRateBp: 0, lineTotalCents: 0 };
+    const large = {
+      description: "", qtyMilli: 2_147_483_647, unitPriceCents: 9_007_199_254_740_991,
+      taxRateBp: 2100, lineTotalCents: 9_007_199_254_740_991,
+    };
+    const cheapest = base({ lines: [small, small] }) - base({ lines: [small] });
+    const dearest = base({ lines: [large, large] }) - base({ lines: [large] });
+
+    expect(cheapest).toBeLessThan(dearest);
+    expect(DOCUMENT_LINE_MARKUP_BYTES).toBeGreaterThanOrEqual(dearest);
   });
 });
 

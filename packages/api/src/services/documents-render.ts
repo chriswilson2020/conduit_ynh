@@ -52,48 +52,56 @@ const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
 /**
  * 128KB of INPUT. **This, not the timeout, is what bounds a render's cost.**
  *
- * Measured on the server (Debian 12, WeasyPrint 57.2) against TABLE-shaped documents,
- * because that is the shape a quote is and it is far more expensive than prose --
- * varied prose at a given size, and a run of one repeated character even more so,
- * both lay out much more cheaply and would have set this cap far too high:
+ * RE-MEASURED, AND THE TABLE THAT WAS HERE WAS WRONG. Every figure below comes from
+ * the SHIPPED script on the server (Debian 12, WeasyPrint 57.2), driven through this
+ * module's own renderPdf, with the child's peak RSS sampled from /proc every 50ms.
+ * The previous table said 128KB cost 5.2s and 157MB; it costs 7.3s and 238MB for the
+ * same shape, and more than that for a worse one.
  *
- *   input     time     peak RSS
- *   2.4 KB    0.6 s     67 MB     (the one-page quote the tests render, 16,776 out)
- *   32 KB     1.6 s     87 MB
- *   64 KB     2.8 s    110 MB
- *   128 KB    5.2 s    157 MB     <- the cap
- *   256 KB    9.8 s    251 MB
- *   1 MB     39.7 s    816 MB
- *   2 MB     86.5 s   1565 MB
+ *   input   shape                       time     peak RSS   rows
+ *   32 KB   table (quote-shaped rows)    2.2 s     102 MB    ~330
+ *   64 KB   table                        4.0 s     148 MB    ~660
+ *   128 KB  table                        7.3 s     238 MB   1,300   <- the cap
+ *   256 KB  table                       15.4 s     416 MB   2,600
+ *   128 KB  prose (no table at all)      1.8 s      84 MB       0
+ *   128 KB  **dense** (19-byte rows)    10.0 s     332 MB   6,897
  *
- * For contrast, 2MB of PROSE is 15.9s and 245MB: at equal size the shape decides, by
- * a factor of six. Single runs on an otherwise idle server; the times move a few per
- * cent between runs and the RSS figures barely at all.
+ * **THE ROW COUNT DRIVES THE COST MORE THAN THE BYTE COUNT DOES, and that is why the
+ * worst case at this cap is 332MB rather than 238MB.** The same 128KB is 84MB as
+ * prose and 332MB as a table of minimal rows -- a factor of four for the same input
+ * size. A template is user-editable and may be nothing but `<tr><td>x</td></tr>`, so
+ * 332MB is the number the concurrency limit has to be built on, not the 157MB an
+ * earlier measurement of a friendlier document produced.
  *
  * **The timeout cannot bound memory, because the expensive documents are the ones
- * fast enough to survive it.** At a 2MB cap, 256KB of table finishes in 10s -- well
- * inside the 20s ceiling -- and costs 251MB; three concurrently is 753MB on a 3819MB
- * server with no swap, where that is a kill rather than a slowdown. Only a size cap
- * catches the ones that succeed.
+ * fast enough to survive it.** Every row above is inside the 20s ceiling, including
+ * the 256KB one that costs 416MB. Only a size cap catches the ones that succeed.
  *
- * 128KB holds a render to ~157MB, so three concurrent renders are ~471MB, which is
- * the budget manifest.toml declares and the concurrency limit Task 4 must enforce.
- * A one-page quote is 2.4KB, so this is ~50x a real document -- and the headroom is
+ * A one-page quote is ~2.4KB, so this is ~50x a real document -- and the headroom is
  * for the org profile's logo, which arrives inlined as a `data:` URI at 4/3 of its
- * stored size. **A logo above ~64KB would not fit, so Task 5's upload has to bound
- * it.** The failure would otherwise be a quote that cannot be raised at all.
+ * stored size, and for the notes, terms and line items that share the same budget.
+ * `@conduit/shared`'s DOCUMENT_CONTENT_BUDGET_BYTES divides this figure up; if this
+ * cap moves, every constant there moves with it.
  */
 const DEFAULT_MAX_INPUT_BYTES = 128 * 1024;
 
 /**
- * THREE CONCURRENT RENDERS, AND THIS IS THE THING THAT MAKES `ram.runtime` TRUE.
+ * TWO CONCURRENT RENDERS, AND THIS IS THE THING THAT MAKES `ram.runtime` TRUE.
  *
- * `manifest.toml` declares 900M on the arithmetic 400M (Node) + 3 x 157MB (a render
- * at the input cap above, in the worst shape measured). That declaration was
- * documentation until this constant existed: YunoHost sets no cgroup from
- * `ram.runtime` and does not evaluate it at install, so nothing outside this process
- * enforces it. The server is 3819MB with NO SWAP, where exceeding it is an OOM kill
- * rather than a slowdown.
+ * **IT WAS THREE, AND THREE WAS BUILT ON A MEASUREMENT THAT WAS 2.1x TOO LOW.** The
+ * arithmetic was 400M (Node) + 3 x 157MB = 900M declared. A render at the input cap
+ * costs 332MB in the worst shape (see the table above), so that same arithmetic is
+ * 400 + 3 x 332 = 1,396M -- on a 3819MB server with NO SWAP, where exceeding the
+ * budget is an OOM kill rather than a slowdown.
+ *
+ * Two rather than three, and the declaration raised to 1100M: 400 + 2 x 332 = 1,064M.
+ * The alternative was to keep three and declare 1400M, which is a third of the
+ * machine for a feature one person uses at a time. Concurrency is only reached at all
+ * when two quotes are dated in different years, or when something other than issuing
+ * renders; the issuing path's own row lock serialises everything else.
+ *
+ * YunoHost sets no cgroup from `ram.runtime` and does not evaluate it at install, so
+ * the declaration is documentation and THIS is the enforcement.
  *
  * **The input cap is the lever; this is the multiplier. Move either and recompute the
  * other**, and the manifest with them -- documents-render.test.ts asserts the three
@@ -120,7 +128,7 @@ const DEFAULT_MAX_INPUT_BYTES = 128 * 1024;
  * timeout plus the render timeout, and a saturated renderer answers 503 rather than
  * hanging.
  */
-export const RENDER_MAX_CONCURRENCY = 3;
+export const RENDER_MAX_CONCURRENCY = 2;
 
 /**
  * How long a render will wait for one of the three slots before giving up.
@@ -147,9 +155,17 @@ const rendersWaiting: RenderWaiter[] = [];
  *
  * A timed-out waiter removes ITSELF from the queue rather than being skipped later:
  * leaving it there would make releaseRenderSlot hand the slot to a caller that is no
- * longer listening, and the count would never come back down. The `done` flag is the
- * belt to that braces -- the two paths are both synchronous, so they cannot
- * interleave, but a leaked slot is permanent and silent.
+ * longer listening, and the count would never come back down.
+ *
+ * THE `splice` AND THE `done` CHECK IN releaseRenderSlot ARE ONE MECHANISM WITH TWO
+ * HALVES, AND NEITHER IS INDIVIDUALLY TESTABLE. Deleting the splice survives every
+ * test, because the `done` check then catches the stale waiter; deleting the `done`
+ * check survives too, because the splice means no stale waiter is ever reached.
+ * Deleting BOTH leaks a slot per timeout permanently. That is what redundancy looks
+ * like from a test suite, and it is recorded here rather than left for a reviewer to
+ * rediscover -- the splice keeps the queue's length honest (a caller that gave up is
+ * not waiting), and the flag is what makes the invariant local to the object rather
+ * than a property of two functions agreeing.
  */
 async function acquireRenderSlot(timeoutMs: number): Promise<void> {
   if (rendersInFlight < RENDER_MAX_CONCURRENCY) {

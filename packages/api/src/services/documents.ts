@@ -1,8 +1,9 @@
 import { Readable } from "node:stream";
-import { asc, desc, eq, inArray } from "drizzle-orm";
+import { asc, desc, eq, inArray, sql } from "drizzle-orm";
 import {
   documentTemplateInputSchema, documentTotals, formatMoneyCents, formatQtyMilli,
-  formatTaxRateBp, issueQuoteInputSchema, lineTotalCents,
+  documentContentBytes, formatTaxRateBp, issueQuoteInputSchema, lineTotalCents,
+  MAX_TEMPLATE_BYTES, RENDER_INPUT_CAP_BYTES,
   type DocumentRecord, type DocumentTemplate, type DocumentTemplateInput,
   type IssueQuoteInput, type OrgProfile,
 } from "@conduit/shared";
@@ -14,7 +15,8 @@ import {
 import { allocateNumber } from "./documents-number.js";
 import { renderPdf } from "./documents-render.js";
 import {
-  documentTemplateWarnings, prepareDocumentHtml, sanitizeDocumentHtml, type MergeContext,
+  documentTemplateErrors, documentTemplateWarnings, prepareDocumentHtml,
+  sanitizeDocumentHtml, type MergeContext,
 } from "./documents-template.js";
 import { getOrgProfile } from "./org-profile.js";
 import { saveBlob } from "./blobs.js";
@@ -40,6 +42,30 @@ export class DocumentInputError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DocumentInputError";
+  }
+}
+
+/**
+ * Raised when the merged document is larger than a render will accept.
+ *
+ * **THIS IS THE AUTHORITATIVE SIZE CHECK, AND THE INPUT GATE IS NOT.**
+ * `documentContentBytes` predicts a merged size from the submission, and a prediction
+ * can be wrong in at least four ways that were all demonstrated: a `"` costs one byte
+ * in text and six in an attribute, the issuer's reserve was unenforced, a character
+ * cap on the template did not bound its bytes, and a template may print a field more
+ * than once. Measuring the merged output is exact, costs one `Buffer.byteLength`, and
+ * happens where the failure can still be attributed to a field -- one layer above
+ * renderPdf's identical cap, which stays as the module's own guard for every other
+ * caller.
+ *
+ * It fires after the number is allocated (the number is printed on the page, so the
+ * merge needs it) and before anything spawns, so it rolls back exactly like a failed
+ * render: no number spent, no file, no document.
+ */
+export class DocumentTooLargeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DocumentTooLargeError";
   }
 }
 
@@ -220,6 +246,18 @@ export async function issueQuote(
   const year = Number(quote.issueDate.slice(0, 4));
 
   const record = await db.transaction(async (tx) => {
+    // THE LOCK HOLD IS BOUNDED; THE LOCK **WAIT** WAS NOT, and they are different
+    // sentences. Two quotes of the same type and year serialise on one row, and each
+    // holds it for up to the render queue timeout plus the render timeout -- so N
+    // callers queue at roughly N x 30s with nothing to stop them: there is no
+    // `lock_timeout`, no `statement_timeout` and no Fastify `requestTimeout` in this
+    // deployment, and the pool tops out at ten. The 503 on a busy renderer covers the
+    // render queue, not this queue.
+    //
+    // 45s is one full worst-case hold plus slack, so an ordinary second quote still
+    // waits its turn and a pile-up fails with 55P03 rather than occupying a
+    // connection indefinitely. SET LOCAL, so it lasts exactly this transaction.
+    await tx.execute(sql`SET LOCAL lock_timeout = '45s'`);
     const [deal] = await tx.select({ currency: deals.currency, archivedAt: deals.archivedAt })
       .from(deals).where(eq(deals.id, dealId));
     if (deal === undefined) throw new NotFoundError("deal", dealId);
@@ -246,6 +284,16 @@ export async function issueQuote(
       ...totals,
       lines,
     }));
+    const mergedBytes = Buffer.byteLength(html, "utf8");
+    if (mergedBytes > RENDER_INPUT_CAP_BYTES) {
+      throw new DocumentTooLargeError(
+        `this quote merges to ${String(mergedBytes)} bytes, over the `
+        + `${String(RENDER_INPUT_CAP_BYTES)} a document may render. Its template is `
+        + `${String(Buffer.byteLength(template.bodyHtml, "utf8"))} bytes, its logo `
+        + `${String(org.logoDataUri.length)}, and its own content `
+        + `${String(documentContentBytes(quote))}; shorten whichever of those you can`,
+      );
+    }
     const pdf = await renderPdf(html);
 
     const { sha256, sizeBytes } = await saveBlob(deps.dataDir, Readable.from([pdf]));
@@ -344,6 +392,23 @@ export async function saveDocumentTemplate(
       "the template is empty once sanitised; it contained no markup the document profile keeps",
     );
   }
+  // SANITISE, THEN MEASURE. The other order was wrong twice: the sanitiser can GROW a
+  // body (16,384 characters of raw `\"` inside a single-quoted attribute store as
+  // 97,546 -- 5.95x), so a length checked before it does not bound what is stored, and
+  // a body that came back from GET could then be refused by PUT as too long. What is
+  // measured here is what the column holds and what a render will carry.
+  const templateBytes = Buffer.byteLength(bodyHtml, "utf8");
+  if (templateBytes > MAX_TEMPLATE_BYTES) {
+    throw new DocumentInputError(
+      `the template is ${String(templateBytes)} bytes once sanitised, over the `
+      + `${String(MAX_TEMPLATE_BYTES)} a template may use`,
+    );
+  }
+  // Refused rather than warned about: a block nested inside itself multiplies its
+  // body by the collection's length per level, and storing one produces a template
+  // every later quote fails on. See documents-template.ts's parse().
+  const errors = documentTemplateErrors(bodyHtml);
+  if (errors.length > 0) throw new DocumentInputError(errors[0]!);
   const updatedAt = new Date();
   const [row] = await db.insert(documentTemplates).values({ type, bodyHtml, updatedAt })
     .onConflictDoUpdate({ target: documentTemplates.type, set: { bodyHtml, updatedAt } })

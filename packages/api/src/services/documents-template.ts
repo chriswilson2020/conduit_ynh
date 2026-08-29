@@ -129,9 +129,36 @@ const REL_ATTACHMENT = /(^|\s)attachment(\s|$)/i;
  */
 type UrlPosition = "fetch" | "link";
 
+/**
+ * A whole attribute value that is exactly one merge token: `src="{{org.logoDataUri}}"`
+ * and nothing else around it.
+ *
+ * **A `{{...}}` IN A URL POSITION IS NOT A URL YET, AND JUDGING IT AS ONE DELETED THE
+ * LOGO FROM THE SHIPPED TEMPLATE.** Sanitising a template refused the token (it is
+ * not `data:` and not a fragment), which dropped the `src`, which made
+ * `exclusiveFilter` drop the whole `<img>` -- so GET the seeded template and PUT it
+ * back unmodified and it came out 38 characters shorter with no logo in it, silently,
+ * with no warning. That is precisely what Task 5's editor does the first time
+ * somebody opens the template and saves it, and every quote after that prints no
+ * logo.
+ *
+ * The layering was wrong rather than the rule. Template-time sanitisation sees
+ * UNMERGED text; the value that eventually lands here is checked by the sanitise pass
+ * that runs AFTER the merge (`prepareDocumentHtml`), where it really is a URL. So a
+ * placeholder is permitted here and refused there if what it became is not allowed --
+ * which is the pass that has always done the deciding.
+ *
+ * DELIBERATELY THE WHOLE VALUE, not a token anywhere inside one. `file:///{{x}}`
+ * stays refused at template time even though the merged pass would catch it too:
+ * there is no template in this repo that needs it, and the narrower rule is the one
+ * that cannot be widened by accident.
+ */
+const WHOLE_MERGE_TOKEN = /^\s*\{\{[A-Za-z][A-Za-z0-9_.]*\}\}\s*$/;
+
 function isPermittedUrl(value: string, position: UrlPosition = "fetch"): boolean {
   const trimmed = value.replace(/^[\x00-\x20]+/, "").replace(/[\x00-\x20]+$/, "");
   if (trimmed === "") return false;
+  if (WHOLE_MERGE_TOKEN.test(trimmed)) return true;
   if (trimmed.startsWith("#")) return true;
   if (position === "link") return false;
   return /^data:/i.test(trimmed);
@@ -537,8 +564,11 @@ export class TemplateError extends Error {
  * -- flat in path length, which is the property.
  *
  * The seeded template with every field filled in merges in 1,656 steps at 130 line
- * items -- the largest quote that can render at all -- and 192 at eight, so a million
- * is nearly three orders of magnitude of headroom.
+ * items and 192 at eight, so a million is nearly three orders of magnitude of
+ * headroom. **130 WAS "the largest quote that can render at all" AND IS NOT ANY
+ * MORE**: DOCUMENT_MAX_LINES is 60, because 130 x 500 was measured against the real
+ * template and does not fit the renderer's input cap. The step figures are left as
+ * measured; the headroom only grew.
  *
  * MERGE_MAX_DEPTH bounds the RECURSION, which is a different failure: `render`
  * descends once per nesting level, and a few thousand levels is a RangeError out of
@@ -638,10 +668,11 @@ function cssRegions(template: string): { from: number; to: number; terminated: b
   return regions;
 }
 
-interface Parsed { nodes: Node[]; warnings: string[] }
+interface Parsed { nodes: Node[]; warnings: string[]; errors: string[] }
 
 function parse(template: string): Parsed {
   const warnings: string[] = [];
+  const errors: string[] = [];
   // WHAT IS INSIDE A <style> BLOCK IS NOT MERGED AT ALL, and that is a refusal rather
   // than an omission. HTML escaping is escaping for one context and CSS is another
   // one, so every direction is wrong there: a value with a quote in it becomes
@@ -710,6 +741,32 @@ function parse(template: string): Parsed {
         warnings.push(`{{/${path}}} closes nothing and is ignored`);
       }
     } else {
+      // A BLOCK NESTED INSIDE ITSELF IS A SIZE MULTIPLIER AND NOTHING ELSE, and it is
+      // refused rather than bounded.
+      //
+      // `{{#lines}}` inside `{{#lines}}` re-resolves `lines` from the ROOT (a line is
+      // not a field of a line), so the body runs lines.length ** depth times. That was
+      // documented as "defined, tested, and bounded by MERGE_MAX_STEPS" -- true about
+      // termination and beside the point about cost. A 114-character template with one
+      // level of nesting, against an ordinary 47-line quote using 11% of the input
+      // gate's budget, merges to 130,346 bytes: UNDER the renderer's cap, so nothing
+      // refused it, and 2,209 table rows that cost 9.65s and 353MB of peak RSS --
+      // comfortably inside the 20s timeout. That is the "fast enough to survive the
+      // timeout" shape the input cap exists to catch, arriving by a route the input
+      // cap cannot see -- and re-measuring the cap showed 353MB is not even
+      // exceptional: a plain 128KB table of minimal rows costs 332MB, which is what
+      // the concurrency limit is now built on.
+      //
+      // There is one collection on a quote. Nesting it has no legitimate use, so the
+      // mechanism goes rather than its symptom -- and with it goes the only way for
+      // merged size to stop tracking input size, which is what lets a measurement of
+      // the merged output be a sound bound on cost.
+      if (open.some((frame) => frame.path === path)) {
+        errors.push(
+          `{{#${path}}} is nested inside another {{#${path}}}, which repeats its body once per `
+          + "item for every level and is not allowed",
+        );
+      }
       open.push({ path, segments: path.split("."), inverted: sigil === "^", body: [] });
     }
   }
@@ -731,7 +788,7 @@ function parse(template: string): Parsed {
     const parent = current();
     for (const node of frame.body) parent.push(node);
   }
-  return { nodes: root, warnings };
+  return { nodes: root, warnings, errors };
 }
 
 function isBag(value: unknown): value is Record<string, unknown> {
@@ -913,8 +970,11 @@ function render(nodes: Node[], scopes: unknown[], sink: Sink, depth: number): vo
  * due. The single exception is MERGE_MAX_OUTPUT_CHARS -- see its comment.
  */
 export function mergeTemplate(template: string, context: MergeContext): string {
+  const parsed = parse(template);
+  // Refused before any expansion happens, so the cost of the refusal is the parse.
+  if (parsed.errors.length > 0) throw new TemplateError(parsed.errors[0]!);
   const sink: Sink = { parts: [], length: 0, steps: 0 };
-  render(parse(template).nodes, [context], sink, 0);
+  render(parsed.nodes, [context], sink, 0);
   return sink.parts.join("");
 }
 
@@ -936,7 +996,20 @@ export function mergeTemplate(template: string, context: MergeContext): string {
  * happened.
  */
 export function documentTemplateWarnings(template: string): string[] {
-  return parse(template).warnings;
+  const parsed = parse(template);
+  return [...parsed.errors, ...parsed.warnings];
+}
+
+/**
+ * Why this template cannot be merged at all, or an empty list.
+ *
+ * Distinct from the warnings above, which are things the merge does silently and
+ * which must never stop a save: a template being edited is half-written by
+ * definition. These are the constructs `mergeTemplate` refuses outright, so a save
+ * that stored one would produce a template every later quote fails on.
+ */
+export function documentTemplateErrors(template: string): string[] {
+  return parse(template).errors;
 }
 
 /**

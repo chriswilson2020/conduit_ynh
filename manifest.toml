@@ -23,17 +23,26 @@ ldap = "not_relevant"
 sso = true
 disk = "2G"
 ram.build = "50M"
-# 400M for the Node API as before, plus 500M for renders. A render is a separate
+# 400M for the Node API as before, plus 700M for renders. A render is a separate
 # Python process, not memory the API already had, and what bounds its cost is the
-# input cap rather than the timeout: at documents-render.ts's 128KB cap the worst
-# shape measured on the Debian 12 target (a long bordered table, which is what a
-# quote is) peaks at 157MB. 500M is three of those plus slack.
+# input cap rather than the timeout.
 #
-# THREE is the concurrency limit Task 4 has to enforce, and this number is only true
-# if it does. Advisory either way -- YunoHost sets no cgroup from it and does not
-# evaluate it at install -- so the real protection is the input cap plus that limit,
-# and this is the honest declaration of what the two of them add up to.
-ram.runtime = "900M"
+# RE-MEASURED, AND THE FIRST FIGURE WAS 2.1x TOO LOW. It said 157MB at
+# documents-render.ts's 128KB cap, from a friendly document. Driven through the
+# shipped renderPdf on the Debian 12 target, with the child's peak RSS sampled from
+# /proc, the same cap costs 238MB for a quote-shaped table and 332MB for a table of
+# minimal rows -- the ROW COUNT drives the cost more than the byte count does, and a
+# template is user-editable, so 332MB is the honest worst case. (The same 128KB of
+# prose is 84MB.)
+#
+# TWO is the concurrency limit documents-render.ts enforces, and this number is only
+# true if it does: 400 + 2 x 332 = 1,064M. It was three against the old figure, which
+# would now be 1,396M -- a third of a 3819MB machine that has NO SWAP, where
+# overshooting is an OOM kill rather than a slowdown. Advisory either way -- YunoHost
+# sets no cgroup from it and does not evaluate it at install -- so the real protection
+# is the input cap plus that limit, and this is the honest declaration of what the two
+# of them add up to. A test asserts the arithmetic against this literal.
+ram.runtime = "1100M"
 
 [install]
 

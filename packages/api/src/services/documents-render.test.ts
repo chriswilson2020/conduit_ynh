@@ -426,18 +426,22 @@ describe("renderPdf concurrency", () => {
   }, 30_000);
 
   it("declares the same three renders manifest.toml budgets for", () => {
-    // ram.runtime = 400M (Node) + RENDER_MAX_CONCURRENCY x 157MB (a render at the
-    // 128KB input cap, worst shape measured on the server). The manifest cannot
-    // enforce anything -- YunoHost sets no cgroup from it -- so this is what stops
-    // the two drifting apart in the only direction that matters: the code growing a
-    // budget the declaration never heard about.
+    // ram.runtime = 400M (Node) + RENDER_MAX_CONCURRENCY x 332MB (a render at the
+    // 128KB input cap, in the worst SHAPE rather than the friendliest -- a table of
+    // minimal rows costs 332MB where the same bytes as prose cost 84MB). The manifest
+    // cannot enforce anything -- YunoHost sets no cgroup from it -- so this is what
+    // stops the two drifting apart in the only direction that matters: the code
+    // growing a budget the declaration never heard about.
+    //
+    // The first version asserted against 157MB, which was a measurement of a
+    // friendlier document and 2.1x too low.
     const manifest = readFileSync(
       join(import.meta.dirname, "..", "..", "..", "..", "manifest.toml"), "utf8",
     );
     const declared = /^ram\.runtime = "(\d+)M"$/m.exec(manifest);
     expect(declared?.[1]).toBeDefined();
-    expect(400 + RENDER_MAX_CONCURRENCY * 157).toBeLessThanOrEqual(Number(declared?.[1]));
-    expect(RENDER_MAX_CONCURRENCY).toBe(3);
+    expect(400 + RENDER_MAX_CONCURRENCY * 332).toBeLessThanOrEqual(Number(declared?.[1]));
+    expect(RENDER_MAX_CONCURRENCY).toBe(2);
     // The other half of the pair: the issuing transaction's lock hold is bounded by
     // the queue timeout plus the render timeout, and only a finite queue timeout
     // makes that sentence true.

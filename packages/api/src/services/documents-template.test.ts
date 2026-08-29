@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { pdfText } from "../test/pdf.js";
 import { renderPdf, weasyprintAvailable } from "./documents-render.js";
 import {
+  documentTemplateErrors,
   documentTemplateWarnings,
   MERGE_MAX_DEPTH,
   MERGE_MAX_OUTPUT_CHARS,
@@ -178,6 +179,59 @@ const REFUSED_URLS: { name: string; url: string; needle: string; inCss?: false }
   // the attribute positions, where htmlparser2 does keep the newline in the value.
   { name: "data: with a newline before the colon", url: "data\n:text/html,x", needle: "text/html", inCss: false },
 ];
+
+describe("a merge token in a URL position is a placeholder, not a URL", () => {
+  /**
+   * THE LAYERING BUG THAT DELETED THE LOGO FROM THE SHIPPED TEMPLATE.
+   *
+   * Template-time sanitisation sees UNMERGED text. `src="{{org.logoDataUri}}"` is not
+   * a `data:` URI and not a fragment, so the URL rule refused it, which dropped the
+   * `src`, which made `exclusiveFilter` drop the whole `<img>` -- silently, with no
+   * warning. Saving the seeded template unmodified therefore removed its letterhead,
+   * which is the first thing Task 5's editor will do.
+   *
+   * The value that eventually lands in that attribute is checked by the sanitise pass
+   * that runs AFTER the merge, where it really is a URL. That pass has always been
+   * the one that decides; this one only has to stop judging a placeholder.
+   */
+  it("keeps an img whose src is a whole merge token", () => {
+    const html = sanitizeDocumentHtml('<img src="{{org.logoDataUri}}" alt="" />');
+    expect(html).toContain("<img");
+    expect(html).toContain("{{org.logoDataUri}}");
+  });
+
+  it("still refuses a token that is only part of the value", () => {
+    // Narrower than it has to be: the merged pass would catch this too. No template
+    // in this repo needs it, and the rule that cannot be widened by accident is the
+    // one worth having.
+    for (const value of ["file:///{{x}}", "{{x}}/logo.png", "http://{{host}}/x.png"]) {
+      expect(sanitizeDocumentHtml(`<img src="${value}" alt="">`)).not.toContain("<img");
+    }
+  });
+
+  it("does not let a placeholder become a live URL after the merge", () => {
+    // The property that makes the allowance safe. The token survives template-time
+    // sanitisation; what it resolves to does not survive the merged pass.
+    const merged = prepareDocumentHtml('<img src="{{org.logoDataUri}}" alt="" />', {
+      org: { logoDataUri: "file:///etc/passwd" }, document: {}, lines: [],
+    });
+    expect(merged).not.toContain("file:");
+    expect(merged).not.toContain("<img");
+
+    const good = prepareDocumentHtml('<img src="{{org.logoDataUri}}" alt="" />', {
+      org: { logoDataUri: "data:image/png;base64,AAAA" }, document: {}, lines: [],
+    });
+    expect(good).toContain("data:image/png;base64,AAAA");
+  });
+
+  it("leaves an href placeholder a placeholder, and refuses what it becomes", () => {
+    expect(sanitizeDocumentHtml('<a href="{{document.link}}">x</a>')).toContain("{{document.link}}");
+    const merged = prepareDocumentHtml('<a href="{{document.link}}">x</a>', {
+      org: {}, document: { link: "https://example.test" }, lines: [],
+    });
+    expect(merged).not.toContain("example.test");
+  });
+});
 
 describe("sanitizeDocumentHtml refuses every scheme but data:, in every attribute", () => {
   for (const { name, url, needle, inCss } of REFUSED_URLS) {
@@ -603,25 +657,42 @@ describe("mergeTemplate and blocks inside blocks", () => {
     expect(out).toBe("");
   });
 
-  it("nests same-named blocks by depth", () => {
-    const out = mergeTemplate(
+  it("REFUSES a block nested inside a block of the same path", () => {
+    // **THIS USED TO BE DEFINED BEHAVIOUR AND IS NOW AN ERROR**, by coordinator
+    // ruling after a review. It was tested here as "n^2, and that is the DEFINED
+    // answer rather than an accidental one" -- true, and beside the point: it is also
+    // a size multiplier with no legitimate use.
+    //
+    // `{{#lines}}` inside `{{#lines}}` re-resolves `lines` from the root, so the body
+    // runs once per line PER LEVEL. A 114-character template and an ordinary 47-line
+    // quote -- 11% of the input gate's budget -- merged to 130,346 bytes, UNDER the
+    // renderer's input cap so nothing refused it, and cost 9.65s and 353MB to lay out
+    // as 2,209 table rows. Bounding the symptom was never going to work, because the
+    // symptom is measured in bytes and the cost is not.
+    //
+    // Removing it is what makes merged size track input size again, which is what
+    // lets issueQuote's measurement of the merged output be a sound bound on cost.
+    for (const template of [
       "{{#document.number}}A{{#document.number}}B{{/document.number}}C{{/document.number}}",
-      CONTEXT,
-    );
-
-    expect(out).toBe("ABC");
+      "{{#lines}}({{#lines}}{{description}}{{/lines}}){{/lines}}",
+      // Not adjacent: any depth of the same path counts.
+      "{{#lines}}{{#org.name}}{{#lines}}x{{/lines}}{{/org.name}}{{/lines}}",
+      // The inverted form multiplies nothing, but it is the same shape and the rule
+      // is about the shape rather than about this context's data.
+      "{{#lines}}{{^lines}}x{{/lines}}{{/lines}}",
+    ]) {
+      expect(() => mergeTemplate(template, CONTEXT)).toThrow(TemplateError);
+      expect(documentTemplateErrors(template)).toHaveLength(1);
+      expect(documentTemplateErrors(template)[0]).toContain("nested inside another");
+    }
   });
 
-  it("repeats a lines block nested in a lines block for every line, every time", () => {
-    // n^2, and that is the DEFINED answer rather than an accidental one: `lines` is
-    // not a field of a line, so the inner block resolves it from the root again.
-    const two: MergeContext = {
-      ...CONTEXT,
-      lines: [CONTEXT.lines[0]!, { ...CONTEXT.lines[0]!, description: "Sprocket" }],
-    };
-    const out = mergeTemplate("{{#lines}}({{#lines}}{{description}}{{/lines}}){{/lines}}", two);
-
-    expect(out).toBe("(WidgetSprocket)(WidgetSprocket)");
+  it("still allows different blocks nested in each other, which is how the template works", () => {
+    // The rule is same-path only. The seeded template nests optional fields inside
+    // the letterhead and fields inside {{#lines}} constantly.
+    expect(mergeTemplate("{{#lines}}{{#org.name}}{{description}}{{/org.name}}{{/lines}}", CONTEXT))
+      .toBe("Widget");
+    expect(documentTemplateErrors("{{#a}}{{#b}}{{#c}}x{{/c}}{{/b}}{{/a}}")).toEqual([]);
   });
 
   /**
@@ -798,10 +869,14 @@ describe("mergeTemplate and a template somebody typed wrong", () => {
     expect(mergeTemplate("<p>No merge fields here.</p>", CONTEXT)).toBe("<p>No merge fields here.</p>");
   });
 
-  it("never throws on any of the shapes above", () => {
+  it("never throws on a malformed template, only on one that cannot be bounded", () => {
+    // A typo has to be a blank on a page, not a failed render an hour before a quote
+    // is due. `{{#lines}}{{#lines}}{{/lines}}` USED TO BE ON THIS LIST and is not any
+    // more: a block nested inside itself is refused outright, which is a different
+    // class from a typo -- it is the one shape whose cost is not bounded by its size.
     for (const template of [
       "{{#lines}}", "{{/lines}}", "{{^}}", "{{#a.b.c.d.e}}x{{/a.b.c.d.e}}",
-      "{{#lines}}{{#lines}}{{/lines}}", "{{/lines}}{{#lines}}x{{/lines}}",
+      "{{/lines}}{{#lines}}x{{/lines}}",
     ]) {
       expect(() => mergeTemplate(template, CONTEXT)).not.toThrow();
     }

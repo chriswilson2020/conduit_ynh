@@ -11,7 +11,7 @@ import {
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, documentSchema, orgProfileSchema,
   documentTemplateSchema, DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES,
-  MAX_TEMPLATE_CHARS,
+  MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
@@ -2207,7 +2207,12 @@ describe("documents routes", () => {
     expect(response.statusCode).toBe(413);
     const body = errorResponseSchema.parse(response.json());
     expect(body.error).toBe("too_large");
-    expect(body.message).toBe("document is too large to render");
+    // THE MESSAGE COMES FROM THE MEASURED CHECK, NOT THE RENDERER. Both refuse the
+    // same document with the same status; the difference is that this one runs where
+    // the parts are still separable, so it can say which of them to shorten instead
+    // of quoting a total from a subprocess the caller never asked about.
+    expect(body.message).toContain("merges to");
+    expect(body.message).toContain("Its template is");
     // Refused before the spawn, so no number was spent and there is nothing to list.
     const listed = await a.inject({
       method: "GET", url: `/api/deals/${deal.id}/documents`, headers: authHeaders,
@@ -2265,7 +2270,7 @@ describe("documents routes", () => {
     const a = await app();
     const tooBig = await a.inject({
       method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
-      payload: { bodyHtml: "x".repeat(MAX_TEMPLATE_CHARS + 1) },
+      payload: { bodyHtml: "x".repeat(MAX_TEMPLATE_BYTES + 1) },
     });
     expect(tooBig.statusCode).toBe(400);
 
@@ -2289,6 +2294,68 @@ describe("documents routes", () => {
       method: "GET", url: "/api/document-templates/invoice", headers: authHeaders,
     });
     expect(unknownType.statusCode).toBe(400);
+    await a.close();
+  });
+
+  it("gives the shipped template back byte for byte, image and all", async () => {
+    // **THE SAVE THAT DESTROYED THE LOGO.** Sanitising a template judged
+    // `src="{{org.logoDataUri}}"` as a URL -- it is not one yet -- dropped the `src`,
+    // and `exclusiveFilter` then dropped the whole `<img>`. GET the seeded template,
+    // PUT it back unmodified, and it came out 38 characters shorter with no logo,
+    // silently, with no warning. That is exactly what Task 5's editor does the first
+    // time somebody opens the template and saves it, and every quote after that
+    // prints no letterhead.
+    //
+    // The property a save needs is f(x) = x, not f(f(x)) = f(x): idempotence would
+    // have held all along while the first save ate the image.
+    await seedTemplate();
+    const a = await app();
+    const fetched = await a.inject({
+      method: "GET", url: "/api/document-templates/quote", headers: authHeaders,
+    });
+    const original = documentTemplateSchema.parse(fetched.json()).bodyHtml;
+    expect(original).toContain("<img");
+    expect(original).toBe(seededQuoteTemplate());
+
+    const saved = await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: original },
+    });
+    expect(saved.statusCode).toBe(200);
+    const body = documentTemplateSchema.parse(saved.json());
+    expect(body.bodyHtml).toBe(original);
+    expect(body.warnings).toEqual([]);
+
+    // ...and a second save changes nothing either, so the fixed point is real.
+    const again = await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: body.bodyHtml },
+    });
+    expect(documentTemplateSchema.parse(again.json()).bodyHtml).toBe(original);
+    await a.close();
+  });
+
+  it("refuses a template that nests a block inside itself, and one that grows when sanitised", async () => {
+    const a = await app();
+    // The size multiplier: `{{#lines}}` inside `{{#lines}}` runs its body once per
+    // line PER LEVEL, so a 114-character template plus an ordinary quote merges to
+    // 130KB of table -- under the renderer's cap, and 353MB to lay out.
+    const nested = await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: "{{#lines}}{{#lines}}<p>{{description}}</p>{{/lines}}{{/lines}}" },
+    });
+    expect(nested.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(nested.json()).message).toContain("nested inside another");
+
+    // THE SANITISER CAN GROW A BODY, so the length that matters is measured after it.
+    // A raw `"` inside a single-quoted attribute is re-serialised as `&quot;`, which
+    // is six bytes for one: 16,384 characters of it store as 97,546.
+    const grows = await a.inject({
+      method: "PUT", url: "/api/document-templates/quote", headers: authHeaders,
+      payload: { bodyHtml: `<p title='${'"'.repeat(16_000)}'>x</p>` },
+    });
+    expect(grows.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(grows.json()).message).toContain("once sanitised");
     await a.close();
   });
 
