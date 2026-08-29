@@ -3134,8 +3134,10 @@ raised.
 
 #### TASK 6 DONE — eight journeys, three mutations, and a CI job that could not have run them
 
-Commits `8b39388`, `542107b`. CI run **33244137100**, tip `542107b`, both jobs
-green: **2347 tests, 0 skipped** and **104 e2e** — the 96 plus this file's eight.
+Commits `8b39388`, `542107b`, `42ae181`. CI run **33244390993**, tip `42ae181`,
+both jobs green: **2347 tests, 0 skipped** and **104 e2e** — the 96 plus this
+file's eight. (Run `33244137100` on `542107b` was green too and is the one an
+earlier draft of this block cited; the tip's run is the one that counts.)
 On the server: 2309 passed / 38 skipped, typecheck clean, build clean with no CSS
 warning and the stylesheet hash unmoved at `index-B1M2buov` (32.96 kB), which is
 also the evidence that naming Tailwind classes in this spec's prose added nothing
@@ -3257,6 +3259,108 @@ close-out covering the branch, the worktree and pulling `main` in the primary
 checkout.
 
 **Nothing was merged, tagged or published.**
+
+##### SPEC REVIEW ROUND — four of nine release steps did not run, and two phase surfaces had no phone test
+
+Commit `ae3a11d`. The code came through: the 96 verified unchanged including the
+runtime half, the rounding mutation reproduced independently on client and server,
+the width guard confirmed to catch a dropped `className` as well as a dropped
+width, and the Playwright split confirmed at the library level — the dev server's
+`chrome-headless-shell` is missing eleven shared objects starting with
+`libatk-1.0.so.0`. **Every finding was in prose or in shell.**
+
+**SV-1 AND SV-2: THE SEQUENCE HALTED AT ITS FIRST REAL COMMAND, AND THEN AGAIN AT
+ITS FOURTH.** `git checkout main` inside this worktree cannot work — `main` is
+checked out in the primary worktree and git refuses one branch in two, which
+`git worktree list` says plainly. **v0.10.0's sequence carried a block-quoted
+warning about exactly this and the first draft of mine lost it**, which is the
+whole argument for those quotes existing. The shape is restored: detach onto
+`origin/main`, merge into the detached HEAD, and push with `HEAD:main`.
+Separately, steps 4-6 ran `git` and `gh` from a `cd "$(mktemp -d)"` that never
+returned, so all three were outside a repository and `gh` cannot find one without
+`GH_REPO`; the download is aimed with `--dir` instead.
+
+**RUN, NOT REASONED.** Step 1 was executed against the real layout up to a
+`--dry-run` push: `fatal: 'main' is already used by worktree` for the old shape,
+then detach, merge and `ee27322..<merge>  HEAD -> main` for the new one. The trial
+merge was discarded.
+
+**AND STEP 9's ORDERING JUSTIFICATION WAS WRONG IN THE CORRECTED FLOW.** It said
+the branch cannot be deleted until the worktree is removed — true before step 1
+and false after it, because the worktree is detached by then. The order is still
+right; the reason is now the true one, which is that it holds in both cases.
+
+**SV-3: `yunohost` NEEDS `sudo` AND NEITHER ARTIFACT HAD IT.** Verified on the
+box: as the ssh user the CLI answers "must be run as root or with sudo", and
+YunoHost hardcodes `PermitRootLogin no`, so there is no root shell either.
+v0.10.0's notes carried no `yunohost` command at all, so there was no precedent
+that quietly worked. `weasyprint --version` correctly stays unprefixed.
+
+**SV-4: THE MEMORY FIGURE WAS WRONG IN THE DIRECTION THAT MATTERS.** The notes
+said 1100M "rather than 900M". `origin/main`'s manifest says **400M** — 900M was
+a planning figure from Task 1 that Task 4's re-measurement superseded before
+anything shipped. The paragraph exists to tell an operator whether their box is
+now tight, and it reported +200M against a true +700M.
+
+**SV-5: THE NOTES ADVERTISED A MERGE FIELD THAT DOES NOT EXIST.** `MergeContext`
+has exactly three roots — `org`, `document`, `lines` — and there is no
+`recipient`. The real path is `{{document.recipientName}}`. Because an unknown
+field renders empty and never throws, anyone copying that line into a template
+would get a silent blank where the customer's name goes: the precise failure the
+notes call harmless two paragraphs later. The section now lists the three
+families, names the trap explicitly, and every field it cites was checked against
+`buildContext`.
+
+**SV-6: THREE STALE CONCURRENCY COMMENTS IN THE REVIEW, SEVEN IN THE TREE.**
+`documents-render.ts` had the flagged three, one of which is a MEASUREMENT taken
+at a cap of 3 — the Conventions' named case. `documents-render.test.ts` had four
+more, including a FIFO comment whose entire wall-clock narrative assumed three
+holders taking three slots simultaneously; at a cap of 2 the third holder is
+itself the first waiter and every absolute figure in it moved. The assertion did
+not, and neither did the 100ms grant separation it actually reads. The
+replacements name no number that can go stale and point at the tests, which are
+parametrised on the constant; the one number kept is the historical note saying
+what the old figure was and why it stopped being true.
+
+**O1: A DEFINITION-OF-DONE CLAUSE THE PHASE DECLARED AND DID NOT TEST.** "Every
+surface this phase adds works on a phone." The phase adds four; one was driven.
+The Documents section rendered at 390 with nothing asserting it, Settings ->
+Organisation was never opened below the breakpoint by any test, and **the quote
+template editor had never been driven at any width by anything**. My own gap list
+named only the editor, which is the more embarrassing half.
+
+Both are covered now, and the template test is worth more than its phone
+assertions: it drives GET then PUT through the editor a person actually uses,
+which is where Task 4's S2 defect lived — `isPermittedUrl` refusing the merge
+token in the logo's `src`, dropping the attribute, taking the `<img>` with it, 38
+characters shorter and no warning. **Restoring that bug fails the new assertion**,
+and it is the fourth mutation this file has been checked against.
+
+**THE FIRST VERSION OF THAT TEST WAS VACUOUS AND THE RUN SAID SO.** The textarea
+renders empty and fills when the query resolves, so it read `""` and would have
+compared `""` to `""` for ever. It waits on the letterhead token now. Finding it
+also established that **the step is destructive when it fails** — the damaged
+template is what the database then holds, which is how the vacuity surfaced —
+and that is recorded at the code beside the `truncateAll()` caveat it resembles.
+
+**O2, O3, O5: three smaller ones.** The logo refusal only names the size in a
+narrow band (at 32,769 decoded bytes the arithmetic branch fires; anything much
+larger trips the character cap first and gets the shorter sentence), so the notes
+now quote what a user will actually see. "89MB" was the installed footprint in a
+sentence about how long a download takes; it is 18MB down, 89MB unpacked. And the
+desktop group's fixtures gained the `${runId}x${retry}` suffix the phone group in
+the same file already honoured.
+
+**O6:** both artifacts live under `/private/tmp/claude-501/...`, which macOS's
+periodic cleaner may empty, and this is the first release whose sequence may wait
+days. The sequence now opens by telling the operator to copy both somewhere
+durable, since step 6 needs the notes file to exist.
+
+**VERIFIED AFTER, NOT BEFORE.** 9 e2e passed on the dev server; 53 passed with
+smoke/crm/pipeline/tasks/meetings alongside — one run of that set also caught
+`pipeline.spec.ts`'s documented dnd-kit keyboard flake, which did not recur and
+which the real config carries `retries: 2` for. 2309 passed / 38 skipped on the
+server, typecheck clean, build clean, stylesheet hash unmoved at `index-B1M2buov`.
 
 ---
 
