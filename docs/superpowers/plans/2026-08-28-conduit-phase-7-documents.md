@@ -3132,6 +3132,132 @@ raised.
 
 - [ ] **Step 4: Do NOT merge, tag or publish.** The coordinator gates the release.
 
+#### TASK 6 DONE — eight journeys, three mutations, and a CI job that could not have run them
+
+Commits `8b39388`, `542107b`. CI run **33244137100**, tip `542107b`, both jobs
+green: **2347 tests, 0 skipped** and **104 e2e** — the 96 plus this file's eight.
+On the server: 2309 passed / 38 skipped, typecheck clean, build clean with no CSS
+warning and the stylesheet hash unmoved at `index-B1M2buov` (32.96 kB), which is
+also the evidence that naming Tailwind classes in this spec's prose added nothing
+to the build.
+
+**1. THE CI GAP WAS REAL AND THE JOB WAS NEVER GOING TO PASS WITHOUT IT.** Task 1
+flagged that the `e2e` job installs no WeasyPrint and it was still true at
+`a084914`. `.github/workflows/test.yml:194` now carries the same
+`python3-munkres weasyprint` step the `test` job has, in the same position and
+for a different reason — there it un-skips the render suite, here it is what lets
+a quote be raised at all. The runner reports **WeasyPrint 61.1**; the server runs
+57.2, and both now have a journey through them.
+
+**2. PLAYWRIGHT IS NOT ACTUALLY CI-ONLY, AND THAT CHANGED THE SHAPE OF THIS
+TASK.** The dev server has the browser binaries but not their shared libraries
+(`libatk-1.0.so.0` missing, so `chrome-headless-shell` exits 127); this Mac has
+Chromium and no database and no container runtime. Neither can run the suite
+alone. **Together they can**: the API process runs on the server against
+`conduit_test`, an `ssh -L 3100` tunnel carries HTTP, and Playwright drives a
+LOCAL Chromium through it with a throwaway config in the session scratchpad
+(`testDir` at the repo's `e2e/`, no `webServer`, `baseURL` at the tunnel). Total
+run time 7-9 seconds. Every finding below came from that loop rather than from a
+red CI round, and there were six of them.
+
+**WHAT IT CAUGHT, in order.** The seeded quote template is destroyed by
+`truncateAll()`, so a machine that has run vitest has an empty
+`document_templates` and every quote is refused with "no quote template exists"
+— re-seeded from 0009's own INSERT to run at all, and a real caveat for anyone
+running this suite locally. Playwright's **per-test timeout is 30s** and no
+config raises it, so the `{ timeout: 60_000 }` on the submit waits could never be
+reached; `test.describe.configure({ timeout: 120_000 })` at file scope fixes it
+and is justified rather than defensive — `renderPdf` bounds a render at 20s and
+the queue wait at 10s, so one legitimate submit is entitled to the whole default
+budget. The org profile is a **singleton and the one fixture that cannot carry a
+run id**, so asserting the empty-logo state passed on a virgin database and
+failed on the second run and on every retry; the logo is cleared first now, which
+is the file's only branch and says so. A `toBeHidden` on a bare `thead` locator
+is a strict-mode violation waiting for the page behind the sheet to grow a table.
+`noUncheckedIndexedAccess` refuses a destructured `boundingBox` array. And the
+euro sign is not ASCII.
+
+**3. THE EIGHT JOURNEYS, AND WHAT EACH IS FOR.** Desktop, one serial group
+sharing a page: the issuer profile with a real 70-byte PNG (a real one, because
+`logoDataUriProblem` decodes the signature); a refusal that NAMES the field
+(Task 5's inherited item 3) asserted as "Recipient is required." with Zod's own
+"Too small" asserted ABSENT, which is what fails if `describeIssue` is ever
+bypassed; four lines at three tax rates with the form's running total, the
+server's stored total, the number's shape, the deal's Documents section and the
+**Files tab**; the download, asserted `application/pdf` and `%PDF-` on the bytes
+rather than on the extension; the rename journey; a second quote taking the next
+number; and the dialog widths. Phone: the stacked card, the three money fields
+sharing a line, zero overflow in the table's own scroll box, the sticky total at
+both ends of a scroll, the 44px floor, and a quote actually raised at 390px.
+
+**THE SCAFFOLDING IS API AND THE JOURNEY IS UI**, deliberately: a company, a
+pipeline, a stage and a deal are what somebody raising a quote already has, and
+driving four creation dialogs would put three other phases' surfaces in this
+one's failure path. `POST /api/deals` takes `companyId`, so unlike
+`e2e/mail.spec.ts`'s contact link this needed no patch-shaped workaround.
+
+**4. `test.use` IS ON THE DESCRIBE, NOT THE FILE, AND THAT IS THE ONE DEVIATION
+FROM `mobile.spec.ts`.** Both of that file's reasons are unchanged and honoured —
+no `projects` array (it would re-home all 96) and `defaultBrowserType` dropped
+from the spread (the job installs chromium and only chromium) — but the width
+guard is a statement about 1280px and cannot live in a file that is 390px
+throughout. A describe-scoped `test.use` keeps the property that actually
+matters: the viewport is set at CONTEXT CREATION, so `useIsMobile()` is in its
+phone state for the whole test. Nothing in the file resizes.
+
+**5. THE GUARD THIS REPO HAS NEVER HAD, and it reproduces the exact number.**
+`dialogWidth` reads the computed `width` AND `max-width` off the one open
+`[role="dialog"]`. **THREE callers are measured, not the two the hand-off asked
+for**, and the third is the point: the quote form and the composer are both
+`max-w-3xl`, so a pair of 768s cannot distinguish "the caller's class decided"
+from "the default is 768px now". Mail settings at `max-w-2xl` reads 672 in the
+same run, and the pair becomes a measurement.
+
+**MUTATION-TESTED, three of them, all against the real app on the server.**
+
+| mutation | result |
+|---|---|
+| `max-w-md` restored to `SHAPES.dialog` | width test fails with **448px**, the spec review's own figure |
+| `divideRoundHalfUp` turned into truncation | tax reads **EUR 465.10** against 465.11 |
+| the documents row rendering `companyName` instead of `document.recipientName` | the rename journey fails |
+
+The second is why the fourth line item is Postage at 0.50 and 21%: 10.5 cents of
+tax exactly, so half-up and half-down differ in the last digit of a total that is
+on screen. The third is the plausible version of the immutability bug — a listing
+that re-derives instead of showing the snapshot — and it is what makes
+`not.toContainText(renamedCompany)` a claim.
+
+**WHAT IS NOT COVERED, said plainly.** The byte-identical PDF across the rename
+is a sha256 of two downloads, which proves the stored bytes did not move; it does
+NOT prove nothing re-rendered, because both reads open the same content-addressed
+path. That stronger claim is `documents.test.ts`'s, where the stub renderer counts
+its spawns. The e2e half is the user-visible statement and is deliberately the
+weaker of the two. Nothing here drives an invoice, a template edit through the
+Settings editor, or the 413/503 refusals — all of those have route-level tests.
+
+**6. RELEASE PREP, PREPARED AND NOT EXECUTED.** 1.0.0 in three package.jsons and
+`1.0.0~ynh1` in the manifest; the lockfile regenerated on the server and
+inspected — **three lines, the workspace versions, nothing resolved
+differently**. `resources.sources.main` is untouched on purpose: the url and the
+sha256 belong together and the sha can only be the one CI computes, so pointing
+the manifest at v1.0.0 is a step in the sequence rather than part of the bump,
+exactly as `ee27322` was for v0.10.0.
+
+`release-notes-v1.0.0.md` and `release-sequence-v1.0.0.md` are in the session
+scratchpad. The notes lead with the upgrade NOT being a no-op — an apt dependency
+and migration 0009, the first non-application-only release since v0.6.0 — carry
+the three desktop-visible changes Task 5 handed over, and state the limits
+(no draft, immutable once issued, invoices deferred, `mailto:`/`tel:` refused).
+The sequence carries v0.10.0's corrections: the `--branch v1.0.0` filter on
+`gh run list`, the digest grep anchored to the tarball's name, the published
+asset re-downloaded and re-hashed as a non-optional cross-check, the
+hand-written notes put on the release explicitly because `release.yml` uses
+`--generate-notes`, `weasyprint --version` BEFORE the first quote, and a
+close-out covering the branch, the worktree and pulling `main` in the primary
+checkout.
+
+**Nothing was merged, tagged or published.**
+
 ---
 
 ## The intermittent unit failure — a name, and a mechanism
