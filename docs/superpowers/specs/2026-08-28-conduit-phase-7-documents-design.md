@@ -130,6 +130,13 @@ Two properties are requirements, not defaults:
   The input cap is 128KB, which holds a render to ~157MB and is what makes the declared
   `ram.runtime` and Task 4's concurrency limit true.
 
+  **Both figures in that last sentence are superseded.** Phase 7's own review re-measured
+  128KB at 332MB (the shape matters more than the size: minimal table rows, not prose),
+  and v1.0.1 re-ran the same measurement at **345MB**. The cap itself is gone: there are
+  two now — 87,357 bytes of markup, which is what a render's memory actually tracks, and
+  409,623 bytes of `data:` image payload, which cannot carry a table row. See the logo
+  section below.
+
 **This is the phase's deployment risk and it must be proved first.** WeasyPrint is an
 apt dependency in `manifest.toml`; it is the first release since v0.6.0 whose upgrade is
 not a pure application change. Task 1 proves the binary runs on the actual server and

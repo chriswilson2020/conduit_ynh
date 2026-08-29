@@ -306,6 +306,15 @@ describe("renderPdf failure paths", () => {
     const pair = await renderPdf(one + one).catch((e: unknown) => e);
     expect(pair).toBeInstanceOf(RenderError);
     expect((pair as RenderError).detail).toContain("2 inline image(s)");
+
+    // Both new bounds are OPTIONS as well as defaults, the way the timeout and the
+    // output cap are -- otherwise the only way to test an edge is to build a
+    // document at the shipped limit, and a knob nothing turns is a knob nothing
+    // checks. One image, under both defaults, refused by each in turn.
+    const tight = await renderPdf(one, { maxImagePixels: 15_999_999 }).catch((e: unknown) => e);
+    expect((tight as RenderError).detail).toContain("limit 15999999");
+    const thin = await renderPdf(one, { maxImageBytes: 8 }).catch((e: unknown) => e);
+    expect((thin as RenderError).detail).toContain("bytes of inline image, limit 8");
   });
 });
 
