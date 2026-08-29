@@ -7,6 +7,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
+import {
+  renderInputCost, RENDER_IMAGE_CAP_BYTES, RENDER_MARKUP_CAP_BYTES,
+} from "@conduit/shared";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
 import {
   pdfEmbedsFiles, renderPdf, RenderBusyError, RenderError, RENDER_MAX_CONCURRENCY,
@@ -120,10 +123,11 @@ describe("renderPdf failure paths", () => {
   it("survives a child that exits before reading a large stdin", async () => {
     // The write is still in flight when the pipe goes away, which is an EPIPE on
     // stdin. It must not surface as an unhandled 'error' event, and the rejection
-    // must be the child's real reason rather than the broken pipe. 100KB is well
-    // past the 64KB pipe buffer and inside the 128KB input cap.
+    // must be the child's real reason rather than the broken pipe. 80KB is well past
+    // the 64KB pipe buffer and inside the 87,357-byte markup cap -- it was 100KB and
+    // inside the 128KB cap of the day, which v1.0.1's markup cap is below.
     const dir = stub("echo 'bad input' >&2\nexit 5");
-    const big = `<html><body>${"x".repeat(100_000)}</body></html>`;
+    const big = `<html><body>${"x".repeat(80_000)}</body></html>`;
     const error = await onPath(dir, async () =>
       await renderPdf(big).catch((e: unknown) => e));
 
@@ -221,18 +225,87 @@ describe("renderPdf failure paths", () => {
     expect((error as RenderError).detail).toContain("4096 bytes of HTML");
   });
 
-  it("applies a default input cap, which is the bound on what a render costs", async () => {
-    // 128KB. Not a formality: on the server a table-shaped document of this size
-    // costs 7.3s and 238MB, and 332MB in the worst shape a quote can take. The
-    // authoritative table is in documents-render.ts beside the constant; this comment
-    // used to carry a superseded pair (5.2s / 157MB) whose 2.1x understatement is the
-    // whole reason the concurrency cap and ram.runtime were redesigned, so restating
-    // it here was worse than saying nothing.
+  it("applies a default markup cap, which is the bound on what a render costs", async () => {
+    // 87,357 bytes, and not a formality: on the server that many bytes of minimal
+    // table rows costs 7.0s and 250MB. The authoritative table is in
+    // documents-render.ts beside the constant; this comment used to carry a
+    // superseded pair (5.2s / 157MB) whose 2.1x understatement is the whole reason
+    // the concurrency cap and ram.runtime were redesigned, so restating it here was
+    // worse than saying nothing.
     const error = await renderPdf("x".repeat(300_000)).catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(RenderError);
     expect((error as RenderError).message).toBe("document is too large to render");
-    expect((error as RenderError).detail).toContain("limit 131072");
+    expect((error as RenderError).detail).toContain(`limit ${String(RENDER_MARKUP_CAP_BYTES)}`);
+    expect(RENDER_MARKUP_CAP_BYTES).toBe(87_357);
+  });
+
+  /**
+   * THE TWO CAPS ARE NOT ONE CAP, and this is the pair of assertions that says so.
+   *
+   * A document may be 496,980 bytes when 409,623 of them are inside a `data:` URI
+   * and 87,357 are not -- and may NOT be 100,000 bytes when all of them are markup.
+   * The reason is measured rather than tidy: base64 cannot contain a `<`, so an
+   * image payload cannot be a table row, and rows are what a render's memory tracks
+   * (87KB of them is 250MB; the same bytes as prose are 71MB).
+   */
+  it("counts a data: payload against the image cap and not against the markup cap", async () => {
+    const payload = "A".repeat(400_000);
+    const withImage = `<img src="data:image/png;base64,${payload}">`;
+    expect(Buffer.byteLength(withImage, "utf8")).toBeGreaterThan(RENDER_MARKUP_CAP_BYTES);
+
+    // No renderer needed: both of these are decided before the spawn, and there is
+    // no stub on PATH.
+    const cost = renderInputCost(withImage);
+    expect(cost.imageBytes).toBe(400_000);
+    expect(cost.markupBytes).toBeLessThan(100);
+
+    // The same bytes as markup are refused.
+    const asMarkup = await renderPdf("x".repeat(400_000)).catch((e: unknown) => e);
+    expect(asMarkup).toBeInstanceOf(RenderError);
+    expect((asMarkup as RenderError).detail).toContain("bytes of HTML");
+
+    // ...and an image payload past ITS cap is refused with its own sentence.
+    const tooMuchImage = await renderPdf(
+      `<img src="data:image/png;base64,${"A".repeat(RENDER_IMAGE_CAP_BYTES + 4)}">`,
+    ).catch((e: unknown) => e);
+    expect(tooMuchImage).toBeInstanceOf(RenderError);
+    expect((tooMuchImage as RenderError).detail).toContain("bytes of inline image");
+  });
+
+  /**
+   * THE CAP A BYTE COUNT CANNOT MAKE.
+   *
+   * The document below is 214 bytes and would decode to 100 megapixels, which cost
+   * 535MB when it was measured on the server through this very function. Every byte
+   * bound in the process passes it. A 16KB template can carry this, which is why the
+   * check is here and not only at the logo upload.
+   */
+  it("refuses a document by the pixels its images decode to, not by their size", async () => {
+    // A PNG header and nothing else: 10,000 x 10,000, in 24 bytes.
+    const ihdr = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]),
+      Buffer.from("IHDR", "ascii"),
+      Buffer.from([0, 0, 0x27, 0x10, 0, 0, 0x27, 0x10]),
+    ]);
+    const bomb = `<img src="data:image/png;base64,${ihdr.toString("base64")}">`;
+    expect(bomb.length).toBeLessThan(256);
+
+    const error = await renderPdf(bomb).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(RenderError);
+    expect((error as RenderError).message).toBe("document is too large to render");
+    expect((error as RenderError).detail).toContain("100000000 pixels");
+
+    // Two images that are each inside the bound and together are not: the cap is on
+    // the sum, because the renderer decodes all of them.
+    const half = Buffer.concat([
+      ihdr.subarray(0, 16), Buffer.from([0, 0, 0x0f, 0xa0, 0, 0, 0x0f, 0xa0]),
+    ]);
+    const one = `<img src="data:image/png;base64,${half.toString("base64")}">`;
+    expect(renderInputCost(one).imagePixels).toBe(16_000_000);
+    const pair = await renderPdf(one + one).catch((e: unknown) => e);
+    expect(pair).toBeInstanceOf(RenderError);
+    expect((pair as RenderError).detail).toContain("2 inline image(s)");
   });
 });
 
@@ -440,21 +513,23 @@ describe("renderPdf concurrency", () => {
   }, 30_000);
 
   it("declares the same renders manifest.toml budgets for", () => {
-    // ram.runtime = 400M (Node) + RENDER_MAX_CONCURRENCY x 332MB (a render at the
-    // 128KB input cap, in the worst SHAPE rather than the friendliest -- a table of
-    // minimal rows costs 332MB where the same bytes as prose cost 84MB). The manifest
-    // cannot enforce anything -- YunoHost sets no cgroup from it -- so this is what
-    // stops the two drifting apart in the only direction that matters: the code
-    // growing a budget the declaration never heard about.
+    // ram.runtime = 400M (Node) + RENDER_MAX_CONCURRENCY x 353MB: a render at BOTH
+    // caps, in the worst SHAPE rather than the friendliest -- the markup cap full of
+    // minimal table rows (250MB) with a logo at the pixel bound beside it. The
+    // manifest cannot enforce anything -- YunoHost sets no cgroup from it -- so this
+    // is what stops the two drifting apart in the only direction that matters: the
+    // code growing a budget the declaration never heard about.
     //
     // The first version asserted against 157MB, which was a measurement of a
-    // friendlier document and 2.1x too low.
+    // friendlier document and 2.1x too low. The second asserted 332MB, from the
+    // dense-row shape at the old 128KB cap -- the right shape, and the same method
+    // re-run for v1.0.1 measures it at 345MB rather than 332MB.
     const manifest = readFileSync(
       join(import.meta.dirname, "..", "..", "..", "..", "manifest.toml"), "utf8",
     );
     const declared = /^ram\.runtime = "(\d+)M"$/m.exec(manifest);
     expect(declared?.[1]).toBeDefined();
-    expect(400 + RENDER_MAX_CONCURRENCY * 332).toBeLessThanOrEqual(Number(declared?.[1]));
+    expect(400 + RENDER_MAX_CONCURRENCY * 353).toBeLessThanOrEqual(Number(declared?.[1]));
     expect(RENDER_MAX_CONCURRENCY).toBe(2);
     // The other half of the pair: the issuing transaction's lock hold is bounded by
     // the queue timeout plus the render timeout, and only a finite queue timeout
@@ -542,6 +617,76 @@ describe("pdfEmbedsFiles", () => {
   it("says no to bytes that are not a PDF at all", () => {
     expect(pdfEmbedsFiles(Buffer.from("not a pdf"))).toBe(false);
     expect(pdfEmbedsFiles(Buffer.alloc(0))).toBe(false);
+  });
+
+  /**
+   * A THREE-BYTE NEEDLE FIRES ON ITS OWN IN A BINARY HAYSTACK, AND THIS WAS NOT
+   * HYPOTHETICAL.
+   *
+   * v1.0.0 searched the raw file, stream bodies included. Measuring v1.0.1's logo
+   * limit produced a 287,090-byte logo whose PDF carried `/EF` inside the compressed
+   * image data, and the render was refused with "rendered PDF embeds a file" -- for
+   * a quote with no attachment anywhere near it. It was not a flake: the same logo
+   * makes the same bytes every time, so that logo could never have been used again.
+   * Raising the limit from 32KB to 300KB takes the odds of it from about 0.2% per
+   * logo to about 1.7%.
+   *
+   * The needle can only mean something in PDF SYNTAX, so that is where it is looked
+   * for. Both halves below are load-bearing in opposite directions: the first fails
+   * if stream bodies are searched again, the second if the exclusion is widened from
+   * "image data" to "streams".
+   */
+  it("does not mistake image data that happens to spell /EF for an embedded file", () => {
+    const raster = Buffer.concat([
+      Buffer.from("some pixels then "), Buffer.from("/EF"),
+      Buffer.from(" then more pixels /Filespec and more"),
+    ]);
+    const pdf = Buffer.concat([
+      Buffer.from("%PDF-1.7\n"),
+      Buffer.from("4 0 obj\n<< /Type /XObject /Subtype /Image /Filter /FlateDecode >>\nstream\n"),
+      deflateSync(raster),
+      Buffer.from("\nendstream\nendobj\n"),
+    ]);
+
+    expect(pdfEmbedsFiles(pdf)).toBe(false);
+  });
+
+  it("still finds a file-spec in the OBJECT of an image, and beside one", () => {
+    // The dictionary is not the raster: an /EF written into an image XObject's own
+    // dictionary is outside the stream body and is still found. So is one in an
+    // ordinary object next to an image whose data is being skipped.
+    const image = Buffer.concat([
+      Buffer.from("4 0 obj\n<< /Subtype /Image /Filter /FlateDecode >>\nstream\n"),
+      deflateSync(Buffer.from("raster bytes, nothing to see")),
+      Buffer.from("\nendstream\nendobj\n"),
+    ]);
+    expect(pdfEmbedsFiles(Buffer.concat([
+      Buffer.from("%PDF-1.7\n"),
+      image,
+      Buffer.from("5 0 obj\n<< /Type /Filespec /F (passwd) >>\nendobj\n"),
+    ]))).toBe(true);
+
+    expect(pdfEmbedsFiles(Buffer.concat([
+      Buffer.from("%PDF-1.7\n"),
+      Buffer.from("4 0 obj\n<< /Subtype /Image /EF << /F 5 0 R >> /Filter /FlateDecode >>\nstream\n"),
+      deflateSync(Buffer.from("raster bytes")),
+      Buffer.from("\nendstream\nendobj\n"),
+    ]))).toBe(true);
+  });
+
+  it("does not let a raw stream's compressed bytes spell a needle either", () => {
+    // The uncompressed half of the same trap: 57.2 does not compress object streams,
+    // so on that version the deflate output of an IMAGE sits in the file as raw
+    // bytes -- which is exactly where the measured false positive was found.
+    const pdf = Buffer.concat([
+      Buffer.from("%PDF-1.7\n"),
+      Buffer.from("4 0 obj\n<< /Subtype /Image >>\nstream\n"),
+      Buffer.from("\xff\xd8/EF\x00\x01raw image bytes", "latin1"),
+      Buffer.from("\nendstream\nendobj\n"),
+    ]);
+
+    expect(pdf.includes("/EF")).toBe(true);
+    expect(pdfEmbedsFiles(pdf)).toBe(false);
   });
 });
 

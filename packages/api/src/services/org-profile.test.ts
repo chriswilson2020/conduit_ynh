@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
-  MAX_LOGO_BYTES, MAX_LOGO_DATA_URI_CHARS, ORG_PROFILE_RESERVE_BYTES, orgProfileBytes,
+  MAX_LOGO_BYTES, MAX_LOGO_DATA_URI_CHARS, MAX_LOGO_PIXELS,
+  ORG_PROFILE_TEXT_RESERVE_BYTES, orgProfileTextBytes,
   type OrgProfileInput,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -14,23 +15,51 @@ beforeEach(async () => { await truncateAll(handle); });
 afterAll(async () => { await handle.close(); });
 
 /**
- * A base64 data: URI whose DECODED length is exactly `bytes`.
+ * A base64 data: URI whose DECODED length is exactly `bytes`, carrying a real
+ * header for its type.
  *
- * IT CARRIES A REAL SIGNATURE FOR ITS TYPE, because logoDataUriProblem sniffs the
- * leading bytes now rather than believing the media type in the prefix -- a
- * `data:image/png` whose payload is an SVG is exactly the case that check exists
- * for. Filler still follows, so the decoded length is unchanged and the two size
- * bounds below are measuring what they always were.
+ * IT CARRIES A REAL SIGNATURE, because logoDataUriProblem sniffs the leading bytes
+ * rather than believing the media type in the prefix -- a `data:image/png` whose
+ * payload is an SVG is exactly the case that check exists for. Filler still follows,
+ * so the decoded length is unchanged and the two size bounds below are measuring
+ * what they always were.
+ *
+ * AND IT CARRIES REAL DIMENSIONS SINCE v1.0.1, because the signature is no longer
+ * the last thing read: the pixel bound needs a header that says how big the picture
+ * is, and eight bytes of magic followed by filler says nothing. These are headers,
+ * not images -- no pixel data follows and nothing here could be decoded -- which is
+ * all `logoDataUriProblem` reads and exactly the fixture the bound needs.
  */
-const LOGO_MAGIC: Record<string, number[]> = {
-  "image/png": [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
-  "image/jpeg": [0xff, 0xd8, 0xff],
-  "image/gif": [0x47, 0x49, 0x46, 0x38, 0x39, 0x61],
-  "image/webp": [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50],
-};
+function header(mime: string, width: number, height: number): number[] {
+  const be32 = (n: number): number[] => [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
+  const le16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
+  switch (mime) {
+    case "image/png":
+      // Signature, then the IHDR chunk: length 13, "IHDR", width, height.
+      return [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, ...be32(width), ...be32(height)];
+    case "image/jpeg":
+      // SOI, then an APP0 segment of 16 bytes to prove the walk skips it, then a
+      // SOF0 whose payload is precision, HEIGHT, WIDTH.
+      return [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, ...Array.from({ length: 14 }, () => 0),
+        0xff, 0xc0, 0x00, 0x11, 0x08,
+        (height >>> 8) & 0xff, height & 0xff, (width >>> 8) & 0xff, width & 0xff];
+    case "image/gif":
+      return [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, ...le16(width), ...le16(height)];
+    case "image/webp":
+      // The extended form: "RIFF", size, "WEBP", "VP8X", chunk size, flags,
+      // reserved, then canvas width-1 and height-1 as 24-bit little-endian.
+      return [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
+        0x56, 0x50, 0x38, 0x58, 0x0a, 0, 0, 0, 0, 0, 0, 0,
+        (width - 1) & 0xff, ((width - 1) >>> 8) & 0xff, ((width - 1) >>> 16) & 0xff,
+        (height - 1) & 0xff, ((height - 1) >>> 8) & 0xff, ((height - 1) >>> 16) & 0xff];
+    default:
+      return [];
+  }
+}
 
-function logoOfBytes(bytes: number, mime = "image/png"): string {
-  const magic = LOGO_MAGIC[mime] ?? [];
+function logoOfBytes(bytes: number, mime = "image/png", width = 800, height = 600): string {
+  const magic = header(mime, width, height);
   const payload = Buffer.alloc(bytes, 7);
   Buffer.from(magic).copy(payload, 0, 0, Math.min(magic.length, bytes));
   return `data:${mime};base64,${payload.toString("base64")}`;
@@ -109,28 +138,37 @@ describe("the logo, which is bytes rather than a file reference", () => {
     expect(saved.logoDataUri.length).toBeLessThanOrEqual(MAX_LOGO_DATA_URI_CHARS);
   });
 
-  // THE TWO BOUNDS ARE NOT THE SAME NUMBER AND NEITHER IMPLIES THE OTHER. This test
-  // was written expecting the over-sized URI to be longer than the column allows,
-  // and it is not: base64 rounds to 4 characters per 3 bytes, so a 32,768-byte
-  // image and a 32,769-byte one produce the SAME 43,692 characters and differ only
-  // in their padding. Both fit `org_profile_logo_size` comfortably.
+  // THE TWO BOUNDS ARE NOT THE SAME NUMBER AND NEITHER IS IN THE SAME UNIT. The gate
+  // refuses on the DECODED size; the column bounds the CHARACTERS that carry it.
   //
-  // So the CHECK cannot see this, and the decoded-size arithmetic in
-  // logoDataUriProblem is the only thing that can. Going the other way -- reusing
-  // MAX_LOGO_BYTES as the character bound -- would have refused a legal 24KB image
-  // while every message still said 32KB.
-  it("refuses one byte more by the DECODED size, which the column bound cannot see", async () => {
-    const atLimit = logoOfBytes(MAX_LOGO_BYTES);
+  // AT 32KB THEY DISAGREED ABOUT ONE BYTE and this test was about that disagreement:
+  // base64 rounds to 4 characters per 3 bytes, so a 32,768-byte image and a
+  // 32,769-byte one produced the same 43,692 characters and the column could not
+  // tell them apart at all. 307,200 is a multiple of 3, so the boundary now lands
+  // exactly on the limit and the disagreement is gone -- which is why the second
+  // size check in `logoDataUriProblem` went with it rather than being left as a
+  // branch no input could reach.
+  //
+  // What has to remain true is that the gate is STRICTLY TIGHTER than the column, in
+  // every prefix the regex allows. That is the assertion below, and it is what stops
+  // an accepted logo meeting a 23514 on its way to the row.
+  it("refuses one byte more by the DECODED size, and never hands the column more than it takes", async () => {
     const overByOne = logoOfBytes(MAX_LOGO_BYTES + 1);
-    expect(overByOne.length).toBe(atLimit.length);
-    expect(overByOne.length).toBeLessThanOrEqual(MAX_LOGO_DATA_URI_CHARS);
-
     const error = await saveOrgProfile(handle.db, profileInput({ logoDataUri: overByOne }))
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(OrgProfileInputError);
     // The size it reports is the decoded one, not the string's length.
     expect((error as Error).message).toContain(String(MAX_LOGO_BYTES + 1));
     expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
+
+    // Every type, at the limit, fits the column exactly -- and the longest prefix
+    // fills it to the character. If MAX_LOGO_BYTES ever stops being a multiple of 3
+    // this is the line that says so.
+    for (const mime of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
+      expect(logoOfBytes(MAX_LOGO_BYTES, mime).length)
+        .toBeLessThanOrEqual(MAX_LOGO_DATA_URI_CHARS);
+    }
+    expect(logoOfBytes(MAX_LOGO_BYTES, "image/jpeg").length).toBe(MAX_LOGO_DATA_URI_CHARS);
   });
 
   it("refuses a logo that is not an inline image", async () => {
@@ -178,37 +216,99 @@ describe("the logo, which is bytes rather than a file reference", () => {
   });
 
   it("accepts every image type the renderer can draw", async () => {
+    // 64 bytes rather than 24: a WEBP's VP8X header is 30 on its own, and a header
+    // truncated below the field being read is exactly what the dimension check
+    // treats as unreadable.
     for (const mime of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
-      const logoDataUri = logoOfBytes(24, mime);
+      const logoDataUri = logoOfBytes(64, mime);
       expect((await saveOrgProfile(handle.db, profileInput({ logoDataUri }))).logoDataUri)
         .toBe(logoDataUri);
     }
   });
 
-  it("refuses a profile that would eat more than a quote reserves for its issuer", async () => {
-    // THE RESERVE WAS A WISH UNTIL THIS EXISTED. A quote's content budget is the
-    // render cap minus a template allowance minus what an issuer may cost -- and
-    // nothing bounded the issuer, so the 48,000 reserved for it could be 60,715: an
-    // `&` escapes to `&amp;`, five bytes for one, and there are 3,400 characters of
-    // text fields beside a 43,715-character logo.
-    const nearlyMaxedLogo = logoOfBytes(MAX_LOGO_BYTES);
+  /**
+   * THE BOUND A BYTE COUNT CANNOT MAKE, and v1.0.0 did not have.
+   *
+   * The two logos below are the same size in bytes and 25 megapixels apart: a
+   * header is a header whatever follows it, which is precisely why a real 20KB
+   * PNG can decode to 169 megapixels and cost the renderer 864MB. Measured on the
+   * server; see MAX_LOGO_PIXELS.
+   */
+  it("refuses a logo by its DIMENSIONS, which its file size does not predict", async () => {
+    const huge = logoOfBytes(4096, "image/png", 10_000, 10_000);
+    const fine = logoOfBytes(4096, "image/png", 4000, 4000);
+    expect(huge.length).toBe(fine.length);
+
+    const error = await saveOrgProfile(handle.db, profileInput({ logoDataUri: huge }))
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(OrgProfileInputError);
+    expect((error as Error).message).toContain(String(MAX_LOGO_PIXELS));
+    expect((error as Error).message).toContain("10000 x 10000");
+    expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
+
+    // 4000 x 4000 is exactly the bound and is stored, so what is refused above is
+    // the pixel count and not the presence of a dimension check.
+    expect((await saveOrgProfile(handle.db, profileInput({ logoDataUri: fine }))).logoDataUri)
+      .toBe(fine);
+  });
+
+  it("refuses every type by its dimensions, not just the one that is easy to read", async () => {
+    // A per-format reader is a per-format hole: an encoder that picks WEBP over PNG
+    // would otherwise walk past the bound. Each of these is over it in its own
+    // format's header layout.
+    for (const mime of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
+      const huge = logoOfBytes(4096, mime, 8000, 8000);
+      await expect(saveOrgProfile(handle.db, profileInput({ logoDataUri: huge })))
+        .rejects.toBeInstanceOf(OrgProfileInputError);
+    }
+    expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
+  });
+
+  it("refuses a logo whose header does not say how large it is", async () => {
+    // A valid signature and nothing behind it: this passed every v1.0.0 check and
+    // is a file no image library could open, so it would have printed as a blank
+    // space on a quote rather than as a logo.
+    const headerless = `data:image/png;base64,${Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.alloc(256, 7),
+    ]).toString("base64")}`;
+
+    const error = await saveOrgProfile(handle.db, profileInput({ logoDataUri: headerless }))
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(OrgProfileInputError);
+    expect((error as Error).message).toContain("does not say how large");
+  });
+
+  it("refuses issuer text over what a quote reserves for it, and no longer counts the logo in", async () => {
+    // THE RESERVE WAS A WISH UNTIL THIS EXISTED, and until v1.0.1 it counted the
+    // logo too: 43,715 characters of picture plus 3,400 of text against one 48,000
+    // figure, which is what made a bigger logo look like it had to come out of the
+    // address. The text is 4,285 on its own now and the logo is charged to the
+    // render's image allowance instead.
+    //
+    // The bound on the text is unchanged by that split: 3,400 characters of ASCII
+    // fit and the same fields full of `&` do not, because an `&` escapes to `&amp;`
+    // -- five bytes for one, so 17,000 against 4,285.
+    const maxedLogo = logoOfBytes(MAX_LOGO_BYTES);
     const withAmpersands = profileInput({
-      logoDataUri: nearlyMaxedLogo,
+      logoDataUri: maxedLogo,
       addressLines: "&".repeat(2000), bankDetails: "&".repeat(500),
     });
-    expect(orgProfileBytes(withAmpersands)).toBeGreaterThan(ORG_PROFILE_RESERVE_BYTES);
+    expect(orgProfileTextBytes(withAmpersands)).toBeGreaterThan(ORG_PROFILE_TEXT_RESERVE_BYTES);
     const error = await saveOrgProfile(handle.db, withAmpersands).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(OrgProfileInputError);
-    expect((error as Error).message).toContain("reserves for its issuer");
+    expect((error as Error).message).toContain("reserves for them");
 
-    // ...and the same profile in plain text, which is what the reserve was measured
-    // on, still fits.
+    // ...and the same profile in plain text, beside a MAXED 300KB logo, is stored.
+    // That pairing is the release: the logo no longer takes the text's budget.
     const plain = profileInput({
-      logoDataUri: nearlyMaxedLogo,
+      logoDataUri: maxedLogo,
       addressLines: "A".repeat(2000), bankDetails: "B".repeat(500),
     });
-    expect(orgProfileBytes(plain)).toBeLessThanOrEqual(ORG_PROFILE_RESERVE_BYTES);
-    expect((await saveOrgProfile(handle.db, plain)).addressLines).toHaveLength(2000);
+    expect(orgProfileTextBytes(plain)).toBeLessThanOrEqual(ORG_PROFILE_TEXT_RESERVE_BYTES);
+    const saved = await saveOrgProfile(handle.db, plain);
+    expect(saved.addressLines).toHaveLength(2000);
+    expect(saved.logoDataUri).toHaveLength(maxedLogo.length);
   });
 
   it("refuses issuer text a column could not hold", async () => {

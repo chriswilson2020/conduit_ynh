@@ -780,11 +780,15 @@ export const orgProfile = pgTable("org_profile", {
   // so empty means no <img> is emitted at all.
   //
   // TWO CHECKS, because this column feeds a subprocess with a hard input cap.
-  // The length bound is the base64 of a 32KB image plus the longest permitted
-  // prefix -- 4 * ceil(32768/3) = 43692 characters plus 23 for
+  // The length bound is the base64 of a 300KB image plus the longest permitted
+  // prefix -- 4 * ceil(307200/3) = 409600 characters plus 23 for
   // "data:image/jpeg;base64," -- so an oversized logo is refused here as well
   // as by orgProfileInputSchema, which is the usual "Zod is the gate, the
-  // CHECK is the backstop" split. The shape bound keeps anything that is not
+  // CHECK is the backstop" split. It was 43715 in v1.0.0, when the logo was
+  // bounded at 32KB and shared one allowance with the document's own text;
+  // 0010 raises it. What the column CANNOT check is the picture's dimensions,
+  // which is the bound that actually protects the renderer -- see
+  // MAX_LOGO_PIXELS. The shape bound keeps anything that is not
   // an inline image out of a src attribute; the renderer allowlists exactly
   // data: and nothing else, so a URL of any other scheme would fail every
   // render rather than fetch anything, but a column that can only hold what
@@ -793,7 +797,7 @@ export const orgProfile = pgTable("org_profile", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   check("org_profile_singleton", sql`id = 1`),
-  check("org_profile_logo_size", sql`char_length(${t.logoDataUri}) <= 43715`),
+  check("org_profile_logo_size", sql`char_length(${t.logoDataUri}) <= 409623`),
   // THE `\073` IS A SEMICOLON, AND IT HAS TO BE ONE. drizzle-kit's generator
   // splits a CHECK expression on `;` without regard for string literals, so
   // writing the character directly produced a migration truncated mid-regex --

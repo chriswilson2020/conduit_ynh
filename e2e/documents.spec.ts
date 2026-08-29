@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { test, expect, devices } from "@playwright/test";
 import type { Locator, Page } from "@playwright/test";
+import { pdfHasImage } from "../packages/api/src/test/pdf.js";
+import { flatColourLogo } from "./logo.js";
 
 /**
  * Phase 7's journey: a quote raised from a deal is a numbered, branded PDF on
@@ -54,18 +56,23 @@ test.describe.configure({ timeout: 120_000 });
 const TOUCH_FLOOR_PX = 44;
 
 /**
- * A 1x1 opaque PNG, 70 bytes, spelled as base64 because this repo's sources are
- * ASCII and a PNG is not.
+ * THE LOGO THIS JOURNEY UPLOADS, AND ITS SIZE IS THE POINT OF v1.0.1.
+ *
+ * It was a 1x1 opaque PNG of 70 bytes, which exercised the upload and said
+ * nothing about the limit -- and the limit is what changed: 32KB was too small
+ * for flat-colour artwork on a large canvas, which is what a company logo is.
+ * This is 2000 x 1400 and about 293KB, the shape and size of a real one, and it
+ * is nine times what v1.0.0 would have accepted.
  *
  * It is a real PNG rather than a plausible one, and that is what the upload
- * needs: `logoDataUriProblem` decodes the first twelve bytes and requires a
- * signature matching the declared type, precisely because `File.type` comes
- * from the EXTENSION and an SVG renamed to .png used to be drawn as vector art
- * in the PDF. A byte string that merely claimed to be a PNG would be refused
- * here for the right reason and would tell us nothing about the journey.
+ * needs: `logoDataUriProblem` decodes the header and requires a signature
+ * matching the declared type -- precisely because `File.type` comes from the
+ * EXTENSION and an SVG renamed to .png used to be drawn as vector art in the
+ * PDF -- and, since v1.0.1, dimensions it can read and afford. A byte string
+ * that merely claimed to be a PNG would be refused here for the right reason
+ * and would tell us nothing about the journey.
  */
-const LOGO_PNG_BASE64 =
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const LOGO_PNG = flatColourLogo();
 
 /**
  * The four lines every quote in this file is built from, and the totals they
@@ -166,6 +173,31 @@ async function downloadQuote(page: Page, number: string): Promise<string> {
   expect(bytes.subarray(0, 5).toString("ascii")).toBe("%PDF-");
   expect(bytes.byteLength).toBeGreaterThan(1000);
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * The same download, plus the assertion this release exists for: the LOGO IS IN
+ * THE PDF.
+ *
+ * A byte count is not proof that it is. The whole journey -- a 293KB image
+ * through the form, past `logoDataUriProblem`, into a `text` column, out of it
+ * into a merge, through the sanitiser, down a pipe as a `data:` URI and into
+ * WeasyPrint -- can succeed at every visible step and produce a quote with a
+ * blank letterhead, which is exactly what happens if the renderer decides it
+ * cannot decode the picture. `pdfHasImage` looks for the image XObject it
+ * becomes, in the compressed streams as well as the plain bytes.
+ */
+async function downloadQuoteWithLogo(page: Page, number: string): Promise<string> {
+  const href = await page.getByTestId(`document-download-${number}`).getAttribute("href");
+  if (href === null) throw new Error(`the download link for ${number} has no href`);
+  const digest = await downloadQuote(page, number);
+  const bytes = await (await page.request.get(href)).body();
+  expect(pdfHasImage(bytes)).toBe(true);
+  // And the image is the logo rather than a rounding error: 2.8 megapixels of
+  // artwork is a PDF several times the size of the 14KB one a logo-less quote
+  // renders to (documents-seed.test.ts prints both).
+  expect(bytes.byteLength).toBeGreaterThan(100_000);
+  return digest;
 }
 
 /**
@@ -290,14 +322,23 @@ test.describe.serial("Raising a quote from a deal", () => {
     const removeLogo = page.getByTestId("org-logo-remove");
     if (await removeLogo.count() > 0) await removeLogo.click();
     await expect(page.getByTestId("org-logo-empty")).toBeVisible();
+    // THE SIZE IS AN ASSERTION, not an assumption about the generator: a logo
+    // that quietly came out at 30KB would pass every step below and would be
+    // testing v1.0.0's limit rather than this one. Past 32KB is the half that
+    // has to be said here; inside 300KB is said by the upload being ACCEPTED
+    // three lines below, which is the black-box version of the same claim and
+    // does not need this process to import the app's constants.
+    expect(LOGO_PNG.byteLength).toBeGreaterThan(32 * 1024);
+    expect(LOGO_PNG.byteLength).toBe(293_138);
     await page.getByTestId("org-logo-input").setInputFiles({
       name: `logo-${attemptId}.png`,
       mimeType: "image/png",
-      buffer: Buffer.from(LOGO_PNG_BASE64, "base64"),
+      buffer: LOGO_PNG,
     });
     // Accepted rather than merely chosen: the preview only renders once
     // logoDataUriProblem has returned null, so its appearance IS the shared
-    // check passing on the decoded bytes, and no refusal is on screen.
+    // check passing on the decoded bytes AND on the dimensions in the header,
+    // and no refusal is on screen.
     await expect(page.getByTestId("org-logo-preview")).toBeVisible();
     await expect(page.getByTestId("org-logo-preview")).toHaveAttribute(
       "src",
@@ -405,9 +446,9 @@ test.describe.serial("Raising a quote from a deal", () => {
     await expect(page.getByTestId("files")).toContainText(`${firstNumber}.pdf`);
   });
 
-  test("downloads the quote and it is a PDF", async () => {
+  test("downloads the quote, and the issuer's logo is really in it", async () => {
     await page.goto(`/deals/${fixture.dealId}`);
-    firstDigest = await downloadQuote(page, firstNumber);
+    firstDigest = await downloadQuoteWithLogo(page, firstNumber);
   });
 
   test("renaming the company does not reach a quote already issued", async () => {

@@ -212,9 +212,31 @@ table is 5.2s and 157MB, while 2MB of table was 86s and 1.5GB. The timeout canno
 that, because the expensive documents are the ones fast enough to survive it. So a
 stored logo much above 64KB cannot render at all, and the template and line items must
 fit alongside it. **Task 5 bounds the upload well below that** — 32KB is the working
-figure, leaving the document itself three quarters of the budget — and rejects an
+figure, leaving the document itself two thirds of the budget — and rejects an
 oversized logo at upload time with a clear message, rather than letting it surface as a
 failed render weeks later when someone raises a quote.
+
+> **SUPERSEDED BY v1.0.1, AND THE PARAGRAPH ABOVE IS WHY IT HAD TO BE.** 32KB was too
+> small for a real logo: flat-colour artwork on a large canvas lands around 300KB as a
+> PNG and looks bad downscaled to fit. The reasoning above is sound and its conclusion
+> followed from ONE premise that v1.0.1 removed — that the logo and the document's own
+> text come out of a single render allowance. They no longer do. The renderer has two
+> byte caps: 87,357 bytes of MARKUP (the template, the issuer's text and the quote's
+> content, which are the same three allowances as before, summed) and 409,623 bytes of
+> `data:` IMAGE PAYLOAD, which cannot contain a table row because the base64 alphabet
+> has no `<` in it. `MAX_LOGO_BYTES` is 300KB and `DOCUMENT_CONTENT_BUDGET_BYTES` is
+> unchanged at 66,688.
+>
+> **And a byte limit was never the bound that mattered.** A PNG's decoded raster is
+> width × height × 4 whatever the file compressed to: measured on the server through
+> the shipped `renderPdf`, a **12,227-byte** 1-bit PNG of 10,000 × 10,000 costs
+> **535MB**, and 20,625 bytes of 13,000 × 13,000 costs **864MB** — the second of which
+> fits inside `MAX_TEMPLATE_BYTES`, so v1.0.0's template editor could already reach it.
+> v1.0.1 adds `MAX_LOGO_PIXELS` (16,000,000 — a 4000 × 4000 canvas), enforced at the
+> upload AND at the renderer, where it also covers template-embedded images and logos
+> stored before the gate existed. The numbers in the paragraph above are also stale as
+> measurements: re-run by the same method, 128KB of dense table rows is **11.2s and
+> 345MB**, not 5.2s and 157MB.
 
 ## The work, surface by surface
 
@@ -237,6 +259,12 @@ failed render weeks later when someone raises a quote.
   a read-and-encode step at render time, since the renderer accepts nothing else, and the
   32KB upload bound makes a blob store pointless for one small image. What is given up is
   sha256 dedup and streaming, neither of which means anything for a single logo.
+
+  **v1.0.1 raised that bound to 300KB and the ruling still holds.** 300KB is 409,623
+  characters in a `text` column, which Postgres stores out-of-line in TOAST and
+  compresses; it is one row read on the path of a render that is about to spend seconds
+  and hundreds of megabytes in a subprocess. Migration 0010 widens
+  `org_profile_logo_size` from 43,715 to 409,623 characters.
 - **`documents`** — number (unique), type, deal FK, currency, issue date, valid-until
   date, the recipient snapshot (name and address as text), subtotal/tax/total in cents,
   frozen notes and terms, the generated PDF's file id, who raised it, when.

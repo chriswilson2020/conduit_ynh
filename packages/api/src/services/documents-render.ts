@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 import { inflateSync } from "node:zlib";
+import {
+  renderInputCost, RENDER_IMAGE_CAP_BYTES, RENDER_IMAGE_PIXEL_CAP, RENDER_MARKUP_CAP_BYTES,
+} from "@conduit/shared";
 
 /** A render that failed for any reason: spawn, timeout, non-zero exit, or a cap. */
 export class RenderError extends Error {
@@ -27,6 +30,8 @@ export interface RenderOptions {
   timeoutMs?: number;
   maxBytes?: number;
   maxInputBytes?: number;
+  maxImageBytes?: number;
+  maxImagePixels?: number;
   queueTimeoutMs?: number;
 }
 
@@ -50,52 +55,99 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
 
 /**
- * 128KB of INPUT. **This, not the timeout, is what bounds a render's cost.**
+ * 87,357 BYTES OF MARKUP. **This, not the timeout, is what bounds a render's cost.**
  *
- * RE-MEASURED, AND THE TABLE THAT WAS HERE WAS WRONG. Every figure below comes from
- * the SHIPPED script on the server (Debian 12, WeasyPrint 57.2), driven through this
- * module's own renderPdf, with the child's peak RSS sampled from /proc every 50ms.
- * The previous table said 128KB cost 5.2s and 157MB; it costs 7.3s and 238MB for the
- * same shape, and more than that for a worse one.
+ * RE-MEASURED FOR v1.0.1, AND TWO FIGURES IN THE TABLE THAT WAS HERE WERE STALE.
+ * Every figure below comes from the same method as before -- the server (Debian 12,
+ * WeasyPrint 57.2, Pillow 9.4.0), driven through this module's own renderPdf, with
+ * the child's peak RSS sampled from /proc every 50ms -- re-run against the shapes
+ * this release makes possible. The dense row at 128KB was recorded as 10.0s/332MB
+ * and measures 11.2s/345MB on two consecutive runs; prose was recorded as 1.8s/84MB
+ * and measures 1.4s/71MB. The conclusions are unchanged; the numbers are not, and
+ * the numbers are what the manifest is built from.
  *
- *   input   shape                       time     peak RSS   rows
- *   32 KB   table (quote-shaped rows)    2.2 s     102 MB    ~330
- *   64 KB   table                        4.0 s     148 MB    ~660
- *   128 KB  table                        7.3 s     238 MB   1,300   <- the cap
- *   256 KB  table                       15.4 s     416 MB   2,600
- *   128 KB  prose (no table at all)      1.8 s      84 MB       0
- *   128 KB  **dense** (19-byte rows)    10.0 s     332 MB   6,897
+ *   markup  images                        time     peak RSS   rows
+ *   128 KB  --      dense (19-byte rows) 11.2 s     345 MB   6,897   <- v1.0.0's cap
+ *   128 KB  --      prose                 1.4 s      71 MB       0
+ *   87 KB   --      dense                 7.0 s     250 MB   4,596   <- this cap
+ *   small   2.8Mpx  a real 300KB logo     0.7 s      79 MB       0
+ *   87 KB   2.8Mpx  that logo, dense      6.9 s     263 MB   4,596
+ *   87 KB   16Mpx   a logo at both caps   7.5 s     353 MB   4,596   <- the worst
+ *   87 KB   20Mpx   what the bound stops  7.3 s     384 MB   4,596
+ *   128 KB  16Mpx   the rejected design  11.5 s     440 MB   6,897
  *
  * **THE ROW COUNT DRIVES THE COST MORE THAN THE BYTE COUNT DOES, and that is why the
- * worst case at this cap is 332MB rather than 238MB.** The same 128KB is 84MB as
- * prose and 332MB as a table of minimal rows -- a factor of four for the same input
- * size. A template is user-editable and may be nothing but `<tr><td>x</td></tr>`, so
- * 332MB is the number the concurrency limit has to be built on, not the 157MB an
- * earlier measurement of a friendlier document produced.
+ * worst case here is 250MB of rows rather than 71MB of prose for the same bytes.** A
+ * template is user-editable and may be nothing but `<tr><td>x</td></tr>`, so the
+ * dense row is the number the concurrency limit has to be built on.
+ *
+ * **AND THE IMAGE HALF IS BOUNDED BY PIXELS, NOT BY BYTES**, because a file's size
+ * says nothing about the raster it decodes to: 12,227 bytes of 1-bit PNG is
+ * 10,000 x 10,000 and costs 535MB. See DEFAULT_MAX_IMAGE_PIXELS.
  *
  * **The timeout cannot bound memory, because the expensive documents are the ones
  * fast enough to survive it.** Every row above is inside the 20s ceiling, including
- * the 256KB one that costs 416MB. Only a size cap catches the ones that succeed.
+ * the 440MB one. Only a size cap catches the ones that succeed.
  *
- * A one-page quote is ~2.4KB, so this is ~50x a real document -- and the headroom is
- * for the org profile's logo, which arrives inlined as a `data:` URI at 4/3 of its
- * stored size, and for the notes, terms and line items that share the same budget.
- * `@conduit/shared`'s DOCUMENT_CONTENT_BUDGET_BYTES divides this figure up; if this
- * cap moves, every constant there moves with it.
+ * A one-page quote is ~2.4KB of markup, so this is ~36x a real document.
+ * `@conduit/shared`'s RENDER_MARKUP_CAP_BYTES is the same figure and the three
+ * allowances it is the sum of; if this cap moves, every constant there moves with it.
  */
-const DEFAULT_MAX_INPUT_BYTES = 128 * 1024;
+const DEFAULT_MAX_INPUT_BYTES = RENDER_MARKUP_CAP_BYTES;
+
+/**
+ * 409,623 BYTES OF `data:` IMAGE PAYLOAD, on top of the markup cap: one logo at
+ * MAX_LOGO_BYTES, inlined at 4/3 of its stored size.
+ *
+ * IT IS A SEPARATE ALLOWANCE BECAUSE BASE64 CANNOT BE A TABLE ROW. The alphabet has
+ * no `<` in it, so a byte inside a payload cannot open a tag however it was smuggled
+ * in -- which is what makes it safe to let this half be five times the other without
+ * five times the memory. Measured: the same 87KB of rows costs 250MB with no image
+ * and 353MB with a logo at both this cap and the pixel one.
+ */
+const DEFAULT_MAX_IMAGE_BYTES = RENDER_IMAGE_CAP_BYTES;
+
+/**
+ * 16,000,000 PIXELS ACROSS EVERY IMAGE IN THE DOCUMENT, AND THIS IS THE ONE A BYTE
+ * CAP CANNOT MAKE.
+ *
+ * Peak RSS is about 56MB + 7.65MB per megapixel -- 3Mpx costs 78MB, 45Mpx costs
+ * 401MB -- and a PNG's file size predicts none of it. Measured on the server:
+ *
+ *   12,227 B   1-bit PNG, 10,000 x 10,000 (100Mpx)    535 MB
+ *   20,625 B   1-bit PNG, 13,000 x 13,000 (169Mpx)    864 MB
+ *   316,191 B  RGB PNG,   10,000 x 10,000             821 MB
+ *   1,209,677 B          20,000 x 20,000 (400Mpx)      67 MB, image DROPPED
+ *
+ * The last one is Pillow refusing over 178,956,970 pixels (twice its own
+ * MAX_IMAGE_PIXELS) and rendering the page without the image. That refusal is the
+ * only thing that stood between v1.0.0 and a gigabyte of RSS, and it does not fire
+ * until 169Mpx has already cost 864MB.
+ *
+ * **THE SECOND ROW FITS IN A TEMPLATE, WHICH IS WHY THIS IS ENFORCED HERE AND NOT
+ * ONLY AT THE UPLOAD.** 20,625 bytes is 27,522 characters of base64, and
+ * MAX_TEMPLATE_BYTES is 16,384 -- so the 100Mpx/12,227-byte row does fit, in a
+ * document template any user can edit, on a v1.0.0 install, today. The logo's own
+ * bound lives in `logoDataUriProblem` and refuses this at the upload; this one is
+ * what covers the template, and what covers a logo that was already stored before
+ * the upload gate existed.
+ */
+const DEFAULT_MAX_IMAGE_PIXELS = RENDER_IMAGE_PIXEL_CAP;
 
 /**
  * TWO CONCURRENT RENDERS, AND THIS IS THE THING THAT MAKES `ram.runtime` TRUE.
  *
  * **IT WAS THREE, AND THREE WAS BUILT ON A MEASUREMENT THAT WAS 2.1x TOO LOW.** The
- * arithmetic was 400M (Node) + 3 x 157MB = 900M declared. A render at the input cap
- * costs 332MB in the worst shape (see the table above), so that same arithmetic is
- * 400 + 3 x 332 = 1,396M -- on a 3819MB server with NO SWAP, where exceeding the
+ * arithmetic was 400M (Node) + 3 x 157MB = 900M declared. A render at the caps costs
+ * 353MB in the worst shape (see the table above), so that same arithmetic is
+ * 400 + 3 x 353 = 1,459M -- on a 3819MB server with NO SWAP, where exceeding the
  * budget is an OOM kill rather than a slowdown.
  *
- * Two rather than three, and the declaration raised to 1100M: 400 + 2 x 332 = 1,064M.
- * The alternative was to keep three and declare the 1,396M computed above, which is
+ * Two rather than three, and the declaration is 1150M: 400 + 2 x 353 = 1,106M. It was
+ * 1100M for v1.0.0's worst case, which the same method now measures at 345MB rather
+ * than the 332MB recorded -- 400 + 2 x 345 = 1,090M, still true, and the 50M this
+ * release adds buys the logo's pixel allowance.
+ * The alternative was to keep three and declare the 1,459M computed above, which is
  * more than a third of the machine for a feature one person uses at a time. Concurrency is only reached at all
  * when two quotes are dated in different years, or when something other than issuing
  * renders; the issuing path's own row lock serialises everything else.
@@ -356,6 +408,23 @@ const NO_NETWORK_ENV = {
  * which is why a raw byte search once made an embedded file look absent -- so this
  * inflates what it can before deciding.
  *
+ * **AND IT SEARCHES PDF SYNTAX RATHER THAN THE WHOLE FILE, BECAUSE A THREE-BYTE
+ * NEEDLE IN A BINARY HAYSTACK FIRES ON ITS OWN.** v1.0.0 searched the raw bytes,
+ * stream contents included, and a 287,090-byte logo measured during v1.0.1's work
+ * produced a PDF whose compressed image stream happened to contain `/EF`. The render
+ * was refused with "rendered PDF embeds a file", and it would have been refused every
+ * time: the same logo makes the same bytes, so that logo could never have been used
+ * again. At a 32KB logo the odds of it are about 0.2% per image and nobody hit it; at
+ * 300KB they are about 1.7%, which over a few hundred installs is somebody.
+ *
+ * So a stream's BODY is excluded from the raw search, and inflated bodies are
+ * searched only when the object's dictionary does not say `/Image`. Neither exclusion
+ * can hide the thing this looks for: an `/EF` or a `/Filespec` is a key in a
+ * DICTIONARY, and a dictionary is never inside a stream body -- except in a
+ * `/Type /ObjStm`, which is exactly the case the inflating branch covers and which
+ * never carries `/Image`. What is excluded is raster data, which cannot be a file
+ * specification and can only ever spell one by accident.
+ *
  * This is the only control that is a statement about the OUTPUT rather than about a
  * mechanism, which is the point of it: it is what would still hold if a future
  * WeasyPrint grew a third route to the filesystem.
@@ -363,27 +432,41 @@ const NO_NETWORK_ENV = {
 export function pdfEmbedsFiles(pdf: Buffer): boolean {
   const needles = ["/EF", "/Filespec"];
   const hit = (haystack: Buffer): boolean => needles.some((n) => haystack.includes(n));
-  if (hit(pdf)) return true;
 
+  // Everything that is not a stream body, joined. The joins land between "stream\n"
+  // and "endstream", so no needle can be manufactured by the concatenation itself.
+  const syntax: Buffer[] = [];
   let from = 0;
+  let at = 0;
   for (;;) {
-    const start = pdf.indexOf("stream", from);
-    if (start === -1) return false;
+    const start = pdf.indexOf("stream", at);
+    if (start === -1) break;
     const end = pdf.indexOf("endstream", start);
-    if (end === -1) return false;
+    if (end === -1) break;
     let body = start + "stream".length;
     if (pdf[body] === 0x0d) body += 1;
     if (pdf[body] === 0x0a) body += 1;
-    try {
-      if (hit(inflateSync(pdf.subarray(body, end)))) return true;
-    } catch {
-      // Not a Flate stream, or not a stream at all. Keep looking.
+    syntax.push(pdf.subarray(from, body));
+
+    // The dictionary this stream belongs to: from its object header, or a generous
+    // window back if the file is malformed enough not to have one.
+    const objAt = pdf.lastIndexOf("obj", start);
+    const dict = pdf.subarray(objAt === -1 ? Math.max(0, start - 4096) : objAt, start);
+    if (!dict.includes("/Image")) {
+      try {
+        if (hit(inflateSync(pdf.subarray(body, end)))) return true;
+      } catch {
+        // Not a Flate stream, or not a stream at all. Keep looking.
+      }
     }
+    from = end;
     // Past the whole "endstream" keyword, not one byte into it: resuming at end+1
     // makes the next search match the "stream" inside it, whose paired "endstream"
     // is the FOLLOWING object's -- which silently skips every other stream.
-    from = end + "endstream".length;
+    at = end + "endstream".length;
   }
+  syntax.push(pdf.subarray(from));
+  return hit(Buffer.concat(syntax));
 }
 
 /**
@@ -402,13 +485,33 @@ export async function renderPdf(html: string, options: RenderOptions = {}): Prom
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
   const maxInputBytes = options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES;
+  const maxImageBytes = options.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+  const maxImagePixels = options.maxImagePixels ?? DEFAULT_MAX_IMAGE_PIXELS;
   const queueTimeoutMs = options.queueTimeoutMs ?? RENDER_QUEUE_TIMEOUT_MS;
 
-  const inputBytes = Buffer.byteLength(html, "utf8");
-  if (inputBytes > maxInputBytes) {
+  // THREE CAPS, ON THE ONE THING THAT ARRIVES: the markup, which is where the rows
+  // are; the image payload, which cannot contain a row; and the pixels those images
+  // decode to, which is the only one of the three that a file's size does not
+  // predict. Each is reported on its own, because "too large" over a document that
+  // is 3KB of markup and one enormous image is a sentence about nothing.
+  const cost = renderInputCost(html);
+  if (cost.markupBytes > maxInputBytes) {
     throw new RenderError(
       "document is too large to render",
-      `${String(inputBytes)} bytes of HTML, limit ${String(maxInputBytes)}`,
+      `${String(cost.markupBytes)} bytes of HTML, limit ${String(maxInputBytes)}`,
+    );
+  }
+  if (cost.imageBytes > maxImageBytes) {
+    throw new RenderError(
+      "document is too large to render",
+      `${String(cost.imageBytes)} bytes of inline image, limit ${String(maxImageBytes)}`,
+    );
+  }
+  if (cost.imagePixels > maxImagePixels) {
+    throw new RenderError(
+      "document is too large to render",
+      `${String(cost.imagePixels)} pixels across ${String(cost.images)} inline image(s), `
+      + `limit ${String(maxImagePixels)}`,
     );
   }
 

@@ -1418,6 +1418,39 @@ describe("documents schema (0009)", () => {
     });
   }, 30000);
 
+  it("applies migration 0010 on top of a real database migrated only through 0009 -- a pre-existing 32KB logo survives and a 300KB one becomes storable", async () => {
+    await withPreMigrationDatabase("0010", async (scratch) => {
+      // A v1.0.0 install with a v1.0.0 logo on it: the row this upgrade must not
+      // disturb. 43,715 characters is the old column bound to the character.
+      const oldPrefix = "data:image/png;base64,";
+      const oldLogo = oldPrefix + "A".repeat(43_715 - oldPrefix.length);
+      await scratch.db.insert(orgProfile).values({ name: "Listerdale", logoDataUri: oldLogo });
+
+      // Pin the premise: before the migration a 300KB logo cannot be stored at all,
+      // so every assertion after it is about the ALTER rather than about a database
+      // that was fully migrated all along.
+      const newLogo = oldPrefix + "A".repeat(MAX_LOGO_DATA_URI_CHARS - oldPrefix.length);
+      await expect(scratch.db.update(orgProfile).set({ logoDataUri: newLogo }))
+        .rejects.toMatchObject({ cause: { constraint_name: "org_profile_logo_size" } });
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // The pre-existing row is untouched -- this is a widening, so no row that
+      // satisfied the old constraint can fail the new one.
+      const [kept] = await scratch.db.select().from(orgProfile);
+      expect(kept?.logoDataUri).toBe(oldLogo);
+
+      await scratch.db.update(orgProfile).set({ logoDataUri: newLogo });
+      const [raised] = await scratch.db.select().from(orgProfile);
+      expect(raised?.logoDataUri).toHaveLength(MAX_LOGO_DATA_URI_CHARS);
+
+      // ...and one character more is still refused, so the bound moved rather
+      // than being dropped.
+      await expect(scratch.db.update(orgProfile).set({ logoDataUri: `${newLogo}A` }))
+        .rejects.toMatchObject({ cause: { constraint_name: "org_profile_logo_size" } });
+    });
+  }, 30000);
+
   // The singleton, which is the claim the whole org_profile design rests on:
   // "one row" has to be enforced by the database, not by everybody
   // remembering to upsert. Both halves are tested because either alone is
@@ -1693,8 +1726,11 @@ describe("documents schema (0009)", () => {
       WHERE conname = 'org_profile_logo_size'
     `);
     // The constant and the constraint cannot drift: one is asserted to be in the
-    // other. 43715 = 4 * ceil(32768/3) + len('data:image/jpeg;base64,').
-    expect(MAX_LOGO_DATA_URI_CHARS).toBe(43_715);
+    // other. 409623 = 4 * ceil(307200/3) + len('data:image/jpeg;base64,'), and it
+    // was 43715 until v1.0.1 raised the logo from 32KB to 300KB -- so migration
+    // 0010 exists to widen this constraint, and this line is what would have
+    // failed if it did not.
+    expect(MAX_LOGO_DATA_URI_CHARS).toBe(409_623);
     expect(check?.src).toContain(String(MAX_LOGO_DATA_URI_CHARS));
 
     const prefix = "data:image/png;base64,";

@@ -1650,36 +1650,68 @@ function escapedBytes(value: string): number {
   return bytes;
 }
 
-/** What an issuer profile will cost a render: its text, escaped, plus its logo. */
-export function orgProfileBytes(profile: {
+/**
+ * What an issuer profile's TEXT will cost a render, escaped.
+ *
+ * IT USED TO ADD THE LOGO IN and be called `orgProfileBytes`, and that sum is what
+ * made the two compete: the logo was charged against the same budget as the eight
+ * fields printed beside it, so a bigger logo could only come out of the address. The
+ * logo is charged to the render's image allowance now and is not counted here. See
+ * ORG_PROFILE_TEXT_RESERVE_BYTES.
+ */
+export function orgProfileTextBytes(profile: {
   name: string; addressLines: string; vatNumber: string; registrationNumber: string;
-  email: string; phone: string; website: string; bankDetails: string; logoDataUri: string;
+  email: string; phone: string; website: string; bankDetails: string;
 }): number {
   return escapedBytes(profile.name) + escapedBytes(profile.addressLines)
     + escapedBytes(profile.vatNumber) + escapedBytes(profile.registrationNumber)
     + escapedBytes(profile.email) + escapedBytes(profile.phone)
-    + escapedBytes(profile.website) + escapedBytes(profile.bankDetails)
-    + profile.logoDataUri.length;
+    + escapedBytes(profile.website) + escapedBytes(profile.bankDetails);
 }
 
 /**
- * THE LOGO'S TWO BOUNDS, AND THEY ARE NOT THE SAME NUMBER.
+ * THE LOGO'S THREE BOUNDS, AND THEY ARE NOT THE SAME NUMBER OR EVEN THE SAME UNIT.
  *
- * `MAX_LOGO_BYTES` bounds the IMAGE. `MAX_LOGO_DATA_URI_CHARS` bounds the COLUMN,
- * which holds base64 -- 4 characters per 3 bytes, plus the longest permitted prefix.
- * Reusing the first as the second would silently shrink the permitted logo to 24KB
- * and nothing would say so: every rejected upload would look like a user's mistake.
+ * `MAX_LOGO_BYTES` bounds the IMAGE and is what `logoDataUriProblem` checks.
+ * `MAX_LOGO_DATA_URI_CHARS` bounds the COLUMN, which holds base64 -- 4 characters per
+ * 3 bytes, plus the longest permitted prefix. Reusing the first as the second would
+ * silently shrink the permitted logo to 225KB and nothing would say so: every
+ * rejected upload would look like a user's mistake.
  *
- * 32KB of image is the figure the spec names. It reaches the renderer inlined at 4/3
- * of its size -- 43,691 bytes against a 131,072-byte input cap, which is 33.3% of it
- * -- so it leaves the document itself TWO THIRDS of the budget. (An earlier version
- * of this sentence said three quarters, which is the same arithmetic rounded in the
- * flattering direction.)
+ * **300KB, NOT THE 32KB v1.0.0 SHIPPED, BECAUSE 32KB WAS TOO SMALL FOR A REAL LOGO.**
+ * Flat-colour artwork on a large canvas lands around 300KB as a PNG and looks bad
+ * downscaled to fit an arbitrary limit. It reaches the renderer inlined at 4/3 of its
+ * size -- 409,600 bytes -- which is more than v1.0.0's ENTIRE 131,072-byte render
+ * input cap, and that is why this is not a one-line change: the logo used to compete
+ * with the document's text for one shared allowance and now has its own. See
+ * RENDER_MARKUP_CAP_BYTES.
+ *
+ * **`MAX_LOGO_PIXELS` IS THE BOUND THAT ACTUALLY PROTECTS THE RENDERER, BECAUSE FILE
+ * BYTES ARE A POOR PROXY FOR WHAT A RENDERER HOLDS.** A PNG's decoded raster is
+ * width x height x 4 whatever its file size, so a small file can decode to an
+ * enormous bitmap. Measured on the server, through renderPdf, sampling the child's
+ * peak RSS from /proc: a 12,227-byte 1-bit PNG of 10,000 x 10,000 costs 535MB, and a
+ * 20,625-byte one of 13,000 x 13,000 costs 864MB. Both are far below any byte limit
+ * worth having. A render's cost tracks PIXELS: peak RSS is about 56MB + 7.65MB per
+ * megapixel across 3Mpx (78MB), 11Mpx (143MB), 25Mpx (250MB) and 45Mpx (401MB).
+ *
+ * 16,000,000 pixels is 4000 x 4000, or 8000 x 2000 -- 5.7x the 2000 x 1400 canvas the
+ * logo this limit was raised for uses. At the byte cap it costs 180MB alone and 353MB
+ * in the worst document that can carry it (a full markup budget of minimal table rows
+ * beside it), which is what `ram.runtime` is built from. The next size up a design
+ * tool would offer, 5000 x 4000, measures 210MB alone and 384MB in that same
+ * document: 31MB per render over the budget, 62MB across the two that can run at
+ * once, on a server with no swap where overshooting is an OOM kill.
+ *
+ * Pillow refuses anything over 178,956,970 pixels outright (twice its
+ * MAX_IMAGE_PIXELS) and drops the image from the page, so the window this bound
+ * closes is the one BELOW that: 169Mpx decoded happily and cost 864MB.
  *
  * `org_profile_logo_size` CHECKs the same character count, and a test asserts the
  * constraint's literal equals this constant so the two cannot drift.
  */
-export const MAX_LOGO_BYTES = 32 * 1024;
+export const MAX_LOGO_BYTES = 300 * 1024;
+export const MAX_LOGO_PIXELS = 16_000_000;
 const LONGEST_LOGO_PREFIX = "data:image/jpeg;base64,".length;
 export const MAX_LOGO_DATA_URI_CHARS = Math.ceil(MAX_LOGO_BYTES / 3) * 4 + LONGEST_LOGO_PREFIX;
 
@@ -1748,6 +1780,136 @@ const LOGO_SIGNATURES: Record<string, (bytes: readonly number[]) => boolean> = {
     && startsWithBytes(b.slice(8), [0x57, 0x45, 0x42, 0x50]),
 };
 
+/** A decoded image's shape. Both sides are positive; a zero is "unreadable". */
+export interface ImageSize { readonly width: number; readonly height: number; }
+
+function be16(b: readonly number[], at: number): number {
+  return (at8(b, at) << 8) | at8(b, at + 1);
+}
+
+function be32(b: readonly number[], at: number): number {
+  // `>>> 0` rather than `|`: a width with its top bit set is a positive 32-bit
+  // number, and the bitwise form would hand back a negative one that compares
+  // BELOW the pixel bound. PNG's fields are unsigned.
+  return ((at8(b, at) << 24) | (at8(b, at + 1) << 16)
+    | (at8(b, at + 2) << 8) | at8(b, at + 3)) >>> 0;
+}
+
+/** The IHDR, which the spec requires to be the first chunk and 13 bytes long. */
+function pngSize(b: readonly number[]): ImageSize | null {
+  if (!startsWithBytes(b.slice(8), [0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52])) return null;
+  return { width: be32(b, 16), height: be32(b, 20) };
+}
+
+/** One byte, or 0 past the end -- so a truncated header reads as zeros, not undefined. */
+function at8(b: readonly number[], at: number): number {
+  return b[at] ?? 0;
+}
+
+/** The logical screen descriptor: two little-endian 16-bit fields at byte 6. */
+function gifSize(b: readonly number[]): ImageSize | null {
+  if (b.length < 10) return null;
+  return {
+    width: at8(b, 6) | (at8(b, 7) << 8),
+    height: at8(b, 8) | (at8(b, 9) << 8),
+  };
+}
+
+/**
+ * THE FRAME HEADER, WHICH IS NOT AT A FIXED OFFSET, so this walks the marker
+ * segments to the first SOFn. A JPEG may carry EXIF, an ICC profile and a thumbnail
+ * ahead of it; DIMENSION_BYTES is how far that walk is willing to go.
+ */
+function jpegSize(b: readonly number[]): ImageSize | null {
+  let at = 2;
+  while (at + 8 < b.length) {
+    if (at8(b, at) !== 0xff) return null;
+    const marker = at8(b, at + 1);
+    // Padding, and the standalone markers that carry no length field.
+    if (marker === 0xff) { at += 1; continue; }
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) { at += 2; continue; }
+    // SOF0..SOF15, less the three markers that share the range and are not frames
+    // (DHT, JPG, DAC). Height precedes width, which is the way round it is easy to
+    // get wrong -- and on a square test image, impossible to notice.
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return { height: be16(b, at + 5), width: be16(b, at + 7) };
+    }
+    // The scan: the frame header can no longer appear ahead of us.
+    if (marker === 0xda) return null;
+    const length = be16(b, at + 2);
+    if (length < 2) return null;
+    at += 2 + length;
+  }
+  return null;
+}
+
+/**
+ * ALL THREE WEBP VARIANTS, because reading only the one everybody names would leave
+ * the other two as a way past the pixel bound. A lossy file is `VP8 `, a lossless one
+ * `VP8L` with its dimensions packed 14 bits at a time, and an extended one `VP8X`
+ * with a 24-bit canvas size -- and an encoder picks between them.
+ */
+function webpSize(b: readonly number[]): ImageSize | null {
+  const fourcc = String.fromCharCode(at8(b, 12), at8(b, 13), at8(b, 14), at8(b, 15));
+  if (fourcc === "VP8X") {
+    if (b.length < 30) return null;
+    return {
+      width: 1 + (at8(b, 24) | (at8(b, 25) << 8) | (at8(b, 26) << 16)),
+      height: 1 + (at8(b, 27) | (at8(b, 28) << 8) | (at8(b, 29) << 16)),
+    };
+  }
+  if (fourcc === "VP8 ") {
+    // The key-frame start code, which is what says the header is where we think.
+    if (b.length < 30) return null;
+    if (at8(b, 23) !== 0x9d || at8(b, 24) !== 0x01 || at8(b, 25) !== 0x2a) return null;
+    return {
+      width: (at8(b, 26) | (at8(b, 27) << 8)) & 0x3fff,
+      height: (at8(b, 28) | (at8(b, 29) << 8)) & 0x3fff,
+    };
+  }
+  if (fourcc === "VP8L") {
+    if (b.length < 25 || at8(b, 20) !== 0x2f) return null;
+    const packed = (at8(b, 21) | (at8(b, 22) << 8) | (at8(b, 23) << 16) | (at8(b, 24) << 24)) >>> 0;
+    return { width: 1 + (packed & 0x3fff), height: 1 + ((packed >>> 14) & 0x3fff) };
+  }
+  return null;
+}
+
+/**
+ * How many bytes of each format have to be decoded before its dimensions are
+ * readable. Three of them are a fixed header; JPEG is a walk, and 64KB is past any
+ * plausible pile of EXIF and thumbnails. A template-embedded image cannot exceed
+ * MAX_TEMPLATE_BYTES of base64 anyway, so for that path this is the whole file.
+ */
+const DIMENSION_BYTES: Record<string, number> = { png: 24, gif: 10, webp: 30, jpeg: 65_536 };
+
+const IMAGE_SIZE_READERS: Record<string, (b: readonly number[]) => ImageSize | null> = {
+  png: pngSize, gif: gifSize, jpeg: jpegSize, webp: webpSize,
+};
+
+/**
+ * How large an image a `data:` URI decodes to, or null if its header does not say.
+ *
+ * THE HEADER, NOT THE PAYLOAD: the same hand-rolled base64 prefix decoder the
+ * signature check uses (see decodeBase64Prefix for why it is hand-rolled), reading
+ * tens of bytes rather than hundreds of thousands. Nothing here decodes an image.
+ *
+ * A null is "this file's header does not say how big it is", which for the four types
+ * allowed here means a file no image library could open either. `logoDataUriProblem`
+ * treats it as a refusal, because a logo that cannot be drawn should be refused at
+ * the upload rather than discovered as a blank space on a quote.
+ */
+export function imageDataUriSize(uri: string): ImageSize | null {
+  const declared = LOGO_DATA_URI.exec(uri)?.[1];
+  if (declared === undefined) return null;
+  const wanted = DIMENSION_BYTES[declared] ?? 0;
+  const base64 = uri.slice(uri.indexOf(",") + 1);
+  const bytes = decodeBase64Prefix(base64.slice(0, Math.ceil(wanted / 3) * 4), wanted);
+  const size = IMAGE_SIZE_READERS[declared]?.(bytes) ?? null;
+  if (size === null || size.width < 1 || size.height < 1) return null;
+  return size;
+}
+
 /**
  * Why this string cannot be a logo, or null if it can. "" is a logo-less profile and
  * is always fine.
@@ -1761,24 +1923,37 @@ const LOGO_SIGNATURES: Record<string, (bytes: readonly number[]) => boolean> = {
  * elements, and it would arrive inside a `data:` URI where neither the document
  * sanitiser nor the renderer's fetcher looks inside it.
  *
- * AND THE TYPE IN THE URI IS NOT EVIDENCE OF ANYTHING, which is why the last check
+ * AND THE TYPE IN THE URI IS NOT EVIDENCE OF ANYTHING, which is why the fourth check
  * reads the bytes. In a browser that string comes from `File.type`, which is decided
  * by the file's EXTENSION -- so an SVG renamed to .png declares `image/png`, passes
  * every check above, and gets drawn as vector art by a renderer that sniffs properly.
  * See LOGO_SIGNATURES.
+ *
+ * THE FIFTH CHECK IS THE ONE THE BYTE BOUND CANNOT MAKE, and v1.0.0 did not have it.
+ * A file's size says nothing about the raster it decodes to: 12,227 bytes of 1-bit
+ * PNG is 10,000 x 10,000 and costs the renderer 535MB. See MAX_LOGO_PIXELS.
  */
 export function logoDataUriProblem(uri: string): string | null {
   if (uri === "") return null;
   if (!LOGO_DATA_URI.test(uri)) {
     return "a logo must be a base64 data: URI for a PNG, JPEG, GIF or WEBP image";
   }
-  if (uri.length > MAX_LOGO_DATA_URI_CHARS) {
-    return `a logo must be ${String(MAX_LOGO_BYTES)} bytes or less`;
-  }
   const base64 = uri.slice(uri.indexOf(",") + 1);
   if (base64.length % 4 !== 0) return "the logo's base64 data is malformed";
   const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
   const bytes = (base64.length / 4) * 3 - padding;
+  // THE DECODED SIZE IS THE BOUND, AND IT IS THE ONLY SIZE BOUND HERE. There was a
+  // second one on the string's length, which fired first and said less; at 32KB it
+  // was reachable, because 32,768 and 32,769 bytes produce the same 43,692
+  // characters and only the arithmetic could tell them apart. At 307,200 -- a
+  // multiple of 3 -- the base64 boundary lands exactly on the limit, so anything the
+  // string-length bound would have caught this one catches first, with the size in
+  // the sentence. Keeping both would have left one that no test could fail.
+  //
+  // Nothing that passes here can overrun `org_profile_logo_size`, and that is
+  // arithmetic rather than hope: MAX_LOGO_BYTES bytes is 409,600 characters of
+  // base64, and the longest permitted prefix is 23, which is MAX_LOGO_DATA_URI_CHARS
+  // exactly. org-profile.test.ts asserts it for every prefix the regex allows.
   if (bytes > MAX_LOGO_BYTES) {
     return `a logo must be ${String(MAX_LOGO_BYTES)} bytes or less; this one is ${String(bytes)}`;
   }
@@ -1789,6 +1964,19 @@ export function logoDataUriProblem(uri: string): string | null {
   if (signature === undefined || !signature(decodeBase64Prefix(base64.slice(0, 16), 12))) {
     return `a logo's contents must really be a ${String(declared)} image;`
       + " this file's data does not match the type it claims";
+  }
+  // And the raster it decodes to has to be one the renderer can afford, which its
+  // file size does not say. An unreadable header is refused rather than waved
+  // through: no image library could open it either, so it would print as nothing.
+  const size = imageDataUriSize(uri);
+  if (size === null) {
+    return `this file's header does not say how large the image is,`
+      + ` so it is not a ${String(declared)} a renderer could draw`;
+  }
+  if (size.width * size.height > MAX_LOGO_PIXELS) {
+    return `a logo must be ${String(MAX_LOGO_PIXELS)} pixels or fewer; this one is `
+      + `${String(size.width)} x ${String(size.height)}, which is `
+      + `${String(size.width * size.height)}`;
   }
   return null;
 }
@@ -1858,19 +2046,23 @@ export const orgProfileInputSchema = z.object({
 }).superRefine((value, ctx) => {
   const problem = logoDataUriProblem(value.logoDataUri);
   if (problem !== null) ctx.addIssue({ code: "custom", path: ["logoDataUri"], message: problem });
-  // THE RESERVE HAS TO BE ENFORCED SOMEWHERE OR IT IS A WISH. A quote's budget is the
-  // render cap minus a template allowance minus what an issuer may cost, and nothing
-  // bounded the issuer at all: a maxed profile is 47,115 bytes in ASCII and 60,715
-  // with an `&` in every text field, because an ampersand escapes to five. The logo
-  // and the text compete for the same reserve, which is why they are counted together
-  // rather than separately.
-  const bytes = orgProfileBytes(value);
-  if (bytes > ORG_PROFILE_RESERVE_BYTES) {
+  // THE RESERVE HAS TO BE ENFORCED SOMEWHERE OR IT IS A WISH. A quote's markup budget
+  // is the render's markup cap minus a template allowance minus what an issuer's text
+  // may cost, and nothing bounded the issuer at all: 3,400 characters of ASCII is
+  // 3,400 bytes and the same fields with an `&` in every position are 17,000, because
+  // an ampersand escapes to five.
+  //
+  // THE LOGO IS NO LONGER PART OF THIS SUM, and the path of the issue moved with it:
+  // it is the text that can overrun this now, so the message names the text and the
+  // issue lands on the first field rather than on the logo the user did not change.
+  const bytes = orgProfileTextBytes(value);
+  if (bytes > ORG_PROFILE_TEXT_RESERVE_BYTES) {
     ctx.addIssue({
       code: "custom",
-      path: ["logoDataUri"],
-      message: `this profile needs ${String(bytes)} bytes of the ${String(ORG_PROFILE_RESERVE_BYTES)}`
-        + " a quote reserves for its issuer; use a smaller logo or shorter details",
+      path: ["name"],
+      message: `this profile's details need ${String(bytes)} bytes of the `
+        + `${String(ORG_PROFILE_TEXT_RESERVE_BYTES)} a quote reserves for them; `
+        + "shorten them (an & costs five bytes, not one)",
     });
   }
 });
@@ -1956,12 +2148,33 @@ export type DocumentRecord = z.infer<typeof documentSchema>;
  */
 
 /**
- * renderPdf's input cap, restated here because the whole budget derives from it --
- * and because THE AUTHORITATIVE CHECK IS NOT THIS FILE'S. `issueQuote` measures the
- * merged, sanitised bytes after the merge and before the spawn; everything below
- * PREDICTS that number from the inputs, and a prediction can be wrong.
+ * **THE RENDERER HAS TWO BYTE CAPS NOW, AND THAT IS THE WHOLE OF v1.0.1'S DESIGN.**
+ * Restated here because the budget below divides one of them up -- and because THE
+ * AUTHORITATIVE CHECK IS NOT THIS FILE'S. `issueQuote` measures the merged, sanitised
+ * bytes after the merge and before the spawn; everything below PREDICTS that number
+ * from the inputs, and a prediction can be wrong.
+ *
+ * MARKUP AND IMAGE PAYLOAD ARE SEPARATE BECAUSE THEY DO NOT COST THE SAME THING. A
+ * render's memory tracks ROWS, not bytes: measured on the server, 128KB of minimal
+ * `<tr><td>x</td></tr>` peaks at 345MB where the same 128KB of prose is 71MB. The
+ * base64 inside a `data:` URI cannot be a row -- it has no `<` in it, by definition
+ * of the alphabet -- so giving it its own allowance lets the logo grow without
+ * letting the row count grow with it.
+ *
+ * v1.0.0 had one cap of 131,072 and the logo took 43,715 of it. A 300KB logo inlines
+ * to 409,623, so keeping one cap would mean 496,980 bytes of ANY shape: 128KB of rows
+ * costs 345MB, and a cap three times larger costs proportionally more. Measured, the
+ * rejected design (a 128KB markup budget with the image allowance added on top)
+ * peaks at 440MB against this one's 353MB.
+ *
+ * The markup half is therefore SMALLER than v1.0.0's single cap, and no document
+ * loses anything by it: the template (16,384), the issuer's text (4,285) and the
+ * quote's content (66,688) each keep exactly the allowance they had, and what has
+ * gone is the 43,715 the logo used to occupy inside the same figure. A merged
+ * document that used that slack -- a template repeating a field, with no logo -- is
+ * the one case this refuses where v1.0.0 did not.
  */
-export const RENDER_INPUT_CAP_BYTES = 128 * 1024;
+export const RENDER_IMAGE_CAP_BYTES = MAX_LOGO_DATA_URI_CHARS;
 
 /**
  * What a user-edited template may cost, IN BYTES rather than characters. The shipped
@@ -1976,22 +2189,27 @@ export const RENDER_INPUT_CAP_BYTES = 128 * 1024;
 export const MAX_TEMPLATE_BYTES = 16 * 1024;
 
 /**
- * What a quote reserves for its issuer: the logo plus the eight text fields, escaped.
+ * What a quote reserves for its issuer's TEXT: the eight fields, escaped, and not
+ * the logo -- which is exactly what changed in v1.0.1.
  *
- * 48,000 was chosen from a measurement of a maxed ASCII profile (47,115) and was
- * simply hoped for: nothing bounded the profile, and the same fields full of `&`
- * measure 60,715. `orgProfileInputSchema` now enforces it, so the reserve is a fact
- * about what can be stored rather than an assumption about what people type.
+ * v1.0.0 reserved 48,000 for the two together, and that number was 43,715 of logo
+ * plus 4,285 of slack around 3,400 characters of text. Adding the two up was the
+ * thing that made a bigger logo look impossible: the sum was measured against the
+ * SAME cap the document's own content came out of, so every byte of logo was a byte
+ * of quote. They are counted separately now -- the logo against MAX_LOGO_BYTES and
+ * the image half of the render cap, this against the markup half.
  *
- * THOSE TWO FIGURES READ 47,320 AND 60,920 UNTIL PHASE 7'S QUALITY REVIEW, each
- * exactly 205 too high, in three places. The arithmetic is checkable in one
- * line and now is: the eight text fields cap at 3,400 characters and the logo
- * column at MAX_LOGO_DATA_URI_CHARS (43,715), so ASCII is 3,400 + 43,715 =
- * 47,115, and an `&` in every text position costs five bytes rather than one
- * for 17,000 + 43,715 = 60,715. The old pair implied a 43,920-character logo,
- * which is 205 more than the column can hold.
+ * 4,285 IS THE SAME BOUND ON THE TEXT AS BEFORE, not a new one: 3,400 characters of
+ * ASCII fit (they did), and the same fields full of `&` cost 17,000 and do not (they
+ * did not). `orgProfileInputSchema` enforces it, so the reserve is a fact about what
+ * can be stored rather than an assumption about what people type.
+ *
+ * THE FIGURES READ 47,320 AND 60,920 UNTIL PHASE 7'S QUALITY REVIEW, each exactly 205
+ * too high, in three places, because the old pair implied a 43,920-character logo --
+ * 205 more than the column could hold. The arithmetic is checkable in one line and
+ * now is one: 3,400 characters of text, five bytes each in the worst case.
  */
-export const ORG_PROFILE_RESERVE_BYTES = 48_000;
+export const ORG_PROFILE_TEXT_RESERVE_BYTES = 4_285;
 
 /**
  * A line's markup, without its description.
@@ -2010,8 +2228,14 @@ export const ORG_PROFILE_RESERVE_BYTES = 48_000;
 export const DOCUMENT_LINE_MARKUP_BYTES = 186;
 
 /**
- * What is left for the quote's own content once the template and the issuer have
- * taken their reserves: 66,688 bytes.
+ * What a quote's own content may cost: 66,688 bytes, THE SAME FIGURE v1.0.0 SHIPPED.
+ *
+ * IT USED TO BE A REMAINDER AND IS A PRIMARY ALLOWANCE NOW, which is the direction
+ * v1.0.1 reversed. It was `cap - template - issuer`, where `issuer` included the
+ * logo; raising the logo would either have shrunk this or been impossible. The three
+ * markup allowances are the given numbers now, and the markup cap is their sum, so
+ * this constant did not move when the logo grew by 365,908 bytes -- which is the
+ * point of the exercise, stated as arithmetic.
  *
  * **THIS IS A PREDICTION AND IT IS NOT THE CHECK THAT DECIDES.** It exists so the
  * form can refuse a quote in the form, with a message about a field, instead of the
@@ -2024,8 +2248,8 @@ export const DOCUMENT_LINE_MARKUP_BYTES = 186;
  *   - `"` costs one byte in text position and SIX in an attribute (`&quot;`), and
  *     this charges one. A 330-character template using each field once, filled with
  *     quote-heavy content, predicts 37,000 and merges to 165,735.
- *   - the issuer's reserve was not enforced, so a profile could cost 60,715 of the
- *     48,000 reserved for it. It is enforced now, which closes that one.
+ *   - the issuer's reserve was not enforced, so a profile's text could cost 17,000 of
+ *     the 4,285 reserved for it. It is enforced now, which closes that one.
  *   - `MAX_TEMPLATE_BYTES` counted characters, so a CJK template cost three times its
  *     allowance. It counts bytes now, which closes that one too.
  *   - a template may repeat a field; the prediction counts a value once and the page
@@ -2037,8 +2261,107 @@ export const DOCUMENT_LINE_MARKUP_BYTES = 186;
  * was too big; the cost of the disagreement is a worse error message, not a bad
  * document or a wasted render.
  */
-export const DOCUMENT_CONTENT_BUDGET_BYTES =
-  RENDER_INPUT_CAP_BYTES - MAX_TEMPLATE_BYTES - ORG_PROFILE_RESERVE_BYTES;
+export const DOCUMENT_CONTENT_BUDGET_BYTES = 66_688;
+
+/**
+ * WHAT THE RENDERER WILL ACCEPT THAT IS NOT AN IMAGE PAYLOAD: 87,357 bytes, the sum
+ * of the three allowances above and nothing else.
+ *
+ * **THIS IS THE FIGURE THE MEMORY ARITHMETIC IS BUILT ON, because rows are what cost
+ * a render and only markup can carry a row.** Measured on the server through
+ * renderPdf with the child's peak RSS sampled from /proc: 87,357 bytes of
+ * `<tr><td>x</td></tr>` peaks at 250MB, where the 131,072 v1.0.0 allowed peaks at
+ * 345MB. A logo at the pixel bound adds 103MB to the first of those, which is the
+ * 353MB documents-render.ts's RENDER_MAX_CONCURRENCY and manifest.toml's
+ * `ram.runtime` are computed from.
+ *
+ * There is no slack in it on purpose: it is exactly what the three parts may cost, so
+ * a merged document that overruns it has overrun one of them (or a template repeating
+ * a field, which the prediction cannot see and the measurement can).
+ */
+export const RENDER_MARKUP_CAP_BYTES =
+  MAX_TEMPLATE_BYTES + ORG_PROFILE_TEXT_RESERVE_BYTES + DOCUMENT_CONTENT_BUDGET_BYTES;
+
+/**
+ * Both halves together: 496,980 bytes. Nothing enforces this on its own -- the two
+ * caps are enforced separately, since a document made ENTIRELY of markup up to this
+ * figure is exactly what the split exists to refuse -- but a caller reporting what a
+ * document cost wants one number for it.
+ */
+export const RENDER_INPUT_CAP_BYTES = RENDER_MARKUP_CAP_BYTES + RENDER_IMAGE_CAP_BYTES;
+
+/**
+ * The pixels a whole document's images may decode to, summed.
+ *
+ * SUMMED, not per image, because the renderer decodes all of them: four images of
+ * 3000 x 2100 measured 198MB, against 250MB for the one 25Mpx image they add up to.
+ * A per-image bound would leave the sum unbounded, and it is the sum the machine
+ * pays for.
+ *
+ * It is MAX_LOGO_PIXELS rather than a multiple of it: a quote has one logo, and a
+ * template that embeds images of its own is spending the same allowance. A document
+ * that wants both has to keep them under it between them.
+ */
+export const RENDER_IMAGE_PIXEL_CAP = MAX_LOGO_PIXELS;
+
+/** What one document will cost the renderer, split the way the caps are. */
+export interface RenderInputCost {
+  /** Every byte of it, UTF-8. */
+  readonly totalBytes: number;
+  /** The base64 payloads of its `data:` images, which cannot contain markup. */
+  readonly imageBytes: number;
+  /** Everything else: the tags, the text, the CSS -- where the rows live. */
+  readonly markupBytes: number;
+  /** What those images decode to, summed, over the ones whose header says. */
+  readonly imagePixels: number;
+  /** How many `data:` images there are, readable header or not. */
+  readonly images: number;
+}
+
+/**
+ * A data: image URI anywhere in a document, and the base64 run that follows it.
+ *
+ * NOT ANCHORED, unlike LOGO_DATA_URI, because this one is looking INSIDE a page. The
+ * run stops at the first character outside the base64 alphabet, which is what makes
+ * the accounting safe: `"` ends the attribute, `<` opens the next tag, and neither is
+ * in the alphabet. So a byte counted as image payload can never be a byte of markup,
+ * and no amount of `data:image/png;base64,` written into a template can smuggle a
+ * table row past the markup cap.
+ */
+const EMBEDDED_IMAGE = /data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]*={0,2}/g;
+
+/**
+ * What a finished document will cost the renderer, measured on the bytes themselves.
+ *
+ * **THE MARKUP HALF AND THE IMAGE HALF ARE NOT INTERCHANGEABLE**, which is the whole
+ * reason this exists rather than one `byteLength`: 128KB of table rows peaked at
+ * 345MB and 128KB of prose at 71MB, and a base64 payload cannot be a table row at
+ * all. See RENDER_MARKUP_CAP_BYTES.
+ *
+ * `imagePixels` counts only the images whose header could be read. An unreadable one
+ * is charged its bytes and no pixels, which is safe for the two ways it can happen:
+ * a logo goes through `logoDataUriProblem`, which refuses an unreadable header
+ * outright, and a template-embedded image is at most MAX_TEMPLATE_BYTES of base64,
+ * which is inside the window this reads. Anything left is a file Pillow cannot open
+ * either -- and if it could, it would still meet its own 178,956,970-pixel refusal.
+ */
+export function renderInputCost(html: string): RenderInputCost {
+  const encoder = new TextEncoder();
+  let imageBytes = 0;
+  let imagePixels = 0;
+  let images = 0;
+  for (const match of html.matchAll(EMBEDDED_IMAGE)) {
+    const uri = match[0];
+    images += 1;
+    imageBytes += uri.length - (uri.indexOf(",") + 1);
+    const size = imageDataUriSize(uri);
+    if (size !== null) imagePixels += size.width * size.height;
+  }
+  // The payloads are base64 and therefore one byte per character, so subtracting
+  // characters from a UTF-8 byte count is exact rather than approximately right.
+  const totalBytes = encoder.encode(html).length;
+  return { totalBytes, imageBytes, markupBytes: totalBytes - imageBytes, imagePixels, images };
+}
 
 /**
  * THE PER-FIELD CAPS, SET TO WHAT IS DELIVERABLE IN THE WORST CASE RATHER THAN THE

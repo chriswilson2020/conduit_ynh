@@ -6,7 +6,7 @@ id = "conduit"
 name = "Conduit"
 description.en = "Self-hosted CRM with pipelines, projects, Gantt charts and an integrated inbox"
 
-version = "1.0.0~ynh1"
+version = "1.0.1~ynh1"
 
 maintainers = ["chriswilson2020"]
 
@@ -23,26 +23,34 @@ ldap = "not_relevant"
 sso = true
 disk = "2G"
 ram.build = "50M"
-# 400M for the Node API as before, plus 700M for renders. A render is a separate
+# 400M for the Node API as before, plus 750M for renders. A render is a separate
 # Python process, not memory the API already had, and what bounds its cost is the
-# input cap rather than the timeout.
+# input caps rather than the timeout.
 #
-# RE-MEASURED, AND THE FIRST FIGURE WAS 2.1x TOO LOW. It said 157MB at
-# documents-render.ts's 128KB cap, from a friendly document. Driven through the
+# RE-MEASURED FOR v1.0.1, THE SAME WAY AND ON THE SAME MACHINE: driven through the
 # shipped renderPdf on the Debian 12 target, with the child's peak RSS sampled from
-# /proc, the same cap costs 238MB for a quote-shaped table and 332MB for a table of
-# minimal rows -- the ROW COUNT drives the cost more than the byte count does, and a
-# template is user-editable, so 332MB is the honest worst case. (The same 128KB of
-# prose is 84MB.)
+# /proc every 50ms. Two figures this comment carried have moved, and neither moved
+# because anything was edited to taste -- the dense-row worst case at the old 128KB
+# cap measures 345MB rather than the 332MB recorded, and 128KB of prose measures
+# 71MB rather than 84MB.
+#
+# WHAT THIS RELEASE CHANGED IS THE SHAPE OF THE WORST CASE, NOT JUST ITS SIZE. The
+# markup cap is 87,357 bytes now (250MB of minimal table rows, measured), and a
+# `data:` image gets a separate 409,623-byte allowance that cannot contain a table
+# row. The worst document that can now be built is a full markup budget of rows with
+# a logo at the pixel bound beside it: 353MB, measured. The logo's file size is not
+# what decides that -- 12,227 bytes of PNG can be 100 megapixels and 535MB, which is
+# why there is a 16,000,000-pixel cap and why it is enforced at the renderer.
 #
 # TWO is the concurrency limit documents-render.ts enforces, and this number is only
-# true if it does: 400 + 2 x 332 = 1,064M. It was three against the old figure, which
-# would now be 1,396M -- a third of a 3819MB machine that has NO SWAP, where
+# true if it does: 400 + 2 x 353 = 1,106M. It was 1100M against v1.0.0's worst case,
+# which the same method now puts at 345MB (400 + 2 x 345 = 1,090M, still true). Three
+# renders would be 1,459M -- a third of a 3819MB machine that has NO SWAP, where
 # overshooting is an OOM kill rather than a slowdown. Advisory either way -- YunoHost
 # sets no cgroup from it and does not evaluate it at install -- so the real protection
-# is the input cap plus that limit, and this is the honest declaration of what the two
-# of them add up to. A test asserts the arithmetic against this literal.
-ram.runtime = "1100M"
+# is the input caps plus that limit, and this is the honest declaration of what they
+# add up to. A test asserts the arithmetic against this literal.
+ram.runtime = "1150M"
 
 [install]
 
