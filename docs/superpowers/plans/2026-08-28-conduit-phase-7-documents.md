@@ -2184,10 +2184,11 @@ outright rather than queued for a slot it would waste) and released in a `finall
 It is in the renderer rather than in the issuing transaction because the budget is a
 property of the process, not of quotes: Task 5's template preview and any future
 document type need the same bound, and a limit a caller has to remember is a limit
-that holds until somebody adds a call site. On the issuing path it is never contended
-today -- the number sequence's row lock already serialises quotes of one type and year
--- so it is the backstop for everything else and for the New Year's Eve case where two
-years' sequences are live.
+that holds until somebody adds a call site. ~~On the issuing path it is never
+contended today -- the number sequence's row lock already serialises quotes of one
+type and year.~~ **FALSE, and measured false in review round 1**: the year comes from
+the caller's issue date, so two quotes dated in different years render side by side.
+The queue is reachable from the issuing path, which is why the wait is now bounded.
 
 Measured from the CHILDREN, not from a counter inside the module: each stub records
 how many copies of itself were running when it started. Six renders at once reach
@@ -2225,9 +2226,10 @@ quote that will not render. The mime is checked too, and SVG is deliberately exc
 `files` row to belong to exactly one company, contact, deal or project -- and an
 issuer's logo belongs to none of them. `org_profile.logo_file_id` references
 `files.id`, so there is no legal row for a logo to be. Both suites here attach their
-logo to a company to get a file id at all, and say so at the line. **Nothing in this
-task can fix it**: the options are widening the CHECK (0009 is unshipped, so it can be
-regenerated) or storing the logo outside `files`, and both are coordinator decisions.
+logo to a company to get a file id at all, and say so at the line. ~~Nothing in this
+task can fix it~~ -- **the coordinator ruled it into a `data:` URI column on
+`org_profile` and review round 1 implemented it, so `MAX_LOGO_BYTES` now bounds a
+value the profile holds directly and there is no `files` row involved at all.**
 
 **The 1x1 transparent placeholder Task 2 suggested is NOT implemented, and should not
 be.** That note predates Task 3's re-seed, which wraps the logo in
@@ -2262,16 +2264,23 @@ on the server's 57.2 and on CI's 61.1.
    `DOCUMENT_MAX_LINES`/`DOCUMENT_MAX_DESCRIPTION_CHARS` are in `@conduit/shared`.**
    The form must parse its text into integer units and reject what does not parse
    before calling `documentTotals` (Task 2's contract), and the schema is what says
-   what "in range" means on both sides.
-2. **The logo blocker above.** A logo upload has nowhere legal to put its `files` row.
+   what "in range" means on both sides. **The two constants are 60 and 250, not the
+   130 and 500 this task shipped -- see review round 1, SV-1 -- and there is a byte
+   budget beside them the editor should show.**
+2. ~~**The logo blocker above.** A logo upload has nowhere legal to put its `files`
+   row.~~ **RESOLVED in review round 1**: the logo is a `data:` URI column on
+   `org_profile` and there is no `files` row to place.
 3. **`formatQtyMilli` and `formatTaxRateBp`** are exported from the barrel, so the
    running total, the quantity column and the rate column are the same code as the
    PDF's.
 4. **`GET /api/deals/:id/documents` returns newest first with lines in position
    order; the PDF downloads from `GET /api/files/:fileId/download`.** There is no
    update or delete route, and that is the phase's claim rather than an omission.
-5. **`documentTemplateWarnings` is still unused.** Task 3 exported it for the template
-   editor; nothing in this task had a surface for it.
+5. ~~**`documentTemplateWarnings` is still unused.** Task 3 exported it for the
+   template editor; nothing in this task had a surface for it.~~ **The surface it was
+   waiting for had no API either, which this note missed. Review round 1 adds
+   `GET`/`PUT /api/document-templates/:type`, and the response carries the
+   warnings.**
 
 ##### THE INTERMITTENT UNIT FAILURE — MEASURED, AND THE NAMED MECHANISM IS FALSIFIED
 
@@ -2309,6 +2318,176 @@ from reading, not a measurement, and it is the shape worth testing next.
 
 **The advice not to raise the timeout stands, and is now stronger**: at 4% of budget,
 a longer timeout only makes the wedge take longer to report.
+
+##### TASK 4 REVIEW ROUND 1 — a gate that promised more than the renderer delivers, and an FK that could never be satisfied
+
+Commit `abdd0ec`. The security core and the immutability claim held: no update or
+delete path, recipient snapshotted, totals read back rather than recomputed, and the
+no-gaps property re-derived by racing two real Postgres sessions. All four mutation
+counts reproduced. Six findings landed on top.
+
+**SV-1: THE ADVERTISED MAXIMUM WAS NOT DELIVERABLE, AND MY COMMENT'S ARITHMETIC WAS
+WRONG TWICE.** 130 lines x 500 characters was documented as sized against renderPdf's
+128KB input cap. Measured end to end against the real template, `buildContext` and
+`prepareDocumentHtml`:
+
+| gate-legal input | merged |
+|---|---|
+| 130 x 500 ASCII, maxed notes/terms/address/names, maxed logo | **141,764 B** |
+| 130 x 500 accented, no logo | **162,699 B** |
+| 130 x 500 ASCII, no logo, short notes | 98,005 B |
+
+Two errors compounded. A line was costed at "about 120 bytes" and measures **145**.
+And the budget subtracted only the template and the logo -- it never accounted for
+`notes` (5000), `terms` (5000), `recipientAddress` (2000) or the two 200-character
+names, all permitted by the same schema. Task 5's editor would have offered a quote
+the server refuses, at roughly half the advertised count for a Dutch or French one.
+
+**Everything is measured now, and the figures are in the code rather than in prose.**
+On the seeded template, as merged and sanitised UTF-8:
+
+| | |
+|---|---|
+| the template with an empty context | 2,211 B |
+| a maxed org profile INCLUDING a maxed logo | +47,320 B |
+| maxed notes/terms/address/names (ASCII) | +12,486 B |
+| one more line item, short description | +145 B |
+| one more ASCII character of description | +1 B |
+
+**Escaping is measured too, and it is not what it looks like.** `&` costs 5 bytes and
+`<` and `>` cost 4, because substitution escapes them and the sanitiser leaves them
+escaped. **`"` and `'` cost 1** -- escaped on the way in and re-serialised bare in text
+position. A budget counting string length would under-count an ampersand-heavy quote
+five to one, and one assuming quotes were expensive would over-count.
+
+**The constants are now 60 lines x 250 characters**, which is what survives the worst
+case the review named: every optional field maxed, a maxed logo, and ACCENTED text
+throughout. That merges to ~113KB. A permanent test builds exactly that quote and
+asserts it fits, so the pair can never drift from the renderer again.
+
+**AND A BYTE BUDGET, BECAUSE CHARACTER COUNTS CANNOT BOUND BYTES.** Sizing the
+constants for the true worst character (a 3-byte CJK glyph, or a 5-byte `&`) would
+have meant about 35 lines, which is not a quote system. So `documentContentBytes`
+counts the actual submission -- escaping included, exact for any script -- against
+`DOCUMENT_CONTENT_BUDGET_BYTES` (66,688 = the 128KB cap minus a 16KB template
+allowance minus a 48KB issuer reserve). A quote inside every field cap and over the
+total is refused by the GATE with a sentence about the budget, not by a 413 naming a
+byte count. Task 5's editor computes the same function to show what is left.
+
+**Its conservatism has one named exception and the 413 stays for it**: the gate counts
+a value once, and a template printing `{{document.notes}}` forty times prints it
+forty times. There is a route test for that shape -- and it is a 413 only between
+128KB and 512K, because above that `mergeTemplate`'s own output bound throws first
+and the answer is a 422.
+
+**SV-2: A FOURTH POST-RENDER 500, GATED IN ONE LINE.** `z.iso.date()` accepts
+`0000-01-01` and **Postgres has no year zero**, so that quote computed, allocated a
+number, RENDERED, wrote the blob and died on the INSERT with `22008` -- a bare Error
+no domain mapping catches, through the public route. Same shape as the three CHECK
+constraints, third error code. `documentDateSchema` floors both dates at a four-digit
+year. `formatDocumentNumber` pads the year too, so the `QUO-0-0001` that quote would
+have carried is unreachable twice over.
+
+**O-1: THE SEMAPHORE IS REACHABLE FROM THE ISSUING PATH, AND TWO OF MY COMMENTS SAID
+IT WAS NOT.** The year comes from the caller's issue date, so quotes dated in
+different years take different sequence rows, different locks, and render side by
+side. Measured from the children, and now a permanent pair of tests: **two quotes in
+different years reach 2 concurrent renders; two in the same year reach 1.** The second
+is the control that says what the row lock does do.
+
+Worse, the companion claim that the lock hold is "bounded by renderPdf's 20s timeout"
+was false in a way that mattered: **the queue wait precedes the timeout and was
+itself unbounded.** With ten pooled connections and ten distinct years, ten
+transactions could hold their row locks and their connections indefinitely while three
+render -- an authenticated-user stall of the whole API. `RENDER_QUEUE_TIMEOUT_MS` is
+10s, so the bound is now 10s + 20s and a saturated renderer answers **503
+`renderer_busy`** rather than hanging. A timed-out waiter removes itself from the
+queue; leaving it would hand a slot to nobody and lose it permanently, which has its
+own test.
+
+**FIFO WAS ONLY A COMMENT, AND MY FIRST TEST FOR IT WAS FLAKY IN THE SAME WAY THE
+CODE UNDER TEST WAS NOT.** It read the order three queued children appended to a log,
+which measures which PROCESS won a start-up race rather than which caller was granted
+a slot: two failures in five runs, "DFE" where the grants had been in order. The
+holders now occupy the three slots for staggered durations so only one slot frees at
+a time and the grants are 100ms apart. Six consecutive clean runs; the LIFO mutation
+answers "FED".
+
+**O-3: THE LOGO MOVED OUT OF `files` AND INTO A `data:` URI COLUMN**, per the
+coordinator's ruling. The old `logo_file_id uuid REFERENCES files(id)` could never be
+satisfied: `files_exactly_one_entity` requires every file to belong to exactly one
+company, contact, deal or project, and an issuer's logo belongs to none of them. Both
+suites had been attaching their test logo to an unrelated company to get an id at all.
+
+0009 was REGENERATED (not hand-edited), the journal's `when` and `tag` restored so its
+diff is empty, the hand-written index and seed re-appended, and `conduit_test` dropped
+and recreated. `orgLogoDataUri` is gone -- the logo arrives with the row, which also
+removes a disk read from inside the issuing transaction.
+
+**THE TRAP THE COORDINATOR FLAGGED IS REAL AND THE TEST FOUND ITS OTHER FACE.**
+`MAX_LOGO_BYTES` (32,768) bounds the IMAGE; `MAX_LOGO_DATA_URI_CHARS` (43,715 = 4 x
+ceil(32768/3) + the longest prefix) bounds the COLUMN. Reusing the first as the second
+shrinks the permitted logo to 24KB silently -- that mutation fails 3 tests. But the
+converse is what the suite actually caught first: **a 32,768-byte image and a
+32,769-byte one produce the SAME 43,692 base64 characters**, differing only in
+padding, so the column CHECK cannot tell them apart at all. The decoded-size
+arithmetic in `logoDataUriProblem` is the only thing that can, and it is the half that
+had to be right.
+
+**A drizzle-kit limitation, recorded because it produced INVALID SQL.** The generator
+splits a CHECK expression on `;` with no regard for string literals, so a regex
+containing `;base64,` came out truncated mid-literal -- no closing quote, no closing
+paren. The shape CHECK uses `\073`, Postgres's octal escape for the same character.
+Read the generated migration, not just the schema.
+
+**The merge contract survived untouched**, as predicted: `org.logoDataUri` was already
+the path on both sides, so `SEEDED_FIELDS` and the Step 5b key-set test passed without
+edits.
+
+**O-2: THE TEMPLATE EDITOR HAD NO API, WHICH IS WHY `documentTemplateWarnings` HAD NO
+CALLER.** My own DONE block noted it was unused "because nothing in this task had a
+surface for it" without noticing the surface it waits for had nothing to call.
+`GET`/`PUT /api/document-templates/:type` now exist, keyed by type (there is one row
+per type by unique constraint, and it saves the client a lookup for an id it can
+derive). A write is sanitised -- belt to `prepareDocumentHtml`'s braces, so what
+Settings shows back is what a quote will use -- refused if it sanitises away to
+nothing, and bounded by `MAX_TEMPLATE_CHARS` (16KB, four and a half times the shipped
+3,614-character template), which is the template's share of the render budget. The
+response carries the warnings.
+
+**O-5, O-6, O-7: the tests.**
+
+- **The immutability claim is now proved in its strong form.** Comparing stored bytes
+  does not prove nothing re-rendered -- both reads open the same content-addressed
+  path, so a re-render whose output was discarded would pass. The stub renderer counts
+  its spawns, and the count is asserted unchanged across the edits. The varying bytes
+  stay as the independent second assertion.
+- **Three cases a user actually performs are now permanent**: archiving the deal,
+  editing the org profile, and raising a second quote. Each asserts the row, the
+  stored bytes AND the render count.
+- **Worth stating plainly: `documents` stores no issuer snapshot at all.** The PDF
+  carries the issuer's name, address, VAT number and logo; the row never held them, so
+  a listing can only ever say who a quote went TO. Consistent with "the PDF is the
+  artifact, the row is the record" -- and a real limit, because renaming the company
+  you trade as makes every historical quote's issuer unrecoverable without opening its
+  PDF. The invoice type the spec defers is where that should be solved, alongside the
+  recipient's missing VAT number.
+- **The key-set test is scope-aware now.** It pooled line-scope names with root ones,
+  so a `{{qty}}` used at top level would have counted as supplied while rendering
+  empty. `seededTemplatePaths()` returns `{ root, line }` and each is checked against
+  its own scope; the split itself is asserted.
+- Route-level tests for the 413, the budget 400, the 503 path's constants, and the
+  template routes.
+
+**MUTATIONS FOR THIS ROUND**, all on the server:
+
+| mutation | fails |
+|---|---|
+| the budget check disabled | 3 |
+| `MAX_LOGO_DATA_URI_CHARS` set to `MAX_LOGO_BYTES` (the named trap) | 3 |
+| the queue timeout made effectively unbounded | 3 |
+| the year floor removed | 1 |
+| the queue served LIFO | 1 |
 
 ---
 
