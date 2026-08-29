@@ -683,8 +683,14 @@ describe("mergeTemplate and blocks inside blocks", () => {
    * extrapolated to about 55 minutes.
    *
    * The path is split once at parse time now, and the same three cases measure 99ms,
-   * 94ms and 79ms -- flat in path length. The timeout is what fails if that
-   * regresses.
+   * 94ms and 79ms -- flat in path length.
+   *
+   * The elapsed assertion is what names a regression, and it is deliberately not left
+   * to the vitest timeout: `mergeTemplate` is synchronous, so the timer cannot fire
+   * until the work finishes, and re-introducing the split makes these three cases
+   * take 139, 31 and 0.1 seconds before anything is reported at all. The failure is
+   * therefore SLOW rather than immediate -- one more reason the bound belongs in the
+   * module and not in a test's patience.
    */
   for (const segments of [1, 5_000, 20_000]) {
     it(`spends a bounded amount per step on a ${String(segments)}-segment path`, () => {
@@ -694,8 +700,10 @@ describe("mergeTemplate and blocks inside blocks", () => {
       // What the timeout is watching is how long those million steps TAKE.
       const lines = Array.from({ length: 130 }, () => TWENTY_LINES[0]!);
 
+      const started = Date.now();
       expect(() => mergeTemplate(nested, { ...CONTEXT, lines })).toThrow(TemplateError);
-    }, 2000);
+      expect(Date.now() - started, "a step must cost a bounded amount").toBeLessThan(2000);
+    }, 300_000);
   }
 
   it("stops a nest whose body DOES emit, which is what the output cap is for", () => {
