@@ -122,8 +122,24 @@ ram.runtime = "1424M"
     # No font package is listed because one is already guaranteed: weasyprint pulls in
     # fontconfig, and fontconfig-config depends on "fonts-dejavu-core | ..." -- so a
     # host that has WeasyPrint has at least DejaVu for sans-serif to resolve to.
+    # p7zip-full provides /usr/bin/7z, which Phase 7.6's encrypted backup shells out
+    # to. DECLARED AHEAD OF THE FEATURE, in v1.2.1 rather than with v1.3.0, and that
+    # is deliberate: a dependency added in the same release as the code that needs it
+    # is a dependency whose packaging is first exercised on the upgrade that also has
+    # to work. Landing it early means an apt problem surfaces on an upgrade carrying
+    # nothing that depends on it. It costs about 1MB and adds no service.
+    #
+    # The binary is the requirement, not the library: 7z is the only practical way to
+    # write a .7z with AES-256 and encrypted headers, and the format was chosen (over
+    # an encrypted zip) because it stretches the passphrase ~524,000 times against
+    # ZIP AES's 1,000 -- see the 7.6 spec. Measured on the Debian 12 target:
+    # p7zip-full 16.02+really26.02, /usr/bin/7z reporting 7-Zip 26.02, with the
+    # 7zAES and AES256CBC codecs both present.
+    #
+    # A missing binary must fail loudly at the button naming this package, never
+    # half-produce an archive.
     [resources.apt]
-    packages = "postgresql, python3-munkres, weasyprint"
+    packages = "p7zip-full, postgresql, python3-munkres, weasyprint"
 
     [resources.database]
     type = "postgresql"
