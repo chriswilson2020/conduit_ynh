@@ -15,6 +15,23 @@ export interface RichTextHandle {
   insertAtCursor(html: string): void;
   /** Signature: adds HTML after the last block, without moving the caret. */
   appendAtEnd(html: string): void;
+  /**
+   * Puts the caret at the START of the document without changing a character
+   * of it. The start is where a reply's caret belongs: the signature sits at
+   * the END, and a message is written above it.
+   *
+   * SEPARATE FROM appendAtEnd("") RATHER THAN A SPECIAL CASE OF IT, because
+   * the two want opposite things from the editor: appendAtEnd exists to leave
+   * focus alone, and this exists to take it. `insertAtCursor` already chains
+   * `.focus()` for the same reason a template insertion has to land where the
+   * user is looking -- this is that capability with nothing inserted.
+   *
+   * ONLY MEANINGFUL AFTER onCreate. TipTap builds the editor asynchronously,
+   * so a caller focusing at dialog-open time is addressing an editor that does
+   * not exist yet; the composer therefore hangs this off the same editor epoch
+   * the signature does rather than off the ref being populated.
+   */
+  focus(): void;
 }
 
 export interface RichTextEditorProps {
@@ -207,7 +224,46 @@ export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
         // insertContentAt(end), not focus("end") + insertContent: appending a
         // signature must not yank the caret (or the page's focus) out of
         // whichever field the user is actually in.
-        editor.chain().insertContentAt(editor.state.doc.content.size, html).run();
+        //
+        // `updateSelection: false` IS PART OF THAT SENTENCE AND WAS MISSING,
+        // which is a real defect this line's own comment did not describe.
+        // TipTap's insertContentAt updates the selection BY DEFAULT, so the
+        // append left the caret after the inserted signature -- it moved the
+        // CARET while leaving DOM focus alone, and the comment above only ever
+        // covered the second half. Measured with a reply focused on open and
+        // typed into immediately: "TOPLINE" arrived as
+        // "-- Vriendelijke groet, s302227TOPLINE", inside the signature,
+        // instead of at the top of the message.
+        //
+        // It could not be SEEN before v1.2.0 because nothing had put a caret
+        // in this editor by the time the signature landed -- the composer
+        // opened with focus on the dialog's Close button or the From combobox.
+        // IT WAS STILL REACHABLE, AND STILL IS NOT COVERED BY A TEST: switching
+        // accounts mid-message appends the new signature, and without this
+        // option that moves a typing user's caret to the end of it. That path
+        // needs two sendable accounts to exercise and no journey builds one, so
+        // this half of the pair is guarded only jointly -- see focus() below.
+        editor.chain().insertContentAt(editor.state.doc.content.size, html, { updateSelection: false }).run();
+      },
+      focus() {
+        // "start", not the current selection: the only thing this editor is
+        // focused on open for is a REPLY, where the message is written ABOVE
+        // the signature the append above has just put at the end. A bare
+        // focus() restores whatever selection the document already had, so the
+        // position is stated rather than inherited.
+        //
+        // THESE TWO LINES ARE EACH OTHER'S BACKSTOP AND NEITHER IS
+        // INDEPENDENTLY GUARDED, which is worth writing down rather than
+        // leaving for someone to discover by deleting one. Mutation-tested
+        // separately against e2e/mail.spec.ts's signature journey: reverting
+        // ONLY this to focus() passes, because updateSelection:false has left
+        // the caret at the start anyway; reverting ONLY the option passes,
+        // because "start" overrides where it moved the caret to. Reverting
+        // BOTH fails, with "TOPLINE" landing inside the signature. So the
+        // redundancy is real and deliberate -- they cover different future
+        // regressions -- and a reader tempted to drop one as dead weight
+        // should know the suite will not stop them.
+        editor?.chain().focus("start").run();
       },
     }), [editor]);
 

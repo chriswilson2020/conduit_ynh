@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent, FormEvent, KeyboardEvent } from "react";
+import { useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import type { ChangeEvent, FormEvent, KeyboardEvent, Ref, RefObject } from "react";
 import { clsx } from "clsx";
 import type { FileMeta, MailAttachment, SendMailInput } from "@conduit/shared";
 import { userLabel } from "../../lib";
@@ -14,6 +14,7 @@ import {
 import {
   attachmentTarget,
   composeErrorMessage,
+  composerInitialFocus,
   dedupeRecipients,
   htmlIsBlank,
   parseRecipientInput,
@@ -95,16 +96,63 @@ const NO_TEMPLATE = "none";
  * what gives the body editor a clean document each time.
  */
 export function Composer({ open, onOpenChange, seed }: ComposerProps) {
+  const form = useRef<ComposerFocusHandle>(null);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] max-w-3xl overflow-y-auto">
-        {open && <ComposerForm seed={seed} onClose={() => onOpenChange(false)} />}
+      <DialogContent
+        className="max-h-[90vh] max-w-3xl overflow-y-auto"
+        /**
+         * OPENING FOCUS, DECLINED FROM RADIX AND PLACED BY HAND -- which is
+         * exactly what ui/dialog.tsx's own hazard note prescribes for a dialog
+         * that cannot live with "the first tabbable descendant".
+         *
+         * MEASURED, BEFORE THIS EXISTED, AND IT WAS THREE DIFFERENT WRONG
+         * ELEMENTS RATHER THAN ONE. At 390 the md:hidden Close is the first
+         * tabbable child of every dialog, so a blank compose, a reply and a
+         * forward all opened on "Close, button" -- the control that throws the
+         * draft away. At 1280 that control is display:none and the answer
+         * depended on the mailbox: with a sendable account it was the From
+         * combobox (a Radix trigger, where letter keys are TYPEAHEAD -- typing
+         * a recipient there silently switches which account sends), and with
+         * none it was the To field's first CHIP REMOVE BUTTON on any seed that
+         * arrives with a recipient, so a reply opened focused on "Remove
+         * alice@example.com". Only a blank compose and a forward at 1280 with
+         * no account were already right, and only by accident of DOM order.
+         *
+         * preventDefault() is not optional here: Radix's FocusScope focuses its
+         * first tabbable descendant unless the event is prevented, and it does
+         * that AFTER this component's effects have run, so an autoFocus or a
+         * mount effect would be overwritten rather than obeyed.
+         */
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          // Radix dispatches this ON the Content element, so currentTarget is
+          // that element; the cast is only because the DOM types it as the
+          // EventTarget any listener could have been attached to.
+          form.current?.focusInitial(event.currentTarget as HTMLElement);
+        }}
+      >
+        {open && <ComposerForm ref={form} seed={seed} onClose={() => onOpenChange(false)} />}
       </DialogContent>
     </Dialog>
   );
 }
 
-function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => void }) {
+/** What Composer's onOpenAutoFocus reaches into the form for. */
+interface ComposerFocusHandle {
+  /**
+   * Puts the caret where composerInitialFocus says it belongs. `container` is
+   * the dialog's own Content element, which is where focus is PARKED while the
+   * body editor is still being built -- see the pending-body-focus effect.
+   */
+  focusInitial(container: HTMLElement): void;
+}
+
+function ComposerForm({ seed, onClose, ref }: {
+  seed?: ComposerSeed;
+  onClose: () => void;
+  ref?: Ref<ComposerFocusHandle>;
+}) {
   const { data: accounts, isLoading: accountsLoading } = useMailAccounts();
   // {archived:false} explicitly, matching the settings page's own call, so
   // both share one ['email-templates', {archived:false}] cache entry.
@@ -113,6 +161,15 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
   const send = useSendMail();
   const upload = useUploadFile();
   const editorRef = useRef<RichTextHandle>(null);
+  const toRef = useRef<HTMLInputElement>(null);
+  const subjectRef = useRef<HTMLInputElement>(null);
+  // Read once, from the seed this form was mounted with: which field the caret
+  // belongs in cannot change while the composer is open, and a user who has
+  // moved on to another field must never be pulled back by a late render.
+  const focusTarget = useRef(composerInitialFocus(seed)).current;
+  // Set when the caret belongs in the body and the editor is not built yet,
+  // cleared by whoever places it. See the effect below.
+  const bodyFocusPending = useRef(false);
 
   // Only what the user PICKED lives in state; the effective selection is
   // derived. An effect that back-filled the first account instead would flip
@@ -181,6 +238,63 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
     editorRef.current?.appendAtEnd(signatureBlock(signature));
   }, [editorEpoch, selectedAccountId, sendableAccounts]);
 
+  /**
+   * THE BODY IS THE ONE TARGET THAT CANNOT BE FOCUSED WHEN THE DIALOG OPENS,
+   * because it does not exist yet: TipTap builds its editor asynchronously and
+   * announces itself through onCreate, which is a whole tick after Radix has
+   * fired onOpenAutoFocus. So focusInitial parks focus on the dialog's Content
+   * element -- inside the focus trap, which is the part that matters -- and
+   * leaves a flag for this effect to drain on the epoch the signature already
+   * hangs off. Nothing here reads editorRef being populated; a ref that is
+   * filled before the ProseMirror view has attached would take a focus() that
+   * does nothing at all. MEASURED at 1280 over five opens of a reply: the
+   * caret sits on the Content element for 38-65ms and then lands in the body,
+   * every time. That window is why the e2e assertion has to be an auto-waiting
+   * toBeFocused rather than a one-shot read of document.activeElement.
+   *
+   * DECLARED AFTER THE SIGNATURE EFFECT ON PURPOSE, so on the epoch that
+   * carries both, the signature is appended and THEN the caret is placed.
+   * THEY DID FIGHT, AND THE FIRST VERSION OF THIS COMMENT SAID THEY COULD NOT.
+   * appendAtEnd's own comment claims it does not move the caret; it moved the
+   * SELECTION, because TipTap's insertContentAt updates it by default, and a
+   * reply typed into the instant it opened put "TOPLINE" inside the signature
+   * as "-- Vriendelijke groet, s302227TOPLINE". Two changes in rich-text.tsx
+   * settle it -- the append passes updateSelection:false, and this focus states
+   * "start" instead of restoring whatever selection it finds -- so the order no
+   * longer decides the outcome. It is still stated, because an ordering that
+   * does not matter costs nothing and an ordering that starts to matter again
+   * would otherwise be silent. The pairing is asserted rather than argued: a
+   * reply is typed into immediately on open and the text has to arrive ABOVE
+   * the signature.
+   *
+   * The flag is cleared before the focus call, not after, so an editor that
+   * announces itself twice (a remount) cannot pull the caret back out of a
+   * field the user has since moved to.
+   */
+  useEffect(() => {
+    if (editorEpoch === 0 || !bodyFocusPending.current) return;
+    bodyFocusPending.current = false;
+    editorRef.current?.focus();
+  }, [editorEpoch]);
+
+  useImperativeHandle(ref, () => ({
+    focusInitial(container: HTMLElement) {
+      if (focusTarget === "to") {
+        toRef.current?.focus();
+        return;
+      }
+      if (focusTarget === "subject") {
+        subjectRef.current?.focus();
+        return;
+      }
+      bodyFocusPending.current = true;
+      // Not left on the opener's button: Radix's autofocus has just been
+      // declined, and focus outside a modal surface is focus the trap has no
+      // reason to intercept -- a Tab in this window would walk the page
+      // BEHIND the dialog. Content carries tabIndex={-1} for exactly this.
+      container.focus();
+    },
+  }), [focusTarget]);
 
   const context: TemplateContext = {
     contactName: seed?.context?.contactName,
@@ -299,6 +413,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
       <RecipientField
         label="To"
         testId="composer-to"
+        inputRef={toRef}
         recipients={to}
         onChange={setTo}
         draft={toDraft}
@@ -336,6 +451,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
       <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
         Subject
         <Input
+          ref={subjectRef}
           data-testid="composer-subject"
           value={subject}
           onChange={(event) => setSubject(event.target.value)}
@@ -467,6 +583,7 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
 function RecipientField({
   label,
   testId,
+  inputRef,
   recipients,
   onChange,
   draft,
@@ -475,6 +592,14 @@ function RecipientField({
 }: {
   label: string;
   testId: string;
+  /**
+   * The typing input, exposed for the ONE line that needs to reach it from
+   * outside: the composer's opening focus. Chips come and go around it, so
+   * the composer cannot get there by querying its own DOM -- and the first
+   * tabbable element of this field is a chip's REMOVE button whenever the
+   * seed arrives with a recipient, which is precisely the wrong answer.
+   */
+  inputRef?: RefObject<HTMLInputElement | null>;
   recipients: ComposerRecipient[];
   onChange: (next: ComposerRecipient[]) => void;
   /** Owned by the composer, not this field -- see its useState comment. */
@@ -615,6 +740,7 @@ function RecipientField({
             </span>
           ))}
           <input
+            ref={inputRef}
             data-testid={testId}
             aria-label={label}
             className="min-w-[12rem] flex-1 border-0 px-1 py-1 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none"

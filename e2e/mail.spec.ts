@@ -1009,6 +1009,15 @@ test.describe.serial("Mail journey", () => {
     // than as an empty body several tests down.
     await expect(composer).toContainText(aliceAddress);
     await expect(page.getByTestId("composer-subject")).toHaveValue(`Re: ${aliceSubject}`);
+    // v1.2.0: BOTH of those being seeded is what sends the caret to the body,
+    // and this is the only fixture in the suite that produces that seed --
+    // e2e/composer-focus.spec.ts covers every other case but cannot reach a
+    // reply without a synced thread. Before it, this dialog opened on the
+    // Close button (390) or the From combobox (1280). toBeFocused rather than
+    // a read of activeElement because the body is a TipTap editor that is
+    // built asynchronously: the caret is parked on the dialog for 38-65ms
+    // first (measured over five opens), and this is what waits it out.
+    await expect(page.getByTestId("composer-body")).toBeFocused();
     await typeIntoEditor(page.getByTestId("composer-body"), replyBody);
     await page.getByTestId("composer-send").click();
     await expect(composer).toBeHidden({ timeout: 30_000 });
@@ -1039,6 +1048,73 @@ test.describe.serial("Mail journey", () => {
     // The composer writes html, so the sent body is an iframe like any other
     // html message -- and being the newest, it is the expanded one.
     await expect(sent.frameLocator('[data-body-kind="html"]').locator("body")).toContainText(replyBody);
+  });
+
+  /**
+   * THE CARET AND THE SIGNATURE, WHICH FOUGHT AND WHOSE FIGHT NOTHING COULD SEE
+   * UNTIL v1.2.0 PUT A CARET IN THIS EDITOR.
+   *
+   * The composer appends the account's signature at the end of the body once
+   * the editor announces itself, and rich-text.tsx's appendAtEnd says in its
+   * own comment that it must not yank the caret. It did not yank FOCUS, which
+   * is what that comment was about -- but TipTap's insertContentAt updates the
+   * SELECTION by default, so the caret ended up after the appended block.
+   * Nothing noticed while the composer opened on Close or on the From combobox,
+   * because there was no caret in the document to move.
+   *
+   * MEASURED against the fix reverted: a reply opened and typed straight into
+   * put "TOPLINE" inside the signature -- "-- Vriendelijke groet, sNNNNNN" came
+   * back as "-- Vriendelijke groet, sNNNNNNTOPLINE". Two lines in rich-text.tsx
+   * settle it (updateSelection:false on the append, "start" on the focus) and
+   * this is what holds them.
+   *
+   * NO CLICK, DELIBERATELY, and it is the only place in this suite that types
+   * into the body without one. typeIntoEditor clicks first and so places the
+   * caret itself, which is right for every other journey and blind to exactly
+   * this: the question here is where the caret was ALREADY, on open.
+   *
+   * The signature is set and cleared inside this test so the group's shared
+   * account leaves it as it found it.
+   */
+  test("a reply opens with the caret above the signature, not inside it", async () => {
+    const accounts = await page.request.get("/api/mail/accounts");
+    expect(accounts.status()).toBe(200);
+    const own = ((await accounts.json()) as { own: { id: string; label: string }[] }).own
+      .find((account) => account.label === accountLabel);
+    expect(own, `no account labelled ${accountLabel}`).toBeDefined();
+    const accountId = own?.id ?? "";
+    const marker = `Groeten ${attemptTag}`;
+    const patched = await page.request.patch(`/api/mail/accounts/${accountId}`, {
+      data: { signatureHtml: `<p>-- ${marker}</p>` },
+    });
+    expect(patched.status(), await patched.text()).toBe(200);
+
+    try {
+      await page.goto(`/mail?thread=${aliceThreadId}`);
+      await expect(page.getByTestId("conversation")).toBeVisible();
+      await page.getByTestId("reply-button").click();
+      const body = page.getByTestId("composer-body");
+      await expect(body).toBeFocused();
+      // The signature has to be IN the document before the caret's position
+      // relative to it means anything.
+      await expect(body).toContainText(marker);
+
+      await page.keyboard.type("TOPLINE");
+      const text = (await body.innerText()).replace(/\s+/g, " ").trim();
+      expect(text).toContain("TOPLINE");
+      expect(text.indexOf("TOPLINE"), `typed text landed inside the signature: ${text}`)
+        .toBeLessThan(text.indexOf(marker));
+      // And it is not merely before it -- it is its own line, at the top.
+      expect(text.startsWith("TOPLINE"), `body reads: ${text}`).toBe(true);
+
+      // Scoped to the composer: the page behind it has buttons of its own, and
+      // Radix's modal aria-hidden is not something a locator should have to
+      // rely on to stay unambiguous.
+      await page.getByTestId("composer").getByRole("button", { name: "Cancel" }).click();
+      await expect(page.getByTestId("composer")).toBeHidden();
+    } finally {
+      await page.request.patch(`/api/mail/accounts/${accountId}`, { data: { signatureHtml: null } });
+    }
   });
 
   test("hides the linked thread behind the unlinked filter and brings it back", async () => {
@@ -1430,6 +1506,12 @@ test.describe.serial("Mail journey", () => {
     await expect(chip).toHaveCount(1);
     await expect(chip).toContainText(attachmentName);
     await expect(page.getByTestId("composer-subject")).toHaveValue(`Fwd: ${attachSubject}`);
+    // v1.2.0, and the row the plan's "a reply focuses the body" rule got
+    // wrong: a forward arrives with a subject and a quoted body but NO
+    // recipient, so To is the first empty field and the caret belongs there.
+    // The fill() below would have worked either way -- it does not need
+    // focus -- which is exactly why this is asserted separately.
+    await expect(page.getByTestId("composer-to")).toBeFocused();
 
     const forwardTarget = `fwd-target-${attemptTag}@example.com`;
     await page.getByTestId("composer-to").fill(forwardTarget);

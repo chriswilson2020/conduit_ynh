@@ -1800,14 +1800,22 @@ test.describe.serial("Phone inbox drill-in stack", () => {
     await expect(conversation.locator('[data-testid^="message-"]')).toHaveCount(2);
 
     // The reply, from the last screen of the stack. The composer is a
-    // full-screen sheet here and opens focused on its own Close (a deferred
-    // phase-level finding), so typing straight away would type into nothing --
-    // typeIntoEditor clicks the editor and proves it took focus first.
+    // full-screen sheet here, and it USED to open focused on its own Close --
+    // the deferred phase-level finding that v1.2.0 closed, and the reason this
+    // comment used to say typing straight away would type into nothing. It now
+    // opens in the body, since a reply arrives with both its recipient and its
+    // subject already settled, and that is asserted rather than assumed
+    // (e2e/composer-focus.spec.ts covers the seeds that need no mail server;
+    // a reply is only reachable from a synced thread, so it is proved here).
+    // typeIntoEditor still clicks the editor, which is the gesture this
+    // journey always made and the one a user makes.
     await page.getByTestId("reply-button").click();
     const composer = page.getByTestId("composer");
     await expect(composer).toBeVisible();
     await expect(composer).toContainText(senderAddress);
     await expect(page.getByTestId("composer-subject")).toHaveValue(`Re: ${subject}`);
+    await expect(page.getByTestId("dialog-close")).toBeVisible();
+    await expect(page.getByTestId("composer-body")).toBeFocused();
     await typeIntoEditor(page.getByTestId("composer-body"), replyBody);
     await page.getByTestId("composer-send").click();
     await expect(composer).toBeHidden({ timeout: 60_000 });

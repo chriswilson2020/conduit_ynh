@@ -195,6 +195,49 @@ export function dedupeRecipients(recipients: readonly ComposerRecipient[]): Comp
   return out;
 }
 
+/** Which field a freshly opened composer puts the caret in. */
+export type ComposerFocusTarget = "to" | "subject" | "body";
+
+/**
+ * WHERE THE CARET GOES WHEN THE COMPOSER OPENS: the FIRST EMPTY field, in the
+ * order To, Subject, body.
+ *
+ * THE PLAN SAID "a new compose focuses To, a reply focuses the body" AND THAT
+ * RULE IS WRONG ON A FORWARD, which is why the discriminator here is the
+ * seed's emptiness rather than the kind of message. A forward carries a quoted
+ * bodyHtml and the original's attachments but NO recipient -- who to send it
+ * to is exactly what has not been decided yet -- so "reply versus new" would
+ * put the caret in the one field that is already full and leave the empty one
+ * to a mouse. First-empty degenerates to the plan's two stated cases and gets
+ * the third right:
+ *
+ *   opened from            to        subject      caret
+ *   inbox, blank compose   empty     empty        To
+ *   a record's Mail tab    seeded    empty        Subject
+ *   a conversation, reply  seeded    "Re: ..."    body
+ *   a conversation, fwd    empty     "Fwd: ..."   To
+ *
+ * The subject is trimmed before it is judged, because `replySubject("")`
+ * returns "Re: " and `forwardSubject("")` returns "Fwd: " -- a thread with no
+ * subject seeds a string that is a prefix and nothing else. Trimming it would
+ * be wrong (those ARE the subject the user is offered), so this only decides
+ * that a subject made of the prefix alone is still a subject: both of those
+ * carry non-space characters and are therefore "filled". What the trim
+ * actually catches is a caller that seeds "   ".
+ *
+ * The BODY is deliberately not consulted. It is the last field in the order,
+ * so it is what is left when To and Subject are both filled, and reading
+ * `bodyHtml` would only let a forward's quoted original argue itself out of
+ * the To it needs.
+ */
+export function composerInitialFocus(
+  seed: { to?: readonly ComposerRecipient[]; subject?: string } | undefined,
+): ComposerFocusTarget {
+  if ((seed?.to ?? []).length === 0) return "to";
+  if ((seed?.subject ?? "").trim() === "") return "subject";
+  return "body";
+}
+
 /**
  * What a `{{...}}` placeholder in a template can resolve to. Supplied by
  * whoever opens the composer (the record page knows its own contact/company)

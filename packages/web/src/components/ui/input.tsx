@@ -8,9 +8,11 @@ import { clsx } from "clsx";
 // same shape, and ui/ui.test.ts holds them all to it.
 // `ComponentPropsWithRef` rather than `InputHTMLAttributes` so a caller can hold
 // a ref to the element. React 19 passes `ref` as an ordinary prop, so the spread
-// below already delivers it; only the TYPE had to admit it. One caller needs it
-// -- components/contact-fields.tsx, which has to take focus back from a Radix
-// Select that restores it to the trigger after the box has mounted.
+// below already delivers it; only the TYPE had to admit it. Two callers need it,
+// and both are about taking focus somewhere Radix would not have put it:
+// components/contact-fields.tsx, which has to take it back from a Select that
+// restores it to the trigger after the box has mounted, and the mail composer's
+// Subject field, which a dialog's onOpenAutoFocus focuses by hand.
 export function Input({ className, ...props }: ComponentPropsWithRef<"input">) {
   return (
     <input

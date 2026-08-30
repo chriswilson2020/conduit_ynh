@@ -27,6 +27,7 @@ import {
   type SidebarFolderInput,
   attachmentTarget,
   composeErrorMessage,
+  composerInitialFocus,
   dedupeRecipients,
   friendlyMailError,
   htmlIsBlank,
@@ -1508,5 +1509,81 @@ describe("messageIsInTrash", () => {
   it("is false when the account has no resolved trash folder, or is not ours to know", () => {
     expect(messageIsInTrash({ accountId: "a2", folder: "Trash" }, trashByAccount)).toBe(false);
     expect(messageIsInTrash({ accountId: "a9", folder: "Trash" }, trashByAccount)).toBe(false);
+  });
+});
+
+/**
+ * WHERE THE CARET GOES WHEN THE COMPOSER OPENS.
+ *
+ * THE FOUR SEEDS ARE BUILT THE WAY THE APP BUILDS THEM rather than written out
+ * by hand, because the rule is only worth anything if it is fed the real
+ * article: `replySubject` and `forwardSubject` are the functions
+ * components/mail/conversation.tsx calls, and a hand-typed "Re: ..." would
+ * still pass if one of them started returning something else. The two seeds
+ * that are hand-written are the two the app writes by hand -- the inbox passes
+ * no seed at all, and the record rail's is an object literal.
+ */
+describe("composerInitialFocus", () => {
+  it("puts a blank compose in To -- and the inbox passes no seed at all", () => {
+    expect(composerInitialFocus(undefined)).toBe("to");
+    expect(composerInitialFocus({})).toBe("to");
+  });
+
+  it("puts a record's Mail tab in Subject, because the address is already known", () => {
+    // components/rail/mail.tsx: the record's first address, no subject.
+    expect(composerInitialFocus({ to: [{ address: "alice@example.com", name: "Alice" }] }))
+      .toBe("subject");
+  });
+
+  /**
+   * A COMPANY HAS NO MAILBOX -- companies carry a domain, and the rail
+   * deliberately does not guess an address from it -- so composing from a
+   * company's Mail tab seeds `to: []` and is a blank compose in every way that
+   * matters here. The empty ARRAY and the absent key have to agree.
+   */
+  it("treats an empty To array as empty, which is what a company's Mail tab sends", () => {
+    expect(composerInitialFocus({ to: [] })).toBe("to");
+  });
+
+  it("puts a reply in the body: both the recipient and the subject are settled", () => {
+    const { to } = replyRecipients(
+      {
+        fromAddr: "alice@example.com", fromName: "Alice",
+        toAddrs: [{ address: "me@corp.example", name: "Me" }], ccAddrs: [],
+        direction: "inbound" as const,
+      },
+      { all: false, ownAddresses: ["me@corp.example"] },
+    );
+    expect(composerInitialFocus({ to, subject: replySubject("Quarterly review") })).toBe("body");
+  });
+
+  /**
+   * THE ROW THE PLAN DID NOT HAVE, and the reason the rule is not "reply
+   * versus new". A forward carries the quoted original and the original's
+   * attachments but NO recipient: who to send it to is exactly what has not
+   * been decided. Under "a reply focuses the body" a forward would focus the
+   * one field that is already full and leave the empty one to a mouse.
+   */
+  it("puts a forward in To, even though it arrives with a subject and a body", () => {
+    expect(composerInitialFocus({
+      subject: forwardSubject("Quarterly review"),
+      // A forward's seed also carries bodyHtml and forwardAttachments; neither
+      // is consulted, which is what stops the quoted original arguing the
+      // caret out of the field that needs it.
+    })).toBe("to");
+  });
+
+  /**
+   * A THREAD WITH NO SUBJECT STILL SEEDS ONE. replySubject("") is "Re: " and
+   * forwardSubject("") is "Fwd: " -- a prefix and nothing else, but a real
+   * string the user is being offered, so it counts as filled. What the trim
+   * is actually for is a seed of pure whitespace, which nothing sends today.
+   */
+  it("counts a bare Re:/Fwd: prefix as a subject, and whitespace as none", () => {
+    const to = [{ address: "alice@example.com", name: null }];
+    expect(replySubject("")).toBe("Re: ");
+    expect(composerInitialFocus({ to, subject: replySubject("") })).toBe("body");
+    expect(composerInitialFocus({ to, subject: "   " })).toBe("subject");
+    expect(composerInitialFocus({ to, subject: "" })).toBe("subject");
   });
 });
