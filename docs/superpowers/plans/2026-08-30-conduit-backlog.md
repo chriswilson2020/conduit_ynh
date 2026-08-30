@@ -7,7 +7,8 @@ Everything here has evidence attached — a file and line, a measurement, or the
 found it. Items without evidence are marked as judgement rather than fact. Where one item
 blocks another, that is stated rather than left to be rediscovered.
 
-Current shipped version: **v1.1.0**. In flight: **Phase 7.5 → v1.2.0**.
+Current shipped version: **v1.2.0**. In flight: **nothing**; next is **v1.2.1**, whose
+scope is fixed and recorded below.
 
 ---
 
@@ -15,11 +16,66 @@ Current shipped version: **v1.1.0**. In flight: **Phase 7.5 → v1.2.0**.
 
 | | What | State |
 |---|---|---|
-| **7.5 → v1.2.0** | Keyboard-operable rows, the composer's focus, focus after a dialog closes, the `mail-sync` intermittent | Specced, in flight |
+| ~~**7.5 → v1.2.0**~~ | Keyboard-operable rows, the composer's focus, focus after a dialog closes, the `mail-sync` intermittent, and the touch floors folded in as Task 4b | **SHIPPED 30 Aug** |
+| **v1.2.1** | Three defects, scope fixed by Chris on 30 Aug -- see "v1.2.1 scope" below | Decided, not specced |
 | **7.6 → v1.3.0** | Export and encrypted backup, downloadable from Settings | Specced, not started |
 | **7.7** | Restore and import, with its decisions already recorded in 7.6's spec | Decided, not specced |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
 | **Phase 4.4** | Mail filing power tools: per-message selection, arbitrary folder moves, folder management, bulk unhide, live inbox beyond page one | Unspecced. Overlaps "emailing a quote" below |
+
+---
+
+## v1.2.1 scope -- decided by Chris, 30 Aug, on the v1.2.0 release
+
+Three defects in, two out. All five are already written up in full under "Defects found and
+deliberately deferred" below; this section decides which of them move, and does not restate
+the evidence.
+
+**IN:**
+
+1. **The reply signature silently lost on a cold accounts cache.** `composer.tsx` stamps its
+   guard key before discovering whether a signature exists, so the epoch-1 pass on a cold
+   `useMailAccounts` claims the key with `sendableAccounts` still `[]` and the pass that runs
+   when the accounts arrive returns early on that same key. A warm cache hides it completely,
+   which is why it has never been seen in use.
+
+   **A NOTE FOR WHOEVER TAKES IT, because the fix reorders two things that another file's
+   option exists to survive.** Fixing this moves the signature append to a pass **after** the
+   caret placement. That is exactly the case `rich-text.tsx`'s `updateSelection: false`
+   covers, and today it is load-bearing only on the account-switch path, which is where it is
+   tested. After this fix it is load-bearing on the reply path too. **Check that guard still
+   holds before shipping the reorder**, and if the order is ever reversed again, fix the
+   option's test first. `composer.tsx`'s pending-body-focus comment currently asserts the
+   append happens before the caret placement -- true on a warm cache only, and it will need
+   correcting with the fix.
+
+2. **A deal's or project's Mail tab can compose with no recipient.** `rail/mail.tsx` resolves
+   the contact through a two-deep query chain from a deal or project tab, and `compose()`
+   reads it at click time, so a click before both queries land seeds `to: []`. The fix is to
+   disable Compose until the queries it reads have settled, which removes the silent
+   wrong-recipient case and not merely the focus symptom. **No test covers the deal or project
+   tabs at all** -- `composer-focus.spec.ts` uses a contact, whose chain is one deep -- so this
+   one needs coverage written, not just a fix.
+
+3. **`({{contact.pronouns}})` renders empty brackets** for a contact with none. Swallowing a
+   following space handles `Dear X Y` and nothing short of conditionals handles brackets or
+   labels. The document template already has `{{#path}}...{{/path}}`; the mail merge does not.
+   v1.1.0's ruling was to document the limitation rather than grow the template language
+   mid-release -- v1.2.1 is where that ruling is revisited, not overturned by default.
+
+**EXPLICITLY OUT, and both for reasons about scope rather than severity:**
+
+- **Focus lost after any navigation that unmounts the focused element.** This is the biggest
+  item on the deferred list and it is out of v1.2.1 precisely because of that. The fix is a
+  route-change concern, so it touches every page in the app, and it would let two hand-rolled
+  cases in `inbox.tsx` and `board.tsx` go at the same time. **It earns its own release**; it
+  does not belong in a three-defect patch. Note that it is NOT the five dialog roots -- those
+  are one entrance to it, and fixing them alone would make them the only navigations in the
+  app that land anywhere, while row links remain the commoner path to the same pages.
+- **The GIF dimension undercharge.** This is hardening on a ceiling that held. The worst of
+  the four variants ran at **59% of the 512MB kernel limit**; the other three were stopped by
+  it outright. Worth fixing, and worth fixing where a payload-size discussion is already open
+  rather than in a patch release about mail and templates.
 
 ---
 
@@ -253,11 +309,16 @@ conditionals handles brackets or labels. The document template already has
 `{{#path}}...{{/path}}`; the mail merge does not. Coordinator ruling at the time was to
 document the limitation rather than grow the language mid-release.
 
-**Touch-floor assertions are blind to clipping.** `documents.spec.ts:647,664,711,747,758,
-763,765` assert `boundingBox().height >= TOUCH_FLOOR_PX`, and a bounding box exists whether
-or not the control is on screen. With `<main>` clipping below the breakpoint, a control
-clipped entirely off-screen still passes. The assertion that was meant to cover that was
-one of the three vacuous overflow checks. **Fits 7.5's shape** and should be folded in.
+~~**Touch-floor assertions are blind to clipping.**~~ **FIXED by 7.5 Task 4b** (`fc2b0d3`,
+round 2 `d2fb306`); the full record is that task's DONE block in the v1.2.0 plan. Seven
+sites in `documents.spec.ts` now go through one `expectTouchTarget` helper: height, then
+`scrollIntoViewIfNeeded`, then `toBeInViewport({ ratio: 1 })`, then `tap({ trial: true })`.
+Six of the seven guards were vacuous against a displaced control and the seventh was
+covered only by an expensive accident. **The line numbers in the original entry were
+already stale by exactly 20 when the task picked it up**, which is why the fix is found
+by `TOUCH_FLOOR_PX` and not by line. **Two things the fix did NOT cover are open below**:
+the two `mobile.spec.ts` sites, and `opacity: 0`, which keeps a box and intersects and so
+walks past every one of the four checks.
 
 **Two PDF text shapes the reader does not handle**, named in `packages/api/src/test/pdf.ts`,
 plus the prose guard's remaining known holes — negative utilities matching nothing,
@@ -267,7 +328,15 @@ uncatchable by design.
 
 ---
 
-## Intermittents -- four, all timing-shaped, none has ever failed CI on its own; the first is FIXED
+## Intermittents -- four, all timing-shaped; the first is FIXED, and the second HAS now failed CI on its own
+
+**The old heading here read "none has ever failed CI on its own" and stopped being true on
+30 Aug**, which is the kind of claim this file exists to keep honest. Number 2 failed run
+**33325721506** outright. The distinction that still matters is between the two runners:
+`playwright.config.ts` sets `retries: 2` on CI, so an e2e intermittent (3 and 4) surfaces as
+a `flaky` line inside a green run. **`vitest.config.ts` sets no retries at all**, so a unit
+intermittent (1 and 2) cannot hide inside a green run -- each failure is one occurrence and
+it fails the whole `test` job.
 
 1. ~~**`mail-sync.test.ts`, a backoff case.**~~ **FIXED by 7.5 Task 4; the full record is
    that task's DONE block in the v1.2.0 plan.** Three hypotheses were falsified in the end,
@@ -284,8 +353,12 @@ uncatchable by design.
    cases unrelated to the backoff one. It measured the harness, not the race. Contending
    with a second vitest on `packages/shared` (CPU only, no truncate) gave **0 in 12**, and
    0 in 24 with four busy loops on top.
-2. **`mail-integration.test.ts`'s Dovecot IDLE burst** — 17 of 20 messages. Surfaced during
-   v1.1.0 on a diff touching no API source. Opt-in suite, CI-only.
+2. **`mail-integration.test.ts`'s Dovecot IDLE burst** -- the burst asserts 20 delivered and
+   gets fewer. Surfaced during v1.1.0 on a diff touching no API source; **17 of 20** that
+   time, **11 of 20** on run **33325721506** during 7.5, which failed the `test` job. Opt-in
+   suite, CI-only. **Rate, from a sweep of the v1.2.0 branch: once in 22 runs.** Because
+   vitest retries nothing, that figure is a true occurrence count rather than a lower bound
+   -- unlike 3 and 4, whose real rates are unknown because Playwright's retries absorb them.
 
    **A SURVIVING, DIFFERENTLY-SHAPED HAZARD IN `mail-sync.test.ts`, so it does not vanish
    under the struck-through entry above.** Two cases still assert a NEGATIVE over a
@@ -298,6 +371,18 @@ uncatchable by design.
 3. **`e2e/mobile.spec.ts`'s phone kanban `addStage`** — once in eight runs, hidden by CI's
    two retries. **"Pre-existing" is not established**: `board.tsx:613` put a sticky strip
    directly above that button in v1.1.0, and the file went from 5 serial groups to 7.
+
+   **SIGHTED A SECOND TIME during 7.5 Task 4b's local sweep**, in a file that task does not
+   touch, on the test "builds a pipeline, which becomes a stage view once it has stages".
+   It then passed on re-run and through 18 further repeats of that group. **The shape of
+   the second sighting is the new information**: it failed as `locator.click` exceeding its
+   timeout, NOT as an element that was missing. A click that times out rather than failing
+   to find its target is what Playwright reports when another element keeps intercepting
+   pointer events -- which is the same shape as Task 4b round 2's occlusion finding, and the
+   sticky strip named above sits directly above this button. **This is a lead, not a
+   diagnosis**: it could not be reproduced under instrumentation, so the call log that would
+   actually say "intercepts pointer events" was never captured. Whoever takes it should
+   start by capturing that log rather than by trusting this paragraph.
 
 4. **`e2e/crm.spec.ts:115`, the "Other..." caret journey** -- one sighting, CI run
    **33311033649**, hidden by the first retry (`1 flaky, 131 passed`). It failed on
@@ -331,6 +416,70 @@ alone deliberately.
 ---
 
 ## Test-infrastructure debt
+
+**A SWEEP FOR ASSERTIONS THAT CANNOT FAIL. Nobody has ever gone looking; every one found so
+far was found by accident, while working on something else.** That is the whole argument for
+scheduling it: the discovery rate is not evidence of scarcity, it is evidence of nobody
+searching. Until this runs, **the honest position is that nobody knows how many more exist.**
+
+The evidence, all of it incidental:
+
+| found | where | what made it vacuous |
+|---|---|---|
+| v1.1.0 | three overflow checks | `documentElement.scrollWidth` is blind to page-content overflow, so the comparison is over a number that never moves |
+| 7.5 Task 4b | **six of seven** touch floors in `documents.spec.ts` | a `boundingBox()` exists whether or not the control is on screen |
+| 7.5 Task 4b | the settings nav's `scrollWidth >= clientWidth` | a self-comparison: `scrollWidth` is never below `clientWidth` |
+| 7.5 Task 4b r2 | **the coordinator's proposed REPLACEMENT for that line** | see below |
+
+**The fourth row is the one that should set the sweep's method.** The replacement proposed
+for the dead nav line was `nav.scrollWidth >= lastTab.offsetLeft + lastTab.offsetWidth`,
+argued to "fail if a tab is displaced or the row stops accommodating its content". It was
+measured instead of accepted, and it does not: with 881px of tabs in a 342px row forced to
+`overflow-x: clip`, Chromium still reports `scrollWidth` **881**, not the 342 the argument
+assumed. It holds identically untouched (342 vs a 324px right edge), under `overflow-x:
+hidden` (881/881), under a transform throwing a tab off the left (342 vs -176), and with
+every tab hidden (342 vs -24). **`scrollWidth` reports content overflow whether or not the
+box can be scrolled, which makes EVERY arithmetic form of that claim true by construction.**
+So a vacuous assertion was diagnosed correctly and then replaced with another one, by the
+person who had just diagnosed it. The line was deleted rather than replaced.
+
+**Method, therefore: a candidate is vacuous until a mutation has been shown to fail it.**
+Reasoning about whether an assertion can fail is exactly what produced the fourth row.
+Task 4b's DONE block in the v1.2.0 plan carries a worked example of the discipline --
+per-guard mutation in the app rather than in the test, one displacement at a time, with a
+pristine pre-fix copy of the file run alongside as the control.
+
+Candidate shapes to grep for, from the four rows above: any comparison of two properties of
+the same element; any `>=` against a quantity that is a lower bound by definition; any
+geometry read that survives the element being unreachable; and any assertion whose stated
+justification is about layout while its expression is about size.
+
+**TWO KNOWN SITES ARE ALREADY WAITING FOR IT, and they are NOT equally exposed** -- the
+asymmetry matters because it decides whether each is a live gap or a regression guard.
+Both are in `e2e/mobile.spec.ts` and both floor a control on `boundingBox()` alone with no
+viewport claim:
+
+- **The Gantt's `compact-button` is inside `<main>` under `max-md:overflow-clip`, and is
+  genuinely the same vacuous class** as the seven Task 4b fixed. A clip is not a scroll
+  container, so a control past its edge is cut rather than reachable, and the box survives.
+- **The task drawer's Close (floored on both axes) sits in a portalled `fixed ...
+  overflow-y-auto` surface, which IS a scroll container** -- so it is the weaker case. A
+  control past that edge can be scrolled to, and `scrollIntoViewIfNeeded` would reach it.
+  Worth converting for consistency; not worth claiming it hides the same defect.
+
+Note that `toBeVisible()` sitting next to the compact one does **not** close it: Playwright's
+visibility test is box-plus-`visibility`, and a clipped element keeps its box. A third site
+in the same file already pairs its height with `toBeInViewport()` at the default ratio, so
+the pattern was known in this suite and simply was not carried across.
+
+**AND THE HELPER'S HOME IS AN OPEN TENSION, to be settled when those two are converted.**
+`expectTouchTarget` currently lives in `e2e/documents.spec.ts`, beside `boxOf`. `e2e/helpers.ts`'s
+own rule is that a helper earns a place there **by being about a property of the app that
+several journeys touch** -- and the 44px floor is exactly that: asserted in `documents.spec.ts`
+and at three sites in `mobile.spec.ts`. By that rule it belongs in `helpers.ts`. It was left
+in place at the time only because moving it would have been a change to a file Task 4b had
+no measurements for. **Doing the move together with the two conversions above is what avoids
+the duplication that leaving it where it is otherwise guarantees.**
 
 **`documentElement.scrollWidth` is blind to page overflow** and has been since the **first
 web commit**, at every viewport — a scroll container does not propagate, and neither does a
@@ -369,7 +518,10 @@ Ordered by how much more expensive each gets if retrofitted rather than designed
 
 ---
 
-## Resolved, pending application
+## Resolved and applied
+
+*(This section was "Resolved, pending application" while its one item waited on the 7.5
+worktree. The item shipped in v1.2.0 and the section is kept only for the reasoning.)*
 
 **`autoupdate.strategy` in `manifest.toml`.** Decision taken 30 Aug: **remove the line.**
 
@@ -386,8 +538,12 @@ verified, repeats the original mistake — and cataloguing would require a diffe
 anyway, at which point the manifest is being rewritten and the declaration can be added
 against the tooling's behaviour at that time.
 
-**Not applied yet**: Phase 7.5 Task 1 is working in the worktree, and two writers on one
-branch is the contamination this project serialises against.
+**APPLIED in `357b800`, shipped in v1.2.0.** The line is gone and `manifest.toml` carries
+the reasoning above in a comment block where the declaration used to sit, specifically so
+that the next person to notice its absence finds the argument instead of re-adding it.
+**v1.1.0's release runbook showed a four-line `[resources.sources.main]` block including
+`autoupdate.strategy`; the block is two lines now, `url` and `sha256`.** Copying an older
+runbook verbatim is the one way this comes back.
 
 ---
 
