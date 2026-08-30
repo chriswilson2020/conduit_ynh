@@ -16,19 +16,30 @@ import { ROW_LINK, ROW_LINK_ROW } from "./row-link";
  * MEASURED, in a real Chromium at 1280 with the row's `position` set to
  * `static` and nothing else changed: the page heading, the Filter field and
  * the sidebar all report the last row's anchor as the element under them.
- * Every control on the page would navigate to that record. And the page still
- * LOOKS right -- across ten full-page screenshots of the broken build (five
- * lists at 1280 and 390), seven are byte-identical to a correct one and the
- * other three differ in 24 pixels TOTAL, every one of them a single level out
- * of 255 on the antialiasing of a table's rounded corner. No type is wrong
- * either. That combination -- catastrophic, silent, invisible -- is exactly
- * the shape of defect a source guard is for.
+ * Every control on the page would navigate to that record.
+ *
+ * AND THE PAGE STILL LOOKS RIGHT, which is the property worth recording. A
+ * full-page screenshot of the broken build differs from a correct one only in
+ * the antialiasing of the lists' rounded corners, and never by more than ONE
+ * LEVEL OF 255 in any channel. THE PIXEL COUNT IS NOT A CONSTANT and an
+ * earlier version of this comment wrongly gave one: it scales with how many
+ * rows the database renders, so the same comparison yields six pixels on a
+ * one-row list and tens across a populated one. The level is the invariant;
+ * the count is a property of a fixture. (A "max delta 6" reported once during
+ * review is not reproducible in any configuration and appears to be an earlier
+ * "six pixels" read as six levels.)
+ *
+ * No type is wrong either. Catastrophic, silent and invisible together is
+ * exactly the shape of defect a source guard is for -- and e2e now covers it
+ * too, in row-links.spec.ts's "nothing outside the row" probe, which was added
+ * after review proved every other test in that file stayed green against this
+ * mutation.
  *
  * THE OTHER REASON THESE ARE HERE. Only two e2e tests click one of these rows,
  * both on companies (crm.spec.ts at 1280, mobile.spec.ts at 390), so most of
  * this pattern has no journey under it at all. e2e/row-links.spec.ts adds the
- * runtime half for the phone tap and the row's far edges; these are the half
- * that catches a deletion in a file no journey visits.
+ * runtime half for the phone tap, the row's far edges and the escape; these
+ * are the half that catches a deletion in a file no journey visits.
  */
 
 const read = (path: string) =>
@@ -47,6 +58,29 @@ function between(source: string, marker: string, endMarker: string): string {
   const end = source.indexOf(endMarker, at);
   expect(end, `end marker not found after ${marker}: ${endMarker}`).toBeGreaterThan(at);
   return source.slice(at, end);
+}
+
+/**
+ * A JSX element's OPENING TAG, from `<Link` to the `>` that closes it.
+ *
+ * "The next `>`" is exactly the shortcut gantt/phone.test.ts records as a
+ * hazard, and here it bites for a specific reason: My Tasks' link carries
+ * `search={(prev) => (...)}`, whose ARROW is a `>`. So the scan skips any `>`
+ * preceded by `=`, which is the only form that occurs in these tags, and is
+ * checked to have found something before it is returned.
+ *
+ * Reading the tag rather than the file is what makes this POSITIONAL. The
+ * earlier version asked only whether a page contained `{...ROW_LINK}`
+ * anywhere, so moving the spread onto the `<span>` or the cell -- where it
+ * would still compile and would silently render no overlay -- kept it green.
+ */
+function openingTag(source: string, from: number, tag: string): string {
+  const at = source.indexOf(tag, from);
+  expect(at, `element not found: ${tag}`).toBeGreaterThan(-1);
+  for (let i = at + tag.length; i < source.length; i += 1) {
+    if (source[i] === ">" && source[i - 1] !== "=") return source.slice(at, i + 1);
+  }
+  throw new Error(`unterminated opening tag for ${tag}`);
 }
 
 describe("the row link's two halves", () => {
@@ -131,17 +165,42 @@ describe("the row link's two halves", () => {
   });
 
   /**
-   * EVERY LIST THAT OPENS A RECORD USES THE SHARED OBJECT rather than retyping
-   * the run, which is the rule components/ui/touch.ts states: a class string
-   * copied twice is a class string that will be edited once. The SPREAD is
-   * asserted, not the name -- an import that is no longer applied to anything
-   * is exactly the failure this is for.
+   * EVERY ROW LINK SPREADS THE OBJECT, ON THE ANCHOR, WITH NOTHING BESIDE IT.
+   *
+   * Three separate failures, all of which were green before this test read the
+   * opening tag instead of the file:
+   *
+   *   - the spread simply absent (the rule components/ui/touch.ts states: a
+   *     class string copied twice is a class string that will be edited once);
+   *   - the spread MOVED off the anchor onto the `<span>` or the cell, which
+   *     compiles, renders no overlay, and leaves the page still "containing"
+   *     the token;
+   *   - the spread OVERRIDDEN beside itself -- `{...ROW_LINK} draggable` puts
+   *     the link drag back and `{...ROW_LINK} className="x"` cancels the
+   *     overlay. Neither is hypothetical; both were tried and both passed.
+   *
+   * So the tag must carry the spread and must carry no `className` and no
+   * `draggable` of its own. That is a real constraint rather than a style
+   * rule: every class these anchors need comes from the object.
    */
-  it("is spread by all three list pages rather than respelled", () => {
-    for (const page of ["companies", "contacts", "projects"]) {
-      const source = read(`../pages/${page}.tsx`);
-      expect(source, page).toContain("{...ROW_LINK}");
-      expect(source, page).not.toContain("after:inset-0");
+  it("spreads the object on the anchor itself, with nothing overriding it", () => {
+    const sites: [string, string][] = [
+      ["../pages/companies.tsx", "<Link"],
+      ["../pages/contacts.tsx", "<Link"],
+      ["../pages/projects.tsx", "<Link"],
+      ["../pages/my-tasks.tsx", "<Link"],
+    ];
+    for (const [file, tag] of sites) {
+      const source = read(file);
+      const from = source.indexOf("renderRowLink") >= 0
+        ? source.indexOf("renderRowLink")
+        : source.indexOf("data-testid={`task-row-${task.id}`}");
+      const opening = openingTag(source, from, tag);
+      expect(opening, file).toContain("{...ROW_LINK}");
+      expect(opening, file).not.toContain("className");
+      expect(opening, file).not.toContain("draggable");
+      // And the class run is never respelled by hand somewhere in the page.
+      expect(source, file).not.toContain("after:inset-0");
     }
   });
 

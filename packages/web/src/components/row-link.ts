@@ -65,33 +65,49 @@
  *    copy. Dragging across it yielded "Acme Holdin" before this change and ""
  *    after.
  *
- *    THE OBVIOUS FIX DOES NOT WORK, AND THE MEASUREMENT IS WHY THIS PARAGRAPH
- *    IS LONG. `draggable: false` was expected to recover the name, on the
- *    reasoning that an anchor is natively draggable and so a mousedown-drag on
- *    it starts a LINK drag rather than a selection. Measured in Chromium,
- *    dragging across the name cell:
+ *    THE FIX PATH EXISTS AND THIS PARAGRAPH USED TO DENY IT. An earlier version
+ *    said the overlay was "not the cause" and that "nothing short of taking the
+ *    name out of the link recovers it". Both halves were wrong, and the error
+ *    came from reading the selection only AFTER mouseup -- in most of these
+ *    states the release navigates, and a navigation clears the selection, so a
+ *    selection that HAD been made read back as none. Read during the drag as
+ *    well, dragging across a row at 1280:
  *
- *      as shipped                    selected ""  dragstart 0  navigated yes
- *      with draggable back to true   selected ""  dragstart 1  navigated no
- *      with the overlay removed too  selected ""  dragstart 0  navigated yes
+ *      state                                 during mouseup   after
+ *      as shipped, name cell                 ""               ""
+ *      as shipped, third cell                ""               ""
+ *      overlay off, name cell                ""               ""
+ *      overlay off, THIRD cell               "8/30/2026"      kept
+ *      overlay off + user-select:text        the name         cleared by nav
+ *      overlay ON + user-select:text         ""               ""
  *
- *    THE NAME IS UNSELECTABLE WITH THE OVERLAY GONE, so the overlay is not the
- *    cause and neither is the drag: the cause is that the name is inside an
- *    anchor at all, and a drag begun on link text is never a text selection.
- *    Nothing short of taking the name out of the link recovers it, and that is
- *    the whole mechanism.
+ *    THE OVERLAY IS THE LARGER CAUSE. With it on, NOTHING in the row selects --
+ *    including the second and third cells, which are not inside the anchor at
+ *    all -- and `user-select: text` gets nowhere against it, on the anchor or
+ *    on the row. With it off, the other cells select normally.
  *
- *    `draggable: false` IS STILL SET, for the one thing it does do: it takes
- *    the dragstart from 1 to 0, so a row cannot be dragged as a URL into
- *    another application -- a behaviour these rows never had before they
- *    became links. What it leaves is a drag-attempt that navigates, which is
- *    exactly what the old `onClick` did on mouseup, so the row behaves as it
- *    used to rather than in a third new way.
+ *    THE ANCHOR IS A SECOND, INDEPENDENT CAUSE for its own text, since a drag
+ *    begun on link text is not a selection. But that half IS defeatable:
+ *    `user-select: text` on the anchor recovers the name with the `href` and
+ *    the link intact.
+ *
+ *    SO THE ORDER IS: the overlay first, then `user-select` -- and then a third
+ *    thing, which is why this is not a one-line change. Even with both, the
+ *    recovered selection is discarded on mouseup, because the release still
+ *    lands on the anchor and navigates. Making the name genuinely copyable
+ *    means trading away some of the whole-row click, and that is a product
+ *    decision rather than a tidy-up.
+ *
+ *    `draggable: false` IS NOT PART OF ANY OF THAT, and was expected to be.
+ *    Measured, it changes the dragstart count from 1 to 0 and the selection not
+ *    at all. It is kept for that one effect: a row cannot be dragged into
+ *    another application as a URL, which is a behaviour these rows never had
+ *    as `<tr>`s with a click handler.
  *
  *    Selection was already close to futile: before this change a mouseup inside
  *    the row fired the row's own `onClick` and navigated away, discarding
  *    whatever had just been selected. But futile and impossible are not the
- *    same thing, and this says which one it is now.
+ *    same thing, and this says which one it is now, and what it would take.
  */
 
 /**
@@ -103,13 +119,21 @@ export const ROW_LINK_ROW = "relative";
 /**
  * SPREAD onto the ANCHOR inside the row's first cell: `<Link ... {...ROW_LINK}>`.
  *
- * A PROPS OBJECT AND NOT A CLASS STRING, which is the point rather than a
- * flourish. The overlay and the drag suppression are ONE contract -- a row that
- * covers itself with a link but can still be dragged into another application
- * as a URL is a row that gained a behaviour nobody asked for -- and a spread
- * cannot be half-remembered the way two attributes side by side can. That
- * matters here because the class had already been shown to be deletable with
- * every guard staying green.
+ * A PROPS OBJECT AND NOT A CLASS STRING, because the overlay and the drag
+ * suppression are ONE contract: a row that covers itself with a link but can
+ * still be dragged into another application as a URL has gained a behaviour
+ * nobody asked for.
+ *
+ * WHAT THE SPREAD ACTUALLY PREVENTS, stated narrowly because an earlier version
+ * of this comment overstated it. It prevents applying half the contract BY
+ * OMISSION -- there is no second attribute to forget. It does NOT make the
+ * object tamper-proof: `<Link {...ROW_LINK} draggable>` puts the link drag
+ * back, `<Link {...ROW_LINK} className="x">` cancels the overlay, and both were
+ * measured to pass every guard that existed when they were tried. What catches
+ * those now is row-link.test.ts, which reads each Link's OPENING TAG and
+ * requires the spread and no `className` or `draggable` beside it -- and which
+ * also catches the spread being moved off the anchor onto a `<span>` or a cell,
+ * since the file merely CONTAINING it was all the earlier guard checked.
  *
  * The anchor itself stays an ordinary inline box around the record's name, so
  * the cell renders exactly as it did; the pseudo-element is what covers the row.

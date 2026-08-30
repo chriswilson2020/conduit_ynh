@@ -15,17 +15,38 @@ import type { Page, Locator } from "@playwright/test";
  * pipelines or task row at all. And Playwright clicks an element's CENTRE, so
  * those two probe one point in the middle of the row and nothing else.
  *
- * THAT MAKES THEM FIXTURE-DEPENDENT IN A WAY THAT IS EASY TO MISS. Shrink the
- * overlay to the first cell (one stray `relative` on a `<td>` does it) and
- * crm.spec.ts still passes or fails purely on how wide its company name is: it
- * clicks x=752 of a 1006px row, and its fixture's first cell ends at x=737. A
- * list whose names run past half the row would leave that mutation invisible
- * to the suite AND to the eye, since the overlay paints nothing.
+ * THAT MAKES THEM FIXTURE-DEPENDENT IN A WAY THAT IS EASY TO MISS, and the
+ * numbers are worth writing down because two earlier attempts at them were
+ * wrong. Shrink the overlay to the first cell -- one stray `relative` on a
+ * `<td>` does it -- and whether crm.spec.ts notices depends entirely on how
+ * long its company name is. Measured at 1280 with ONE row rendered, which is
+ * the geometry crm.spec.ts:49-55 actually produces:
+ *
+ *   name                       first cell ends   row centre   centre lands on
+ *   `Acme <runid>` (13 ch)     428               503          the CELL
+ *   25 characters              534               503          the ANCHOR
+ *   this file's fixture (56)   715               503          the ANCHOR
+ *
+ * (Row-relative; add the 249px sidebar for viewport x. The centre is 752 in
+ * viewport terms, which is the number Playwright clicks.)
+ *
+ * SO crm.spec.ts DOES CATCH IT TODAY, with 75px to spare, and 25 characters
+ * is enough to take that away. It is not a guard, it is a coincidence of
+ * fixture length -- and the mutation is invisible to the eye as well, since
+ * the overlay paints nothing.
  *
  * SO THE FIXTURE HERE IS THE WIDE CASE ON PURPOSE, and the test asserts that
  * it is -- the first cell is checked to extend PAST the row's centre before
  * the far edges are probed. Prove the instrument, then trust the reading, the
  * same care e2e/mobile.spec.ts takes with its overflow probe.
+ *
+ * THE SECOND HALF OF THE PAIR NEEDS ITS OWN PROBE, and did not have one. Drop
+ * `ROW_LINK_ROW` from the row and the overlay does not shrink, it ESCAPES: with
+ * no positioned ancestor it resolves against the initial containing block and
+ * covers the viewport. Every test in this file stayed green against that, since
+ * a link that covers too much still covers the row. The last test below is the
+ * one that fails -- it asks what owns the page heading, the Filter field and
+ * the sidebar, which must be anything except a row.
  */
 
 /** A long first column, so the row's centre lands INSIDE the name cell. */
@@ -94,6 +115,35 @@ test.describe.serial("Row links cover the whole row", () => {
     const row = page.getByTestId(`row-${companyId}`);
     await expect(row).toBeVisible();
     expect(await ownerAcross(row, ACROSS)).toEqual(ACROSS.map(() => "A"));
+  });
+
+  /**
+   * THE ESCAPE, not the shrink. Every other test in this file passes when the
+   * overlay covers TOO MUCH, so this is the only one that notices
+   * `ROW_LINK_ROW` going missing -- against that mutation the heading, the
+   * Filter field and the sidebar all report a row's anchor as the element
+   * under them, and every control on the page navigates to that record.
+   */
+  test("nothing outside the row belongs to the row's link", async () => {
+    await page.goto("/companies");
+    await page.getByPlaceholder("Filter...").fill(runId);
+    await expect(page.getByTestId(`row-${companyId}`)).toBeVisible();
+
+    const owners = await page.evaluate(() => {
+      const at = (el: Element | null): string => {
+        if (el === null) return "(absent)";
+        const r = el.getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + Math.min(10, r.width / 2), r.top + r.height / 2);
+        if (hit === null) return "none";
+        return hit.closest('[data-testid^="row-"]') === null ? "outside a row" : "A ROW";
+      };
+      return {
+        heading: at(document.querySelector("h1")),
+        filter: at(document.querySelector('input[aria-label="Filter"]')),
+        sidebar: at(document.querySelector("nav a")),
+      };
+    });
+    expect(owners).toEqual({ heading: "outside a row", filter: "outside a row", sidebar: "outside a row" });
   });
 
   test("a click at the row's far right edge opens the record", async () => {
