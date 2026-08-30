@@ -39,10 +39,17 @@ Three constraints, and the third is the one that will bite:
 - **The desktop table semantics must survive.** A row is a `<tr>` at desk width; the link
   has to live inside it without breaking the table, and the phone card layout has to keep
   working from the same DOM.
-- **105 e2e tests click these rows.** Their selectors must keep working, or every one that
-  breaks has to be understood rather than adjusted until it passes. A test that needed
-  changing because the markup legitimately moved is fine; a test that needed *loosening* is
-  a signal the change went too far.
+- **The e2e safety net here is TWO tests, not the hundred-odd this sentence used to claim.**
+  Measured during Task 1's review: `crm.spec.ts:54` (companies at 1280) and
+  `mobile.spec.ts:169` (companies at 390) are the only tests that click a row this change
+  touches. Two others locate a contacts row and assert text only; nothing clicks a projects,
+  pipelines or task row. The earlier figure counted every test in the suite rather than the
+  tests that exercise a row, and it made the net look far denser than it is.
+
+  So the constraint stands but its enforcement does not: a selector that keeps working
+  proves almost nothing here, and the change needs guards of its own rather than confidence
+  in the existing suite. A test that needed *loosening* is still a signal the change went
+  too far.
 
 ## 2. The composer opens with Close focused
 
