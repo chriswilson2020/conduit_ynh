@@ -261,13 +261,22 @@ export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
         // resolve to the same position in every state this app can reach --
         // including a reply, which seeds NO body at all (conversation.tsx's
         // openReply sets bodyHtml nowhere; only a forward quotes an original,
-        // and a forward focuses To). Mutation-tested: reverting only this to
-        // focus() passes the whole suite, and so does reverting only the
-        // option. Reverting both fails. It stays because stating the caret's
-        // position costs a word and inheriting it costs an argument -- not
-        // because it defends anything the option does not. A reader dropping
-        // it will not be stopped by the suite, and that is the honest position
-        // rather than a claim that the two diverge somewhere.
+        // and a forward focuses To).
+        //
+        // MUTATION-TESTED, AND THE ANSWER CHANGED WHEN THE SUITE DID. Reverting
+        // only this to focus() still passes the whole suite: nothing is
+        // asserted that the two spellings can tell apart. Reverting only
+        // updateSelection:false USED to pass and no longer does -- the
+        // account-switch journey in e2e/composer-focus.spec.ts, added in the
+        // same commit as this comment, catches it on its own. An earlier draft
+        // of these lines said both mutations survived alone, which was true of
+        // the suite it was written against and false of the one it shipped in.
+        //
+        // So the redundancy is one-sided: the option defends itself, and this
+        // stays only because stating the caret's position costs a word while
+        // inheriting it costs an argument. A reader who drops it will not be
+        // stopped by the suite, and that is the honest position rather than a
+        // claim that the two diverge somewhere.
         editor?.chain().focus("start").run();
       },
     }), [editor]);

@@ -3,31 +3,51 @@ import { describe, expect, it } from "vitest";
 import { withoutComments } from "../../test/source";
 
 /**
- * THE COMPOSER'S OPENING FOCUS, PINNED IN THE SOURCE, BECAUSE ITS ONLY OTHER
- * DESKTOP GUARD DEPENDS ON A NETWORK TIMEOUT.
+ * THE COMPOSER'S OPENING FOCUS, PINNED IN THE SOURCE.
  *
  * The behaviour is proved in e2e (e2e/composer-focus.spec.ts and the composer
  * assertions in e2e/mail.spec.ts and e2e/mobile.spec.ts) and that is where it
  * belongs -- this repo has no testing-library, so JSX has no unit-level check
- * except its text. But exactly ONE of those e2e tests separates the new
- * desktop behaviour from the old one: a blank compose at 1280 lands on the To
- * input either way unless a From combobox sits in front of it, and the only
- * fixture that puts one there is a mail account whose IMAP host is
- * unreachable. That account stays `active` for as long as a TCP connect to
- * 192.0.2.1 hangs -- about 25 seconds on the dev server, and nothing on a
- * network that answers with an immediate ICMP unreachable. If that test is
- * ever quarantined for flaking, the objected-to half of the coordinator's
- * ruling -- change the desk, not just the phone -- would retire with it and
- * nothing would say so.
+ * except its text. This file is a second guard of a different KIND: no
+ * browser, no database, no network, and it fails on the same mutation.
  *
- * So this file is the second guard, and it is deliberately a different KIND of
- * guard rather than a second instance of the same one: it needs no browser, no
- * database and no network, and it fails on the same mutation.
+ * ITS FIRST STATED REASON FOR EXISTING WAS FALSE and is corrected here rather
+ * than deleted, because the correction is the useful part. It said "exactly
+ * ONE e2e test separates the new desktop behaviour from the old one", that one
+ * being the blank compose at 1280 which needs an unreachable-mailbox fixture to
+ * put a From combobox in front of the To input. There are TWO. The other is a
+ * record's Mail tab at 1280, which needs no mailbox at all: its To arrives
+ * holding a chip, and a chip's "Remove <address>" button is the first tabbable
+ * element, so the old and new behaviours differ there for free. Measured, not
+ * argued -- under the mutation that deletes onOpenAutoFocus,
+ * e2e/composer-focus.spec.ts:128 failed in CI run 33308943883 with no account
+ * in the database, and e2e/composer-focus.spec.ts's own header said so in the
+ * same commit that got this wrong.
  *
- * IT MATCHES SPELLINGS, NOT BEHAVIOUR, which is the honest limit and the same
- * one components/touch-floors.test.ts states about itself. A spelling that is
- * present but wired to nothing would pass here; that is what the e2e is for.
- * What this cannot miss is the whole mechanism being deleted.
+ * So the desk is not one flaky fixture away from being unguarded, and this
+ * file is worth keeping for a smaller reason: it is the only guard here that
+ * cannot flake, and it names the mechanism rather than its consequences.
+ *
+ * WHAT IT ACTUALLY GUARANTEES, STATED NARROWLY BECAUSE A SOURCE-READING GUARD
+ * CANNOT DO MORE. It prevents the mechanism being removed BY OMISSION -- a
+ * deleted prop, a deleted branch, a dropped option. It does not survive
+ * deliberate tampering, and the honest response to that is to say so rather
+ * than to widen the match until it looks stronger:
+ *
+ *   - Renaming the prop, or moving the handler to an element that does not
+ *     take it, is caught by `npm run typecheck`, which CI runs. Not by this.
+ *   - A spelling in a string literal, or after a TRAILING `//` comment,
+ *     satisfies these assertions: test/source.ts's withoutComments strips
+ *     block comments and LINE-LEADING `//` only, and its own doc explains why
+ *     that restriction is deliberate.
+ *   - `if (false as boolean) form_.focusInitial(container)` passes.
+ *   - So does reverting the pending-flag fix in ComposerForm's drain effect
+ *     (spending bodyFocusPending before there is an editor to spend it on),
+ *     which nothing in this file or in typecheck sees at all.
+ *
+ * Task 1 reached the same place and the answer was the same: narrow the claim
+ * rather than widen the match. components/touch-floors.test.ts states the same
+ * limit about itself in one line.
  */
 
 const read = (path: string) =>
@@ -102,8 +122,15 @@ describe("the composer declines Radix's opening focus and places its own", () =>
   it("falls back to the dialog container on every branch", () => {
     expect(composer).toContain("(toRef.current ?? container).focus()");
     expect(composer).toContain("(subjectRef.current ?? container).focus()");
-    // The null-handle branch in Composer's own handler.
-    expect(composer).toContain("container.focus();");
+    // SCOPED, AND THE UNSCOPED VERSION WAS A HOLE. `container.focus();` is
+    // spelled twice in this file -- here in the null-handle branch, and again
+    // in focusInitial's own body branch, which parks focus while the editor is
+    // built. A file-wide match was therefore satisfied by the second one, so
+    // deleting precisely the null-handle branch this assertion is named after
+    // left the guard green and the typechecker clean. Same defect as the
+    // preventDefault assertion above, found the same way.
+    const nullHandle = between(composer, "if (form_ === null)", "form_.focusInitial");
+    expect(nullHandle).toContain("container.focus();");
   });
 });
 

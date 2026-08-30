@@ -48,12 +48,13 @@ import type { Page } from "@playwright/test";
  * test, and a reader comparing mutation results across runs would be reading
  * two different fixtures. In CI the ordering is fixed: workers is 1 and
  * Playwright walks the files alphabetically, so "composer-focus" runs before
- * "mail", which is the only spec that creates one. e2e/mail.spec.ts never
- * archives its own account at the end of its run -- its beforeAll sweeps
- * leftovers instead -- so the ordering is the whole of the guarantee. Locally,
- * with default workers, the two files can overlap in both directions: this
- * file's accounts can be swept by mail.spec.ts's beforeAll, and its account
- * can appear in these composers. Run this file alone in that loop.
+ * both specs that create an account -- e2e/mail.spec.ts (its beforeAll) and
+ * e2e/mobile.spec.ts:1569 (its own phone journey). NEITHER archives its
+ * account when it finishes; both instead SWEEP every live own account when
+ * they start, so the alphabetical order is the whole of the guarantee. Locally,
+ * with default workers, all three files can overlap in both directions: this
+ * file's accounts can be swept by either sweeper mid-test, and either file's
+ * account can appear in these composers. Run this file alone in that loop.
  *
  * THE REPLY AND THE FORWARD ARE NOT HERE, and there is nowhere else they could
  * be. Both seeds come from an open conversation, which exists only after a real
@@ -160,9 +161,14 @@ test.describe.serial("The composer opens on the first empty field, at a desk", (
  * that answers TEST-NET-1 with an immediate ICMP unreachable would shrink it
  * to nothing. The repair is a slower failure, not a longer timeout: nothing
  * here waits on an account, it either exists in the select or it does not.
- * packages/web/src/components/mail/composer-focus.test.ts is the second,
- * fixture-free guard over the same two mechanisms, written precisely so that
- * quarantining these would not silently retire them.
+ *
+ * AND NEITHER OF THESE IS LOAD-BEARING ON ITS OWN, which is worth saying so
+ * that a flake here is triaged as a flake rather than as a hole. The desk's
+ * opening focus is separated from the old behaviour by the record-rail test
+ * above as well, which needs no mailbox at all -- a seeded To arrives holding
+ * a chip, and the chip's Remove button is what the old code focused. And
+ * packages/web/src/components/mail/composer-focus.test.ts pins both mechanisms
+ * in the source without a browser, a database or a network.
  */
 interface Fixture { id: string; label: string }
 

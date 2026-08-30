@@ -211,6 +211,19 @@ pass, after the caret. That later append is exactly the case `rich-text.tsx`'s
 reply path as well as on the account-switch path it is tested through. Fix the option's
 test first if the order is ever reversed.
 
+**A deal's or project's Mail tab can compose with no recipient, for a reason Task 2 fixed
+one instance of.** `packages/web/src/components/rail/mail.tsx:37` resolves the contact as
+`useContact(contactId ?? deal?.contactId ?? "")` -- so from a DEAL or PROJECT tab it is a
+two-deep chain: the deal query must settle before the contact query is even enabled, and
+`compose()` reads `contact` at CLICK time. Click Compose before both have landed and the
+seed carries `to: []`, which is a blank compose: no recipient, and (since v1.2.0) the caret
+in To rather than in Subject. Nothing waits on either query and no test covers the deal or
+project tabs at all -- `e2e/composer-focus.spec.ts` uses a contact, whose chain is one deep
+and which now waits on the record heading before clicking. **Fix:** disable the Compose
+button until the queries it reads have settled, which also removes the silent
+wrong-recipient case rather than only the focus symptom. Found during 7.5 Task 2's review;
+out of scope there because Task 2 owned the composer, not the rail.
+
 **Conditional blocks in mail templates.** `({{contact.pronouns}})` renders `()` for a
 contact with none. Swallowing one following space handles `Dear X Y`; nothing short of
 conditionals handles brackets or labels. The document template already has

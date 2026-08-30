@@ -228,7 +228,16 @@ export type ComposerFocusTarget = "to" | "subject" | "body";
  * plan's rule wrong on an INSTANCE OF ONE OF ITS OWN TWO NAMED CASES rather
  * than on an unmentioned third, which is a smaller claim and the true one.
  * Mutation-tested: replacing this body with `threadId === undefined ? "to" :
- * "body"` fails three of the six cases below and passes the forward.
+ * "body"` fails TWO of the six cases below -- the record's Mail tab and the
+ * bare-prefix case -- and passes the forward, which is the point.
+ *
+ * IT WAS THREE UNTIL THE FIXTURES MOVED, AND THE FIXTURES MOVED IN THE SAME
+ * COMMIT THAT WROTE "three". The reply case below gained an explicit
+ * `threadId`, to record that this function never reads one -- and that is
+ * exactly what makes the reply case survive a rule which reads nothing else.
+ * The number is restated here rather than dropped because the reason it moved
+ * is the useful half: a measurement taken against one set of fixtures does not
+ * survive a change to those fixtures, however small the change looks.
  *
  * The subject is trimmed before it is judged so that a caller seeding "   "
  * counts as having seeded nothing. That is the whole reason, and an earlier
