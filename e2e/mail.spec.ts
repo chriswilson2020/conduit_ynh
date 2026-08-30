@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import type { BrowserContext, Locator, Page } from "@playwright/test";
+import type { BrowserContext, Locator, Page, Route } from "@playwright/test";
 import { ImapFlow } from "imapflow";
 import { typeIntoEditor } from "./helpers.js";
 
@@ -1141,10 +1141,20 @@ test.describe.serial("Mail journey", () => {
    * clicking Reply promptly. The delay is scoped to the LIST url so the
    * signature PATCH and the account lookup around this test are untouched.
    *
-   * WITHOUT updateSelection:false THE REPLY'S FIRST WORD LANDS INSIDE THE
-   * SIGNATURE. Measured in Chromium against the composer with this exact
-   * timing: "TOPLINE -- <marker>" with the option, "-- <marker>TOPLINE"
-   * without it.
+   * IT HAS TO TYPE AFTER THE APPEND, AND THE FIRST VERSION OF THIS TEST DID
+   * NOT -- IT WAS VACUOUS AND CI PROVED IT. That version typed once, before
+   * the signature existed, and asserted the typed word came out above the
+   * marker. It does: the append lands at the END of the document whatever it
+   * does to the SELECTION, so the assertion held with updateSelection:false
+   * deleted (measured, on a throwaway branch: this test and the warm one above
+   * both passed while composer-focus.spec.ts's account-switch journey failed
+   * three times out of three). Where the caret ended up is only observable by
+   * typing AGAIN afterwards, so the assertion is on the two typed fragments
+   * being contiguous.
+   *
+   * MEASURED, with the accounts held and the option deleted: "TOPLINE
+   * -- <marker>MORE" -- the continuation went into the signature. With it:
+   * "TOPLINEMORE -- <marker>".
    */
   test("a reply opened before the accounts land still keeps the caret above the signature", async () => {
     const accounts = await page.request.get("/api/mail/accounts");
@@ -1162,10 +1172,28 @@ test.describe.serial("Mail journey", () => {
     // Long enough that the editor is built and its caret placed well before
     // the list arrives, short enough to leave the rest of the test its budget.
     const ACCOUNTS_DELAY_MS = 3_000;
-    await page.route("**/api/mail/accounts", async (route) => {
+    // ONLY THE FIRST REQUEST IS HELD, and the rest of this handler is teardown
+    // safety rather than ceremony. A handler that sleeps and then continues is
+    // a landmine for the tests after it: the poll, the SSE invalidation and a
+    // refocus all re-fetch this list, so a request can still be parked in the
+    // sleep when the test ends -- and `route.continue()` on a route whose page
+    // has moved on throws "Route is already handled!" asynchronously, which
+    // lands on WHICHEVER test is running by then. It did: the first version of
+    // this test failed "keeps the private mailbox out of the second user's
+    // inbox entirely" and "carries the deal-linked thread to the second user"
+    // on two different CI runs, and was reported as a flake in a test it has
+    // nothing to do with.
+    let held = false;
+    const holdAccounts = async (route: Route) => {
+      if (held) {
+        await route.continue().catch(() => undefined);
+        return;
+      }
+      held = true;
       await new Promise((resolve) => setTimeout(resolve, ACCOUNTS_DELAY_MS));
-      await route.continue();
-    });
+      await route.continue().catch(() => undefined);
+    };
+    await page.route("**/api/mail/accounts", holdAccounts);
 
     try {
       await page.goto(`/mail?thread=${aliceThreadId}`);
@@ -1187,15 +1215,20 @@ test.describe.serial("Mail journey", () => {
       await page.keyboard.type("TOPLINE");
       await expect(body, "the deferred append never ran").toContainText(marker);
 
+      // AND AGAIN AFTERWARDS, which is the only step that can see where the
+      // append left the caret. No click in between: a click would place the
+      // caret itself and prove nothing, exactly as the warm test above notes.
+      await page.keyboard.type("MORE");
       const text = (await body.innerText()).replace(/\s+/g, " ").trim();
-      expect(text.indexOf("TOPLINE"), `the deferred append swallowed the caret: ${text}`)
-        .toBeLessThan(text.indexOf(marker));
-      expect(text.startsWith("TOPLINE"), `body reads: ${text}`).toBe(true);
+      expect(text, `the deferred append dragged the caret into the signature: ${text}`)
+        .toContain("TOPLINEMORE");
+      expect(text.indexOf("TOPLINEMORE")).toBeLessThan(text.indexOf(marker));
+      expect(text.startsWith("TOPLINEMORE"), `body reads: ${text}`).toBe(true);
 
       await page.getByTestId("composer").getByRole("button", { name: "Cancel" }).click();
       await expect(page.getByTestId("composer")).toBeHidden();
     } finally {
-      await page.unroute("**/api/mail/accounts");
+      await page.unroute("**/api/mail/accounts", holdAccounts);
       await page.request.patch(`/api/mail/accounts/${accountId}`, { data: { signatureHtml: null } });
     }
   });
