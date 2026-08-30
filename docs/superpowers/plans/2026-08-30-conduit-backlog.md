@@ -81,10 +81,10 @@ but that is a brainstorm decision, not a foregone one.
 **Two structural facts that will shape it, both found while agreeing the list:**
 
 1. **`documents.deal_id` is `NOT NULL`.** A meeting summary belongs to a meeting, a status
-   report to a project, an NDA to a company, a letter to anyone. The FK model has to widen —
-   `files` and `events` already show two different precedents in this schema (exactly-one
-   CHECK versus any-subset), and which one applies is a real decision rather than a
-   detail.
+   report to a project, an NDA to a company, a letter to anyone. The FK model has to widen,
+   and this schema already contains three different answers to that question — see the
+   table under Phase 10 below, which enumerates them. Which one applies is a real decision
+   rather than a detail, and Phases 9 and 10 face it independently.
 2. **Immutability is per type, not universal.** A quote is frozen because you sent somebody
    a price. A **status report** you would legitimately want to regenerate next month, and a
    **letter** may want redrafting before it goes. Phase 7's "an issued document never
@@ -99,6 +99,69 @@ sequence at all is a per-type decision, and the machinery already permits either
 three file-read controls and kernel memory ceiling, the sanitiser, the merge engine with
 `{{#path}}` blocks, content-addressed storage, and the seeded-template migration pattern.
 The expensive parts are done.
+
+---
+
+## Phase 10 - time tracking and timesheets (agreed 30 Aug, unspecced)
+
+Record time against work, and see it back as a timesheet.
+
+**Two structural facts, read out of `schema.ts` rather than assumed:**
+
+1. **`meetings.duration_minutes` already exists** (Phase 5, nullable because not every
+   logged meeting has a known length). Conduit therefore ALREADY HOLDS TRACKED TIME -- a
+   logged meeting with a duration is a recorded hour, just never aggregated. **A timesheet
+   that ignores it under-reports the week; one that counts it alongside a manual entry for
+   the same hour double-counts.** That is a day-one decision, not a later refinement.
+2. **`tasks` has no effort or estimate column.** It carries `start_date`, `due_date`,
+   `completed_at`, `status` and `progress_pct` -- dates and a percentage, never a quantity
+   of work. "Booked versus estimated", which is usually the point of tracking time against
+   tasks, needs a column adding before it can exist at all.
+
+**The precedent to copy is a three-way choice, not a two-way one.** Exactly five tables carry
+the same four foreign keys -- company / contact / deal / project -- and they enforce three
+DIFFERENT rules over them:
+
+| Tables | Rule | Constraint |
+|---|---|---|
+| `notes`, `files` | exactly one | `num_nonnulls(...) = 1` |
+| `meetings` | at least one | `num_nonnulls(...) >= 1` |
+| `tasks`, `mail_threads` | any subset, including none | no CHECK at all |
+
+(`events` is NOT a sixth member of that family and is the wrong thing to copy: it carries
+**seven** entity FKs -- those four plus `task_id`, `meeting_id` and `mail_thread_id` -- and
+no link CHECK. It is a log of things that happened to rows, not a row that belongs to
+something.)
+
+An hour can legitimately belong to a project AND the deal it came from, so exactly-one is
+wrong here. The live question is `meetings`' rule against `tasks`': **is an hour attached to
+nothing a legal row?** Answer it in the schema, because the reporting consequence is the
+whole feature -- unattached time is time that never appears in any report and can only be
+found by SQL.
+
+**Questions the brainstorm has to settle, none of them obvious:**
+
+- **What do you book against?** A task is the natural unit, but not all work is a task --
+  admin, a sales call, travel. See the rule choice above.
+- **Timer or after the fact?** A start/stop timer is nicer, and brings running state to
+  store plus the "left a timer going over the weekend" problem. Post-hoc duration entry is
+  simpler and is what most people actually do. Both is a bigger feature than either.
+- **Do meetings become time entries automatically**, or stay separate and get summed at
+  report time? See fact 1 -- whichever is chosen, **the other must be impossible rather
+  than merely discouraged**, or the week's total is quietly wrong.
+- **Billable or not, and at what rate.** Invoicing is ruled out of Conduit, so billable time
+  here feeds REPORTING AND EXPORT, not billing. Rates would touch the products/rate-card
+  item already on this list.
+- **Timesheet shape.** A weekly grid (days across, projects down) is the classic and is the
+  hardest thing to get right on a phone; a list is easier and less useful. No approval
+  workflow -- single user.
+
+**What it connects to, already on this list:**
+
+- **Phase 9's project status report** would naturally carry time booked against the project.
+- **The quote becomes comparable to reality**: quoted line items against hours actually
+  spent is the margin question, and neither half exists without this.
+- **7.6's export must include time entries**, or a timesheet is trapped in the app.
 
 ---
 
