@@ -91,30 +91,44 @@ Everything needed to reconstruct the install: a `pg_dump` of the database, the b
 `mail.key`, and a manifest recording the app version, schema version and migration journal
 position.
 
-### Encryption — the one decision worth Chris's attention
+### Encryption -- decided by Chris, 30 Aug: **AES-256 `.7z`**
 
-**Requirement, written in at brainstorm: the format is documented in the repo with a working
-`openssl` recipe, and a test runs that recipe.** A backup only openable by the tool that
-wrote it is a second single point of failure, and the scenario a backup exists for is the one
-where Conduit is not running.
+The brainstorm requirement was that a backup be openable without Conduit, and my first draft
+met it with two `openssl` commands and a detached HMAC. **Chris rejected that: "It needs to be
+decryptable by a normal person not a computer scientist."** He is right, and the corrected
+requirement is the stronger one:
 
-That requirement rules out anything needing a bespoke tool, and it is why the proposal is
-plain OpenSSL primitives rather than `age` or a hand-rolled AEAD framing:
+> **A backup must be openable by double-clicking it and typing the passphrase.** No command
+> line, no flags, no recipe to follow.
 
-- **Key derivation:** PBKDF2-HMAC-SHA256, 600,000 iterations, 16-byte random salt.
-- **Cipher:** AES-256-CBC, random IV. Chosen over GCM **because `openssl enc` cannot
-  reliably decrypt a streamed GCM file in one command**, which would defeat the recipe
-  requirement. This is the trade being made, stated plainly.
-- **Integrity:** encrypt-then-MAC. A detached HMAC-SHA256 over the ciphertext, under a second
-  key derived from the same passphrase with a different info string, **verified before
-  decryption is attempted**. CBC without a MAC is malleable; this closes that.
-- **Recipe:** two `openssl` commands — verify the HMAC, then decrypt. Documented in
-  `docs/backup-format.md` and **executed by a test**, so the docs cannot drift from the
-  format.
+**The format is a standard AES-256 encrypted `.7z` archive**, chosen over an encrypted `.zip`
+on Chris's ruling, for a reason that outweighs the less familiar extension:
 
-The passphrase is typed in Settings, travels over HTTPS, is used to derive the two keys, and
-is **never stored, logged, or written to disk**. There is no recovery path. The page says so
+- **`.7z` stretches the passphrase about 524,000 times** (SHA-256, 2^19 iterations) before
+  using it. **The ZIP standard's AES stretches it 1,000 times** -- 500x weaker -- so a short
+  or guessable passphrase on a stolen archive could be cracked offline. The passphrase is one
+  Chris types rather than one Conduit generates, which is what makes that difference the whole
+  argument.
+- **Header encryption is on** (`-mhe=on`), so the file *names* -- which leak what an install
+  contains -- are unreadable without the passphrase.
+
+**How a normal person opens it. This belongs in the UI, not only in the docs:**
+
+| Windows | **7-Zip** -- free, and already installed on most machines that handle archives |
+| Mac | **Keka** -- free. **macOS's built-in unarchiver will not open an encrypted archive**, so this is a one-time install and the page must say so rather than let a double-click fail mysteriously |
+| Linux | Ark, File Roller, or `7z x` |
+
+**Still documented, and still tested.** `docs/backup-format.md` records the format and names
+the three tools. A test **produces a real backup, opens it with `7z` using the passphrase, and
+compares the contents** -- so the documentation cannot drift from what the code writes.
+
+The passphrase is typed in Settings, travels over HTTPS, is handed to the archiver, and is
+**never stored, logged, or written to disk**. There is no recovery path. The page says so
 before the first backup is taken, not after.
+
+**Packaging consequence, and it is a real one:** this needs **`p7zip-full`** as an apt
+dependency in `manifest.toml`. It is not installed by default on Debian 12. A missing binary
+must fail loudly at the button, naming the package -- never half-produce an archive.
 
 ### Streaming, and the memory ceiling
 
@@ -123,11 +137,28 @@ easily hundreds of megabytes on a server with **no swap** — and this is the sa
 that spent an entire release learning that lesson about the PDF renderer, ending with a
 kernel `RLIMIT_DATA` because five successive accounting fixes were each bypassed.
 
-- `pg_dump` → gzip → encrypt → HTTP response, chunk by chunk. Nothing whole in memory.
-- **The ceiling is enforced, not intended.** A measured resident-memory bound, asserted by a
-  test that fails if the implementation ever buffers.
-- A truncated download must be detectable: the manifest carries a SHA-256 of the plaintext
-  archive, and the recipe's first step verifies it.
+**AND THE `.7z` DECISION CHANGES THIS, so it is stated rather than inherited from the draft
+it replaced.** The first draft piped `pg_dump | gzip | encrypt` straight into the HTTP
+response, with nothing whole anywhere. **`7z` cannot be driven that way**: it seeks to write
+its headers, and with `-mhe=on` it must finish the archive before the header block is final.
+So the backup is **built to a temporary file and then streamed to the browser**.
+
+That is a real trade for the double-click requirement, and it has consequences that must be
+handled rather than noted:
+
+- **The temp file is a credential store on disk.** Mode `0600`, inside `$data_dir`, never
+  `/tmp`, and **deleted on every exit path including a failed or abandoned download**. A
+  half-written backup left behind after a crash is the failure mode to design against.
+- **Disk, not memory, is now the ceiling.** A backup needs free space roughly equal to its own
+  size. **Check before starting and fail with a clear message**, rather than filling the disk
+  of a live server.
+- **Memory is still bounded and still measured** — `7z` streams its input, and the download
+  streams the finished file. A measured resident-memory bound, asserted by a test that fails
+  if the implementation ever buffers the archive in the process.
+- A truncated download must be detectable: the manifest inside the archive carries a SHA-256
+  per member, and `7z t` verifies the archive's own integrity.
+- **The export keeps the pipe.** It is a plain ZIP with no header encryption, so it can be
+  streamed directly and should be. Only the backup pays this cost.
 
 ---
 
@@ -135,10 +166,11 @@ kernel `RLIMIT_DATA` because five successive accounting fixes were each bypassed
 
 - Export and backup both downloadable from Settings, each labelled with its purpose *and* its
   limitation.
-- `docs/backup-format.md` written, with an `openssl` recipe **a test executes**.
+- `docs/backup-format.md` written, naming the three tools, with **a test that opens a real
+  backup using `7z` and the passphrase and compares the contents**.
 - A memory bound measured and asserted for both paths.
-- A backup taken on a populated install, decrypted **outside Conduit** using only the
-  documented recipe, and its `pg_dump` shown to restore into a scratch database. That last
+- A backup taken on a populated install, opened **outside Conduit** with an ordinary archive
+  tool and the passphrase, and its `pg_dump` shown to restore into a scratch database. That last
   step is the only evidence that the artefact is worth anything, and it belongs in this phase
   even though restore does not.
 - Export opened in a spreadsheet with accented characters intact.
