@@ -67,7 +67,32 @@ ram.runtime = "1424M"
     [resources.sources.main]
     url = "https://github.com/chriswilson2020/conduit_ynh/releases/download/v1.1.0/conduit-1.1.0.tar.gz"
     sha256 = "92f2bddbc985b99cbbf7875522e87f04e14d3276b44575d4650ba37552e9cecc"
-    autoupdate.strategy = "latest_github_release"
+
+    # NO autoupdate BLOCK, DELIBERATELY. It carried
+    # `autoupdate.strategy = "latest_github_release"` until 30 Aug 2026, where it
+    # was both inert and wrong, and removing it is more honest than fixing it.
+    #
+    # INERT: the autoupdater only runs against catalogued apps, and this one is not
+    # catalogued. YunoHost's apps.toml carries `[conduit]` (added 2023-08-11,
+    # category "communication", listed as an alternative to Discord and Signal) --
+    # the Matrix homeserver. `chriswilson2020` appears zero times across 707
+    # entries. That same id collision is why every upgrade command in the release
+    # runbooks carries `-u https://github.com/chriswilson2020/conduit_ynh`.
+    #
+    # WRONG IF IT EVER FIRED: with no `asset` key the autoupdater repoints this url
+    # at GitHub's auto-generated source archive rather than the tarball
+    # .github/workflows/release.yml builds and uploads. That archive has no built
+    # dist/, so scripts/install's `npm ci --omit=dev` and the service start would
+    # produce an app that cannot boot.
+    #
+    # WHY NOT JUST ADD `asset`: YunoHost's schemas/manifest.v2.schema.json shows
+    # `asset` accepts a string or an object keyed by amd64|i386|armhf|arm64 -- but
+    # it does not define what the string is MATCHED as (regex, glob, substring).
+    # Adding a key whose semantics could not be verified, to repair a declaration
+    # nobody had verified, is the original mistake repeated. And cataloguing would
+    # need a different app id anyway, since `conduit` is taken -- at which point
+    # this manifest is being rewritten and the block can be added against the
+    # tooling's actual behaviour.
 
     [resources.system_user]
     allow_email = true
