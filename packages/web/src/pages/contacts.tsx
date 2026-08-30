@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
-import { useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import type { Contact } from "@conduit/shared";
 import { useCompanies, useContacts, useCreateContact, useUsers } from "../queries";
 import { nameWithSalutation } from "../components/contact-fields-lib";
 import { EntityTable, type EntityTableColumn } from "../components/entity-table";
+import { ROW_LINK } from "../components/row-link";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { DialogTitle } from "../components/ui/dialog";
@@ -16,7 +17,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 const NO_COMPANY = "none";
 
 export function ContactsPage() {
-  const navigate = useNavigate();
   const [q, setQ] = useState<string | undefined>(undefined);
   const [archived, setArchived] = useState(false);
   const [cursor, setCursor] = useState<string | undefined>(undefined);
@@ -86,7 +86,11 @@ export function ContactsPage() {
         columns={columns}
         rows={rows}
         isLoading={isLoading}
-        onRowClick={(row) => void navigate({ to: "/contacts/$contactId", params: { contactId: row.id } })}
+        renderRowLink={(row, name) => (
+          <Link to="/contacts/$contactId" params={{ contactId: row.id }} className={ROW_LINK}>
+            {name}
+          </Link>
+        )}
         onQueryChange={(next) => {
           setQ(next.trim() === "" ? undefined : next.trim());
           setCursor(undefined);

@@ -1,10 +1,11 @@
 import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
-import { useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import type { Project } from "@conduit/shared";
 import { userLabel } from "../lib";
 import { useCompanies, useCreateProject, useProjects, useUsers } from "../queries";
 import { EntityTable, type EntityTableColumn } from "../components/entity-table";
+import { ROW_LINK } from "../components/row-link";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { DialogTitle } from "../components/ui/dialog";
@@ -15,7 +16,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 const NO_COMPANY = "none";
 
 export function ProjectsPage() {
-  const navigate = useNavigate();
   const [q, setQ] = useState("");
   const [archived, setArchived] = useState(false);
 
@@ -79,7 +79,11 @@ export function ProjectsPage() {
         columns={columns}
         rows={filtered}
         isLoading={isLoading}
-        onRowClick={(row) => void navigate({ to: "/projects/$projectId", params: { projectId: row.id } })}
+        renderRowLink={(row, name) => (
+          <Link to="/projects/$projectId" params={{ projectId: row.id }} className={ROW_LINK}>
+            {name}
+          </Link>
+        )}
         onQueryChange={setQ}
         onArchivedChange={setArchived}
         renderCreateDialog={(close) => <NewProjectDialog onClose={close} />}

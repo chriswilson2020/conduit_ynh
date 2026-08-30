@@ -1,15 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
-import { useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import type { Company } from "@conduit/shared";
 import { useCompanies, useCreateCompany, useUsers } from "../queries";
 import { EntityTable, type EntityTableColumn } from "../components/entity-table";
+import { ROW_LINK } from "../components/row-link";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { DialogTitle } from "../components/ui/dialog";
 
 export function CompaniesPage() {
-  const navigate = useNavigate();
   const [q, setQ] = useState<string | undefined>(undefined);
   const [archived, setArchived] = useState(false);
   const [cursor, setCursor] = useState<string | undefined>(undefined);
@@ -52,7 +52,11 @@ export function CompaniesPage() {
         columns={columns}
         rows={rows}
         isLoading={isLoading}
-        onRowClick={(row) => void navigate({ to: "/companies/$companyId", params: { companyId: row.id } })}
+        renderRowLink={(row, name) => (
+          <Link to="/companies/$companyId" params={{ companyId: row.id }} className={ROW_LINK}>
+            {name}
+          </Link>
+        )}
         onQueryChange={(next) => {
           setQ(next.trim() === "" ? undefined : next.trim());
           setCursor(undefined);

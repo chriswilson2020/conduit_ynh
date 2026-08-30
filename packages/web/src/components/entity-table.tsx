@@ -4,6 +4,7 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Dialog, DialogContent, DialogTrigger } from "./ui/dialog";
 import { Table, TableHead, TableBody, TableRow, TableHeaderCell, TableCell } from "./ui/table";
+import { ROW_LINK_ROW } from "./row-link";
 import { CHECKBOX_LABEL } from "./ui/touch";
 
 export interface EntityTableColumn<T> {
@@ -15,7 +16,19 @@ export interface EntityTableColumn<T> {
 export interface EntityTableProps<T extends { id: string }> {
   columns: EntityTableColumn<T>[];
   rows: T[];
-  onRowClick?: (row: T) => void;
+  /**
+   * Makes each row a link to its record: given the row and its FIRST column's
+   * rendered content, return that content wrapped in a router `Link` carrying
+   * the ROW_LINK classes. See components/row-link.ts for what the two halves
+   * do and why this replaced an `onClick` on the row.
+   *
+   * The caller supplies the whole link rather than a route, because the routes
+   * are typed per page ("/companies/$companyId" and its params) and a generic
+   * component cannot carry that type through. What it costs is one repeated
+   * `className={ROW_LINK}` in each list page; what it buys is that a wrong
+   * route is still a compile error at the page that owns it.
+   */
+  renderRowLink?: (row: T, name: ReactNode) => ReactNode;
   /** Called (debounced 200ms) whenever the filter input's text changes. */
   onQueryChange: (q: string) => void;
   /** Called immediately whenever the "Archived" toggle changes. */
@@ -46,7 +59,7 @@ export interface EntityTableProps<T extends { id: string }> {
 export function EntityTable<T extends { id: string }>({
   columns,
   rows,
-  onRowClick,
+  renderRowLink,
   onQueryChange,
   onArchivedChange,
   renderCreateDialog,
@@ -116,10 +129,9 @@ export function EntityTable<T extends { id: string }>({
             <TableRow
               key={row.id}
               data-testid={`row-${row.id}`}
-              onClick={onRowClick ? () => onRowClick(row) : undefined}
-              className={onRowClick ? "cursor-pointer" : undefined}
+              className={renderRowLink ? `${ROW_LINK_ROW} cursor-pointer` : undefined}
             >
-              {columns.map((column) => (
+              {columns.map((column, index) => (
                 <TableCell key={column.key}>
                   {/*
                     The column heading, repeated per cell and shown only where
@@ -136,7 +148,20 @@ export function EntityTable<T extends { id: string }>({
                     tree entirely -- the heading row is doing the job there.
                   */}
                   <span className="text-xs font-medium uppercase text-slate-400 md:hidden">{column.header}</span>
-                  {column.render(row)}
+                  {/*
+                    THE LINK GOES IN THE FIRST COLUMN AND ONLY THERE, because
+                    that column is the record's name in all three lists and the
+                    anchor's content is what a screen reader announces as the
+                    link. A link per cell would be three to five tab stops to
+                    one record (three columns here for companies and contacts,
+                    five for projects); a link around the whole row cannot
+                    exist, since an anchor may not wrap `<td>`s.
+
+                    The heading label above stays OUTSIDE it deliberately: it is
+                    the phone layout's stand-in for the hidden column head, and
+                    inside the anchor it would make the link read "NAME Acme BV".
+                  */}
+                  {index === 0 && renderRowLink ? renderRowLink(row, column.render(row)) : column.render(row)}
                 </TableCell>
               ))}
             </TableRow>

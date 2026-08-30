@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
-import { useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import type { Pipeline } from "@conduit/shared";
 import { useCompanies, useCreatePipeline, usePipelines } from "../queries";
 import { Button } from "../components/ui/button";
@@ -15,7 +15,6 @@ import { CHECKBOX_LABEL } from "../components/ui/touch";
 const GLOBAL = "global";
 
 export function PipelinesPage() {
-  const navigate = useNavigate();
   const [createOpen, setCreateOpen] = useState(false);
   // Archived pipelines hidden by default (usePipelines({}) -- archived
   // undefined -- already resolves to the server's own default of "only
@@ -50,10 +49,6 @@ export function PipelinesPage() {
     return groups;
   }, [pipelines]);
 
-  function openBoard(pipeline: Pipeline) {
-    void navigate({ to: "/pipelines/$pipelineId", params: { pipelineId: pipeline.id } });
-  }
-
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
@@ -76,14 +71,13 @@ export function PipelinesPage() {
 
       {isLoading && <p className="text-sm text-slate-400">Loading...</p>}
 
-      <PipelineSection title="Global" pipelines={globalPipelines} onSelect={openBoard} />
+      <PipelineSection title="Global" pipelines={globalPipelines} />
 
       {[...byCompany.entries()].map(([companyId, companyPipelines]) => (
         <PipelineSection
           key={companyId}
           title={companyMap.get(companyId) ?? "Unknown company"}
           pipelines={companyPipelines}
-          onSelect={openBoard}
         />
       ))}
 
@@ -92,15 +86,7 @@ export function PipelinesPage() {
   );
 }
 
-function PipelineSection({
-  title,
-  pipelines,
-  onSelect,
-}: {
-  title: string;
-  pipelines: Pipeline[];
-  onSelect: (pipeline: Pipeline) => void;
-}) {
+function PipelineSection({ title, pipelines }: { title: string; pipelines: Pipeline[] }) {
   if (pipelines.length === 0) return null;
   return (
     <section>
@@ -108,14 +94,29 @@ function PipelineSection({
       <ul data-testid="pipeline-list" className="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white">
         {pipelines.map((pipeline) => (
           <li key={pipeline.id}>
-            <button
-              type="button"
+            {/*
+              THE ONE ROW IN THIS APP THAT ALREADY HAD A TAB STOP, and it is
+              still changing. A `<button>` was reachable and Enter worked, but
+              it announced itself as a button and could not be middle-clicked or
+              opened in a new tab -- and this row does nothing but navigate.
+
+              THE SHAPE IS NOT NEW TO THE APP: company-detail.tsx has listed a
+              company's pipelines as `<li><Link>` since 403b3bf (Phase 2), and
+              e2e/crm.spec.ts addresses those rows with `getByRole("link")`.
+              This page was the odd one out.
+
+              It needs no ROW_LINK overlay: the anchor is already `block w-full`,
+              so it IS the row. Every class is the button's, unchanged, so the
+              row renders exactly as it did.
+            */}
+            <Link
+              to="/pipelines/$pipelineId"
+              params={{ pipelineId: pipeline.id }}
               data-testid={`pipeline-row-${pipeline.id}`}
-              onClick={() => onSelect(pipeline)}
               className="block w-full px-4 py-3 text-left text-sm text-slate-900 hover:bg-slate-50"
             >
               {pipeline.name}
-            </button>
+            </Link>
           </li>
         ))}
       </ul>
