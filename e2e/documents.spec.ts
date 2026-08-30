@@ -239,9 +239,9 @@ async function boxOf(locator: Locator): Promise<{ x: number; y: number; width: n
 }
 
 /**
- * A touch target has to be BOTH big enough and actually on screen, and until this
- * existed the seven assertion sites below -- fourteen controls between them -- only
- * asked the first question.
+ * A touch target has to be big enough, on screen, and actually under the thumb, and
+ * until this existed the seven assertion sites below -- fourteen controls between them
+ * -- only asked the first of those.
  *
  * A BOUNDING BOX EXISTS WHETHER OR NOT THE CONTROL IS VISIBLE. `<main>` carries
  * `max-md:overflow-clip` (components/shell.tsx explains why: it is what lets a phone
@@ -256,7 +256,7 @@ async function boxOf(locator: Locator): Promise<{ x: number; y: number; width: n
  * intersection rect is clipped by every ancestor's clip rect on the way up. THE SCROLL
  * IN FRONT OF IT IS NOT DECORATION, and the obvious version of this guard -- a bare
  * `toBeInViewport` -- is simply wrong: measured in this file's own order with nothing
- * scrolled, SEVEN of the fourteen controls it covers are outside the viewport at the
+ * scrolled, EIGHT of the fourteen controls it covers are outside the viewport at the
  * moment they are reached, at intersection ratio 0. All four line fields and Add line
  * are below the fold inside the quote dialog, and `org-email`, the logo picker and
  * `org-save` are below it down the settings form. Every one of them is reachable; a
@@ -265,26 +265,74 @@ async function boxOf(locator: Locator): Promise<{ x: number; y: number; width: n
  * establishes no scroll container, and the clipped child does not reach the document's
  * scrolling area either, so nothing can bring it back.
  *
+ * AND THE VIEWPORT IS NOT THE THUMB. IntersectionObserver does no occlusion testing,
+ * and `scrollIntoViewIfNeeded` is a NO-OP on an element already inside the scrollport
+ * -- including when "inside" means "underneath something". `BottomNav` is
+ * `fixed inset-x-0 bottom-0` on every phone page, and NINE of these fourteen are on a
+ * page rather than in the quote dialog -- the dialog is portalled to the end of
+ * `<body>`, which is what puts it above a bar that carries no z-index. So the failure
+ * has a standing shape here for those nine. MEASURED, by deleting
+ * the bottom reservation `<main>` carries for exactly this reason
+ * (`pb-[calc(6rem_+_env(safe-area-inset-bottom))]`, and components/bottom-nav.tsx says
+ * why): `org-save` then sits at y 620..664 against a bar whose top edge is 619, with
+ * the page already at its maximum scroll, `document.elementFromPoint` at the control's
+ * centre returning the NAV -- and the viewport check passes. `tap({ trial: true })`
+ * is what fails it: a trial action runs the actionability checks (visible, stable,
+ * receives events) and performs no tap. It is `tap` rather than `click` because
+ * `click` also waits for ENABLED and `org-save` carries `disabled={pending}`, and the
+ * group is `devices["iPhone 13"]`, so touch exists to be trialled.
+ *
  * PROVED AGAINST CASES THAT MUST FAIL, at 390x664 on this file's iPhone 13 group, one
- * displacement at a time injected at `org-save` on an otherwise untouched app. The
- * height check answered PASS to every displacement in this table; this answers:
+ * displacement at a time injected at `org-save` on the SETTINGS page -- directly under
+ * `<main>`'s `max-md:overflow-clip`, which is where the rows below were taken and is
+ * not the container five of the seven sites sit in (see the next paragraph). The
+ * height check answered PASS to every displacement here:
  *
- *   | displacement of `org-save`                     | height | this |
- *   | 500px right, or 500px left, inside main's clip | PASS   | FAIL |
- *   | `position: fixed; left: -9999px`               | PASS   | FAIL |
- *   | 3000px down by `position: relative` (clipped)  | PASS   | FAIL |
- *   | 3000px down by MARGIN (main grows, doc scrolls)| PASS   | PASS |
- *   | `display: none`                                | FAIL   | FAIL |
+ *   | displacement of `org-save`                     | height | viewport | tap |
+ *   | 500px right, or 500px left, inside main's clip | PASS   | FAIL     | FAIL|
+ *   | `position: fixed; left: -9999px`               | PASS   | FAIL     | FAIL|
+ *   | 3000px down by `position: relative` (clipped)  | PASS   | FAIL     | FAIL|
+ *   | 3000px down by MARGIN (main grows, doc scrolls)| PASS   | PASS     | PASS|
+ *   | under the bar, page at maximum scroll          | PASS   | PASS     | FAIL|
+ *   | a full-viewport `position: fixed` overlay      | PASS   | PASS     | FAIL|
+ *   | `visibility: hidden`                           | PASS   | PASS     | FAIL|
+ *   | `opacity: 0`                                   | PASS   | PASS     | PASS|
+ *   | `display: none`                                | FAIL   | FAIL     | FAIL|
  *
- * The middle pair is the discrimination, and it is why the scroll is here: the same
- * 3000px moves a control out of reach when `<main>` clips it and merely far down the
- * page when `<main>` grows with it. A settings tab pushed outside the nav's own
- * `overflow-x: auto` row passes as well, which is the allowance that row's comment
- * below claims for it -- verified by giving the first tab 600px of padding:
- * intersection ratio 0 before the scroll, 1 after. What it does NOT see is a control
- * that is placed but invisible: `opacity: 0` and `visibility: hidden` both keep their
- * box (56x44, measured on `org-save`) and both intersect, so both walk past this as
- * well as past the height check. `display: none` is caught, by the `boxOf` above.
+ * The fourth row is the discrimination that keeps the scroll honest: the same 3000px
+ * moves a control out of reach when `<main>` clips it and merely far down the page
+ * when `<main>` grows with it. A settings tab pushed outside the nav's own
+ * `overflow-x: auto` row passes both checks as well -- verified by giving the first
+ * tab 600px of padding: intersection ratio 0 before the scroll, 1 after, tap in 49ms.
+ *
+ * WHAT IS STILL MISSED, and it is one thing rather than none. `opacity: 0` keeps its
+ * box (56x44 on `org-save`), intersects, and receives events, so it walks past all
+ * three checks; catching it needs a computed-style read, which is a different guard.
+ * `display: none` is caught by the `boxOf` above -- which is also why the height is
+ * taken FIRST: a missing control then fails as `no box for ...`, naming itself,
+ * instead of spending a timeout inside the scroll.
+ *
+ * AND `overflow: hidden` MANUFACTURES A PASS, which is worth knowing before the next
+ * reader generalises "a clip cannot be scrolled past". A `hidden` box is a scroll
+ * container that simply has no scrollbar and cannot be panned by a thumb, so
+ * `scrollIntoViewIfNeeded` scrolls it programmatically and everything below answers
+ * PASS: measured twice, with `<main>` forced to `hidden` and `org-save` displaced
+ * +500px (main scrolled to 476 and the control passed all three checks), and with the
+ * settings nav forced to `hidden` around 881px of tabs (row scrolled to 539, pass).
+ * Nothing in this app wraps any of the fourteen in `overflow-hidden` today, and
+ * `clip` -- which is what shell.tsx actually uses -- does fail correctly.
+ *
+ * THE ROWS ABOVE WERE TAKEN UNDER `<main>`, AND FIVE OF THE SEVEN SITES ARE NOT
+ * THERE. The four line fields and Add line are inside the quote dialog, whose phone
+ * surface is `max-md:overflow-y-auto` on a `fixed` box and computes to
+ * `overflow-x: auto` as well -- a scroll container on both axes, not a clip. So a
+ * RIGHTWARD displacement inside the dialog is scroll-reachable and passes here, as it
+ * should: measured, by pushing the description field 500px right, which this let
+ * through and which the line table's own `overflow-x-auto` assertion below caught
+ * instead. The per-guard mutations used `translateX(-500px)` precisely because
+ * leftward overflow is unreachable in LTR whatever the container, so they say nothing
+ * about the dialog's horizontal axis either. What guards these five is the clip on the
+ * page behind them and the reachability of each field in a dialog that scrolls.
  *
  * RATIO 1 IS THE WHOLE CONTROL, and it is a measurement rather than an aspiration:
  * every one of the fourteen answers exactly 1 after its scroll, so nothing here is
@@ -301,15 +349,20 @@ async function boxOf(locator: Locator): Promise<{ x: number; y: number; width: n
  * -- a frame that moved 334px between two `boxOf` calls. Boxes handed back from
  * separate calls would sit in different coordinate systems, and any y comparison
  * across them would be arithmetic over two frames. Widths and heights are
- * scroll-invariant, which is why the height check here can be taken before the scroll
- * -- and taking it first also means a control that has stopped rendering fails as
- * `no box for ...`, naming itself, instead of timing out inside the scroll.
+ * scroll-invariant, which is why the height check here can be taken before the scroll.
+ *
+ * THE TRIAL TAP'S TIMEOUT IS BOUNDED because its failures are timeouts: a trial action
+ * retries until it succeeds or the clock runs out, and with no bound that clock is
+ * this file's 120s per-test budget. 5s is Playwright's own default expect timeout,
+ * which the line above it already spends, and a passing trial on these controls
+ * measured 43-51ms through this loop's ssh tunnel -- two orders of magnitude of slack.
  */
 async function expectTouchTarget(locator: Locator): Promise<void> {
   const box = await boxOf(locator);
   expect(box.height, `${String(locator)} touch height`).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
   await locator.scrollIntoViewIfNeeded();
   await expect(locator, `${String(locator)} reachable`).toBeInViewport({ ratio: 1 });
+  await locator.tap({ trial: true, timeout: 5_000 });
 }
 
 /**
@@ -836,30 +889,39 @@ test.describe("The line-item editor on a phone", () => {
     await expect(profile.getByText("Loading...", { exact: true })).toHaveCount(0);
 
     // All three settings destinations stay reachable at this width: each takes the
-    // touch floor AND can be brought fully on screen, which for this row means
-    // scrolled to rather than merely laid out. `expectTouchTarget` makes both claims
-    // and its comment records the tab pushed outside this row that it catches.
+    // touch floor, can be brought fully on screen, and answers a trial tap -- which
+    // for this row means scrolled to rather than merely laid out.
     //
-    // THE scrollWidth LINE BELOW CANNOT FAIL, and it is left standing rather than
-    // quietly deleted. It was written to say "the row scrolls rather than clips", but
-    // `scrollWidth` is defined as the width of the scrolling AREA, which is never less
-    // than the client width -- MEASURED here by hiding every tab in the row and by
-    // shrinking them to a 1px font: the row answered scrollWidth 342 against
-    // clientWidth 342 in both cases, exactly as it does untouched. So it is a fourth
-    // instrument of the kind v1.1.0 found three of, and the claim it was meant to make
-    // is now made by the reachability check above. `overflowX` is the live half of the
-    // pair: that one really does fail if this row stops being a scroll container.
+    // A DELETED ASSERTION, AND WHY IT IS NOT REPLACED. This passage used to carry
+    // `expect(navScroll.scrollWidth).toBeGreaterThanOrEqual(navScroll.clientWidth)`
+    // beside a comment claiming "a row that clipped would fail the second and pass the
+    // first". Both were false. `scrollWidth` is the width of the scrolling AREA and is
+    // never below the client width: measured with every tab in this row hidden, and
+    // again with them shrunk to a 1px font, the row still answered 342 against 342. It
+    // was a fourth instrument of the kind v1.1.0 found three of.
+    //
+    // The obvious repair, `scrollWidth >= the last tab's right edge`, was measured too
+    // and is vacuous in the same way -- including in the case it was proposed for. A
+    // row forced to `overflow-x: clip` around 881px of tabs still reports scrollWidth
+    // 881, not its 342px client width, so the comparison holds there exactly as it
+    // holds untouched (342 against a 324px right edge) and under a transform that
+    // moves a tab off the left (342 against -176). Chromium reports the content's
+    // overflow in `scrollWidth` whether or not the box can be scrolled, which is what
+    // makes every arithmetic form of this claim true by construction.
+    //
+    // What actually fails on a clipped row is the reachability check above, because a
+    // clip cannot be scrolled: with the same 881px of tabs, `overflow-x: clip` leaves
+    // the last tab unreachable (scrollLeft stuck at 0) and `expectTouchTarget` fails
+    // it, while `auto` scrolls to 539 and passes. `hidden` also passes, and correctly
+    // records the caveat in the helper's comment: it scrolls programmatically though
+    // no thumb can pan it, which is why the `overflowX` line below is kept. That one
+    // is failable -- it is the only surviving claim about what kind of box this is.
     const nav = page.getByTestId("settings-nav");
     for (const name of ["Mail accounts", "Templates", "Organisation"]) {
       await expectTouchTarget(nav.getByRole("link", { name, exact: true }));
     }
-    const navScroll = await nav.evaluate((element) => ({
-      scrollWidth: element.scrollWidth,
-      clientWidth: element.clientWidth,
-      overflowX: getComputedStyle(element).overflowX,
-    }));
-    expect(navScroll.overflowX).toBe("auto");
-    expect(navScroll.scrollWidth).toBeGreaterThanOrEqual(navScroll.clientWidth);
+    const navOverflowX = await nav.evaluate((element) => getComputedStyle(element).overflowX);
+    expect(navOverflowX, "the settings tab row is a scroll container").toBe("auto");
     for (const testId of ["org-name", "org-vat", "org-email"]) {
       await expectTouchTarget(page.getByTestId(testId));
     }
