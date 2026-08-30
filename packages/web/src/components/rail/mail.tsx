@@ -5,6 +5,7 @@ import { Composer, type ComposerSeed } from "../mail/composer";
 import { ThreadList } from "../mail/thread-list";
 import { Button } from "../ui/button";
 import { useDialogReturnFocus } from "../ui/dialog-focus";
+import { composeGate } from "./mail-lib";
 
 export interface MailRailProps {
   companyId?: string;
@@ -27,21 +28,54 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
   const navigate = useNavigate();
   const [seed, setSeed] = useState<ComposerSeed | null>(null);
 
-  // Each hook is disabled on an empty id, and everything here is normally a
-  // cache read: the detail page around this rail has already fetched its own
-  // record.
-  const { data: deal } = useDeal(dealId ?? "");
-  const { data: project } = useProject(projectId ?? "");
+  /*
+   * THE KEYS ARE NAMED BEFORE THEY ARE FETCHED, and the gate below reads the
+   * same names. Every hook in queries.ts is `enabled: id !== ""`, so an empty
+   * key is exactly a disabled query -- binding the two to one expression is
+   * what stops the gate and the fetch from disagreeing about which hops are
+   * live.
+   *
+   * Each hook is disabled on an empty id, and everything here is normally a
+   * cache read: the detail page around this rail has already fetched its own
+   * record.
+   */
+  const dealKey = dealId ?? "";
+  const projectKey = projectId ?? "";
+  const dealQuery = useDeal(dealKey);
+  const projectQuery = useProject(projectKey);
+  const deal = dealQuery.data;
+  const project = projectQuery.data;
   // A deal's contact/company (and a project's company) stand in for the
   // record's own when composing from those tabs -- a deal has no address of
-  // its own, its contact does.
-  const { data: contact } = useContact(contactId ?? deal?.contactId ?? "");
-  const { data: company } = useCompany(
-    companyId ?? deal?.companyId ?? project?.companyId ?? contact?.companyId ?? "",
-  );
+  // its own, its contact does. A PROJECT REACHES NO CONTACT: it has no
+  // contactId of its own and this does not hop through its deal, so a project
+  // tab composes with an empty To by construction. Measured, and stated here
+  // because v1.2.1's plan and spec both describe a project's chain as
+  // "deal -> contact", which is the deal tab's chain and not this one's.
+  const contactKey = contactId ?? deal?.contactId ?? "";
+  const contactQuery = useContact(contactKey);
+  const contact = contactQuery.data;
+  const companyKey = companyId ?? deal?.companyId ?? project?.companyId ?? contact?.companyId ?? "";
+  const companyQuery = useCompany(companyKey);
+  const company = companyQuery.data;
 
   const contactName = contact === undefined
     ? undefined : `${contact.firstName} ${contact.lastName ?? ""}`.trim();
+
+  /*
+   * WHETHER THE SEED CAN BE BUILT YET. compose() reads these four queries at
+   * CLICK TIME, and from a deal tab two of them are chained -- the deal, then
+   * the contact it names -- so a click landing between them seeds `to: []` and
+   * addresses the message to nobody with nothing on screen to say so. See
+   * mail-lib.ts for why this is three states rather than a boolean, and
+   * e2e/rail-compose.spec.ts for the journeys.
+   */
+  const gate = composeGate([
+    { enabled: dealKey !== "", isPending: dealQuery.isPending, isError: dealQuery.isError },
+    { enabled: projectKey !== "", isPending: projectQuery.isPending, isError: projectQuery.isError },
+    { enabled: contactKey !== "", isPending: contactQuery.isPending, isError: contactQuery.isError },
+    { enabled: companyKey !== "", isPending: companyQuery.isPending, isError: companyQuery.isError },
+  ]);
 
   // The Compose button is where the composer's close puts the caret back --
   // see components/ui/dialog-focus.ts.
@@ -71,11 +105,34 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex justify-end">
-        <Button variant="outline" data-testid="mail-compose" onClick={(event) => compose(event.currentTarget)}>
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        {/* The reason the button is off, beside the button. A control disabled
+            with nothing on screen to explain it is what v1.1.0 refused when it
+            considered this shape for the blank-quote race, and what
+            components/document-form.tsx's own gate spells out. */}
+        {gate === "resolving" && (
+          <p data-testid="mail-compose-pending" className="text-xs text-slate-500">
+            Fetching this record's details...
+          </p>
+        )}
+        <Button
+          variant="outline"
+          data-testid="mail-compose"
+          disabled={gate === "resolving"}
+          onClick={(event) => compose(event.currentTarget)}
+        >
           Compose
         </Button>
       </div>
+      {/* A failed hop does NOT disable anything -- an address can be typed by
+          hand, and a gate that cannot tell "not yet" from "never" is the one
+          v1.1.0 rejected. It says what is missing instead, so an empty To is
+          not read as this record's own answer. */}
+      {gate === "failed" && (
+        <p role="alert" data-testid="mail-compose-error" className="text-xs text-red-600">
+          Could not load this record's contact or company, so Compose may open with no recipient.
+        </p>
+      )}
       <ThreadList
         filters={{ companyId, contactId, dealId, projectId }}
         onSelect={(threadId) => { void navigate({ to: "/mail", search: { thread: threadId } }); }}
