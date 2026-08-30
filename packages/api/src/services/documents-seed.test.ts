@@ -1,6 +1,6 @@
 import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
-import { pageCount, pdfHasImage, pdfText } from "../test/pdf.js";
+import { pageCount, pdfHasImage, pdfText, pdfVisibleText } from "../test/pdf.js";
 import { seededQuoteTemplate } from "../test/seed-template.js";
 import { pdfEmbedsFiles, renderPdf, weasyprintAvailable } from "./documents-render.js";
 import { prepareDocumentHtml, type MergeContext } from "./documents-template.js";
@@ -193,6 +193,72 @@ describe("the seeded quote template", () => {
     expect(pageCount(compressed)).toBe(1);
     expect(/\/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]/.exec(pdfText(compressed))?.[1])
       .toBe("595.275591");
+  });
+
+  /**
+   * THE OTHER READER, PROVED THE SAME WAY: bytes built here, no renderer involved.
+   *
+   * `pdfVisibleText` translates glyph ids back through the font's `/ToUnicode`
+   * table, and the file below carries the two forms such a table comes in --
+   * `bfchar` pairs, which is what both WeasyPrints here emit, and a `bfrange`,
+   * which is the compact form a producer may use for a contiguous run and which no
+   * output measured in this project happens to contain. Supporting the second
+   * unproven would be exactly the version-specific guess the Conventions warn
+   * about; proving it costs three lines.
+   *
+   * The content stream is COMPRESSED and the table is not, which is also the split
+   * a real quote has on the runner, and it is what makes the premise assertion
+   * below a real one.
+   */
+  it("reads a printed line back through the font's ToUnicode table", () => {
+    const table = [
+      "begincmap",
+      "2 beginbfchar", "<0024> <0048>", "<0044> <0069>", "endbfchar",
+      "1 beginbfrange", "<0050> <0052> <0061>", "endbfrange",
+      "endcmap",
+    ].join("\n");
+    const built = Buffer.concat([
+      Buffer.from(`%PDF-1.7\n5 0 obj\n<< /Length ${String(table.length)} >>\nstream\n${table}\nendstream\nendobj\n`),
+      Buffer.from("6 0 obj\n<< /Filter /FlateDecode >>\nstream\n"),
+      deflateSync(Buffer.from("BT [<0024>17<0044>] TJ ET\nBT <005000510052> Tj ET\n")),
+      Buffer.from("\nendstream\nendobj\n%%EOF\n"),
+    ]);
+
+    // The premise, and the whole reason this function exists: the words are not in
+    // the file as words, so `pdfText` -- which finds everything else in this suite
+    // -- answers "no" for text that is on the page. A negative assertion built on
+    // it would pass whatever the page said.
+    expect(pdfText(built)).not.toContain("Hi");
+    expect(pdfText(built)).not.toContain("abc");
+
+    // The TJ array's kerning number splits one line into two hex strings, and they
+    // are one line: the ids either side of it belong to the same word.
+    expect(pdfVisibleText(built)).toContain("Hi");
+    // The bfrange half: <0050> <0051> <0052> against a base of <0061>.
+    expect(pdfVisibleText(built)).toContain("abc");
+    // And two operators are two lines. A needle spanning them would mean a caller
+    // could assert text that appears nowhere on the page.
+    expect(pdfVisibleText(built)).not.toContain("Hiabc");
+  });
+
+  /**
+   * v1.1.0's column, ON THE PRINTED PAGE. The merge assertions above are about the
+   * HTML that goes into the renderer; this is the only one about what comes out,
+   * and it is what a customer reading the quote sees. Both directions, because an
+   * install that records no salutation must print the name alone rather than a
+   * stray space or an orphaned title.
+   */
+  itReal("prints the salutation in front of the contact's name", async () => {
+    const withTitle = await renderPdf(prepareDocumentHtml(seededTemplate(), WITH_LOGO));
+    expect(pdfVisibleText(withTitle)).toContain("Dr Jane Smith");
+
+    const without = await renderPdf(prepareDocumentHtml(seededTemplate(), {
+      ...WITH_LOGO,
+      document: { ...WITH_LOGO.document, recipientSalutation: "" },
+    }));
+    const printed = pdfVisibleText(without);
+    expect(printed).toContain("Jane Smith");
+    expect(printed).not.toContain("Dr Jane Smith");
   });
 
   itReal("renders to a PDF on an install where nothing has been filled in", async () => {

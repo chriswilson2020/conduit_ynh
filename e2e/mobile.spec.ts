@@ -381,6 +381,112 @@ test.describe.serial("Phone contact salutation", () => {
   });
 });
 
+/**
+ * THE OTHER TWO SURFACES THE SALUTATION APPEARS ON, AT 390.
+ *
+ * The group above is about the picker; this one is about where the value then
+ * shows up. Both surfaces changed shape below the breakpoint independently of
+ * v1.1.0 -- the contacts table reads as stacked cards, and the quote form's
+ * recipient block is one column rather than two -- so a value that sits neatly
+ * beside a name at 1280 is not thereby proved to at 390.
+ *
+ * AND NOTHING MAY HANG OVER THE EDGE, which is a v1.1.0 requirement rather than
+ * a general tidiness one. `<main>` used to scroll sideways, so anything past the
+ * viewport was reachable with a swipe; it clips below the breakpoint now, so the
+ * board's stage picker can stick, and a row that overflows is CUT rather than
+ * merely awkward. The salutation makes both of these surfaces wider than they
+ * were, which is exactly the change that could have caused it. Measured on the
+ * page, not on the boxes: `documentElement.scrollWidth` against `innerWidth`.
+ *
+ * The fields are seeded through the API here, deliberately: setting them through
+ * the picker is the group above's journey and re-driving it would put that
+ * surface in this one's failure path.
+ */
+test.describe.serial("Phone salutation on the list and on a quote", () => {
+  const runId = Date.now().toString(36);
+  let attemptId = "";
+  let page: Page;
+  let contactId = "";
+  let dealId = "";
+  let contactName = "";
+
+  /** How far the PAGE scrolls sideways, which below the breakpoint must be zero. */
+  async function pageOverflow(): Promise<number> {
+    return await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  }
+
+  async function create(path: string, data: unknown): Promise<{ id: string }> {
+    const response = await page.request.post(path, { data });
+    const body = await response.text();
+    expect(response.status(), `POST ${path} answered ${String(response.status())}: ${body}`).toBe(201);
+    return JSON.parse(body) as { id: string };
+  }
+
+  test.beforeAll(async ({ browser }, testInfo) => {
+    attemptId = `${runId}x${String(testInfo.retry)}`;
+    page = await browser.newPage({ ...IPHONE_13 });
+    contactName = `Wilhelmina Zeldenrust${attemptId}`;
+
+    const company = await create("/api/companies", {
+      name: `Phoneco ${attemptId}`,
+      address: "3 Prinsengracht\n1015 DX Amsterdam",
+    });
+    const contact = await create("/api/contacts", {
+      firstName: "Wilhelmina",
+      lastName: `Zeldenrust${attemptId}`,
+      companyId: company.id,
+      salutation: "Prof",
+      pronouns: "hij/hem",
+    });
+    const pipeline = await create("/api/pipelines", { name: `Phone salutation ${attemptId}`, scope: "global" });
+    const stage = await create(`/api/pipelines/${pipeline.id}/stages`, { name: "Lead" });
+    const deal = await create("/api/deals", {
+      title: `Phone advisory ${attemptId}`,
+      pipelineId: pipeline.id,
+      stageId: stage.id,
+      companyId: company.id,
+      contactId: contact.id,
+      valueCents: 50_000,
+    });
+    contactId = contact.id;
+    dealId = deal.id;
+  });
+
+  test.afterAll(async () => {
+    await page.close();
+  });
+
+  test("puts the salutation in the contact's card and the pronouns nowhere", async () => {
+    await page.goto("/contacts");
+    await page.getByPlaceholder("Filter...").fill(`Zeldenrust${attemptId}`);
+    const row = page.getByTestId(`row-${contactId}`);
+    await expect(row).toBeVisible();
+    // A card, not a table row: the heading row is hidden below the breakpoint and
+    // each cell carries its own label, so `Name` reads before the value here and
+    // the accessible-name assertion the desktop journey makes does not apply.
+    await expect(row).toContainText(`Prof ${contactName}`);
+    // The list is for finding someone; a pronoun is for writing to them.
+    await expect(row).not.toContainText("hij/hem");
+    expect(await pageOverflow()).toBe(0);
+  });
+
+  test("defaults the salutation into the quote form", async () => {
+    await page.goto(`/deals/${dealId}`);
+    // The Contact row carrying the name is the linked-contact query having
+    // resolved, which is where the form's default comes from.
+    await expect(page.getByTestId("field-contactId")).toContainText(contactName);
+    expect(await pageOverflow()).toBe(0);
+
+    await page.getByTestId("new-quote-button").click();
+    await expect(page.getByTestId("quote-form")).toBeVisible();
+    await expect(page.getByTestId("quote-recipient-salutation")).toHaveValue("Prof");
+    await expect(page.getByTestId("quote-recipient-contact")).toHaveValue(contactName);
+    // The fourth box in a block that used to hold three, in a dialog that is
+    // nearly the width of the screen at 390.
+    expect(await pageOverflow()).toBe(0);
+  });
+});
+
 test.describe.serial("Phone kanban stage view", () => {
   const runId = Date.now().toString(36);
   let attemptId = "";
