@@ -13,11 +13,16 @@ import type { Page, Route } from "@playwright/test";
  * GET held open, the composer opened with an empty To and the caret in it,
  * which is indistinguishable from a deliberate blank compose.
  *
- * NOTHING COVERED THE DEAL OR PROJECT TABS AT ALL until this file.
- * e2e/composer-focus.spec.ts drives the rail from a CONTACT, whose chain is one
- * deep and whose only hop the detail page's own heading already proves warm
- * (see openRailCompose's comment there, which is where the one-deep case was
- * closed in v1.2.0). The two-deep case was recorded then and left.
+ * NOTHING COMPOSED FROM A DEAL OR A PROJECT TAB BEFORE THIS FILE, and the
+ * project tab was not opened at all -- which is one word weaker than the plan,
+ * whose "no test covers the deal or project tabs AT ALL" is wrong about the
+ * deal. e2e/mail.spec.ts's "carries the deal-linked thread to the second user"
+ * journey does open a deal's Mail tab; it reads the THREAD LIST there and never
+ * presses Compose. The only rail compose in the suite was
+ * e2e/composer-focus.spec.ts's, from a CONTACT, whose chain is one deep and
+ * whose only hop the detail page's own heading already proves warm (see
+ * openRailCompose's comment there, which is where the one-deep case was closed
+ * in v1.2.0). The two-deep case was recorded then and left.
  *
  * THE PROJECT TAB IS NOT THE SAME DEFECT, AND MEASURING IT CORRECTED THE PLAN.
  * v1.2.1's plan and spec both say a project tab resolves the contact "deal ->
