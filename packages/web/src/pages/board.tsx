@@ -15,6 +15,7 @@ import { Input } from "../components/ui/input";
 import {
   Dialog, DialogContent, DialogTitle, DialogTrigger, SheetBody, SheetContent, SheetHeader,
 } from "../components/ui/dialog";
+import { useDialogReturnFocus } from "../components/ui/dialog-focus";
 import { Funnel } from "../components/funnel";
 import {
   KanbanEmptyPlaceholder, kanbanSortableItems, useKanbanBoard, useKanbanCardSortable, useKanbanColumnDroppable,
@@ -483,23 +484,29 @@ function StageView({
 }) {
   const [movingDealId, setMovingDealId] = useState<string | null>(null);
   const [moveResult, setMoveResult] = useState<string | null>(null);
-  // Whether the sheet is closing because a move was made, rather than because
-  // the user dismissed it -- read once by the close handler below.
-  const movedRef = useRef(false);
   // The list of targets, so the sheet can open on the first of them rather than
   // on its own Close. See the sheet's onOpenAutoFocus.
   const targetsRef = useRef<HTMLDivElement>(null);
-  // The Move button the sheet was opened from, so it can be given focus back.
-  // Kept as the ELEMENT rather than an id because that is what the close
-  // handler needs, and because `isConnected` on it answers the one question
-  // that decides where focus goes -- see onCloseAutoFocus.
-  const triggerRef = useRef<HTMLElement | null>(null);
 
   const deals = dealsByStage.get(stage.id) ?? [];
   // Resolved from the CURRENT list rather than held as an object, so a deal
   // that leaves this stage (a move, an SSE update, a win in another tab) takes
   // the sheet with it instead of stranding it over a card that is gone.
   const movingDeal = deals.find((deal) => deal.id === movingDealId) ?? null;
+  /**
+   * BOTH EXITS FROM THE MOVE SHEET, which this file used to answer with a
+   * handler and two refs of its own. components/ui/dialog-focus.ts is where
+   * they live now, because this page's own comment predicted the same hole in
+   * four other dialogs and was right about all four -- see that file for the
+   * mechanism and the measurement.
+   *
+   * The heading is passed because this surface has a better answer than the
+   * shared `<main>` fallback: it is the phone board, pages/inbox.tsx already
+   * sends focus to the same h1 on the same phone, and the two surfaces
+   * disagreeing about where a screen change puts the caret would be worse than
+   * either choice.
+   */
+  const returnFocus = useDialogReturnFocus(movingDeal !== null, headingRef);
 
   /**
    * ...AND THE ID GOES WITH IT, which the derivation above does not do on its
@@ -528,8 +535,14 @@ function StageView({
     onPick(stageId);
   }
 
-  function requestMove(dealId: string, trigger: HTMLElement) {
-    triggerRef.current = trigger;
+  /**
+   * The Move button is no longer passed in. It used to be, so the close handler
+   * could focus it again; useDialogReturnFocus reads `document.activeElement` on
+   * the render that opens the sheet instead, and the button a user has just
+   * pressed is what holds focus then. One capture point for six dialogs beats a
+   * seventh spelling of the same idea.
+   */
+  function requestMove(dealId: string) {
     setMovingDealId(dealId);
   }
 
@@ -564,7 +577,14 @@ function StageView({
     onMove(movingDeal, target, () => setMoveResult(null));
     setMoveResult(`Moved ${movingDeal.title} to ${target.name}.`);
     setMovingDealId(null);
-    movedRef.current = true;
+    // The card this sheet was opened from belongs to a stage the deal is
+    // leaving, so it is not somewhere to send the caret back to. Said here
+    // rather than left to `isConnected`, and that is not belt-and-braces:
+    // pages/deal-detail.tsx measured the button its own dialog retires STILL
+    // CONNECTED at the moment focus was handed back, unmounting a frame later
+    // and dropping the caret on <body>. A caller that knows beats a check that
+    // has to be right about when React commits.
+    returnFocus.forget();
   }
 
   return (
@@ -705,34 +725,20 @@ function StageView({
             event.preventDefault();
             first.focus();
           }}
-          /* BOTH EXITS ARE HANDLED HERE, because Radix handles NEITHER for a
-             dialog opened the way this one is.
+          /* BOTH EXITS: the Move button back on a dismissal, the heading after
+             a move. Written out here until v1.2.0, and now
+             components/ui/dialog-focus.ts, which six dialogs share.
 
-             Measured rather than assumed: dismissing this sheet with Close --
-             no move, the trigger still in the DOM and still focusable -- left
-             `document.activeElement` on <body>. The cause is that
-             DialogContentModal's own onCloseAutoFocus focuses
-             `context.triggerRef.current`, which is set by <DialogTrigger>; this
-             sheet is one page-level dialog driven by state, because the trigger
-             is a different button on every card, so that ref is null and Radix
-             focuses nothing at all. Every state-driven Dialog in this app has
-             the same hole -- the composer, the task drawer and the two settings
-             dialogs -- which is pre-existing and desktop-visible, so it is a
-             finding rather than something to fix from this page.
-
-             So: the trigger back on a dismissal, the heading after a move (when
-             the trigger has gone with its card). `isConnected` is the test
-             rather than the flag alone, because an SSE update or another tab
-             can retire that card while the sheet is open. */
-          onCloseAutoFocus={(event) => {
-            event.preventDefault();
-            const moved = movedRef.current;
-            movedRef.current = false;
-            const trigger = triggerRef.current;
-            triggerRef.current = null;
-            if (!moved && trigger !== null && trigger.isConnected) trigger.focus();
-            else headingRef.current?.focus();
-          }}
+             THE FINDING THIS COMMENT USED TO CARRY HAS BEEN ACTED ON, and it
+             was right and slightly incomplete. It said every state-driven
+             Dialog in this app had the same hole -- the composer, the task
+             drawer and the two settings dialogs -- and measurement at 1280 and
+             390 found all four on <body>, exactly as predicted. What it missed
+             is that being state-driven is not the whole of it: the Lose dialog
+             on pages/deal-detail.tsx has a real <DialogTrigger> and fails the
+             same way, because a successful lose unmounts the button Radix is
+             about to focus. Five sites, not four. */
+          onCloseAutoFocus={returnFocus.restore}
         >
           <SheetHeader
             title={movingDeal === null ? "Move" : `Move ${movingDeal.title}`}
@@ -781,7 +787,7 @@ function StageDealCard({
   companyName?: string;
   ownerInitial?: string;
   canMove: boolean;
-  onRequestMove: (dealId: string, trigger: HTMLElement) => void;
+  onRequestMove: (dealId: string) => void;
 }) {
   const navigate = useNavigate();
   const rot = dealRot(deal.updatedAt, stage.rotDays, Date.now());
@@ -818,7 +824,7 @@ function StageDealCard({
           // matches (WCAG's label-in-name).
           aria-label={`Move ${deal.title}`}
           className="shrink-0"
-          onClick={(event) => onRequestMove(deal.id, event.currentTarget)}
+          onClick={() => onRequestMove(deal.id)}
         >
           Move
         </Button>

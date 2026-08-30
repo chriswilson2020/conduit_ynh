@@ -253,9 +253,30 @@ export function Shell({ children }: { children: ReactNode }) {
           Desktop keeps `overflow-auto` untouched, per the `max-md:`-over-a-
           desktop-string convention in ui/dialog.tsx.
         */}
+        {/*
+          tabIndex -1 MAKES THIS THE APP'S FALLBACK FOCUS TARGET, and nothing
+          else changes: -1 keeps it out of everyone's tab order, so no keyboard
+          user meets an extra stop, and no pixel moves.
+
+          It is where a dialog's close sends the caret when the control that
+          opened the dialog has gone -- see components/ui/dialog-focus.ts, which
+          finds this element by its tag and explains why a landmark rather than
+          a heading. Without the attribute, focus() on it is a silent no-op and
+          the caret stays on <body>, which is the bug that hook exists to fix;
+          e2e/dialog-focus.spec.ts asserts the landing, so removing this is a
+          red test rather than a quiet regression.
+
+          `focus:outline-none` for the same reason every surface in
+          ui/dialog.tsx carries it: this is a container being focused
+          programmatically, not a control being operated, and a ring around the
+          whole content area announces nothing a screen reader has not already
+          been told by the landmark itself. The class is already in the
+          stylesheet for those surfaces, so it adds no CSS.
+        */}
         <main
+          tabIndex={-1}
           className={clsx(
-            "flex-1 overflow-auto px-6 py-6 max-md:overflow-clip",
+            "flex-1 overflow-auto px-6 py-6 focus:outline-none max-md:overflow-clip",
             isMobile && "pb-[calc(6rem_+_env(safe-area-inset-bottom))]",
           )}
         >

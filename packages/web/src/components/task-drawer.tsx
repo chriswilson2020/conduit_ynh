@@ -25,6 +25,7 @@ import { OwnerSelect } from "./owner-select";
 import { Timeline } from "./rail/timeline";
 import { Button } from "./ui/button";
 import { Dialog, DialogClose, DialogTitle, DrawerContent } from "./ui/dialog";
+import { useDialogReturnFocus } from "./ui/dialog-focus";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 
 export interface TaskDrawerProps {
@@ -42,9 +43,26 @@ export interface TaskDrawerProps {
  * where the id came from, it just renders (or doesn't) based on it.
  */
 export function TaskDrawer({ taskId, onClose }: TaskDrawerProps) {
+  /**
+   * WHERE THE CARET GOES WHEN THIS CLOSES, which Radix cannot answer for a
+   * drawer opened this way -- see components/ui/dialog-focus.ts for the
+   * mechanism and for what was measured here before it existed (`<body>`, at
+   * 1280 and at 390).
+   *
+   * THE OPENER IS CAPTURED AT OPENING TIME rather than held in a ref this
+   * component owns, because there is no such thing as "the" trigger: this
+   * drawer is opened from a card on the task board, a row on My Tasks, a bar on
+   * the Gantt, and by a `?task=` deep link with no opener at all. The deep link
+   * is the case that fixes the design -- an element cannot travel through a URL,
+   * so it lands on the fallback, and that is asserted rather than assumed.
+   */
+  const returnFocus = useDialogReturnFocus(taskId !== null);
   return (
     <Dialog open={taskId !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DrawerContent data-testid="task-drawer">
+      <DrawerContent
+        data-testid="task-drawer"
+        onCloseAutoFocus={returnFocus.restore}
+      >
         {taskId !== null && <TaskDrawerBody taskId={taskId} />}
       </DrawerContent>
     </Dialog>

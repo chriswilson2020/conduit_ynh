@@ -16,6 +16,7 @@ import { RichTextEditor } from "../components/mail/rich-text";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "../components/ui/dialog";
+import { useDialogReturnFocus } from "../components/ui/dialog-focus";
 import { Input } from "../components/ui/input";
 import { Textarea } from "../components/ui/textarea";
 import { CHECKBOX_LABEL } from "../components/ui/touch";
@@ -30,6 +31,9 @@ export function SettingsTemplatesPage() {
   const { data: templates = [], isLoading, error } = useMailTemplates({ archived });
   // null = closed; { template: undefined } = new; { template } = edit.
   const [formTarget, setFormTarget] = useState<{ template?: EmailTemplate } | null>(null);
+  // One dialog and an Edit button on every row, so the caret goes back to
+  // whichever one opened it. See components/ui/dialog-focus.ts.
+  const returnFocus = useDialogReturnFocus(formTarget !== null);
 
   return (
     <SettingsLayout>
@@ -70,7 +74,10 @@ export function SettingsTemplatesPage() {
           if (!open) setFormTarget(null);
         }}
       >
-        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+        <DialogContent
+          className="max-h-[85vh] max-w-2xl overflow-y-auto"
+          onCloseAutoFocus={returnFocus.restore}
+        >
           {formTarget !== null && (
             <TemplateForm template={formTarget.template} onClose={() => setFormTarget(null)} />
           )}

@@ -30,6 +30,7 @@ import { RichTextEditor } from "../components/mail/rich-text";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "../components/ui/dialog";
+import { useDialogReturnFocus } from "../components/ui/dialog-focus";
 import { Input } from "../components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { CHECKBOX_LABEL } from "../components/ui/touch";
@@ -55,6 +56,10 @@ export function SettingsMailPage() {
   // inside starts from a clean state on every open.
   const [formTarget, setFormTarget] = useState<{ account?: MailAccountWithSyncStats } | null>(null);
   const [showArchived, setShowArchived] = useState(false);
+  // One dialog, two openers per account plus Add account at the top, so the
+  // control to give the caret back to is whichever one was used -- captured on
+  // open rather than held here. See components/ui/dialog-focus.ts.
+  const returnFocus = useDialogReturnFocus(formTarget !== null);
 
   const own = data?.own ?? [];
   const active = own.filter((account) => account.archivedAt === null);
@@ -140,7 +145,10 @@ export function SettingsMailPage() {
           if (!open) setFormTarget(null);
         }}
       >
-        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+        <DialogContent
+          className="max-h-[85vh] max-w-2xl overflow-y-auto"
+          onCloseAutoFocus={returnFocus.restore}
+        >
           {formTarget !== null && (
             <AccountForm account={formTarget.account} onClose={() => setFormTarget(null)} />
           )}

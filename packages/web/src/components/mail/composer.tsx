@@ -29,6 +29,7 @@ import {
 import { RichTextEditor, type RichTextHandle } from "./rich-text";
 import { Button } from "../ui/button";
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog";
+import { useDialogReturnFocus } from "../ui/dialog-focus";
 import { Input } from "../ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 import { CHIP_REMOVE_TOUCH } from "../ui/touch";
@@ -97,6 +98,16 @@ const NO_TEMPLATE = "none";
  */
 export function Composer({ open, onOpenChange, seed }: ComposerProps) {
   const form = useRef<ComposerFocusHandle>(null);
+  /**
+   * CLOSING FOCUS, WHICH IS A DIFFERENT PROBLEM FROM THE OPENING FOCUS BELOW
+   * and was measured landing on `<body>` at both widths. This composer has no
+   * `<DialogTrigger>` -- it is opened from the inbox's Compose, from a record's
+   * Mail tab, and from a conversation's Reply and Forward -- so Radix's own
+   * restore has nothing to restore to. components/ui/dialog-focus.ts carries
+   * the mechanism, including why it reads `open` instead of hanging off the
+   * handler below, which would have been the obvious place.
+   */
+  const returnFocus = useDialogReturnFocus(open);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -165,6 +176,7 @@ export function Composer({ open, onOpenChange, seed }: ComposerProps) {
           }
           form_.focusInitial(container);
         }}
+        onCloseAutoFocus={returnFocus.restore}
       >
         {open && <ComposerForm ref={form} seed={seed} onClose={() => onOpenChange(false)} />}
       </DialogContent>

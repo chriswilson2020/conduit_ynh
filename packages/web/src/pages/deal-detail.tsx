@@ -25,6 +25,7 @@ import { Rail } from "../components/rail/rail";
 import { Button } from "../components/ui/button";
 import { Textarea } from "../components/ui/textarea";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
+import { useDialogReturnFocus } from "../components/ui/dialog-focus";
 
 function buildDealPatch(name: string, value: string): UpdateDealInput {
   const trimmed = value.trim();
@@ -86,6 +87,18 @@ export function DealDetailPage() {
   const [bannerError, setBannerError] = useState<string | null>(null);
   const [savingField, setSavingField] = useState<string | null>(null);
   const [loseOpen, setLoseOpen] = useState(false);
+  /**
+   * THE ONE `<DialogTrigger>` IN THIS APP WHOSE OWN DIALOG RETIRES IT, and the
+   * reason this hook is not only for the trigger-less dialogs. Radix restores
+   * focus to `context.triggerRef.current` unconditionally; mark a deal lost and
+   * `deal.status` stops being "open", so the Lose button unmounts with the
+   * dialog and Radix focuses a node on its way out. Measured at 1280 and 390:
+   * `<body>`, while the same dialog DISMISSED restored the button correctly.
+   * What separates the two is the `forget()` on the success path below --
+   * `isConnected` alone does not, because the button was measured STILL
+   * CONNECTED at the moment the caret was handed back to it.
+   */
+  const returnFocus = useDialogReturnFocus(loseOpen);
 
   // ApiError.code is the server's machine-readable `error` field: branching
   // on it (rather than the human-readable message, which for "archived"
@@ -270,8 +283,21 @@ export function DealDetailPage() {
                       Lose
                     </Button>
                   </DialogTrigger>
-                  <DialogContent>
-                    <LoseDealDialog dealId={deal.id} onClose={() => setLoseOpen(false)} />
+                  <DialogContent onCloseAutoFocus={returnFocus.restore}>
+                    {/* onClose is the SUCCESS path and nothing else -- the
+                        dialog calls it from the mutation's onSuccess, and a
+                        dismissal never reaches it. So this is the one place
+                        that knows the Lose button is about to go, and saying
+                        so beats waiting to observe it: measured, `isConnected`
+                        was still true when the caret was handed back, and the
+                        button unmounted a moment later, leaving <body>. */}
+                    <LoseDealDialog
+                      dealId={deal.id}
+                      onClose={() => {
+                        returnFocus.forget();
+                        setLoseOpen(false);
+                      }}
+                    />
                   </DialogContent>
                 </Dialog>
               </>

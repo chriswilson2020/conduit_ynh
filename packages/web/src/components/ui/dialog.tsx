@@ -130,6 +130,20 @@ const SHAPES = {
  *
  * Not exported. Callers pick a named variant below, so "which shapes exist" is
  * a closed set a reader can enumerate rather than a free-form class string.
+ *
+ * CLOSING FOCUS IS NOT PART OF THIS SKELETON, and the decision is worth
+ * recording next to it. `useDialogReturnFocus` in ./dialog-focus.ts gives a
+ * dialog's close somewhere to put the caret, and six callers pass its
+ * `restore` to `onCloseAutoFocus` -- but it is opted into rather than applied
+ * here, because the app's other ten `<Dialog>` roots were MEASURED restoring
+ * their trigger through Radix's own mechanism, and replacing a working
+ * mechanism with a differently-fallible one buys nothing. That file says which
+ * ten and how the six differ.
+ *
+ * It lives beside this file rather than in it because this package's vitest
+ * environment is `node` with no testing-library, so nothing here can be
+ * imported by a unit test; a `.ts` sibling can, and the one decision inside it
+ * is worth testing rather than reading.
  */
 function Overlaid({
   shape,

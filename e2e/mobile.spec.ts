@@ -796,8 +796,11 @@ test.describe.serial("Phone kanban stage view", () => {
     await expect(page.getByTestId(`card-${dealId}`)).toHaveCount(0);
     // The card that carried the trigger has gone with the move, so focus goes
     // to the page heading. Radix restores nothing for a dialog opened from
-    // state (a phase-level finding), so this is the page's own doing and e2e
-    // is the only thing that re-checks it.
+    // state, so this is the page's own doing and e2e is the only thing that
+    // re-checks it. v1.2.0 moved the handler that did it into
+    // web: components/ui/dialog-focus.ts, shared with five other dialogs; this
+    // test and the one below are what pin that the move did not change either
+    // exit.
     await expect(page.getByRole("heading", { name: pipelineName, level: 1 })).toBeFocused();
 
     await page.getByTestId(`stage-pick-${wonStageId}`).click();
