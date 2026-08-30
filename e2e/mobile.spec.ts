@@ -1799,6 +1799,22 @@ test.describe.serial("Phone inbox drill-in stack", () => {
     await expect(conversation).toContainText(subject);
     await expect(conversation.locator('[data-testid^="message-"]')).toHaveCount(2);
 
+    // A FORWARD FROM THE SAME SCREEN, OPENED AND ABANDONED, because this is
+    // the only width the forward's opening focus was not asserted at and it is
+    // the width where the old behaviour was worst: below the breakpoint the
+    // dialog's first tabbable child is Close, so a forward opened on the
+    // control that discards it. A forward seeds a subject and a quoted body
+    // and NO recipient, so To is the first empty field. Cancelled rather than
+    // sent -- the send path is the reply's job two paragraphs down, and
+    // forwarding from here would put a second outbound message on the thread
+    // that this journey's later toHaveCount(3) does not expect.
+    await page.getByTestId("forward-button").click();
+    await expect(page.getByTestId("composer")).toBeVisible();
+    await expect(page.getByTestId("dialog-close")).toBeVisible();
+    await expect(page.getByTestId("composer-to")).toBeFocused();
+    await page.getByTestId("composer").getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByTestId("composer")).toBeHidden();
+
     // The reply, from the last screen of the stack. The composer is a
     // full-screen sheet here, and it USED to open focused on its own Close --
     // the deferred phase-level finding that v1.2.0 closed, and the reason this

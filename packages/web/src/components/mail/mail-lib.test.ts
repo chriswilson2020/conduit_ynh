@@ -1529,6 +1529,14 @@ describe("composerInitialFocus", () => {
     expect(composerInitialFocus({})).toBe("to");
   });
 
+  /**
+   * THE ROW THE PLAN'S RULE ACTUALLY MISSES, and it is an instance of one of
+   * the plan's own two named cases rather than a third case it forgot. A
+   * record's Mail tab carries no threadId, so this codebase's own
+   * reply-versus-new discriminator (composer.tsx's DialogTitle) calls it a new
+   * compose, so "a new compose focuses To" -- but To already holds the
+   * contact's address, and the empty field is the one after it.
+   */
   it("puts a record's Mail tab in Subject, because the address is already known", () => {
     // components/rail/mail.tsx: the record's first address, no subject.
     expect(composerInitialFocus({ to: [{ address: "alice@example.com", name: "Alice" }] }))
@@ -1545,6 +1553,13 @@ describe("composerInitialFocus", () => {
     expect(composerInitialFocus({ to: [] })).toBe("to");
   });
 
+  /**
+   * THE SEED CARRIES A threadId AND THIS FUNCTION NEVER READS IT, which is the
+   * point of spelling it into the fixture. threadId is the codebase's
+   * reply-versus-new discriminator everywhere else (composer.tsx's title, the
+   * API's threading); here the answer comes from the two fields being full,
+   * and it would be the same answer for a seed that had no threadId at all.
+   */
   it("puts a reply in the body: both the recipient and the subject are settled", () => {
     const { to } = replyRecipients(
       {
@@ -1554,15 +1569,18 @@ describe("composerInitialFocus", () => {
       },
       { all: false, ownAddresses: ["me@corp.example"] },
     );
-    expect(composerInitialFocus({ to, subject: replySubject("Quarterly review") })).toBe("body");
+    const replySeed = { threadId: "6ef3d2a9", to, subject: replySubject("Quarterly review") };
+    expect(composerInitialFocus(replySeed)).toBe("body");
   });
 
   /**
-   * THE ROW THE PLAN DID NOT HAVE, and the reason the rule is not "reply
-   * versus new". A forward carries the quoted original and the original's
-   * attachments but NO recipient: who to send it to is exactly what has not
-   * been decided. Under "a reply focuses the body" a forward would focus the
-   * one field that is already full and leave the empty one to a mouse.
+   * A FORWARD, WHICH THE PLAN'S RULE ALSO GETS RIGHT -- and the first version
+   * of this block said the opposite. conversation.tsx's openForward sets NO
+   * threadId ("a forward starts its own conversation with someone new"), so a
+   * forward is a new compose and "a new compose focuses To" lands where this
+   * rule does. The case is kept because it is a row of the ruling's table and
+   * because the seed's quoted body must not argue the caret away from the
+   * empty field, not because it separates the two rules.
    */
   it("puts a forward in To, even though it arrives with a subject and a body", () => {
     expect(composerInitialFocus({
@@ -1576,8 +1594,10 @@ describe("composerInitialFocus", () => {
   /**
    * A THREAD WITH NO SUBJECT STILL SEEDS ONE. replySubject("") is "Re: " and
    * forwardSubject("") is "Fwd: " -- a prefix and nothing else, but a real
-   * string the user is being offered, so it counts as filled. What the trim
-   * is actually for is a seed of pure whitespace, which nothing sends today.
+   * string the user is being offered, so it counts as filled. NOTE THAT THE
+   * TRIM IS NOT WHAT DECIDES THAT: "Re: ".trim() is "Re:", not "", so those
+   * two answer the same with the trim or without it. The trim is for the
+   * whitespace-only seed on the third line, which nothing sends today.
    */
   it("counts a bare Re:/Fwd: prefix as a subject, and whitespace as none", () => {
     const to = [{ address: "alice@example.com", name: null }];

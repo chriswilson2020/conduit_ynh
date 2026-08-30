@@ -180,6 +180,37 @@ catches what the arithmetic cannot — does not hold for a payload that *starts*
 **This is the ceiling working**: the worst variant ran at 59% of the limit rather than
 taking the server down.
 
+**A reply's signature is silently lost on a cold accounts cache -- found during 7.5 Task 2,
+deliberately not fixed there.** `packages/web/src/components/mail/composer.tsx:265-273`
+stamps its guard key **before** discovering whether a signature exists:
+
+```
+if (editorEpoch === 0 || selectedAccountId === null) return;
+const key = `${editorEpoch}:${selectedAccountId}`;
+if (signedFor.current === key) return;
+signedFor.current = key;                       // <- stamped here
+const signature = sendableAccounts.find(...)?.signatureHtml;   // <- looked up after
+if (signature == null || signature === "") return;
+```
+
+`selectedAccountId` is `accountId ?? sendableAccounts[0]?.id ?? null`, and `accountId`
+starts at `seed?.accountId`. **The reply path sets that seed** (`conversation.tsx`'s
+`seedAccountId`), so on a cold `useMailAccounts` cache `selectedAccountId` is a real id
+while `sendableAccounts` is still `[]`. The epoch-1 pass therefore stamps the key, finds no
+account, appends nothing, and the pass that runs when the accounts arrive returns early on
+the same key. A warm cache hides it completely, which is why it has never been seen: open
+the inbox first and the query is already populated. **Fix:** stamp `signedFor.current` only
+on the paths that actually append, or key the guard on the resolved account object rather
+than on the id.
+
+**It interacts with Task 2's work, in both directions.** `composer.tsx`'s
+pending-body-focus comment says that on the epoch carrying both, the signature is appended
+and then the caret is placed -- true only on a warm cache; cold, the append lands on a later
+pass, after the caret. That later append is exactly the case `rich-text.tsx`'s
+`updateSelection: false` covers, so fixing this bug makes that option load-bearing on the
+reply path as well as on the account-switch path it is tested through. Fix the option's
+test first if the order is ever reversed.
+
 **Conditional blocks in mail templates.** `({{contact.pronouns}})` renders `()` for a
 contact with none. Swallowing one following space handles `Dear X Y`; nothing short of
 conditionals handles brackets or labels. The document template already has

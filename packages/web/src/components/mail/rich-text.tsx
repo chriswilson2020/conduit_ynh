@@ -240,29 +240,34 @@ export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
         // opened with focus on the dialog's Close button or the From combobox.
         // IT WAS STILL REACHABLE, AND STILL IS NOT COVERED BY A TEST: switching
         // accounts mid-message appends the new signature, and without this
-        // option that moves a typing user's caret to the end of it. That path
-        // needs two sendable accounts to exercise and no journey builds one, so
-        // this half of the pair is guarded only jointly -- see focus() below.
+        // option that moves a typing user's caret to the end of it. THAT PATH
+        // NOW HAS ITS OWN TEST: e2e/composer-focus.spec.ts's account-switch
+        // journey builds two sendable accounts over the API, types, switches,
+        // and types again -- so this line fails on its own mutation, without
+        // help from focus() below. (An earlier version of this comment said no
+        // journey could build two accounts. The fixture that builds one was in
+        // the same commit.)
         editor.chain().insertContentAt(editor.state.doc.content.size, html, { updateSelection: false }).run();
       },
       focus() {
-        // "start", not the current selection: the only thing this editor is
-        // focused on open for is a REPLY, where the message is written ABOVE
-        // the signature the append above has just put at the end. A bare
-        // focus() restores whatever selection the document already had, so the
-        // position is stated rather than inherited.
+        // "start", not the current selection. The only thing this editor is
+        // focused on open for is a REPLY, where the message is written above
+        // the signature the append has just put at the end, so the position is
+        // stated rather than inherited.
         //
-        // THESE TWO LINES ARE EACH OTHER'S BACKSTOP AND NEITHER IS
-        // INDEPENDENTLY GUARDED, which is worth writing down rather than
-        // leaving for someone to discover by deleting one. Mutation-tested
-        // separately against e2e/mail.spec.ts's signature journey: reverting
-        // ONLY this to focus() passes, because updateSelection:false has left
-        // the caret at the start anyway; reverting ONLY the option passes,
-        // because "start" overrides where it moved the caret to. Reverting
-        // BOTH fails, with "TOPLINE" landing inside the signature. So the
-        // redundancy is real and deliberate -- they cover different future
-        // regressions -- and a reader tempted to drop one as dead weight
-        // should know the suite will not stop them.
+        // A DELIBERATELY KEPT REDUNDANCY, AND DEAD-EQUIVALENT TODAY. With
+        // updateSelection:false above, the selection of a document nobody has
+        // typed in is already at the start, so focus() and focus("start")
+        // resolve to the same position in every state this app can reach --
+        // including a reply, which seeds NO body at all (conversation.tsx's
+        // openReply sets bodyHtml nowhere; only a forward quotes an original,
+        // and a forward focuses To). Mutation-tested: reverting only this to
+        // focus() passes the whole suite, and so does reverting only the
+        // option. Reverting both fails. It stays because stating the caret's
+        // position costs a word and inheriting it costs an argument -- not
+        // because it defends anything the option does not. A reader dropping
+        // it will not be stopped by the suite, and that is the honest position
+        // rather than a claim that the two diverge somewhere.
         editor?.chain().focus("start").run();
       },
     }), [editor]);

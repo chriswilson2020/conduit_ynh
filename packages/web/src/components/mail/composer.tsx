@@ -119,17 +119,51 @@ export function Composer({ open, onOpenChange, seed }: ComposerProps) {
          * alice@example.com". Only a blank compose and a forward at 1280 with
          * no account were already right, and only by accident of DOM order.
          *
-         * preventDefault() is not optional here: Radix's FocusScope focuses its
-         * first tabbable descendant unless the event is prevented, and it does
-         * that AFTER this component's effects have run, so an autoFocus or a
-         * mount effect would be overwritten rather than obeyed.
+         * preventDefault() IS REQUIRED, AND NOT FOR THE REASON THIS COMMENT
+         * FIRST GAVE. It claimed an autoFocus would be overwritten. It would
+         * not: @radix-ui/react-focus-scope gates its whole mount block on
+         * `if (!container.contains(document.activeElement))` (dist/index.mjs:80),
+         * so focus already inside the content means the AUTOFOCUS_ON_MOUNT
+         * event is never even dispatched and focusFirst never runs. That is
+         * what ui/dialog.tsx:175-178 has said correctly all along, and a
+         * reviewer measured it: a conditional autoFocus on the To input lands
+         * correctly with no onOpenAutoFocus at all, chip and combobox ahead of
+         * it or not.
+         *
+         * The real reason is that focus is placed INSIDE this handler, which
+         * runs during the dispatch -- after that gate has already been
+         * evaluated and passed, since the caret is still on the opener. Radix
+         * then runs focusFirst unless the event is prevented, so every one of
+         * the three targets would be overwritten. The body case could not use
+         * autoFocus in any event: its editor does not exist yet, and the
+         * element focus is parked on meanwhile is the Content container, which
+         * is not a tabbable descendant and would lose to focusFirst outright.
+         * Three targets, one mechanism, and the one that cannot use the
+         * simpler tool decides for all of them.
          */
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           // Radix dispatches this ON the Content element, so currentTarget is
           // that element; the cast is only because the DOM types it as the
           // EventTarget any listener could have been attached to.
-          form.current?.focusInitial(event.currentTarget as HTMLElement);
+          const container = event.currentTarget as HTMLElement;
+          const form_ = form.current;
+          if (form_ === null) {
+            // NOT REACHABLE TODAY -- the handle is set in a layout effect and
+            // all three targets render unconditionally -- and written anyway
+            // because of how bad the alternative is. preventDefault() has just
+            // disabled BOTH of Radix's fallbacks (focusFirst and its own
+            // `focus(container)` when that finds nothing), so returning here
+            // would leave the caret on the opener, OUTSIDE the portal, with
+            // the trap unable to reclaim it: its focusin handler recovers by
+            // focusing lastFocusedElementRef, which is still null because
+            // nothing inside has ever held focus (focus-scope dist/index.mjs:44).
+            // A modal nobody can Tab out of, opened with focus behind it, is
+            // the worst thing an accessibility fix can leave behind.
+            container.focus();
+            return;
+          }
+          form_.focusInitial(container);
         }}
       >
         {open && <ComposerForm ref={form} seed={seed} onClose={() => onOpenChange(false)} />}
@@ -247,10 +281,19 @@ function ComposerForm({ seed, onClose, ref }: {
    * leaves a flag for this effect to drain on the epoch the signature already
    * hangs off. Nothing here reads editorRef being populated; a ref that is
    * filled before the ProseMirror view has attached would take a focus() that
-   * does nothing at all. MEASURED at 1280 over five opens of a reply: the
-   * caret sits on the Content element for 38-65ms and then lands in the body,
-   * every time. That window is why the e2e assertion has to be an auto-waiting
-   * toBeFocused rather than a one-shot read of document.activeElement.
+   * does nothing at all. MEASURED at 1280 over five opens of a reply, IN A
+   * FOREGROUND TAB: the caret sits on the Content element for 38-65ms and then
+   * lands in the body, every time. That is the whole of what the number
+   * covers. TipTap sets the ProseMirror selection synchronously but defers the
+   * DOM focus into a requestAnimationFrame (@tiptap/core dist/index.js:653),
+   * which a backgrounded tab does not run -- so in a hidden tab the caret does
+   * not reach the body until the tab is shown, however long that is. (Safari,
+   * iOS and Android take an extra synchronous view.dom.focus() four lines
+   * above and do not wait; Chromium, which is what the suite runs, does.) It
+   * heals itself on the next frame and predates this change; the figure is a
+   * foreground measurement and nothing more. It is also why the e2e assertion
+   * has to be an auto-waiting toBeFocused rather than a one-shot read of
+   * document.activeElement.
    *
    * DECLARED AFTER THE SIGNATURE EFFECT ON PURPOSE, so on the epoch that
    * carries both, the signature is appended and THEN the caret is placed.
@@ -258,33 +301,45 @@ function ComposerForm({ seed, onClose, ref }: {
    * appendAtEnd's own comment claims it does not move the caret; it moved the
    * SELECTION, because TipTap's insertContentAt updates it by default, and a
    * reply typed into the instant it opened put "TOPLINE" inside the signature
-   * as "-- Vriendelijke groet, s302227TOPLINE". Two changes in rich-text.tsx
-   * settle it -- the append passes updateSelection:false, and this focus states
-   * "start" instead of restoring whatever selection it finds -- so the order no
-   * longer decides the outcome. It is still stated, because an ordering that
-   * does not matter costs nothing and an ordering that starts to matter again
-   * would otherwise be silent. The pairing is asserted rather than argued: a
-   * reply is typed into immediately on open and the text has to arrive ABOVE
-   * the signature.
+   * as "-- Vriendelijke groet, s302227TOPLINE". updateSelection:false on the
+   * append settles it; rich-text.tsx's focus() carries a deliberately
+   * redundant "start" beside it, and says so.
    *
-   * The flag is cleared before the focus call, not after, so an editor that
-   * announces itself twice (a remount) cannot pull the caret back out of a
-   * field the user has since moved to.
+   * AND THE ORDERING ONLY HOLDS ON A WARM ACCOUNTS CACHE, which is worth
+   * naming because a bug recorded in the backlog will change it: the signature
+   * effect returns early while sendableAccounts is still empty, so on a cold
+   * cache the append lands on a LATER pass, after the caret. That is the case
+   * updateSelection:false covers and the reason it is not optional.
    */
   useEffect(() => {
     if (editorEpoch === 0 || !bodyFocusPending.current) return;
+    const editor = editorRef.current;
+    // The flag is spent only once there is something to spend it ON. Clearing
+    // it first would drop the caret on the floor for an epoch that arrived
+    // without a populated ref, with no later pass able to notice. Cleared
+    // BEFORE the focus call rather than after, so an editor that announces
+    // itself twice (a remount) cannot pull the caret back out of a field the
+    // user has since moved to.
+    if (editor === null) return;
     bodyFocusPending.current = false;
-    editorRef.current?.focus();
+    editor.focus();
   }, [editorEpoch]);
 
   useImperativeHandle(ref, () => ({
     focusInitial(container: HTMLElement) {
+      // EVERY BRANCH ENDS WITH FOCUS INSIDE THE CONTENT, including the ones
+      // that cannot happen. Composer's handler has already declined Radix's
+      // autofocus AND the container fallback it runs when focusFirst finds
+      // nothing, so a branch that focuses nothing leaves the caret on the
+      // opener, outside the portal, where the trap cannot reclaim it. None of
+      // these refs is null today -- all three fields render unconditionally --
+      // which is exactly the kind of "today" that stops being true quietly.
       if (focusTarget === "to") {
-        toRef.current?.focus();
+        (toRef.current ?? container).focus();
         return;
       }
       if (focusTarget === "subject") {
-        subjectRef.current?.focus();
+        (subjectRef.current ?? container).focus();
         return;
       }
       bodyFocusPending.current = true;

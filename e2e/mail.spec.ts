@@ -1015,8 +1015,11 @@ test.describe.serial("Mail journey", () => {
     // reply without a synced thread. Before it, this dialog opened on the
     // Close button (390) or the From combobox (1280). toBeFocused rather than
     // a read of activeElement because the body is a TipTap editor that is
-    // built asynchronously: the caret is parked on the dialog for 38-65ms
-    // first (measured over five opens), and this is what waits it out.
+    // built asynchronously: the caret is parked on the dialog first, for
+    // 38-65ms measured over five opens IN A FOREGROUND TAB. That bound is a
+    // foreground bound only -- TipTap defers the DOM focus into a
+    // requestAnimationFrame, which a hidden tab does not run -- so what this
+    // relies on is toBeFocused's polling, not the figure.
     await expect(page.getByTestId("composer-body")).toBeFocused();
     await typeIntoEditor(page.getByTestId("composer-body"), replyBody);
     await page.getByTestId("composer-send").click();
@@ -1506,9 +1509,13 @@ test.describe.serial("Mail journey", () => {
     await expect(chip).toHaveCount(1);
     await expect(chip).toContainText(attachmentName);
     await expect(page.getByTestId("composer-subject")).toHaveValue(`Fwd: ${attachSubject}`);
-    // v1.2.0, and the row the plan's "a reply focuses the body" rule got
-    // wrong: a forward arrives with a subject and a quoted body but NO
+    // v1.2.0: a forward arrives with a subject and a quoted body but NO
     // recipient, so To is the first empty field and the caret belongs there.
+    // (An earlier version of this comment called it the row the plan's
+    // "a reply focuses the body" rule got wrong. It is not: openForward above
+    // sets no threadId, so the plan's rule calls a forward a new compose and
+    // reaches To as well. The row the plan misses is a record's Mail tab --
+    // see mail-lib.ts's composerInitialFocus.)
     // The fill() below would have worked either way -- it does not need
     // focus -- which is exactly why this is asserted separately.
     await expect(page.getByTestId("composer-to")).toBeFocused();

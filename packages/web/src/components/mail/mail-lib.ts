@@ -202,14 +202,9 @@ export type ComposerFocusTarget = "to" | "subject" | "body";
  * WHERE THE CARET GOES WHEN THE COMPOSER OPENS: the FIRST EMPTY field, in the
  * order To, Subject, body.
  *
- * THE PLAN SAID "a new compose focuses To, a reply focuses the body" AND THAT
- * RULE IS WRONG ON A FORWARD, which is why the discriminator here is the
- * seed's emptiness rather than the kind of message. A forward carries a quoted
- * bodyHtml and the original's attachments but NO recipient -- who to send it
- * to is exactly what has not been decided yet -- so "reply versus new" would
- * put the caret in the one field that is already full and leave the empty one
- * to a mouse. First-empty degenerates to the plan's two stated cases and gets
- * the third right:
+ * THE PLAN SAID "a new compose focuses To, a reply focuses the body", and the
+ * discriminator here is the seed's emptiness instead. The four cases and the
+ * answers are the coordinator's ruling and stand exactly as ruled:
  *
  *   opened from            to        subject      caret
  *   inbox, blank compose   empty     empty        To
@@ -217,13 +212,32 @@ export type ComposerFocusTarget = "to" | "subject" | "body";
  *   a conversation, reply  seeded    "Re: ..."    body
  *   a conversation, fwd    empty     "Fwd: ..."   To
  *
- * The subject is trimmed before it is judged, because `replySubject("")`
- * returns "Re: " and `forwardSubject("")` returns "Fwd: " -- a thread with no
- * subject seeds a string that is a prefix and nothing else. Trimming it would
- * be wrong (those ARE the subject the user is offered), so this only decides
- * that a subject made of the prefix alone is still a subject: both of those
- * carry non-space characters and are therefore "filled". What the trim
- * actually catches is a caller that seeds "   ".
+ * WHAT THE PLAN'S RULE ACTUALLY GETS WRONG IS ROW 2, NOT ROW 4, and the first
+ * version of this comment had it backwards. The ruling that reached this file
+ * said "reply versus new" misplaces a FORWARD, because a forward carries a
+ * quoted body and no recipient. That is false and the coordinator has withdrawn
+ * it. This codebase's own reply-versus-new discriminator is the seed's
+ * threadId -- composer.tsx titles the dialog `threadId === undefined ? "New
+ * message" : "Reply"` -- and conversation.tsx's openForward sets NO threadId
+ * ("a forward starts its own conversation with someone new"). So a forward IS
+ * a new compose under the plan's rule, and the plan's rule puts the caret in
+ * To, which is the right answer.
+ *
+ * The row it misses is a RECORD'S MAIL TAB: no threadId, so a new compose, so
+ * To -- but To arrives already holding the contact's address. That makes the
+ * plan's rule wrong on an INSTANCE OF ONE OF ITS OWN TWO NAMED CASES rather
+ * than on an unmentioned third, which is a smaller claim and the true one.
+ * Mutation-tested: replacing this body with `threadId === undefined ? "to" :
+ * "body"` fails three of the six cases below and passes the forward.
+ *
+ * The subject is trimmed before it is judged so that a caller seeding "   "
+ * counts as having seeded nothing. That is the whole reason, and an earlier
+ * version of this comment also offered a second one that does not survive
+ * arithmetic: `replySubject("")` returns "Re: " and `forwardSubject("")`
+ * returns "Fwd: ", and both are "body"/"to" with the trim or without it,
+ * because trimming them leaves "Re:" and "Fwd:" rather than "". Those seeds
+ * are still worth their test -- a bare prefix IS the subject the user is being
+ * offered and must count as filled -- but they are not what the trim is for.
  *
  * The BODY is deliberately not consulted. It is the last field in the order,
  * so it is what is left when To and Subject are both filled, and reading
