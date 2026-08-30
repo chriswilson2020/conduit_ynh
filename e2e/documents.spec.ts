@@ -239,6 +239,80 @@ async function boxOf(locator: Locator): Promise<{ x: number; y: number; width: n
 }
 
 /**
+ * A touch target has to be BOTH big enough and actually on screen, and until this
+ * existed the seven assertion sites below -- fourteen controls between them -- only
+ * asked the first question.
+ *
+ * A BOUNDING BOX EXISTS WHETHER OR NOT THE CONTROL IS VISIBLE. `<main>` carries
+ * `max-md:overflow-clip` (components/shell.tsx explains why: it is what lets a phone
+ * page have a sticky strip at all), so below the breakpoint a control laid out past
+ * its edge is CUT rather than scrolled to -- and `boundingBox().height` answers 44
+ * for it exactly as it does for one a thumb can reach. The assertion meant to cover
+ * that was `documentElement.scrollWidth`, which v1.1.0 found had been blind since the
+ * first web commit; `pageOverflow` above is its repair, but it measures the PAGE and
+ * cannot say which control went over the side.
+ *
+ * `toBeInViewport` is the instrument because it is IntersectionObserver, and an
+ * intersection rect is clipped by every ancestor's clip rect on the way up. THE SCROLL
+ * IN FRONT OF IT IS NOT DECORATION, and the obvious version of this guard -- a bare
+ * `toBeInViewport` -- is simply wrong: measured in this file's own order with nothing
+ * scrolled, SEVEN of the fourteen controls it covers are outside the viewport at the
+ * moment they are reached, at intersection ratio 0. All four line fields and Add line
+ * are below the fold inside the quote dialog, and `org-email`, the logo picker and
+ * `org-save` are below it down the settings form. Every one of them is reachable; a
+ * bare check would have failed them for being far away. Scrolling first is what a
+ * person does, and a clip is the thing that cannot be scrolled past: `overflow: clip`
+ * establishes no scroll container, and the clipped child does not reach the document's
+ * scrolling area either, so nothing can bring it back.
+ *
+ * PROVED AGAINST CASES THAT MUST FAIL, at 390x664 on this file's iPhone 13 group, one
+ * displacement at a time injected at `org-save` on an otherwise untouched app. The
+ * height check answered PASS to every displacement in this table; this answers:
+ *
+ *   | displacement of `org-save`                     | height | this |
+ *   | 500px right, or 500px left, inside main's clip | PASS   | FAIL |
+ *   | `position: fixed; left: -9999px`               | PASS   | FAIL |
+ *   | 3000px down by `position: relative` (clipped)  | PASS   | FAIL |
+ *   | 3000px down by MARGIN (main grows, doc scrolls)| PASS   | PASS |
+ *   | `display: none`                                | FAIL   | FAIL |
+ *
+ * The middle pair is the discrimination, and it is why the scroll is here: the same
+ * 3000px moves a control out of reach when `<main>` clips it and merely far down the
+ * page when `<main>` grows with it. A settings tab pushed outside the nav's own
+ * `overflow-x: auto` row passes as well, which is the allowance that row's comment
+ * below claims for it -- verified by giving the first tab 600px of padding:
+ * intersection ratio 0 before the scroll, 1 after. What it does NOT see is a control
+ * that is placed but invisible: `opacity: 0` and `visibility: hidden` both keep their
+ * box (56x44, measured on `org-save`) and both intersect, so both walk past this as
+ * well as past the height check. `display: none` is caught, by the `boxOf` above.
+ *
+ * RATIO 1 IS THE WHOLE CONTROL, and it is a measurement rather than an aspiration:
+ * every one of the fourteen answers exactly 1 after its scroll, so nothing here is
+ * passing on rounding slack (Playwright's own epsilon is 1e-9). A control that only
+ * half clears the clip is the same defect as one entirely behind it. The one thing
+ * ratio 1 cannot be asked about is a control BIGGER than the viewport, which can never
+ * satisfy it -- measured, by inflating a nav tab to 708px in a 390px viewport, where
+ * it fails after being scrolled correctly into view. Every control here is at most
+ * 342x44.
+ *
+ * IT RETURNS NOTHING, DELIBERATELY. Callers that also compare geometry keep their own
+ * `boxOf` call, because scrolling moves the frame: the description field measured at
+ * y=680, and after its own scroll the three fields on the line under it measured y=390
+ * -- a frame that moved 334px between two `boxOf` calls. Boxes handed back from
+ * separate calls would sit in different coordinate systems, and any y comparison
+ * across them would be arithmetic over two frames. Widths and heights are
+ * scroll-invariant, which is why the height check here can be taken before the scroll
+ * -- and taking it first also means a control that has stopped rendering fails as
+ * `no box for ...`, naming itself, instead of timing out inside the scroll.
+ */
+async function expectTouchTarget(locator: Locator): Promise<void> {
+  const box = await boxOf(locator);
+  expect(box.height, `${String(locator)} touch height`).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+  await locator.scrollIntoViewIfNeeded();
+  await expect(locator, `${String(locator)} reachable`).toBeInViewport({ ratio: 1 });
+}
+
+/**
  * The computed width of the one open dialog, in CSS pixels.
  *
  * COMPUTED, and that is the whole reason this exists. Nothing in this repo has
@@ -654,6 +728,9 @@ test.describe("The line-item editor on a phone", () => {
     // to 418px for nothing. So the claim is structural -- description alone on
     // its own line, the three money fields sharing the next -- rather than a
     // pixel count that would re-baseline on any font change.
+    // THE FOUR BOXES ARE TAKEN BEFORE ANYTHING SCROLLS, and they have to be: these
+    // are comparisons BETWEEN boxes, so all four must come from one coordinate frame.
+    // The reachability pass below is what moves the frame, and it runs after.
     const descriptionBox = await boxOf(page.getByTestId("quote-line-description-0"));
     const qtyBox = await boxOf(page.getByTestId("quote-line-qty-0"));
     const priceBox = await boxOf(page.getByTestId("quote-line-price-0"));
@@ -662,9 +739,9 @@ test.describe("The line-item editor on a phone", () => {
     expect(Math.abs(priceBox.y - qtyBox.y)).toBeLessThanOrEqual(1);
     expect(Math.abs(taxBox.y - qtyBox.y)).toBeLessThanOrEqual(1);
     expect(descriptionBox.width).toBeGreaterThan(qtyBox.width * 2);
-    // Every one of them still reachable with a thumb.
-    for (const box of [descriptionBox, qtyBox, priceBox, taxBox]) {
-      expect(box.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+    // Every one of them still reachable with a thumb -- big enough AND on screen.
+    for (const id of ["quote-line-description-0", "quote-line-qty-0", "quote-line-price-0", "quote-line-tax-0"]) {
+      await expectTouchTarget(page.getByTestId(id));
     }
 
     // AND NOTHING OVERFLOWS SIDEWAYS. The `Table` primitive puts its table in an
@@ -680,8 +757,9 @@ test.describe("The line-item editor on a phone", () => {
 
     // Adding a line takes no aim: full width, and above the floor.
     const addLine = page.getByTestId("quote-add-line");
+    await expectTouchTarget(addLine);
+    // Width only, and widths do not move when the frame does.
     const addBox = await boxOf(addLine);
-    expect(addBox.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
     expect(addBox.width).toBeGreaterThan(descriptionBox.width * 0.9);
 
     await fillLine(page, 0, QUOTE_LINES[0]);
@@ -727,8 +805,9 @@ test.describe("The line-item editor on a phone", () => {
     const documentRow = page.getByTestId(`document-${number}`);
     const numberBox = await boxOf(documentRow.getByText(number, { exact: true }));
     const downloadBox = await boxOf(page.getByTestId(`document-download-${number}`));
+    // One frame for the stacking comparison, then the reachability pass.
     expect(downloadBox.y).toBeGreaterThanOrEqual(numberBox.y + numberBox.height - 1);
-    expect(downloadBox.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+    await expectTouchTarget(page.getByTestId(`document-download-${number}`));
     expect(await pageOverflow(page)).toBeLessThanOrEqual(1);
   });
 
@@ -756,15 +835,23 @@ test.describe("The line-item editor on a phone", () => {
     await expect(profile).toBeVisible();
     await expect(profile.getByText("Loading...", { exact: true })).toHaveCount(0);
 
-    // All three settings destinations stay reachable at this width. Two claims, and
-    // the second one is the one a height check cannot make: every tab takes the touch
-    // floor, AND the row is reachable by scrolling rather than by clipping -- so the
-    // last tab's right edge is inside the row's SCROLL width even when it is outside
-    // the visible box. A row that clipped would fail the second and pass the first.
+    // All three settings destinations stay reachable at this width: each takes the
+    // touch floor AND can be brought fully on screen, which for this row means
+    // scrolled to rather than merely laid out. `expectTouchTarget` makes both claims
+    // and its comment records the tab pushed outside this row that it catches.
+    //
+    // THE scrollWidth LINE BELOW CANNOT FAIL, and it is left standing rather than
+    // quietly deleted. It was written to say "the row scrolls rather than clips", but
+    // `scrollWidth` is defined as the width of the scrolling AREA, which is never less
+    // than the client width -- MEASURED here by hiding every tab in the row and by
+    // shrinking them to a 1px font: the row answered scrollWidth 342 against
+    // clientWidth 342 in both cases, exactly as it does untouched. So it is a fourth
+    // instrument of the kind v1.1.0 found three of, and the claim it was meant to make
+    // is now made by the reachability check above. `overflowX` is the live half of the
+    // pair: that one really does fail if this row stops being a scroll container.
     const nav = page.getByTestId("settings-nav");
     for (const name of ["Mail accounts", "Templates", "Organisation"]) {
-      const tab = await boxOf(nav.getByRole("link", { name, exact: true }));
-      expect(tab.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+      await expectTouchTarget(nav.getByRole("link", { name, exact: true }));
     }
     const navScroll = await nav.evaluate((element) => ({
       scrollWidth: element.scrollWidth,
@@ -774,15 +861,12 @@ test.describe("The line-item editor on a phone", () => {
     expect(navScroll.overflowX).toBe("auto");
     expect(navScroll.scrollWidth).toBeGreaterThanOrEqual(navScroll.clientWidth);
     for (const testId of ["org-name", "org-vat", "org-email"]) {
-      const box = await boxOf(page.getByTestId(testId));
-      expect(box.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+      await expectTouchTarget(page.getByTestId(testId));
     }
     // The logo picker is a styled <label> wrapping an sr-only input, so the input's
     // own box says nothing about what a thumb can hit -- the label is the target.
-    const picker = await boxOf(page.getByText("Choose an image", { exact: true }));
-    expect(picker.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
-    const saveBox = await boxOf(page.getByTestId("org-save"));
-    expect(saveBox.height).toBeGreaterThanOrEqual(TOUCH_FLOOR_PX);
+    await expectTouchTarget(page.getByText("Choose an image", { exact: true }));
+    await expectTouchTarget(page.getByTestId("org-save"));
     expect(await pageOverflow(page)).toBeLessThanOrEqual(1);
 
     await page.goto("/settings/templates");
