@@ -244,7 +244,7 @@ uncatchable by design.
 
 ---
 
-## Intermittents — three, all timing-shaped, none has ever failed CI on its own
+## Intermittents -- four, all timing-shaped, none has ever failed CI on its own
 
 1. **`mail-sync.test.ts`, a backoff case.** Four sightings across two phases. Measured **1
    failure in 12 runs idle, 8 in 12 with a second vitest process running**. Two hypotheses
@@ -257,6 +257,18 @@ uncatchable by design.
 3. **`e2e/mobile.spec.ts`'s phone kanban `addStage`** — once in eight runs, hidden by CI's
    two retries. **"Pre-existing" is not established**: `board.tsx:613` put a sticky strip
    directly above that button in v1.1.0, and the file went from 5 serial groups to 7.
+
+4. **`e2e/crm.spec.ts:115`, the "Other..." caret journey** -- one sighting, CI run
+   **33311033649**, hidden by the first retry (`1 flaky, 131 passed`). It failed on
+   `getByTestId("salutation-other")` "element(s) not found" at `crm.spec.ts:132`, i.e. the
+   box the Select's "Other..." option reveals had not rendered when the value was read.
+   **Sighted on a 7.5 Task 2 diff that cannot have caused it**: the only file Task 2 shares
+   with `contact-fields.tsx` is `components/ui/input.tsx`, and that change is comment-only
+   (`git diff 46a70b3..32ba01c -- packages/web/src/components/ui/input.tsx`). Worth noting
+   beside the others because it is the FIRST focus-shaped one -- the other three are a
+   clock, an IMAP burst and a sticky strip -- and because `contact-fields.tsx:51-67`
+   documents at length that this control's focus is restored by Radix *after* a re-render,
+   which is a race the test observes rather than controls.
 
 **The fix for any of these must be deterministic, not a longer timeout.** `mail-sync.test.ts`
 owns a `ManualClock`, and a wall-clock deadline inside a test that controls its own clock is
