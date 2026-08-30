@@ -41,6 +41,7 @@ import {
   resolveRecipients,
   sendFailureMessage,
   signatureAppend,
+  type SignatureKey,
   signatureBlock,
   substitutePlaceholders,
   substitutePlaceholdersHtml,
@@ -569,15 +570,17 @@ describe("signatureBlock", () => {
 
 describe("signatureAppend", () => {
   const SIGNATURE = "<p>-- Vriendelijke groet</p>";
+  const OTHER = "<p>-- Met vriendelijke groet</p>";
   const signed = { id: "acct-signed", signatureHtml: SIGNATURE };
+  const second = { id: "acct-second", signatureHtml: OTHER };
   const plain = { id: "acct-plain", signatureHtml: null };
+  const NOTHING_SIGNED: ReadonlySet<SignatureKey> = new Set();
 
   /**
-   * ComposerForm's effect, line for line: a ref remembering the last claimed
-   * key, one call per pass, and the key stamped only from what came back.
-   * The tests below are SEQUENCES because the defect this function replaces
-   * was only ever visible as one -- a single pass in isolation looked correct
-   * either way.
+   * ComposerForm's effect, line for line: a ref holding the ledger, one call
+   * per pass, and the ledger replaced only by what came back. The tests below
+   * are SEQUENCES because both defects this function exists for were only ever
+   * visible as one -- a single pass in isolation looked correct either way.
    */
   function drive(
     passes: readonly {
@@ -586,12 +589,12 @@ describe("signatureAppend", () => {
       accounts: readonly { id: string; signatureHtml: string | null }[];
     }[],
   ): string[] {
-    let signedFor: string | null = null;
+    let signedFor = NOTHING_SIGNED;
     const appended: string[] = [];
     for (const pass of passes) {
       const append = signatureAppend({ ...pass, signedFor });
       if (append === null) continue;
-      signedFor = append.key;
+      signedFor = append.signed;
       appended.push(append.html);
     }
     return appended;
@@ -599,13 +602,13 @@ describe("signatureAppend", () => {
 
   it("appends nothing before the editor has announced itself", () => {
     expect(signatureAppend({
-      editorEpoch: 0, selectedAccountId: signed.id, accounts: [signed], signedFor: null,
+      editorEpoch: 0, selectedAccountId: signed.id, accounts: [signed], signedFor: NOTHING_SIGNED,
     })).toBeNull();
   });
 
   it("appends nothing while no account is selected", () => {
     expect(signatureAppend({
-      editorEpoch: 1, selectedAccountId: null, accounts: [signed], signedFor: null,
+      editorEpoch: 1, selectedAccountId: null, accounts: [signed], signedFor: NOTHING_SIGNED,
     })).toBeNull();
   });
 
@@ -667,6 +670,27 @@ describe("signatureAppend", () => {
   });
 
   /**
+   * GOING BACK TO AN ACCOUNT ALREADY SIGNED FOR MUST ADD NOTHING, and against
+   * a scalar `signedFor` it added the signature a second time: the guard
+   * remembered only the LAST pair, so A, B, A saw "1:A" again after "1:B" had
+   * displaced it. Two signed accounts in the From dropdown is the reachable
+   * gesture, and e2e/composer-focus.spec.ts's account-switch journey already
+   * builds exactly that fixture.
+   *
+   * THE THREE-STEP SWITCH ABOVE CANNOT CATCH IT. It returns to the PLAIN
+   * account, which has nothing to append either way, so it passes against a
+   * scalar and against a set alike. That near-miss is why this case is spelled
+   * out separately rather than folded into it.
+   */
+  it("adds nothing when the user switches back to an account already signed for", () => {
+    expect(drive([
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [signed, second] },
+      { editorEpoch: 1, selectedAccountId: second.id, accounts: [signed, second] },
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [signed, second] },
+    ])).toEqual([signatureBlock(SIGNATURE), signatureBlock(OTHER)]);
+  });
+
+  /**
    * A REBUILT EDITOR IS A FRESH, EMPTY DOCUMENT, which is why the guard is
    * keyed on the epoch and not on the account alone: the same account signs
    * again rather than the new document silently going out unsigned.
@@ -678,12 +702,29 @@ describe("signatureAppend", () => {
     ])).toEqual([signatureBlock(SIGNATURE), signatureBlock(SIGNATURE)]);
   });
 
-  // mailAccountSchema stores `min(1).nullable()`, so "" never arrives off the
-  // wire; the arm exists because the parameter's type admits it and an empty
-  // signature must not put a bare separator paragraph in the body.
-  it("treats an empty signature as no signature", () => {
+  /**
+   * A SIGNATURE THAT RENDERS AS NOTHING MUST NOT PUT A BARE SEPARATOR
+   * PARAGRAPH AT THE END OF THE BODY, and the first version of this arm tested
+   * `=== ""` -- the one spelling that CANNOT arrive. The API's nullableString
+   * is `min(1).nullable()`, so "" is rejected on the way in, while "   " and
+   * "<p></p>" are accepted, survive sanitizeMailHtml unchanged, and both used
+   * to come back as `<p></p>` plus themselves.
+   *
+   * REACHABLE FROM ANY CLIENT BUT THE SETTINGS PAGE, which maps a blank editor
+   * to null itself (pages/settings-mail.tsx, where "<p></p>" is named as
+   * TipTap's empty document). e2e/composer-focus.spec.ts's own makeAccount
+   * PATCHes signatureHtml raw.
+   */
+  it.each([
+    ["the empty string, which the API rejects but the type admits", ""],
+    ["whitespace", "   "],
+    ["TipTap's empty document", "<p></p>"],
+  ])("treats %s as no signature", (_label, signatureHtml) => {
     expect(signatureAppend({
-      editorEpoch: 1, selectedAccountId: signed.id, accounts: [{ ...signed, signatureHtml: "" }], signedFor: null,
+      editorEpoch: 1,
+      selectedAccountId: signed.id,
+      accounts: [{ ...signed, signatureHtml }],
+      signedFor: NOTHING_SIGNED,
     })).toBeNull();
   });
 });

@@ -223,6 +223,24 @@ found by SQL.
 
 ## Defects found and deliberately deferred
 
+**THE SERVER CAN STORE A SIGNATURE ITS OWN RESPONSE SCHEMA REJECTS, AND THE WEB CLIENT
+THEN FAILS ON EVERY `GET /api/mail/accounts` FOR THAT USER -- found during v1.2.1 Task 1,
+outside that commit's subject.** `mailAccountUpdateInputSchema`'s `signatureHtml` is
+`nullableString` (`z.string().min(1).nullable()`), so `PATCH /api/mail/accounts/:id` with
+`{ signatureHtml: "<script>alert(1)</script>" }` is accepted; `sanitizeMailHtml` strips it
+to `""`; and `""` is what gets stored. On the way back out, `mailAccountSchema` applies the
+same `min(1)`, so `parseWith` throws a `ResponseShapeError` and `useMailAccounts` errors --
+for the composer, the inbox and the settings page alike -- until the row is repaired
+directly in the database. The write validates the INPUT and the read validates the OUTPUT,
+and nothing validates the sanitizer's effect in between.
+
+*Not in scope for the signature-guard fix, which is a client-side ordering defect.* The
+repair is server-side and there is a choice to make: reject a payload that sanitizes to
+empty (a 422 the settings page would have to render), or store `NULL` for it (silent, and
+consistent with what the settings UI already does with a blank editor on its own way in).
+The same shape may exist on other sanitized-then-stored fields; template bodies are the
+obvious neighbour to check.
+
 **A NAVIGATION THAT UNMOUNTS THE FOCUSED ELEMENT LEAVES THE CARET ON `<body>` -- found
 during 7.5 Task 3, deliberately not fixed there, and it is bigger than the dialogs that
 exposed it.** Measured at 1280: click a company ROW LINK, land on the record, and

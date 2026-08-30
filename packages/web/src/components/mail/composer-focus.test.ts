@@ -155,11 +155,11 @@ describe("the signature append leaves the caret where the user put it", () => {
 describe("the composer stamps its signature guard from what it appended", () => {
   /**
    * THE v1.2.1 FIX IS A COUPLING, AND THIS IS WHAT STOPS IT BEING UNCOUPLED BY
-   * OMISSION. mail-lib's signatureAppend hands back the guard key together
-   * with the HTML, so the effect has no key to stamp unless a signature was
+   * OMISSION. mail-lib's signatureAppend hands back the guard ledger together
+   * with the HTML, so the effect has nothing to store unless a signature was
    * actually found; the rule's own behaviour is tested beside it in
    * mail-lib.test.ts, sequence by sequence. What is left for this file is that
-   * the composer still takes its key from there instead of building one.
+   * the composer still stores what that pass returned.
    *
    * THE DEFECT IT REPLACES WAS INVISIBLE TO EVERY BROWSER TEST IN THIS REPO. A
    * `signedFor.current` assignment restored above the lookup only loses a
@@ -168,12 +168,28 @@ describe("the composer stamps its signature guard from what it appended", () => 
    * the real component with the accounts request held for 800ms: the body
    * ended empty.
    *
-   * NARROW ON PURPOSE, in the shape this file's header records for the rest of
-   * its assertions -- it stops a deleted line, not a determined author. A
-   * hand-built key assigned somewhere else in the effect would satisfy it.
+   * WHAT ACTUALLY DEFENDS THAT ORDERING IS THE TYPE, NOT THIS LINE, and the
+   * distinction is worth stating because an earlier draft of this block
+   * claimed otherwise. Three mutations were measured passing it with
+   * `tsc --noEmit -p packages/web` clean:
+   *
+   *   - capturing the prior ledger, storing a hand-built key BEFORE the call,
+   *     and passing the capture in -- which is v1.2.0's semantics exactly;
+   *   - guarding the store on `signedFor.current` being non-empty, so it never
+   *     stores and the signature re-appends on every pass;
+   *   - deleting the statement and satisfying this assertion from a TRAILING
+   *     `//` comment, which test/source.ts's withoutComments does not strip
+   *     and this file's header documents for its other assertions.
+   *
+   * The first of those is now a type error rather than a green mutation:
+   * SignatureKey is branded, so an `${epoch}:${id}` template literal is not
+   * assignable to the ledger and no key is spelled in composer.tsx at all. The
+   * other two survive, as does anything a determined author writes. This
+   * assertion stops the line being DELETED, which is measured (1 of 6 fails),
+   * and claims nothing further.
    */
-  it("stamps only the key signatureAppend handed back", () => {
+  it("stores only the ledger signatureAppend handed back", () => {
     const effect = between(composer, "const append = signatureAppend({", "appendAtEnd");
-    expect(effect).toContain("signedFor.current = append.key;");
+    expect(effect).toContain("signedFor.current = append.signed;");
   });
 });

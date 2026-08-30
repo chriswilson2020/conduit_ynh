@@ -493,13 +493,33 @@ export interface SignatureAccount {
   signatureHtml?: string | null;
 }
 
+declare const SIGNATURE_KEY_BRAND: unique symbol;
+
 /**
- * What one pass of the composer's signature effect should do: the key to
- * stamp AND the HTML to append, or nothing at all. Never one without the
- * other, which is the whole point -- see signatureAppend.
+ * One (editor epoch, account) pair, as a value only signatureAppend can mint.
+ *
+ * BRANDED SO THE CALLER CANNOT BUILD ONE, which is the whole reason this type
+ * exists rather than a bare string. The defect v1.2.1 removed was a composer
+ * that assembled its own key and stamped it before knowing whether there was
+ * anything to sign; with the brand, an `${epoch}:${id}` template literal is
+ * not assignable here and `tsc` refuses it.
+ *
+ * IT RAISES THE COST OF THAT MISTAKE RATHER THAN MAKING IT IMPOSSIBLE. A cast
+ * defeats any brand in TypeScript, so this stops the accident and the
+ * absent-minded refactor, not a determined author -- stated because the
+ * honest limit of a guard is worth more than an overclaim, which is the same
+ * position components/mail/composer-focus.test.ts takes about reading source.
+ */
+export type SignatureKey = string & { readonly [SIGNATURE_KEY_BRAND]: true };
+
+/**
+ * What one pass of the composer's signature effect should do: the HTML to
+ * append AND the ledger to remember it by, or nothing at all. Never one
+ * without the other, which is the whole point -- see signatureAppend.
  */
 export interface SignatureAppend {
-  key: string;
+  /** Everything signed before this pass, plus the pair this pass signs. */
+  signed: ReadonlySet<SignatureKey>;
   html: string;
 }
 
@@ -511,54 +531,67 @@ export interface SignatureAppend {
  *
  * The selected account's signature is appended ONCE, at the end of the body,
  * for each (editor epoch, account) pair -- the initial auto-selection
- * included. `signedFor` is the key the last append claimed. Keying on the
- * editor EPOCH rather than on the account alone is what makes that robust: an
- * editor that gets rebuilt announces itself again, so the fresh, empty
- * document gets the signature instead of silently losing it.
+ * included. `signedFor` is EVERY pair signed so far, not the last one:
+ * switching A to B and back to A is one gesture in the From dropdown, and
+ * against a scalar it appended A's signature a second time. Keying on the
+ * editor EPOCH as well as the account is what keeps a rebuilt editor covered:
+ * it announces itself again, so the fresh, empty document gets the signature
+ * instead of silently losing it.
  *
- * THE KEY COMES BACK WITH THE HTML, AND THAT COUPLING IS THE FIX. The effect
- * used to stamp the key and look the signature up afterwards, so a pass that
- * ran while the accounts list was still empty claimed the key and appended
- * nothing -- and the pass that ran when the accounts arrived returned early on
- * that same key. The signature was then lost for the life of that composer.
- * A caller has no key to stamp unless this returned one, so it cannot claim a
- * pair it did not sign.
+ * THE LEDGER COMES BACK WITH THE HTML, AND THAT COUPLING IS THE FIX. The
+ * effect used to stamp its key and look the signature up afterwards, so a pass
+ * that ran while the selected account was still missing from the list claimed
+ * the pair and appended nothing -- and the pass that ran once the accounts
+ * arrived returned early on that same key. The signature was then lost for the
+ * life of that composer. A caller has no key to stamp unless a pass handed one
+ * back, so it cannot claim a pair it did not sign.
  *
  * MEASURED IN CHROMIUM AGAINST THE REAL COMPONENT, with GET /api/mail/accounts
  * held for 800ms: a seed carrying an accountId ended with an empty body, and
  * the same seed against an already-resolved accounts cache ended holding the
  * signature. So did a seed carrying no accountId at all against the cold one,
- * because a null selection makes this return null WITHOUT a key.
+ * because a null selection makes this return null WITHOUT claiming anything.
  *
- * THAT STATE IS NOT ONE THE APP CAN REACH TODAY, and the record is worth more
- * than the fix. Only a reply or a forward seeds an accountId, and
+ * THE SEEDED HALF OF THAT IS NOT A STATE THE APP CAN REACH, and the record is
+ * worth more than the fix. Only a reply or a forward seeds an accountId, and
  * conversation.tsx builds it by searching the same ["mail-accounts"] query the
- * composer reads -- so a seeded accountId implies a resolved cache, and a
- * Reply clicked early enough to beat the accounts arrives carrying no
- * accountId (measured in the same harness: the signature lands). The ordering
- * is corrected anyway because the next caller to seed an account id from
- * somewhere else -- a route parameter, a per-record default, a restored draft
- * -- reopens it with no other line changing.
+ * composer reads with a predicate identical to this one's -- so a seeded
+ * accountId implies a resolved cache, and a Reply clicked early enough to beat
+ * the accounts arrives carrying no accountId at all. A review enumerated every
+ * ComposerSeed construction in the repo and found no other producer: no route
+ * parameter, no per-record default, no restored draft, and no browser storage
+ * anywhere in packages/web/src. The ordering is corrected anyway because the
+ * first caller to seed an account id from somewhere else reopens it with no
+ * other line changing.
+ *
+ * THE UNSEEDED COLD REPLY IS REACHABLE, AND IT IS WHERE THE DEFERRED APPEND
+ * ACTUALLY HAPPENS -- see composer.tsx's pending-body-focus comment, which
+ * has said so correctly since v1.2.0.
  */
 export function signatureAppend(args: {
   editorEpoch: number;
   selectedAccountId: string | null;
   accounts: readonly SignatureAccount[];
-  signedFor: string | null;
+  signedFor: ReadonlySet<SignatureKey>;
 }): SignatureAppend | null {
   const { editorEpoch, selectedAccountId, accounts, signedFor } = args;
   // Epoch 0 is "the editor has not announced itself yet", so there is nothing
   // to append TO -- see RichTextEditor's onCreate.
   if (editorEpoch === 0 || selectedAccountId === null) return null;
-  const key = `${editorEpoch}:${selectedAccountId}`;
-  if (signedFor === key) return null;
+  const key = `${editorEpoch}:${selectedAccountId}` as SignatureKey;
+  if (signedFor.has(key)) return null;
   const signature = accounts.find((account) => account.id === selectedAccountId)?.signatureHtml;
-  // Three absences, not one: no such account in the list (undefined), an
-  // account with no signature set (null), and the empty string, which
-  // mailAccountSchema's own `min(1).nullable()` does not currently allow
-  // through but which is what a caller with a looser type would send.
-  if (signature === undefined || signature === null || signature === "") return null;
-  return { key, html: signatureBlock(signature) };
+  if (signature === undefined || signature === null) return null;
+  // htmlIsBlank, NOT `=== ""`, and the difference is reachable. The API's
+  // nullableString is `min(1).nullable()`, so "" never arrives off the wire
+  // and an equality check guards the one case that cannot happen -- while
+  // "   " and "<p></p>" (TipTap's empty document, named as such in
+  // pages/settings-mail.tsx) both pass min(1), survive sanitizeMailHtml, and
+  // would put a bare separator paragraph at the end of the body. The settings
+  // UI maps them to null on its way in; nothing makes another client do the
+  // same, and e2e/composer-focus.spec.ts's own fixture PATCHes the field raw.
+  if (htmlIsBlank(signature)) return null;
+  return { signed: new Set(signedFor).add(key), html: signatureBlock(signature) };
 }
 
 /** The four record links a composed thread can carry (sendMailInputSchema's

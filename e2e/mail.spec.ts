@@ -1120,6 +1120,86 @@ test.describe.serial("Mail journey", () => {
     }
   });
 
+  /**
+   * THE SAME REPLY WITH THE ACCOUNTS QUERY STILL IN FLIGHT, WHICH REVERSES THE
+   * ORDER THE TEST ABOVE MEASURES and is the case rich-text.tsx's
+   * `updateSelection: false` actually exists for on this path.
+   *
+   * Above, the accounts are cached by the time Reply is clicked, so the
+   * signature is appended on the epoch that also places the caret -- the
+   * append happens FIRST and the caret lands after it. Here the list has not
+   * arrived: `selectedAccountId` is null on that epoch (the reply's seed
+   * carries an accountId only when conversation.tsx could already read one
+   * from this very query), so the signature effect claims nothing, the caret
+   * is placed into an empty document, and the append runs on the LATER pass
+   * that follows the accounts landing -- underneath a caret the user may
+   * already be typing at.
+   *
+   * NOTHING IS SEEDED OR STUBBED TO GET THERE. The only intervention is a
+   * delay on the accounts response, and it is what makes the race a schedule
+   * instead of a coin toss; a user on a cold page reaches the same state by
+   * clicking Reply promptly. The delay is scoped to the LIST url so the
+   * signature PATCH and the account lookup around this test are untouched.
+   *
+   * WITHOUT updateSelection:false THE REPLY'S FIRST WORD LANDS INSIDE THE
+   * SIGNATURE. Measured in Chromium against the composer with this exact
+   * timing: "TOPLINE -- <marker>" with the option, "-- <marker>TOPLINE"
+   * without it.
+   */
+  test("a reply opened before the accounts land still keeps the caret above the signature", async () => {
+    const accounts = await page.request.get("/api/mail/accounts");
+    expect(accounts.status()).toBe(200);
+    const own = ((await accounts.json()) as { own: { id: string; label: string }[] }).own
+      .find((account) => account.label === accountLabel);
+    expect(own, `no account labelled ${accountLabel}`).toBeDefined();
+    const accountId = own?.id ?? "";
+    const marker = `Koud ${attemptTag}`;
+    const patched = await page.request.patch(`/api/mail/accounts/${accountId}`, {
+      data: { signatureHtml: `<p>-- ${marker}</p>` },
+    });
+    expect(patched.status(), await patched.text()).toBe(200);
+
+    // Long enough that the editor is built and its caret placed well before
+    // the list arrives, short enough to leave the rest of the test its budget.
+    const ACCOUNTS_DELAY_MS = 3_000;
+    await page.route("**/api/mail/accounts", async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, ACCOUNTS_DELAY_MS));
+      await route.continue();
+    });
+
+    try {
+      await page.goto(`/mail?thread=${aliceThreadId}`);
+      await expect(page.getByTestId("conversation")).toBeVisible();
+      await page.getByTestId("reply-button").click();
+      const body = page.getByTestId("composer-body");
+      await expect(body).toBeFocused();
+      // THE INSTRUMENT, AND POSITIVE ON PURPOSE: the composer's From slot
+      // shows this text only while `accountsLoading` is true, so it proves the
+      // query really was in flight. Asserting the absence of the From combobox
+      // instead would also pass for a control that never existed at all.
+      await expect(
+        page.getByTestId("composer").getByText("Loading accounts..."),
+        "the accounts arrived before the composer opened, so this is not the case this test exists for",
+      ).toBeVisible();
+
+      // Typed BEFORE the signature exists, which is the whole point: this is
+      // the user who starts writing the instant the reply opens.
+      await page.keyboard.type("TOPLINE");
+      await expect(body, "the deferred append never ran").toContainText(marker);
+
+      const text = (await body.innerText()).replace(/\s+/g, " ").trim();
+      expect(text.indexOf("TOPLINE"), `the deferred append swallowed the caret: ${text}`)
+        .toBeLessThan(text.indexOf(marker));
+      expect(text.startsWith("TOPLINE"), `body reads: ${text}`).toBe(true);
+
+      await page.getByTestId("composer").getByRole("button", { name: "Cancel" }).click();
+      await expect(page.getByTestId("composer")).toBeHidden();
+    } finally {
+      await page.unroute("**/api/mail/accounts");
+      await page.request.patch(`/api/mail/accounts/${accountId}`, { data: { signatureHtml: null } });
+    }
+  });
+
   test("hides the linked thread behind the unlinked filter and brings it back", async () => {
     await page.goto("/mail");
     await expect(threadRow(aliceSubject)).toHaveCount(1);

@@ -24,6 +24,7 @@ import {
   templateSubject,
   type ComposerLinks,
   type ComposerRecipient,
+  type SignatureKey,
   type TemplateContext,
 } from "./mail-lib";
 import { RichTextEditor, type RichTextHandle } from "./rich-text";
@@ -258,8 +259,10 @@ function ComposerForm({ seed, onClose, ref }: {
   // entirely for an instance that was destroyed first). Everything about the
   // signature hangs off this rather than off the ref being populated.
   const [editorEpoch, setEditorEpoch] = useState(0);
-  // Which (editor instance, account) pair has already had a signature.
-  const signedFor = useRef<string | null>(null);
+  // EVERY (editor instance, account) pair that has already had a signature,
+  // not just the last one: A to B and back to A is one gesture in the From
+  // dropdown, and a scalar here appended A's signature a second time.
+  const signedFor = useRef<ReadonlySet<SignatureKey>>(new Set());
 
   // Own, non-archived, non-error accounts: those are exactly the ones
   // mail-send.ts will accept a send from (owner-only, active, not archived).
@@ -280,12 +283,13 @@ function ComposerForm({ seed, onClose, ref }: {
    * anyway, so there is nothing reliable left to match on.
    *
    * THE RULE ITSELF LIVES IN mail-lib's signatureAppend, which carries the
-   * guard key, the epoch, and the reordering that made the two arrive
+   * guard ledger, the epoch, and the ordering that makes the two arrive
    * together. What is left here is the two things a pure function cannot do:
-   * remember what was signed, and touch the editor. Nothing constructs a key
-   * on this side, which is what stops the old ordering coming back by
-   * omission -- and because the append only ever runs after onCreate, it can
-   * never race the editor's own construction.
+   * hold what was signed across renders, and touch the editor. NO KEY IS
+   * SPELLED ON THIS SIDE AT ALL -- the ledger is whatever the last pass handed
+   * back -- so restoring the old "stamp first, look up second" ordering needs
+   * a cast rather than an oversight. And because the append only ever runs
+   * after onCreate, it can never race the editor's own construction.
    */
   useEffect(() => {
     const append = signatureAppend({
@@ -295,7 +299,7 @@ function ComposerForm({ seed, onClose, ref }: {
       signedFor: signedFor.current,
     });
     if (append === null) return;
-    signedFor.current = append.key;
+    signedFor.current = append.signed;
     editorRef.current?.appendAtEnd(append.html);
   }, [editorEpoch, selectedAccountId, sendableAccounts]);
 
@@ -322,10 +326,10 @@ function ComposerForm({ seed, onClose, ref }: {
    * has to be an auto-waiting toBeFocused rather than a one-shot read of
    * document.activeElement.
    *
-   * DECLARED AFTER THE SIGNATURE EFFECT, AND THE ORDER THAT BUYS ONLY HOLDS
-   * ON A WARM ACCOUNTS CACHE. On the epoch that carries both, the signature is
-   * appended and THEN the caret is placed. THEY DID FIGHT, AND THE FIRST
-   * VERSION OF THIS COMMENT SAID THEY COULD NOT. appendAtEnd's own comment
+   * DECLARED AFTER THE SIGNATURE EFFECT ON PURPOSE, so on the epoch that
+   * carries both, the signature is appended and THEN the caret is placed.
+   * THEY DID FIGHT, AND THE FIRST VERSION OF THIS COMMENT SAID THEY COULD NOT.
+   * appendAtEnd's own comment
    * claims it does not move the caret; it moved the SELECTION, because
    * TipTap's insertContentAt updates it by default, and a reply typed into the
    * instant it opened put "TOPLINE" inside the signature as
@@ -333,20 +337,25 @@ function ComposerForm({ seed, onClose, ref }: {
    * append settles it; rich-text.tsx's focus() carries a deliberately
    * redundant "start" beside it, and says so.
    *
-   * ON A COLD ACCOUNTS CACHE THE APPEND LANDS ON A LATER PASS, AFTER THE
-   * CARET -- WHICH IS WHAT THIS COMMENT ALREADY CLAIMED AND WHAT THE CODE DID
-   * NOT DO. The signature effect used to claim its guard key before looking
-   * the signature up, so the pass that ran with the account still missing from
-   * sendableAccounts took the pair and appended nothing, and the pass that
-   * followed the accounts arriving returned early on that same key. There was
-   * no later pass and no signature at all. v1.2.1 reordered it (mail-lib's
-   * signatureAppend) and the sentence is now true of the code as well.
+   * AND THE ORDERING ONLY HOLDS ON A WARM ACCOUNTS CACHE. On a cold one the
+   * signature effect returns without claiming anything -- there is no selected
+   * account while sendableAccounts is empty and the seed carried none, which
+   * is what a reply opened before the accounts query lands actually looks like
+   * -- so the append lands on a LATER pass, after the caret. That is the case
+   * updateSelection:false covers and the reason it is not optional. THIS
+   * PARAGRAPH IS OLDER THAN v1.2.1 AND WAS ALREADY TRUE; a v1.2.1 draft
+   * replaced it with the opposite claim, on the strength of a bug that turned
+   * out to need a seeded accountId, and the seeded state is unreachable (see
+   * signatureAppend). Restored, and measured rather than restored on trust:
+   * with GET /api/mail/accounts held for 800ms and no accountId in the seed, a
+   * word typed after the deferred append reads "TOPLINE -- <signature>" with
+   * the option and "-- <signature>TOPLINE" without it.
    *
-   * WHICH MAKES updateSelection:false LOAD-BEARING ON THIS PATH TOO, not only
-   * on the account switch its e2e journey covers. Measured in Chromium against
-   * this component with GET /api/mail/accounts held for 800ms, on a
-   * reply-shaped seed: with the option, a word typed after the deferred append
-   * reads "TOPLINE -- <signature>"; without it, "-- <signature>TOPLINE".
+   * WHAT v1.2.1 CHANGED IS THE SEEDED HALF ALONE. There, the account IS
+   * selected from the first render, so the cold pass used to claim the pair
+   * and append nothing, and no later pass ran at all. That path is latent
+   * rather than live, and the deferred append this paragraph describes has
+   * been the reachable one all along.
    */
   useEffect(() => {
     if (editorEpoch === 0 || !bodyFocusPending.current) return;

@@ -296,6 +296,68 @@ test.describe("A desk compose with a mailbox configured", () => {
       await page.request.post(`/api/mail/accounts/${plain.id}/archive`);
     }
   });
+
+  /**
+   * GOING BACK TO AN ACCOUNT ALREADY SIGNED FOR MUST NOT SIGN IT AGAIN, and
+   * until v1.2.1 it did. The composer's guard remembered only the LAST (editor
+   * epoch, account) pair it had signed, so selecting A, then B, then A found
+   * "1:A" unrecorded again -- B's key had displaced it -- and appended A's
+   * signature a second time. mail-lib's signatureAppend now carries a set of
+   * every pair signed, and its own unit tests drive the same three passes.
+   *
+   * TWO SIGNED ACCOUNTS, WHICH IS WHAT THE JOURNEY ABOVE STOPS SHORT OF. That
+   * one switches plain to signed and back to plain, and the return leg lands
+   * on an account with nothing to append either way -- so it passes against a
+   * scalar guard and against a set alike. The whole difference is that both
+   * accounts here carry a signature.
+   *
+   * COUNTED, NOT MERELY FOUND. `toContainText` is satisfied by two copies,
+   * which is the entire defect, so the assertion is on the number of
+   * occurrences in the body's text.
+   */
+  test("switching back to an account already signed for adds no second signature", async ({ page }) => {
+    const tag = Date.now().toString(36);
+    const firstMarker = `Eerste ${tag}`;
+    const secondMarker = `Tweede ${tag}`;
+    // Newest first: the API lists own accounts desc(createdAt) and the composer
+    // selects the head, so `later` is the one auto-selected on open.
+    const earlier = await makeAccount(page, `Earlier ${tag}`, `<p>-- ${firstMarker}</p>`);
+    const later = await makeAccount(page, `Later ${tag}`, `<p>-- ${secondMarker}</p>`);
+
+    const occurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+    try {
+      await page.goto("/mail");
+      await page.getByTestId("compose-button").click();
+      await expect(page.getByTestId("composer")).toBeVisible();
+      const trigger = page.getByTestId("composer-account");
+      await expect(trigger, "the newest account should be the one auto-selected")
+        .toContainText(later.label);
+
+      const body = page.getByTestId("composer-body");
+      await expect(body, "the auto-selected account signs on open").toContainText(secondMarker);
+
+      await trigger.click();
+      await page.getByRole("option", { name: new RegExp(earlier.label) }).click();
+      await expect(body, "switching signs the account switched TO").toContainText(firstMarker);
+
+      await trigger.click();
+      await page.getByRole("option", { name: new RegExp(later.label) }).click();
+      // The return leg appends nothing, so there is no new text to wait ON.
+      // Waiting for the trigger to show the account again is the observable
+      // effect of the switch itself, and the append -- if the guard were still
+      // a scalar -- lands in the same effect pass as that render.
+      await expect(trigger).toContainText(later.label);
+
+      const text = (await body.innerText()).replace(/\s+/g, " ").trim();
+      expect(occurrences(text, secondMarker), `the returned-to signature was appended twice: ${text}`)
+        .toBe(1);
+      expect(occurrences(text, firstMarker), `body reads: ${text}`).toBe(1);
+    } finally {
+      await page.request.post(`/api/mail/accounts/${earlier.id}/archive`);
+      await page.request.post(`/api/mail/accounts/${later.id}/archive`);
+    }
+  });
 });
 
 test.describe.serial("The composer opens on the first empty field, under a thumb", () => {
