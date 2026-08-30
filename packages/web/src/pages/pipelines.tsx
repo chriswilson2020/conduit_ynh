@@ -58,6 +58,12 @@ export function PipelinesPage() {
             <input type="checkbox" checked={archived} onChange={(event) => setArchived(event.target.checked)} />
             Archived
           </label>
+          {/* Loses the caret on success and is deliberately left that way:
+              CreatePipelineDialog navigates, which unmounts this trigger, and
+              the same `<body>` landing was measured after an ordinary row-link
+              navigation with no dialog involved. It is a route change's defect.
+              See components/entity-table.tsx for the long form, and
+              components/ui/dialog-focus.ts for the mechanism. */}
           <Dialog open={createOpen} onOpenChange={setCreateOpen}>
             <DialogTrigger asChild>
               <Button>New pipeline</Button>

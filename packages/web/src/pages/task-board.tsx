@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { FormEvent, RefObject } from "react";
+import type { FormEvent, MouseEvent as ReactMouseEvent, RefObject } from "react";
 import { DndContext, DragOverlay } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
@@ -9,6 +9,7 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
 import { TaskDrawer } from "../components/task-drawer";
+import { useDialogReturnFocus } from "../components/ui/dialog-focus";
 import {
   KanbanEmptyPlaceholder, kanbanSortableItems, useKanbanBoard, useKanbanCardSortable, useKanbanColumnDroppable,
 } from "../components/kanban-core";
@@ -49,7 +50,15 @@ export function TaskBoardPage() {
   // search.tsx's task-result navigation, which lands on a DIFFERENT route
   // (this board, or My Tasks) and deliberately stays a push -- that one's a
   // real navigation a user expects Back to undo.
-  function openTask(id: string) {
+  //
+  // The drawer's close needs the card back, and only the card knows which card
+  // it was -- so the capture happens in the handler that opens the drawer, not
+  // inside it. components/ui/dialog-focus.ts says why that is the only place
+  // it can happen.
+  const returnFocus = useDialogReturnFocus();
+
+  function openTask(id: string, trigger: HTMLElement | null) {
+    returnFocus.capture(trigger);
     void navigate({
       to: "/projects/$projectId/board", params: { projectId }, search: (prev) => ({ ...prev, task: id }), replace: true,
     });
@@ -140,7 +149,7 @@ export function TaskBoardPage() {
           ) : null}
         </DragOverlay>
       </DndContext>
-      <TaskDrawer taskId={openTaskId ?? null} onClose={closeTask} />
+      <TaskDrawer taskId={openTaskId ?? null} onClose={closeTask} returnFocus={returnFocus} />
     </div>
   );
 }
@@ -158,7 +167,7 @@ function Column({
   projectId: string;
   userInitials: Map<string, string>;
   suppressCardClickRef: RefObject<boolean>;
-  onCardClick: (id: string) => void;
+  onCardClick: (id: string, trigger: HTMLElement | null) => void;
 }) {
   const { setNodeRef } = useKanbanColumnDroppable(status);
   const taskIds = tasks.map((task) => task.id);
@@ -198,7 +207,7 @@ function TaskCard({
   task: Task;
   ownerInitial?: string;
   suppressCardClickRef: RefObject<boolean>;
-  onClick: (id: string) => void;
+  onClick: (id: string, trigger: HTMLElement | null) => void;
 }) {
   const { attributes, listeners, setNodeRef, style } = useKanbanCardSortable(task.id, task.status);
 
@@ -207,9 +216,9 @@ function TaskCard({
   // here regardless of what the click does, since dnd-kit's drop gesture can
   // still fire a trailing native click event (see kanban-core's
   // useKanbanBoard doc comment on suppressCardClickRef).
-  function handleClick() {
+  function handleClick(event: ReactMouseEvent<HTMLDivElement>) {
     if (suppressCardClickRef.current) return;
-    onClick(task.id);
+    onClick(task.id, event.currentTarget);
   }
 
   return (

@@ -263,7 +263,13 @@ describe("the tap targets that replace them", () => {
   it("opens the same task drawer the keyboard already opened", () => {
     // The no-capability-gap claim rests on this being the EXISTING path, not
     // a second one: onOpenTask is what Enter on a bar has always called.
-    expect(chartSource.match(/onClick=\{\(\) => onOpenTask\(row\.task\.id\)\}/g) ?? []).toHaveLength(2);
+    //
+    // THE SECOND ARGUMENT IS PART OF THE PIN, not noise the match had to
+    // absorb. v1.2.0 gave onOpenTask a `trigger` for the task drawer's closing
+    // focus (components/ui/dialog-focus.ts), and these two layers must pass
+    // `null`: they are `aria-hidden` overlays, so returning the caret to one
+    // would be worse than returning it to the page's content landmark.
+    expect(chartSource.match(/onClick=\{\(\) => onOpenTask\(row\.task\.id, null\)\}/g) ?? []).toHaveLength(2);
   });
 });
 
@@ -332,7 +338,10 @@ describe("the two imperative breakpoint reads", () => {
     // the one path the phase's no-capability-gap claim rests on. Moved below
     // accumulateNudge, it would stop nothing at all.
     const handler = chartSource.slice(chartSource.indexOf("const handleBarKeyDown"));
-    const enter = handler.indexOf("onOpenTask(task.id)");
+    // The keyboard path passes the BAR as the drawer's return-focus target --
+    // it is the focusable element Enter came from, and the one thing on this
+    // row a caret should go back to.
+    const enter = handler.indexOf("onOpenTask(task.id, e.currentTarget)");
     const read = handler.indexOf("window.matchMedia(mobileMediaQuery()).matches");
     const commits = handler.indexOf("accumulateNudge(");
     expect(enter).toBeGreaterThan(-1);

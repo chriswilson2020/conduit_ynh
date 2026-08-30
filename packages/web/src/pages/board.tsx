@@ -506,7 +506,7 @@ function StageView({
    * disagreeing about where a screen change puts the caret would be worse than
    * either choice.
    */
-  const returnFocus = useDialogReturnFocus(movingDeal !== null, headingRef);
+  const returnFocus = useDialogReturnFocus(headingRef);
 
   /**
    * ...AND THE ID GOES WITH IT, which the derivation above does not do on its
@@ -518,8 +518,9 @@ function StageView({
    * and a sheet re-opens that nobody asked for and takes focus to its first
    * target with it.
    *
-   * This is the same event the close handler's `isConnected` check is for; that
-   * check handles the focus half and this handles the state half. An effect
+   * This is the same event that useDialogReturnFocus's `isConnected` test is
+   * for (components/ui/dialog-focus.ts -- there is no such test in this file
+   * any more); that handles the focus half and this handles the state half. An effect
    * rather than a derivation because clearing it IS a state change: the sheet
    * is controlled, so React never calls onOpenChange for a close that came from
    * the data rather than from the user.
@@ -536,13 +537,16 @@ function StageView({
   }
 
   /**
-   * The Move button is no longer passed in. It used to be, so the close handler
-   * could focus it again; useDialogReturnFocus reads `document.activeElement` on
-   * the render that opens the sheet instead, and the button a user has just
-   * pressed is what holds focus then. One capture point for six dialogs beats a
-   * seventh spelling of the same idea.
+   * The Move button travels in from the card's own click handler, which is
+   * where every caller of useDialogReturnFocus now captures. This page has done
+   * it that way since the sheet existed, and it is the shape the shared hook
+   * settled on rather than the other way round -- reading
+   * `document.activeElement` instead would make the answer depend on whether
+   * the browser focuses a `<button>` on click, which is a thing browsers
+   * disagree about and this file never had to care about.
    */
-  function requestMove(dealId: string) {
+  function requestMove(dealId: string, trigger: HTMLElement) {
+    returnFocus.capture(trigger);
     setMovingDealId(dealId);
   }
 
@@ -578,12 +582,20 @@ function StageView({
     setMoveResult(`Moved ${movingDeal.title} to ${target.name}.`);
     setMovingDealId(null);
     // The card this sheet was opened from belongs to a stage the deal is
-    // leaving, so it is not somewhere to send the caret back to. Said here
-    // rather than left to `isConnected`, and that is not belt-and-braces:
-    // pages/deal-detail.tsx measured the button its own dialog retires STILL
-    // CONNECTED at the moment focus was handed back, unmounting a frame later
-    // and dropping the caret on <body>. A caller that knows beats a check that
-    // has to be right about when React commits.
+    // leaving, so it is not somewhere to send the caret back to.
+    //
+    // AND IT IS REDUNDANT TODAY, WHICH IS WORTH SAYING RATHER THAN IMPLYING
+    // OTHERWISE. Deleting this line leaves all three of e2e/mobile.spec.ts's
+    // phone kanban tests green, because useMoveDeal (queries.ts) has an
+    // optimistic onMutate: the card is out of the cache before the sheet
+    // closes, so useDialogReturnFocus's `isConnected` test already answers
+    // false. pages/deal-detail.tsx is the case where it is NOT redundant --
+    // useLoseDeal only invalidates, so its trigger is still connected when the
+    // caret is handed back, and deleting its forget() turns two tests red.
+    //
+    // It stays because the redundancy is another file's choice. If useMoveDeal
+    // ever stops being optimistic this page silently becomes deal-detail's
+    // case, and nothing here would notice. No test covers this line.
     returnFocus.forget();
   }
 
@@ -787,7 +799,7 @@ function StageDealCard({
   companyName?: string;
   ownerInitial?: string;
   canMove: boolean;
-  onRequestMove: (dealId: string) => void;
+  onRequestMove: (dealId: string, trigger: HTMLElement) => void;
 }) {
   const navigate = useNavigate();
   const rot = dealRot(deal.updatedAt, stage.rotDays, Date.now());
@@ -824,7 +836,7 @@ function StageDealCard({
           // matches (WCAG's label-in-name).
           aria-label={`Move ${deal.title}`}
           className="shrink-0"
-          onClick={() => onRequestMove(deal.id)}
+          onClick={(event) => onRequestMove(deal.id, event.currentTarget)}
         >
           Move
         </Button>

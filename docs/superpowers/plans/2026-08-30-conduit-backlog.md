@@ -167,6 +167,27 @@ found by SQL.
 
 ## Defects found and deliberately deferred
 
+**A NAVIGATION THAT UNMOUNTS THE FOCUSED ELEMENT LEAVES THE CARET ON `<body>` -- found
+during 7.5 Task 3, deliberately not fixed there, and it is bigger than the dialogs that
+exposed it.** Measured at 1280: click a company ROW LINK, land on the record, and
+`document.activeElement` is `<body>` -- the anchor unmounted with the list and TanStack
+Router moves focus nowhere. A SIDEBAR link, whose anchor survives the navigation, keeps
+focus on itself, which is what isolates the rule: it is not "navigation", it is "the
+focused element went away".
+
+**Seven create dialogs are one entrance to it** and were left alone for that reason:
+`entity-table.tsx`'s New (companies, contacts, projects), `pipelines.tsx`, both of
+`company-detail.tsx`'s, and `project-detail.tsx`'s all `navigate()` in `onSuccess`. Each
+was measured landing on `<body>`. `components/ui/dialog-focus.ts` would fix all seven in
+one line each -- deliberately not applied, because that would make them the only
+navigations in the app that land anywhere, and row links are by far the commoner path to
+the same destination pages. Each of the five roots carries a comment saying so.
+
+**Fix, when it is taken:** move focus on route change, once, where the router can see
+every navigation -- `<main>` already carries `tabIndex={-1}` for the dialog work, and
+`pages/inbox.tsx` and `pages/board.tsx` already do the same thing by hand for their own
+phone screen changes. That would let those two hand-rolled cases go as well.
+
 **A GIF undercharge — v1.0.2's first item.** A **37-byte** GIF whose logical screen
 descriptor claims 8000x8000 but which fails the trailer check returns `null` from
 `gifSize`, is charged `length * 8256` = 429,312 pixels, and Pillow opens it at **64

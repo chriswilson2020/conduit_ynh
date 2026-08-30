@@ -8,6 +8,7 @@ import { useIsMobile } from "../use-is-mobile";
 import { inboxStackView } from "./inbox-lib";
 import { BulkBar, BulkResult, type BulkOutcome } from "../components/mail/bulk-bar";
 import { Composer } from "../components/mail/composer";
+import { useDialogReturnFocus } from "../components/ui/dialog-focus";
 import { Conversation } from "../components/mail/conversation";
 import { FolderSidebar } from "../components/mail/folder-sidebar";
 import {
@@ -77,6 +78,7 @@ export function InboxPage() {
   const [unlinked, setUnlinked] = useState(false);
   const [hidden, setHidden] = useState(false);
   const [composeOpen, setComposeOpen] = useState(false);
+  const returnFocus = useDialogReturnFocus();
   /**
    * The ONE piece of state the stack adds, and only because there is nothing
    * to derive it from: the folder screen is a place the user asks to go, not
@@ -501,7 +503,15 @@ export function InboxPage() {
         >
           {view.title}
         </h1>
-        <Button data-testid="compose-button" onClick={() => setComposeOpen(true)}>
+        <Button
+          data-testid="compose-button"
+          onClick={(event) => {
+            // Where the composer's close puts the caret back -- see
+            // components/ui/dialog-focus.ts.
+            returnFocus.capture(event.currentTarget);
+            setComposeOpen(true);
+          }}
+        >
           Compose
         </Button>
       </div>
@@ -687,7 +697,7 @@ export function InboxPage() {
         </div>
       </div>
 
-      <Composer open={composeOpen} onOpenChange={setComposeOpen} />
+      <Composer open={composeOpen} onOpenChange={setComposeOpen} returnFocus={returnFocus} />
     </div>
   );
 }

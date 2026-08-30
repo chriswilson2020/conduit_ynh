@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import type { Deal, UpdateDealInput } from "@conduit/shared";
@@ -97,8 +97,17 @@ export function DealDetailPage() {
    * What separates the two is the `forget()` on the success path below --
    * `isConnected` alone does not, because the button was measured STILL
    * CONNECTED at the moment the caret was handed back to it.
+   *
+   * THE HEADING RATHER THAN THE SHARED `<main>` FALLBACK, because on the one
+   * path that reaches it the user has just changed the deal's status and
+   * nothing else on this page says so: there is no live region here, only
+   * error alerts. The status badge is the heading's sibling inside the same
+   * row, so a screen reader moved to the h1 reads the deal and then its new
+   * state. `tabIndex={-1}` at BOTH widths, unlike pages/inbox.tsx's and
+   * pages/board.tsx's phone-only headings -- this dialog exists at both.
    */
-  const returnFocus = useDialogReturnFocus(loseOpen);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const returnFocus = useDialogReturnFocus(headingRef);
 
   // ApiError.code is the server's machine-readable `error` field: branching
   // on it (rather than the human-readable message, which for "archived"
@@ -263,7 +272,9 @@ export function DealDetailPage() {
         */}
         <div className="mb-4 flex items-center justify-between gap-4 max-md:flex-wrap">
           <div className="flex min-w-0 items-center gap-3">
-            <h1 className="text-xl font-semibold break-words text-slate-900">{deal.title}</h1>
+            <h1 ref={headingRef} tabIndex={-1} className="text-xl font-semibold break-words text-slate-900 focus:outline-none">
+              {deal.title}
+            </h1>
             <span
               data-testid="deal-status"
               className={`rounded-full px-2 py-1 text-xs font-medium ${STATUS_CLASSES[deal.status] ?? STATUS_CLASSES.open}`}
@@ -279,7 +290,15 @@ export function DealDetailPage() {
                 </Button>
                 <Dialog open={loseOpen} onOpenChange={setLoseOpen}>
                   <DialogTrigger asChild>
-                    <Button data-testid="lose-button" variant="outline">
+                    {/* The capture rides on the trigger's own click, which is
+                        where it has to be: this dialog's form marks its
+                        textarea `autoFocus`, so Radix never dispatches the
+                        open-focus event this used to hang off. */}
+                    <Button
+                      data-testid="lose-button"
+                      variant="outline"
+                      onClick={(event) => returnFocus.capture(event.currentTarget)}
+                    >
                       Lose
                     </Button>
                   </DialogTrigger>

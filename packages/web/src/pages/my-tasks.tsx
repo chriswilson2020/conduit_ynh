@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import type { Task } from "@conduit/shared";
 import { useMe, useMyTasks, useProjects, useSetTaskStatus } from "../queries";
 import { TaskDrawer } from "../components/task-drawer";
+import { useDialogReturnFocus } from "../components/ui/dialog-focus";
 import { ROW_LINK, ROW_LINK_ROW } from "../components/row-link";
 import { TYPE_BADGE, TYPE_LABEL } from "./task-board";
 import { todayLocalIso } from "../lib";
@@ -81,6 +82,12 @@ export function MyTasksPage() {
   // TaskRow's own Link (which carries the same `replace`); only the close is
   // still driven from here, because a drawer's X is not a navigation anyone
   // wants to middle-click.
+  //
+  // The opening half is also where the drawer's close gets its target: the row
+  // anchor records itself, since nothing downstream of the URL can. See
+  // components/ui/dialog-focus.ts.
+  const returnFocus = useDialogReturnFocus();
+
   function closeTask() {
     void navigate({ to: "/my-tasks", search: (prev) => ({ ...prev, task: undefined }), replace: true });
   }
@@ -127,6 +134,7 @@ export function MyTasksPage() {
             group={group}
             projectNameById={projectNameById}
             onToggle={toggleDone}
+            onOpen={returnFocus.capture}
           />
         ) : (
           <TaskGroupSection
@@ -134,10 +142,11 @@ export function MyTasksPage() {
             group={group}
             projectNameById={projectNameById}
             onToggle={toggleDone}
+            onOpen={returnFocus.capture}
           />
         ),
       )}
-      <TaskDrawer taskId={openTaskId ?? null} onClose={closeTask} />
+      <TaskDrawer taskId={openTaskId ?? null} onClose={closeTask} returnFocus={returnFocus} />
     </div>
   );
 }
@@ -146,10 +155,12 @@ function TaskGroupSection({
   group,
   projectNameById,
   onToggle,
+  onOpen,
 }: {
   group: Group;
   projectNameById: Map<string, string>;
   onToggle: (task: Task, checked: boolean) => void;
+  onOpen: (trigger: HTMLElement | null) => void;
 }) {
   return (
     <section data-testid={`group-${group.key}`}>
@@ -159,7 +170,7 @@ function TaskGroupSection({
       </h2>
       <ul className="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white">
         {group.tasks.map((task) => (
-          <TaskRow key={task.id} task={task} projectName={projectNameById.get(task.projectId ?? "") ?? null} onToggle={onToggle} />
+          <TaskRow key={task.id} task={task} projectName={projectNameById.get(task.projectId ?? "") ?? null} onToggle={onToggle} onOpen={onOpen} />
         ))}
         {group.tasks.length === 0 && <li className="px-4 py-2 text-sm text-slate-400">Nothing here</li>}
       </ul>
@@ -175,10 +186,12 @@ function DoneGroup({
   group,
   projectNameById,
   onToggle,
+  onOpen,
 }: {
   group: Group;
   projectNameById: Map<string, string>;
   onToggle: (task: Task, checked: boolean) => void;
+  onOpen: (trigger: HTMLElement | null) => void;
 }) {
   return (
     <details data-testid={`group-${group.key}`}>
@@ -187,7 +200,7 @@ function DoneGroup({
       </summary>
       <ul className="divide-y divide-slate-200 rounded-md border border-slate-200 bg-white">
         {group.tasks.map((task) => (
-          <TaskRow key={task.id} task={task} projectName={projectNameById.get(task.projectId ?? "") ?? null} onToggle={onToggle} />
+          <TaskRow key={task.id} task={task} projectName={projectNameById.get(task.projectId ?? "") ?? null} onToggle={onToggle} onOpen={onOpen} />
         ))}
         {group.tasks.length === 0 && <li className="px-4 py-2 text-sm text-slate-400">Nothing here</li>}
       </ul>
@@ -199,10 +212,13 @@ function TaskRow({
   task,
   projectName,
   onToggle,
+  onOpen,
 }: {
   task: Task;
   projectName: string | null;
   onToggle: (task: Task, checked: boolean) => void;
+  /** Hands the drawer's close somewhere to put the caret back. */
+  onOpen: (trigger: HTMLElement | null) => void;
 }) {
   const overdue = task.dueDate !== null && task.status !== "done" && task.dueDate < todayLocalIso();
   return (
@@ -273,7 +289,17 @@ function TaskRow({
           type badge stay row content, so the link announces "Ship the thing,
           link" instead of reading four columns out as one name.
         */}
-        <Link to="/my-tasks" search={(prev) => ({ ...prev, task: task.id })} replace {...ROW_LINK}>
+        {/* The anchor is also what the drawer's close hands the caret back
+            to, so it records itself on the way in -- see the page's onOpen and
+            components/ui/dialog-focus.ts. A middle-click or a new tab never
+            reaches this, which is correct: neither opens a drawer here. */}
+        <Link
+          to="/my-tasks"
+          search={(prev) => ({ ...prev, task: task.id })}
+          replace
+          onClick={(event) => onOpen(event.currentTarget)}
+          {...ROW_LINK}
+        >
           {task.title}
         </Link>
       </span>

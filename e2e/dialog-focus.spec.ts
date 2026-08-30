@@ -22,17 +22,23 @@ import type { Browser, Page } from "@playwright/test";
  * on `<body>` and are the subject of this file: the four driven by state
  * instead of a trigger (the composer, the task drawer, and the two settings
  * dialogs) and the Lose dialog on a deal, which HAS a trigger and still fails
- * because a successful lose unmounts it. Ten more restore their trigger through
- * Radix, need nothing, and are deliberately untouched, so nothing here asserts
- * them; the sixteenth is the phone board's move sheet, which had this fixed by
- * hand a task earlier and is covered by e2e/mobile.spec.ts.
+ * because a successful lose unmounts it. The sixteenth caller is the phone
+ * board's move sheet, which had this fixed by hand a task earlier and is
+ * covered by e2e/mobile.spec.ts's two move tests.
+ *
+ * TEN ROOTS ARE LEFT TO RADIX and none is asserted here. All ten restore their
+ * trigger on a dismissal. SEVEN of them do lose the caret on their success
+ * path -- they navigate, which unmounts the page the trigger was on -- and that
+ * is deliberately out of scope, because the same `<body>` was measured after
+ * clicking an ordinary row link with no dialog in sight. See
+ * web: components/entity-table.tsx, which carries the argument.
  *
  * PROVE THE INSTRUMENT BEFORE TRUSTING A READING, and the first version of the
  * probe behind this file failed exactly that test. FocusScope dispatches its
  * close-focus event from a `setTimeout(..., 0)` in the unmount cleanup
  * (@radix-ui/react-focus-scope dist/index.mjs:94), so the dialog is out of the
  * DOM a whole task before focus is placed. A `page.evaluate` taken the moment
- * the dialog disappears answers BODY for EVERY dialog in this app, the seven
+ * the dialog disappears answers BODY for EVERY dialog in this app, the ten
  * working ones included -- which is a false positive that looks exactly like
  * the bug. `toBeFocused` polls, so it does not have that hole, and it is also
  * the assertion the plan asks for: focus lands ON THE TRIGGER, not merely
@@ -58,8 +64,11 @@ async function create(page: Page, path: string, data: unknown): Promise<{ id: st
 interface Fixture {
   readonly projectId: string;
   readonly taskId: string;
+  readonly archivableTaskId: string;
   readonly pipelineId: string;
   readonly dealId: string;
+  readonly templateAId: string;
+  readonly templateBId: string;
 }
 
 /**
@@ -77,6 +86,12 @@ async function seed(page: Page, tag: string): Promise<Fixture> {
     projectId: project.id,
     assigneeUserId: me.user.id,
   });
+  // A second task, because the archive test consumes the one it uses.
+  const archivable = await create(page, "/api/tasks", {
+    title: `Focusarch ${tag}`,
+    projectId: project.id,
+    assigneeUserId: me.user.id,
+  });
   const pipeline = await create(page, "/api/pipelines", { name: `Focuspipe ${tag}`, scope: "global" });
   const stage = await create(page, `/api/pipelines/${pipeline.id}/stages`, { name: "Lead" });
   const deal = await create(page, "/api/deals", {
@@ -84,7 +99,23 @@ async function seed(page: Page, tag: string): Promise<Fixture> {
     pipelineId: pipeline.id,
     stageId: stage.id,
   });
-  return { projectId: project.id, taskId: task.id, pipelineId: pipeline.id, dealId: deal.id };
+  return {
+    projectId: project.id,
+    taskId: task.id,
+    archivableTaskId: archivable.id,
+    pipelineId: pipeline.id,
+    dealId: deal.id,
+    // Two rows on one settings page, so one dialog has two different Edit
+    // buttons. Templates rather than mail accounts because a template needs no
+    // mail server at all, and because leaving a live account behind would
+    // change the composer fixture of any spec running beside this one.
+    templateAId: (await create(page, "/api/mail/templates", {
+      name: `Focus template A ${tag}`, subject: "A", bodyHtml: "<p>A</p>",
+    })).id,
+    templateBId: (await create(page, "/api/mail/templates", {
+      name: `Focus template B ${tag}`, subject: "B", bodyHtml: "<p>B</p>",
+    })).id,
+  };
 }
 
 function suite(label: string, phone: boolean, open: (browser: Browser) => Promise<Page>): void {
@@ -138,6 +169,34 @@ function suite(label: string, phone: boolean, open: (browser: Browser) => Promis
     });
 
     /**
+     * THE DRAWER'S OWN ACTIONS RETIRE THE CARD, AND `isConnected` CANNOT SEE
+     * IT. Archiving takes the task off the board, but the drawer stays open and
+     * the user closes it whenever they like -- so if they close BEFORE the
+     * invalidate-and-refetch lands, the card is still in the document, still
+     * `isConnected`, and gets the caret a frame before it unmounts. Measured
+     * exactly that way: the caret went to the card and then to `<body>`.
+     *
+     * The `Escape` is deliberately not preceded by any wait, which is what puts
+     * this inside the round trip. Deleting the `forget()` in task-drawer.tsx's
+     * handleArchive is what this fails on; waiting for the refetch first would
+     * make it pass either way, which is why no assertion here waits.
+     */
+    test("a task archived from the drawer lands on the page, not on the card", async () => {
+      await page.goto(`/projects/${fixture.projectId}/board`);
+      const trigger = page.getByTestId(`card-${fixture.archivableTaskId}`);
+      await trigger.click();
+      await expect(page.getByTestId("task-drawer")).toBeVisible();
+      page.once("dialog", (confirm) => void confirm.accept());
+      await page.getByRole("button", { name: "Archive", exact: true }).click();
+      await dismissDrawer();
+      await expect(page.getByTestId("task-drawer")).toHaveCount(0);
+      await expect(page.locator("main")).toBeFocused();
+      // The instrument: the card really did go, so this is the fallback rather
+      // than a coincidence of the card never having been there.
+      await expect(trigger).toHaveCount(0);
+    });
+
+    /**
      * THE CASE THAT DECIDED THE DESIGN. `?task=` is a supported deep link, so
      * this drawer can open on page load with no opener anywhere -- an element
      * cannot travel through a URL. Nothing to go back to is not the same as
@@ -166,6 +225,36 @@ function suite(label: string, phone: boolean, open: (browser: Browser) => Promis
       await dismiss();
       await expect(page.getByTestId("account-form")).toHaveCount(0);
       await expect(trigger).toBeFocused();
+    });
+
+    /**
+     * THE WHOLE JUSTIFICATION FOR CAPTURING AT THE OPENER, and until this test
+     * nothing exercised it: every other case here opens from a single
+     * top-of-page button, which one hard-coded ref would satisfy just as well.
+     * Two template rows, two Edit buttons, one dialog -- opened from the second
+     * row and then the first, so a stale capture from the previous open is a
+     * failure rather than a coincidence.
+     */
+    test("the template dialog goes back to the ROW that opened it, not the last one", async () => {
+      await page.goto("/settings/templates");
+      const first = page.getByTestId(`email-template-${fixture.templateAId}`);
+      const second = page.getByTestId(`email-template-${fixture.templateBId}`);
+      await expect(first).toBeVisible();
+      await expect(second).toBeVisible();
+
+      const secondEdit = second.getByRole("button", { name: "Edit" });
+      await secondEdit.click();
+      await expect(page.getByTestId("template-form")).toBeVisible();
+      await dismiss();
+      await expect(page.getByTestId("template-form")).toHaveCount(0);
+      await expect(secondEdit).toBeFocused();
+
+      const firstEdit = first.getByRole("button", { name: "Edit" });
+      await firstEdit.click();
+      await expect(page.getByTestId("template-form")).toBeVisible();
+      await dismiss();
+      await expect(page.getByTestId("template-form")).toHaveCount(0);
+      await expect(firstEdit).toBeFocused();
     });
 
     /** The second `autoFocus` dialog, and the fourth of the four. */
@@ -222,7 +311,12 @@ function suite(label: string, phone: boolean, open: (browser: Browser) => Promis
       // The instrument: the trigger really has gone, so the landing below is
       // the fallback rather than a coincidence.
       await expect(page.getByTestId("lose-button")).toHaveCount(0);
-      await expect(page.locator("main")).toBeFocused();
+      // THE DEAL'S OWN HEADING, not the shared `<main>`: this page passes a
+      // better fallback, because the status badge is the heading's sibling and
+      // nothing else on the page announces the change the user just made. So
+      // this asserts the override as well as the landing.
+      await expect(page.getByRole("heading", { level: 1 })).toBeFocused();
+      await expect(page.getByTestId("deal-status")).toContainText("Lost");
     });
   });
 }

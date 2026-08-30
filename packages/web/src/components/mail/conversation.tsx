@@ -16,6 +16,7 @@ import {
   useUnhideThread,
 } from "../../queries";
 import { Composer, type ComposerSeed } from "./composer";
+import { useDialogReturnFocus } from "../ui/dialog-focus";
 import { LinkPanel } from "./link-panel";
 import { MessageFrame } from "./message-frame";
 import {
@@ -213,7 +214,13 @@ export function Conversation({ threadId }: ConversationProps) {
     return own?.id;
   }
 
-  function openReply(all: boolean) {
+  // Reply, Reply all and Forward are all somewhere the caret can go back to
+  // when the composer closes, and each is a different button -- so each hands
+  // its own element in. See components/ui/dialog-focus.ts.
+  const returnFocus = useDialogReturnFocus();
+
+  function openReply(all: boolean, trigger: HTMLElement) {
+    returnFocus.capture(trigger);
     if (thread === undefined) return;
     const source = replySource(messages);
     if (source === undefined) return;
@@ -234,7 +241,8 @@ export function Conversation({ threadId }: ConversationProps) {
     });
   }
 
-  function openForward() {
+  function openForward(trigger: HTMLElement) {
+    returnFocus.capture(trigger);
     if (thread === undefined) return;
     const source = messages[messages.length - 1];
     if (source === undefined) return;
@@ -406,11 +414,11 @@ export function Conversation({ threadId }: ConversationProps) {
       <LinkPanel thread={thread} dealSuggestions={data.dealSuggestions} />
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button data-testid="reply-button" onClick={() => openReply(false)}>Reply</Button>
-        <Button variant="outline" data-testid="reply-all-button" onClick={() => openReply(true)}>
+        <Button data-testid="reply-button" onClick={(event) => openReply(false, event.currentTarget)}>Reply</Button>
+        <Button variant="outline" data-testid="reply-all-button" onClick={(event) => openReply(true, event.currentTarget)}>
           Reply all
         </Button>
-        <Button variant="outline" data-testid="forward-button" onClick={openForward}>
+        <Button variant="outline" data-testid="forward-button" onClick={(event) => openForward(event.currentTarget)}>
           Forward
         </Button>
       </div>
@@ -464,6 +472,7 @@ export function Conversation({ threadId }: ConversationProps) {
         open={seed !== null}
         onOpenChange={(open) => { if (!open) setSeed(null); }}
         seed={seed ?? undefined}
+        returnFocus={returnFocus}
       />
     </div>
   );

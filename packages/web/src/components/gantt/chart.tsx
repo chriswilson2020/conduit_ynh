@@ -276,7 +276,7 @@ const Sidebar = memo(function Sidebar({
    * identity and the sidebar bails out, exactly as its three sibling
    * callbacks do. Wrapping the page's two handlers would make the claim
    * general; that is a change to a file this task does not own. */
-  onOpenTask: (taskId: string) => void;
+  onOpenTask: (taskId: string, trigger: HTMLElement | null) => void;
   onGroupCompacted: (result: ShiftResult) => void;
   onGroupCompactEmpty: () => void;
   onGroupCompactError: (err: unknown) => void;
@@ -340,7 +340,7 @@ const Sidebar = memo(function Sidebar({
             data-testid={`gantt-label-tap-${row.task.id}`}
             aria-hidden="true"
             className="absolute inset-0 hidden max-md:block"
-            onClick={() => onOpenTask(row.task.id)}
+            onClick={() => onOpenTask(row.task.id, null)}
           />
         </div>
       )))}
@@ -382,7 +382,15 @@ export interface GanttChartProps {
   /** Opens the task drawer -- the page owns the `?task=` navigation (mirrors
    * task-board.tsx's openTask), this component just needs somewhere to send
    * Enter. */
-  onOpenTask: (taskId: string) => void;
+  /**
+   * `trigger` is where the task drawer's close should put the caret back, and
+   * `null` is a real answer rather than a gap: the two phone tap targets that
+   * call this are `aria-hidden` overlays, so handing one back to a screen
+   * reader would be worse than the app's content landmark. The KEYBOARD path
+   * passes the bar itself, which is the focusable element Enter came from.
+   * See components/ui/dialog-focus.ts.
+   */
+  onOpenTask: (taskId: string, trigger: HTMLElement | null) => void;
 }
 
 export function GanttChart({ target, onOpenTask }: GanttChartProps) {
@@ -895,7 +903,7 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
   const handleBarKeyDown = useCallback((e: ReactKeyboardEvent<HTMLDivElement>, task: GanttTask) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      onOpenTask(task.id);
+      onOpenTask(task.id, e.currentTarget);
       return;
     }
     if (task.startDate === null || task.dueDate === null) return;
@@ -1143,7 +1151,7 @@ export function GanttChart({ target, onOpenTask }: GanttChartProps) {
                   aria-hidden="true"
                   className="absolute left-0 hidden max-md:block"
                   style={{ top: rowTop.get(row.task.id) ?? 0, height: ROW_HEIGHT, width: chartWidth }}
-                  onClick={() => onOpenTask(row.task.id)}
+                  onClick={() => onOpenTask(row.task.id, null)}
                 />
               ))}
               <GanttArrows

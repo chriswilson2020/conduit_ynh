@@ -33,7 +33,7 @@ export function SettingsTemplatesPage() {
   const [formTarget, setFormTarget] = useState<{ template?: EmailTemplate } | null>(null);
   // One dialog and an Edit button on every row, so the caret goes back to
   // whichever one opened it. See components/ui/dialog-focus.ts.
-  const returnFocus = useDialogReturnFocus(formTarget !== null);
+  const returnFocus = useDialogReturnFocus();
 
   return (
     <SettingsLayout>
@@ -45,7 +45,14 @@ export function SettingsTemplatesPage() {
               <input type="checkbox" checked={archived} onChange={(event) => setArchived(event.target.checked)} />
               Archived
             </label>
-            <Button onClick={() => setFormTarget({})}>New template</Button>
+            <Button
+              onClick={(event) => {
+                returnFocus.capture(event.currentTarget);
+                setFormTarget({});
+              }}
+            >
+              New template
+            </Button>
           </div>
         </div>
 
@@ -61,7 +68,7 @@ export function SettingsTemplatesPage() {
 
         <ul className="flex flex-col gap-2">
           {templates.map((template) => (
-            <TemplateRow key={template.id} template={template} onEdit={() => setFormTarget({ template })} />
+            <TemplateRow key={template.id} template={template} onEdit={(trigger) => { returnFocus.capture(trigger); setFormTarget({ template }); }} />
           ))}
         </ul>
       </div>
@@ -304,7 +311,7 @@ function DocumentTemplateEditor() {
   );
 }
 
-function TemplateRow({ template, onEdit }: { template: EmailTemplate; onEdit: () => void }) {
+function TemplateRow({ template, onEdit }: { template: EmailTemplate; onEdit: (trigger: HTMLElement) => void }) {
   const archive = useArchiveMailTemplate();
   const unarchive = useUnarchiveMailTemplate();
   const isArchived = template.archivedAt !== null;
@@ -326,7 +333,7 @@ function TemplateRow({ template, onEdit }: { template: EmailTemplate; onEdit: ()
         )}
       </div>
       <div className="flex shrink-0 gap-2">
-        {!isArchived && <Button variant="outline" onClick={onEdit}>Edit</Button>}
+        {!isArchived && <Button variant="outline" onClick={(event) => onEdit(event.currentTarget)}>Edit</Button>}
         {isArchived ? (
           <Button variant="outline" disabled={unarchive.isPending} onClick={() => unarchive.mutate(template.id)}>
             Unarchive

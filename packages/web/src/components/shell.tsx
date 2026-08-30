@@ -254,9 +254,20 @@ export function Shell({ children }: { children: ReactNode }) {
           desktop-string convention in ui/dialog.tsx.
         */}
         {/*
-          tabIndex -1 MAKES THIS THE APP'S FALLBACK FOCUS TARGET, and nothing
-          else changes: -1 keeps it out of everyone's tab order, so no keyboard
-          user meets an extra stop, and no pixel moves.
+          tabIndex -1 MAKES THIS THE APP'S FALLBACK FOCUS TARGET. It keeps this
+          element out of everyone's TAB ORDER, so no keyboard user meets an
+          extra stop, and no pixel moves.
+
+          IT IS NOT INERT OTHERWISE, and the first version of this comment
+          claimed it was. Measured: a click on plain, non-focusable content
+          inside this box -- a heading, a paragraph -- now leaves
+          `document.activeElement` on MAIN, where before it left `<body>`,
+          because the browser walks up to the nearest focusable ancestor and
+          this is now one. Two consequences, both small and both preferred to
+          the alternative: a mouse user's next Tab starts from inside the
+          content rather than from the top of the document, which is nearer
+          where they were; and `<body>` is no longer where a stray click parks
+          the caret.
 
           It is where a dialog's close sends the caret when the control that
           opened the dialog has gone -- see components/ui/dialog-focus.ts, which

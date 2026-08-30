@@ -136,14 +136,20 @@ const SHAPES = {
  * dialog's close somewhere to put the caret, and six callers pass its
  * `restore` to `onCloseAutoFocus` -- but it is opted into rather than applied
  * here, because the app's other ten `<Dialog>` roots were MEASURED restoring
- * their trigger through Radix's own mechanism, and replacing a working
- * mechanism with a differently-fallible one buys nothing. That file says which
- * ten and how the six differ.
+ * their trigger on a dismissal through Radix's own mechanism. Seven of those
+ * ten DO lose the caret on their success path -- they navigate, which unmounts
+ * the page the trigger was on -- and that file says why a route change is
+ * where that belongs rather than here.
  *
- * It lives beside this file rather than in it because this package's vitest
- * environment is `node` with no testing-library, so nothing here can be
- * imported by a unit test; a `.ts` sibling can, and the one decision inside it
- * is worth testing rather than reading.
+ * IT LIVES BESIDE THIS FILE RATHER THAN IN IT for size and subject, and the
+ * first version of this comment gave a technical reason that is false. It said
+ * a unit test could not import a `.tsx` under this package's `node` vitest
+ * environment. Measured: a test importing `./components/ui/dialog` and
+ * `./components/mail/composer` passes, both modules importing cleanly. The two
+ * real constraints are narrower and neither forces a split -- nothing here can
+ * be RENDERED (no DOM, no testing-library), and vitest.config.ts's include glob
+ * ends in `.test.ts` and so does not match a `.test.tsx`, meaning a co-located
+ * test file has to carry the `.ts` extension whatever it imports.
  */
 function Overlaid({
   shape,

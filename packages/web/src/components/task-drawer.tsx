@@ -25,7 +25,7 @@ import { OwnerSelect } from "./owner-select";
 import { Timeline } from "./rail/timeline";
 import { Button } from "./ui/button";
 import { Dialog, DialogClose, DialogTitle, DrawerContent } from "./ui/dialog";
-import { useDialogReturnFocus } from "./ui/dialog-focus";
+import type { DialogReturnFocus } from "./ui/dialog-focus";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 
 export interface TaskDrawerProps {
@@ -33,6 +33,15 @@ export interface TaskDrawerProps {
    * comment for why Radix's `open` prop, not an unmount, drives visibility. */
   taskId: string | null;
   onClose: () => void;
+  /**
+   * Where the caret goes when this closes. REQUIRED, and owned by the page
+   * rather than by this component, because the capture has to happen in the
+   * handler of whatever opened the drawer -- a card on the task board, a row on
+   * My Tasks, a bar on the Gantt -- and that handler is the page's. Required so
+   * that a new mount site is a type error rather than a silent landing on
+   * `<main>`. See components/ui/dialog-focus.ts.
+   */
+  returnFocus: DialogReturnFocus;
 }
 
 /**
@@ -42,28 +51,21 @@ export interface TaskDrawerProps {
  * opens straight to this drawer -- this component itself is agnostic to
  * where the id came from, it just renders (or doesn't) based on it.
  */
-export function TaskDrawer({ taskId, onClose }: TaskDrawerProps) {
+export function TaskDrawer({ taskId, onClose, returnFocus }: TaskDrawerProps) {
   /**
    * WHERE THE CARET GOES WHEN THIS CLOSES, which Radix cannot answer for a
    * drawer opened this way -- see components/ui/dialog-focus.ts for the
    * mechanism and for what was measured here before it existed (`<body>`, at
    * 1280 and at 390).
    *
-   * THE OPENER IS CAPTURED AT OPENING TIME rather than held in a ref this
-   * component owns, because there is no such thing as "the" trigger: this
-   * drawer is opened from a card on the task board, a row on My Tasks, a bar on
-   * the Gantt, and by a `?task=` deep link with no opener at all. The deep link
-   * is the case that fixes the design -- an element cannot travel through a URL,
-   * so it lands on the fallback, and that is asserted rather than assumed.
+   * THE `?task=` DEEP LINK IS THE CASE THAT DECIDED THE DESIGN: an element
+   * cannot travel through a URL, so a drawer opened on page load has no opener
+   * at all and lands on the fallback. That is asserted rather than assumed.
    */
-  const returnFocus = useDialogReturnFocus(taskId !== null);
   return (
     <Dialog open={taskId !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DrawerContent
-        data-testid="task-drawer"
-        onCloseAutoFocus={returnFocus.restore}
-      >
-        {taskId !== null && <TaskDrawerBody taskId={taskId} />}
+      <DrawerContent data-testid="task-drawer" onCloseAutoFocus={returnFocus.restore}>
+        {taskId !== null && <TaskDrawerBody taskId={taskId} returnFocus={returnFocus} />}
       </DrawerContent>
     </Dialog>
   );
@@ -81,7 +83,7 @@ function buildTaskPatch(name: string, value: string): Record<string, unknown> {
   }
 }
 
-function TaskDrawerBody({ taskId }: { taskId: string }) {
+function TaskDrawerBody({ taskId, returnFocus }: { taskId: string; returnFocus: DialogReturnFocus }) {
   const { data: task, isLoading, error } = useTask(taskId);
   const { data: linkedProject } = useProject(task?.projectId ?? "");
   const { data: linkedCompany } = useCompany(task?.companyId ?? "");
@@ -145,8 +147,28 @@ function TaskDrawerBody({ taskId }: { taskId: string }) {
     updateTask.mutate({ id: task.id, patch: { type } }, { onError: reportError });
   }
 
+  /**
+   * TWO OF THIS DRAWER'S OWN ACTIONS RETIRE THE CARD IT WAS OPENED FROM, and
+   * both leave the drawer standing, so the user closes it themselves at a
+   * moment nobody can predict.
+   *
+   * A status change moves the card to a different column, which is a different
+   * parent and therefore an unmount; an archive takes it off the board
+   * altogether. Neither mutation is optimistic (queries.ts's useSetTaskStatus
+   * and useArchiveTask invalidate on success), so there is a real window
+   * between the click and the refetch -- and closing inside it was MEASURED
+   * landing on the card, which then unmounted, leaving `<body>`. Wait for the
+   * refetch first and `isConnected` catches it; do not wait and nothing does.
+   *
+   * So the drawer says so instead of hoping. `forget()` is unconditional rather
+   * than conditional on the new status: a card that stays in its column is
+   * reconciled in place and would still be a fine target, but distinguishing
+   * the two means predicting React's reconciliation from here, and landing on
+   * the page's content is not a bad outcome for a task the user just changed.
+   */
   function handleStatusChange(status: TaskStatus) {
     if (!task) return;
+    returnFocus.forget();
     setTaskStatus.mutate({ id: task.id, status }, { onError: reportError });
   }
 
@@ -200,9 +222,11 @@ function TaskDrawerBody({ taskId }: { taskId: string }) {
     );
   }
 
+  /** Takes the card off the board -- see handleStatusChange for the window. */
   function handleArchive() {
     if (!task) return;
     if (!window.confirm(`Archive ${task.title}?`)) return;
+    returnFocus.forget();
     archiveTask.mutate(task.id, { onError: reportError });
   }
 

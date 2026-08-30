@@ -4,6 +4,7 @@ import { useCompany, useContact, useDeal, useProject } from "../../queries";
 import { Composer, type ComposerSeed } from "../mail/composer";
 import { ThreadList } from "../mail/thread-list";
 import { Button } from "../ui/button";
+import { useDialogReturnFocus } from "../ui/dialog-focus";
 
 export interface MailRailProps {
   companyId?: string;
@@ -42,7 +43,12 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
   const contactName = contact === undefined
     ? undefined : `${contact.firstName} ${contact.lastName ?? ""}`.trim();
 
-  function compose() {
+  // The Compose button is where the composer's close puts the caret back --
+  // see components/ui/dialog-focus.ts.
+  const returnFocus = useDialogReturnFocus();
+
+  function compose(trigger: HTMLElement) {
+    returnFocus.capture(trigger);
     setSeed({
       // The record's first address, when the record has one. A company has
       // none (companies carry a domain, not a mailbox), so composing from a
@@ -66,7 +72,7 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
   return (
     <div className="flex flex-col gap-2">
       <div className="flex justify-end">
-        <Button variant="outline" data-testid="mail-compose" onClick={compose}>
+        <Button variant="outline" data-testid="mail-compose" onClick={(event) => compose(event.currentTarget)}>
           Compose
         </Button>
       </div>
@@ -80,6 +86,7 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
         open={seed !== null}
         onOpenChange={(open) => { if (!open) setSeed(null); }}
         seed={seed ?? undefined}
+        returnFocus={returnFocus}
       />
     </div>
   );

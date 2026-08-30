@@ -211,6 +211,12 @@ export function CompanyDetailPage() {
         <section className="mt-6">
           <div className="mb-2 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-900">Contacts</h2>
+            {/* Loses the caret on success and is deliberately left that way:
+                NewContactDialog navigates, which unmounts this trigger, and the
+                same `<body>` landing was measured after an ordinary row-link
+                navigation with no dialog involved. It is a route change's
+                defect. See components/entity-table.tsx for the long form, and
+                components/ui/dialog-focus.ts for the mechanism. */}
             <Dialog open={newContactOpen} onOpenChange={setNewContactOpen}>
               <DialogTrigger asChild>
                 <Button variant="outline">New contact</Button>
@@ -254,6 +260,8 @@ export function CompanyDetailPage() {
                 />
                 Archived
               </label>
+              {/* Same as this page's New contact above: navigates on success,
+                  so the caret is a route change's business. */}
               <Dialog open={newPipelineOpen} onOpenChange={setNewPipelineOpen}>
                 <DialogTrigger asChild>
                   <Button variant="outline">New pipeline</Button>

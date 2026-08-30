@@ -110,6 +110,21 @@ export function EntityTable<T extends { id: string }>({
           Archived
         </label>
         <div className="flex-1" />
+        {/*
+          THIS DIALOG LOSES THE CARET ON SUCCESS, AND IT IS NOT THE DIALOG'S TO
+          FIX. Every caller's onSuccess navigates to the record it just made,
+          which unmounts the page this trigger is on, so Radix restores focus to
+          a detached node and `document.activeElement` ends on `<body>` --
+          measured at 1280, here and at the six other create-and-navigate
+          dialogs. Dismissing it restores the trigger correctly.
+
+          components/ui/dialog-focus.ts would land it on the destination's
+          `<main>` in one line, and deliberately is not used: the same `<body>`
+          was measured after clicking an ordinary ROW LINK with no dialog within
+          reach. The rule is "any navigation that unmounts the focused element",
+          and this app has far more of those through row links than through
+          create dialogs. See that file, and the backlog's routing item.
+        */}
         <Dialog open={createOpen} onOpenChange={setCreateOpen}>
           <DialogTrigger asChild>
             <Button>New</Button>

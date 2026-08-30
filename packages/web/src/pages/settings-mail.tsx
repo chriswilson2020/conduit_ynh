@@ -59,7 +59,7 @@ export function SettingsMailPage() {
   // One dialog, two openers per account plus Add account at the top, so the
   // control to give the caret back to is whichever one was used -- captured on
   // open rather than held here. See components/ui/dialog-focus.ts.
-  const returnFocus = useDialogReturnFocus(formTarget !== null);
+  const returnFocus = useDialogReturnFocus();
 
   const own = data?.own ?? [];
   const active = own.filter((account) => account.archivedAt === null);
@@ -71,7 +71,14 @@ export function SettingsMailPage() {
       <div data-testid="mail-settings" className="flex flex-col gap-4">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-slate-900">Your mail accounts</h2>
-          <Button onClick={() => setFormTarget({})}>Add account</Button>
+          <Button
+            onClick={(event) => {
+              returnFocus.capture(event.currentTarget);
+              setFormTarget({});
+            }}
+          >
+            Add account
+          </Button>
         </div>
 
         {isLoading && <p className="text-sm text-slate-400">Loading...</p>}
@@ -91,7 +98,7 @@ export function SettingsMailPage() {
           <AccountCard
             key={account.id}
             account={account}
-            onEdit={() => setFormTarget({ account })}
+            onEdit={(trigger) => { returnFocus.capture(trigger); setFormTarget({ account }); }}
           />
         ))}
 
@@ -109,7 +116,7 @@ export function SettingsMailPage() {
                 and unarchiving is the only way back (re-adding the mailbox
                 would re-ingest every thread under a new account id). */}
             {showArchived && archived.map((account) => (
-              <AccountCard key={account.id} account={account} onEdit={() => setFormTarget({ account })} />
+              <AccountCard key={account.id} account={account} onEdit={(trigger) => { returnFocus.capture(trigger); setFormTarget({ account }); }} />
             ))}
           </section>
         )}
@@ -163,7 +170,7 @@ function AccountCard({
   onEdit,
 }: {
   account: MailAccountWithSyncStats;
-  onEdit: () => void;
+  onEdit: (trigger: HTMLElement) => void;
 }) {
   const test = useTestMailAccount();
   const archive = useArchiveMailAccount();
@@ -213,7 +220,7 @@ function AccountCard({
         <div className="flex flex-wrap gap-2">
           {!isArchived && (
             <>
-              <Button variant="outline" onClick={onEdit}>Edit</Button>
+              <Button variant="outline" onClick={(event) => onEdit(event.currentTarget)}>Edit</Button>
               <Button
                 variant="outline"
                 disabled={test.isPending}

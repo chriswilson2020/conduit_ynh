@@ -29,7 +29,7 @@ import {
 import { RichTextEditor, type RichTextHandle } from "./rich-text";
 import { Button } from "../ui/button";
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog";
-import { useDialogReturnFocus } from "../ui/dialog-focus";
+import type { DialogReturnFocus } from "../ui/dialog-focus";
 import { Input } from "../ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 import { CHIP_REMOVE_TOUCH } from "../ui/touch";
@@ -82,6 +82,15 @@ export interface ComposerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   seed?: ComposerSeed;
+  /**
+   * Where the caret goes when this closes. REQUIRED, and owned by whatever
+   * mounts the composer, because the capture has to happen in the handler of
+   * the control that opened it -- the inbox's Compose, a record's Mail tab, a
+   * conversation's Reply or Forward -- and that handler is not this component's.
+   * Required so that a new mount site is a type error rather than a silent
+   * landing on `<main>`. See components/ui/dialog-focus.ts.
+   */
+  returnFocus: DialogReturnFocus;
 }
 
 const NO_TEMPLATE = "none";
@@ -96,18 +105,8 @@ const NO_TEMPLATE = "none";
  * the composer with a different seed" work without a single reset effect, and
  * what gives the body editor a clean document each time.
  */
-export function Composer({ open, onOpenChange, seed }: ComposerProps) {
+export function Composer({ open, onOpenChange, seed, returnFocus }: ComposerProps) {
   const form = useRef<ComposerFocusHandle>(null);
-  /**
-   * CLOSING FOCUS, WHICH IS A DIFFERENT PROBLEM FROM THE OPENING FOCUS BELOW
-   * and was measured landing on `<body>` at both widths. This composer has no
-   * `<DialogTrigger>` -- it is opened from the inbox's Compose, from a record's
-   * Mail tab, and from a conversation's Reply and Forward -- so Radix's own
-   * restore has nothing to restore to. components/ui/dialog-focus.ts carries
-   * the mechanism, including why it reads `open` instead of hanging off the
-   * handler below, which would have been the obvious place.
-   */
-  const returnFocus = useDialogReturnFocus(open);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -136,7 +135,8 @@ export function Composer({ open, onOpenChange, seed }: ComposerProps) {
          * `if (!container.contains(document.activeElement))` (dist/index.mjs:80),
          * so focus already inside the content means the AUTOFOCUS_ON_MOUNT
          * event is never even dispatched and focusFirst never runs. That is
-         * what ui/dialog.tsx:175-178 has said correctly all along, and a
+         * what ui/dialog.tsx:189-192 has said correctly all along (it was
+         * 175-178 until v1.2.0 put a block above it in that file), and a
          * reviewer measured it: a conditional autoFocus on the To input lands
          * correctly with no onOpenAutoFocus at all, chip and combobox ahead of
          * it or not.
@@ -176,6 +176,15 @@ export function Composer({ open, onOpenChange, seed }: ComposerProps) {
           }
           form_.focusInitial(container);
         }}
+        /**
+         * CLOSING FOCUS, A DIFFERENT PROBLEM FROM THE OPENING FOCUS ABOVE and
+         * measured landing on `<body>` at both widths. This composer has no
+         * `<DialogTrigger>` -- it is opened from the inbox's Compose, a
+         * record's Mail tab, and a conversation's Reply and Forward -- so
+         * Radix's own restore has nothing to restore to. The opener records
+         * itself and hands the object in; components/ui/dialog-focus.ts carries
+         * the mechanism and the two designs that tried to avoid the plumbing.
+         */
         onCloseAutoFocus={returnFocus.restore}
       >
         {open && <ComposerForm ref={form} seed={seed} onClose={() => onOpenChange(false)} />}
