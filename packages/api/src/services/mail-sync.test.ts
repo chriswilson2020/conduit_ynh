@@ -30,11 +30,10 @@ let hints: SseHint[];
 let unsubscribe: () => void;
 /** Everything a test started, stopped in afterEach so no loop outlives its case. */
 let running: { stop(): Promise<void> }[];
-/** When the current case began, for waitFor's budget. See that function. */
+/** When the current case's BODY began, for waitFor's budget. See that function. */
 let caseStartedAt = 0;
 
 beforeEach(async () => {
-  caseStartedAt = Date.now();
   await truncateAll(handle);
   actorId = (await resolveUser(handle.db, { username: "chris", email: null, fullName: null })).id;
   dir = await mkdtemp(path.join(os.tmpdir(), "conduit-mail-sync-"));
@@ -44,6 +43,15 @@ beforeEach(async () => {
   hints = [];
   unsubscribe = subscribe((hint) => { hints.push(hint); });
   running = [];
+  // LAST, not first. Vitest's testTimeout excludes hook time -- measured
+  // against this repo's vitest: a 3500ms beforeEach plus a 3000ms body passes
+  // at 6510ms, while a 5600ms body alone dies at 5006ms. Stamped at the top of
+  // this hook instead, waitFor's budget would be `4000 - whatever setup cost`
+  // against vitest's full 5000, and `truncateAll` takes ACCESS EXCLUSIVE on
+  // every table in a database this project deliberately loads with a second
+  // vitest process when hunting flakes. Stamped here, the budget is measured
+  // from the same instant vitest measures from.
+  caseStartedAt = Date.now();
 });
 
 afterEach(async () => {
@@ -463,24 +471,30 @@ const silentLogger: SyncLogger = { info: () => {}, warn: () => {}, error: () => 
  * default `testTimeout` is 5000ms and `vitest.config.ts` does not raise it, so
  * the ten-second budget this used to carry could never fire. The sightings of
  * this file's intermittent are listed in the backlog's intermittents section
- * (`docs/superpowers/plans/2026-08-30-conduit-backlog.md`); every one of them
- * arrived as vitest's own anonymous "Test timed out in 5000ms" with no
- * indication of WHICH wait had stopped moving, and one lost its identity
- * entirely to a truncated tail. A per-call budget has the same hole from the
- * other side -- an earlier wait can spend the case's five seconds and leave
- * the label just as unreachable -- so the budget runs from the start of the
- * case and stops short of vitest's, which makes the label reachable from any
- * wait in any case.
+ * (`docs/superpowers/plans/2026-08-30-conduit-backlog.md`); each one whose
+ * message survives is vitest's own anonymous "Test timed out in 5000ms", with
+ * no indication of WHICH wait had stopped moving, and the one exception is no
+ * better -- its tail was truncated, so it has no message at all. A per-call
+ * budget has the same hole from the other side -- an earlier wait can spend
+ * the case's five seconds and leave the label just as unreachable -- so the
+ * budget runs from the start of the case BODY (see the stamp at the end of
+ * beforeEach, and why it is at the end) and stops short of vitest's, which
+ * makes the label reachable from any wait in any case.
  *
  * 4000ms is a measurement, not a round number. Over 24 runs of this file on
  * the dev server with four busy loops and a second vitest process alongside,
  * the slowest single wait was 1369ms (always "the first pass") and the slowest
  * whole case was 1942ms. So the budget is a little over twice the worst case
- * seen under load, and a full second clear of vitest -- enough for the label
- * to appear, which it does: with this budget a wedged wait reports at 4038ms.
+ * seen under load, and -- because the stamp and vitest now start counting at
+ * the same instant -- a full second clear of vitest whatever setup cost. That
+ * second is enough for the label to appear, which it does: with this budget a
+ * wedged wait reports at 4120ms.
  */
 async function waitFor(predicate: () => boolean, label: string, budgetMs = 4_000): Promise<void> {
-  const deadline = caseStartedAt + budgetMs;
+  // A wait outside any case would otherwise get a deadline in 1970 and throw
+  // instantly, naming a wait that never had a chance. Unreachable today.
+  const start = caseStartedAt === 0 ? Date.now() : caseStartedAt;
+  const deadline = start + budgetMs;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -1255,12 +1269,21 @@ describe("AccountSync: pass failures", () => {
     // 32-minute backoff that nothing here ever fires, so the wait for the
     // recovery pass can never end. That is the intermittent the backlog
     // records against this case, and it is why the repair is above the fire.
+    //
+    // The whole-array `toEqual` below pins the LENGTH, which `slice(0, 8)` did
+    // not. It does not catch a ninth wait: measured at that position in the old
+    // source, `clock.requested.length` is 8 with no await after the fire and
+    // still 8 after one microtask -- the ninth entry needs the ninth pass to
+    // have failed first, which takes two database round trips.
     expect(clock.requested).toEqual([
       60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000, 1_920_000, 1_920_000,
     ]);
     expect((await accountRow(accountId)).status).toBe("error");
-    // Nine here would mean a pass has already started against a client that is
-    // still broken, i.e. that the repair below has drifted back after the fire.
+    // A REARRANGEMENT TRIPWIRE, and only that. It reads 8 because the fire is
+    // still below it and the loop is parked; move this block or the fire past
+    // one another and it reads 9. It does NOT catch the repair alone drifting
+    // back below the fire -- that leaves this line where it is, still reading
+    // 8, and the escape below the fire is what catches that one.
     expect(client.connectCalls).toBe(8);
     client.connectError = null;
 

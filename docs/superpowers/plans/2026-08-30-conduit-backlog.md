@@ -286,6 +286,15 @@ uncatchable by design.
    0 in 24 with four busy loops on top.
 2. **`mail-integration.test.ts`'s Dovecot IDLE burst** — 17 of 20 messages. Surfaced during
    v1.1.0 on a diff touching no API source. Opt-in suite, CI-only.
+
+   **A SURVIVING, DIFFERENTLY-SHAPED HAZARD IN `mail-sync.test.ts`, so it does not vanish
+   under the struck-through entry above.** Two cases still assert a NEGATIVE over a
+   wall-clock window: the poll-only degradation case sleeps a bare 50ms and then asserts
+   `sync.stats.passes` is exactly 1, and the SyncManager section has a 30ms sibling. v0.9.1's
+   backlog logged that shape as its own flake candidate. It is **not** the intermittent 7.5
+   Task 4 fixed and was correctly left alone: a scheduler stall there falsifies an assertion
+   and says so by name, rather than wedging into an anonymous timeout. Nothing to fix
+   urgently; something to recognise if either case ever fails.
 3. **`e2e/mobile.spec.ts`'s phone kanban `addStage`** — once in eight runs, hidden by CI's
    two retries. **"Pre-existing" is not established**: `board.tsx:613` put a sticky strip
    directly above that button in v1.1.0, and the file went from 5 serial groups to 7.
@@ -309,9 +318,15 @@ either side of the moment that used to decide it.
 **AND THE DIAGNOSTIC HALF IS WORTH COPYING.** Vitest's default `testTimeout` is 5000ms and
 nothing raises it, so any in-test polling helper with a longer budget can never name the
 wait that stopped moving -- which is why every sighting of the first one arrived anonymous.
-`mail-sync.test.ts`'s helper now takes its budget from the start of the case and stops
-short of vitest's. `mail-move.test.ts` still has the same hole from the other side (a
-`5_000` default, exactly vitest's own); it has one call site and has never flaked.
+`mail-sync.test.ts`'s helper now takes its budget from the start of the case BODY -- stamped
+at the END of `beforeEach`, because `testTimeout` excludes hook time (measured: a 3500ms
+hook plus a 3000ms body passes at 6510ms, a 5600ms body alone dies at 5006ms), so a stamp
+taken before the hook would spend the body's budget on setup. `mail-move.test.ts` still has
+the same hole from the other side (a `5_000` default, exactly vitest's own). **The remedy
+there is the same case-start treatment, NOT a smaller constant** -- its deadline is
+`Date.now() + 5_000` at the call, so a smaller number would only make the label reachable
+when pre-call setup happens to be short. It has one call site and has never flaked; left
+alone deliberately.
 
 ---
 
