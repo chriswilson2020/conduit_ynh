@@ -410,6 +410,15 @@ test.describe.serial("Phone contact salutation", () => {
 const LONG_SALUTATION = "Grootmeester in de Nederlandse Letteren en Wetenschappen Utrecht";
 /** A custom pronoun set long enough to be the widest realistic one. */
 const LONG_PRONOUNS = "hij/hem/zijn, of zij/haar naar gelang de dag";
+/**
+ * A name and an email with NO SPACE TO WRAP AT, which is what actually cut real
+ * data off a phone screen: `flex-1` beside a `w-32 shrink-0` label floors at its
+ * content's min-content width, and an email address has no break opportunity in
+ * it at all. Measured on this build before the fix: 16px past `main` at 320 on
+ * the deal page with this name, 42px on the contact page.
+ */
+const LONG_SURNAME = "Vandenberghemf3k2x9";
+const LONG_EMAIL = "cornelia.vandenberghe@onbreekbaar.example.nl";
 
 test.describe.serial("Phone salutation on the list and on a quote", () => {
   const runId = Date.now().toString(36);
@@ -418,31 +427,40 @@ test.describe.serial("Phone salutation on the list and on a quote", () => {
   let contactId = "";
   let dealId = "";
   let contactName = "";
-  /** The contact whose two boxes hold the widest value the columns allow. */
+  /** The contact whose fields hold the widest values these columns allow. */
   let longTitleContactId = "";
+  /** And a deal linked to it, where the same rows are a flex row at every width. */
+  let longTitleDealId = "";
 
   /**
    * HOW FAR CONTENT RUNS PAST THE EDGE -- MEASURED ON `<main>`, NOT ON THE
    * DOCUMENT, AND THE DIFFERENCE IS THE WHOLE POINT AFTER v1.1.0.
    *
    * The suite's older phone assertions read
-   * `documentElement.scrollWidth - innerWidth`, and that reading has QUIETLY
-   * STOPPED WORKING below the breakpoint. `<main>` now computes
-   * `overflow-x: clip` (Task 2 gave it that so the board's stage picker could
-   * stick), and a clip neither scrolls nor propagates: content over the edge is
-   * CUT, and the document never grows to accommodate it.
+   * `documentElement.scrollWidth - innerWidth`, and THAT READING HAS NEVER
+   * WORKED. An earlier version of this comment blamed Task 2's
+   * `max-md:overflow-clip`, and that was wrong in a way worth keeping on the
+   * record: `<main>` has carried `overflow-auto` since the first web commit of
+   * this project, and a scroll container does not propagate its overflow to its
+   * ancestors any more than a clipped one does. The document never grew, at any
+   * viewport, however far a child ran over.
    *
-   * MEASURED, by injecting a div 200px wider than the viewport into `main` on this
-   * very page: `documentElement.scrollWidth - innerWidth` answered **0** at 390 and at
-   * 320, while `main.scrollWidth - main.clientWidth` answered **224** at both.
-   * A document-level assertion here would be a test that cannot fail.
+   * MEASURED BOTH WAYS, by injecting a div 200px wider than the viewport into
+   * `main`. At 1280, where `main` is `overflow-auto`: the document answered **0**
+   * and `main.scrollWidth - main.clientWidth` answered **472**. At 390, under the
+   * clip: **0** and **224**. `auto` is exactly as opaque as `clip`.
    *
-   * `main`'s own scrollWidth keeps growing under the clip, which is what makes it
-   * the right box to ask -- and it also gives the sweep's "ignore anything inside
-   * its own horizontal scroller" rule for free, since a nested scroll container's
-   * overflow does not propagate to its ancestors either. The contacts table's
-   * `overflow-x-auto` box and the Gantt grid are allowed to scroll by design and
-   * do not register here.
+   * WHAT TASK 2 CHANGED IS THE CONSEQUENCE, NOT THE BLINDNESS, and having the
+   * cause backwards hid how much had never been measured at all: under `auto` the
+   * overflow was at least swipe-reachable, under `clip` it is cut. Three
+   * assertions in e2e/documents.spec.ts had been `0 <= 1` at every viewport since
+   * the day they were written, and are corrected in the same change as this.
+   *
+   * Reading `main` also gives the sweep's "ignore anything inside its own
+   * horizontal scroller" rule for free, since a nested scroll container does not
+   * propagate either. The contacts table's `overflow-x-auto` box, the record
+   * rail's tab strip and the Gantt grid are allowed to scroll by design and do
+   * not register here.
    *
    * The threshold is 1 rather than 0, matching e2e/documents.spec.ts: sub-pixel
    * rounding is not a layout defect, and a row that genuinely does not fit is over
@@ -519,12 +537,26 @@ test.describe.serial("Phone salutation on the list and on a quote", () => {
     // "Prof", and given a different surname so the list filter cannot see it.
     const wide = await create("/api/contacts", {
       firstName: "Cornelia",
-      lastName: `Vandenberghe${attemptId}`,
+      lastName: LONG_SURNAME,
       companyId: company.id,
+      emails: [LONG_EMAIL],
       salutation: LONG_SALUTATION,
       pronouns: LONG_PRONOUNS,
     });
     longTitleContactId = wide.id;
+    // Its own deal, because the Company and Contact rows that were cutting data
+    // off the screen live on the DEAL page as well and are `flex` at every width
+    // there -- the contact page stacks its field card below `sm` and hides half
+    // the defect.
+    const wideDeal = await create("/api/deals", {
+      title: `Phone overflow ${attemptId}`,
+      pipelineId: pipeline.id,
+      stageId: stage.id,
+      companyId: company.id,
+      contactId: wide.id,
+      valueCents: 10_000,
+    });
+    longTitleDealId = wideDeal.id;
   });
 
   test.afterAll(async () => {
@@ -588,34 +620,82 @@ test.describe.serial("Phone salutation on the list and on a quote", () => {
    * hazard is not live here, but a second context costs nothing and keeps the
    * file's "nothing resizes" property true.
    */
-  test("keeps the contact page inside the screen at 390 and at 320", async ({ browser }) => {
-    // Asserted rather than assumed: this is the cap from CONTACT_FIELD_CAPS, and a
-    // constant that quietly came out at 40 characters would be testing nothing.
+  /**
+   * REAL DATA, NOT CUT OFF THE SCREEN -- WHICH IS WHAT THIS GUARD IS FOR.
+   *
+   * v1.1.0 put two picker rows and a revealed text box on the contact page, and
+   * the release's own 18-route sweep called every route clear at 390 and 320.
+   * That sweep was adversarial in ONE dimension: a project name holding a long
+   * unbreakable word. It gave every other field a short value, so it never asked
+   * what a long contact name or an email address does to a `flex-1` cell beside a
+   * `w-32 shrink-0` label -- and those cells floor at their content's min-content
+   * width, which for an email is the entire unbroken string.
+   *
+   * MEASURED ON THIS BUILD, before `min-w-0 break-words` went onto those cells:
+   * `/deals/:id` at 320 with this fixture's 28-character contact name was 16px
+   * past `main`'s content edge, and `/contacts/:id` at 320 was 42px past it. The
+   * data was CUT, not scrollable -- `<main>` clips below the breakpoint -- with no
+   * scrollbar and nothing on screen to say a character was missing. Before Task 2
+   * it was swipe-reachable; the clip is what turned it into loss.
+   *
+   * BOTH ROUTES, because they are not the same layout: the contact page's field
+   * card stacks below `sm` and so hides half the defect, while the deal page's
+   * Company and Contact rows are a flex row at every width.
+   *
+   * AT 320 AS WELL AS 390, and 320 is where it was found: the phone standard is
+   * anchored at 390 and this defect is invisible there.
+   */
+  test("does not cut a long name or email off the screen", async ({ browser }) => {
+    // Asserted rather than assumed: this is the cap from CONTACT_FIELD_CAPS, and
+    // a constant that quietly came out at 40 characters would prove less.
     expect(LONG_SALUTATION).toHaveLength(64);
 
+    for (const [label, path] of [
+      ["the contact page", `/contacts/${longTitleContactId}`],
+      ["the deal page", `/deals/${longTitleDealId}`],
+    ] as const) {
+      for (const width of [390, 320]) {
+        const narrow = await browser.newPage({ ...IPHONE_13, viewport: { width, height: 664 } });
+        try {
+          await narrow.goto(path);
+          // The values are really on screen, so the measurement is of the page
+          // this release ships rather than of an empty one.
+          await expect(narrow.getByText(LONG_SURNAME).first()).toBeVisible();
+
+          await expect
+            .poll(async () => await mainOverflow(narrow), {
+              message: `${label} runs past the edge at ${String(width)}px`,
+            })
+            .toBeLessThanOrEqual(1);
+
+          // AND THE MEASUREMENT CAN FAIL, proved on the page it was just used on
+          // rather than assumed. The clip makes the obvious reading -- the
+          // DOCUMENT's scroll width -- report 0 whatever the content does, so a
+          // guard built on it would be green for ever. This puts something 200px
+          // too wide into `main` and requires the number to move, then takes it
+          // out again, so the assertion above is still the one describing the
+          // shipped page.
+          expect(await overhangOf(narrow, 200)).toBeGreaterThan(100);
+        } finally {
+          await narrow.close();
+        }
+      }
+    }
+  });
+
+  test("keeps the two pickers inside the screen at 390 and at 320", async ({ browser }) => {
     for (const width of [390, 320]) {
       const narrow = await browser.newPage({ ...IPHONE_13, viewport: { width, height: 664 } });
       try {
         await narrow.goto(`/contacts/${longTitleContactId}`);
-        // The boxes are on screen and hold the stored values, so the measurement
-        // below is of the page this release actually produces.
+        // The boxes are on screen and hold the cap in both fields.
         await expect(narrow.getByTestId("salutation-other")).toHaveValue(LONG_SALUTATION);
         await expect(narrow.getByTestId("pronouns-other")).toHaveValue(LONG_PRONOUNS);
-
         await expect
           .poll(async () => await mainOverflow(narrow), {
-            message: `the contact page runs past the edge at ${String(width)}px`,
+            message: `the pickers run past the edge at ${String(width)}px`,
           })
           .toBeLessThanOrEqual(1);
-
-        // AND THE MEASUREMENT CAN FAIL, proved on the page it was just used on
-        // rather than assumed. The clip makes the obvious reading -- the
-        // DOCUMENT's scroll width -- report 0 whatever the content does, so a
-        // guard built on it would be green for ever. This puts something 200px
-        // too wide into `main` and requires the number to move, then takes it
-        // out again, so the assertion above is still the one describing the
-        // shipped page.
-        expect(await overhangOf(narrow, 200)).toBeGreaterThan(100);
       } finally {
         await narrow.close();
       }

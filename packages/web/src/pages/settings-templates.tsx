@@ -157,8 +157,14 @@ function FieldList({ title, fields, note }: {
  * back 38 characters shorter with the letterhead's image silently gone, because
  * template-time sanitising judged an unmerged merge token as a URL, dropped the
  * src and then dropped the whole element. It is now byte-identical for the
- * shipped template, 3,616 in and 3,616 out, and it is EASY TO BREAK FROM THIS
- * SIDE. So:
+ * shipped template, and it is EASY TO BREAK FROM THIS SIDE.
+ *
+ * NO BYTE COUNT HERE ANY MORE. It said "3,616 in and 3,616 out", which was true
+ * of the template Phase 7 seeded and stopped being true the moment v1.1.0's
+ * migration 0011 amended the recipient line -- measured at 3,715 after it. A
+ * figure that a later migration invalidates is a comment that goes stale on
+ * somebody else's change, in a file that change never touches; the property is
+ * "byte-identical", and that is what the round-trip test asserts. So:
  *
  *   - A PLAIN TEXTAREA. Not the rich-text editor the email templates use --
  *     that one serialises through a document model and would rewrite the HTML

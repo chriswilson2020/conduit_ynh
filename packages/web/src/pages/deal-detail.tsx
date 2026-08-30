@@ -333,7 +333,7 @@ export function DealDetailPage() {
 
         <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
           <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Company</span>
-          <div data-testid="field-companyId" className="flex-1 text-sm text-slate-900">
+          <div data-testid="field-companyId" className="min-w-0 flex-1 break-words text-sm text-slate-900">
             {deal.companyId === null ? (
               <span>{"\u2014"}</span>
             ) : linkedCompany ? (
@@ -352,7 +352,7 @@ export function DealDetailPage() {
 
         <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
           <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Contact</span>
-          <div data-testid="field-contactId" className="flex-1 text-sm text-slate-900">
+          <div data-testid="field-contactId" className="min-w-0 flex-1 break-words text-sm text-slate-900">
             {deal.contactId === null ? (
               <span>{"\u2014"}</span>
             ) : linkedContact ? (

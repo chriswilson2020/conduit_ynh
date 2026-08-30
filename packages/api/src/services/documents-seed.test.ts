@@ -304,6 +304,129 @@ describe("the seeded quote template", () => {
     expect(printed).toContain(String.fromCodePoint(0x1f600));
   });
 
+
+  /**
+   * THE LENGTH BOUND REINSTATED THE BUG THE ARRAY FORM CLOSES, which is why it is
+   * gone. `[^\]]` cannot backtrack, so `{0,4096}` bought nothing -- and an array
+   * longer than it fails the alternation, `matchAll` advances INTO the array, and
+   * its own first three entries are read as `<lo> <hi> <destination>`. The real
+   * line disappears and two ids the file never mapped invent characters.
+   */
+  it("reads a destination array longer than any bound a pattern might have carried", () => {
+    // 600 entries at 8 characters each is comfortably past the 4096 the bound was.
+    const entries = Array.from({ length: 600 }, (_, i) => `<${(0x41 + (i % 26)).toString(16).padStart(4, "0")}>`);
+    const table = [
+      "begincmap",
+      "1 beginbfrange", `<0100> <0357> [${entries.join(" ")}]`, "endbfrange",
+      "endcmap",
+    ].join("\n");
+    const built = cmapPdf(table, "BT [<010001010102>] TJ ET\n");
+
+    expect(pdfVisibleText(built)).toContain("ABC");
+  });
+
+  /**
+   * WHITE SPACE INSIDE A HEXADECIMAL STRING IS IGNORED (ISO 32000-1 7.3.4.3), so
+   * `<0024 0044>` is two codes and not one malformed one. A line-wrapping producer
+   * emits this, and so does anything that has been through a `qpdf` pass. Read
+   * naively the run misaligns and the entire line decodes to NOTHING -- silent
+   * loss, which is the shape that makes a `not.toContain` pass for the wrong
+   * reason.
+   */
+  it("ignores white space inside a hexadecimal string, as the spec requires", () => {
+    const table = ["begincmap", "2 beginbfchar", "<0024> <0048>", "<0044> <0069>", "endbfchar", "endcmap"].join("\n");
+    expect(pdfVisibleText(cmapPdf(table, "BT [<0024 0044>] TJ ET\n"))).toContain("Hi");
+    expect(pdfVisibleText(cmapPdf(table, "BT <00240044> Tj ET\n"))).toContain("Hi");
+    // And in the table itself, where a wrapped CMap is just as legal.
+    const wrapped = ["begincmap", "1 beginbfchar", "<00 24> <0048>", "endbfchar", "endcmap"].join("\n");
+    expect(pdfVisibleText(cmapPdf(wrapped, "BT <0024> Tj ET\n"))).toContain("H");
+  });
+
+  /**
+   * A CODE IS TWO BYTES OR IT IS NOT THIS READER'S, and folding a wider one into a
+   * four-digit key made two different codes share an entry. `<000041>` is a
+   * three-byte code in some other codespace; `<0041>` is the one `decodeRun` looks
+   * up. Normalising both to `0041` let the first quietly answer for the second.
+   */
+  it("does not let a three-byte code answer for a two-byte one", () => {
+    const table = [
+      "begincmap",
+      "2 beginbfchar", "<000041> <0058>", "<0041> <0059>", "endbfchar",
+      "endcmap",
+    ].join("\n");
+    const built = cmapPdf(table, "BT <0041> Tj ET\n");
+
+    // The two-byte code's own destination, not the three-byte entry's.
+    expect(pdfVisibleText(built)).toContain("Y");
+    expect(pdfVisibleText(built)).not.toContain("X");
+  });
+
+  /**
+   * A `/name` IS A LEGAL ARRAY ELEMENT, and skipping one shifts every destination
+   * after it by a place -- ids silently mapped to their neighbour's character,
+   * which is the quiet version of the same error the array form closed.
+   */
+  it("counts a glyph name in a destination array rather than shifting past it", () => {
+    const table = [
+      "begincmap",
+      "1 beginbfrange", "<0070> <0072> [<0058> /quoteright <005a>]", "endbfrange",
+      "endcmap",
+    ].join("\n");
+    const built = cmapPdf(table, "BT <007000710072> Tj ET\n");
+
+    const printed = pdfVisibleText(built);
+    // 0070 -> X, 0071 -> the name (unresolvable, so nothing), 0072 -> Z.
+    expect(printed).toContain("XZ");
+    // What the shift produced: Z pulled forward into 0071's place.
+    expect(printed).not.toContain("XZZ");
+  });
+
+  /**
+   * A LITERAL STRING IS TEXT THIS READER USED TO DROP ENTIRELY, and a dropped run
+   * is missing text. It is read now, GATED INSIDE `BT..ET` -- an ungated scan over
+   * the inflated font and image data `pdfText` carries invents characters out of
+   * binary noise, and a text object is where every real show operator lives.
+   */
+  it("reads a literal string shown inside a text object, and nothing outside one", () => {
+    const table = ["begincmap", "1 beginbfchar", "<0024> <0048>", "endbfchar", "endcmap"].join("\n");
+    const content = [
+      "BT (Mevr Zeldenrust) Tj ET",
+      // Escaped parentheses, and separately BALANCED ones -- the two shapes a
+      // `\\(([^)]*)\\)` pattern reads wrongly, and both legal. (An unbalanced
+      // unescaped `(` is not: it never terminates, and this scanner drops it
+      // rather than guessing where the author meant it to end.)
+      "BT (Invoice \\(final\\) ready) Tj ET",
+      "BT (Nested (parens) here) Tj ET",
+      // Outside any text object: an operand, not something on the page.
+      "/Fontname (NotOnThePage) Tj",
+    ].join("\n");
+    const printed = pdfVisibleText(cmapPdf(table, content));
+
+    expect(printed).toContain("Mevr Zeldenrust");
+    expect(printed).toContain("Invoice (final) ready");
+    expect(printed).toContain("Nested (parens) here");
+    expect(printed).not.toContain("NotOnThePage");
+  });
+
+  /**
+   * A RANGE MAY NOT WALK OUT OF A SURROGATE HALF. A destination outside the BMP
+   * ends in a low surrogate, and incrementing past 0xdfff leaves a lone high
+   * surrogate followed by an ordinary character -- a string no producer wrote.
+   */
+  it("stops a bfrange that would walk off the end of a surrogate pair", () => {
+    const table = [
+      "begincmap",
+      "1 beginbfrange", "<0090> <0092> <d83ddfff>", "endbfrange",
+      "endcmap",
+    ].join("\n");
+    const printed = pdfVisibleText(cmapPdf(table, "BT <009000910092> Tj ET\n"));
+
+    // The first id is a legal pair; the next two would step past 0xdfff and
+    // contribute nothing rather than a lone surrogate.
+    expect(printed).toContain(String.fromCharCode(0xd83d, 0xdfff));
+    expect(printed).not.toContain(String.fromCharCode(0xd83d, 0xe000));
+  });
+
   /**
    * THE LIMITATION, PINNED SO NOBODY WIDENS THE COMMENT BACK.
    *

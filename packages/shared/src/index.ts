@@ -1704,13 +1704,17 @@ const UNSTORABLE_TEXT = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\
  * page has no rewriting layer at all, so whatever DOES reach it arrives verbatim.
  * Fewer messages, not more.
  *
- * So: every field built on this function keeps Zod's own English -- the SIX on
- * issueQuoteInputSchema (recipientName, recipientContactName, recipientSalutation,
- * recipientAddress, notes and terms; the two dates are documentDateSchema and `lines`
- * is an array), plus documentLineInputSchema's description, which makes seven call
- * sites. An earlier version of this sentence said "all seven fields" of the schema,
- * which is a different count of a different set -- that schema has eight fields
- * besides `lines` -- and it was stale by exactly the field this release adds. The
+ * So: every field built on this function keeps Zod's own English. There are SIXTEEN
+ * of them -- the eight on orgProfileInputSchema, the six on issueQuoteInputSchema
+ * (recipientName, recipientContactName, recipientSalutation, recipientAddress, notes
+ * and terms; the two dates are documentDateSchema and `lines` is an array),
+ * documentLineInputSchema's description, and the template body. THE ARGUMENT ABOVE
+ * IS ABOUT THE QUOTE FORM'S SEVEN of those, which are the ones `describeIssue`
+ * renames; the org profile and the template editor surface their own messages and
+ * are not what this paragraph reasons about. Two earlier versions of this sentence
+ * miscounted: "all seven fields" of the schema, which is a different count of a
+ * different set, and then "seven call sites", which silently narrowed "every field
+ * built on this function" to the subset being discussed. The
  * naming is `describeIssue`'s job alone -- held there by a test that walks this
  * schema's shape, so the layer that does the naming cannot silently gain a hole. The
  * residual reader is a direct API caller. `parseOrReject` sends `{error, message}`

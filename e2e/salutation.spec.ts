@@ -133,8 +133,19 @@ async function newestDocument(page: Page, dealId: string): Promise<DocumentJson>
  * e2e/documents.spec.ts has a near-neighbour of this that returns a DIGEST; this
  * one returns the BYTES, because every assertion in this file reads the page's
  * text as well as its identity. Left as two small functions rather than folded
- * into one shared one, so that file -- and the 109 tests this release must not
- * move -- is untouched by v1.1.0's e2e work.
+ * into one shared one, so the existing files stay as close to untouched as the
+ * work allows.
+ *
+ * "THE 109 THIS RELEASE MUST NOT MOVE" WAS THE WRONG BASELINE, and this sentence
+ * used to say it. `origin/main` has 105; the 109 already included four tests
+ * v1.1.0's own Tasks 1 and 2 wrote, so quoting it silently counted this release's
+ * work as somebody else's baseline. The release adds THIRTEEN. The property that
+ * actually matters is stronger than the count anyway and is worth stating in its
+ * place: no test that existed before this release has had an executable line
+ * changed by it. e2e/documents.spec.ts's `pageOverflow` is the one exception and
+ * it is a CORRECTION -- it measured the document, which a scroll container has
+ * never propagated to, so its three callers were asserting `0 <= 1` at every
+ * viewport since the day they were written.
  */
 async function downloadQuote(page: Page, number: string): Promise<Buffer> {
   const href = await page.getByTestId(`document-download-${number}`).getAttribute("href");

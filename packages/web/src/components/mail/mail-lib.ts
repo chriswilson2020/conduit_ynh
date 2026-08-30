@@ -315,7 +315,31 @@ function substitute(input: string, context: TemplateContext, escape: (value: str
     const key = PLACEHOLDER_KEYS[path];
     const value = key === undefined ? undefined : context[key];
     if (value != null && value.trim() !== "") return escape(value) + trailingSpace;
-    // `match` carries the trailing space with it, so a name placeholder left literal
+    /**
+     * `undefined` IS NOT THE SAME AS EMPTY, AND CONFLATING THEM LOST A FIELD IN
+     * SENT MAIL.
+     *
+     * BLANK_MEANS_BLANK exists for the contact who HAS no salutation: the
+     * placeholder disappears, takes one following space with it, and `Dear
+     * {{contact.salutation}} {{contact.name}},` reads `Dear Alice,`. That is
+     * right when the composer knows which contact it is writing to.
+     *
+     * The Inbox's own Compose knows no contact at all -- pages/inbox.tsx opens
+     * the composer with no seed, so there is no record behind the draft -- and
+     * there the same rule DELETED the placeholder out of the template with
+     * nothing to show for it. `Dear {{contact.salutation}} {{contact.name}},`
+     * came out as `Dear {{contact.name}},`: the name field stayed visible, the
+     * salutation vanished, and nothing on screen said a field had been dropped.
+     * Composing from a record's Mail tab or replying in a thread was unaffected,
+     * which is exactly the shape of a defect nobody reports.
+     *
+     * So only a value the context actually CARRIES may blank the placeholder.
+     * `null` and `""` mean "this contact has none"; `undefined` means "there is
+     * no contact in scope", and then every path falls back to Phase 4's rule of
+     * leaving the placeholder literal for the user to see and deal with.
+     */
+    if (value === undefined) return match;
+    // `match` carries the trailing space with it, so a placeholder left literal
     // leaves the line exactly as it was written.
     return BLANK_MEANS_BLANK.has(path) ? "" : match;
   });

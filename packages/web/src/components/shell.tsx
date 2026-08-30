@@ -232,11 +232,23 @@ export function Shell({ children }: { children: ReactNode }) {
           this change, and pages/project-detail.tsx, which the first sweep
           missed and where the cost was worse (its Archive button measured 0px
           on screen at both widths, with its centre outside the viewport).
-          All 18 measure 390/390 and 320/320 now, with a project name chosen to
-          hold one long unbreakable word. A future
-          child that does not fit will be clipped instead of scrollable, which
-          is the correct phone posture -- a page that scrolls sideways is the
-          bug -- but it is a silent one, so it is written down here.
+          THAT SWEEP THEN CLAIMED "all 18 measure 390/390 and 320/320", AND IT
+          WAS FALSE ON THIS EXACT BUILD. Its fixture was adversarial in one
+          dimension only -- a project name holding a long unbreakable word --
+          and gave every other field a short value, so it never asked what a
+          long CONTACT NAME or EMAIL does. Measured afterwards on the real app:
+          `/deals/:id` at 320 with a 28-character contact name is 16px over,
+          because the Company and Contact rows are `flex` at every width with a
+          `w-32 shrink-0` label, and a `flex-1` sibling floors at its content's
+          min-content width unless it is told not to. Every one of those value
+          containers carries `min-w-0 break-words` now (see
+          components/field-card.tsx, where the reasoning is written out).
+
+          The lesson is about the sweep rather than the rule: a fixture that is
+          adversarial in one dimension proves one dimension. A future child
+          that does not fit will be clipped instead of scrollable, which is the
+          correct phone posture -- a page that scrolls sideways is the bug --
+          but it is a silent one, so it is written down here.
 
           Desktop keeps `overflow-auto` untouched, per the `max-md:`-over-a-
           desktop-string convention in ui/dialog.tsx.

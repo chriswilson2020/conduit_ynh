@@ -303,8 +303,12 @@ export function contentBudget(draft: DraftQuote): BudgetState {
     recipientContactName: draft.recipientContactName,
     // EVERY FIELD THE SERVER'S GATE COUNTS, and this one is easy to omit
     // because documentContentBytes takes it OPTIONALLY: leaving it out is not
-    // a type error, it is a form that under-reports by up to 64 bytes against
-    // a budget the server measures with the same function. The guard is
+    // a type error, it is a form that under-reports against a budget the
+    // server measures with the same function. BY UP TO 320 BYTES, not 64: the
+    // cap is 64 CHARACTERS and `escapedBytes` charges an `&` five bytes, so a
+    // salutation of 64 ampersands is 320 -- a byte budget and a character cap
+    // are different quantities, and this file is the wrong place to confuse
+    // them. The guard is
     // derived rather than written out -- contentBudget's test walks the keys
     // of DOCUMENT_FIELD_CAPS, which is exactly the set of capped text fields a
     // quote carries, and charges each one in turn.
