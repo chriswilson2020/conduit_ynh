@@ -332,35 +332,68 @@ describe("the Tailwind-in-prose trap", () => {
   const VARIANT = "(?:max-)?(?:sm|md|lg|xl|2xl|hover|focus|active|disabled|group-hover|peer-focus|dark|print)";
   const CLASS_TOKEN = new RegExp(`\\b${VARIANT}:[a-z0-9][a-z0-9./%[\\]()_-]*`, "g");
 
+  /**
+   * EVERY FILE TAILWIND SCANS, WHICH IS NOT THE SAME SET AS "THE SOURCE".
+   *
+   * This walked `.ts`/`.tsx` under `src` and stopped there, and Tailwind does
+   * not: it scans the whole of `packages/web` that is not ignored, whatever the
+   * extension. Proved by dropping a `.md` file in beside the sources -- two
+   * rules appeared in the built stylesheet and the hash moved, with the guard
+   * green throughout. `index.html`, `vite.config.ts` and anything else added
+   * there were in the same hole.
+   *
+   * `node_modules` and `dist` are excluded because Tailwind excludes them, and
+   * binary and lock files because a candidate cannot hide in one usefully.
+   */
+  const SCANNED = /\.(?:tsx?|jsx?|html?|md|mdx|css|json|svg|txt)$/;
+
   function sources(dir: URL): URL[] {
     const out: URL[] = [];
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === "node_modules" || entry.name === "dist") continue;
       if (entry.isDirectory()) out.push(...sources(new URL(`${entry.name}/`, dir)));
-      else if (entry.name.endsWith(".ts") || entry.name.endsWith(".tsx")) {
-        out.push(new URL(entry.name, dir));
-      }
+      else if (SCANNED.test(entry.name)) out.push(new URL(entry.name, dir));
     }
     return out;
   }
 
+  /**
+   * WHICH HALF OF A FILE IS "PROSE" DEPENDS ON THE FILE, and getting that wrong
+   * would make the wider walk useless. A `.md` has no code in it at all, so
+   * every token in one is prose -- treating it as code would let a document
+   * grant tree-wide amnesty to any class it mentions, which is the opposite of
+   * the rule. Everything else keeps the existing split: comments are prose, the
+   * rest is code.
+   */
+  const isProseOnly = (name: string): boolean => name.endsWith(".md") || name.endsWith(".mdx");
+
+  const scannedCorpus = (): { name: string; source: string }[] =>
+    sources(new URL("../", import.meta.url)).map((file) => {
+      const whole = readFileSync(file, "utf8");
+      const name = file.pathname.split("/packages/web/")[1] ?? file.pathname;
+      return { name, source: whole, prose: isProseOnly(name) };
+    }).map(({ name, source, prose }) => ({
+      name,
+      // A prose-only file contributes nothing to the "used in code" set, which
+      // is what `withoutComments` does for the others.
+      source: prose ? `/*${source.replace(/\*\//g, "* /")}*/` : source,
+    }));
+
   it("names no variant-prefixed class in prose that the code does not also use", () => {
-    const files = sources(new URL("./", import.meta.url));
     const inCode = new Set<string>();
     const inProse = new Map<string, string>();
 
-    for (const file of files) {
-      const whole = readFileSync(file, "utf8");
-      const code = withoutComments(whole);
-      for (const match of code.matchAll(CLASS_TOKEN)) inCode.add(match[0]);
-      // Whatever the comments held that the code did not.
+    for (const { name, source } of scannedCorpus()) {
+      const code = withoutComments(source);
       const codeTokens = new Set([...code.matchAll(CLASS_TOKEN)].map((m) => m[0]));
-      for (const match of whole.matchAll(CLASS_TOKEN)) {
-        if (!codeTokens.has(match[0])) inProse.set(match[0], file.pathname);
+      for (const token of codeTokens) inCode.add(token);
+      for (const match of source.matchAll(CLASS_TOKEN)) {
+        if (!codeTokens.has(match[0])) inProse.set(match[0], name);
       }
     }
 
     const onlyInProse = [...inProse].filter(([cls]) => !inCode.has(cls));
-    expect(onlyInProse.map(([cls, where]) => `${cls} (${where.split("/src/")[1] ?? where})`)).toEqual([]);
+    expect(onlyInProse.map(([cls, where]) => `${cls} (${where})`)).toEqual([]);
   });
 
   /**
@@ -396,16 +429,36 @@ describe("the Tailwind-in-prose trap", () => {
    * explained a font stack is worse than no guard, and this repo learned that
    * lesson once already from a looser comment stripper.
    *
+   * WHAT IT DOES NOT CATCH, listed so nobody reads it as a proof:
+   * - a NEGATIVE utility. `-mx-6` in prose matches nothing here, because the
+   *   candidate pattern starts at a letter.
+   * - a family of more than two segments. `familyOf` splits at the LAST hyphen,
+   *   so `grid-cols-2` has the family `grid-cols` (listed) but `inset-x-0`
+   *   resolves to `inset-x` and a four-segment utility would resolve to
+   *   something not on the list at all.
+   * - a class kept alive in a TRAILING `//` comment. test/source.ts strips only
+   *   comments that BEGIN a line, deliberately -- the looser form threw away
+   *   real code after a URL -- so a trailing one is code as far as this is
+   *   concerned, and grants the token amnesty tree-wide.
+   * - a URL. A docs link containing a utility name is code by the same rule and
+   *   whitelists that token everywhere.
+   *
    * WHAT IT STILL CANNOT CATCH, and this is the ruling rather than an
    * oversight: a BARE ENGLISH WORD that is also a utility. `visible`, `block`,
    * `hidden`, `sticky`, `fixed`, `truncate` and `flex` cannot be told apart
    * from prose by any regex, and `.visible{visibility:visible}` is in the
-   * shipped stylesheet today for exactly that reason. Counted before this was
-   * written down: the standalone word "visible" appears 195 times across 61
-   * source files here, every one of them an ordinary English sentence. Closing
-   * that half means banning those words from comments to save 27 bytes, which
-   * is a worse trade than the rule it would enforce. The hyphenated half is
-   * closable and is closed.
+   * shipped stylesheet today for exactly that reason, and it costs 28 bytes:
+   * the rule is `.visible{visibility:visible}`, counted rather than estimated.
+   *
+   * COUNTED UNDER ONE STATED RULE, because the first attempt gave a pair of
+   * numbers no rule produces: the word as a standalone candidate token, over
+   * the files Tailwind actually scans (everything under packages/web that is
+   * not ignored), is 75 occurrences across 30 files. Nearly all are ordinary
+   * English; a few are identifiers, which is the same problem -- `const
+   * { threadId: visible }` compiles a rule too. Closing that half means banning
+   * a common English word from comments AND from local names to save 28 bytes,
+   * which is a worse trade than the rule it would enforce. The hyphenated half
+   * is closable and is closed.
    */
   /**
    * EVERY ENTRY CARRIES A `_` THAT IS STRIPPED, and that is not decoration.
@@ -485,11 +538,30 @@ describe("the Tailwind-in-prose trap", () => {
   }
 
   it("names no hyphenated utility in prose that the code does not also use", () => {
-    const corpus = sources(new URL("./", import.meta.url)).map((file) => ({
-      name: file.pathname.split("/src/")[1] ?? file.pathname,
-      source: readFileSync(file, "utf8"),
-    }));
-    expect(proseOnlyUtilities(corpus)).toEqual([]);
+    expect(proseOnlyUtilities(scannedCorpus())).toEqual([]);
+  });
+
+  /**
+   * THE WALK'S COVERAGE, PINNED -- because narrowing it back to `.ts`/`.tsx`
+   * leaves the suite green until somebody adds the file that needs it, which is
+   * exactly how the hole existed in the first place. A `.md` dropped under
+   * packages/web emitted two rules and moved the built hash with this guard
+   * green throughout.
+   *
+   * Asserted as a property of the corpus rather than of the regex: the walk has
+   * to reach beyond `src` (index.html and vite.config.ts live above it), and
+   * the extension set has to admit the documentation formats Tailwind reads.
+   */
+  it("reads every file type Tailwind scans, not just the sources", () => {
+    const names = scannedCorpus().map((file) => file.name);
+    expect(names).toContain("index.html");
+    expect(names).toContain("vite.config.ts");
+    expect(names.some((name) => name.startsWith("src/"))).toBe(true);
+    expect(names.some((name) => name.includes("node_modules"))).toBe(false);
+    expect(names.some((name) => name.startsWith("dist/"))).toBe(false);
+    for (const extension of [".md", ".mdx", ".html", ".json", ".svg", ".txt", ".css", ".jsx"]) {
+      expect(SCANNED.test(`anything${extension}`), extension).toBe(true);
+    }
   });
 
   /**

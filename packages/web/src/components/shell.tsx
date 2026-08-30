@@ -202,10 +202,9 @@ export function Shell({ children }: { children: ReactNode }) {
           the top of the screen, with the strip's whole purpose defeated.
 
           THE THREE WAYS OUT WERE MEASURED AGAINST EACH OTHER. `visible` fixes
-          sticky and re-opens the defect Phase 6 closed: of fifteen phone pages
-          swept, the deal detail was the one whose content was wider than this
-          box (403 against 390, from its Win/Lose/Archive row), and with
-          `visible` the PAGE itself scrolled sideways (404 against 390).
+          sticky and re-opens the defect Phase 6 closed: the deal detail's
+          Win/Lose/Archive row was wider than this box (403 against 390), and
+          with `visible` the PAGE itself scrolled sideways (404 against 390).
           Bounding the shell with a viewport height
           would make this a real scroller, but `100vh` is the LARGE viewport on
           iOS and the bottom of every phone page would sit under the browser
@@ -216,10 +215,25 @@ export function Shell({ children }: { children: ReactNode }) {
           sideways.
 
           The one thing `clip` costs is that a too-wide child is cut rather than
-          swipe-revealed. That was true of exactly one page and it is now true
-          of none: pages/deal-detail.tsx's action row wraps below the
-          breakpoint, which takes that page's own scroll width back to 390
-          against 390, so all fifteen fit. A future
+          swipe-revealed, so EVERY ROUTE HAS TO FIT. The first sweep said
+          "fifteen pages" and was wrong twice over: it counted a page list
+          rather than the router's, it had no project seeded so two routes never
+          rendered, and its detector counted children of nested scroll
+          containers -- the record rail's tab strip, the task board's columns,
+          the Gantt grid -- which are swipe-reachable by design and are not
+          cuts.
+
+          The sweep is now the ROUTER'S OWN LIST: 18 routes over 18 page
+          components (the two Gantt routes are two components sharing one
+          chart), at 390 and at 320, ignoring anything inside its own
+          horizontal scroller. It found two offenders, both the same shape --
+          a `shrink-0` action group beside a title that cannot shrink -- and
+          both now wrap below the breakpoint: pages/deal-detail.tsx, fixed with
+          this change, and pages/project-detail.tsx, which the first sweep
+          missed and where the cost was worse (its Archive button measured 0px
+          on screen at both widths, with its centre outside the viewport).
+          All 18 measure 390/390 and 320/320 now, with a project name chosen to
+          hold one long unbreakable word. A future
           child that does not fit will be clipped instead of scrollable, which
           is the correct phone posture -- a page that scrolls sideways is the
           bug -- but it is a silent one, so it is written down here.

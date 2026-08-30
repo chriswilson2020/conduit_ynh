@@ -178,14 +178,31 @@ export function ProjectDetailPage() {
           </div>
         )}
 
-        <div className="mb-4 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
+        {/*
+          THE SAME SHAPE AS pages/deal-detail.tsx's HEADER, AND IT WAS MISSED
+          WHEN THAT ONE WAS FIXED.
+          Measured at 390 with a project whose name holds one long unbreakable
+          word: this row ran to 546 against a 390 box, so the Archive button sat
+          off the edge -- and at 320 its centre was outside the viewport
+          entirely, which is a control that cannot be tapped at all. Before
+          components/shell.tsx started clipping below the breakpoint that row
+          was swipe-reachable, so this is that change's own regression and not a
+          pre-existing one.
+          `flex-wrap` drops the action group onto its own line; `min-w-0` on the
+          title beside it is what lets the title shrink at all (a flex item
+          defaults to `min-width: auto`, which floors it at its longest word),
+          and `break-words` is what stops a single long word overflowing the
+          line it has been given. All three are needed: the first two alone
+          still left a 40-character word over the edge, measured.
+        */}
+        <div className="mb-4 flex items-center justify-between gap-4 max-md:flex-wrap">
+          <div className="flex min-w-0 items-center gap-3">
             <span
               aria-hidden="true"
               className="h-4 w-4 shrink-0 rounded-full border border-slate-300"
               style={{ backgroundColor: project.color ?? DEFAULT_COLOR }}
             />
-            <h1 className="text-xl font-semibold text-slate-900">{project.name}</h1>
+            <h1 className="text-xl font-semibold break-words text-slate-900">{project.name}</h1>
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <Link
@@ -235,7 +252,12 @@ export function ProjectDetailPage() {
 
         <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
           <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Start date</span>
-          <div data-testid="field-startDate" className="flex-1">
+          {/* `min-w-0` for the reason pages/deal-detail.tsx's own date row
+              carries it: Chromium's date control has an intrinsic min-content
+              width that a `flex-1` item's default `min-width: auto` cannot
+              shrink past, so at 320 this wrapper ran 185 to 326 against a 320
+              box. Identical defect, identical fix, missed here first time. */}
+          <div data-testid="field-startDate" className="min-w-0 flex-1">
             <input
               type="date"
               value={project.startDate ?? ""}
@@ -248,7 +270,7 @@ export function ProjectDetailPage() {
 
         <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
           <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Due date</span>
-          <div data-testid="field-dueDate" className="flex-1">
+          <div data-testid="field-dueDate" className="min-w-0 flex-1">
             <input
               type="date"
               value={project.dueDate ?? ""}

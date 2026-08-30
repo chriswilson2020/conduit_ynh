@@ -294,6 +294,93 @@ test.describe.serial("Phone navigation and the record rail", () => {
 // 2. The kanban: one stage at a time, with a Move action in place of a drag.
 // ---------------------------------------------------------------------------
 
+/**
+ * THE SALUTATION PICKER'S "Other..." BOX, AT A PHONE VIEWPORT.
+ *
+ * e2e/crm.spec.ts asserts the same rule at a desk, and this is here because
+ * THE FAILURE MODE IS DIFFERENT AT 390 -- measured under the mutation that
+ * removes the fix: at a desk focus lands on the Radix trigger and letter keys
+ * become typeahead, which COMMITS a preset and destroys a stored free-text
+ * title; at 390 focus settles on BODY and the typing is simply lost. A desktop
+ * test shaped around typeahead would not have caught the silent one, so both
+ * widths are driven.
+ *
+ * The three gestures are the three that reach the box: picking "Other..." on a
+ * field that is not on it, RE-PICKING it on a field that already is (Radix
+ * fires no value change for a same-value selection, which the first fix relied
+ * on and so missed), and dismissing the menu with Escape (which fires no value
+ * change either). All three destroyed a stored `Dhr` before this.
+ */
+test.describe.serial("Phone contact salutation", () => {
+  const runId = Date.now().toString(36);
+  let page: Page;
+  let contactId = "";
+
+  test.beforeAll(async ({ browser }) => {
+    page = await browser.newPage({ ...IPHONE_13 });
+  });
+  test.afterAll(async () => {
+    await page.close();
+  });
+
+  test("stores a typed title through the Other... box", async () => {
+    await page.goto("/contacts");
+    await page.getByRole("button", { name: "New" }).click();
+    await page.getByPlaceholder("First name").fill(`Phone ${runId}`);
+    await page.getByRole("button", { name: "Create" }).click();
+    await expect(page).toHaveURL(/\/contacts\/[0-9a-f-]{36}$/);
+    contactId = page.url().split("/").pop() as string;
+
+    await page.getByTestId("salutation").click();
+    await page.getByRole("option", { name: "Other..." }).click();
+    const box = page.getByTestId("salutation-other");
+    await expect(box).toBeFocused();
+    // page.keyboard, not box.fill: this has to go wherever the DOCUMENT has
+    // focus, which is the whole question.
+    await page.keyboard.type("Dhr");
+    await expect(box).toHaveValue("Dhr");
+    await page.keyboard.press("Enter");
+    await page.reload();
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhr");
+  });
+
+  /**
+   * RE-PICKING "Other..." ON A FIELD ALREADY SHOWING IT. Radix fires no
+   * onValueChange for a same-value selection, so a fix keyed on that event does
+   * nothing here -- and the stored `Dhr` was destroyed by the `D` of the next
+   * word, measured.
+   */
+  test("keeps the caret in the box when Other... is picked again", async () => {
+    await page.goto(`/contacts/${contactId}`);
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhr");
+    await page.getByTestId("salutation").click();
+    await page.getByRole("option", { name: "Other..." }).click();
+    await expect(page.getByTestId("salutation-other")).toBeFocused();
+
+    await page.keyboard.type("s");
+    // The stored value is still there and has GAINED the keystroke, rather than
+    // having been replaced by a preset the typeahead matched.
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhrs");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhr");
+  });
+
+  /** Escape closes the menu without any value change at all, and reached it too. */
+  test("keeps the caret in the box when the menu is dismissed", async () => {
+    await page.goto(`/contacts/${contactId}`);
+    await page.getByTestId("salutation").click();
+    await page.getByRole("option", { name: "Other...", exact: true }).waitFor();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("salutation-other")).toBeFocused();
+
+    await page.keyboard.type("x");
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhrx");
+    await page.keyboard.press("Enter");
+    await page.reload();
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhrx");
+  });
+});
+
 test.describe.serial("Phone kanban stage view", () => {
   const runId = Date.now().toString(36);
   let attemptId = "";

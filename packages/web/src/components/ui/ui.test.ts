@@ -296,6 +296,27 @@ describe("the 44px touch floor", () => {
   }
 
   /**
+   * THE REF HAS TO REACH THE ELEMENT, and a guard that only reads the props
+   * TYPE cannot see that it does not.
+   *
+   * `Input` was widened to ComponentPropsWithRef so components/contact-fields
+   * could take focus back from a Radix Select that restores it to the trigger.
+   * Nothing about that type stops somebody writing
+   * `function Input({ className, ref, ...props })` and never forwarding it:
+   * that compiles, passes the whole suite, and silently reintroduces the exact
+   * data loss this release fixed -- typing a title into a box that never has
+   * the caret. So the SHAPE is asserted: className comes out, everything else
+   * goes in, and `ref` is never named on the way past.
+   */
+  it("forwards a ref to the element rather than destructuring it away", () => {
+    const source = component("input.tsx", "Input");
+    expect(source).toMatch(/function Input\(\{\s*className,\s*\.\.\.props\s*\}/);
+    expect(source).toContain("{...props}");
+    const params = /function Input\(\{([^}]*)\}/.exec(source)?.[1] ?? "";
+    expect(params.split(",").map((name) => name.trim())).toEqual(["className", "...props"]);
+  });
+
+  /**
    * The two icon buttons whose whole label is a glyph: they need the floor on
    * BOTH axes, and the height alone leaves a target as narrow as the glyph.
    * The drawer's close was measured at 34.7 x 44 that way -- and below the

@@ -98,11 +98,11 @@ export function Files({ companyId, contactId, dealId, projectId }: FilesProps) {
             {/*
               THE DOWNLOAD LINK HAS NEVER HAD THE 44px FLOOR, and it is the only
               way to get a file back out of the rail. Measured at 390x664 before
-              this line: 64.5 x 17px for a nine-character filename -- an inline
-              box one line of text tall, which is under half the platform
+              this line: 64.5 x 17px for "fixture.txt", eleven characters -- an
+              inline box one line of text tall, which is under half the platform
               minimum. BOTH AXES, because the width is content: 64.5px is what
-              "fixture.txt" happens to measure, and a file called "a.pdf" would
-              be narrower than the floor on its own.
+              that one filename happens to measure, and a file called "a.pdf"
+              would be narrower than the floor on its own.
 
               EVERY PART OF THE FIX IS SCOPED, INCLUDING THE DISPLAY. A height
               floor does nothing to an inline box, so the element has to become

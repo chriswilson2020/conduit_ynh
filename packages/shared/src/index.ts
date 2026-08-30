@@ -1704,7 +1704,13 @@ const UNSTORABLE_TEXT = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\
  * page has no rewriting layer at all, so whatever DOES reach it arrives verbatim.
  * Fewer messages, not more.
  *
- * So: all seven of issueQuoteInputSchema's fields keep Zod's own English, and the
+ * So: every field built on this function keeps Zod's own English -- the SIX on
+ * issueQuoteInputSchema (recipientName, recipientContactName, recipientSalutation,
+ * recipientAddress, notes and terms; the two dates are documentDateSchema and `lines`
+ * is an array), plus documentLineInputSchema's description, which makes seven call
+ * sites. An earlier version of this sentence said "all seven fields" of the schema,
+ * which is a different count of a different set -- that schema has eight fields
+ * besides `lines` -- and it was stale by exactly the field this release adds. The
  * naming is `describeIssue`'s job alone -- held there by a test that walks this
  * schema's shape, so the layer that does the naming cannot silently gain a hole. The
  * residual reader is a direct API caller. `parseOrReject` sends `{error, message}`
@@ -2411,9 +2417,19 @@ export type DocumentRecord = z.infer<typeof documentSchema>;
  * that measured it, and 413,228 - 47,320 is 365,908, which is exactly v1.0.1 raising
  * the logo from 43,715 characters to 409,623. The 47,320 became 47,115 in the same
  * edit that corrected ORG_PROFILE_TEXT_RESERVE_BYTES's INPUT arithmetic from one to
- * the other -- but this row measures a merged DOCUMENT, and the 205 bytes between
- * them are the `<div class="logo"><img ... /></div>` the template prints around the
- * URI. One number, two meanings, one edit applied to both.
+ * the other -- but this row measures a merged DOCUMENT, so the edit did not belong
+ * to it and 47,320 is the figure that stands.
+ *
+ * WHAT THE 205 BETWEEN THEM IS HAS NOW BEEN ASKED AND ONLY PARTLY ANSWERED, and the
+ * answer this comment gave twice was wrong. It said the 205 bytes ARE the markup the
+ * template prints around the URI. That markup is
+ * `<div class="logo"><img src="" alt="" /></div>` once the placeholder is
+ * substituted, which is 45 bytes, counted. So 45 of the 205 are the markup and the
+ * remaining 160 are not attributed to anything -- the row is a difference between two
+ * measurements rather than a sum anybody built, and nothing in this file establishes
+ * what else moved. Left as an open figure rather than given a second story that
+ * happens to fit: the row's own number is the measured one, and the composition of
+ * the gap wants a fresh merge measurement, not a guess.
  *
  * The empty-document row has no such story: 0009's body measures 2,106/2,112 at every
  * commit that has ever held it, so 2,205/2,211 was never reproducible and its
@@ -2495,10 +2511,14 @@ export const MAX_TEMPLATE_BYTES = 16 * 1024;
  *
  * THAT CORRECTION WAS APPLIED TO ONE PLACE TOO MANY, and v1.1.0 put it back. The
  * budget table above has a row measuring a maxed org profile in a MERGED DOCUMENT,
- * which is a different quantity from this reserve: there the 205 bytes are real --
- * they are the `<div class="logo"><img ... /></div>` the template prints around the
- * URI -- so 47,320 was right in that row and was edited to 47,115 along with these.
- * One number, two meanings.
+ * which is a different quantity from this reserve, so 47,320 was right in that row
+ * and was edited to 47,115 along with these. One number, two meanings.
+ *
+ * WHY THE 205 IS 205 THERE IS NOT SETTLED, and this paragraph used to claim it was:
+ * it said the gap IS the `<div class="logo">...</div>` markup the template prints
+ * around the URI. Counted, that markup is 45 bytes. The other 160 are unattributed.
+ * The budget table above carries the same correction; do not re-derive the old story
+ * from this end.
  */
 export const ORG_PROFILE_TEXT_RESERVE_BYTES = 4_285;
 

@@ -198,31 +198,38 @@ export const RECIPIENT_DEFAULT_FIELDS = [
  * corrected, only re-raised under a new number. `recipientContactName` had this
  * before v1.1.0; the salutation makes it one field wider.
  *
- * A GATE ON THE BUTTON WAS THE OTHER OPTION AND IS WORSE. "Disabled until the
- * data is here" reads the same as "disabled" when a query FAILS, and a deal
- * whose company 404s would lose the ability to raise a quote at all with
- * nothing on screen to say why. Seeding late costs nothing when the data is
- * already there and fixes the window when it is not.
+ * `touched` IS AN EXPLICIT SET, AND THE STRING COMPARISON IT REPLACED WAS WRONG
+ * IN EXACTLY THE WINDOW THIS FUNCTION EXISTS FOR. The first version compared
+ * the draft against the LAST SEEDED default and called them equal-means-
+ * untouched. During the loading window that default is `""` -- and so is a
+ * field the user has just CLEARED, which is the one thing the rule was supposed
+ * to tell apart. Measured with the contact GET held open four seconds: typing
+ * into both recipient fields and then clearing them had both overwritten when
+ * the query landed. A set recorded on every edit cannot make that mistake,
+ * because it remembers the ACT rather than trying to infer it from the value.
  *
- * THE UNTOUCHED TEST IS `current === previous`, not `current === ""`. A field
- * the user has cleared on purpose is not the same as one nothing has filled
- * yet, and a blank-means-adopt rule would refill a recipient somebody had just
- * emptied. Comparing against the LAST SEEDED default is what tells those apart.
+ * A GATE ON THE "New quote" BUTTON WAS THE OTHER OPTION AND IS STILL WORSE.
+ * "Disabled until the data is here" reads the same as "disabled" when a query
+ * FAILS, and a deal whose company 404s would lose the ability to raise a quote
+ * at all with nothing on screen to say why. What the form does instead is hold
+ * the SUBMIT while the defaults are in flight, with a line saying so -- see
+ * document-form.tsx, and note that "in flight" and "not arrived" are different
+ * predicates on purpose.
  *
  * Returns only the fields to change, so an unchanged draft keeps its identity
  * and the form does not re-render for nothing.
  */
 export function reseedRecipients(
   current: RecipientDefaults,
-  previous: RecipientDefaults,
   incoming: RecipientDefaults,
+  touched: ReadonlySet<keyof RecipientDefaults>,
 ): Partial<RecipientDefaults> {
   // Mutable inside, readonly to the caller: RecipientDefaults' fields carry
   // `readonly`, which Partial<> preserves.
   const over: { -readonly [K in keyof RecipientDefaults]?: RecipientDefaults[K] } = {};
   for (const field of RECIPIENT_DEFAULT_FIELDS) {
-    if (incoming[field] === previous[field]) continue;
-    if (current[field] !== previous[field]) continue;
+    if (touched.has(field)) continue;
+    if (current[field] === incoming[field]) continue;
     over[field] = incoming[field];
   }
   return over;

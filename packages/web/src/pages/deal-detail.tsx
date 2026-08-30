@@ -58,8 +58,24 @@ const STATUS_CLASSES: Record<string, string> = {
 export function DealDetailPage() {
   const { dealId } = useParams({ from: "/deals/$dealId" });
   const { data: deal, isLoading, error } = useDeal(dealId);
-  const { data: linkedCompany } = useCompany(deal?.companyId ?? "");
-  const { data: linkedContact } = useContact(deal?.contactId ?? "");
+  const companyQuery = useCompany(deal?.companyId ?? "");
+  const contactQuery = useContact(deal?.contactId ?? "");
+  const linkedCompany = companyQuery.data;
+  const linkedContact = contactQuery.data;
+  /**
+   * WHETHER THE QUOTE FORM'S DEFAULTS ARE STILL ON THE WIRE.
+   *
+   * `fetchStatus`, not `isLoading` or `isPending`: a DISABLED query (this deal
+   * has no company, or no contact) sits at `status: "pending"` for ever in
+   * TanStack v5, so anything derived from `isPending` would report "still
+   * loading" on a deal that will never have one. `fetchStatus === "fetching"`
+   * is true only while a request is actually open, which also means a query
+   * that FAILED lifts the gate rather than holding it shut -- see
+   * components/document-form.tsx, where the reason that distinction matters is
+   * written out.
+   */
+  const defaultsInFlight =
+    companyQuery.fetchStatus === "fetching" || contactQuery.fetchStatus === "fetching";
   const { data: pipelineData } = usePipeline(deal?.pipelineId ?? "");
   const updateDeal = useUpdateDeal();
   const archiveDeal = useArchiveDeal();
@@ -233,8 +249,8 @@ export function DealDetailPage() {
           that comment for the rest of the measurements.
         */}
         <div className="mb-4 flex items-center justify-between gap-4 max-md:flex-wrap">
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl font-semibold text-slate-900">{deal.title}</h1>
+          <div className="flex min-w-0 items-center gap-3">
+            <h1 className="text-xl font-semibold break-words text-slate-900">{deal.title}</h1>
             <span
               data-testid="deal-status"
               className={`rounded-full px-2 py-1 text-xs font-medium ${STATUS_CLASSES[deal.status] ?? STATUS_CLASSES.open}`}
@@ -365,6 +381,7 @@ export function DealDetailPage() {
           // else. A quote for a contact without a salutation carries none.
           contactSalutation={linkedContact?.salutation ?? ""}
           companyAddress={linkedCompany?.address ?? ""}
+          defaultsInFlight={defaultsInFlight}
         />
       </div>
       <aside className="min-w-0 lg:w-1/3">
@@ -391,12 +408,15 @@ export function DealDetailPage() {
  * than an omission: a quote already issued never changes, and a corrected quote
  * is a new quote with a new number.
  */
-function DocumentsSection({ deal, companyName, contactName, contactSalutation, companyAddress }: {
+function DocumentsSection({
+  deal, companyName, contactName, contactSalutation, companyAddress, defaultsInFlight,
+}: {
   deal: Deal;
   companyName: string;
   contactName: string;
   contactSalutation: string;
   companyAddress: string;
+  defaultsInFlight: boolean;
 }) {
   const { data: documents = [], isLoading, error } = useDealDocuments(deal.id);
   const [formOpen, setFormOpen] = useState(false);
@@ -432,6 +452,7 @@ function DocumentsSection({ deal, companyName, contactName, contactSalutation, c
                 defaultRecipientContactName={contactName}
                 defaultRecipientSalutation={contactSalutation}
                 defaultRecipientAddress={companyAddress}
+                defaultsInFlight={defaultsInFlight}
                 onIssued={() => setFormOpen(false)}
                 onCancel={() => setFormOpen(false)}
               />

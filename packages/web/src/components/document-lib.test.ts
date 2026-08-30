@@ -314,36 +314,49 @@ describe("reseedRecipients", () => {
     recipientName: "", recipientContactName: "", recipientSalutation: "",
     recipientAddress: "", ...over,
   });
+  const untouched = new Set<keyof RecipientDefaults>();
+  const touched = (...fields: (keyof RecipientDefaults)[]) => new Set(fields);
+
+  const ARRIVED = defaults({
+    recipientName: "Acme Ltd", recipientContactName: "Alice Lovelace",
+    recipientSalutation: "Prof", recipientAddress: "1 Test Way",
+  });
 
   it("adopts a default that arrives after the form opened", () => {
-    const empty = defaults();
-    const arrived = defaults({
-      recipientName: "Acme Ltd", recipientContactName: "Alice Lovelace",
-      recipientSalutation: "Prof", recipientAddress: "1 Test Way",
-    });
-    expect(reseedRecipients(empty, empty, arrived)).toEqual({
+    expect(reseedRecipients(defaults(), ARRIVED, untouched)).toEqual({
       recipientName: "Acme Ltd", recipientContactName: "Alice Lovelace",
       recipientSalutation: "Prof", recipientAddress: "1 Test Way",
     });
   });
 
   /**
-   * THE UNTOUCHED TEST IS `current === previous`, NOT `current === ""`, and the
-   * difference is the whole of the correctness here. A field somebody CLEARED
-   * on purpose looks exactly like one nothing has filled yet, and a
-   * blank-means-adopt rule would refill a recipient they had just emptied.
+   * THE CASE THE PREVIOUS VERSION GOT WRONG, AND IT WAS THE ONLY WINDOW THE
+   * FUNCTION RUNS IN.
+   *
+   * That version compared the draft against the LAST SEEDED default and called
+   * them equal-means-untouched. During the loading window that default is `""`
+   * -- and so is a field the user has just cleared, so the two cases it existed
+   * to tell apart were indistinguishable exactly where it mattered. Measured
+   * with the contact GET held open four seconds: typing into both recipient
+   * fields and clearing them had BOTH overwritten when the query landed.
+   *
+   * A set records the ACT rather than inferring it from the value, so a cleared
+   * field and an unfilled one are different things whatever they both contain.
    */
-  it("leaves an edited field alone, including one deliberately cleared", () => {
-    const previous = defaults({ recipientSalutation: "Dr", recipientName: "Old Ltd" });
-    const current = defaults({ recipientSalutation: "Mx", recipientName: "" });
-    const incoming = defaults({ recipientSalutation: "Prof", recipientName: "New Ltd" });
-    expect(reseedRecipients(current, previous, incoming)).toEqual({});
+  it("keeps a field cleared during the loading window, which the value could not tell", () => {
+    const cleared = defaults();
+    expect(reseedRecipients(cleared, ARRIVED, touched("recipientSalutation", "recipientContactName")))
+      .toEqual({ recipientName: "Acme Ltd", recipientAddress: "1 Test Way" });
   });
 
-  it("changes nothing when the defaults have not moved", () => {
-    const same = defaults({ recipientSalutation: "Prof" });
-    const edited = defaults({ recipientSalutation: "Prof", recipientName: "Typed Ltd" });
-    expect(reseedRecipients(edited, same, same)).toEqual({});
+  it("leaves an edited field alone", () => {
+    const current = defaults({ recipientSalutation: "Mx", recipientName: "Typed Ltd" });
+    expect(reseedRecipients(current, ARRIVED, touched("recipientSalutation", "recipientName")))
+      .toEqual({ recipientContactName: "Alice Lovelace", recipientAddress: "1 Test Way" });
+  });
+
+  it("changes nothing when the defaults already match the draft", () => {
+    expect(reseedRecipients(ARRIVED, ARRIVED, untouched)).toEqual({});
   });
 
   /**
@@ -351,36 +364,24 @@ describe("reseedRecipients", () => {
    * the Recipient box must fill the salutation and leave the box alone -- the
    * two arrive from two different queries and land in one effect.
    */
-  it("adopts only the fields that moved", () => {
-    const previous = defaults();
+  it("adopts only the fields that moved and were not touched", () => {
     const current = defaults({ recipientName: "Half-typed Ltd" });
-    const incoming = defaults({ recipientSalutation: "Prof", recipientContactName: "Alice" });
-    expect(reseedRecipients(current, previous, incoming))
+    const incoming = defaults({
+      recipientName: "Acme Ltd", recipientSalutation: "Prof", recipientContactName: "Alice",
+    });
+    expect(reseedRecipients(current, incoming, touched("recipientName")))
       .toEqual({ recipientSalutation: "Prof", recipientContactName: "Alice" });
   });
 
   /**
-   * AND THE FORM ACTUALLY CALLS IT, WITH THE PREVIOUS DEFAULTS.
-   *
-   * The function above is pure and fully covered, and that is exactly why this
-   * exists: a mutation that passed `incoming` as BOTH arguments turned the
-   * whole re-seed into a no-op and left every test here green, because nothing
-   * asserted the wiring. A source guard is the only unit-level check available
-   * -- packages/web has no testing-library -- and it matches a spelling, so a
-   * rename on both sides would satisfy it.
+   * AN UPSTREAM CLEAR REACHES AN UNTOUCHED FIELD. If the linked company loses
+   * its address while the form is open and nobody has typed in that box, the
+   * box follows the record rather than keeping a value the record no longer
+   * has.
    */
-  it("is wired into the form with the defaults it last applied", () => {
-    const form = withoutComments(
-      readFileSync(new URL("./document-form.tsx", import.meta.url), "utf8"),
-    );
-    expect(form).toContain("const previous = seededDefaults.current;");
-    expect(form).toContain("seededDefaults.current = incoming;");
-    expect(form).toContain("reseedRecipients(current, previous, incoming)");
-    // The effect has to watch all four, or a late default never arrives.
-    for (const field of RECIPIENT_DEFAULT_FIELDS) {
-      const prop = `default${field.charAt(0).toUpperCase()}${field.slice(1)}`;
-      expect(form.split(prop).length, prop).toBeGreaterThanOrEqual(4);
-    }
+  it("follows a default that becomes empty, when nothing has been typed there", () => {
+    expect(reseedRecipients(ARRIVED, defaults({ ...ARRIVED, recipientAddress: "" }), untouched))
+      .toEqual({ recipientAddress: "" });
   });
 
   /** Every field the form seeds is covered, derived rather than listed twice. */
@@ -390,8 +391,64 @@ describe("reseedRecipients", () => {
     const empty = defaults();
     for (const field of RECIPIENT_DEFAULT_FIELDS) {
       const incoming = { ...empty, [field]: "late" } as RecipientDefaults;
-      expect(reseedRecipients(empty, empty, incoming), field).toEqual({ [field]: "late" });
+      expect(reseedRecipients(empty, incoming, untouched), field).toEqual({ [field]: "late" });
+      expect(reseedRecipients(empty, incoming, touched(field)), field).toEqual({});
     }
+  });
+
+  /**
+   * AND THE FORM ACTUALLY CALLS IT, WITH THE SET IT MAINTAINS.
+   *
+   * The function above is pure and fully covered, and that is exactly why this
+   * exists: a mutation that passed the wrong second argument turned the whole
+   * re-seed into a no-op and left every test here green, because nothing
+   * asserted the wiring. A source guard is the only unit-level check available
+   * -- packages/web has no testing-library -- and it matches a spelling, so a
+   * rename on both sides would satisfy it.
+   */
+  it("is wired into the form, recording a touch on every recipient edit", () => {
+    const form = withoutComments(
+      readFileSync(new URL("./document-form.tsx", import.meta.url), "utf8"),
+    );
+    expect(form).toContain("reseedRecipients(current, incoming, touchedRecipients.current)");
+    // The touch is recorded in `patch`, so a fifth field cannot be added
+    // without it, and it is recorded for a CLEAR as much as for a keystroke.
+    expect(form).toContain("if (over[field] !== undefined) touchedRecipients.current.add(field);");
+    // The effect has to watch all four, or a late default never arrives.
+    for (const field of RECIPIENT_DEFAULT_FIELDS) {
+      const prop = `default${field.charAt(0).toUpperCase()}${field.slice(1)}`;
+      expect(form.split(prop).length, prop).toBeGreaterThanOrEqual(4);
+    }
+  });
+
+  /**
+   * THE SUBMIT WAITS WHILE THEY ARE IN FLIGHT, because re-seeding narrows the
+   * window and cannot close it: a quote issued inside it freezes a blank onto a
+   * row that can never be corrected. Gated on IN FLIGHT rather than on arrival,
+   * so a failed query lifts the gate instead of disabling the form for ever.
+   */
+  it("holds the submit while the defaults are still on the wire, and says so", () => {
+    const form = withoutComments(
+      readFileSync(new URL("./document-form.tsx", import.meta.url), "utf8"),
+    );
+    expect(form).toContain("disabled={pending || defaultsInFlight}");
+    expect(form).toContain('data-testid="quote-defaults-loading"');
+    const page = withoutComments(
+      readFileSync(new URL("../pages/deal-detail.tsx", import.meta.url), "utf8"),
+    );
+    // fetchStatus, never isPending: a DISABLED query (a deal with no contact)
+    // sits at pending for ever in TanStack v5, so a gate built on it would
+    // report "still loading" on a deal that will never have one. Scoped to the
+    // derivation -- `isPending` is a legitimate word elsewhere on this page,
+    // where it means a MUTATION is in flight.
+    const derivation = page.slice(
+      page.indexOf("const defaultsInFlight"),
+      page.indexOf(";", page.indexOf("const defaultsInFlight")),
+    );
+    expect(derivation).toContain('companyQuery.fetchStatus === "fetching"');
+    expect(derivation).toContain('contactQuery.fetchStatus === "fetching"');
+    expect(derivation).not.toContain("isPending");
+    expect(derivation).not.toContain("isLoading");
   });
 });
 

@@ -175,6 +175,21 @@ describe("a box holding only whitespace", () => {
   });
 
   /**
+   * `trim()` IS NOT THE RULE, and the difference is not academic. JS trim
+   * strips U+FEFF and U+00A0 but NOT U+200B or U+200F, so the first version of
+   * this rule stored a zero-width space -- which rendered a measured 3.8px
+   * indent in the contacts list and was otherwise indistinguishable from a
+   * cleared field. Every character below is invisible; a box holding only
+   * these holds nothing.
+   */
+  it("clears a box whose only content is invisible, whatever trim would say", () => {
+    for (const blank of ["\u200b", "\u200e", "\u200f", "\ufeff", "\u00a0", "\u200b \u200f"]) {
+      expect(typedValue(blank), JSON.stringify(blank)).toBeNull();
+      expect(blank.trim() === "", `${JSON.stringify(blank)} via trim`).toBe(blank === "\ufeff" || blank === "\u00a0");
+    }
+  });
+
+  /**
    * AND FORMAT CHARACTERS ARE DELIBERATELY NOT POLICED. A stored U+200F can
    * reorder the visible row and `trim` does not remove it -- but the same class
    * holds U+200C, which is load-bearing in Persian and Indic names, and
@@ -184,7 +199,10 @@ describe("a box holding only whitespace", () => {
    */
   it("stores a format character rather than guessing what it was for", () => {
     expect(typedValue("\u200cDhr")).toBe("\u200cDhr");
-    expect(typedValue("\u200f")).toBe("\u200f");
+    expect(typedValue("Dhr\u200c")).toBe("Dhr\u200c");
+    // The rule is about the WHOLE BOX. A value with visible content keeps every
+    // invisible character in it; only a box with nothing visible is empty.
+    expect(typedValue("\u200fDhr\u200f")).toBe("\u200fDhr\u200f");
   });
 });
 
@@ -331,7 +349,14 @@ describe("the pickers and the list, as written", () => {
       picker.indexOf("function commitTyped"),
     );
     expect(handler).toContain("event.preventDefault()");
-    expect(handler).toContain("otherRef.current?.focus()");
+    expect(handler).toContain("box.focus()");
+
+    // THE CONDITION IS THE BOX BEING ON SCREEN, not a flag set by one gesture.
+    // The flag version missed a same-value re-pick (Radix fires no
+    // onValueChange for one) and Escape, and both destroyed a stored free-text
+    // value by typeahead. The handler must read the ref and nothing else.
+    expect(handler).toContain("otherRef.current");
+    expect(picker).not.toContain("openedOther");
   });
 
   /**

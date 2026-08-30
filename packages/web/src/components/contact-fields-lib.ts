@@ -111,25 +111,54 @@ export function chooseOption(option: string): OptionChoice {
  * mean by "no value", and services/contacts.test.ts already names this function
  * as the reason it tests null.
  *
- * A BOX HOLDING ONLY SPACES IS AN EMPTY BOX, and that is a deliberate ruling
- * rather than a stray trim. It is the one place where "store exactly what was
- * typed" and "what you see is what is stored" disagree: a whitespace-only
- * salutation clears `.min(1)`, so it STORED, read back into a box that looked
- * empty, and reached the contacts list as a leading run of spaces before the
- * name. The operator has no way to tell that field from a cleared one, and no
- * way to discover why the list is ragged. Emptiness is a question about the
- * box, not about the value -- so an all-whitespace box clears the field, and
- * every box with any content in it is stored byte for byte, spaces included.
+ * A BOX WITH NOTHING VISIBLE IN IT IS AN EMPTY BOX, and that is a deliberate
+ * ruling rather than a stray trim. It is the one place where "store exactly
+ * what was typed" and "what you see is what is stored" disagree: an invisible
+ * salutation clears `.min(1)`, so it STORES, reads back into a box that looks
+ * empty, and reaches the contacts list where nobody can tell it from a cleared
+ * one -- or find out why the row is not quite aligned with its neighbours.
+ * Emptiness is a question about the box, so a box with no visible content
+ * clears the field and every box with any is stored byte for byte, spaces
+ * included.
  *
- * WHAT THIS DELIBERATELY DOES NOT DO is police format characters. A stored
- * U+200F can reorder the visible row and `trim` does not remove it, but the
- * same class holds U+200C, which is load-bearing in Persian and Indic names --
- * and refusing it would break exactly the people whose titles this field exists
- * to record. A guess about which invisible characters somebody meant is the
- * inference this feature is built to avoid.
+ * `trim()` IS NOT THAT RULE, WHICH IS WHY THIS IS A CHARACTER CLASS. JS `trim`
+ * strips U+FEFF and U+00A0 but NOT U+200B or U+200F, so a zero-width space
+ * survived it, stored, and rendered a measured 3.8px indent in the contacts
+ * list -- precisely the invisible-value-you-cannot-tell-from-cleared this rule
+ * exists to prevent. `\p{Cf}` is what covers those: U+200B through U+200F and
+ * U+FEFF are all format characters.
+ *
+ * AND IT IS ABOUT THE WHOLE BOX, NEVER ABOUT INDIVIDUAL CHARACTERS. `Dhr\u200c`
+ * has visible content and is stored with its joiner intact -- U+200C is
+ * load-bearing in Persian and Indic names, and stripping or refusing it would
+ * break exactly the people whose titles this field exists to record. Only a box
+ * in which NOTHING is visible is treated as empty.
+ *
+ * FIVE SURFACES CARRY THIS VALUE AND THEY DO NOT ALL DO THE SAME THING. That is
+ * deliberate, and worth writing down rather than discovering:
+ *
+ *   this form        an invisible box clears the field. It is the only place
+ *                    that normalises, because it is the only one that can see
+ *                    what the operator meant.
+ *   the API          stores what it is given. `cappedNullableString` is a
+ *                    LENGTH gate plus a storability refinement; deciding what a
+ *                    value MEANS is not a wire concern, and a client that sends
+ *                    a zero-width space has said something deliberate.
+ *   the contacts list  renders it. HTML collapses leading ASCII spaces to 0px,
+ *                    so a spaces-only value was never the "ragged edge" an
+ *                    earlier version of this comment claimed -- it was
+ *                    invisible, which is worse. A zero-width space is 3.8px.
+ *   the mail merge   treats an absent field as nothing and eats one following
+ *                    space (Task 1's SV-1 ruling). An invisible value is not
+ *                    absent, so it renders as itself.
+ *   the quote form   trims its own salutation on submit, because that one is a
+ *                    printed line on an immutable PDF rather than a record of
+ *                    what somebody typed. See document-lib.ts.
  */
+const NOTHING_VISIBLE = /^[\s\p{Cf}]*$/u;
+
 export function typedValue(text: string): string | null {
-  return text.trim() === "" ? null : text;
+  return NOTHING_VISIBLE.test(text) ? null : text;
 }
 
 /**

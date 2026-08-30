@@ -64,12 +64,29 @@ export function PresetOrOtherField({
    * never reached the box, so no unit test could see it: the functions in
    * contact-fields-lib.ts were never called at all.
    *
-   * A ref rather than state because nothing renders from it, and it is CONSUMED
-   * by the close handler below -- so a later close (a preset, a dismissal)
-   * leaves Radix's own restore alone, which is the right behaviour everywhere
-   * except this one option.
+   * THE CONDITION IS "IS THE BOX ON SCREEN", NOT "DID THIS CLICK OPEN IT", and
+   * the first version got that wrong in a way that left the same data loss one
+   * click away. It set a flag inside `onValueChange` -- and Radix does not fire
+   * that for a SAME-VALUE selection, so on a field already showing "Other..."
+   * re-picking "Other..." set nothing, this handler returned early, and focus
+   * went back to the trigger. Measured on a contact holding `Dhr`: typing `Drs`
+   * after the re-pick fired typeahead on the `D`, saved `{"salutation":"Dr"}`
+   * and destroyed `Dhr`. Escape reached it too, since a dismissal fires no
+   * value change at all.
+   *
+   * Reading the ref instead answers the question that actually matters: the box
+   * is rendered exactly when the field is on "Other...", so if it is there the
+   * caret belongs in it, whichever gesture closed the menu. If it is not, there
+   * is nothing to focus and Radix's own restore is the right behaviour -- which
+   * is what every other Select in the app keeps.
+   *
+   * WHAT THIS DOES NOT FIX, deliberately: Escape-then-type on a field showing a
+   * PRESET still commits a preset by typeahead, because the trigger really does
+   * hold focus and that is Radix's behaviour app-wide (the owner picker assigns
+   * an owner from a single `r`). It is handled HERE and not there because this
+   * is the only Select in the app whose typeahead can destroy free text that
+   * has no other home; a preset it overwrites is one click from being restored.
    */
-  const openedOther = useRef(false);
   /**
    * THE VALUE A COMMIT IS IN FLIGHT FOR, so one edit is one request.
    *
@@ -121,20 +138,17 @@ export function PresetOrOtherField({
   function handleOption(next: string) {
     setOption(next);
     const chosen = chooseOption(next);
-    if (chosen.kind === "other") {
-      openedOther.current = true;
-      return;
-    }
+    if (chosen.kind === "other") return;
     setTyped("");
     commit(chosen.value);
   }
 
-  /** See `openedOther`: this is what survives Radix's focus restore. */
+  /** The box wins the caret whenever it is on screen -- see the note above. */
   function takeFocusFromTheMenu(event: Event) {
-    if (!openedOther.current) return;
-    openedOther.current = false;
+    const box = otherRef.current;
+    if (box === null) return;
     event.preventDefault();
-    otherRef.current?.focus();
+    box.focus();
   }
 
   function commitTyped() {
