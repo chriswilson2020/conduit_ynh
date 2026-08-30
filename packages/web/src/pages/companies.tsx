@@ -53,7 +53,7 @@ export function CompaniesPage() {
         rows={rows}
         isLoading={isLoading}
         renderRowLink={(row, name) => (
-          <Link to="/companies/$companyId" params={{ companyId: row.id }} className={ROW_LINK}>
+          <Link to="/companies/$companyId" params={{ companyId: row.id }} {...ROW_LINK}>
             {name}
           </Link>
         )}

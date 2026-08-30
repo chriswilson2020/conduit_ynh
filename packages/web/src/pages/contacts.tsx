@@ -87,7 +87,7 @@ export function ContactsPage() {
         rows={rows}
         isLoading={isLoading}
         renderRowLink={(row, name) => (
-          <Link to="/contacts/$contactId" params={{ contactId: row.id }} className={ROW_LINK}>
+          <Link to="/contacts/$contactId" params={{ contactId: row.id }} {...ROW_LINK}>
             {name}
           </Link>
         )}

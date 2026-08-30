@@ -18,15 +18,16 @@ export interface EntityTableProps<T extends { id: string }> {
   rows: T[];
   /**
    * Makes each row a link to its record: given the row and its FIRST column's
-   * rendered content, return that content wrapped in a router `Link` carrying
-   * the ROW_LINK classes. See components/row-link.ts for what the two halves
-   * do and why this replaced an `onClick` on the row.
+   * rendered content, return that content wrapped in a router `Link` that
+   * spreads ROW_LINK. See components/row-link.ts for what the two halves do
+   * and why this replaced an `onClick` on the row.
    *
    * The caller supplies the whole link rather than a route, because the routes
    * are typed per page ("/companies/$companyId" and its params) and a generic
    * component cannot carry that type through. What it costs is one repeated
-   * `className={ROW_LINK}` in each list page; what it buys is that a wrong
-   * route is still a compile error at the page that owns it.
+   * `{...ROW_LINK}` in each list page; what it buys is that a wrong route is
+   * still a compile error at the page that owns it. ROW_LINK is a props object
+   * precisely so that repetition cannot be got half right.
    */
   renderRowLink?: (row: T, name: ReactNode) => ReactNode;
   /** Called (debounced 200ms) whenever the filter input's text changes. */

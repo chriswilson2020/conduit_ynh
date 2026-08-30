@@ -108,11 +108,19 @@ function PipelineSection({ title, pipelines }: { title: string; pipelines: Pipel
               It needs no ROW_LINK overlay: the anchor is already `block w-full`,
               so it IS the row. Every class is the button's, unchanged, so the
               row renders exactly as it did.
+
+              `draggable={false}` is the one thing it needs that ROW_LINK would
+              otherwise have carried. A button is not draggable and an anchor
+              is, so without it this row would have gained a link-drag the
+              button never had -- the same difference that costs the entity
+              lists their name selection. Spelled out rather than spread,
+              because this link takes no overlay and so takes no ROW_LINK.
             */}
             <Link
               to="/pipelines/$pipelineId"
               params={{ pipelineId: pipeline.id }}
               data-testid={`pipeline-row-${pipeline.id}`}
+              draggable={false}
               className="block w-full px-4 py-3 text-left text-sm text-slate-900 hover:bg-slate-50"
             >
               {pipeline.name}

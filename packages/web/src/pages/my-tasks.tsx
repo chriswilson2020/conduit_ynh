@@ -273,12 +273,7 @@ function TaskRow({
           type badge stay row content, so the link announces "Ship the thing,
           link" instead of reading four columns out as one name.
         */}
-        <Link
-          to="/my-tasks"
-          search={(prev) => ({ ...prev, task: task.id })}
-          replace
-          className={ROW_LINK}
-        >
+        <Link to="/my-tasks" search={(prev) => ({ ...prev, task: task.id })} replace {...ROW_LINK}>
           {task.title}
         </Link>
       </span>

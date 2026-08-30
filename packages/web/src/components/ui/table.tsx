@@ -39,9 +39,14 @@ export function TableBody({ children }: { children: ReactNode }) {
   return <tbody className="divide-y divide-slate-200 max-md:block">{children}</tbody>;
 }
 
-// Spreads the rest of a native <tr>'s attributes (onClick, data-testid, ...)
-// through: entity-table.tsx needs row click handling and per-row test ids,
-// which a children/className-only signature couldn't carry.
+// Spreads the rest of a native <tr>'s attributes (data-testid, ...) through:
+// entity-table.tsx needs per-row test ids, which a children/className-only
+// signature couldn't carry.
+//
+// It needed ROW CLICK HANDLING too until v1.2.0, when the row became a link
+// (see components/row-link.ts). Nothing passes an onClick now; the spread is
+// kept because the test id still needs it, not because a handler might come
+// back.
 export function TableRow({
   children,
   className,

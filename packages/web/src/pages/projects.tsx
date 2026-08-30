@@ -80,7 +80,7 @@ export function ProjectsPage() {
         rows={filtered}
         isLoading={isLoading}
         renderRowLink={(row, name) => (
-          <Link to="/projects/$projectId" params={{ projectId: row.id }} className={ROW_LINK}>
+          <Link to="/projects/$projectId" params={{ projectId: row.id }} {...ROW_LINK}>
             {name}
           </Link>
         )}
