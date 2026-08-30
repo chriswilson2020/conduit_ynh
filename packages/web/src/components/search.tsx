@@ -5,6 +5,7 @@ import { clsx } from "clsx";
 import { useSearch } from "../queries";
 import { subjectLabel } from "./mail/mail-lib";
 import { Input } from "./ui/input";
+import { useTaskDrawerFocus } from "./task-drawer-focus";
 
 type FlatResult =
   | { kind: "company"; key: string; id: string; label: string }
@@ -42,6 +43,24 @@ const GROUP_LABEL: Record<FlatResult["kind"], string> = {
 export function GlobalSearch({ onNavigate }: { onNavigate?: () => void } = {}) {
   const navigate = useNavigate();
   const containerRef = useRef<HTMLDivElement>(null);
+  /**
+   * THIS BOX IS AN OPENER OF THE TASK DRAWER, which is why it holds a ref to
+   * its own input and reaches for a context rather than a local hook. A task
+   * result navigates to `?task=<id>` on the board or on My Tasks, and the
+   * drawer that opens there has no other way to learn what opened it -- see
+   * components/task-drawer.tsx.
+   *
+   * AT A DESK THE BOX SURVIVES that navigation (it is in the shell's header,
+   * outside the router outlet), and if the task is on the route the user is
+   * already on the page does not even re-mount -- so the caret really can come
+   * back here, and was measured landing on `<main>` before this. On a phone the
+   * same box is inside the search SHEET, which closes behind the result: the
+   * input is detached by the time the drawer closes, `isConnected` refuses it,
+   * and the fallback takes over. One capture, correct at both widths for two
+   * different reasons.
+   */
+  const inputRef = useRef<HTMLInputElement>(null);
+  const taskDrawerFocus = useTaskDrawerFocus();
   const [rawQuery, setRawQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [open, setOpen] = useState(false);
@@ -144,6 +163,8 @@ export function GlobalSearch({ onNavigate }: { onNavigate?: () => void } = {}) {
       // invoked from, so it's a real navigation Back should undo -- only a
       // same-route ?task= toggle (the drawer opening/closing without
       // otherwise leaving the page) gets replace: true.
+      // The one branch here that opens a DIALOG rather than only changing route.
+      taskDrawerFocus.capture(inputRef.current);
       if (entry.projectId !== null) {
         void navigate({ to: "/projects/$projectId/board", params: { projectId: entry.projectId }, search: { task: entry.id } });
       } else {
@@ -189,6 +210,7 @@ export function GlobalSearch({ onNavigate }: { onNavigate?: () => void } = {}) {
   return (
     <div data-testid="global-search" ref={containerRef} className="relative">
       <Input
+        ref={inputRef}
         data-testid="search-input"
         value={rawQuery}
         onChange={(event) => {

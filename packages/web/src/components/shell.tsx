@@ -5,6 +5,7 @@ import { useUnreadMailCount } from "../queries";
 import { useIsMobile } from "../use-is-mobile";
 import { BottomNav, MobileSearch } from "./bottom-nav";
 import { GlobalSearch } from "./search";
+import { TaskDrawerFocusProvider } from "./task-drawer-focus";
 import { useSseInvalidation } from "./sse";
 
 // activeProps.className replaces (rather than merges with) the base className
@@ -62,6 +63,14 @@ export function Shell({ children }: { children: ReactNode }) {
   const inSettings = useRouterState({ select: (state) => state.location.pathname.startsWith("/settings") });
 
   return (
+    /*
+      THE PROVIDER WRAPS EVERYTHING because the task drawer's opener is not
+      always on the page the drawer opens on: the header's search box below and
+      the phone sheet's copy of it both navigate to `?task=<id>` on another
+      route. See components/task-drawer.tsx, which owns the context and the
+      reasoning.
+    */
+    <TaskDrawerFocusProvider>
     <div data-testid="shell" className="flex min-h-screen bg-slate-50">
       {/*
         THE SIDEBAR GETS ITS OWN SCROLL ON A SHORT VIEWPORT, and only there.
@@ -296,5 +305,6 @@ export function Shell({ children }: { children: ReactNode }) {
         {isMobile && <BottomNav unreadMail={unreadMail} />}
       </div>
     </div>
+    </TaskDrawerFocusProvider>
   );
 }

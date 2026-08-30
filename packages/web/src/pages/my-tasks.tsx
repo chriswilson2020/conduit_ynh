@@ -3,7 +3,7 @@ import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import type { Task } from "@conduit/shared";
 import { useMe, useMyTasks, useProjects, useSetTaskStatus } from "../queries";
 import { TaskDrawer } from "../components/task-drawer";
-import { useDialogReturnFocus } from "../components/ui/dialog-focus";
+import { useTaskDrawerFocus } from "../components/task-drawer-focus";
 import { ROW_LINK, ROW_LINK_ROW } from "../components/row-link";
 import { TYPE_BADGE, TYPE_LABEL } from "./task-board";
 import { todayLocalIso } from "../lib";
@@ -86,7 +86,7 @@ export function MyTasksPage() {
   // The opening half is also where the drawer's close gets its target: the row
   // anchor records itself, since nothing downstream of the URL can. See
   // components/ui/dialog-focus.ts.
-  const returnFocus = useDialogReturnFocus();
+  const returnFocus = useTaskDrawerFocus();
 
   function closeTask() {
     void navigate({ to: "/my-tasks", search: (prev) => ({ ...prev, task: undefined }), replace: true });

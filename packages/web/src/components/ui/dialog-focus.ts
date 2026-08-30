@@ -39,12 +39,23 @@ import type { RefObject } from "react";
  *   failure is invisible unless the other exit is tried, and `forget()` below
  *   is what separates the two.
  *
- * WHAT THE OTHER TEN ROOTS DO, AND WHY SEVEN OF THEM ARE STILL LEFT ALONE.
- * All ten were measured restoring their trigger on a dismissal. Seven of them
- * ALSO land on `<body>` on their success path -- the create dialogs on
- * companies, contacts, projects, pipelines, a company's contacts and pipelines,
- * and a project's pipelines all `navigate()` in `onSuccess`, which unmounts the
- * whole page the trigger was on.
+ * WHAT THE OTHER TEN ROOTS DO, AND WHY FIVE OF THEM ARE STILL LEFT ALONE. All
+ * ten were measured restoring their trigger on a dismissal, and they divide
+ * three ways at ROOT granularity -- five, two and three.
+ *
+ * FIVE ROOTS ALSO LAND ON `<body>` ON THEIR SUCCESS PATH, because they
+ * `navigate()` in `onSuccess` from a trigger inside the router outlet, so the
+ * whole page the trigger was on unmounts: entity-table.tsx's New (which
+ * companies, contacts and projects share -- five roots, seven surfaces),
+ * pipelines.tsx's, both of company-detail.tsx's, and project-detail.tsx's.
+ *
+ * TWO ROOTS NAVIGATE AND KEEP THEIR TRIGGER, and they are why this counts roots
+ * rather than navigations: bottom-nav.tsx's More sheet and its search sheet are
+ * rendered by the shell, OUTSIDE the outlet. Measured: picking a destination
+ * returns the caret to More, picking a result returns it to the search icon.
+ *
+ * THREE ROOTS DO NOT NAVIGATE AT ALL -- a deal's New quote, the board's New
+ * deal, the task board's New task -- so their trigger is simply still there.
  *
  * THAT IS A ROUTE CHANGE'S DEFECT, NOT A DIALOG'S, and it was measured that way
  * rather than argued: clicking an ordinary company ROW LINK -- no dialog within
@@ -53,12 +64,9 @@ import type { RefObject } from "react";
  * link, whose anchor SURVIVES the navigation, keeps focus on itself. So the
  * rule is "any navigation that unmounts the focused element", and this app has
  * far more of those through row links than through create dialogs. Fixing the
- * seven here would make them the only navigations in the app that land
+ * five here would make them the only navigations in the app that land
  * somewhere, which is a worse kind of inconsistent than landing nowhere. It is
  * recorded in the backlog as one item about routing.
- *
- * The three that do not navigate -- a deal's New quote, the board's New deal,
- * the task board's New task -- keep their trigger and need nothing.
  */
 
 /**
@@ -237,3 +245,25 @@ export function useDialogReturnFocus(fallback?: RefObject<HTMLElement | null>): 
 
   return { capture, forget, restore };
 }
+
+/**
+ * What a consumer gets when no provider is above it -- see
+ * components/task-drawer.tsx's context, which is the only thing that needs a
+ * default at all.
+ *
+ * A CAPTURE-LESS INSTANCE RATHER THAN A NO-OP, deliberately. Nothing captures,
+ * so every close lands on the content landmark, which is exactly what the hook
+ * itself does when its opener never recorded one. A `throw` would turn a
+ * missing provider into a blank page, and a silent no-op would hand the close
+ * back to Radix, which for a trigger-less dialog means `<body>` -- the bug.
+ * Degrading to the fallback is the only one of the three that cannot make
+ * things worse than they were.
+ */
+export const NO_RETURN_FOCUS: DialogReturnFocus = {
+  capture: () => undefined,
+  forget: () => undefined,
+  restore: (event: Event) => {
+    event.preventDefault();
+    mainLandmark()?.focus();
+  },
+};

@@ -22,16 +22,27 @@ import type { Browser, Page } from "@playwright/test";
  * on `<body>` and are the subject of this file: the four driven by state
  * instead of a trigger (the composer, the task drawer, and the two settings
  * dialogs) and the Lose dialog on a deal, which HAS a trigger and still fails
- * because a successful lose unmounts it. The sixteenth caller is the phone
- * board's move sheet, which had this fixed by hand a task earlier and is
- * covered by e2e/mobile.spec.ts's two move tests.
+ * because a successful lose unmounts it. The SIXTH caller of the shared hook is
+ * the phone board's move sheet, which had this fixed by hand a task earlier and
+ * is covered by e2e/mobile.spec.ts's two move tests.
  *
- * TEN ROOTS ARE LEFT TO RADIX and none is asserted here. All ten restore their
- * trigger on a dismissal. SEVEN of them do lose the caret on their success
- * path -- they navigate, which unmounts the page the trigger was on -- and that
- * is deliberately out of scope, because the same `<body>` was measured after
- * clicking an ordinary row link with no dialog in sight. See
- * web: components/entity-table.tsx, which carries the argument.
+ * THE OTHER TEN ROOTS ARE LEFT TO RADIX and none is asserted here. All ten
+ * restore their trigger on a dismissal, and they divide three ways:
+ *
+ *   FIVE navigate on success from a trigger inside the router outlet, so the
+ *   page carrying the trigger unmounts and the caret lands on `<body>`:
+ *   entity-table.tsx's New (three pages share that one root), pipelines.tsx,
+ *   both of company-detail.tsx's, project-detail.tsx's. Deliberately out of
+ *   scope -- the same `<body>` was measured after clicking an ordinary row link
+ *   with no dialog in sight. See web: components/entity-table.tsx.
+ *
+ *   TWO navigate but keep their trigger, because bottom-nav.tsx's More sheet
+ *   and its search sheet are rendered by the shell, OUTSIDE the outlet.
+ *   Measured: picking a destination returns the caret to More, and picking a
+ *   result returns it to the search icon.
+ *
+ *   THREE do not navigate at all -- a deal's New quote, the board's New deal,
+ *   the task board's New task -- so their trigger is simply still there.
  *
  * PROVE THE INSTRUMENT BEFORE TRUSTING A READING, and the first version of the
  * probe behind this file failed exactly that test. FocusScope dispatches its
@@ -64,6 +75,7 @@ async function create(page: Page, path: string, data: unknown): Promise<{ id: st
 interface Fixture {
   readonly projectId: string;
   readonly taskId: string;
+  readonly taskTitle: string;
   readonly archivableTaskId: string;
   readonly pipelineId: string;
   readonly dealId: string;
@@ -81,8 +93,9 @@ interface Fixture {
 async function seed(page: Page, tag: string): Promise<Fixture> {
   const me = (await (await page.request.get("/api/me")).json()) as { user: { id: string } };
   const project = await create(page, "/api/projects", { name: `Focusproj ${tag}` });
+  const taskTitle = `Focustask ${tag}`;
   const task = await create(page, "/api/tasks", {
-    title: `Focustask ${tag}`,
+    title: taskTitle,
     projectId: project.id,
     assigneeUserId: me.user.id,
   });
@@ -102,6 +115,7 @@ async function seed(page: Page, tag: string): Promise<Fixture> {
   return {
     projectId: project.id,
     taskId: task.id,
+    taskTitle,
     archivableTaskId: archivable.id,
     pipelineId: pipeline.id,
     dealId: deal.id,
@@ -166,6 +180,44 @@ function suite(label: string, phone: boolean, open: (browser: Browser) => Promis
       await dismissDrawer();
       await expect(page.getByTestId("task-drawer")).toHaveCount(0);
       await expect(trigger).toBeFocused();
+    });
+
+    /**
+     * THE OPENER THAT IS NOT ON THE PAGE THE DRAWER OPENS ON. Global search
+     * navigates to `?task=<id>`, and when the task is on the route already
+     * showing -- searching a task in the project whose board is open -- the
+     * page never re-mounts and the search box is still sitting there. Measured
+     * landing on `<main>` before components/task-drawer-focus.ts existed: a
+     * live control on screen, and the caret dumped at the top of the content.
+     *
+     * IT IS THE ONE CASE THE FALLBACK CANNOT BE MISTAKEN FOR, which is why it
+     * is asserted rather than left to the deep-link test: `<main>` is also the
+     * CORRECT answer for a legitimately retired opener, so nothing else here
+     * can tell a missing capture from a working one.
+     *
+     * At 390 the same box lives inside the search sheet, which closes behind
+     * the result -- so the input is detached and the fallback is right there.
+     * Both are asserted, because they are different answers for one action.
+     */
+    test("a drawer opened from global search goes back to the search box", async () => {
+      await page.goto(`/projects/${fixture.projectId}/board`);
+      const box = page.getByTestId("search-input");
+      if (phone) await page.getByTestId("open-search").click();
+      await box.fill(fixture.taskTitle);
+      const result = page.getByTestId("search-result").filter({ hasText: fixture.taskTitle });
+      await expect(result).toHaveCount(1);
+      await result.click();
+      await expect(page.getByTestId("task-drawer")).toBeVisible();
+      await dismissDrawer();
+      await expect(page.getByTestId("task-drawer")).toHaveCount(0);
+      if (phone) {
+        // The instrument: the sheet took the box with it, so the fallback is
+        // the only honest answer here.
+        await expect(box).toHaveCount(0);
+        await expect(page.locator("main")).toBeFocused();
+      } else {
+        await expect(box).toBeFocused();
+      }
     });
 
     /**

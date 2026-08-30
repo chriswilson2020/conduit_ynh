@@ -135,8 +135,11 @@ export function Composer({ open, onOpenChange, seed, returnFocus }: ComposerProp
          * `if (!container.contains(document.activeElement))` (dist/index.mjs:80),
          * so focus already inside the content means the AUTOFOCUS_ON_MOUNT
          * event is never even dispatched and focusFirst never runs. That is
-         * what ui/dialog.tsx:189-192 has said correctly all along (it was
-         * 175-178 until v1.2.0 put a block above it in that file), and a
+         * what ui/dialog.tsx's "A HAZARD THIS CREATES FOR THE NEXT DIALOG"
+         * note has said correctly all along -- named rather than cited by
+         * line, because a line number into that file has now rotted twice in
+         * one task, both times because this task edited the file above it --
+         * and a
          * reviewer measured it: a conditional autoFocus on the To input lands
          * correctly with no onOpenAutoFocus at all, chip and combobox ahead of
          * it or not.

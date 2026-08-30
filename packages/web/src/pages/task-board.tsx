@@ -9,7 +9,7 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
 import { TaskDrawer } from "../components/task-drawer";
-import { useDialogReturnFocus } from "../components/ui/dialog-focus";
+import { useTaskDrawerFocus } from "../components/task-drawer-focus";
 import {
   KanbanEmptyPlaceholder, kanbanSortableItems, useKanbanBoard, useKanbanCardSortable, useKanbanColumnDroppable,
 } from "../components/kanban-core";
@@ -55,7 +55,7 @@ export function TaskBoardPage() {
   // it was -- so the capture happens in the handler that opens the drawer, not
   // inside it. components/ui/dialog-focus.ts says why that is the only place
   // it can happen.
-  const returnFocus = useDialogReturnFocus();
+  const returnFocus = useTaskDrawerFocus();
 
   function openTask(id: string, trigger: HTMLElement | null) {
     returnFocus.capture(trigger);

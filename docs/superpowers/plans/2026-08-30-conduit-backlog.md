@@ -175,11 +175,13 @@ Router moves focus nowhere. A SIDEBAR link, whose anchor survives the navigation
 focus on itself, which is what isolates the rule: it is not "navigation", it is "the
 focused element went away".
 
-**Seven create dialogs are one entrance to it** and were left alone for that reason:
+**Five `<Dialog>` roots -- seven dialog surfaces -- are one entrance to it** and were left
+alone for that reason (`entity-table.tsx`'s New is one root that companies, contacts and
+projects share):
 `entity-table.tsx`'s New (companies, contacts, projects), `pipelines.tsx`, both of
 `company-detail.tsx`'s, and `project-detail.tsx`'s all `navigate()` in `onSuccess`. Each
-was measured landing on `<body>`. `components/ui/dialog-focus.ts` would fix all seven in
-one line each -- deliberately not applied, because that would make them the only
+was measured landing on `<body>`. `components/ui/dialog-focus.ts` would fix all five roots
+in one line each -- deliberately not applied, because that would make them the only
 navigations in the app that land anywhere, and row links are by far the commoner path to
 the same destination pages. Each of the five roots carries a comment saying so.
 

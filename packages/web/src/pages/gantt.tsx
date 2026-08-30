@@ -2,7 +2,7 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { useProject } from "../queries";
 import { GanttChart } from "../components/gantt/chart";
 import { TaskDrawer } from "../components/task-drawer";
-import { useDialogReturnFocus } from "../components/ui/dialog-focus";
+import { useTaskDrawerFocus } from "../components/task-drawer-focus";
 
 /**
  * The real Gantt (Task 9), replacing project-gantt-placeholder.tsx (deleted
@@ -20,7 +20,7 @@ export function ProjectGanttPage() {
   const navigate = useNavigate();
   const { data: project } = useProject(projectId);
 
-  const returnFocus = useDialogReturnFocus();
+  const returnFocus = useTaskDrawerFocus();
 
   function openTask(id: string, trigger: HTMLElement | null) {
     returnFocus.capture(trigger);
@@ -56,7 +56,7 @@ export function GlobalGanttPage() {
   const { task: openTaskId } = useSearch({ from: "/gantt" });
   const navigate = useNavigate();
 
-  const returnFocus = useDialogReturnFocus();
+  const returnFocus = useTaskDrawerFocus();
 
   function openTask(id: string, trigger: HTMLElement | null) {
     returnFocus.capture(trigger);
