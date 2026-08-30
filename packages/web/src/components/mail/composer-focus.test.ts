@@ -151,3 +151,29 @@ describe("the signature append leaves the caret where the user put it", () => {
     expect(richText).toContain("updateSelection: false");
   });
 });
+
+describe("the composer stamps its signature guard from what it appended", () => {
+  /**
+   * THE v1.2.1 FIX IS A COUPLING, AND THIS IS WHAT STOPS IT BEING UNCOUPLED BY
+   * OMISSION. mail-lib's signatureAppend hands back the guard key together
+   * with the HTML, so the effect has no key to stamp unless a signature was
+   * actually found; the rule's own behaviour is tested beside it in
+   * mail-lib.test.ts, sequence by sequence. What is left for this file is that
+   * the composer still takes its key from there instead of building one.
+   *
+   * THE DEFECT IT REPLACES WAS INVISIBLE TO EVERY BROWSER TEST IN THIS REPO. A
+   * `signedFor.current` assignment restored above the lookup only loses a
+   * signature while the selected account is missing from the accounts list,
+   * and every e2e fixture here has a warm one. Measured in Chromium against
+   * the real component with the accounts request held for 800ms: the body
+   * ended empty.
+   *
+   * NARROW ON PURPOSE, in the shape this file's header records for the rest of
+   * its assertions -- it stops a deleted line, not a determined author. A
+   * hand-built key assigned somewhere else in the effect would satisfy it.
+   */
+  it("stamps only the key signatureAppend handed back", () => {
+    const effect = between(composer, "const append = signatureAppend({", "appendAtEnd");
+    expect(effect).toContain("signedFor.current = append.key;");
+  });
+});

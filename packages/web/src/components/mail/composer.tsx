@@ -19,7 +19,7 @@ import {
   htmlIsBlank,
   parseRecipientInput,
   resolveRecipients,
-  signatureBlock,
+  signatureAppend,
   substitutePlaceholdersHtml,
   templateSubject,
   type ComposerLinks,
@@ -279,21 +279,24 @@ function ComposerForm({ seed, onClose, ref }: {
    * may have rewritten, and TipTap's schema will have normalised the markup
    * anyway, so there is nothing reliable left to match on.
    *
-   * Keying the guard on the editor EPOCH rather than on the account alone is
-   * what makes this robust: an editor that gets rebuilt (a remount, or a
-   * TipTap version that recreates its instance) announces itself again, so
-   * the fresh, empty document gets the signature instead of silently losing
-   * it -- and because the append only ever runs after onCreate, it can never
-   * race the editor's own construction.
+   * THE RULE ITSELF LIVES IN mail-lib's signatureAppend, which carries the
+   * guard key, the epoch, and the reordering that made the two arrive
+   * together. What is left here is the two things a pure function cannot do:
+   * remember what was signed, and touch the editor. Nothing constructs a key
+   * on this side, which is what stops the old ordering coming back by
+   * omission -- and because the append only ever runs after onCreate, it can
+   * never race the editor's own construction.
    */
   useEffect(() => {
-    if (editorEpoch === 0 || selectedAccountId === null) return;
-    const key = `${editorEpoch}:${selectedAccountId}`;
-    if (signedFor.current === key) return;
-    signedFor.current = key;
-    const signature = sendableAccounts.find((account) => account.id === selectedAccountId)?.signatureHtml;
-    if (signature == null || signature === "") return;
-    editorRef.current?.appendAtEnd(signatureBlock(signature));
+    const append = signatureAppend({
+      editorEpoch,
+      selectedAccountId,
+      accounts: sendableAccounts,
+      signedFor: signedFor.current,
+    });
+    if (append === null) return;
+    signedFor.current = append.key;
+    editorRef.current?.appendAtEnd(append.html);
   }, [editorEpoch, selectedAccountId, sendableAccounts]);
 
   /**
@@ -319,21 +322,31 @@ function ComposerForm({ seed, onClose, ref }: {
    * has to be an auto-waiting toBeFocused rather than a one-shot read of
    * document.activeElement.
    *
-   * DECLARED AFTER THE SIGNATURE EFFECT ON PURPOSE, so on the epoch that
-   * carries both, the signature is appended and THEN the caret is placed.
-   * THEY DID FIGHT, AND THE FIRST VERSION OF THIS COMMENT SAID THEY COULD NOT.
-   * appendAtEnd's own comment claims it does not move the caret; it moved the
-   * SELECTION, because TipTap's insertContentAt updates it by default, and a
-   * reply typed into the instant it opened put "TOPLINE" inside the signature
-   * as "-- Vriendelijke groet, s302227TOPLINE". updateSelection:false on the
+   * DECLARED AFTER THE SIGNATURE EFFECT, AND THE ORDER THAT BUYS ONLY HOLDS
+   * ON A WARM ACCOUNTS CACHE. On the epoch that carries both, the signature is
+   * appended and THEN the caret is placed. THEY DID FIGHT, AND THE FIRST
+   * VERSION OF THIS COMMENT SAID THEY COULD NOT. appendAtEnd's own comment
+   * claims it does not move the caret; it moved the SELECTION, because
+   * TipTap's insertContentAt updates it by default, and a reply typed into the
+   * instant it opened put "TOPLINE" inside the signature as
+   * "-- Vriendelijke groet, s302227TOPLINE". updateSelection:false on the
    * append settles it; rich-text.tsx's focus() carries a deliberately
    * redundant "start" beside it, and says so.
    *
-   * AND THE ORDERING ONLY HOLDS ON A WARM ACCOUNTS CACHE, which is worth
-   * naming because a bug recorded in the backlog will change it: the signature
-   * effect returns early while sendableAccounts is still empty, so on a cold
-   * cache the append lands on a LATER pass, after the caret. That is the case
-   * updateSelection:false covers and the reason it is not optional.
+   * ON A COLD ACCOUNTS CACHE THE APPEND LANDS ON A LATER PASS, AFTER THE
+   * CARET -- WHICH IS WHAT THIS COMMENT ALREADY CLAIMED AND WHAT THE CODE DID
+   * NOT DO. The signature effect used to claim its guard key before looking
+   * the signature up, so the pass that ran with the account still missing from
+   * sendableAccounts took the pair and appended nothing, and the pass that
+   * followed the accounts arriving returned early on that same key. There was
+   * no later pass and no signature at all. v1.2.1 reordered it (mail-lib's
+   * signatureAppend) and the sentence is now true of the code as well.
+   *
+   * WHICH MAKES updateSelection:false LOAD-BEARING ON THIS PATH TOO, not only
+   * on the account switch its e2e journey covers. Measured in Chromium against
+   * this component with GET /api/mail/accounts held for 800ms, on a
+   * reply-shaped seed: with the option, a word typed after the deferred append
+   * reads "TOPLINE -- <signature>"; without it, "-- <signature>TOPLINE".
    */
   useEffect(() => {
     if (editorEpoch === 0 || !bodyFocusPending.current) return;

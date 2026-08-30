@@ -40,6 +40,7 @@ import {
   PLACEHOLDER_KEYS,
   resolveRecipients,
   sendFailureMessage,
+  signatureAppend,
   signatureBlock,
   substitutePlaceholders,
   substitutePlaceholdersHtml,
@@ -563,6 +564,127 @@ describe("htmlIsBlank", () => {
 describe("signatureBlock", () => {
   it("separates the signature from the body with an empty paragraph", () => {
     expect(signatureBlock("<p>Chris</p>")).toBe("<p></p><p>Chris</p>");
+  });
+});
+
+describe("signatureAppend", () => {
+  const SIGNATURE = "<p>-- Vriendelijke groet</p>";
+  const signed = { id: "acct-signed", signatureHtml: SIGNATURE };
+  const plain = { id: "acct-plain", signatureHtml: null };
+
+  /**
+   * ComposerForm's effect, line for line: a ref remembering the last claimed
+   * key, one call per pass, and the key stamped only from what came back.
+   * The tests below are SEQUENCES because the defect this function replaces
+   * was only ever visible as one -- a single pass in isolation looked correct
+   * either way.
+   */
+  function drive(
+    passes: readonly {
+      editorEpoch: number;
+      selectedAccountId: string | null;
+      accounts: readonly { id: string; signatureHtml: string | null }[];
+    }[],
+  ): string[] {
+    let signedFor: string | null = null;
+    const appended: string[] = [];
+    for (const pass of passes) {
+      const append = signatureAppend({ ...pass, signedFor });
+      if (append === null) continue;
+      signedFor = append.key;
+      appended.push(append.html);
+    }
+    return appended;
+  }
+
+  it("appends nothing before the editor has announced itself", () => {
+    expect(signatureAppend({
+      editorEpoch: 0, selectedAccountId: signed.id, accounts: [signed], signedFor: null,
+    })).toBeNull();
+  });
+
+  it("appends nothing while no account is selected", () => {
+    expect(signatureAppend({
+      editorEpoch: 1, selectedAccountId: null, accounts: [signed], signedFor: null,
+    })).toBeNull();
+  });
+
+  it("appends the signature once, and the next pass on the same pair adds nothing", () => {
+    expect(drive([
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [signed] },
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [signed] },
+    ])).toEqual([signatureBlock(SIGNATURE)]);
+  });
+
+  /**
+   * THE COLD ACCOUNTS CACHE, AND THE CASE THIS FUNCTION EXISTS FOR. The
+   * composer's account selection can be settled before the accounts list is:
+   * `accountId` is seeded into state on the first render, while
+   * `sendableAccounts` is derived from a query that may still be in flight. So
+   * the epoch-1 pass runs with a selected account that is not in the list yet.
+   *
+   * IT MUST CLAIM NOTHING. The effect used to stamp the key first and look the
+   * signature up afterwards, so this first pass took the pair, appended
+   * nothing, and the pass that followed the accounts arriving returned early
+   * on the key it had just taken -- the signature was gone for the life of
+   * that composer. Reverting the ordering fails this case and the two below
+   * it; measured in Chromium against the real component as well, with the
+   * accounts request held for 800ms.
+   */
+  it("claims nothing while the selected account is missing, and signs when it arrives", () => {
+    expect(drive([
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [] },
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [signed] },
+    ])).toEqual([signatureBlock(SIGNATURE)]);
+  });
+
+  /**
+   * THE SAME SHAPE ONE STEP FURTHER IN, because "not in the list yet" and "in
+   * the list with nothing to append" are two different absences and only the
+   * first is about a cold cache. An account whose signature is set while the
+   * composer is open is a settings edit in another tab, which invalidates
+   * ["mail-accounts"] and re-runs this effect.
+   */
+  it("claims nothing for an account with no signature, so a later one still lands", () => {
+    expect(drive([
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [{ ...signed, signatureHtml: null }] },
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [signed] },
+    ])).toEqual([signatureBlock(SIGNATURE)]);
+  });
+
+  /**
+   * SWITCHING ACCOUNTS APPENDS THE NEW SIGNATURE rather than replacing the old
+   * block -- see the composer's own note on why nothing tries to find and
+   * remove it. The plain account contributes nothing and, crucially, does not
+   * consume the signed account's turn.
+   */
+  it("signs each account of a switch in turn", () => {
+    expect(drive([
+      { editorEpoch: 1, selectedAccountId: plain.id, accounts: [plain, signed] },
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [plain, signed] },
+      { editorEpoch: 1, selectedAccountId: plain.id, accounts: [plain, signed] },
+    ])).toEqual([signatureBlock(SIGNATURE)]);
+  });
+
+  /**
+   * A REBUILT EDITOR IS A FRESH, EMPTY DOCUMENT, which is why the guard is
+   * keyed on the epoch and not on the account alone: the same account signs
+   * again rather than the new document silently going out unsigned.
+   */
+  it("signs again on a new editor epoch", () => {
+    expect(drive([
+      { editorEpoch: 1, selectedAccountId: signed.id, accounts: [signed] },
+      { editorEpoch: 2, selectedAccountId: signed.id, accounts: [signed] },
+    ])).toEqual([signatureBlock(SIGNATURE), signatureBlock(SIGNATURE)]);
+  });
+
+  // mailAccountSchema stores `min(1).nullable()`, so "" never arrives off the
+  // wire; the arm exists because the parameter's type admits it and an empty
+  // signature must not put a bare separator paragraph in the body.
+  it("treats an empty signature as no signature", () => {
+    expect(signatureAppend({
+      editorEpoch: 1, selectedAccountId: signed.id, accounts: [{ ...signed, signatureHtml: "" }], signedFor: null,
+    })).toBeNull();
   });
 });
 

@@ -487,6 +487,80 @@ export function signatureBlock(signatureHtml: string): string {
   return `<p></p>${signatureHtml}`;
 }
 
+/** As much of a mail account as the signature rule below reads. */
+export interface SignatureAccount {
+  id: string;
+  signatureHtml?: string | null;
+}
+
+/**
+ * What one pass of the composer's signature effect should do: the key to
+ * stamp AND the HTML to append, or nothing at all. Never one without the
+ * other, which is the whole point -- see signatureAppend.
+ */
+export interface SignatureAppend {
+  key: string;
+  html: string;
+}
+
+/**
+ * ONE PASS OF THE COMPOSER'S SIGNATURE EFFECT, AS A DECISION RATHER THAN AN
+ * EFFECT BODY. Extracted for the reason composerInitialFocus above was: this
+ * package has no testing-library, so a rule that stays inside a component has
+ * no unit-level check at all.
+ *
+ * The selected account's signature is appended ONCE, at the end of the body,
+ * for each (editor epoch, account) pair -- the initial auto-selection
+ * included. `signedFor` is the key the last append claimed. Keying on the
+ * editor EPOCH rather than on the account alone is what makes that robust: an
+ * editor that gets rebuilt announces itself again, so the fresh, empty
+ * document gets the signature instead of silently losing it.
+ *
+ * THE KEY COMES BACK WITH THE HTML, AND THAT COUPLING IS THE FIX. The effect
+ * used to stamp the key and look the signature up afterwards, so a pass that
+ * ran while the accounts list was still empty claimed the key and appended
+ * nothing -- and the pass that ran when the accounts arrived returned early on
+ * that same key. The signature was then lost for the life of that composer.
+ * A caller has no key to stamp unless this returned one, so it cannot claim a
+ * pair it did not sign.
+ *
+ * MEASURED IN CHROMIUM AGAINST THE REAL COMPONENT, with GET /api/mail/accounts
+ * held for 800ms: a seed carrying an accountId ended with an empty body, and
+ * the same seed against an already-resolved accounts cache ended holding the
+ * signature. So did a seed carrying no accountId at all against the cold one,
+ * because a null selection makes this return null WITHOUT a key.
+ *
+ * THAT STATE IS NOT ONE THE APP CAN REACH TODAY, and the record is worth more
+ * than the fix. Only a reply or a forward seeds an accountId, and
+ * conversation.tsx builds it by searching the same ["mail-accounts"] query the
+ * composer reads -- so a seeded accountId implies a resolved cache, and a
+ * Reply clicked early enough to beat the accounts arrives carrying no
+ * accountId (measured in the same harness: the signature lands). The ordering
+ * is corrected anyway because the next caller to seed an account id from
+ * somewhere else -- a route parameter, a per-record default, a restored draft
+ * -- reopens it with no other line changing.
+ */
+export function signatureAppend(args: {
+  editorEpoch: number;
+  selectedAccountId: string | null;
+  accounts: readonly SignatureAccount[];
+  signedFor: string | null;
+}): SignatureAppend | null {
+  const { editorEpoch, selectedAccountId, accounts, signedFor } = args;
+  // Epoch 0 is "the editor has not announced itself yet", so there is nothing
+  // to append TO -- see RichTextEditor's onCreate.
+  if (editorEpoch === 0 || selectedAccountId === null) return null;
+  const key = `${editorEpoch}:${selectedAccountId}`;
+  if (signedFor === key) return null;
+  const signature = accounts.find((account) => account.id === selectedAccountId)?.signatureHtml;
+  // Three absences, not one: no such account in the list (undefined), an
+  // account with no signature set (null), and the empty string, which
+  // mailAccountSchema's own `min(1).nullable()` does not currently allow
+  // through but which is what a caller with a looser type would send.
+  if (signature === undefined || signature === null || signature === "") return null;
+  return { key, html: signatureBlock(signature) };
+}
+
 /** The four record links a composed thread can carry (sendMailInputSchema's
  * own `links` shape). */
 export interface ComposerLinks {
