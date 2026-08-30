@@ -402,6 +402,15 @@ test.describe.serial("Phone contact salutation", () => {
  * the picker is the group above's journey and re-driving it would put that
  * surface in this one's failure path.
  */
+/**
+ * The widest a salutation can be: CONTACT_FIELD_CAPS puts both fields at 64
+ * characters, and a real Dutch honorific of exactly that length is what the
+ * "Other..." box has to render without pushing the page off the screen.
+ */
+const LONG_SALUTATION = "Grootmeester in de Nederlandse Letteren en Wetenschappen Utrecht";
+/** A custom pronoun set long enough to be the widest realistic one. */
+const LONG_PRONOUNS = "hij/hem/zijn, of zij/haar naar gelang de dag";
+
 test.describe.serial("Phone salutation on the list and on a quote", () => {
   const runId = Date.now().toString(36);
   let attemptId = "";
@@ -409,10 +418,64 @@ test.describe.serial("Phone salutation on the list and on a quote", () => {
   let contactId = "";
   let dealId = "";
   let contactName = "";
+  /** The contact whose two boxes hold the widest value the columns allow. */
+  let longTitleContactId = "";
 
-  /** How far the PAGE scrolls sideways, which below the breakpoint must be zero. */
-  async function pageOverflow(): Promise<number> {
-    return await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  /**
+   * HOW FAR CONTENT RUNS PAST THE EDGE -- MEASURED ON `<main>`, NOT ON THE
+   * DOCUMENT, AND THE DIFFERENCE IS THE WHOLE POINT AFTER v1.1.0.
+   *
+   * The suite's older phone assertions read
+   * `documentElement.scrollWidth - innerWidth`, and that reading has QUIETLY
+   * STOPPED WORKING below the breakpoint. `<main>` now computes
+   * `overflow-x: clip` (Task 2 gave it that so the board's stage picker could
+   * stick), and a clip neither scrolls nor propagates: content over the edge is
+   * CUT, and the document never grows to accommodate it.
+   *
+   * MEASURED, by injecting a div 200px wider than the viewport into `main` on this
+   * very page: `documentElement.scrollWidth - innerWidth` answered **0** at 390 and at
+   * 320, while `main.scrollWidth - main.clientWidth` answered **224** at both.
+   * A document-level assertion here would be a test that cannot fail.
+   *
+   * `main`'s own scrollWidth keeps growing under the clip, which is what makes it
+   * the right box to ask -- and it also gives the sweep's "ignore anything inside
+   * its own horizontal scroller" rule for free, since a nested scroll container's
+   * overflow does not propagate to its ancestors either. The contacts table's
+   * `overflow-x-auto` box and the Gantt grid are allowed to scroll by design and
+   * do not register here.
+   *
+   * The threshold is 1 rather than 0, matching e2e/documents.spec.ts: sub-pixel
+   * rounding is not a layout defect, and a row that genuinely does not fit is over
+   * by tens of pixels (the deal page was 403 against 390 before Task 2 wrapped it).
+   */
+  async function mainOverflow(target: Page): Promise<number> {
+    return await target.evaluate(() => {
+      const main = document.querySelector("main");
+      if (main === null) throw new Error("this page has no <main> to measure");
+      return main.scrollWidth - main.clientWidth;
+    });
+  }
+
+  /**
+   * What `mainOverflow` reports when something `extra` pixels too wide is put into
+   * `main`, with the offending element removed again before the value comes back.
+   *
+   * This exists so a guard that measures the wrong box cannot pass silently. It is
+   * the same care e2e/documents.spec.ts takes when it asserts its logo fixture's
+   * byte length: prove the instrument, then trust the reading.
+   */
+  async function overhangOf(target: Page, extra: number): Promise<number> {
+    return await target.evaluate((over: number) => {
+      const main = document.querySelector("main");
+      if (main === null) throw new Error("this page has no <main> to measure");
+      const probe = document.createElement("div");
+      probe.style.width = `${String(window.innerWidth + over)}px`;
+      probe.style.height = "1px";
+      main.append(probe);
+      const measured = main.scrollWidth - main.clientWidth;
+      probe.remove();
+      return measured;
+    }, extra);
   }
 
   async function create(path: string, data: unknown): Promise<{ id: string }> {
@@ -450,6 +513,18 @@ test.describe.serial("Phone salutation on the list and on a quote", () => {
     });
     contactId = contact.id;
     dealId = deal.id;
+
+    // A second contact, carrying the cap in both boxes. Separate from the one
+    // above so the list and quote assertions keep reading a short, realistic
+    // "Prof", and given a different surname so the list filter cannot see it.
+    const wide = await create("/api/contacts", {
+      firstName: "Cornelia",
+      lastName: `Vandenberghe${attemptId}`,
+      companyId: company.id,
+      salutation: LONG_SALUTATION,
+      pronouns: LONG_PRONOUNS,
+    });
+    longTitleContactId = wide.id;
   });
 
   test.afterAll(async () => {
@@ -467,7 +542,7 @@ test.describe.serial("Phone salutation on the list and on a quote", () => {
     await expect(row).toContainText(`Prof ${contactName}`);
     // The list is for finding someone; a pronoun is for writing to them.
     await expect(row).not.toContainText("hij/hem");
-    expect(await pageOverflow()).toBe(0);
+    await expect.poll(async () => await mainOverflow(page)).toBeLessThanOrEqual(1);
   });
 
   test("defaults the salutation into the quote form", async () => {
@@ -475,7 +550,7 @@ test.describe.serial("Phone salutation on the list and on a quote", () => {
     // The Contact row carrying the name is the linked-contact query having
     // resolved, which is where the form's default comes from.
     await expect(page.getByTestId("field-contactId")).toContainText(contactName);
-    expect(await pageOverflow()).toBe(0);
+    await expect.poll(async () => await mainOverflow(page)).toBeLessThanOrEqual(1);
 
     await page.getByTestId("new-quote-button").click();
     await expect(page.getByTestId("quote-form")).toBeVisible();
@@ -483,7 +558,68 @@ test.describe.serial("Phone salutation on the list and on a quote", () => {
     await expect(page.getByTestId("quote-recipient-contact")).toHaveValue(contactName);
     // The fourth box in a block that used to hold three, in a dialog that is
     // nearly the width of the screen at 390.
-    expect(await pageOverflow()).toBe(0);
+    await expect.poll(async () => await mainOverflow(page)).toBeLessThanOrEqual(1);
+  });
+
+  /**
+   * THE CONTACT PAGE ITSELF, WHICH IS THE SURFACE v1.1.0 ACTUALLY CHANGED AND THE
+   * ONE NOTHING MEASURED.
+   *
+   * The two tests above cover where the value LANDS. This covers where it is
+   * typed: two picker rows and, on "Other...", a revealed text box, added to a
+   * page that already carries a field card, a company row and an owner picker.
+   * The release's own phone sweep walked all eighteen routes and found this one
+   * fitting -- but that sweep was a scratchpad script, and a measurement nothing
+   * re-runs is not coverage. This is the committed version, on the one route that
+   * gained controls.
+   *
+   * AT 320 AS WELL AS 390, because 320 is where a fixed-width control shows and
+   * the phone standard's own anchor is 390. It is also the width at which the deal
+   * page's date input was found six pixels over.
+   *
+   * THE VALUE IS THE CAP, 64 characters, which is the widest thing this field can
+   * ever hold. A "Other..." box seeded from a stored value renders it; a shorter
+   * one would leave the question of what happens at the limit unasked.
+   *
+   * A SECOND PAGE PER WIDTH RATHER THAN A RESIZE. `setViewportSize` mid-test
+   * updates a MediaQueryList's `matches` without dispatching `change`, so
+   * `useIsMobile()` would never see it -- the reason this file's header gives for
+   * `test.use` in the first place. Both widths are below the breakpoint, so the
+   * hazard is not live here, but a second context costs nothing and keeps the
+   * file's "nothing resizes" property true.
+   */
+  test("keeps the contact page inside the screen at 390 and at 320", async ({ browser }) => {
+    // Asserted rather than assumed: this is the cap from CONTACT_FIELD_CAPS, and a
+    // constant that quietly came out at 40 characters would be testing nothing.
+    expect(LONG_SALUTATION).toHaveLength(64);
+
+    for (const width of [390, 320]) {
+      const narrow = await browser.newPage({ ...IPHONE_13, viewport: { width, height: 664 } });
+      try {
+        await narrow.goto(`/contacts/${longTitleContactId}`);
+        // The boxes are on screen and hold the stored values, so the measurement
+        // below is of the page this release actually produces.
+        await expect(narrow.getByTestId("salutation-other")).toHaveValue(LONG_SALUTATION);
+        await expect(narrow.getByTestId("pronouns-other")).toHaveValue(LONG_PRONOUNS);
+
+        await expect
+          .poll(async () => await mainOverflow(narrow), {
+            message: `the contact page runs past the edge at ${String(width)}px`,
+          })
+          .toBeLessThanOrEqual(1);
+
+        // AND THE MEASUREMENT CAN FAIL, proved on the page it was just used on
+        // rather than assumed. The clip makes the obvious reading -- the
+        // DOCUMENT's scroll width -- report 0 whatever the content does, so a
+        // guard built on it would be green for ever. This puts something 200px
+        // too wide into `main` and requires the number to move, then takes it
+        // out again, so the assertion above is still the one describing the
+        // shipped page.
+        expect(await overhangOf(narrow, 200)).toBeGreaterThan(100);
+      } finally {
+        await narrow.close();
+      }
+    }
   });
 });
 

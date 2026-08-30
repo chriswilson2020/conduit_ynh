@@ -89,6 +89,22 @@ const WITH_LOGO: MergeContext = {
   lines: WITHOUT_LOGO.lines,
 };
 
+/**
+ * A PDF carrying `table` as a PLAIN stream and `content` as a COMPRESSED one,
+ * which is the split a real quote has on the runner -- and what makes the
+ * "pdfText cannot see this" premise in the tests below a real assertion rather
+ * than an artefact of how the fixture was written. No renderer is involved, which
+ * is the only way to exercise a CMap shape neither WeasyPrint here produces.
+ */
+function cmapPdf(table: string, content: string): Buffer {
+  return Buffer.concat([
+    Buffer.from(`%PDF-1.7\n5 0 obj\n<< /Length ${String(table.length)} >>\nstream\n${table}\nendstream\nendobj\n`),
+    Buffer.from("6 0 obj\n<< /Filter /FlateDecode >>\nstream\n"),
+    deflateSync(Buffer.from(content)),
+    Buffer.from("\nendstream\nendobj\n%%EOF\n"),
+  ]);
+}
+
 describe("the seeded quote template", () => {
   it("resolves every merge construct in it, whichever fields are filled in", () => {
     // Not "the regex found no {{" -- the real resolver ran and left nothing behind,
@@ -217,12 +233,7 @@ describe("the seeded quote template", () => {
       "1 beginbfrange", "<0050> <0052> <0061>", "endbfrange",
       "endcmap",
     ].join("\n");
-    const built = Buffer.concat([
-      Buffer.from(`%PDF-1.7\n5 0 obj\n<< /Length ${String(table.length)} >>\nstream\n${table}\nendstream\nendobj\n`),
-      Buffer.from("6 0 obj\n<< /Filter /FlateDecode >>\nstream\n"),
-      deflateSync(Buffer.from("BT [<0024>17<0044>] TJ ET\nBT <005000510052> Tj ET\n")),
-      Buffer.from("\nendstream\nendobj\n%%EOF\n"),
-    ]);
+    const built = cmapPdf(table, "BT [<0024>17<0044>] TJ ET\nBT <005000510052> Tj ET\n");
 
     // The premise, and the whole reason this function exists: the words are not in
     // the file as words, so `pdfText` -- which finds everything else in this suite
@@ -239,6 +250,94 @@ describe("the seeded quote template", () => {
     // And two operators are two lines. A needle spanning them would mean a caller
     // could assert text that appears nowhere on the page.
     expect(pdfVisibleText(built)).not.toContain("Hiabc");
+  });
+
+  /**
+   * THE ARRAY DESTINATION, AND THE FAILURE IS NOT A MISSED MATCH.
+   *
+   * `<0070> <0072> [<0058> <0059> <005a>]` is a legal `bfrange`: one destination
+   * per id, for a run whose characters are not consecutive. A pattern looking for
+   * three `<...>` in a row does not fail on it -- it skips the real pair and
+   * matches the ARRAY's own first three entries as a range, so ids 0058 and 0059,
+   * which the file maps to nothing at all, come out as characters. That is a map
+   * inventing assignments, which is the error this module is built to avoid.
+   */
+  it("reads a bfrange whose destinations are an array, and does not read the array as a range", () => {
+    const table = [
+      "begincmap",
+      "1 beginbfrange", "<0070> <0072> [<0058> <0059> <005a>]", "endbfrange",
+      "endcmap",
+    ].join("\n");
+    const built = cmapPdf(table, "BT [<007000710072>] TJ ET\nBT <00580059> Tj ET\n");
+
+    expect(pdfVisibleText(built)).toContain("XYZ");
+    // What the mis-read produced: 0058 and 0059 taken as the range's own start and
+    // end, against a base of 005a.
+    expect(pdfVisibleText(built)).not.toContain("Z[");
+  });
+
+  /**
+   * A DESTINATION THAT IS NOT ONE CODE UNIT, WHICH USED TO THROW OUT OF A TEST
+   * HELPER.
+   *
+   * A `bfrange` destination is a UTF-16BE STRING: a ligature is two code units and
+   * an emoji is a surrogate pair, both eight hex digits. Parsing the lot as one
+   * integer gives a number past U+10FFFF and `String.fromCodePoint` raises
+   * `RangeError` -- on a legal file, from a helper every PDF assertion goes
+   * through. The spec's rule is that the LAST code unit increments, which is both
+   * correct and what keeps the arithmetic inside 16 bits.
+   */
+  it("survives a bfrange destination that is a ligature or outside the BMP", () => {
+    const table = [
+      "begincmap",
+      "2 beginbfrange", "<0080> <0081> <00660069>", "<0090> <0090> <d83dde00>", "endbfrange",
+      "endcmap",
+    ].join("\n");
+    const built = cmapPdf(table, "BT [<00800081>] TJ ET\nBT <0090> Tj ET\n");
+
+    const printed = pdfVisibleText(built);
+    // "fi", then the same string with its last unit incremented -- the range's
+    // second id, per the spec, rather than a second whole code point.
+    expect(printed).toContain("fifj");
+    // Written as a code point rather than as the character, because this file is
+    // ASCII by house rule.
+    expect(printed).toContain(String.fromCodePoint(0x1f600));
+  });
+
+  /**
+   * THE LIMITATION, PINNED SO NOBODY WIDENS THE COMMENT BACK.
+   *
+   * `pdfVisibleText` applies every CMap in the file to every run, and the claim
+   * that used to sit on it -- "a wrong map cannot invent characters" -- is only
+   * true while the subsets DISAGREE ABOUT NOTHING. An id present in both with
+   * different meanings substitutes, and the output then contains a word that is on
+   * no line of the page.
+   *
+   * This is unreachable from this project's output: both subsets are DejaVu-Sans
+   * in two weights and a family gives a character the same id in every weight, so
+   * a real quote shares 32 ids between its two maps and none of them disagree.
+   * Two unrelated families would break it, which needs an operator editing the
+   * template's `font-family`. The test exists so the boundary is a fact rather
+   * than a paragraph.
+   */
+  it("substitutes rather than drops when two fonts assign one id different meanings", () => {
+    const shown = "<000100020003000400050006>";
+    const asVrouwe = ["<0001> <0056>", "<0002> <0072>", "<0003> <006f>",
+      "<0004> <0075>", "<0005> <0077>", "<0006> <0065>"];
+    const asAbcdef = ["<0001> <0041>", "<0002> <0042>", "<0003> <0043>",
+      "<0004> <0044>", "<0005> <0045>", "<0006> <0046>"];
+    const table = [
+      "begincmap", "6 beginbfchar", ...asAbcdef, "endbfchar", "endcmap",
+      "begincmap", "6 beginbfchar", ...asVrouwe, "endbfchar", "endcmap",
+    ].join("\n");
+    const built = cmapPdf(table, `BT [${shown}] TJ ET\n`);
+
+    const printed = pdfVisibleText(built);
+    // What the page says, under the map that belongs to the run.
+    expect(printed).toContain("ABCDEF");
+    // And what it does not say anywhere, under the other one. Documented rather
+    // than fixed: fixing it means resolving fonts by object number.
+    expect(printed).toContain("Vrouwe");
   });
 
   /**

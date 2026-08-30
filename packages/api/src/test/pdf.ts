@@ -85,15 +85,24 @@ export function pdfHasImage(pdf: Buffer): boolean {
  *
  *   - a run in the font whose CMap is being applied decodes CORRECTLY, so
  *     anything really on the page appears in the output;
- *   - a run in a different font decodes to a SUBSEQUENCE of its true text with
- *     the unmapped ids dropped (the bold subset over the body text produces
- *     "Mer ilelmia elderust"), because a wrong map cannot INVENT characters --
- *     an id absent from it contributes nothing rather than something else.
+ *   - a run in a different font decodes to a SUBSEQUENCE of its true text
+ *     wherever the two subsets merely DISAGREE ABOUT NOTHING: an id the map does
+ *     not carry contributes nothing, which is what turns the body text into
+ *     "Mer ilelmia elderust" under the bold subset;
+ *   - BUT AN ID PRESENT IN BOTH WITH DIFFERENT MEANINGS SUBSTITUTES RATHER THAN
+ *     DROPS, and that can put a word in the output that is on no line of the
+ *     page. "Cannot invent characters" was this comment's first claim and it is
+ *     false: built by hand and run through this module, two subsets whose ids
+ *     collide produce a word outright.
  *
- * So a false positive would need the needle to be spelled by dropping letters out
- * of text that is genuinely on the page, which a distinctive multi-word needle
- * cannot be, and a false negative cannot happen at all. Assert on something more
- * specific than a two-letter word and the ambiguity never arises.
+ * WHY THAT IS UNREACHABLE FROM THIS PROJECT'S OUTPUT, measured on a real quote
+ * rather than argued. It carries 2 CMaps of 38 and 49 ids which share 32, and
+ * ZERO of those 32 disagree -- because both subsets are DejaVu-Sans, one regular
+ * and one bold, and a family gives a character the same id in every weight. Two
+ * UNRELATED families in one document would break that, and the only way to get
+ * one is an operator editing `font-family` in the quote template, which no test
+ * here covers. If that ever becomes a thing this product supports, this function
+ * needs the parser rather than a wider comment.
  *
  * LINES ARE JOINED WITH A NEWLINE AND NEVER RUN TOGETHER, so a needle can never
  * be assembled out of two unrelated lines that happen to abut. A run is one
@@ -101,11 +110,23 @@ export function pdfHasImage(pdf: Buffer): boolean {
  * inside a `TJ` array split one line into several hex strings, and those ARE
  * concatenated, since they are one line by construction.
  *
- * THE ONE SHAPE IT DOES NOT READ is a literal `(...)` string, which a font with a
- * simple encoding would produce. Neither renderer in this project writes one --
- * both subset -- and if one ever did, `pdfText`'s raw half would find the text
- * directly. The `itReal` assertion in documents-seed.test.ts is what would notice:
- * it renders a real quote and requires a real line back, so a version that changed
+ * A RUN THIS READER DOES NOT SEE IS SILENTLY MISSING TEXT, and that is the failure
+ * to be afraid of rather than a wrong character: a `not.toContain` over output that
+ * lost the run is exactly the vacuous pass this module exists to prevent.
+ * `textRuns` lists the five shapes it does not read. None of them occurs in either
+ * renderer here -- measured on a real quote, 25 of 25 text operators matched, the
+ * widest body 110 characters against the 4096 bound, and not one literal-string
+ * operator in the file -- but "none today" is the whole of that claim.
+ *
+ * SO THE REAL DEFENCE IS THE PAIRING, NOT THIS FUNCTION, and callers should keep
+ * the shape: every `not.toContain` in this suite sits immediately after a
+ * `toContain` on the SAME buffer. A reader that came back empty, or that dropped
+ * the very run the assertion is about, fails the positive one first, so the
+ * negative one is never reached on a reader that has stopped working. An absence
+ * asserted on its own would have nothing holding it up.
+ *
+ * The `itReal` assertion in documents-seed.test.ts is the other half of that: it
+ * renders a real quote and requires a real line back, so a renderer that changed
  * its encoding fails there rather than turning every caller vacuous.
  */
 export function pdfVisibleText(pdf: Buffer): string {
@@ -126,6 +147,27 @@ export function pdfVisibleText(pdf: Buffer): string {
  * journeys each paid it. `[^\]]` cannot backtrack, and the bound stops a stray `[`
  * in binary data swallowing the rest of the file looking for a `] TJ`. Whatever
  * the looser match lets through is filtered by the hex extraction inside it.
+ *
+ * FIVE SHAPES THIS DOES NOT READ, listed because a MISSING run is what makes a
+ * `not.toContain` pass vacuously, and a caller cannot weigh that risk against a
+ * promise of completeness that was never true:
+ *
+ *   1. a `TJ` array containing a literal `(...)` string with a `]` inside it --
+ *      the negated class stops at that `]` and the operator is cut short;
+ *   2. a nested array, for the same reason;
+ *   3. a body over the 4096-character bound, which is simply not matched;
+ *   4. the `'` and `"` show operators, which show a string and move to the next
+ *      line, and which nothing here looks for;
+ *   5. `(...) Tj`, a literal string with a simple encoding rather than glyph ids.
+ *
+ * Shapes 1, 2 and 5 are what a producer that does not subset its fonts writes;
+ * neither WeasyPrint here does. Measured on a real quote: 25 text operators, all
+ * 25 matched, the widest body 110 characters, and zero `) Tj`. The reason none of
+ * this is closed is shape 5 specifically -- scanning for literal strings across
+ * the megabytes of inflated font and image data `pdfText` hands over would match
+ * binary noise and put invented text into the output, which is worse than a gap
+ * the caller is told about. See `pdfVisibleText` for the pairing that is the
+ * actual protection.
  */
 function textRuns(text: string): string[] {
   const runs: string[] = [];
@@ -149,11 +191,26 @@ function decodeRun(run: string, map: ReadonlyMap<string, string>): string {
 /**
  * Every `/ToUnicode` CMap in the file, as glyph id -> characters.
  *
- * Both of the CMap's own forms are read. `bfchar` lists pairs and is what 57.2
- * emits; `bfrange` gives a start, an end and the first destination, and is the
- * compact form a producer uses for a contiguous run -- absent from the output
- * measured here, and cheap enough to support rather than discover missing on the
- * runner. A range is bounded so a malformed `<0000> <ffff>` cannot spin.
+ * BOTH SECTIONS, AND BOTH OF `bfrange`'s DESTINATION FORMS. `bfchar` lists pairs
+ * and is what 57.2 emits. `bfrange` gives a start and an end, and then EITHER a
+ * single destination that increments across the range OR an ARRAY holding one
+ * destination per id -- and the array is not an exotic corner, it is what a
+ * producer writes for a run of ids whose characters are not consecutive.
+ *
+ * THE ARRAY FORM HAD TO BE HANDLED RATHER THAN IGNORED, which is the part worth
+ * writing down. A pattern looking only for three `<...>` in a row does not FAIL to
+ * match `<0070> <0072> [<0058> <0059> <005a>]` -- it matches the wrong three,
+ * skipping past the real pair and reading the ARRAY's first three entries as a
+ * range. The result is a map assigning characters the file never assigned, to ids
+ * it really does carry: the one error class this whole module exists to avoid, and
+ * silent. One alternation covers both forms, and matching leftmost-first is what
+ * stops an array being re-read as a range.
+ *
+ * Neither WeasyPrint here emits a `bfrange` at all (measured: zero occurrences in
+ * a real quote), so all of this is support for a shape that has not arrived rather
+ * than a description of today's output.
+ *
+ * A range is bounded so a malformed `<0000> <ffff>` cannot spin.
  */
 function toUnicodeMaps(text: string): ReadonlyMap<string, string>[] {
   const maps: ReadonlyMap<string, string>[] = [];
@@ -161,22 +218,60 @@ function toUnicodeMaps(text: string): ReadonlyMap<string, string>[] {
     const map = new Map<string, string>();
     for (const chunk of block.match(/beginbfchar[\s\S]*?endbfchar/g) ?? []) {
       for (const [, code, value] of chunk.matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g)) {
-        map.set((code ?? "").toLowerCase().padStart(4, "0"), utf16(value ?? ""));
+        map.set(idKey(Number.parseInt(code ?? "", 16)), utf16(value ?? ""));
       }
     }
     for (const chunk of block.match(/beginbfrange[\s\S]*?endbfrange/g) ?? []) {
-      for (const [, lo, hi, value] of chunk.matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g)) {
+      const entries = chunk.matchAll(
+        /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*(?:<([0-9a-fA-F]+)>|\[([^\]]{0,4096})\])/g,
+      );
+      for (const [, lo, hi, single, list] of entries) {
         const first = Number.parseInt(lo ?? "", 16);
         const last = Math.min(Number.parseInt(hi ?? "", 16), first + 65_535);
-        const base = Number.parseInt(value ?? "", 16);
+        if (list !== undefined) {
+          const destinations = [...list.matchAll(/<([0-9a-fA-F]*)>/g)].map(([, hex]) => utf16(hex ?? ""));
+          for (let code = first; code <= last; code += 1) {
+            const destination = destinations[code - first];
+            if (destination !== undefined && destination !== "") map.set(idKey(code), destination);
+          }
+          continue;
+        }
+        const base = utf16(single ?? "");
         for (let code = first; code <= last; code += 1) {
-          map.set(code.toString(16).padStart(4, "0"), String.fromCodePoint(base + (code - first)));
+          const destination = nextInSequence(base, code - first);
+          if (destination !== "") map.set(idKey(code), destination);
         }
       }
     }
     if (map.size > 0) maps.push(map);
   }
   return maps;
+}
+
+/** A glyph id as this module's keys spell it: four lower-case hex digits. */
+function idKey(code: number): string {
+  return code.toString(16).padStart(4, "0");
+}
+
+/**
+ * The nth destination of a `bfrange`, WHICH INCREMENTS THE LAST CODE UNIT AND NOT
+ * THE WHOLE STRING.
+ *
+ * That is the spec's rule, and following it is also what stops this throwing. A
+ * destination is a UTF-16BE STRING, not a number: a ligature (`<00660069>`, "fi")
+ * or anything outside the BMP (`<d83dde00>`, a surrogate pair) is eight hex digits,
+ * and parsing the lot as one integer gives a value past U+10FFFF -- which is a
+ * `RangeError: Invalid code point` out of `String.fromCodePoint`, thrown from a
+ * test helper on a perfectly legal file. `bfchar` was always routed through
+ * `utf16`; this side was not.
+ *
+ * A range that walks a code unit past 0xffff is malformed, and contributes nothing
+ * rather than wrapping into a character the file did not mean.
+ */
+function nextInSequence(destination: string, offset: number): string {
+  if (destination === "") return "";
+  const last = destination.charCodeAt(destination.length - 1) + offset;
+  return last > 0xffff ? "" : destination.slice(0, -1) + String.fromCharCode(last);
 }
 
 /** A CMap destination: UTF-16BE, so one code point can be four hex digits or eight. */

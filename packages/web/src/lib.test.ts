@@ -450,15 +450,22 @@ describe("the Tailwind-in-prose trap", () => {
    * shipped stylesheet today for exactly that reason, and it costs 28 bytes:
    * the rule is `.visible{visibility:visible}`, counted rather than estimated.
    *
-   * COUNTED UNDER ONE STATED RULE, because the first attempt gave a pair of
-   * numbers no rule produces: the word as a standalone candidate token, over
-   * the files Tailwind actually scans (everything under packages/web that is
-   * not ignored), is 75 occurrences across 30 files. Nearly all are ordinary
-   * English; a few are identifiers, which is the same problem -- `const
-   * { threadId: visible }` compiles a rule too. Closing that half means banning
-   * a common English word from comments AND from local names to save 28 bytes,
-   * which is a worse trade than the rule it would enforce. The hyphenated half
-   * is closable and is closed.
+   * NO OCCURRENCE COUNT, AND THAT IS THE SECOND CORRECTION THIS PARAGRAPH HAS
+   * TAKEN. It first carried a pair of numbers no rule produced; the replacement
+   * said "75 occurrences across 30 files", and a reviewer reproducing it landed
+   * on 79 or 67 depending on where a token is judged to begin -- the bare word
+   * inside a longer hyphenated utility, inside a URL, inside an object key.
+   * (Writing one of those hyphenated examples out here is what the guard below
+   * caught while this paragraph was being edited, which is the shortest possible
+   * demonstration that it works.)
+   * The file count moves the same way (30 or 36 by two defensible rules), so both
+   * numbers are dropped rather than restated a third time under a rule elaborate
+   * enough to be right. The argument never needed either: the word is spread
+   * across dozens
+   * of files as ordinary English and as identifiers -- `const { threadId:
+   * visible }` compiles a rule too -- so closing this half means banning a common
+   * English word from comments AND from local names to save 28 bytes, whatever
+   * the exact total is. The hyphenated half is closable and is closed.
    */
   /**
    * EVERY ENTRY CARRIES A `_` THAT IS STRIPPED, and that is not decoration.

@@ -24,6 +24,15 @@ import { pdfVisibleText } from "../packages/api/src/test/pdf.js";
  * vacuously whatever the page said, which is the failure mode that matters most in
  * the immutability test.
  *
+ * AND EVERY `not.toContain` BELOW SITS IMMEDIATELY AFTER A `toContain` ON THE SAME
+ * BUFFER, which is not a stylistic habit but the thing actually holding those
+ * assertions up. `pdfVisibleText` reads five text-operator shapes it does not
+ * handle (they are listed at `textRuns`, and neither renderer here writes one),
+ * and a run it failed to read would make an absence pass for the wrong reason. A
+ * reader that came back empty, or that dropped the very line the assertion is
+ * about, fails the positive claim first and never reaches the negative one. Keep
+ * the pairing; an absence asserted on its own here would have nothing under it.
+ *
  * THE SCAFFOLDING IS API AND THE JOURNEY IS UI, the rule e2e/documents.spec.ts
  * states: a company, a contact, a pipeline, a stage and a deal are what somebody
  * recording a salutation already has, and driving five creation dialogs would put
