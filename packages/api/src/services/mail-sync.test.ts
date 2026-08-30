@@ -30,8 +30,11 @@ let hints: SseHint[];
 let unsubscribe: () => void;
 /** Everything a test started, stopped in afterEach so no loop outlives its case. */
 let running: { stop(): Promise<void> }[];
+/** When the current case began, for waitFor's budget. See that function. */
+let caseStartedAt = 0;
 
 beforeEach(async () => {
+  caseStartedAt = Date.now();
   await truncateAll(handle);
   actorId = (await resolveUser(handle.db, { username: "chris", email: null, fullName: null })).id;
   dir = await mkdtemp(path.join(os.tmpdir(), "conduit-mail-sync-"));
@@ -450,8 +453,34 @@ class ManualClock implements SyncClock {
 
 const silentLogger: SyncLogger = { info: () => {}, warn: () => {}, error: () => {} };
 
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+/**
+ * Poll until the loop makes `predicate` true. Everything waited on here is
+ * something the loop is already on its way to doing, so the budget is a
+ * DIAGNOSTIC rather than a synchronisation device -- and a diagnostic that
+ * expires second says nothing at all.
+ *
+ * That is why it is neither ten seconds nor measured from this call. Vitest's
+ * default `testTimeout` is 5000ms and `vitest.config.ts` does not raise it, so
+ * the ten-second budget this used to carry could never fire. The sightings of
+ * this file's intermittent are listed in the backlog's intermittents section
+ * (`docs/superpowers/plans/2026-08-30-conduit-backlog.md`); every one of them
+ * arrived as vitest's own anonymous "Test timed out in 5000ms" with no
+ * indication of WHICH wait had stopped moving, and one lost its identity
+ * entirely to a truncated tail. A per-call budget has the same hole from the
+ * other side -- an earlier wait can spend the case's five seconds and leave
+ * the label just as unreachable -- so the budget runs from the start of the
+ * case and stops short of vitest's, which makes the label reachable from any
+ * wait in any case.
+ *
+ * 4000ms is a measurement, not a round number. Over 24 runs of this file on
+ * the dev server with four busy loops and a second vitest process alongside,
+ * the slowest single wait was 1369ms (always "the first pass") and the slowest
+ * whole case was 1942ms. So the budget is a little over twice the worst case
+ * seen under load, and a full second clear of vitest -- enough for the label
+ * to appear, which it does: with this budget a wedged wait reports at 4038ms.
+ */
+async function waitFor(predicate: () => boolean, label: string, budgetMs = 4_000): Promise<void> {
+  const deadline = caseStartedAt + budgetMs;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -1201,18 +1230,48 @@ describe("AccountSync: pass failures", () => {
     client.connectError = new Error("ECONNREFUSED");
 
     sync.start();
-    for (let failure = 1; failure <= 8; failure += 1) {
+    // Seven rounds of "let the pass fail, then let its backoff elapse". The
+    // eighth backoff is deliberately NOT fired in here: firing a backoff is
+    // what starts the next pass, and the next pass after the eighth is the one
+    // that has to succeed.
+    for (let failure = 1; failure <= 7; failure += 1) {
       await waitFor(() => sync.stats.failures >= failure, `failure ${failure}`);
       await waitFor(() => clock.pendingCount() > 0, `backoff wait ${failure}`);
       clock.fire();
     }
-    expect(clock.requested.slice(0, 8)).toEqual([
+    await waitFor(() => sync.stats.failures >= 8, "failure 8");
+    await waitFor(() => clock.pendingCount() > 0, "backoff wait 8");
+
+    // EVERYTHING FROM HERE TO THE FIRE HAPPENS WHILE THE LOOP IS PARKED, AND
+    // THAT IS THE WHOLE POINT. `clock.fire()` resolves the wait and hands
+    // control straight to the loop, which loads the account, reads the
+    // credentials and only then calls connect(). Repairing the account AFTER
+    // the fire raced exactly that, and the race was decided by whether one
+    // database round trip on this side finished before two plus a key file
+    // read on the loop's. Instrumented over 20 runs under load, the test won
+    // by a median of 7.3ms and by as little as 3.3ms. Lose it -- a GC pause, a
+    // busy box, another suite on the same machine -- and the pass this fire
+    // starts reads the old error, fails, and parks the loop in a NINTH
+    // 32-minute backoff that nothing here ever fires, so the wait for the
+    // recovery pass can never end. That is the intermittent the backlog
+    // records against this case, and it is why the repair is above the fire.
+    expect(clock.requested).toEqual([
       60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000, 1_920_000, 1_920_000,
     ]);
     expect((await accountRow(accountId)).status).toBe("error");
-
+    // Nine here would mean a pass has already started against a client that is
+    // still broken, i.e. that the repair below has drifted back after the fire.
+    expect(client.connectCalls).toBe(8);
     client.connectError = null;
-    await waitFor(() => sync.stats.passes >= 1, "the recovery pass");
+
+    clock.fire();
+    // `failures > 8` is an ESCAPE, not an expectation. If the pass this fire
+    // starts ever fails -- for this reason or any other -- the loop parks in a
+    // backoff nothing here fires, and waiting only on `passes` would hang until
+    // vitest killed the case with no name. Ending on either outcome turns that
+    // into the assertion below, which says which one happened.
+    await waitFor(() => sync.stats.passes >= 1 || sync.stats.failures > 8, "the recovery pass");
+    expect(sync.stats.failures).toBe(8);
     expect(sync.stats.attempt).toBe(0);
     const row = await accountRow(accountId);
     expect(row.status).toBe("active");

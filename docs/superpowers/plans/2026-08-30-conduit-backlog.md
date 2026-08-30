@@ -267,14 +267,23 @@ uncatchable by design.
 
 ---
 
-## Intermittents -- four, all timing-shaped, none has ever failed CI on its own
+## Intermittents -- four, all timing-shaped, none has ever failed CI on its own; the first is FIXED
 
-1. **`mail-sync.test.ts`, a backoff case.** Four sightings across two phases. Measured **1
-   failure in 12 runs idle, 8 in 12 with a second vitest process running**. Two hypotheses
-   falsified with evidence: not `waitFor`'s 10s deadline (vitest's 5000ms fires first, so
-   that label can never appear) and not a slowdown (the case costs 180-240ms and instead
-   **wedges**). Next suspect, untested: `ManualClock.wait(ms <= 0)` resolving without
-   registering a pending entry. **7.5 Task 4 owns this.**
+1. ~~**`mail-sync.test.ts`, a backoff case.**~~ **FIXED by 7.5 Task 4; the full record is
+   that task's DONE block in the v1.2.0 plan.** Three hypotheses were falsified in the end,
+   not two: it was not `waitFor`'s 10s deadline, not a slowdown, and not
+   `ManualClock.wait(ms <= 0)` either -- that branch is taken exactly once in the 60-case
+   file and never in the case that flakes. The case repaired the account AFTER the
+   `clock.fire()` that starts the pass the repair was for, and won that race by a **median
+   7.3ms, minimum 3.3ms** over 20 instrumented runs; losing it parks the loop in a ninth
+   32-minute backoff nothing fires. The repair now happens while the loop is parked.
+
+   **DO NOT REUSE THE "8 in 12 with a second vitest process running" FIGURE.** Two vitest
+   processes share `conduit_test` and truncate each other's rows mid-case; reproducing that
+   condition gave foreign-key violations and vanished account rows within three runs, in
+   cases unrelated to the backoff one. It measured the harness, not the race. Contending
+   with a second vitest on `packages/shared` (CPU only, no truncate) gave **0 in 12**, and
+   0 in 24 with four busy loops on top.
 2. **`mail-integration.test.ts`'s Dovecot IDLE burst** — 17 of 20 messages. Surfaced during
    v1.1.0 on a diff touching no API source. Opt-in suite, CI-only.
 3. **`e2e/mobile.spec.ts`'s phone kanban `addStage`** — once in eight runs, hidden by CI's
@@ -293,9 +302,16 @@ uncatchable by design.
    documents at length that this control's focus is restored by Radix *after* a re-render,
    which is a race the test observes rather than controls.
 
-**The fix for any of these must be deterministic, not a longer timeout.** `mail-sync.test.ts`
-owns a `ManualClock`, and a wall-clock deadline inside a test that controls its own clock is
-the defect.
+**The fix for any of these must be deterministic, not a longer timeout.** The one that is
+fixed was fixed by ordering two statements, and it now survives a 500ms stall injected on
+either side of the moment that used to decide it.
+
+**AND THE DIAGNOSTIC HALF IS WORTH COPYING.** Vitest's default `testTimeout` is 5000ms and
+nothing raises it, so any in-test polling helper with a longer budget can never name the
+wait that stopped moving -- which is why every sighting of the first one arrived anonymous.
+`mail-sync.test.ts`'s helper now takes its budget from the start of the case and stops
+short of vitest's. `mail-move.test.ts` still has the same hole from the other side (a
+`5_000` default, exactly vitest's own); it has one call site and has never flaked.
 
 ---
 
