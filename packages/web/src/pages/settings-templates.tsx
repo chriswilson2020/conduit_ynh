@@ -11,7 +11,7 @@ import {
   useUnarchiveMailTemplate,
   useUpdateMailTemplate,
 } from "../queries";
-import { htmlIsBlank } from "../components/mail/mail-lib";
+import { htmlIsBlank, PLACEHOLDER_KEYS } from "../components/mail/mail-lib";
 import { RichTextEditor } from "../components/mail/rich-text";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
@@ -103,6 +103,7 @@ const ROOT_FIELDS: readonly [string, string][] = [
   ["document.validUntilDate", "The valid-until date, or empty"],
   ["document.recipientName", "Who the quote is for"],
   ["document.recipientContactName", "The named contact, or empty"],
+  ["document.recipientSalutation", "How that contact is addressed, or empty"],
   ["document.recipientAddress", "Their address, line breaks kept"],
   ["document.subtotal", "The subtotal, formatted"],
   ["document.tax", "The tax, formatted"],
@@ -110,6 +111,14 @@ const ROOT_FIELDS: readonly [string, string][] = [
   ["document.notes", "The notes typed on the quote"],
   ["document.terms", "The terms typed on the quote"],
 ];
+
+/** "{{a}}, {{b}} and {{c}}" -- the mail merge fields as a sentence fragment, so the
+ * paragraph below can be written from PLACEHOLDER_KEYS rather than beside it. */
+function mergeFieldSentence(paths: readonly string[]): string {
+  const tokens = paths.map((path) => `{{${path}}}`);
+  const last = tokens.at(-1) ?? "";
+  return tokens.length < 2 ? last : `${tokens.slice(0, -1).join(", ")} and ${last}`;
+}
 
 const LINE_FIELDS: readonly [string, string][] = [
   ["description", "The line's description"],
@@ -148,8 +157,14 @@ function FieldList({ title, fields, note }: {
  * back 38 characters shorter with the letterhead's image silently gone, because
  * template-time sanitising judged an unmerged merge token as a URL, dropped the
  * src and then dropped the whole element. It is now byte-identical for the
- * shipped template, 3,616 in and 3,616 out, and it is EASY TO BREAK FROM THIS
- * SIDE. So:
+ * shipped template, and it is EASY TO BREAK FROM THIS SIDE.
+ *
+ * NO BYTE COUNT HERE ANY MORE. It said "3,616 in and 3,616 out", which was true
+ * of the template Phase 7 seeded and stopped being true the moment v1.1.0's
+ * migration 0011 amended the recipient line -- measured at 3,715 after it. A
+ * figure that a later migration invalidates is a comment that goes stale on
+ * somebody else's change, in a file that change never touches; the property is
+ * "byte-identical", and that is what the round-trip test asserts. So:
  *
  *   - A PLAIN TEXTAREA. Not the rich-text editor the email templates use --
  *     that one serialises through a document model and would rewrite the HTML
@@ -376,9 +391,31 @@ function TemplateForm({ template, onClose }: { template?: EmailTemplate; onClose
           ariaLabel="Template body"
           testId="template-body"
         />
+        {/* RENDERED FROM THE SUBSTITUTION'S OWN LIST, not typed out beside it. This
+            paragraph is the only place anybody will look for the merge fields, and a
+            path documented here that the code does not substitute is an unfilled
+            placeholder in a sent email -- so it is derived rather than maintained.
+            The quote half of this page (ROOT_FIELDS above) cannot do the same: those
+            keys live in the API's buildContext, which this bundle cannot import. */}
         <p className="text-xs font-normal text-slate-400">
-          {"{{contact.name}}"}, {"{{company.name}}"} and {"{{user.name}}"} are filled in when the
-          template is used; anything else is left as written.
+          {mergeFieldSentence(Object.keys(PLACEHOLDER_KEYS))} are filled in from the
+          records as they stand when the template is used; anything else is left as
+          written. An unfilled name stays visible, so you can see what is missing.
+        </p>
+        {/* THE LIMITATION, SAID PLAINLY RATHER THAN DISCOVERED. An empty salutation
+            removes itself and one following space, which handles "Dear X Y" -- but
+            nothing removes brackets or a label written around it, so
+            "({{contact.pronouns}})" on a contact with none prints "()". Fixing that
+            needs conditional blocks, which the mail merge language does not have and
+            which is a feature rather than a fix (v1.1.0 coordinator ruling; it is on
+            the backlog). Documenting it is what turns a surprise into a choice. */}
+        <p className="text-xs font-normal text-slate-400">
+          An empty salutation or set of pronouns removes itself, and one space after
+          it, so <code>{"Dear {{contact.salutation}} {{contact.name}}"}</code> reads
+          &quot;Dear Alice&quot; for a contact with no salutation. Any brackets or
+          labels you write around one stay put:{" "}
+          <code>{"({{contact.pronouns}})"}</code> prints empty brackets when there are
+          no pronouns to put in them.
         </p>
       </div>
 

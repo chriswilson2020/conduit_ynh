@@ -375,4 +375,43 @@ describe("the desktop board in pages/board.tsx", () => {
     expect(element).toContain("moveTargets={stageView.moveTargets}");
     expect(code).toContain("boardStageView({ isMobile, ");
   });
+
+  /**
+   * THE STICKY STAGE PICKER IS TWO FILES, AND EITHER HALF ALONE IS NOTHING.
+   *
+   * Measured at 390x664 with 25 deals in one stage: the board is 2,684px of
+   * page, and after scrolling 2,089px the strip sat at -1,840px -- switching
+   * stage meant scrolling the whole list back up first. Pinned, it sits at top
+   * 0 from that same scroll position.
+   *
+   * The other half is components/shell.tsx. `<main>` is an `overflow-auto` box
+   * that never scrolls on a phone (the document does), and `overflow: auto`
+   * establishes a scroll container whether or not it ever scrolls -- so a
+   * sticky descendant sticks to a scrollport that does not move, and this strip
+   * was measured at -1,751px with the sticky class on and nothing else changed.
+   * That is why the shell's half is asserted here rather than only beside it:
+   * this file is where somebody deleting it would look for the reason.
+   *
+   * What it cannot see: a stacking or background change that leaves the strip
+   * pinned but unreadable, and the rendering itself. Task 3's phone e2e is
+   * where that is settled.
+   */
+  it("pins the phone stage picker, and keeps the shell half that lets it", () => {
+    const strip = code.slice(code.indexOf('data-testid="stage-picker"'));
+    const classes = (/className="([^"]*)"/.exec(strip)?.[1] ?? "").split(/\s+/);
+    expect(classes).toContain("sticky");
+    expect(classes).toContain("top-0");
+    // The opaque background and the gutter bleed: without them the list shows
+    // through the strip and slides past its edges.
+    expect(classes).toContain("bg-slate-50");
+    expect(classes).toContain("-mx-6");
+    expect(classes).toContain("px-6");
+    // Raised, so cards pass UNDER it rather than through it.
+    expect(classes).toContain("z-10");
+
+    const shell = withoutComments(
+      readFileSync(new URL("../components/shell.tsx", import.meta.url), "utf8"),
+    );
+    expect(shell).toContain("max-md:overflow-clip");
+  });
 });

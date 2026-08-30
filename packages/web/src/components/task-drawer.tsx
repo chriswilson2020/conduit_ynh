@@ -371,7 +371,7 @@ function Field({ label, testId, children }: { label: string; testId: string; chi
   return (
     <div className="flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
       <span className="w-24 shrink-0 text-sm font-medium text-slate-500">{label}</span>
-      <div data-testid={`field-${testId}`} className="flex-1 text-sm text-slate-900">
+      <div data-testid={`field-${testId}`} className="min-w-0 flex-1 break-words text-sm text-slate-900">
         {children}
       </div>
     </div>

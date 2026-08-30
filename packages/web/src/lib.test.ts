@@ -332,34 +332,289 @@ describe("the Tailwind-in-prose trap", () => {
   const VARIANT = "(?:max-)?(?:sm|md|lg|xl|2xl|hover|focus|active|disabled|group-hover|peer-focus|dark|print)";
   const CLASS_TOKEN = new RegExp(`\\b${VARIANT}:[a-z0-9][a-z0-9./%[\\]()_-]*`, "g");
 
+  /**
+   * EVERY FILE TAILWIND SCANS, WHICH IS NOT THE SAME SET AS "THE SOURCE".
+   *
+   * This walked `.ts`/`.tsx` under `src` and stopped there, and Tailwind does
+   * not: it scans the whole of `packages/web` that is not ignored, whatever the
+   * extension. Proved by dropping a `.md` file in beside the sources -- two
+   * rules appeared in the built stylesheet and the hash moved, with the guard
+   * green throughout. `index.html`, `vite.config.ts` and anything else added
+   * there were in the same hole.
+   *
+   * `node_modules` and `dist` are excluded because Tailwind excludes them, and
+   * binary and lock files because a candidate cannot hide in one usefully.
+   */
+  const SCANNED = /\.(?:tsx?|jsx?|html?|md|mdx|css|json|svg|txt)$/;
+
   function sources(dir: URL): URL[] {
     const out: URL[] = [];
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === "node_modules" || entry.name === "dist") continue;
       if (entry.isDirectory()) out.push(...sources(new URL(`${entry.name}/`, dir)));
-      else if (entry.name.endsWith(".ts") || entry.name.endsWith(".tsx")) {
-        out.push(new URL(entry.name, dir));
-      }
+      else if (SCANNED.test(entry.name)) out.push(new URL(entry.name, dir));
     }
     return out;
   }
 
+  /**
+   * WHICH HALF OF A FILE IS "PROSE" DEPENDS ON THE FILE, and getting that wrong
+   * would make the wider walk useless. A `.md` has no code in it at all, so
+   * every token in one is prose -- treating it as code would let a document
+   * grant tree-wide amnesty to any class it mentions, which is the opposite of
+   * the rule. Everything else keeps the existing split: comments are prose, the
+   * rest is code.
+   */
+  const isProseOnly = (name: string): boolean => name.endsWith(".md") || name.endsWith(".mdx");
+
+  const scannedCorpus = (): { name: string; source: string }[] =>
+    sources(new URL("../", import.meta.url)).map((file) => {
+      const whole = readFileSync(file, "utf8");
+      const name = file.pathname.split("/packages/web/")[1] ?? file.pathname;
+      return { name, source: whole, prose: isProseOnly(name) };
+    }).map(({ name, source, prose }) => ({
+      name,
+      // A prose-only file contributes nothing to the "used in code" set, which
+      // is what `withoutComments` does for the others.
+      source: prose ? `/*${source.replace(/\*\//g, "* /")}*/` : source,
+    }));
+
   it("names no variant-prefixed class in prose that the code does not also use", () => {
-    const files = sources(new URL("./", import.meta.url));
     const inCode = new Set<string>();
     const inProse = new Map<string, string>();
 
-    for (const file of files) {
-      const whole = readFileSync(file, "utf8");
-      const code = withoutComments(whole);
-      for (const match of code.matchAll(CLASS_TOKEN)) inCode.add(match[0]);
-      // Whatever the comments held that the code did not.
+    for (const { name, source } of scannedCorpus()) {
+      const code = withoutComments(source);
       const codeTokens = new Set([...code.matchAll(CLASS_TOKEN)].map((m) => m[0]));
-      for (const match of whole.matchAll(CLASS_TOKEN)) {
-        if (!codeTokens.has(match[0])) inProse.set(match[0], file.pathname);
+      for (const token of codeTokens) inCode.add(token);
+      for (const match of source.matchAll(CLASS_TOKEN)) {
+        if (!codeTokens.has(match[0])) inProse.set(match[0], name);
       }
     }
 
     const onlyInProse = [...inProse].filter(([cls]) => !inCode.has(cls));
-    expect(onlyInProse.map(([cls, where]) => `${cls} (${where.split("/src/")[1] ?? where})`)).toEqual([]);
+    expect(onlyInProse.map(([cls, where]) => `${cls} (${where})`)).toEqual([]);
+  });
+
+  /**
+   * THE HYPHENATED HALF, WHICH THE VARIANT GUARD ABOVE CANNOT SEE.
+   *
+   * v1.1.0 wrote the BARE FORM of `max-md:overflow-clip` in a comment while the
+   * code used only the variant. Tailwind emitted the bare rule, nothing rendered it,
+   * and it moved the build's hash -- the fourth time this repo has paid for
+   * this trap and the first the variant guard could not catch, because the
+   * token carried no variant prefix.
+   *
+   * BOTH HALVES OF THE TOKEN ARE CHECKED, AND THE FAMILY ALONE IS NOT ENOUGH.
+   * A hyphenated token in lower case is not evidence of anything: this
+   * tree's prose is full of `read-only`, `hand-written`, `font-metric`,
+   * `drag-to-reschedule` and `min-content`, none of which Tailwind compiles.
+   * The family list below -- everything before a token's last hyphenated
+   * segment -- cuts most of that, and it deliberately omits families that
+   * collide with ordinary English (`font`, `text`, `border`, `list`, `object`,
+   * `order`, `content`, `space`, `box`).
+   *
+   * IT WAS STILL NOT ENOUGH, MEASURED: the family half alone flagged twelve
+   * innocent phrases across this tree -- `top-level`, `self-heals`,
+   * `inline-image`, `z-indices`, `row-level`, `flex-basis`, `cursor-page` and
+   * more. So the VALUE half is checked too, against what these families
+   * actually take: a number, a fraction, an arbitrary bracket, or one of a
+   * short list of keywords. The bare form of `max-md:overflow-clip` passes both
+   * and is caught; `top-level` shares a family with `top-0` and fails on
+   * `level`.
+   *
+   * The consequence of a wrong list is asymmetric, so it errs one way: a
+   * missing value is a utility this guard does not catch, and a spurious one is
+   * a red suite for a sentence. A guard that goes red because somebody
+   * explained a font stack is worse than no guard, and this repo learned that
+   * lesson once already from a looser comment stripper.
+   *
+   * WHAT IT DOES NOT CATCH, listed so nobody reads it as a proof:
+   * - a NEGATIVE utility. `-mx-6` in prose matches nothing here, because the
+   *   candidate pattern starts at a letter.
+   * - a family of more than two segments. `familyOf` splits at the LAST hyphen,
+   *   so `grid-cols-2` has the family `grid-cols` (listed) but `inset-x-0`
+   *   resolves to `inset-x` and a four-segment utility would resolve to
+   *   something not on the list at all.
+   * - a class kept alive in a TRAILING `//` comment. test/source.ts strips only
+   *   comments that BEGIN a line, deliberately -- the looser form threw away
+   *   real code after a URL -- so a trailing one is code as far as this is
+   *   concerned, and grants the token amnesty tree-wide.
+   * - a URL. A docs link containing a utility name is code by the same rule and
+   *   whitelists that token everywhere.
+   *
+   * WHAT IT STILL CANNOT CATCH, and this is the ruling rather than an
+   * oversight: a BARE ENGLISH WORD that is also a utility. `visible`, `block`,
+   * `hidden`, `sticky`, `fixed`, `truncate` and `flex` cannot be told apart
+   * from prose by any regex, and `.visible{visibility:visible}` is in the
+   * shipped stylesheet today for exactly that reason, and it costs 28 bytes:
+   * the rule is `.visible{visibility:visible}`, counted rather than estimated.
+   *
+   * NO OCCURRENCE COUNT, AND THAT IS THE SECOND CORRECTION THIS PARAGRAPH HAS
+   * TAKEN. It first carried a pair of numbers no rule produced; the replacement
+   * said "75 occurrences across 30 files", and a reviewer reproducing it landed
+   * on 79 or 67 depending on where a token is judged to begin -- the bare word
+   * inside a longer hyphenated utility, inside a URL, inside an object key.
+   * (Writing one of those hyphenated examples out here is what the guard below
+   * caught while this paragraph was being edited, which is the shortest possible
+   * demonstration that it works.)
+   * The file count moves the same way (30 or 36 by two defensible rules), so both
+   * numbers are dropped rather than restated a third time under a rule elaborate
+   * enough to be right. The argument never needed either: the word is spread
+   * across dozens
+   * of files as ordinary English and as identifiers -- `const { threadId:
+   * visible }` compiles a rule too -- so closing this half means banning a common
+   * English word from comments AND from local names to save 28 bytes, whatever
+   * the exact total is. The hyphenated half is closable and is closed.
+   */
+  /**
+   * EVERY ENTRY CARRIES A `_` THAT IS STRIPPED, and that is not decoration.
+   *
+   * This file is scanned by Tailwind exactly like every other, so a family name
+   * that is ALSO a bare utility -- several below are -- becomes a real rule
+   * just by being a string literal here. Measured: the first version of these
+   * two lists shipped one such rule into the stylesheet with nothing rendering
+   * it, which is a guard against dead rules emitting one of its own. The marker
+   * makes each entry resolve to nothing, and `_` is a word character so the
+   * scanner does not split on it.
+   *
+   * The prose has to obey the same rule, and it took a second build to learn
+   * that: naming the offending utility HERE, while explaining it, put the rule
+   * straight back. This paragraph names none.
+   */
+  const withoutMarker = (list: string): Set<string> =>
+    new Set(list.split(/\s+/).filter(Boolean).map((entry) => entry.slice(1)));
+
+  const FAMILIES = withoutMarker(`
+    _overflow _overflow-x _overflow-y _overscroll
+    _min-w _min-h _max-w _max-h _w _h _size
+    _top _bottom _left _right _inset _inset-x _inset-y _z
+    _p _px _py _pt _pb _pl _pr
+    _m _mx _my _mt _mb _ml _mr
+    _gap _gap-x _gap-y _flex _grid _grid-cols _col _col-span _row
+    _items _justify _self _place _shrink _grow _basis
+    _rounded _divide _ring _shadow _opacity _cursor _whitespace
+    _inline _float _clear _aspect _columns _isolation
+  `);
+  /**
+   * What those families take as a value: a number, a fraction, an arbitrary
+   * bracket, or one of these. Short on purpose -- see the note above on which
+   * way a wrong list should err.
+   */
+  const VALUES = withoutMarker(`
+    _auto _none _full _screen _px _min _max _fit _clip _visible
+    _hidden _scroll _contain _center _start _end _between _around
+    _evenly _stretch _baseline _col _row _wrap _nowrap _reverse
+    _pointer _default _move _grab _grabbing _wait _help _crosshair
+    _block _flex _grid _table _contents _sm _md _lg _xl _2xl
+    _3xl _dashed _dotted _solid _initial _first _last
+  `);
+  /**
+   * THE LOOKBEHIND IS THE DIFFERENCE BETWEEN THIS GUARD WORKING AND NOT, and it
+   * was found by mutation rather than by reasoning. Without it, the bare form
+   * is harvested out of the `max-md:overflow-clip` in REAL CODE -- so the bare
+   * form named in prose looked like a class the code also used, and this
+   * round's actual mistake sailed straight through the guard written to catch
+   * it. A variant-prefixed class is the variant guard's business; only a token
+   * standing on its own counts here.
+   */
+  const HYPHENATED = /(?<![\w:.-])[a-z][a-z0-9]*(?:-[a-z0-9.[\]/%]+)+\b/g;
+
+  const familyOf = (token: string): string => token.slice(0, token.lastIndexOf("-"));
+  const valueOf = (token: string): string => token.slice(token.lastIndexOf("-") + 1);
+  const looksLikeAValue = (value: string): boolean =>
+    VALUES.has(value) || /^\d+(?:\.\d+)?$/.test(value) || /^\d+\/\d+$/.test(value)
+    || /^\[.*\]$/.test(value);
+
+  /** The rule itself, over any corpus -- so it can be driven by the test below. */
+  function proseOnlyUtilities(corpus: readonly { name: string; source: string }[]): string[] {
+    const inCode = new Set<string>();
+    const inProse = new Map<string, string>();
+    for (const { name, source } of corpus) {
+      const code = withoutComments(source);
+      const codeTokens = new Set([...code.matchAll(HYPHENATED)].map((m) => m[0]));
+      for (const token of codeTokens) inCode.add(token);
+      for (const match of source.matchAll(HYPHENATED)) {
+        if (!codeTokens.has(match[0])) inProse.set(match[0], name);
+      }
+    }
+    return [...inProse]
+      .filter(([token]) =>
+        !inCode.has(token) && FAMILIES.has(familyOf(token)) && looksLikeAValue(valueOf(token)))
+      .map(([token, where]) => `${token} (${where})`);
+  }
+
+  it("names no hyphenated utility in prose that the code does not also use", () => {
+    expect(proseOnlyUtilities(scannedCorpus())).toEqual([]);
+  });
+
+  /**
+   * THE WALK'S COVERAGE, PINNED -- because narrowing it back to `.ts`/`.tsx`
+   * leaves the suite green until somebody adds the file that needs it, which is
+   * exactly how the hole existed in the first place. A `.md` dropped under
+   * packages/web emitted two rules and moved the built hash with this guard
+   * green throughout.
+   *
+   * Asserted as a property of the corpus rather than of the regex: the walk has
+   * to reach beyond `src` (index.html and vite.config.ts live above it), and
+   * the extension set has to admit the documentation formats Tailwind reads.
+   */
+  it("reads every file type Tailwind scans, not just the sources", () => {
+    const names = scannedCorpus().map((file) => file.name);
+    expect(names).toContain("index.html");
+    expect(names).toContain("vite.config.ts");
+    expect(names.some((name) => name.startsWith("src/"))).toBe(true);
+    expect(names.some((name) => name.includes("node_modules"))).toBe(false);
+    expect(names.some((name) => name.startsWith("dist/"))).toBe(false);
+    for (const extension of [".md", ".mdx", ".html", ".json", ".svg", ".txt", ".css", ".jsx"]) {
+      expect(SCANNED.test(`anything${extension}`), extension).toBe(true);
+    }
+  });
+
+  /**
+   * THE GUARD'S OWN STRENGTH, PINNED -- because a guard that quietly stops
+   * guarding is worse than none, and this one did.
+   *
+   * Mutation found two ways it degraded in silence: dropping the lookbehind
+   * made it harvest a bare token out of a VARIANT-PREFIXED class in real code,
+   * so the exact mistake it was written for stopped being caught; and a value
+   * list that was too permissive turned it red over ordinary English. Neither
+   * showed up in a suite run over this tree, because the tree is clean. So the
+   * rule is driven over a corpus written to contain both.
+   *
+   * The tokens are assembled from marked strings for the same reason the lists
+   * above are: this file is scanned, and spelling a utility here would emit it.
+   */
+  it("catches the shape that got past the variant guard, and nothing else", () => {
+    const unmark = (token: string): string => token.slice(1);
+    const bare = unmark("_overflow-clip");
+    const variant = `max-md:${bare}`;
+
+    // The real case: the code uses only the variant, the comment names the bare
+    // form. Without the lookbehind the bare form is harvested out of the
+    // variant and this comes back empty.
+    expect(proseOnlyUtilities([
+      { name: "a.tsx", source: `const x = "${variant}";\n/* about ${bare} */` },
+    ])).toEqual([`${bare} (a.tsx)`]);
+
+    // Named in prose AND used in code: Tailwind was going to emit it anyway.
+    expect(proseOnlyUtilities([
+      { name: "a.tsx", source: `const x = "${bare}";\n/* about ${bare} */` },
+    ])).toEqual([]);
+
+    // Used in one file, explained in another: still fine, the set is tree-wide.
+    expect(proseOnlyUtilities([
+      { name: "a.tsx", source: `const x = "${bare}";` },
+      { name: "b.tsx", source: `/* about ${bare} */` },
+    ])).toEqual([]);
+
+    // AND ORDINARY ENGLISH IS NOT A UTILITY. Every one of these shares a family
+    // with a real class in this tree and was flagged by an earlier version.
+    const english = ["top-level", "self-heals", "row-level", "inline-image",
+      "z-indices", "flex-basis", "cursor-page", "right-alignment", "min-content",
+      "read-only", "hand-written", "font-metric"];
+    expect(proseOnlyUtilities([
+      { name: "a.tsx", source: `const x = "${bare}";\n/* ${english.join(" ")} */` },
+    ])).toEqual([]);
   });
 });

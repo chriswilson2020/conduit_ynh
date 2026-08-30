@@ -294,6 +294,415 @@ test.describe.serial("Phone navigation and the record rail", () => {
 // 2. The kanban: one stage at a time, with a Move action in place of a drag.
 // ---------------------------------------------------------------------------
 
+/**
+ * THE SALUTATION PICKER'S "Other..." BOX, AT A PHONE VIEWPORT.
+ *
+ * e2e/crm.spec.ts asserts the same rule at a desk, and this is here because
+ * THE FAILURE MODE IS DIFFERENT AT 390 -- measured under the mutation that
+ * removes the fix: at a desk focus lands on the Radix trigger and letter keys
+ * become typeahead, which COMMITS a preset and destroys a stored free-text
+ * title; at 390 focus settles on BODY and the typing is simply lost. A desktop
+ * test shaped around typeahead would not have caught the silent one, so both
+ * widths are driven.
+ *
+ * The three gestures are the three that reach the box: picking "Other..." on a
+ * field that is not on it, RE-PICKING it on a field that already is (Radix
+ * fires no value change for a same-value selection, which the first fix relied
+ * on and so missed), and dismissing the menu with Escape (which fires no value
+ * change either). All three destroyed a stored `Dhr` before this.
+ */
+test.describe.serial("Phone contact salutation", () => {
+  const runId = Date.now().toString(36);
+  let page: Page;
+  let contactId = "";
+
+  test.beforeAll(async ({ browser }) => {
+    page = await browser.newPage({ ...IPHONE_13 });
+  });
+  test.afterAll(async () => {
+    await page.close();
+  });
+
+  test("stores a typed title through the Other... box", async () => {
+    await page.goto("/contacts");
+    await page.getByRole("button", { name: "New" }).click();
+    await page.getByPlaceholder("First name").fill(`Phone ${runId}`);
+    await page.getByRole("button", { name: "Create" }).click();
+    await expect(page).toHaveURL(/\/contacts\/[0-9a-f-]{36}$/);
+    contactId = page.url().split("/").pop() as string;
+
+    await page.getByTestId("salutation").click();
+    await page.getByRole("option", { name: "Other..." }).click();
+    const box = page.getByTestId("salutation-other");
+    await expect(box).toBeFocused();
+    // page.keyboard, not box.fill: this has to go wherever the DOCUMENT has
+    // focus, which is the whole question.
+    await page.keyboard.type("Dhr");
+    await expect(box).toHaveValue("Dhr");
+    await page.keyboard.press("Enter");
+    await page.reload();
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhr");
+  });
+
+  /**
+   * RE-PICKING "Other..." ON A FIELD ALREADY SHOWING IT. Radix fires no
+   * onValueChange for a same-value selection, so a fix keyed on that event does
+   * nothing here -- and the stored `Dhr` was destroyed by the `D` of the next
+   * word, measured.
+   */
+  test("keeps the caret in the box when Other... is picked again", async () => {
+    await page.goto(`/contacts/${contactId}`);
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhr");
+    await page.getByTestId("salutation").click();
+    await page.getByRole("option", { name: "Other..." }).click();
+    await expect(page.getByTestId("salutation-other")).toBeFocused();
+
+    await page.keyboard.type("s");
+    // The stored value is still there and has GAINED the keystroke, rather than
+    // having been replaced by a preset the typeahead matched.
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhrs");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhr");
+  });
+
+  /** Escape closes the menu without any value change at all, and reached it too. */
+  test("keeps the caret in the box when the menu is dismissed", async () => {
+    await page.goto(`/contacts/${contactId}`);
+    await page.getByTestId("salutation").click();
+    await page.getByRole("option", { name: "Other...", exact: true }).waitFor();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("salutation-other")).toBeFocused();
+
+    await page.keyboard.type("x");
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhrx");
+    await page.keyboard.press("Enter");
+    await page.reload();
+    await expect(page.getByTestId("salutation-other")).toHaveValue("Dhrx");
+  });
+});
+
+/**
+ * THE OTHER TWO SURFACES THE SALUTATION APPEARS ON, AT 390.
+ *
+ * The group above is about the picker; this one is about where the value then
+ * shows up. Both surfaces changed shape below the breakpoint independently of
+ * v1.1.0 -- the contacts table reads as stacked cards, and the quote form's
+ * recipient block is one column rather than two -- so a value that sits neatly
+ * beside a name at 1280 is not thereby proved to at 390.
+ *
+ * AND NOTHING MAY HANG OVER THE EDGE, which is a v1.1.0 requirement rather than
+ * a general tidiness one. `<main>` used to scroll sideways, so anything past the
+ * viewport was reachable with a swipe; it clips below the breakpoint now, so the
+ * board's stage picker can stick, and a row that overflows is CUT rather than
+ * merely awkward. The salutation makes both of these surfaces wider than they
+ * were, which is exactly the change that could have caused it. Measured on the
+ * page, not on the boxes: `documentElement.scrollWidth` against `innerWidth`.
+ *
+ * The fields are seeded through the API here, deliberately: setting them through
+ * the picker is the group above's journey and re-driving it would put that
+ * surface in this one's failure path.
+ */
+/**
+ * The widest a salutation can be: CONTACT_FIELD_CAPS puts both fields at 64
+ * characters, and a real Dutch honorific of exactly that length is what the
+ * "Other..." box has to render without pushing the page off the screen.
+ */
+const LONG_SALUTATION = "Grootmeester in de Nederlandse Letteren en Wetenschappen Utrecht";
+/** A custom pronoun set long enough to be the widest realistic one. */
+const LONG_PRONOUNS = "hij/hem/zijn, of zij/haar naar gelang de dag";
+/**
+ * A name and an email with NO SPACE TO WRAP AT, which is what actually cut real
+ * data off a phone screen: `flex-1` beside a `w-32 shrink-0` label floors at its
+ * content's min-content width, and an email address has no break opportunity in
+ * it at all. Measured on this build before the fix: 16px past `main` at 320 on
+ * the deal page with this name, 42px on the contact page.
+ */
+const LONG_SURNAME = "Vandenberghemf3k2x9";
+const LONG_EMAIL = "cornelia.vandenberghe@onbreekbaar.example.nl";
+
+test.describe.serial("Phone salutation on the list and on a quote", () => {
+  const runId = Date.now().toString(36);
+  let attemptId = "";
+  let page: Page;
+  let contactId = "";
+  let dealId = "";
+  let contactName = "";
+  /** The contact whose fields hold the widest values these columns allow. */
+  let longTitleContactId = "";
+  /** And a deal linked to it, where the same rows are a flex row at every width. */
+  let longTitleDealId = "";
+
+  /**
+   * HOW FAR CONTENT RUNS PAST THE EDGE -- MEASURED ON `<main>`, NOT ON THE
+   * DOCUMENT, AND THE DIFFERENCE IS THE WHOLE POINT AFTER v1.1.0.
+   *
+   * The suite's older phone assertions read
+   * `documentElement.scrollWidth - innerWidth`, and THAT READING HAS NEVER
+   * WORKED. An earlier version of this comment blamed Task 2's
+   * `max-md:overflow-clip`, and that was wrong in a way worth keeping on the
+   * record: `<main>` has carried `overflow-auto` since the first web commit of
+   * this project, and a scroll container does not propagate its overflow to its
+   * ancestors any more than a clipped one does. The document never grew, at any
+   * viewport, however far a child ran over.
+   *
+   * MEASURED BOTH WAYS, by injecting a div 200px wider than the viewport into
+   * `main`. At 1280, where `main` is `overflow-auto`: the document answered **0**
+   * and `main.scrollWidth - main.clientWidth` answered **472**. At 390, under the
+   * clip: **0** and **224**. `auto` is exactly as opaque as `clip`.
+   *
+   * WHAT TASK 2 CHANGED IS THE CONSEQUENCE, NOT THE BLINDNESS, and having the
+   * cause backwards hid how much had never been measured at all: under `auto` the
+   * overflow was at least swipe-reachable, under `clip` it is cut. Three
+   * assertions in e2e/documents.spec.ts had been `0 <= 1` at every viewport since
+   * the day they were written, and are corrected in the same change as this.
+   *
+   * Reading `main` also gives the sweep's "ignore anything inside its own
+   * horizontal scroller" rule for free, since a nested scroll container does not
+   * propagate either. The contacts table's `overflow-x-auto` box, the record
+   * rail's tab strip and the Gantt grid are allowed to scroll by design and do
+   * not register here.
+   *
+   * The threshold is 1 rather than 0, matching e2e/documents.spec.ts: sub-pixel
+   * rounding is not a layout defect, and a row that genuinely does not fit is over
+   * by tens of pixels (the deal page was 403 against 390 before Task 2 wrapped it).
+   */
+  async function mainOverflow(target: Page): Promise<number> {
+    return await target.evaluate(() => {
+      const main = document.querySelector("main");
+      if (main === null) throw new Error("this page has no <main> to measure");
+      return main.scrollWidth - main.clientWidth;
+    });
+  }
+
+  /**
+   * What `mainOverflow` reports when something `extra` pixels too wide is put into
+   * `main`, with the offending element removed again before the value comes back.
+   *
+   * This exists so a guard that measures the wrong box cannot pass silently. It is
+   * the same care e2e/documents.spec.ts takes when it asserts its logo fixture's
+   * byte length: prove the instrument, then trust the reading.
+   */
+  async function overhangOf(target: Page, extra: number): Promise<number> {
+    return await target.evaluate((over: number) => {
+      const main = document.querySelector("main");
+      if (main === null) throw new Error("this page has no <main> to measure");
+      const probe = document.createElement("div");
+      probe.style.width = `${String(window.innerWidth + over)}px`;
+      probe.style.height = "1px";
+      main.append(probe);
+      const measured = main.scrollWidth - main.clientWidth;
+      probe.remove();
+      return measured;
+    }, extra);
+  }
+
+  async function create(path: string, data: unknown): Promise<{ id: string }> {
+    const response = await page.request.post(path, { data });
+    const body = await response.text();
+    expect(response.status(), `POST ${path} answered ${String(response.status())}: ${body}`).toBe(201);
+    return JSON.parse(body) as { id: string };
+  }
+
+  test.beforeAll(async ({ browser }, testInfo) => {
+    attemptId = `${runId}x${String(testInfo.retry)}`;
+    page = await browser.newPage({ ...IPHONE_13 });
+    contactName = `Wilhelmina Zeldenrust${attemptId}`;
+
+    const company = await create("/api/companies", {
+      name: `Phoneco ${attemptId}`,
+      address: "3 Prinsengracht\n1015 DX Amsterdam",
+    });
+    const contact = await create("/api/contacts", {
+      firstName: "Wilhelmina",
+      lastName: `Zeldenrust${attemptId}`,
+      companyId: company.id,
+      salutation: "Prof",
+      pronouns: "hij/hem",
+    });
+    const pipeline = await create("/api/pipelines", { name: `Phone salutation ${attemptId}`, scope: "global" });
+    const stage = await create(`/api/pipelines/${pipeline.id}/stages`, { name: "Lead" });
+    const deal = await create("/api/deals", {
+      title: `Phone advisory ${attemptId}`,
+      pipelineId: pipeline.id,
+      stageId: stage.id,
+      companyId: company.id,
+      contactId: contact.id,
+      valueCents: 50_000,
+    });
+    contactId = contact.id;
+    dealId = deal.id;
+
+    // A second contact, carrying the cap in both boxes. Separate from the one
+    // above so the list and quote assertions keep reading a short, realistic
+    // "Prof", and given a different surname so the list filter cannot see it.
+    const wide = await create("/api/contacts", {
+      firstName: "Cornelia",
+      lastName: LONG_SURNAME,
+      companyId: company.id,
+      emails: [LONG_EMAIL],
+      salutation: LONG_SALUTATION,
+      pronouns: LONG_PRONOUNS,
+    });
+    longTitleContactId = wide.id;
+    // Its own deal, because the Company and Contact rows that were cutting data
+    // off the screen live on the DEAL page as well and are `flex` at every width
+    // there -- the contact page stacks its field card below `sm` and hides half
+    // the defect.
+    const wideDeal = await create("/api/deals", {
+      title: `Phone overflow ${attemptId}`,
+      pipelineId: pipeline.id,
+      stageId: stage.id,
+      companyId: company.id,
+      contactId: wide.id,
+      valueCents: 10_000,
+    });
+    longTitleDealId = wideDeal.id;
+  });
+
+  test.afterAll(async () => {
+    await page.close();
+  });
+
+  test("puts the salutation in the contact's card and the pronouns nowhere", async () => {
+    await page.goto("/contacts");
+    await page.getByPlaceholder("Filter...").fill(`Zeldenrust${attemptId}`);
+    const row = page.getByTestId(`row-${contactId}`);
+    await expect(row).toBeVisible();
+    // A card, not a table row: the heading row is hidden below the breakpoint and
+    // each cell carries its own label, so `Name` reads before the value here and
+    // the accessible-name assertion the desktop journey makes does not apply.
+    await expect(row).toContainText(`Prof ${contactName}`);
+    // The list is for finding someone; a pronoun is for writing to them.
+    await expect(row).not.toContainText("hij/hem");
+    await expect.poll(async () => await mainOverflow(page)).toBeLessThanOrEqual(1);
+  });
+
+  test("defaults the salutation into the quote form", async () => {
+    await page.goto(`/deals/${dealId}`);
+    // The Contact row carrying the name is the linked-contact query having
+    // resolved, which is where the form's default comes from.
+    await expect(page.getByTestId("field-contactId")).toContainText(contactName);
+    await expect.poll(async () => await mainOverflow(page)).toBeLessThanOrEqual(1);
+
+    await page.getByTestId("new-quote-button").click();
+    await expect(page.getByTestId("quote-form")).toBeVisible();
+    await expect(page.getByTestId("quote-recipient-salutation")).toHaveValue("Prof");
+    await expect(page.getByTestId("quote-recipient-contact")).toHaveValue(contactName);
+    // The fourth box in a block that used to hold three, in a dialog that is
+    // nearly the width of the screen at 390.
+    await expect.poll(async () => await mainOverflow(page)).toBeLessThanOrEqual(1);
+  });
+
+  /**
+   * THE CONTACT PAGE ITSELF, WHICH IS THE SURFACE v1.1.0 ACTUALLY CHANGED AND THE
+   * ONE NOTHING MEASURED.
+   *
+   * The two tests above cover where the value LANDS. This covers where it is
+   * typed: two picker rows and, on "Other...", a revealed text box, added to a
+   * page that already carries a field card, a company row and an owner picker.
+   * The release's own phone sweep walked all eighteen routes and found this one
+   * fitting -- but that sweep was a scratchpad script, and a measurement nothing
+   * re-runs is not coverage. This is the committed version, on the one route that
+   * gained controls.
+   *
+   * AT 320 AS WELL AS 390, because 320 is where a fixed-width control shows and
+   * the phone standard's own anchor is 390. It is also the width at which the deal
+   * page's date input was found six pixels over.
+   *
+   * THE VALUE IS THE CAP, 64 characters, which is the widest thing this field can
+   * ever hold. A "Other..." box seeded from a stored value renders it; a shorter
+   * one would leave the question of what happens at the limit unasked.
+   *
+   * A SECOND PAGE PER WIDTH RATHER THAN A RESIZE. `setViewportSize` mid-test
+   * updates a MediaQueryList's `matches` without dispatching `change`, so
+   * `useIsMobile()` would never see it -- the reason this file's header gives for
+   * `test.use` in the first place. Both widths are below the breakpoint, so the
+   * hazard is not live here, but a second context costs nothing and keeps the
+   * file's "nothing resizes" property true.
+   */
+  /**
+   * REAL DATA, NOT CUT OFF THE SCREEN -- WHICH IS WHAT THIS GUARD IS FOR.
+   *
+   * v1.1.0 put two picker rows and a revealed text box on the contact page, and
+   * the release's own 18-route sweep called every route clear at 390 and 320.
+   * That sweep was adversarial in ONE dimension: a project name holding a long
+   * unbreakable word. It gave every other field a short value, so it never asked
+   * what a long contact name or an email address does to a `flex-1` cell beside a
+   * `w-32 shrink-0` label -- and those cells floor at their content's min-content
+   * width, which for an email is the entire unbroken string.
+   *
+   * MEASURED ON THIS BUILD, before `min-w-0 break-words` went onto those cells:
+   * `/deals/:id` at 320 with this fixture's 28-character contact name was 16px
+   * past `main`'s content edge, and `/contacts/:id` at 320 was 42px past it. The
+   * data was CUT, not scrollable -- `<main>` clips below the breakpoint -- with no
+   * scrollbar and nothing on screen to say a character was missing. Before Task 2
+   * it was swipe-reachable; the clip is what turned it into loss.
+   *
+   * BOTH ROUTES, because they are not the same layout: the contact page's field
+   * card stacks below `sm` and so hides half the defect, while the deal page's
+   * Company and Contact rows are a flex row at every width.
+   *
+   * AT 320 AS WELL AS 390, and 320 is where it was found: the phone standard is
+   * anchored at 390 and this defect is invisible there.
+   */
+  test("does not cut a long name or email off the screen", async ({ browser }) => {
+    // Asserted rather than assumed: this is the cap from CONTACT_FIELD_CAPS, and
+    // a constant that quietly came out at 40 characters would prove less.
+    expect(LONG_SALUTATION).toHaveLength(64);
+
+    for (const [label, path] of [
+      ["the contact page", `/contacts/${longTitleContactId}`],
+      ["the deal page", `/deals/${longTitleDealId}`],
+    ] as const) {
+      for (const width of [390, 320]) {
+        const narrow = await browser.newPage({ ...IPHONE_13, viewport: { width, height: 664 } });
+        try {
+          await narrow.goto(path);
+          // The values are really on screen, so the measurement is of the page
+          // this release ships rather than of an empty one.
+          await expect(narrow.getByText(LONG_SURNAME).first()).toBeVisible();
+
+          await expect
+            .poll(async () => await mainOverflow(narrow), {
+              message: `${label} runs past the edge at ${String(width)}px`,
+            })
+            .toBeLessThanOrEqual(1);
+
+          // AND THE MEASUREMENT CAN FAIL, proved on the page it was just used on
+          // rather than assumed. The clip makes the obvious reading -- the
+          // DOCUMENT's scroll width -- report 0 whatever the content does, so a
+          // guard built on it would be green for ever. This puts something 200px
+          // too wide into `main` and requires the number to move, then takes it
+          // out again, so the assertion above is still the one describing the
+          // shipped page.
+          expect(await overhangOf(narrow, 200)).toBeGreaterThan(100);
+        } finally {
+          await narrow.close();
+        }
+      }
+    }
+  });
+
+  test("keeps the two pickers inside the screen at 390 and at 320", async ({ browser }) => {
+    for (const width of [390, 320]) {
+      const narrow = await browser.newPage({ ...IPHONE_13, viewport: { width, height: 664 } });
+      try {
+        await narrow.goto(`/contacts/${longTitleContactId}`);
+        // The boxes are on screen and hold the cap in both fields.
+        await expect(narrow.getByTestId("salutation-other")).toHaveValue(LONG_SALUTATION);
+        await expect(narrow.getByTestId("pronouns-other")).toHaveValue(LONG_PRONOUNS);
+        await expect
+          .poll(async () => await mainOverflow(narrow), {
+            message: `the pickers run past the edge at ${String(width)}px`,
+          })
+          .toBeLessThanOrEqual(1);
+      } finally {
+        await narrow.close();
+      }
+    }
+  });
+});
+
 test.describe.serial("Phone kanban stage view", () => {
   const runId = Date.now().toString(36);
   let attemptId = "";
@@ -466,10 +875,16 @@ test.describe.serial("Phone Gantt", () => {
    * Task 5 gave that box no `data-testid`, and addressing it by its Tailwind
    * classes would break the day one utility is reordered -- so it is found
    * from a testid the app does render, by walking up to the nearest scrolling
-   * ancestor. `<main>` is also `overflow-auto`, so "nearest" is what keeps
-   * this off it; the two assertions every caller makes -- that the box
-   * overflows on BOTH axes -- are also the check that we did not land on
-   * `<main>`, which at this width overflows on neither.
+   * ancestor.
+   *
+   * THE WALK CAN NO LONGER LAND ON `<main>` AT ALL, which is a v1.1.0 change
+   * and the reason this paragraph was rewritten. It used to say `<main>` was
+   * also `overflow-auto` and that "nearest" was what kept this off it; below
+   * the breakpoint `<main>` is now `overflow: clip`, which this loop does not
+   * accept, so a chart box that stopped matching would walk past it to the
+   * root rather than stopping one element short. The two assertions every
+   * caller makes -- that the box overflows on BOTH axes -- still catch that,
+   * as they always did.
    */
   async function chartScrollBox(page: Page, taskId: string): Promise<{
     scrollLeft: number; scrollWidth: number; clientWidth: number;

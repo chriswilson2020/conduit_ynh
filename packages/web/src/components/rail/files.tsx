@@ -95,9 +95,26 @@ export function Files({ companyId, contactId, dealId, projectId }: FilesProps) {
       <ul className="flex flex-col gap-2">
         {sorted.map((file) => (
           <li key={file.id} className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm">
+            {/*
+              THE DOWNLOAD LINK HAS NEVER HAD THE 44px FLOOR, and it is the only
+              way to get a file back out of the rail. Measured at 390x664 before
+              this line: 64.5 x 17px for "fixture.txt", eleven characters -- an
+              inline box one line of text tall, which is under half the platform
+              minimum. BOTH AXES, because the width is content: 64.5px is what
+              that one filename happens to measure, and a file called "a.pdf"
+              would be narrower than the floor on its own.
+
+              EVERY PART OF THE FIX IS SCOPED, INCLUDING THE DISPLAY. A height
+              floor does nothing to an inline box, so the element has to become
+              a flex one for the floor to bite -- but unscoped that changed the
+              DESKTOP hit-box too, from 16.5px to 20px, for no reason anybody
+              asked for. The first round left it unscoped and the guard pinned
+              the mistake. Below the breakpoint it is a 44px flex target; above
+              it, it is the inline link it always was.
+            */}
             <a
               href={apiUrl(`/files/${file.id}/download`)}
-              className="font-medium text-slate-900 underline hover:text-slate-700"
+              className="font-medium text-slate-900 underline hover:text-slate-700 max-md:inline-flex max-md:min-h-11 max-md:min-w-11 max-md:items-center"
             >
               {file.originalName}
             </a>

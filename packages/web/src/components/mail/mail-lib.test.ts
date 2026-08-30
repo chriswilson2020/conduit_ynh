@@ -35,6 +35,8 @@ import {
   MAIL_CONNECTION_MESSAGE,
   parseAddressToken,
   parseRecipientInput,
+  placeholderPattern,
+  PLACEHOLDER_KEYS,
   resolveRecipients,
   sendFailureMessage,
   signatureBlock,
@@ -297,10 +299,181 @@ describe("dedupeRecipients", () => {
 describe("substitutePlaceholders", () => {
   it("substitutes every supported placeholder", () => {
     const out = substitutePlaceholders(
-      "<p>Hi {{contact.name}} at {{company.name}}, - {{user.name}}</p>",
-      { contactName: "Alice", companyName: "Acme", userName: "Chris" },
+      "<p>Dear {{contact.salutation}} {{contact.name}} ({{contact.pronouns}}) at"
+      + " {{company.name}}, - {{user.name}}</p>",
+      {
+        contactName: "Alice", contactSalutation: "Dr", contactPronouns: "she/her",
+        companyName: "Acme", userName: "Chris",
+      },
     );
-    expect(out).toBe("<p>Hi Alice at Acme, - Chris</p>");
+    expect(out).toBe("<p>Dear Dr Alice (she/her) at Acme, - Chris</p>");
+  });
+
+  // THE RULE, AS AN ABSENCE. Neither field is ever inferred -- not from the name,
+  // not from the other one. A contact with a salutation and no pronouns fills the
+  // one and renders nothing for the other.
+  /**
+   * A contact the composer HAS, whose two new fields are empty. An OMITTED key
+   * means something different now -- "no contact in scope at all" -- and is
+   * covered by its own test; see substitute() in mail-lib.ts for why the two had
+   * to stop being the same thing.
+   */
+  const EMPTY = { contactSalutation: null, contactPronouns: null };
+
+  it("infers neither field from the other, nor from the name", () => {
+    expect(substitutePlaceholders(
+      "{{contact.salutation}}|{{contact.pronouns}}",
+      { contactName: "Alice Jansen", contactSalutation: "Mr", contactPronouns: null },
+    )).toBe("Mr|");
+    expect(substitutePlaceholders(
+      "{{contact.salutation}}|{{contact.pronouns}}",
+      { contactName: "Alice Jansen", contactSalutation: null, contactPronouns: null },
+    )).toBe("|");
+  });
+
+  /**
+   * THE TWO NEW FIELDS DELIBERATELY DIFFER FROM THE NAME FIELDS, and this is the
+   * test that says so out loud.
+   *
+   * Phase 4's rule leaves an unresolved placeholder visible because a missing
+   * `{{contact.name}}` means somebody forgot something. Salutation and pronouns are
+   * normally empty -- every contact from before v1.1.0 has neither -- so leaving
+   * them visible would put `Dear {{contact.salutation}} Alice,` in front of the user
+   * on most sends. Blank means blank for these two, and the name fields are checked
+   * alongside so the departure stays deliberate rather than spreading.
+   */
+  it("renders an absent salutation or set of pronouns as nothing, while an absent name is still left literal", () => {
+    const context = {
+      contactName: "Alice", companyName: "Acme", userName: "Chris",
+      // NULL, not omitted: "this contact has no salutation" is the case this
+      // rule is for, and an omitted key means something else now -- see the
+      // test below about a composer with no contact in scope.
+      contactSalutation: null, contactPronouns: null,
+    };
+    expect(substitutePlaceholders("Dear {{contact.salutation}} {{contact.name}},", context))
+      .toBe("Dear Alice,");
+    expect(substitutePlaceholders("Alice ({{contact.pronouns}}) at {{company.name}}", context))
+      .toBe("Alice () at Acme");
+    // ...and the names keep the old rule.
+    expect(substitutePlaceholders("Hi {{contact.name}} at {{company.name}} - {{user.name}}", {}))
+      .toBe("Hi {{contact.name}} at {{company.name}} - {{user.name}}");
+  });
+
+
+  /**
+   * A COMPOSER WITH NO CONTACT IN SCOPE KEEPS THE PLACEHOLDER, AND THE INBOX IS
+   * WHY THIS TEST EXISTS.
+   *
+   * pages/inbox.tsx renders `<Composer open onOpenChange />` with NO seed, so its
+   * context carries no contact at all -- there is no record behind a message
+   * started from the Inbox. Under the first version of BLANK_MEANS_BLANK that was
+   * indistinguishable from "this contact has no salutation", so applying a
+   * template there DELETED the field: `Dear {{contact.salutation}} {{contact.name}},`
+   * came out `Dear {{contact.name}},`, the name still visible and the salutation
+   * gone with nothing on screen to say so. Composing from a record's Mail tab and
+   * replying in a thread both pass a contact and were unaffected, which is exactly
+   * how a defect like this survives.
+   *
+   * So the rule is about the VALUE, not the path: `null` and `""` are a contact
+   * with none, `undefined` is no contact, and only the first blanks.
+   */
+  it("leaves the new fields literal when the composer has no contact at all", () => {
+    // The Inbox's context: a user, and nothing else. Not one contact key present.
+    const inboxContext = { userName: "Chris" };
+    expect(substitutePlaceholders("Dear {{contact.salutation}} {{contact.name}},", inboxContext))
+      .toBe("Dear {{contact.salutation}} {{contact.name}},");
+    expect(substitutePlaceholders("Alice ({{contact.pronouns}})", inboxContext))
+      .toBe("Alice ({{contact.pronouns}})");
+    // And the same template, from a record whose contact simply has neither, still
+    // blanks -- which is the behaviour the release is actually for.
+    const knownContact = { userName: "Chris", contactName: "Alice", contactSalutation: null, contactPronouns: null };
+    expect(substitutePlaceholders("Dear {{contact.salutation}} {{contact.name}},", knownContact))
+      .toBe("Dear Alice,");
+  });
+
+  // THE SPACE, WHICH IS THE WHOLE REASON BLANK CANNOT JUST MEAN "". Substituting
+  // nothing for the salutation in "Dear {{contact.salutation}} Alice," leaves a
+  // doubled space; one following space goes with it.
+  it("consumes exactly one following space when a blank-means-blank field renders as nothing", () => {
+    const filled = { contactSalutation: "Dr", contactName: "Alice" };
+    expect(substitutePlaceholders("Dear {{contact.salutation}} {{contact.name}},", filled))
+      .toBe("Dear Dr Alice,");
+    // ONE space, not whitespace collapsing: a second space, a newline and a tab are
+    // the author's layout and survive untouched.
+    expect(substitutePlaceholders("Dear {{contact.salutation}}  Alice,", EMPTY)).toBe("Dear  Alice,");
+    expect(substitutePlaceholders("{{contact.salutation}}\nAlice", EMPTY)).toBe("\nAlice");
+    expect(substitutePlaceholders("{{contact.salutation}}\tAlice", EMPTY)).toBe("\tAlice");
+    // Nothing following it at all is not a special case.
+    expect(substitutePlaceholders("Alice {{contact.pronouns}}", EMPTY)).toBe("Alice ");
+    // The HTML path behaves identically -- the space handling is in the shared
+    // substitution, not in either wrapper.
+    expect(substitutePlaceholdersHtml("<p>Dear {{contact.salutation}} Alice</p>", EMPTY))
+      .toBe("<p>Dear Alice</p>");
+  });
+
+  /**
+   * U+00A0 IS THE SPACE THE PIPELINE ACTUALLY STORES, and an ASCII-only class missed
+   * it. `sanitizeMailHtml` decodes `&nbsp;`, `&#160;` and `&#x00a0;` into a literal
+   * non-breaking space and stores that, and it runs on every template save -- so a
+   * template typed with a non-breaking space between the salutation and the name came
+   * back out of the database matching nothing, and an empty salutation left exactly
+   * the doubled space the group exists to remove. Invisible in review, which is why
+   * this test spells the character as an escape.
+   */
+  it("consumes a stored non-breaking space as readily as an ASCII one", () => {
+    // Spelled as an escape because this repo's source is ASCII, and because a raw
+    // U+00A0 in a test is indistinguishable from a space in every review tool.
+    const NB = "\u00a0";
+    expect(substitutePlaceholders(`Dear {{contact.salutation}}${NB}Alice,`, EMPTY))
+      .toBe("Dear Alice,");
+    expect(substitutePlaceholdersHtml(`<p>Dear {{contact.salutation}}${NB}Alice</p>`, EMPTY))
+      .toBe("<p>Dear Alice</p>");
+    // ...and it is put back when the field IS filled, like any other trailing space.
+    expect(substitutePlaceholders(`Dear {{contact.salutation}}${NB}Alice,`, { contactSalutation: "Dr" }))
+      .toBe(`Dear Dr${NB}Alice,`);
+    // Still one character: a second non-breaking space is the author's layout.
+    expect(substitutePlaceholders(`Dear {{contact.salutation}}${NB}${NB}Alice,`, EMPTY))
+      .toBe(`Dear ${NB}Alice,`);
+  });
+
+  /**
+   * THE ESCAPING, DRIVEN WITH PATHS THIS CODEBASE DOES NOT CONTAIN YET. Only `.`
+   * occurs in a key today, so no test of the real five can reach this -- and the
+   * failure it guards is not a wrong match but `new RegExp` THROWING AT MODULE
+   * EVALUATION, which in a module the composer, the inbox and Settings all import is
+   * a blank application rather than a local fault.
+   */
+  it("escapes every regex metacharacter a future placeholder path could contain", () => {
+    const hostile = ["a.b", "c(d", "e|f", "g[h", "i+j", "k*l", "m?n", "o^p", "q$r", "s\\t", "u{v"];
+    const pattern = placeholderPattern(hostile);
+    for (const path of hostile) {
+      // The path matches as a LITERAL. No space after the braces in the fixture: the
+      // pattern would consume one into the match, which is its job and not this
+      // test's subject.
+      expect(`x[{{${path}}}]y`.replace(pattern, "HIT")).toBe("x[HIT]y");
+    }
+    // ...and the metacharacters have no power: `c(d` must not match `cd`, and the
+    // alternation must not have swallowed a stray group.
+    expect("x[{{cd}}]y".replace(pattern, "HIT")).toBe("x[{{cd}}]y");
+    expect("x[{{a_b}}]y".replace(pattern, "HIT")).toBe("x[{{a_b}}]y");
+  });
+
+  // The paths are whole, and there is only ONE list of them: PLACEHOLDER is built
+  // from PLACEHOLDER_KEYS, so a path the lookup does not know cannot be matched in
+  // the first place. {{company.pronouns}} is the shape that would exist if the regex
+  // crossed the prefixes with the field names.
+  it("matches only the paths PLACEHOLDER_KEYS declares", () => {
+    expect(substitutePlaceholders(
+      "{{company.pronouns}} {{user.salutation}} {{deal.title}}",
+      { contactSalutation: "Dr", contactPronouns: "she/her", companyName: "Acme", userName: "Chris" },
+    )).toBe("{{company.pronouns}} {{user.salutation}} {{deal.title}}");
+    // Every declared path resolves, which is the other direction of the same claim.
+    for (const path of Object.keys(PLACEHOLDER_KEYS)) {
+      expect(substitutePlaceholders(`[{{${path}}}]`, {
+        contactName: "Alice", contactSalutation: "Dr", contactPronouns: "she/her",
+        companyName: "Acme", userName: "Chris",
+      })).not.toContain("{{");
+    }
   });
 
   it("tolerates whitespace inside the braces", () => {

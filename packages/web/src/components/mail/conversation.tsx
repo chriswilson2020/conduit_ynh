@@ -196,6 +196,10 @@ export function Conversation({ threadId }: ConversationProps) {
   const context = {
     contactName: linkedContact === undefined
       ? undefined : `${linkedContact.firstName} ${linkedContact.lastName ?? ""}`.trim(),
+    // The live record's own values, so a reply addresses the person the way the
+    // contact says to. Nothing is inferred from the name when they are absent.
+    contactSalutation: linkedContact?.salutation,
+    contactPronouns: linkedContact?.pronouns,
     companyName: linkedCompany?.name,
   };
 

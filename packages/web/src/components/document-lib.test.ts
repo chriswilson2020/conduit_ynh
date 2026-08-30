@@ -1,14 +1,16 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import { withoutComments } from "../test/source";
 import {
-  DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES,
-  documentTotals, issueQuoteInputSchema,
+  DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_FIELD_CAPS, DOCUMENT_MAX_DESCRIPTION_CHARS,
+  DOCUMENT_MAX_LINES, documentLineInputSchema, documentTotals, issueQuoteInputSchema,
 } from "@conduit/shared";
 import {
-  QTY_SPEC, TAX_RATE_SPEC, UNIT_PRICE_SPEC,
-  buildIssueQuoteInput, contentBudget, describeIssue, parseUnits, runningTotals, unitsOrZero,
+  FIELD_LABELS, QTY_SPEC, RECIPIENT_DEFAULT_FIELDS, TAX_RATE_SPEC, UNIT_PRICE_SPEC,
+  buildIssueQuoteInput, contentBudget, describeIssue, parseUnits, reseedRecipients,
+  runningTotals, unitsOrZero,
 } from "./document-lib";
-import type { DraftLine, DraftQuote } from "./document-lib";
+import type { DraftLine, DraftQuote, RecipientDefaults } from "./document-lib";
 
 function line(over: Partial<DraftLine> = {}): DraftLine {
   return { id: "l1", description: "Consultancy", qty: "1", unitPrice: "100", taxRate: "21", ...over };
@@ -31,6 +33,7 @@ const FULL_DRAFT = {
   validUntilDate: null,
   recipientName: "Acme Ltd",
   recipientContactName: "",
+  recipientSalutation: "",
   recipientAddress: "",
   notes: "",
   terms: "",
@@ -43,6 +46,7 @@ function draft(over: Partial<DraftQuote> = {}): DraftQuote {
     validUntilDate: "",
     recipientName: "Acme Ltd",
     recipientContactName: "",
+    recipientSalutation: "",
     recipientAddress: "",
     notes: "",
     terms: "",
@@ -265,6 +269,187 @@ describe("contentBudget", () => {
     expect(state.remaining).toBeLessThan(0);
     expect(state.used).toBeGreaterThan(contentBudget(ascii).used);
   });
+
+  /**
+   * EVERY CAPPED FIELD IS CHARGED, AND THE LIST IS DERIVED RATHER THAN WRITTEN
+   * OUT HERE.
+   *
+   * `documentContentBytes` takes each of them OPTIONALLY, so a field left out
+   * of contentBudget's call is not a type error -- it is a form that quietly
+   * under-reports against a server gate computing the same figure from the same
+   * function. v1.1.0 shipped exactly that hole for `recipientSalutation`, worth
+   * up to 64 bytes, and nothing failed.
+   *
+   * DOCUMENT_FIELD_CAPS is the right list to walk because it IS the set of
+   * capped free-text fields a quote carries, so a seventh added there without a
+   * line in contentBudget fails here. Each is charged in turn with a value only
+   * that field could contribute, and the delta is asserted exactly.
+   */
+  it("charges every capped text field the schema has", () => {
+    // Every capped field EMPTY, so each delta below is that field's alone.
+    const empty = draft({ recipientName: "" });
+    const base = contentBudget(empty).used;
+    const filler = "z".repeat(16);
+    for (const field of Object.keys(DOCUMENT_FIELD_CAPS)) {
+      // The cast is what lets a derived key index a typed literal, and it is
+      // safe because a key that is NOT one of DraftQuote's own fields charges
+      // nothing and fails the exact delta below.
+      const over = { ...empty, [field]: filler } as DraftQuote;
+      expect(contentBudget(over).used - base, `${field} is not charged to the budget`).toBe(16);
+    }
+  });
+});
+
+/**
+ * O2: A DEFAULT THAT ARRIVES LATE MUST STILL ARRIVE, AND MUST NOT CLOBBER.
+ *
+ * A deal's company and contact are separate queries. Opening "New quote" before
+ * they resolve seeded a blank salutation and a blank contact name into a draft
+ * that is never re-seeded -- and an issued quote is IMMUTABLE, so a quick click
+ * could freeze a blank onto an artifact that can only be replaced under a new
+ * number, never corrected.
+ */
+describe("reseedRecipients", () => {
+  const defaults = (over: Partial<RecipientDefaults> = {}): RecipientDefaults => ({
+    recipientName: "", recipientContactName: "", recipientSalutation: "",
+    recipientAddress: "", ...over,
+  });
+  const untouched = new Set<keyof RecipientDefaults>();
+  const touched = (...fields: (keyof RecipientDefaults)[]) => new Set(fields);
+
+  const ARRIVED = defaults({
+    recipientName: "Acme Ltd", recipientContactName: "Alice Lovelace",
+    recipientSalutation: "Prof", recipientAddress: "1 Test Way",
+  });
+
+  it("adopts a default that arrives after the form opened", () => {
+    expect(reseedRecipients(defaults(), ARRIVED, untouched)).toEqual({
+      recipientName: "Acme Ltd", recipientContactName: "Alice Lovelace",
+      recipientSalutation: "Prof", recipientAddress: "1 Test Way",
+    });
+  });
+
+  /**
+   * THE CASE THE PREVIOUS VERSION GOT WRONG, AND IT WAS THE ONLY WINDOW THE
+   * FUNCTION RUNS IN.
+   *
+   * That version compared the draft against the LAST SEEDED default and called
+   * them equal-means-untouched. During the loading window that default is `""`
+   * -- and so is a field the user has just cleared, so the two cases it existed
+   * to tell apart were indistinguishable exactly where it mattered. Measured
+   * with the contact GET held open four seconds: typing into both recipient
+   * fields and clearing them had BOTH overwritten when the query landed.
+   *
+   * A set records the ACT rather than inferring it from the value, so a cleared
+   * field and an unfilled one are different things whatever they both contain.
+   */
+  it("keeps a field cleared during the loading window, which the value could not tell", () => {
+    const cleared = defaults();
+    expect(reseedRecipients(cleared, ARRIVED, touched("recipientSalutation", "recipientContactName")))
+      .toEqual({ recipientName: "Acme Ltd", recipientAddress: "1 Test Way" });
+  });
+
+  it("leaves an edited field alone", () => {
+    const current = defaults({ recipientSalutation: "Mx", recipientName: "Typed Ltd" });
+    expect(reseedRecipients(current, ARRIVED, touched("recipientSalutation", "recipientName")))
+      .toEqual({ recipientContactName: "Alice Lovelace", recipientAddress: "1 Test Way" });
+  });
+
+  it("changes nothing when the defaults already match the draft", () => {
+    expect(reseedRecipients(ARRIVED, ARRIVED, untouched)).toEqual({});
+  });
+
+  /**
+   * ONE FIELD AT A TIME. A contact resolving while the operator is mid-word in
+   * the Recipient box must fill the salutation and leave the box alone -- the
+   * two arrive from two different queries and land in one effect.
+   */
+  it("adopts only the fields that moved and were not touched", () => {
+    const current = defaults({ recipientName: "Half-typed Ltd" });
+    const incoming = defaults({
+      recipientName: "Acme Ltd", recipientSalutation: "Prof", recipientContactName: "Alice",
+    });
+    expect(reseedRecipients(current, incoming, touched("recipientName")))
+      .toEqual({ recipientSalutation: "Prof", recipientContactName: "Alice" });
+  });
+
+  /**
+   * AN UPSTREAM CLEAR REACHES AN UNTOUCHED FIELD. If the linked company loses
+   * its address while the form is open and nobody has typed in that box, the
+   * box follows the record rather than keeping a value the record no longer
+   * has.
+   */
+  it("follows a default that becomes empty, when nothing has been typed there", () => {
+    expect(reseedRecipients(ARRIVED, defaults({ ...ARRIVED, recipientAddress: "" }), untouched))
+      .toEqual({ recipientAddress: "" });
+  });
+
+  /** Every field the form seeds is covered, derived rather than listed twice. */
+  it("covers every recipient field the form seeds", () => {
+    expect([...RECIPIENT_DEFAULT_FIELDS].sort())
+      .toEqual(["recipientAddress", "recipientContactName", "recipientName", "recipientSalutation"]);
+    const empty = defaults();
+    for (const field of RECIPIENT_DEFAULT_FIELDS) {
+      const incoming = { ...empty, [field]: "late" } as RecipientDefaults;
+      expect(reseedRecipients(empty, incoming, untouched), field).toEqual({ [field]: "late" });
+      expect(reseedRecipients(empty, incoming, touched(field)), field).toEqual({});
+    }
+  });
+
+  /**
+   * AND THE FORM ACTUALLY CALLS IT, WITH THE SET IT MAINTAINS.
+   *
+   * The function above is pure and fully covered, and that is exactly why this
+   * exists: a mutation that passed the wrong second argument turned the whole
+   * re-seed into a no-op and left every test here green, because nothing
+   * asserted the wiring. A source guard is the only unit-level check available
+   * -- packages/web has no testing-library -- and it matches a spelling, so a
+   * rename on both sides would satisfy it.
+   */
+  it("is wired into the form, recording a touch on every recipient edit", () => {
+    const form = withoutComments(
+      readFileSync(new URL("./document-form.tsx", import.meta.url), "utf8"),
+    );
+    expect(form).toContain("reseedRecipients(current, incoming, touchedRecipients.current)");
+    // The touch is recorded in `patch`, so a fifth field cannot be added
+    // without it, and it is recorded for a CLEAR as much as for a keystroke.
+    expect(form).toContain("if (over[field] !== undefined) touchedRecipients.current.add(field);");
+    // The effect has to watch all four, or a late default never arrives.
+    for (const field of RECIPIENT_DEFAULT_FIELDS) {
+      const prop = `default${field.charAt(0).toUpperCase()}${field.slice(1)}`;
+      expect(form.split(prop).length, prop).toBeGreaterThanOrEqual(4);
+    }
+  });
+
+  /**
+   * THE SUBMIT WAITS WHILE THEY ARE IN FLIGHT, because re-seeding narrows the
+   * window and cannot close it: a quote issued inside it freezes a blank onto a
+   * row that can never be corrected. Gated on IN FLIGHT rather than on arrival,
+   * so a failed query lifts the gate instead of disabling the form for ever.
+   */
+  it("holds the submit while the defaults are still on the wire, and says so", () => {
+    const form = withoutComments(
+      readFileSync(new URL("./document-form.tsx", import.meta.url), "utf8"),
+    );
+    expect(form).toContain("disabled={pending || defaultsInFlight}");
+    expect(form).toContain('data-testid="quote-defaults-loading"');
+    const page = withoutComments(
+      readFileSync(new URL("../pages/deal-detail.tsx", import.meta.url), "utf8"),
+    );
+    // fetchStatus, never isPending: a DISABLED query (a deal with no contact)
+    // sits at pending for ever in TanStack v5, so a gate built on it would
+    // report "still loading" on a deal that will never have one. Scoped to the
+    // derivation -- `isPending` is a legitimate word elsewhere on this page,
+    // where it means a MUTATION is in flight.
+    const derivation = page.slice(
+      page.indexOf("const defaultsInFlight"),
+      page.indexOf(";", page.indexOf("const defaultsInFlight")),
+    );
+    expect(derivation).toContain('companyQuery.fetchStatus === "fetching"');
+    expect(derivation).toContain('contactQuery.fetchStatus === "fetching"');
+    expect(derivation).not.toContain("isPending");
+    expect(derivation).not.toContain("isLoading");
+  });
 });
 
 describe("buildIssueQuoteInput", () => {
@@ -281,6 +466,35 @@ describe("buildIssueQuoteInput", () => {
     ]);
     expect(result.input.issueDate).toBe("2026-08-29");
     expect(result.input.validUntilDate).toBe("2026-09-30");
+  });
+
+  /**
+   * THE SALUTATION REACHES THE WIRE, AND IT IS TRIMMED HERE AND NOT ON THE
+   * CONTACT.
+   *
+   * The two are different fields doing different jobs. A contact's salutation
+   * must survive exactly as typed -- that is what "Other..." is for, and
+   * contact-fields-lib.test.ts pins it. This one is the line a template prints
+   * beside the recipient's name, between two other trimmed name fields, so a
+   * stray space becomes a visible double space on a PDF that can never be
+   * reissued. Both halves are asserted, because a future tidy-up that made them
+   * agree would break one of them.
+   */
+  it("carries the salutation, trimmed like the two name fields beside it", () => {
+    const result = buildIssueQuoteInput(draft({ recipientSalutation: "  Dr  " }));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.input.recipientSalutation).toBe("Dr");
+
+    const empty = buildIssueQuoteInput(draft({ recipientSalutation: "" }));
+    expect(empty.ok).toBe(true);
+    if (empty.ok) expect(empty.input.recipientSalutation).toBe("");
+
+    // A value the contact record accepts is a value this form accepts: the two
+    // caps are pinned to each other in @conduit/shared for exactly this.
+    const longest = buildIssueQuoteInput(draft({
+      recipientSalutation: "x".repeat(DOCUMENT_FIELD_CAPS.recipientSalutation),
+    }));
+    expect(longest.ok).toBe(true);
   });
 
   it("sends no valid-until date rather than an empty string when the field is blank", () => {
@@ -488,6 +702,7 @@ describe("the schema's own refusals, through describeIssue", () => {
       ["Valid-until date", draft({ validUntilDate: "13-13-13" })],
       ["Recipient", draft({ recipientName: "" })],
       ["Contact name", draft({ recipientContactName: "x".repeat(201) })],
+      ["Salutation", draft({ recipientSalutation: "x".repeat(65) })],
       ["Address", draft({ recipientAddress: "x".repeat(2001) })],
       ["Notes", draft({ notes: "x".repeat(5001) })],
       ["Terms", draft({ terms: "x".repeat(5001) })],
@@ -500,6 +715,40 @@ describe("the schema's own refusals, through describeIssue", () => {
       expect(result.problems.some((p) => p.startsWith(label)), `${label}: ${result.problems.join(" | ")}`)
         .toBe(true);
     }
+  });
+
+  /**
+   * THE CASE LIST ABOVE COULD NOT CATCH A FIELD BEING ADDED, WHICH IS HOW
+   * v1.1.0 GOT HERE.
+   *
+   * It is hand-written, so it caught the seven entries a previous round deleted
+   * and said nothing at all when `recipientSalutation` joined
+   * issueQuoteInputSchema with no label -- the form was one over-long
+   * salutation away from printing the wire name at somebody, and the whole
+   * suite was green. This walks the SCHEMA instead, so the next field fails
+   * here on the day it is added.
+   *
+   * `lines` is excluded and the exclusion is real rather than a hole:
+   * describeIssue routes a `lines` path with no index to describeLinesIssue,
+   * which answers for the whole set in its own words. The assertion below says
+   * so, so removing that branch without removing this exclusion is visible.
+   *
+   * What it cannot see: a label that is present but WRONG. The case list above
+   * is what reads the sentences back.
+   */
+  it("has a label for every field the schema can name", () => {
+    const whole = Object.keys(issueQuoteInputSchema.shape);
+    const perLine = Object.keys(documentLineInputSchema.shape);
+    expect(whole).toContain("lines");
+    expect(whole.length).toBeGreaterThan(1);
+    expect(perLine.length).toBeGreaterThan(1);
+    for (const key of [...whole.filter((k) => k !== "lines"), ...perLine]) {
+      expect(FIELD_LABELS[key], `no label for ${key}`).toBeDefined();
+    }
+    // The one exclusion, and what covers it instead.
+    expect(FIELD_LABELS.lines).toBeUndefined();
+    expect(describeIssue({ path: ["lines"], message: "x", code: "too_small" }))
+      .toBe("A quote needs at least one line item.");
   });
 
   /**

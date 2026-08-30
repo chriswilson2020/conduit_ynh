@@ -14,7 +14,11 @@ function publishContactHint(id: string): void {
 function toContact(row: ContactRow): Contact {
   return {
     id: row.id, firstName: row.firstName, lastName: row.lastName, companyId: row.companyId,
-    emails: row.emails, phones: row.phones, jobTitle: row.jobTitle, ownerUserId: row.ownerUserId,
+    emails: row.emails, phones: row.phones, jobTitle: row.jobTitle,
+    // Passed through exactly as stored. Nothing here derives one from the other or
+    // from the name -- see contactSchema, where that rule is written down.
+    salutation: row.salutation, pronouns: row.pronouns,
+    ownerUserId: row.ownerUserId,
     archivedAt: row.archivedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
   };

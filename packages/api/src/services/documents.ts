@@ -105,6 +105,7 @@ function toDocumentRecord(row: DocumentRow, lines: DocumentLineItemRow[]): Docum
     validUntilDate: row.validUntilDate,
     recipientName: row.recipientName,
     recipientContactName: row.recipientContactName,
+    recipientSalutation: row.recipientSalutation,
     recipientAddress: row.recipientAddress,
     subtotalCents: row.subtotalCents,
     taxCents: row.taxCents,
@@ -134,6 +135,8 @@ export interface QuoteContextInput {
   validUntilDate: string | null;
   recipientName: string;
   recipientContactName: string;
+  /** Snapshot at issue, never read live from the contact -- see the column. */
+  recipientSalutation: string;
   recipientAddress: string;
   notes: string;
   terms: string;
@@ -186,6 +189,10 @@ export function buildContext(input: QuoteContextInput): MergeContext {
       validUntilDate: input.validUntilDate ?? "",
       recipientName: input.recipientName,
       recipientContactName: input.recipientContactName,
+      // NO PRONOUNS KEY, and its absence is the design rather than an oversight: a
+      // quote's greeting takes the salutation, and there is no `documents` column to
+      // build one from. Mail templates read pronouns live from the contact instead.
+      recipientSalutation: input.recipientSalutation,
       recipientAddress: input.recipientAddress,
       subtotal: money(input.subtotalCents),
       tax: money(input.taxCents),
@@ -284,6 +291,7 @@ export async function issueQuote(
       validUntilDate: quote.validUntilDate ?? null,
       recipientName: quote.recipientName,
       recipientContactName: quote.recipientContactName ?? "",
+      recipientSalutation: quote.recipientSalutation ?? "",
       recipientAddress: quote.recipientAddress ?? "",
       notes: quote.notes ?? "",
       terms: quote.terms ?? "",
@@ -343,6 +351,10 @@ export async function issueQuote(
       validUntilDate: quote.validUntilDate ?? null,
       recipientName: quote.recipientName,
       recipientContactName: quote.recipientContactName ?? "",
+      // THE SNAPSHOT. Written from the submission, which the form defaulted from the
+      // contact -- never joined at read time, or a title corrected next year would
+      // rewrite the greeting on a quote sent last year.
+      recipientSalutation: quote.recipientSalutation ?? "",
       recipientAddress: quote.recipientAddress ?? "",
       subtotalCents: totals.subtotalCents,
       taxCents: totals.taxCents,

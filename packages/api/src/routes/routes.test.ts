@@ -10,8 +10,8 @@ import {
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, documentSchema, orgProfileSchema,
-  documentTemplateSchema, DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES,
-  MAX_TEMPLATE_BYTES,
+  documentTemplateSchema, CONTACT_FIELD_CAPS, DOCUMENT_MAX_DESCRIPTION_CHARS,
+  DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
@@ -199,6 +199,66 @@ describe("contacts routes", () => {
     expect(response.statusCode).toBe(400);
     const body = errorResponseSchema.parse(response.json());
     expect(body.error).toBe("validation");
+    await a.close();
+  });
+
+  // v1.1.0's two fields, over the wire: POST them, PATCH one, clear both. The
+  // response is parsed by contactSchema, so a column the DTO forgot to carry would
+  // fail here rather than showing up as a blank field on the detail page.
+  it("round-trips a salutation and pronouns, and clears them with null", async () => {
+    const a = await app();
+    const created = await a.inject({
+      method: "POST", url: "/api/contacts", headers: authHeaders,
+      payload: { firstName: "Ada", salutation: "Dr", pronouns: "she/her" },
+    });
+    expect(created.statusCode).toBe(201);
+    const contact = contactSchema.parse(created.json());
+    expect(contact).toMatchObject({ salutation: "Dr", pronouns: "she/her" });
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/contacts/${contact.id}`, headers: authHeaders,
+      payload: { salutation: "Prof" },
+    });
+    // The pronouns are UNTOUCHED by a patch that names only the salutation --
+    // nothing here derives one from the other.
+    expect(contactSchema.parse(patched.json())).toMatchObject({
+      salutation: "Prof", pronouns: "she/her",
+    });
+
+    const cleared = await a.inject({
+      method: "PATCH", url: `/api/contacts/${contact.id}`, headers: authHeaders,
+      payload: { salutation: null, pronouns: null },
+    });
+    expect(contactSchema.parse(cleared.json())).toMatchObject({
+      salutation: null, pronouns: null,
+    });
+    await a.close();
+  });
+
+  // The gate, at the layer that answers the form: a 400 naming the field, not a
+  // 23514 from the CHECK behind it. The two bounds are the same number, so the
+  // message is what says which one was hit.
+  it("returns 400 naming the field for a salutation or pronouns past the cap", async () => {
+    const a = await app();
+    const past = "x".repeat(CONTACT_FIELD_CAPS.salutation + 1);
+    for (const [field, word] of [["salutation", "salutation"], ["pronouns", "pronouns"]] as const) {
+      const response = await a.inject({
+        method: "POST", url: "/api/contacts", headers: authHeaders,
+        payload: { firstName: "Ada", [field]: past },
+      });
+      expect(response.statusCode).toBe(400);
+      const body = errorResponseSchema.parse(response.json());
+      expect(body.error).toBe("validation");
+      expect(body.message).toContain(word);
+    }
+
+    // ...and one character less is stored, so the bound is the cap and not one off it.
+    const ok = await a.inject({
+      method: "POST", url: "/api/contacts", headers: authHeaders,
+      payload: { firstName: "Ada", salutation: past.slice(1), pronouns: past.slice(1) },
+    });
+    expect(ok.statusCode).toBe(201);
+    expect(contactSchema.parse(ok.json()).salutation).toHaveLength(CONTACT_FIELD_CAPS.salutation);
     await a.close();
   });
 });

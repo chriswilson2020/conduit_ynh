@@ -115,7 +115,31 @@ export function FieldCard({
               className="flex flex-col gap-1 px-4 py-3 sm:flex-row sm:items-start sm:gap-4"
             >
               <dt className="w-32 shrink-0 pt-2 text-sm font-medium text-slate-500">{field.label}</dt>
-              <dd data-testid={`field-${field.name}`} className="flex-1 text-sm text-slate-900">
+              {/*
+                `min-w-0 break-words` ON EVERY VALUE CELL, AND IT IS REAL DATA
+                LOSS WITHOUT THEM.
+
+                A flex item defaults to `min-width: auto`, so a `flex-1` value
+                beside a `w-32 shrink-0` label floors at its content's
+                min-content width -- which for an email address, a company name
+                or a person's name is the whole unbroken string. It used to be
+                swipe-reachable; components/shell.tsx now clips `<main>` below
+                the breakpoint so the board's stage picker can stick, so the
+                overflow is CUT instead, with no scrollbar and nothing on screen
+                to say anything is missing.
+
+                MEASURED on the real app, at 320 with a 28-character contact
+                name: `/deals/:id` ran 16px past `main`'s content edge, and
+                `documentElement.scrollWidth` reported 0 the whole time -- the
+                clip is why the page-level reading cannot see it, and why
+                e2e/mobile.spec.ts measures `main` instead.
+
+                `min-w-0` lets the item shrink; `break-words` is what makes the
+                shrinking safe, because an email address has no space to wrap
+                at and would otherwise just start again one character narrower.
+                Both are needed and neither is tidiness.
+              */}
+              <dd data-testid={`field-${field.name}`} className="min-w-0 flex-1 break-words text-sm text-slate-900">
                 {isEditing ? (
                   field.multiline ? (
                     <Textarea

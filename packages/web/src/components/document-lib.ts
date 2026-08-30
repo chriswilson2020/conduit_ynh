@@ -152,10 +152,87 @@ export interface DraftQuote {
   readonly validUntilDate: string;
   readonly recipientName: string;
   readonly recipientContactName: string;
+  /**
+   * v1.1.0's snapshot field. It defaults from the contact's salutation and is
+   * editable before issuing like every other recipient field -- and once issued
+   * it is frozen on the documents row, so editing the contact's title next year
+   * cannot rewrite a quote sent last year. PRONOUNS ARE DELIBERATELY NOT HERE:
+   * a quote's greeting takes the salutation and has no use for them, and
+   * freezing a personal detail into an artifact that is downloaded and emailed
+   * should need a reason.
+   */
+  readonly recipientSalutation: string;
   readonly recipientAddress: string;
   readonly notes: string;
   readonly terms: string;
   readonly lines: readonly DraftLine[];
+}
+
+/**
+ * The four recipient fields a deal can fill in for you, as they arrive.
+ *
+ * A DEAL'S COMPANY AND CONTACT ARE SEPARATE QUERIES, and they resolve after the
+ * page does. See reseedRecipients for what that costs and why it is not
+ * cosmetic here.
+ */
+export interface RecipientDefaults {
+  readonly recipientName: string;
+  readonly recipientContactName: string;
+  readonly recipientSalutation: string;
+  readonly recipientAddress: string;
+}
+
+export const RECIPIENT_DEFAULT_FIELDS = [
+  "recipientName", "recipientContactName", "recipientSalutation", "recipientAddress",
+] as const;
+
+/**
+ * WHAT TO ADOPT WHEN A DEFAULT ARRIVES LATE, WITHOUT CLOBBERING AN EDIT.
+ *
+ * THE BUG THIS EXISTS FOR IS THE WORST KIND THIS FEATURE CAN HAVE, because the
+ * artifact is IMMUTABLE. The form seeds its draft from props at mount, and a
+ * deal's company and contact are their own queries: opening "New quote" before
+ * they resolve gave a recipient with a blank salutation and a blank contact
+ * name, while the page's own Contact row rendered the name a second later.
+ * Issue in that window and the quote is frozen wrong for ever -- it cannot be
+ * corrected, only re-raised under a new number. `recipientContactName` had this
+ * before v1.1.0; the salutation makes it one field wider.
+ *
+ * `touched` IS AN EXPLICIT SET, AND THE STRING COMPARISON IT REPLACED WAS WRONG
+ * IN EXACTLY THE WINDOW THIS FUNCTION EXISTS FOR. The first version compared
+ * the draft against the LAST SEEDED default and called them equal-means-
+ * untouched. During the loading window that default is `""` -- and so is a
+ * field the user has just CLEARED, which is the one thing the rule was supposed
+ * to tell apart. Measured with the contact GET held open four seconds: typing
+ * into both recipient fields and then clearing them had both overwritten when
+ * the query landed. A set recorded on every edit cannot make that mistake,
+ * because it remembers the ACT rather than trying to infer it from the value.
+ *
+ * A GATE ON THE "New quote" BUTTON WAS THE OTHER OPTION AND IS STILL WORSE.
+ * "Disabled until the data is here" reads the same as "disabled" when a query
+ * FAILS, and a deal whose company 404s would lose the ability to raise a quote
+ * at all with nothing on screen to say why. What the form does instead is hold
+ * the SUBMIT while the defaults are in flight, with a line saying so -- see
+ * document-form.tsx, and note that "in flight" and "not arrived" are different
+ * predicates on purpose.
+ *
+ * Returns only the fields to change, so an unchanged draft keeps its identity
+ * and the form does not re-render for nothing.
+ */
+export function reseedRecipients(
+  current: RecipientDefaults,
+  incoming: RecipientDefaults,
+  touched: ReadonlySet<keyof RecipientDefaults>,
+): Partial<RecipientDefaults> {
+  // Mutable inside, readonly to the caller: RecipientDefaults' fields carry
+  // `readonly`, which Partial<> preserves.
+  const over: { -readonly [K in keyof RecipientDefaults]?: RecipientDefaults[K] } = {};
+  for (const field of RECIPIENT_DEFAULT_FIELDS) {
+    if (touched.has(field)) continue;
+    if (current[field] === incoming[field]) continue;
+    over[field] = incoming[field];
+  }
+  return over;
 }
 
 export interface ParsedLine {
@@ -224,6 +301,18 @@ export function contentBudget(draft: DraftQuote): BudgetState {
   const used = documentContentBytes({
     recipientName: draft.recipientName,
     recipientContactName: draft.recipientContactName,
+    // EVERY FIELD THE SERVER'S GATE COUNTS, and this one is easy to omit
+    // because documentContentBytes takes it OPTIONALLY: leaving it out is not
+    // a type error, it is a form that under-reports against a budget the
+    // server measures with the same function. BY UP TO 320 BYTES, not 64: the
+    // cap is 64 CHARACTERS and `escapedBytes` charges an `&` five bytes, so a
+    // salutation of 64 ampersands is 320 -- a byte budget and a character cap
+    // are different quantities, and this file is the wrong place to confuse
+    // them. The guard is
+    // derived rather than written out -- contentBudget's test walks the keys
+    // of DOCUMENT_FIELD_CAPS, which is exactly the set of capped text fields a
+    // quote carries, and charges each one in turn.
+    recipientSalutation: draft.recipientSalutation,
     recipientAddress: draft.recipientAddress,
     notes: draft.notes,
     terms: draft.terms,
@@ -244,16 +333,28 @@ export function contentBudget(draft: DraftQuote): BudgetState {
  * A key missing from here falls back to the RAW WIRE NAME, so the failure mode
  * is a user reading "Line 1 qtyMilli: ..." rather than anything breaking.
  *
- * THE TEST THAT KEEPS THIS COMPLETE DRIVES THE REAL SCHEMA, one deliberately
- * bad draft per field, and asserts the sentence begins with the label. An
- * earlier version of this comment claimed such a test existed when it did not,
- * and deleting seven of these eleven entries left the whole suite green.
+ * TWO TESTS KEEP IT COMPLETE, AND IT TOOK BOTH.
+ *
+ * The first drives the real schema with one deliberately bad draft per field
+ * and asserts the sentence begins with the label. It caught the seven entries
+ * an earlier round deleted -- but it is a HAND-WRITTEN CASE LIST, so it could
+ * not catch a field being ADDED: v1.1.0 put `recipientSalutation` into
+ * issueQuoteInputSchema and that test stayed green while the form was ready to
+ * print the wire name at somebody.
+ *
+ * So the second is derived: it walks `issueQuoteInputSchema.shape` and
+ * `documentLineInputSchema.shape` and requires an entry here for every key.
+ * `lines` is the one exclusion, and it is a real one rather than a hole --
+ * describeLinesIssue answers for the whole set, and that test names it.
+ *
+ * Exported for those tests, which is the only reason it is not file-local.
  */
-const FIELD_LABELS: Record<string, string> = {
+export const FIELD_LABELS: Record<string, string> = {
   issueDate: "Issue date",
   validUntilDate: "Valid-until date",
   recipientName: "Recipient",
   recipientContactName: "Contact name",
+  recipientSalutation: "Salutation",
   recipientAddress: "Address",
   notes: "Notes",
   terms: "Terms",
@@ -413,6 +514,13 @@ export function buildIssueQuoteInput(draft: DraftQuote): BuildResult {
     validUntilDate: draft.validUntilDate === "" ? null : draft.validUntilDate,
     recipientName: draft.recipientName.trim(),
     recipientContactName: draft.recipientContactName.trim(),
+    // TRIMMED HERE AND NOT ON THE CONTACT, and the two are different fields
+    // doing different jobs. The contact's salutation must survive exactly as
+    // typed -- that is what "Other..." is for. This is the printed line of a
+    // letter, sitting between two other trimmed name fields, and the template
+    // sets it beside the recipient's name: a trailing space typed into this box
+    // becomes a visible double space on a PDF nobody can reissue.
+    recipientSalutation: draft.recipientSalutation.trim(),
     recipientAddress: draft.recipientAddress,
     notes: draft.notes,
     terms: draft.terms,

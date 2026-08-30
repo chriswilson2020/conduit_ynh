@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { Contact } from "@conduit/shared";
 import { useCompanies, useContacts, useCreateContact, useUsers } from "../queries";
+import { nameWithSalutation } from "../components/contact-fields-lib";
 import { EntityTable, type EntityTableColumn } from "../components/entity-table";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -49,7 +50,18 @@ export function ContactsPage() {
       {
         key: "name",
         header: "Name",
-        render: (contact) => `${contact.firstName} ${contact.lastName ?? ""}`.trim(),
+        /*
+         * THE SALUTATION SHOWS HERE AND THE PRONOUNS DO NOT, which is a
+         * decision rather than an omission: a list is for finding someone, and
+         * a pronoun is for writing to them. nameWithSalutation is not even
+         * given the field -- see its signature.
+         *
+         * A contact without a salutation reads exactly as it did before
+         * v1.1.0: a blank contributes nothing, not a placeholder and not a
+         * dash, so the column does not gain a ragged left edge for the
+         * majority of rows that will never carry one.
+         */
+        render: (contact) => nameWithSalutation(contact),
       },
       {
         key: "company",

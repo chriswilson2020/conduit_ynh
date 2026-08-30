@@ -58,8 +58,24 @@ const STATUS_CLASSES: Record<string, string> = {
 export function DealDetailPage() {
   const { dealId } = useParams({ from: "/deals/$dealId" });
   const { data: deal, isLoading, error } = useDeal(dealId);
-  const { data: linkedCompany } = useCompany(deal?.companyId ?? "");
-  const { data: linkedContact } = useContact(deal?.contactId ?? "");
+  const companyQuery = useCompany(deal?.companyId ?? "");
+  const contactQuery = useContact(deal?.contactId ?? "");
+  const linkedCompany = companyQuery.data;
+  const linkedContact = contactQuery.data;
+  /**
+   * WHETHER THE QUOTE FORM'S DEFAULTS ARE STILL ON THE WIRE.
+   *
+   * `fetchStatus`, not `isLoading` or `isPending`: a DISABLED query (this deal
+   * has no company, or no contact) sits at `status: "pending"` for ever in
+   * TanStack v5, so anything derived from `isPending` would report "still
+   * loading" on a deal that will never have one. `fetchStatus === "fetching"`
+   * is true only while a request is actually open, which also means a query
+   * that FAILED lifts the gate rather than holding it shut -- see
+   * components/document-form.tsx, where the reason that distinction matters is
+   * written out.
+   */
+  const defaultsInFlight =
+    companyQuery.fetchStatus === "fetching" || contactQuery.fetchStatus === "fetching";
   const { data: pipelineData } = usePipeline(deal?.pipelineId ?? "");
   const updateDeal = useUpdateDeal();
   const archiveDeal = useArchiveDeal();
@@ -221,9 +237,20 @@ export function DealDetailPage() {
           </Link>
         </div>
 
-        <div className="mb-4 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl font-semibold text-slate-900">{deal.title}</h1>
+        {/*
+          WRAPS BELOW THE BREAKPOINT, AND IT IS NOT COSMETIC. Measured at 390px:
+          the title, the status pill and the Win/Lose/Archive group are 403px of
+          row against a 390px box, and this was the ONE phone page in the app
+          whose content did not fit -- which components/shell.tsx used to hide
+          by letting <main> scroll sideways, and can no longer, now that main
+          clips below the breakpoint so the board's stage picker can stick.
+          Wrapping drops the action group onto its own line, which takes this
+          page's scroll width to 390 against 390 -- nothing over the edge. See
+          that comment for the rest of the measurements.
+        */}
+        <div className="mb-4 flex items-center justify-between gap-4 max-md:flex-wrap">
+          <div className="flex min-w-0 items-center gap-3">
+            <h1 className="text-xl font-semibold break-words text-slate-900">{deal.title}</h1>
             <span
               data-testid="deal-status"
               className={`rounded-full px-2 py-1 text-xs font-medium ${STATUS_CLASSES[deal.status] ?? STATUS_CLASSES.open}`}
@@ -272,7 +299,21 @@ export function DealDetailPage() {
 
         <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
           <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Expected close</span>
-          <div data-testid="field-expectedCloseDate" className="flex-1">
+          {/*
+            `min-w-0` BECAUSE A DATE INPUT WILL NOT SHRINK. A flex item defaults
+            to `min-width: auto`, which floors it at its content's min-content
+            width -- and Chromium's date control has an intrinsic one it will
+            not go below, so at 320px this wrapper ran 185 to 326 against a
+            320px box: 6px over, on the only page in the app that overflowed at
+            that width. It used to be swipe-reachable because <main> scrolled
+            sideways; components/shell.tsx now clips below the breakpoint so the
+            board's stage picker can stick, which turns a swipe into a cut.
+            `min-w-0` lets the item shrink and the input's own `max-w-xs` still
+            caps it at a desk. The phone standard is anchored at 390 and this
+            was never a violation of it -- it is the regression the clip would
+            otherwise have introduced.
+          */}
+          <div data-testid="field-expectedCloseDate" className="min-w-0 flex-1">
             <input
               type="date"
               value={deal.expectedCloseDate ?? ""}
@@ -292,7 +333,7 @@ export function DealDetailPage() {
 
         <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
           <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Company</span>
-          <div data-testid="field-companyId" className="flex-1 text-sm text-slate-900">
+          <div data-testid="field-companyId" className="min-w-0 flex-1 break-words text-sm text-slate-900">
             {deal.companyId === null ? (
               <span>{"\u2014"}</span>
             ) : linkedCompany ? (
@@ -311,7 +352,7 @@ export function DealDetailPage() {
 
         <div className="mt-4 flex items-center gap-4 rounded-lg border border-slate-200 bg-white px-4 py-3">
           <span className="w-32 shrink-0 text-sm font-medium text-slate-500">Contact</span>
-          <div data-testid="field-contactId" className="flex-1 text-sm text-slate-900">
+          <div data-testid="field-contactId" className="min-w-0 flex-1 break-words text-sm text-slate-900">
             {deal.contactId === null ? (
               <span>{"\u2014"}</span>
             ) : linkedContact ? (
@@ -335,7 +376,12 @@ export function DealDetailPage() {
               ? ""
               : `${linkedContact.firstName} ${linkedContact.lastName ?? ""}`.trim()
           }
+          // Picked up exactly as the name beside it is, and EMPTY WHEN THE
+          // CONTACT HAS NONE -- no guess from the name, and none from anything
+          // else. A quote for a contact without a salutation carries none.
+          contactSalutation={linkedContact?.salutation ?? ""}
           companyAddress={linkedCompany?.address ?? ""}
+          defaultsInFlight={defaultsInFlight}
         />
       </div>
       <aside className="min-w-0 lg:w-1/3">
@@ -362,11 +408,15 @@ export function DealDetailPage() {
  * than an omission: a quote already issued never changes, and a corrected quote
  * is a new quote with a new number.
  */
-function DocumentsSection({ deal, companyName, contactName, companyAddress }: {
+function DocumentsSection({
+  deal, companyName, contactName, contactSalutation, companyAddress, defaultsInFlight,
+}: {
   deal: Deal;
   companyName: string;
   contactName: string;
+  contactSalutation: string;
   companyAddress: string;
+  defaultsInFlight: boolean;
 }) {
   const { data: documents = [], isLoading, error } = useDealDocuments(deal.id);
   const [formOpen, setFormOpen] = useState(false);
@@ -400,7 +450,9 @@ function DocumentsSection({ deal, companyName, contactName, companyAddress }: {
                 currency={deal.currency}
                 defaultRecipientName={companyName}
                 defaultRecipientContactName={contactName}
+                defaultRecipientSalutation={contactSalutation}
                 defaultRecipientAddress={companyAddress}
+                defaultsInFlight={defaultsInFlight}
                 onIssued={() => setFormOpen(false)}
                 onCancel={() => setFormOpen(false)}
               />

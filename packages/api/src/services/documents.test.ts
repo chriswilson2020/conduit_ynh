@@ -6,7 +6,8 @@ import { Readable } from "node:stream";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
-  documentContentBytes, DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_LINE_MARKUP_BYTES,
+  documentContentBytes, DOCUMENT_CONTENT_BUDGET_BYTES, DOCUMENT_FIELD_CAPS,
+  DOCUMENT_LINE_MARKUP_BYTES,
   DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, MAX_LOGO_DATA_URI_CHARS,
   renderInputCost, RENDER_IMAGE_CAP_BYTES, RENDER_MARKUP_CAP_BYTES,
   type IssueQuoteInput,
@@ -149,6 +150,7 @@ function quoteInput(overrides: Partial<IssueQuoteInput> = {}): IssueQuoteInput {
     validUntilDate: "2026-09-27",
     recipientName: "Acme Manufacturing BV",
     recipientContactName: "Jane Smith",
+    recipientSalutation: "Dr",
     recipientAddress: "2 Low Street\n1015 CJ Amsterdam",
     notes: "Thank you for your interest.",
     terms: "Payment within 30 days.",
@@ -209,6 +211,9 @@ describe("issueQuote", () => {
     expect(doc.lines).toHaveLength(1);
     expect(doc.lines[0]).toMatchObject({ position: 1, description: "Widget", lineTotalCents: 10_000 });
     expect(doc.recipientContactName).toBe("Jane Smith");
+    // Snapshot beside the name at issue, so a later edit to the contact cannot
+    // reach it (the immutability suite below is where that is proved).
+    expect(doc.recipientSalutation).toBe("Dr");
 
     // The PDF is an ordinary files row on the same deal, so it appears on the Files
     // tab and downloads through GET /api/files/:id/download with no second path.
@@ -572,8 +577,13 @@ describe("issueQuote input gate", () => {
       quoteInput({ lines: [{ description: "a\u0000b", qtyMilli: 1000, unitPriceCents: 1, taxRateBp: 0 }] }),
       quoteInput({ notes: "a\u0000b" }),
       quoteInput({ recipientName: "Acme\u0000" }),
+      // v1.1.0's field, on the same footing as the others -- it is merged into the
+      // page and stored on the row exactly as they are, and CONTACT_FIELD_CAPS's
+      // matching refusal is what keeps the contact end from being the softer one.
+      quoteInput({ recipientSalutation: "D\u0000r" }),
       // The other way to produce bytes that are not valid UTF-8.
       quoteInput({ terms: "lone \ud800 surrogate" }),
+      quoteInput({ recipientSalutation: "lone \ud800" }),
     ];
     for (const input of bad) {
       const error = await issueExpectingFailure(
@@ -706,6 +716,7 @@ function sampleContextInput(overrides: Partial<QuoteContextInput> = {}): QuoteCo
     validUntilDate: "2026-09-27",
     recipientName: "Acme Manufacturing BV",
     recipientContactName: "Jane Smith",
+    recipientSalutation: "Dr",
     recipientAddress: "2 Low Street\n1015 CJ Amsterdam",
     notes: "Thank you for your interest.",
     terms: "Payment within 30 days.",
@@ -749,6 +760,11 @@ describe("buildContext", () => {
     expect(paths.root.length).toBeGreaterThan(20);
     expect(paths.line.length).toBeGreaterThan(3);
     expect(paths.root).toContain("document.subtotal");
+    // v1.1.0's field, named here because the reader has to see the token 0011 adds
+    // by an UPDATE rather than in 0009's INSERT -- if it stopped applying that
+    // amendment this list would silently lose the path and the containment check
+    // below would go on passing.
+    expect(paths.root).toContain("document.recipientSalutation");
     expect(paths.root).toContain("org.logoDataUri");
     expect(paths.root).toContain("lines");
     expect(paths.line).toContain("qty");
@@ -794,7 +810,9 @@ describe("buildContext", () => {
     expect(html).toContain("QUO-2026-0001");
     expect(html).toContain("11,000.00");
     expect(html).toContain("13,310.00");
-    expect(html).toContain("Jane Smith");
+    // The salutation prints ON the contact's line, which is the arrangement 0011's
+    // rewrite makes and the reason the column exists at all.
+    expect(html).toContain("<div>Dr Jane Smith</div>");
     expect(html).toContain("Consultancy");
     expect(html).toContain("21%");
     expect(html).toContain("NL001234567B01");
@@ -824,6 +842,7 @@ describe("buildContext", () => {
       },
       recipientName: "\u00e9".repeat(200),
       recipientContactName: "\u00e9".repeat(200),
+      recipientSalutation: "\u00e9".repeat(DOCUMENT_FIELD_CAPS.recipientSalutation),
       recipientAddress: "\u00e9".repeat(2000),
       notes: "\u00e9".repeat(5000),
       terms: "\u00e9".repeat(5000),
@@ -848,6 +867,7 @@ describe("buildContext", () => {
     // the budget the form will show.
     expect(documentContentBytes({
       recipientName: worst.recipientName, recipientContactName: worst.recipientContactName,
+      recipientSalutation: worst.recipientSalutation,
       recipientAddress: worst.recipientAddress, notes: worst.notes, terms: worst.terms,
       lines: worst.lines,
     })).toBeLessThanOrEqual(DOCUMENT_CONTENT_BUDGET_BYTES);

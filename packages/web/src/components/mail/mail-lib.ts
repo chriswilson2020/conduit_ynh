@@ -202,11 +202,25 @@ export function dedupeRecipients(recipients: readonly ComposerRecipient[]): Comp
  */
 export interface TemplateContext {
   contactName?: string | null;
+  /**
+   * How this contact is addressed, and their pronouns, TAKEN LIVE FROM THE RECORD
+   * AT COMPOSE TIME.
+   *
+   * No snapshot and no new storage, which is the opposite of what a quote does with
+   * the same salutation (`documents.recipient_salutation`) and is right for the same
+   * reason: a quote is an artifact somebody keeps, so it freezes what it printed,
+   * while a message is composed and sent in the moment. A person who corrects their
+   * pronouns has corrected them for the next message, and nothing stored disagrees.
+   *
+   * NEITHER IS EVER INFERRED -- not from the name, not from each other. An absent
+   * value renders as NOTHING, which is where these two part company with the name
+   * fields; see BLANK_MEANS_BLANK.
+   */
+  contactSalutation?: string | null;
+  contactPronouns?: string | null;
   companyName?: string | null;
   userName?: string | null;
 }
-
-const PLACEHOLDER = /\{\{\s*(contact|company|user)\.name\s*\}\}/g;
 
 /** Text-node escaping for a value being spliced into markup. Ampersand
  * first, or it would double-escape the entities the others produce. */
@@ -214,22 +228,134 @@ function escapeHtmlText(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/**
+ * EVERY PLACEHOLDER PATH, AND THE CONTEXT KEY THAT FILLS IT. This is the only list:
+ * PLACEHOLDER below is built from these keys, so a path cannot be in the regex and
+ * missing from the lookup, or the reverse. Two hand-written lists that had to agree
+ * was the first shape of this, with nothing asserting that they did.
+ *
+ * Exported because Settings -> Templates documents these paths on the page, and that
+ * page is the only place anybody will look. Rendering the list from this object is
+ * what keeps the documentation and the substitution from drifting -- a path
+ * documented there and misspelt is an unfilled placeholder in a sent email.
+ */
+export const PLACEHOLDER_KEYS: Record<string, keyof TemplateContext> = {
+  "contact.name": "contactName",
+  "contact.salutation": "contactSalutation",
+  "contact.pronouns": "contactPronouns",
+  "company.name": "companyName",
+  "user.name": "userName",
+};
+
+/**
+ * THE TWO PATHS WHERE ABSENT MEANS EMPTY RATHER THAN VISIBLE, and the one place this
+ * module deliberately departs from Phase 4's rule.
+ *
+ * That rule -- an unresolved placeholder is left literal for the user to fill -- was
+ * written for `{{contact.name}}`, which is essentially always present, so one
+ * surviving into the editor means somebody forgot something. Salutation and pronouns
+ * are NORMALLY EMPTY: every contact created before v1.1.0 has neither, so the same
+ * rule would put `Dear {{contact.salutation}} Alice,` in front of the user on most
+ * sends, to be deleted by hand every time. A field that costs a deletion per message
+ * is worse than no field at all.
+ *
+ * The name fields keep the old rule, because a missing name really is a mistake worth
+ * surfacing. (v1.1.0 coordinator ruling; the spec said "renders as nothing" for all
+ * of them and was wrong about the names.)
+ */
+const BLANK_MEANS_BLANK: ReadonlySet<string> = new Set(["contact.salutation", "contact.pronouns"]);
+
+/** Every character a regex gives a meaning to, so a path can be spliced into one as a
+ * literal. Only `.` occurs in a path today; the rest is here because the alternative
+ * failure is not a wrong match but a THROW FROM `new RegExp` AT MODULE EVALUATION --
+ * and this module is imported by the composer, the conversation view, the inbox and
+ * Settings, so an unescaped `(` in a future key is a blank application rather than a
+ * local fault. */
+const REGEX_SPECIAL = /[.*+?^${}()|[\]\\]/g;
+
+/**
+ * The placeholders, built from PLACEHOLDER_KEYS so the two cannot disagree, plus ONE
+ * OPTIONAL FOLLOWING SPACE.
+ *
+ * That trailing group is what makes an empty salutation read correctly. `Dear
+ * {{contact.salutation}} {{contact.name}},` with nothing to fill the first would
+ * otherwise leave `Dear  Alice,` with a doubled space -- the quote template solves
+ * the same problem by nesting the field inside a `{{#...}}` block, which this
+ * language does not have. So a BLANK_MEANS_BLANK path resolving to nothing takes a
+ * single following space with it, and every other outcome puts the space back
+ * untouched.
+ *
+ * U+00A0 COUNTS AS THAT SPACE, AND THIS IS THE ONE THE ASCII CLASS MISSED.
+ * `sanitizeMailHtml` decodes `&nbsp;` (and `&#160;`, and `&#x00a0;`) into a literal
+ * non-breaking space and stores it, and it runs on every template save -- so a
+ * template written `Dear {{contact.salutation}}&nbsp;{{contact.name}},` comes back out
+ * of the database with a character an ASCII-space class does not match, and an empty
+ * salutation would leave exactly the doubled space this group exists to remove,
+ * invisibly. Measured through the real sanitizer, not assumed.
+ *
+ * ONE SPACE, AND NOT WHITESPACE COLLAPSING. A newline, a tab and a second space go
+ * through this substitution untouched, and the sanitizer preserves all three as well
+ * (measured) -- this fixes the one layout a missing salutation breaks, and is not a
+ * formatter. What the compose editor's own parser does to a run of spaces it is
+ * given is its business and is not a claim made here.
+ *
+ * Exported only so the escaping can be driven with paths this codebase does not
+ * contain yet -- the failure it guards against is a module that will not load, which
+ * no test of the current five keys can reach.
+ */
+export function placeholderPattern(paths: readonly string[]): RegExp {
+  const alternation = paths.map((path) => path.replace(REGEX_SPECIAL, "\\$&")).join("|");
+  return new RegExp(`\\{\\{\\s*(${alternation})\\s*\\}\\}([ \\u00a0]?)`, "g");
+}
+
+const PLACEHOLDER = placeholderPattern(Object.keys(PLACEHOLDER_KEYS));
+
 function substitute(input: string, context: TemplateContext, escape: (value: string) => string): string {
-  return input.replace(PLACEHOLDER, (match, field: string) => {
-    const value = field === "contact" ? context.contactName
-      : field === "company" ? context.companyName
-        : context.userName;
-    return value != null && value.trim() !== "" ? escape(value) : match;
+  return input.replace(PLACEHOLDER, (match, path: string, trailingSpace: string) => {
+    const key = PLACEHOLDER_KEYS[path];
+    const value = key === undefined ? undefined : context[key];
+    if (value != null && value.trim() !== "") return escape(value) + trailingSpace;
+    /**
+     * `undefined` IS NOT THE SAME AS EMPTY, AND CONFLATING THEM LOST A FIELD IN
+     * SENT MAIL.
+     *
+     * BLANK_MEANS_BLANK exists for the contact who HAS no salutation: the
+     * placeholder disappears, takes one following space with it, and `Dear
+     * {{contact.salutation}} {{contact.name}},` reads `Dear Alice,`. That is
+     * right when the composer knows which contact it is writing to.
+     *
+     * The Inbox's own Compose knows no contact at all -- pages/inbox.tsx opens
+     * the composer with no seed, so there is no record behind the draft -- and
+     * there the same rule DELETED the placeholder out of the template with
+     * nothing to show for it. `Dear {{contact.salutation}} {{contact.name}},`
+     * came out as `Dear {{contact.name}},`: the name field stayed visible, the
+     * salutation vanished, and nothing on screen said a field had been dropped.
+     * Composing from a record's Mail tab or replying in a thread was unaffected,
+     * which is exactly the shape of a defect nobody reports.
+     *
+     * So only a value the context actually CARRIES may blank the placeholder.
+     * `null` and `""` mean "this contact has none"; `undefined` means "there is
+     * no contact in scope", and then every path falls back to Phase 4's rule of
+     * leaving the placeholder literal for the user to see and deal with.
+     */
+    if (value === undefined) return match;
+    // `match` carries the trailing space with it, so a placeholder left literal
+    // leaves the line exactly as it was written.
+    return BLANK_MEANS_BLANK.has(path) ? "" : match;
   });
 }
 
 /**
- * Substitutes `{{contact.name}}`, `{{company.name}}` and `{{user.name}}` from
- * the given context into PLAIN TEXT (the subject line). A placeholder with
- * nothing to fill it is LEFT LITERAL (spec: "unresolved placeholders are left
- * visible for the user to fill"), never replaced with an empty string -- an
- * email that silently reads "Hi ," is worse than one that visibly still needs
- * a name.
+ * Substitutes every path in PLACEHOLDER_KEYS -- `{{contact.name}}`,
+ * `{{contact.salutation}}`, `{{contact.pronouns}}`, `{{company.name}}` and
+ * `{{user.name}}` -- from the given context into PLAIN TEXT (the subject line,
+ * where a salutation is the likely one).
+ *
+ * AN UNFILLED NAME IS LEFT LITERAL (spec: "unresolved placeholders are left visible
+ * for the user to fill"), never replaced with an empty string -- an email that
+ * silently reads "Hi ," is worse than one that visibly still needs a name. AN
+ * UNFILLED SALUTATION OR SET OF PRONOUNS RENDERS AS NOTHING, taking one following
+ * space with it. See BLANK_MEANS_BLANK for why the two differ.
  */
 export function substitutePlaceholders(input: string, context: TemplateContext): string {
   return substitute(input, context, (value) => value);

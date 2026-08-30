@@ -8,9 +8,10 @@ import { ApiError } from "../api";
 import { todayLocalIso } from "../lib";
 import { useIssueQuote } from "../queries";
 import {
-  buildIssueQuoteInput, contentBudget, parseDraftLine, runningTotals,
+  RECIPIENT_DEFAULT_FIELDS,
+  buildIssueQuoteInput, contentBudget, parseDraftLine, reseedRecipients, runningTotals,
 } from "./document-lib";
-import type { DraftLine, DraftQuote, ParsedUnits } from "./document-lib";
+import type { DraftLine, DraftQuote, ParsedUnits, RecipientDefaults } from "./document-lib";
 import { Button } from "./ui/button";
 import { DialogTitle } from "./ui/dialog";
 import { Input } from "./ui/input";
@@ -263,7 +264,9 @@ export function DocumentForm({
   currency,
   defaultRecipientName,
   defaultRecipientContactName,
+  defaultRecipientSalutation,
   defaultRecipientAddress,
+  defaultsInFlight,
   onIssued,
   onCancel,
 }: {
@@ -272,7 +275,18 @@ export function DocumentForm({
   currency: string;
   defaultRecipientName: string;
   defaultRecipientContactName: string;
+  /** The linked contact's salutation, picked up exactly as the name above is. */
+  defaultRecipientSalutation: string;
   defaultRecipientAddress: string;
+  /**
+   * Whether a query that fills the four defaults above is still ON THE WIRE.
+   *
+   * "In flight" and "has not arrived" are different predicates and the
+   * difference is the whole reason this is the one that is passed: a query that
+   * FAILED has not arrived and never will, and a form gated on arrival would
+   * sit disabled for ever with nothing on screen to say why.
+   */
+  defaultsInFlight: boolean;
   onIssued: (document: DocumentRecord) => void;
   onCancel: () => void;
 }) {
@@ -285,11 +299,43 @@ export function DocumentForm({
     validUntilDate: "",
     recipientName: defaultRecipientName,
     recipientContactName: defaultRecipientContactName,
+    recipientSalutation: defaultRecipientSalutation,
     recipientAddress: defaultRecipientAddress,
     notes: "",
     terms: "",
     lines: [blankLine()],
   }));
+  /**
+   * THE DEFAULTS ARRIVE LATE, AND THIS ADOPTS THEM WITHOUT CLOBBERING AN EDIT.
+   *
+   * The draft above is seeded once, at mount. A deal's company and contact are
+   * separate queries, so opening this form before they resolve gave a blank
+   * salutation and a blank "for the attention of" -- and an issued quote is
+   * IMMUTABLE, so a quick click could freeze a blank onto an artifact that can
+   * only be replaced under a new number, never corrected. See reseedRecipients
+   * for the whole argument, including why gating the button was rejected.
+   *
+   * The ref holds the defaults this form has already applied, so "the user has
+   * not touched it" is `current === previously seeded` rather than
+   * `current === ""` -- a field somebody cleared on purpose stays cleared.
+   */
+  const touchedRecipients = useRef(new Set<keyof RecipientDefaults>());
+  useEffect(() => {
+    const incoming: RecipientDefaults = {
+      recipientName: defaultRecipientName,
+      recipientContactName: defaultRecipientContactName,
+      recipientSalutation: defaultRecipientSalutation,
+      recipientAddress: defaultRecipientAddress,
+    };
+    setDraft((current) => {
+      const over = reseedRecipients(current, incoming, touchedRecipients.current);
+      return Object.keys(over).length === 0 ? current : { ...current, ...over };
+    });
+  }, [
+    defaultRecipientName, defaultRecipientContactName,
+    defaultRecipientSalutation, defaultRecipientAddress,
+  ]);
+
   const [problems, setProblems] = useState<readonly string[]>([]);
   const issueQuote = useIssueQuote();
   const problemsRef = useRef<HTMLDivElement | null>(null);
@@ -343,6 +389,14 @@ export function DocumentForm({
   const budget = useMemo(() => contentBudget(draft), [draft]);
 
   function patch(over: Partial<DraftQuote>) {
+    // ANY EDIT TO A RECIPIENT FIELD IS REMEMBERED AS AN ACT, which is what
+    // stops a late default overwriting it. Recorded here rather than in each
+    // input's onChange so a fifth field cannot be added without it, and
+    // recorded even when the edit CLEARS the box -- that is precisely the case
+    // the value-comparison this replaced could not see.
+    for (const field of RECIPIENT_DEFAULT_FIELDS) {
+      if (over[field] !== undefined) touchedRecipients.current.add(field);
+    }
     setDraft((current) => ({ ...current, ...over }));
   }
 
@@ -373,7 +427,13 @@ export function DocumentForm({
       <DialogTitle>New quote</DialogTitle>
 
       <div className="grid gap-3 md:grid-cols-2">
-        <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+        {/*
+          THE COMPANY SPANS THE ROW, so the pair below it reads as the one thing
+          it is: the person this quote is addressed to, title and name together.
+          v1.1.0 added a fourth box to a block that packed a two-column grid
+          exactly, and the alternative was a hole beside it.
+        */}
+        <label className="flex flex-col gap-1 text-xs font-medium text-slate-600 md:col-span-2">
           Recipient
           <Input
             autoFocus
@@ -382,6 +442,25 @@ export function DocumentForm({
             disabled={pending}
             data-testid="quote-recipient-name"
             onChange={(event) => patch({ recipientName: event.target.value })}
+          />
+        </label>
+        {/*
+          DEFAULTED FROM THE CONTACT AND EDITABLE BEFORE ISSUING, like every
+          other field in this block -- and then FROZEN. An issued quote never
+          changes, so the value is copied onto the documents row at issue rather
+          than joined to the contact: editing a title next year must not rewrite
+          a quote sent last year. A plain box rather than the contact page's
+          picker, because this is not the contact's record; it is the line that
+          will be printed on this document.
+        */}
+        <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+          Salutation
+          <Input
+            value={draft.recipientSalutation}
+            maxLength={DOCUMENT_FIELD_CAPS.recipientSalutation}
+            disabled={pending}
+            data-testid="quote-recipient-salutation"
+            onChange={(event) => patch({ recipientSalutation: event.target.value })}
           />
         </label>
         <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
@@ -596,9 +675,27 @@ export function DocumentForm({
         </div>
       )}
 
+      {/*
+        THE SUBMIT WAITS FOR THE RECIPIENT, AND SAYS SO.
+        Re-seeding narrows the window in which the defaults are missing; it
+        cannot close it, because somebody can fill in four line items and press
+        Generate inside it. An issued quote is IMMUTABLE, so a blank recipient
+        frozen that way can never be corrected -- only re-raised under a new
+        number. Measured: submitting with the contact GET held open issued a
+        document with an empty recipientSalutation on the row.
+        Gated on IN FLIGHT rather than on arrival, so a query that fails lifts
+        the gate instead of disabling the form for ever, and with a line beside
+        it -- a control that is disabled for a reason nobody can see is the
+        thing this release has now twice refused to ship.
+      */}
+      {defaultsInFlight && (
+        <p data-testid="quote-defaults-loading" className="text-right text-xs text-slate-500">
+          Fetching the recipient's details...
+        </p>
+      )}
       <div className="flex justify-end gap-2 max-md:flex-col-reverse">
         <Button variant="outline" disabled={pending} onClick={onCancel}>Cancel</Button>
-        <Button type="submit" data-testid="quote-submit" disabled={pending}>
+        <Button type="submit" data-testid="quote-submit" disabled={pending || defaultsInFlight}>
           {pending ? "Generating..." : "Generate quote"}
         </Button>
       </div>

@@ -71,7 +71,9 @@ export interface ComposerSeed {
    * `links`: the caller already holds them, and an unresolved placeholder is
    * a supported outcome, not a failure.
    */
-  context?: Pick<TemplateContext, "contactName" | "companyName">;
+  context?: Pick<
+    TemplateContext, "contactName" | "contactSalutation" | "contactPronouns" | "companyName"
+  >;
 }
 
 export interface ComposerProps {
@@ -182,6 +184,10 @@ function ComposerForm({ seed, onClose }: { seed?: ComposerSeed; onClose: () => v
 
   const context: TemplateContext = {
     contactName: seed?.context?.contactName,
+    // Live off the contact record the opener is holding, not stored anywhere: mail
+    // is composed and sent in the moment. See TemplateContext.
+    contactSalutation: seed?.context?.contactSalutation,
+    contactPronouns: seed?.context?.contactPronouns,
     companyName: seed?.context?.companyName,
     userName: userLabel(me, undefined),
   };
@@ -634,6 +640,18 @@ function RecipientField({
                   data-testid="composer-suggestion"
                   className={clsx(
                     "block w-full px-3 py-2 text-left text-sm",
+                    // THE 44px FLOOR, and the finding that named this row got
+                    // the number from the classes rather than from the page.
+                    // Measured at 390x664: a suggestion for a real contact is
+                    // 52px, because `name` is never null (firstName is min(1))
+                    // so the address always renders as a second line. 36px is
+                    // the ONE-LINE shape -- reachable, since min(1) admits a
+                    // whitespace-only first name, which trims to "" and drops
+                    // the name line. The floor covers that shape and leaves the
+                    // 52px one exactly as it was; the flex column is what keeps
+                    // the label centred in a box the floor has grown, the same
+                    // pairing ui/select.tsx's SelectItem documents.
+                    "max-md:flex max-md:min-h-11 max-md:flex-col max-md:justify-center",
                     index === highlight ? "bg-slate-100" : "hover:bg-slate-50",
                   )}
                   // Keeps focus in the input: without this the mousedown

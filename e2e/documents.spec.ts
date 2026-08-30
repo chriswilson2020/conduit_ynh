@@ -201,14 +201,34 @@ async function downloadQuoteWithLogo(page: Page, number: string): Promise<string
 }
 
 /**
- * How far the PAGE scrolls sideways, which on a phone should be not at all.
+ * How far content runs past the edge, measured on `<main>` -- WHICH IS NOT WHERE
+ * THIS USED TO LOOK, AND THE OLD READING COULD NOT FAIL.
  *
- * Distinct from the table's own `overflow-x-auto` box: that one is allowed to scroll
- * by design and is asserted not to need to, while the whole page scrolling sideways
- * is the screen-wide version of the same defect and is never intended.
+ * It read `documentElement.scrollWidth - innerWidth`, and `<main>` has carried
+ * `overflow-auto` since the first web commit of this project. A scroll container
+ * does not propagate its overflow to its ancestors, so the document never grew
+ * however far a child ran over, and all three callers below were asserting
+ * `0 <= 1` at every viewport from the day they were written. MEASURED, by
+ * injecting a div 200px wider than the viewport into `main`: the document
+ * answered 0 and `main.scrollWidth - main.clientWidth` answered 472 at 1280 and
+ * 224 at 390.
+ *
+ * v1.1.0 first blamed the `max-md:overflow-clip` Task 2 added, and that was
+ * wrong in a way worth recording: `clip` did not break this reading, it made the
+ * CONSEQUENCE worse. Under `auto` the overflow was at least swipe-reachable;
+ * under `clip` it is cut. The blindness is older than either.
+ *
+ * Reading `main` also gives the right exclusion for free: the line-item table's
+ * own `overflow-x-auto` box is allowed to scroll by design, and a nested scroll
+ * container does not propagate to `main` either. The threshold stays 1 for
+ * sub-pixel rounding.
  */
 async function pageOverflow(page: Page): Promise<number> {
-  return await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  return await page.evaluate(() => {
+    const main = document.querySelector("main");
+    if (main === null) throw new Error("this page has no <main> to measure");
+    return main.scrollWidth - main.clientWidth;
+  });
 }
 
 /** An element's box, or a failure that names the element rather than a null. */
@@ -793,8 +813,9 @@ test.describe("The line-item editor on a phone", () => {
     // `toHaveValue` regex waiting for the letterhead token -- the template no longer
     // contains it, so the wait times out and reads like a seeding problem rather than
     // a sanitiser one. Both mean the same thing. Re-seed by replaying the INSERT at
-    // the end of packages/api/drizzle/0009_calm_rhodey.sql, which is the same repair
-    // a `truncateAll()` from the unit suite already needs.
+    // the end of packages/api/drizzle/0009_calm_rhodey.sql AND THEN 0011's UPDATE,
+    // which amends the recipient line -- 0009 alone restores a v1.0.x template. That
+    // is the same repair a `truncateAll()` from the unit suite already needs.
     //
     // The restore below makes the SUCCEEDING path leave nothing behind either.
     await page.getByTestId("document-template-save").click();

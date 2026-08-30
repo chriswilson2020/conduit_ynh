@@ -577,27 +577,27 @@ function StageView({
           be squeezed towards its min-content width (the same pairing
           ui/tabs.tsx documents for the record rail's strip).
 
-          IT DOES NOT STICK TO THE TOP, AND ON A BUSY STAGE THAT IS THE REAL
-          COST OF THIS SURFACE. A quality review put the number on it: 200
-          deals is roughly 12,000px of list, so "New deal" and "+ Stage" sit at
-          the bottom of it and switching stages means scrolling all the way
-          back up. The remedy is to pin this strip to the top of the scroll
-          region with an opaque background, and to widen it by negative
-          horizontal margins with matching padding so it bleeds <main>'s
-          gutter and the list does not slide past its edges.
+          IT STICKS TO THE TOP NOW, AND ON A BUSY STAGE THAT WAS THE REAL COST
+          OF THIS SURFACE. Measured at 390x664 with 25 deals in one stage: the
+          page is 2,753px tall, and after scrolling 2,089px of it the strip sat
+          at -1,840px -- switching stage meant scrolling the whole list back up
+          first. A quality review had put the same number on 200 deals, at
+          roughly 12,000px. The strip is now pinned with an opaque background,
+          bled out to <main>'s gutter by negative horizontal margins with
+          matching padding so the list does not slide past its edges, and
+          raised so cards pass under it rather than through it.
 
-          THE UTILITY NAMES ARE DELIBERATELY NOT SPELLED IN THIS PARAGRAPH.
-          Tailwind v4 scans source as plain text and cannot tell a comment from
-          code, so naming them here would emit real rules for a fix that has
-          not been made -- Task 1 hit exactly this and the constraint is
-          recorded in styles.css. Measured on this very comment: an earlier
-          draft that named them grew the built stylesheet by one dead rule.
+          THE SCROLL-CONTAINER QUESTION BEHIND IT WAS THE WHOLE JOB, and the
+          answer is in components/shell.tsx: <main> is an `overflow-auto` box
+          that never scrolls on a phone, which made `sticky top-0` here inert
+          until that overflow became `clip` below the breakpoint. Read that
+          comment before touching either half -- this one does nothing without
+          it, measured.
 
-          Recorded rather than done: it is a layout change with a
-          scroll-container question behind it (<main> only bounds its content
-          while that content fits, which pages/inbox.tsx's height budget covers
-          at length), and it wants measuring on a real long list rather than
-          adding at the end of a review round. */}
+          Below the breakpoint by construction rather than by a variant: this
+          whole component is the phone board, so an unprefixed class here is
+          already phone-only and a `max-md:` copy of each would be four rules
+          nothing else can use. */}
       {/* `role="group"`, not `role="tablist"` or `role="radiogroup"`: both of
           those promise arrow-key navigation between their members, and
           claiming a keyboard contract nothing implements leaves a keyboard
@@ -610,7 +610,7 @@ function StageView({
         data-testid="stage-picker"
         role="group"
         aria-label="Stages"
-        className="flex gap-2 overflow-x-auto pb-1"
+        className="sticky top-0 z-10 -mx-6 flex gap-2 overflow-x-auto bg-slate-50 px-6 pt-3 pb-2"
       >
         {picker.map((option) => (
           <Button
