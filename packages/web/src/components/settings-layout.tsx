@@ -37,6 +37,9 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
         <Link to="/settings/org" className={tabClass} activeProps={{ className: activeTabClass }}>
           Organisation
         </Link>
+        <Link to="/settings/data" className={tabClass} activeProps={{ className: activeTabClass }}>
+          Export and backup
+        </Link>
       </nav>
       {children}
     </div>

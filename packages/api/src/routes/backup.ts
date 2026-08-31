@@ -2,8 +2,9 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { CrmRouteDeps } from "./index.js";
 import { requireUser, contentDisposition, parseOrReject } from "./helpers.js";
+import { requireReauth } from "./reauth.js";
 import {
-  buildBackup, sweepAbandonedBackups, MAX_PASSPHRASE_LENGTH,
+  buildBackup, sweepAbandonedBackups, estimateBackup, MAX_PASSPHRASE_LENGTH,
   BackupToolMissingError, BackupKeyMissingError, BackupDiskSpaceError,
   BackupPassphraseError, BackupFailedError,
 } from "../services/backup.js";
@@ -67,11 +68,15 @@ const backupRequestSchema = z.object({
  * for all of Settings at once rather than being invented for one button. It is
  * recorded here so the next person to add roles knows this route is one of the
  * places that has been waiting for them.
+ *
+ * AND SINCE TASK 3 IT IS BEHIND A SECOND GATE -- see requireReauth. That
+ * paragraph names this route as the one place where the escalation is real in
+ * kind rather than only in convenience, and the gate is the answer that could
+ * be given without inventing a role model for one button: not "who may", but
+ * "prove you are still at the keyboard".
  */
-export function registerBackupRoutes(
-  app: FastifyInstance,
-  { db, dataDir, mailKeyPath, databaseUrl, appVersion }: CrmRouteDeps,
-): void {
+export function registerBackupRoutes(app: FastifyInstance, deps: CrmRouteDeps): void {
+  const { db, dataDir, mailKeyPath, databaseUrl, appVersion } = deps;
   // AT BOOT, ONCE. A work directory in $data_dir can only have survived a
   // SIGKILL, an OOM kill or a power cut -- every other exit path disposes of
   // its own -- and what it holds is a partially written archive containing
@@ -89,8 +94,35 @@ export function registerBackupRoutes(
     (error: unknown) => { app.log.warn({ err: error }, "could not sweep abandoned backup work directories"); },
   );
 
-  app.post("/api/backup", async (request, reply) => {
+  /**
+   * GET /api/backup/preflight -- what a backup would cost, before one starts.
+   *
+   * CHRIS RULED FOR BOTH HALVES ON 31 AUG: raise the proxy timeout AND warn
+   * before starting, not either. The raise is in conf/nginx.conf; this is the
+   * warning's source. The failure it exists to stop is the silent one -- the
+   * backup cannot stream, so an install too large for the proxy's patience
+   * produces a 504 after several minutes with nothing to show for it, and
+   * every other pre-flight the service has would have passed.
+   *
+   * NO RE-AUTHENTICATION ON THIS ONE, and that is a decision rather than an
+   * omission. It carries no data -- two sizes and a duration -- and requiring
+   * a password to be told "this will take eleven minutes" would put the
+   * warning AFTER the commitment it exists to inform. requireUser still
+   * applies, like every other route.
+   */
+  app.get("/api/backup/preflight", async (request, reply) => {
     if (requireUser(request, reply) === null) return;
+    return await estimateBackup({ db, dataDir });
+  });
+
+  app.post("/api/backup", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+
+    // BEFORE THE BODY IS PARSED, so a caller with no ticket never gets a
+    // validation message about the passphrase field -- which would be a small
+    // free lesson in how to drive this endpoint.
+    if (!requireReauth(request, reply, user, deps)) return;
 
     const body = parseOrReject(backupRequestSchema, request.body, reply);
     if (body === undefined) return;

@@ -158,6 +158,27 @@ describe("docs/backup-format.md", () => {
     expect(doc).toContain("There is no recovery path for the passphrase.");
   });
 
+  // TASK 3 DROVE ARCHIVE UTILITY, WHICH TASK 2 COULD NOT. Task 2 wrote the Mac
+  // line from the command-line tools and said so; this asserts the page now
+  // records what the GUI unarchiver actually did, and in the narrower form the
+  // measurement supports -- it opened an unencrypted .7z from the same writer
+  // and produced nothing for the encrypted one, so the claim is about
+  // encryption rather than about the extension.
+  it("says what Archive Utility was measured doing, not more", () => {
+    expect(doc).toContain("it extracted an unencrypted `.7z`");
+    expect(doc).toContain("produced\n  **nothing at all**");
+    expect(doc).toContain('not "macOS cannot open a `.7z`"');
+  });
+
+  // The rule the Settings page enforces at the keyboard and this service
+  // enforces at the boundary. On the page BECAUSE it is unrecoverable: an
+  // archive encrypted with a truncated passphrase is lost the moment it is
+  // written, and nothing would have said so.
+  it("says a passphrase may not contain a line break, and why", () => {
+    expect(doc).toContain("cannot contain a line break");
+    expect(doc).toContain("encrypts with `abc` and reports success");
+  });
+
   // The spec's own words: the Settings page and the docs must not imply this
   // replaces YunoHost's own backup.
   it("says this does not replace yunohost backup", () => {

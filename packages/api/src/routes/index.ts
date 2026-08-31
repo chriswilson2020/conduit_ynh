@@ -21,6 +21,8 @@ import { registerMeetingRoutes } from "./meetings.js";
 import { registerDocumentRoutes } from "./documents.js";
 import { registerExportRoutes } from "./export.js";
 import { registerBackupRoutes } from "./backup.js";
+import { registerReauthRoutes } from "./reauth.js";
+import type { ReauthTickets, ReauthThrottle, ReauthVerifier } from "../services/reauth.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -90,6 +92,26 @@ export interface CrmRouteDeps {
    * mail-imapflow.ts's createSmtpTransportFactory.
    */
   transportFactory: SendMailTransportFactory;
+  /**
+   * How a password is checked, supplied by the composition root the same way
+   * transportFactory is -- production binds against YunoHost's portal API,
+   * a test hands in a function. See services/reauth.ts for why 7.6's two
+   * downloads need this at all.
+   */
+  reauthVerifier: ReauthVerifier;
+  /**
+   * The outstanding single-use tickets a successful check mints. ONE INSTANCE
+   * PER APP, which is what makes a ticket issued by POST /api/reauth
+   * redeemable by the export and backup routes: three modules, one map.
+   */
+  reauthTickets: ReauthTickets;
+  /**
+   * The wrong-password counter. Also one instance per app, and also not
+   * optional: nothing upstream throttles these (see ReauthThrottle), so
+   * without it /api/reauth would be an unmetered guessing oracle for the
+   * server's own account password.
+   */
+  reauthThrottle: ReauthThrottle;
 }
 
 /**
@@ -131,4 +153,5 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerDocumentRoutes(app, deps);
   registerExportRoutes(app, deps);
   registerBackupRoutes(app, deps);
+  registerReauthRoutes(app, deps);
 }

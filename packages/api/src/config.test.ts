@@ -54,6 +54,39 @@ describe("parseConfig", () => {
     );
   });
 
+  // 7.6 Task 3's re-authentication gate. CONDUIT_REAUTH_PASSWORD replaces a
+  // real credential check with a constant, which is the gate turned off while
+  // still appearing to be there -- the worst of the three possible states.
+  it("accepts CONDUIT_REAUTH_PASSWORD outside production", () => {
+    const config = parseConfig({
+      ...valid, NODE_ENV: "development", CONDUIT_REAUTH_PASSWORD: "fixture",
+    });
+    expect(config.reauthPassword).toBe("fixture");
+  });
+
+  it("refuses to boot with CONDUIT_REAUTH_PASSWORD set in production", () => {
+    expect(() => parseConfig({ ...valid, CONDUIT_REAUTH_PASSWORD: "fixture" })).toThrow(
+      /CONDUIT_REAUTH_PASSWORD/,
+    );
+  });
+
+  it("leaves reauthPassword null when unset, so the real portal check is used", () => {
+    expect(parseConfig(valid).reauthPassword).toBeNull();
+  });
+
+  it("defaults the portal API to where YunoHost 12 puts it", () => {
+    // Measured on the deploy target: /etc/nginx/conf.d/yunohost_api.conf.inc
+    // proxies /yunohost/portalapi/ to 127.0.0.1:6788.
+    expect(parseConfig(valid).portalApiUrl).toBe("http://127.0.0.1:6788");
+  });
+
+  it("carries through an explicit CONDUIT_PORTAL_API_URL and refuses a non-URL", () => {
+    expect(parseConfig({ ...valid, CONDUIT_PORTAL_API_URL: "http://127.0.0.1:9999" }).portalApiUrl)
+      .toBe("http://127.0.0.1:9999");
+    expect(() => parseConfig({ ...valid, CONDUIT_PORTAL_API_URL: "not a url" }))
+      .toThrow(/CONDUIT_PORTAL_API_URL/);
+  });
+
   it("defaults DATA_DIR to ./data when unset", () => {
     expect(parseConfig(valid).dataDir).toBe("./data");
   });

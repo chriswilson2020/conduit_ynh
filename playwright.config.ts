@@ -55,6 +55,15 @@ export default defineConfig({
       MAIL_TLS_REJECT_UNAUTHORIZED: process.env.MAIL_TLS_REJECT_UNAUTHORIZED ?? "1",
       APP_VERSION: "0.1.0-e2e",
       CONDUIT_DEV_USER: "e2euser",
+      // 7.6's re-authentication gate, which checks a password against
+      // YunoHost's portal API in a real deployment. There is no portal here, so
+      // this is the development-and-CI-only fixed password config.ts refuses
+      // under NODE_ENV=production -- the same guard CONDUIT_DEV_USER above has
+      // carried since Phase 0. THE GATE ITSELF IS THE REAL ONE: the same
+      // verifier type, the same single-use tickets, the same 401s. Without this
+      // the journey could only ever prove that the prompt appears, which is not
+      // the property (see e2e/data.spec.ts).
+      CONDUIT_REAUTH_PASSWORD: "e2e-reauth-password",
       BASE_PATH: "/",
       WEB_ROOT: "packages/web/dist",
     },

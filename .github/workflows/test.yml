@@ -229,11 +229,31 @@ jobs:
       # 89MB. DEBIAN_FRONTEND because an apt-get that tries to prompt on a runner
       # hangs until the job's timeout rather than failing (this job's Playwright step
       # carries that scar).
-      - name: Install WeasyPrint
+      #
+      # p7zip-full ARRIVED WITH 7.6 TASK 3, and the gap it closes is the mirror
+      # of the one Task 2 found in the other job. Task 2 added the package to the
+      # `test` job only, because that was where a test opened an archive. Task 3
+      # made e2e/data.spec.ts download a real backup from the page and open it
+      # with the passphrase that was typed into the form -- which spawns 7z
+      # inside the request. Without the package here that journey fails on a
+      # missing binary, and the one thing only an e2e run can say about this
+      # feature would say nothing.
+      - name: Install WeasyPrint and 7-Zip
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-munkres weasyprint
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y p7zip-full python3-munkres weasyprint
           weasyprint --version
+          7z i | head -3
+      # pg_dump IS THE BACKUP'S OTHER BINARY, and unlike 7z it is not installed
+      # here by name -- ubuntu-latest ships PostgreSQL's client tools. Asserted
+      # rather than assumed, because buildBackup refuses to start when pg_dump is
+      # OLDER than the server (postgres:15 in the service container above), and a
+      # runner image that dropped or downgraded it would turn the backup journey
+      # into a puzzling 503 rather than a missing dependency.
+      - name: Check pg_dump is present and new enough for the service container
+        run: |
+          pg_dump --version
+          test "$(pg_dump --version | grep -oE '[0-9]+' | head -1)" -ge 15
       - name: Install dependencies
         run: npm ci
       # Browser binary only. NOT --with-deps: that shells out to apt-get, which

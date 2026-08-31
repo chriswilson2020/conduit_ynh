@@ -37,6 +37,12 @@ const config: Config = {
   defaultCurrency: "EUR",
   mailKeyPath: "unused-in-tests",
   mailTlsRejectUnauthorized: true,
+  // 7.6 Task 3's two config fields. No YunoHost portal exists here to bind
+  // against and no fixed password is set either, so the default verifier is a
+  // REAL one that cannot succeed -- a test that needs the re-authentication
+  // gate to open hands buildApp its own. Nothing passes the gate by forgetting.
+  portalApiUrl: "http://127.0.0.1:6788",
+  reauthPassword: null,
 };
 
 const authHeaders = {

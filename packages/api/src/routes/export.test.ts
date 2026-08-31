@@ -13,6 +13,7 @@ import { saveBlob } from "../services/blobs.js";
 import { resolveUser } from "../users.js";
 import type { ExportManifest } from "../services/export.js";
 import type { Config } from "../config.js";
+import { testReauthVerifier, reauthedHeaders } from "../test/reauth.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -41,6 +42,12 @@ const config: Config = {
   defaultCurrency: "EUR",
   mailKeyPath: "unused-in-tests",
   mailTlsRejectUnauthorized: true,
+  // 7.6 Task 3's two config fields. No YunoHost portal exists here to bind
+  // against and no fixed password is set either, so the default verifier is a
+  // REAL one that cannot succeed -- a test that needs the re-authentication
+  // gate to open hands buildApp its own. Nothing passes the gate by forgetting.
+  portalApiUrl: "http://127.0.0.1:6788",
+  reauthPassword: null,
 };
 
 const authHeaders = {
@@ -71,7 +78,12 @@ afterEach(async () => {
 afterAll(async () => { await handle.close(); });
 
 function app() {
-  return buildApp({ config, db: handle.db, dataDir });
+  // THE RE-AUTHENTICATION GATE IS REAL IN THESE TESTS. Every request below
+  // that expects an archive first mints a ticket through POST /api/reauth
+  // with the right password (reauthedHeaders); the ones that expect a refusal
+  // deliberately do not. See test/reauth.ts for why the verifier is the real
+  // fixed-password one rather than a function that always agrees.
+  return buildApp({ config, db: handle.db, dataDir, reauthVerifier: testReauthVerifier() });
 }
 
 /** Write one response body out and extract it, returning the extraction root. */
@@ -91,8 +103,9 @@ describe("GET /api/export", () => {
   });
 
   it("answers a zip with an attachment disposition and nosniff", async () => {
-    const response = await (await app()).inject({
-      method: "GET", url: "/api/export", headers: authHeaders,
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, authHeaders),
     });
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toBe("application/zip");
@@ -111,8 +124,9 @@ describe("GET /api/export", () => {
       originalName: "Angebot-M\u00FCller.pdf", mime: "application/pdf", sizeBytes, sha256, companyId: company.id,
     });
 
-    const response = await (await app()).inject({
-      method: "GET", url: "/api/export", headers: authHeaders,
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, authHeaders),
     });
     expect(response.statusCode).toBe(200);
 
@@ -152,8 +166,14 @@ describe("GET /api/export", () => {
     // inject() resolves only once the whole body is read, so the two requests
     // are started and only then awaited -- otherwise the first has finished and
     // released its slot before the second is made.
-    const first = a.inject({ method: "GET", url: "/api/export", headers: authHeaders });
-    const second = a.inject({ method: "GET", url: "/api/export", headers: authHeaders });
+    // Two tickets, minted up front. A ticket is spent by the request that
+    // carries it, so the two concurrent requests cannot share one -- and the
+    // minting has to happen before either starts, or awaiting it would let the
+    // first export finish and release its slot.
+    const firstHeaders = await reauthedHeaders(a, authHeaders);
+    const secondHeaders = await reauthedHeaders(a, authHeaders);
+    const first = a.inject({ method: "GET", url: "/api/export", headers: firstHeaders });
+    const second = a.inject({ method: "GET", url: "/api/export", headers: secondHeaders });
     const [one, two] = await Promise.all([first, second]);
 
     const statuses = [one.statusCode, two.statusCode].sort();
@@ -163,7 +183,9 @@ describe("GET /api/export", () => {
 
     // THE SLOT COMES BACK. A guard that never releases turns one export into a
     // permanently broken route, which is worse than the problem it solves.
-    const afterwards = await a.inject({ method: "GET", url: "/api/export", headers: authHeaders });
+    const afterwards = await a.inject({
+      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, authHeaders),
+    });
     expect(afterwards.statusCode).toBe(200);
   });
 
@@ -173,9 +195,11 @@ describe("GET /api/export", () => {
   itZip("gives a second authenticated user the same whole-database archive", async () => {
     await createCompany(handle.db, actorId, { name: "Acme" });
     const a = await app();
+    const samHeaders = {
+      "ynh-user": "sam", "ynh-user-email": "sam@example.com", "ynh-user-fullname": "Sam",
+    };
     const theirs = await a.inject({
-      method: "GET", url: "/api/export",
-      headers: { "ynh-user": "sam", "ynh-user-email": "sam@example.com", "ynh-user-fullname": "Sam" },
+      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, samHeaders),
     });
     expect(theirs.statusCode).toBe(200);
     const root = await extractResponse("theirs", theirs.rawPayload);

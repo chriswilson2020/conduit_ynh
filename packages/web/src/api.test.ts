@@ -1,5 +1,8 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { basePath, apiUrl, deleteRequest, fetchHealth, getJson, patchJson, ApiError } from "./api";
+import {
+  basePath, apiUrl, deleteRequest, downloadArchive, fetchHealth, filenameFromDisposition,
+  getJson, patchJson, ApiError,
+} from "./api";
 
 // vitest.config.ts runs this suite under environment: "node", so there is no
 // global `window`. api.ts only reads `window.__CONDUIT_BASE__` inside function
@@ -202,6 +205,115 @@ describe("deleteRequest", () => {
       const apiError = err as ApiError;
       expect(apiError.status).toBe(404);
       expect(apiError.code).toBe("not_found");
+    });
+  });
+});
+
+/**
+ * 7.6's downloads. Both archives are fetched rather than linked to -- the
+ * backup because a passphrase must not travel in a query string, the export
+ * because the re-authentication ticket must not either -- so the filename and
+ * the failure handling are this module's business rather than the browser's.
+ */
+describe("filenameFromDisposition", () => {
+  it("reads the plain filename the server sends", () => {
+    expect(filenameFromDisposition(
+      'attachment; filename="conduit-export-2026-08-31.zip"', "fallback.zip",
+    )).toBe("conduit-export-2026-08-31.zip");
+  });
+
+  it("prefers the RFC 5987 form, which is the accurate half", () => {
+    // routes/helpers.ts's contentDisposition emits BOTH, and the plain one is
+    // the lossy fallback: it replaces every non-ASCII character with "_".
+    expect(filenameFromDisposition(
+      "attachment; filename=\"M_ller.zip\"; filename*=UTF-8''M%C3%BCller.zip", "fallback.zip",
+    )).toBe("M\u00FCller.zip");
+  });
+
+  it("falls back rather than saving a file called nothing", () => {
+    expect(filenameFromDisposition(null, "fallback.zip")).toBe("fallback.zip");
+    expect(filenameFromDisposition("attachment", "fallback.zip")).toBe("fallback.zip");
+    expect(filenameFromDisposition('attachment; filename=""', "fallback.zip")).toBe("fallback.zip");
+  });
+
+  it("falls through a malformed percent-escape instead of throwing", () => {
+    // A rejected decodeURIComponent must not fail a download that has already
+    // arrived; the plain form is right there.
+    expect(filenameFromDisposition(
+      "attachment; filename=\"ok.7z\"; filename*=UTF-8''%E0%A4%A", "fallback.7z",
+    )).toBe("ok.7z");
+  });
+});
+
+describe("downloadArchive", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("sends the ticket in a header and never in the URL", async () => {
+    setBase(undefined);
+    const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = vi.fn().mockImplementation((url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return Promise.resolve({
+        ok: true, status: 200,
+        headers: { get: () => 'attachment; filename="conduit-export-2026-08-31.zip"' },
+        blob: () => Promise.resolve(new Blob(["PK"])),
+      });
+    }) as unknown as typeof fetch;
+
+    const archive = await downloadArchive({
+      path: "/export", method: "GET", ticket: "abc123", fallbackFilename: "x.zip",
+    });
+    expect(archive.filename).toBe("conduit-export-2026-08-31.zip");
+    // THE POINT: nginx writes a query string to its access log verbatim, and
+    // the browser keeps it in history. A single-use ticket is still a
+    // credential for one copy of the whole database.
+    expect(calls[0]?.url).toBe("/api/export");
+    expect(calls[0]?.url).not.toContain("abc123");
+    const headers = calls[0]?.init.headers as Record<string, string>;
+    expect(headers["X-Conduit-Reauth"]).toBe("abc123");
+    // A GET carries no body and so declares no content type.
+    expect(headers["Content-Type"]).toBeUndefined();
+  });
+
+  it("sends the passphrase in a POST body, with the ticket beside it", async () => {
+    setBase(undefined);
+    const calls: { url: string; init: RequestInit }[] = [];
+    globalThis.fetch = vi.fn().mockImplementation((url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return Promise.resolve({
+        ok: true, status: 200,
+        headers: { get: () => null },
+        blob: () => Promise.resolve(new Blob(["7z"])),
+      });
+    }) as unknown as typeof fetch;
+
+    await downloadArchive({
+      path: "/backup", method: "POST", ticket: "tkt",
+      body: { passphrase: "correct horse" }, fallbackFilename: "x.7z",
+    });
+    expect(calls[0]?.url).toBe("/api/backup");
+    expect(calls[0]?.url).not.toContain("correct");
+    expect(calls[0]?.init.method).toBe("POST");
+    expect(calls[0]?.init.body).toBe(JSON.stringify({ passphrase: "correct horse" }));
+  });
+
+  it("throws the app's ApiError rather than saving a JSON body as an archive", async () => {
+    setBase(undefined);
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false, status: 401,
+      json: () => Promise.resolve({ error: "reauth_required", message: "confirm your password" }),
+      headers: { get: () => null },
+      blob: () => Promise.resolve(new Blob(["should not be reached"])),
+    }) as unknown as typeof fetch;
+
+    const rejection = downloadArchive({
+      path: "/export", method: "GET", ticket: "spent", fallbackFilename: "x.zip",
+    });
+    await expect(rejection).rejects.toBeInstanceOf(ApiError);
+    await rejection.catch((error: unknown) => {
+      expect((error as ApiError).code).toBe("reauth_required");
+      expect((error as ApiError).status).toBe(401);
     });
   });
 });

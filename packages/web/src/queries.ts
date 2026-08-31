@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  backupPreflightSchema,
   bulkThreadResultSchema,
   companySchema,
   contactSchema,
@@ -28,6 +29,7 @@ import {
   midpoint,
   noteSchema,
   orgProfileSchema,
+  reauthTicketSchema,
   pipelineSchema,
   pipelineWithStagesSchema,
   projectSchema,
@@ -88,7 +90,8 @@ import {
   type UpdateTaskInput,
 } from "@conduit/shared";
 import {
-  ApiError, ResponseShapeError, deleteJson, deleteRequest, getJson, patchJson, postForm, postJson, putJson,
+  ApiError, ResponseShapeError, deleteJson, deleteRequest, downloadArchive, getJson,
+  patchJson, postForm, postJson, putJson, saveBlob,
 } from "./api";
 
 const companyListSchema = listResponseSchema(companySchema);
@@ -1958,5 +1961,88 @@ export function useSaveDocumentTemplate() {
     // typed.
     onSuccess: (template: DocumentTemplate) =>
       queryClient.setQueryData(["document-template", template.type], template),
+  });
+}
+
+/**
+ * PHASE 7.6: THE TWO DOWNLOADS, AND THE GATE IN FRONT OF THEM.
+ *
+ * Read Settings -> Export and backup (pages/settings-data.tsx) alongside these.
+ * The shape is unusual for this file and the reason is worth stating: nothing
+ * here caches, and nothing here belongs in a query cache. A ticket is
+ * single-use, an archive is hundreds of megabytes, and a passphrase must not
+ * outlive the request it was typed for. So all three are mutations, and the one
+ * genuine query -- the pre-flight -- is the only thing with a queryKey.
+ */
+
+/**
+ * What a backup would cost, asked BEFORE the passphrase field is filled in.
+ *
+ * `staleTime: 0` against this file's 10-second default: the numbers are the
+ * database's current size and the disk's current free space, and a stale
+ * "there is room" is the one answer that would be worth nothing.
+ */
+export function useBackupPreflight() {
+  return useQuery({
+    queryKey: ["backup-preflight"],
+    queryFn: async () =>
+      parseWith(backupPreflightSchema, await getJson<unknown>("/backup/preflight"), "backup preflight"),
+    staleTime: 0,
+  });
+}
+
+/**
+ * Exchange the operator's password for a single-use download ticket.
+ *
+ * THE PASSWORD IS NEVER STORED, not in this hook, not in the query cache and
+ * not in a component that outlives the click: it is an argument, it goes into
+ * one request body, and the ticket is what comes back. See services/reauth.ts
+ * on the server for why a real credential check is here at all.
+ */
+export function useReauth() {
+  return useMutation({
+    mutationFn: async (password: string) =>
+      parseWith(reauthTicketSchema, await postJson<unknown>("/reauth", { password }), "reauth ticket"),
+  });
+}
+
+/**
+ * Download the readable half. Spends a ticket.
+ *
+ * A MUTATION RATHER THAN A QUERY even though the server call is a GET, and it
+ * is not a technicality: it spends a single-use ticket and writes a file to the
+ * operator's disk. A query would be free to retry it, refetch it on a window
+ * focus, or serve it from a cache -- and each of those is either a wasted
+ * ticket or a second copy of the entire CRM in the browser's memory.
+ */
+export function useDownloadExport() {
+  return useMutation({
+    mutationFn: async (ticket: string) => {
+      const archive = await downloadArchive({
+        path: "/export", method: "GET", ticket,
+        fallbackFilename: "conduit-export.zip",
+      });
+      saveBlob(archive.blob, archive.filename);
+      return archive.filename;
+    },
+  });
+}
+
+/**
+ * Download the exact half. Spends a ticket, and carries the passphrase.
+ *
+ * The passphrase reaches the server in a POST body and nowhere else -- see
+ * routes/backup.ts for why that is a security decision rather than a REST one.
+ */
+export function useDownloadBackup() {
+  return useMutation({
+    mutationFn: async ({ ticket, passphrase }: { ticket: string; passphrase: string }) => {
+      const archive = await downloadArchive({
+        path: "/backup", method: "POST", ticket, body: { passphrase },
+        fallbackFilename: "conduit-backup.7z",
+      });
+      saveBlob(archive.blob, archive.filename);
+      return archive.filename;
+    },
   });
 }

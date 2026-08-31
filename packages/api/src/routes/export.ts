@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type { CrmRouteDeps } from "./index.js";
 import { requireUser, contentDisposition } from "./helpers.js";
+import { requireReauth } from "./reauth.js";
 import { buildExport } from "../services/export.js";
 
 /**
@@ -34,10 +35,23 @@ let exportsInFlight = 0;
  * caller can already read every company, contact, deal and file through the
  * individual endpoints. This route changes how many requests that takes, not
  * who may make them. A role model would have to arrive for all of them at once.
+ *
+ * AND SINCE TASK 3 IT IS BEHIND A SECOND GATE AS WELL -- see requireReauth.
+ * The paragraph above is still true and is exactly why the gate is not about
+ * authorisation: nothing new is readable here. What changed is the EFFORT. A
+ * session that used to be worth a page-by-page scrape is now worth one request
+ * for the entire CRM, and on a YunoHost box with no second factor the session
+ * cookie is the whole perimeter. So the download asks for the password again.
  */
-export function registerExportRoutes(app: FastifyInstance, { db, dataDir, appVersion }: CrmRouteDeps): void {
+export function registerExportRoutes(app: FastifyInstance, deps: CrmRouteDeps): void {
+  const { db, dataDir, appVersion } = deps;
   app.get("/api/export", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    // BEFORE THE CONCURRENCY SLOT, deliberately. A caller with no ticket must
+    // not be able to occupy the one export slot, or refusing them would still
+    // have cost every other caller the feature.
+    if (!requireReauth(request, reply, user, deps)) return;
 
     if (exportsInFlight >= MAX_CONCURRENT_EXPORTS) {
       // 503 with its own code, matching the shape documents.ts answers for a

@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { TEST_DATABASE_URL } from "../test/global-setup.js";
 import { buildApp } from "../app.js";
+import { testReauthVerifier, reauthedHeaders } from "../test/reauth.js";
 import { createCompany } from "../services/companies.js";
 import { attachFile } from "../services/files.js";
 import { saveBlob } from "../services/blobs.js";
@@ -67,6 +68,12 @@ beforeEach(async () => {
     defaultCurrency: "EUR",
     mailKeyPath: path.join(dataDir, "mail.key"),
     mailTlsRejectUnauthorized: true,
+    // 7.6 Task 3's two config fields. No YunoHost portal exists here to bind
+    // against and no fixed password is set either, so the default verifier is a
+    // REAL one that cannot succeed -- a test that needs the re-authentication
+    // gate to open hands buildApp its own. Nothing passes the gate by forgetting.
+    portalApiUrl: "http://127.0.0.1:6788",
+    reauthPassword: null,
   };
 });
 afterEach(async () => {
@@ -76,7 +83,11 @@ afterEach(async () => {
 afterAll(async () => { await handle.close(); });
 
 function app() {
-  return buildApp({ config, db: handle.db, dataDir });
+  // THE RE-AUTHENTICATION GATE IS REAL IN THESE TESTS -- the same
+  // fixed-password verifier a CI deployment uses, not a stub that agrees.
+  // `post` below mints a ticket through POST /api/reauth for each request;
+  // the tests that expect a refusal deliberately send none.
+  return buildApp({ config, db: handle.db, dataDir, reauthVerifier: testReauthVerifier() });
 }
 
 /** Write a response body out and extract it with 7z, returning the root. */
@@ -88,10 +99,25 @@ async function extractResponse(name: string, body: Buffer): Promise<string> {
   return out;
 }
 
-function post(a: Awaited<ReturnType<typeof app>>, passphrase: unknown = PASSPHRASE) {
-  return a.inject({
-    method: "POST", url: "/api/backup", headers: authHeaders, payload: { passphrase },
-  });
+/**
+ * One backup request, carrying a freshly minted single-use ticket.
+ *
+ * `headers` is passed in by the ONE caller that needs two requests genuinely
+ * concurrent: minting inside would put an await before the inject, and the
+ * whole point there is that neither request has finished when the other
+ * starts. Everywhere else the default is what the page does -- one
+ * re-authentication, one archive.
+ */
+function post(
+  a: Awaited<ReturnType<typeof app>>,
+  passphrase: unknown = PASSPHRASE,
+  headers?: Record<string, string>,
+) {
+  if (headers !== undefined) {
+    return a.inject({ method: "POST", url: "/api/backup", headers, payload: { passphrase } });
+  }
+  return reauthedHeaders(a, authHeaders).then((fresh) =>
+    a.inject({ method: "POST", url: "/api/backup", headers: fresh, payload: { passphrase } }));
 }
 
 describe("POST /api/backup", () => {
@@ -117,8 +143,12 @@ describe("POST /api/backup", () => {
   it("refuses a missing or empty passphrase without echoing anything", async () => {
     const a = await app();
     for (const payload of [{}, { passphrase: "" }]) {
+      // A ticket per attempt: the gate runs BEFORE the body is parsed and spends
+      // the ticket, so a second attempt on the same one would 401 and this test
+      // would stop asserting anything about validation at all.
       const response = await a.inject({
-        method: "POST", url: "/api/backup", headers: authHeaders, payload,
+        method: "POST", url: "/api/backup",
+        headers: await reauthedHeaders(a, authHeaders), payload,
       });
       expect(response.statusCode, JSON.stringify(payload)).toBe(400);
       expect(response.json()).toMatchObject({ error: "validation" });
@@ -200,7 +230,13 @@ describe("POST /api/backup", () => {
     const a = await app();
     // Started, then awaited: inject() resolves only once the whole body is
     // read, so awaiting the first would release its slot before the second ran.
-    const [one, two] = await Promise.all([post(a), post(a)]);
+    // Both tickets minted up front, so neither request waits on a round trip
+    // the other could finish inside.
+    const firstHeaders = await reauthedHeaders(a, authHeaders);
+    const secondHeaders = await reauthedHeaders(a, authHeaders);
+    const [one, two] = await Promise.all([
+      post(a, PASSPHRASE, firstHeaders), post(a, PASSPHRASE, secondHeaders),
+    ]);
     const statuses = [one.statusCode, two.statusCode].sort();
     expect(statuses).toEqual([200, 503]);
     const refused = one.statusCode === 503 ? one : two;
@@ -250,9 +286,11 @@ describe("POST /api/backup", () => {
       db: handle.db,
       dataDir,
       loggerStream: { write: (line: string) => { lines.push(line); } },
+      reauthVerifier: testReauthVerifier(),
     });
     const response = await a.inject({
-      method: "POST", url: "/api/backup", headers: authHeaders, payload: { passphrase: marker },
+      method: "POST", url: "/api/backup",
+      headers: await reauthedHeaders(a, authHeaders), payload: { passphrase: marker },
     });
     expect(response.statusCode).toBe(200);
     // The instrument, shown working: the logger really did capture this

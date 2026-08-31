@@ -6,6 +6,7 @@ import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { sql } from "drizzle-orm";
+import { passphraseProblem } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { readMigrationJournal } from "./migration-journal.js";
 
@@ -256,46 +257,30 @@ function formatMiB(bytes: number): string {
 /**
  * Reject a passphrase 7z would not use as typed.
  *
- * THE TRUNCATION IS THE WHOLE REASON THIS EXISTS, and it was measured rather
- * than assumed. 7z reads the passphrase as ONE LINE from stdin: given
- * "abc\ndef" it encrypts with "abc" and reports success. So a passphrase
- * containing a newline produces an archive whose passphrase is a prefix of
- * what the operator typed -- and because there is no recovery path, an archive
- * nobody can ever open again. A carriage return is worse still: 7z keeps it,
- * so the archive's passphrase has an invisible character on the end that no
- * dialog box will ever reproduce.
+ * THE RULE MOVED TO @conduit/shared IN TASK 3 AND THE REASONING WENT WITH IT --
+ * see passphrase.ts there for what 7z does to a newline and why the archive it
+ * writes is unrecoverable. It moved because the Settings page has to refuse the
+ * same passphrase at the keyboard, next to the field, while the character is
+ * still on the screen; two independent checks that agree today are two checks
+ * that can stop agreeing, and the one a person reads would be the one that
+ * drifted.
  *
- * Every other control character is refused for the same reason: it is either
- * silently dropped, silently kept, or unenterable in the Keka and 7-Zip
- * dialogs this format exists to be opened by. Everything printable is allowed,
- * including spaces (leading and trailing ones survive the pipe -- measured)
- * and every non-ASCII character (a passphrase with umlauts round-trips --
- * measured).
+ * WHAT STAYS HERE IS THE THROW. The shared function returns a sentence or null,
+ * because a browser has nothing to do with a BackupPassphraseError; this is
+ * where that sentence becomes the exception routes/backup.ts maps to a 400, and
+ * it is still the check that runs for a caller who never opened the page.
  */
 export function validatePassphrase(passphrase: string): void {
-  if (passphrase === "") {
-    throw new BackupPassphraseError("a passphrase is required; a backup is never written unencrypted");
-  }
-  if (/[\u0000-\u001F\u007F]/.test(passphrase)) {
-    throw new BackupPassphraseError(
-      "the passphrase must not contain line breaks, tabs or other control characters: "
-      + "7z reads it up to the first line break, which would encrypt the backup with "
-      + "something other than what you typed",
-    );
-  }
-  if (passphrase.length > MAX_PASSPHRASE_LENGTH) {
-    throw new BackupPassphraseError(
-      `the passphrase must be at most ${String(MAX_PASSPHRASE_LENGTH)} characters`,
-    );
-  }
+  const problem = passphraseProblem(passphrase);
+  if (problem !== null) throw new BackupPassphraseError(problem);
 }
 
 /**
- * 256 characters. Not a security bound -- there is no upper limit at which a
- * passphrase becomes weak -- but a bound on what travels to a child process's
- * stdin, and a value a person could conceivably retype.
+ * Re-exported rather than redefined, so routes/backup.ts's request schema and
+ * the page's `maxLength` are bounded by one number. See @conduit/shared's
+ * passphrase.ts for what 256 is and is not.
  */
-export const MAX_PASSPHRASE_LENGTH = 256;
+export { MAX_PASSPHRASE_LENGTH } from "@conduit/shared";
 
 /**
  * The argument list 7z is spawned with. EXPORTED SO A TEST CAN ASSERT WHAT IS
@@ -450,6 +435,159 @@ export function majorVersion(versionText: string): number | null {
  */
 export function requiredFreeBytes(input: { databaseBytes: number; blobBytes: number }): number {
   return input.databaseBytes * 2 + input.blobBytes + DISK_MARGIN_BYTES;
+}
+
+/**
+ * HOW FAST A BACKUP IS WRITTEN, MEASURED, AND WHY A NUMBER EXISTS AT ALL.
+ *
+ * 24.4 MB/s. It is COMPRESSION_LEVEL's own measurement read the other way
+ * round: 367,002,306 bytes of real-shaped input took 15.0 seconds at -mx=1 on
+ * the deploy target, which is 24,466,820 B/s -- rounded DOWN to the nearest
+ * tenth of a megabyte, because a lower rate predicts a LONGER wait and this
+ * figure exists to warn. Rounding it up to the 24.5 that reads more naturally
+ * makes every estimate slightly optimistic, which is the one direction a
+ * warning must not err in; backup-estimate.test.ts holds the constant to the
+ * measurement and caught exactly that mistake while this was being written.
+ *
+ * THE POINT OF HAVING IT: the backup cannot stream. The whole archive is built
+ * before the first byte leaves, so the gap between the request and the response
+ * IS the build, and nginx's proxy_read_timeout measures exactly that gap. At
+ * the 300 seconds conf/nginx.conf carried before this task, an install of about
+ * 7.3GB would 504 with nothing to show for it -- and the disk pre-flight would
+ * have passed, because there was nothing wrong with the disk.
+ *
+ * IT IS AN ESTIMATE AND IT IS ANNOUNCED AS ONE. It is a single-figure rate for
+ * a mixed workload on one machine: a dump that compresses 10:1 runs slower per
+ * input byte than blobs 7z gives up on, and a busier server is slower than the
+ * idle one this was measured on. Nothing branches on it except a sentence
+ * shown to a person before they commit to waiting.
+ */
+export const BACKUP_BYTES_PER_SECOND = 24_400_000;
+
+/**
+ * The read timeout conf/nginx.conf gives the backup route, in seconds.
+ *
+ * ONE HOUR, SCOPED TO THAT ONE ROUTE. Chris ruled on 31 Aug that the timeout
+ * should be raised AND the wait warned about -- both, not either: the raise
+ * buys headroom, the warning stops the failure being silent. At
+ * BACKUP_BYTES_PER_SECOND this is about 88GB of headroom against the 7.3GB the
+ * old global 300 allowed (87.8 and 7.32 decimal gigabytes exactly).
+ *
+ * NOT RAISED GLOBALLY. Every other route in this app answers in milliseconds,
+ * and a global hour would turn a wedged handler into an hour of a held
+ * connection instead of a 504 somebody notices. YunoHost's own config makes
+ * the same distinction in the same file family -- its admin API location
+ * carries proxy_read_timeout 3600s while its portal location carries 30s.
+ *
+ * DECLARED HERE AND ASSERTED AGAINST THE FILE. backup-nginx.test.ts reads
+ * conf/nginx.conf and fails if the block's number is not this one, if the block
+ * stops being scoped to the backup route, or if the app's own location has been
+ * raised along with it. A constant that only agrees with the deployment by
+ * having been correct once is not a constant anyone can rely on.
+ */
+export const BACKUP_PROXY_READ_TIMEOUT_SECONDS = 3600;
+
+/**
+ * How long a wait has to be before it is worth interrupting somebody with.
+ *
+ * 60 seconds. Below a minute the honest advice is "it is working"; above it,
+ * a progress-less spinner is indistinguishable from a hang, and the person
+ * deserves to be told the number before they start rather than after they have
+ * reloaded the page and started a second one.
+ */
+export const BACKUP_SLOW_SECONDS = 60;
+
+export interface BackupEstimate {
+  /** pg_database_size of the current database. */
+  databaseBytes: number;
+  /** The blob store on disk, at full size. */
+  blobBytes: number;
+  /** Free space where the archive would be built. */
+  availableBytes: number;
+  /** What requiredFreeBytes says this backup needs. */
+  requiredBytes: number;
+  /** False when the pre-flight would refuse before spawning anything. */
+  enoughDisk: boolean;
+  /** Predicted build time, whole seconds, rounded up. */
+  estimatedSeconds: number;
+  /** Long enough to be worth a sentence before starting. */
+  slow: boolean;
+  /** What nginx allows the route, so the page can say what happens at the end. */
+  timeoutSeconds: number;
+}
+
+/**
+ * What a backup would cost, WITHOUT STARTING ONE.
+ *
+ * IT ANSWERS THE QUESTION THE DISK PRE-FLIGHT CANNOT. buildBackup's own checks
+ * are perfectly good and they all happen after the operator has committed:
+ * they run inside the request, and the one failure they cannot report at all
+ * is the one where everything was fine and the proxy gave up waiting. This
+ * runs BEFORE the button, cheaply, so a wait that will be long is a sentence
+ * rather than a surprise.
+ *
+ * CHEAP DELIBERATELY: two catalogue queries and a directory listing. It does
+ * NOT hash anything, which is the one expensive thing collectBlobs does and
+ * the reason this does not call it -- a pre-flight that read every byte of the
+ * blob store would cost about what the backup costs, to decide whether to take
+ * one.
+ *
+ * IT SHARES requiredFreeBytes AND freeSpaceBytes WITH THE REAL RUN, so the
+ * disk verdict shown here and the disk verdict enforced there are one
+ * calculation. They can still disagree across the gap between the two calls --
+ * something else can fill the disk in between -- and that is why this is a
+ * warning and buildBackup's is the control.
+ */
+export async function estimateBackup(options: {
+  db: Database;
+  dataDir: string;
+  freeBytes?: (dir: string) => Promise<number>;
+}): Promise<BackupEstimate> {
+  const { db, dataDir, freeBytes = freeSpaceBytes } = options;
+
+  const databaseBytesRows = await db.execute<{ size: string }>(
+    sql`SELECT pg_database_size(current_database())::text AS size`,
+  );
+  const databaseBytes = Number(databaseBytesRows[0]?.size ?? "0");
+  const blobBytes = await blobStoreBytes(path.join(dataDir, "files"));
+
+  const requiredBytes = requiredFreeBytes({ databaseBytes, blobBytes });
+  const availableBytes = await freeBytes(dataDir);
+
+  // THE INPUT 7z READS, not the archive it writes: the rate was measured
+  // against input bytes, and the dump is read once and the blobs once.
+  const estimatedSeconds = Math.ceil((databaseBytes + blobBytes) / BACKUP_BYTES_PER_SECOND);
+
+  return {
+    databaseBytes, blobBytes, availableBytes, requiredBytes,
+    enoughDisk: availableBytes >= requiredBytes,
+    estimatedSeconds,
+    slow: estimatedSeconds >= BACKUP_SLOW_SECONDS,
+    timeoutSeconds: BACKUP_PROXY_READ_TIMEOUT_SECONDS,
+  };
+}
+
+/**
+ * The blob store's size on disk, without hashing a byte of it.
+ *
+ * The same walk collectBlobs makes and the same tolerance of an absent
+ * directory (a fresh install has uploaded nothing), minus the digest -- see
+ * estimateBackup for why that difference is the whole reason this exists
+ * separately.
+ */
+async function blobStoreBytes(blobDir: string): Promise<number> {
+  let names: string[];
+  try {
+    names = await readdir(blobDir);
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const name of names) {
+    const info = await stat(path.join(blobDir, name));
+    if (info.isFile()) total += info.size;
+  }
+  return total;
 }
 
 /**

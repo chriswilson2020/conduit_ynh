@@ -20,14 +20,47 @@ it is here to say what is inside and why the format is what it is.
 | Your computer | Use |
 |---|---|
 | **Windows** | **7-Zip** -- free, from <https://www.7-zip.org>. Right-click the file, "7-Zip" then "Extract Here", and type the passphrase. |
-| **Mac** | **Keka** -- free, from <https://www.keka.io>. **macOS's built-in Archive Utility will not open an encrypted archive**, so this is a one-time install. Double-clicking without it fails with an unhelpful message rather than asking for a passphrase. Measured on macOS 26.5: the built-in `tar` answers "The archive header is encrypted, but currently not supported", and `ditto` does not recognise the file at all. |
+| **Mac** | **Keka** -- free, from <https://www.keka.io>. **macOS's built-in Archive Utility will not open an encrypted archive**, so this is a one-time install. Double-clicking without it fails without ever asking for a passphrase. |
 | **Linux** | **Ark** or **File Roller**, whichever your desktop ships, or `7z x conduit-backup-YYYY-MM-DD.7z` from a terminal (`apt install p7zip-full`). |
+
+### What the Mac line is based on
+
+Task 2 wrote that line from the command-line tools alone and said so, because
+it was working on a Linux server and could not drive Archive Utility itself.
+**Task 3 drove it, on macOS 26.5.2, and the claim survives -- but in a narrower
+form than the obvious one.**
+
+- Archive Utility **does** list `org.7-zip.7-zip-archive` among the types it
+  handles, and **it extracted an unencrypted `.7z`** written by the same 7-Zip
+  26.02 on the deploy target: the payload appeared beside the archive.
+- Given the **same archive encrypted** with AES-256 and `-mhe=on`, it produced
+  **nothing at all** -- no extracted file, no passphrase prompt.
+
+So the honest sentence is not "macOS cannot open a `.7z`". It is that it will
+not open an **encrypted** one, which is the only kind Conduit writes. Keka is a
+one-time install for that reason and not because of the extension.
+
+The command-line measurements Task 2 recorded reproduce on the same machine:
+`tar` answers "The archive header is encrypted, but currently not supported",
+`ditto` answers "Couldn't read PKZip signature", and `unzip` reports no
+end-of-central-directory signature.
 
 **There is no recovery path for the passphrase.** Conduit never stores it, never
 logs it and never writes it to disk. If it is lost, the backup is a file of
 random bytes and nobody -- not you, not Conduit, not anyone with the server --
 can open it. That is the property that makes the file safe to keep in cloud
 storage, and it is not adjustable.
+
+**The passphrase cannot contain a line break, a tab, or any other control
+character**, and Conduit refuses one at the field rather than at the archiver.
+`7z` reads the passphrase as one line, so `abc` then a newline then `def`
+encrypts with `abc` and reports success -- an archive with a passphrase nobody
+typed and, given the paragraph above, no way back. A carriage return is worse:
+`7z` keeps it, so the archive ends up protected by an invisible character no
+dialog will reproduce. Both were measured, and re-measured in Task 3 along with
+the characters the rule **allows**: leading and trailing spaces, umlauts,
+colons, the whole ASCII punctuation set, and the C1 block (U+0085, U+009F) all
+round-trip unchanged.
 
 ---
 
