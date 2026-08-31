@@ -148,9 +148,13 @@ export function chooseOption(option: string): OptionChoice {
  *                    so a spaces-only value was never the "ragged edge" an
  *                    earlier version of this comment claimed -- it was
  *                    invisible, which is worse. A zero-width space is 3.8px.
- *   the mail merge   treats an absent field as nothing and eats one following
- *                    space (Task 1's SV-1 ruling). An invisible value is not
- *                    absent, so it renders as itself.
+ *   the quote merge  treats an absent salutation as nothing, via the seeded
+ *                    template's {{#document.recipientSalutation}} block. An
+ *                    invisible value is not absent, so it renders as itself.
+ *                    (This row said "the mail merge" and named v1.1.0's
+ *                    one-following-space rule until v1.2.2 removed the mail
+ *                    template feature; that merge no longer exists, and the
+ *                    quote's is the only one a contact field now reaches.)
  *   the quote form   trims its own salutation on submit, because that one is a
  *                    printed line on an immutable PDF rather than a record of
  *                    what somebody typed. See document-lib.ts.

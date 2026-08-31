@@ -184,11 +184,15 @@ export function RichTextView({ html, className, testId, ariaLabel }: {
 
 /**
  * The one rich-text editor in the app (Phase 4's first TipTap use): message
- * bodies, per-account signatures and email templates all render through it.
- * StarterKit + Link, and nothing else -- see EXTENSIONS above.
+ * bodies, per-account signatures and a meeting's notes all render through it.
+ * StarterKit + Link, and nothing else -- see EXTENSIONS above. (Email templates
+ * were a fourth until v1.2.2 removed them; the QUOTE template is edited in a
+ * plain textarea and always was, because this editor reserialises through a
+ * document model and would rewrite the letterhead on the first keystroke --
+ * pages/settings-templates.tsx says so at length.)
  *
  * All output HTML is sanitized SERVER-side on every write path (signatures,
- * templates and compose bodies all run through mail-content.ts's shared
+ * meeting notes and compose bodies all run through mail-content.ts's shared
  * sanitizer), so this editor never has to be the security boundary.
  */
 export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
