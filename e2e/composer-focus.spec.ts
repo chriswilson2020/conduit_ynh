@@ -61,8 +61,11 @@ import type { Page } from "@playwright/test";
  * Ctrl-C in the local loop, a timed-out CI job -- left one alive against a
  * database nothing empties. That account is unreachable by construction
  * (192.0.2.1 is TEST-NET-1), so its sync pass sits in a TCP connect that never
- * completes, and the next API shutdown waits out mail-sync's STOP_TIMEOUT_MS
- * (15s) on it. The beforeAll below mirrors the two sweepers named above, and
+ * completes, and the next API shutdown waits out mail-sync's STOP_TIMEOUT_MS on
+ * it. MEASURED on the dev server against this same build, SIGTERM to exit: 103ms
+ * with nothing live, 15,035ms with one such account left behind -- which is the
+ * constant, to the millisecond, plus the time to notice.
+ * The beforeAll below mirrors the two sweepers named above, and
  * takes e2e/mobile.spec.ts's half of them -- the refusal to run beside another
  * worker, which e2e/mail.spec.ts's own sweep does not carry because it sits
  * inside a serial group and this one does not.
