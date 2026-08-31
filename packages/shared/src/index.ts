@@ -2273,6 +2273,13 @@ export function logoDataUriProblem(uri: string): string | null {
   // bytes inside a TEMPLATE, where there is no upload check, were charged per
   // character and accepted. `gifSize` now answers null only where Pillow raises
   // EOFError for want of an image descriptor, which is what makes the clause true.
+  //
+  // THE COST IS ONE UPLOAD THAT USED TO BE REFUSED AND NOW IS NOT: a small GIF whose
+  // frame descriptor is whole and whose image data is truncated. Pillow opens it at
+  // the declared size and fails on `load()`, so it draws as nothing -- but so does
+  // the `org-logo-preview` <img> on the same screen, since a browser cannot decode it
+  // either, and the sentence this used to refuse it with was the false half of the
+  // clause above. Pinned in index.test.ts so it stays a decision.
   const size = imageDataUriSize(uri);
   if (size === null) {
     return `this file's header does not say how large the image is,`

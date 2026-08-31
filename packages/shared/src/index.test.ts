@@ -1993,6 +1993,29 @@ describe("imageDataUriSize", () => {
     // A GIF with no frame at all still cannot be drawn by anything, and still says so.
     expect(logoDataUriProblem(gif([...header(8_000, 8_000)])))
       .toContain("does not say how large the image is");
+
+  });
+
+  /**
+   * THE ONE UPLOAD THIS CHANGES, IN ITS OWN CASE SO IT CAN FAIL ON ITS OWN. A small
+   * GIF with a whole frame descriptor and a sub-block chain that runs off the end --
+   * a half-downloaded logo -- was refused with "this file's header does not say how
+   * large the image is" and is now ACCEPTED. The header does say 100x100, Pillow
+   * opens it at 100x100, and the pixel bound has nothing to object to; the sentence
+   * it used to be refused with was the false one. `load()` still raises "image file
+   * is truncated", so it draws as nothing -- and so does the `org-logo-preview`
+   * <img> on the same screen, since a browser cannot decode it either, which is
+   * where an admin finds out.
+   *
+   * Pinned so this stays a decision rather than a side effect of the fallback.
+   */
+  it("accepts a GIF logo whose frame is whole and whose image data is truncated", () => {
+    const half = gif([
+      ...header(100, 100), 0x2c, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x64, 0x00, 0x00,
+      0x02, 0x0c, ...Array.from({ length: 6 }, () => 0x00),
+    ]);
+    expect(imageDataUriSize(half)).toEqual({ width: 100, height: 100 });
+    expect(logoDataUriProblem(half)).toBeNull();
   });
 
   it("reads all three WEBP variants, not just the extended one", () => {
