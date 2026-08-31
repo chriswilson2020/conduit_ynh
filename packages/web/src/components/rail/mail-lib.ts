@@ -1,6 +1,6 @@
 /**
  * The Mail rail tab's one pure part: whether its Compose button may be pressed,
- * and what to say when it may not.
+ * what to say when it may not, and which hops a Retry should ask again.
  *
  * Kept out of mail.tsx so it can be unit-tested without a DOM -- this project
  * wires no testing-library, so a component's logic is only reachable by a test
@@ -26,7 +26,7 @@
  * cannot tell "not yet" from "never": a hop that 404s or 500s leaves a dead
  * button with nothing on screen to explain it. The refusal was about the
  * silence, not about the disabling -- so the pending state carries a reason,
- * the failed state does NOT disable anything and says what is missing, and the
+ * the failed state does NOT disable anything and offers a Retry, and the
  * settled state is simply allowed.
  *
  * AND `to: []` IS NOT ALWAYS WRONG, which is the third state's whole point. A
@@ -38,50 +38,110 @@
 export type ComposeGate = "ready" | "resolving" | "failed";
 
 /**
- * One link in the chain, as the two things the gate needs to know about it.
+ * One link in the chain, as the three fields this gate reads off a TanStack
+ * query result.
  *
- * `enabled` IS NOT REDUNDANT AND CANNOT BE READ OFF THE QUERY. Every hook in
- * queries.ts is `enabled: id !== ""`, and a disabled query sits at
- * `status: "pending"` for ever in TanStack v5 -- so `isPending` alone would
- * report "still loading" on a deal that has no contact and never will, and the
- * button would never come back. TanStack exposes no `enabled` on the result and
- * `fetchStatus: "idle"` covers both "disabled" and "about to start", so the
- * caller passes the same emptiness test it passed to the hook.
+ * `data` IS IN HERE BECAUSE A FAILURE IS NOT ALWAYS A LOSS. Measured against
+ * the installed @tanstack/query-core 5.101.4: a query that succeeded and whose
+ * REFETCH then fails goes to `status: "error"` while its data survives --
+ * `isError: true`, `data: {...}`. With `staleTime: 10_000` and
+ * `refetchOnWindowFocus` left at its default (router.tsx sets only staleTime
+ * and retry), one transient 500 on a tab refocus would otherwise paint "could
+ * not load the contact" beside a composer that goes on to seed that contact
+ * correctly. A hop holding data is USABLE, whatever its status says.
  *
- * `isPending` RATHER THAN `isFetching` OR `fetchStatus`, which is the one place
- * this differs from pages/deal-detail.tsx's `defaultsInFlight` -- and the
- * difference is the second hop. When the deal answers, `contactId` becomes
- * available and the contact query becomes enabled in the SAME render, but its
- * fetch does not start until an effect runs; across that commit `fetchStatus`
- * reads "idle" while `isPending` already reads true. A gate on "in flight"
- * would flicker open there. `isPending` also lets a background refetch of
- * already-cached data through, which is right: stale data still names a real
- * recipient.
+ * `fetchStatus` RATHER THAN `isPending`, which is also what
+ * pages/deal-detail.tsx's `defaultsInFlight` reads, and the reason to match it
+ * is the OFFLINE state neither `isPending` nor `isError` describes.
+ * `networkMode` is the default "online" here, so an offline fetch is PAUSED:
+ * measured, `fetchStatus: "paused"`, `isPending: true`, `isError: false`,
+ * queryFn never called, and it stays that way until the network returns. A gate
+ * built on `isPending` would sit at "resolving" for ever with no error to
+ * escape through -- exactly the "cannot tell 'not yet' from 'never'" shape
+ * v1.1.0 rejected -- and it is reachable, because pages/deal-detail.tsx mounts
+ * this rail inside its `isLoading` branch. So paused counts as stalled, not as
+ * in flight.
+ *
+ * (An earlier draft claimed `fetchStatus` reads "idle" for one commit after a
+ * chained key goes live, so a gate on it would flicker open. THAT IS FALSE.
+ * Measured through useBaseQuery's own per-render sequence with the key flipping
+ * "" -> "contact-1": `fetchStatus` is already "fetching" on that very render,
+ * because getOptimisticResult applies `fetchState()` when `_optimisticResults`
+ * is set and the query would fetch. The window exists for the network call and
+ * not for the reported status.)
+ *
+ * THERE IS DELIBERATELY NO `enabled` FLAG, and an earlier draft's was deleted
+ * rather than kept. Every hook in queries.ts is `enabled: id !== ""`, so it was
+ * tempting to restate that test here -- but a DISABLED query reports exactly
+ * the same three fields as one that has simply not been asked for: no data,
+ * `fetchStatus: "idle"`, no error. Both predicates below require a REASON, so
+ * such a hop is neither in flight nor stalled and needs no flag to be ignored.
+ * Measured: with the flag forced true on all four hops, every one of the ten
+ * journeys in e2e/rail-compose.spec.ts still passed and the only red was the
+ * source guard that existed to protect the flag itself. Restating queries.ts's
+ * predicate across a module boundary bought nothing and could drift; not
+ * restating it cannot. Drift is still caught, behaviourally and in both
+ * directions -- see the journeys' own note.
  */
 export interface ComposeHop {
-  /** Whether this hop's query is enabled -- i.e. whether it has an id to fetch. */
-  readonly enabled: boolean;
-  /** TanStack's `isPending`: enabled, and neither answered nor failed yet. */
-  readonly isPending: boolean;
-  /** TanStack's `isError`: answered with a failure, retries spent. */
+  /** `undefined` until something has arrived; survives a later failed refetch. */
+  readonly data: unknown;
   readonly isError: boolean;
+  readonly fetchStatus: "fetching" | "paused" | "idle";
+}
+
+/** Holds nothing to seed from. */
+function empty(hop: ComposeHop): boolean {
+  return hop.data === undefined;
+}
+
+/** Empty, and something is on the wire for it. */
+function inFlight(hop: ComposeHop): boolean {
+  return empty(hop) && hop.fetchStatus === "fetching";
+}
+
+/**
+ * Empty, and nothing is coming: it failed, or the network is gone.
+ *
+ * THE REASON IS REQUIRED, not inferred from "empty and not fetching". A query
+ * that was never asked for -- `useContact("")` on a deal with no contact, and
+ * the project hook on every deal tab -- is empty and idle with no error, and
+ * without this clause it would read as a failure and paint an alert on every
+ * record in the app.
+ *
+ * A hop can be in flight AND stalled -- a failed query being refetched is
+ * `isError` with `fetchStatus: "fetching"` and no data, which is exactly what
+ * the Retry button produces -- and composeGate resolves that by order.
+ */
+function stalled(hop: ComposeHop): boolean {
+  return empty(hop) && (hop.isError || hop.fetchStatus === "paused");
 }
 
 /**
  * The gate over a whole chain.
  *
- * RESOLVING WINS OVER FAILED when both are present, because the button's state
- * is the question being answered and a chain with anything still on the wire
- * must not be pressed yet. Once that hop settles the failure is reported on the
- * next render -- a failed hop never becomes un-failed, so nothing is lost by
- * being late.
- *
- * A DISABLED HOP IS NOT A HOP. It contributes to neither state, which is what
- * makes a deal with no contact, a project tab and a company tab all "ready"
- * rather than either of the other two.
+ * IN FLIGHT WINS OVER STALLED when a hop is both, because the button's state is
+ * the question being answered and a chain with anything on the wire must not be
+ * pressed yet. Nothing is lost by reporting the failure a render later: a hop
+ * that fails again comes back stalled with the fetch over.
  */
 export function composeGate(hops: readonly ComposeHop[]): ComposeGate {
-  if (hops.some((hop) => hop.enabled && hop.isPending)) return "resolving";
-  if (hops.some((hop) => hop.enabled && hop.isError)) return "failed";
+  if (hops.some(inFlight)) return "resolving";
+  if (hops.some(stalled)) return "failed";
   return "ready";
+}
+
+/**
+ * The hops a Retry should ask again: the same predicate the "failed" state is
+ * built on, exported rather than restated so the control cannot drift from the
+ * message beside it.
+ *
+ * SCOPED TO THE STALLED HOPS RATHER THAN REFETCHING EVERYTHING, and that is not
+ * tidiness. Measured: `refetch()` on a DISABLED query goes to the network
+ * anyway -- queryFn calls went 0 to 1 against query-core 5.101.4 -- so a Retry
+ * that asked all four would send `GET /contacts/` with an empty id from every
+ * deal that has no contact.
+ */
+export function stalledHops<T extends ComposeHop>(hops: readonly T[]): readonly T[] {
+  return hops.filter(stalled);
 }
