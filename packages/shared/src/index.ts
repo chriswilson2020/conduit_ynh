@@ -1927,9 +1927,35 @@ function at8(b: readonly number[], at: number): number {
  * So this walks the block stream and takes the largest of the screen and every frame's
  * `left + width` by `top + height`. Walking means reading the whole file: extension
  * blocks and image data are variable-length chains of sub-blocks, and a later frame
- * can be the biggest one. If the walk runs out of bytes before the trailer it gives up
- * rather than returning the largest SO FAR -- a truncated answer is an undercharge,
- * which is exactly the class of bug this is.
+ * can be the biggest one.
+ *
+ * **AND A WALK THAT DOES NOT REACH THE TRAILER ANSWERS WITH THE LARGEST EXTENT IT
+ * ESTABLISHED, RATHER THAN NULL.** Giving up used to look like the conservative
+ * choice -- an incomplete maximum is smaller than the real one -- but null is not a
+ * refusal here: `renderInputCost` charges an unreadable payload per CHARACTER, so a
+ * 37-byte GIF whose screen claims 8000x8000 and whose walk runs out of bytes was
+ * charged 429,312 pixels against a 16,000,000 cap and waved through, while Pillow
+ * opened it at 64 megapixels. Four variants of that shape were built in v1.0.1; the
+ * worst rendered at 302MB and the other three died on the kernel bound. The screen
+ * descriptor was in hand the whole time.
+ *
+ * **THE FALLBACK IS CONDITIONAL ON HAVING PARSED AN IMAGE DESCRIPTOR, because that is
+ * exactly Pillow's condition for opening the file at all.** `GifImageFile._open`
+ * scans for the first `,` and raises EOFError if it reaches the end without one, so a
+ * GIF with no frame is not an image anybody can draw and stays unreadable -- which is
+ * the answer `logoDataUriProblem` needs, and it is measured rather than assumed: a
+ * probe was built for each of the six ways the old walk could answer null, and Pillow
+ * refuses the five that reach no image descriptor and opens the one that does, at the
+ * size this now returns.
+ *
+ * **A BYTE THAT IS NOT A BLOCK INTRODUCER RESYNCS RATHER THAN ENDING THE WALK, for
+ * the same reason: Pillow's scanner skips it and carries on.** Ending the walk there
+ * and then falling back would have opened a fresh undercharge rather than closing
+ * one -- a 1x1 screen with a 13000x13000 frame hidden behind a single 0x00 byte reads
+ * as 1x1 to a reader that stops, and Pillow opens it at 169 megapixels. Measured on
+ * Pillow 12.3.0: with the resync this file is charged 169,000,000 and refused; the
+ * padded form of it was refused by the per-character charge before this change and
+ * would have become acceptable without the resync.
  */
 function gifSize(b: readonly number[]): ImageSize | null {
   if (b.length < 13) return null;
@@ -1938,6 +1964,7 @@ function gifSize(b: readonly number[]): ImageSize | null {
   // A global colour table, if the packed field says so: 3 bytes per entry, 2^(N+1)
   // entries.
   let at = 13 + ((at8(b, 10) & 0x80) === 0 ? 0 : 3 * (1 << ((at8(b, 10) & 0x07) + 1)));
+  let framed = false;
 
   /** Past a chain of length-prefixed sub-blocks, or -1 if it runs off the end. */
   const skipSubBlocks = (from: number): number => {
@@ -1950,33 +1977,43 @@ function gifSize(b: readonly number[]): ImageSize | null {
     }
   };
 
+  /**
+   * The answer for a walk that ended before the trailer: everything established so
+   * far if a frame was reached, and otherwise nothing, because Pillow could not have
+   * opened the file either.
+   */
+  const soFar = (): ImageSize | null => (framed ? { width, height } : null);
+
   for (;;) {
-    if (at >= b.length) return null;
+    if (at >= b.length) return soFar();
     const block = at8(b, at);
     if (block === 0x3b) break; // the trailer: the file is complete, so is the answer
     if (block === 0x21) {
       // An extension: a label, then sub-blocks. Comment, graphic-control and
       // application blocks all take this shape.
       at = skipSubBlocks(at + 2);
-      if (at === -1) return null;
+      if (at === -1) return soFar();
       continue;
     }
     if (block === 0x2c) {
-      // An image descriptor: left, top, width, height, packed.
-      if (at + 10 > b.length) return null;
+      // An image descriptor: left, top, width, height, packed. A truncated one is
+      // read by nobody -- Pillow's own unpack raises on the short buffer -- so it
+      // contributes no extent, and any earlier frame still counts.
+      if (at + 10 > b.length) return soFar();
       const left = at8(b, at + 1) | (at8(b, at + 2) << 8);
       const top = at8(b, at + 3) | (at8(b, at + 4) << 8);
       width = Math.max(width, left + (at8(b, at + 5) | (at8(b, at + 6) << 8)));
       height = Math.max(height, top + (at8(b, at + 7) | (at8(b, at + 8) << 8)));
+      framed = true;
       const packed = at8(b, at + 9);
       const local = (packed & 0x80) === 0 ? 0 : 3 * (1 << ((packed & 0x07) + 1));
       // The local colour table, the LZW minimum code size, then the image's own
       // sub-blocks.
       at = skipSubBlocks(at + 10 + local + 1);
-      if (at === -1) return null;
+      if (at === -1) return soFar();
       continue;
     }
-    return null; // not a block introducer: malformed, and not ours to guess at
+    at += 1; // malformed: skip the byte and keep looking, which is what Pillow does
   }
   return { width, height };
 }
@@ -2228,6 +2265,14 @@ export function logoDataUriProblem(uri: string): string | null {
   // And the raster it decodes to has to be one the renderer can afford, which its
   // file size does not say. An unreadable header is refused rather than waved
   // through: no image library could open it either, so it would print as nothing.
+  //
+  // THAT LAST CLAUSE WAS FALSE OF GIF UNTIL v1.2.1 and is what the fallback in
+  // `gifSize` is for. A GIF whose walk stopped short read as unreadable here and was
+  // refused with this sentence, while Pillow opened the same bytes at the size in its
+  // screen descriptor -- so the refusal was right for the wrong reason, and the same
+  // bytes inside a TEMPLATE, where there is no upload check, were charged per
+  // character and accepted. `gifSize` now answers null only where Pillow raises
+  // EOFError for want of an image descriptor, which is what makes the clause true.
   const size = imageDataUriSize(uri);
   if (size === null) {
     return `this file's header does not say how large the image is,`
@@ -2707,19 +2752,26 @@ function wholeDataUri(html: string, uri: string, at: number | undefined): string
  *
  * **BUT "THE FETCHER STOPS IT" IS NOT TRUE OF EVERY UNIDENTIFIABLE PAYLOAD, AND AN
  * EARLIER VERSION OF THIS COMMENT SAID IT WAS.** The fetcher sniffs the same four
- * signatures, so a payload that BEGINS `GIF89a` passes it and can still be
- * unidentifiable HERE: a 37-byte GIF whose screen descriptor says 8000x8000 but which
- * fails `gifSize`'s trailer check is charged 37 x 8,256 = 305,472 pixels, and Pillow
- * opens it at 64 megapixels and renders it, measured at 302MB. The kernel bound is
- * what holds there -- 302MB is 59% of RENDER_MEMORY_LIMIT_BYTES -- and it is the only
- * thing that does. Three larger variants of the same trick, including a GIF that is
- * simply missing its trailer, die on that bound instead.
+ * signatures, so a payload that BEGINS `GIF89a` passes it and could still be
+ * unidentifiable HERE: a 37-byte GIF whose screen descriptor says 8000x8000 but whose
+ * block walk ran off the end was charged 429,312 pixels, and Pillow opens it at 64
+ * megapixels and renders it, measured at 302MB. The kernel bound was what held there
+ * -- 302MB is 59% of RENDER_MEMORY_LIMIT_BYTES -- and it was the only thing that did.
+ * Three larger variants of the same trick, including a GIF that is simply missing its
+ * trailer, died on that bound instead.
  *
- * The fix is small and is NOT in this release: `gifSize` should fall back to the
- * screen descriptor's dimensions rather than null on those paths, which would charge
- * all four variants 64 to 169 megapixels and refuse every one of them. It is recorded
- * here and in v1.0.1's release notes rather than done at the end of a release, and it
- * is v1.0.2's first item.
+ * **THAT NUMBER WAS WRITTEN AS 37 x 8,256 = 305,472 AND IT WAS WRONG, in a comment
+ * whose own last line says why**: the charge is per CHARACTER of the payload as
+ * written, and 37 bytes is 52 base64 characters, so it was 52 x 8,256 = 429,312. Both
+ * figures are far under the 16,000,000 cap, so the conclusion held and only the
+ * arithmetic did not.
+ *
+ * **FIXED IN v1.2.1**: `gifSize` now falls back to the largest extent it established
+ * rather than null, wherever the walk ends before the trailer having reached a frame,
+ * and all four variants are charged 64 to 169 megapixels and refused. What remains
+ * unidentifiable is a GIF that reaches no frame at all, which Pillow will not open
+ * either -- so this per-character charge is no longer what stands between a GIF and
+ * the renderer, and the JPEG2000 case above is now the whole of its job.
  *
  * Charged per CHARACTER of the payload as written, which over-charges base64 by 4/3,
  * deliberately and in the safe direction.

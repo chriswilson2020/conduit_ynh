@@ -283,6 +283,16 @@ catches what the arithmetic cannot — does not hold for a payload that *starts*
 **This is the ceiling working**: the worst variant ran at 59% of the limit rather than
 taking the server down.
 
+**DONE in v1.2.1 Task 4, and the prescription above is one shape short.** Falling back
+to the SCREEN DESCRIPTOR alone leaves a fifth variant reading 1x1: hide the huge frame
+behind one byte that is not a block introducer and Pillow skips the byte where a reader
+that stops does not. So `gifSize` resyncs the way Pillow's scanner does and falls back
+to the largest extent it established, conditional on having reached an image
+descriptor -- which is Pillow's own condition for opening the file, measured, and what
+keeps the logo path's "no image library could open it either" true. See the plan's
+Task 4 corrections. The `length * 8256` = 429,312 above is right; the copy of it in
+`shared/src/index.ts` said 305,472 and has been corrected.
+
 **A reply's signature is silently lost on a cold accounts cache -- found during 7.5 Task 2,
 deliberately not fixed there.** `packages/web/src/components/mail/composer.tsx:265-273`
 stamps its guard key **before** discovering whether a signature exists:

@@ -73,6 +73,9 @@ import {
   imageDataUriSize,
   renderInputCost,
   MAX_PIXELS_PER_PAYLOAD_BYTE,
+  RENDER_IMAGE_PIXEL_CAP,
+  logoDataUriProblem,
+  MAX_LOGO_PIXELS,
 } from "./index.js";
 
 const uuid1 = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -1792,6 +1795,15 @@ describe("imageDataUriSize", () => {
     [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
   const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
   const RIFF = [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50];
+  const le16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
+  const header = (w: number, h: number): number[] =>
+    [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, ...le16(w), ...le16(h), 0x00, 0x00, 0x00];
+  // A frame: descriptor, no local table, LZW minimum code size, one empty
+  // sub-block, then the block terminator.
+  const frame = (left: number, top: number, w: number, h: number): number[] =>
+    [0x2c, ...le16(left), ...le16(top), ...le16(w), ...le16(h), 0x00, 0x02, 0x00];
+  const TRAILER = 0x3b;
+  const gif = (bytes: number[]): string => `data:image/gif;base64,${b64(bytes)}`;
 
   it("reads a PNG's IHDR", () => {
     const png = [...PNG_SIGNATURE,
@@ -1834,15 +1846,6 @@ describe("imageDataUriSize", () => {
    * the old assertion thinking it was a simplification.
    */
   it("takes the LARGEST of a GIF's screen and its frame extents, not the screen alone", () => {
-    const le16 = (n: number): number[] => [n & 0xff, (n >>> 8) & 0xff];
-    const header = (w: number, h: number): number[] =>
-      [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, ...le16(w), ...le16(h), 0x00, 0x00, 0x00];
-    // A frame: descriptor, no local table, LZW minimum code size, one empty
-    // sub-block, then the block terminator.
-    const frame = (left: number, top: number, w: number, h: number): number[] =>
-      [0x2c, ...le16(left), ...le16(top), ...le16(w), ...le16(h), 0x00, 0x02, 0x00];
-    const TRAILER = 0x3b;
-
     // The honest case is unchanged: screen and frame agree.
     expect(imageDataUriSize(`data:image/gif;base64,${b64([
       ...header(2000, 1400), ...frame(0, 0, 2000, 1400), TRAILER,
@@ -1865,13 +1868,131 @@ describe("imageDataUriSize", () => {
       ...frame(0, 0, 900, 800), TRAILER,
     ])}`)).toEqual({ width: 900, height: 800 });
 
-    // AND A GIF THAT ENDS BEFORE ITS TRAILER IS UNREADABLE RATHER THAN
-    // OPTIMISTICALLY MEASURED. Returning the largest extent seen so far would be an
-    // undercharge, which is the whole class of defect this test exists for.
-    expect(imageDataUriSize(`data:image/gif;base64,${b64([...header(1, 1)])}`)).toBeNull();
-    expect(imageDataUriSize(`data:image/gif;base64,${b64([
-      ...header(1, 1), ...frame(0, 0, 13_000, 13_000),
-    ])}`)).toBeNull();
+    // A GIF WITH NO IMAGE DESCRIPTOR AT ALL IS STILL UNREADABLE, and that is the one
+    // half of the old truncation rule that survives -- see the fallback test below
+    // for the half that did not.
+    expect(imageDataUriSize(gif([...header(1, 1)]))).toBeNull();
+  });
+
+  /**
+   * THE SECOND TIME THIS FILE HAS HAD TO CHANGE A PASSING ASSERTION ABOUT GIFs, AND
+   * FOR THE SAME REASON BOTH TIMES: the reader disagreed with Pillow.
+   *
+   * The test above used to end with a second `toBeNull`, on a GIF carrying a
+   * 13000x13000 frame and no trailer, justified as "returning the largest extent seen
+   * so far would be an undercharge". It was the undercharge. A null is not a refusal:
+   * `renderInputCost` charges an unreadable payload MAX_PIXELS_PER_PAYLOAD_BYTE per
+   * CHARACTER, so these files -- all of them tiny -- were charged a few hundred
+   * thousand pixels against a 16,000,000 cap and accepted, and Pillow opened them at
+   * 64 to 169 megapixels. Named here so nobody restores the old line thinking the
+   * fallback was a shortcut.
+   *
+   * Every expected size below is what Pillow 12.3.0 answers for the same bytes,
+   * checked file by file rather than reasoned about.
+   */
+  it("charges a GIF whose walk never reaches the trailer what Pillow would open", () => {
+    // v1.0.1's four variants. The first three are 37 bytes: a screen descriptor
+    // claiming N x N, one 1x1 frame, and a sub-block chain that runs off the end.
+    const truncatedWalk = (n: number): number[] => [
+      ...header(n, n), ...frame(0, 0, 1, 1).slice(0, 10),
+      0x02, 0x0c, ...Array.from({ length: 12 }, () => 0x00),
+    ];
+    expect(imageDataUriSize(gif(truncatedWalk(8_000))))
+      .toEqual({ width: 8_000, height: 8_000 });
+    expect(imageDataUriSize(gif(truncatedWalk(10_000))))
+      .toEqual({ width: 10_000, height: 10_000 });
+    expect(imageDataUriSize(gif(truncatedWalk(13_000))))
+      .toEqual({ width: 13_000, height: 13_000 });
+    // The fourth is a real artifact rather than a crafted one: a complete GIF whose
+    // trailer byte is simply absent.
+    expect(imageDataUriSize(gif([...header(1, 1), ...frame(0, 0, 13_000, 13_000)])))
+      .toEqual({ width: 13_000, height: 13_000 });
+
+    // AND A FIFTH SHAPE, WHICH FALLING BACK TO THE SCREEN DESCRIPTOR ALONE WOULD HAVE
+    // READ AS 1x1. The huge frame sits behind one byte that is not a block
+    // introducer; Pillow's scanner skips such a byte and carries on, so this walk
+    // does too. Ending the walk there instead would have made the padded form below
+    // CHEAPER than it was before the fallback existed, which is the shape v1.0.1
+    // spent five rounds on.
+    const behindGarbage = (pad: number): number[] => [
+      ...header(1, 1), ...Array.from({ length: pad }, () => 0x00),
+      ...frame(0, 0, 13_000, 13_000), TRAILER,
+    ];
+    expect(imageDataUriSize(gif(behindGarbage(1))))
+      .toEqual({ width: 13_000, height: 13_000 });
+    expect(imageDataUriSize(gif(behindGarbage(2_000))))
+      .toEqual({ width: 13_000, height: 13_000 });
+
+    // THE FALLBACK IS CONDITIONAL ON HAVING REACHED A FRAME, which is Pillow's own
+    // condition for opening the file: `GifImageFile._open` scans for the first `,`
+    // and raises EOFError without one. So a walk that ends before any image
+    // descriptor stays unreadable -- charged per character, and refused as a logo
+    // with a sentence about the header rather than one about pixels. Measured: Pillow
+    // refuses all four of these and opens all six above.
+    expect(imageDataUriSize(gif([...header(8_000, 8_000)]))).toBeNull();
+    expect(imageDataUriSize(gif([...header(8_000, 8_000), 0x21, 0xfe, 0x03, 0x61])))
+      .toBeNull();
+    expect(imageDataUriSize(gif([...header(8_000, 8_000), 0x2c, 0x00, 0x00, 0x00])))
+      .toBeNull();
+    expect(imageDataUriSize(gif([...header(8_000, 8_000), 0x99]))).toBeNull();
+
+    // Once a frame HAS been reached, every later way for the walk to end early keeps
+    // it -- and there are three of them, one per `return` in the walk, which the four
+    // lines above cannot tell apart because none of them reaches a frame at all.
+    // Pillow reads both of these as 900x800, since it stops at the first frame.
+    expect(imageDataUriSize(gif([...header(1, 1), ...frame(0, 0, 900, 800), 0x2c, 0x00, 0x00])))
+      .toEqual({ width: 900, height: 800 });
+    expect(imageDataUriSize(gif([
+      ...header(1, 1), ...frame(0, 0, 900, 800), 0x21, 0xfe, 0x03, 0x61,
+    ]))).toEqual({ width: 900, height: 800 });
+  });
+
+  /**
+   * THE CHARGE IS THE POINT, NOT THE DIMENSIONS, so the four variants are also
+   * asserted where the cap acts on them. Before this fallback every one of these was
+   * `unreadableImages: 1` and a five-figure charge; the cap is 16,000,000.
+   */
+  it("refuses v1.0.1's four GIF variants at the pixel cap rather than waving them through", () => {
+    const truncatedWalk = (n: number): number[] => [
+      ...header(n, n), ...frame(0, 0, 1, 1).slice(0, 10),
+      0x02, 0x0c, ...Array.from({ length: 12 }, () => 0x00),
+    ];
+    const charge = (bytes: number[]): { pixels: number; unreadable: number } => {
+      const cost = renderInputCost(`<img src="${gif(bytes)}">`);
+      return { pixels: cost.imagePixels, unreadable: cost.unreadableImages };
+    };
+    expect(charge(truncatedWalk(8_000))).toEqual({ pixels: 64_000_000, unreadable: 0 });
+    expect(charge(truncatedWalk(10_000))).toEqual({ pixels: 100_000_000, unreadable: 0 });
+    expect(charge(truncatedWalk(13_000))).toEqual({ pixels: 169_000_000, unreadable: 0 });
+    expect(charge([...header(1, 1), ...frame(0, 0, 13_000, 13_000)]))
+      .toEqual({ pixels: 169_000_000, unreadable: 0 });
+    for (const bytes of [truncatedWalk(8_000), truncatedWalk(10_000), truncatedWalk(13_000),
+      [...header(1, 1), ...frame(0, 0, 13_000, 13_000)]]) {
+      expect(charge(bytes).pixels).toBeGreaterThan(RENDER_IMAGE_PIXEL_CAP);
+    }
+    // The smallest of them is 37 bytes, which is 52 base64 characters -- so the old
+    // per-character charge was 429,312, which is 2.7% of the cap.
+    expect(truncatedWalk(8_000)).toHaveLength(37);
+    expect(52 * MAX_PIXELS_PER_PAYLOAD_BYTE).toBeLessThan(RENDER_IMAGE_PIXEL_CAP);
+  });
+
+  /**
+   * AND THE LOGO UPLOAD, which is the entrance v1.0.1 found this through: the four
+   * variants were already refused there, but for the wrong reason -- "this file's
+   * header does not say how large the image is" -- which is a sentence about a broken
+   * file rather than about a 64-megapixel one, and which stopped being true of them
+   * the moment Pillow opened one.
+   */
+  it("refuses the GIF variants as logos with the size in the sentence", () => {
+    const problem = logoDataUriProblem(gif([
+      ...header(8_000, 8_000), ...frame(0, 0, 1, 1).slice(0, 10),
+      0x02, 0x0c, ...Array.from({ length: 12 }, () => 0x00),
+    ]));
+    expect(problem).toContain("8000 x 8000");
+    expect(problem).toContain(String(MAX_LOGO_PIXELS));
+    // A GIF with no frame at all still cannot be drawn by anything, and still says so.
+    expect(logoDataUriProblem(gif([...header(8_000, 8_000)])))
+      .toContain("does not say how large the image is");
   });
 
   it("reads all three WEBP variants, not just the extended one", () => {
