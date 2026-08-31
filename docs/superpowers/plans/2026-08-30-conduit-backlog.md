@@ -373,7 +373,10 @@ replacement therefore **passed with the two branches swapped**, and was deleted 
 kept for the look of it. The rule survives as a property of a generic function, guarded by
 the two unit tests that do go red under that swap (2 of 16). Three comments were corrected.
 
-**Counts: unit 2464 unchanged, e2e 161 -> 166.** The stylesheet did not move.
+**Counts: unit 2464 unchanged, e2e 161 -> 166**, both green on CI run `33370646642` at
+`13d1afa`, first attempt, no retries. The stylesheet did not move -- `index-CKKLeVXr.css`,
+33,221 B, sha256 `ef95eb79...a46f`, byte-identical to item 1's, because the fix emits no
+Tailwind class the build did not already carry.
 
 ---
 
