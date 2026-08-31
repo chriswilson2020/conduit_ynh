@@ -6,19 +6,21 @@ import { composeGate, stalledHops, type ComposeHop } from "./mail-lib";
  *
  * WHAT THIS FILE DOES NOT COVER, said here rather than left to be discovered:
  * it pins the RULE, not the wiring. Nothing here can tell whether mail.tsx
- * builds its four hops from the right queries, or whether the button reads this
+ * builds its hops from the right queries, or whether the button reads this
  * answer at all -- that is e2e/rail-compose.spec.ts's job, against the real app
  * with a real query chain held open. A green file here and a red one there is
  * the expected shape of a wiring mistake.
  *
- * THE QUERY STATES BELOW ARE MEASURED, not invented. Each was produced against
- * the installed @tanstack/query-core 5.101.4 by driving a QueryObserver through
- * useBaseQuery's own per-render sequence: a first success followed by a failing
- * refetch really does report `isError` with `data` intact; an offline fetch
- * really does sit at `fetchStatus: "paused"` with `isError: false` and the
+ * THE QUERY STATES BELOW ARE MEASURED, not invented -- WITH ONE EXCEPTION, and
+ * finding it is why this sentence now names the exception. Each was produced
+ * against the installed @tanstack/query-core 5.101.4 by driving a QueryObserver
+ * through useBaseQuery's own per-render sequence: a first success followed by a
+ * failing refetch really does report `isError` with `data` intact; an offline
+ * fetch really does sit at `fetchStatus: "paused"` with `isError: false` and the
  * queryFn never called; and a query nobody asked for really does sit at no
  * data, idle, no error -- which is why `neverAsked` is a state here and not a
- * flag on the hop.
+ * flag on the hop. `retrying` is the exception: it was never measured, the app
+ * cannot produce it, and its own comment now says so.
  */
 
 function state(over: Partial<ComposeHop> = {}): ComposeHop {
@@ -33,13 +35,26 @@ const fetching = (): ComposeHop => state({ fetchStatus: "fetching" });
 const failed = (): ComposeHop => state({ isError: true });
 /** Offline: pending for ever, and it never errors. */
 const paused = (): ComposeHop => state({ fetchStatus: "paused" });
-/** Failed, and being asked again -- which is what the Retry button produces. */
+/**
+ * Failed, empty, and on the wire, which is the one state in this file that the
+ * app CANNOT currently produce.
+ *
+ * It was written here as "what the Retry button produces", and that was never
+ * measured. It is wrong: driven through a real QueryObserver against
+ * query-core 5.101.4, a query that has never succeeded reports
+ * `isError: false, fetchStatus: "fetching", data: undefined` while its refetch
+ * is out, because `fetchState()` resets `error` and `status` whenever
+ * `data === undefined`. Kept as a state of the ARGUMENT rather than of the app,
+ * because composeGate is generic over the chain it is handed and this is the
+ * only guard on how it resolves the overlap -- see mail-lib.ts's `stalled`.
+ */
 const retrying = (): ComposeHop => state({ isError: true, fetchStatus: "fetching" });
 /** Cached data, refetch in flight. */
 const refetching = (): ComposeHop => state({ data: { id: "x" }, fetchStatus: "fetching" });
 /** Cached data, refetch failed: `isError` true and the data still there. */
 const refetchFailed = (): ComposeHop => state({ data: { id: "x" }, isError: true });
-/** A DISABLED query: `useContact("")`, and the project hook on every deal tab. */
+/** A DISABLED query: `useContact("")` on a deal with no contact, and both of
+ * the rail's hooks on a company tab or a project one. */
 const neverAsked = (): ComposeHop => state();
 
 describe("composeGate", () => {
@@ -90,8 +105,14 @@ describe("composeGate", () => {
     expect(composeGate([failed(), fetching()])).toBe("resolving");
   });
 
-  /** A single hop can be both, and that is exactly what pressing Retry makes. */
-  it("reads a failed hop that is being retried as resolving", () => {
+  /**
+   * A single hop can be both AS AN ARGUMENT, and these two cases are now the
+   * whole guard on which branch wins -- e2e/rail-compose.spec.ts's journey for
+   * it was retired in v1.2.2 when the chain narrowed to two hops and the
+   * overlap stopped being reachable. See `retrying` above for the measurement
+   * that corrected what this state was thought to be.
+   */
+  it("reads a failed hop that is also on the wire as resolving", () => {
     expect(composeGate([retrying()])).toBe("resolving");
   });
 
@@ -131,9 +152,13 @@ describe("stalledHops", () => {
     const hops = [
       tagged("deal", answered()),
       tagged("contact", failed()),
-      tagged("company", paused()),
+      // A THIRD, so this is shown to filter rather than to find the first.
+      // composeGate and stalledHops are generic over the chain's length; the
+      // rail's own chain has been two hops long since v1.2.2, which is why the
+      // third carries no hop's name.
+      tagged("spare", paused()),
     ];
-    expect(stalledHops(hops).map((hop) => hop.tag)).toEqual(["contact", "company"]);
+    expect(stalledHops(hops).map((hop) => hop.tag)).toEqual(["contact", "spare"]);
   });
 
   it("leaves out a hop whose failed refetch kept its data", () => {

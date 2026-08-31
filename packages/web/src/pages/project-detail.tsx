@@ -33,7 +33,7 @@ export function ProjectDetailPage() {
   const { data: project, isLoading, error } = useProject(projectId);
   const { data: linkedCompany } = useCompany(project?.companyId ?? "");
   const { data: linkedDeal } = useDeal(project?.dealId ?? "");
-  const { data: pipelines = [] } = usePipelines({ projectId });
+  const { data: pipelines = [], isLoading: pipelinesLoading } = usePipelines({ projectId });
   const { data: tasks = [] } = useTasks({ projectId });
   const updateProject = useUpdateProject();
   const archiveProject = useArchiveProject();
@@ -391,7 +391,13 @@ export function ProjectDetailPage() {
                 </Link>
               </li>
             ))}
-            {pipelines.length === 0 && <li className="px-4 py-2 text-sm text-slate-400">No pipelines</li>}
+            {/* The same claim, gated the same way as company-detail.tsx's
+                Pipelines section -- see the long form there for why it is
+                `isLoading` and not `isPending`. */}
+            {pipelinesLoading && <li className="px-4 py-2 text-sm text-slate-400">Loading...</li>}
+            {!pipelinesLoading && pipelines.length === 0 && (
+              <li className="px-4 py-2 text-sm text-slate-400">No pipelines</li>
+            )}
           </ul>
         </section>
       </div>

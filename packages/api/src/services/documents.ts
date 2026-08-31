@@ -419,9 +419,9 @@ export async function getDocumentTemplate(db: Database, type: string): Promise<D
  * rather than silently absent from a PDF weeks later. The profile is idempotent, so
  * the second pass at issue time changes nothing.
  *
- * A body that sanitises away to nothing is refused rather than stored, mirroring
- * mail-templates.ts: the row exists so a quote renders, and a template that renders
- * as a blank page with a number on it is not one.
+ * A body that sanitises away to nothing is refused rather than stored: the row exists
+ * so a quote renders, and a template that renders as a blank page with a number on it
+ * is not one.
  */
 export async function saveDocumentTemplate(
   db: Database, type: string, input: DocumentTemplateInput,

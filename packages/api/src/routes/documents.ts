@@ -151,7 +151,9 @@ export function registerDocumentRoutes(app: FastifyInstance, { db, dataDir }: Cr
   // THE TEMPLATE EDITOR'S API. `document_templates` was read in one place and written
   // nowhere outside tests, so the Settings panel the spec requires had no server to
   // call and `documentTemplateWarnings` -- exported for exactly that editor -- had
-  // nothing calling it. Only mail templates had routes.
+  // nothing calling it. At the time these were written, only MAIL templates had
+  // routes; v1.2.2 removed those, so these are now the only template routes there
+  // are.
   //
   // Keyed by TYPE rather than by id: there is one row per type by unique constraint,
   // the type is what the URL means to a reader, and it saves the client a lookup to

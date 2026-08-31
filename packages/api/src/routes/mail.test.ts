@@ -11,7 +11,7 @@ import {
   mailThreadListItemSchema, mailThreadDetailSchema, markThreadReadResponseSchema,
   mailMessageSchema, mailUnreadCountSchema,
   mailUnreadFolderCountsSchema, mailAccountFolderSchema, bulkThreadResultSchema,
-  emailTemplateSchema, searchResultsSchema,
+  searchResultsSchema,
   type MailAccountCreateInput, type MailAccountSyncStats, type SendMailInput,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -2452,108 +2452,6 @@ describe("mail attachment routes", () => {
       expect(response.statusCode).toBe(404);
       expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
     }
-    await a.close();
-  });
-});
-
-// --- Templates --------------------------------------------------------------
-
-describe("mail template routes", () => {
-  it("runs the template CRUD happy path and sanitizes the body on write", async () => {
-    const a = await app();
-    const created = await a.inject({
-      method: "POST", url: "/api/mail/templates", headers: authHeaders,
-      payload: { name: "Intro", subject: "Hello", bodyHtml: "<p>Hi</p><script>alert(1)</script>" },
-    });
-    expect(created.statusCode).toBe(201);
-    const template = emailTemplateSchema.parse(created.json());
-    expect(template.bodyHtml).not.toContain("script");
-
-    const listed = await a.inject({ method: "GET", url: "/api/mail/templates", headers: authHeaders });
-    expect(listed.statusCode).toBe(200);
-    expect(emailTemplateSchema.array().parse(listed.json()).map((t) => t.id)).toEqual([template.id]);
-
-    const patched = await a.inject({
-      method: "PATCH", url: `/api/mail/templates/${template.id}`, headers: authHeaders,
-      payload: { name: "Intro v2" },
-    });
-    expect(patched.statusCode).toBe(200);
-    expect(emailTemplateSchema.parse(patched.json()).name).toBe("Intro v2");
-
-    const archived = await a.inject({
-      method: "POST", url: `/api/mail/templates/${template.id}/archive`, headers: authHeaders,
-    });
-    expect(archived.statusCode).toBe(200);
-    const afterArchive = await a.inject({ method: "GET", url: "/api/mail/templates", headers: authHeaders });
-    expect(emailTemplateSchema.array().parse(afterArchive.json())).toHaveLength(0);
-
-    const restored = await a.inject({
-      method: "POST", url: `/api/mail/templates/${template.id}/unarchive`, headers: authHeaders,
-    });
-    expect(restored.statusCode).toBe(200);
-    expect(emailTemplateSchema.parse(restored.json()).archivedAt).toBeNull();
-    await a.close();
-  });
-
-  it("lists archived templates only when archived=true is on the wire", async () => {
-    const a = await app();
-    const live = emailTemplateSchema.parse((await a.inject({
-      method: "POST", url: "/api/mail/templates", headers: authHeaders,
-      payload: { name: "Live", bodyHtml: "<p>Live</p>" },
-    })).json());
-    const filed = emailTemplateSchema.parse((await a.inject({
-      method: "POST", url: "/api/mail/templates", headers: authHeaders,
-      payload: { name: "Filed", bodyHtml: "<p>Filed</p>" },
-    })).json());
-    await a.inject({ method: "POST", url: `/api/mail/templates/${filed.id}/archive`, headers: authHeaders });
-
-    async function ids(query: string): Promise<string[]> {
-      const response = await a.inject({ method: "GET", url: `/api/mail/templates${query}`, headers: authHeaders });
-      expect(response.statusCode).toBe(200);
-      return emailTemplateSchema.array().parse(response.json()).map((t) => t.id);
-    }
-    expect(await ids("")).toEqual([live.id]);
-    expect(await ids("?archived=false")).toEqual([live.id]);
-    expect(await ids("?archived=true")).toEqual([filed.id]);
-    await a.close();
-  });
-
-  it("is shared: one user sees and can edit another user's template", async () => {
-    const a = await app();
-    const created = await a.inject({
-      method: "POST", url: "/api/mail/templates", headers: authHeaders,
-      payload: { name: "House style", bodyHtml: "<p>Hi</p>" },
-    });
-    const template = emailTemplateSchema.parse(created.json());
-
-    const theirView = await a.inject({ method: "GET", url: "/api/mail/templates", headers: otherHeaders });
-    expect(emailTemplateSchema.array().parse(theirView.json()).map((t) => t.id)).toEqual([template.id]);
-
-    const theirEdit = await a.inject({
-      method: "PATCH", url: `/api/mail/templates/${template.id}`, headers: otherHeaders, payload: { name: "Ours" },
-    });
-    expect(theirEdit.statusCode).toBe(200);
-    await a.close();
-  });
-
-  it("400s an invalid body, 404s an unknown id, and 409s a body that sanitizes to nothing", async () => {
-    const a = await app();
-    const invalid = await a.inject({
-      method: "POST", url: "/api/mail/templates", headers: authHeaders, payload: { name: "", bodyHtml: "<p>Hi</p>" },
-    });
-    expect(invalid.statusCode).toBe(400);
-
-    const unknown = await a.inject({
-      method: "PATCH", url: `/api/mail/templates/${UNKNOWN_ID}`, headers: authHeaders, payload: { name: "x" },
-    });
-    expect(unknown.statusCode).toBe(404);
-
-    const emptied = await a.inject({
-      method: "POST", url: "/api/mail/templates", headers: authHeaders,
-      payload: { name: "Hostile", bodyHtml: "<script>alert(1)</script>" },
-    });
-    expect(emptied.statusCode).toBe(409);
-    expect(errorResponseSchema.parse(emptied.json()).error).toBe("conflict");
     await a.close();
   });
 });

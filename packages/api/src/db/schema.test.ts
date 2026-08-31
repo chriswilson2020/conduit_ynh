@@ -23,7 +23,7 @@ import { createDatabase, migrationsFolder, type DatabaseHandle } from "./client.
 import {
   users, companies, contacts, pipelines, stages, deals, projects, events, files,
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
-  mailThreadHides, emailTemplates, meetings, meetingAttendees,
+  mailThreadHides, meetings, meetingAttendees,
   orgProfile, documents, documentLineItems, documentNumberSequences, documentTemplates,
 } from "./schema.js";
 
@@ -279,11 +279,6 @@ describe("mail schema (0004)", () => {
       messageId: message!.id, filename: "a.pdf", mime: "application/pdf", sizeBytes: 1, blobPath: "x",
     }).returning();
     expect(attachment?.isInline).toBe(false);
-
-    const [template] = await handle.db.insert(emailTemplates).values({
-      name: "Follow-up", bodyHtml: "<p>Hi</p>",
-    }).returning();
-    expect(template?.subject).toBe("");
   });
 
   it("enforces UNIQUE (account_id, folder) on mail_folder_state", async () => {

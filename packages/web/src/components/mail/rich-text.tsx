@@ -11,8 +11,6 @@ import { clsx } from "clsx";
  * seeded once from `initialHtml` and reports every change through `onChange`.
  */
 export interface RichTextHandle {
-  /** Template insertion: drops HTML in at the caret. */
-  insertAtCursor(html: string): void;
   /** Signature: adds HTML after the last block, without moving the caret. */
   appendAtEnd(html: string): void;
   /**
@@ -22,9 +20,7 @@ export interface RichTextHandle {
    *
    * SEPARATE FROM appendAtEnd("") RATHER THAN A SPECIAL CASE OF IT, because
    * the two want opposite things from the editor: appendAtEnd exists to leave
-   * focus alone, and this exists to take it. `insertAtCursor` already chains
-   * `.focus()` for the same reason a template insertion has to land where the
-   * user is looking -- this is that capability with nothing inserted.
+   * focus alone, and this exists to take it.
    *
    * ONLY MEANINGFUL AFTER onCreate. TipTap builds the editor asynchronously,
    * so a caller focusing at dialog-open time is addressing an editor that does
@@ -188,11 +184,15 @@ export function RichTextView({ html, className, testId, ariaLabel }: {
 
 /**
  * The one rich-text editor in the app (Phase 4's first TipTap use): message
- * bodies, per-account signatures and email templates all render through it.
- * StarterKit + Link, and nothing else -- see EXTENSIONS above.
+ * bodies, per-account signatures and a meeting's notes all render through it.
+ * StarterKit + Link, and nothing else -- see EXTENSIONS above. (Email templates
+ * were a fourth until v1.2.2 removed them; the QUOTE template is edited in a
+ * plain textarea and always was, because this editor reserialises through a
+ * document model and would rewrite the letterhead on the first keystroke --
+ * pages/settings-templates.tsx says so at length.)
  *
  * All output HTML is sanitized SERVER-side on every write path (signatures,
- * templates and compose bodies all run through mail-content.ts's shared
+ * meeting notes and compose bodies all run through mail-content.ts's shared
  * sanitizer), so this editor never has to be the security boundary.
  */
 export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
@@ -216,9 +216,6 @@ export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
     });
 
     useImperativeHandle(ref, () => ({
-      insertAtCursor(html: string) {
-        editor?.chain().focus().insertContent(html).run();
-      },
       appendAtEnd(html: string) {
         if (editor === null) return;
         // insertContentAt(end), not focus("end") + insertContent: appending a

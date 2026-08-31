@@ -238,7 +238,7 @@ describe("meetings service", () => {
     expect(meeting.notes).toBe("<p>Agreed the scope</p>");
     expect(meeting.notes).not.toContain("script");
 
-    // Nullable column, so this is null rather than mail-templates.ts's 409:
+    // Nullable column, so emptied markup becomes null rather than an error:
     // a meeting with no notes is completely ordinary.
     const emptied = await createMeeting(handle.db, actorId, {
       title: "No notes", occurredAt: daysAgo(1), companyId: company.id,

@@ -12,7 +12,7 @@ export interface NotesProps {
 
 export function Notes({ companyId, contactId, dealId, projectId }: NotesProps) {
   const [draft, setDraft] = useState("");
-  const { data: notes = [] } = useNotes({ companyId, contactId, dealId, projectId });
+  const { data: notes = [], isLoading } = useNotes({ companyId, contactId, dealId, projectId });
   const { data: users = [] } = useUsers();
   const createNote = useCreateNote();
   const userMap = useMemo(() => new Map(users.map((user) => [user.id, user.username])), [users]);
@@ -51,6 +51,13 @@ export function Notes({ companyId, contactId, dealId, projectId }: NotesProps) {
           </Button>
         </div>
       </div>
+      {/* Its two neighbours in this directory already do exactly this --
+          timeline.tsx and meetings.tsx both put the line here and gate the
+          empty label below on the same flag -- and "No notes yet" on a record
+          that has plenty is the same wrong claim theirs avoid. See
+          pages/company-detail.tsx's Pipelines section for the full note on
+          `isLoading` against `isPending`. */}
+      {isLoading && <p className="text-sm text-slate-400">Loading...</p>}
       <ul className="flex flex-col gap-3">
         {sorted.map((note) => (
           <li key={note.id} className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm">
@@ -61,7 +68,7 @@ export function Notes({ companyId, contactId, dealId, projectId }: NotesProps) {
             <p className="whitespace-pre-wrap text-slate-900">{note.body}</p>
           </li>
         ))}
-        {sorted.length === 0 && <li className="text-sm text-slate-400">No notes yet</li>}
+        {!isLoading && sorted.length === 0 && <li className="text-sm text-slate-400">No notes yet</li>}
       </ul>
     </div>
   );

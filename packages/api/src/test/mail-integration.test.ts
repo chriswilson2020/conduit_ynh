@@ -202,7 +202,11 @@ async function doveadm(...args: string[]): Promise<void> {
   await execFileAsync("docker", ["exec", DOVECOT_CONTAINER, "doveadm", ...args]);
 }
 
-/** Walk a folder to exhaustion the way AccountSync does, returning the UIDs. */
+/**
+ * ONE PASS. Walk a folder to exhaustion the way `syncFolder` does within a
+ * single pass, returning the UIDs: batch after batch from the cursor, and a
+ * short batch ends it.
+ */
 async function walkToEnd(
   client: ImapflowClient, folder: string, from: number, limit: number,
 ): Promise<number[]> {
@@ -213,6 +217,51 @@ async function walkToEnd(
     for (const message of batch) uids.push(message.uid);
     if (batch.length < limit) return uids;
     cursor = batch[batch.length - 1]?.uid ?? cursor;
+  }
+}
+
+/**
+ * PASS AFTER PASS, which is the contract the app actually offers. A short
+ * walk is re-entered from where the last one stopped, until `wanted` UIDs
+ * have arrived or the budget runs out.
+ *
+ * WHY THIS AND NOT A LONGER WAIT BEFORE ONE WALK. A single walk asserts that
+ * the server's view happened to be complete at one instant, which is not
+ * something AccountSync needs or promises -- and it is what made the storm
+ * case fail about 1 attempt in 44, always with a partial view. Waiting longer
+ * would buy a better schedule for the same untested claim. Re-walking from
+ * the cursor tests the claim the loop really makes: `syncFolder` saves the
+ * cursor as its batch's highest UID and the next pass searches above it, so a
+ * view that is merely BEHIND costs a pass and nothing else.
+ *
+ * AND IT STILL BITES. Everything below the cursor is out of reach here for
+ * exactly the reason it is out of reach for the loop: neither ever searches
+ * below where it has already been. So a genuine hole -- a UID the server
+ * skipped past rather than delayed -- is not recovered by re-entering, the
+ * budget expires, and the case fails with the UIDs it did get, which is the
+ * diagnostic that mattered in the four CI sightings. Returning short rather
+ * than throwing is what keeps that list in the failure output.
+ *
+ * The prefix/hole distinction itself is pinned deterministically against the
+ * in-memory fake, in mail-sync.test.ts's "a short view of the folder" pair;
+ * this only has to stop asserting something stronger than the contract.
+ */
+async function walkUntil(
+  client: ImapflowClient, folder: string, from: number, limit: number,
+  wanted: number, budgetMs: number,
+): Promise<number[]> {
+  const uids: number[] = [];
+  let cursor = from;
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    const pass = await walkToEnd(client, folder, cursor, limit);
+    uids.push(...pass);
+    cursor = uids[uids.length - 1] ?? cursor;
+    if (uids.length >= wanted || Date.now() >= deadline) return uids;
+    // A real loop re-enters IDLE here and is woken by the next EXISTS. There
+    // is nothing to wait on from outside the adapter, so this is a poll --
+    // short enough that the budget is spent walking rather than sleeping.
+    await delay(250);
   }
 }
 
@@ -643,7 +692,15 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
 
       // And nothing is lost between the wake and that pass: the loop walks
       // from its cursor, not from whatever the notification implied.
-      const seen = await walkToEnd(idler, "INBOX", base, BATCH_SIZE);
+      //
+      // PASSES, plural, deliberately. The connection's view of the mailbox
+      // can still be catching up when the first walk runs -- that is what
+      // this case was measured doing about 1 attempt in 44, and every
+      // surviving failure showed a contiguous prefix rather than a gap. The
+      // loop's answer to a prefix is the next pass, so that is what is
+      // asserted here. See walkUntil for why this is not a longer wait, and
+      // for why it still fails if a UID is genuinely skipped.
+      const seen = await walkUntil(idler, "INBOX", base, BATCH_SIZE, STORM_MESSAGES, 30_000);
       expect(seen).toHaveLength(STORM_MESSAGES);
     }, 90_000);
 

@@ -256,17 +256,25 @@ test.describe.serial("CRM journey", () => {
 
     // The company's default Pipelines list no longer carries it.
     //
-    // THE EMPTY LABEL IS NOT THE LOADED-LIST SENTINEL THIS PASSAGE USED TO CALL
-    // IT, and that is a fact about the page rather than about the test:
-    // company-detail.tsx's Pipelines section has no loading state of its own
-    // and renders `data = []` while its query is in flight, so "No pipelines"
-    // is also exactly what an unanswered list looks like. Measured with
+    // THE EMPTY LABEL WAS NOT THE LOADED-LIST SENTINEL THIS PASSAGE ONCE CALLED
+    // IT, and that was a fact about the page rather than about the test:
+    // company-detail.tsx's Pipelines section had no loading state of its own and
+    // rendered `data = []` while its query was in flight, so "No pipelines" was
+    // also exactly what an unanswered list looked like. Measured with
     // listPipelines's archived filter removed server-side, so the archived row
     // DOES come back here: over six attempts the pair below passed twice and
     // failed four times -- a race, decided by whether the response beat the
     // first poll, which is the worst shape an assertion can have. The response
     // itself is the sentinel instead, armed before the navigation that makes
     // it.
+    //
+    // v1.2.2 gave that section the loading branch its siblings had, so the
+    // label now renders only once the query has settled and would serve as a
+    // sentinel on its own. This wait is KEPT anyway: it is armed before the
+    // navigation rather than after it, it does not depend on what the page
+    // chooses to render, and swapping a measured instrument for a newly
+    // adequate one buys nothing. e2e/list-loading.spec.ts is where the label's
+    // new behaviour is asserted.
     const listed = page.waitForResponse(
       (response) =>
         response.url().includes("/api/pipelines?")

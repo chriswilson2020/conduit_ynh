@@ -217,11 +217,12 @@ describe("the modal skeleton", () => {
     // dialog in the app loses its card width.
     expect(dialog).toContain('overridableClass(DIALOG_DEFAULT_MAX_WIDTH, "max-w-", className)');
 
-    // THE DEFAULT'S VALUE, PINNED. Eight of the twelve DialogContent callers pass
+    // THE DEFAULT'S VALUE, PINNED. Eight of the eleven DialogContent callers pass
     // no width at all and get this one; changing it to `max-w-xs` shrinks every
     // one of them from 448px to 320px, and nothing else in this repo would have
-    // noticed. (Nine was wrong by one: four callers DO pass a width -- the
-    // composer, the quote form, mail settings and email templates.)
+    // noticed. THREE callers DO pass a width -- the composer, the quote form and
+    // mail settings. (Recounted at v1.2.2: it was four of twelve until the email
+    // templates dialog went with the mail template feature.)
     expect(dialog).toContain('const DIALOG_DEFAULT_MAX_WIDTH = "max-w-md";');
 
     const tunable = /^(max-w-|max-h-|overflow-|md:)/;

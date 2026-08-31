@@ -6,7 +6,6 @@ import {
   dealSchema,
   documentSchema,
   documentTemplateSchema,
-  emailTemplateSchema,
   eventSchema,
   fileMetaSchema,
   funnelRowSchema,
@@ -44,7 +43,6 @@ import {
   type CreateCompanyInput,
   type CreateContactInput,
   type CreateDealInput,
-  type CreateEmailTemplateInput,
   type CreateNoteInput,
   type CreatePipelineInput,
   type CreateProjectInput,
@@ -84,7 +82,6 @@ import {
   type UpdateCompanyInput,
   type UpdateContactInput,
   type UpdateDealInput,
-  type UpdateEmailTemplateInput,
   type UpdatePipelineInput,
   type UpdateProjectInput,
   type UpdateStageInput,
@@ -107,7 +104,6 @@ const taskListSchema = taskSchema.array();
 const taskDependencyListSchema = taskDependencySchema.array();
 const mailThreadListSchema = listResponseSchema(mailThreadListItemSchema);
 const mailAccountFolderListSchema = mailAccountFolderSchema.array();
-const emailTemplateListSchema = emailTemplateSchema.array();
 const meetingListSchema = listResponseSchema(meetingSchema);
 
 /** Builds a `?a=1&b=2` query string, dropping keys whose value is undefined. */
@@ -1302,8 +1298,8 @@ export function useSearch(q: string) {
  * publish -- ["mail-accounts"] (services/mail-accounts.ts, and mail-sync.ts's
  * status flips), ["mail-threads"]/["mail-thread", id]/["mail-unread"]
  * (services/mail-threads.ts's publishThreadHint and mail-ingest.ts's ingest
- * hint), ["email-templates"] (services/mail-templates.ts) -- so components/
- * sse.tsx's invalidation works on them unchanged, with no mail-specific case.
+ * hint) -- so components/sse.tsx's invalidation works on them unchanged, with
+ * no mail-specific case.
  *
  * Phase 4.1 adds one more published family, registered here so the next hook
  * to need it uses the key the server already sends rather than inventing one:
@@ -1650,65 +1646,6 @@ export function useSendMail() {
     mutationFn: async (input: SendMailInput) =>
       parseWith(mailMessageSchema, await postJson<unknown>("/mail/send", input), "sent mail message"),
     onSuccess: (message: MailMessage) => invalidate(message.threadId),
-  });
-}
-
-// Unpaginated plain array (services/mail-templates.ts's listTemplates orders
-// by name), same shape usePipelines/useProjects use.
-export function useMailTemplates(params: { archived?: boolean } = {}) {
-  return useQuery({
-    queryKey: ["email-templates", params],
-    queryFn: async () => {
-      const qs = toQueryString({ archived: params.archived });
-      return parseWith(emailTemplateListSchema, await getJson<unknown>(`/mail/templates${qs}`), "email templates");
-    },
-  });
-}
-
-// Templates are SHARED (no owner column) and their SSE hint is the bare
-// ["email-templates"] key, which prefix-matches every ["email-templates",
-// params] list above.
-function useInvalidateMailTemplate() {
-  const queryClient = useQueryClient();
-  return () => {
-    void queryClient.invalidateQueries({ queryKey: ["email-templates"] });
-    void queryClient.invalidateQueries({ queryKey: ["search"] });
-  };
-}
-
-export function useCreateMailTemplate() {
-  const invalidate = useInvalidateMailTemplate();
-  return useMutation({
-    mutationFn: async (input: CreateEmailTemplateInput) =>
-      parseWith(emailTemplateSchema, await postJson<unknown>("/mail/templates", input), "email template"),
-    onSuccess: () => invalidate(),
-  });
-}
-
-export function useUpdateMailTemplate() {
-  const invalidate = useInvalidateMailTemplate();
-  return useMutation({
-    mutationFn: async ({ id, patch }: { id: string; patch: UpdateEmailTemplateInput }) =>
-      parseWith(emailTemplateSchema, await patchJson<unknown>(`/mail/templates/${id}`, patch), "email template"),
-    onSuccess: () => invalidate(),
-  });
-}
-
-export function useArchiveMailTemplate() {
-  const invalidate = useInvalidateMailTemplate();
-  return useMutation({
-    mutationFn: async (id: string) =>
-      parseWith(emailTemplateSchema, await postJson<unknown>(`/mail/templates/${id}/archive`), "email template"),
-    onSuccess: () => invalidate(),
-  });
-}
-
-export function useUnarchiveMailTemplate() {
-  const invalidate = useInvalidateMailTemplate();
-  return useMutation({
-    mutationFn: async (id: string) =>
-      parseWith(emailTemplateSchema, await postJson<unknown>(`/mail/templates/${id}/unarchive`), "email template"),
-    onSuccess: () => invalidate(),
   });
 }
 

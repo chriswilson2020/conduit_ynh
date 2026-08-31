@@ -166,17 +166,15 @@ async function hydrate(db: Database, row: MeetingRow): Promise<Meeting> {
 /**
  * `notes` is rich-text HTML from the log form, run through the system's ONE
  * shared sanitizer profile -- mail-content.ts's sanitizeMailHtml, which
- * email_templates.body_html already reuses. notes.body is NOT the precedent
- * despite the spec's wording: it is plain text and passes through no
- * sanitizer at all. No cidMap: a meeting note has no attachments, so an
- * `<img src="cid:...">` pasted into one is dropped exactly as an unmapped cid
- * is at ingest.
+ * mail_accounts.signature_html and every composed body already reuse.
+ * notes.body is NOT the precedent despite the spec's wording: it is plain
+ * text and passes through no sanitizer at all. No cidMap: a meeting note has
+ * no attachments, so an `<img src="cid:...">` pasted into one is dropped
+ * exactly as an unmapped cid is at ingest.
  *
- * Markup that sanitizes away to nothing becomes NULL, deliberately NOT the
- * 409 mail-templates.ts's sanitizeBody raises for the same condition: that
- * column is non-nullable `.min(1)` ("a template that renders as nothing is
- * not a template"), while meetings.notes is nullable and a meeting with no
- * notes is completely ordinary. "" is not a storable value either way --
+ * Markup that sanitizes away to nothing becomes NULL rather than an error,
+ * because meetings.notes is nullable and a meeting with no notes is
+ * completely ordinary. "" is not a storable value either way --
  * meetingSchema's notes is nullableString -- so empty must become null, not
  * "".
  */

@@ -1372,19 +1372,6 @@ export const sendMailInputSchema = z.object({
 });
 export type SendMailInput = z.infer<typeof sendMailInputSchema>;
 
-export const emailTemplateSchema = z.object({
-  id: z.uuid(), name: z.string().min(1), subject: z.string(), bodyHtml: z.string().min(1),
-  archivedAt: z.iso.datetime().nullable(), ...timestamps,
-});
-export type EmailTemplate = z.infer<typeof emailTemplateSchema>;
-
-export const createEmailTemplateInputSchema = z.object({
-  name: z.string().min(1), subject: z.string().optional(), bodyHtml: z.string().min(1),
-});
-export type CreateEmailTemplateInput = z.infer<typeof createEmailTemplateInputSchema>;
-export const updateEmailTemplateInputSchema = createEmailTemplateInputSchema.partial();
-export type UpdateEmailTemplateInput = z.infer<typeof updateEmailTemplateInputSchema>;
-
 export const searchResultsSchema = z.object({
   companies: z.array(z.object({ id: z.uuid(), name: z.string() })),
   contacts: z.array(z.object({

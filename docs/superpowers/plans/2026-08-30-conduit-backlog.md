@@ -7,9 +7,10 @@ Everything here has evidence attached — a file and line, a measurement, or the
 found it. Items without evidence are marked as judgement rather than fact. Where one item
 blocks another, that is stated rather than left to be rediscovered.
 
-Current shipped version: **v1.2.1**. In flight: **nothing**; next is **v1.2.2**, whose
-scope Chris decided on 31 Aug and which is recorded below. The order after that is
-**v1.2.2 -> 7.6**.
+Current shipped version: **v1.2.2**. In flight: **nothing**; next is **Phase 7.6**, export
+and encrypted backup, which is specced. All three of v1.2.2's items shipped and their records
+are below. **v1.2.2 is the first release carrying a destructive migration** -- `0012` drops
+`email_templates` -- and the first schema change of any kind since v1.1.0's `0011`.
 
 ---
 
@@ -19,7 +20,7 @@ scope Chris decided on 31 Aug and which is recorded below. The order after that 
 |---|---|---|
 | ~~**7.5 → v1.2.0**~~ | Keyboard-operable rows, the composer's focus, focus after a dialog closes, the `mail-sync` intermittent, and the touch floors folded in as Task 4b | **SHIPPED 30 Aug** |
 | ~~**v1.2.1**~~ | The reply signature, the Mail tab composing to nobody, the GIF undercharge Chris moved in, and the first deliberate sweep for assertions that cannot fail | **SHIPPED 31 Aug** |
-| **v1.2.2** | THREE items, all decided by Chris on 31 Aug: remove the MAIL template feature entirely (table included; the QUOTE template stays); give the five lists with no loading branch the branch their siblings have; and **diagnose the Dovecot IDLE burst -- report and stop, no fix**. See "v1.2.2 scope" below. **Item 3 can reorder the other two**, and 7.6, if the answer is that the app can lose mail | Decided, not specced |
+| ~~**v1.2.2**~~ | The MAIL template feature removed, table included (the QUOTE template stayed); the five lists given the loading branch their siblings have; and the Dovecot IDLE burst diagnosed -- **the answer was NO**, so nothing was reordered. **Ships `0012`, a `DROP TABLE`** | **SHIPPED 31 Aug** |
 | **7.6 → v1.3.0** | Export and encrypted backup, downloadable from Settings | Specced, not started. **Queued behind v1.2.2** |
 | **7.7** | Restore and import, with its decisions already recorded in 7.6's spec | Decided, not specced |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
@@ -79,15 +80,17 @@ blocks are the authority; this is the closing summary.
    untouched, but `e2e/mail.spec.ts` opens a DEAL tab -- it just never presses Compose, so the
    claim that holds is that no test had ever built a seed from either tab.
 
-3. **The empty pronoun brackets -- REVISITED AND DEFERRED A SECOND TIME, WITH THE
-   MEASUREMENT.** This is a success, not a failure: the ruling was tested rather than
-   inherited. **13 of the mail merge's 26 documented behaviours conflict with the document
-   engine**, measured by running mail's own contract through the real `mergeTemplate`. The
-   deciding one is that **mail's blanking rule has no block form**, so the port would have to
-   invent a second dialect inside the function that renders every quote PDF. Had the semantics
-   agreed it would still have been **~525 lines, ~14 files and two package boundaries** for
-   one cosmetic defect in a patch release. The full entry is in the deferred list below.
-   **v1.2.2 makes this item unreachable rather than fixing it** -- see that scope.
+3. ~~**The empty pronoun brackets -- REVISITED AND DEFERRED A SECOND TIME, WITH THE
+   MEASUREMENT.**~~ **CLOSED BY v1.2.2 Task 3, WITHOUT BEING FIXED: THE DEFECT IS NOW
+   UNREACHABLE.** `({{contact.pronouns}})` could only render `()` inside a MAIL template,
+   and mail templates no longer exist -- the merge, `PLACEHOLDER_KEYS`, `MERGE_EXAMPLES`
+   and the guard on them all went with the feature. Nothing here was repaired and nothing
+   should be re-opened on the old reasoning. Kept for the record: the deferral was a
+   success rather than a failure, because the ruling was tested rather than inherited --
+   **13 of the mail merge's 26 documented behaviours conflicted with the document
+   engine**, measured by running mail's own contract through the real `mergeTemplate`,
+   and the deciding one was that **mail's blanking rule had no block form**. The quote
+   template's own `{{#path}}` blocks are untouched and keep working.
 
 4. **The GIF undercharge -- FIXED, and the prescription was one shape short.** Chris moved
    this in from the OUT list. The prescribed "fall back to the logical screen descriptor"
@@ -208,6 +211,87 @@ and is untouched.
 **Also retires:** v1.2.1 Task 3's deferral (the empty-brackets defect becomes unreachable),
 and the `MERGE_EXAMPLES` guard that task shipped.
 
+### DONE, v1.2.2 Task 3 -- `6e3d0e3`, CI `33365166752` green
+
+**2464 unit / 0 skipped** (from 2499) and **161 e2e** (from 164), both from that run.
+The e2e line reads `1 flaky, 160 passed`: `pipeline.spec.ts:173`'s downward-drop keyboard
+drag fired the dnd-kit intermittent this backlog already tracks and passed on retry, in a
+file this commit does not touch. Said out loud rather than reported as a clean 161,
+because a retry recorded as a pass is how a flaky test becomes a permanent lie.
+
+**The quote path was proved end to end rather than assumed**, since it shares this page
+and this sanitiser: `documents.spec.ts` (9) and `salutation.spec.ts` (6) both green
+through the hybrid loop, and a quote was then issued and downloaded by hand --
+QUO-2026-0005, `application/pdf`, 475,028 bytes, `%PDF-1.7`, rendering the letterhead
+logo, the `{{#path}}` blocks, the money columns and the recipient's salutation.
+
+**The file list above was two files short**, found by following the types rather than the
+grep: `components/rail/mail.tsx` and `components/mail/conversation.tsx` each BUILD the
+merge context that `ComposerSeed.context` carried, and neither is named above. Both are
+now context-free; `conversation.tsx`'s `useContact`/`useCompany` calls existed only to
+fill it and went with it. `mail-lib.test.ts` was not named either, and it held 22 of the
+35 unit tests this removed.
+
+**`meetings.ts` was a comment reference only, as suspected** -- one line naming
+`email_templates.body_html` as a fellow user of `sanitizeMailHtml`. The claim was true
+and is now false, so the comment was rewritten to name the users that remain
+(`mail_accounts.signature_html` and every composed body). Three more comments said the
+same thing elsewhere and were corrected the same way: `db/schema.ts` twice and
+`services/documents.ts` once.
+
+**A SYMBOL GREP CANNOT SEE A SENTENCE, AND THAT COST A SECOND SWEEP.** The four comments
+above were all found by following `sanitizeMailHtml` -- an identifier. Four MORE described
+the removed feature in prose that mentions no identifier at all, and were found only by
+sweeping for the phrases "mail merge", "mail template" and "email template" after the symbols
+were already gone (`0f9803c`): `components/contact-fields-lib.ts`'s table of who normalises
+what, which had a row for the mail merge and v1.1.0's one-following-space rule and now
+describes the QUOTE merge; `components/mail/rich-text.tsx`, which listed email templates
+among the three surfaces it renders; `routes/documents.ts`'s "Only mail templates had
+routes"; and `lib.ts`'s `overridableClass` note counting three pre-Phase-7 width callers, one
+of them the templates dialog. **Eight comments in total, four of them reachable only by
+reading prose.** The last two were dated rather than deleted, because the measurements they
+record really did happen.
+
+~~**ONE PIECE OF THE REMOVAL WAS DELIBERATELY NOT DONE, and it needs a decision rather than
+a follow-up commit.**~~ **DECIDED AND DONE in item 2's task, 31 Aug.**
+`components/rail/mail.tsx`'s compose gate read FOUR hops -- deal, project, contact,
+company. After this task only `deal -> contact` decided anything the seed uses (`to`); the
+project and company hops fed `context.companyName` for the merge and fed nothing after it,
+so Compose was gated on data no seed reads. The coordinator ruled that a control held shut
+by data nobody reads is a slower button and nothing else; it is narrowed to two hops, and
+Chris can reverse it.
+
+**The "two journeys" in this note was already one.** Two held `COMPANY_GET` before this
+task; this task deleted the merge journey, so by the time the note was written one was
+left -- and that one was not testing the company coupling at all. See item 2's entry below
+for what happened to it, which is the more interesting half.
+
+**What went from the tests, itemised, because the unit count moved 2499 -> 2464 (-35):**
+
+| file | tests | what they covered |
+|---|---|---|
+| `packages/api/src/services/mail-templates.test.ts` | 7 | the whole service; file deleted |
+| `packages/web/src/components/mail/mail-lib.test.ts` | 22 | `substitutePlaceholders` (14), `substitutePlaceholdersHtml` (5), `templateSubject` (3) |
+| `packages/api/src/routes/mail.test.ts` | 4 | the five CRUD endpoints |
+| `packages/shared/src/index.test.ts` | 2 | `emailTemplateSchema`, `createEmailTemplateInputSchema` |
+
+E2E moved 164 -> 161 (-3). `rail-compose.spec.ts` lost one journey outright (the merge field
+was the only way `context.companyName` was observable from outside the seed, and there is
+no merge any more). `dialog-focus.spec.ts` lost its "goes back to New template" test in
+both of its two suites -- it was the templates page's duplicate of the Add-account test
+beside it -- and its "goes back to the ROW that opened it" test was MOVED to the mail
+accounts page rather than deleted, because what it guards is `ui/dialog-focus.ts`, which
+still ships and has no other two-opener coverage. That fixture now archives its accounts
+in `afterAll`, asserted.
+
+**The stylesheet moved by exactly one rule.** `index-M5teG3jg.css` (33,259 B, sha256
+`3031a0c4...d90e2`) became `index-CKKLeVXr.css` (33,221 B, sha256 `ef95eb79...a46f`),
+measured with `npx vite build` on the dev server (Debian 12, node v24.19.0). The base
+tree was rebuilt from `git archive HEAD` beside it and reproduced the old name and hash
+byte for byte, so the two are comparable: the ONLY difference is the deletion of
+`.w-64{width:calc(var(--spacing) * 64)}`, 38 bytes, which is the whole 38-byte delta.
+`w-64` was the width of the composer's Template select wrapper and occurred nowhere else.
+
 ---
 
 ## v1.2.2, item 2 -- the five lists that say "there is nothing here" while still fetching
@@ -235,11 +319,18 @@ surfaces do it correctly -- `entity-table.tsx`, `mail/thread-list.tsx`, `rail/me
 last one is why this is a defect rather than a convention: the same file does it both ways.
 
 All seven were re-checked on 31 Aug, at the moment this was scheduled, rather than carried
-over from the filing. **One interaction between the two v1.2.2 items:** `settings-templates.tsx`
-is on that list twice over -- its MAIL half and its QUOTE half each gate their empty label on
-`isLoading` -- and item 1 deletes the mail half. It stays a correct sibling through the quote
-half, so the pattern survives; whoever does item 1 should not take the loading branch out with
-the rest of the mail code.
+over from the filing.
+
+**CORRECTED AFTER ITEM 1 LANDED, AND THE COUNT IS NOW SIX.** The scheduling note here said
+`settings-templates.tsx` was on that list "twice over -- its MAIL half and its QUOTE half
+each gate their empty label on `isLoading`", and told whoever did item 1 not to take the
+loading branch out with the mail code. **Both halves of that were wrong.** The MAIL half was
+the only one with an empty label (`No templates yet.` behind `!isLoading`); the QUOTE half
+has a loading line and NO empty label at all, because there is always exactly one quote
+template row. Removing the mail half therefore took the whole sibling with it, and nothing
+was left behind to preserve. **Take the pattern from one of the remaining six** --
+`company-detail.tsx`'s Contacts section is the closest, and is the one that makes the
+Pipelines section beside it a defect.
 
 **A CORRECTION TO THE ORIGINAL FILING, made while scheduling this.** It said `rail/notes.tsx`,
 `rail/files.tsx` and `task-drawer.tsx` "do not currently destructure `isLoading` at all". True
@@ -249,6 +340,57 @@ SITE, not the file: `DependenciesSection` takes only `data` from `useTaskDepende
 makes `task-drawer.tsx` a second file that does it both ways, alongside `company-detail.tsx`
 -- which strengthens the argument rather than weakening it. Only `rail/notes.tsx` and
 `rail/files.tsx` need the flag introducing to a file that has never used one.
+
+### DONE, 31 Aug. Both halves, twenty mutations, and one instrument thrown away.
+
+**THE COUNT OF SIX IS RIGHT AND THE LIST IT COUNTS WAS NEVER A CENSUS.** All six were
+re-read: all six gate correctly. So do **`rail/timeline.tsx` and `settings-mail.tsx`**,
+which no filing here ever named, and `mail/composer.tsx`'s From block, which picks between
+"Loading accounts...", an empty-state line and the select. Six of the ENUMERATED do it
+correctly; the app has at least eight. The difference decided nothing -- the pattern is
+identical in all of them -- but nobody should quote six as a total. **And Contacts is one
+section above Pipelines, not three:** `company-detail.tsx` has exactly two `<section>`
+elements and they are adjacent. The three counts the field card and the owner row.
+
+**The pattern taken is the majority one and not the nearest one.** Six of those eight pair
+`{isLoading && <Loading/>}` with `{!isLoading && rows.length === 0 && <Empty/>}`, and that
+is what the five got. `company-detail.tsx`'s Contacts section, the closest sibling to one of
+them, uses the truthiness spelling instead and was deliberately not copied: the correction
+above ("only `rail/notes.tsx` and `rail/files.tsx` need the flag introducing to a file that
+has never used one") only makes sense if all five take a flag. `isLoading` rather than
+`isPending`, because `isLoading` is `isPending && isFetching` in the installed query-core
+5.101.4 -- so a DISABLED `useNotes`/`useFiles` reports false and shows its empty label at
+once, which is correct, where `isPending` would say "Loading..." for ever.
+
+**Guards proved, not assumed.** Five new journeys in `e2e/list-loading.spec.ts`, each
+holding one list GET open and taking a ONE-SHOT read of the surface (a negated auto-retrying
+matcher is satisfied the instant the lie goes away, which is v1.2.1's own lesson from the
+other side), then walking to a second, genuinely empty record so the label is shown to still
+arrive. All five were red before the fix. **Fifteen mutations, one at a time**: for each of
+the five, dropping the `!isLoading` guard, deleting the loading line, and deleting the empty
+label -- fifteen reds, each on its own journey and its own assertion.
+
+**THE COMPOSE-GATE HALF CARRIED IN FROM ITEM 1** narrowed `rail/mail.tsx` from four hops to
+two. Two journeys were added, each holding a dropped hop open and reading `isDisabled()`
+once; both were red before the narrowing, and putting either hop back turns its own one red
+again. The alert copy said "contact or company" and now says "contact".
+
+**AND THE PART WORTH READING TWICE.** The one surviving `COMPANY_GET` journey built "one hop
+stalled while another is in flight", the only state in which `composeGate`'s branch ORDER is
+observable. Narrowing makes that state unreachable -- the contact's key comes from the deal,
+so a deal that has not answered never starts a contact fetch. A replacement was written on
+`mail-lib.ts`'s own claim that a Retry produces a single hop that is both. **That claim was
+false and had never been measured.** Driven through a real QueryObserver against query-core
+5.101.4: a query that has never succeeded reports `isError: false` while its refetch is out,
+because `fetchState()` resets `error` and `status` whenever `data === undefined`. The
+replacement therefore **passed with the two branches swapped**, and was deleted rather than
+kept for the look of it. The rule survives as a property of a generic function, guarded by
+the two unit tests that do go red under that swap (2 of 16). Three comments were corrected.
+
+**Counts: unit 2464 unchanged, e2e 161 -> 166**, both green on CI run `33370646642` at
+`13d1afa`, first attempt, no retries. The stylesheet did not move -- `index-CKKLeVXr.css`,
+33,221 B, sha256 `ef95eb79...a46f`, byte-identical to item 1's, because the fix emits no
+Tailwind class the build did not already carry.
 
 ---
 
@@ -311,6 +453,64 @@ to schedule a test fix.
 halves the figure, which has already happened once -- "once in 22 runs on the v1.2.0 branch,
 and once on `a15e6f6`" was **one event described twice**, and it was the number this project
 believed until Task 4 read the attempts.
+
+### ANSWERED, 31 Aug: NO. The test's view of the server lags -- and the brief's premise was false
+
+**"The existing logs provably cannot separate them" was wrong, and that is the finding.**
+vitest's `toHaveLength` failure prints the RECEIVED array, so two of the four events carry
+their UID list, and both are the same **contiguous prefix** `[2..12]`, 11 of 20 -- four days
+apart, on different branches. No instrumentation and no new runs were needed; the answer had
+been sitting in CI since 27 August. The storm's twenty APPENDs are sequential and awaited, so
+UIDs ascend in delivery order and the nine missing messages were appended AFTER the twelve
+seen. **Nothing below the cursor was skipped.**
+
+**Why that settles the product question.** A short batch ends the pass, the cursor is saved,
+and the next pass searches `cursor+1:*`. So a **prefix costs a PASS; a hole would cost a
+MESSAGE.** A pass is guaranteed: `waitForWork` caps IDLE at `pollIntervalMs`, and in
+production the stragglers are already on the server, so re-entering IDLE draws an immediate
+`EXISTS`. **Item 3 reordered nothing.**
+
+#### THE CORRECTION TASK 2 MADE, AND IT RUNS IN THE DANGEROUS DIRECTION
+
+The answer above rests on what the cursor is, and the first statement of it -- **"the cursor
+is the highest UID actually ingested"** -- is FALSE. `syncFolder` computes `highest` over
+every descriptor the SERVER LISTED in the batch, and advances the cursor to it whether or not
+`ingestOne` stored anything. Read out of the shipped code rather than inferred:
+
+- `fetchRaw` returning `null` (expunged between listing and fetch) returns early; the comment
+  says in terms that "the cursor moves past it with the rest of the batch".
+- a poison message that survives `POISON_RETRIES` is recorded and skipped, and the comment on
+  the cursor assignment names this as the mechanism that moves past it -- "the skip needs no
+  arithmetic of its own, because the batch's highest UID is already beyond it".
+
+**So a message the server lists but Conduit cannot fetch moves the cursor past itself and is
+never retried.** That is deliberate -- the alternative is walking an entire mailbox one
+failure at a time -- but it means the honest answer to "can Conduit silently skip a message"
+is **NO for the case that was asked about, and YES in this narrow one**. It does not change
+the diagnosis: a lagging view lists nothing, so nothing is skipped past. It is written down
+because the safe-sounding version of the sentence was the one that got written first.
+
+**There is still no backstop if a hole ever did occur.** `reconcileFlags` only `UPDATE`s rows
+matched on `(account, folder, imap_uid)`; it never ingests. A skipped UID is invisible for
+ever. That is why item 3's second half was worth more than its first.
+
+#### THE RECOVERY PROPERTY IS NOW TESTED, AND SO IS ITS CONTROL
+
+`mail-sync.test.ts` gained a deterministic pair on `FakeImapClient`: a PREFIX on pass 1 and
+the full set on pass 2 must store all twenty, and a HOLEY view's skipped UIDs must never
+arrive. **The second is the load-bearing one** -- the first passes just as happily against a
+loop that re-walks from zero. Its uniqueness is measured rather than claimed: loosen
+`syncFolder` to advance only over a contiguous run and **2460 tests pass while that one alone
+goes red**. It is the only thing in the codebase that would notice if the cursor discipline
+regressed, and given there is no backstop it is the whole safety net.
+
+#### FILED, NOT FIXED: the short-batch `break`
+
+`syncFolder` ends the folder pass on `batch.length < BATCH_SIZE`. Deleting it is invisible to
+all 62 tests in `mail-sync.test.ts`. It is left alone deliberately: without it the loop makes
+one more `fetchNewer`, gets an empty batch, and exits through the non-advancing guard beside
+it. **It costs a round trip and a spurious warning, never a message**, so there is nothing
+here to repair and a test asserting a round-trip count would be asserting the implementation.
 
 ---
 
@@ -458,13 +658,14 @@ found by SQL.
 
 ## Defects found and deliberately deferred
 
-**FIVE LISTS SAY "THERE IS NOTHING HERE" WHILE THEIR QUERY IS STILL ON THE WIRE -- found
-during v1.2.1 Task 5's sweep, filed rather than fixed because the release was already scoped.
-SCHEDULED: Chris moved it into v1.2.2 on 31 Aug -- see "v1.2.2, item 2" above.** Each
-destructures `const { data: rows = [] } = use...()` and renders its
-empty label on `rows.length === 0` with no loading branch, so the reader is told the record
-has no pipelines/notes/files/dependencies for as long as the fetch takes, and the list then
-appears underneath that sentence:
+~~**FIVE LISTS SAY "THERE IS NOTHING HERE" WHILE THEIR QUERY IS STILL ON THE WIRE**~~ **--
+FIXED 31 Aug in v1.2.2's item 2; see that section above for what was done, what the count of
+"seven siblings" below was actually counting, and the false comment the work turned up.**
+Found during v1.2.1 Task 5's sweep, filed rather than fixed because the release was already
+scoped. Each destructured `const { data: rows = [] } = use...()` and rendered its
+empty label on `rows.length === 0` with no loading branch, so the reader was told the record
+had no pipelines/notes/files/dependencies for as long as the fetch took, and the list then
+appeared underneath that sentence:
 
 | where | label |
 |---|---|
@@ -486,7 +687,14 @@ neighbours have. ~~`rail/notes.tsx`, `rail/files.tsx` and `task-drawer.tsx` do n
 destructure `isLoading` at all.~~ **Corrected 31 Aug: that is true of the first two only.**
 `task-drawer.tsx` destructures `isLoading` from `useTask` and branches on it; it is
 `DependenciesSection`'s own call that takes only `data`. The claim is about the call site, not
-the file -- see "v1.2.2, item 2" above, where this is now scheduled.
+the file -- see "v1.2.2, item 2" above, where this was fixed.
+
+**AND "SEVEN OTHER PLACES" WAS TWO SHORT, found when the fix re-read them on 31 Aug.**
+`rail/timeline.tsx` and `settings-mail.tsx` gate an empty label on `isLoading` too and appear
+in no filing; `mail/composer.tsx`'s From block does the three-way version of it. With
+`settings-templates.tsx`'s gone alongside the mail templates, the enumerated set is six and
+the real one is at least eight. It changed nothing about the fix -- the pattern is the same
+in all of them -- and it is recorded because a list of examples read as a census.
 
 **HOW IT WAS FOUND, because the test consequence is the reason it matters.** Two e2e sites
 leaned on one of these labels as a "the list has loaded" sentinel, and one of them said so
@@ -496,7 +704,8 @@ back in the default list, its `toContainText("No pipelines")` pair passed twice 
 four times over six attempts -- a race, decided by whether the response beat the first poll,
 which is worse than either a pass or a failure. That test now waits on the response instead.
 `e2e/mobile.spec.ts`'s `No dependencies` precondition is the same shape and was left alone:
-it is a precondition rather than the test's claim, and a false pass there costs nothing.
+it is a precondition rather than the test's claim, and a false pass there costs nothing. It
+is a real sentinel now, as a side effect of the fix rather than by anyone editing it.
 
 **THE SERVER CAN STORE A SIGNATURE ITS OWN RESPONSE SCHEMA REJECTS, AND THE WEB CLIENT
 THEN FAILS ON EVERY `GET /api/mail/accounts` FOR THAT USER -- found during v1.2.1 Task 1,
@@ -642,11 +851,12 @@ button until the queries it reads have settled, which also removes the silent
 wrong-recipient case rather than only the focus symptom. Found during 7.5 Task 2's review;
 out of scope there because Task 2 owned the composer, not the rail.
 
-**Conditional blocks in mail templates.** `({{contact.pronouns}})` renders `()` for a
-contact with none. Swallowing one following space handles `Dear X Y`; nothing short of
-conditionals handles brackets or labels. The document template already has
-`{{#path}}...{{/path}}`; the mail merge does not. Coordinator ruling at the time was to
-document the limitation rather than grow the language mid-release.
+~~**Conditional blocks in mail templates.**~~ **GONE, NOT FIXED: v1.2.2 Task 3 removed
+the mail template feature outright, so there is no mail merge left to grow a conditional
+into.** `({{contact.pronouns}})` rendered `()` for a contact with none; swallowing one
+following space handled `Dear X Y` and nothing short of conditionals handled brackets or
+labels. The document template's own `{{#path}}...{{/path}}` is unaffected. The record
+below is kept because the MEASUREMENT is worth keeping, not because anything is open.
 
 **v1.2.1 REVISITED THIS AND DEFERRED IT AGAIN, WITH A MEASUREMENT** -- full record in
 that release's plan, Task 3. The short form, so nobody re-opens it on the old reasoning:
@@ -692,9 +902,43 @@ date**: an attempt counts only if its own log shows that test running, so a rate
 divided by attempts that predate the test. They are ATTEMPTS, not runs -- a re-run is a second
 trial and hides the first.
 
+**THE DOVECOT DENOMINATOR HAS BEEN STATED THREE WAYS, AND ALL THREE NUMBERS ARE CORRECT --
+they count three different populations. The canonical one is 177.** Settled in v1.2.2's
+release task by re-deriving each figure from the Actions API rather than by choosing between
+them:
+
+| figure | what it actually counts | measured |
+|---|---|---|
+| **177** | **ATTEMPTS of `test.yml` that ran the storm case**: everything since the Dovecot suite entered CI on 20 Aug, less the 16 experiment-branch runs excluded by name. **174 runs, 177 attempts** -- three re-runs in that window are the whole difference | 31 Aug 01:08Z |
+| **313** | **RUNS of `test.yml` over its entire history** -- the harvest this section opens with, 284 + 13 + 16 exactly as broken down above. The same instant shows 319 attempts | the same instant |
+| **354 / 360** | **runs / attempts of EVERY workflow in the repository**: `test.yml`, `Release`, `Mutation probe` and `Audit61` together (339 + 20 + 2 + 2 = 363 runs today) | 31 Aug 04:52Z |
+
+Each was pinned by finding the instant at which the count is exactly that number, and each
+instant lands inside the task that reported it: 313 runs is the moment `worktree-v1.2.1-fixes`
+had exactly the 13 runs this section attributes to it, and 354 all-workflow runs is a run on
+`worktree-v1.2.2-templates` at 04:52 on 31 Aug, in the middle of item 3's investigation.
+
+**SO ITEM 3'S CORRECTION -- "the sample is 354 runs / 360 attempts, not 313" -- WAS ITSELF
+WRONG, AND IS WITHDRAWN.** It compared its own all-workflow count against a `test.yml`-only
+one and read the difference as an error in the earlier figure. `test.yml` has 339 runs in
+total TODAY and has never had 354, so the number is arithmetically impossible for the
+population it was correcting. **313 was right, and it was right as RUNS**, which is what
+this section already called it.
+
+**177 is canonical because it is the only one whose denominator could have produced the
+numerator.** The other two include attempts that could not: 132 `test.yml` runs predate the
+suite entirely, 20 `Release` runs never start Dovecot, and the experiment branches were red
+on purpose. **4 in 177 = 2.3%, about 1 attempt in 44** -- which is the figure
+`mail-integration.test.ts` states in its own prose, so the code and this table now agree.
+
+**The population has since grown to 210 attempts with no further sighting**, so 1-in-44 is a
+high-water mark rather than a current estimate. It is not restated as 4-in-210 because five
+of the intervening attempts were deliberately-broken probe branches, where a Dovecot firing
+would have been masked by the failure the branch existed to produce.
+
 | intermittent | rate | 95% interval | over | recommendation |
 |---|---|---|---|---|
-| Dovecot IDLE burst (2) | **4 in 177, 2.3% -- 1 CI attempt in 44** | 0.9-5.7% | 20-31 Aug | **SCHEDULE IT** |
+| ~~Dovecot IDLE burst (2)~~ | **4 in 177, 2.3% -- 1 CI attempt in 44** | 0.9-5.7% | 20-31 Aug | **FIXED in v1.2.2.** Historical rate, kept for the method |
 | `pipeline.spec.ts` keyboard-drag (5) | **2 in 179 since 20 Aug, 1.1%** | 0.3-4.0% | 20-31 Aug | **FILE IT** |
 | `crm.spec.ts` "Other..." caret (4) | **1 in 50, 2.0%** | 0.4-10.5% | 29-31 Aug | leave and re-measure |
 | phone kanban `addStage` (3) | **0 in 111** | 0-3.4% | 28-31 Aug | **CLOSE IT** |
@@ -733,10 +977,15 @@ attempts, not runs.
    cases unrelated to the backoff one. It measured the harness, not the race. Contending
    with a second vitest on `packages/shared` (CPU only, no truncate) gave **0 in 12**, and
    0 in 24 with four busy loops on top.
-2. **`mail-integration.test.ts`'s Dovecot IDLE burst -- 4 in 177, about 1 CI attempt in 44.
-   RECOMMENDATION: SCHEDULE IT.** The burst asserts 20 delivered and gets fewer. Opt-in
-   suite, CI-only. It is the only intermittent here with a real number and the only one that
-   turns CI red, because vitest sets no retries.
+2. ~~**`mail-integration.test.ts`'s Dovecot IDLE burst -- 4 in 177, about 1 CI attempt in
+   44. RECOMMENDATION: SCHEDULE IT.**~~ **DIAGNOSED AND FIXED in v1.2.2 -- see item 3's
+   answer below.** The test was asserting that twenty messages arrive in ONE walk, which is
+   stronger than anything `AccountSync` promises; it now re-walks from the cursor until
+   twenty arrive or a budget expires, which is what the loop does. Everything below is kept
+   because the METHOD is what generalises -- reading attempts rather than runs, and refusing
+   to divide by attempts that predate the test. The burst asserts 20 delivered and gets
+   fewer. Opt-in suite, CI-only. It was the only intermittent here with a real number and
+   the only one that turns CI red, because vitest sets no retries.
 
    **THE COUNT IS FOUR, NOT TWO, AND TWO OF THEM WERE RE-RUN INTO INVISIBILITY.** The two
    visible firings are run **33094190471** (27 Aug, the v0.9.0 tag, 11 of 20) and run
@@ -789,6 +1038,12 @@ attempts, not runs.
    original entry is kept below for the occlusion lead, which is still the best guess anyone
    has.*
 
+   **THIRD SIGHTING, AND STILL LOCAL ONLY.** v1.2.2 Task 3's hybrid loop hit it once on the
+   same test ("builds a pipeline, which becomes a stage view once it has stages"), and it
+   passed both in isolation and on a straight re-run of the whole file immediately after.
+   The recommendation is unchanged and so is the reason: three sightings, all in the local
+   loop, none in a runner.
+
    **"Pre-existing" is not established**: `board.tsx` put a sticky strip
    directly above that button in v1.1.0, and the file went from 5 serial groups to 7.
 
@@ -835,6 +1090,13 @@ attempts, not runs.
 
    Nothing has been changed here. This entry exists so the next person to see a red
    keyboard-drag finds a number instead of a shrug.
+
+   **THIRD SIGHTING SINCE 20 AUG, on v1.2.2 Task 3's CI run `33365166752`** (`1 flaky, 160
+   passed`), on `pipeline.spec.ts:173`'s downward-drop journey -- a file that commit does
+   not touch. Reported rather than absorbed: the run is green because `retries: 2` caught
+   it on the second attempt, not because the suite passed clean. The rate above is left as
+   measured rather than recomputed, since that would need the whole harvest re-run; read it
+   as 3 flaky since 20 Aug rather than 2, against an attempt count that has also grown.
 
 **The fix for any of these must be deterministic, not a longer timeout.** The one that is
 fixed was fixed by ordering two statements, and it now survives a 500ms stall injected on
@@ -894,8 +1156,9 @@ supposed to. **Conduit did not have seven bugs.**
 **ONE GENUINE APPLICATION DEFECT CAME OUT OF THE SWEEP**, and it was found by READING the
 surface behind a suspicious assertion rather than by a repair going red: the five lists that
 render their empty label with no loading branch, at the head of the deferred-defects section
-above. Scheduled into v1.2.2. That is the whole application-side yield, and stating it plainly
-is the point -- the sweep's value was in what the tests were failing to claim.
+above. **Fixed in v1.2.2's item 2 on 31 Aug**, each with a journey shown failing first. That
+is the whole application-side yield, and stating it plainly is the point -- the sweep's value
+was in what the tests were failing to claim.
 
 **The discovery-rate argument is now settled in the direction it was posed.** Seven in one
 deliberate pass, against four found by accident in the whole project to date. The candidate
