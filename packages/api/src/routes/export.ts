@@ -4,6 +4,22 @@ import { requireUser, contentDisposition } from "./helpers.js";
 import { buildExport } from "../services/export.js";
 
 /**
+ * How many exports may be in flight at once, across all callers.
+ *
+ * ONE, and it is a memory decision rather than a politeness one. An export
+ * materialises its largest CSV whole (see buildExport) and reads the blob store
+ * end to end; the deploy target has 3.8GB and no swap. Nothing stopped an
+ * authenticated caller from starting ten at once, and ten would multiply the
+ * one bound this module works hardest to hold. There is no role model here, so
+ * "an authenticated caller" is every user.
+ *
+ * The counter is per PROCESS, which is the whole deployment: one systemd unit,
+ * one node process (see conf/systemd.service).
+ */
+const MAX_CONCURRENT_EXPORTS = 1;
+let exportsInFlight = 0;
+
+/**
  * GET /api/export -- the readable half of 7.6, as a download.
  *
  * NO PASSPHRASE, and that is a property of the contents rather than an omission:
@@ -23,13 +39,39 @@ export function registerExportRoutes(app: FastifyInstance, { db, dataDir, appVer
   app.get("/api/export", async (request, reply) => {
     if (requireUser(request, reply) === null) return;
 
-    // Everything that CAN be checked is checked HERE, before a byte of the body
-    // is written: the queries run inside one read-only snapshot, every blob is
-    // stat'd, and the manifest is built. Once reply.send has the stream there is
-    // no status line left to change, so anything that fails afterwards can only
-    // truncate the download -- which buildExport's ZipFile error handler is what
-    // turns into a truncated download rather than a dead process.
-    const archive = await buildExport({ db, dataDir, appVersion });
+    if (exportsInFlight >= MAX_CONCURRENT_EXPORTS) {
+      // 503 with its own code, matching the shape documents.ts answers for a
+      // saturated renderer: the caller's request was fine, the server is busy,
+      // and retrying shortly is the correct client behaviour.
+      return reply.code(503).send({
+        error: "export_busy",
+        message: "another export is already running; try again when it has finished",
+      });
+    }
+    exportsInFlight += 1;
+
+    let archive;
+    try {
+      // Everything that CAN be checked is checked HERE, before a byte of the
+      // body is written: the queries run inside one read-only snapshot, every
+      // blob is stat'd, and the manifest is built. Once reply.send has the
+      // stream there is no status line left to change, so anything that fails
+      // afterwards can only truncate the download -- which buildExport's
+      // ZipFile error handler turns into a truncated download rather than a
+      // dead process.
+      archive = await buildExport({ db, dataDir, appVersion });
+    } catch (error) {
+      // The slot has to come back on the throwing path too, or one failed
+      // export closes the route for the lifetime of the process.
+      exportsInFlight -= 1;
+      throw error;
+    }
+
+    // Released on `close`, which fastify emits for a finished response and for
+    // an abandoned one alike -- the same event buildExport hangs its descriptor
+    // cleanup on, and for the same reason: a client that disappears must not
+    // leave anything behind it.
+    archive.stream.once("close", () => { exportsInFlight -= 1; });
 
     reply.header("X-Content-Type-Options", "nosniff");
     reply.header("Content-Type", "application/zip");

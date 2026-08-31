@@ -39,32 +39,50 @@ export const CSV_BOM = "\uFEFF";
 export const CSV_EOL = "\r\n";
 
 /**
- * Characters that, at the START of a cell, make a spreadsheet treat the cell as
- * a formula instead of text.
+ * Values that a spreadsheet would treat as a FORMULA rather than as text.
  *
- * `=` and `@` ONLY, and the two that are missing are the point of the comment.
+ * WHAT IS MATCHED, and every part of it was paid for. After any leading
+ * whitespace, an optional run of `+` or `-`, then `=` or `@`.
  *
  * Neutralising a leading `=` is not primarily about a hostile `=cmd|...` DDE
  * payload, which modern Excel refuses to run without several explicit prompts.
- * It is about the ordinary case: a note whose body begins `== Meeting summary`
- * is a formula Excel cannot evaluate, so the cell shows `#NAME?` and the
- * operator's note is INVISIBLE. Prefixing it makes the cell read
- * `'== Meeting summary`, which is one stray character in front of text the
- * operator can still read. Both directions of the trade favour prefixing.
+ * It is the ordinary case: a note whose body begins `== Meeting summary` is a
+ * formula Excel cannot evaluate, so the cell shows `#NAME?` and the operator's
+ * note is INVISIBLE. One stray character in front of readable text is the
+ * better half of that trade in both directions.
  *
- * `+` and `-` are DELIBERATELY ABSENT, and that is the opposite trade on the
- * same reasoning. Both begin legitimate values in columns this export
- * ships -- a phone number `+31 6 ...`, a negative amount `-1250` becoming
- * `-12.50` -- and a spreadsheet renders both of those correctly as-is. Adding
- * them to this set would put a `'` in front of every phone number and every
- * credit in the file to defuse a formula that, for those two characters,
- * evaluates to a number rather than hiding the cell. That is a visible,
- * certain corruption of common data traded against an invisible, rare one.
+ * `+` and `-` ARE NOT MATCHED ON THEIR OWN, deliberately, and that is the
+ * opposite trade on the same reasoning: both begin legitimate values this
+ * export ships -- a phone number `+31 6 ...`, a credit of `-12.50` -- and a
+ * spreadsheet renders both correctly as they are. Guarding them would put an
+ * apostrophe in front of every phone number and every credit in the file.
  *
- * Documented as a judgement call rather than a rule handed down: the spec asks
- * for RFC 4180 and a BOM and says nothing about formulas.
+ * BUT A SIGN FOLLOWED BY `=` IS NOT A NUMBER. `+=1+1` reached Excel as a
+ * formula under the first version of this rule, which anchored on the first
+ * character alone; so did a tab before `=1+1`, because Excel trims leading
+ * whitespace before deciding. The `[+-]*` run and the leading `\s*` close both
+ * without touching `+31 6 12345678` (whose next character is a digit) or
+ * `-12.50`.
  */
-const FORMULA_LEAD = /^[=@]/;
+const FORMULA_LEAD = /^\s*[+-]*[=@]/;
+
+/**
+ * The escape character, and the reason the transform below is INVERTIBLE.
+ *
+ * A cell already starting with an apostrophe is prefixed with a second one, so
+ * "remove exactly one leading apostrophe" recovers the stored value in every
+ * case -- a formula that was guarded, an apostrophe that was doubled, or a
+ * value that was left alone and so never starts with one.
+ *
+ * WITHOUT THAT DOUBLING THE EXPORT IS LOSSY, and lossy for the one consumer
+ * `formatVersion` exists to serve: 7.7's exact importer cannot tell a guarded
+ * `=x` from a stored `'=x`, and a note reading `@here please review` comes back
+ * as `'@here please review` for ever. The transform is declared in
+ * manifest.json as a named, versioned entry (EXPORT_CELL_TRANSFORM in
+ * services/export.ts) so that importer undoes it deterministically rather than
+ * guessing at it.
+ */
+const CELL_ESCAPE = "'";
 
 /**
  * One field, in the dialect.
@@ -78,14 +96,39 @@ const FORMULA_LEAD = /^[=@]/;
  * there, which is the whole of RFC 4180's escaping. There is no backslash
  * escape in CSV and adding one would be a private dialect.
  *
- * The formula prefix is applied BEFORE the quoting decision, not after, so a
- * cell like `=1,2` gets both treatments and in the right order: the `'` goes on
+ * The escape is applied BEFORE the quoting decision, not after, so a cell like
+ * `=1,2` gets both treatments and in the right order: the apostrophe goes on
  * the value, and the value is then quoted because it contains a comma.
  */
 export function csvCell(value: string): string {
-  const guarded = FORMULA_LEAD.test(value) ? `'${value}` : value;
+  const guarded = escapeCellValue(value);
   if (!/["\r\n,]/.test(guarded)) return guarded;
   return `"${guarded.replaceAll('"', '""')}"`;
+}
+
+/**
+ * The reversible half of the dialect, exported so its inverse can be written
+ * against it rather than inferred from it.
+ *
+ * An apostrophe is prefixed when the value would read as a formula, OR when it
+ * already starts with one. Those two arms together are what make
+ * unescapeCellValue total.
+ */
+export function escapeCellValue(value: string): string {
+  const needsEscape = value.startsWith(CELL_ESCAPE) || FORMULA_LEAD.test(value);
+  return needsEscape ? CELL_ESCAPE + value : value;
+}
+
+/**
+ * The exact inverse of escapeCellValue: remove one leading apostrophe if there
+ * is one.
+ *
+ * Lives beside the transform so the two cannot drift, and so 7.7's importer has
+ * a definition to copy rather than a sentence to interpret. The round trip is
+ * asserted over a table of values in csv.test.ts.
+ */
+export function unescapeCellValue(value: string): string {
+  return value.startsWith(CELL_ESCAPE) ? value.slice(CELL_ESCAPE.length) : value;
 }
 
 /** One record: cells joined by the delimiter, terminated by CRLF. */

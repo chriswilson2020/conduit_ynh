@@ -26,5 +26,22 @@ export default defineConfig({
     // Only reaches pool workers, not globalSetup — which runs in the main
     // process and sets its own PGHOST fallback. See test/global-setup.ts.
     env: { PGHOST: process.env.PGHOST ?? "/run/postgresql" },
+    // --expose-gc, for the two memory bounds in
+    // packages/api/src/services/export.test.ts and for nothing else.
+    //
+    // THEY CANNOT MEASURE WHAT THEY CLAIM WITHOUT IT. Both compare an
+    // implementation that releases memory against one that holds it, and V8
+    // does not hand released memory back promptly -- so resident set alone reads
+    // the same for "dropped" and "still referenced", and the row bound measured
+    // a 30MB gap where the real difference is the whole corpus. Forcing a
+    // collection at each sample makes the reading track LIVE memory, which is
+    // the property under test.
+    //
+    // An earlier version of those tests called `global.gc?.()` with nothing
+    // enabling it, so the call was always undefined and the line implied a
+    // guarantee it never gave. Enabling it costs nothing for the other test
+    // files, which never call it.
+    // Top-level rather than under poolOptions, which Vitest 4 removed.
+    execArgv: ["--expose-gc"],
   },
 });

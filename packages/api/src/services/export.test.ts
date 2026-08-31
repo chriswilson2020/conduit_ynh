@@ -1,9 +1,9 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  chmod, mkdtemp, mkdir, open, readFile, readdir, rename, rm, writeFile,
+  chmod, mkdtemp, mkdir, open, readFile, readdir, readlink, rename, rm, writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -30,8 +30,9 @@ import {
 } from "../db/schema.js";
 import {
   archiveFileName, buildExport, withExportSnapshot,
-  EXPORT_FORMAT_VERSION, type ExportManifest,
+  EXPORT_CELL_TRANSFORM, EXPORT_FORMAT_VERSION, type ExportManifest,
 } from "./export.js";
+import { unescapeCellValue } from "./csv.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -56,6 +57,30 @@ const HAVE_UNZIP = await (async () => {
   }
 })();
 const itZip = HAVE_UNZIP ? it : it.skip;
+
+// /proc is the only way for a process to count its own open descriptors, and it
+// is Linux-only. The dev server and the CI runner both have it, which is where
+// the descriptor bound has to hold; a developer on macOS gets a visible skip
+// rather than a silent pass.
+/**
+ * Force a garbage collection, or fail loudly.
+ *
+ * NOT `global.gc?.()`. The optional call is what let an earlier version of the
+ * memory bounds read as though a collection had happened when none could: with
+ * no --expose-gc the property is undefined and the `?.` swallows it silently.
+ * If the flag ever stops being passed, these tests must say so rather than
+ * quietly measure something else.
+ */
+function forceGc(): void {
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (gc === undefined) {
+    throw new Error("these bounds need --expose-gc; see poolOptions in vitest.config.ts");
+  }
+  gc();
+}
+
+const HAVE_PROC = await readdir("/proc/self/fd").then(() => true, () => false);
+const itFd = HAVE_PROC ? it : it.skip;
 
 const handle = openTestDatabase();
 let actorId: string;
@@ -215,13 +240,31 @@ describe("archiveFileName", () => {
     expect(archiveFileName("///")).toBe("file");
   });
 
-  it("escapes a Windows reserved device name, extension and all", () => {
+  it("escapes a Windows reserved device name", () => {
     expect(archiveFileName("CON.pdf")).toBe("_CON.pdf");
     expect(archiveFileName("nul")).toBe("_nul");
     expect(archiveFileName("COM4.txt")).toBe("_COM4.txt");
     // Not reserved: only COM1-9 and LPT1-9 are.
     expect(archiveFileName("COM10.txt")).toBe("COM10.txt");
     expect(archiveFileName("CONTRACT.pdf")).toBe("CONTRACT.pdf");
+  });
+
+  // WIN32 STOPS AT THE FIRST DOT, and the first version of this rule asked
+  // splitExtension -- which correctly splits at the LAST one, because its job is
+  // to keep a collision suffix in front of the extension. So it read the stem of
+  // `CON.tar.gz` as `CON.tar` and let the device name straight through. The old
+  // test was titled "extension and all" and exercised only single extensions.
+  it("escapes a reserved name under a COMPOUND extension, which Win32 also resolves", () => {
+    expect(archiveFileName("CON.tar.gz")).toBe("_CON.tar.gz");
+    expect(archiveFileName("COM1.tar.gz")).toBe("_COM1.tar.gz");
+    expect(archiveFileName("nul.a.b")).toBe("_nul.a.b");
+    expect(archiveFileName("LPT9.blah.txt")).toBe("_LPT9.blah.txt");
+    // Trailing spaces go before Win32 resolves the segment, so this is the
+    // device too.
+    expect(archiveFileName("CON .pdf")).toBe("_CON .pdf");
+    // And the negatives still hold under a compound extension.
+    expect(archiveFileName("CONTRACT.tar.gz")).toBe("CONTRACT.tar.gz");
+    expect(archiveFileName("COM10.tar.gz")).toBe("COM10.tar.gz");
   });
 
   it("truncates a very long name to a byte budget, keeping the extension", () => {
@@ -320,6 +363,31 @@ describe("withExportSnapshot", () => {
     expect(await handle.db.select().from(companiesTable)).toHaveLength(0);
   });
 
+  // THE WIRING, WHICH NOTHING ASSERTED BEFORE. The two tests here prove both
+  // properties of the HELPER; neither noticed whether buildExport used it.
+  // Replacing `withExportSnapshot(db, read)` with `read(db)` survived the whole
+  // suite, and it always would have -- as the comment above this describe says
+  // in as many words, a torn export and a consistent one are the same file
+  // shape. So the seam is asserted directly.
+  it("is what buildExport opens its reads in, with both settings", async () => {
+    const calls: unknown[] = [];
+    // Object.create rather than a Proxy: drizzle's own internals stay on the
+    // prototype and resolve normally, and only `transaction` is observed.
+    const observed = Object.create(handle.db) as Database;
+    (observed as { transaction: unknown }).transaction = ((
+      fn: (tx: Database) => Promise<unknown>, config: unknown,
+    ) => {
+      calls.push(config);
+      return handle.db.transaction(fn, config as Parameters<Database["transaction"]>[1]);
+    }) as Database["transaction"];
+
+    const archive = await buildExport({ db: observed, dataDir, appVersion: "1.3.0-test" });
+    archive.stream.resume();
+
+    expect(calls, "buildExport must open exactly one transaction").toHaveLength(1);
+    expect(calls[0]).toEqual({ isolationLevel: "repeatable read", accessMode: "read only" });
+  });
+
   // THE SNAPSHOT HALF. Under Postgres's default READ COMMITTED each statement
   // takes a fresh snapshot, so the second read below would see TWO rows where the
   // first saw one -- and in the export proper, a deals query running after a
@@ -387,6 +455,46 @@ describe("export archive shape", () => {
       expect(createHash("sha256").update(bytes).digest("hex"), member.path).toBe(member.sha256);
       expect(bytes.byteLength, member.path).toBe(member.bytes);
     }
+  });
+
+  // THE RULING'S OTHER HALF. Making the escape reversible is worth nothing to
+  // 7.7's importer if the archive does not SAY it was applied -- and nothing
+  // asserted that it did, so removing the declaration survived the whole suite.
+  itZip("declares the cell transform, named and versioned", async () => {
+    const manifest = await readManifest(await extract(await writeArchive()));
+    expect(manifest.cellTransforms).toHaveLength(1);
+    const [transform] = manifest.cellTransforms;
+    expect(transform?.name).toBe("leading-apostrophe-escape");
+    expect(transform?.version).toBe(1);
+    expect(transform?.description).toMatch(/remove exactly one leading apostrophe/i);
+    expect(transform).toEqual(EXPORT_CELL_TRANSFORM);
+  });
+
+  // THE PROPERTY THE DECLARATION EXISTS FOR, end to end: a note the guard
+  // rewrote comes back byte-identical once the declared rule is applied. This
+  // is the whole of what 7.7's exact importer will do.
+  itZip("round-trips a guarded cell through the archive and the declared inverse", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const bodies = ["== Zusammenfassung ==", "@here please review", "'already quoted", "+31 6 12345678"];
+    for (const body of bodies) await createNote(handle.db, actorId, { body, companyId: company.id });
+
+    const root = await extract(await writeArchive());
+    const manifest = await readManifest(root);
+    expect(manifest.cellTransforms.map((t) => t.name)).toContain("leading-apostrophe-escape");
+
+    const sheet = await readSheet(root, "notes.csv");
+    const recovered = sheet.records
+      .map((r) => unescapeCellValue(r[sheet.header.indexOf("body")] ?? ""))
+      .sort();
+    expect(recovered).toEqual([...bodies].sort());
+
+    // And the guard really did fire on the two it should have, so the round
+    // trip is not passing because nothing was transformed.
+    const written = sheet.records.map((r) => r[sheet.header.indexOf("body")] ?? "");
+    expect(written).toContain("'== Zusammenfassung ==");
+    expect(written).toContain("'@here please review");
+    expect(written).toContain("''already quoted");
+    expect(written).toContain("+31 6 12345678");
   });
 
   itZip("does not list manifest.json among its own members", async () => {
@@ -614,6 +722,50 @@ describe("export files", () => {
     expect(new Set(byContent.values()).size).toBe(3);
   });
 
+  // THE SAME DESTRUCTIVE COLLISION AS ABOVE, THROUGH THE OTHER DOOR, and the
+  // one the first version missed: `toLowerCase()` does not normalise. macOS
+  // uploads have historically carried NFD filenames while Windows and Linux
+  // carry NFC, so an install with both is ordinary rather than contrived.
+  // Measured before the fix, end to end with real unzip: two members, ONE file
+  // on disk, the first silently overwritten -- with files.csv still naming both
+  // paths and one of them now pointing at the other's bytes. On an archive
+  // whose stated purpose is carrying accented filenames.
+  itZip("disambiguates NFC and NFD spellings of one name, which lowercasing alone does not", async () => {
+    const nfc = "Caf\u00E9.pdf";           // e-acute as one code point
+    const nfd = "Cafe\u0301.pdf";          // e + combining acute
+    expect(nfc).not.toBe(nfd);
+    expect(nfc.normalize("NFC")).toBe(nfd.normalize("NFC"));
+    expect(nfc.toLowerCase()).not.toBe(nfd.toLowerCase());
+
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    await attachBlob(handle.db, company.id, nfc, Buffer.from("i am the nfc file"));
+    await attachBlob(handle.db, company.id, nfd, Buffer.from("i am the nfd file"));
+
+    const root = await extract(await writeArchive());
+    const sheet = await readSheet(root, "files.csv");
+    const paths = sheet.records.map((r) => r[sheet.header.indexOf("archive_path")] ?? "");
+    expect(paths).toHaveLength(2);
+
+    // THE ASSERTION IS ON THE MEMBER NAMES, NOT ON THE EXTRACTED FILES, and the
+    // first version of this test got that wrong and could not fail here. ext4
+    // stores the two spellings as the different byte sequences they are, so
+    // even the buggy archive extracts to two files on the dev server and in CI
+    // -- the destruction only happens on the normalising filesystem the
+    // operator is likely to be using. What is true on every platform is that
+    // two members whose names differ ONLY by normalisation are one name
+    // wherever it matters, so that is what is checked.
+    const distinctOnANormalisingFilesystem = new Set(paths.map((m) => m.normalize("NFC").toLowerCase()));
+    expect(
+      distinctOnANormalisingFilesystem.size,
+      `two members that collide once normalised: ${paths.join(" and ")}`,
+    ).toBe(2);
+
+    // Every row's own bytes are at its own recorded path.
+    const contents: string[] = [];
+    for (const archivePath of paths) contents.push(await readFile(path.join(root, archivePath), "utf8"));
+    expect(contents.sort()).toEqual(["i am the nfc file", "i am the nfd file"]);
+  });
+
   // A blob missing from the store is a broken install, not a reason to abandon
   // the download -- and the check happens before the response starts, because
   // after that there is no status left to change.
@@ -676,6 +828,37 @@ describe("export stream failure", () => {
   });
 });
 
+/** Exactly 32 bytes, like a real AES-256 key, and findable by a byte scan. */
+const MAIL_KEY_BYTES = "MAIL-KEY-BYTES-MUST-NEVER-TRAVEL";
+const CREDENTIAL_CIPHERTEXT = "SUPER-SECRET-CIPHERTEXT";
+const MAIL_BODY = "THE MAIL BODY THAT MUST NOT TRAVEL";
+const MAIL_ATTACHMENT = "THE MAIL ATTACHMENT THAT MUST NOT TRAVEL";
+
+/**
+ * Search every EXTRACTED member for a string, returning the members that hold
+ * it.
+ *
+ * EXTRACTED, NOT THE RAW ZIP, and that is the whole of this helper's reason to
+ * exist. The first version of these tests scanned the archive's own bytes --
+ * which is a live check for a STORED member and a dead one for a DEFLATED
+ * member, and every CSV is deflated. Proved by building an archive whose
+ * mail_accounts.csv literally contained the ciphertext: the raw scan returned
+ * false while the CSV plainly held it. Two of the three assertions this suite
+ * leads with were passing for that reason and could not have failed.
+ *
+ * Scanning the extracted members catches what the name check cannot: a
+ * `credentials_ciphertext` column appearing on users.csv, or a mail body
+ * reaching notes.csv, neither of which introduces a member called `mail`.
+ */
+async function membersContaining(root: string, needle: string): Promise<string[]> {
+  const hits: string[] = [];
+  for (const member of await memberPaths(root)) {
+    const bytes = await readFile(path.join(root, member));
+    if (bytes.includes(needle)) hits.push(member);
+  }
+  return hits;
+}
+
 // The three absences that make this archive safe to hand to anyone, and the
 // reason it needs no passphrase. Each is asserted against an install that HAS
 // the thing, so the test would notice if it started coming along.
@@ -683,14 +866,17 @@ describe("export safety", () => {
   beforeEach(async () => {
     // A mail account with an encrypted password, a message, and an attachment
     // blob sitting in the same content-addressed store the export reads from.
-    await writeFile(path.join(dataDir, "mail.key"), Buffer.alloc(32, 7), { mode: 0o600 });
+    // 32 bytes, as a real key is, but RECOGNISABLE -- the first version wrote
+    // 32 copies of 0x07, which no scan could look for, so mail.key was only
+    // ever checked by NAME.
+    await writeFile(path.join(dataDir, "mail.key"), Buffer.from(MAIL_KEY_BYTES), { mode: 0o600 });
     await mkdir(path.join(dataDir, "files"), { recursive: true });
 
     const [account] = await handle.db.insert(mailAccounts).values({
       userId: actorId, label: "Work", email: "chris@listerdale.example",
       imapHost: "imap.example", imapPort: 993, imapSecurity: "tls",
       smtpHost: "smtp.example", smtpPort: 465, smtpSecurity: "tls",
-      username: "chris", credentialsCiphertext: "SUPER-SECRET-CIPHERTEXT",
+      username: "chris", credentialsCiphertext: CREDENTIAL_CIPHERTEXT,
     }).returning();
     const [thread] = await handle.db.insert(mailThreads).values({
       subject: "Re: the quote", lastMessageAt: new Date(),
@@ -699,10 +885,10 @@ describe("export safety", () => {
       threadId: thread?.id ?? "", accountId: account?.id ?? "", messageId: `<${randomUUID()}@example>`,
       fromAddr: "them@example", toAddrs: [{ address: "chris@listerdale.example" }],
       subject: "Re: the quote", sentAt: new Date(), folder: "INBOX", direction: "inbound",
-      bodyText: "THE MAIL BODY THAT MUST NOT TRAVEL", bodyHtml: "<p>THE MAIL BODY THAT MUST NOT TRAVEL</p>",
+      bodyText: MAIL_BODY, bodyHtml: `<p>${MAIL_BODY}</p>`,
     }).returning();
 
-    const attachmentBytes = Buffer.from("THE MAIL ATTACHMENT THAT MUST NOT TRAVEL");
+    const attachmentBytes = Buffer.from(MAIL_ATTACHMENT);
     const { sha256 } = await saveBlob(dataDir, Readable.from([attachmentBytes]));
     await handle.db.insert(mailAttachments).values({
       messageId: message?.id ?? "", filename: "their-terms.pdf", mime: "application/pdf",
@@ -710,16 +896,28 @@ describe("export safety", () => {
     });
   });
 
-  itZip("carries no mail.key, no credentials and no mail body", async () => {
-    const zipPath = await writeArchive();
-    // The whole archive, as bytes: nothing has to be extracted for this, and a
-    // member added by some future change is covered without being named.
-    const raw = await readFile(zipPath);
-    expect(raw.includes("SUPER-SECRET-CIPHERTEXT")).toBe(false);
-    expect(raw.includes("THE MAIL BODY THAT MUST NOT TRAVEL")).toBe(false);
-    expect(raw.includes("chris@listerdale.example")).toBe(false);
+  // THE INSTRUMENT, SHOWN WORKING, before anything is asserted absent. A scan
+  // that cannot find a string that IS there proves nothing about the strings
+  // that are not, and the raw-bytes version of this suite failed exactly that
+  // way against every deflated member.
+  itZip("finds a string that really is in a deflated CSV member", async () => {
+    await createCompany(handle.db, actorId, { name: "A Findable Company Name" });
+    const root = await extract(await writeArchive());
+    expect(await membersContaining(root, "A Findable Company Name")).toEqual(["companies.csv"]);
+  });
 
-    const root = await extract(zipPath);
+  itZip("carries no credential, no mail body and no mail.key CONTENTS", async () => {
+    // A company too, so the archive is not trivially empty of everything.
+    await createCompany(handle.db, actorId, { name: "Acme" });
+    const root = await extract(await writeArchive());
+
+    expect(await membersContaining(root, CREDENTIAL_CIPHERTEXT)).toEqual([]);
+    expect(await membersContaining(root, MAIL_BODY)).toEqual([]);
+    expect(await membersContaining(root, "chris@listerdale.example")).toEqual([]);
+    // THE BYTES, not only the name. mail.key's contents were never scanned
+    // before, so a copy of it under any other member name would have passed.
+    expect(await membersContaining(root, MAIL_KEY_BYTES)).toEqual([]);
+
     const members = await memberPaths(root);
     expect(members).not.toContain("mail.key");
     expect(members.some((m) => m.includes("mail"))).toBe(false);
@@ -728,10 +926,8 @@ describe("export safety", () => {
   // The one-character difference between reading the `files` TABLE and reading
   // the $data_dir/files DIRECTORY. The directory holds mail attachments too.
   itZip("carries no mail attachment, though its blob shares the store", async () => {
-    const zipPath = await writeArchive();
-    expect((await readFile(zipPath)).includes("THE MAIL ATTACHMENT THAT MUST NOT TRAVEL")).toBe(false);
-
-    const root = await extract(zipPath);
+    const root = await extract(await writeArchive());
+    expect(await membersContaining(root, MAIL_ATTACHMENT)).toEqual([]);
     const members = await memberPaths(root);
     expect(members.filter((m) => m.startsWith("files/"))).toEqual([]);
     expect(members).not.toContain("files/their-terms.pdf");
@@ -744,6 +940,7 @@ describe("export safety", () => {
     await attachBlob(handle.db, company.id, "ours.pdf", Buffer.from("OUR OWN UPLOAD"));
     const root = await extract(await writeArchive());
     expect((await memberPaths(root)).filter((m) => m.startsWith("files/"))).toEqual(["files/ours.pdf"]);
+    expect(await membersContaining(root, "OUR OWN UPLOAD")).toEqual(["files/ours.pdf"]);
   });
 });
 
@@ -801,6 +998,167 @@ describe("export documents", () => {
 // test: ftruncate reserves no blocks, reads return zeros, and yazl streams the
 // same bytes it would stream from a real PDF. Stored rather than deflated, like
 // every files/ member.
+// EVERY ABORTED DOWNLOAD USED TO COST A FILE DESCRIPTOR, PERMANENTLY.
+//
+// Measured before the fix: five aborted downloads left five open descriptors on
+// the blob, and neither a forced GC nor closing the app reclaimed them.
+// Descriptor exhaustion fails every file operation in the process, not only
+// exports -- and cancelling a large download is a far more ordinary act than
+// any of the failures the error forwarding was built for.
+describe("export descriptors", () => {
+  /**
+   * How many descriptors this process holds on `target`.
+   *
+   * /proc is the only way to see this from inside the process. It exists on the
+   * dev server and on the CI runner, which is where this has to hold; a
+   * developer on macOS gets a skip rather than a false pass.
+   */
+  async function openDescriptorsFor(target: string): Promise<number> {
+    let entries: string[];
+    try {
+      entries = await readdir("/proc/self/fd");
+    } catch {
+      return -1;
+    }
+    let count = 0;
+    for (const entry of entries) {
+      try {
+        if (await readlink(path.join("/proc/self/fd", entry)) === target) count += 1;
+      } catch { /* the descriptor closed while we were looking */ }
+    }
+    return count;
+  }
+
+  itFd("closes the blob's descriptor when the download is abandoned", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    // Big enough that the read is still in flight when the client goes away.
+    const stored = await attachBlob(handle.db, company.id, "big.pdf", Buffer.alloc(4 * 1024 * 1024, 3));
+    const blobPath = path.join(dataDir, "files", stored.sha256);
+    expect(await openDescriptorsFor(blobPath)).toBe(0);
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const archive = await buildExport({ db: handle.db, dataDir, appVersion: "1.3.0-test" });
+      const stream = archive.stream as Readable;
+      // Read one chunk so the pump is genuinely under way, then walk off --
+      // which is what fastify does to the stream when a client disconnects.
+      await new Promise<void>((resolve) => stream.once("data", () => { resolve(); }));
+      stream.destroy();
+      await new Promise<void>((resolve) => stream.once("close", () => { resolve(); }));
+    }
+
+    // Give the destroy a turn to propagate through yazl's pipe.
+    await new Promise<void>((resolve) => { setImmediate(() => { resolve(); }); });
+    expect(
+      await openDescriptorsFor(blobPath),
+      "an abandoned download must not leave the blob open",
+    ).toBe(0);
+  }, 60_000);
+
+  itFd("leaves nothing open after a download that completes", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const stored = await attachBlob(handle.db, company.id, "big.pdf", Buffer.alloc(2 * 1024 * 1024, 4));
+    const blobPath = path.join(dataDir, "files", stored.sha256);
+
+    const archive = await buildExport({ db: handle.db, dataDir, appVersion: "1.3.0-test" });
+    for await (const chunk of archive.stream) void chunk;
+    await new Promise<void>((resolve) => { setImmediate(() => { resolve(); }); });
+    expect(await openDescriptorsFor(blobPath)).toBe(0);
+  }, 60_000);
+});
+
+// THE OTHER HALF OF THE MEMORY STORY, and the half the blob bound never
+// touched. An export cannot stream its CSVs -- manifest.json records a SHA-256
+// per member, and a digest needs the whole member -- so the question is not
+// whether a sheet is materialised but how many are materialised AT ONCE. The
+// first implementation held all nine: the mapped rows, the finished buffers,
+// and yazl's deflated copies, simultaneously.
+describe("export row memory", () => {
+  const ROWS_PER_SHEET = 40_000;
+  const BODY_CHARS = 400;
+  // MEASURED ON BOTH SHAPES, on the deploy target, against 61MB of CSV spread
+  // over three large sheets. One sheet at a time: 53, 59, 60MB of live heap
+  // across three runs. Every sheet held at once, which is the shape this
+  // replaced: 93MB. The ceiling sits between them.
+  //
+  // The gap is 1.6x rather than 3x because the mutation measured holds only the
+  // ROWS; the implementation it replaced also held all nine finished buffers
+  // and yazl'''s deflated copies on top. So this bound is conservative: it fires
+  // on the mildest version of the regression.
+  const ROW_HEAP_CEILING_BYTES = 75 * 1024 * 1024;
+
+  /** Fill three of the nine sheets with enough text to be measurable. */
+  async function seedWideCorpus(): Promise<void> {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    // Raw SQL rather than the services: 120,000 rows through createNote would
+    // dominate the runtime of the thing being measured.
+    await handle.db.execute(sql`
+      INSERT INTO notes (body, author_user_id, company_id)
+      SELECT repeat('n', ${BODY_CHARS}), ${actorId}::uuid, ${company.id}::uuid
+      FROM generate_series(1, ${ROWS_PER_SHEET})
+    `);
+    await handle.db.execute(sql`
+      INSERT INTO companies (name, address)
+      SELECT 'Company ' || g, repeat('a', ${BODY_CHARS})
+      FROM generate_series(1, ${ROWS_PER_SHEET}) g
+    `);
+    await handle.db.execute(sql`
+      INSERT INTO contacts (first_name, last_name, job_title)
+      SELECT 'First' || g, 'Last' || g, repeat('t', ${BODY_CHARS})
+      FROM generate_series(1, ${ROWS_PER_SHEET}) g
+    `);
+  }
+
+  it("holds one sheet at a time, not nine", async () => {
+    await seedWideCorpus();
+
+    // FORCED COLLECTION AT EVERY SAMPLE, which is the only way this reading
+    // means anything. Both shapes allocate the same rows; the difference is
+    // whether they are still REFERENCED when the next sheet is built, and
+    // resident set on its own cannot tell "dropped" from "held" because V8 does
+    // not return dropped pages promptly. Measured without it, the two shapes
+    // read 298MB and 328MB -- a 30MB gap for a difference of the whole corpus.
+    // vitest.config.ts enables --expose-gc for exactly this.
+    // HEAP USED, NOT RESIDENT SET, and that is what makes the two shapes
+    // separable. The mapped rows are JavaScript strings and arrays, so they live
+    // on the V8 heap; the finished CSVs are Buffers, which do not. Resident set
+    // sums both plus V8'''s slack and reads 211MB against 250MB for shapes whose
+    // real difference is the whole corpus. heapUsed after a forced collection is
+    // the live row data and almost nothing else.
+    forceGc();
+    const before = process.memoryUsage().heapUsed;
+    let peak = before;
+    const sampler = setInterval(() => {
+      forceGc();
+      const heap = process.memoryUsage().heapUsed;
+      if (heap > peak) peak = heap;
+    }, 100);
+
+    let bytes = 0;
+    let csvBytes = 0;
+    try {
+      const archive = await buildExport({ db: handle.db, dataDir, appVersion: "1.3.0-test" });
+      for (const member of archive.manifest.members) {
+        if (member.path.endsWith(".csv")) csvBytes += member.bytes;
+      }
+      for await (const chunk of archive.stream) bytes += (chunk as Buffer).length;
+    } finally {
+      clearInterval(sampler);
+    }
+
+    // The corpus really is large enough for the question to mean something.
+    expect(csvBytes).toBeGreaterThan(40 * 1024 * 1024);
+    expect(bytes).toBeGreaterThan(0);
+
+    const grew = peak - before;
+    expect(
+      grew,
+      `live heap grew ${String(Math.round(grew / 1024 / 1024))}MB while building `
+      + `${String(Math.round(csvBytes / 1024 / 1024))}MB of CSV across three large sheets; `
+      + "holding every sheet at once costs roughly three times this",
+    ).toBeLessThan(ROW_HEAP_CEILING_BYTES);
+  }, 300_000);
+});
+
 describe("export memory", () => {
   const BLOB_BYTES = 400 * 1024 * 1024;
   // MEASURED ON BOTH SIDES, on the deploy target. Streaming: the resident set
@@ -839,7 +1197,12 @@ describe("export memory", () => {
     // 400MB by the time `before` was sampled, the delta stayed flat, and the
     // mutation sailed through a green test. Sampling across the build AND the
     // stream is what catches buffering wherever it happens.
-    global.gc?.();
+    // A REAL collection before the baseline. An earlier version wrote
+    // `global.gc?.()` with nothing enabling it, so the call was always
+    // undefined and the line implied a guarantee it never gave;
+    // vitest.config.ts now passes --expose-gc and forceGc throws if it is
+    // missing rather than silently doing nothing.
+    forceGc();
     const before = process.memoryUsage.rss();
     let peak = before;
     const sampler = setInterval(() => {

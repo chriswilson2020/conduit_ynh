@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { CSV_BOM, CSV_EOL, csvCell, csvDocument, csvRow } from "./csv.js";
+import {
+  CSV_BOM, CSV_EOL, csvCell, csvDocument, csvRow, escapeCellValue, unescapeCellValue,
+} from "./csv.js";
 
 // The dialect's rules, each one broken on purpose somewhere below. A rule that
 // no test can violate is a rule nobody knows is there -- see the plan's
@@ -54,6 +56,22 @@ describe("csvCell formula neutralisation", () => {
     expect(csvCell("=SUM(A1,B1)")).toBe('"\'=SUM(A1,B1)"');
   });
 
+  // BOTH BYPASSES THE FIRST VERSION HAD, and both reached Excel as formulas.
+  // Excel trims leading whitespace before deciding, and a sign in front of `=`
+  // is not a number however much a bare sign is.
+  it("sees through leading whitespace, which Excel trims before deciding", () => {
+    // Unquoted: a tab is not one of the four characters RFC 4180 quotes for.
+    expect(csvCell("\t=1+1")).toBe("'\t=1+1");
+    expect(csvCell("  =1+1")).toBe("'  =1+1");
+    expect(csvCell(" @sum")).toBe("' @sum");
+  });
+
+  it("sees through a leading sign, because +=1+1 is a formula and not a number", () => {
+    expect(csvCell("+=1+1")).toBe("'+=1+1");
+    expect(csvCell("-=1+1")).toBe("'-=1+1");
+    expect(csvCell("+-@x")).toBe("'+-@x");
+  });
+
   // The deliberate other half of the decision, and the one most likely to be
   // "fixed" by someone who has read an OWASP page and not this file's comment:
   // prefixing these would put a stray quote in front of every phone number and
@@ -64,11 +82,55 @@ describe("csvCell formula neutralisation", () => {
 
   it("leaves a leading - alone, so a negative amount stays a number", () => {
     expect(csvCell("-12.50")).toBe("-12.50");
+    expect(csvCell("--strikethrough")).toBe("--strikethrough");
   });
 
-  it("only looks at the FIRST character", () => {
+  it("only looks at the start", () => {
     expect(csvCell("total = 5")).toBe("total = 5");
     expect(csvCell("chris@example.com")).toBe("chris@example.com");
+  });
+});
+
+// THE RULING: the guard stays, but it has to be REVERSIBLE, because 7.7's exact
+// importer is a declared consumer of this file and an export that silently
+// rewrites the operator's notes is not acceptable. Doubling a leading
+// apostrophe is what makes "remove exactly one" total.
+describe("escapeCellValue / unescapeCellValue", () => {
+  it("doubles an apostrophe a value genuinely starts with", () => {
+    expect(escapeCellValue("'quoted")).toBe("''quoted");
+    // Without the doubling this is the ambiguity: a stored `'=x` and a guarded
+    // `=x` would both be written `'=x` and could not be told apart on the way
+    // back in.
+    expect(escapeCellValue("'=x")).toBe("''=x");
+    expect(escapeCellValue("=x")).toBe("'=x");
+    expect(escapeCellValue("'=x")).not.toBe(escapeCellValue("=x"));
+  });
+
+  // The property the manifest's declared transform promises, over every shape
+  // the guard can see.
+  const values = [
+    "", "Acme Ltd", "M\u00FCller GmbH", "-12.50", "+31 6 12345678",
+    "=SUM(A1,B1)", "@here", "== Zusammenfassung ==", "+=1+1", "-=1+1", "\t=1+1", "  @x",
+    "'", "'x", "'=x", "''already", "total = 5", "a,b", 'the "big" one', "line\r\nbreak",
+  ];
+
+  it("round-trips every value through escape and back", () => {
+    for (const value of values) {
+      expect(unescapeCellValue(escapeCellValue(value)), JSON.stringify(value)).toBe(value);
+    }
+  });
+
+  it("is injective, so no two stored values collide on one escaped form", () => {
+    const escaped = values.map(escapeCellValue);
+    expect(new Set(escaped).size).toBe(new Set(values).size);
+  });
+
+  // The instrument for the round trip, shown failing: without the doubling arm
+  // the transform is not invertible, and this is the pair that proves it.
+  it("would not round-trip if a leading apostrophe were left alone", () => {
+    const naive = (value: string): string => (/^\s*[+-]*[=@]/.test(value) ? `'${value}` : value);
+    expect(unescapeCellValue(naive("'=x"))).toBe("=x");
+    expect(unescapeCellValue(naive("'=x"))).not.toBe("'=x");
   });
 });
 

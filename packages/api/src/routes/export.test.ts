@@ -133,6 +133,40 @@ describe("GET /api/export", () => {
     expect(manifest.appVersion).toBe("1.3.0-test");
   });
 
+  // THE MOST EXPENSIVE ENDPOINT IN THE APP HAD NO LIMIT ON IT. An export
+  // materialises its largest CSV whole and reads the blob store end to end;
+  // nothing stopped any authenticated caller from starting ten at once, on a
+  // 3.8GB no-swap box, which multiplies the one bound buildExport works hardest
+  // to hold. There is no role model here, so "any authenticated caller" is
+  // every user.
+  itZip("refuses a second export while one is still streaming, and frees the slot after", async () => {
+    await createCompany(handle.db, actorId, { name: "Acme" });
+    const content = Buffer.alloc(2 * 1024 * 1024, 9);
+    const { sha256, sizeBytes } = await saveBlob(dataDir, Readable.from([content]));
+    await attachFile(handle.db, actorId, {
+      originalName: "big.bin", mime: "application/octet-stream", sizeBytes, sha256,
+      companyId: (await createCompany(handle.db, actorId, { name: "Holder" })).id,
+    });
+
+    const a = await app();
+    // inject() resolves only once the whole body is read, so the two requests
+    // are started and only then awaited -- otherwise the first has finished and
+    // released its slot before the second is made.
+    const first = a.inject({ method: "GET", url: "/api/export", headers: authHeaders });
+    const second = a.inject({ method: "GET", url: "/api/export", headers: authHeaders });
+    const [one, two] = await Promise.all([first, second]);
+
+    const statuses = [one.statusCode, two.statusCode].sort();
+    expect(statuses).toEqual([200, 503]);
+    const refused = one.statusCode === 503 ? one : two;
+    expect(refused.json()).toMatchObject({ error: "export_busy" });
+
+    // THE SLOT COMES BACK. A guard that never releases turns one export into a
+    // permanently broken route, which is worse than the problem it solves.
+    const afterwards = await a.inject({ method: "GET", url: "/api/export", headers: authHeaders });
+    expect(afterwards.statusCode).toBe(200);
+  });
+
   // Conduit has no role model, so this route is no broader than the list
   // endpoints it summarises -- and that fact is worth pinning, because a future
   // reader will ask.

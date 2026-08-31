@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 import { eq } from "drizzle-orm";
 import yazl from "yazl";
 import { decimalFromCents } from "@conduit/shared";
@@ -65,6 +66,37 @@ export interface ExportManifestMember {
   sha256: string;
 }
 
+/**
+ * One transformation applied to CELL VALUES on the way out, named and versioned
+ * so 7.7's exact importer can undo it deterministically rather than inferring
+ * it from the data.
+ *
+ * DECLARED RATHER THAN SILENT, on the coordinator's ruling. An export that
+ * quietly rewrites the operator's notes is not acceptable; one that says
+ * exactly what it rewrote, and how to reverse it, is.
+ */
+export interface ExportCellTransform {
+  name: string;
+  version: number;
+  /** What was done, and the rule that undoes it. */
+  description: string;
+}
+
+/**
+ * The apostrophe escape csv.ts applies to every cell, as manifest.json records
+ * it. `unescapeCellValue` in services/csv.ts is the executable form of the
+ * sentence below, and csv.test.ts asserts the round trip over a table.
+ */
+export const EXPORT_CELL_TRANSFORM: ExportCellTransform = {
+  name: "leading-apostrophe-escape",
+  version: 1,
+  description:
+    "A cell value is prefixed with one apostrophe when it already begins with an "
+    + "apostrophe, or when -- after any leading whitespace and an optional run of "
+    + "+ or - -- it begins with = or @. To recover the stored value, remove exactly "
+    + "one leading apostrophe if the cell has one. Applied to every cell of every CSV.",
+};
+
 export interface ExportManifest {
   formatVersion: number;
   appVersion: string;
@@ -76,6 +108,11 @@ export interface ExportManifest {
   schemaVersion: string;
   /** When the export was taken, ISO 8601 UTC. */
   generatedAt: string;
+  /**
+   * Every value-level transformation the CSVs carry. Read this before treating
+   * a cell as the stored value.
+   */
+  cellTransforms: ExportCellTransform[];
   /**
    * Every member EXCEPT manifest.json, which cannot carry its own digest.
    *
@@ -97,6 +134,22 @@ export interface ExportManifest {
  * cannot.
  */
 const WINDOWS_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
+/**
+ * Whether Win32 would resolve this name to a device rather than a file.
+ *
+ * THE SEGMENT IS TAKEN UP TO THE FIRST DOT, not the last, and that distinction
+ * is the whole of the fix. Win32 stops at the first one, so `CON.tar.gz`,
+ * `COM1.tar.gz` and `nul.a.b` are every bit as reserved as `CON.pdf` -- while
+ * splitExtension, which exists to keep a collision suffix in front of the
+ * extension, correctly splits at the LAST dot and so answered `tar.gz`,
+ * `tar.gz` and `a.b` for those three. Trailing spaces go too, because Win32
+ * discards them before resolving: `"CON .pdf"` is the device.
+ */
+function isWindowsReserved(name: string): boolean {
+  const firstSegment = (name.split(".")[0] ?? "").replace(/ +$/, "");
+  return WINDOWS_RESERVED.test(firstSegment);
+}
 
 /**
  * The longest member name this produces, before the collision suffix. Chosen to
@@ -136,7 +189,7 @@ export function archiveFileName(originalName: string): string {
   // "." and ".." are not names, and neither is the empty string.
   const named = cleaned === "" || cleaned === "." || cleaned === ".." ? "file" : cleaned;
   const truncated = truncateToBytes(named, MAX_NAME_BYTES);
-  return WINDOWS_RESERVED.test(splitExtension(truncated).stem) ? `_${truncated}` : truncated;
+  return isWindowsReserved(truncated) ? `_${truncated}` : truncated;
 }
 
 /** The name split at its LAST dot, with a leading dot never treated as one. */
@@ -191,20 +244,40 @@ function truncateToBytes(value: string, maxBytes: number): string {
  * default macOS volume the second silently overwrites the first on extraction.
  * Deduping on the lowercased name is what stops one of the operator's documents
  * disappearing during the one operation that was supposed to preserve it.
+ *
+ * AND UNICODE-NORMALISED, WHICH IS THE SAME BUG ONE CLASS OVER AND WAS MISSED
+ * THE FIRST TIME. `toLowerCase()` does not normalise, so an accented name in
+ * NFC and the same name in NFD compare as different keys, get the same member
+ * path, and the second overwrites the first on extraction -- measured with real
+ * `unzip`: two members, one file on disk, and files.csv still naming both paths
+ * with one of them now pointing at the wrong bytes. A mixed corpus is ordinary
+ * rather than exotic: macOS uploads have historically carried NFD filenames
+ * while Windows and Linux carry NFC. On an archive whose stated purpose is
+ * carrying accented filenames, this is the failure the case rule exists to
+ * prevent, reached through the other door.
+ *
+ * The KEY is normalised; the member NAME is not. Normalising the name would
+ * rewrite bytes the operator chose, and `files.csv` keeps `original_name`
+ * either way -- what has to be true is only that two distinct rows never claim
+ * one path.
  */
+function collisionKey(name: string): string {
+  return name.normalize("NFC").toLowerCase();
+}
+
 function createNamer(): (originalName: string) => string {
   const taken = new Set<string>();
   return (originalName: string): string => {
     const safe = archiveFileName(originalName);
-    if (!taken.has(safe.toLowerCase())) {
-      taken.add(safe.toLowerCase());
+    if (!taken.has(collisionKey(safe))) {
+      taken.add(collisionKey(safe));
       return safe;
     }
     const { stem, extension } = splitExtension(safe);
     for (let n = 2; ; n += 1) {
       const candidate = `${stem} (${n})${extension}`;
-      if (!taken.has(candidate.toLowerCase())) {
-        taken.add(candidate.toLowerCase());
+      if (!taken.has(collisionKey(candidate))) {
+        taken.add(collisionKey(candidate));
         return candidate;
       }
     }
@@ -577,7 +650,10 @@ interface ExportFile {
   id: string;
   archivePath: string;
   absolutePath: string;
+  /** The `files.size_bytes` column, as files.csv reports it. */
   sizeBytes: number;
+  /** The blob's size on disk, which is what the archive member will contain. */
+  blobBytes: number;
   sha256: string;
   originalName: string;
   mime: string;
@@ -632,9 +708,19 @@ async function collectFiles(db: Database, dataDir: string): Promise<ExportFile[]
     // sha256 is not a digest can never address anything outside the store.
     const absolutePath = path.join(dataDir, "files", r.f.sha256);
     let present = /^[0-9a-f]{64}$/.test(r.f.sha256);
+    // THE SIZE ON DISK, NOT THE SIZE IN THE ROW. The two agree on every blob
+    // saveBlob wrote, since both come from the same bytes -- but the member's
+    // declared size is now checked against the stream by yazl, so it has to be
+    // what will actually be written rather than what the row remembers. A row
+    // that disagrees with its blob still exports; files.csv keeps reporting the
+    // column, and the manifest reports the archive, so the disagreement is
+    // visible instead of fatal.
+    let blobBytes = r.f.sizeBytes;
     if (present) {
       try {
-        present = (await stat(absolutePath)).isFile();
+        const info = await stat(absolutePath);
+        present = info.isFile();
+        blobBytes = info.size;
       } catch {
         present = false;
       }
@@ -644,6 +730,7 @@ async function collectFiles(db: Database, dataDir: string): Promise<ExportFile[]
       archivePath: present ? `files/${nameFor(r.f.originalName)}` : "",
       absolutePath,
       sizeBytes: r.f.sizeBytes,
+      blobBytes,
       sha256: r.f.sha256,
       originalName: r.f.originalName,
       mime: r.f.mime,
@@ -758,19 +845,39 @@ export interface ExportArchive {
 /**
  * Build the export and return it as a stream.
  *
- * NOTHING IS BUFFERED WHOLE. Each CSV is assembled in memory -- bounded by the
- * rows themselves, which had to be read anyway -- and every stored file is
- * handed to yazl as a PATH, which it opens and pumps only when the consumer has
- * read far enough to need it. Peak memory is therefore a function of the row
- * data and one file's read buffer, never of the archive size.
+ * THE ARCHIVE IS NEVER HELD WHOLE, and it has two halves that reach memory by
+ * different routes. Both are bounded and both are measured; the first version
+ * of this comment bounded only one of them and said so as if it were the whole.
  *
- * MEASURED, on the deploy target (3.8GB, NO SWAP): building and streaming a
- * 400MB archive grows the process's resident set by 9-13MB across three runs.
- * The same run with the one line below changed from addFile to
- * `addBuffer(await readFile(...))` grows it by 338MB. export.test.ts's memory
- * case asserts a 150MB ceiling, which is what makes those two numbers a bound
- * rather than an anecdote -- and that mutation is how the bound was proved to
- * fail, after a first version of it measured from the wrong moment and passed.
+ * THE BLOB HALF streams. Every stored file is opened only when the consumer has
+ * read far enough to need it, and closed as soon as it is written. Measured on
+ * the deploy target (3.8GB, NO SWAP): building and streaming a 400MB archive
+ * grows the resident set by 9-13MB across three runs; the same run with the
+ * lazy read stream replaced by `addBuffer(readFile(...))` grows it by 338MB.
+ *
+ * THE ROW HALF cannot stream, because manifest.json records a SHA-256 per
+ * member and a digest is only known once the whole member exists. So each CSV
+ * is materialised -- but ONE AT A TIME, and its rows are released before the
+ * next query runs. That makes the peak the largest single sheet rather than the
+ * sum of nine, which on a large install is the difference that matters: 200,000
+ * notes rows of 400 characters hold 409MB for 103MB of CSV, a ~4x steady-state
+ * multiplier, and nine of those summed is the whole box.
+ *
+ * export.test.ts asserts a ceiling on each half separately, and each was proved
+ * to fail against the shape it forbids. The blob bound sat over the wrong
+ * moment in its first version and passed against a buffering implementation;
+ * the row bound did not exist at all, which is how the sum-of-nine shape got as
+ * far as review.
+ *
+ * WHAT IS NOT BOUNDED is the time to the FIRST byte. The pre-flight -- the read
+ * transaction, one stat per stored file, nine CSV builds and nine SHA-256
+ * passes, plus the journal read -- all happens before the response begins, and
+ * it grows with row and file count. The 15-20ms first-byte figure measured for
+ * the format decision is yazl's, not this route's. The comparison it informed
+ * stays fair because a 7z build pays the same pre-flight and then the whole
+ * archive on top; but "structurally unreachable" overstates it, and the largest
+ * gap between two bytes on the wire is this pre-flight rather than anything in
+ * the pump.
  *
  * COMPRESSION IS PER MEMBER, and the split is measured rather than assumed. The
  * CSVs and the manifest are deflated; the stored files are not.
@@ -795,48 +902,113 @@ export interface ExportArchive {
 export async function buildExport(options: BuildExportOptions): Promise<ExportArchive> {
   const { db, dataDir, appVersion, now = new Date() } = options;
 
+  const members: ExportManifestMember[] = [];
+  const zip = new yazl.ZipFile();
+
+  // A FAILURE TO READ A MEMBER MUST NOT TAKE THE SERVER DOWN, and without this
+  // line it does. yazl reports such a failure on the ZipFile's OWN emitter
+  // rather than on outputStream, and an `error` event with no listener is an
+  // uncaught exception -- which on this single-process app means systemd
+  // restarts it and every other request in flight dies too. Measured on yazl
+  // 3.3.1: a member whose source file has vanished exits the process with
+  // ENOENT instead of failing the download.
+  //
+  // Forwarding it to the stream makes it what it should be -- this one response
+  // ends early, the archive does not open, and the server keeps serving.
+  // collectFiles' pre-flight stat is what makes the case rare; this is what
+  // makes it survivable, and the two are not substitutes for each other.
+  //
+  // ONE PATH IT CANNOT REACH, recorded rather than fixed: yazl's addBuffer
+  // ignores the error from zlib's deflateRaw and then dereferences the
+  // undefined result, so a deflate failure throws synchronously out of
+  // addBuffer instead of arriving here. deflateRaw on a valid Buffer has no
+  // failure mode short of allocation failure, so this is unreachable in
+  // practice; it is noted so the next reader does not assume the emitter covers
+  // every case.
+  zip.on("error", (error: Error) => { (zip.outputStream as Readable).destroy(error); });
+
+  // THE FILE DESCRIPTORS, AND THE FAILURE THAT COST THE MOST TO FIND.
+  //
+  // Measured before this existed: five aborted downloads left five open
+  // descriptors on the blob, for ever -- neither a forced GC nor closing the
+  // fastify instance reclaimed them. When the client disconnects, fastify
+  // destroys outputStream; `pipe`'s unpipe then detaches yazl's blob read
+  // stream WITHOUT destroying it, and yazl 3.3.1 exposes no `abort` or
+  // `destroy` on ZipFile, so nothing outside can reach it. Descriptor
+  // exhaustion fails every file operation in the app, not only exports -- the
+  // same class as the uncaught-error crash above, through the far more common
+  // door of a user cancelling a large download.
+  //
+  // addReadStreamLazy rather than addFile is what makes the streams reachable:
+  // this module opens them, so this module can close them. `aborted` closes the
+  // second half of the race -- yazl may pump on to the next entry after a
+  // failure, and without the flag that would open a fresh descriptor after the
+  // client had already gone.
+  const openReads = new Set<Readable>();
+  let aborted = false;
+  const releaseOpenReads = (): void => {
+    aborted = true;
+    for (const readStream of openReads) readStream.destroy();
+    openReads.clear();
+  };
+  // `close` fires on a clean finish as well as on a destroy. On a clean finish
+  // every read stream has already removed itself, so this is a no-op there.
+  zip.outputStream.on("close", releaseOpenReads);
+
   // ONE SNAPSHOT FOR EVERY READ -- see withExportSnapshot. The blob bytes are
   // deliberately outside it: they are content-addressed and never rewritten, and
   // holding a transaction open for the whole download would pin a snapshot for
   // as long as the operator's connection lasts.
-  const { exportFiles, sheets } = await withExportSnapshot(db, async (tx) => {
+  //
+  // ONE SHEET IS MATERIALISED AT A TIME, and that is a memory bound rather than
+  // a tidiness preference. The first version built all nine Sheet objects, then
+  // all nine CSV buffers, then handed all nine to yazl -- three live copies of
+  // every row at once. Measured on 200,000 notes rows of 400 characters: one
+  // sheet's mapped rows and its finished 103.0 MB CSV together held 409.2 MB
+  // after a forced GC, a ~4x steady-state multiplier over the CSV text. Summed
+  // across nine sheets that is the ceiling on a 3.8 GB no-swap box, reached by
+  // the half the blob-streaming bound never touched. Building and handing off
+  // one sheet at a time makes the peak the LARGEST sheet rather than the sum,
+  // and lets each sheet's rows go before the next query runs -- yazl deflates a
+  // buffer as it is added, so what it retains afterwards is the compressed copy.
+  const exportFiles = await withExportSnapshot(db, async (tx) => {
     const collected = await collectFiles(tx, dataDir);
     const archivePathByFileId = new Map<string, string>();
     for (const f of collected) {
       if (f.archivePath !== "") archivePathByFileId.set(f.id, f.archivePath);
     }
-    return {
-      exportFiles: collected,
-      sheets: [
-        await companiesSheet(tx),
-        await contactsSheet(tx),
-        await dealsSheet(tx),
-        await projectsSheet(tx),
-        await tasksSheet(tx),
-        await notesSheet(tx),
-        await meetingsSheet(tx),
-        await documentsSheet(tx, archivePathByFileId),
-        filesSheet(collected),
-      ] satisfies Sheet[],
-    };
+
+    // Thunks, not sheets: nothing is queried until its turn, and nothing
+    // survives past it.
+    const build: (() => Promise<Sheet>)[] = [
+      () => companiesSheet(tx),
+      () => contactsSheet(tx),
+      () => dealsSheet(tx),
+      () => projectsSheet(tx),
+      () => tasksSheet(tx),
+      () => notesSheet(tx),
+      () => meetingsSheet(tx),
+      () => documentsSheet(tx, archivePathByFileId),
+      () => Promise.resolve(filesSheet(collected)),
+    ];
+    for (const buildSheet of build) {
+      const sheet = await buildSheet();
+      const bytes = csvDocument(sheet.header, sheet.rows);
+      members.push({
+        path: sheet.name,
+        bytes: bytes.byteLength,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      });
+      zip.addBuffer(bytes, sheet.name);
+    }
+    return collected;
   });
 
-  const members: ExportManifestMember[] = [];
-  const csvBuffers: { name: string; bytes: Buffer }[] = [];
-  for (const sheet of sheets) {
-    const bytes = csvDocument(sheet.header, sheet.rows);
-    csvBuffers.push({ name: sheet.name, bytes });
-    members.push({
-      path: sheet.name,
-      bytes: bytes.byteLength,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-    });
-  }
   for (const f of exportFiles) {
     if (f.archivePath === "") continue;
     members.push({
       path: f.archivePath,
-      bytes: f.sizeBytes,
+      bytes: f.blobBytes,
       // files.sha256 is the blob store's own content address, computed by
       // saveBlob from the bytes as they were written. Reusing it keeps the
       // export to ONE pass over the blobs instead of two -- and it means a
@@ -851,30 +1023,35 @@ export async function buildExport(options: BuildExportOptions): Promise<ExportAr
     appVersion,
     schemaVersion: await schemaVersion(),
     generatedAt: now.toISOString(),
+    cellTransforms: [EXPORT_CELL_TRANSFORM],
     members,
   };
-
-  const zip = new yazl.ZipFile();
-  // A FAILURE TO READ A MEMBER MUST NOT TAKE THE SERVER DOWN, and without this
-  // line it does. yazl reports such a failure on the ZipFile's OWN emitter
-  // rather than on outputStream, and an `error` event with no listener is an
-  // uncaught exception -- which on this single-process app means systemd
-  // restarts it and every other request in flight dies too. Measured on yazl
-  // 3.3.1: a member whose source file has vanished exits the process with
-  // ENOENT instead of failing the download.
-  //
-  // Forwarding it to the stream makes it what it should be -- this one response
-  // ends early, the archive does not open, and the server keeps serving.
-  // collectFiles' pre-flight stat is what makes the case rare; this is what
-  // makes it survivable, and the two are not substitutes for each other.
-  zip.on("error", (error: Error) => { (zip.outputStream as Readable).destroy(error); });
-  // manifest.json first, so it is the first thing a reader sees and the first
-  // thing out of the pipe.
+  // AFTER the CSVs rather than before them, because its own contents depend on
+  // their digests and those are only known once each has been built. A zip's
+  // members carry no meaningful order to a reader, so the cost is nil.
   zip.addBuffer(Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8"), "manifest.json");
-  for (const { name, bytes } of csvBuffers) zip.addBuffer(bytes, name);
+
   for (const f of exportFiles) {
     if (f.archivePath === "") continue;
-    zip.addFile(f.absolutePath, f.archivePath, { compress: false });
+    zip.addReadStreamLazy(f.archivePath, { size: f.blobBytes, compress: false }, (callback) => {
+      if (aborted) {
+        callback(new Error(`export abandoned before ${f.archivePath} was read`), Readable.from([]));
+        return;
+      }
+      const readStream = createReadStream(f.absolutePath);
+      // THE OBLIGATION MOVED WITH THE STREAM. yazl attaches its own error
+      // handler to a stream it opened itself (addFile) and NOT to one it was
+      // handed (addReadStream/addReadStreamLazy) -- reasonably, since it does
+      // not own it. So switching to the lazy form to get the descriptors back
+      // took this on, and without this line an unreadable blob raised an
+      // uncaught EACCES: the same crash the ZipFile handler above exists to
+      // prevent, reintroduced by the fix for a different bug. Routing it
+      // through the ZipFile's emitter keeps one path for both.
+      readStream.on("error", (error: Error) => { zip.emit("error", error); });
+      openReads.add(readStream);
+      readStream.on("close", () => openReads.delete(readStream));
+      callback(null, readStream);
+    });
   }
   zip.end();
 
