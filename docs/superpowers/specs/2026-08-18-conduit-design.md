@@ -96,6 +96,14 @@ since resolution also stamps `last_seen_at`. The TTL is deliberately not process
 permanent cache would never notice an LDAP display-name or email change until a restart. This removes cookie signing, session storage, expiry, and logout from the app
 entirely.
 
+**Two of those four came back in 7.6, in one place and for one thing.** The export and the
+encrypted backup are gated by a re-authentication check, and what it mints is a single-use
+ticket held in memory with a five-minute lifetime — session storage and expiry, in the
+narrow. There is still no cookie, nothing is signed, there is no logout, and no password is
+stored: the check itself is a bind against YunoHost's own portal API. The sentence above is
+still the right description of how a REQUEST is authenticated; it is no longer a complete
+description of what the app keeps.
+
 The security boundary is that **the app binds to `127.0.0.1` only**, so nothing can reach it without
 passing through nginx and SSOwat. This is the standard YunoHost trust model, and it is worth stating
 its limit plainly: another process already running on the same host could connect to the loopback
@@ -104,8 +112,21 @@ local users could read from the world-readable nginx conf anyway, so it buys not
 app ever needs to defend against hostile local processes, that is a change of threat model, not a
 tweak.
 
+**7.6 made that limit consequential without changing it.** `POST /api/reauth` checks a
+password against YunoHost's portal, and the account it checks is the one in `Ynh-User` — so
+a local process that sets the header freely can ask this app to test passwords for *any*
+account on the box. Nothing upstream counts those attempts: the portal call goes over
+loopback, YunoHost's fail2ban jails read nginx's logs, and YunoHost's own authenticator
+carries a `FIXME` saying failed logins are not caught by fail2ban at all. The per-account
+throttle in `services/reauth.ts` is the whole of what bounds it, which is why its check and
+its count are one synchronous step rather than a read either side of an `await`.
+
 A dev-only fake-user env var (`CONDUIT_DEV_USER`) stands in for the header when running off-YunoHost.
-It hard-fails at boot when `NODE_ENV=production`.
+It hard-fails at boot when `NODE_ENV=production`. **7.6 added a second variable of exactly
+this kind and with exactly this guard**: `CONDUIT_REAUTH_PASSWORD` replaces the portal bind
+with a fixed value so the re-authentication gate can be exercised on a machine with no
+YunoHost portal, and `parseConfig` refuses to boot with it set in production for the same
+reason. They are a family of two now, not a single flag.
 
 ### Subpath support
 

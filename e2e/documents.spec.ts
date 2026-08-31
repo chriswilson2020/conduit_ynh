@@ -917,7 +917,11 @@ test.describe("The line-item editor on a phone", () => {
     // no thumb can pan it, which is why the `overflowX` line below is kept. That one
     // is failable -- it is the only surviving claim about what kind of box this is.
     const nav = page.getByTestId("settings-nav");
-    for (const name of ["Mail accounts", "Templates", "Organisation"]) {
+    // "Export and backup" is 7.6's fourth tab, added to this list rather than
+    // left out of it: it is the same styled Link as the other three and carries
+    // the same 44px floor, and a new control that nothing holds to the floor is
+    // how the floor stops being true.
+    for (const name of ["Mail accounts", "Templates", "Organisation", "Export and backup"]) {
       await expectTouchTarget(nav.getByRole("link", { name, exact: true }));
     }
     const navOverflowX = await nav.evaluate((element) => getComputedStyle(element).overflowX);

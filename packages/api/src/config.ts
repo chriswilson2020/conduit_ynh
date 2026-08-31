@@ -26,6 +26,20 @@ const envSchema = z.object({
   // a boolean coercion so that a typo ("true", "yes") fails SAFE: only the
   // exact string "0" disables verification.
   MAIL_TLS_REJECT_UNAUTHORIZED: z.string().default("1"),
+  // Where YunoHost's portal API listens. 7.6's two downloads re-check the
+  // operator's password against it (services/reauth.ts), and the default is
+  // where every YunoHost 12 box puts it -- measured on the deploy target:
+  // /etc/nginx/conf.d/yunohost_api.conf.inc proxies /yunohost/portalapi/ to
+  // 127.0.0.1:6788. Configurable rather than hard-coded because a test needs
+  // to point it somewhere else, not because a deployment is expected to.
+  CONDUIT_PORTAL_API_URL: z.url().default("http://127.0.0.1:6788"),
+  // A FIXED PASSWORD FOR THE RE-AUTHENTICATION GATE, FOR DEVELOPMENT AND CI
+  // ONLY, refused below when NODE_ENV=production exactly as CONDUIT_DEV_USER
+  // is. Neither a developer's machine nor a GitHub runner has a YunoHost
+  // portal to bind against, and a gate that can only be exercised on the
+  // deploy target is a gate nobody ever proves -- including the half that
+  // matters most, that bypassing it fails.
+  CONDUIT_REAUTH_PASSWORD: z.string().min(1).optional(),
 });
 
 export interface Config {
@@ -45,6 +59,11 @@ export interface Config {
   /** Whether the IMAP/SMTP adapters verify server certificates. False only in
    * CI (MAIL_TLS_REJECT_UNAUTHORIZED=0), never in a real deployment. */
   mailTlsRejectUnauthorized: boolean;
+  /** YunoHost's portal API, which 7.6's re-authentication gate binds against. */
+  portalApiUrl: string;
+  /** A fixed re-authentication password. Never set in production; see the
+   * schema entry and the guard in parseConfig. */
+  reauthPassword: string | null;
 }
 
 export function parseConfig(env: Record<string, string | undefined>): Config {
@@ -69,6 +88,20 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     );
   }
 
+  // The same guard, one line down, for the same class of variable and with the
+  // same caveat: it only fires when NODE_ENV is exactly "production", so the
+  // systemd unit and the .env template remain responsible for setting it. A
+  // deployment that shipped this one set would answer the re-authentication
+  // gate with a constant instead of the operator's real password -- which is
+  // the gate turned off while still appearing to be there, the worst of the
+  // three possible states.
+  if (value.NODE_ENV === "production" && value.CONDUIT_REAUTH_PASSWORD !== undefined) {
+    throw new Error(
+      "CONDUIT_REAUTH_PASSWORD must not be set when NODE_ENV=production: "
+      + "it replaces the re-authentication check with a fixed value",
+    );
+  }
+
   return {
     nodeEnv: value.NODE_ENV,
     port: value.PORT,
@@ -80,5 +113,7 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     defaultCurrency: value.DEFAULT_CURRENCY,
     mailKeyPath: value.MAIL_KEY_PATH ?? path.join(value.DATA_DIR, "mail.key"),
     mailTlsRejectUnauthorized: value.MAIL_TLS_REJECT_UNAUTHORIZED !== "0",
+    portalApiUrl: value.CONDUIT_PORTAL_API_URL,
+    reauthPassword: value.CONDUIT_REAUTH_PASSWORD ?? null,
   };
 }

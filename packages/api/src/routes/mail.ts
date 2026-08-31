@@ -541,7 +541,7 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * on its account's serial sync loop, so this request waits for the mail
    * server, and an account halfway through a first backfill can make that wait
    * minutes (see moveThreads' own note). The deployed ceiling is concrete:
-   * conf/nginx.conf sets `proxy_read_timeout 300`, so five minutes is where
+   * conf/nginx.conf sets `proxy_read_timeout 300` for this route (7.6 gave the backup route a location of its own at 3600; every other route, this one included, keeps the 300), so five minutes is where
    * this app's own reverse proxy gives up on the response -- while the loop
    * carries on regardless, because nothing about a client disconnecting
    * cancels queued work. If the answer is lost that way the work still lands,

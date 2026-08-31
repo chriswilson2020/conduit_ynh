@@ -10,6 +10,11 @@ import { registerCrmRoutes } from "./routes/index.js";
 import { createSmtpTransportFactory } from "./services/mail-imapflow.js";
 import type { SendMailTransportFactory } from "./services/mail-send.js";
 import type { MailRouteSyncManager } from "./routes/mail.js";
+import {
+  ReauthTickets, ReauthThrottle,
+  createPortalVerifier, createFixedPasswordVerifier,
+} from "./services/reauth.js";
+import type { ReauthVerifier } from "./services/reauth.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -43,13 +48,46 @@ export interface BuildAppOptions {
     syncManager: () => MailRouteSyncManager | null;
     transportFactory: SendMailTransportFactory;
   };
+  /**
+   * Test-only sink for the request log, so a test can read what was written
+   * rather than assume it. It exists for ONE assertion -- that POST /api/backup
+   * never writes the passphrase anywhere -- and that assertion cannot be made
+   * against the suite's usual apps, because logging is off entirely under
+   * NODE_ENV=test. "The logger is disabled" is not a proof that a secret is
+   * absent from it.
+   *
+   * Ignored when logging is off, which is every other test. Never set outside
+   * a test, same as multipartFileSizeLimit above.
+   */
+  loggerStream?: { write: (line: string) => void };
+  /**
+   * How 7.6's re-authentication gate checks a password.
+   *
+   * Optional, and the fallback is built from config the same way
+   * transportFactory's is -- CONDUIT_REAUTH_PASSWORD when it is set (dev and
+   * CI only; config.ts refuses it in production), otherwise a real bind
+   * against YunoHost's portal API. A test that wants to drive the gate passes
+   * a function; a test that never touches a download passes nothing and gets
+   * a verifier it never calls.
+   *
+   * IT IS NEVER A `() => true` DEFAULT. A seam whose default answer is "yes"
+   * would make every test that forgot to set it pass a gate that is not
+   * there, which is the shape of the vacuous assertion this project keeps
+   * finding.
+   */
+  reauthVerifier?: ReauthVerifier;
 }
 
 export async function buildApp(
-  { config, db, dataDir = "./data", webRoot, multipartFileSizeLimit, mail }: BuildAppOptions,
+  {
+    config, db, dataDir = "./data", webRoot, multipartFileSizeLimit, mail, loggerStream,
+    reauthVerifier,
+  }: BuildAppOptions,
 ): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: config.nodeEnv === "test" ? false : { level: "info" },
+    logger: config.nodeEnv === "test"
+      ? false
+      : { level: "info", ...(loggerStream === undefined ? {} : { stream: loggerStream }) },
     // 1, not true: the app binds to loopback and is reachable through exactly one
     // hop, YunoHost's nginx. trustProxy: 1 trusts only that single nearest hop's
     // X-Forwarded-* headers. trustProxy: true would trust an unbounded chain,
@@ -145,11 +183,25 @@ export async function buildApp(
 
   await registerCrmRoutes(app, {
     db, dataDir, multipartFileSizeLimit,
-    defaultCurrency: config.defaultCurrency,
+    defaultCurrency: config.defaultCurrency, appVersion: config.version,
     basePath: config.basePath, mailKeyPath: config.mailKeyPath,
+    databaseUrl: config.databaseUrl,
     syncManager: mail?.syncManager ?? (() => null),
     transportFactory: mail?.transportFactory
       ?? createSmtpTransportFactory({ rejectUnauthorized: config.mailTlsRejectUnauthorized }),
+    reauthVerifier: reauthVerifier ?? (
+      config.reauthPassword === null
+        ? createPortalVerifier(config.portalApiUrl)
+        : createFixedPasswordVerifier(config.reauthPassword)
+    ),
+    // ONE INSTANCE EACH, PER APP, and that is what makes the gate work at all:
+    // the ticket POST /api/reauth mints has to be the ticket the export and
+    // backup routes look up, and the throttle has to remember across requests.
+    // Building them inside registerCrmRoutes would be one per registration,
+    // which is the same thing here and would stop being so the moment anything
+    // registered the routes twice.
+    reauthTickets: new ReauthTickets(),
+    reauthThrottle: new ReauthThrottle(),
   });
 
   if (webRoot === undefined) {

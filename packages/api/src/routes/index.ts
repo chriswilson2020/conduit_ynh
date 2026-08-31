@@ -19,6 +19,10 @@ import { registerGanttRoutes } from "./gantt.js";
 import { registerMailRoutes } from "./mail.js";
 import { registerMeetingRoutes } from "./meetings.js";
 import { registerDocumentRoutes } from "./documents.js";
+import { registerExportRoutes } from "./export.js";
+import { registerBackupRoutes } from "./backup.js";
+import { registerReauthRoutes } from "./reauth.js";
+import type { ReauthTickets, ReauthThrottle, ReauthVerifier } from "../services/reauth.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -38,6 +42,13 @@ export interface CrmRouteDeps {
    * threaded straight from config.defaultCurrency (see config.ts). */
   defaultCurrency: string;
   /**
+   * The running app's version, threaded straight from config.version
+   * (APP_VERSION). Recorded in the manifest.json of BOTH 7.6 archives -- the
+   * export's and the backup's -- so an archive found on a disk in two years
+   * says which Conduit wrote it. See services/export.ts and services/backup.ts.
+   */
+  appVersion: string;
+  /**
    * Public path this app is mounted at, without a trailing slash ("/" for a
    * root deployment) -- config.basePath, threaded straight through.
    * routes/mail.ts resolves stored `mailattachment:` placeholders against it
@@ -47,8 +58,20 @@ export interface CrmRouteDeps {
    */
   basePath: string;
   /** Threaded straight from config.mailKeyPath (see config.ts) for
-   * routes/mail.ts to pass into mail-accounts.ts's service calls. */
+   * routes/mail.ts to pass into mail-accounts.ts's service calls, and for
+   * routes/backup.ts, which archives the key file itself -- a backup without
+   * it restores an install that cannot decrypt a single mail password. */
   mailKeyPath: string;
+  /**
+   * config.databaseUrl, threaded straight through for routes/backup.ts to hand
+   * to pg_dump. THE ONLY CONSUMER, and the only one that should be: every
+   * other route talks to the database through `db`, which is the pool built
+   * from this string at the composition root. This is here because pg_dump is
+   * a separate process that has to be told where to connect, and
+   * services/backup.ts splits it into libpq environment variables rather than
+   * passing it on a command line where the password would be world-readable.
+   */
+  databaseUrl: string;
   /**
    * The live sync engine, fetched at REQUEST time rather than captured at
    * registration time -- routes are registered while the HTTP server is still
@@ -69,13 +92,39 @@ export interface CrmRouteDeps {
    * mail-imapflow.ts's createSmtpTransportFactory.
    */
   transportFactory: SendMailTransportFactory;
+  /**
+   * How a password is checked, supplied by the composition root the same way
+   * transportFactory is -- production binds against YunoHost's portal API,
+   * a test hands in a function. See services/reauth.ts for why 7.6's two
+   * downloads need this at all.
+   */
+  reauthVerifier: ReauthVerifier;
+  /**
+   * The outstanding single-use tickets a successful check mints. ONE INSTANCE
+   * PER APP, which is what makes a ticket issued by POST /api/reauth
+   * redeemable by the export and backup routes: three modules, one map.
+   */
+  reauthTickets: ReauthTickets;
+  /**
+   * The wrong-password counter. Also one instance per app, and also not
+   * optional: nothing upstream throttles these (see ReauthThrottle), so
+   * without it /api/reauth would be an unmetered guessing oracle for the
+   * server's own account password.
+   */
+  reauthThrottle: ReauthThrottle;
 }
 
 /**
  * Wires the hardened CRM/PM services (plus the plain user listing) into HTTP:
  * companies, contacts, notes, files, events, search, pipelines/deals (Phase
- * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5), and
- * documents plus the issuer profile (Phase 7).
+ * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5),
+ * documents plus the issuer profile (Phase 7), and the data export, the
+ * encrypted backup, its pre-flight and the re-authentication that gates both
+ * downloads (Phase 7.6).
+ *
+ * THIS LIST IS EXHAUSTIVE BY CONSTRUCTION -- it is the register calls below,
+ * in words -- so a family added without a line here is a list that has started
+ * lying. The re-auth family was exactly that until a review found it.
  * Registered after /api/health and /api/me and before the not-found/SPA branch,
  * so it inherits the same onRequest auth hook without having to repeat it.
  *
@@ -107,4 +156,7 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerMailRoutes(app, deps);
   registerMeetingRoutes(app, deps);
   registerDocumentRoutes(app, deps);
+  registerExportRoutes(app, deps);
+  registerBackupRoutes(app, deps);
+  registerReauthRoutes(app, deps);
 }

@@ -29,20 +29,25 @@ cp -R "$ROOT/packages/web/dist/." "$STAGE/web/"
 
 # --- @conduit/shared resolution -------------------------------------------
 #
-# packages/api/src currently imports @conduit/shared only with `import type`,
-# which verbatimModuleSyntax erases completely from the compiled output --
-# building the workspace and grepping dist/*.js confirms there is today no
-# "@conduit/shared" specifier left in any runtime .js file, only in the .d.ts
-# files Node never loads. So, strictly, nothing needs to resolve at runtime
-# right now.
+# packages/api/src imports VALUES from @conduit/shared, so the specifier has to
+# resolve at runtime -- `grep -c "@conduit/shared" packages/api/dist/**/*.js`
+# finds it in the compiled output, most recently in dist/services/export.js,
+# which imports decimalFromCents.
 #
-# Relying on that is a trap, though: the moment someone imports a *value* from
-# @conduit/shared (e.g. one of its zod schemas, to validate a response body
-# instead of just typing it), the compiled runtime code needs the specifier to
-# resolve. Dev would keep working fine (npm workspace symlink), and only the
-# packaged tarball would break -- silently, with no compile-time signal that
-# packaging was affected. So this script makes "@conduit/shared" resolve
-# unconditionally, rather than betting on the current import shape.
+# THIS PARAGRAPH USED TO SAY THE OPPOSITE, and the day it stopped being true is
+# the day this arrangement started earning its keep. It read: "packages/api/src
+# currently imports @conduit/shared only with `import type`, which
+# verbatimModuleSyntax erases completely from the compiled output ... So,
+# strictly, nothing needs to resolve at runtime right now" -- with the next
+# paragraph explaining that relying on that would be a trap, because the moment
+# someone imports a value the packaged tarball breaks silently with no
+# compile-time signal. That is exactly what happened, in Phase 2 and in most
+# phases since; nothing broke, because this script never took the bet. The claim
+# went stale years of commits ago and no symbol grep could have seen it, which
+# is why it is corrected here rather than left as a curiosity.
+#
+# So this script makes "@conduit/shared" resolve unconditionally, rather than
+# betting on any particular import shape.
 #
 # Approach taken: vendor the compiled shared package as a real `file:`
 # dependency instead of a bare directory copy. server/shared gets its own

@@ -1,10 +1,54 @@
 import { describe, expect, it } from "vitest";
-import { formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE } from "./money-format.js";
+import {
+  decimalFromCents, formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE,
+} from "./money-format.js";
 
 // The currency SYMBOLS are deliberately not asserted: they are non-ASCII, this
 // repo's sources are ASCII-only, and the symbol is not what was ever in doubt.
 // What is asserted is the part `undefined` was getting wrong -- the grouping and
 // decimal separators, which is exactly where en-GB and nl-NL disagree.
+// Exported in v1.3.0 for the CSV export, which needs the decimal and not the
+// formatted currency string. It was private before, so its behaviour was only
+// ever asserted through formatMoneyCents' output -- which is exactly the kind of
+// coverage that disappears when a caller stops going through the formatter.
+describe("decimalFromCents", () => {
+  it("builds the exact decimal, with two places, either sign", () => {
+    expect(decimalFromCents(1250)).toBe("12.50");
+    expect(decimalFromCents(-1250)).toBe("-12.50");
+    expect(decimalFromCents(0)).toBe("0.00");
+    expect(decimalFromCents(5)).toBe("0.05");
+    expect(decimalFromCents(-5)).toBe("-0.05");
+    expect(decimalFromCents(100)).toBe("1.00");
+  });
+
+  // NEITHER a separator NOR a symbol, which is the whole reason a CSV cell
+  // cannot use formatMoneyCents: a spreadsheet parses `1234.56` as a number and
+  // `1,234.56` as text.
+  it("has no grouping separator and no currency symbol", () => {
+    expect(decimalFromCents(123_456_789)).toBe("1234567.89");
+    expect(decimalFromCents(123_456_789)).not.toContain(",");
+  });
+
+  // THE REASON IT IS BigInt. At this magnitude `cents / 100` in double precision
+  // loses the last digit, and the money columns of an export are read by an
+  // accountant.
+  it("keeps a digit that dividing by 100 in double precision loses", () => {
+    expect(decimalFromCents(9_007_199_254_740_991)).toBe("90071992547409.91");
+    expect(String(9_007_199_254_740_991 / 100)).toBe("90071992547409.9");
+  });
+
+  it("stays exact past the safe integer range, where BigInt still reads the value", () => {
+    expect(decimalFromCents(1e21)).toBe("10000000000000000000.00");
+  });
+
+  // The precondition, stated in the doc comment and pinned here: formatMoneyCents
+  // guards with Number.isSafeInteger before calling, because ITS contract is that
+  // it never throws. This one has no such contract and must not pretend to.
+  it("throws on a fractional input rather than inventing a rounding", () => {
+    expect(() => decimalFromCents(12.5)).toThrow();
+  });
+});
+
 describe("formatMoneyCents", () => {
   it("formats whole and part cents in the shared locale", () => {
     expect(formatMoneyCents(1_100_000, "EUR")).toContain("11,000.00");

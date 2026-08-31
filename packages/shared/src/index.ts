@@ -11,7 +11,17 @@ export type { LineInput, DocumentTotals } from "./money.js";
 // Formatting is a separate module from the arithmetic, and reaches web the same
 // way: the one locale every money figure in the app is rendered in, so the
 // quote form and the PDF beside it cannot disagree.
-export { formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE } from "./money-format.js";
+// decimalFromCents rides along for the CSV export (services/export.ts), which
+// needs the bare decimal and not the formatted currency string -- see its own
+// comment for why a spreadsheet cell must have neither symbol nor separator.
+export {
+  decimalFromCents, formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE,
+} from "./money-format.js";
+// 7.6's backup passphrase rule, reaching web the same way and for the same
+// reason the money helpers do: the Settings page refuses a passphrase before it
+// is sent and services/backup.ts refuses one that arrives anyway, and those two
+// refusals have to be the same sentence rather than two that agree today.
+export { MAX_PASSPHRASE_LENGTH, passphraseProblem } from "./passphrase.js";
 
 export const userSchema = z.object({
   id: z.uuid(),
@@ -3046,3 +3056,47 @@ export const documentTemplateInputSchema = z.object({
   bodyHtml: documentText(MAX_TEMPLATE_BYTES * 4, 1),
 });
 export type DocumentTemplateInput = z.infer<typeof documentTemplateInputSchema>;
+
+/**
+ * POST /api/reauth's answer: a single-use ticket for one download.
+ *
+ * NOTHING ABOUT THE USER IS IN IT. The ticket is opaque -- 32 random bytes as
+ * hex -- and the server remembers which account it belongs to; a client that
+ * could read an identity out of it would be a client somebody would eventually
+ * trust to.
+ */
+export const reauthTicketSchema = z.object({
+  ticket: z.string().min(1),
+  expiresInSeconds: z.number().int().positive(),
+});
+export type ReauthTicket = z.infer<typeof reauthTicketSchema>;
+
+/**
+ * GET /api/backup/preflight's answer: what a backup would cost, before one is
+ * started.
+ *
+ * IT EXISTS BECAUSE THE BACKUP CANNOT STREAM. The whole archive is built before
+ * the first byte of the response, so the wait is invisible from the browser and
+ * a proxy that gives up on it produces a 504 with nothing to show. Chris ruled
+ * on 31 Aug for both halves of the answer: nginx's read timeout is raised for
+ * that one route (conf/nginx.conf), and this is what lets the page say how long
+ * it will take BEFORE somebody commits to waiting.
+ *
+ * `estimatedSeconds` is a prediction from a rate measured on the deploy target,
+ * not a promise -- see BACKUP_BYTES_PER_SECOND in the API's backup service for
+ * what it is made of and how wrong it is allowed to be.
+ */
+export const backupPreflightSchema = z.object({
+  databaseBytes: z.number().int().nonnegative(),
+  blobBytes: z.number().int().nonnegative(),
+  requiredBytes: z.number().nonnegative(),
+  enoughDisk: z.boolean(),
+  // How much MORE space is needed than there is, and 0 when there is enough.
+  // The server's free disk is deliberately NOT here: this route answers
+  // without a password, so everything in it is readable by any session holder.
+  shortfallBytes: z.number().nonnegative(),
+  estimatedSeconds: z.number().int().nonnegative(),
+  slow: z.boolean(),
+  timeoutSeconds: z.number().int().positive(),
+});
+export type BackupPreflight = z.infer<typeof backupPreflightSchema>;

@@ -79,19 +79,42 @@ jobs:
       # service containers are created before the workspace is checked out.
       - name: Start Dovecot
         run: .github/scripts/start-dovecot.sh
-      # The gate on packages/api/src/services/documents-render.test.ts: without the
-      # binary its render half skips, so this step is what makes CI the place the
-      # PDF path is actually proved. The package list matches manifest.toml's
+      # The gate on packages/api/src/services/documents-render.test.ts and on the
+      # three backup suites: without these binaries those tests skip, so this
+      # step is what makes CI the place the PDF path and the encrypted backup
+      # are actually proved. The package list matches manifest.toml's
       # resources.apt (minus postgresql, which is a service container here) so CI
       # exercises the same dependency resolution the server will -- see that file
       # for why python3-munkres is named. DEBIAN_FRONTEND because an apt-get that
       # tries to prompt on a runner hangs until the job's timeout rather than
       # failing (the e2e job's Playwright step carries the scar).
-      - name: Install WeasyPrint
+      #
+      # p7zip-full ARRIVED WITH 7.6 TASK 2, and it closes a claim this comment
+      # was already making and no longer keeping: the package was added to
+      # manifest.toml in v1.2.1, ahead of the feature, and this list did not
+      # follow it. Every test that opens a real encrypted archive was skipping
+      # here as a result.
+      - name: Install WeasyPrint and 7-Zip
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-munkres weasyprint
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y p7zip-full python3-munkres weasyprint
           weasyprint --version
+      # THE BINARY'S PRESENCE IS NOT THE REQUIREMENT; ITS BEHAVIOUR IS, and the
+      # runner's p7zip is not the same build as the server's (Debian 12 ships
+      # 16.02+really26.02, i.e. 7-Zip 26.02's sources under the old name). Two
+      # properties the backup depends on are checked here rather than left to
+      # surface as a puzzling test failure: that a passphrase piped to `-p` on
+      # STDIN is the passphrase the archive ends up with -- Conduit never puts
+      # one in argv, where /proc/<pid>/cmdline is world-readable -- and that
+      # -mhe=on gives 7zAES:19, the 2^19 = 524,288 iterations the whole format
+      # choice rests on.
+      - name: Check 7z can be driven the way the backup drives it
+        run: |
+          7z i | head -3
+          mkdir -p /tmp/7zcheck && echo hello > /tmp/7zcheck/a.txt
+          printf 'pw' | 7z a -t7z -p -mhe=on -mx=1 -bd -y -- /tmp/7zcheck/out.7z /tmp/7zcheck/a.txt
+          7z t -ppw -- /tmp/7zcheck/out.7z
+          7z l -slt -ppw -- /tmp/7zcheck/out.7z | grep -q '7zAES:19'
       - name: Install dependencies
         run: npm ci
       # Protocol-level, not TCP-level: `docker run -p` publishes through a
@@ -206,11 +229,31 @@ jobs:
       # 89MB. DEBIAN_FRONTEND because an apt-get that tries to prompt on a runner
       # hangs until the job's timeout rather than failing (this job's Playwright step
       # carries that scar).
-      - name: Install WeasyPrint
+      #
+      # p7zip-full ARRIVED WITH 7.6 TASK 3, and the gap it closes is the mirror
+      # of the one Task 2 found in the other job. Task 2 added the package to the
+      # `test` job only, because that was where a test opened an archive. Task 3
+      # made e2e/data.spec.ts download a real backup from the page and open it
+      # with the passphrase that was typed into the form -- which spawns 7z
+      # inside the request. Without the package here that journey fails on a
+      # missing binary, and the one thing only an e2e run can say about this
+      # feature would say nothing.
+      - name: Install WeasyPrint and 7-Zip
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-munkres weasyprint
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y p7zip-full python3-munkres weasyprint
           weasyprint --version
+          7z i | head -3
+      # pg_dump IS THE BACKUP'S OTHER BINARY, and unlike 7z it is not installed
+      # here by name -- ubuntu-latest ships PostgreSQL's client tools. Asserted
+      # rather than assumed, because buildBackup refuses to start when pg_dump is
+      # OLDER than the server (postgres:15 in the service container above), and a
+      # runner image that dropped or downgraded it would turn the backup journey
+      # into a puzzling 503 rather than a missing dependency.
+      - name: Check pg_dump is present and new enough for the service container
+        run: |
+          pg_dump --version
+          test "$(pg_dump --version | grep -oE '[0-9]+' | head -1)" -ge 15
       - name: Install dependencies
         run: npm ci
       # Browser binary only. NOT --with-deps: that shells out to apt-get, which

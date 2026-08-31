@@ -15,6 +15,7 @@ import { MyTasksPage } from "./pages/my-tasks";
 import { PipelinesPage } from "./pages/pipelines";
 import { ProjectsPage } from "./pages/projects";
 import { ProjectDetailPage } from "./pages/project-detail";
+import { SettingsDataPage } from "./pages/settings-data";
 import { SettingsMailPage } from "./pages/settings-mail";
 import { SettingsOrgPage } from "./pages/settings-org";
 import { SettingsTemplatesPage } from "./pages/settings-templates";
@@ -180,6 +181,16 @@ const settingsOrgRoute = createRoute({
   component: SettingsOrgPage,
 });
 
+// Phase 7.6: the two downloads, and the page whose job is to stop them being
+// confused for each other. A fourth sibling under /settings for the same reason
+// the other three are siblings -- it has its own URL, and "send me the export
+// page" has to be a link somebody can follow.
+const settingsDataRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/data",
+  component: SettingsDataPage,
+});
+
 // Rendered by the router itself (not a route) whenever the URL matches no
 // route in the tree -- a stale bookmark or a mistyped path. It renders as the
 // root route's Outlet content, i.e. inside Shell, so the sidebar/header stay
@@ -229,6 +240,7 @@ const routeTree = rootRoute.addChildren([
   settingsMailRoute,
   settingsTemplatesRoute,
   settingsOrgRoute,
+  settingsDataRoute,
 ]);
 
 // basePath() returns "/" both at a root install and during `vite dev` (see its
