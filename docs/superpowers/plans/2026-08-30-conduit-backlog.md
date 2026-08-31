@@ -19,7 +19,7 @@ scope Chris decided on 31 Aug and which is recorded below. The order after that 
 |---|---|---|
 | ~~**7.5 → v1.2.0**~~ | Keyboard-operable rows, the composer's focus, focus after a dialog closes, the `mail-sync` intermittent, and the touch floors folded in as Task 4b | **SHIPPED 30 Aug** |
 | ~~**v1.2.1**~~ | The reply signature, the Mail tab composing to nobody, the GIF undercharge Chris moved in, and the first deliberate sweep for assertions that cannot fail | **SHIPPED 31 Aug** |
-| **v1.2.2** | TWO items, both decided by Chris on 31 Aug: remove the MAIL template feature entirely (table included; the QUOTE template stays), and give the five lists with no loading branch the branch their siblings have -- see "v1.2.2 scope" below | Decided, not specced |
+| **v1.2.2** | THREE items, all decided by Chris on 31 Aug: remove the MAIL template feature entirely (table included; the QUOTE template stays); give the five lists with no loading branch the branch their siblings have; and **diagnose the Dovecot IDLE burst -- report and stop, no fix**. See "v1.2.2 scope" below. **Item 3 can reorder the other two**, and 7.6, if the answer is that the app can lose mail | Decided, not specced |
 | **7.6 → v1.3.0** | Export and encrypted backup, downloadable from Settings | Specced, not started. **Queued behind v1.2.2** |
 | **7.7** | Restore and import, with its decisions already recorded in 7.6's spec | Decided, not specced |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
@@ -128,13 +128,18 @@ in the app that land anywhere, while row links remain the commoner path to the s
 
 ---
 
-## v1.2.2 scope -- two items. Chris's decisions, 31 Aug
+## v1.2.2 scope -- three items. Chris's decisions, 31 Aug
 
 **Order: v1.2.1 (shipped) -> v1.2.2 -> Phase 7.6.**
 
 1. **Remove the MAIL template feature entirely**, table included. The QUOTE template stays.
 2. **The five lists that render their empty label with no loading branch.** Filed by v1.2.1
    Task 5's sweep, moved into scope by Chris.
+3. **Determine whether the Dovecot IDLE burst is a test defect or a real hole in mail sync.
+   DIAGNOSTIC ONLY -- report and STOP. Do not fix.**
+
+**ITEM 3 CAN REORDER THE OTHER TWO.** If the answer is that the app can lose messages, it
+jumps ahead of both. That is why it is worth doing first even though it produces no code.
 
 ---
 
@@ -231,6 +236,68 @@ SITE, not the file: `DependenciesSection` takes only `data` from `useTaskDepende
 makes `task-drawer.tsx` a second file that does it both ways, alongside `company-detail.tsx`
 -- which strengthens the argument rather than weakening it. Only `rail/notes.tsx` and
 `rail/files.tsx` need the flag introducing to a file that has never used one.
+
+---
+
+## v1.2.2, item 3 -- CAN CONDUIT FETCH ONLY SOME OF A BATCH OF NEW MAIL AND NEVER COME BACK FOR THE REST?
+
+**DIAGNOSTIC ONLY. The deliverable is an answer with evidence, not a repair. REPORT AND
+STOP.** Chris, verbatim: *"test it but before spending a crap ton of tokens report back what
+you find and we can decide together the next steps."* That stop is written into this entry on
+purpose, because the natural drift from "I have found it" to "I have fixed it" is exactly what
+must not happen here -- he decides what follows.
+
+**FRAME IT AS THE QUESTION, NOT AS THE FLAKE.** The `mail-integration.test.ts` Dovecot IDLE
+burst is how this surfaced, and it is tempting to treat it as a flaky test to be stabilised.
+It may not be one. The open question is about the PRODUCT:
+
+> Can Conduit fetch part of a batch of newly-delivered messages, report success, and never
+> come back for the remainder?
+
+If it can, that is a serious defect: **messages sitting on the server that never appear in
+the app, with nothing to tell the operator anything is missing.** A CRM that silently drops
+mail is worse than one that fails loudly. If instead it is the test's view of the IMAP server
+lagging behind the delivery, it is a test fix and stays where intermittent 2 already is.
+
+**WHAT TASK 4 ESTABLISHED, AND WHY THAT MAKES THIS ANSWERABLE NOW.**
+
+- **4 events in 177 attempts, about 1 CI attempt in 44** -- a real rate rather than an
+  impression, and a true per-attempt one because vitest sets no retries.
+- **Every one of the four showed a PARTIAL view: 11, 16, 17 and 11 of the 20 messages. Never
+  0, and never a wedged wait.** That is the shape that makes this a product question. A lost
+  wake would look like 0; a hung connection would look like a timeout. Seeing most-but-not-all
+  is what both candidate causes produce.
+- **TWO OF THE FOUR HAD BEEN RE-RUN INTO INVISIBILITY**, which is why nobody had a number
+  before. `gh run list` reports a workflow's LATEST attempt only, so a failed first attempt
+  under a green second one vanishes from the run list.
+
+**THE TWO CAUSES PRODUCE THE SAME SIGNATURE, AND THE EXISTING LOGS PROVABLY CANNOT SEPARATE
+THEM.** `walkToEnd` stops as soon as one `fetchNewer` returns fewer than the batch size, on
+the idler's own connection, the instant the wake settles. Both of these end the walk early
+with a partial count:
+
+| candidate | what it would mean |
+|---|---|
+| the IMAP connection's view is lagging the delivery | a test-side wait; the app would catch the rest on the next pass |
+| `fetchNewer` has a genuine hole | a product defect: the walk ends and nothing returns for the remainder |
+
+**So the first deliverable is INSTRUMENTATION that distinguishes them** -- what the server
+reported existing at each step against what the walk actually fetched, and critically
+**whether a later pass ever collects the missing messages**. That last one is close to the
+whole question: a lagging view is self-healing, a hole is not.
+
+**Do not change behaviour while measuring.** Any fix applied before the cause is known will
+make the rate unmeasurable and the question unanswerable.
+
+**Ordering consequence, stated so it is not missed:** if the answer is "the app can lose
+messages", **this jumps ahead of items 1 and 2** and probably ahead of 7.6 as well. If the
+answer is "the test's view lags", it goes back to being intermittent 2 with a recommendation
+to schedule a test fix.
+
+**A WARNING FOR WHOEVER RE-MEASURES THE RATE: COUNT ATTEMPTS, NOT RUNS.** Doing otherwise
+halves the figure, which has already happened once -- "once in 22 runs on the v1.2.0 branch,
+and once on `a15e6f6`" was **one event described twice**, and it was the number this project
+believed until Task 4 read the attempts.
 
 ---
 
@@ -677,6 +744,12 @@ attempts, not runs.
    and a real hole in `fetchNewer` both produce exactly this shape, and the logs cannot
    separate them. **Which of the two it is has to be measured before anything is changed** --
    the second would be a product defect in the sync loop, not a test-side wait.
+
+   **SCHEDULED AS v1.2.2 ITEM 3, and framed there as the product question rather than as this
+   flake: can Conduit fetch part of a batch of new mail and never come back for the rest?**
+   That item is DIAGNOSTIC ONLY -- instrument, report, stop -- and if the answer is yes it
+   reorders the rest of v1.2.2. Do not "stabilise" this test in the meantime: a change to
+   behaviour before the cause is known makes the question unanswerable.
 
    **Why it is worth scheduling rather than watching.** At 4 in 177 a branch of 14 pushes has
    a **27%** chance of going red at least once, and it takes about 30 pushes to reach even
