@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { eq } from "drizzle-orm";
 import yazl from "yazl";
 import { decimalFromCents } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { migrationsFolder } from "../db/client.js";
+import { readMigrationJournal } from "./migration-journal.js";
 import {
   companies, contacts, deals, documents, files, meetingAttendees, meetings,
   notes, pipelines, projects, stages, tasks, users,
@@ -785,12 +785,13 @@ function filesSheet(exportFiles: readonly ExportFile[]): Sheet {
  * The migration journal position, read from the same folder runMigrations
  * applies from -- so it names the migration set this build ships, which is what
  * the columns above were compiled against.
+ *
+ * The parse itself moved to services/migration-journal.ts when the backup
+ * became its second consumer; only the tag is recorded here, because a CSV
+ * reader has nothing to do with the ordinal.
  */
 async function schemaVersion(): Promise<string> {
-  const journalPath = path.join(migrationsFolder(), "meta", "_journal.json");
-  const journal = JSON.parse(await readFile(journalPath, "utf8")) as { entries?: { tag?: string }[] };
-  const entries = journal.entries ?? [];
-  return entries[entries.length - 1]?.tag ?? "unknown";
+  return (await readMigrationJournal()).tag;
 }
 
 /**

@@ -20,6 +20,7 @@ import { registerMailRoutes } from "./mail.js";
 import { registerMeetingRoutes } from "./meetings.js";
 import { registerDocumentRoutes } from "./documents.js";
 import { registerExportRoutes } from "./export.js";
+import { registerBackupRoutes } from "./backup.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -40,9 +41,9 @@ export interface CrmRouteDeps {
   defaultCurrency: string;
   /**
    * The running app's version, threaded straight from config.version
-   * (APP_VERSION). Recorded in the export's manifest.json so an archive found
-   * on a disk in two years says which Conduit wrote it -- see
-   * services/export.ts.
+   * (APP_VERSION). Recorded in the manifest.json of BOTH 7.6 archives -- the
+   * export's and the backup's -- so an archive found on a disk in two years
+   * says which Conduit wrote it. See services/export.ts and services/backup.ts.
    */
   appVersion: string;
   /**
@@ -55,8 +56,20 @@ export interface CrmRouteDeps {
    */
   basePath: string;
   /** Threaded straight from config.mailKeyPath (see config.ts) for
-   * routes/mail.ts to pass into mail-accounts.ts's service calls. */
+   * routes/mail.ts to pass into mail-accounts.ts's service calls, and for
+   * routes/backup.ts, which archives the key file itself -- a backup without
+   * it restores an install that cannot decrypt a single mail password. */
   mailKeyPath: string;
+  /**
+   * config.databaseUrl, threaded straight through for routes/backup.ts to hand
+   * to pg_dump. THE ONLY CONSUMER, and the only one that should be: every
+   * other route talks to the database through `db`, which is the pool built
+   * from this string at the composition root. This is here because pg_dump is
+   * a separate process that has to be told where to connect, and
+   * services/backup.ts splits it into libpq environment variables rather than
+   * passing it on a command line where the password would be world-readable.
+   */
+  databaseUrl: string;
   /**
    * The live sync engine, fetched at REQUEST time rather than captured at
    * registration time -- routes are registered while the HTTP server is still
@@ -83,7 +96,8 @@ export interface CrmRouteDeps {
  * Wires the hardened CRM/PM services (plus the plain user listing) into HTTP:
  * companies, contacts, notes, files, events, search, pipelines/deals (Phase
  * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5), and
- * documents plus the issuer profile (Phase 7), and the data export (Phase 7.6).
+ * documents plus the issuer profile (Phase 7), and the data export and
+ * encrypted backup (Phase 7.6).
  * Registered after /api/health and /api/me and before the not-found/SPA branch,
  * so it inherits the same onRequest auth hook without having to repeat it.
  *
@@ -116,4 +130,5 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerMeetingRoutes(app, deps);
   registerDocumentRoutes(app, deps);
   registerExportRoutes(app, deps);
+  registerBackupRoutes(app, deps);
 }

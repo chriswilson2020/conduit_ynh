@@ -1,0 +1,889 @@
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
+import { chmod, mkdtemp, readdir, rm, stat, statfs, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { sql } from "drizzle-orm";
+import type { Database } from "../db/client.js";
+import { readMigrationJournal } from "./migration-journal.js";
+
+// THE EXACT HALF (7.6 Task 2). Everything needed to reconstruct the install:
+// a pg_dump of the database, the whole blob store, mail.key, and a manifest.
+//
+// IT IS THE MIRROR IMAGE OF THE EXPORT, and every property is inverted. The
+// export is readable, not restorable, and carries no secrets; this is exact,
+// always encrypted, and carries EVERY secret in the system -- mail.key plus
+// every encrypted mail password plus every mail body. So the safety test
+// inverts with it: where export.test.ts proves the secrets are ABSENT, this
+// module's tests prove they are PRESENT. A backup that quietly omitted
+// mail.key would restore into an install that cannot decrypt a single mail
+// password, and nobody would find out until the day they needed it.
+//
+// WHY .7z AND NOT AN ENCRYPTED ZIP -- Chris's ruling, 31 Aug, and not
+// relitigated here. Two reasons, both measurable:
+//
+//   - .7z stretches the passphrase 2^19 = 524,288 times (SHA-256). The ZIP
+//     standard's AES stretches it 1,000. The passphrase is one a person types
+//     rather than one Conduit generates, so that 500x is the whole argument
+//     for an archive that will sit in a Downloads folder or a cloud drive.
+//     It is visible in the archive itself: `7z l -slt` reports the method as
+//     "7zAES:19", and backup.test.ts asserts exactly that string rather than
+//     trusting this comment.
+//   - -mhe=on encrypts the HEADERS, so the file NAMES are unreadable without
+//     the passphrase. Without it, an archive listing leaks that this install
+//     has a mail.key, how many blobs it holds and how big they are.
+//
+// The requirement the format serves is stronger than "encrypted": a backup
+// must be openable by DOUBLE-CLICKING IT AND TYPING THE PASSPHRASE. No
+// command line, no recipe. docs/backup-format.md names the three tools that
+// do that, and a test in backup.test.ts opens a real archive with 7z and
+// compares the contents, so the documentation cannot drift from the writer.
+//
+// WHAT IT COSTS, HANDLED HERE RATHER THAN DISCOVERED LATER: 7z cannot be
+// driven as a pipe. It seeks to write its headers, and with -mhe=on the
+// header block is only final once the archive is. So the backup builds to a
+// temp file and then streams it, and that temp file is a credential store on
+// disk -- see buildBackup for the discipline that follows from it.
+
+/**
+ * The layout version of the archive, bumped when a member is renamed or
+ * removed or the dump's flags change -- not when a field is added to the
+ * manifest, which every reader tolerates.
+ *
+ * 7.7's restore branches on this rather than guessing from what it finds.
+ */
+export const BACKUP_FORMAT_VERSION = 1;
+
+/**
+ * The apt package that provides /usr/bin/7z. Named in the failure message
+ * because "7z not found" tells an operator nothing they can act on, and this
+ * is the one dependency of the feature that an install can be missing.
+ */
+export const SEVEN_ZIP_PACKAGE = "p7zip-full";
+
+/** The apt package that provides pg_dump on the deploy target. */
+export const PG_DUMP_PACKAGE = "postgresql-client";
+
+/**
+ * THE COMPRESSION LEVEL, AND IT IS A MEASUREMENT RATHER THAN A DEFAULT.
+ *
+ * Measured on the deploy target (Debian 12, 2 CPUs, 3.8GB, NO SWAP) against
+ * 367MB of input -- 315MB of incompressible blobs plus a 52MB SQL dump, which
+ * is the shape a real install has:
+ *
+ *   level        time     archive bytes    peak RSS of 7z
+ *   -mx=0        1.0 s     367,002,306          9.4 MB
+ *   -mx=1       15.0 s     314,764,642         19.0 MB
+ *   default     42.0 s     314,920,274        393.6 MB
+ *
+ * -mx=1 BEATS THE DEFAULT ON EVERY AXIS, which is not the usual shape of a
+ * compression trade and is why it is written down. It is 2.8x faster, it uses
+ * 20x less memory, and the archive it produces is 155KB SMALLER -- the
+ * default's larger dictionary buys nothing on blobs that are already
+ * compressed and costs framing on them.
+ *
+ * The memory column is the one that decides it. 393MB in a second process on a
+ * 3.8GB box with no swap is the same ceiling the PDF renderer spent a release
+ * learning about, and it would be spent on 155KB. backup.test.ts samples the
+ * CHILD's resident set from /proc and asserts a ceiling that the default level
+ * fails -- so this constant is guarded by an instrument, not by this comment.
+ *
+ * -mx=0 is not chosen despite being 15x faster: the 52MB of dump it would stop
+ * compressing is the half of the archive that compresses 10:1, and an operator
+ * downloading a backup over a domestic uplink pays for those bytes.
+ */
+const COMPRESSION_LEVEL = "-mx=1";
+
+/**
+ * The prefix every work directory carries, inside $data_dir.
+ *
+ * A FIXED, RECOGNISABLE PREFIX IS WHAT MAKES THE CRASH CASE RECOVERABLE.
+ * sweepAbandonedBackups matches on it, so a work directory orphaned by a
+ * SIGKILL -- the one exit path no `finally` can cover -- is removed at the
+ * next boot and at the next backup instead of sitting in $data_dir with a
+ * half-written credential store in it until somebody notices.
+ *
+ * The leading dot keeps it out of an operator's `ls` and, more importantly,
+ * out of any future code that walks $data_dir looking for real content.
+ */
+const WORK_PREFIX = ".backup-work-";
+
+/**
+ * Bytes of slack the disk pre-flight demands beyond its own estimate.
+ *
+ * 64MB, and it is not a rounding allowance: it is what stops a backup that
+ * fits EXACTLY from leaving a live server with zero free blocks, where the
+ * next write from any other part of the system -- the journal, Postgres's WAL,
+ * an upload -- is the one that fails.
+ */
+const DISK_MARGIN_BYTES = 64 * 1024 * 1024;
+
+/** One archive member, as the manifest records it. */
+export interface BackupManifestMember {
+  /** The member's path inside the archive, exactly as an extractor will write it. */
+  path: string;
+  bytes: number;
+  sha256: string;
+}
+
+export interface BackupManifest {
+  formatVersion: number;
+  /**
+   * "backup", against the export's absence of the field. An operator with two
+   * archives and a manifest in each should not have to infer which is which
+   * from the member list, and 7.7 must never restore an export.
+   */
+  kind: "backup";
+  appVersion: string;
+  /** The last migration tag this build ships, e.g. "0012_misty_phantom_reporter". */
+  schemaVersion: string;
+  /** How many migrations that is -- the journal POSITION, which is orderable. */
+  migrationPosition: number;
+  /** When the backup was taken, ISO 8601 UTC. */
+  generatedAt: string;
+  /**
+   * Both halves of the dump's provenance. A dump is only restorable into a
+   * server that understands it, and 7.7 has to be able to check that without
+   * parsing the SQL: `serverVersion` is what was dumped, `pgDumpVersion` is
+   * what dumped it, and `pgDumpArgs` is how -- so a restore knows whether the
+   * file carries ownership and privilege statements before it runs one.
+   */
+  postgres: {
+    serverVersion: string;
+    pgDumpVersion: string;
+    pgDumpArgs: string[];
+  };
+  /**
+   * What it takes to open this file, recorded INSIDE the file for the reader
+   * who already has it open and outside it in docs/backup-format.md for the
+   * one who does not.
+   */
+  encryption: {
+    container: "7z";
+    cipher: "AES-256";
+    /** Whether the member names are encrypted too (-mhe=on). Always true. */
+    headerEncryption: boolean;
+    /** e.g. "SHA-256, 2^19 (524288) iterations" -- the 7zAES:19 the archive reports. */
+    keyDerivation: string;
+  };
+  /**
+   * Every member except manifest.json, which cannot carry its own digest.
+   *
+   * WHERE THE BLOB DIGESTS COME FROM, because it is not a second read. A blob
+   * in $data_dir/files is named by its own SHA-256 -- that is what
+   * services/blobs.ts's saveBlob computes from the bytes as it writes them --
+   * so the name IS the digest and re-hashing 300MB to rediscover it would
+   * double the read for nothing. A file under files/ whose name is not a
+   * 64-hex digest (a `.upload-` temp file from an interrupted upload) is
+   * hashed for real, because for those the name says nothing.
+   */
+  members: BackupManifestMember[];
+}
+
+/**
+ * A tool the backup needs is not installed. 503 at the route, and the message
+ * NAMES THE PACKAGE -- the spec's requirement, and the difference between an
+ * operator running one apt command and an operator filing a bug.
+ */
+export class BackupToolMissingError extends Error {
+  constructor(readonly tool: string, readonly aptPackage: string, detail = "") {
+    super(
+      `${tool} is not available${detail === "" ? "" : ` (${detail})`}; `
+      + `install the ${aptPackage} package and try again`,
+    );
+    this.name = "BackupToolMissingError";
+  }
+}
+
+/**
+ * mail.key is absent, so the backup would be missing the one file without
+ * which every stored mail password is unrecoverable.
+ *
+ * THIS FAILS THE BACKUP RATHER THAN OMITTING THE FILE, deliberately. An
+ * install whose mail.key has gone is already broken -- mail-crypto's
+ * loadMailKey answers 503 on every mail route -- and the failure an operator
+ * must not be allowed to have is the silent one: a backup taken today, trusted
+ * for a year, restored after a disk failure, and only then found to contain no
+ * key. Refusing is loud, immediate and fixable.
+ */
+export class BackupKeyMissingError extends Error {
+  constructor(keyPath: string) {
+    super(`mail key not found at ${keyPath}; a backup without it could not restore mail`);
+    this.name = "BackupKeyMissingError";
+  }
+}
+
+/** Not enough free space in $data_dir to build the archive. Numbers included. */
+export class BackupDiskSpaceError extends Error {
+  constructor(readonly requiredBytes: number, readonly availableBytes: number) {
+    super(
+      `a backup needs about ${formatMiB(requiredBytes)} of free space and `
+      + `${formatMiB(availableBytes)} is available; free some space and try again`,
+    );
+    this.name = "BackupDiskSpaceError";
+  }
+}
+
+/**
+ * The passphrase cannot be used as given.
+ *
+ * NEVER ECHOES THE PASSPHRASE. Every message here describes the RULE that was
+ * broken, never the value that broke it -- a validation error is one of the
+ * few places a secret gets copied into a string that is on its way to a log,
+ * a browser console and a bug report.
+ */
+export class BackupPassphraseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BackupPassphraseError";
+  }
+}
+
+/** pg_dump or 7z ran and failed. The detail never carries the passphrase. */
+export class BackupFailedError extends Error {
+  constructor(message: string, readonly detail = "") {
+    super(message);
+    this.name = "BackupFailedError";
+  }
+}
+
+function formatMiB(bytes: number): string {
+  return `${String(Math.ceil(bytes / (1024 * 1024)))}MB`;
+}
+
+/**
+ * Reject a passphrase 7z would not use as typed.
+ *
+ * THE TRUNCATION IS THE WHOLE REASON THIS EXISTS, and it was measured rather
+ * than assumed. 7z reads the passphrase as ONE LINE from stdin: given
+ * "abc\ndef" it encrypts with "abc" and reports success. So a passphrase
+ * containing a newline produces an archive whose passphrase is a prefix of
+ * what the operator typed -- and because there is no recovery path, an archive
+ * nobody can ever open again. A carriage return is worse still: 7z keeps it,
+ * so the archive's passphrase has an invisible character on the end that no
+ * dialog box will ever reproduce.
+ *
+ * Every other control character is refused for the same reason: it is either
+ * silently dropped, silently kept, or unenterable in the Keka and 7-Zip
+ * dialogs this format exists to be opened by. Everything printable is allowed,
+ * including spaces (leading and trailing ones survive the pipe -- measured)
+ * and every non-ASCII character (a passphrase with umlauts round-trips --
+ * measured).
+ */
+export function validatePassphrase(passphrase: string): void {
+  if (passphrase === "") {
+    throw new BackupPassphraseError("a passphrase is required; a backup is never written unencrypted");
+  }
+  if (/[\u0000-\u001F\u007F]/.test(passphrase)) {
+    throw new BackupPassphraseError(
+      "the passphrase must not contain line breaks, tabs or other control characters: "
+      + "7z reads it up to the first line break, which would encrypt the backup with "
+      + "something other than what you typed",
+    );
+  }
+  if (passphrase.length > MAX_PASSPHRASE_LENGTH) {
+    throw new BackupPassphraseError(
+      `the passphrase must be at most ${String(MAX_PASSPHRASE_LENGTH)} characters`,
+    );
+  }
+}
+
+/**
+ * 256 characters. Not a security bound -- there is no upper limit at which a
+ * passphrase becomes weak -- but a bound on what travels to a child process's
+ * stdin, and a value a person could conceivably retype.
+ */
+export const MAX_PASSPHRASE_LENGTH = 256;
+
+/**
+ * The argument list 7z is spawned with. EXPORTED SO A TEST CAN ASSERT WHAT IS
+ * NOT IN IT.
+ *
+ * THE PASSPHRASE IS NOT HERE, and that is the point of the function existing
+ * separately from the spawn. `-p` with no value makes 7z read the passphrase
+ * from ITS STDIN; `-p<value>` would put it in argv, and on Linux
+ * /proc/<pid>/cmdline is world-readable, so every other local user -- every
+ * other YunoHost app on the box -- could read the passphrase of a backup while
+ * it was being written. Measured on the deploy target: a piped passphrase
+ * produces an archive that opens with that passphrase, and the trailing
+ * newline is stripped, so nothing is appended here.
+ *
+ * (The read side is not symmetric, and it is worth knowing: `7z x -p` reading
+ * from a pipe does NOT work on p7zip 16.02 -- it fails with "Cannot open
+ * encrypted archive. Wrong password?". Conduit only ever writes, and a human
+ * extracting types into a terminal or a dialog, so the asymmetry costs
+ * nothing here; the test that opens an archive passes -p<value> on a command
+ * line, where the passphrase is a fixture rather than a secret.)
+ */
+export function sevenZipArgs(archivePath: string, inputs: readonly string[]): string[] {
+  return [
+    "a",              // add to archive
+    "-t7z",           // the container, stated rather than inferred from the extension
+    "-p",             // read the passphrase from stdin: see above
+    "-mhe=on",        // encrypt the headers, so the member names do not leak
+    COMPRESSION_LEVEL,
+    "-bd",            // no progress indicator: this is not a terminal
+    "-y",             // never prompt; a prompt here would hang the request
+    "--",
+    archivePath,
+    ...inputs,
+  ];
+}
+
+/**
+ * How pg_dump is invoked: the arguments, and separately the environment.
+ *
+ * THE DATABASE PASSWORD GOES IN THE ENVIRONMENT, NOT THE ARGUMENT LIST, and
+ * the split is the whole reason this is a function rather than three lines at
+ * the call site. `pg_dump "postgres://user:pw@host/db"` is the obvious form
+ * and it puts the password in /proc/<pid>/cmdline, which every local user can
+ * read. /proc/<pid>/environ is readable only by the process's own owner.
+ *
+ * PGPASSWORD is only set when the URL carries one -- the deploy target's
+ * DATABASE_URL does (conf/.env), the test database's socket URL does not, and
+ * an empty PGPASSWORD is not the same as an absent one to libpq.
+ */
+export function pgDumpInvocation(
+  databaseUrl: string,
+): { args: string[]; env: Record<string, string> } {
+  const url = new URL(databaseUrl);
+  const env: Record<string, string> = {};
+  // A URL's components are percent-encoded; libpq wants the decoded values.
+  if (url.hostname !== "") env.PGHOST = decodeURIComponent(url.hostname);
+  if (url.port !== "") env.PGPORT = url.port;
+  if (url.username !== "") env.PGUSER = decodeURIComponent(url.username);
+  if (url.password !== "") env.PGPASSWORD = decodeURIComponent(url.password);
+  const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
+  if (database !== "") env.PGDATABASE = database;
+  return { args: [...PG_DUMP_ARGS], env };
+}
+
+/**
+ * The dump's flags, fixed and recorded in the manifest so 7.7 knows what it is
+ * reading without parsing the SQL.
+ *
+ * --no-owner and --no-privileges because a restore lands in a database whose
+ * role is generated by YunoHost at install time and is NOT the role that was
+ * dumped: `ynh_psql_setup_db` mints a fresh user and password. A dump carrying
+ * ALTER ... OWNER TO for a role that no longer exists fails every one of those
+ * statements on restore.
+ *
+ * NO --clean, and that is 7.7's decision to make rather than this task's: a
+ * dump that drops before it creates is a dump that destroys a database when it
+ * is run by mistake, and the spec puts "restore replaces everything" behind a
+ * typed confirmation and an automatic backup. The file stays additive; the
+ * restore decides how to make room for it.
+ *
+ * Plain SQL rather than a custom-format archive, because the whole format
+ * argument is that an operator can open this without Conduit -- and a .sql
+ * file is readable in any editor and restorable with psql alone, where a
+ * custom dump needs pg_restore and the right version of it.
+ *
+ * Every non-system schema is included, which is what carries drizzle's own
+ * `drizzle` schema and therefore the applied-migration bookkeeping. Without it
+ * a restored database would re-run every migration over its own restored data.
+ */
+const PG_DUMP_ARGS = ["--no-owner", "--no-privileges", "--format=plain"] as const;
+
+/** Run a command that produces no interesting output, resolving its exit status. */
+async function probeVersion(command: string): Promise<string | null> {
+  return await new Promise<string | null>((resolve) => {
+    const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    child.stdout.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+    child.on("error", () => { resolve(null); });
+    child.on("close", (code) => { resolve(code === 0 ? out.trim() : null); });
+  });
+}
+
+/** The version string 7z prints, or null when it is not installed. */
+export async function sevenZipVersion(): Promise<string | null> {
+  // 7z has no --version; `7z` with no arguments prints the banner and exits 0
+  // on p7zip 16.02. The banner's first non-empty line is the version.
+  return await new Promise<string | null>((resolve) => {
+    const child = spawn("7z", ["i"], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    child.stdout.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+    child.on("error", () => { resolve(null); });
+    child.on("close", (code) => {
+      if (code !== 0) { resolve(null); return; }
+      const line = out.split("\n").map((l) => l.trim()).find((l) => l.startsWith("7-Zip"));
+      resolve(line ?? "7-Zip");
+    });
+  });
+}
+
+/** The version string pg_dump prints, or null when it is not installed. */
+export async function pgDumpVersion(): Promise<string | null> {
+  return await probeVersion("pg_dump");
+}
+
+/** The major version out of "pg_dump (PostgreSQL) 15.19 (Debian ...)" or "15.19". */
+export function majorVersion(versionText: string): number | null {
+  const match = /(\d+)(?:\.\d+)*/.exec(versionText.replace(/^\D*\(PostgreSQL\)\s*/, ""));
+  return match === null ? null : Number(match[1]);
+}
+
+/**
+ * What the archive will cost in free disk space before it exists.
+ *
+ * TWO COPIES OF THE DUMP AND ONE OF THE BLOBS, and each term is a real file
+ * that is on the disk at the same moment as the others:
+ *
+ *   - the plain dump, written to the work directory and still there while 7z
+ *     reads it;
+ *   - the dump AGAIN inside the archive. It compresses roughly 10:1 in
+ *     practice, so counting it at full size is deliberate over-estimation --
+ *     the alternative is a pre-flight that passes and then runs out;
+ *   - the blob store inside the archive, at full size, because blobs are PDFs
+ *     and images and do not compress. Measured: 315MB of blobs produced a
+ *     314.8MB archive.
+ *
+ * `databaseBytes` comes from pg_database_size, which counts indexes, the
+ * visibility map and dead tuples that a plain dump does not carry -- so it
+ * over-estimates the dump too, again in the safe direction.
+ *
+ * Exported and pure so the arithmetic can be tested without a database, a
+ * disk, or a filesystem that can be made full.
+ */
+export function requiredFreeBytes(input: { databaseBytes: number; blobBytes: number }): number {
+  return input.databaseBytes * 2 + input.blobBytes + DISK_MARGIN_BYTES;
+}
+
+/**
+ * Free bytes available to an unprivileged writer under `dir`.
+ *
+ * Exported so the DEFAULT probe can be checked against df. Every other
+ * disk-pre-flight test injects a replacement -- a machine with 28GB free
+ * cannot be made to fail the real one -- and without a test on this function
+ * itself, swapping statfs for `() => Infinity` would break nothing.
+ */
+export async function freeSpaceBytes(dir: string): Promise<number> {
+  const info = await statfs(dir);
+  // bavail, not bfree: bfree includes the blocks reserved for root, which this
+  // process cannot use.
+  return Number(info.bavail) * Number(info.bsize);
+}
+
+/**
+ * Remove work directories left behind by a previous run.
+ *
+ * THE EXIT PATH NO `finally` COVERS. Everything else -- a failed build, a
+ * refused passphrase, an abandoned download -- is cleaned by buildBackup's own
+ * disposal. A SIGKILL, an OOM kill or a power cut is not, and what it leaves
+ * in $data_dir is a partially written archive containing mail.key. This is
+ * what removes it: called at route registration (so it runs at every boot) and
+ * again at the start of every build.
+ *
+ * Safe to call while a backup is running only because the route allows exactly
+ * one at a time and calls this BEFORE creating its own directory -- see
+ * MAX_CONCURRENT_BACKUPS. Never throws: a sweep that cannot read $data_dir is
+ * not a reason to fail a backup that has not started yet.
+ */
+export async function sweepAbandonedBackups(dataDir: string): Promise<string[]> {
+  let entries: string[];
+  try {
+    entries = await readdir(dataDir);
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const entry of entries) {
+    if (!entry.startsWith(WORK_PREFIX)) continue;
+    try {
+      await rm(path.join(dataDir, entry), { recursive: true, force: true });
+      removed.push(entry);
+    } catch { /* an unremovable orphan is not a reason to fail the next backup */ }
+  }
+  return removed;
+}
+
+export interface BuildBackupOptions {
+  db: Database;
+  /** $data_dir: the blob store's parent, mail.key's home, and where the work directory goes. */
+  dataDir: string;
+  /** config.mailKeyPath -- normally $data_dir/mail.key, but overridable. */
+  mailKeyPath: string;
+  /** config.databaseUrl, for pg_dump. Never logged; the password reaches libpq via the environment. */
+  databaseUrl: string;
+  appVersion: string;
+  /** What the archive is encrypted with. Never stored, never logged, never on a command line. */
+  passphrase: string;
+  /** Injected by tests so the manifest's timestamp is a value, not a moving target. */
+  now?: Date;
+  /**
+   * Injected by the disk pre-flight's test, which needs the check to fail on a
+   * machine that has plenty of space. Production uses statfs.
+   */
+  freeBytes?: (dir: string) => Promise<number>;
+}
+
+export interface BackupArchive {
+  /** The finished archive, as a stream over the temp file. Nothing holds it whole. */
+  stream: Readable;
+  /** Known exactly, unlike the export's: the archive is finished before a byte is sent. */
+  sizeBytes: number;
+  /** Suggested download name, e.g. "conduit-backup-2026-08-31.7z". */
+  filename: string;
+  /** What went in. Also the archive's own manifest.json. */
+  manifest: BackupManifest;
+  /**
+   * Destroy the read stream and remove the work directory. IDEMPOTENT, and
+   * already wired to the stream's `close` event -- so an abandoned download
+   * cleans itself up without the route having to notice.
+   */
+  dispose: () => Promise<void>;
+}
+
+/**
+ * Build the encrypted backup and return it as a stream over its temp file.
+ *
+ * THE TEMP FILE IS A CREDENTIAL STORE ON DISK, and every line of its handling
+ * follows from that:
+ *
+ *   - IN $data_dir, NEVER /tmp. The spec says so and the systemd unit enforces
+ *     it: conf/systemd.service sets ProtectSystem=full with
+ *     ReadWritePaths=__DATA_DIR__, so $data_dir is the only place this process
+ *     can write at all. (PrivateTmp=yes would make /tmp private per-service
+ *     anyway; that is a reason the rule is cheap, not a reason to bend it.)
+ *   - MODE 0700 ON THE DIRECTORY, 0600 ON THE ARCHIVE. mkdtemp creates the
+ *     directory 0700, which is the bound that actually holds: a file inside a
+ *     directory nobody else can traverse is unreachable whatever its own mode
+ *     says. 7z creates the archive under the process umask, so it is chmod'd
+ *     to 0600 the moment it exists -- belt and braces, and the property a test
+ *     can assert directly.
+ *   - REMOVED ON EVERY EXIT PATH. Success, failure, and an abandoned download
+ *     alike, via `dispose` on the stream's `close`. The one path that cannot
+ *     be covered from inside the process is a SIGKILL, and
+ *     sweepAbandonedBackups covers that from the next boot.
+ *
+ * MEMORY IS BOUNDED IN TWO PROCESSES, NOT ONE, and the second is the larger.
+ * Node never holds the archive: pg_dump's stdout is piped straight to a file
+ * and the finished archive is read back with a 64KB stream. 7z is the process
+ * with the appetite, and COMPRESSION_LEVEL is what bounds it -- 19MB at -mx=1
+ * against 393MB at the default, measured. backup.test.ts asserts a ceiling on
+ * each.
+ *
+ * DISK IS THE OTHER CEILING and it is checked before anything is written. See
+ * requiredFreeBytes for what the estimate is made of.
+ */
+export async function buildBackup(options: BuildBackupOptions): Promise<BackupArchive> {
+  const {
+    db, dataDir, mailKeyPath, databaseUrl, appVersion, passphrase,
+    now = new Date(), freeBytes = freeSpaceBytes,
+  } = options;
+
+  // FIRST, BEFORE ANYTHING TOUCHES THE DISK. A refused passphrase must cost
+  // nothing, and validation that ran after a 300MB pg_dump would be a denial
+  // of service wearing a validation message.
+  validatePassphrase(passphrase);
+
+  // EVERYTHING THAT CAN FAIL, FAILS BEFORE A FILE IS CREATED. The route has a
+  // status line to send right up until it calls reply.send, and every check
+  // below exists so an operator gets a sentence rather than a truncated
+  // download.
+  const sevenZip = await sevenZipVersion();
+  if (sevenZip === null) {
+    throw new BackupToolMissingError("7z", SEVEN_ZIP_PACKAGE);
+  }
+  const pgDump = await pgDumpVersion();
+  if (pgDump === null) {
+    throw new BackupToolMissingError("pg_dump", PG_DUMP_PACKAGE);
+  }
+
+  const serverVersionRows = await db.execute<{ server_version: string }>(
+    sql`SHOW server_version`,
+  );
+  const serverVersion = serverVersionRows[0]?.server_version ?? "unknown";
+  const serverMajor = majorVersion(serverVersion);
+  const dumpMajor = majorVersion(pgDump);
+  // NEWER pg_dump IS FINE, OLDER IS NOT, and the asymmetry is pg_dump's own:
+  // it refuses to dump from a server newer than itself, and the error it gives
+  // ("server version mismatch") arrives after the spawn where this arrives
+  // before it. The spec asks that pg_dump "match the server's major version";
+  // this is that requirement in the direction that can actually go wrong,
+  // narrowed deliberately -- a runner with pg_dump 16 against a PostgreSQL 15
+  // server is an ordinary, working setup, and refusing it would refuse CI.
+  if (serverMajor !== null && dumpMajor !== null && dumpMajor < serverMajor) {
+    throw new BackupToolMissingError(
+      "pg_dump", `${PG_DUMP_PACKAGE}-${String(serverMajor)}`,
+      `pg_dump is version ${String(dumpMajor)} and the database server is ${String(serverMajor)}`,
+    );
+  }
+
+  // mail.key BEFORE THE DUMP, because this is the check whose failure is the
+  // whole reason the backup exists. See BackupKeyMissingError.
+  let keyBytes: number;
+  try {
+    const info = await stat(mailKeyPath);
+    if (!info.isFile()) throw new Error("not a file");
+    keyBytes = info.size;
+  } catch {
+    throw new BackupKeyMissingError(mailKeyPath);
+  }
+
+  // THE MEMBER LIST IS EXPLICIT, NEVER "$data_dir". Archiving the data
+  // directory wholesale would sweep in the work directory this function is
+  // about to create -- an archive containing a partial copy of itself -- and
+  // any future file that lands there. Naming mail.key and files/ means a new
+  // thing in $data_dir is a deliberate decision to include it.
+  const blobDir = path.join(dataDir, "files");
+  const blobs = await collectBlobs(blobDir);
+  const blobBytes = blobs.reduce((total, blob) => total + blob.bytes, 0);
+
+  const databaseBytesRows = await db.execute<{ size: string }>(
+    sql`SELECT pg_database_size(current_database())::text AS size`,
+  );
+  const databaseBytes = Number(databaseBytesRows[0]?.size ?? "0");
+
+  const required = requiredFreeBytes({ databaseBytes, blobBytes });
+  const available = await freeBytes(dataDir);
+  if (available < required) {
+    throw new BackupDiskSpaceError(required, available);
+  }
+
+  // Anything orphaned by an earlier crash goes now, before this run adds a
+  // directory of its own -- so a stale credential store is never on the disk
+  // beside a live one.
+  await sweepAbandonedBackups(dataDir);
+
+  // mkdtemp gives 0700 and a name nothing can predict. Inside $data_dir, which
+  // the systemd unit makes the only writable path anyway.
+  const work = await mkdtemp(path.join(dataDir, WORK_PREFIX));
+  const archivePath = path.join(work, "backup.7z");
+  let disposed = false;
+  let stream: Readable | null = null;
+  const dispose = async (): Promise<void> => {
+    if (disposed) return;
+    disposed = true;
+    if (stream !== null && !stream.destroyed) stream.destroy();
+    await rm(work, { recursive: true, force: true });
+  };
+
+  try {
+    const dumpPath = path.join(work, "database.sql");
+    const dumpDigest = await runPgDump(databaseUrl, dumpPath);
+    const dumpBytes = (await stat(dumpPath)).size;
+
+    const members: BackupManifestMember[] = [
+      { path: "database.sql", bytes: dumpBytes, sha256: dumpDigest },
+      { path: "mail.key", bytes: keyBytes, sha256: await digestOf(mailKeyPath) },
+      ...blobs.map((blob) => ({
+        path: `files/${blob.name}`, bytes: blob.bytes, sha256: blob.sha256,
+      })),
+    ];
+
+    const journal = await readMigrationJournal();
+    const manifest: BackupManifest = {
+      formatVersion: BACKUP_FORMAT_VERSION,
+      kind: "backup",
+      appVersion,
+      schemaVersion: journal.tag,
+      migrationPosition: journal.position,
+      generatedAt: now.toISOString(),
+      postgres: { serverVersion, pgDumpVersion: pgDump, pgDumpArgs: [...PG_DUMP_ARGS] },
+      encryption: {
+        container: "7z",
+        cipher: "AES-256",
+        headerEncryption: true,
+        keyDerivation: "SHA-256, 2^19 (524288) iterations",
+      },
+      members,
+    };
+    const manifestPath = path.join(work, "manifest.json");
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+
+    // 7z strips each input's parent directory and stores what is below it --
+    // verified on the deploy target, which is why four inputs from two
+    // different parents produce the flat layout the manifest declares:
+    // database.sql, manifest.json, mail.key, files/<digest>.
+    const inputs = [dumpPath, manifestPath, mailKeyPath];
+    if (blobs.length > 0) inputs.push(blobDir);
+    await runSevenZip(archivePath, inputs, passphrase);
+
+    // The window in which the archive carries 7z's umask-derived mode is
+    // spent entirely inside a 0700 directory, so nothing else could open it
+    // then either. This is the belt to that directory's braces, and the
+    // property a test can read off the file itself.
+    await chmod(archivePath, 0o600);
+    const sizeBytes = (await stat(archivePath)).size;
+
+    stream = createReadStream(archivePath);
+    // THE SAME EVENT THE EXPORT LEARNED TO HANG ITS CLEANUP ON. `close` fires
+    // for a finished response and an abandoned one alike, so a client that
+    // disappears mid-download takes the work directory with it rather than
+    // leaving a credential store behind. Idempotent, so the route calling
+    // dispose too is free.
+    stream.once("close", () => { void dispose(); });
+
+    const day = now.toISOString().slice(0, 10);
+    return { stream, sizeBytes, filename: `conduit-backup-${day}.7z`, manifest, dispose };
+  } catch (error) {
+    await dispose();
+    throw error;
+  }
+}
+
+interface CollectedBlob { name: string; bytes: number; sha256: string }
+
+/**
+ * Every file in the blob store, with its size and digest.
+ *
+ * THE WHOLE DIRECTORY, NOT THE `files` TABLE, and that is the exact inversion
+ * of the export. The export reads the TABLE precisely so that mail attachments
+ * -- which live in the same content-addressed directory -- stay out of it. A
+ * backup that dropped them would restore an install whose messages had lost
+ * their attachments, so here the directory is the right source and the table
+ * would be the bug.
+ */
+async function collectBlobs(blobDir: string): Promise<CollectedBlob[]> {
+  let names: string[];
+  try {
+    names = await readdir(blobDir);
+  } catch {
+    return [];   // a fresh install has uploaded nothing yet
+  }
+  names.sort();
+  const collected: CollectedBlob[] = [];
+  for (const name of names) {
+    const full = path.join(blobDir, name);
+    const info = await stat(full);
+    if (!info.isFile()) continue;
+    collected.push({
+      name,
+      bytes: info.size,
+      // The name IS the digest for anything saveBlob wrote. Anything else --
+      // an interrupted upload's `.upload-` temp file -- has to be hashed.
+      sha256: /^[0-9a-f]{64}$/.test(name) ? name : await digestOf(full),
+    });
+  }
+  return collected;
+}
+
+/** SHA-256 of a file, streamed. */
+async function digestOf(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk as Buffer);
+  return hash.digest("hex");
+}
+
+/**
+ * Dump the database to `dumpPath`, returning the dump's SHA-256.
+ *
+ * HASHED ON THE WAY PAST rather than in a second read: the bytes are already
+ * moving through this process on their way from pg_dump's stdout to the file,
+ * and a 50MB dump re-read to hash it is 50MB of disk for nothing. Nothing is
+ * buffered -- the pipeline's back-pressure is what keeps a dump of any size
+ * costing one 64KB chunk of memory.
+ */
+async function runPgDump(databaseUrl: string, dumpPath: string): Promise<string> {
+  const { args, env } = pgDumpInvocation(databaseUrl);
+  const child = spawn("pg_dump", args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    // The password rides in here, where /proc/<pid>/environ is readable only
+    // by this process's own owner -- see pgDumpInvocation.
+    env: { ...process.env, ...env },
+  });
+
+  const errors: Buffer[] = [];
+  let errorBytes = 0;
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (errorBytes >= STDERR_CAP_BYTES) return;
+    errorBytes += chunk.length;
+    errors.push(chunk);
+  });
+
+  const hash = createHash("sha256");
+  const out = createWriteStream(dumpPath, { mode: 0o600 });
+  // HASHED AS A TRANSFORM IN THE PIPELINE, NEVER AS A SECOND `data` LISTENER.
+  // services/blobs.ts learned this one: a second listener puts the stream in
+  // flowing mode alongside the pipeline's own reads, so correctness would
+  // depend on Node's internal consumption strategy rather than on this code.
+  // One consumer, and the digest is a side effect of the bytes passing.
+  const hasher = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      hash.update(chunk);
+      callback(null, chunk);
+    },
+  });
+
+  const exited = new Promise<void>((resolve, reject) => {
+    child.on("error", (error) => {
+      reject(new BackupFailedError("could not start pg_dump", error.message));
+    });
+    child.on("close", (code, signal) => {
+      if (signal !== null) {
+        reject(new BackupFailedError(`pg_dump was killed by ${signal}`, stderrText(errors)));
+        return;
+      }
+      if (code !== 0) {
+        reject(new BackupFailedError(`pg_dump exited ${String(code)}`, stderrText(errors)));
+        return;
+      }
+      resolve();
+    });
+  });
+
+  await Promise.all([pipeline(child.stdout, hasher, out), exited]);
+  return hash.digest("hex");
+}
+
+/** 8KB of a child's stderr is plenty to diagnose it and short enough to log. */
+const STDERR_CAP_BYTES = 8 * 1024;
+
+function stderrText(chunks: readonly Buffer[]): string {
+  return Buffer.concat(chunks).toString("utf8").slice(0, STDERR_CAP_BYTES).trim();
+}
+
+/**
+ * Run 7z, feeding the passphrase to its stdin.
+ *
+ * EXIT 1 IS A FAILURE HERE, where for most callers of 7z it is a warning. 7z
+ * answers 1 when it could not read one of the files it was asked to archive --
+ * which for a backup is precisely the outcome that must never be presented as
+ * a success. A backup missing one blob is a backup that restores an install
+ * with a missing document, discovered years later.
+ */
+async function runSevenZip(
+  archivePath: string, inputs: readonly string[], passphrase: string,
+): Promise<void> {
+  const child = spawn("7z", sevenZipArgs(archivePath, inputs), {
+    stdio: ["pipe", "ignore", "pipe"],
+  });
+
+  const errors: Buffer[] = [];
+  let errorBytes = 0;
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (errorBytes >= STDERR_CAP_BYTES) return;
+    errorBytes += chunk.length;
+    errors.push(chunk);
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    child.on("error", (error) => {
+      reject(new BackupFailedError("could not start 7z", error.message));
+    });
+    child.on("close", (code, signal) => {
+      if (signal !== null) {
+        reject(new BackupFailedError(`7z was killed by ${signal}`, stderrText(errors)));
+        return;
+      }
+      if (code !== 0) {
+        reject(new BackupFailedError(`7z exited ${String(code)}`, stderrText(errors)));
+        return;
+      }
+      resolve();
+    });
+    // Registered before the write: a 7z that fails immediately closes its
+    // stdin while this write is in flight, and the EPIPE that follows must not
+    // become an unhandled 'error' event. `close` reports the real reason.
+    child.stdin.on("error", () => { /* see above */ });
+    // NO TRAILING NEWLINE. 7z strips one if it is there (measured), so adding
+    // one would be harmless -- but "harmless because the tool trims it" is a
+    // property of p7zip 16.02 rather than of the format, and the passphrase a
+    // person types has no newline in it.
+    child.stdin.end(passphrase, "utf8");
+  });
+}

@@ -43,13 +43,27 @@ export interface BuildAppOptions {
     syncManager: () => MailRouteSyncManager | null;
     transportFactory: SendMailTransportFactory;
   };
+  /**
+   * Test-only sink for the request log, so a test can read what was written
+   * rather than assume it. It exists for ONE assertion -- that POST /api/backup
+   * never writes the passphrase anywhere -- and that assertion cannot be made
+   * against the suite's usual apps, because logging is off entirely under
+   * NODE_ENV=test. "The logger is disabled" is not a proof that a secret is
+   * absent from it.
+   *
+   * Ignored when logging is off, which is every other test. Never set outside
+   * a test, same as multipartFileSizeLimit above.
+   */
+  loggerStream?: { write: (line: string) => void };
 }
 
 export async function buildApp(
-  { config, db, dataDir = "./data", webRoot, multipartFileSizeLimit, mail }: BuildAppOptions,
+  { config, db, dataDir = "./data", webRoot, multipartFileSizeLimit, mail, loggerStream }: BuildAppOptions,
 ): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: config.nodeEnv === "test" ? false : { level: "info" },
+    logger: config.nodeEnv === "test"
+      ? false
+      : { level: "info", ...(loggerStream === undefined ? {} : { stream: loggerStream }) },
     // 1, not true: the app binds to loopback and is reachable through exactly one
     // hop, YunoHost's nginx. trustProxy: 1 trusts only that single nearest hop's
     // X-Forwarded-* headers. trustProxy: true would trust an unbounded chain,
@@ -147,6 +161,7 @@ export async function buildApp(
     db, dataDir, multipartFileSizeLimit,
     defaultCurrency: config.defaultCurrency, appVersion: config.version,
     basePath: config.basePath, mailKeyPath: config.mailKeyPath,
+    databaseUrl: config.databaseUrl,
     syncManager: mail?.syncManager ?? (() => null),
     transportFactory: mail?.transportFactory
       ?? createSmtpTransportFactory({ rejectUnauthorized: config.mailTlsRejectUnauthorized }),
