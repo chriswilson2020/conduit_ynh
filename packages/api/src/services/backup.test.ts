@@ -950,3 +950,74 @@ async function openDescriptorsFor(target: string): Promise<number> {
   }
   return count;
 }
+
+/**
+ * THE LAYOUT MUST NOT DEPEND ON HOW DATA_DIR IS SPELLED.
+ *
+ * "7z strips the parent of every input" is true of an ABSOLUTE path and false
+ * of a relative one: given `data/files` it keeps the path as written. config.ts
+ * DEFAULTS DATA_DIR to "./data", so a perfectly ordinary deployment produced an
+ * archive whose four documented members sat one level down, under a top-level
+ * `data` directory.
+ *
+ * NOTHING IN THIS FILE COULD SEE IT, and that is the reason this test exists
+ * rather than a comment. Every fixture here uses mkdtemp, which is absolute, so
+ * the whole suite agreed the layout was flat. It was 7.6 Task 3's e2e journey --
+ * a backup downloaded from the page on a runner where DATA_DIR was left at its
+ * default -- that extracted a single directory called `data` and said so.
+ *
+ * docs/backup-format.md states the four members as a fact about the FORMAT, and
+ * 7.7's restore will look them up by name. An archive one layer deeper is one a
+ * restore would not recognise, from an install that did nothing wrong.
+ */
+describe("a relative DATA_DIR", () => {
+  it7z("produces the same four members as an absolute one", async () => {
+    // A RELATIVE PATH THAT IS A DESCENDANT OF THE WORKING DIRECTORY, which is
+    // the shape config.ts's "./data" default has and the only shape that
+    // reproduces the defect. A relative path that climbs out with ".." does
+    // NOT: 7z drops the climbing components and stores the members flat, so
+    // the first version of this test passed against the unfixed code and a
+    // mutation caught it doing so.
+    //
+    // Created and removed here rather than with mkdtemp, because mkdtemp's
+    // directory is under the system temp root and nothing there is a
+    // descendant of the repository this process runs in.
+    const relativeDataDir = `.backup-relative-${randomUUID()}`;
+    const absoluteDataDir = path.resolve(relativeDataDir);
+    await mkdir(path.join(absoluteDataDir, "files"), { recursive: true });
+    try {
+      await writeFile(
+        path.join(absoluteDataDir, "mail.key"),
+        Buffer.from(`${MAIL_KEY_BYTES}!`), { mode: 0o600 },
+      );
+      const company = await createCompany(handle.db, actorId, { name: "Acme" });
+      const { sha256, sizeBytes } = await saveBlob(
+        absoluteDataDir, Readable.from([Buffer.from("a blob")]),
+      );
+      await attachFile(handle.db, actorId, {
+        originalName: "a.bin", mime: "application/octet-stream", sizeBytes, sha256,
+        companyId: company.id,
+      });
+
+      const archive = await buildBackup({
+        db: handle.db,
+        dataDir: relativeDataDir,
+        mailKeyPath: path.join(relativeDataDir, "mail.key"),
+        databaseUrl: TEST_DATABASE_URL,
+        appVersion: "1.3.0-test",
+        passphrase: PASSPHRASE,
+      });
+      const target = path.join(scratch, archive.filename);
+      await pipeline(archive.stream, createWriteStream(target));
+
+      const root = await extract(target);
+      expect((await readdir(root)).sort()).toEqual([
+        "database.sql", "files", "mail.key", "manifest.json",
+      ]);
+      // And the blob is under files/ by its digest, not two levels down.
+      expect(await memberPaths(root)).toContain(`files/${sha256}`);
+    } finally {
+      await rm(absoluteDataDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+});

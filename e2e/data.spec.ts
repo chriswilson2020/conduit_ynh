@@ -3,7 +3,7 @@ import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { test, expect } from "@playwright/test";
+import { test, expect, devices } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
 const execFileAsync = promisify(execFile);
@@ -150,6 +150,62 @@ test.describe("Settings -> Export and backup", () => {
     await page.getByTestId("backup-passphrase-repeat").fill(`${PASSPHRASE} `);
     await expect(page.getByTestId("backup-form-problem")).toContainText("not the same");
     await expect(page.getByTestId("backup-download")).toBeDisabled();
+  });
+});
+
+/**
+ * THE FOURTH SETTINGS TAB, ON A PHONE.
+ *
+ * 7.6 is the first phase to make that row overflow at a phone width -- three
+ * tabs fit and four do not -- so "Export and backup" is the first tab that has
+ * to be scrolled to before it can be touched. e2e/documents.spec.ts's phone
+ * journey holds every settings tab to the 44px floor and to being wholly in the
+ * viewport; this asserts the same property and, when it fails, SAYS WHY IN
+ * NUMBERS.
+ *
+ * The message is the point. The shared helper's failure is a bare viewport
+ * ratio, and a ratio on its own cannot distinguish a row that did not scroll
+ * from a container whose own edge is outside the viewport -- two different
+ * defects with two different fixes. Every figure needed to tell them apart is
+ * in the message here, so a failing CI run is a diagnosis rather than the start
+ * of one.
+ */
+const { defaultBrowserType: _phoneDefault, ...IPHONE_13 } = devices["iPhone 13"];
+
+test.describe("the settings tabs on a phone", () => {
+  test.use(IPHONE_13);
+
+  test("the fourth tab is a 44px target and wholly in the viewport once scrolled to", async ({ page }) => {
+    await openDataSettings(page);
+    const nav = page.getByTestId("settings-nav");
+    const tab = nav.getByRole("link", { name: "Export and backup", exact: true });
+
+    const height = (await tab.boundingBox())?.height ?? 0;
+    expect(height, "touch height").toBeGreaterThanOrEqual(44);
+
+    await tab.scrollIntoViewIfNeeded();
+    const box = await tab.boundingBox();
+    const viewport = page.viewportSize();
+    if (box === null || viewport === null) throw new Error("no geometry");
+    const geometry = await nav.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        navLeft: rect.left, navRight: rect.right,
+        scrollLeft: element.scrollLeft,
+        maxScroll: element.scrollWidth - element.clientWidth,
+        clientWidth: element.clientWidth,
+        docOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        docScroll: document.documentElement.scrollLeft,
+      };
+    });
+    const outside = Math.max(0, (box.x + box.width) - viewport.width) + Math.max(0, -box.x);
+    const detail = `tab x=${box.x.toFixed(2)} w=${box.width.toFixed(2)}`
+      + ` right=${(box.x + box.width).toFixed(2)} vw=${String(viewport.width)}`
+      + ` | nav left=${geometry.navLeft.toFixed(2)} right=${geometry.navRight.toFixed(2)}`
+      + ` client=${geometry.clientWidth.toFixed(2)}`
+      + ` scroll=${geometry.scrollLeft.toFixed(2)}/${geometry.maxScroll.toFixed(2)}`
+      + ` | doc overflow=${geometry.docOverflow.toFixed(2)} scroll=${geometry.docScroll.toFixed(2)}`;
+    expect(outside, `pixels of the tab outside the viewport -- ${detail}`).toBe(0);
   });
 });
 

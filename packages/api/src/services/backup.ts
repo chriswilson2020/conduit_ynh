@@ -853,8 +853,20 @@ export async function buildBackup(options: BuildBackupOptions): Promise<BackupAr
     // the layout: 7z strips the parent of every input it is given, so
     // $data_dir/files/<digest> would be stored as <digest> at the top level
     // rather than under files/.
-    const inputs = [dumpPath, manifestPath, mailKeyPath];
-    if (blobs.length > 0) inputs.push(blobDir);
+    //
+    // ABSOLUTE, AND THAT IS WHAT MAKES THE LAYOUT A PROPERTY OF THE FORMAT
+    // RATHER THAN OF THE DEPLOYMENT. "7z strips the parent" is true only of an
+    // ABSOLUTE input: given a RELATIVE one it keeps the path as written, so a
+    // DATA_DIR of "./data" -- which config.ts not only permits but DEFAULTS to
+    // -- produced an archive whose whole contents sat under a top-level `data`
+    // directory. Every test here used mkdtemp, which is absolute, so nothing
+    // saw it until 7.6 Task 3's e2e journey downloaded a backup from the page
+    // on a runner where DATA_DIR was left at its default. docs/backup-format.md
+    // states the four members as a fact about the format, and 7.7's restore
+    // will read them by name; an archive one layer deeper is one that restore
+    // would not recognise.
+    const inputs = [dumpPath, manifestPath, mailKeyPath].map((input) => path.resolve(input));
+    if (blobs.length > 0) inputs.push(path.resolve(blobDir));
     await runSevenZip(archivePath, inputs, passphrase);
 
     // The window in which the archive carries 7z's umask-derived mode is
