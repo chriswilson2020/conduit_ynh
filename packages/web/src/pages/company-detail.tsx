@@ -54,7 +54,9 @@ export function CompanyDetailPage() {
   // archived pipeline (board.tsx's readOnly banner). The section's one
   // mutation, New pipeline, creates a fresh live pipeline either way.
   const [archivedPipelines, setArchivedPipelines] = useState(false);
-  const { data: pipelines = [] } = usePipelines({ companyId, archived: archivedPipelines });
+  const { data: pipelines = [], isLoading: pipelinesLoading } = usePipelines({
+    companyId, archived: archivedPipelines,
+  });
   const updateCompany = useUpdateCompany();
   const archiveCompany = useArchiveCompany();
   const unarchiveCompany = useUnarchiveCompany();
@@ -299,7 +301,34 @@ export function CompanyDetailPage() {
                 </Link>
               </li>
             ))}
-            {pipelines.length === 0 && (
+            {/*
+              AN UNANSWERED LIST AND AN EMPTY ONE ARE DIFFERENT FACTS, and this
+              section spelled them the same way until v1.2.2. "No pipelines" is
+              a claim about the COMPANY; while the fetch is out it is a claim
+              nobody has the answer to yet, and the rows then arrive underneath
+              the sentence that denied them. The Contacts section IMMEDIATELY
+              ABOVE never had the bug -- it waits for `contactsData` itself --
+              which is what made this one a defect rather than a convention.
+              (Every filing of this says "three sections up". There is one
+              section between them and it is Contacts; the three counts the
+              field card and the owner row, which are not sections.)
+
+              The flag rather than the data, because that is how the rest of the
+              app says it: rail/timeline.tsx, rail/meetings.tsx,
+              mail/thread-list.tsx, deal-detail.tsx's Documents, pipelines.tsx
+              and settings-mail.tsx all gate an empty label on `isLoading`, and
+              every one of them pairs it with this same "Loading..." line.
+
+              `isLoading`, NOT `isPending`: measured against the installed
+              @tanstack/query-core 5.101.4, `isLoading` is `isPending &&
+              isFetching`, so a query nobody asked for reports false and its
+              empty label shows at once -- which is correct, since nothing is
+              coming. `isPending` alone would hold this list at "Loading..." for
+              ever on such a query. Same distinction pages/deal-detail.tsx draws
+              for `defaultsInFlight`.
+            */}
+            {pipelinesLoading && <li className="px-4 py-2 text-sm text-slate-400">Loading...</li>}
+            {!pipelinesLoading && pipelines.length === 0 && (
               <li className="px-4 py-2 text-sm text-slate-400">
                 {archivedPipelines ? "No archived pipelines" : "No pipelines"}
               </li>

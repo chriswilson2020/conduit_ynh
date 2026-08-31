@@ -1,5 +1,5 @@
 import { expect } from "@playwright/test";
-import type { Locator } from "@playwright/test";
+import type { Locator, Page, Route } from "@playwright/test";
 
 /**
  * What more than one journey in this suite needs.
@@ -70,4 +70,59 @@ export async function typeIntoEditor(editor: Locator, text: string): Promise<voi
   await expect(editor).toBeFocused();
   await editor.page().keyboard.type(text);
   await expect(editor).toContainText(text);
+}
+
+/**
+ * A held request, and whether it is STILL held.
+ *
+ * `holding()` is the fixture checking itself, and it is what makes every
+ * assertion about an UNANSWERED surface worth anything: on a slow runner a hold
+ * that expired before the read would leave such a test passing without ever
+ * exercising the window, silently. Asserted rather than trusted, so the failure
+ * says "the hold expired" instead of saying nothing at all.
+ */
+export interface Hold {
+  /** A matching request has arrived and has not been let go. */
+  holding: () => boolean;
+  unroute: () => Promise<void>;
+}
+
+/**
+ * DELAY THE FIRST REQUEST MATCHING `pattern`, AND ONLY THE FIRST.
+ *
+ * The shape is dictated by a failure this suite has already paid for: a
+ * handler that parks every matching request and continues it later throws
+ * "Route is already handled!" ASYNCHRONOUSLY if one is still parked when the
+ * test ends, and Playwright reports that on whichever test is running by then
+ * -- it took down two unrelated second-user journeys in v1.2.1's Task 1 and was
+ * triaged as a flake both times. So: exactly one request is held, every later
+ * one is continued immediately, both continues swallow their errors, and every
+ * caller unroutes in a finally. Each caller must also wait on an effect of the
+ * release before its test ends, so the held request is never still open at
+ * teardown.
+ *
+ * IT LIVES HERE BECAUSE TWO FILES NOW HOLD A HOP OPEN -- rail-compose.spec.ts,
+ * which wrote it, and list-loading.spec.ts. The scar above is the reason it is
+ * shared rather than copied: a second hand-rolled parker would be one edit away
+ * from reintroducing the flake this shape exists to prevent. (The per-file
+ * `create` helpers are copied and stay copied; six lines of POST cannot drift
+ * into a cross-file failure.)
+ */
+export function delayFirst(page: Page, pattern: string, ms: number): Promise<Hold> {
+  let arrived = false;
+  let released = false;
+  const routed = page.route(pattern, async (route: Route) => {
+    if (arrived) {
+      await route.continue().catch(() => {});
+      return;
+    }
+    arrived = true;
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    released = true;
+    await route.continue().catch(() => {});
+  });
+  return routed.then(() => ({
+    holding: () => arrived && !released,
+    unroute: async () => { await page.unroute(pattern).catch(() => {}); },
+  }));
 }

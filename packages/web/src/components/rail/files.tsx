@@ -28,7 +28,7 @@ function uploadErrorMessage(err: unknown): string {
 }
 
 export function Files({ companyId, contactId, dealId, projectId }: FilesProps) {
-  const { data: files = [] } = useFiles({ companyId, contactId, dealId, projectId });
+  const { data: files = [], isLoading } = useFiles({ companyId, contactId, dealId, projectId });
   const { data: users = [] } = useUsers();
   const uploadFile = useUploadFile();
   const [error, setError] = useState<string | null>(null);
@@ -92,6 +92,13 @@ export function Files({ companyId, contactId, dealId, projectId }: FilesProps) {
       </div>
       {uploadFile.isPending && <p className="text-xs text-slate-400">Uploading...</p>}
       {error && <p className="text-xs text-red-600">{error}</p>}
+      {/* THE LIST'S OWN FETCH, not the upload's -- `uploadFile.isPending` above
+          is a MUTATION in flight and says "Uploading...". This one is why "No
+          files yet" no longer appears on a record whose files are still coming;
+          the rail's timeline.tsx and meetings.tsx put the same line in the same
+          place. See pages/company-detail.tsx's Pipelines section for the note
+          on `isLoading` against `isPending`. */}
+      {isLoading && <p className="text-sm text-slate-400">Loading...</p>}
       <ul className="flex flex-col gap-2">
         {sorted.map((file) => (
           <li key={file.id} className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm">
@@ -126,7 +133,7 @@ export function Files({ companyId, contactId, dealId, projectId }: FilesProps) {
             </div>
           </li>
         ))}
-        {sorted.length === 0 && <li className="text-sm text-slate-400">No files yet</li>}
+        {!isLoading && sorted.length === 0 && <li className="text-sm text-slate-400">No files yet</li>}
       </ul>
     </div>
   );

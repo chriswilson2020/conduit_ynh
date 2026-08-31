@@ -13,8 +13,8 @@
 /**
  * WHY THERE IS A GATE AT ALL.
  *
- * The rail builds the composer's seed AT CLICK TIME from up to four queries,
- * and from a deal tab two of them are chained: the deal, then
+ * The rail builds the composer's seed AT CLICK TIME from up to two queries,
+ * and from a deal tab they are chained: the deal, then
  * `useContact(deal.contactId)`. A click that lands before the second one
  * answers seeds `to: []` -- a compose addressed to nobody, indistinguishable on
  * screen from a deliberate blank one. Measured in Chromium against the real app
@@ -76,9 +76,11 @@ export type ComposeGate = "ready" | "resolving" | "failed";
  * the same three fields as one that has simply not been asked for: no data,
  * `fetchStatus: "idle"`, no error. Both predicates below require a REASON, so
  * such a hop is neither in flight nor stalled and needs no flag to be ignored.
- * Measured: with the flag forced true on all four hops, every one of the ten
- * journeys in e2e/rail-compose.spec.ts still passed and the only red was the
- * source guard that existed to protect the flag itself. Restating queries.ts's
+ * Measured in v1.2.1, when this gate still had four hops and that file ten
+ * journeys: with the flag forced true on all four, every one of the ten still
+ * passed and the only red was the source guard that existed to protect the flag
+ * itself. (v1.2.2 narrowed the chain to two -- see mail.tsx -- which cannot
+ * revive a flag that measurement retired.) Restating queries.ts's
  * predicate across a module boundary bought nothing and could drift; not
  * restating it cannot. Drift is still caught, behaviourally and in both
  * directions -- see the journeys' own note.
@@ -105,13 +107,23 @@ function inFlight(hop: ComposeHop): boolean {
  *
  * THE REASON IS REQUIRED, not inferred from "empty and not fetching". A query
  * that was never asked for -- `useContact("")` on a deal with no contact, and
- * the project hook on every deal tab -- is empty and idle with no error, and
- * without this clause it would read as a failure and paint an alert on every
- * record in the app.
+ * BOTH hooks on a company tab or a project one -- is empty and idle with no
+ * error, and without this clause it would read as a failure and paint an alert
+ * on every record in the app.
  *
- * A hop can be in flight AND stalled -- a failed query being refetched is
- * `isError` with `fetchStatus: "fetching"` and no data, which is exactly what
- * the Retry button produces -- and composeGate resolves that by order.
+ * A hop CAN be in flight and stalled at once as a matter of type -- no data,
+ * `isError`, and `fetchStatus: "fetching"` -- and composeGate resolves that by
+ * order. THE COMMENT HERE USED TO SAY THAT IS WHAT THE RETRY BUTTON MAKES, AND
+ * THAT IS FALSE. Driven through a real QueryObserver against the installed
+ * @tanstack/query-core 5.101.4: a query that has never succeeded reports
+ * `isError: false, fetchStatus: "fetching", data: undefined` while its refetch
+ * is out, because `fetchState()` resets `error` and `status` whenever
+ * `data === undefined`. So through queries.ts that combination is unreachable,
+ * and since v1.2.2 narrowed this chain to deal -> contact no two hops can hold
+ * the two states either (the contact's key comes from the deal, so a deal that
+ * has not answered never starts a contact fetch). The order below is kept
+ * anyway: it is a rule about an argument, this module is generic over the
+ * chain it is handed, and mail-lib.test.ts is where it is guarded.
  */
 function stalled(hop: ComposeHop): boolean {
   return empty(hop) && (hop.isError || hop.fetchStatus === "paused");
@@ -124,6 +136,12 @@ function stalled(hop: ComposeHop): boolean {
  * the question being answered and a chain with anything on the wire must not be
  * pressed yet. Nothing is lost by reporting the failure a render later: a hop
  * that fails again comes back stalled with the fetch over.
+ *
+ * NOTHING THE RAIL CAN HAND THIS FUNCTION TODAY DISTINGUISHES THE TWO ORDERS --
+ * see `stalled` above for the two measurements that say why -- so the order is a
+ * decision about an input rather than an observable behaviour of the app. It is
+ * stated here, and pinned in mail-lib.test.ts, so that a chain which does reach
+ * the overlap again inherits the answer instead of rediscovering it.
  */
 export function composeGate(hops: readonly ComposeHop[]): ComposeGate {
   if (hops.some(inFlight)) return "resolving";
@@ -139,7 +157,7 @@ export function composeGate(hops: readonly ComposeHop[]): ComposeGate {
  * SCOPED TO THE STALLED HOPS RATHER THAN REFETCHING EVERYTHING, and that is not
  * tidiness. Measured: `refetch()` on a DISABLED query goes to the network
  * anyway -- queryFn calls went 0 to 1 against query-core 5.101.4 -- so a Retry
- * that asked all four would send `GET /contacts/` with an empty id from every
+ * that asked every hop would send `GET /contacts/` with an empty id from every
  * deal that has no contact.
  */
 export function stalledHops<T extends ComposeHop>(hops: readonly T[]): readonly T[] {

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { useCompany, useContact, useDeal, useProject } from "../../queries";
+import { useContact, useDeal } from "../../queries";
 import { Composer, type ComposerSeed } from "../mail/composer";
 import { ThreadList } from "../mail/thread-list";
 import { Button } from "../ui/button";
@@ -17,8 +17,8 @@ export interface MailRailProps {
 /**
  * One hop with the refetch already bound to it.
  *
- * BOUND HERE RATHER THAN HANDED TO mail-lib, because the four `refetch`
- * functions have four different return types and a heterogeneous array of the
+ * BOUND HERE RATHER THAN HANDED TO mail-lib, because each hook's `refetch` has
+ * its own return type and a heterogeneous array of the
  * query results would make `hop.refetch()` a call on a union of signatures. A
  * `() => void` per hop keeps the lib free of TanStack's types, and the three
  * fields the gate reads are copied across by name rather than by spreading a
@@ -56,43 +56,40 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
    * has already fetched its own record.
    */
   const dealKey = dealId ?? "";
-  const projectKey = projectId ?? "";
   const dealQuery = useDeal(dealKey);
-  const projectQuery = useProject(projectKey);
   const deal = dealQuery.data;
-  const project = projectQuery.data;
-  // A deal's contact/company (and a project's company) stand in for the
-  // record's own when composing from those tabs -- a deal has no address of
-  // its own, its contact does. A PROJECT REACHES NO CONTACT: it has no
-  // contactId of its own and this does not hop through its deal, so a project
-  // tab composes with an empty To by construction. Measured, and stated here
-  // because v1.2.1's plan and spec both describe a project's chain as
-  // "deal -> contact", which is the deal tab's chain and not this one's.
+  // A deal's contact stands in for the record's own when composing from that
+  // tab -- a deal has no address of its own, its contact does. A PROJECT
+  // REACHES NO CONTACT: it has no contactId of its own and this does not hop
+  // through its deal, so a project tab composes with an empty To by
+  // construction. Measured, and stated here because v1.2.1's plan and spec both
+  // describe a project's chain as "deal -> contact", which is the deal tab's
+  // chain and not this one's.
   const contactKey = contactId ?? deal?.contactId ?? "";
   const contactQuery = useContact(contactKey);
   const contact = contactQuery.data;
-  const companyKey = companyId ?? deal?.companyId ?? project?.companyId ?? contact?.companyId ?? "";
-  const companyQuery = useCompany(companyKey);
 
   const contactName = contact === undefined
     ? undefined : `${contact.firstName} ${contact.lastName ?? ""}`.trim();
 
   /*
    * WHETHER THE SEED CAN BE BUILT YET. compose() reads these queries at CLICK
-   * TIME, and from a deal tab two of them are chained -- the deal, then the
+   * TIME, and from a deal tab they are chained -- the deal, then the
    * contact it names -- so a click landing between them seeds `to: []` and
    * addresses the message to nobody with nothing on screen to say so. See
    * mail-lib.ts for what each of the three states means and what was measured
    * to arrive at them, and e2e/rail-compose.spec.ts for the journeys.
    *
-   * THE GATE IS WIDER THAN THE SEED SINCE v1.2.2, DELIBERATELY AND ON RECORD.
-   * The company and project hops used to feed `context.companyName` for the
-   * mail merge; that merge is gone, so the only seed field any hop still
-   * decides is `to`, through deal -> contact. Both are kept as gate inputs
-   * rather than narrowed here, because narrowing them changes when Compose
-   * becomes clickable -- a product decision, not a consequence of deleting the
-   * templates. Filed in the backlog; whoever takes it also owns the two
-   * rail-compose journeys that hold the COMPANY hop.
+   * THE GATE IS EXACTLY THE SEED'S OWN CHAIN, and it was narrowed to that in
+   * v1.2.2. It used to carry a project hop and a company hop as well, which fed
+   * `context.companyName` for the mail merge; that merge went with the mail
+   * templates, so `to` is the only seed field any query still decides and
+   * deal -> contact is the only chain that reaches it. A control held shut by
+   * data nothing reads is a slower button and nothing else, so those two were
+   * dropped rather than kept for symmetry -- which means Compose comes live
+   * SOONER on a deal tab, and immediately on a project or company one.
+   * e2e/rail-compose.spec.ts holds each of the dropped hops open and asserts
+   * that it no longer waits.
    */
   const hops: readonly RailHop[] = [
     {
@@ -100,16 +97,8 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
       retry: () => { void dealQuery.refetch(); },
     },
     {
-      data: projectQuery.data, isError: projectQuery.isError, fetchStatus: projectQuery.fetchStatus,
-      retry: () => { void projectQuery.refetch(); },
-    },
-    {
       data: contactQuery.data, isError: contactQuery.isError, fetchStatus: contactQuery.fetchStatus,
       retry: () => { void contactQuery.refetch(); },
-    },
-    {
-      data: companyQuery.data, isError: companyQuery.isError, fetchStatus: companyQuery.fetchStatus,
-      retry: () => { void companyQuery.refetch(); },
     },
   ];
   const gate = composeGate(hops);
@@ -164,8 +153,7 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
       {gate === "failed" && (
         <div className="flex items-center gap-2">
           <p role="alert" data-testid="mail-compose-error" className="text-xs text-red-600">
-            Could not load this record's contact or company, so Compose may open with no
-            recipient.
+            Could not load this record's contact, so Compose may open with no recipient.
           </p>
           <Button
             variant="outline"

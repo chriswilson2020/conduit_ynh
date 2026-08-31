@@ -1,12 +1,13 @@
 import { test, expect } from "@playwright/test";
 import type { Page, Route } from "@playwright/test";
+import { delayFirst } from "./helpers.js";
 
 /**
  * WHAT A RECORD'S MAIL TAB COMPOSES TO, WHEN THE QUERIES IT READS ARE STILL
  * ON THE WIRE.
  *
  * components/rail/mail.tsx builds the composer's seed AT CLICK TIME out of up
- * to four queries, and from a DEAL tab two of them are chained: the deal, then
+ * to two queries, and from a DEAL tab they are chained: the deal, then
  * `useContact(deal.contactId)`. A click that lands between the two seeds
  * `to: []` -- a compose addressed to nobody, with nothing on screen to say so.
  * Measured in Chromium against the real app before the fix: with the contact
@@ -30,11 +31,12 @@ import type { Page, Route } from "@playwright/test";
  * `dealId` prop, which a project tab does not pass, so `useContact` is disabled
  * and a project tab NEVER seeds a recipient -- measured, with every query
  * settled and two seconds to spare, and confirmed on the wire (a project page
- * requests no `/api/contacts/<id>` at all). What a project tab does have two
- * deep is project -> company, which fills `context.companyName` for the mail
- * merge; held open, `{{company.name}}` reaches the body unsubstituted. That is
- * the same race and it is visible rather than silent, which is why the deal's
- * empty To is the defect and this is the one beside it.
+ * requests no `/api/contacts/<id>` at all). What a project tab HAD two deep was
+ * project -> company, filling `context.companyName` for the mail merge; held
+ * open, `{{company.name}}` reached the body unsubstituted. v1.2.2 deleted the
+ * merge and then the two hops that only fed it, so a project tab now has no
+ * enabled query in its gate at all -- which its journey below holds the project
+ * GET open to say.
  *
  * THE THREE STATES ARE ALL TESTED, because two of them are legitimate and a
  * fix that gates on "the data has arrived" would break them:
@@ -53,9 +55,12 @@ import type { Page, Route } from "@playwright/test";
  * deliberately does not restate that predicate -- mail-lib.ts's ComposeHop says
  * why, and the flag that used to carry it was measured inert and deleted -- so
  * no unit test can notice if queries.ts changes it. These journeys are the whole
- * net, and they hold in BOTH directions. Measured: enabling `useContact` on an
- * empty id turns `["contact", ""]` into a 404 and takes down two of them,
- * including the contactless deal's; disabling it outright takes down seven.
+ * net, and they hold in BOTH directions. RE-MEASURED against this file as it
+ * now stands, because the journey set changed in v1.2.2 and so did both numbers:
+ * enabling `useContact` on an empty id takes down FOUR of the nine, and
+ * disabling it outright takes down SEVEN -- the two that survive that being the
+ * contactless deal's and the project tab's, which are exactly the two whose
+ * whole claim is that nothing is fetched for them.
  *
  * EVERY TEST SEEDS ITS OWN FIXTURE ON ITS OWN PAGE, rather than sharing one
  * across a `describe.serial` the way composer-focus.spec.ts does. The reason is
@@ -68,14 +73,36 @@ import type { Page, Route } from "@playwright/test";
  * NO MAIL SERVER AND NO MAIL ACCOUNT, so this file runs in the local hybrid
  * loop the same way composer-focus.spec.ts does.
  *
- * WHAT v1.2.2 TOOK OUT OF HERE, so the gap is on record rather than discovered.
- * The project tab's two-deep chain is project -> company, and the company it
- * reached fed `context.companyName` for the MAIL MERGE and nothing else. The
- * merge is gone, so that value is no longer observable from outside the seed at
- * all, and the journey that read it back out of a composed body went with it.
- * The company hop itself is still a gate input (components/rail/mail.tsx says
- * why it was not narrowed here), which is what the "hop still on the wire" test
- * below still holds open.
+ * WHAT v1.2.2 TOOK OUT OF HERE, IN TWO STEPS, so the gap is on record rather
+ * than discovered. Removing the mail templates removed the merge, and
+ * `context.companyName` with it: that value was the ONLY way a company hop was
+ * observable from outside the seed, so the journey that read it back out of a
+ * composed body went at the same time. The project and company hops then had
+ * nothing left to feed, and narrowing the gate to `to`'s own chain dropped them
+ * too. Two journeys were added in the same round, each holding one of the
+ * dropped hops open and asserting that Compose no longer waits for it.
+ *
+ * AND ONE JOURNEY WAS RETIRED BECAUSE THE STATE IT BUILT NO LONGER EXISTS, not
+ * because it was redundant. "A hop still on the wire keeps Compose shut, and the
+ * alert waits its turn" failed the contact and HELD THE COMPANY, putting two
+ * independent hops in the two states composeGate resolves by order. With the
+ * chain narrowed to deal -> contact there is no second hop to put anywhere: the
+ * contact's key comes from the deal, so a failed or unanswered deal never starts
+ * a contact fetch at all, and no two hops can be stalled and in flight together.
+ *
+ * A REPLACEMENT ON THE SINGLE HOP WAS WRITTEN, MEASURED, AND THROWN AWAY, which
+ * is the part worth keeping on record. mail-lib.ts said a hop can be both at
+ * once because "a failed query being refetched is `isError` with
+ * `fetchStatus: fetching` and no data, which is exactly what the Retry button
+ * produces". IT IS NOT. Driven through a real QueryObserver against the
+ * installed @tanstack/query-core 5.101.4: a query that has NEVER succeeded
+ * reports `isError: false, fetchStatus: "fetching", data: undefined` during its
+ * refetch, because `fetchState()` resets `error` and `status` whenever
+ * `data === undefined`. The replacement journey therefore passed with
+ * composeGate's two branches SWAPPED -- an assertion that could not fail -- and
+ * was deleted rather than kept for the look of it. The ordering rule survives in
+ * mail-lib.ts as a property of a function generic over its chain, guarded by the
+ * two unit tests in mail-lib.test.ts that DO go red under that swap.
  */
 
 /** POST as the dev user, failing with the server's own words rather than a bare status. */
@@ -84,55 +111,6 @@ async function create(page: Page, path: string, data: unknown): Promise<{ id: st
   const body = await response.text();
   expect(response.status(), `POST ${path} answered ${String(response.status())}: ${body}`).toBe(201);
   return JSON.parse(body) as { id: string };
-}
-
-/**
- * A held request, and whether it is STILL held.
- *
- * `holding()` is the fixture checking itself, and it exists because two of the
- * journeys below -- including the one that is the whole defect -- assert only
- * that the recipient arrived. On a slow runner a hold that expired before the
- * click would leave those passing without ever exercising the race, silently.
- * Asserted rather than trusted, so the failure says "the hold expired" instead
- * of saying nothing at all.
- */
-interface Hold {
-  /** A matching request has arrived and has not been let go. */
-  holding: () => boolean;
-  unroute: () => Promise<void>;
-}
-
-/**
- * DELAY THE FIRST REQUEST MATCHING `pattern`, AND ONLY THE FIRST.
- *
- * The shape is dictated by a failure this suite has already paid for: a
- * handler that parks every matching request and continues it later throws
- * "Route is already handled!" ASYNCHRONOUSLY if one is still parked when the
- * test ends, and Playwright reports that on whichever test is running by then
- * -- it took down two unrelated second-user journeys in v1.2.1's Task 1 and was
- * triaged as a flake both times. So: exactly one request is held, every later
- * one is continued immediately, both continues swallow their errors, and every
- * caller unroutes in a finally. Each journey below also waits on an effect of
- * the release before it ends, so the held request is never still open at
- * teardown.
- */
-function delayFirst(page: Page, pattern: string, ms: number): Promise<Hold> {
-  let arrived = false;
-  let released = false;
-  const routed = page.route(pattern, async (route: Route) => {
-    if (arrived) {
-      await route.continue().catch(() => {});
-      return;
-    }
-    arrived = true;
-    await new Promise((resolve) => setTimeout(resolve, ms));
-    released = true;
-    await route.continue().catch(() => {});
-  });
-  return routed.then(() => ({
-    holding: () => arrived && !released,
-    unroute: async () => { await page.unroute(pattern).catch(() => {}); },
-  }));
 }
 
 /**
@@ -165,24 +143,10 @@ async function failUntilStopped(page: Page, pattern: string): Promise<{ stop: ()
  */
 const CONTACT_GET = "**/api/contacts/*";
 const COMPANY_GET = "**/api/companies/*";
+const PROJECT_GET = "**/api/projects/*";
 
 /** How long a held hop is held. Long enough that a click cannot beat it. */
 const HELD_MS = 1_500;
-
-/**
- * Longer, and only where a hold has to OUTLIVE a failing hop's retries.
- *
- * THE ARITHMETIC, because this number is the whole discriminating window. The
- * query client is `retry: 1` and TanStack's first retry delay is
- * `min(1000 * 2 ** 0, 30000)` = 1s, so a hop answered 500 twice reaches its
- * error state about a second in. Three seconds leaves two seconds during which
- * one hop has failed and another is still on the wire -- the only moment at
- * which the gate's ORDER is observable -- and still lands the alert inside
- * Playwright's default five-second expect budget with two seconds to spare.
- * HELD_MS would have been gone before the failure arrived and the two states
- * would never have overlapped at all.
- */
-const OUTLAST_RETRIES_MS = 3_000;
 
 interface Fixture {
   readonly companyId: string;
@@ -313,6 +277,47 @@ test.describe("A deal's Mail tab composes to the deal's contact, or waits", () =
   });
 
   /**
+   * THE HOP THAT WAS NARROWED OUT IN v1.2.2, ASSERTED FROM THE OUTSIDE.
+   *
+   * The company hop fed `context.companyName` for the mail merge and nothing
+   * else. The merge went with the templates, so no field of the seed reads a
+   * company any more -- and a control held shut by data nobody reads is just a
+   * slower button. Holding the company GET open used to disable Compose here;
+   * measured before the narrowing, this test failed on exactly that.
+   *
+   * THE CONTACT IS WAITED FOR FIRST, on the page's OWN rendering of it, so the
+   * one-shot read below happens at a moment when the company is the only thing
+   * outstanding -- otherwise a slow contact would disable Compose legitimately
+   * and this would be measuring the wrong hop. `isDisabled()` rather than
+   * `toBeEnabled()` for the same reason the contactless deal's test gives: an
+   * auto-retrying matcher would let a four-second wait pass a test whose claim
+   * is that there is no wait at all.
+   */
+  test("the company hop is gone: holding it open no longer shuts Compose", async ({ page }) => {
+    const fixture = await seed(page, runTag("dc"));
+    const hold = await delayFirst(page, COMPANY_GET, HELD_MS);
+    try {
+      await page.goto(`/deals/${fixture.dealId}`);
+      await expect(page.getByRole("heading", { level: 1 })).toContainText(fixture.dealTitle);
+      await expect(page.getByTestId("field-contactId")).toContainText("Ontvanger");
+      await page.getByTestId("mail-tab").click();
+      await expect(page.getByTestId("mail-compose")).toBeVisible();
+
+      const disabled = await page.getByTestId("mail-compose").isDisabled();
+      const pending = await page.getByTestId("mail-compose-pending").count();
+      expect(hold.holding(), "the company hop was already back: this read raced nothing").toBe(true);
+      expect(disabled, "Compose waited for a company no field of the seed reads").toBe(false);
+      expect(pending, "the rail said it was fetching this record's details for a hop it no longer has").toBe(0);
+
+      // ...and the hop that DOES decide something still decides it.
+      await page.getByTestId("mail-compose").click();
+      await expect(page.getByTestId("composer")).toContainText(fixture.address);
+    } finally {
+      await hold.unroute();
+    }
+  });
+
+  /**
    * THE STATE THE PLAN GLOSSES. `to: []` is not always wrong: a deal with no
    * linked contact has no address to seed, and composing to a manually typed
    * one is ordinary. A gate on ARRIVAL would disable this deal's Compose for
@@ -400,52 +405,9 @@ test.describe("A deal's Mail tab composes to the deal's contact, or waits", () =
     }
   });
 
-  /**
-   * ONE HOP FAILED, ANOTHER STILL ON THE WIRE, and the button's state is the
-   * first of those rather than the second. A deal reaches its company through
-   * `deal.companyId`, independently of the contact hop, so failing the contact
-   * and holding the company puts both states in play at once.
-   *
-   * THE DISCRIMINATOR IS `hold.holding()`, NOT THE SEQUENCE OF STATES, and the
-   * first version of this test taught that the hard way. It asserted disabled,
-   * then pending, then the alert hidden, then the alert visible, then enabled
-   * -- and a composeGate with the two branches SWAPPED passes every one of
-   * those, because it walks through the same states EARLIER: it paints the
-   * alert as soon as the contact's retry is spent, about a second in, against
-   * the OUTLAST_RETRIES_MS the hold runs for. Every assertion in this file
-   * auto-retries for five seconds, which is longer than either, so "earlier"
-   * is invisible to a sequence. What separates the two orders is
-   * WHETHER ANYTHING WAS STILL ON THE WIRE when the alert appeared: with the
-   * shipped order the company hop has landed by then, with the branches swapped
-   * it has not. Measured both ways.
-   */
-  test("a hop still on the wire keeps Compose shut, and the alert waits its turn", async ({ page }) => {
-    const fixture = await seed(page, runTag("dm"));
-    const failure = await failUntilStopped(page, CONTACT_GET);
-    const hold = await delayFirst(page, COMPANY_GET, OUTLAST_RETRIES_MS);
-    try {
-      await openMailTab(page, `/deals/${fixture.dealId}`, fixture.dealTitle);
-      expect(hold.holding(), "the company hop was already back before the race began").toBe(true);
-      await expect(page.getByTestId("mail-compose")).toBeDisabled();
-      await expect(page.getByTestId("mail-compose-pending")).toBeVisible();
-      await expect(page.getByTestId("mail-compose-error")).toBeHidden();
-
-      // ...and once the company lands, the contact's failure is what is left.
-      await expect(page.getByTestId("mail-compose-error")).toBeVisible();
-      expect(
-        hold.holding(),
-        "the alert was painted while a hop was still on the wire: the gate reported a failure it should have deferred",
-      ).toBe(false);
-      await expect(page.getByTestId("mail-compose")).toBeEnabled();
-      await expect(page.getByTestId("mail-compose-pending")).toBeHidden();
-    } finally {
-      await hold.unroute();
-      await failure.unroute();
-    }
-  });
 });
 
-test.describe("A project's Mail tab, whose second hop is the company", () => {
+test.describe("A project's Mail tab, which reaches no hop at all", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   /**
@@ -454,14 +416,35 @@ test.describe("A project's Mail tab, whose second hop is the company", () => {
    * from its own `dealId` prop and a project tab passes none -- there is no
    * project -> deal -> contact hop to race. Asserted here so that adding one
    * later is a red test rather than a surprise.
+   *
+   * AND SINCE v1.2.2 IT WAITS FOR NOTHING EITHER. What a project tab used to
+   * have two deep was project -> company, filling `context.companyName` for the
+   * mail merge; the merge is gone and both of those hops went with it, so this
+   * tab's gate now has no enabled query in it whatsoever. The project GET is
+   * held open here to say so: the rail is mounted inside project-detail.tsx's
+   * own loading branch (THE FRAME OUTLIVES THE FETCH), so the Mail tab is
+   * reachable while the record it belongs to is still on the wire -- and
+   * measured before the narrowing, Compose was disabled at exactly this moment.
    */
-  test("seeds no recipient, because it has no contact to reach", async ({ page }) => {
+  test("seeds no recipient, and waits for no record, because it has neither", async ({ page }) => {
     const fixture = await seed(page, runTag("pn"));
-    await openMailTab(page, `/projects/${fixture.projectId}`, fixture.projectName);
-    await expect(page.getByTestId("mail-compose")).toBeEnabled();
-    await page.getByTestId("mail-compose").click();
-    await expect(page.getByTestId("composer")).toBeVisible();
-    await expect(page.getByRole("button", { name: /^Remove / })).toHaveCount(0);
+    const hold = await delayFirst(page, PROJECT_GET, HELD_MS);
+    try {
+      await page.goto(`/projects/${fixture.projectId}`);
+      await page.getByTestId("mail-tab").click();
+      await expect(page.getByTestId("mail-compose")).toBeVisible();
+
+      const disabled = await page.getByTestId("mail-compose").isDisabled();
+      expect(hold.holding(), "the project hop was already back: this read raced nothing").toBe(true);
+      expect(disabled, "Compose waited for a project that decides nothing it seeds").toBe(false);
+
+      await expect(page.getByRole("heading", { level: 1 })).toContainText(fixture.projectName);
+      await page.getByTestId("mail-compose").click();
+      await expect(page.getByTestId("composer")).toBeVisible();
+      await expect(page.getByRole("button", { name: /^Remove / })).toHaveCount(0);
+    } finally {
+      await hold.unroute();
+    }
   });
 });
 

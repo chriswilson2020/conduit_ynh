@@ -478,7 +478,13 @@ function DealLink({ id, deal }: { id: string | null; deal: Deal | undefined }) {
  * plan.
  */
 function DependenciesSection({ task, archived }: { task: Task; archived: boolean }) {
-  const { data: dependencies = [] } = useTaskDependencies(task.id);
+  // `isLoading` is taken HERE and not only at the top of the drawer: this
+  // section mounts after `useTask` has answered, so the drawer's own loading
+  // branch is long gone by the time these predecessors are on the wire, and
+  // "No dependencies" was rendered over that whole window. (The filing said
+  // this file never destructured the flag at all; it always did, from
+  // `useTask` -- what was missing was this call site.)
+  const { data: dependencies = [], isLoading } = useTaskDependencies(task.id);
   const { data: poolTasks = [] } = useTasks(
     task.projectId !== null ? { projectId: task.projectId } : { standalone: true },
   );
@@ -518,7 +524,10 @@ function DependenciesSection({ task, archived }: { task: Task; archived: boolean
             )}
           </li>
         ))}
-        {dependencies.length === 0 && <li className="px-4 py-2 text-sm text-slate-400">No dependencies</li>}
+        {isLoading && <li className="px-4 py-2 text-sm text-slate-400">Loading...</li>}
+        {!isLoading && dependencies.length === 0 && (
+          <li className="px-4 py-2 text-sm text-slate-400">No dependencies</li>
+        )}
       </ul>
       {!archived && (
         <div className="mt-2 flex items-center gap-2">

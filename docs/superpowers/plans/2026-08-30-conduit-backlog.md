@@ -238,14 +238,19 @@ and is now false, so the comment was rewritten to name the users that remain
 same thing elsewhere and were corrected the same way: `db/schema.ts` twice and
 `services/documents.ts` once.
 
-**ONE PIECE OF THE REMOVAL WAS DELIBERATELY NOT DONE, and it needs a decision rather than
-a follow-up commit.** `components/rail/mail.tsx`'s compose gate reads FOUR hops -- deal,
-project, contact, company. After this task only `deal -> contact` decides anything the
-seed uses (`to`); the project and company hops fed `context.companyName` for the merge
-and now feed nothing, so Compose is gated on data no seed reads. Narrowing them changes
-WHEN the Compose button becomes clickable, which is a product decision Chris has not been
-asked about, and it would take out two of `e2e/rail-compose.spec.ts`'s journeys (the ones
-that hold `COMPANY_GET` open). Left as it stands, with the reason written at the gate.
+~~**ONE PIECE OF THE REMOVAL WAS DELIBERATELY NOT DONE, and it needs a decision rather than
+a follow-up commit.**~~ **DECIDED AND DONE in item 2's task, 31 Aug.**
+`components/rail/mail.tsx`'s compose gate read FOUR hops -- deal, project, contact,
+company. After this task only `deal -> contact` decided anything the seed uses (`to`); the
+project and company hops fed `context.companyName` for the merge and fed nothing after it,
+so Compose was gated on data no seed reads. The coordinator ruled that a control held shut
+by data nobody reads is a slower button and nothing else; it is narrowed to two hops, and
+Chris can reverse it.
+
+**The "two journeys" in this note was already one.** Two held `COMPANY_GET` before this
+task; this task deleted the merge journey, so by the time the note was written one was
+left -- and that one was not testing the company coupling at all. See item 2's entry below
+for what happened to it, which is the more interesting half.
 
 **What went from the tests, itemised, because the unit count moved 2499 -> 2464 (-35):**
 
@@ -321,6 +326,54 @@ SITE, not the file: `DependenciesSection` takes only `data` from `useTaskDepende
 makes `task-drawer.tsx` a second file that does it both ways, alongside `company-detail.tsx`
 -- which strengthens the argument rather than weakening it. Only `rail/notes.tsx` and
 `rail/files.tsx` need the flag introducing to a file that has never used one.
+
+### DONE, 31 Aug. Both halves, twenty mutations, and one instrument thrown away.
+
+**THE COUNT OF SIX IS RIGHT AND THE LIST IT COUNTS WAS NEVER A CENSUS.** All six were
+re-read: all six gate correctly. So do **`rail/timeline.tsx` and `settings-mail.tsx`**,
+which no filing here ever named, and `mail/composer.tsx`'s From block, which picks between
+"Loading accounts...", an empty-state line and the select. Six of the ENUMERATED do it
+correctly; the app has at least eight. The difference decided nothing -- the pattern is
+identical in all of them -- but nobody should quote six as a total. **And Contacts is one
+section above Pipelines, not three:** `company-detail.tsx` has exactly two `<section>`
+elements and they are adjacent. The three counts the field card and the owner row.
+
+**The pattern taken is the majority one and not the nearest one.** Six of those eight pair
+`{isLoading && <Loading/>}` with `{!isLoading && rows.length === 0 && <Empty/>}`, and that
+is what the five got. `company-detail.tsx`'s Contacts section, the closest sibling to one of
+them, uses the truthiness spelling instead and was deliberately not copied: the correction
+above ("only `rail/notes.tsx` and `rail/files.tsx` need the flag introducing to a file that
+has never used one") only makes sense if all five take a flag. `isLoading` rather than
+`isPending`, because `isLoading` is `isPending && isFetching` in the installed query-core
+5.101.4 -- so a DISABLED `useNotes`/`useFiles` reports false and shows its empty label at
+once, which is correct, where `isPending` would say "Loading..." for ever.
+
+**Guards proved, not assumed.** Five new journeys in `e2e/list-loading.spec.ts`, each
+holding one list GET open and taking a ONE-SHOT read of the surface (a negated auto-retrying
+matcher is satisfied the instant the lie goes away, which is v1.2.1's own lesson from the
+other side), then walking to a second, genuinely empty record so the label is shown to still
+arrive. All five were red before the fix. **Fifteen mutations, one at a time**: for each of
+the five, dropping the `!isLoading` guard, deleting the loading line, and deleting the empty
+label -- fifteen reds, each on its own journey and its own assertion.
+
+**THE COMPOSE-GATE HALF CARRIED IN FROM ITEM 1** narrowed `rail/mail.tsx` from four hops to
+two. Two journeys were added, each holding a dropped hop open and reading `isDisabled()`
+once; both were red before the narrowing, and putting either hop back turns its own one red
+again. The alert copy said "contact or company" and now says "contact".
+
+**AND THE PART WORTH READING TWICE.** The one surviving `COMPANY_GET` journey built "one hop
+stalled while another is in flight", the only state in which `composeGate`'s branch ORDER is
+observable. Narrowing makes that state unreachable -- the contact's key comes from the deal,
+so a deal that has not answered never starts a contact fetch. A replacement was written on
+`mail-lib.ts`'s own claim that a Retry produces a single hop that is both. **That claim was
+false and had never been measured.** Driven through a real QueryObserver against query-core
+5.101.4: a query that has never succeeded reports `isError: false` while its refetch is out,
+because `fetchState()` resets `error` and `status` whenever `data === undefined`. The
+replacement therefore **passed with the two branches swapped**, and was deleted rather than
+kept for the look of it. The rule survives as a property of a generic function, guarded by
+the two unit tests that do go red under that swap (2 of 16). Three comments were corrected.
+
+**Counts: unit 2464 unchanged, e2e 161 -> 166.** The stylesheet did not move.
 
 ---
 
@@ -530,13 +583,14 @@ found by SQL.
 
 ## Defects found and deliberately deferred
 
-**FIVE LISTS SAY "THERE IS NOTHING HERE" WHILE THEIR QUERY IS STILL ON THE WIRE -- found
-during v1.2.1 Task 5's sweep, filed rather than fixed because the release was already scoped.
-SCHEDULED: Chris moved it into v1.2.2 on 31 Aug -- see "v1.2.2, item 2" above.** Each
-destructures `const { data: rows = [] } = use...()` and renders its
-empty label on `rows.length === 0` with no loading branch, so the reader is told the record
-has no pipelines/notes/files/dependencies for as long as the fetch takes, and the list then
-appears underneath that sentence:
+~~**FIVE LISTS SAY "THERE IS NOTHING HERE" WHILE THEIR QUERY IS STILL ON THE WIRE**~~ **--
+FIXED 31 Aug in v1.2.2's item 2; see that section above for what was done, what the count of
+"seven siblings" below was actually counting, and the false comment the work turned up.**
+Found during v1.2.1 Task 5's sweep, filed rather than fixed because the release was already
+scoped. Each destructured `const { data: rows = [] } = use...()` and rendered its
+empty label on `rows.length === 0` with no loading branch, so the reader was told the record
+had no pipelines/notes/files/dependencies for as long as the fetch took, and the list then
+appeared underneath that sentence:
 
 | where | label |
 |---|---|
@@ -558,7 +612,14 @@ neighbours have. ~~`rail/notes.tsx`, `rail/files.tsx` and `task-drawer.tsx` do n
 destructure `isLoading` at all.~~ **Corrected 31 Aug: that is true of the first two only.**
 `task-drawer.tsx` destructures `isLoading` from `useTask` and branches on it; it is
 `DependenciesSection`'s own call that takes only `data`. The claim is about the call site, not
-the file -- see "v1.2.2, item 2" above, where this is now scheduled.
+the file -- see "v1.2.2, item 2" above, where this was fixed.
+
+**AND "SEVEN OTHER PLACES" WAS TWO SHORT, found when the fix re-read them on 31 Aug.**
+`rail/timeline.tsx` and `settings-mail.tsx` gate an empty label on `isLoading` too and appear
+in no filing; `mail/composer.tsx`'s From block does the three-way version of it. With
+`settings-templates.tsx`'s gone alongside the mail templates, the enumerated set is six and
+the real one is at least eight. It changed nothing about the fix -- the pattern is the same
+in all of them -- and it is recorded because a list of examples read as a census.
 
 **HOW IT WAS FOUND, because the test consequence is the reason it matters.** Two e2e sites
 leaned on one of these labels as a "the list has loaded" sentinel, and one of them said so
@@ -568,7 +629,8 @@ back in the default list, its `toContainText("No pipelines")` pair passed twice 
 four times over six attempts -- a race, decided by whether the response beat the first poll,
 which is worse than either a pass or a failure. That test now waits on the response instead.
 `e2e/mobile.spec.ts`'s `No dependencies` precondition is the same shape and was left alone:
-it is a precondition rather than the test's claim, and a false pass there costs nothing.
+it is a precondition rather than the test's claim, and a false pass there costs nothing. It
+is a real sentinel now, as a side effect of the fix rather than by anyone editing it.
 
 **THE SERVER CAN STORE A SIGNATURE ITS OWN RESPONSE SCHEMA REJECTS, AND THE WEB CLIENT
 THEN FAILS ON EVERY `GET /api/mail/accounts` FOR THAT USER -- found during v1.2.1 Task 1,
@@ -980,8 +1042,9 @@ supposed to. **Conduit did not have seven bugs.**
 **ONE GENUINE APPLICATION DEFECT CAME OUT OF THE SWEEP**, and it was found by READING the
 surface behind a suspicious assertion rather than by a repair going red: the five lists that
 render their empty label with no loading branch, at the head of the deferred-defects section
-above. Scheduled into v1.2.2. That is the whole application-side yield, and stating it plainly
-is the point -- the sweep's value was in what the tests were failing to claim.
+above. **Fixed in v1.2.2's item 2 on 31 Aug**, each with a journey shown failing first. That
+is the whole application-side yield, and stating it plainly is the point -- the sweep's value
+was in what the tests were failing to claim.
 
 **The discovery-rate argument is now settled in the direction it was posed.** Seven in one
 deliberate pass, against four found by accident in the whole project to date. The candidate
