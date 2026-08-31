@@ -65,8 +65,8 @@ ram.runtime = "1424M"
 [resources]
 
     [resources.sources.main]
-    url = "https://github.com/chriswilson2020/conduit_ynh/releases/download/v1.2.2/conduit-1.2.2.tar.gz"
-    sha256 = "036c33000a1dfd3019e980c6944bad0afdc9eb66106d1cd945353373ddbedbc4"
+    url = "https://github.com/chriswilson2020/conduit_ynh/releases/download/v1.3.0/conduit-1.3.0.tar.gz"
+    sha256 = "ba4c9b604c95891c2b41c7bb7503bfee02712faf20c6f641bf340a7a15af48e8"
 
     # NO autoupdate BLOCK, DELIBERATELY. It carried
     # `autoupdate.strategy = "latest_github_release"` until 30 Aug 2026, where it
