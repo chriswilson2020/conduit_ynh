@@ -145,7 +145,7 @@ export async function buildApp(
 
   await registerCrmRoutes(app, {
     db, dataDir, multipartFileSizeLimit,
-    defaultCurrency: config.defaultCurrency,
+    defaultCurrency: config.defaultCurrency, appVersion: config.version,
     basePath: config.basePath, mailKeyPath: config.mailKeyPath,
     syncManager: mail?.syncManager ?? (() => null),
     transportFactory: mail?.transportFactory

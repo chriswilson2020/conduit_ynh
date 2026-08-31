@@ -19,6 +19,7 @@ import { registerGanttRoutes } from "./gantt.js";
 import { registerMailRoutes } from "./mail.js";
 import { registerMeetingRoutes } from "./meetings.js";
 import { registerDocumentRoutes } from "./documents.js";
+import { registerExportRoutes } from "./export.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -37,6 +38,13 @@ export interface CrmRouteDeps {
   /** Applied by deals.ts's POST /api/deals when the caller omits a currency --
    * threaded straight from config.defaultCurrency (see config.ts). */
   defaultCurrency: string;
+  /**
+   * The running app's version, threaded straight from config.version
+   * (APP_VERSION). Recorded in the export's manifest.json so an archive found
+   * on a disk in two years says which Conduit wrote it -- see
+   * services/export.ts.
+   */
+  appVersion: string;
   /**
    * Public path this app is mounted at, without a trailing slash ("/" for a
    * root deployment) -- config.basePath, threaded straight through.
@@ -75,7 +83,7 @@ export interface CrmRouteDeps {
  * Wires the hardened CRM/PM services (plus the plain user listing) into HTTP:
  * companies, contacts, notes, files, events, search, pipelines/deals (Phase
  * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5), and
- * documents plus the issuer profile (Phase 7).
+ * documents plus the issuer profile (Phase 7), and the data export (Phase 7.6).
  * Registered after /api/health and /api/me and before the not-found/SPA branch,
  * so it inherits the same onRequest auth hook without having to repeat it.
  *
@@ -107,4 +115,5 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerMailRoutes(app, deps);
   registerMeetingRoutes(app, deps);
   registerDocumentRoutes(app, deps);
+  registerExportRoutes(app, deps);
 }

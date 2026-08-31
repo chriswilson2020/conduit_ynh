@@ -11,7 +11,12 @@ export type { LineInput, DocumentTotals } from "./money.js";
 // Formatting is a separate module from the arithmetic, and reaches web the same
 // way: the one locale every money figure in the app is rendered in, so the
 // quote form and the PDF beside it cannot disagree.
-export { formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE } from "./money-format.js";
+// decimalFromCents rides along for the CSV export (services/export.ts), which
+// needs the bare decimal and not the formatted currency string -- see its own
+// comment for why a spreadsheet cell must have neither symbol nor separator.
+export {
+  decimalFromCents, formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE,
+} from "./money-format.js";
 
 export const userSchema = z.object({
   id: z.uuid(),

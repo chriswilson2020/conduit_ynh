@@ -15,14 +15,20 @@
 // from another. (Deliberately uncounted: it said "six places" and there are nine
 // calls across seven files, which is exactly the kind of number that drifts.)
 //
-// THIS FUNCTION NEVER THROWS, and that is a hard rule rather than a preference.
-// It is display code with no error boundary anywhere in packages/web to catch it
-// -- no ErrorBoundary, no componentDidCatch, no router errorComponent -- so a
-// throw here unmounts the application rather than degrading a label. An earlier
+// THE FORMATTERS NEVER THROW, and that is a hard rule rather than a preference.
+// They are display code with no error boundary anywhere in packages/web to catch
+// it -- no ErrorBoundary, no componentDidCatch, no router errorComponent -- so a
+// throw there unmounts the application rather than degrading a label. An earlier
 // version of this file refused amounts above a measured exactness ceiling, which
 // turned an approximate figure into a blank screen: `deals.value_cents` accepts
 // any safe integer, and board-lib.ts sums a stage's deals into a plain number
 // before formatting, so two API-legal deals could add up to a crash.
+//
+// THE RULE IS THE FORMATTERS', NOT THE FILE'S, and since v1.3.0 that distinction
+// is load-bearing: decimalFromCents is exported too, it is server-side only, and
+// it DOES throw on a fractional input. Each formatter guards with
+// Number.isSafeInteger before calling it, which is what keeps their own contract
+// intact -- see decimalFromCents' precondition.
 //
 // EXACTNESS COMES FROM THE STRING, NOT FROM A CEILING. The decimal is built out
 // of the integer with BigInt -- no divide by 100 in double precision anywhere --
@@ -48,6 +54,22 @@ export const MONEY_LOCALE = "en-GB";
  * The exact decimal for an integer number of cents, e.g. -1250 -> "-12.50".
  * BigInt throughout, so no magnitude loses a digit on the way through.
  *
+ * EXPORTED SINCE v1.3.0, for the CSV export's money columns. The export needs
+ * the bare decimal and not formatMoneyCents' output: a spreadsheet parses
+ * `12.50` as a number and `EUR 1,234.56` as text, so the grouping separator and
+ * the currency symbol -- the whole of what Intl adds -- are exactly what a CSV
+ * cell must not have. Sharing the DECIMAL rather than re-deriving it is what
+ * keeps the promise money.ts's header makes: no `/ 100` in double precision
+ * anywhere, in any consumer.
+ *
+ * PRECONDITION: `cents` is integral. BigInt() accepts any integral number,
+ * including one past Number.MAX_SAFE_INTEGER (where it reflects the double's
+ * exact value, which is the best any caller can know), and THROWS on a
+ * fractional one. Every column that reaches this is a Postgres `bigint` or
+ * `integer` read through drizzle's `mode: "number"`, so a fractional value
+ * cannot arrive from the database -- and formatMoneyCents, whose contract is
+ * that it never throws, still guards with Number.isSafeInteger before calling.
+ *
  * The return type is the template-literal `${number}` rather than `string`, and the
  * assertion is what earns it. TypeScript types Intl's string overload as
  * `StringNumericLiteral`, which is exactly `${number} | "Infinity" | ...` -- a type
@@ -56,7 +78,7 @@ export const MONEY_LOCALE = "en-GB";
  * established -- optional minus, digits, a point, two digits -- keeps the assertion
  * next to the thing that makes it true and leaves the call site honestly typed.
  */
-function exactDecimal(cents: number): `${number}` {
+export function decimalFromCents(cents: number): `${number}` {
   const value = BigInt(cents);
   const negative = value < 0n;
   const absolute = negative ? -value : value;
@@ -88,7 +110,7 @@ export function formatMoneyCents(cents: number, currency: string, locale: string
   // here would put the crash back into display code for the one input class that
   // is already a symptom of something else being wrong.
   if (!Number.isSafeInteger(cents)) return format.format(cents / 100);
-  return format.format(exactDecimal(cents));
+  return format.format(decimalFromCents(cents));
 }
 
 /**
