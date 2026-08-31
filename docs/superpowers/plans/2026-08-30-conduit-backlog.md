@@ -184,6 +184,19 @@ This is the first migration since v1.1.0's `0011`. Regenerating means restoring 
 `when`/`tag`, verifying the journal diff is empty, and **dropping and recreating
 `conduit_test`** -- the migrator skips by timestamp.
 
+### A trap waiting for v1.2.2's version bump, measured on `main` at the v1.2.1 release
+
+**The lockfile must be regenerated with `npm install --package-lock-only`, never edited**, and
+the reason gets worse rather than better each release. v1.2.0's brief claimed six
+self-references at the outgoing version; there were three. At **1.2.1 there are FOUR
+occurrences of `"version": "1.2.1"` and only three are this app** -- `packages/api`,
+`packages/shared`, `packages/web`. The fourth is `node_modules/source-map-js`, genuinely at
+that version and nothing to do with Conduit. (The three left at `1.2.0` are `node_modules/he`,
+twice, and `node_modules/setprototypeof`.) **A search-and-replace of `1.2.1` -> `1.2.2` would
+silently corrupt `source-map-js`'s pinned version and integrity pairing.** The foreign package
+is a DIFFERENT one each release, so checking last release's list is no defence -- regenerate,
+then confirm the diff is nothing but the three workspace version strings.
+
 ### Consequence for v1.1.0's work, and say it in the release notes
 
 v1.1.0 added `{{contact.salutation}}` and `{{contact.pronouns}}` to the MAIL merge and paid
