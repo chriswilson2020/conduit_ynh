@@ -2092,10 +2092,24 @@ const DIMENSION_BYTES: Record<string, number> = {
   png: 24,
   webp: 30,
   jpeg: 65_536,
-  // GIF IS THE WHOLE FILE, because its answer is a maximum over every frame and the
-  // biggest frame can be the last one. A window would mean either an undercharge (the
-  // largest extent so far) or a refusal of any GIF bigger than the window; reading it
-  // all is a few milliseconds on a payload the image cap already bounds.
+  // GIF IS (ALL BUT 15 BYTES OF) THE WHOLE FILE, because its answer is a maximum over
+  // every frame and the biggest frame can be the last one. Reading it all is a few
+  // milliseconds on a payload the image cap already bounds.
+  //
+  // **THE 15 BYTES ARE REAL AND THIS COMMENT SAID "THE WHOLE FILE" FLATLY UNTIL
+  // v1.2.1.** RENDER_IMAGE_CAP_BYTES admits 409,623 payload characters; the longest
+  // DECODABLE prefix of that is 409,620, since Python raises "Incorrect padding" on
+  // the three-character tail, and 409,620 characters is 307,215 bytes against this
+  // window's 307,200. It could not matter before, because a walk that ran out of
+  // window answered null and a payload that long was then charged billions of pixels.
+  // It can now: `gifSize` falls back to the largest extent it established, and an
+  // extent hiding in those 15 bytes is not in it. What keeps it harmless is that
+  // Pillow sizes a still image from the screen descriptor and FRAME ZERO, both inside
+  // the first ~800 bytes (a global colour table is at most 768); a later frame
+  // enlarges `_size` only for a caller that seeks to it, and the render path never
+  // does. Left at MAX_LOGO_BYTES rather than widened: widening is a behaviour change
+  // with no failing case behind it, and this is a patch release. Recorded here so the
+  // next reader does not have to rediscover that the window and the cap differ.
   gif: MAX_LOGO_BYTES,
 };
 
