@@ -117,9 +117,14 @@ export interface CrmRouteDeps {
 /**
  * Wires the hardened CRM/PM services (plus the plain user listing) into HTTP:
  * companies, contacts, notes, files, events, search, pipelines/deals (Phase
- * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5), and
- * documents plus the issuer profile (Phase 7), and the data export and
- * encrypted backup (Phase 7.6).
+ * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5),
+ * documents plus the issuer profile (Phase 7), and the data export, the
+ * encrypted backup, its pre-flight and the re-authentication that gates both
+ * downloads (Phase 7.6).
+ *
+ * THIS LIST IS EXHAUSTIVE BY CONSTRUCTION -- it is the register calls below,
+ * in words -- so a family added without a line here is a list that has started
+ * lying. The re-auth family was exactly that until a review found it.
  * Registered after /api/health and /api/me and before the not-found/SPA branch,
  * so it inherits the same onRequest auth hook without having to repeat it.
  *

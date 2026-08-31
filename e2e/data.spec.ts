@@ -348,6 +348,22 @@ test.describe("the pre-flight warning", () => {
     await expect(page.getByTestId("backup-preflight")).toContainText("to archive");
   });
 
+  test("the route answers without a password and discloses no free space", async ({ page }) => {
+    // Two properties in one request, and they are two halves of one decision.
+    // The warning has to come BEFORE the commitment it informs, so this route
+    // is deliberately not behind the gate -- and because it is not, everything
+    // in its answer is readable by any session holder, which is why the
+    // server's free disk is not in it.
+    await openDataSettings(page);
+    const answer = await page.evaluate(async () => {
+      const response = await fetch("/api/backup/preflight", { headers: { Accept: "application/json" } });
+      return { status: response.status, body: await response.text() };
+    });
+    expect(answer.status).toBe(200);
+    expect(answer.body).not.toContain("availableBytes");
+    expect(answer.body).toContain("shortfallBytes");
+  });
+
   test("WARNS when the estimate runs past what the proxy will wait for", async ({ page }) => {
     // The failure this exists to stop is silent: the backup cannot stream, so
     // an install too large for the proxy's patience produces a 504 after
@@ -360,8 +376,8 @@ test.describe("the pre-flight warning", () => {
         contentType: "application/json",
         body: JSON.stringify({
           databaseBytes: 200 * 1024 ** 3, blobBytes: 0,
-          availableBytes: 900 * 1024 ** 3, requiredBytes: 400 * 1024 ** 3,
-          enoughDisk: true, estimatedSeconds: 8_800, slow: true, timeoutSeconds: 3600,
+          requiredBytes: 400 * 1024 ** 3, enoughDisk: true, shortfallBytes: 0,
+          estimatedSeconds: 8_800, slow: true, timeoutSeconds: 3600,
         }),
       });
     });
@@ -383,8 +399,9 @@ test.describe("the pre-flight warning", () => {
         contentType: "application/json",
         body: JSON.stringify({
           databaseBytes: 900 * 1024 ** 2, blobBytes: 0,
-          availableBytes: 100 * 1024 ** 2, requiredBytes: 1900 * 1024 ** 2,
-          enoughDisk: false, estimatedSeconds: 40, slow: false, timeoutSeconds: 3600,
+          requiredBytes: 1900 * 1024 ** 2, enoughDisk: false,
+          shortfallBytes: 1800 * 1024 ** 2,
+          estimatedSeconds: 40, slow: false, timeoutSeconds: 3600,
         }),
       });
     });

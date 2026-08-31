@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  ReauthTickets, ReauthThrottle, REAUTH_TICKET_TTL_MS,
+  ReauthTickets, ReauthThrottle, REAUTH_TICKET_TTL_MS, PORTAL_TIMEOUT_MS,
   createFixedPasswordVerifier, createPortalVerifier,
 } from "./reauth.js";
 
@@ -67,43 +67,105 @@ describe("ReauthThrottle", () => {
   it("allows attempts until the limit, then locks the account out", () => {
     const throttle = new ReauthThrottle(3, 60_000);
     const at = 1_000;
-    expect(throttle.retryAfterMs("chris", at)).toBe(0);
-    throttle.fail("chris", at);
-    throttle.fail("chris", at);
-    expect(throttle.retryAfterMs("chris", at)).toBe(0);
-    throttle.fail("chris", at);
-    expect(throttle.retryAfterMs("chris", at)).toBe(60_000);
+    expect(throttle.reserve("chris", at)).toBe(0);
+    expect(throttle.reserve("chris", at)).toBe(0);
+    expect(throttle.reserve("chris", at)).toBe(0);
+    expect(throttle.reserve("chris", at)).toBe(60_000);
+  });
+
+  /**
+   * THE PROPERTY THE FIRST VERSION DID NOT HAVE, and the reason `reserve`
+   * exists at all. The route used to read the counter, await the password
+   * check, and record the failure afterwards -- so every request that arrived
+   * inside the await saw a counter that had not moved.
+   *
+   * This is that shape, reduced to its arithmetic: N callers all read before
+   * any of them writes. With a check-then-write pair every one of them gets
+   * through; with `reserve` exactly `maxAttempts` do.
+   */
+  it("counts an attempt AT THE CHECK, so simultaneous callers cannot all pass", () => {
+    const throttle = new ReauthThrottle(5, 60_000);
+    const at = 1_000;
+    const allowed = Array.from({ length: 200 }, () => throttle.reserve("chris", at) === 0);
+    expect(allowed.filter(Boolean)).toHaveLength(5);
+
+    // And the old shape, for contrast: reading without counting lets all 200
+    // through, which is exactly what was measured against the real server.
+    const loose = new ReauthThrottle(5, 60_000);
+    const readOnly = Array.from({ length: 200 }, () => loose.retryAfterMs("chris", at) === 0);
+    expect(readOnly.filter(Boolean)).toHaveLength(200);
+  });
+
+  it("gives an attempt back when nothing was tested", () => {
+    const throttle = new ReauthThrottle(2, 60_000);
+    const at = 1_000;
+    expect(throttle.reserve("chris", at)).toBe(0);
+    throttle.release("chris", at);
+    // The released attempt is genuinely back: two more are still allowed.
+    expect(throttle.reserve("chris", at)).toBe(0);
+    expect(throttle.reserve("chris", at)).toBe(0);
+    expect(throttle.reserve("chris", at)).toBe(60_000);
+  });
+
+  it("forgets an account entirely once its last attempt is released", () => {
+    const throttle = new ReauthThrottle(2, 60_000);
+    throttle.reserve("chris", 1_000);
+    throttle.release("chris", 1_000);
+    expect(throttle.size()).toBe(0);
   });
 
   it("lets the account back in once the window has passed", () => {
     const throttle = new ReauthThrottle(1, 60_000);
-    throttle.fail("chris", 1_000);
+    throttle.reserve("chris", 1_000);
     expect(throttle.retryAfterMs("chris", 1_000)).toBe(60_000);
     expect(throttle.retryAfterMs("chris", 61_001)).toBe(0);
   });
 
   it("counts from one again after a window has run out, rather than resuming", () => {
     const throttle = new ReauthThrottle(2, 60_000);
-    throttle.fail("chris", 1_000);
-    // Long after the first window: this is a fresh first failure, so one more
+    throttle.reserve("chris", 1_000);
+    // Long after the first window: this is a fresh first attempt, so one more
     // is still allowed.
-    throttle.fail("chris", 500_000);
-    expect(throttle.retryAfterMs("chris", 500_000)).toBe(0);
+    throttle.reserve("chris", 500_000);
+    expect(throttle.reserve("chris", 500_000)).toBe(0);
   });
 
   it("clears the count on a correct password", () => {
     const throttle = new ReauthThrottle(2, 60_000);
-    throttle.fail("chris", 1_000);
+    throttle.reserve("chris", 1_000);
     throttle.succeed("chris");
-    throttle.fail("chris", 1_000);
-    expect(throttle.retryAfterMs("chris", 1_000)).toBe(0);
+    throttle.reserve("chris", 1_000);
+    expect(throttle.reserve("chris", 1_000)).toBe(0);
   });
 
   it("locks one account without touching another", () => {
     const throttle = new ReauthThrottle(1, 60_000);
-    throttle.fail("chris", 1_000);
+    throttle.reserve("chris", 1_000);
     expect(throttle.retryAfterMs("chris", 1_000)).toBe(60_000);
     expect(throttle.retryAfterMs("sam", 1_000)).toBe(0);
+  });
+
+  /**
+   * THE MAP IS BOUNDED, and it needs to be for a reason narrower than tidiness:
+   * the key is a username taken from the Ynh-User header, and any LOCAL process
+   * on the box can set that freely (the app binds loopback and nginx forwards
+   * $http_ynh_user). ReauthTickets was capped from the start with a comment
+   * about exactly this; a review found that this map was not.
+   */
+  it("does not grow without bound when the account name varies", () => {
+    const throttle = new ReauthThrottle(5, 60_000);
+    for (let i = 0; i < 20_000; i += 1) throttle.reserve(`account-${String(i)}`, 1_000);
+    expect(throttle.size()).toBeLessThanOrEqual(4096);
+  });
+
+  it("forgets expired accounts before it evicts live ones", () => {
+    const throttle = new ReauthThrottle(5, 60_000);
+    for (let i = 0; i < 5_000; i += 1) throttle.reserve(`old-${String(i)}`, 1_000);
+    // Long after every one of those windows: one new account should find room
+    // by sweeping rather than by evicting, and should be remembered.
+    throttle.reserve("chris", 10_000_000);
+    expect(throttle.retryAfterMs("chris", 10_000_000)).toBe(0);
+    expect(throttle.size()).toBeLessThan(4096);
   });
 });
 
@@ -186,6 +248,33 @@ describe("createPortalVerifier", () => {
     await withPortal(() => ({ status: 502 }), async (url) => {
       await expect(createPortalVerifier(url)("chris", "hunter2")).rejects.toThrow(/502/);
     });
+  });
+
+  it("gives up on a portal that accepts the connection and then says nothing", async () => {
+    // PORTAL_TIMEOUT_MS had no test at all. Driven with a short injected
+    // timeout rather than the real ten seconds -- the bound is what is under
+    // test, not its value, and the value is asserted separately below.
+    const http = await import("node:http");
+    const server = http.createServer(() => { /* accept, and never answer */ });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("no port");
+    try {
+      const verify = createPortalVerifier(`http://127.0.0.1:${String(address.port)}`, 150);
+      const started = Date.now();
+      await expect(verify("chris", "hunter2")).rejects.toThrow();
+      // Bounded, rather than hanging until the request's own deadline.
+      expect(Date.now() - started).toBeLessThan(3_000);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => { resolve(); }));
+    }
+  });
+
+  it("allows the portal ten seconds by default", () => {
+    // Shorter than the 30s nginx gives its own portal location (measured on
+    // the deploy target), because a person is watching a spinner over this.
+    expect(PORTAL_TIMEOUT_MS).toBe(10_000);
+    expect(PORTAL_TIMEOUT_MS).toBeLessThan(30_000);
   });
 
   it("throws when nothing is listening at all", async () => {

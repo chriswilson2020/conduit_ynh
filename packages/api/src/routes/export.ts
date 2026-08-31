@@ -45,7 +45,15 @@ let exportsInFlight = 0;
  */
 export function registerExportRoutes(app: FastifyInstance, deps: CrmRouteDeps): void {
   const { db, dataDir, appVersion } = deps;
-  app.get("/api/export", async (request, reply) => {
+  // NO AUTOMATIC HEAD ROUTE, and a review is what found the cost of the
+  // default. Fastify mirrors every GET with a HEAD that runs the same handler
+  // and discards the body -- so `HEAD /api/export` with a valid ticket built
+  // the ENTIRE archive, read the whole blob store, held the one concurrency
+  // slot for the duration, and spent the ticket, to answer with no bytes at
+  // all. There is no caller for it: this route exists to be downloaded, and
+  // the page issues a GET through fetch(). 404 is both cheaper and more honest
+  // than a HEAD that means nothing.
+  app.get("/api/export", { exposeHeadRoute: false }, async (request, reply) => {
     const user = requireUser(request, reply);
     if (user === null) return;
     // BEFORE THE CONCURRENCY SLOT, deliberately. A caller with no ticket must

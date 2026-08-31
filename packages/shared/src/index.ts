@@ -3089,9 +3089,12 @@ export type ReauthTicket = z.infer<typeof reauthTicketSchema>;
 export const backupPreflightSchema = z.object({
   databaseBytes: z.number().int().nonnegative(),
   blobBytes: z.number().int().nonnegative(),
-  availableBytes: z.number().nonnegative(),
   requiredBytes: z.number().nonnegative(),
   enoughDisk: z.boolean(),
+  // How much MORE space is needed than there is, and 0 when there is enough.
+  // The server's free disk is deliberately NOT here: this route answers
+  // without a password, so everything in it is readable by any session holder.
+  shortfallBytes: z.number().nonnegative(),
   estimatedSeconds: z.number().int().nonnegative(),
   slow: z.boolean(),
   timeoutSeconds: z.number().int().positive(),

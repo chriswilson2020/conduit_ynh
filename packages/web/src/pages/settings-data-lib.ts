@@ -179,8 +179,13 @@ export function formatDuration(seconds: number): string {
  */
 export function preflightWarning(preflight: BackupPreflight): string | null {
   if (!preflight.enoughDisk) {
+    // THE SHORTFALL, NOT THE FREE SPACE. The route answers without a password
+    // -- a warning has to come before the commitment it informs -- so the
+    // server's free disk is deliberately not in its response at all. What an
+    // operator needs is how much to clear, and that is what this says.
     return `There is not enough free space to build a backup: it needs about `
-      + `${formatBytes(preflight.requiredBytes)} and ${formatBytes(preflight.availableBytes)} is free. `
+      + `${formatBytes(preflight.shortfallBytes)} more than is free `
+      + `(the whole archive needs about ${formatBytes(preflight.requiredBytes)}). `
       + `Free some space and reload this page.`;
   }
   if (preflight.estimatedSeconds > preflight.timeoutSeconds) {

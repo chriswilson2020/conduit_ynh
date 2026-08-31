@@ -14,7 +14,7 @@ import { Link } from "@tanstack/react-router";
 // makes this row a scroller rather than a squeezer. These are flex children, so
 // until now they SHRANK: with three tabs there was room and nothing showed, and
 // with four there is not -- measured at a phone width, each tab compressed to
-// 72.7px for a label that needs about 134px, so the text was being squeezed
+// 72.7px for a label that measures 148 uncompressed, so the text was squeezed
 // rather than the row scrolled. A compressed tab is also a smaller touch target
 // and a less predictable one, which is how this surfaced at all: the last tab
 // measured 0.9946 of itself inside the viewport where every other control in

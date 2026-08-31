@@ -497,17 +497,54 @@ export const BACKUP_PROXY_READ_TIMEOUT_SECONDS = 3600;
  */
 export const BACKUP_SLOW_SECONDS = 60;
 
+/**
+ * Whether a wait of this length is worth interrupting somebody with.
+ *
+ * A FUNCTION SO THE BOUNDARY CAN BE ASSERTED FROM BOTH SIDES. It was a `>=`
+ * buried in an object literal that needed a database to reach, so the only
+ * test that could touch it approached from far below and the boundary itself
+ * was never exercised.
+ */
+export function isSlowBackup(estimatedSeconds: number): boolean {
+  return estimatedSeconds >= BACKUP_SLOW_SECONDS;
+}
+
 export interface BackupEstimate {
   /** pg_database_size of the current database. */
   databaseBytes: number;
   /** The blob store on disk, at full size. */
   blobBytes: number;
-  /** Free space where the archive would be built. */
-  availableBytes: number;
   /** What requiredFreeBytes says this backup needs. */
   requiredBytes: number;
+  /**
+   * Free space where the archive would be built.
+   *
+   * MEASURED HERE AND NOT SENT ANYWHERE. routes/backup.ts projects this
+   * interface onto the wire shape by hand and leaves this field out -- see the
+   * pre-flight route, and shortfallBytes below, for why. It stays on the
+   * service's own answer because the service's job is to report what it
+   * measured, and because a probe nothing can read is a probe nothing can
+   * check: without it, swapping the default for `() => Infinity` would be
+   * invisible to every test.
+   */
+  availableBytes: number;
   /** False when the pre-flight would refuse before spawning anything. */
   enoughDisk: boolean;
+  /**
+   * How much MORE space a backup needs than there is, or 0 when there is
+   * enough.
+   *
+   * THE SHORTFALL IS WHAT THE ROUTE SENDS, AND THE FREE SPACE IS NOT. The
+   * pre-flight deliberately does not require a password -- a warning has to
+   * come before the commitment it informs -- so everything in its response is
+   * readable by any session holder. The size of the install is something they
+   * can already work out by reading it; how much room is left on the server's
+   * disk is not, and it is exactly the fact that tells somebody how much they
+   * would have to write to fill it. When there IS enough this is 0 and says
+   * nothing at all; when there is not, it is the one number an operator needs,
+   * and they were going to be told the backup could not run either way.
+   */
+  shortfallBytes: number;
   /** Predicted build time, whole seconds, rounded up. */
   estimatedSeconds: number;
   /** Long enough to be worth a sentence before starting. */
@@ -553,16 +590,17 @@ export async function estimateBackup(options: {
 
   const requiredBytes = requiredFreeBytes({ databaseBytes, blobBytes });
   const availableBytes = await freeBytes(dataDir);
+  const enoughDisk = availableBytes >= requiredBytes;
 
   // THE INPUT 7z READS, not the archive it writes: the rate was measured
   // against input bytes, and the dump is read once and the blobs once.
   const estimatedSeconds = Math.ceil((databaseBytes + blobBytes) / BACKUP_BYTES_PER_SECOND);
 
   return {
-    databaseBytes, blobBytes, availableBytes, requiredBytes,
-    enoughDisk: availableBytes >= requiredBytes,
+    databaseBytes, blobBytes, requiredBytes, availableBytes, enoughDisk,
+    shortfallBytes: enoughDisk ? 0 : requiredBytes - availableBytes,
     estimatedSeconds,
-    slow: estimatedSeconds >= BACKUP_SLOW_SECONDS,
+    slow: isSlowBackup(estimatedSeconds),
     timeoutSeconds: BACKUP_PROXY_READ_TIMEOUT_SECONDS,
   };
 }

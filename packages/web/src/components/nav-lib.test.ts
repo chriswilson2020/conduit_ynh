@@ -71,13 +71,20 @@ describe("isNavDestinationActive", () => {
     expect(isNavDestinationActive("/companies-archive", { match: "/companies" })).toBe(false);
   });
 
-  /** Settings links at one of its two tabs and must read as current on both. */
+  /**
+   * Settings links at one of its FOUR tabs and must read as current on every
+   * one of them. It was two until 7.6 added Export and backup; this test named
+   * the count in prose and asserted only two of the paths, so the tab that
+   * arrived last was the one nothing here would have noticed going wrong.
+   */
   it("is active on either Settings tab", () => {
     const settings = NAV_DESTINATIONS.find((destination) => destination.id === "settings");
     expect(settings).toBeDefined();
     if (settings === undefined) return;
     expect(isNavDestinationActive("/settings/mail", settings)).toBe(true);
     expect(isNavDestinationActive("/settings/templates", settings)).toBe(true);
+    expect(isNavDestinationActive("/settings/org", settings)).toBe(true);
+    expect(isNavDestinationActive("/settings/data", settings)).toBe(true);
   });
 
   it("lights More up for anything inside the sheet, and not for anything in the bar", () => {

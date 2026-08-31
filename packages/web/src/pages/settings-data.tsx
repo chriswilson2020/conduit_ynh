@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { MAX_PASSPHRASE_LENGTH } from "@conduit/shared";
 import {
-  useBackupPreflight, useDownloadBackup, useDownloadExport, useReauth,
+  requestReauthTicket, useBackupPreflight, useDownloadBackup, useDownloadExport,
 } from "../queries";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
@@ -56,7 +56,6 @@ type Pending = "export" | "backup";
 
 export function SettingsDataPage() {
   const preflight = useBackupPreflight();
-  const reauth = useReauth();
   const exportDownload = useDownloadExport();
   const backupDownload = useDownloadBackup();
 
@@ -66,8 +65,18 @@ export function SettingsDataPage() {
   const [password, setPassword] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
+  /**
+   * The password check, tracked here rather than by a mutation.
+   *
+   * requestReauthTicket is a plain function precisely so the password does not
+   * outlive the call -- see its own comment for the measurement that made it
+   * one -- and the cost of that is one boolean. It is a small price for the
+   * only copy of the password being the field state below, which closing the
+   * prompt clears.
+   */
+  const [checking, setChecking] = useState(false);
 
-  const busy = reauth.isPending || exportDownload.isPending || backupDownload.isPending;
+  const busy = checking || exportDownload.isPending || backupDownload.isPending;
   const formProblem = backupFormProblem(form, touched);
   const backupReady = canSubmitBackup(form);
 
@@ -92,11 +101,13 @@ export function SettingsDataPage() {
     const which = pending;
     if (which === null) return;
     setProblem(null);
+    setChecking(true);
     try {
       // ONE TICKET, ONE ARCHIVE. The ticket is minted here and spent by the
       // very next call; it is never held in state, so there is nothing on this
-      // page for a second click to reuse.
-      const { ticket } = await reauth.mutateAsync(password);
+      // page for a second click to reuse. The password is a local const and an
+      // argument, and nothing keeps a copy of either.
+      const { ticket } = await requestReauthTicket(password);
       closePrompt();
       const filename = which === "export"
         ? await exportDownload.mutateAsync(ticket)
@@ -115,6 +126,8 @@ export function SettingsDataPage() {
       // against a throttle the person cannot see.
       closePrompt();
       setProblem(downloadProblem(error));
+    } finally {
+      setChecking(false);
     }
   }
 

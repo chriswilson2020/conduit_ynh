@@ -169,9 +169,9 @@ function preflight(over: Partial<BackupPreflight> = {}): BackupPreflight {
   return {
     databaseBytes: 20 * 1024 ** 2,
     blobBytes: 10 * 1024 ** 2,
-    availableBytes: 40 * 1024 ** 3,
     requiredBytes: 200 * 1024 ** 2,
     enoughDisk: true,
+    shortfallBytes: 0,
     estimatedSeconds: 2,
     slow: false,
     timeoutSeconds: 3600,
@@ -204,13 +204,15 @@ describe("preflightWarning", () => {
 
   it("leads with the disk, because that one will not work at all", () => {
     const full = preflight({
-      enoughDisk: false, availableBytes: 100 * 1024 ** 2,
+      enoughDisk: false, shortfallBytes: 800 * 1024 ** 2,
       requiredBytes: 900 * 1024 ** 2, estimatedSeconds: 5000, slow: true,
     });
     const warning = preflightWarning(full) ?? "";
     expect(warning).toContain("not enough free space");
+    // The SHORTFALL is what an operator acts on, and it is what the server
+    // sends: the free-space figure is deliberately absent from the response.
+    expect(warning).toContain("800 MB");
     expect(warning).toContain("900 MB");
-    expect(warning).toContain("100 MB");
     expect(preflightSeverity(full)).toBe("blocking");
   });
 

@@ -1994,16 +1994,28 @@ export function useBackupPreflight() {
 /**
  * Exchange the operator's password for a single-use download ticket.
  *
- * THE PASSWORD IS NEVER STORED, not in this hook, not in the query cache and
- * not in a component that outlives the click: it is an argument, it goes into
- * one request body, and the ticket is what comes back. See services/reauth.ts
- * on the server for why a real credential check is here at all.
+ * A PLAIN FUNCTION, NOT A MUTATION, AND THAT IS THE WHOLE POINT OF IT.
+ *
+ * It was `useMutation` and carried a comment saying the password was never
+ * stored. A review measured otherwise: TanStack Query v5 keeps a mutation's
+ * `variables` in the observer's result AND in the shared queryClient's
+ * mutation cache after it settles, surviving the observer unsubscribing, until
+ * the mutation is garbage-collected. The page cleared its own React state and
+ * never called `reset()`, so the copy in the cache outlived the request that
+ * needed it. Browser memory only -- but the comment claimed the opposite of
+ * what the library does, which is worse than saying nothing.
+ *
+ * Nothing here needed a mutation. There is no cache to invalidate, no retry
+ * that would be safe, and no state worth keeping: one request, one answer, and
+ * the password should be unreachable the moment it returns. As a plain
+ * function the password is an argument that goes out of scope with the call,
+ * and the only copy that outlives it is the page's own field state, which
+ * closing the prompt clears.
  */
-export function useReauth() {
-  return useMutation({
-    mutationFn: async (password: string) =>
-      parseWith(reauthTicketSchema, await postJson<unknown>("/reauth", { password }), "reauth ticket"),
-  });
+export async function requestReauthTicket(password: string) {
+  return parseWith(
+    reauthTicketSchema, await postJson<unknown>("/reauth", { password }), "reauth ticket",
+  );
 }
 
 /**

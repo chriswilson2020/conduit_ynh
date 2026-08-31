@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -49,6 +49,27 @@ const sam = {
   "ynh-user-email": "sam@example.com",
   "ynh-user-fullname": "Sam",
 };
+
+/**
+ * Is a REAL YunoHost portal API listening where config.ts expects one?
+ *
+ * Probed rather than assumed, on the precedent of this suite's 7z and
+ * WeasyPrint gates. The dev server is a YunoHost box and answers; a CI runner
+ * and a developer's laptop are not and skip visibly.
+ *
+ * WHY IT IS WORTH A PROBE AT ALL: every other test of the portal verifier
+ * points it at a stub or at a closed port, so the one path that runs in
+ * production -- a real bind against a real portal -- had never been exercised
+ * by anything. A review established it works; this is what keeps that true.
+ */
+const PORTAL_URL = "http://127.0.0.1:6788";
+const HAVE_PORTAL = await fetch(new URL("/login", PORTAL_URL), {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ credentials: "conduit-probe-no-such-user:x" }),
+  signal: AbortSignal.timeout(2_000),
+}).then((response) => response.status === 401, () => false);
+const itPortal = HAVE_PORTAL ? it : it.skip;
 
 let dataDir: string;
 
@@ -159,6 +180,103 @@ describe("POST /api/reauth", () => {
     expect(correct.statusCode).toBe(429);
   });
 
+  /**
+   * A BURST, WHICH IS THE ONLY SHAPE THAT FINDS THIS.
+   *
+   * The lockout test above loops five times and awaits each, which the broken
+   * code passed: it read the counter, awaited the verifier, and recorded the
+   * failure afterwards, so a SEQUENTIAL caller always saw the previous
+   * failure. Every request that arrived inside the await did not. Measured
+   * against the real server over pre-connected sockets, written in one
+   * synchronous pass: at a 3ms check 6 got through, at 25ms 63 did, and at
+   * 100ms all two hundred did with not a single 429.
+   *
+   * The verifier here is deliberately SLOW and COUNTS ITS CALLS, because the
+   * status codes alone would not say what was reached: what must be bounded is
+   * how many passwords are actually tested, not how many requests are answered.
+   */
+  it("bounds a BURST of simultaneous attempts, not only sequential ones", async () => {
+    let reached = 0;
+    const slow: ReauthVerifier = () => {
+      reached += 1;
+      return new Promise((resolve) => { setTimeout(() => { resolve(false); }, 50); });
+    };
+    const a = await app(slow);
+
+    // Every request written before any of them is awaited -- the whole point.
+    const burst = Array.from({ length: 200 }, () => a.inject({
+      method: "POST", url: "/api/reauth", headers: chris, payload: { password: "guess" },
+    }));
+    const answers = await Promise.all(burst);
+
+    expect(reached, "passwords actually tested").toBe(5);
+    expect(answers.filter((r) => r.statusCode === 401)).toHaveLength(5);
+    expect(answers.filter((r) => r.statusCode === 429)).toHaveLength(195);
+
+    // The instrument, shown working: the same burst with no throttle at all
+    // would have tested all two hundred. This asserts the verifier really was
+    // slow enough for the window to exist -- a fast one would bound it by
+    // accident and say nothing.
+    expect(reached).toBeLessThan(200);
+  });
+
+  it("bounds a burst against a fast verifier too", async () => {
+    // The deploy target's portal answers a bad bind in 1.5-1.7ms, so the
+    // window is small there -- but "small" is not "bounded", and the window is
+    // attacker-influenceable: the portal API is publicly reachable, so loading
+    // it widens the gap for a simultaneous burst here.
+    let reached = 0;
+    const fast: ReauthVerifier = () => { reached += 1; return Promise.resolve(false); };
+    const a = await app(fast);
+    await Promise.all(Array.from({ length: 100 }, () => a.inject({
+      method: "POST", url: "/api/reauth", headers: chris, payload: { password: "guess" },
+    })));
+    expect(reached).toBe(5);
+  });
+
+  it("leaves no lockout behind after a burst against a broken portal", async () => {
+    /*
+     * WHAT AN OUTAGE COSTS, STATED PRECISELY, because the obvious assertion is
+     * wrong and was written first.
+     *
+     * A reservation is taken BEFORE the check and given back only when the
+     * check turns out to have tested nothing -- which cannot be known until it
+     * returns. So during an outage a BURST does meet 429s: five checks are in
+     * flight, and the sixth simultaneous caller is refused exactly as it would
+     * be if those five were real attempts. That is the in-flight bound doing
+     * its job, not a bug, and asserting "every one of these is a 503" asserted
+     * the absence of the property.
+     *
+     * What must be true is the thing an operator would actually feel: when the
+     * portal comes back, the account is not locked out by an outage it had no
+     * part in. Every reservation was released, so the counter is clear.
+     */
+    let broken = true;
+    const flaky: ReauthVerifier = (_user, password) =>
+      broken
+        ? new Promise((_resolve, reject) => { setTimeout(() => { reject(new Error("down")); }, 20); })
+        : Promise.resolve(password === TEST_REAUTH_PASSWORD);
+    const a = await app(flaky);
+    const answers = await Promise.all(Array.from({ length: 50 }, () => a.inject({
+      method: "POST", url: "/api/reauth", headers: chris,
+      payload: { password: TEST_REAUTH_PASSWORD },
+    })));
+    // Some got as far as the portal and some were refused while those were in
+    // flight. Neither count is the property; that both codes appear is what
+    // shows the burst really did contend, so the assertion after it is not
+    // passing on an empty run.
+    expect(answers.some((r) => r.statusCode === 503)).toBe(true);
+    expect(answers.every((r) => r.statusCode === 503 || r.statusCode === 429)).toBe(true);
+    expect(answers.some((r) => r.statusCode === 401)).toBe(false);
+
+    broken = false;
+    const recovered = await a.inject({
+      method: "POST", url: "/api/reauth", headers: chris,
+      payload: { password: TEST_REAUTH_PASSWORD },
+    });
+    expect(recovered.statusCode, "the outage left no lockout behind").toBe(200);
+  });
+
   it("locks one account without locking another", async () => {
     const a = await app();
     for (let i = 0; i < 5; i += 1) {
@@ -256,14 +374,65 @@ describe("buildApp's default re-authentication verifier", () => {
     expect(right.statusCode).toBe(200);
   });
 
-  it("gates a download with the default wiring too, not only with an injected verifier", async () => {
+  it("carries a ticket minted through the default wiring all the way to a download", async () => {
+    // WHAT THIS ONE ALONE SAYS, and it is not what its first version said. It
+    // used to send NO ticket and assert a 401, which is true whatever the
+    // verifier is -- so it killed nothing, and a review said so. The property
+    // only this test has is that the chain works end to end with nothing
+    // injected anywhere: config chooses the verifier, the verifier mints a
+    // ticket, and the download route accepts that ticket.
     const a = await buildApp({
-      config: { ...config, portalApiUrl: "http://127.0.0.1:1" },
+      config: { ...config, reauthPassword: "from-the-environment" },
       db: handle.db, dataDir,
     });
-    const response = await a.inject({ method: "GET", url: "/api/export", headers: chris });
+    const minted = await a.inject({
+      method: "POST", url: "/api/reauth", headers: chris,
+      payload: { password: "from-the-environment" },
+    });
+    expect(minted.statusCode).toBe(200);
+    const { ticket } = minted.json() as { ticket: string };
+
+    const download = await a.inject({
+      method: "GET", url: "/api/export",
+      headers: { ...chris, "x-conduit-reauth": ticket },
+    });
+    expect(download.statusCode).not.toBe(401);
+    expect(download.body).not.toContain("reauth_required");
+  }, 120_000);
+
+  /**
+   * THE PATH THAT ACTUALLY RUNS IN PRODUCTION, against the real thing.
+   *
+   * Every other test here points the verifier at a stub or at a closed port.
+   * This one lets the default composition-root wiring reach the portal API on
+   * the box it is running on and asserts what a wrong password does: a clean
+   * 401 reauth_failed, not a 503 and not a ticket. Skipped where there is no
+   * portal.
+   *
+   * The username is one that does not exist, and the portal answers the same
+   * "Invalid password" either way -- so this tests nobody's credentials and
+   * enumerates nothing.
+   */
+  itPortal("refuses a wrong password against the REAL portal, through the default wiring", async () => {
+    const a = await buildApp({
+      config: { ...config, portalApiUrl: PORTAL_URL },
+      db: handle.db, dataDir,
+    });
+    const response = await a.inject({
+      method: "POST", url: "/api/reauth",
+      headers: {
+        "ynh-user": "conduit-probe-no-such-user",
+        "ynh-user-email": "nobody@example.com",
+        "ynh-user-fullname": "Probe",
+      },
+      payload: { password: "definitely-not-the-password" },
+    });
+    // 401, which means the portal was REACHED and answered. A 503 here would
+    // mean the verifier could not talk to it, and the assertion below is what
+    // tells those two apart -- they are the two states this whole seam exists
+    // to keep separate.
     expect(response.statusCode).toBe(401);
-    expect(response.json()).toMatchObject({ error: "reauth_required" });
+    expect(response.json()).toMatchObject({ error: "reauth_failed" });
   });
 });
 
@@ -330,6 +499,32 @@ describe.each(DOWNLOADS)("bypassing the gate on $what", ({ method, url, payload 
     expect(refusedByGate(second)).toBe(true);
   }, 120_000);
 
+  it("fails when a junk value is sent alongside a real ticket, in either order", async () => {
+    // WHY IT FAILS, corrected: Node joins repeated occurrences of an ordinary
+    // header into ONE comma-separated string (only set-cookie becomes an
+    // array), so the gate looks up "junk, <ticket>" or "<ticket>, junk" whole.
+    // It misses the map. Nothing is refused for being an array -- there is no
+    // array here to refuse.
+    for (const order of ["junk-first", "ticket-first"] as const) {
+      const a = await app();
+      const ticket = await reauthTicket(a, chris);
+      const value = order === "junk-first" ? `junk, ${ticket}` : `${ticket}, junk`;
+      const response = await a.inject({
+        method, url, payload, headers: { ...chris, "x-conduit-reauth": value },
+      });
+      expect(response.statusCode, order).toBe(401);
+      expect(response.body, order).toContain("reauth_required");
+    }
+  });
+
+  it("fails on a very long ticket value without reading it as anything", async () => {
+    const response = await (await app()).inject({
+      method, url, payload,
+      headers: { ...chris, "x-conduit-reauth": "a".repeat(60_000) },
+    });
+    expect(response.statusCode).toBe(401);
+  });
+
   it("fails on another account's ticket", async () => {
     const a = await app();
     const theirs = await reauthTicket(a, sam);
@@ -366,6 +561,27 @@ describe.each(DOWNLOADS)("bypassing the gate on $what", ({ method, url, payload 
   });
 });
 
+describe("HEAD /api/export", () => {
+  it("does not exist, so nothing can build the whole archive for no bytes", async () => {
+    // Fastify mirrors every GET with a HEAD by default, running the same
+    // handler and discarding the body -- so a HEAD with a valid ticket built
+    // the entire archive, held the one concurrency slot, spent the ticket and
+    // answered with nothing. A review measured it returning 200. The route
+    // opts out; there is no caller for it.
+    const a = await app();
+    const ticket = await reauthTicket(a, chris);
+    const response = await a.inject({
+      method: "HEAD", url: "/api/export", headers: { ...chris, "x-conduit-reauth": ticket },
+    });
+    expect(response.statusCode).toBe(404);
+    // And the ticket was not spent by it, because the handler never ran.
+    const download = await a.inject({
+      method: "GET", url: "/api/export", headers: { ...chris, "x-conduit-reauth": ticket },
+    });
+    expect(download.statusCode).toBe(200);
+  }, 120_000);
+});
+
 describe("the gate and the unauthenticated check are two different refusals", () => {
   it("answers unauthenticated before it answers reauth_required", async () => {
     // No identity at all: the answer must be about the session, not about a
@@ -398,16 +614,68 @@ describe("GET /api/backup/preflight", () => {
     expect(typeof body.enoughDisk).toBe("boolean");
   });
 
-  it("carries no data, only sizes", async () => {
+  it("carries no data, only sizes -- and NOT the server's free disk", async () => {
     // A route that answers without re-authentication must not be a way to read
     // anything. Its whole body is numbers and two booleans.
+    //
+    // THE EXHAUSTIVE KEY LIST IS THE DISCLOSURE CONTROL. `availableBytes` was
+    // in it until a review pointed out what it is: the free space on the
+    // server's disk, handed to anyone holding a session and no password. The
+    // service still measures it -- routes/backup.ts projects the response field
+    // by field and leaves it out -- so a future field cannot reach the wire by
+    // being spread, and this list is what fails if one does.
     const response = await (await app()).inject({
       method: "GET", url: "/api/backup/preflight", headers: chris,
     });
     const body = response.json() as Record<string, unknown>;
     expect(Object.keys(body).sort()).toEqual([
-      "availableBytes", "blobBytes", "databaseBytes", "enoughDisk",
-      "estimatedSeconds", "requiredBytes", "slow", "timeoutSeconds",
+      "blobBytes", "databaseBytes", "enoughDisk", "estimatedSeconds",
+      "requiredBytes", "shortfallBytes", "slow", "timeoutSeconds",
     ]);
+    expect(response.body).not.toContain("availableBytes");
   });
+
+  it("collapses simultaneous callers onto ONE walk of the blob store", async () => {
+    /*
+     * Each answer costs a pg_database_size and a stat of every blob in the
+     * store. There is deliberately no concurrency slot here -- a warning that
+     * answers "busy" is no warning -- so the bound is sharing rather than
+     * refusing.
+     *
+     * HOW THE SHARING IS OBSERVED, because the obvious test does not observe
+     * it. The first version fired forty requests and asserted they all came
+     * back identical, which is equally true of forty independent walks of a
+     * directory that is not changing: a mutation that removed the sharing
+     * outright left it green. What distinguishes reuse from recomputation is
+     * CHANGING THE ANSWER UNDERNEATH and seeing the old one come back.
+     */
+    const a = await app();
+    const blobDir = path.join(dataDir, "files");
+    await mkdir(blobDir, { recursive: true });
+
+    const first = await a.inject({ method: "GET", url: "/api/backup/preflight", headers: chris });
+    expect(first.statusCode).toBe(200);
+    const before = (first.json() as { blobBytes: number }).blobBytes;
+
+    // A blob the next walk WOULD see, if a next walk happened.
+    await writeFile(path.join(blobDir, "a".repeat(64)), Buffer.alloc(4096, 1));
+
+    const answers = await Promise.all(Array.from({ length: 40 }, () => a.inject({
+      method: "GET", url: "/api/backup/preflight", headers: chris,
+    })));
+    expect(answers.every((r) => r.statusCode === 200)).toBe(true);
+    for (const answer of answers) {
+      expect((answer.json() as { blobBytes: number }).blobBytes).toBe(before);
+    }
+
+    // AND IT IS A SHORT WINDOW, NOT A PERMANENT ANSWER. An operator who frees
+    // space and reloads must not be told the old story for ever -- so the
+    // reuse has to expire, and this is where that is asserted rather than
+    // assumed. The window is three seconds; four is past it.
+    await new Promise<void>((resolve) => { setTimeout(resolve, 4_000); });
+    const afterwards = await a.inject({
+      method: "GET", url: "/api/backup/preflight", headers: chris,
+    });
+    expect((afterwards.json() as { blobBytes: number }).blobBytes).toBe(before + 4096);
+  }, 30_000);
 });

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import {
-  estimateBackup, requiredFreeBytes, freeSpaceBytes,
+  estimateBackup, isSlowBackup, requiredFreeBytes, freeSpaceBytes,
   BACKUP_BYTES_PER_SECOND, BACKUP_PROXY_READ_TIMEOUT_SECONDS, BACKUP_SLOW_SECONDS,
 } from "./backup.js";
 
@@ -58,20 +58,32 @@ describe("estimateBackup", () => {
     }));
   });
 
-  it("says there is not enough disk when there is not", async () => {
+  it("says there is not enough disk when there is not, and by how much", async () => {
     const estimate = await estimateBackup({
       db: handle.db, dataDir, freeBytes: () => Promise.resolve(1024),
     });
     expect(estimate.enoughDisk).toBe(false);
-    expect(estimate.availableBytes).toBe(1024);
+    expect(estimate.shortfallBytes).toBe(estimate.requiredBytes - 1024);
   });
 
-  it("says there is enough when there is", async () => {
+  it("says there is enough when there is, and reports no shortfall", async () => {
     const estimate = await estimateBackup({
       db: handle.db, dataDir, freeBytes: () => Promise.resolve(1024 ** 4),
     });
     expect(estimate.enoughDisk).toBe(true);
+    expect(estimate.shortfallBytes).toBe(0);
   });
+
+  /**
+   * THE SERVER'S FREE DISK IS NOT IN THE ANSWER, and that is a decision rather
+   * than an oversight of the shape. This route deliberately answers WITHOUT a
+   * password -- a warning has to come before the commitment it informs -- so
+   * everything in its body is readable by any session holder. How much room is
+   * left on the disk is exactly the fact that tells somebody how much they
+   * would have to write to fill it, and it is not needed to warn anybody about
+   * anything.
+   */
+
 
   it("uses the real free-space probe by default", async () => {
     // Without this the default could be swapped for `() => Infinity` and no
@@ -90,6 +102,15 @@ describe("estimateBackup", () => {
       (estimate.databaseBytes + estimate.blobBytes) / BACKUP_BYTES_PER_SECOND,
     );
     expect(estimate.estimatedSeconds).toBe(expected);
+  });
+
+  it("draws the slow boundary at the threshold, from both sides", () => {
+    // Asserted from ABOVE as well as below, which nothing did while this was a
+    // comparison buried in an object literal that needed a database to reach.
+    expect(isSlowBackup(BACKUP_SLOW_SECONDS - 1)).toBe(false);
+    expect(isSlowBackup(BACKUP_SLOW_SECONDS)).toBe(true);
+    expect(isSlowBackup(BACKUP_SLOW_SECONDS + 1)).toBe(true);
+    expect(isSlowBackup(0)).toBe(false);
   });
 
   it("does not call a small install slow", async () => {

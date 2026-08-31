@@ -1247,9 +1247,15 @@ Ordered by how much more expensive each gets if retrofitted rather than designed
 2. **Permissions.** `PUT /api/document-templates/:type` is gated only by `requireUser`, so
    any authenticated user rewrites the shared quote template. Fine for one person, wrong for
    a team, and there will be a dozen more like it.
-3. **Authentication.** Conduit has none of its own — it trusts a `Ynh-User` header that
-   YunoHost's SSO injects. A non-YunoHost deployment is a packaging question only while it
-   stays single-user; multi-user means real login, sessions and password reset.
+3. **Authentication.** Conduit has almost none of its own — it trusts a `Ynh-User` header
+   that YunoHost's SSO injects. 7.6 added the one exception, and it is narrow enough to be
+   worth stating precisely: `POST /api/reauth` checks a password against YunoHost's portal
+   API before either data download, and mints a single-use ticket. Conduit still stores no
+   password and still has no login of its own; what it has is one gate that asks YunoHost
+   to check one. A non-YunoHost deployment is a packaging question only while it stays
+   single-user; multi-user means real login, sessions and password reset — and 7.6's ticket
+   store is the first thing in this codebase that would have to grow into the second of
+   those.
 4. **An audit trail.** Currently "deferred indefinitely". The moment two people can edit the
    same deal, "who changed this" is the first question, and it cannot be reconstructed after
    the fact.

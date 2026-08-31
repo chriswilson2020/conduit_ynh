@@ -50,9 +50,11 @@ export function Shell({ children }: { children: ReactNode }) {
   // not alter the desktop shell, and `false && ...` renders no node at all.
   const isMobile = useIsMobile();
 
-  // The Settings entry links at one of its two tabs but must stay highlighted
-  // on both, and activeProps only knows about the link's own target -- so its
-  // active state is computed from the path instead.
+  // The Settings entry links at one of its FOUR tabs but must stay highlighted
+  // on all of them, and activeProps only knows about the link's own target --
+  // so its active state is computed from the path instead. (It said "two" from
+  // Phase 4 until 7.6 added Export and backup; the mechanism never counted
+  // them, which is exactly why the sentence could go stale unnoticed.)
   //
   // The literal "/settings" is correct at every install path, root or subpath:
   // a configured basepath installs router-core's own basepath rewrite, whose
@@ -232,16 +234,21 @@ export function Shell({ children }: { children: ReactNode }) {
           the Gantt grid -- which are swipe-reachable by design and are not
           cuts.
 
-          The sweep is now the ROUTER'S OWN LIST: 18 routes over 18 page
+          The sweep is now the ROUTER'S OWN LIST: 19 routes over 19 page
           components (the two Gantt routes are two components sharing one
           chart), at 390 and at 320, ignoring anything inside its own
-          horizontal scroller. It found two offenders, both the same shape --
+          horizontal scroller. The nineteenth is 7.6's /settings/data, swept
+          when it was added: it is a single column of cards with no action row
+          beside a title, which is the shape both offenders below had, and its
+          one horizontally-sensitive element -- the settings tab strip -- is a
+          scroller of its own and so is ignored by the rule above and covered
+          by e2e/data.spec.ts instead. It found two offenders, both the same shape --
           a `shrink-0` action group beside a title that cannot shrink -- and
           both now wrap below the breakpoint: pages/deal-detail.tsx, fixed with
           this change, and pages/project-detail.tsx, which the first sweep
           missed and where the cost was worse (its Archive button measured 0px
           on screen at both widths, with its centre outside the viewport).
-          THAT SWEEP THEN CLAIMED "all 18 measure 390/390 and 320/320", AND IT
+          THAT SWEEP THEN CLAIMED "all of them measure 390/390 and 320/320", AND IT
           WAS FALSE ON THIS EXACT BUILD. Its fixture was adversarial in one
           dimension only -- a project name holding a long unbreakable word --
           and gave every other field a short value, so it never asked what a

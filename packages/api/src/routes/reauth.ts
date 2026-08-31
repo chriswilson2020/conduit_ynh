@@ -72,16 +72,30 @@ export function registerReauthRoutes(
     const body = parseOrReject(reauthRequestSchema, request.body, reply);
     if (body === undefined) return;
 
-    // BEFORE THE VERIFIER, not after: a locked-out account must not be able to
-    // keep an LDAP bind busy, and must not learn anything from how long the
-    // refusal took.
-    const retryAfterMs = reauthThrottle.retryAfterMs(user.username);
+    // COUNTED HERE, BEFORE THE AWAIT, AND THAT ORDERING IS THE BOUND.
+    //
+    // The first version of this handler read the counter, awaited the password
+    // check and only then recorded a failure -- so every request arriving
+    // inside that await saw a counter that had not moved. Measured against the
+    // real server with the requests written in one synchronous pass: at a 3ms
+    // check 6 got through, at 25ms 63 did, and at 100ms all two hundred did
+    // with not one 429. `reserve` reads and writes without awaiting, which on
+    // a single-threaded event loop cannot be interleaved.
+    //
+    // A locked-out account is refused before the verifier for the reasons it
+    // always was: it must not keep an LDAP bind busy, and must not learn
+    // anything from how long the refusal took.
+    const retryAfterMs = reauthThrottle.reserve(user.username);
     if (retryAfterMs > 0) {
       const seconds = Math.ceil(retryAfterMs / 1000);
+      // "attempts" rather than "wrong passwords": since the count is taken at
+      // the check rather than after it, a refusal can also mean five checks are
+      // in flight -- which is the bound working and is not a statement about
+      // anybody's typing.
       void reply.header("Retry-After", String(seconds));
       return reply.code(429).send({
         error: "reauth_throttled",
-        message: `too many wrong passwords; try again in ${String(Math.ceil(seconds / 60))} minutes`,
+        message: `too many attempts; try again in ${String(Math.ceil(seconds / 60))} minutes`,
         retryAfterSeconds: seconds,
       });
     }
@@ -95,8 +109,10 @@ export function registerReauthRoutes(
     } catch (error) {
       // A THROW IS NOT A WRONG PASSWORD -- see ReauthVerifier's doc comment.
       // The portal being down is an operator's problem with a fix, and telling
-      // the person at the keyboard to retype would be a lie. Not counted
-      // against the throttle either: nothing was tested.
+      // the person at the keyboard to retype would be a lie. The attempt taken
+      // above is given back, because nothing was tested: an outage must not
+      // push somebody towards a lockout.
+      reauthThrottle.release(user.username);
       request.log.error({ err: error }, "re-authentication could not be checked");
       return reply.code(503).send({
         error: "reauth_unavailable",
@@ -105,10 +121,9 @@ export function registerReauthRoutes(
     }
 
     if (!ok) {
-      reauthThrottle.fail(user.username);
-      // Logged because a burst of these is the only warning an operator gets
-      // that somebody is working on the password. The password itself is not
-      // in scope here and never reaches a log line.
+      // Already counted by `reserve`. Logged because a burst of these is the
+      // only warning an operator gets that somebody is working on the
+      // password. The password itself never reaches a log line.
       request.log.warn({ username: user.username }, "re-authentication refused");
       return reply.code(401).send(REFUSED);
     }
@@ -142,10 +157,21 @@ export function requireReauth(
   deps: Pick<CrmRouteDeps, "reauthTickets">,
 ): boolean {
   const header = request.headers[REAUTH_HEADER];
-  // An array is what fastify gives for a repeated header. Refused rather than
-  // reduced to its first element: nothing legitimate sends this twice.
+  // WHAT A REPEATED HEADER ACTUALLY DOES HERE, corrected after a review found
+  // this comment claiming the wrong reason. Node joins repeated occurrences of
+  // an ordinary header into ONE comma-separated STRING -- only set-cookie ever
+  // becomes an array -- so `X-Conduit-Reauth: junk` alongside a real ticket
+  // arrives as "junk, <ticket>" and is looked up whole. It misses the map and
+  // is refused, in every ordering. Nothing is being rejected for being an
+  // array; the lookup is what refuses it, and that is the only claim this code
+  // can make.
+  //
+  // The narrowing stays because IncomingHttpHeaders is typed for every header
+  // including set-cookie, so the array arm must be handled to compile. An
+  // absent header becomes "", which redeem refuses like any other miss -- so
+  // there is no separate empty-string check to get wrong.
   const ticket = typeof header === "string" ? header : "";
-  if (ticket === "" || !deps.reauthTickets.redeem(ticket, user.username)) {
+  if (!deps.reauthTickets.redeem(ticket, user.username)) {
     void reply.code(401).send({
       error: "reauth_required",
       message: "confirm your password before downloading; this download carries the whole database",

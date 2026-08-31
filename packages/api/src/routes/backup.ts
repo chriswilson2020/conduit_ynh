@@ -35,6 +35,17 @@ const MAX_CONCURRENT_BACKUPS = 1;
 let backupsInFlight = 0;
 
 /**
+ * How long a pre-flight answer is reused for.
+ *
+ * Three seconds. Long enough that a page load, a refresh and a burst of
+ * curious callers cost one walk of the blob store between them; short enough
+ * that an operator who has just freed disk space and reloaded sees the new
+ * answer rather than the old one. The figures it reports move at the speed of
+ * an upload, and the real disk check happens inside buildBackup either way.
+ */
+const PREFLIGHT_CACHE_MS = 3_000;
+
+/**
  * The request body. A PASSPHRASE AND NOTHING ELSE.
  *
  * The bounds are here as well as in validatePassphrase because this is where a
@@ -77,6 +88,21 @@ const backupRequestSchema = z.object({
  */
 export function registerBackupRoutes(app: FastifyInstance, deps: CrmRouteDeps): void {
   const { db, dataDir, mailKeyPath, databaseUrl, appVersion } = deps;
+
+  // The one in-flight estimate, and the last one that finished. See the
+  // pre-flight route's own comment for why this is shared rather than a slot.
+  let inFlight: Promise<Awaited<ReturnType<typeof estimateBackup>>> | null = null;
+  let last: { at: number; value: Awaited<ReturnType<typeof estimateBackup>> } | null = null;
+
+  async function sharedEstimate() {
+    const fresh = last;
+    if (fresh !== null && Date.now() - fresh.at < PREFLIGHT_CACHE_MS) return fresh.value;
+    inFlight ??= estimateBackup({ db, dataDir }).then(
+      (value) => { last = { at: Date.now(), value }; inFlight = null; return value; },
+      (error: unknown) => { inFlight = null; throw error; },
+    );
+    return await inFlight;
+  }
   // AT BOOT, ONCE. A work directory in $data_dir can only have survived a
   // SIGKILL, an OOM kill or a power cut -- every other exit path disposes of
   // its own -- and what it holds is a partially written archive containing
@@ -105,14 +131,42 @@ export function registerBackupRoutes(app: FastifyInstance, deps: CrmRouteDeps): 
    * every other pre-flight the service has would have passed.
    *
    * NO RE-AUTHENTICATION ON THIS ONE, and that is a decision rather than an
-   * omission. It carries no data -- two sizes and a duration -- and requiring
-   * a password to be told "this will take eleven minutes" would put the
-   * warning AFTER the commitment it exists to inform. requireUser still
-   * applies, like every other route.
+   * omission. Requiring a password to be told "this will take eleven minutes"
+   * would put the warning AFTER the commitment it exists to inform. What
+   * follows from that decision is that everything in the answer is readable by
+   * any session holder, which is why the server's free disk is NOT in it --
+   * see BackupEstimate's shortfallBytes.
+   *
+   * AND WHY IT IS SHARED RATHER THAN RECOMPUTED. It is the one route here with
+   * no concurrency slot in front of it, deliberately -- a warning that answers
+   * "busy" is no warning -- and each answer costs a pg_database_size and a
+   * stat of every blob in the store. Forty simultaneous callers used to mean
+   * forty walks. `sharedEstimate` collapses those into one: a call already in
+   * flight is joined rather than started, and an answer less than a few seconds
+   * old is reused. Nothing here is stale in a way that matters -- the numbers
+   * move at the speed of an upload, and buildBackup runs its OWN disk check
+   * before it spawns anything, so this is the warning and never the control.
    */
   app.get("/api/backup/preflight", async (request, reply) => {
     if (requireUser(request, reply) === null) return;
-    return await estimateBackup({ db, dataDir });
+    const estimate = await sharedEstimate();
+    // PROJECTED FIELD BY FIELD, NOT SPREAD, and that is the disclosure control
+    // rather than a style. The service measures the server's free disk and
+    // says so on its own answer; this route does not send it, because this
+    // route answers without a password. Written out by hand so that a field
+    // added to BackupEstimate later cannot arrive on the wire by accident --
+    // the shape here has to be changed deliberately, and shared's
+    // backupPreflightSchema is what the browser then parses it against.
+    return {
+      databaseBytes: estimate.databaseBytes,
+      blobBytes: estimate.blobBytes,
+      requiredBytes: estimate.requiredBytes,
+      enoughDisk: estimate.enoughDisk,
+      shortfallBytes: estimate.shortfallBytes,
+      estimatedSeconds: estimate.estimatedSeconds,
+      slow: estimate.slow,
+      timeoutSeconds: estimate.timeoutSeconds,
+    };
   });
 
   app.post("/api/backup", async (request, reply) => {
