@@ -210,7 +210,19 @@ and is untouched.
 **Also retires:** v1.2.1 Task 3's deferral (the empty-brackets defect becomes unreachable),
 and the `MERGE_EXAMPLES` guard that task shipped.
 
-### DONE, v1.2.2 Task 3
+### DONE, v1.2.2 Task 3 -- `6e3d0e3`, CI `33365166752` green
+
+**2464 unit / 0 skipped** (from 2499) and **161 e2e** (from 164), both from that run.
+The e2e line reads `1 flaky, 160 passed`: `pipeline.spec.ts:173`'s downward-drop keyboard
+drag fired the dnd-kit intermittent this backlog already tracks and passed on retry, in a
+file this commit does not touch. Said out loud rather than reported as a clean 161,
+because a retry recorded as a pass is how a flaky test becomes a permanent lie.
+
+**The quote path was proved end to end rather than assumed**, since it shares this page
+and this sanitiser: `documents.spec.ts` (9) and `salutation.spec.ts` (6) both green
+through the hybrid loop, and a quote was then issued and downloaded by hand --
+QUO-2026-0005, `application/pdf`, 475,028 bytes, `%PDF-1.7`, rendering the letterhead
+logo, the `{{#path}}` blocks, the money columns and the recipient's salutation.
 
 **The file list above was two files short**, found by following the types rather than the
 grep: `components/rail/mail.tsx` and `components/mail/conversation.tsx` each BUILD the
@@ -850,6 +862,12 @@ attempts, not runs.
    original entry is kept below for the occlusion lead, which is still the best guess anyone
    has.*
 
+   **THIRD SIGHTING, AND STILL LOCAL ONLY.** v1.2.2 Task 3's hybrid loop hit it once on the
+   same test ("builds a pipeline, which becomes a stage view once it has stages"), and it
+   passed both in isolation and on a straight re-run of the whole file immediately after.
+   The recommendation is unchanged and so is the reason: three sightings, all in the local
+   loop, none in a runner.
+
    **"Pre-existing" is not established**: `board.tsx` put a sticky strip
    directly above that button in v1.1.0, and the file went from 5 serial groups to 7.
 
@@ -896,6 +914,13 @@ attempts, not runs.
 
    Nothing has been changed here. This entry exists so the next person to see a red
    keyboard-drag finds a number instead of a shrug.
+
+   **THIRD SIGHTING SINCE 20 AUG, on v1.2.2 Task 3's CI run `33365166752`** (`1 flaky, 160
+   passed`), on `pipeline.spec.ts:173`'s downward-drop journey -- a file that commit does
+   not touch. Reported rather than absorbed: the run is green because `retries: 2` caught
+   it on the second attempt, not because the suite passed clean. The rate above is left as
+   measured rather than recomputed, since that would need the whole harvest re-run; read it
+   as 3 flaky since 20 Aug rather than 2, against an attempt count that has also grown.
 
 **The fix for any of these must be deterministic, not a longer timeout.** The one that is
 fixed was fixed by ordering two statements, and it now survives a 500ms stall injected on
