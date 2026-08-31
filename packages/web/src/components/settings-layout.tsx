@@ -27,7 +27,29 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
   return (
     <div className="flex flex-col gap-6">
       <h1 className="text-xl font-semibold text-slate-900">Settings</h1>
-      <nav data-testid="settings-nav" className="flex gap-1 overflow-x-auto border-b border-slate-200">
+      {/*
+        THE TRAILING PADDING IS WHAT MAKES THE LAST TAB REACHABLE, and it arrived
+        with 7.6's fourth tab: three tabs do not overflow this row at a phone
+        width and four do.
+        WHAT BREAKS WITHOUT IT, measured in CI at the moment it broke and then
+        reproduced against a real Chromium at iPhone 13's viewport. Scrolled to
+        the end, the last tab lands flush against this container's right edge --
+        and that edge is itself a fraction of a pixel OUTSIDE the viewport,
+        because the phone layout overflows the page by under a pixel and the
+        journey's own page-overflow assertion tolerates up to 1px. So the tab is
+        fully scrolled into view and still not fully IN VIEW: it answered a
+        viewport ratio of 0.9946 in CI where every other touch target in that
+        suite answers exactly 1, and scrollIntoViewIfNeeded has nothing left to
+        scroll.
+        Four pixels of trailing padding gives the scroller four more pixels of
+        range, and the browser uses them: modelled with the same 0.74px page
+        overflow, the last tab measured 0.9888 without this class and exactly
+        1.000000 with it. Trailing padding was the only thing that moved it --
+        scroll-padding did not, and neither did anything the browser could do on
+        its own.
+        `pr-1` is already in the stylesheet, so this adds no rule to it.
+      */}
+      <nav data-testid="settings-nav" className="flex gap-1 overflow-x-auto border-b border-slate-200 pr-1">
         <Link to="/settings/mail" className={tabClass} activeProps={{ className: activeTabClass }}>
           Mail accounts
         </Link>

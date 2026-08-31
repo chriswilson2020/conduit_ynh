@@ -133,8 +133,8 @@ export function SettingsDataPage() {
           <p data-testid="data-lead" className="text-sm text-slate-600">
             Two downloads that look alike and are not. An export is readable and cannot be
             restored. A backup can be restored and cannot be read. Three years of tidy CSV
-            exports is not a way to put Conduit back -- only a backup is. Take both, and
-            keep both.
+            exports is no way to put Conduit back -- only a backup is. Take both, and keep
+            both.
           </p>
         </div>
 
