@@ -79,8 +79,10 @@ import { delayFirst } from "./helpers.js";
  * observable from outside the seed, so the journey that read it back out of a
  * composed body went at the same time. The project and company hops then had
  * nothing left to feed, and narrowing the gate to `to`'s own chain dropped them
- * too. Two journeys were added in the same round, each holding one of the
- * dropped hops open and asserting that Compose no longer waits for it.
+ * too. Each dropped hop is now held open by a journey that asserts Compose does
+ * not wait for it: the company's is new, and the project tab's existing one was
+ * rewritten to hold `PROJECT_GET` rather than merely to find Compose enabled.
+ * Both were red before the narrowing.
  *
  * AND ONE JOURNEY WAS RETIRED BECAUSE THE STATE IT BUILT NO LONGER EXISTS, not
  * because it was redundant. "A hop still on the wire keeps Compose shut, and the
