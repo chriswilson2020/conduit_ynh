@@ -432,9 +432,11 @@ test.describe("A deal's Mail tab composes to the deal's contact, or waits", () =
    * first version of this test taught that the hard way. It asserted disabled,
    * then pending, then the alert hidden, then the alert visible, then enabled
    * -- and a composeGate with the two branches SWAPPED passes every one of
-   * those, because it walks through the same states, just three seconds
-   * earlier. Every assertion in this file auto-retries for five seconds, so
-   * "earlier" is invisible to a sequence. What separates the two orders is
+   * those, because it walks through the same states EARLIER: it paints the
+   * alert as soon as the contact's retry is spent, about a second in, against
+   * the OUTLAST_RETRIES_MS the hold runs for. Every assertion in this file
+   * auto-retries for five seconds, which is longer than either, so "earlier"
+   * is invisible to a sequence. What separates the two orders is
    * WHETHER ANYTHING WAS STILL ON THE WIRE when the alert appeared: with the
    * shipped order the company hop has landed by then, with the branches swapped
    * it has not. Measured both ways.
