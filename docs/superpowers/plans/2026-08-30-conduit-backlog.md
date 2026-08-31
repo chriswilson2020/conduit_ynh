@@ -7,9 +7,10 @@ Everything here has evidence attached — a file and line, a measurement, or the
 found it. Items without evidence are marked as judgement rather than fact. Where one item
 blocks another, that is stated rather than left to be rediscovered.
 
-Current shipped version: **v1.2.1**. In flight: **nothing**; next is **v1.2.2**, whose
-scope Chris decided on 31 Aug and which is recorded below. The order after that is
-**v1.2.2 -> 7.6**.
+Current shipped version: **v1.2.2**. In flight: **nothing**; next is **Phase 7.6**, export
+and encrypted backup, which is specced. All three of v1.2.2's items shipped and their records
+are below. **v1.2.2 is the first release carrying a destructive migration** -- `0012` drops
+`email_templates` -- and the first schema change of any kind since v1.1.0's `0011`.
 
 ---
 
@@ -19,7 +20,7 @@ scope Chris decided on 31 Aug and which is recorded below. The order after that 
 |---|---|---|
 | ~~**7.5 → v1.2.0**~~ | Keyboard-operable rows, the composer's focus, focus after a dialog closes, the `mail-sync` intermittent, and the touch floors folded in as Task 4b | **SHIPPED 30 Aug** |
 | ~~**v1.2.1**~~ | The reply signature, the Mail tab composing to nobody, the GIF undercharge Chris moved in, and the first deliberate sweep for assertions that cannot fail | **SHIPPED 31 Aug** |
-| **v1.2.2** | THREE items, all decided by Chris on 31 Aug: remove the MAIL template feature entirely (table included; the QUOTE template stays); give the five lists with no loading branch the branch their siblings have; and **diagnose the Dovecot IDLE burst -- report and stop, no fix**. See "v1.2.2 scope" below. **Item 3 can reorder the other two**, and 7.6, if the answer is that the app can lose mail | Decided, not specced |
+| ~~**v1.2.2**~~ | The MAIL template feature removed, table included (the QUOTE template stayed); the five lists given the loading branch their siblings have; and the Dovecot IDLE burst diagnosed -- **the answer was NO**, so nothing was reordered. **Ships `0012`, a `DROP TABLE`** | **SHIPPED 31 Aug** |
 | **7.6 → v1.3.0** | Export and encrypted backup, downloadable from Settings | Specced, not started. **Queued behind v1.2.2** |
 | **7.7** | Restore and import, with its decisions already recorded in 7.6's spec | Decided, not specced |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
@@ -238,6 +239,19 @@ and is now false, so the comment was rewritten to name the users that remain
 same thing elsewhere and were corrected the same way: `db/schema.ts` twice and
 `services/documents.ts` once.
 
+**A SYMBOL GREP CANNOT SEE A SENTENCE, AND THAT COST A SECOND SWEEP.** The four comments
+above were all found by following `sanitizeMailHtml` -- an identifier. Four MORE described
+the removed feature in prose that mentions no identifier at all, and were found only by
+sweeping for the phrases "mail merge", "mail template" and "email template" after the symbols
+were already gone (`0f9803c`): `components/contact-fields-lib.ts`'s table of who normalises
+what, which had a row for the mail merge and v1.1.0's one-following-space rule and now
+describes the QUOTE merge; `components/mail/rich-text.tsx`, which listed email templates
+among the three surfaces it renders; `routes/documents.ts`'s "Only mail templates had
+routes"; and `lib.ts`'s `overridableClass` note counting three pre-Phase-7 width callers, one
+of them the templates dialog. **Eight comments in total, four of them reachable only by
+reading prose.** The last two were dated rather than deleted, because the measurements they
+record really did happen.
+
 ~~**ONE PIECE OF THE REMOVAL WAS DELIBERATELY NOT DONE, and it needs a decision rather than
 a follow-up commit.**~~ **DECIDED AND DONE in item 2's task, 31 Aug.**
 `components/rail/mail.tsx`'s compose gate read FOUR hops -- deal, project, contact,
@@ -439,6 +453,64 @@ to schedule a test fix.
 halves the figure, which has already happened once -- "once in 22 runs on the v1.2.0 branch,
 and once on `a15e6f6`" was **one event described twice**, and it was the number this project
 believed until Task 4 read the attempts.
+
+### ANSWERED, 31 Aug: NO. The test's view of the server lags -- and the brief's premise was false
+
+**"The existing logs provably cannot separate them" was wrong, and that is the finding.**
+vitest's `toHaveLength` failure prints the RECEIVED array, so two of the four events carry
+their UID list, and both are the same **contiguous prefix** `[2..12]`, 11 of 20 -- four days
+apart, on different branches. No instrumentation and no new runs were needed; the answer had
+been sitting in CI since 27 August. The storm's twenty APPENDs are sequential and awaited, so
+UIDs ascend in delivery order and the nine missing messages were appended AFTER the twelve
+seen. **Nothing below the cursor was skipped.**
+
+**Why that settles the product question.** A short batch ends the pass, the cursor is saved,
+and the next pass searches `cursor+1:*`. So a **prefix costs a PASS; a hole would cost a
+MESSAGE.** A pass is guaranteed: `waitForWork` caps IDLE at `pollIntervalMs`, and in
+production the stragglers are already on the server, so re-entering IDLE draws an immediate
+`EXISTS`. **Item 3 reordered nothing.**
+
+#### THE CORRECTION TASK 2 MADE, AND IT RUNS IN THE DANGEROUS DIRECTION
+
+The answer above rests on what the cursor is, and the first statement of it -- **"the cursor
+is the highest UID actually ingested"** -- is FALSE. `syncFolder` computes `highest` over
+every descriptor the SERVER LISTED in the batch, and advances the cursor to it whether or not
+`ingestOne` stored anything. Read out of the shipped code rather than inferred:
+
+- `fetchRaw` returning `null` (expunged between listing and fetch) returns early; the comment
+  says in terms that "the cursor moves past it with the rest of the batch".
+- a poison message that survives `POISON_RETRIES` is recorded and skipped, and the comment on
+  the cursor assignment names this as the mechanism that moves past it -- "the skip needs no
+  arithmetic of its own, because the batch's highest UID is already beyond it".
+
+**So a message the server lists but Conduit cannot fetch moves the cursor past itself and is
+never retried.** That is deliberate -- the alternative is walking an entire mailbox one
+failure at a time -- but it means the honest answer to "can Conduit silently skip a message"
+is **NO for the case that was asked about, and YES in this narrow one**. It does not change
+the diagnosis: a lagging view lists nothing, so nothing is skipped past. It is written down
+because the safe-sounding version of the sentence was the one that got written first.
+
+**There is still no backstop if a hole ever did occur.** `reconcileFlags` only `UPDATE`s rows
+matched on `(account, folder, imap_uid)`; it never ingests. A skipped UID is invisible for
+ever. That is why item 3's second half was worth more than its first.
+
+#### THE RECOVERY PROPERTY IS NOW TESTED, AND SO IS ITS CONTROL
+
+`mail-sync.test.ts` gained a deterministic pair on `FakeImapClient`: a PREFIX on pass 1 and
+the full set on pass 2 must store all twenty, and a HOLEY view's skipped UIDs must never
+arrive. **The second is the load-bearing one** -- the first passes just as happily against a
+loop that re-walks from zero. Its uniqueness is measured rather than claimed: loosen
+`syncFolder` to advance only over a contiguous run and **2460 tests pass while that one alone
+goes red**. It is the only thing in the codebase that would notice if the cursor discipline
+regressed, and given there is no backstop it is the whole safety net.
+
+#### FILED, NOT FIXED: the short-batch `break`
+
+`syncFolder` ends the folder pass on `batch.length < BATCH_SIZE`. Deleting it is invisible to
+all 62 tests in `mail-sync.test.ts`. It is left alone deliberately: without it the loop makes
+one more `fetchNewer`, gets an empty batch, and exits through the non-advancing guard beside
+it. **It costs a round trip and a spurious warning, never a message**, so there is nothing
+here to repair and a test asserting a round-trip count would be asserting the implementation.
 
 ---
 
@@ -830,9 +902,43 @@ date**: an attempt counts only if its own log shows that test running, so a rate
 divided by attempts that predate the test. They are ATTEMPTS, not runs -- a re-run is a second
 trial and hides the first.
 
+**THE DOVECOT DENOMINATOR HAS BEEN STATED THREE WAYS, AND ALL THREE NUMBERS ARE CORRECT --
+they count three different populations. The canonical one is 177.** Settled in v1.2.2's
+release task by re-deriving each figure from the Actions API rather than by choosing between
+them:
+
+| figure | what it actually counts | measured |
+|---|---|---|
+| **177** | **ATTEMPTS of `test.yml` that ran the storm case**: everything since the Dovecot suite entered CI on 20 Aug, less the 16 experiment-branch runs excluded by name. **174 runs, 177 attempts** -- three re-runs in that window are the whole difference | 31 Aug 01:08Z |
+| **313** | **RUNS of `test.yml` over its entire history** -- the harvest this section opens with, 284 + 13 + 16 exactly as broken down above. The same instant shows 319 attempts | the same instant |
+| **354 / 360** | **runs / attempts of EVERY workflow in the repository**: `test.yml`, `Release`, `Mutation probe` and `Audit61` together (339 + 20 + 2 + 2 = 363 runs today) | 31 Aug 04:52Z |
+
+Each was pinned by finding the instant at which the count is exactly that number, and each
+instant lands inside the task that reported it: 313 runs is the moment `worktree-v1.2.1-fixes`
+had exactly the 13 runs this section attributes to it, and 354 all-workflow runs is a run on
+`worktree-v1.2.2-templates` at 04:52 on 31 Aug, in the middle of item 3's investigation.
+
+**SO ITEM 3'S CORRECTION -- "the sample is 354 runs / 360 attempts, not 313" -- WAS ITSELF
+WRONG, AND IS WITHDRAWN.** It compared its own all-workflow count against a `test.yml`-only
+one and read the difference as an error in the earlier figure. `test.yml` has 339 runs in
+total TODAY and has never had 354, so the number is arithmetically impossible for the
+population it was correcting. **313 was right, and it was right as RUNS**, which is what
+this section already called it.
+
+**177 is canonical because it is the only one whose denominator could have produced the
+numerator.** The other two include attempts that could not: 132 `test.yml` runs predate the
+suite entirely, 20 `Release` runs never start Dovecot, and the experiment branches were red
+on purpose. **4 in 177 = 2.3%, about 1 attempt in 44** -- which is the figure
+`mail-integration.test.ts` states in its own prose, so the code and this table now agree.
+
+**The population has since grown to 210 attempts with no further sighting**, so 1-in-44 is a
+high-water mark rather than a current estimate. It is not restated as 4-in-210 because five
+of the intervening attempts were deliberately-broken probe branches, where a Dovecot firing
+would have been masked by the failure the branch existed to produce.
+
 | intermittent | rate | 95% interval | over | recommendation |
 |---|---|---|---|---|
-| Dovecot IDLE burst (2) | **4 in 177, 2.3% -- 1 CI attempt in 44** | 0.9-5.7% | 20-31 Aug | **SCHEDULE IT** |
+| ~~Dovecot IDLE burst (2)~~ | **4 in 177, 2.3% -- 1 CI attempt in 44** | 0.9-5.7% | 20-31 Aug | **FIXED in v1.2.2.** Historical rate, kept for the method |
 | `pipeline.spec.ts` keyboard-drag (5) | **2 in 179 since 20 Aug, 1.1%** | 0.3-4.0% | 20-31 Aug | **FILE IT** |
 | `crm.spec.ts` "Other..." caret (4) | **1 in 50, 2.0%** | 0.4-10.5% | 29-31 Aug | leave and re-measure |
 | phone kanban `addStage` (3) | **0 in 111** | 0-3.4% | 28-31 Aug | **CLOSE IT** |
@@ -871,10 +977,15 @@ attempts, not runs.
    cases unrelated to the backoff one. It measured the harness, not the race. Contending
    with a second vitest on `packages/shared` (CPU only, no truncate) gave **0 in 12**, and
    0 in 24 with four busy loops on top.
-2. **`mail-integration.test.ts`'s Dovecot IDLE burst -- 4 in 177, about 1 CI attempt in 44.
-   RECOMMENDATION: SCHEDULE IT.** The burst asserts 20 delivered and gets fewer. Opt-in
-   suite, CI-only. It is the only intermittent here with a real number and the only one that
-   turns CI red, because vitest sets no retries.
+2. ~~**`mail-integration.test.ts`'s Dovecot IDLE burst -- 4 in 177, about 1 CI attempt in
+   44. RECOMMENDATION: SCHEDULE IT.**~~ **DIAGNOSED AND FIXED in v1.2.2 -- see item 3's
+   answer below.** The test was asserting that twenty messages arrive in ONE walk, which is
+   stronger than anything `AccountSync` promises; it now re-walks from the cursor until
+   twenty arrive or a budget expires, which is what the loop does. Everything below is kept
+   because the METHOD is what generalises -- reading attempts rather than runs, and refusing
+   to divide by attempts that predate the test. The burst asserts 20 delivered and gets
+   fewer. Opt-in suite, CI-only. It was the only intermittent here with a real number and
+   the only one that turns CI red, because vitest sets no retries.
 
    **THE COUNT IS FOUR, NOT TWO, AND TWO OF THEM WERE RE-RUN INTO INVISIBILITY.** The two
    visible firings are run **33094190471** (27 Aug, the v0.9.0 tag, 11 of 20) and run
