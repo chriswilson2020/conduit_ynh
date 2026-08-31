@@ -175,13 +175,25 @@ const { defaultBrowserType: _phoneDefault, ...IPHONE_13 } = devices["iPhone 13"]
 test.describe("the settings tabs on a phone", () => {
   test.use(IPHONE_13);
 
-  test("the fourth tab is a 44px target and wholly in the viewport once scrolled to", async ({ page }) => {
-    await openDataSettings(page);
+  // BOTH PAGES, because the failure was page-dependent before it was understood:
+  // the tab passed on 7.6's own page and failed on the issuer profile, which is
+  // the sort of difference that looks like a mystery and turns out to be a flex
+  // row squeezing its children by different amounts under different content.
+  for (const route of ["/settings/data", "/settings/org"]) {
+    test(`the fourth tab is a 44px target and wholly in the viewport on ${route}`, async ({ page }) => {
+    await page.goto(route);
     const nav = page.getByTestId("settings-nav");
+    await expect(nav).toBeVisible();
     const tab = nav.getByRole("link", { name: "Export and backup", exact: true });
 
-    const height = (await tab.boundingBox())?.height ?? 0;
-    expect(height, "touch height").toBeGreaterThanOrEqual(44);
+    const natural = await tab.boundingBox();
+    expect(natural?.height ?? 0, "touch height").toBeGreaterThanOrEqual(44);
+    // AND NOT SQUEEZED. These are flex children; before 7.6 gave them shrink-0
+    // they compressed to about half the width their label needs -- 72.7px for
+    // one that measures 148 -- which clipped the text and made the geometry
+    // below depend on what else was on the page. A tab narrower than its own
+    // label is not a tab a thumb can read.
+    expect(natural?.width ?? 0, "tab width, uncompressed").toBeGreaterThan(120);
 
     await tab.scrollIntoViewIfNeeded();
     const box = await tab.boundingBox();
@@ -206,7 +218,8 @@ test.describe("the settings tabs on a phone", () => {
       + ` scroll=${geometry.scrollLeft.toFixed(2)}/${geometry.maxScroll.toFixed(2)}`
       + ` | doc overflow=${geometry.docOverflow.toFixed(2)} scroll=${geometry.docScroll.toFixed(2)}`;
     expect(outside, `pixels of the tab outside the viewport -- ${detail}`).toBe(0);
-  });
+    });
+  }
 });
 
 test.describe("the re-authentication gate", () => {

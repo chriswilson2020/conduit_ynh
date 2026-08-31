@@ -10,10 +10,20 @@ import { Link } from "@tanstack/react-router";
 // and so are already blockified -- and the flex is here for the OTHER half:
 // an anchor does not centre its own text in a box taller than its line, the
 // way a <button> does.
+// `shrink-0 whitespace-nowrap` ARRIVED WITH 7.6'S FOURTH TAB, and it is what
+// makes this row a scroller rather than a squeezer. These are flex children, so
+// until now they SHRANK: with three tabs there was room and nothing showed, and
+// with four there is not -- measured at a phone width, each tab compressed to
+// 72.7px for a label that needs about 134px, so the text was being squeezed
+// rather than the row scrolled. A compressed tab is also a smaller touch target
+// and a less predictable one, which is how this surfaced at all: the last tab
+// measured 0.9946 of itself inside the viewport where every other control in
+// the phone journey measures exactly 1.
+// Both classes are already in the stylesheet, so this adds no rule to it.
 const tabClass =
-  "border-b-2 border-transparent px-3 py-2 text-sm font-medium text-slate-500 hover:text-slate-900 max-md:inline-flex max-md:min-h-11 max-md:items-center";
+  "shrink-0 whitespace-nowrap border-b-2 border-transparent px-3 py-2 text-sm font-medium text-slate-500 hover:text-slate-900 max-md:inline-flex max-md:min-h-11 max-md:items-center";
 const activeTabClass =
-  "border-b-2 border-slate-900 px-3 py-2 text-sm font-medium text-slate-900 max-md:inline-flex max-md:min-h-11 max-md:items-center";
+  "shrink-0 whitespace-nowrap border-b-2 border-slate-900 px-3 py-2 text-sm font-medium text-slate-900 max-md:inline-flex max-md:min-h-11 max-md:items-center";
 
 /**
  * The Settings area's frame: a title and the tab nav every settings page
