@@ -20,7 +20,7 @@ it is here to say what is inside and why the format is what it is.
 | Your computer | Use |
 |---|---|
 | **Windows** | **7-Zip** -- free, from <https://www.7-zip.org>. Right-click the file, "7-Zip" then "Extract Here", and type the passphrase. |
-| **Mac** | **Keka** -- free, from <https://www.keka.io>. **macOS's built-in Archive Utility will not open an encrypted archive**, so this is a one-time install. Double-clicking without it fails with an unhelpful message rather than asking for a passphrase. |
+| **Mac** | **Keka** -- free, from <https://www.keka.io>. **macOS's built-in Archive Utility will not open an encrypted archive**, so this is a one-time install. Double-clicking without it fails with an unhelpful message rather than asking for a passphrase. Measured on macOS 26.5: the built-in `tar` answers "The archive header is encrypted, but currently not supported", and `ditto` does not recognise the file at all. |
 | **Linux** | **Ark** or **File Roller**, whichever your desktop ships, or `7z x conduit-backup-YYYY-MM-DD.7z` from a terminal (`apt install p7zip-full`). |
 
 **There is no recovery path for the passphrase.** Conduit never stores it, never

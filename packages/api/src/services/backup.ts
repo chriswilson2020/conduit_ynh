@@ -699,6 +699,22 @@ export async function buildBackup(options: BuildBackupOptions): Promise<BackupAr
     // verified on the deploy target, which is why four inputs from two
     // different parents produce the flat layout the manifest declares:
     // database.sql, manifest.json, mail.key, files/<digest>.
+    //
+    // THE BLOB STORE IS NAMED AS A DIRECTORY, NOT AS A LIST, and there is one
+    // consequence worth stating rather than discovering. The manifest's member
+    // list is the walk's snapshot; 7z reads the directory again when it runs.
+    // An upload that lands between the two puts a member in the archive that
+    // the manifest does not list -- harmless, because blobs are
+    // content-addressed and immutable, so the extra member is a whole file
+    // rather than a partial one, and 7.7 should treat an unlisted files/ member
+    // as extra rather than as damage. The opposite skew is not benign and is
+    // not silent: a blob DELETED in that window makes 7z exit non-zero, which
+    // runSevenZip turns into a failed backup rather than a short one.
+    //
+    // Naming each blob individually instead would close the window and break
+    // the layout: 7z strips the parent of every input it is given, so
+    // $data_dir/files/<digest> would be stored as <digest> at the top level
+    // rather than under files/.
     const inputs = [dumpPath, manifestPath, mailKeyPath];
     if (blobs.length > 0) inputs.push(blobDir);
     await runSevenZip(archivePath, inputs, passphrase);
