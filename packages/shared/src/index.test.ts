@@ -50,8 +50,6 @@ import {
   threadListFiltersSchema,
   threadLinksInputSchema,
   sendMailInputSchema,
-  emailTemplateSchema,
-  createEmailTemplateInputSchema,
   specialUseSchema,
   mailAccountFolderSchema,
   folderPatchInputSchema,
@@ -1555,21 +1553,6 @@ describe("sendMailInputSchema", () => {
   // whatever the wire actually contained.
   it("rejects a garbage (non-email) address in to[]", () =>
     expect(() => sendMailInputSchema.parse({ ...base, to: [{ address: "not-an-email" }] })).toThrow());
-});
-
-describe("emailTemplateSchema and createEmailTemplateInputSchema", () => {
-  it("accepts a complete template", () => {
-    const template = {
-      id: uuid1, name: "Follow-up", subject: "Following up", bodyHtml: "<p>Hi</p>",
-      archivedAt: null, createdAt: now, updatedAt: now,
-    };
-    expect(emailTemplateSchema.parse(template)).toEqual(template);
-  });
-
-  it("accepts a create input with subject omitted (defaults to '' at the DB)", () => {
-    const input = { name: "Follow-up", bodyHtml: "<p>Hi</p>" };
-    expect(createEmailTemplateInputSchema.parse(input)).toEqual(input);
-  });
 });
 
 describe("meetingAttendeeSchema and meetingAttendeeInputSchema", () => {

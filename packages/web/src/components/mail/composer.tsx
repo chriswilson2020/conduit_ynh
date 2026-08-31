@@ -2,12 +2,9 @@ import { useEffect, useImperativeHandle, useMemo, useRef, useState } from "react
 import type { ChangeEvent, FormEvent, KeyboardEvent, Ref, RefObject } from "react";
 import { clsx } from "clsx";
 import type { FileMeta, MailAttachment, SendMailInput } from "@conduit/shared";
-import { userLabel } from "../../lib";
 import {
   useContacts,
   useMailAccounts,
-  useMailTemplates,
-  useMe,
   useSendMail,
   useUploadFile,
 } from "../../queries";
@@ -20,12 +17,9 @@ import {
   parseRecipientInput,
   resolveRecipients,
   signatureAppend,
-  substitutePlaceholdersHtml,
-  templateSubject,
   type ComposerLinks,
   type ComposerRecipient,
   type SignatureKey,
-  type TemplateContext,
 } from "./mail-lib";
 import { RichTextEditor, type RichTextHandle } from "./rich-text";
 import { Button } from "../ui/button";
@@ -68,15 +62,6 @@ export interface ComposerSeed {
    * reply opened from a conversation should pass the THREAD's links.
    */
   links?: ComposerLinks;
-  /**
-   * Names for template placeholders. Supplied by the opener (a record page
-   * knows its own contact/company) rather than fetched here from
-   * `links`: the caller already holds them, and an unresolved placeholder is
-   * a supported outcome, not a failure.
-   */
-  context?: Pick<
-    TemplateContext, "contactName" | "contactSalutation" | "contactPronouns" | "companyName"
-  >;
 }
 
 export interface ComposerProps {
@@ -93,8 +78,6 @@ export interface ComposerProps {
    */
   returnFocus: DialogReturnFocus;
 }
-
-const NO_TEMPLATE = "none";
 
 /**
  * The compose/reply dialog, mounted by the inbox, the conversation view and
@@ -213,10 +196,6 @@ function ComposerForm({ seed, onClose, ref }: {
   ref?: Ref<ComposerFocusHandle>;
 }) {
   const { data: accounts, isLoading: accountsLoading } = useMailAccounts();
-  // {archived:false} explicitly, matching the settings page's own call, so
-  // both share one ['email-templates', {archived:false}] cache entry.
-  const { data: templates = [] } = useMailTemplates({ archived: false });
-  const { data: me } = useMe();
   const send = useSendMail();
   const upload = useUploadFile();
   const editorRef = useRef<RichTextHandle>(null);
@@ -397,16 +376,6 @@ function ComposerForm({ seed, onClose, ref }: {
     },
   }), [focusTarget]);
 
-  const context: TemplateContext = {
-    contactName: seed?.context?.contactName,
-    // Live off the contact record the opener is holding, not stored anywhere: mail
-    // is composed and sent in the moment. See TemplateContext.
-    contactSalutation: seed?.context?.contactSalutation,
-    contactPronouns: seed?.context?.contactPronouns,
-    companyName: seed?.context?.companyName,
-    userName: userLabel(me, undefined),
-  };
-
   const target = attachmentTarget(seed?.links);
 
   function handleUpload(event: ChangeEvent<HTMLInputElement>) {
@@ -421,14 +390,6 @@ function ComposerForm({ seed, onClose, ref }: {
         onError: (error: unknown) => setLocalError(composeErrorMessage(error)),
       },
     );
-  }
-
-  function applyTemplate(templateId: string) {
-    const template = templates.find((entry) => entry.id === templateId);
-    if (template === undefined) return;
-    setSubject((current) =>
-      templateSubject(current, template.subject, { isReply: seed?.threadId !== undefined, context }));
-    editorRef.current?.insertAtCursor(substitutePlaceholdersHtml(template.bodyHtml, context));
   }
 
   function handleSubmit(event: FormEvent) {
@@ -558,31 +519,6 @@ function ComposerForm({ seed, onClose, ref }: {
           onChange={(event) => setSubject(event.target.value)}
         />
       </label>
-
-      {templates.length > 0 && (
-        <div className="flex items-center gap-2 max-md:flex-wrap">
-          <span className="text-xs font-medium text-slate-600">Template</span>
-          {/* The select takes its own line below the breakpoint; 16rem beside
-              the label is wider than a phone's content box. */}
-          <div className="w-64 max-md:w-full">
-            {/* Value stays on the sentinel: picking an entry APPLIES it (the
-                subject when composing fresh, the body at the caret) rather
-                than putting the composer into a "template mode" it would then
-                have to leave. */}
-            <Select value={NO_TEMPLATE} onValueChange={applyTemplate}>
-              <SelectTrigger ariaLabel="Template" testId="composer-template">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={NO_TEMPLATE}>Insert a template...</SelectItem>
-                {templates.map((template) => (
-                  <SelectItem key={template.id} value={template.id}>{template.name}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-      )}
 
       <RichTextEditor
         ref={editorRef}

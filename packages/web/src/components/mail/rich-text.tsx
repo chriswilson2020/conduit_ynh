@@ -11,8 +11,6 @@ import { clsx } from "clsx";
  * seeded once from `initialHtml` and reports every change through `onChange`.
  */
 export interface RichTextHandle {
-  /** Template insertion: drops HTML in at the caret. */
-  insertAtCursor(html: string): void;
   /** Signature: adds HTML after the last block, without moving the caret. */
   appendAtEnd(html: string): void;
   /**
@@ -22,9 +20,7 @@ export interface RichTextHandle {
    *
    * SEPARATE FROM appendAtEnd("") RATHER THAN A SPECIAL CASE OF IT, because
    * the two want opposite things from the editor: appendAtEnd exists to leave
-   * focus alone, and this exists to take it. `insertAtCursor` already chains
-   * `.focus()` for the same reason a template insertion has to land where the
-   * user is looking -- this is that capability with nothing inserted.
+   * focus alone, and this exists to take it.
    *
    * ONLY MEANINGFUL AFTER onCreate. TipTap builds the editor asynchronously,
    * so a caller focusing at dialog-open time is addressing an editor that does
@@ -216,9 +212,6 @@ export const RichTextEditor = forwardRef<RichTextHandle, RichTextEditorProps>(
     });
 
     useImperativeHandle(ref, () => ({
-      insertAtCursor(html: string) {
-        editor?.chain().focus().insertContent(html).run();
-      },
       appendAtEnd(html: string) {
         if (editor === null) return;
         // insertContentAt(end), not focus("end") + insertContent: appending a

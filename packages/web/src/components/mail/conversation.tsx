@@ -7,8 +7,6 @@ import { apiUrl } from "../../api";
 import { humanSize, relativeTime } from "../../lib";
 import {
   useBulkThreadAction,
-  useCompany,
-  useContact,
   useHideThread,
   useMailAccounts,
   useMailThread,
@@ -108,11 +106,6 @@ export function Conversation({ threadId }: ConversationProps) {
     });
   }, []);
 
-  // Names for the composer's template placeholders, from whatever the thread
-  // is linked to. Both hooks are disabled when the link is absent.
-  const { data: linkedContact } = useContact(thread?.contactId ?? "");
-  const { data: linkedCompany } = useCompany(thread?.companyId ?? "");
-
   /**
    * Mark read ONCE per opened thread, not once per render.
    *
@@ -194,16 +187,6 @@ export function Conversation({ threadId }: ConversationProps) {
     ...(thread.projectId === null ? {} : { projectId: thread.projectId }),
   };
 
-  const context = {
-    contactName: linkedContact === undefined
-      ? undefined : `${linkedContact.firstName} ${linkedContact.lastName ?? ""}`.trim(),
-    // The live record's own values, so a reply addresses the person the way the
-    // contact says to. Nothing is inferred from the name when they are absent.
-    contactSalutation: linkedContact?.salutation,
-    contactPronouns: linkedContact?.pronouns,
-    companyName: linkedCompany?.name,
-  };
-
   /** Send from the account the conversation actually arrived through, when
    * that is one of the current user's own sendable accounts; otherwise leave
    * it unset and let the composer pick its default. */
@@ -237,7 +220,6 @@ export function Conversation({ threadId }: ConversationProps) {
       // composer's attach control outright (POST /api/files needs a record to
       // file an upload against -- Task 9's handover note).
       links,
-      context,
     });
   }
 
@@ -259,7 +241,6 @@ export function Conversation({ threadId }: ConversationProps) {
       // attachment, the same way every mail client forwards one.
       forwardAttachments: source.attachments,
       links,
-      context,
     });
   }
 

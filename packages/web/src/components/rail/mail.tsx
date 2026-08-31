@@ -73,18 +73,26 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
   const contact = contactQuery.data;
   const companyKey = companyId ?? deal?.companyId ?? project?.companyId ?? contact?.companyId ?? "";
   const companyQuery = useCompany(companyKey);
-  const company = companyQuery.data;
 
   const contactName = contact === undefined
     ? undefined : `${contact.firstName} ${contact.lastName ?? ""}`.trim();
 
   /*
-   * WHETHER THE SEED CAN BE BUILT YET. compose() reads these four queries at
-   * CLICK TIME, and from a deal tab two of them are chained -- the deal, then
-   * the contact it names -- so a click landing between them seeds `to: []` and
+   * WHETHER THE SEED CAN BE BUILT YET. compose() reads these queries at CLICK
+   * TIME, and from a deal tab two of them are chained -- the deal, then the
+   * contact it names -- so a click landing between them seeds `to: []` and
    * addresses the message to nobody with nothing on screen to say so. See
    * mail-lib.ts for what each of the three states means and what was measured
    * to arrive at them, and e2e/rail-compose.spec.ts for the journeys.
+   *
+   * THE GATE IS WIDER THAN THE SEED SINCE v1.2.2, DELIBERATELY AND ON RECORD.
+   * The company and project hops used to feed `context.companyName` for the
+   * mail merge; that merge is gone, so the only seed field any hop still
+   * decides is `to`, through deal -> contact. Both are kept as gate inputs
+   * rather than narrowed here, because narrowing them changes when Compose
+   * becomes clickable -- a product decision, not a consequence of deleting the
+   * templates. Filed in the backlog; whoever takes it also owns the two
+   * rail-compose journeys that hold the COMPANY hop.
    */
   const hops: readonly RailHop[] = [
     {
@@ -122,13 +130,6 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
       // and so the composer's attach control is enabled (POST /api/files needs
       // a record to file the upload against).
       links: { companyId, contactId, dealId, projectId },
-      context: {
-        contactName, companyName: company?.name,
-        // Straight off the record, unchanged and unguessed: a contact with no
-        // salutation supplies none, and the placeholder renders as nothing rather
-        // than staying visible the way an unfilled name does (see BLANK_MEANS_BLANK).
-        contactSalutation: contact?.salutation, contactPronouns: contact?.pronouns,
-      },
     });
   }
 
@@ -157,15 +158,14 @@ export function MailRail({ companyId, contactId, dealId, projectId }: MailRailPr
           yet" from "never" is the one v1.1.0 rejected -- so it says what is
           missing and offers the way back, in the shape this rail's own
           neighbours use (see timeline.tsx and meetings.tsx, which pair the same
-          alert with the same Retry). Typing an address by hand recovers the
-          RECIPIENT and nothing else: contactName and companyName feed the
-          template placeholders and cannot be typed anywhere, so without this
-          control the only repair is a page reload. */}
+          alert with the same Retry). The Retry is what gets the recipient
+          without a page reload; typing the address by hand is the other way,
+          and this says which one is missing rather than opening silently. */}
       {gate === "failed" && (
         <div className="flex items-center gap-2">
           <p role="alert" data-testid="mail-compose-error" className="text-xs text-red-600">
-            Could not load this record's contact or company, so Compose may open with no recipient
-            and with its name placeholders unfilled.
+            Could not load this record's contact or company, so Compose may open with no
+            recipient.
           </p>
           <Button
             variant="outline"

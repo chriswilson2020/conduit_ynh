@@ -79,15 +79,17 @@ blocks are the authority; this is the closing summary.
    untouched, but `e2e/mail.spec.ts` opens a DEAL tab -- it just never presses Compose, so the
    claim that holds is that no test had ever built a seed from either tab.
 
-3. **The empty pronoun brackets -- REVISITED AND DEFERRED A SECOND TIME, WITH THE
-   MEASUREMENT.** This is a success, not a failure: the ruling was tested rather than
-   inherited. **13 of the mail merge's 26 documented behaviours conflict with the document
-   engine**, measured by running mail's own contract through the real `mergeTemplate`. The
-   deciding one is that **mail's blanking rule has no block form**, so the port would have to
-   invent a second dialect inside the function that renders every quote PDF. Had the semantics
-   agreed it would still have been **~525 lines, ~14 files and two package boundaries** for
-   one cosmetic defect in a patch release. The full entry is in the deferred list below.
-   **v1.2.2 makes this item unreachable rather than fixing it** -- see that scope.
+3. ~~**The empty pronoun brackets -- REVISITED AND DEFERRED A SECOND TIME, WITH THE
+   MEASUREMENT.**~~ **CLOSED BY v1.2.2 Task 3, WITHOUT BEING FIXED: THE DEFECT IS NOW
+   UNREACHABLE.** `({{contact.pronouns}})` could only render `()` inside a MAIL template,
+   and mail templates no longer exist -- the merge, `PLACEHOLDER_KEYS`, `MERGE_EXAMPLES`
+   and the guard on them all went with the feature. Nothing here was repaired and nothing
+   should be re-opened on the old reasoning. Kept for the record: the deferral was a
+   success rather than a failure, because the ruling was tested rather than inherited --
+   **13 of the mail merge's 26 documented behaviours conflicted with the document
+   engine**, measured by running mail's own contract through the real `mergeTemplate`,
+   and the deciding one was that **mail's blanking rule had no block form**. The quote
+   template's own `{{#path}}` blocks are untouched and keep working.
 
 4. **The GIF undercharge -- FIXED, and the prescription was one shape short.** Chris moved
    this in from the OUT list. The prescribed "fall back to the logical screen descriptor"
@@ -208,6 +210,57 @@ and is untouched.
 **Also retires:** v1.2.1 Task 3's deferral (the empty-brackets defect becomes unreachable),
 and the `MERGE_EXAMPLES` guard that task shipped.
 
+### DONE, v1.2.2 Task 3
+
+**The file list above was two files short**, found by following the types rather than the
+grep: `components/rail/mail.tsx` and `components/mail/conversation.tsx` each BUILD the
+merge context that `ComposerSeed.context` carried, and neither is named above. Both are
+now context-free; `conversation.tsx`'s `useContact`/`useCompany` calls existed only to
+fill it and went with it. `mail-lib.test.ts` was not named either, and it held 22 of the
+35 unit tests this removed.
+
+**`meetings.ts` was a comment reference only, as suspected** -- one line naming
+`email_templates.body_html` as a fellow user of `sanitizeMailHtml`. The claim was true
+and is now false, so the comment was rewritten to name the users that remain
+(`mail_accounts.signature_html` and every composed body). Three more comments said the
+same thing elsewhere and were corrected the same way: `db/schema.ts` twice and
+`services/documents.ts` once.
+
+**ONE PIECE OF THE REMOVAL WAS DELIBERATELY NOT DONE, and it needs a decision rather than
+a follow-up commit.** `components/rail/mail.tsx`'s compose gate reads FOUR hops -- deal,
+project, contact, company. After this task only `deal -> contact` decides anything the
+seed uses (`to`); the project and company hops fed `context.companyName` for the merge
+and now feed nothing, so Compose is gated on data no seed reads. Narrowing them changes
+WHEN the Compose button becomes clickable, which is a product decision Chris has not been
+asked about, and it would take out two of `e2e/rail-compose.spec.ts`'s journeys (the ones
+that hold `COMPANY_GET` open). Left as it stands, with the reason written at the gate.
+
+**What went from the tests, itemised, because the unit count moved 2499 -> 2464 (-35):**
+
+| file | tests | what they covered |
+|---|---|---|
+| `packages/api/src/services/mail-templates.test.ts` | 7 | the whole service; file deleted |
+| `packages/web/src/components/mail/mail-lib.test.ts` | 22 | `substitutePlaceholders` (14), `substitutePlaceholdersHtml` (5), `templateSubject` (3) |
+| `packages/api/src/routes/mail.test.ts` | 4 | the five CRUD endpoints |
+| `packages/shared/src/index.test.ts` | 2 | `emailTemplateSchema`, `createEmailTemplateInputSchema` |
+
+E2E moved 164 -> 161 (-3). `rail-compose.spec.ts` lost one journey outright (the merge field
+was the only way `context.companyName` was observable from outside the seed, and there is
+no merge any more). `dialog-focus.spec.ts` lost its "goes back to New template" test in
+both of its two suites -- it was the templates page's duplicate of the Add-account test
+beside it -- and its "goes back to the ROW that opened it" test was MOVED to the mail
+accounts page rather than deleted, because what it guards is `ui/dialog-focus.ts`, which
+still ships and has no other two-opener coverage. That fixture now archives its accounts
+in `afterAll`, asserted.
+
+**The stylesheet moved by exactly one rule.** `index-M5teG3jg.css` (33,259 B, sha256
+`3031a0c4...d90e2`) became `index-CKKLeVXr.css` (33,221 B, sha256 `ef95eb79...a46f`),
+measured with `npx vite build` on the dev server (Debian 12, node v24.19.0). The base
+tree was rebuilt from `git archive HEAD` beside it and reproduced the old name and hash
+byte for byte, so the two are comparable: the ONLY difference is the deletion of
+`.w-64{width:calc(var(--spacing) * 64)}`, 38 bytes, which is the whole 38-byte delta.
+`w-64` was the width of the composer's Template select wrapper and occurred nowhere else.
+
 ---
 
 ## v1.2.2, item 2 -- the five lists that say "there is nothing here" while still fetching
@@ -235,11 +288,18 @@ surfaces do it correctly -- `entity-table.tsx`, `mail/thread-list.tsx`, `rail/me
 last one is why this is a defect rather than a convention: the same file does it both ways.
 
 All seven were re-checked on 31 Aug, at the moment this was scheduled, rather than carried
-over from the filing. **One interaction between the two v1.2.2 items:** `settings-templates.tsx`
-is on that list twice over -- its MAIL half and its QUOTE half each gate their empty label on
-`isLoading` -- and item 1 deletes the mail half. It stays a correct sibling through the quote
-half, so the pattern survives; whoever does item 1 should not take the loading branch out with
-the rest of the mail code.
+over from the filing.
+
+**CORRECTED AFTER ITEM 1 LANDED, AND THE COUNT IS NOW SIX.** The scheduling note here said
+`settings-templates.tsx` was on that list "twice over -- its MAIL half and its QUOTE half
+each gate their empty label on `isLoading`", and told whoever did item 1 not to take the
+loading branch out with the mail code. **Both halves of that were wrong.** The MAIL half was
+the only one with an empty label (`No templates yet.` behind `!isLoading`); the QUOTE half
+has a loading line and NO empty label at all, because there is always exactly one quote
+template row. Removing the mail half therefore took the whole sibling with it, and nothing
+was left behind to preserve. **Take the pattern from one of the remaining six** --
+`company-detail.tsx`'s Contacts section is the closest, and is the one that makes the
+Pipelines section beside it a defect.
 
 **A CORRECTION TO THE ORIGINAL FILING, made while scheduling this.** It said `rail/notes.tsx`,
 `rail/files.tsx` and `task-drawer.tsx` "do not currently destructure `isLoading` at all". True
@@ -642,11 +702,12 @@ button until the queries it reads have settled, which also removes the silent
 wrong-recipient case rather than only the focus symptom. Found during 7.5 Task 2's review;
 out of scope there because Task 2 owned the composer, not the rail.
 
-**Conditional blocks in mail templates.** `({{contact.pronouns}})` renders `()` for a
-contact with none. Swallowing one following space handles `Dear X Y`; nothing short of
-conditionals handles brackets or labels. The document template already has
-`{{#path}}...{{/path}}`; the mail merge does not. Coordinator ruling at the time was to
-document the limitation rather than grow the language mid-release.
+~~**Conditional blocks in mail templates.**~~ **GONE, NOT FIXED: v1.2.2 Task 3 removed
+the mail template feature outright, so there is no mail merge left to grow a conditional
+into.** `({{contact.pronouns}})` rendered `()` for a contact with none; swallowing one
+following space handled `Dear X Y` and nothing short of conditionals handled brackets or
+labels. The document template's own `{{#path}}...{{/path}}` is unaffected. The record
+below is kept because the MEASUREMENT is worth keeping, not because anything is open.
 
 **v1.2.1 REVISITED THIS AND DEFERRED IT AGAIN, WITH A MEASUREMENT** -- full record in
 that release's plan, Task 3. The short form, so nobody re-opens it on the old reasoning:

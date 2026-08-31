@@ -3,7 +3,6 @@ import { z } from "zod";
 import {
   mailAccountCreateInputSchema, mailAccountUpdateInputSchema, mailAccountUpdatePasswordFieldsSchema,
   mailAccountTestInputSchema, mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
-  createEmailTemplateInputSchema, updateEmailTemplateInputSchema,
   bulkThreadActionInputSchema, folderPatchInputSchema, MOVE_ACTION_THREAD_CAP,
   type MailAccountSyncStats,
 } from "@conduit/shared";
@@ -26,9 +25,6 @@ import {
 } from "../services/mail-threads.js";
 import { listAccountFolders, setFolderSyncEnabled } from "../services/mail-folders.js";
 import { moveThreads } from "../services/mail-move.js";
-import {
-  listTemplates, createTemplate, updateTemplate, archiveTemplate, unarchiveTemplate,
-} from "../services/mail-templates.js";
 
 /**
  * The slice of mail-sync.ts's SyncManager the ROUTES use, declared here for
@@ -114,10 +110,6 @@ const threadDetailQuerySchema = z.object({
 // does not have should hear about it.
 const unreadCountQuerySchema = z.object({
   byFolder: z.literal("1").optional(),
-});
-
-const templateListQuerySchema = z.object({
-  archived: z.enum(["true", "false"]).optional().transform((v) => v === "true"),
 });
 
 // A PATCH may carry settings, password fields, or both. The two shared
@@ -680,65 +672,6 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     if (params === undefined) return;
     try {
       return await serveAttachment(reply, user.id, params.id, "inline");
-    } catch (error) {
-      mapDomainError(reply, error);
-    }
-  });
-
-  // --- Templates -----------------------------------------------------------
-
-  // Shared, not owner-scoped: email_templates has no owner column (see
-  // services/mail-templates.ts). Auth is still required -- every route here
-  // sits behind the same onRequest hook -- it is just not per-row.
-  app.get("/api/mail/templates", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
-    const query = parseOrReject(templateListQuerySchema, request.query, reply);
-    if (query === undefined) return;
-    return listTemplates(db, { archived: query.archived });
-  });
-
-  app.post("/api/mail/templates", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
-    const input = parseOrReject(createEmailTemplateInputSchema, request.body, reply);
-    if (input === undefined) return;
-    try {
-      const template = await createTemplate(db, input);
-      return reply.code(201).send(template);
-    } catch (error) {
-      mapDomainError(reply, error);
-    }
-  });
-
-  app.patch("/api/mail/templates/:id", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
-    const params = parseOrReject(idParamSchema, request.params, reply);
-    if (params === undefined) return;
-    const patch = parseOrReject(updateEmailTemplateInputSchema, request.body, reply);
-    if (patch === undefined) return;
-    try {
-      return await updateTemplate(db, params.id, patch);
-    } catch (error) {
-      mapDomainError(reply, error);
-    }
-  });
-
-  app.post("/api/mail/templates/:id/archive", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
-    const params = parseOrReject(idParamSchema, request.params, reply);
-    if (params === undefined) return;
-    try {
-      return await archiveTemplate(db, params.id);
-    } catch (error) {
-      mapDomainError(reply, error);
-    }
-  });
-
-  app.post("/api/mail/templates/:id/unarchive", async (request, reply) => {
-    if (requireUser(request, reply) === null) return;
-    const params = parseOrReject(idParamSchema, request.params, reply);
-    if (params === undefined) return;
-    try {
-      return await unarchiveTemplate(db, params.id);
     } catch (error) {
       mapDomainError(reply, error);
     }

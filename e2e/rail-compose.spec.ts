@@ -66,10 +66,16 @@ import type { Page, Route } from "@playwright/test";
  * shared page would have needed the serial mode to be safe at all.
  *
  * NO MAIL SERVER AND NO MAIL ACCOUNT, so this file runs in the local hybrid
- * loop the same way composer-focus.spec.ts does. It creates one email TEMPLATE
- * per template-using test (the only way `context.companyName` is observable
- * from outside the seed) and archives it again, because a live template puts a
- * Template select into every other spec's composer.
+ * loop the same way composer-focus.spec.ts does.
+ *
+ * WHAT v1.2.2 TOOK OUT OF HERE, so the gap is on record rather than discovered.
+ * The project tab's two-deep chain is project -> company, and the company it
+ * reached fed `context.companyName` for the MAIL MERGE and nothing else. The
+ * merge is gone, so that value is no longer observable from outside the seed at
+ * all, and the journey that read it back out of a composed body went with it.
+ * The company hop itself is still a gate input (components/rail/mail.tsx says
+ * why it was not narrowed here), which is what the "hop still on the wire" test
+ * below still holds open.
  */
 
 /** POST as the dev user, failing with the server's own words rather than a bare status. */
@@ -237,33 +243,6 @@ async function openMailTab(page: Page, path: string, heading: string): Promise<v
   await expect(page.getByTestId("mail-compose")).toBeVisible();
 }
 
-const MERGE_OPEN = "MERGEOPEN";
-const MERGE_CLOSE = "MERGECLOSE";
-
-/**
- * A template whose body is the company-name placeholder between two markers,
- * so what reached the merge can be read off the composed body: the markers with
- * the company between them, the markers with nothing between them, or the
- * markers with the placeholder itself still between them.
- */
-async function makeTemplate(page: Page, tag: string): Promise<{ id: string; name: string }> {
-  const name = `Rail template ${tag}`;
-  const template = await create(page, "/api/mail/templates", {
-    name, subject: "", bodyHtml: `<p>${MERGE_OPEN}{{company.name}}${MERGE_CLOSE}</p>`,
-  });
-  return { id: template.id, name };
-}
-
-/**
- * Archive it again, ASSERTED. A silently failed archive leaves a live template
- * that puts a Template select into every composer in every spec that runs after
- * this file -- the hazard this file's own header names.
- */
-async function archiveTemplate(page: Page, id: string): Promise<void> {
-  const response = await page.request.post(`/api/mail/templates/${id}/archive`);
-  expect(response.status(), await response.text()).toBe(200);
-}
-
 test.describe("A deal's Mail tab composes to the deal's contact, or waits", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -398,10 +377,9 @@ test.describe("A deal's Mail tab composes to the deal's contact, or waits", () =
 
   /**
    * AND THE WAY BACK, which is what separates this alert from the two the rail
-   * already had. Typing an address by hand recovers the recipient; it does not
-   * recover `context.companyName` or `contactName`, which feed the template
-   * placeholders and cannot be typed anywhere -- so without a Retry the only
-   * repair is a page reload. rail/timeline.tsx and rail/meetings.tsx both pair
+   * already had. Retry is how a reader gets the recipient after a failed hop
+   * without reloading the page; the alternative is typing the address by hand,
+   * which means knowing it. rail/timeline.tsx and rail/meetings.tsx both pair
    * this alert with this control and both say why.
    */
   test("Retry asks again, and the alert goes when the hop answers", async ({ page }) => {
@@ -484,36 +462,6 @@ test.describe("A project's Mail tab, whose second hop is the company", () => {
     await page.getByTestId("mail-compose").click();
     await expect(page.getByTestId("composer")).toBeVisible();
     await expect(page.getByRole("button", { name: /^Remove / })).toHaveCount(0);
-  });
-
-  /**
-   * THE PROJECT'S ACTUAL TWO-DEEP CHAIN, which is project -> company and fills
-   * `context.companyName`. A merge template is the only way that field is
-   * observable from outside the seed, so the body is the instrument: the
-   * company's name between the two markers means the context arrived, and the
-   * placeholder still sitting between them means it did not.
-   */
-  test("with the company still on the wire, the merge field still resolves", async ({ page }) => {
-    const tag = runTag("pc");
-    const fixture = await seed(page, tag);
-    const template = await makeTemplate(page, tag);
-    try {
-      const hold = await delayFirst(page, COMPANY_GET, HELD_MS);
-      try {
-        await openMailTab(page, `/projects/${fixture.projectId}`, fixture.projectName);
-        expect(hold.holding(), "the company hop was already back: this click never raced anything").toBe(true);
-        await page.getByTestId("mail-compose").click();
-        await expect(page.getByTestId("composer")).toBeVisible();
-        await page.getByTestId("composer-template").click();
-        await page.getByRole("option", { name: new RegExp(template.name) }).click();
-        await expect(page.getByTestId("composer-body"))
-          .toContainText(`${MERGE_OPEN}${fixture.companyName}${MERGE_CLOSE}`);
-      } finally {
-        await hold.unroute();
-      }
-    } finally {
-      await archiveTemplate(page, template.id);
-    }
   });
 });
 

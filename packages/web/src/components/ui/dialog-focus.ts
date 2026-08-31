@@ -20,17 +20,16 @@ import type { RefObject } from "react";
  * back at the top of the document with nothing announced, and a screen-reader
  * user is told nothing at all.
  *
- * MEASURED, at 1280 and at 390. This app opens SIXTEEN `<Dialog>` roots across
- * twelve files. Six use this, and they are two different shapes:
+ * MEASURED, at 1280 and at 390. This app opens FIFTEEN `<Dialog>` roots across
+ * eleven files. Five use this, and they are two different shapes:
  *
- *   the five driven by state instead of by a trigger --
+ *   the four driven by state instead of by a trigger --
  *   components/task-drawer.tsx, components/mail/composer.tsx,
- *   pages/settings-mail.tsx, pages/settings-templates.tsx and pages/board.tsx's
- *   move sheet -- because the control that opens each of them is a different
- *   one on every row or card, or lives on another page entirely, so
- *   `<DialogTrigger>` cannot express it. Four of the five were measured landing
- *   on `<body>`; board's had a hand-rolled version of this and is the reason it
- *   is shared; and
+ *   pages/settings-mail.tsx and pages/board.tsx's move sheet -- because the
+ *   control that opens each of them is a different one on every row or card, or
+ *   lives on another page entirely, so `<DialogTrigger>` cannot express it.
+ *   Three of the four were measured landing on `<body>`; board's had a
+ *   hand-rolled version of this and is the reason it is shared; and
  *
  *   pages/deal-detail.tsx's Lose dialog, which DOES use `<DialogTrigger>` and
  *   still fails, because a successful lose unmounts the Lose button -- Radix
@@ -38,6 +37,11 @@ import type { RefObject } from "react";
  *   same. The same dialog DISMISSED restored its trigger correctly, so its
  *   failure is invisible unless the other exit is tried, and `forget()` below
  *   is what separates the two.
+ *
+ * (Sixteen roots across twelve files, and six users, until v1.2.2 removed the
+ * mail template feature -- pages/settings-templates.tsx was a state-driven
+ * caller and is now the quote template editor with no dialog at all. The ten
+ * left to Radix below never included it, so only the first paragraph moved.)
  *
  * WHAT THE OTHER TEN ROOTS DO, AND WHY FIVE OF THEM ARE STILL LEFT ALONE. All
  * ten were measured restoring their trigger on a dismissal, and they divide

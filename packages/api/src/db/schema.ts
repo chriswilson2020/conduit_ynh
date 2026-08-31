@@ -630,19 +630,6 @@ export const mailAttachments = pgTable("mail_attachments", {
 });
 export type MailAttachmentRow = typeof mailAttachments.$inferSelect;
 
-// Shared across users (spec) -- no ownerUserId/authorUserId, unlike most
-// other tables in this file.
-export const emailTemplates = pgTable("email_templates", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  name: text("name").notNull(),
-  subject: text("subject").notNull().default(""),
-  bodyHtml: text("body_html").notNull(),
-  archivedAt: timestamp("archived_at", { withTimezone: true }),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
-export type EmailTemplateRow = typeof emailTemplates.$inferSelect;
-
 // --- Meetings (Phase 5) --------------------------------------------------
 
 // A logged meeting: what happened (or is arranged -- occurred_at is free in
@@ -669,8 +656,8 @@ export const meetings = pgTable("meetings", {
   durationMinutes: integer("duration_minutes"),
   // Rich-text HTML, sanitized on write by services/meetings.ts (Task 2)
   // through the system's ONE shared sanitizer profile -- sanitizeMailHtml in
-  // services/mail-content.ts, which email_templates.body_html already reuses
-  // (see mail-templates.ts's sanitizeBody: "one shared sanitizer profile").
+  // services/mail-content.ts, which mail_accounts.signature_html and every
+  // composed body reuse (see mail-accounts.ts and mail-send.ts).
   // notes.body is NOT that precedent despite the Phase 5 spec's wording: it
   // is plain text, stored raw and rendered as text (web: rail/notes.tsx's
   // whitespace-pre-wrap <p>), so it passes through no sanitizer at all.
@@ -884,10 +871,10 @@ export const documents = pgTable("documents", {
   //
   // PRONOUNS ARE DELIBERATELY NOT HERE. A quote's greeting takes the salutation
   // and has no use for them, and freezing a personal detail into an immutable
-  // artifact that gets downloaded and emailed should need a reason. Mail templates
-  // read pronouns live from the contact instead (see mail-lib.ts), which is the
-  // right lifetime for them: a person who corrects their pronouns has corrected
-  // them for the next message, and no stored copy disagrees.
+  // artifact that gets downloaded and emailed should need a reason. contacts.pronouns
+  // is read live off the record wherever it is shown, which is the right lifetime
+  // for it: a person who corrects their pronouns has corrected them everywhere at
+  // once, and no stored copy disagrees.
   recipientSalutation: text("recipient_salutation").notNull().default(""),
   recipientAddress: text("recipient_address").notNull().default(""),
   // Integer cents, as deals.value_cents already is, computed by
@@ -1007,9 +994,9 @@ export type DocumentNumberSequenceRow = typeof documentNumberSequences.$inferSel
 
 // One editable template per document type, seeded with a working default in
 // drizzle/0009_*.sql so a quote renders before anyone has opened Settings.
-// Edited with the same editor as email_templates but NOT sanitised with the
-// same profile: mail's exists to defang HTML written by strangers, and it
-// strips exactly the page-layout CSS a printed document is made of.
+// NOT sanitised with the mail profile: mail's exists to defang HTML written by
+// strangers, and it strips exactly the page-layout CSS a printed document is
+// made of. See services/documents-template.ts for the profile this one uses.
 export const documentTemplates = pgTable("document_templates", {
   id: uuid("id").primaryKey().defaultRandom(),
   type: text("type").notNull(),

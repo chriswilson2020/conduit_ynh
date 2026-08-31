@@ -1,95 +1,23 @@
 import { useEffect, useState } from "react";
-import type { FormEvent } from "react";
 import { MAX_TEMPLATE_BYTES } from "@conduit/shared";
-import type { EmailTemplate } from "@conduit/shared";
-import {
-  useArchiveMailTemplate,
-  useCreateMailTemplate,
-  useDocumentTemplate,
-  useMailTemplates,
-  useSaveDocumentTemplate,
-  useUnarchiveMailTemplate,
-  useUpdateMailTemplate,
-} from "../queries";
-import { htmlIsBlank, MERGE_EXAMPLES, PLACEHOLDER_KEYS } from "../components/mail/mail-lib";
-import { RichTextEditor } from "../components/mail/rich-text";
+import { useDocumentTemplate, useSaveDocumentTemplate } from "../queries";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
-import { Dialog, DialogContent, DialogTitle } from "../components/ui/dialog";
-import { useDialogReturnFocus } from "../components/ui/dialog-focus";
-import { Input } from "../components/ui/input";
 import { Textarea } from "../components/ui/textarea";
-import { CHECKBOX_LABEL } from "../components/ui/touch";
 
 /**
- * Templates are SHARED across users (email_templates has no owner column), so
- * this page is deliberately not scoped to "my" templates the way the mail
- * accounts page is -- everyone sees, edits and archives the same list.
+ * Settings -> Templates: the quote template, and nothing else.
+ *
+ * It carried the MAIL templates too until v1.2.2, when that feature was removed
+ * outright -- Chris: "I don't think we should ever be templating emails, that's
+ * messy and ends up with things like dear first name last name emails!" The route
+ * keeps its path and its tab label, because the QUOTE template is what anybody
+ * actually opens this page for.
  */
 export function SettingsTemplatesPage() {
-  const [archived, setArchived] = useState(false);
-  const { data: templates = [], isLoading, error } = useMailTemplates({ archived });
-  // null = closed; { template: undefined } = new; { template } = edit.
-  const [formTarget, setFormTarget] = useState<{ template?: EmailTemplate } | null>(null);
-  // One dialog and an Edit button on every row, so the caret goes back to
-  // whichever one opened it. See components/ui/dialog-focus.ts.
-  const returnFocus = useDialogReturnFocus();
-
   return (
     <SettingsLayout>
-      <div data-testid="template-settings" className="flex flex-col gap-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-slate-900">Email templates</h2>
-          <div className="flex items-center gap-3">
-            <label className={CHECKBOX_LABEL}>
-              <input type="checkbox" checked={archived} onChange={(event) => setArchived(event.target.checked)} />
-              Archived
-            </label>
-            <Button
-              onClick={(event) => {
-                returnFocus.capture(event.currentTarget);
-                setFormTarget({});
-              }}
-            >
-              New template
-            </Button>
-          </div>
-        </div>
-
-        {isLoading && <p className="text-sm text-slate-400">Loading...</p>}
-        {error && (
-          <p role="alert" className="text-sm text-red-600">Could not load templates: {error.message}</p>
-        )}
-        {!isLoading && templates.length === 0 && (
-          <p className="text-sm text-slate-400">
-            {archived ? "No archived templates." : "No templates yet."}
-          </p>
-        )}
-
-        <ul className="flex flex-col gap-2">
-          {templates.map((template) => (
-            <TemplateRow key={template.id} template={template} onEdit={(trigger) => { returnFocus.capture(trigger); setFormTarget({ template }); }} />
-          ))}
-        </ul>
-      </div>
-
       <DocumentTemplateEditor />
-
-      <Dialog
-        open={formTarget !== null}
-        onOpenChange={(open) => {
-          if (!open) setFormTarget(null);
-        }}
-      >
-        <DialogContent
-          className="max-h-[85vh] max-w-2xl overflow-y-auto"
-          onCloseAutoFocus={returnFocus.restore}
-        >
-          {formTarget !== null && (
-            <TemplateForm template={formTarget.template} onClose={() => setFormTarget(null)} />
-          )}
-        </DialogContent>
-      </Dialog>
     </SettingsLayout>
   );
 }
@@ -125,14 +53,6 @@ const ROOT_FIELDS: readonly [string, string][] = [
   ["document.notes", "The notes typed on the quote"],
   ["document.terms", "The terms typed on the quote"],
 ];
-
-/** "{{a}}, {{b}} and {{c}}" -- the mail merge fields as a sentence fragment, so the
- * paragraph below can be written from PLACEHOLDER_KEYS rather than beside it. */
-function mergeFieldSentence(paths: readonly string[]): string {
-  const tokens = paths.map((path) => `{{${path}}}`);
-  const last = tokens.at(-1) ?? "";
-  return tokens.length < 2 ? last : `${tokens.slice(0, -1).join(", ")} and ${last}`;
-}
 
 const LINE_FIELDS: readonly [string, string][] = [
   ["description", "The line's description"],
@@ -180,10 +100,10 @@ function FieldList({ title, fields, note }: {
  * somebody else's change, in a file that change never touches; the property is
  * "byte-identical", and that is what the round-trip test asserts. So:
  *
- *   - A PLAIN TEXTAREA. Not the rich-text editor the email templates use --
- *     that one serialises through a document model and would rewrite the HTML
- *     wholesale on the first keystroke, which is the same defect from a
- *     different direction.
+ *   - A PLAIN TEXTAREA. Not the rich-text editor (components/mail/rich-text.tsx,
+ *     which the compose body and the signature field use) -- that one serialises
+ *     through a document model and would rewrite the HTML wholesale on the first
+ *     keystroke, which is the same defect from a different direction.
  *   - NO trim, NO newline normalisation, NO "tidying" of any kind on the way in
  *     or out. What was fetched is what is held in state and what is sent.
  *   - The response body is written straight back into the field, because the
@@ -308,149 +228,5 @@ function DocumentTemplateEditor() {
         </p>
       </div>
     </div>
-  );
-}
-
-function TemplateRow({ template, onEdit }: { template: EmailTemplate; onEdit: (trigger: HTMLElement) => void }) {
-  const archive = useArchiveMailTemplate();
-  const unarchive = useUnarchiveMailTemplate();
-  const isArchived = template.archivedAt !== null;
-
-  return (
-    <li
-      data-testid={`email-template-${template.id}`}
-      className={`flex items-center justify-between gap-3 rounded-md border border-slate-200 bg-white px-4 py-3 ${
-        isArchived ? "opacity-60" : ""
-      }`}
-    >
-      <div className="min-w-0">
-        <p className="truncate text-sm font-medium text-slate-900">{template.name}</p>
-        <p className="truncate text-xs text-slate-400">
-          {template.subject === "" ? "(no subject)" : template.subject}
-        </p>
-        {(archive.isError || unarchive.isError) && (
-          <p role="alert" className="text-xs text-red-600">{(archive.error ?? unarchive.error)?.message}</p>
-        )}
-      </div>
-      <div className="flex shrink-0 gap-2">
-        {!isArchived && <Button variant="outline" onClick={(event) => onEdit(event.currentTarget)}>Edit</Button>}
-        {isArchived ? (
-          <Button variant="outline" disabled={unarchive.isPending} onClick={() => unarchive.mutate(template.id)}>
-            Unarchive
-          </Button>
-        ) : (
-          <Button variant="danger" disabled={archive.isPending} onClick={() => archive.mutate(template.id)}>
-            Archive
-          </Button>
-        )}
-      </div>
-    </li>
-  );
-}
-
-function TemplateForm({ template, onClose }: { template?: EmailTemplate; onClose: () => void }) {
-  const isEdit = template !== undefined;
-  const [name, setName] = useState(template?.name ?? "");
-  const [subject, setSubject] = useState(template?.subject ?? "");
-  const [bodyHtml, setBodyHtml] = useState(template?.bodyHtml ?? "");
-  const [localError, setLocalError] = useState<string | null>(null);
-  const create = useCreateMailTemplate();
-  const update = useUpdateMailTemplate();
-
-  function handleSubmit(event: FormEvent) {
-    event.preventDefault();
-    if (name.trim() === "") {
-      setLocalError("A name is required.");
-      return;
-    }
-    // bodyHtml is `.min(1)` server-side, and an untouched editor still
-    // serializes to "<p></p>" -- so emptiness is decided on the rendered
-    // text, not the string length (see htmlIsBlank).
-    if (htmlIsBlank(bodyHtml)) {
-      setLocalError("The template body is empty.");
-      return;
-    }
-    setLocalError(null);
-    const input = { name: name.trim(), subject, bodyHtml };
-    if (template === undefined) create.mutate(input, { onSuccess: onClose });
-    else update.mutate({ id: template.id, patch: input }, { onSuccess: onClose });
-  }
-
-  const pending = create.isPending || update.isPending;
-  const submitError = create.error ?? update.error;
-
-  return (
-    <form data-testid="template-form" onSubmit={handleSubmit} className="flex flex-col gap-4">
-      <DialogTitle>{isEdit ? "Edit template" : "New template"}</DialogTitle>
-
-      <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
-        Name
-        <Input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="Follow-up" />
-      </label>
-
-      <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
-        Subject
-        <Input
-          value={subject}
-          onChange={(event) => setSubject(event.target.value)}
-          placeholder="Following up on {{company.name}}"
-        />
-      </label>
-
-      <div className="flex flex-col gap-1 text-xs font-medium text-slate-600">
-        Body
-        <RichTextEditor
-          initialHtml={template?.bodyHtml ?? ""}
-          onChange={setBodyHtml}
-          ariaLabel="Template body"
-          testId="template-body"
-        />
-        {/* RENDERED FROM THE SUBSTITUTION'S OWN LIST, not typed out beside it. This
-            paragraph is the only place anybody will look for the merge fields, and a
-            path documented here that the code does not substitute is an unfilled
-            placeholder in a sent email -- so it is derived rather than maintained.
-            The quote half of this page (ROOT_FIELDS above) cannot do the same: those
-            keys live in the API's buildContext, which this bundle cannot import. */}
-        <p className="text-xs font-normal text-slate-400">
-          {mergeFieldSentence(Object.keys(PLACEHOLDER_KEYS))} are filled in from the
-          records as they stand when the template is used; anything else is left as
-          written. An unfilled name stays visible, so you can see what is missing.
-        </p>
-        {/* THE LIMITATION, SAID PLAINLY RATHER THAN DISCOVERED, and the three
-            renderings below come out of MERGE_EXAMPLES rather than being typed here
-            -- the paragraph above is derived from the substitution's own key list for
-            exactly this reason, and its claims about EMPTY fields were not.
-
-            Blanking happens only where the composer knows the contact; the Inbox
-            knows none and leaves both fields visible, which this said nothing about
-            until v1.2.1. And nothing removes brackets or a label written around a
-            placeholder, so "({{contact.pronouns}})" on a contact with none prints
-            "()". Fixing that needs conditional blocks. v1.1.0 ruled to document the
-            limitation rather than grow the language; v1.2.1 measured the port to the
-            document engine's blocks and deferred it again -- half the mail merge's
-            behaviours conflict with that engine, and its rule for "no record in
-            scope" has no block form at all. Documenting it is what turns a surprise
-            into a choice. */}
-        <p className="text-xs font-normal text-slate-400">
-          When the composer knows which contact you are writing to, an empty
-          salutation or set of pronouns removes itself and one space after it:{" "}
-          <code>{MERGE_EXAMPLES[0]?.template}</code> reads &quot;
-          {MERGE_EXAMPLES[0]?.rendered}&quot;. Started from the Inbox there is no
-          contact for them to be empty on, and both stay visible like a name:{" "}
-          <code>{MERGE_EXAMPLES[1]?.rendered}</code>. Either way, brackets or a label
-          you write around one stay put: <code>{MERGE_EXAMPLES[2]?.template}</code>{" "}
-          reads &quot;{MERGE_EXAMPLES[2]?.rendered}&quot; when there are no pronouns
-          to put in them.
-        </p>
-      </div>
-
-      {localError !== null && <p role="alert" className="text-sm text-red-600">{localError}</p>}
-      {submitError && <p role="alert" className="text-sm text-red-600">{submitError.message}</p>}
-
-      <div className="flex justify-end gap-2">
-        <Button variant="outline" onClick={onClose}>Cancel</Button>
-        <Button type="submit" disabled={pending}>{pending ? "Saving..." : "Save"}</Button>
-      </div>
-    </form>
   );
 }

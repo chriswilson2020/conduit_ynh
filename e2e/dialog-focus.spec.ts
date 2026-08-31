@@ -18,13 +18,18 @@ import type { Browser, Page } from "@playwright/test";
  * web: components/ui/dialog-focus.ts is the fix and carries the mechanism.
  *
  * WHICH DIALOGS, MEASURED RATHER THAN REASONED ABOUT, at 1280 and 390, over
- * all SIXTEEN `<Dialog>` roots this app opens across twelve files. Five landed
- * on `<body>` and are the subject of this file: the four driven by state
- * instead of a trigger (the composer, the task drawer, and the two settings
- * dialogs) and the Lose dialog on a deal, which HAS a trigger and still fails
- * because a successful lose unmounts it. The SIXTH caller of the shared hook is
+ * all FIFTEEN `<Dialog>` roots this app opens across eleven files. Four landed
+ * on `<body>` and are the subject of this file: the three driven by state
+ * instead of a trigger (the composer, the task drawer, and the mail settings
+ * dialog) and the Lose dialog on a deal, which HAS a trigger and still fails
+ * because a successful lose unmounts it. The FIFTH caller of the shared hook is
  * the phone board's move sheet, which had this fixed by hand a task earlier and
  * is covered by e2e/mobile.spec.ts's two move tests.
+ *
+ * (Sixteen roots across twelve files until v1.2.2, when the mail template
+ * feature and its Settings dialog went. Recounted here rather than decremented:
+ * the email templates page was one root in one file, and the ten left to Radix
+ * below never included it.)
  *
  * THE OTHER TEN ROOTS ARE LEFT TO RADIX and none is asserted here. All ten
  * restore their trigger on a dismissal, and they divide three ways:
@@ -72,6 +77,22 @@ async function create(page: Page, path: string, data: unknown): Promise<{ id: st
   return JSON.parse(body) as { id: string };
 }
 
+/**
+ * A mail account with nowhere to connect to. 192.0.2.1 is TEST-NET-1 (RFC 5737),
+ * reserved and unrouted, so the sync worker's attempts go nowhere and never
+ * reach a real mailbox -- the same fixture e2e/composer-focus.spec.ts uses and
+ * for the same reason.
+ */
+async function makeAccount(page: Page, label: string): Promise<{ id: string }> {
+  return create(page, "/api/mail/accounts", {
+    label,
+    email: `${label.replace(/\W+/g, "-").toLowerCase()}@example.com`,
+    imapHost: "192.0.2.1", imapPort: 993, imapSecurity: "tls",
+    smtpHost: "192.0.2.1", smtpPort: 587, smtpSecurity: "starttls",
+    username: "focus", password: "not-a-real-mailbox",
+  });
+}
+
 interface Fixture {
   readonly projectId: string;
   readonly taskId: string;
@@ -79,8 +100,8 @@ interface Fixture {
   readonly archivableTaskId: string;
   readonly pipelineId: string;
   readonly dealId: string;
-  readonly templateAId: string;
-  readonly templateBId: string;
+  readonly accountAId: string;
+  readonly accountBId: string;
 }
 
 /**
@@ -120,15 +141,15 @@ async function seed(page: Page, tag: string): Promise<Fixture> {
     pipelineId: pipeline.id,
     dealId: deal.id,
     // Two rows on one settings page, so one dialog has two different Edit
-    // buttons. Templates rather than mail accounts because a template needs no
-    // mail server at all, and because leaving a live account behind would
-    // change the composer fixture of any spec running beside this one.
-    templateAId: (await create(page, "/api/mail/templates", {
-      name: `Focus template A ${tag}`, subject: "A", bodyHtml: "<p>A</p>",
-    })).id,
-    templateBId: (await create(page, "/api/mail/templates", {
-      name: `Focus template B ${tag}`, subject: "B", bodyHtml: "<p>B</p>",
-    })).id,
+    // buttons. These were email templates until v1.2.2 removed that feature;
+    // mail accounts are the only other surface in this app with the shape the
+    // ROW test below needs, and they need no mail server either -- the hosts
+    // are TEST-NET-1, exactly as e2e/composer-focus.spec.ts seeds them, and
+    // nothing here ever reads a message. THE afterAll ARCHIVES THEM, ASSERTED:
+    // a live account left behind puts a From combobox into every composer in
+    // every spec that runs after this file.
+    accountAId: (await makeAccount(page, `Focusmail A ${tag}`)).id,
+    accountBId: (await makeAccount(page, `Focusmail B ${tag}`)).id,
   };
 }
 
@@ -144,6 +165,14 @@ function suite(label: string, phone: boolean, open: (browser: Browser) => Promis
     });
 
     test.afterAll(async () => {
+      // ARCHIVED, AND THE STATUS IS CHECKED. A live mail account outlives this
+      // file and adds a From combobox to every composer opened after it, which
+      // is the hazard the seed's own note names -- a silently failed archive
+      // would hand that to the next spec with nothing to say it happened.
+      for (const id of [fixture.accountAId, fixture.accountBId]) {
+        const archived = await page.request.post(`/api/mail/accounts/${id}/archive`);
+        expect(archived.status(), await archived.text()).toBe(200);
+      }
       await page.close();
     });
 
@@ -280,44 +309,41 @@ function suite(label: string, phone: boolean, open: (browser: Browser) => Promis
     });
 
     /**
-     * THE WHOLE JUSTIFICATION FOR CAPTURING AT THE OPENER, and until this test
-     * nothing exercised it: every other case here opens from a single
-     * top-of-page button, which one hard-coded ref would satisfy just as well.
-     * Two template rows, two Edit buttons, one dialog -- opened from the second
-     * row and then the first, so a stale capture from the previous open is a
-     * failure rather than a coincidence.
+     * THE WHOLE JUSTIFICATION FOR CAPTURING AT THE OPENER, and nothing else
+     * here exercises it: every other case opens from a single top-of-page
+     * button, which one hard-coded ref would satisfy just as well. Two account
+     * rows, two Edit buttons, one dialog -- opened from the second row and then
+     * the first, so a stale capture from the previous open is a failure rather
+     * than a coincidence.
+     *
+     * IT WAS THE TEMPLATES PAGE UNTIL v1.2.2, which removed the mail template
+     * feature. Moved rather than deleted: what it guards is
+     * components/ui/dialog-focus.ts, which is still shipped and still has no
+     * other two-opener coverage. The `Add account` test above is the same
+     * dialog from its OTHER opener, so this file no longer needs a separate
+     * "goes back to New" case -- that was the templates page's own duplicate of
+     * it and went with the feature.
      */
-    test("the template dialog goes back to the ROW that opened it, not the last one", async () => {
-      await page.goto("/settings/templates");
-      const first = page.getByTestId(`email-template-${fixture.templateAId}`);
-      const second = page.getByTestId(`email-template-${fixture.templateBId}`);
+    test("the account dialog goes back to the ROW that opened it, not the last one", async () => {
+      await page.goto("/settings/mail");
+      const first = page.getByTestId(`mail-account-${fixture.accountAId}`);
+      const second = page.getByTestId(`mail-account-${fixture.accountBId}`);
       await expect(first).toBeVisible();
       await expect(second).toBeVisible();
 
       const secondEdit = second.getByRole("button", { name: "Edit" });
       await secondEdit.click();
-      await expect(page.getByTestId("template-form")).toBeVisible();
+      await expect(page.getByTestId("account-form")).toBeVisible();
       await dismiss();
-      await expect(page.getByTestId("template-form")).toHaveCount(0);
+      await expect(page.getByTestId("account-form")).toHaveCount(0);
       await expect(secondEdit).toBeFocused();
 
       const firstEdit = first.getByRole("button", { name: "Edit" });
       await firstEdit.click();
-      await expect(page.getByTestId("template-form")).toBeVisible();
+      await expect(page.getByTestId("account-form")).toBeVisible();
       await dismiss();
-      await expect(page.getByTestId("template-form")).toHaveCount(0);
+      await expect(page.getByTestId("account-form")).toHaveCount(0);
       await expect(firstEdit).toBeFocused();
-    });
-
-    /** The second `autoFocus` dialog, and the fourth of the four. */
-    test("the template dialog goes back to New template", async () => {
-      await page.goto("/settings/templates");
-      const trigger = page.getByRole("button", { name: "New template" });
-      await trigger.click();
-      await expect(page.getByTestId("template-form")).toBeVisible();
-      await dismiss();
-      await expect(page.getByTestId("template-form")).toHaveCount(0);
-      await expect(trigger).toBeFocused();
     });
 
     /**
