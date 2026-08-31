@@ -229,6 +229,42 @@ found by SQL.
 
 ## Defects found and deliberately deferred
 
+**FIVE LISTS SAY "THERE IS NOTHING HERE" WHILE THEIR QUERY IS STILL ON THE WIRE -- found
+during v1.2.1 Task 5's sweep, filed rather than fixed because the release was scoped to
+three defects.** Each destructures `const { data: rows = [] } = use...()` and renders its
+empty label on `rows.length === 0` with no loading branch, so the reader is told the record
+has no pipelines/notes/files/dependencies for as long as the fetch takes, and the list then
+appears underneath that sentence:
+
+| where | label |
+|---|---|
+| `pages/company-detail.tsx`, Pipelines | `No pipelines` |
+| `pages/project-detail.tsx`, Pipelines | `No pipelines` |
+| `components/rail/notes.tsx` | `No notes yet` |
+| `components/rail/files.tsx` | `No files yet` |
+| `components/task-drawer.tsx`, Dependencies | `No dependencies` |
+
+**The app already has the right shape in seven other places** and they are what makes this a
+defect rather than a convention: `components/entity-table.tsx` renders `Loading...` and
+`No results` from the same cell; `components/mail/thread-list.tsx` renders its empty label
+only `!isLoading && !error`; `rail/meetings.tsx`, `deal-detail.tsx`'s Documents,
+`settings-templates.tsx` and `pipelines.tsx` all do the same; and `company-detail.tsx`'s
+CONTACTS section -- three sections above its Pipelines one -- gates on
+`contactsData && contactsData.items.length === 0`, which is the same claim spelled with a
+truthiness check instead of a flag. **Fix:** give the five above the branch their
+neighbours have. `rail/notes.tsx`, `rail/files.tsx` and `task-drawer.tsx` do not currently
+destructure `isLoading` at all.
+
+**HOW IT WAS FOUND, because the test consequence is the reason it matters.** Two e2e sites
+leaned on one of these labels as a "the list has loaded" sentinel, and one of them said so
+in a comment. `e2e/crm.spec.ts`'s archived-pipeline journey is the one that was measured:
+with `listPipelines`'s archived filter removed server-side, so the archived row DOES come
+back in the default list, its `toContainText("No pipelines")` pair passed twice and failed
+four times over six attempts -- a race, decided by whether the response beat the first poll,
+which is worse than either a pass or a failure. That test now waits on the response instead.
+`e2e/mobile.spec.ts`'s `No dependencies` precondition is the same shape and was left alone:
+it is a precondition rather than the test's claim, and a false pass there costs nothing.
+
 **THE SERVER CAN STORE A SIGNATURE ITS OWN RESPONSE SCHEMA REJECTS, AND THE WEB CLIENT
 THEN FAILS ON EVERY `GET /api/mail/accounts` FOR THAT USER -- found during v1.2.1 Task 1,
 outside that commit's subject.** `mailAccountUpdateInputSchema`'s `signatureHtml` is

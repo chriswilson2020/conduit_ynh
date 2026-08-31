@@ -198,10 +198,20 @@ test.describe.serial("CRM journey", () => {
     await page.getByRole("button", { name: "Archive" }).click();
     await expect(page.getByTestId("archived-badge")).toBeVisible();
 
-    // Gone from the default (non-archived) list.
+    // Gone from the default (non-archived) list -- ASKED OF A LIST THAT HAS
+    // ANSWERED, which the bare absence was not. Rows are rendered from the
+    // companies query, so for the first moments after the navigation (and
+    // again while the filter's own fetch is out) there are no rows at all, and
+    // a negated auto-retrying matcher passes on an element that does not exist
+    // yet. Measured with listCompanies's archived filter removed server-side,
+    // so this row DOES come back in the default list: the bare form stayed
+    // green on both of the two attempts that ran under it.
+    // entity-table.tsx's empty cell IS a real sentinel here, because it
+    // reads "Loading..." until the query settles and "No results" only after.
     await page.goto("/companies");
     await page.getByPlaceholder("Filter...").fill(runId);
-    await expect(page.getByTestId(`row-${companyId}`)).not.toBeVisible();
+    await expect(page.getByTestId("entity-table")).toContainText("No results");
+    await expect(page.getByTestId(`row-${companyId}`)).toHaveCount(0);
 
     // Present once the Archived filter is turned on.
     await page.getByRole("checkbox", { name: "Archived" }).check();
@@ -244,10 +254,27 @@ test.describe.serial("CRM journey", () => {
     await page.getByTestId("archive-pipeline-button").click();
     await expect(page).toHaveURL(/\/pipelines$/);
 
-    // The company's default Pipelines list no longer carries it -- and the
-    // empty label doubles as the loaded-list sentinel, since this pipeline
-    // was the company's only one.
+    // The company's default Pipelines list no longer carries it.
+    //
+    // THE EMPTY LABEL IS NOT THE LOADED-LIST SENTINEL THIS PASSAGE USED TO CALL
+    // IT, and that is a fact about the page rather than about the test:
+    // company-detail.tsx's Pipelines section has no loading state of its own
+    // and renders `data = []` while its query is in flight, so "No pipelines"
+    // is also exactly what an unanswered list looks like. Measured with
+    // listPipelines's archived filter removed server-side, so the archived row
+    // DOES come back here: over six attempts the pair below passed twice and
+    // failed four times -- a race, decided by whether the response beat the
+    // first poll, which is the worst shape an assertion can have. The response
+    // itself is the sentinel instead, armed before the navigation that makes
+    // it.
+    const listed = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/pipelines?")
+        && response.url().includes(`company_id=${companyId}`)
+        && response.ok(),
+    );
     await page.goto(`/companies/${companyId}`);
+    await listed;
     const pipelinesList = page.getByTestId("company-pipelines");
     await expect(pipelinesList).toContainText("No pipelines");
     await expect(pipelinesList).not.toContainText(pipelineName);

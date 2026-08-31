@@ -236,8 +236,6 @@ test.describe.serial("Tasks/Gantt journey", () => {
     const designBar = page.getByTestId(`gantt-bar-${designId}`);
     const buildBar = page.getByTestId(`gantt-bar-${buildId}`);
 
-    const buildTitleBefore = await buildBar.getAttribute("title");
-
     // Design runs 2026-09-01 to 2026-09-05, Build starts 2026-09-08 -- a
     // 10-day rightward nudge pushes Design's due date to 2026-09-15, well
     // past Build's start, which the successor-respecting shift must push
@@ -252,20 +250,26 @@ test.describe.serial("Tasks/Gantt journey", () => {
     // triggerFlash), so assert it promptly rather than after any other wait.
     await expect(page.getByTestId("cascade-note")).toContainText(/task.*shifted/);
 
-    // The bar's title carries "<title>: <start> to <due>" (bar.tsx) -- wait
-    // for it to actually change from its pre-nudge value, which is the
-    // commit landing (the shiftTask mutation resolving and taskById
-    // refetching), not just the local drag-preview render.
-    await expect(async () => {
-      const titleNow = await buildBar.getAttribute("title");
-      expect(titleNow).not.toBe(buildTitleBefore);
-    }).toPass();
-
-    const buildTitleAfter = await buildBar.getAttribute("title");
-    expect(buildTitleAfter).toContain("2026-09");
-    // Build's due date must land AFTER Design's new due date (2026-09-15) --
-    // confirms this was a genuine successor cascade, not a no-op.
-    expect(buildTitleAfter).not.toBe(`${buildTitle}: 2026-09-08 to 2026-09-12`);
+    // The bar's title carries "<title>: <start> to <due>" (bar.tsx), read back
+    // from the refetched task -- so this is the commit landing (the shiftTask
+    // mutation resolving and taskById refetching), not the local drag-preview
+    // render. It auto-retries, which is also the wait.
+    //
+    // THE EXACT LANDING, BECAUSE "IT MOVED" CANNOT TELL A CASCADE FROM ANY
+    // OTHER CHANGE. shiftTask sets a violated successor's start to exactly its
+    // predecessor's new due date and preserves the successor's duration, so
+    // Design at 2026-09-11..09-15 takes Build's four days to 09-15..09-19 --
+    // which is also the position the compaction test below expects to find
+    // Build in before it reintroduces slack. What this replaced was a `toPass`
+    // that the title had CHANGED followed by a `not.toBe` of the same
+    // pre-nudge value, which is that one claim spelled twice, and a
+    // `toContain("2026-09")` that a one-day shift satisfies as happily as a
+    // ten-day one. The comment beside them said Build "must land AFTER
+    // Design's new due date" and no assertion said it. Measured, with
+    // scheduling.ts's cascade delta forced to 1 so Build moved a single day
+    // and landed a week SHORT of Design's due date: all fourteen tests in this
+    // file stayed green.
+    await expect(buildBar).toHaveAttribute("title", `${buildTitle}: 2026-09-15 to 2026-09-19`);
   });
 
   test("Remove slack pulls Build back to touch Design's due date once slack is reintroduced", async () => {
@@ -484,13 +488,22 @@ test.describe.serial("Task board keyboard drag with off-screen columns", () => {
     const announcement = page.locator('[id^="DndLiveRegion"]');
     await expect(async () => {
       await page.goto(`/projects/${projectId}/board`);
+      // THE BOARD HAS TO BE ON SCREEN BEFORE THE PREMISE BELOW MEANS ANYTHING.
+      // Every column is rendered from the tasks query, so straight after this
+      // navigation there is nothing under `column-done` at all -- and a
+      // negated auto-retrying matcher is satisfied by an element that does not
+      // exist, on its first poll. Measured by widening this group to 1600x900,
+      // where Done is fully in view and the premise is FALSE: the bare form
+      // stayed green, in the same run as the in-viewport probe below answering
+      // true. The card is this board's cheapest proof the query has answered.
+      const card = blocked.getByTestId(`card-${taskId}`);
+      await expect(card).toBeVisible();
       // The regression's premise: Done must actually start off-screen, or
       // this degenerates into the same on-screen drag the wide journey
       // already covers. Guards the viewport/column arithmetic above against
       // layout drift silently widening what fits.
       await expect(done).not.toBeInViewport();
 
-      const card = blocked.getByTestId(`card-${taskId}`);
       await card.focus();
       await page.keyboard.press("Space");
       await expect(announcement).toContainText("was moved over");

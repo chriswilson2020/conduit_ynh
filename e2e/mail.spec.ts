@@ -1068,8 +1068,32 @@ test.describe.serial("Mail journey", () => {
    * MEASURED against the fix reverted: a reply opened and typed straight into
    * put "TOPLINE" inside the signature -- "-- Vriendelijke groet, sNNNNNN" came
    * back as "-- Vriendelijke groet, sNNNNNNTOPLINE". Two lines in rich-text.tsx
-   * settle it (updateSelection:false on the append, "start" on the focus) and
-   * this is what holds them.
+   * settle it: `updateSelection: false` on the append, and `"start"` on the
+   * focus.
+   *
+   * THIS TEST HOLDS ONE OF THOSE TWO, AND THE SENTENCE HERE USED TO CLAIM BOTH.
+   * On the WARM path -- which is what this test is, the accounts being cached
+   * by the time Reply is clicked -- the append and the caret placement run on
+   * the same editor epoch, append first, and `focus("start")` then states the
+   * caret's position outright. Whatever the append did to the SELECTION is
+   * overwritten a line later, so no assertion this test can make separates
+   * `updateSelection: false` from its absence. Measured on CI run 33352477158
+   * with that option deleted: this test passed all three attempts, while the
+   * cold reply below failed all three ("TOPLINE -- Koud ...MORE"),
+   * e2e/composer-focus.spec.ts's account-switch journey failed all three, and
+   * composer-focus.test.ts's source guard over that exact string failed in the
+   * unit job. Those three are what hold it.
+   *
+   * WHAT IT DOES HOLD, and nothing else in the suite does: the reply's opening
+   * focus landing in the BODY (composer-focus.spec.ts covers every seed that
+   * needs no mail server and cannot reach a reply), the signature arriving on
+   * the warm path at all, and `focus("start")` against `focus("end")` -- with
+   * the signature already in the document, "end" puts the caret after it.
+   * Measured on CI run 33352506359: this was the run's only red test, three
+   * attempts out of three, "typed text landed inside the signature: --
+   * Groeten ...TOPLINE" -- 141 others passed and the rest of this serial group
+   * was skipped behind it. The cold test below cannot hold that one: it
+   * focuses an EMPTY document, where "start" and "end" are the same position.
    *
    * NO CLICK, DELIBERATELY, and it is the only place in this suite that types
    * into the body without one. typeIntoEditor clicks first and so places the
@@ -1240,8 +1264,22 @@ test.describe.serial("Mail journey", () => {
     await page.getByTestId("filter-unlinked").click();
     // Alice's thread is claimed (contact and deal); Bob's is claimed by
     // nothing, which is exactly what the triage filter is for.
-    await expect(threadRow(aliceSubject)).toHaveCount(0);
+    //
+    // BOB FIRST, AND THAT IS THE WHOLE OF THE ORDER'S JOB. A filter toggle
+    // changes the list's QUERY KEY, and thread-list.tsx renders
+    // `pages.key === key ? flatten(pages) : []` -- so between the click and
+    // the new page landing there are no rows at all, and Alice's absence is
+    // satisfied by a list that has not answered yet. Bob's presence is that
+    // list answering.
+    //
+    // MEASURED WITH THE SERVER'S `unlinked` PREDICATE MADE A NO-OP, so Alice's
+    // thread stays in the filtered list and this test is looking straight at
+    // the state it exists to refuse. In the old order -- Alice's absence
+    // first -- run 33353893938's e2e job was GREEN, all 164 tests, this one
+    // among them. In this order, run 33353484548 failed it three attempts out
+    // of three.
     await expect(threadRow(bobSubject)).toHaveCount(1);
+    await expect(threadRow(aliceSubject)).toHaveCount(0);
 
     await page.getByTestId("filter-unlinked").click();
     await expect(threadRow(aliceSubject)).toHaveCount(1);

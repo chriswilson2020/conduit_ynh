@@ -49,12 +49,23 @@ import type { Page } from "@playwright/test";
  * two different fixtures. In CI the ordering is fixed: workers is 1 and
  * Playwright walks the files alphabetically, so "composer-focus" runs before
  * both specs that create an account -- e2e/mail.spec.ts (its beforeAll) and
- * e2e/mobile.spec.ts:1569 (its own phone journey). NEITHER archives its
+ * e2e/mobile.spec.ts (its own phone journey). NEITHER archives its
  * account when it finishes; both instead SWEEP every live own account when
  * they start, so the alphabetical order is the whole of the guarantee. Locally,
  * with default workers, all three files can overlap in both directions: this
  * file's accounts can be swept by either sweeper mid-test, and either file's
  * account can appear in these composers. Run this file alone in that loop.
+ *
+ * AND THIS FILE NOW SWEEPS TOO, which it did not. Its own accounts were
+ * archived only in per-test `finally` blocks, so a run killed mid-test -- a
+ * Ctrl-C in the local loop, a timed-out CI job -- left one alive against a
+ * database nothing empties. That account is unreachable by construction
+ * (192.0.2.1 is TEST-NET-1), so its sync pass sits in a TCP connect that never
+ * completes, and the next API shutdown waits out mail-sync's STOP_TIMEOUT_MS
+ * (15s) on it. The beforeAll below mirrors the two sweepers named above, and
+ * takes e2e/mobile.spec.ts's half of them -- the refusal to run beside another
+ * worker, which e2e/mail.spec.ts's own sweep does not carry because it sits
+ * inside a serial group and this one does not.
  *
  * THE REPLY AND THE FORWARD ARE NOT HERE, and there is nowhere else they could
  * be. Both seeds come from an open conversation, which exists only after a real
@@ -67,6 +78,61 @@ import type { Page } from "@playwright/test";
 // See mobile.spec.ts: everything the device describes except the browser
 // choice, since the job installs chromium and only chromium.
 const { defaultBrowserType: _webkitByDefault, ...IPHONE_13 } = devices["iPhone 13"];
+
+/**
+ * ARCHIVE WHATEVER A DEAD RUN LEFT BEHIND, before this file makes any more.
+ *
+ * The accounts below are archived in per-test `finally` blocks, which covers a
+ * failing assertion and covers nothing else: a killed worker, a Ctrl-C or a
+ * timed-out job skips them, and nothing empties this database between runs. See
+ * the header for what a leftover then costs -- an unreachable account whose
+ * sync pass blocks a shutdown for mail-sync's STOP_TIMEOUT_MS.
+ *
+ * IT ARCHIVES EVERY LIVE OWN ACCOUNT, NOT ONLY THIS FILE'S, for the reason
+ * e2e/mobile.spec.ts gives at the same block: a label filter would not contain
+ * the hazard, it would defeat it, since the leftover worth stopping may carry
+ * any label at all. What contains it is refusing to run concurrently --
+ * `workers: 1` in CI, and this file's own describes are the thing most at risk
+ * from more, since a second worker's sweep would archive the accounts a first
+ * worker's mailbox tests are in the middle of using.
+ *
+ * The visibility flip is the same one both sweepers make and for the same
+ * reason: archiving does not clear visibility and the account PATCH refuses
+ * archived rows, so a shared leftover has to be made private FIRST or it can
+ * never be made private again. Nothing here ever shares an account; the flip is
+ * for a leftover from e2e/mail.spec.ts, whose journey does.
+ */
+test.beforeAll(async ({ browser }, testInfo) => {
+  const page = await browser.newPage();
+  try {
+    const listed = await page.request.get("/api/mail/accounts");
+    expect(listed.ok(), await listed.text()).toBe(true);
+    const { own } = (await listed.json()) as {
+      own: { id: string; archivedAt: string | null; visibility: "private" | "shared" }[];
+    };
+    const live = own.filter((account) => account.archivedAt === null);
+    if (live.length > 0 && testInfo.config.workers !== 1) {
+      throw new Error(
+        `This file archives every live mail account (${String(live.length)} found) before it starts, `
+        + "because a leftover unreachable one stalls the API's shutdown and puts a From select into "
+        + "the four composers below. That races its own other groups, and e2e/mail.spec.ts and "
+        + "e2e/mobile.spec.ts, at more than one worker. Re-run with --workers=1.",
+      );
+    }
+    for (const account of live) {
+      if (account.visibility === "shared") {
+        const flipped = await page.request.patch(`/api/mail/accounts/${account.id}`, {
+          data: { visibility: "private" },
+        });
+        expect(flipped.ok(), await flipped.text()).toBe(true);
+      }
+      const archived = await page.request.post(`/api/mail/accounts/${account.id}/archive`);
+      expect(archived.ok(), await archived.text()).toBe(true);
+    }
+  } finally {
+    await page.close();
+  }
+});
 
 /** A contact with an address, so the rail's Compose seeds a recipient. */
 async function seedContact(page: Page, tag: string): Promise<string> {

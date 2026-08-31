@@ -202,8 +202,19 @@ test.describe.serial("Pipeline journey", () => {
     await expect(page.getByTestId("timeline-entry").filter({ hasText: "won" })).toBeVisible();
 
     // Won/lost deals never render on the board -- open-only filter.
+    //
+    // GAMMA IS THE LOADED-BOARD SENTINEL, AND WITHOUT ONE THIS SAID NOTHING.
+    // Every card on this page is rendered from the deals query, so for the
+    // first moments after a navigation the board holds no cards at all -- and
+    // a negated auto-retrying matcher is satisfied by an element that does not
+    // exist yet, on its very first poll. Measured with board.tsx's open-only
+    // filter replaced by `filter(() => true)`, so a won deal DOES render here:
+    // this test stayed green, while a probe that waited for the card first saw
+    // it arrive. Gamma is still open in Lead and is the cheapest thing on the
+    // page that proves the query has answered.
     await page.goto(`/pipelines/${pipelineId}`);
-    await expect(page.getByTestId(`card-${betaId}`)).not.toBeVisible();
+    await expect(page.getByTestId(`card-${gammaId}`)).toBeVisible();
+    await expect(page.getByTestId(`card-${betaId}`)).toHaveCount(0);
   });
 
   test("funnel view shows counts and formatted values", async () => {
@@ -261,12 +272,25 @@ test.describe.serial("Pipeline journey", () => {
   test("archives the pipeline, hides it from the default list, and restores it via the board's Unarchive banner", async () => {
     await page.goto(`/pipelines/${pipelineId}`);
     page.once("dialog", (dialog) => void dialog.accept());
+    // ARMED BEFORE THE CLICK THAT CAUSES IT, because the absence below has to
+    // be asked of a list that has ANSWERED and this index has no sentinel of
+    // its own: pipelines.tsx renders `data = []` while the query is in flight,
+    // and its "No pipelines yet." never appears in a full run because other
+    // specs' pipelines are on this page too. Measured with listPipelines's
+    // archived filter removed server-side, so the archived row DOES come back
+    // in the default list: without this wait the assertion below stayed green
+    // across two runs, because a negated auto-retrying matcher is satisfied by
+    // an element that has not been rendered yet.
+    const listed = page.waitForResponse(
+      (response) => /\/api\/pipelines\?archived=false$/.test(response.url()) && response.ok(),
+    );
     await page.getByTestId("archive-pipeline-button").click();
 
     await expect(page).toHaveURL(/\/pipelines$/);
 
     // Gone from the default (non-archived) list.
-    await expect(page.getByTestId(`pipeline-row-${pipelineId}`)).not.toBeVisible();
+    await listed;
+    await expect(page.getByTestId(`pipeline-row-${pipelineId}`)).toHaveCount(0);
 
     // Present once the Archived toggle is turned on.
     await page.getByRole("checkbox", { name: "Archived" }).check();
