@@ -11,7 +11,7 @@ import {
   useUnarchiveMailTemplate,
   useUpdateMailTemplate,
 } from "../queries";
-import { htmlIsBlank, PLACEHOLDER_KEYS } from "../components/mail/mail-lib";
+import { htmlIsBlank, MERGE_EXAMPLES, PLACEHOLDER_KEYS } from "../components/mail/mail-lib";
 import { RichTextEditor } from "../components/mail/rich-text";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
@@ -416,20 +416,31 @@ function TemplateForm({ template, onClose }: { template?: EmailTemplate; onClose
           records as they stand when the template is used; anything else is left as
           written. An unfilled name stays visible, so you can see what is missing.
         </p>
-        {/* THE LIMITATION, SAID PLAINLY RATHER THAN DISCOVERED. An empty salutation
-            removes itself and one following space, which handles "Dear X Y" -- but
-            nothing removes brackets or a label written around it, so
-            "({{contact.pronouns}})" on a contact with none prints "()". Fixing that
-            needs conditional blocks, which the mail merge language does not have and
-            which is a feature rather than a fix (v1.1.0 coordinator ruling; it is on
-            the backlog). Documenting it is what turns a surprise into a choice. */}
+        {/* THE LIMITATION, SAID PLAINLY RATHER THAN DISCOVERED, and the three
+            renderings below come out of MERGE_EXAMPLES rather than being typed here
+            -- the paragraph above is derived from the substitution's own key list for
+            exactly this reason, and its claims about EMPTY fields were not.
+
+            Blanking happens only where the composer knows the contact; the Inbox
+            knows none and leaves both fields visible, which this said nothing about
+            until v1.2.1. And nothing removes brackets or a label written around a
+            placeholder, so "({{contact.pronouns}})" on a contact with none prints
+            "()". Fixing that needs conditional blocks. v1.1.0 ruled to document the
+            limitation rather than grow the language; v1.2.1 measured the port to the
+            document engine's blocks and deferred it again -- half the mail merge's
+            behaviours conflict with that engine, and its rule for "no record in
+            scope" has no block form at all. Documenting it is what turns a surprise
+            into a choice. */}
         <p className="text-xs font-normal text-slate-400">
-          An empty salutation or set of pronouns removes itself, and one space after
-          it, so <code>{"Dear {{contact.salutation}} {{contact.name}}"}</code> reads
-          &quot;Dear Alice&quot; for a contact with no salutation. Any brackets or
-          labels you write around one stay put:{" "}
-          <code>{"({{contact.pronouns}})"}</code> prints empty brackets when there are
-          no pronouns to put in them.
+          When the composer knows which contact you are writing to, an empty
+          salutation or set of pronouns removes itself and one space after it:{" "}
+          <code>{MERGE_EXAMPLES[0]?.template}</code> reads &quot;
+          {MERGE_EXAMPLES[0]?.rendered}&quot;. Started from the Inbox there is no
+          contact for them to be empty on, and both stay visible like a name:{" "}
+          <code>{MERGE_EXAMPLES[1]?.rendered}</code>. Either way, brackets or a label
+          you write around one stay put: <code>{MERGE_EXAMPLES[2]?.template}</code>{" "}
+          reads &quot;{MERGE_EXAMPLES[2]?.rendered}&quot; when there are no pronouns
+          to put in them.
         </p>
       </div>
 

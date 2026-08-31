@@ -62,6 +62,12 @@ the evidence.
    labels. The document template already has `{{#path}}...{{/path}}`; the mail merge does not.
    v1.1.0's ruling was to document the limitation rather than grow the template language
    mid-release -- v1.2.1 is where that ruling is revisited, not overturned by default.
+   **Outcome: revisited and DEFERRED AGAIN with a measurement** (v1.2.1 plan, Task 3).
+   13 of the mail merge's 26 documented behaviours conflict with the document engine, and
+   its "no record in scope" rule has no block form, so the port would have to invent a
+   second dialect. The limitation stays documented, and the Settings page's claims about
+   empty fields are now derived from the substitution rather than typed beside it. The
+   full entry is in the deferred list below.
 
 **EXPLICITLY OUT, and both for reasons about scope rather than severity:**
 
@@ -326,6 +332,21 @@ contact with none. Swallowing one following space handles `Dear X Y`; nothing sh
 conditionals handles brackets or labels. The document template already has
 `{{#path}}...{{/path}}`; the mail merge does not. Coordinator ruling at the time was to
 document the limitation rather than grow the language mid-release.
+
+**v1.2.1 REVISITED THIS AND DEFERRED IT AGAIN, WITH A MEASUREMENT** -- full record in
+that release's plan, Task 3. The short form, so nobody re-opens it on the old reasoning:
+the obstacle is not the cost of moving `mergeTemplate` into `@conduit/shared`, it is that
+**13 of the mail merge's 26 documented behaviours conflict with the document engine**
+(measured by running mail's own contract through it). An absent path is empty there and
+literal here; the one-space swallow has no expression in a node tree; the escaper is
+fixed at five characters where mail needs none for a subject; and `mergeTemplate` throws
+where `composer.tsx` has no `catch`. **The deciding one: mail's "no record in scope
+leaves the placeholder visible" rule has no block form** -- every answer for
+`{{#contact.pronouns}}` with no contact is a new language decision the document engine
+cannot supply, so the port must invent a second dialect inside the quote renderer. Had
+the semantics agreed it would still have been ~14 files across two packages. **Whoever
+picks this up next owns a language design, not a port**, and the first thing to settle is
+what a block does when the composer has no record.
 
 ~~**Touch-floor assertions are blind to clipping.**~~ **FIXED by 7.5 Task 4b** (`fc2b0d3`,
 round 2 `d2fb306`); the full record is that task's DONE block in the v1.2.0 plan. Seven

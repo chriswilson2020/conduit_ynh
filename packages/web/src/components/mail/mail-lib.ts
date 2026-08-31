@@ -443,6 +443,60 @@ export function substitutePlaceholdersHtml(input: string, context: TemplateConte
   return substitute(input, context, escapeHtmlText);
 }
 
+/** One worked example on the Settings -> Templates page: what an author types, the
+ * context it is rendered against, and what comes out. */
+export interface MergeExample {
+  /** What the author writes in the template. */
+  template: string;
+  /** The composer's context. Which composer it stands for is the page's sentence. */
+  context: TemplateContext;
+  /** What substitutePlaceholders produces, asserted in this module's test. */
+  rendered: string;
+}
+
+/**
+ * THE THREE CLAIMS SETTINGS -> TEMPLATES MAKES ABOUT EMPTY FIELDS, AS DATA RATHER
+ * THAN PROSE.
+ *
+ * That page is the only place a template author is ever told what an empty field
+ * does, and its examples were typed out beside this substitution rather than
+ * derived from it -- the two-hand-written-lists shape PLACEHOLDER_KEYS exists to
+ * avoid, and the one that lets a page promise a rendering this module does not
+ * produce. The page prints `rendered` from here; this module's test asserts the
+ * substitution actually produces it, so a change to the substitution that the page
+ * does not follow fails rather than misleading somebody writing a template.
+ *
+ * THE SECOND ENTRY IS THE ONE THE PAGE WAS MISSING, and it is the distinction
+ * v1.1.0 paid for with a live defect (see substitute()): blanking is what a
+ * composer does when it KNOWS the contact. The Inbox knows none, so both fields
+ * stay visible there like a name -- and the page said "an empty salutation removes
+ * itself" flat, which an author composing from the Inbox would watch not happen.
+ *
+ * THE THIRD IS THE LIMITATION, KEPT RATHER THAN FIXED. Nothing removes brackets or
+ * a label written around a placeholder; conditional blocks would, and v1.2.1
+ * measured that port and deferred it a second time. The measurement is in the
+ * v1.2.1 plan's Task 3.
+ */
+export const MERGE_EXAMPLES: readonly MergeExample[] = [
+  {
+    template: "Dear {{contact.salutation}} {{contact.name}},",
+    context: { contactName: "Alice", contactSalutation: null, contactPronouns: null },
+    rendered: "Dear Alice,",
+  },
+  {
+    template: "Dear {{contact.salutation}} {{contact.name}},",
+    // The Inbox's context: a user and nothing else, because there is no record
+    // behind a message started there. Not one contact key is present.
+    context: { userName: "Chris" },
+    rendered: "Dear {{contact.salutation}} {{contact.name}},",
+  },
+  {
+    template: "{{contact.name}} ({{contact.pronouns}})",
+    context: { contactName: "Alice", contactSalutation: null, contactPronouns: null },
+    rendered: "Alice ()",
+  },
+];
+
 /**
  * The subject a template application should leave behind. A template's
  * subject only takes effect when composing FRESH and the field is still

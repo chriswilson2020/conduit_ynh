@@ -37,6 +37,7 @@ import {
   parseAddressToken,
   parseRecipientInput,
   placeholderPattern,
+  MERGE_EXAMPLES,
   PLACEHOLDER_KEYS,
   resolveRecipients,
   sendFailureMessage,
@@ -498,6 +499,39 @@ describe("substitutePlaceholders", () => {
   it("substitutes every occurrence, not just the first", () => {
     expect(substitutePlaceholders("{{user.name}} and {{user.name}}", { userName: "Chris" }))
       .toBe("Chris and Chris");
+  });
+
+  /**
+   * SETTINGS -> TEMPLATES PRINTS THESE RENDERINGS TO THE AUTHOR, AND THIS IS WHAT
+   * MAKES THEM TRUE.
+   *
+   * The page's field LIST has been derived from PLACEHOLDER_KEYS since v1.1.0,
+   * because a path documented there and misspelt is an unfilled placeholder in a
+   * sent email. Its claims about what an EMPTY field does were still typed out
+   * beside this module -- and one of them was wrong by omission, saying an empty
+   * salutation removes itself without saying that only happens where a contact is
+   * in scope. The page now prints `rendered` from this list, so a change to the
+   * substitution that the page does not follow fails here rather than misleading
+   * somebody writing a template.
+   *
+   * The third entry asserts the DEFERRED limitation: `({{contact.pronouns}})` on a
+   * contact with none prints `()`. It is pinned rather than fixed, and it should be
+   * this test that goes red on the day conditional blocks arrive.
+   *
+   * WHAT IT DOES NOT COVER, SAID SO IT IS NOT MISTAKEN FOR MORE: it ties the list
+   * to the substitution, not the page to the list. Nobody would be stopped from
+   * replacing settings-templates.tsx's `{MERGE_EXAMPLES[2]?.rendered}` with the
+   * same string typed by hand -- that page has no component test and its paragraph
+   * no e2e assertion. What is guarded is that a string the page prints is one this
+   * module actually produces.
+   */
+  it("renders exactly what Settings -> Templates promises an author", () => {
+    // Not decoration: an emptied list leaves the loop below asserting nothing and
+    // passing. Measured -- sliced to nothing, this is the line that goes red.
+    expect(MERGE_EXAMPLES).toHaveLength(3);
+    for (const example of MERGE_EXAMPLES) {
+      expect(substitutePlaceholders(example.template, example.context)).toBe(example.rendered);
+    }
   });
 });
 
