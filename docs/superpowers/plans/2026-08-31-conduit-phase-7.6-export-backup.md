@@ -95,3 +95,117 @@ Carried from v1.2.0, v1.2.1 and v1.2.2, where each was paid for at least twice.
 - [ ] Manifest snippet is **two lines**. **`autoupdate.strategy` must not come back.**
 - [ ] The command must carry `-u https://github.com/chriswilson2020/conduit_ynh`.
 - [ ] **If the Dovecot intermittent fires, re-run and SAY SO.** Its rate is 4 in **177** attempts — canonical, reconciled in v1.2.2 against two other populations that count different things.
+
+#### DONE, Task 4's remnant, 31 Aug. One item confirmed, one recorded as outstanding
+
+Tasks 2 and 3 absorbed nearly all of this task before it ran: Task 2 opened a backup outside
+Conduit with an ordinary archive tool and restored its `pg_dump` into a scratch database,
+and Task 3 wrote the browser journeys and added the `pg_dump` version assertion. Two items
+were left.
+
+**THE WRONG PASSPHRASE IS ALREADY COVERED, AND THE SPEC'S SENTENCE ABOUT IT IS WRONG.**
+`backup-format.test.ts`'s "describes the encryption the archive actually reports" asserts
+that `7z l -pwrong` against a real backup rejects -- with `-mhe=on` the archive cannot even
+be **listed** without the passphrase, so the failure is at the **header**, before any member
+is decrypted.
+
+The spec says it "fails at the HMAC before decryption". That is a leftover from the rejected
+`openssl` draft and does not apply here: a `.7z` has no detached HMAC, and more to the point
+**Conduit never validates a passphrase because it never decrypts.** The only two `7z`
+invocations in the whole application are `7z i` (the capability probe) and `7z a` (write);
+there is no extraction path anywhere in `packages/api/src`. So the message a person sees on a
+wrong passphrase is **the extractor's**, not Conduit's, and there is nothing in this codebase
+that could leak whether a passphrase was close, because nothing here ever compares one.
+
+**THE EXCEL VISUAL COULD NOT BE COMPLETED AND IS OUTSTANDING.** Screen access was declined
+and the agent correctly did not route around it. What exists instead is byte-level proof,
+re-run at release time rather than quoted from a transcript: the exported `companies.csv`
+starts `EF BB BF`, and a BOM-aware UTF-8 reader renders the first company name with its
+umlauts intact (`M`, u-umlaut, `ller & S`, o-umlaut, `hne GmbH`).
+
+The same bytes with the BOM stripped and read as cp1252 -- what a spreadsheet does to a
+BOM-less file on a Western European machine -- corrupt exactly as the BOM exists to prevent:
+the two UTF-8 bytes `C3 BC` behind the u-umlaut are shown as the two separate cp1252
+characters `C3` and `BC`, so one letter becomes two and the name gains a character. Four
+other rows (Cafe Elysee with two accents, Arhus with A-ring and o-slash, Lodz with L-stroke,
+and one carrying an embedded comma and doubled quotes) corrupt the same way. This paragraph
+is deliberately transliterated: the convention here is ASCII only, and a document that
+demonstrated mojibake by containing some would be the wrong place to keep the evidence.
+
+The two files are prepared and ready for whoever has a spreadsheet in front of them, in the
+session scratchpad: `t1-proof/excel/companies-WITH-BOM.csv` and
+`t1-proof/excel/companies-NO-BOM.csv`, the same data differing only in those three bytes.
+The proof script is `t1-bomproof.py`. **Do not attempt the visual again from an agent** --
+it needs a human with a screen.
+
+- [x] A backup taken on a populated install, opened OUTSIDE Conduit and its `pg_dump` restored into a scratch database -- **done in Task 2**.
+- [ ] An export opened in a spreadsheet with accented characters intact -- **OUTSTANDING**, byte-level proof stands in its place, see above.
+- [x] A wrong passphrase fails cleanly, with a message that does not leak whether the passphrase was close -- and the honest version of that claim is above.
+- [x] Memory bounds asserted for both paths, each shown failing if the implementation buffers.
+- [x] `pg_dump` present and matching the server's major version; absent, it fails loudly at the button -- **added in Task 3**.
+
+---
+
+#### DONE, Task 5, 31 Aug. Tag `v1.3.0` at `4d59019`, and NEITHER FLAKE FIRED
+
+**NEITHER FLAKE FIRED, AND THAT IS SAID BECAUSE A RETRY WOULD HAVE BEEN.** CI `33436493145`
+on the bumped branch: **2741 passed, 1 skipped (2742), 78 test files, and 184 e2e. Attempt 1,
+both jobs, no `flaky` line anywhere in the e2e output.** The Dovecot intermittent did not
+fire, and neither did `pipeline.spec.ts`'s keyboard-drag flake, which had appeared twice
+earlier in the evening behind Playwright's `retries: 2`. Release run `33437091338` on the
+tag, green in 1m09s.
+
+**THE SKIPPED TEST IS ACCOUNTED FOR AND IT IS NOT NEW BREAKAGE.** The baseline had 0 skipped;
+this branch has 1, and it is `packages/api/src/routes/reauth.test.ts`'s "refuses a wrong
+password against the REAL portal, through the default wiring". It is gated on `HAVE_PORTAL`,
+which **probes** rather than assumes: it POSTs to `http://127.0.0.1:6788/login` and runs only
+if something answers 401. The dev server is a YunoHost box and answers; a CI runner and a
+developer's laptop are not, and it skips visibly. It exists because every other test of the
+portal verifier points at a stub or a closed port, so the one path that runs in production
+had never been exercised by anything.
+
+**The five bump locations**: `packages/{api,shared,web}/package.json`, `manifest.toml`'s
+`version` to `1.3.0~ynh1`, and the lockfile regenerated with
+`npm install --package-lock-only`, never edited by hand.
+
+**THE DECOYS ARE NOW ON BOTH SIDES AND THE COUNT CHECK IS DEAD.** After the bump the lockfile
+still holds **seven** `"1.2.2"` (the `@radix-ui/react-context` decoy v1.2.2 flagged, still
+there) and **eight** `"1.3.0"` (four `libbase64` pins and one other package, all of which
+predate this release). Neither number is 0, and neither is 3. **The diff is three lines** and
+all three are workspace `version` fields.
+
+**The new dependencies check out.** Against a clean `npm ci --omit=dev` in a scratch tree:
+`yazl` 3.3.1 and its transitive `buffer-crc32` 1.0.0 **are** installed; `@types/yazl` **is
+not**, in a `node_modules/@types` that does exist and holds three other entries -- so the
+absence is the flag working, not the directory missing. `p7zip-full` stays in
+`resources.apt`, and for the first time it is not declared ahead of its feature.
+
+**Digest `ba4c9b60...48e8`, verified twice, both by a script's exit status, and both scripts
+shown failing first.**
+
+1. The digest grepped out of Release run `33437091338` **anchored to the filename**
+   `conduit-1.3.0.tar.gz` -- `make-release.sh`'s line and the Publish step's `sha256sum` agree
+   -- then the published asset re-downloaded with `gh release download` and re-hashed. Shown
+   exiting 1 against a zeroed digest before it was trusted exiting 0.
+2. The url **read back out of `manifest.toml`**, fetched, **HTTP 200** confirmed, and hashed
+   against the `sha256` read out of the same file. **This is not a repeat of 1**: check 1
+   downloads BY TAG and never opens the manifest, so a correct new digest beside a stale url
+   sails through it. Shown failing exactly that way -- a decoy manifest pairing this
+   release's digest with v1.2.2's url answered **200** and served `036c3300...dbc4`, and the
+   script exited 1.
+
+**The stylesheet, checked from inside the published tarball** as v1.2.2 established:
+`index-B_nAuDrf.css`, the only css in the archive, **33,584 bytes**, sha256
+`038476b4...68d2` -- byte-identical to the local build.
+
+**FOUR UTILITIES ADDED, MEASURED RATHER THAN CARRIED FORWARD.** The 7.6 baseline stylesheet
+was rebuilt from `ea11b6f` and reproduced exactly (`index-CKKLeVXr.css`, 33,221 B, sha256
+`ef95eb79...a46f`), then the two `@layer utilities` blocks were diffed rule by rule:
+**324 against 320, four added and none removed** -- `.border-green-200`, `.bg-green-50`,
+`.text-amber-900`, `.text-red-800`, which are the Settings page's two result banners.
+
+- [x] Five bump locations, lockfile via `npm install --package-lock-only`, checked by diff rather than count.
+- [x] Digest verified twice, by script exiting non-zero, plus the manifest's own url fetched and hashed.
+- [x] Manifest snippet is two lines. `autoupdate.strategy` did not come back -- the four `autoupdate` hits in the file are all inside the comment explaining why there is none.
+- [x] The command carries `-u https://github.com/chriswilson2020/conduit_ynh`.
+- [x] Neither flake fired, and it is said in those words.

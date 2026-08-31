@@ -7,10 +7,12 @@ Everything here has evidence attached — a file and line, a measurement, or the
 found it. Items without evidence are marked as judgement rather than fact. Where one item
 blocks another, that is stated rather than left to be rediscovered.
 
-Current shipped version: **v1.2.2**. In flight: **nothing**; next is **Phase 7.6**, export
-and encrypted backup, which is specced. All three of v1.2.2's items shipped and their records
-are below. **v1.2.2 is the first release carrying a destructive migration** -- `0012` drops
-`email_templates` -- and the first schema change of any kind since v1.1.0's `0011`.
+Current shipped version: **v1.3.0**. In flight: **nothing**; next is **Phase 7.7**, restore
+and import, whose decisions are already recorded in 7.6's spec and which therefore needs a
+plan rather than a spec. All of 7.6 shipped and its record is below.
+
+**v1.3.0 changes behaviour on a path Chris uses without thinking, and that is the first thing
+in its notes rather than a footnote: both downloads now ask for the password again.**
 
 ---
 
@@ -21,10 +23,95 @@ are below. **v1.2.2 is the first release carrying a destructive migration** -- `
 | ~~**7.5 → v1.2.0**~~ | Keyboard-operable rows, the composer's focus, focus after a dialog closes, the `mail-sync` intermittent, and the touch floors folded in as Task 4b | **SHIPPED 30 Aug** |
 | ~~**v1.2.1**~~ | The reply signature, the Mail tab composing to nobody, the GIF undercharge Chris moved in, and the first deliberate sweep for assertions that cannot fail | **SHIPPED 31 Aug** |
 | ~~**v1.2.2**~~ | The MAIL template feature removed, table included (the QUOTE template stayed); the five lists given the loading branch their siblings have; and the Dovecot IDLE burst diagnosed -- **the answer was NO**, so nothing was reordered. **Ships `0012`, a `DROP TABLE`** | **SHIPPED 31 Aug** |
-| **7.6 → v1.3.0** | Export and encrypted backup, downloadable from Settings | Specced, not started. **Queued behind v1.2.2** |
-| **7.7** | Restore and import, with its decisions already recorded in 7.6's spec | Decided, not specced |
+| ~~**7.6 → v1.3.0**~~ | Export (plain ZIP, readable, not restorable) and backup (AES-256 `.7z`, exact, not readable), told apart on a Settings page, **both behind a password re-prompt**. No schema change | **SHIPPED 31 Aug** |
+| **7.7** | Restore and import, with its decisions already recorded in 7.6's spec | **NEXT.** Decided and specced-by-reference; needs a plan. Five carry-forward items below, one of which it must not get wrong |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
 | **Phase 4.4** | Mail filing power tools: per-message selection, arbitrary folder moves, folder management, bulk unhide, live inbox beyond page one | Unspecced. Overlaps "emailing a quote" below |
+
+---
+
+## 7.6 -> v1.3.0 -- SHIPPED 31 Aug. Retired here, and five things carried forward
+
+Tag `v1.3.0` at `4d59019`. Release run `33437091338`; asset digest
+`ba4c9b604c95891c2b41c7bb7503bfee02712faf20c6f641bf340a7a15af48e8`, verified twice. CI
+`33436493145` on the bumped branch: 2741 passed, 1 skipped (2742), 184 e2e, attempt 1, no
+`flaky` line. **Neither the Dovecot intermittent nor `pipeline.spec.ts`'s keyboard-drag flake
+fired**, said explicitly because a retry would have been. The full working record is
+`docs/superpowers/plans/2026-08-31-conduit-phase-7.6-export-backup.md`, whose per-task DONE
+blocks are the authority; this is the closing summary.
+
+**No schema change.** The last was v1.2.2's `0012`.
+
+**THE ONE SKIPPED TEST IS BY DESIGN, NOT DRIFT.** The baseline was 0 skipped. The one skip is
+`reauth.test.ts`'s real-portal probe, gated on a live POST to `http://127.0.0.1:6788/login`
+answering 401. The dev server answers; runners and laptops do not, and it skips visibly. An
+unexplained skip is exactly what this project keeps catching, so it is written down here as
+well as in the plan.
+
+### The five carry-forward items
+
+**1. THE EXCEL VISUAL IS OUTSTANDING, and it needs a human with a screen.** Task 4's "an
+export opened in a spreadsheet with accented characters intact" was never done: screen access
+was declined and the agent correctly did not route around it rather than inventing a
+substitute and calling it the same thing. Byte-level proof stands in its place and was re-run
+at release time -- the artefact starts `EF BB BF`, and the same bytes without the BOM read as
+cp1252 split every umlaut into two characters. The two files are prepared and differ only in
+those three bytes: `t1-proof/excel/companies-WITH-BOM.csv` and
+`t1-proof/excel/companies-NO-BOM.csv` in the session scratchpad, with `t1-bomproof.py` beside
+them. **Judgement, not fact:** the BOM is almost certainly right, because the byte-level
+behaviour is not in doubt; what is unproven is the last inch, that a real Excel on a real
+machine renders it the way the bytes predict.
+
+**2. THE PORTAL SESSION LITTER.** Every successful re-authentication makes YunoHost's portal
+mint a session it did not need to: moulinette's login handler calls `set_session_cookie`,
+which issues a three-day JWT **and** touches a file under
+`/var/cache/yunohost-portal/sessions/`. Conduit discards the `Set-Cookie`, so the session is
+never usable -- but the file stays, because purging only runs inside `get_session_cookie` and
+nothing here calls it. One small file per successful re-auth, cleared the next time somebody
+uses the portal itself. **Litter rather than a hole**, and the price of using the same door
+the SSO portal uses instead of binding LDAP directly. Named in `services/reauth.ts` rather
+than left to be discovered by whoever next reads that cache directory.
+
+**3. `Ynh-User` IS FORGEABLE BY ANY LOCAL PROCESS, and the throttle is what bounds it.** This
+app binds loopback and nginx forwards `$http_ynh_user`, so with no proxy in front the header
+is whatever the caller says. That makes `/api/reauth` an oracle for guessing **any** account
+on the box rather than only the caller's own -- and there is no upstream throttle to inherit:
+YunoHost's fail2ban jails read nginx's logs, this app talks to the portal over loopback so
+nothing there counts a failure, and YunoHost's own `ldap_ynhuser` authenticator carries a
+FIXME on the `INVALID_CREDENTIALS` path saying failed logins are not caught by fail2ban
+either. `ReauthThrottle` is therefore load-bearing rather than belt-and-braces, is keyed on
+the **username** rather than `req.ip` (which behind nginx is one hop's `X-Forwarded-For` and
+variable by anyone holding a session), and counts at the check rather than after the await --
+`f8e647d` fixed exactly that. **Local forgery is a perimeter property and not something this
+app can close**; it is recorded so nobody later reads the header as an authenticated identity.
+
+**4. THE MANIFEST/BLOB-WALK WINDOW -- 7.7 MUST TREAT AN UNLISTED `files/` MEMBER AS EXTRA,
+NOT AS DAMAGE.** The backup manifest's member list is the blob walk's snapshot, and `7z`
+reads the directory **again** when it runs. An upload landing between the two puts a member in
+the archive that the manifest does not list. That is harmless -- blobs are content-addressed
+and immutable, so the extra member is a whole file rather than a partial one -- but a restore
+that treats "in the archive, not in the manifest" as corruption would reject a perfectly good
+backup. **This is the item 7.7 must not get wrong.** The opposite skew is neither harmless
+nor silent and needs no handling: a blob **deleted** in that window makes `7z` exit non-zero,
+which `runSevenZip` already turns into a failed backup rather than a short one. Naming each
+blob individually would close the window and break the layout -- `7z` strips the parent of
+every input, so `$data_dir/files/<digest>` would be stored as `<digest>` at the top level --
+so it is recorded rather than fixed, with the reason the fix is not available.
+
+**5. THE NGINX TIMEOUT CEILING, AND IT IS A CEILING RATHER THAN A GUARANTEE.**
+`conf/nginx.conf` gained a `location` block of its own for the backup route at
+`proxy_read_timeout 3600`; every other route, the app's own included, keeps the 300 it had.
+The backup cannot stream -- the whole archive is built before the first byte leaves -- so the
+gap between request and response **is** the build, and the read timeout measures exactly that
+gap. At the measured `BACKUP_BYTES_PER_SECOND` of 24.4 MB/s the hour is about **87.8 decimal
+GB** of headroom (81.8 GiB), against the **7.32 GB** the old global 300 allowed. **The "~85GB"
+figure in circulation is a rounding of this and slightly understates it**; 87.8 is the one
+that comes out of the constant. It is an **estimate announced as one**: a single-figure rate
+for a mixed workload on one idle machine, and a busier server is slower. Nothing branches on
+it except a sentence shown to a person before they commit to waiting.
+`backup-nginx.test.ts` reads `conf/nginx.conf` and fails if the number moves, if the block
+stops being scoped to the backup route, or if the app's own location gets raised along with
+it.
 
 ---
 
@@ -652,7 +739,17 @@ found by SQL.
 - **Phase 9's project status report** would naturally carry time booked against the project.
 - **The quote becomes comparable to reality**: quoted line items against hours actually
   spent is the margin question, and neither half exists without this.
-- **7.6's export must include time entries**, or a timesheet is trapped in the app.
+- **THE DIRECTION OF THIS ONE HAS REVERSED NOW THAT 7.6 HAS SHIPPED.** It used to read
+  "7.6's export must include time entries, or a timesheet is trapped in the app". 7.6 shipped
+  without them, correctly -- there is no time-entry table to export. So the obligation moves:
+  **Phase 10 must add a sheet to the export in the same change that creates its table.**
+  `export.ts` has one hand-written `*Sheet` function per entity with its columns selected
+  explicitly; it does not walk the schema, so a table added later appears in the export only
+  if somebody writes the function. **The backup needs nothing** -- it is a `pg_dump` of the
+  whole database, so a new table is in it the day it exists, and the manifest lists archive
+  members rather than tables. That asymmetry is the point: the exact half picks up new
+  entities for free and the readable half does not, and a timesheet trapped in the app is the
+  failure this bullet was always about.
 
 ---
 
