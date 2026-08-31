@@ -189,6 +189,21 @@ class FakeImapClient implements ImapClient {
   readonly fetchRawFailures = new Map<number, number>();
   /** uids fetchRaw reports as expunged. */
   readonly vanished = new Set<number>();
+  /**
+   * UIDs this connection's view of the mailbox has not caught up with yet:
+   * fetchNewer does not list them, so the walk never learns they exist.
+   *
+   * A LAGGING VIEW, not a missing message. fetchRaw and fetchFlags ignore
+   * this set on purpose -- the messages really are on the server, and
+   * anything the walk does ask for by UID answers normally. What is being
+   * staged is the LISTING coming back short, which is the only thing the
+   * four CI sightings of the storm case ever showed.
+   *
+   * Applied before `limit`, because a view that has not caught up genuinely
+   * has nothing to hand out for those UIDs. Mutable so a case can stage one
+   * pass short and the next complete.
+   */
+  readonly unlisted = new Set<number>();
   /** While set, fetchRaw blocks on it -- used to hold a pass open. */
   gate: Promise<void> | null = null;
   /** While set, disconnect() blocks on it -- a socket that will not go away,
@@ -277,6 +292,8 @@ class FakeImapClient implements ImapClient {
       const target = this.folder(folder);
       return [...target.messages.entries()]
         .filter(([uid]) => uid > options.sinceUid)
+        // Before `limit`, not after: see the field's comment.
+        .filter(([uid]) => !this.unlisted.has(uid))
         .filter(([, message]) => options.sinceDate === null || message.internalDate >= options.sinceDate)
         .sort((a, b) => a[0] - b[0])
         .slice(0, options.limit)
@@ -812,6 +829,145 @@ describe("AccountSync: backfill and cursor", () => {
     // Not poison, not an error: the cursor simply moved past it.
     expect(sync.stats.poisonSkips).toBe(0);
     expect((await cursorFor(accountId, "INBOX"))?.lastSeenUid).toBe(2);
+    expect((await accountRow(accountId)).status).toBe("active");
+  });
+});
+
+// --- A short view of the folder ---------------------------------------------
+
+/**
+ * THE RECOVERY PROPERTY, AND ITS CONTROL.
+ *
+ * v1.2.1 measured mail-integration.test.ts's storm case failing about 1
+ * attempt in 44, always with a PARTIAL view of the twenty messages. The
+ * v1.2.2 diagnosis found the surviving failure output carried the UID list
+ * twice, and both were the same contiguous prefix -- so the question the
+ * sightings really posed was whether a short view costs a PASS or a MESSAGE.
+ *
+ * These two cases are the answer, and they only mean anything as a pair.
+ * `syncFolder` saves the cursor as the highest UID in the batch and the next
+ * pass searches above it, so:
+ *
+ *   a PREFIX is recovered by the next pass    -- the first case;
+ *   a HOLE is skipped forever                 -- the second.
+ *
+ * The second is the load-bearing one, for two measured reasons.
+ *
+ * It is what makes the distinction real rather than cosmetic: the first case
+ * on its own passes just as happily against a loop that re-walks every folder
+ * from zero every time, which would prove nothing about cursors at all.
+ * (Measured: with loadCursor stubbed to return 0, the first case still goes
+ * green on its counts and fails only on its last line, while this one fails
+ * on the messages themselves.)
+ *
+ * And it is the only thing in the codebase that notices the cursor rule
+ * loosening in the direction that would matter. Every other cursor test walks
+ * a COMPLETE view, where "highest UID in the batch" and "highest contiguous
+ * UID" are the same number -- so a `syncFolder` changed to advance only over
+ * a contiguous run leaves the whole suite green except for this one case.
+ * (Measured: 2460 passed, this one failed.) Nothing downstream would catch it
+ * either, because `reconcileFlags` only UPDATEs rows matched on (account,
+ * folder, imap_uid) and never ingests, so no later pass ever goes looking for
+ * a UID that was skipped.
+ *
+ * So the second case PINS BEHAVIOUR RATHER THAN GUARANTEEING SAFETY. If a
+ * backstop for holes is ever built, this case is supposed to go red, and the
+ * right response is to rewrite it deliberately -- not to widen it until it
+ * tolerates both answers.
+ */
+describe("AccountSync: a short view of the folder", () => {
+  /** The storm case's shape: twenty messages, eleven of them visible. */
+  const STORM = 20;
+
+  async function stormInbox(): Promise<{ accountId: string } & Harness> {
+    const accountId = await makeAccount({ backfillDays: null });
+    const harness = makeSync(accountId);
+    const inbox = harness.client.folder("INBOX");
+    for (let uid = 1; uid <= STORM; uid += 1) {
+      inbox.add(uid, rawMail({ messageId: `m${uid}@example.com` }));
+    }
+    return { accountId, ...harness };
+  }
+
+  function uidsOf(rows: { imapUid: number | null }[]): (number | null)[] {
+    return rows.map((row) => row.imapUid);
+  }
+
+  it("recovers a contiguous prefix on the next pass: a short view costs a pass", async () => {
+    const { accountId, sync, client } = await stormInbox();
+    // Eleven of twenty, contiguous from the bottom: the shape CI printed in
+    // both sightings whose output survived -- the same [2..12], four days
+    // apart on different branches -- renumbered to start at 1.
+    for (let uid = 12; uid <= STORM; uid += 1) client.unlisted.add(uid);
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the short first pass");
+
+    // The pass is not wrong, just early: it stored everything it was shown
+    // and left the cursor at the top of what it saw.
+    expect(await messageRows()).toHaveLength(11);
+    expect((await cursorFor(accountId, "INBOX"))?.lastSeenUid).toBe(11);
+
+    // The view catches up. Nothing else changes -- same folder, same
+    // messages, same cursor in the database.
+    client.unlisted.clear();
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 2, "the pass that catches up");
+
+    const stored = await messageRows();
+    expect(stored).toHaveLength(STORM);
+    expect(uidsOf(stored)).toEqual(Array.from({ length: STORM }, (_, index) => index + 1));
+    expect((await cursorFor(accountId, "INBOX"))?.lastSeenUid).toBe(STORM);
+    // And the recovery really was a walk from the cursor rather than a
+    // re-walk of the folder: the second pass asked for what was above 11.
+    expect(client.fetchNewerOptions.some((options) => options.sinceUid === 11)).toBe(true);
+  });
+
+  it("never comes back for the UIDs a holey view skipped: a hole costs the messages", async () => {
+    const { accountId, sync, client } = await stormInbox();
+    // The SAME eleven visible and nine missing as the case above. The only
+    // difference is where the gap sits: 1, 2, then nothing until 12.
+    for (let uid = 3; uid <= 11; uid += 1) client.unlisted.add(uid);
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the holey first pass");
+
+    // The cursor took the batch's highest UID, which is above the gap.
+    expect(await messageRows()).toHaveLength(11);
+    expect((await cursorFor(accountId, "INBOX"))?.lastSeenUid).toBe(STORM);
+
+    // THE ANTI-VACUITY CHECK, and the case is worthless without it. It has to
+    // run HERE, while the short view is still in force -- after the clear
+    // below it could not fail, whatever the fixture did. The nine are absent
+    // from the walk because the LISTING was short, not because the fixture
+    // deleted them: ask for one by UID, the way the walk would have if it had
+    // ever been told it existed, and the server hands it over.
+    expect(await client.fetchRaw("INBOX", 7)).not.toBeNull();
+    // Which is also why reconcileFlags is no backstop. Its own view is the
+    // whole mailbox -- all twenty, the skipped ones included -- and it has
+    // ingested nothing, because it only UPDATEs rows matched on (account,
+    // folder, imap_uid) and those nine have no row to match.
+    expect(client.opsOf("fetchFlags").some((call) => call.folder === "INBOX")).toBe(true);
+    expect(await client.fetchFlags("INBOX", new Date(0))).toHaveLength(STORM);
+    expect(await messageRows()).toHaveLength(11);
+
+    // Give it every chance the prefix case got, and one more: the view
+    // catches up completely, and two further passes run over it.
+    client.unlisted.clear();
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 2, "the pass after the view caught up");
+    sync.wake();
+    await waitFor(() => sync.stats.passes >= 3, "one more pass, for good measure");
+
+    // Still eleven. 3..11 are on the server, were never listed to the walk,
+    // and are now below a cursor that only ever moves up.
+    const stored = await messageRows();
+    expect(stored).toHaveLength(11);
+    expect(uidsOf(stored)).toEqual([1, 2, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+    // Not an error, not a poison skip, not a warning -- which is exactly why
+    // a hole would be undetectable in production.
+    expect(sync.stats.poisonSkips).toBe(0);
+    expect(sync.stats.failures).toBe(0);
     expect((await accountRow(accountId)).status).toBe("active");
   });
 });
