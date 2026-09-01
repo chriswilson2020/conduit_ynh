@@ -68,17 +68,46 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 //   - A count cannot see a half-applied load at all, because a half-applied
 //     load recreates exactly the schemas and tables it dropped.
 //
-// So the three instruments are separate and none is redundant:
+// THE MISTAKE UNDERNEATH ALL OF THIS, SAID ONCE, BECAUSE THREE REVIEW ROUNDS
+// EACH FOUND A DIFFERENT DOOR INTO THE SAME ROOM: every instrument here began
+// life measuring THE PROCESS -- the exit code, the flags, the bytes handed over
+// -- and a process that goes perfectly can still leave the wrong result. Each
+// round closed one door (a swallowed stream error, a count that could not see a
+// replacement, a manifest that made no claims, a `\q`) and the next round found
+// another, because the class was never addressed. The class is: A RESTORE IS
+// NOT VERIFIED UNTIL THE RESULT IS COMPARED WITH WHAT WAS PROMISED.
+//
+// So there are now four instruments, three of them about the process and ONE
+// about the result, and the last is the only one that closes the class:
 //
 //   THE FLAGS decide whether a failed statement rolls the transaction back.
-//   THE SOURCE decides whether psql was given the whole dump -- see runPsqlLoad,
-//     because a truncated stream is a CLEAN END OF FILE and end of file means
-//     COMMIT.
-//   THE IDENTITY of every table -- pg_class.oid, not a count -- decides, after
-//     a failure, whether the rollback actually held. See DatabaseShape.
+//   THE SOURCE decides whether psql was handed the whole dump -- see
+//     runPsqlLoad, because a truncated stream is a CLEAN END OF FILE and end of
+//     file means COMMIT.
+//   THE DUMP'S OWN CONTENT decides whether psql could diverge from it at all --
+//     see ALLOWED_META_COMMANDS. Without this the other two are worthless:
+//     measured, a `\q` makes psql commit a prefix and exit 0 having been handed
+//     every byte.
+//   THE RESULT -- the tables that are actually in the database afterwards,
+//     BY NAME, against the tables the dump declared -- decides whether the
+//     restore did what the preview said. See LoadDumpEffect.tables. And, on the
+//     failure path, the IDENTITY of every table (pg_class.oid, not a count)
+//     decides whether the rollback held. See DatabaseShape.
 //
 // Never pg_stat_user_tables, whose estimates read identically before and after
 // a full replacement -- and, for exactly the same reason, never a table count.
+//
+// WHAT IS STILL NOT CLOSED, AND CANNOT BE FROM HERE. The result is compared
+// against the DUMP, which is the file the load consumed. A manifest that lies
+// about its own archive is caught only as far as the digests reach: every
+// listed member's bytes are verified, and the two members a restore cannot do
+// without must now be LISTED and not merely present -- but nothing signs the
+// manifest, and nothing in format version 1 records an inventory of the
+// database's contents. The complete answer is a backup format that records what
+// the database HELD (tables, and row counts per table) and a restore that
+// checks the restored database against THAT. It is a change to
+// services/backup.ts's format and to docs/backup-format.md, additive and
+// backward compatible, and it is 7.6's to make rather than this task's.
 //
 // ================ THE ATOMIC ACT THE OPERATOR SEES AS TWO ==================
 //
@@ -221,6 +250,8 @@ export const RESTORE_REFUSALS = {
   memberMissing: "member-missing",
   /** A member's bytes do not match the digest the manifest recorded. */
   memberCorrupt: "member-corrupt",
+  /** The dump carries a psql meta-command that could stop it part way. */
+  dumpMetaCommand: "dump-meta-command",
 } as const;
 
 /** Findings a restore plan can carry. Notes and warnings; never refusals. */
@@ -332,6 +363,62 @@ export class RestoreHalfAppliedError extends Error {
 }
 
 /**
+ * THE DATABASE IS RESTORED AND THE MIGRATIONS DID NOT FINISH.
+ *
+ * The restore itself committed; what failed is bringing an older backup's
+ * schema up to this build's. The install is NOT broken in the way a failed load
+ * would leave it -- the data is there and it is the backup's data -- but its
+ * schema is behind the code that will be reading it, which is its own kind of
+ * broken and needs saying rather than a stack trace about an accounting budget.
+ */
+export class RestoreMigrationError extends Error {
+  constructor(
+    readonly fromPosition: number,
+    readonly toPosition: number,
+    override readonly cause: unknown,
+  ) {
+    super(
+      "the backup was restored, but bringing its database schema up to date failed "
+      + `(${cause instanceof Error ? cause.message : String(cause)}). The restored data is `
+      + `there and it is the backup's data, at migration ${String(fromPosition)} of `
+      + `${String(toPosition)}. Do not use this install until the migrations run: restart `
+      + "Conduit, which applies them at boot, and read the log if they fail again.",
+    );
+    this.name = "RestoreMigrationError";
+  }
+}
+
+/**
+ * THE MIGRATIONS RAN AND THERE WERE NOT THE NUMBER THE PREVIEW SAID.
+ *
+ * Sibling of RestoreUnexpectedResultError, one step later and for the same
+ * reason: the database is already replaced, so this cannot be reported as a
+ * step exceeding its plan. The likeliest cause is not damage -- the manifest's
+ * migrationPosition is the number of migrations the build that TOOK the backup
+ * shipped, not the number the dumped database had applied -- so it says what
+ * happened and names the way back.
+ */
+export class RestoreUnexpectedMigrationsError extends Error {
+  constructor(
+    readonly plannedMigrations: number,
+    readonly actualMigrations: number,
+    readonly safetyBackupPath: string | null,
+    readonly recoveryCommands: readonly string[],
+  ) {
+    super(
+      "the backup was restored and its schema brought up to date, but not by the number of "
+      + `migrations the preview described: it said ${String(plannedMigrations)} and `
+      + `${String(actualMigrations)} ran. The restore has HAPPENED -- check the data before `
+      + "using this install."
+      + (safetyBackupPath === null ? ""
+        : ` A safety backup of the previous state is at ${safetyBackupPath}. To go back:\n`
+          + recoveryCommands.map((line) => `  ${line}`).join("\n")),
+    );
+    this.name = "RestoreUnexpectedMigrationsError";
+  }
+}
+
+/**
  * THE DATABASE IS RESTORED AND mail.key IS NOT.
  *
  * The one window this module's ordering cannot close, said out loud. mail.key
@@ -373,25 +460,33 @@ export class RestoreMailKeyError extends Error {
  * moment when the operator's database has just been replaced and what they need
  * is the safety backup's path.
  *
- * The most likely cause is not damage: countDumpTables reads CREATE TABLE
- * statements out of the SQL and describeDatabaseShape counts what postgres
- * ended up with, and the day a dump carries a CREATE EXTENSION that brings its
- * own tables, or a partition parent counted differently, the two disagree about
- * a restore that worked perfectly. So this says what happened rather than
- * accusing anyone, and still names the way back.
+ * IT NAMES THE TABLES THAT ARE NOT THERE, which is the difference between this
+ * and a count. "The preview said 27 and there are 26" sends an operator looking
+ * at all of them; "mail_messages is not there at all" is the sentence that ends
+ * the search.
+ *
+ * The most likely cause is not damage: readDumpLine reads CREATE TABLE
+ * statements out of the SQL and describeDatabaseShape reads what postgres ended
+ * up with, and the day a dump carries a CREATE EXTENSION that brings its own
+ * tables the two disagree about a restore that worked perfectly. That direction
+ * shows up as a COUNT mismatch with nothing missing, which is why both are
+ * reported and why this says what happened rather than accusing anyone.
  */
 export class RestoreUnexpectedResultError extends Error {
   constructor(
     readonly plannedTables: number,
     readonly actualTables: number,
+    readonly missingTables: readonly string[],
     readonly safetyBackupPath: string | null,
     readonly recoveryCommands: readonly string[],
   ) {
     super(
       "the backup loaded and was committed, but the result is not what the preview "
       + `described: it said ${String(plannedTables)} table(s) and the database now holds `
-      + `${String(actualTables)}. The restore has HAPPENED -- check the data before using `
-      + "this install."
+      + `${String(actualTables)}`
+      + (missingTables.length === 0 ? ""
+        : `, and these are not there at all: ${missingTables.slice(0, 10).join(", ")}`)
+      + ". The restore has HAPPENED -- check the data before using this install."
       + (safetyBackupPath === null ? ""
         : ` A safety backup of the previous state is at ${safetyBackupPath}. To go back:\n`
           + recoveryCommands.map((line) => `  ${line}`).join("\n")),
@@ -436,6 +531,13 @@ export interface DatabaseShape {
    * THE FIELD THAT DISTINGUISHES A ROLLBACK FROM A REPLACEMENT. See above.
    */
   readonly tableIds: readonly string[];
+  /**
+   * Every table's schema-qualified name, sorted.
+   *
+   * WHAT THE RESULT IS COMPARED AGAINST. The oids say whether the tables were
+   * replaced; the names say whether the RIGHT ones are there.
+   */
+  readonly tableNames: readonly string[];
 }
 
 /**
@@ -451,8 +553,8 @@ export async function describeDatabaseShape(db: Database): Promise<DatabaseShape
     WHERE left(nspname, 3) <> 'pg_' AND nspname <> 'information_schema'
     ORDER BY nspname
   `);
-  const tables = await db.execute<{ id: string }>(sql`
-    SELECT c.oid::text AS id FROM pg_class c
+  const tables = await db.execute<{ id: string; name: string }>(sql`
+    SELECT c.oid::text AS id, n.nspname || '.' || c.relname AS name FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind IN ('r', 'p')
       AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
@@ -463,6 +565,7 @@ export async function describeDatabaseShape(db: Database): Promise<DatabaseShape
     schemas: schemas.map((row) => row.nspname),
     tables: tableIds.length,
     tableIds,
+    tableNames: tables.map((row) => row.name).sort(),
   };
 }
 
@@ -493,9 +596,16 @@ export function sameShape(a: DatabaseShape, b: DatabaseShape): boolean {
  * that assertion alone -- an argument list a test agrees with is not evidence.
  * Removing `--single-transaction` makes a failed load genuinely half-apply,
  * which the post-failure measurement catches and reports as
- * RestoreHalfAppliedError; removing ON_ERROR_STOP makes a failed load report
- * exit 0, which the post-load table count catches as an accounting mismatch.
- * Both mutations change the observable behaviour of real tests.
+ * RestoreHalfAppliedError.
+ *
+ * REMOVING ON_ERROR_STOP IS CAUGHT BY THE ROLLBACK TESTS AND BY NOTHING ELSE,
+ * and an earlier version of this comment said the table count caught it. IT
+ * DOES NOT: measured, applyRestore RETURNS SUCCESS, because a load that errored
+ * part way still created every table and the count therefore matches. Four
+ * tests fail on that mutation, and every one of them fails because it expected
+ * a REFUSAL and did not get one. This module's header says the same thing 400
+ * lines above -- "the flag is what catches it; nothing else was" -- and two
+ * statements in one file disagreeing is how the next reader stops looking.
  *
  * `--no-psqlrc` because a ~/.psqlrc on the deploy target could set variables
  * this depends on -- including turning ON_ERROR_STOP back off, which is the
@@ -602,14 +712,21 @@ async function runPsqlLoad(options: {
     let streamError: Error | null = null;
     let streamSettled = false;
     let closed: { code: number } | null = null;
-    // BOTH HALVES MUST HAVE SETTLED. The wait is an ORDERING GUARANTEE FOR THE
-    // MESSAGE, not a guard, and mutation testing says so: removing it leaves
-    // every test passing, because psql closes only after reading to end of file
-    // and the counter is therefore already final. What it does buy is that
-    // `streamError` is populated before the result is read, so the sentence an
-    // operator sees at the worst possible moment says WHY the bytes stopped
-    // rather than only that they did. Kept for that, and labelled rather than
-    // left looking like a second guard.
+    // BOTH HALVES MUST HAVE SETTLED, and the reason is NOT the one this comment
+    // used to give. It said "psql closes only after reading to end of file, so
+    // the counter is already final" -- which is false, and falsest in the cases
+    // that matter: an ON_ERROR_STOP abort closes stdin mid-stream, and so does
+    // `\q`, which is why ALLOWED_META_COMMANDS exists at all. A label that
+    // tells the next reader not to look has to be true.
+    //
+    // The guarantee that actually holds is weaker and still enough: when the
+    // counter is NOT final, the outcome is the same either way -- a mid-flight
+    // count is short, a settled count after an early close is also short, and
+    // either routes to the failure path, as does the non-zero exit that
+    // accompanies most early closes. So no test can discriminate it, and it is
+    // kept for a narrower reason: it makes `streamError` deterministic, so the
+    // sentence an operator reads at the worst possible moment says WHY the
+    // bytes stopped rather than only that they did.
     const finish = (): void => {
       if (closed === null || !streamSettled) return;
       resolve({
@@ -718,39 +835,95 @@ export function compareAppVersions(a: string, b: string): number | null {
 }
 
 /**
- * How many tables a plain pg_dump creates, counted the way psql parses it.
+ * THE ONLY psql META-COMMANDS A PLAIN pg_dump EMITS.
+ *
+ * MEASURED, not assumed: every backslash line in a real dump of conduit_test on
+ * the deploy target, counted by kind, is one of exactly three --
+ *
+ *   \.            the COPY terminator (inside a COPY block, handled by state)
+ *   \restrict     opens the dump
+ *   \unrestrict   closes it
+ *
+ * Anything else is refused, and the reason is not tidiness. `\q` MAKES psql
+ * COMMIT A PREFIX: measured with the exact command this module runs, a script
+ * whose second line is `\q` exits 0 with one of three INSERTs committed and the
+ * rest silently discarded. psql closes WITHOUT READING TO END OF FILE, so the
+ * byte count sees a fully delivered file, ON_ERROR_STOP sees no error, and
+ * `--single-transaction` commits what ran. Every process instrument passes.
+ *
+ * `\i`, `\o` and `\!` are worse in kind rather than degree -- they read files,
+ * write files and run shell commands as the account this process runs as -- and
+ * `\connect` would load the dump into a DIFFERENT DATABASE than the one the
+ * preview described.
+ *
+ * THIS IS WHAT MAKES THE OTHER INSTRUMENTS MEAN ANYTHING. "psql exited 0 and
+ * was handed every byte" only implies "the whole dump ran" if the dump cannot
+ * tell psql to stop. It is not a security boundary: whoever built the archive
+ * could put any SQL they liked in it, and the operator supplied the passphrase.
+ * It is an INTEGRITY boundary, which is the one this module needs.
+ */
+const ALLOWED_META_COMMANDS = ["\\restrict ", "\\unrestrict "];
+
+/** What one line of a dump is, read the way psql reads it. */
+export type DumpLine =
+  | { kind: "table"; name: string }
+  | { kind: "meta"; command: string }
+  | { kind: "other" };
+
+/**
+ * Read one line of a plain pg_dump.
  *
  * THE COPY DATA IS SKIPPED, AND IT HAS TO BE. A dump's COPY blocks carry the
  * operator's own text -- a note body, a company name -- and a row whose value
- * begins a line with "CREATE TABLE " would otherwise be counted as a table.
- * The state machine below is psql's own rule: everything between a
- * `COPY ... FROM stdin;` and the `\.` on a line by itself is data, not SQL.
+ * begins a line with "CREATE TABLE ", or with a backslash, would otherwise be
+ * read as SQL. The state machine is psql's own rule: everything between a
+ * `COPY ... FROM stdin;` and the `\.` on a line by itself is data.
  *
- * MEASURED AGAINST THE REAL THING: a plain dump of conduit_test on the deploy
- * target has 27 `CREATE TABLE` statements, and the database it came from has
- * exactly 27 ordinary tables. That equality is what makes the count usable as
- * the load step's budget -- see loadDump, which measures the tables that
- * actually arrived and accounts for them against this number.
+ * THE TABLE'S NAME, NOT JUST A TALLY. A count is satisfied by any twenty-seven
+ * tables; the names are what let the load say WHICH of them failed to arrive.
+ * Measured against the real thing: a plain dump of conduit_test has 27
+ * `CREATE TABLE` statements and the database it came from has exactly those 27
+ * tables, schema-qualified and matching name for name.
  */
-export function countDumpTables(line: string, state: { inCopy: boolean }): number {
+export function readDumpLine(line: string, state: { inCopy: boolean }): DumpLine {
   if (state.inCopy) {
     if (line === "\\.") state.inCopy = false;
-    return 0;
+    return { kind: "other" };
   }
   if (/^COPY .* FROM stdin;\s*$/.test(line)) {
     state.inCopy = true;
-    return 0;
+    return { kind: "other" };
   }
-  return /^CREATE (?:UNLOGGED )?TABLE /.test(line) ? 1 : 0;
+  if (line.startsWith("\\")) {
+    if (ALLOWED_META_COMMANDS.some((allowed) => line.startsWith(allowed))) {
+      return { kind: "other" };
+    }
+    return { kind: "meta", command: line.trim().split(/\s+/)[0] ?? line.trim() };
+  }
+  const table = /^CREATE (?:UNLOGGED )?TABLE (?:IF NOT EXISTS )?([^\s(]+)/.exec(line);
+  return table === null ? { kind: "other" } : { kind: "table", name: table[1] ?? "" };
 }
 
-/** Count the CREATE TABLE statements in a dump, streaming, bounded memory. */
-async function countTablesInDump(stream: Readable): Promise<number> {
+/** What a dump says it will create, and anything in it that must not run. */
+interface DumpContents {
+  /** Every table the dump creates, schema-qualified, in the order declared. */
+  tables: string[];
+  /** The first meta-command that is not one pg_dump emits, or null. */
+  forbidden: string | null;
+}
+
+/** Read a dump without holding it: one pass, bounded memory. */
+async function readDumpContents(stream: Readable): Promise<DumpContents> {
   const state = { inCopy: false };
-  let tables = 0;
+  const tables: string[] = [];
+  let forbidden: string | null = null;
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
-  for await (const line of lines) tables += countDumpTables(line, state);
-  return tables;
+  for await (const line of lines) {
+    const read = readDumpLine(line, state);
+    if (read.kind === "table") tables.push(read.name);
+    else if (read.kind === "meta" && forbidden === null) forbidden = read.command;
+  }
+  return { tables, forbidden };
 }
 
 /** SHA-256 of a stream, without holding it. */
@@ -802,6 +975,17 @@ export interface LoadDumpEffect extends PlannedEffect {
    * `--single-transaction` commits on end of file. See runPsqlLoad.
    */
   readonly dumpBytes: number;
+  /**
+   * Every table the dump creates, schema-qualified, as the dump declares them.
+   *
+   * A RESULT, NOT A PROCESS. Every other instrument on this step measures how
+   * the load WENT -- the exit code, the bytes delivered, the flags. This is the
+   * only one that measures what the load LEFT, and it is what the tables in the
+   * database are compared against afterwards. Names rather than a tally,
+   * because a tally is satisfied by any twenty-seven tables and cannot say
+   * which one is missing.
+   */
+  readonly tables: readonly string[];
 }
 
 export interface ReplaceMailKeyEffect extends PlannedEffect {
@@ -1005,24 +1189,64 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
     });
   }
 
-  // THE TWO MEMBERS THE RESTORE CANNOT DO WITHOUT, checked separately from the
-  // manifest sweep below: a manifest that simply omitted them would pass every
-  // digest it listed and still describe an archive with nothing to restore.
-  // FIRST, because it costs two lookups and the sweep below reads every blob.
+  // THE MEMBER LIST IS A LIST, and a manifest whose `members` is missing or is
+  // not an array described nothing. It used to be read as
+  // `Array.isArray(...) ? ... : []`, which turned "this manifest makes no
+  // claims at all" into "this manifest makes zero claims and they all hold".
+  if (!Array.isArray(manifest.members)) {
+    return refuse(options, {
+      code: RESTORE_REFUSALS.manifestUnreadable,
+      message: "this backup's manifest does not list what is in the archive, so nothing in "
+        + "it can be checked.",
+    });
+  }
+  const listed = manifest.members;
+
+  // THE TWO MEMBERS THE RESTORE CANNOT DO WITHOUT, AND THEY MUST BE IN THE
+  // MANIFEST, NOT MERELY IN THE ARCHIVE. This check used to ask payload.byName,
+  // which reads the ARCHIVE, while its own comment claimed it caught "a
+  // manifest that simply omitted them" -- and that gap was a silent
+  // half-restore, measured. Dropping database.sql from `members` meant the
+  // digest sweep below never looked at it, so a corrupted dump inspected
+  // clean, applied, and emptied every table with `unrealised: []` and no error.
+  //
+  // The manifest entry is also where the load's byte count comes from, and that
+  // is the point of finding it here: a size taken from a stat() of the file the
+  // load is about to stream is a comparison of a file with itself.
+  //
+  // SAID PLAINLY: once the sweep below has checked the manifest's size AND
+  // digest against the archive, the two numbers are equal, so mutation testing
+  // cannot tell this provenance from the old one. It is kept because the
+  // manifest is the DECLARED witness and the staged file is the thing being
+  // judged -- and because the sweep is what makes them equal, which is a
+  // guard, and which is tested.
+  const dumpEntry = listed.find((entry) => entry.path === DUMP_MEMBER);
+  const keyEntry = listed.find((entry) => entry.path === MAIL_KEY_MEMBER);
+  for (const [name, entry] of [[DUMP_MEMBER, dumpEntry], [MAIL_KEY_MEMBER, keyEntry]] as const) {
+    if (entry === undefined) {
+      return refuse(options, {
+        code: RESTORE_REFUSALS.memberMissing,
+        message: `this backup's manifest does not list ${name}, so the archive cannot be `
+          + "checked against it and must not be restored.",
+      });
+    }
+    if (payload.byName(name) === undefined) {
+      return refuse(options, {
+        code: RESTORE_REFUSALS.memberMissing,
+        message: `this backup is incomplete: it has no ${name}.`,
+      });
+    }
+  }
+  if (dumpEntry === undefined || keyEntry === undefined) return refuse(options, {
+    code: RESTORE_REFUSALS.memberMissing,
+    message: "this backup is incomplete.",
+  });
   const dumpMember = payload.byName(DUMP_MEMBER);
-  if (dumpMember === undefined) {
-    return refuse(options, {
-      code: RESTORE_REFUSALS.memberMissing,
-      message: `this backup is incomplete: it has no ${DUMP_MEMBER}.`,
-    });
-  }
   const keyMember = payload.byName(MAIL_KEY_MEMBER);
-  if (keyMember === undefined) {
-    return refuse(options, {
-      code: RESTORE_REFUSALS.memberMissing,
-      message: `this backup is incomplete: it has no ${MAIL_KEY_MEMBER}.`,
-    });
-  }
+  if (dumpMember === undefined || keyMember === undefined) return refuse(options, {
+    code: RESTORE_REFUSALS.memberMissing,
+    message: "this backup is incomplete.",
+  });
 
   // EVERY LISTED MEMBER MUST BE PRESENT AND MUST BE ITS OWN DIGEST. This is
   // the corruption check, and it is separate from 7z's: 7z verifies that the
@@ -1033,7 +1257,6 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
   // LAST, because it is the only check that reads the whole archive. Every
   // refusal above answers from the manifest alone, so an operator who uploaded
   // the wrong file is told so without 300MB of blobs being hashed first.
-  const listed = Array.isArray(manifest.members) ? manifest.members : [];
   for (const entry of listed) {
     const member = payload.byName(entry.path);
     if (member === undefined) {
@@ -1041,6 +1264,18 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
         code: RESTORE_REFUSALS.memberMissing,
         message: `this backup is incomplete: its manifest lists ${entry.path} and the archive `
           + "does not contain it.",
+      });
+    }
+    // THE SIZE AS WELL AS THE DIGEST, and the size first because it is free.
+    // The manifest's `bytes` is what the load's budget is taken from -- see
+    // LoadDumpEffect.dumpBytes -- so a manifest whose size is wrong would be
+    // discovered by the LOAD, half way through replacing the database, rather
+    // than here where nothing has been touched.
+    if (entry.bytes !== member.bytes) {
+      return refuse(options, {
+        code: RESTORE_REFUSALS.memberCorrupt,
+        message: `this backup is damaged: its manifest says ${entry.path} is `
+          + `${String(entry.bytes)} bytes and the archive holds ${String(member.bytes)}.`,
       });
     }
     const digest = await digestOfStream(await payload.open(member.ref));
@@ -1120,7 +1355,19 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
   // --- the effects, in the order they run ---
 
   const shape = await describeDatabaseShape(db);
-  const dumpTables = await countTablesInDump(await payload.open(dumpMember.ref));
+  const dump = await readDumpContents(await payload.open(dumpMember.ref));
+  // A DUMP THAT CAN TELL psql TO STOP IS REFUSED, and this is what makes every
+  // other instrument mean something -- see ALLOWED_META_COMMANDS. Refused
+  // BEFORE anything is destroyed, like every other refusal here.
+  if (dump.forbidden !== null) {
+    return refuse(options, {
+      code: RESTORE_REFUSALS.dumpMetaCommand,
+      message: `this backup's database file contains ${dump.forbidden}, which is a psql `
+        + "command rather than data and is not something a Conduit backup contains. It could "
+        + "make only part of the backup load while reporting success, so it is refused.",
+      });
+  }
+  const dumpTables = dump.tables.length;
   const stamp = now.toISOString().replace(/[:.]/g, "-").replace(/-\d{3}Z$/, "Z");
   const archivePath = path.join(dataDir, `conduit-safety-backup-${stamp}.7z`);
 
@@ -1173,10 +1420,13 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
       unit: "table",
       destroys: false,
       detail: `${String(dumpTables)} table(s) from the backup replace what was there. The `
-        + `whole ${String(dumpMember.bytes)} bytes must reach the loader, and the tables that `
+        + `whole ${String(dumpEntry.bytes)} bytes must reach the loader, and the tables that `
         + "arrive are counted afterwards rather than taken from an exit code.",
       sources: [dumpMember.ref],
-      dumpBytes: dumpMember.bytes,
+      dumpBytes: dumpEntry.bytes,
+      // FROZEN HERE for the reason `schemas` is: newPlan freezes what it knows
+      // about, and restore's own arrays are not among them.
+      tables: Object.freeze([...dump.tables]),
     },
     {
       op: "replace-mail-key",
@@ -1500,7 +1750,9 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
             : `only ${String(result.streamedBytes)} of ${String(effect.dumpBytes)} bytes of the `
               + "backup's database reached the loader, so psql was given a truncated file and "
               + "committed what it had";
-        if (unmeasurable === "" && before !== null && after !== null && sameShape(before, after)) {
+        // `after !== null` is exactly `unmeasurable === ""` and is not written
+        // twice; this module names that pattern four times and had it here.
+        if (before !== null && after !== null && sameShape(before, after)) {
           throw new RestoreLoadFailedError(
             "the backup's database could not be loaded, and the whole attempt was rolled "
             + "back. This install is exactly as it was before you started: nothing was "
@@ -1517,19 +1769,22 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
         );
       }
 
-      // THE LOAD COMMITTED. What arrived is measured -- never taken from the
-      // exit code, which is worth saying precisely because the exit code is
-      // ALSO load-bearing above: neither alone is enough.
+      // THE LOAD COMMITTED, AND NOW THE RESULT IS CHECKED RATHER THAN THE
+      // PROCESS. Every instrument above measures how the load WENT; this one
+      // measures what it LEFT, against the tables the dump said it would
+      // create. Names, not a tally: a tally is satisfied by any twenty-seven
+      // tables and cannot say which one is absent.
       //
-      // A COUNT THAT DISAGREES IS NOT AN ACCOUNTING BUG, so it is not left to
-      // the frame. The database has already been replaced; a PlanExceededError
-      // out of the executor would travel unwrapped, name no safety backup, and
-      // tell the operator "the plan said otherwise" about a restore that has
-      // happened. See RestoreUnexpectedResultError.
+      // A MISMATCH IS NOT AN ACCOUNTING BUG, so it is not left to the frame.
+      // The database has already been replaced; a PlanExceededError out of the
+      // executor would travel unwrapped, name no safety backup, and tell the
+      // operator "the plan said otherwise" about a restore that has happened.
       const loaded = await shapeOf(db);
-      if (loaded.tables !== effect.count) {
+      const present = new Set(loaded.tableNames);
+      const missing = [...effect.tables].filter((name) => !present.has(name)).sort();
+      if (missing.length > 0 || loaded.tables !== effect.count) {
         throw new RestoreUnexpectedResultError(
-          effect.count, loaded.tables, safetyBackupPath,
+          effect.count, loaded.tables, missing, safetyBackupPath,
           recoveryCommands(safetyBackupPath, databaseUrl, [...loaded.schemas]),
         );
       }
@@ -1573,21 +1828,49 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
     },
 
     "migrate-forward": async (effect, ctx) => {
+      // EVERYTHING HERE HAPPENS AFTER THE DATABASE HAS ALREADY BEEN REPLACED,
+      // and that is why this step owns its own failure the way the load does.
+      // It used to let the frame's accounting error out: unwrapped, carrying no
+      // outcome, naming no safety backup, saying "the plan said otherwise" over
+      // an install whose every table had just been swapped and whose mail.key
+      // was about to be. That is verbatim the reporting hazard this module was
+      // written to close, surviving one step further down the plan.
+      //
       // A FRESH CONNECTION, NOT THE CALLER'S. The pool handed in has sessions
       // that were open across a DROP SCHEMA of everything they had ever
       // referenced; migrating over them would be relying on plan invalidation
       // reaching a pool this module does not own.
       const handle = createDatabase(databaseUrl, 1);
+      let ran: number;
       try {
         const before = await appliedMigrationCount(handle.db);
         await runMigrations(handle.db);
         const after = await appliedMigrationCount(handle.db);
         // MEASURED FROM THE DATABASE'S OWN BOOKKEEPING, not from the journal
-        // this build ships: what is being accounted for is what actually ran.
-        ctx.spend(after - before);
+        // this build ships: what is accounted for is what actually ran.
+        ran = after - before;
+      } catch (error) {
+        // MIGRATING REAL DATA FORWARD IS AN ORDINARY WAY TO FAIL -- a
+        // constraint that a years-old install violates is exactly the case the
+        // older-backup path exists for -- and the database is restored either
+        // way. Say both halves.
+        throw new RestoreMigrationError(effect.fromPosition, effect.toPosition, error);
       } finally {
         await handle.close();
       }
+      // A COUNT THAT DISAGREES IS NOT AN ACCOUNTING BUG HERE EITHER. The
+      // manifest's migrationPosition is what services/backup.ts recorded, and
+      // it records the number of migrations the BUILD SHIPS rather than the
+      // number the dumped database had applied -- so the two can differ for a
+      // backup that is perfectly good, and the answer is a sentence rather than
+      // an exception about a plan.
+      if (ran !== effect.count) {
+        throw new RestoreUnexpectedMigrationsError(
+          effect.count, ran, safetyBackupPath,
+          recoveryCommands(safetyBackupPath, databaseUrl, []),
+        );
+      }
+      ctx.spend(effect.count);
     },
   };
 
@@ -1649,7 +1932,13 @@ export function recoveryCommands(
   schemas: readonly string[] = [],
 ): string[] {
   if (safetyBackupPath === null) return [];
-  const database = libpqEnvironment(databaseUrl).PGDATABASE ?? "conduit";
+  // NEVER A DEFAULT NAME HERE. This line runs DROP SCHEMA ... CASCADE, and a
+  // URL with no path used to make it say `-d conduit` -- a database that exists
+  // on the deploy target. A command printed as the way back that can wreck a
+  // DIFFERENT install is the worst thing in this file. The placeholder cannot
+  // be pasted: it has spaces and angle brackets, so a shell refuses it.
+  const database = libpqEnvironment(databaseUrl).PGDATABASE
+    ?? "<the database name from DATABASE_URL>";
   const dir = `${safetyBackupPath}.recovered`;
   // THE DROPS ARE THE HALF THAT WAS MISSING, and without them the printed
   // command DOES NOT WORK -- proved by running it. The safety backup's dump is

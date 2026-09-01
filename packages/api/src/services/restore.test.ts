@@ -31,11 +31,12 @@ import {
 } from "./intake.js";
 import { newPlan, PlanApplyError, PlanExceededError, PlanRefusedError } from "./intake-plan.js";
 import {
-  applyRestore, compareAppVersions, countDumpTables, describeDatabaseShape, inspectRestore,
+  applyRestore, compareAppVersions, describeDatabaseShape, inspectRestore, readDumpLine,
   proveArchiveOpens, psqlLoadArgs, psqlVersion, recoveryCommands, sameShape,
   RESTORE_FINDINGS, RESTORE_REFUSALS,
   RestoreDatabaseChangedError, RestoreHalfAppliedError, RestoreLoadFailedError,
-  RestoreSafetyBackupError, RestoreUnexpectedResultError,
+  RestoreMigrationError, RestoreSafetyBackupError, RestoreUnexpectedMigrationsError,
+  RestoreUnexpectedResultError,
   type DatabaseShape, type RestoreEffect, type RestorePlan, type SafetyBackupEffect,
 } from "./restore.js";
 
@@ -422,28 +423,51 @@ describe("version ordering", () => {
   });
 });
 
-describe("counting the tables a dump creates", () => {
-  it("counts CREATE TABLE statements", () => {
+describe("reading a dump the way psql reads it", () => {
+  it("names the tables it creates", () => {
     const state = { inCopy: false };
-    expect(countDumpTables("CREATE TABLE public.companies (", state)).toBe(1);
-    expect(countDumpTables("CREATE UNLOGGED TABLE public.scratch (", state)).toBe(1);
-    expect(countDumpTables("    CREATE TABLE indented (", state)).toBe(0);
-    expect(countDumpTables("-- CREATE TABLE commented (", state)).toBe(0);
+    expect(readDumpLine("CREATE TABLE public.companies (", state))
+      .toEqual({ kind: "table", name: "public.companies" });
+    expect(readDumpLine("CREATE UNLOGGED TABLE public.scratch (", state))
+      .toEqual({ kind: "table", name: "public.scratch" });
+    expect(readDumpLine("    CREATE TABLE indented (", state)).toEqual({ kind: "other" });
+    expect(readDumpLine("-- CREATE TABLE commented (", state)).toEqual({ kind: "other" });
   });
 
   // THE ONE THAT MATTERS, and it is the operator's own text doing it. A note
   // body or a company name whose value begins a line inside a COPY block is
-  // not SQL, and a counter that did not know that would inflate the load
-  // step's budget by however many times a customer wrote those two words.
-  it("does not count CREATE TABLE inside COPY data, and resumes after it", () => {
+  // not SQL, and a reader that did not know that would take a customer's
+  // sentence for a table -- or for a psql command, and refuse the backup.
+  it("reads nothing out of COPY data, and resumes after it", () => {
     const state = { inCopy: false };
-    expect(countDumpTables("COPY public.notes (id, body) FROM stdin;", state)).toBe(0);
+    expect(readDumpLine("COPY public.notes (id, body) FROM stdin;", state))
+      .toEqual({ kind: "other" });
     expect(state.inCopy).toBe(true);
-    expect(countDumpTables("CREATE TABLE this is a note body, not SQL", state)).toBe(0);
-    expect(countDumpTables("CREATE TABLE so is this", state)).toBe(0);
-    expect(countDumpTables("\\.", state)).toBe(0);
+    expect(readDumpLine("CREATE TABLE this is a note body, not SQL", state))
+      .toEqual({ kind: "other" });
+    expect(readDumpLine("\\q and so is this", state)).toEqual({ kind: "other" });
+    expect(readDumpLine("\\.", state)).toEqual({ kind: "other" });
     expect(state.inCopy).toBe(false);
-    expect(countDumpTables("CREATE TABLE public.deals (", state)).toBe(1);
+    expect(readDumpLine("CREATE TABLE public.deals (", state))
+      .toEqual({ kind: "table", name: "public.deals" });
+  });
+
+  // MEASURED: a real plain pg_dump carries exactly these two outside its COPY
+  // blocks, and the terminator inside them. Everything else is something psql
+  // would ACT on, and the acting is the problem.
+  it("allows the two meta-commands pg_dump emits and no others", () => {
+    const state = { inCopy: false };
+    expect(readDumpLine("\\restrict aBcD1234", state)).toEqual({ kind: "other" });
+    expect(readDumpLine("\\unrestrict aBcD1234", state)).toEqual({ kind: "other" });
+    for (const [line, command] of [
+      ["\\q", "\\q"],
+      ["\\connect otherdb", "\\connect"],
+      ["\\i /etc/passwd", "\\i"],
+      ["\\! rm -rf /", "\\!"],
+      ["\\o /tmp/out", "\\o"],
+    ] as const) {
+      expect(readDumpLine(line, state)).toEqual({ kind: "meta", command });
+    }
   });
 });
 
@@ -462,7 +486,7 @@ describe("the psql arguments", () => {
 
 describe("shape comparison", () => {
   const shape = (schemas: string[], ids: string[]): DatabaseShape =>
-    ({ schemas, tables: ids.length, tableIds: ids });
+    ({ schemas, tables: ids.length, tableIds: ids, tableNames: ids.map((id) => `s.t${id}`) });
 
   it("is sensitive to the schema list and to every table's identity", () => {
     const base = shape(["drizzle", "public"], ["100", "200"]);
@@ -496,6 +520,19 @@ describe("the recovery instructions", () => {
     expect(commands[1]).toContain("conduit_prod");
     expect(commands[1]).toContain("--single-transaction");
     expect(commands.join("\n")).not.toContain("hunter2");
+  });
+
+  // A COMMAND THAT DROPS SCHEMAS MUST NEVER GUESS WHICH DATABASE. The fallback
+  // used to be the literal name "conduit", which EXISTS on the deploy target --
+  // so a URL carrying no path printed a working command aimed at a different,
+  // live install. The placeholder is unpasteable on purpose.
+  it("never guesses a database name into a command that drops schemas", () => {
+    const commands = recoveryCommands("/data/safety.7z", "postgres://user@host:5432",
+      ["public"]);
+    const psql = commands[1] ?? "";
+    expect(psql).toContain("DROP SCHEMA");
+    expect(psql).not.toMatch(/-d conduit\b/);
+    expect(psql).toContain("<the database name from DATABASE_URL>");
   });
 
   it("says there is nothing to recover from when no safety backup was taken", () => {
@@ -677,6 +714,127 @@ describe("refusing before anything is destroyed", () => {
     expect(plan.refusal?.code).toBe(RESTORE_REFUSALS.memberMissing);
     expect(plan.refusal?.message).toContain("database.sql");
   });
+
+  // ===================================================================
+  // THE MANIFEST THAT MAKES NO CLAIM.
+  //
+  // The digest sweep is the ONLY independent witness to the dump's contents --
+  // the byte count the load checks is a stat() of the very file the load
+  // streams, so it compares a file with itself. Drop `database.sql` out of
+  // `members` and the sweep never looks at it: measured on tip, a dump cut
+  // after a COPY terminator then inspected CLEAN, applied, and emptied all 26
+  // tables with `{dispatched:5, realised:5, unrealised:[]}` and no error.
+  //
+  // The fixture is a manifest that OMITS the member, not a corrupted file --
+  // a corrupted file was already refused, which is exactly why this hid.
+  // ===================================================================
+  itRestore("refuses a manifest that does not list database.sql", async () => {
+    const source = await makeInstall("srcunlisted");
+    await seed(source, ["Acme", "Globex"]);
+    const target = await makeInstall("dstunlisted");
+    await seed(target, ["Untouched"]);
+    const before = await rowCounts(target.url);
+
+    // The dump is cut AND the manifest stops mentioning it, so nothing but the
+    // required-member rule can see anything wrong.
+    const archive = await repackedBackup(source, async (dir) => {
+      const manifestPath = path.join(dir, "manifest.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as BackupManifest;
+      const dumpPath = path.join(dir, "database.sql");
+      const dump = await readFile(dumpPath, "utf8");
+      const terminator = dump.indexOf("\n\\.\n", dump.indexOf("\nCOPY "));
+      expect(terminator).toBeGreaterThan(0);
+      await writeFile(dumpPath, dump.slice(0, terminator + 4));
+      await writeFile(manifestPath, `${JSON.stringify({
+        ...manifest,
+        members: manifest.members.filter((member) => member.path !== "database.sql"),
+      }, null, 2)}\n`);
+    });
+
+    const staged = await stageAndInspect(archive, target);
+    expect(staged.plan.refusal?.code).toBe(RESTORE_REFUSALS.memberMissing);
+    expect(staged.plan.refusal?.message).toContain("does not list database.sql");
+    expect(staged.plan.effects).toEqual([]);
+    expect(await rowCounts(target.url)).toEqual(before);
+  });
+
+  itRestore("refuses a manifest whose declared size is not the size in the archive",
+    async () => {
+      const source = await makeInstall("srcbadsize");
+      await seed(source, ["Acme"]);
+      const target = await makeInstall("dstbadsize");
+      // THE DIGEST IS LEFT CORRECT, so only the size check can see this -- and
+      // the size is what the load takes its budget from, so a manifest that
+      // lied about it would be found half way through replacing the database.
+      const archive = await alteredBackup(source, async (_dir, manifest) => ({
+        ...manifest,
+        members: manifest.members.map((member) => member.path === "database.sql"
+          ? { ...member, bytes: member.bytes + 1 }
+          : member),
+      }));
+      const { plan } = await stageAndInspect(archive, target);
+      expect(plan.refusal?.code).toBe(RESTORE_REFUSALS.memberCorrupt);
+      expect(plan.refusal?.message).toContain("bytes");
+      expect(plan.effects).toEqual([]);
+    });
+
+  itRestore("refuses a manifest with no member list at all", async () => {
+    const source = await makeInstall("srcnolist");
+    await seed(source, ["Acme"]);
+    const target = await makeInstall("dstnolist");
+    const archive = await repackedBackup(source, async (dir) => {
+      const manifestPath = path.join(dir, "manifest.json");
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+      delete manifest.members;
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    });
+    const { plan } = await stageAndInspect(archive, target);
+    // NOT "zero claims and they all hold", which is what
+    // `Array.isArray(x) ? x : []` turned this into.
+    expect(plan.refusal?.code).toBe(RESTORE_REFUSALS.manifestUnreadable);
+    expect(plan.refusal?.message).toContain("does not list what is in the archive");
+  });
+
+  // ===================================================================
+  // THE DUMP THAT TELLS psql TO STOP.
+  //
+  // MEASURED with the exact command this module runs: a script whose second
+  // line is `\q` exits 0 with one of three INSERTs committed. psql closes
+  // WITHOUT reading to end of file, so the flags see no error, the byte count
+  // sees a fully delivered file, and the table count sees every table -- all
+  // three process instruments pass over a database that got a prefix.
+  // ===================================================================
+  itRestore("refuses a dump carrying a psql command that could stop it part way",
+    async () => {
+      const source = await makeInstall("srcmeta");
+      await seed(source, ["Acme"]);
+      const target = await makeInstall("dstmeta");
+      await seed(target, ["Untouched"]);
+      const before = await rowCounts(target.url);
+
+      // Placed after the last CREATE TABLE, where every table exists and the
+      // data does not -- the position that satisfies every other instrument.
+      const archive = await alteredBackup(source, async (dir, manifest) => {
+        const dumpPath = path.join(dir, "database.sql");
+        const dump = await readFile(dumpPath, "utf8");
+        const at = dump.indexOf("\nCOPY ");
+        expect(at).toBeGreaterThan(0);
+        const injected = `${dump.slice(0, at)}\n\\q\n${dump.slice(at)}`;
+        await writeFile(dumpPath, injected);
+        return {
+          ...manifest,
+          members: manifest.members.map((member) => member.path === "database.sql"
+            ? { ...member, bytes: Buffer.byteLength(injected), sha256: digestOf(injected) }
+            : member),
+        };
+      });
+
+      const { plan } = await stageAndInspect(archive, target);
+      expect(plan.refusal?.code).toBe(RESTORE_REFUSALS.dumpMetaCommand);
+      expect(plan.refusal?.message).toContain("\\q");
+      expect(plan.effects).toEqual([]);
+      expect(await rowCounts(target.url)).toEqual(before);
+    });
 
   itRestore("refuses an archive with no mail.key in it", async () => {
     const source = await makeInstall("srcnokey");
@@ -914,9 +1072,82 @@ describe("restoring onto a different install", () => {
     });
 
     const failure = await rejection(runRestore({ ...staged, plan: edited }, target));
-    expect(failure).toBeInstanceOf(PlanExceededError);
-    expect((failure as PlanExceededError).op).toBe("migrate-forward");
-    expect(failure.message).toContain(`accounted for ${String(forward.count)}`);
+    // NOT the frame's accounting error, and this test used to ASSERT THAT IT
+    // WAS -- over an install whose every table had already been replaced and
+    // whose mail.key had already been swapped. `PlanExceededError` travels
+    // unwrapped, so the caller got no outcome, no safety backup path and no
+    // recovery commands: verbatim the hazard the load step was fixed for,
+    // surviving one step further down the plan, with a green test on top of it.
+    expect(failure).not.toBeInstanceOf(PlanExceededError);
+    const cause = (failure as PlanApplyError).cause;
+    expect(cause).toBeInstanceOf(RestoreUnexpectedMigrationsError);
+    const message = (cause as Error).message;
+    expect(message).toContain(`said ${String(forward.count + 1)}`);
+    expect(message).toContain(`${String(forward.count)} ran`);
+    expect(message).toContain("has HAPPENED");
+    expect(message).toContain(safetyPathOf(staged.plan));
+    // The partial outcome travels, which is the whole point of not letting the
+    // frame report this.
+    expect((failure as PlanApplyError).outcome.dispatched).toBeGreaterThan(0);
+  });
+
+  // A migration that THROWS after the load has committed is an ordinary way to
+  // fail -- a constraint a years-old install violates is exactly what the
+  // older-backup path exists for -- and it left the same silence.
+  itRestore("says the database is restored when the migrations themselves fail", async () => {
+    const journal = await readMigrationJournal();
+    // FULLY migrated, so every object the last migration creates is already in
+    // the dump...
+    const source = await makeInstall("srcmigfail");
+    await seed(source, ["Ancient Holdings"]);
+    const target = await makeInstall("dstmigfail");
+
+    // ...but the dump's own drizzle bookkeeping is made to forget the last one.
+    // The restored database then has the schema and claims not to, so drizzle
+    // applies a migration over objects that already exist and throws. No seam:
+    // this is what migrating real data forward looks like when it goes wrong,
+    // and it happens AFTER the load has committed.
+    const archive = await alteredBackup(source, async (dir, manifest) => {
+      const dumpPath = path.join(dir, "database.sql");
+      const dump = await readFile(dumpPath, "utf8");
+      const copyAt = dump.indexOf("COPY drizzle.");
+      expect(copyAt).toBeGreaterThan(0);
+      const endAt = dump.indexOf("\n\\.\n", copyAt);
+      expect(endAt).toBeGreaterThan(copyAt);
+      const head = dump.slice(0, copyAt);
+      const block = dump.slice(copyAt, endAt);
+      const tail = dump.slice(endAt);
+      const rows = block.split("\n");
+      expect(rows.length).toBeGreaterThan(2);
+      const edited = `${head}${rows.slice(0, -1).join("\n")}${tail}`;
+      await writeFile(dumpPath, edited);
+      return {
+        ...manifest,
+        migrationPosition: journal.position - 1,
+        schemaVersion: "an-older-tag",
+        members: manifest.members.map((member) => member.path === "database.sql"
+          ? { ...member, bytes: Buffer.byteLength(edited), sha256: digestOf(edited) }
+          : member),
+      };
+    });
+    const staged = await stageAndInspect(archive, target);
+    expect(staged.plan.refusal).toBeNull();
+
+    const failure = await rejection(runRestore(staged, target));
+    const cause = (failure as PlanApplyError).cause;
+    expect(cause).toBeInstanceOf(RestoreMigrationError);
+    const message = (cause as Error).message;
+    expect(message).toContain("was restored");
+    expect(message).toContain("Do not use this install");
+
+    // AND THE RESTORE REALLY DID HAPPEN, which is the half the old silence hid.
+    const restored = createDatabase(target.url, 1);
+    try {
+      const rows = await restored.db.execute<{ name: string }>(sql`SELECT name FROM companies`);
+      expect(rows.map((row) => row.name)).toEqual(["Ancient Holdings"]);
+    } finally {
+      await restored.close();
+    }
   });
 
   itRestore("replaces mail.key atomically and drops this process's cached copy", async () => {
@@ -1443,6 +1674,7 @@ describe("a load that fails", () => {
             schemas: [...real.schemas],
             tables: real.tables,
             tableIds: real.tableIds.map((id) => `9${id}`),
+            tableNames: [...real.tableNames],
           };
         },
       }));
@@ -1657,6 +1889,40 @@ describe("apply cannot exceed the plan", () => {
       expect(message).toContain(safetyPathOf(staged.plan));
       // And the partial outcome travels with it.
       expect((failure as PlanApplyError).outcome.unrealised).toEqual(["destroy-schema"]);
+    });
+
+  // THE RESULT CHECK IS ABOUT NAMES AND NOT A TALLY, and this is what says so:
+  // the plan is edited to expect a table that will never arrive while the COUNT
+  // stays exactly right. A tally is satisfied by any twenty-seven tables.
+  itRestore("notices a table that did not arrive even when the count is right",
+    async () => {
+      const source = await makeInstall("srcnames");
+      await seed(source, ["Acme"]);
+      const target = await makeInstall("dstnames");
+      const work = await scratchDir("names");
+      const archive = await realBackup(source, work);
+      const staged = await stageAndInspect(archive, target);
+
+      const load = effectFor(staged.plan, "load-dump") as RestoreEffect & {
+        tables: readonly string[];
+      };
+      const swapped = [...load.tables.slice(0, -1), "public.a_table_the_dump_never_creates"];
+      expect(swapped).toHaveLength(load.tables.length);
+      const edited = newPlan<RestoreEffect>({
+        kind: "restore",
+        source: staged.plan.source,
+        effects: staged.plan.effects.map((effect) => effect.op === "load-dump"
+          ? { ...load, tables: swapped } as RestoreEffect
+          : effect),
+      });
+
+      const failure = await rejection(runRestore({ ...staged, plan: edited }, target));
+      const cause = (failure as PlanApplyError).cause;
+      expect(cause).toBeInstanceOf(RestoreUnexpectedResultError);
+      const message = (cause as Error).message;
+      expect(message).toContain("a_table_the_dump_never_creates");
+      expect(message).toContain("not there at all");
+      expect(message).toContain("has HAPPENED");
     });
 
   itRestore("gives each step reading rights over exactly the members it needs",
