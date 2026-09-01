@@ -48,7 +48,14 @@ const HAVE_PSQL = (await psqlVersion()) !== null;
 const HAVE_PG_DUMP = (await pgDumpVersion()) !== null;
 /** Everything a real restore needs. A developer on macOS gets a visible skip. */
 const itRestore = HAVE_7Z && HAVE_PSQL && HAVE_PG_DUMP ? it : it.skip;
-const it7z = HAVE_7Z ? it : it.skip;
+/**
+ * Enough to BUILD and READ an archive, which is what every preview case needs:
+ * a fixture is a real backup, so pg_dump is as required as 7z even though no
+ * dump is loaded. Naming only 7z here would have turned a missing pg_dump into
+ * a crash in a `beforeEach` rather than the visible skip the convention asks
+ * for.
+ */
+const itArchive = HAVE_7Z && HAVE_PG_DUMP ? it : it.skip;
 
 // /proc is the only way for a process to count its own open descriptors, and it
 // is Linux-only. The dev server and CI are both Linux, which is where the
@@ -651,7 +658,7 @@ describe("POST /api/restore/inspect", () => {
     archive = await realBackup(source, await scratchDir("archive"));
   });
 
-  it7z("returns a plan and the install's name, and holds the staging", async () => {
+  itArchive("returns a plan and the install's name, and holds the staging", async () => {
     const response = await inspect(app, archive);
     expect(response.statusCode).toBe(200);
     const body = response.json() as { plan: PlanView; installName: string };
@@ -670,7 +677,7 @@ describe("POST /api/restore/inspect", () => {
   // THE PLAN NEVER TRAVELS. What comes back is a RENDERING: no staged-member
   // refs, which are the object identities that would let a caller describe
   // work, and nothing else the wire form does not declare.
-  it7z("sends a rendering of the plan and never the plan", async () => {
+  itArchive("sends a rendering of the plan and never the plan", async () => {
     const plan = await previewOf(app, archive);
     expect(Object.keys(plan).sort()).toEqual([
       "createdAt", "effects", "expiresAt", "findings", "kind", "planId", "refusal", "source",
@@ -684,7 +691,7 @@ describe("POST /api/restore/inspect", () => {
     expect(JSON.stringify(plan)).not.toContain("sources");
   });
 
-  it7z("refuses a wrong passphrase without saying which of the two it was", async () => {
+  itArchive("refuses a wrong passphrase without saying which of the two it was", async () => {
     const response = await inspect(app, archive, { passphrase: "not the passphrase" });
     expect(response.statusCode).toBe(400);
     const body = response.json() as { error: string; message: string };
@@ -695,7 +702,7 @@ describe("POST /api/restore/inspect", () => {
     expect(await intakeWorkDirs(target)).toEqual([]);
   });
 
-  it7z("refuses a body that is not an archive, and stages nothing", async () => {
+  itArchive("refuses a body that is not an archive, and stages nothing", async () => {
     const form = upload({ content: Buffer.from("hello, not a 7z"), passphrase: PASSPHRASE });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
@@ -705,7 +712,7 @@ describe("POST /api/restore/inspect", () => {
     expect(await intakeWorkDirs(target)).toEqual([]);
   });
 
-  it7z("refuses a missing passphrase with the rule, not with a stack trace", async () => {
+  itArchive("refuses a missing passphrase with the rule, not with a stack trace", async () => {
     const form = upload({ content: Buffer.from("anything") });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
@@ -725,7 +732,7 @@ describe("POST /api/restore/inspect", () => {
   // and one written to fail would need a chunk-timing race of exactly the kind
   // this project has already lost once in CI. The refusal an absent passphrase
   // gets -- which is the same refusal -- is asserted above.
-  it7z("takes the passphrase field when it arrives before the file", async () => {
+  itArchive("takes the passphrase field when it arrives before the file", async () => {
     const form = upload({
       content: Buffer.from("anything"), passphrase: PASSPHRASE, fieldOrder: "passphrase-first",
     });
@@ -739,7 +746,7 @@ describe("POST /api/restore/inspect", () => {
     expect((response.json() as { error: string }).error).toBe("restore_archive_refused");
   });
 
-  it7z("refuses a file field under any other name", async () => {
+  itArchive("refuses a file field under any other name", async () => {
     const form = upload({
       content: Buffer.from("anything"), passphrase: PASSPHRASE, fileField: "archive",
     });
@@ -751,7 +758,7 @@ describe("POST /api/restore/inspect", () => {
     expect((response.json() as { message: string }).message).toContain('named "file"');
   });
 
-  it7z("refuses a request that is not multipart at all", async () => {
+  itArchive("refuses a request that is not multipart at all", async () => {
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
       headers: await reauthed(app, chris), payload: { passphrase: PASSPHRASE },
@@ -763,7 +770,7 @@ describe("POST /api/restore/inspect", () => {
   // `truncated` check the route would hand a PREFIX of a .7z to the stager and
   // report it as a damaged archive, which is a true sentence about the wrong
   // thing.
-  it7z("refuses an upload over the cap as too large, and leaves nothing staged", async () => {
+  itArchive("refuses an upload over the cap as too large, and leaves nothing staged", async () => {
     // ITS OWN INSTALL, so nothing else has an app pointed at this $data_dir:
     // a second app's boot sweep would remove the staging for its own reasons
     // and this assertion would pass without proving anything.
@@ -783,7 +790,7 @@ describe("POST /api/restore/inspect", () => {
   // credential store with no remaining purpose, and the discipline says every
   // exit path removes one -- "success, refusal, failure and an abandoned
   // upload alike".
-  it7z("renders a refusal, holds nothing, and leaves nothing decrypted on disk", async () => {
+  itArchive("renders a refusal, holds nothing, and leaves nothing decrypted on disk", async () => {
     const newer = await alteredBackup(source, async (_dir, manifest) => {
       await Promise.resolve();
       return { ...manifest, appVersion: "99.0.0" };
@@ -805,7 +812,7 @@ describe("POST /api/restore/inspect", () => {
 
   // ONE AT A TIME, because a held session is an unpacked install sitting in
   // $data_dir and two of them is two installs.
-  it7z("refuses a second upload while one is waiting, and keeps the first", async () => {
+  itArchive("refuses a second upload while one is waiting, and keeps the first", async () => {
     const first = await previewOf(app, archive);
     const second = await inspect(app, archive);
     expect(second.statusCode).toBe(409);
@@ -823,7 +830,7 @@ describe("POST /api/restore/inspect", () => {
   // owner and not behind a second password: the failure mode of making it
   // harder to reach is a decrypted backup sitting in $data_dir until the plan
   // expires.
-  it7z("cancels only a plan that exists, and only for its owner", async () => {
+  itArchive("cancels only a plan that exists, and only for its owner", async () => {
     expect((await app.inject({
       method: "DELETE", url: `/api/restore/${randomUUID()}`, headers: chris,
     })).statusCode).toBe(404);
@@ -840,7 +847,7 @@ describe("POST /api/restore/inspect", () => {
   // discriminates the two layers: the pre-check exists so a second operator is
   // not made to upload three gigabytes before being told, and `hold` is the one
   // that actually holds.
-  it7z("refuses the loser of two simultaneous uploads and disposes of its staging", async () => {
+  itArchive("refuses the loser of two simultaneous uploads and disposes of its staging", async () => {
     const both = await Promise.all([inspect(app, archive), inspect(app, archive)]);
     const codes = both.map((response) => response.statusCode).sort((a, b) => a - b);
     expect(codes).toEqual([200, 409]);
@@ -1410,7 +1417,7 @@ describe("descriptors and the staged archive", () => {
   // A SHUTDOWN WITH A PREVIEW STILL OPEN. What is in $data_dir at that moment
   // is a decrypted backup -- mail.key in the clear -- and the process must not
   // leave it there.
-  it7z("deletes a waiting preview's staging when the app closes", async () => {
+  itArchive("deletes a waiting preview's staging when the app closes", async () => {
     const source = await makeInstall("src");
     const target = await makeInstall("dst");
     const app = await appFor(target);

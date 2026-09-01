@@ -602,6 +602,16 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
       // closed would be an install that answers 503 to every write until
       // somebody restarts it -- and the failure paths below are exactly the
       // ones where an operator needs the install to keep working.
+      //
+      // AND THIS ONE REALLY CAN LIVE IN THE `finally`, WHERE THE PREVIEW'S
+      // DISPOSAL COULD NOT, because the difference is whether it yields.
+      // `reply.send()` schedules the response and returns, so the question is
+      // what runs before the event loop can deliver it: `discard` awaits an
+      // `rm` and therefore hands control back -- which is how a caller came to
+      // see a refusal while the decrypted archive was still on disk -- and
+      // `resume` is synchronous, so it completes in the same continuation as
+      // the `return` that triggered it. There is no instant at which an answer
+      // has gone out and the gate is still shut.
       writeGate.resume();
     }
   });
