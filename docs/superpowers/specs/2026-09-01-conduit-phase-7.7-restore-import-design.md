@@ -35,6 +35,58 @@ So: one phase, one release, restore first.
 
 ---
 
+## THE SHARED SPINE — designed before either half, on Chris's argument
+
+**Chris, 1 Sep:** *"Both mechanisms may use similar elements... You implement one then start the
+other and realise you should have implemented it differently to do the other part and you waste
+my tokens getting there and tying yourself in a knot."*
+
+He is right, and the first attempt at this phase was stopped mid-task because of it. Restore
+and both importers are the same pipeline with different last steps:
+
+| | ingest | stage | inspect | **plan** | apply |
+|---|---|---|---|---|---|
+| Restore | upload `.7z` | `7z x` + passphrase | manifest, versions, journal | what will be DESTROYED and replaced | safety backup, then load |
+| Import (own export) | upload `.zip` | unzip | manifest, `formatVersion`, declared transform | what will be CREATED and skipped | insert |
+| Import (foreign CSV) | upload `.csv` | none | sniff headers, delimiter, encoding | mapping applied, rows, errors | insert |
+
+**The last column differs. The first four do not.** Building restore's apply path first and
+retrofitting the rest is exactly the knot.
+
+### The one decision that makes the spine hold: THE PLAN IS A VALUE
+
+`inspect` produces a **plan object**; the UI renders it; `apply` consumes it and may do nothing
+the plan did not describe. Three consequences, and they are the reason to do it this way:
+
+- **The preview cannot lie.** It is not a second implementation that predicts what apply will
+  do — it is the same object apply is given.
+- **Apply cannot surprise.** Anything not in the plan is a bug with an obvious shape.
+- **Every hard case is testable without executing it.** A plan for a corrupted archive, a
+  newer schema, a 200,000-row CSV — all assertable as values, no database required.
+
+Chris made the preview a requirement for import. It is the right guard for restore too, where
+the thing being previewed is destruction.
+
+### What the spine owns, so neither half re-invents it
+
+- **The uploaded file is a credential store from the moment it lands** — `0600`, inside
+  `$data_dir`, **never `/tmp`**, deleted on every exit path including failure and abort, proved
+  by counting descriptors as v1.3.0 did.
+- **Size and shape limits before unpacking**, so a hostile archive cannot fill the disk.
+- **Validate before mutate, always.** Every refusal happens with nothing written.
+- **Apply runs in one transaction** and rolls back as a unit; if the rollback itself fails, the
+  failure is loud and names what to do by hand.
+
+### What stays different, and must not be generalised
+
+- **Only restore takes a safety backup.** An import that goes wrong adds rows the operator can
+  archive; a restore that goes wrong has already destroyed them.
+- **Only restore replaces `mail.key`**, and that is irreversible in effect.
+- **Only the foreign CSV importer has an interactive step** between inspect and plan — the
+  column mapping. The other two produce their plan without asking anything.
+
+---
+
 ## Restore — the architecture
 
 ### The operational problem, which shapes everything
