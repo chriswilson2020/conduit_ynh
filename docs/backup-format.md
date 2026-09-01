@@ -123,8 +123,8 @@ after the dump loads.
 
 ### `inventory` -- what the database held, recorded separately from the dump
 
-`inventory` lists **every table the database held and exactly how many rows was
-in each**, and it is there so that a restore can check its result against
+`inventory` lists **every table the database held, and exactly how many rows
+each one had**, and it is there so that a restore can check its result against
 something **other than the file it just loaded**.
 
 That distinction is the whole reason the field exists. A restore already
