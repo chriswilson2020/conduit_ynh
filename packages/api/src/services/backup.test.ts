@@ -638,7 +638,7 @@ describe("backup passphrase handling", () => {
   });
 
   it("refuses control characters and an over-long passphrase", () => {
-    for (const bad of ["one\ntwo", "one\rtwo", "one\ttwo", "one two", "onetwo"]) {
+    for (const bad of ["one\ntwo", "one\rtwo", "one\ttwo", "one\u0000two", "one\u007Ftwo"]) {
       expect(() => { validatePassphrase(bad); }, JSON.stringify(bad)).toThrow(BackupPassphraseError);
     }
     expect(() => { validatePassphrase("a".repeat(MAX_PASSPHRASE_LENGTH + 1)); })
@@ -693,7 +693,7 @@ describe("backup secrecy of arguments", () => {
         parts.push((await readFile(`/proc/${entry}/cmdline`)).toString("utf8"));
       } catch { /* the process exited while we looked */ }
     }
-    return parts.join(" ");
+    return parts.join("\u0000");
   }
 
   it("keeps the passphrase out of the argument list it builds", () => {
