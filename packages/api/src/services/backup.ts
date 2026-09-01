@@ -332,7 +332,8 @@ export function sevenZipArgs(archivePath: string, inputs: readonly string[]): st
 }
 
 /**
- * How pg_dump is invoked: the arguments, and separately the environment.
+ * A DATABASE_URL as the libpq environment variables every postgres client
+ * binary reads.
  *
  * THE DATABASE PASSWORD GOES IN THE ENVIRONMENT, NOT THE ARGUMENT LIST, and
  * the split is the whole reason this is a function rather than three lines at
@@ -343,10 +344,13 @@ export function sevenZipArgs(archivePath: string, inputs: readonly string[]): st
  * PGPASSWORD is only set when the URL carries one -- the deploy target's
  * DATABASE_URL does (conf/.env), the test database's socket URL does not, and
  * an empty PGPASSWORD is not the same as an absent one to libpq.
+ *
+ * ONE READER, TWO CONSUMERS, on migration-journal.ts's precedent. 7.7's
+ * restore drives `psql` and needs exactly this environment for exactly this
+ * reason; a second copy of the derivation would be a copy that drifts silently,
+ * and the direction it would drift in is a password reaching a command line.
  */
-export function pgDumpInvocation(
-  databaseUrl: string,
-): { args: string[]; env: Record<string, string> } {
+export function libpqEnvironment(databaseUrl: string): Record<string, string> {
   const url = new URL(databaseUrl);
   const env: Record<string, string> = {};
   // A URL's components are percent-encoded; libpq wants the decoded values.
@@ -356,7 +360,14 @@ export function pgDumpInvocation(
   if (url.password !== "") env.PGPASSWORD = decodeURIComponent(url.password);
   const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
   if (database !== "") env.PGDATABASE = database;
-  return { args: [...PG_DUMP_ARGS], env };
+  return env;
+}
+
+/** How pg_dump is invoked: the arguments, and separately the environment. */
+export function pgDumpInvocation(
+  databaseUrl: string,
+): { args: string[]; env: Record<string, string> } {
+  return { args: [...PG_DUMP_ARGS], env: libpqEnvironment(databaseUrl) };
 }
 
 /**

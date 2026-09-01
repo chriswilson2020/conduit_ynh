@@ -108,7 +108,11 @@ Settings page and it exists for exactly that.
 
 `schemaVersion` and `migrationPosition` say which shape of the database this
 dump came out of; `appVersion` says which Conduit wrote it. Together they are
-what a future restore checks before it touches anything.
+what a restore checks before it touches anything: a backup from a **newer**
+Conduit, or one carrying more migrations than the running build ships, is
+refused outright, because its data may use columns that build does not have. A
+backup from an **older** one is accepted, and its schema is brought up to date
+after the dump loads.
 
 ---
 
