@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import {
-  copyFile, mkdir, mkdtemp, readdir, readFile, rm, stat, truncate, writeFile,
+  chmod, copyFile, mkdir, mkdtemp, readdir, readFile, rm, stat, truncate, writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -19,19 +19,23 @@ import { resolveUser } from "../users.js";
 import { saveBlob } from "./blobs.js";
 import { attachFile } from "./files.js";
 import { createCompany } from "./companies.js";
-import { buildBackup, pgDumpVersion, type BackupManifest } from "./backup.js";
+import {
+  buildBackup, libpqEnvironment, pgDumpVersion, type BackupManifest,
+} from "./backup.js";
 import {
   decryptCredentials, encryptCredentials, forgetMailKey, loadMailKey,
 } from "./mail-crypto.js";
 import { readMigrationJournal } from "./migration-journal.js";
-import { receiveIntake, stageArchive, type StagedPayload } from "./intake.js";
+import {
+  receiveIntake, stageArchive, INTAKE_WORK_PREFIX, type StagedPayload,
+} from "./intake.js";
 import { newPlan, PlanApplyError, PlanExceededError, PlanRefusedError } from "./intake-plan.js";
 import {
   applyRestore, compareAppVersions, countDumpTables, describeDatabaseShape, inspectRestore,
   proveArchiveOpens, psqlLoadArgs, psqlVersion, recoveryCommands, sameShape,
   RESTORE_FINDINGS, RESTORE_REFUSALS,
   RestoreDatabaseChangedError, RestoreHalfAppliedError, RestoreLoadFailedError,
-  RestoreSafetyBackupError,
+  RestoreSafetyBackupError, RestoreUnexpectedResultError,
   type DatabaseShape, type RestoreEffect, type RestorePlan, type SafetyBackupEffect,
 } from "./restore.js";
 
@@ -372,6 +376,22 @@ async function runRestore(
   });
 }
 
+/**
+ * Where the staged `database.sql` landed, found by walking $data_dir.
+ *
+ * SERVICES/INTAKE.TS HIDES THIS FROM APPLY ON PURPOSE, and nothing here
+ * undermines that: a handler still receives only a ref. This is the test
+ * reaching around the outside to break the source WHILE the plan holds a
+ * perfectly good ref to it -- which is the only way to reproduce a dump that
+ * stops part way through, and it is the failure that committed a truncated
+ * database on the deploy target.
+ */
+async function stagedDumpPath(install: Install): Promise<string> {
+  const work = (await readdir(install.dataDir)).find((e) => e.startsWith(INTAKE_WORK_PREFIX));
+  if (work === undefined) throw new Error("no intake work directory in $data_dir");
+  return path.join(install.dataDir, work, "staged", "database.sql");
+}
+
 function safetyPathOf(plan: RestorePlan): string {
   const effect = plan.effects
     .find((candidate): candidate is SafetyBackupEffect => candidate.op === "safety-backup");
@@ -441,12 +461,27 @@ describe("the psql arguments", () => {
 });
 
 describe("shape comparison", () => {
-  it("is sensitive to the schema list and to the table count", () => {
-    const base: DatabaseShape = { schemas: ["drizzle", "public"], tables: 27 };
-    expect(sameShape(base, { schemas: ["drizzle", "public"], tables: 27 })).toBe(true);
-    expect(sameShape(base, { schemas: ["drizzle", "public"], tables: 26 })).toBe(false);
-    expect(sameShape(base, { schemas: ["public"], tables: 27 })).toBe(false);
-    expect(sameShape(base, { schemas: ["public", "drizzle"], tables: 27 })).toBe(false);
+  const shape = (schemas: string[], ids: string[]): DatabaseShape =>
+    ({ schemas, tables: ids.length, tableIds: ids });
+
+  it("is sensitive to the schema list and to every table's identity", () => {
+    const base = shape(["drizzle", "public"], ["100", "200"]);
+    expect(sameShape(base, shape(["drizzle", "public"], ["100", "200"]))).toBe(true);
+    expect(sameShape(base, shape(["public"], ["100", "200"]))).toBe(false);
+    expect(sameShape(base, shape(["public", "drizzle"], ["100", "200"]))).toBe(false);
+    // THE CASE THAT MATTERS MOST: the same schemas and the same NUMBER of
+    // tables, recreated. A count says nothing changed; an identity says the
+    // database was replaced. Measured on the deploy target as exactly this.
+    expect(sameShape(base, shape(["drizzle", "public"], ["300", "400"]))).toBe(false);
+  });
+
+  // A LENGTH CHECK AND AN ELEMENT CHECK MASK EACH OTHER when one list is a
+  // PREFIX of the other, because `every` is vacuously true over the shorter.
+  // Both lists get the case, because the mask would be per-list.
+  it("is not fooled by a list that is a prefix of the other", () => {
+    const base = shape(["drizzle", "public"], ["100", "200"]);
+    expect(sameShape(base, shape(["drizzle", "public", "extra"], ["100", "200"]))).toBe(false);
+    expect(sameShape(base, shape(["drizzle", "public"], ["100", "200", "300"]))).toBe(false);
   });
 });
 
@@ -641,6 +676,27 @@ describe("refusing before anything is destroyed", () => {
     const { plan } = await stageAndInspect(archive, target);
     expect(plan.refusal?.code).toBe(RESTORE_REFUSALS.memberMissing);
     expect(plan.refusal?.message).toContain("database.sql");
+  });
+
+  itRestore("refuses an archive with no mail.key in it", async () => {
+    const source = await makeInstall("srcnokey");
+    await seed(source, ["Acme"]);
+    const target = await makeInstall("dstnokey");
+    // Out of the archive AND out of the manifest, so the digest sweep cannot
+    // see it either -- the required-member rule is the only layer left, which
+    // is what makes this discriminate. The dump has the same fixture; the key
+    // did not, in a commit claiming every guard was mutation-tested.
+    const archive = await alteredBackup(source, async (dir, manifest) => {
+      await rm(path.join(dir, "mail.key"), { force: true });
+      return {
+        ...manifest,
+        members: manifest.members.filter((member) => member.path !== "mail.key"),
+      };
+    });
+    const { plan } = await stageAndInspect(archive, target);
+    expect(plan.refusal?.code).toBe(RESTORE_REFUSALS.memberMissing);
+    expect(plan.refusal?.message).toContain("mail.key");
+    expect(plan.effects).toEqual([]);
   });
 
   itRestore("refuses an export, which is not a backup", async () => {
@@ -906,6 +962,47 @@ describe("restoring onto a different install", () => {
 // The safety backup, proved before the destructive step.
 // ===========================================================================
 
+// THE MUTATION THAT SURVIVED, AND SHOULD NOT HAVE. Writing mail.key in place
+// instead of to a sibling and renaming was reported as "not observable from a
+// passing test without crash injection". That was wrong, and the distinction is
+// an ordinary unix one: rename(2) needs write permission on the DIRECTORY,
+// while writing in place needs it on the FILE. A read-only mail.key separates
+// them exactly -- the real code replaces the inode and passes, an in-place
+// write gets EACCES -- and it costs fifteen lines and no crash.
+//
+// Skipped for root, which ignores file permissions and would pass either way:
+// a test that cannot fail is not a test. Neither CI nor the dev server runs as
+// root, so this is a guard on the guard rather than a routine skip.
+const itNotRoot = (process.getuid?.() ?? 0) !== 0 ? itRestore : it.skip;
+
+describe("replacing mail.key without a window", () => {
+  itNotRoot("replaces a read-only mail.key, which an in-place write could not",
+    async () => {
+      const source = await makeInstall("srcro");
+      await seed(source, ["Acme"]);
+      const target = await makeInstall("dstro");
+
+      const work = await scratchDir("ro");
+      const archive = await realBackup(source, work);
+      const staged = await stageAndInspect(archive, target);
+
+      // Read-only, and unwritable in place. The directory stays writable, so a
+      // rename is still allowed -- which is the whole difference.
+      await chmod(target.mailKeyPath, 0o400);
+      await expect(writeFile(target.mailKeyPath, Buffer.alloc(32, 9))).rejects.toThrow();
+
+      const outcome = await runRestore(staged, target);
+      expect(outcome.realised).toBe(outcome.dispatched);
+
+      // The key was replaced, and the new file carries its own mode rather
+      // than inheriting the old inode's.
+      expect((await readFile(target.mailKeyPath)).equals(await readFile(source.mailKeyPath)))
+        .toBe(true);
+      expect((await stat(target.mailKeyPath)).mode & 0o777).toBe(0o600);
+      expect((await readdir(target.dataDir)).filter((n) => n.includes(".restoring-"))).toEqual([]);
+    });
+});
+
 describe("the safety backup", () => {
   itRestore("exists, is 0600, and opens with the operator's passphrase", async () => {
     const source = await makeInstall("srcsafe");
@@ -1161,6 +1258,164 @@ describe("a load that fails", () => {
       expect(await rowCounts(target.url)).toEqual(before);
     });
 
+  // ===================================================================
+  // THE DUMP THAT STOPS PART WAY THROUGH.
+  //
+  // psql's stdin is a pipe, and a pipe that stops is a CLEAN END OF FILE.
+  // `--single-transaction` COMMITS on end of file, so a source that dies half
+  // way produces exit 0 over a database whose own tables have been dropped and
+  // partially replaced. Measured on the deploy target before these existed: 21
+  // of 500 rows committed, the install's own table gone, exit 0.
+  //
+  // The cut is placed INSIDE THE COPY DATA on purpose. Every CREATE TABLE in a
+  // plain pg_dump sits in the first few KB, so by then the table count and the
+  // schema list are already what a successful restore would leave -- which is
+  // why the proof has to be an identity and not a count.
+  // ===================================================================
+  itRestore("refuses to call a truncated dump a success, and says the database moved",
+    async () => {
+      const source = await makeInstall("srccut");
+      await seed(source, ["Acme", "Globex"]);
+      const target = await makeInstall("dstcut");
+      await seed(target, ["Was Here"]);
+
+      const work = await scratchDir("cut");
+      const archive = await realBackup(source, work);
+      const staged = await stageAndInspect(archive, target);
+      const safetyPath = safetyPathOf(staged.plan);
+      const load = effectFor(staged.plan, "load-dump");
+
+      // CUT AFTER THE FIRST COPY BLOCK'S TERMINATOR, so the prefix is
+      // PERFECTLY WELL FORMED: every statement complete, every COPY closed.
+      // That is the cruel case and the one that commits -- psql reaches a clean
+      // end of file with nothing to complain about, and --single-transaction
+      // answers end of file with COMMIT. A cut in the middle of a row would
+      // usually raise an error instead and roll back, which is the easy case
+      // and proves nothing about this one.
+      const dumpPath = await stagedDumpPath(target);
+      const dump = await readFile(dumpPath, "utf8");
+      const copyAt = dump.indexOf("\nCOPY ");
+      expect(copyAt).toBeGreaterThan(0);
+      const terminator = dump.indexOf("\n\\.\n", copyAt);
+      expect(terminator).toBeGreaterThan(copyAt);
+      const cut = terminator + 4;
+      await writeFile(dumpPath, dump.slice(0, cut));
+      expect(cut).toBeLessThan((load as { dumpBytes: number }).dumpBytes);
+
+      const failure = await rejection(runRestore(staged, target));
+      const cause = (failure as PlanApplyError).cause;
+      expect(cause).toBeInstanceOf(RestoreHalfAppliedError);
+      const message = (cause as Error).message;
+      expect(message).toContain("HALF-RESTORED");
+      expect(message).toContain("reached the loader");
+      expect(message).toContain(safetyPath);
+      // AND NOT the sentence that would have been a lie.
+      expect(message).not.toContain("exactly as it was");
+      // The destroy is reported for what it is: dispatched, and NOT realised.
+      expect((failure as PlanApplyError).outcome.unrealised).toEqual(["destroy-schema"]);
+    });
+
+  itRestore("refuses when the dump cannot be read at all, and names the safety backup",
+    async () => {
+      const source = await makeInstall("srcunread");
+      await seed(source, ["Acme"]);
+      const target = await makeInstall("dstunread");
+      await seed(target, ["Was Here"]);
+
+      const work = await scratchDir("unread");
+      const archive = await realBackup(source, work);
+      const staged = await stageAndInspect(archive, target);
+      const safetyPath = safetyPathOf(staged.plan);
+
+      // Readable when the plan was made, unreadable when the step runs. Only
+      // the preamble reaches psql, which commits the DROP and exits 0 -- which
+      // used to surface as a bare accounting error with the database empty.
+      await chmod(await stagedDumpPath(target), 0o000);
+
+      const failure = await rejection(runRestore(staged, target));
+      const cause = (failure as PlanApplyError).cause;
+      expect(cause).toBeInstanceOf(RestoreHalfAppliedError);
+      expect((cause as Error).message).toContain(safetyPath);
+      expect(failure).toBeInstanceOf(PlanApplyError);
+      // The partial outcome travels, which an unwrapped PlanExceededError
+      // would not have done.
+      expect((failure as PlanApplyError).outcome.unrealised).toEqual(["destroy-schema"]);
+    });
+
+  // ===================================================================
+  // THE RECOVERY INSTRUCTIONS, RUN.
+  //
+  // THE THREE TESTS AROUND recoveryCommands ASSERT STRING CONTENTS AND THAT IS
+  // NOT ENOUGH -- the commands had never been executed, and they did not work:
+  // the safety backup's dump is a plain pg_dump with no --clean, so it cannot
+  // load into a database that still holds its schema, which is precisely the
+  // state this message is printed in. Typing the old form verbatim gave
+  // `ERROR: schema "drizzle" already exists`, exit 3, and an install still
+  // broken. So this one produces a real half-restored database, takes the
+  // commands off the error object, and RUNS THEM.
+  // ===================================================================
+  itRestore("prints commands that actually put a half-restored install back", async () => {
+    const source = await makeInstall("srcrecov");
+    await seed(source, ["Acme", "Globex"]);
+    const target = await makeInstall("dstrecov");
+    await seed(target, ["The Install To Get Back"]);
+    const before = await rowCounts(target.url);
+
+    const work = await scratchDir("recov");
+    const archive = await realBackup(source, work);
+    const staged = await stageAndInspect(archive, target);
+
+    // Half-restore it for real, by the measured route: a well-formed prefix,
+    // a clean end of file, and a COMMIT.
+    const dumpPath = await stagedDumpPath(target);
+    const dump = await readFile(dumpPath, "utf8");
+    const terminator = dump.indexOf("\n\\.\n", dump.indexOf("\nCOPY "));
+    expect(terminator).toBeGreaterThan(0);
+    await writeFile(dumpPath, dump.slice(0, terminator + 4));
+
+    const failure = await rejection(runRestore(staged, target));
+    const cause = (failure as PlanApplyError).cause;
+    expect(cause).toBeInstanceOf(RestoreHalfAppliedError);
+    const commands = (cause as RestoreHalfAppliedError).recoveryCommands;
+    expect(commands).toHaveLength(2);
+
+    // THE PREMISE, CHECKED. If the database were still fine there would be
+    // nothing for the recovery to do and this would pass for the wrong reason.
+    expect(await rowCounts(target.url)).not.toEqual(before);
+
+    // NOW TYPE THEM. The libpq environment stands in for the operator being on
+    // the box: the printed command addresses the database by NAME, on purpose,
+    // so a password never reaches a line somebody pastes into a bug report.
+    const env = { ...process.env, ...libpqEnvironment(target.url) };
+    for (const command of commands) {
+      const code = await new Promise<number>((resolve, reject) => {
+        const child = spawn("bash", ["-c", command], { stdio: ["pipe", "ignore", "pipe"], env });
+        let stderr = "";
+        child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+        child.on("error", reject);
+        child.on("close", (status) => {
+          if (status !== 0) reject(new Error(`${command}\nexited ${String(status)}: ${stderr}`));
+          else resolve(0);
+        });
+        // The 7z step prompts for the passphrase and reads it from stdin with
+        // no -p, exactly as the operator would type it. The psql step ignores
+        // stdin, and closing it is what stops it waiting on a terminal.
+        child.stdin.end(PASSPHRASE);
+      });
+      expect(code).toBe(0);
+    }
+
+    // AND THE INSTALL IS BACK, by exact row counts over a fresh connection.
+    expect(await rowCounts(target.url)).toEqual(before);
+    const recovered = createDatabase(target.url, 1);
+    try {
+      const rows = await recovered.db.execute<{ name: string }>(sql`SELECT name FROM companies`);
+      expect(rows.map((row) => row.name)).toEqual(["The Install To Get Back"]);
+    } finally {
+      await recovered.close();
+    }
+  });
+
   itRestore("is LOUD, and names the safety backup, when the rollback cannot be proved",
     async () => {
       const source = await makeInstall("srcloud");
@@ -1180,7 +1435,15 @@ describe("a load that fails", () => {
         shapeOf: async (db) => {
           call += 1;
           const real = await describeDatabaseShape(db);
-          return call === 1 ? real : { schemas: [...real.schemas], tables: real.tables - 1 };
+          if (call === 1) return real;
+          // The same schemas and the same table COUNT, with every table
+          // recreated -- which is precisely what a half-applied load leaves,
+          // and precisely what a count cannot see.
+          return {
+            schemas: [...real.schemas],
+            tables: real.tables,
+            tableIds: real.tableIds.map((id) => `9${id}`),
+          };
         },
       }));
       const cause = (failure as PlanApplyError).cause;
@@ -1188,7 +1451,7 @@ describe("a load that fails", () => {
       const message = (cause as Error).message;
       expect(message).toContain("HALF-RESTORED");
       expect(message).toContain(safetyPath);
-      for (const command of recoveryCommands(safetyPath, target.url)) {
+      for (const command of recoveryCommands(safetyPath, target.url, ["drizzle", "public"])) {
         expect(message).toContain(command);
       }
       // The safety backup the message names really is there and really opens.
@@ -1215,6 +1478,34 @@ describe("a load that fails", () => {
       expect(cause).toBeInstanceOf(RestoreHalfAppliedError);
       expect((cause as Error).message).toContain("the connection went away");
     });
+
+  // A SYNC THAT THROWS ON THE WAY DOWN IS STILL STARTED AGAIN, and it was not
+  // until this test existed: the stop sat OUTSIDE the try, so a throwing stop
+  // skipped the finally entirely and left the install silently receiving no
+  // mail -- the exact failure the comment beside it forbids, one line above the
+  // comment. Nothing else in the suite calls a sync that refuses to stop.
+  itRestore("restarts the mail sync even when stopping it threw", async () => {
+    const source = await makeInstall("srcsyncthrow");
+    await seed(source, ["Acme"]);
+    const target = await makeInstall("dstsyncthrow");
+    const work = await scratchDir("syncthrow");
+    const archive = await realBackup(source, work);
+    const staged = await stageAndInspect(archive, target);
+
+    const events: string[] = [];
+    const failure = await rejection(runRestore(staged, target, {
+      sync: {
+        stop: async () => {
+          events.push("stop");
+          throw new Error("the sync would not stop");
+        },
+        start: async () => { events.push("start"); },
+      },
+    }));
+    expect(failure.message).toContain("would not stop");
+    // Stopped, threw, and STARTED ANYWAY.
+    expect(events).toEqual(["stop", "start"]);
+  });
 
   itRestore("restarts the mail sync even when the restore fails", async () => {
     const source = await makeInstall("srcsync");
@@ -1349,13 +1640,23 @@ describe("apply cannot exceed the plan", () => {
       });
 
       const failure = await rejection(runRestore({ ...staged, plan: edited }, target));
-      expect(failure).toBeInstanceOf(PlanExceededError);
-      expect((failure as PlanExceededError).op).toBe("load-dump");
-      // AND THE NUMBER IN THE MESSAGE IS THE ONE THAT WAS MEASURED, not the one
-      // the exit code implied: the load succeeded, the tables were counted, and
-      // the count did not match what the plan published.
-      expect(failure.message).toContain(`described ${String(load.count + 1)}`);
-      expect(failure.message).toContain(`accounted for ${String(load.count)}`);
+      // NOT a PlanExceededError, and that is the repair. The database has just
+      // been replaced; the frame's accounting error would travel unwrapped,
+      // name no safety backup, and tell the operator "the plan said otherwise"
+      // about a restore that HAS HAPPENED.
+      expect(failure).not.toBeInstanceOf(PlanExceededError);
+      const cause = (failure as PlanApplyError).cause;
+      expect(cause).toBeInstanceOf(RestoreUnexpectedResultError);
+      const message = (cause as Error).message;
+      // THE NUMBER IS THE ONE THAT WAS MEASURED, not the one the exit code
+      // implied: the load committed, the tables were counted, and the count did
+      // not match what the plan published.
+      expect(message).toContain(`said ${String(load.count + 1)} table(s)`);
+      expect(message).toContain(`now holds ${String(load.count)}`);
+      expect(message).toContain("has HAPPENED");
+      expect(message).toContain(safetyPathOf(staged.plan));
+      // And the partial outcome travels with it.
+      expect((failure as PlanApplyError).outcome.unrealised).toEqual(["destroy-schema"]);
     });
 
   itRestore("gives each step reading rights over exactly the members it needs",

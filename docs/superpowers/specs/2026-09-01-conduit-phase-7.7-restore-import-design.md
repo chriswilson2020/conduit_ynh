@@ -97,8 +97,20 @@ the thing being previewed is destruction.
 2. **Upload the `.7z` and take the passphrase.** The upload is a credential store on disk the moment it lands — same discipline as the backup's temp file: `0600`, inside `$data_dir`, never `/tmp`, deleted on every exit path.
 3. **Decrypt and validate BEFORE touching anything.** Extract to a temp directory; read `manifest.json`; check the app version, the schema version and the migration journal position. **A backup from a NEWER Conduit than the running one is refused** — its dump may reference columns this code does not have. A backup from an OLDER one is accepted and migrated forward after load.
 4. **Take a safety backup**, using the same passphrase the operator just typed for the restore. They demonstrably have it, so this adds no new thing to lose. **If the safety backup fails, the restore does not start.**
-5. **Stop the mail sync** and refuse new writes.
-6. **Load the dump**, then the blobs, then `mail.key`.
+5. **Stop the mail sync** and refuse new writes. *(Corrected during 7.7 Task 2: the
+   sync is stopped **before** the safety backup, not after it -- a backup taken while
+   the second writer is running is an undo to a state that stopped being true a moment
+   later. **"Refuse new writes" is still unimplemented**: it has no home in the engine,
+   which cannot see a request, and it belongs to the routes task.)*
+6. **Load the blobs, then the dump, then `mail.key`.** *(Corrected during 7.7 Task 2.
+   This step originally read "load the dump, then the blobs, then `mail.key`", which
+   contradicted this document's own failure analysis below -- "database LAST, so a crash
+   mid-blob leaves a consistent database referencing files that exist". Blobs are
+   content-addressed and additive, so writing them first is safe and re-runnable.
+   `mail.key` stays **after** the database, and deliberately: it is a REPLACEMENT, so a
+   key installed before a load that then rolled back would strand every stored mail
+   password under a key no longer on disk -- the exact state the rollback exists to
+   prevent. The residual window is the mirror case, and is named in `services/restore.ts`.)*
 7. **Run migrations forward** if the backup's schema version is older.
 8. **Restart the sync. Invalidate every re-auth ticket** — the in-memory map dies with the process anyway, but say so rather than relying on it.
 

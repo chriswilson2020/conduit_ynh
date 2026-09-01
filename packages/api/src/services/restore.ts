@@ -54,11 +54,31 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 //   neither                                   0  half-applied
 //
 // Only the first cell is both safe and truthful, and the second is the trap:
-// an exit code of 0 over a database that kept its old contents. THAT IS WHY
-// THE POST-LOAD STATE IS MEASURED RATHER THAN INFERRED FROM AN EXIT CODE --
-// see loadDump, which counts the tables that actually exist and accounts for
-// them against the number the plan published. Never pg_stat_user_tables: its
-// estimates read identically before and after a full replacement.
+// an exit code of 0 over a database that kept its old contents.
+//
+// THE EXIT CODE IS LOAD-BEARING, AND SO IS EVERYTHING BESIDE IT. An earlier
+// version of this comment said "the post-load state is measured, never inferred
+// from an exit code", and that was FALSE TWICE OVER -- said plainly here
+// because a claim like it is exactly what stops the next reader looking.
+//
+//   - Dropping ON_ERROR_STOP made applyRestore RETURN SUCCESS over a load that
+//     failed and rolled back. The compensating "measurement" was a table count,
+//     and the table count MATCHES in that case -- it is the normal case for a
+//     restore. The flag is what catches it; nothing else was.
+//   - A count cannot see a half-applied load at all, because a half-applied
+//     load recreates exactly the schemas and tables it dropped.
+//
+// So the three instruments are separate and none is redundant:
+//
+//   THE FLAGS decide whether a failed statement rolls the transaction back.
+//   THE SOURCE decides whether psql was given the whole dump -- see runPsqlLoad,
+//     because a truncated stream is a CLEAN END OF FILE and end of file means
+//     COMMIT.
+//   THE IDENTITY of every table -- pg_class.oid, not a count -- decides, after
+//     a failure, whether the rollback actually held. See DatabaseShape.
+//
+// Never pg_stat_user_tables, whose estimates read identically before and after
+// a full replacement -- and, for exactly the same reason, never a table count.
 //
 // ================ THE ATOMIC ACT THE OPERATOR SEES AS TWO ==================
 //
@@ -126,6 +146,30 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 // here: this module applies a plan somebody else decided to apply. The routes
 // task owns both, owns binding a plan to the operator who uploaded it (see
 // IntakeSession's own note), and owns calling sweepAbandonedIntakes at boot.
+//
+// AND IT OWNS THE OTHER SECOND WRITER, which is not the sync. The spec's step 5
+// says "stop the mail sync AND REFUSE NEW WRITES"; only the first half exists,
+// here, and the second half has no home in a service that cannot see a request.
+// The argument is the one this module already makes: a restore is only true if
+// nothing else is writing, and an operator with a browser open in another tab
+// is exactly as much a second writer as the sync engine. Nothing implements it
+// today.
+//
+// TWO SMALLER THINGS THE ROUTES WILL TRIP OVER:
+//
+//   mail-crypto.ts's key cache is keyed by the PATH STRING it was given, not by
+//   a resolved path, whatever its own comment says -- so forgetMailKey only
+//   clears what an identical string put there. Pass config.mailKeyPath, the
+//   same value every other reader passes, or the invalidation silently misses.
+//
+//   countDumpTables is LEXICAL and describeDatabaseShape is CATALOGUE. They
+//   agree across all thirteen migrations this build ships, and they are not
+//   guaranteed to: a dump that ever carries a CREATE EXTENSION bringing its own
+//   tables would make a perfectly successful restore report
+//   RestoreUnexpectedResultError. That is the safe direction -- the database is
+//   whole and the message says the restore HAPPENED -- but it is a false alarm
+//   of the loudest kind, and the fix when it comes is to count what the dump
+//   creates the way postgres does rather than the way a reader does.
 //
 // A MIGRATION CANNOT HELP ANY OF THIS. Restore bookkeeping cannot live in a
 // database the restore replaces: a row written before the destruction is
@@ -252,11 +296,21 @@ export class RestoreLoadFailedError extends Error {
  * THE LOAD FAILED AND THE ROLLBACK COULD NOT BE PROVED. The worst outcome this
  * application can produce, and it is never silent.
  *
- * The message names the safety backup's path on disk and gives the exact two
+ * The message names the safety backup's path on disk and gives the exact
  * commands to restore it by hand, because the person reading it has a broken
- * install and no reason to trust the thing that broke it. A silent half-restore
- * is unreachable: every path out of a failed load throws one of this or
- * RestoreLoadFailedError, and the difference between them is a measurement.
+ * install and no reason to trust the thing that broke it. THE COMMANDS ARE RUN
+ * BY A TEST, not merely spelled by one: the first version of them could not
+ * work, because the safety backup's dump has no --clean and will not load over
+ * a schema that still exists.
+ *
+ * "EVERY PATH OUT OF A FAILED LOAD THROWS THIS OR RestoreLoadFailedError" IS
+ * WHAT THIS COMMENT USED TO CLAIM, AND THERE WERE TWO MORE. A dump that could
+ * not be read left only the DROP preamble to psql, which committed it and
+ * exited 0 -- and the accounting mismatch that followed travelled out as the
+ * frame's own PlanExceededError: unwrapped, naming no safety backup, over an
+ * empty database. And a load that committed something OTHER than what the
+ * preview described was the same shape. Both now belong to the load step:
+ * see RestoreUnexpectedResultError, and the source check in runPsqlLoad.
  */
 export class RestoreHalfAppliedError extends Error {
   constructor(
@@ -278,18 +332,110 @@ export class RestoreHalfAppliedError extends Error {
 }
 
 /**
- * WHAT THE DATABASE IS, MEASURED.
+ * THE DATABASE IS RESTORED AND mail.key IS NOT.
  *
- * The schema names and the exact number of ordinary and partitioned tables in
- * them. NOT pg_stat_user_tables, whose row estimates are collector statistics:
- * they are stale by construction and read identically before and after a full
- * replacement, so a restore verified with them would verify nothing.
+ * The one window this module's ordering cannot close, said out loud. mail.key
+ * is replaced AFTER the database commits, so that a failed load cannot strand
+ * every stored mail password under a key that is no longer on disk. The price
+ * is the mirror case: if the key write fails, or the process dies between the
+ * commit and the rename, the restored database's passwords are under the
+ * BACKUP's key while the OLD key is still on disk.
+ *
+ * Nothing is lost -- the key is in the archive that was just restored from --
+ * and the message says so, because the symptom otherwise is "no mail account
+ * will connect" and it points nowhere near the cause.
+ */
+export class RestoreMailKeyError extends Error {
+  constructor(readonly mailKeyPath: string, override readonly cause: unknown) {
+    super(
+      "the database was restored, but its mail encryption key could not be written to "
+      + `${mailKeyPath} (${cause instanceof Error ? cause.message : String(cause)}). The `
+      + "restored data is intact; stored mail passwords will not decrypt until mail.key is "
+      + "replaced with the one in the backup you restored from -- extract it with "
+      + "`7z x` and copy it into place, mode 0600.",
+    );
+    this.name = "RestoreMailKeyError";
+  }
+}
+
+/**
+ * THE LOAD COMMITTED, AND THE RESULT IS NOT WHAT THE PREVIEW DESCRIBED.
+ *
+ * A DIFFERENT STATE FROM THE OTHER TWO, and it needs its own name because the
+ * operator's next move is different. The transaction committed: the restore
+ * happened, the database is whole and self-consistent, and nothing is
+ * half-anything. What is wrong is that it does not match the plan they were
+ * shown -- more or fewer tables arrived than the dump said it would create.
+ *
+ * IT USED TO BE A PlanExceededError, and that was wrong twice over. The frame's
+ * accounting error travels UNWRAPPED, so the caller lost the partial outcome;
+ * and its message ("the plan said otherwise") describes a bug in a step, at a
+ * moment when the operator's database has just been replaced and what they need
+ * is the safety backup's path.
+ *
+ * The most likely cause is not damage: countDumpTables reads CREATE TABLE
+ * statements out of the SQL and describeDatabaseShape counts what postgres
+ * ended up with, and the day a dump carries a CREATE EXTENSION that brings its
+ * own tables, or a partition parent counted differently, the two disagree about
+ * a restore that worked perfectly. So this says what happened rather than
+ * accusing anyone, and still names the way back.
+ */
+export class RestoreUnexpectedResultError extends Error {
+  constructor(
+    readonly plannedTables: number,
+    readonly actualTables: number,
+    readonly safetyBackupPath: string | null,
+    readonly recoveryCommands: readonly string[],
+  ) {
+    super(
+      "the backup loaded and was committed, but the result is not what the preview "
+      + `described: it said ${String(plannedTables)} table(s) and the database now holds `
+      + `${String(actualTables)}. The restore has HAPPENED -- check the data before using `
+      + "this install."
+      + (safetyBackupPath === null ? ""
+        : ` A safety backup of the previous state is at ${safetyBackupPath}. To go back:\n`
+          + recoveryCommands.map((line) => `  ${line}`).join("\n")),
+    );
+    this.name = "RestoreUnexpectedResultError";
+  }
+}
+
+/**
+ * WHAT THE DATABASE IS, MEASURED -- AND THE MEASUREMENT IS AN IDENTITY, NOT A
+ * COUNT.
+ *
+ * A COUNT CANNOT SEE THE FAILURE THIS EXISTS FOR, and that was measured rather
+ * than argued. A half-applied load recreates exactly the schemas and tables it
+ * dropped, because the backup and the install share a schema -- so "two
+ * schemas, twenty-seven tables" reads identically before and after. Measured on
+ * the deploy target, cutting a dump at a clean EOF inside its COPY data:
+ *
+ *   psql exit ................... 0        <- it COMMITTED
+ *   the install's own table ..... destroyed
+ *   rows loaded ................. 21 of 500
+ *   table count before / after .. 1 / 1     <- a count says NOTHING HAPPENED
+ *   pg_class oids before/after .. DIFFERENT <- an identity says what did
+ *
+ * So `tableIds` is the load-bearing field. A rolled-back DROP leaves the
+ * original catalogue rows untouched and their oids identical; a committed one
+ * recreates every table with a new oid. It costs one catalogue query -- no
+ * count(*) over the operator's data -- and it is exact.
+ *
+ * The same argument this module makes against pg_stat_user_tables applies
+ * verbatim to a table count. Both are summaries, and a summary of a
+ * replacement looks like the thing it replaced.
  */
 export interface DatabaseShape {
   /** Every non-system schema, sorted. */
   readonly schemas: readonly string[];
   /** Ordinary and partitioned tables across those schemas. */
   readonly tables: number;
+  /**
+   * Every table's catalogue identity (pg_class.oid), sorted.
+   *
+   * THE FIELD THAT DISTINGUISHES A ROLLBACK FROM A REPLACEMENT. See above.
+   */
+  readonly tableIds: readonly string[];
 }
 
 /**
@@ -305,23 +451,38 @@ export async function describeDatabaseShape(db: Database): Promise<DatabaseShape
     WHERE left(nspname, 3) <> 'pg_' AND nspname <> 'information_schema'
     ORDER BY nspname
   `);
-  const tables = await db.execute<{ count: string }>(sql`
-    SELECT count(*)::text AS count FROM pg_class c
+  const tables = await db.execute<{ id: string }>(sql`
+    SELECT c.oid::text AS id FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind IN ('r', 'p')
       AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+    ORDER BY c.oid
   `);
+  const tableIds = tables.map((row) => row.id);
   return {
     schemas: schemas.map((row) => row.nspname),
-    tables: Number(tables[0]?.count ?? "0"),
+    tables: tableIds.length,
+    tableIds,
   };
 }
 
-/** Whether two measurements describe the same database. */
+/**
+ * Whether two measurements describe the same database.
+ *
+ * ONE COMPARISON FOR BOTH LISTS, and that is a repair rather than tidiness. The
+ * first version wrote the length check and the element check as separate
+ * clauses per list, and deleting the LENGTH clause changed nothing any test
+ * could see: `every` is vacuously true where one list is a PREFIX of the other,
+ * so ["public"] and ["public", "leftover"] compared equal. Two clauses, each
+ * masking the other's absence -- the fourth time that pattern has been found on
+ * this project. There is now one helper and one place for it to be wrong.
+ */
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((value, at) => b[at] === value);
+}
+
 export function sameShape(a: DatabaseShape, b: DatabaseShape): boolean {
-  return a.tables === b.tables
-    && a.schemas.length === b.schemas.length
-    && a.schemas.every((name, at) => b.schemas[at] === name);
+  return sameList(a.schemas, b.schemas) && sameList(a.tableIds, b.tableIds);
 }
 
 /**
@@ -368,7 +529,50 @@ export async function psqlVersion(): Promise<string | null> {
 }
 
 /**
+ * What psql did, and -- separately -- whether it was given the whole dump.
+ *
+ * THE SECOND FIELD IS NOT A DETAIL. See runPsqlLoad.
+ */
+interface PsqlLoadResult {
+  code: number;
+  stderr: string;
+  /**
+   * Bytes of the dump that actually reached psql's stdin.
+   *
+   * THE ONE THE CALLER DECIDES ON, against the size the plan published.
+   */
+  streamedBytes: number;
+  /**
+   * The stream's own failure, if it had one. Null when it ended by itself.
+   *
+   * DIAGNOSTIC, NOT A GUARD. A stream that fails delivers fewer bytes, so this
+   * never fires where `streamedBytes` does not -- it exists to say WHY the
+   * bytes stopped, in the message somebody reads at the worst moment.
+   */
+  streamError: Error | null;
+}
+
+/**
  * Run psql over the preamble and then the dump, as one transaction.
+ *
+ * THE EXIT CODE IS NOT ENOUGH, AND THIS IS THE WORST BUG THIS MODULE HAS HAD.
+ * psql's stdin is a pipe. A dump that stops early -- a read error, a truncated
+ * staged file, a stream destroyed by a failed pipeline -- reaches psql as a
+ * CLEAN END OF FILE, and `--single-transaction` responds to end of file by
+ * issuing COMMIT. Measured on the deploy target, cutting a real dump inside its
+ * COPY data and feeding it to the exact command this module runs:
+ *
+ *   psql exit ............... 0
+ *   the install's own table . destroyed
+ *   rows loaded ............. 21 of 500, committed
+ *
+ * An earlier version of this function wrote `void pipeline(...).catch(() => {})`
+ * and said in a comment that the exit code was the outcome. It is not: the exit
+ * code cannot distinguish "the dump ended" from "the dump was cut off", because
+ * to psql those are the same event. So the SOURCE is measured too -- how many
+ * bytes reached the child, and whether the stream failed -- and the caller
+ * compares that against the size the plan published. A load that was not given
+ * the whole dump FAILED, whatever psql says about it.
  *
  * The password rides in the environment, never in argv -- see
  * backup.ts's libpqEnvironment for why, and note that the process environment
@@ -379,7 +583,7 @@ async function runPsqlLoad(options: {
   databaseUrl: string;
   preamble: string;
   dump: Readable;
-}): Promise<{ code: number; stderr: string }> {
+}): Promise<PsqlLoadResult> {
   return await new Promise((resolve, reject) => {
     const child = spawn("psql", psqlLoadArgs(), {
       stdio: ["pipe", "ignore", "pipe"],
@@ -393,17 +597,53 @@ async function runPsqlLoad(options: {
       errors.push(chunk);
     });
     child.on("error", () => { reject(new RestoreToolMissingError("psql", PSQL_PACKAGE)); });
-    child.on("close", (code) => {
+
+    let streamedBytes = 0;
+    let streamError: Error | null = null;
+    let streamSettled = false;
+    let closed: { code: number } | null = null;
+    // BOTH HALVES MUST HAVE SETTLED. The wait is an ORDERING GUARANTEE FOR THE
+    // MESSAGE, not a guard, and mutation testing says so: removing it leaves
+    // every test passing, because psql closes only after reading to end of file
+    // and the counter is therefore already final. What it does buy is that
+    // `streamError` is populated before the result is read, so the sentence an
+    // operator sees at the worst possible moment says WHY the bytes stopped
+    // rather than only that they did. Kept for that, and labelled rather than
+    // left looking like a second guard.
+    const finish = (): void => {
+      if (closed === null || !streamSettled) return;
       resolve({
-        code: code ?? -1,
+        code: closed.code,
         stderr: Buffer.concat(errors).toString("utf8").slice(0, STDERR_CAP_BYTES),
+        streamedBytes,
+        streamError,
       });
-    });
+    };
+
+    child.on("close", (code) => { closed = { code: code ?? -1 }; finish(); });
     child.stdin.write(options.preamble);
-    // A psql that exits early makes this reject with EPIPE, which is not the
-    // outcome -- the exit code is. The close handler above is the only thing
-    // that resolves.
-    void pipeline(options.dump, child.stdin).catch(() => { /* see above */ });
+    // BOTH HALVES ARE WAITED FOR, and the stream's outcome is KEPT. A psql that
+    // exits early makes this reject with EPIPE -- that one is not interesting,
+    // because the exit code is non-zero and says so. The interesting rejection
+    // is the other direction: a source that failed while psql was perfectly
+    // happy, which the caller can only see from here.
+    void pipeline(
+      options.dump,
+      async function* count(chunks: AsyncIterable<Buffer>) {
+        for await (const chunk of chunks) {
+          streamedBytes += chunk.length;
+          yield chunk;
+        }
+      },
+      child.stdin,
+    ).then(
+      () => { streamSettled = true; finish(); },
+      (error: unknown) => {
+        streamError = error instanceof Error ? error : new Error(String(error));
+        streamSettled = true;
+        finish();
+      },
+    );
   });
 }
 
@@ -552,6 +792,16 @@ export interface DestroySchemaEffect extends PlannedEffect {
 
 export interface LoadDumpEffect extends PlannedEffect {
   readonly op: "load-dump";
+  /**
+   * How many bytes of dump the load must deliver to psql.
+   *
+   * ON THE EFFECT BECAUSE THE HANDLER CANNOT ASK. A staged member is reachable
+   * only through a ref, and a ref carries no size -- so without this the step
+   * has no way to tell a dump that ENDED from one that was CUT OFF, and psql
+   * cannot tell it either: both arrive as a clean end of file, and
+   * `--single-transaction` commits on end of file. See runPsqlLoad.
+   */
+  readonly dumpBytes: number;
 }
 
 export interface ReplaceMailKeyEffect extends PlannedEffect {
@@ -923,8 +1173,10 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
       unit: "table",
       destroys: false,
       detail: `${String(dumpTables)} table(s) from the backup replace what was there. The `
-        + "tables that arrive are counted afterwards rather than taken from an exit code.",
+        + `whole ${String(dumpMember.bytes)} bytes must reach the loader, and the tables that `
+        + "arrive are counted afterwards rather than taken from an exit code.",
       sources: [dumpMember.ref],
+      dumpBytes: dumpMember.bytes,
     },
     {
       op: "replace-mail-key",
@@ -1156,8 +1408,15 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
         // blob. Writing to a temp sibling and renaming means a crash never
         // leaves a partial file under a digest name that claims to be whole.
         const temp = `${target}.restoring-${process.pid}`;
-        await pipeline(await ctx.open(ref), createWriteStream(temp, { mode: 0o600 }));
-        await rename(temp, target);
+        // REMOVED ON EVERY EXIT PATH, which is the spine's rule for anything
+        // this writes and not a nicety: a failed rename would otherwise leave a
+        // whole blob under a name nothing will ever look at or clean up.
+        try {
+          await pipeline(await ctx.open(ref), createWriteStream(temp, { mode: 0o600 }));
+          await rename(temp, target);
+        } finally {
+          await rm(temp, { force: true });
+        }
         ctx.spend(1);
       }
     },
@@ -1205,38 +1464,76 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
         dump: await ctx.open(ref),
       });
 
-      if (result.code !== 0) {
-        // THE EXIT CODE SAYS THE LOAD FAILED. WHAT HAPPENED IS MEASURED.
+      // THE LOAD FAILED IF psql SAID SO **OR** IF THE DUMP DID NOT ALL ARRIVE,
+      // and the second half is not redundant with the first. psql cannot tell a
+      // dump that ended from one that was cut off -- both are a clean end of
+      // file, and --single-transaction COMMITS on end of file. Measured: a dump
+      // cut inside its COPY data gives exit 0 over a database whose own tables
+      // have been dropped and 21 of 500 rows committed in their place. So the
+      // source is checked against the size the plan published, and a stream
+      // that failed is a failure whatever the child reported.
+      // ONE TEST OF IT, NOT TWO. An earlier version asked "did the stream fail
+      // OR did it come up short", and mutation testing found the first half was
+      // not independently observable: a stream that fails delivers fewer bytes,
+      // so the SAME fixture satisfied both and deleting either changed nothing.
+      // Two clauses that cannot be told apart are the two-layer mask this
+      // project keeps paying for, so there is one clause. `streamError` is kept
+      // for the MESSAGE, where it says why the bytes stopped, and decides
+      // nothing.
+      const delivered = result.streamedBytes === effect.dumpBytes;
+      if (result.code !== 0 || !delivered) {
+        // WHAT ACTUALLY HAPPENED IS MEASURED, and by IDENTITY rather than by
+        // count -- see DatabaseShape. A half-applied load recreates exactly the
+        // schemas and table count it dropped, so a count would report "nothing
+        // was replaced" over a database whose rows are gone.
         let after: DatabaseShape | null = null;
-        let why = "";
+        let unmeasurable = "";
         try {
           after = await shapeOf(db);
         } catch (error) {
-          why = `the database could not be measured afterwards: ${errorText(error)}`;
+          unmeasurable = `the database could not be measured afterwards: ${errorText(error)}`;
         }
-        if (before !== null && after !== null && sameShape(before, after)) {
+        const why = result.code !== 0
+          ? `psql exited ${String(result.code)}`
+          : result.streamError !== null
+            ? `the backup's database file could not be read: ${result.streamError.message}`
+            : `only ${String(result.streamedBytes)} of ${String(effect.dumpBytes)} bytes of the `
+              + "backup's database reached the loader, so psql was given a truncated file and "
+              + "committed what it had";
+        if (unmeasurable === "" && before !== null && after !== null && sameShape(before, after)) {
           throw new RestoreLoadFailedError(
             "the backup's database could not be loaded, and the whole attempt was rolled "
             + "back. This install is exactly as it was before you started: nothing was "
-            + "destroyed and nothing was replaced.",
+            + `destroyed and nothing was replaced. (${why})`,
             result.stderr,
           );
         }
         throw new RestoreHalfAppliedError(
           safetyBackupPath,
-          recoveryCommands(safetyBackupPath, databaseUrl),
-          why !== "" ? why
-            : `it held ${describeShape(before)} before the load and ${describeShape(after)} now`,
+          recoveryCommands(safetyBackupPath, databaseUrl, schemasToClear(before, after)),
+          unmeasurable !== "" ? `${why}; ${unmeasurable}`
+            : `${why}; it held ${describeShape(before)} before the load and `
+              + `${describeShape(after)} now`,
         );
       }
 
-      // THE POST-LOAD STATE IS MEASURED, NOT INFERRED FROM AN EXIT CODE. One
-      // cell of the matrix at the top of this file reports exit 0 over a
-      // rolled-back load, and this is what would catch it: the tables that
-      // actually exist, accounted against the number the plan published from
-      // the dump itself. A mismatch is a PlanExceededError out of the frame.
+      // THE LOAD COMMITTED. What arrived is measured -- never taken from the
+      // exit code, which is worth saying precisely because the exit code is
+      // ALSO load-bearing above: neither alone is enough.
+      //
+      // A COUNT THAT DISAGREES IS NOT AN ACCOUNTING BUG, so it is not left to
+      // the frame. The database has already been replaced; a PlanExceededError
+      // out of the executor would travel unwrapped, name no safety backup, and
+      // tell the operator "the plan said otherwise" about a restore that has
+      // happened. See RestoreUnexpectedResultError.
       const loaded = await shapeOf(db);
-      ctx.spend(loaded.tables);
+      if (loaded.tables !== effect.count) {
+        throw new RestoreUnexpectedResultError(
+          effect.count, loaded.tables, safetyBackupPath,
+          recoveryCommands(safetyBackupPath, databaseUrl, [...loaded.schemas]),
+        );
+      }
+      ctx.spend(effect.count);
     },
 
     "replace-mail-key": async (effect, ctx) => {
@@ -1249,9 +1546,25 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
       // filesystem is atomic on the deploy target, which is why the temp file
       // is a sibling rather than in a temp directory.
       const temp = `${mailKeyPath}.restoring-${process.pid}`;
-      await writeFile(temp, bytes, { mode: 0o600 });
-      await chmod(temp, 0o600);
-      await rename(temp, mailKeyPath);
+      try {
+        await writeFile(temp, bytes, { mode: 0o600 });
+        await chmod(temp, 0o600);
+        await rename(temp, mailKeyPath);
+      } catch (error) {
+        // THE RESIDUAL WINDOW, NAMED RATHER THAN LEFT TO BE FOUND. The database
+        // has already committed by the time this runs -- that ordering is
+        // deliberate, so that a failed LOAD cannot strand the passwords -- which
+        // means a failure HERE leaves the mirror image: a restored database
+        // whose stored mail passwords are encrypted under the backup's key,
+        // and the OLD key still on disk. Nothing is lost, and the way out is
+        // short, but an operator who is not told would hunt a connection bug.
+        throw new RestoreMailKeyError(mailKeyPath, error);
+      } finally {
+        // A 32-BYTE AES KEY IS NOT LEFT LYING ABOUT under a name nothing
+        // cleans up. Same rule as the blobs above, and more sharply: this one
+        // is a credential.
+        await rm(temp, { force: true });
+      }
       // THIS PROCESS CACHES THE KEY AND HAS NO INVALIDATION OF ITS OWN. Without
       // this, every mail password would be decrypted with the key this process
       // happened to load before the restore.
@@ -1278,8 +1591,11 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
     },
   };
 
-  await sync?.stop();
+  // INSIDE THE `try`, AND THAT IS THE WHOLE POINT OF THE `finally`. With the
+  // stop outside it, a sync that threw on the way down was never started again
+  // -- the exact failure the comment below forbids, one line above the comment.
   try {
+    await sync?.stop();
     return await applyPlan<RestoreEffect, RestoreCarrier>({
       plan, reader: payload, handlers, carrier,
     });
@@ -1328,15 +1644,51 @@ function describeShape(shape: DatabaseShape | null): string {
  * terminal and then into a bug report.
  */
 export function recoveryCommands(
-  safetyBackupPath: string | null, databaseUrl: string,
+  safetyBackupPath: string | null,
+  databaseUrl: string,
+  schemas: readonly string[] = [],
 ): string[] {
   if (safetyBackupPath === null) return [];
   const database = libpqEnvironment(databaseUrl).PGDATABASE ?? "conduit";
   const dir = `${safetyBackupPath}.recovered`;
+  // THE DROPS ARE THE HALF THAT WAS MISSING, and without them the printed
+  // command DOES NOT WORK -- proved by running it. The safety backup's dump is
+  // a plain pg_dump with no --clean and no --if-exists (services/backup.ts
+  // explains why: a dump that drops before it creates destroys a database when
+  // it is run by mistake), so it cannot load into a database that still holds
+  // its schema -- which is exactly the state this message describes. Typing the
+  // old two-line form verbatim gave `ERROR: schema "drizzle" already exists`,
+  // exit 3, and an install still broken.
+  //
+  // ONE psql INVOCATION, so the drops and the load are ONE TRANSACTION. psql
+  // applies --single-transaction across every -c and -f it is given, in order,
+  // which is the same atomic act the engine performs -- an operator who runs
+  // this and has it fail is left where they were rather than one step worse.
+  //
+  // Identifiers are double-quoted for SQL and contain no single quote, so each
+  // -c argument survives the shell's single quotes unescaped.
+  const drops = [...new Set(schemas)]
+    .map((schema) => `-c 'DROP SCHEMA IF EXISTS "${schema.replace(/"/g, '""')}" CASCADE' `)
+    .join("");
   return [
     `7z x -o${dir} -- ${safetyBackupPath}`,
-    `psql --single-transaction -v ON_ERROR_STOP=1 -d ${database} -f ${dir}/database.sql`,
+    `psql --single-transaction -v ON_ERROR_STOP=1 -d ${database} `
+    + `${drops}-c 'CREATE SCHEMA IF NOT EXISTS "public"' -f ${dir}/database.sql`,
   ];
+}
+
+/**
+ * Which schemas the printed recovery has to clear out of the way.
+ *
+ * THE UNION OF BEFORE AND AFTER, because either may be what is on the disk when
+ * somebody types the command: the install's own schemas if the drop did not
+ * commit, and the backup's if it did. Dropping one that is not there is a
+ * no-op; failing to drop one that is stops the recovery dead.
+ */
+function schemasToClear(
+  before: DatabaseShape | null, after: DatabaseShape | null,
+): string[] {
+  return [...new Set([...(before?.schemas ?? []), ...(after?.schemas ?? [])])].sort();
 }
 
 function errorText(error: unknown): string {
