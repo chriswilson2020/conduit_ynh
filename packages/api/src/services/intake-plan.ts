@@ -3,6 +3,7 @@ import type { Readable } from "node:stream";
 import type {
   PlanEffectView, PlanFindingView, PlanKind, PlanRefusalView, PlanSourceView, PlanView,
 } from "@conduit/shared";
+import { IntakeRefError } from "./intake.js";
 import type { IntakeFile, StagedMemberRef, StagedPayload, StagedReader } from "./intake.js";
 
 // THE SHARED SPINE'S LAST TWO STAGES: THE PLAN, AND THE FRAME APPLY RUNS IN.
@@ -32,8 +33,19 @@ import type { IntakeFile, StagedMemberRef, StagedPayload, StagedReader } from ".
 //      This is what makes the preview honest about QUANTITY -- 200,000 rows is
 //      one effect with a count, and it cannot be applied as 200,001, nor as
 //      199,999 without the mismatch being thrown.
+//
+//      IT BINDS QUANTITY AND NEVER IDENTITY, and that is said plainly rather
+//      than left to be inferred. An effect declaring "3 companies created" is
+//      satisfied by a handler that DELETES THREE DEALS and spends 3 -- measured,
+//      not theorised. The count says how much; nothing here says what. Mechanism
+//      2 is the only thing that constrains what a step touches, and it
+//      constrains reads, not writes.
 //   4. A REFUSAL PLAN CANNOT BE DISPATCHED AT ALL. A corrupt archive and a
 //      newer schema produce plans, not exceptions, and those plans are inert.
+//   5. THE PLAN IS FROZEN AND ITS EFFECTS ARE COPIES. `readonly` is compile-time
+//      only, and until newPlan froze them a caller who kept the array it passed
+//      in could push onto it after the page had rendered the preview: one
+//      harmless row previewed, "DROP EVERYTHING" applied. See newPlan.
 //
 // WHAT IS NOT ENFORCED, SAID HERE RATHER THAN LEFT TO BE FOUND. TypeScript has
 // no capability-safe module system: a handler that imported `node:fs` could
@@ -49,7 +61,9 @@ import type { IntakeFile, StagedMemberRef, StagedPayload, StagedReader } from ".
 // types:
 //
 //   A PLAN IS A SNAPSHOT, NOT A LEASE. What it guarantees is that apply does
-//   what the plan says -- not that the plan is still true of the database. An
+//   what the plan says -- not that the plan is still true of the database. The
+//   value itself is frozen, so it cannot change; the world it was measured
+//   against can. An
 //   inspect that counted rows, or checked a CSV row against existing records
 //   for duplicates, read a database that can change before apply runs. For
 //   restore that is harmless: the row counts are there so an operator sees what
@@ -58,15 +72,28 @@ import type { IntakeFile, StagedMemberRef, StagedPayload, StagedReader } from ".
 //   duplicate in the meantime is inserted anyway. IntakeSessionStore's TTL is
 //   what bounds the window; it does not close it.
 //
-//   TWO EFFECTS CAN BE ONE ATOMIC ACT, AND THE FRAME DOES NOT KNOW IT. Restore
-//   has to drop the schema and load the dump inside ONE psql transaction, but
-//   the operator has to SEE those as two things -- what is destroyed, and what
-//   replaces it. The frame does not need to grow for that: the destroy step
-//   puts its SQL preamble on the carrier and the load step runs psql over both,
-//   so both effects dispatch, both account, and the atomicity lives inside the
-//   child process where it belongs. Worth knowing that an effect may therefore
-//   be PREPARATORY -- accounted for at its own step, visible in the world at a
-//   later one -- rather than discovering it halfway through writing restore.
+//   TWO EFFECTS CAN BE ONE ATOMIC ACT. Restore has to drop the schema and load
+//   the dump inside ONE psql transaction, but the operator has to SEE those as
+//   two things -- what is destroyed, and what replaces it. The mechanism is the
+//   carrier: the destroy step leaves its SQL preamble on it and the load step
+//   runs psql over both, so the atomicity lives inside the child process where
+//   it belongs. But the VOCABULARY had to grow, and `realisedBy` is it -- three
+//   things follow from a preparatory effect that the carrier alone does not
+//   answer, all of them cheaper now than after restore is written on top:
+//
+//     - its accounting is vacuous. `spent === count` is satisfied before the
+//       work is attempted, so the one effect marked `destroys: true` that
+//       matters most is the one whose accounting means nothing;
+//     - the outcome would be wrong on failure. Anything reading `dispatched`
+//       after a mid-plan throw would report the destroy as having happened when
+//       the transaction rolled it back -- reporting inside the blast radius the
+//       spec calls the worst outcome this app can produce;
+//     - nothing paired a preparation with its consumer, so a preamble could sit
+//       unused while the plan reported success.
+//
+//   The field answers all three: the executor refuses a plan whose preparation
+//   has no later consumer, and ApplyOutcome separates `dispatched` from
+//   `realised`.
 
 /**
  * ONE THING APPLY WILL DO, server-side.
@@ -85,6 +112,28 @@ export interface PlannedEffect extends PlanEffectView {
    * effect with no sources gets a context whose `open` refuses every ref.
    */
   readonly sources?: readonly StagedMemberRef[];
+  /**
+   * The `op` of the LATER effect that realises this one, when this effect only
+   * PREPARES work rather than doing it.
+   *
+   * THIS EXISTS BECAUSE A PREPARATORY EFFECT'S ACCOUNTING IS VACUOUS, and the
+   * case that needs it is the most dangerous one in the product. Restore must
+   * drop the schema and load the dump inside ONE psql transaction, so the
+   * destroy step can only leave its SQL preamble on the carrier for the load
+   * step to run. It therefore satisfies `spent === count` BEFORE anything has
+   * been destroyed -- the one effect marked `destroys: true` that matters most
+   * is the one whose accounting means nothing, and without this field nothing
+   * in the types would tell a reviewer which `spend` calls are real.
+   *
+   * Naming the consumer buys two things the executor enforces. A plan whose
+   * preparation has no later consumer is REFUSED before anything dispatches, so
+   * a preamble cannot be left sitting unused while the plan reports success.
+   * And ApplyOutcome can separate DISPATCHED from REALISED, so a failure part
+   * way through does not report a destruction that the transaction rolled back
+   * -- reporting inside the silent-half-restore blast radius is the worst thing
+   * this frame could get wrong.
+   */
+  readonly realisedBy?: string;
 }
 
 /**
@@ -157,6 +206,12 @@ export interface ApplyContext<C> {
    * count when the handler returns, so a step that inserts more rows than the
    * preview promised fails at the moment it exceeds it, and one that inserts
    * fewer fails when it finishes. Call it with what was actually done.
+   *
+   * IT BINDS QUANTITY, NEVER IDENTITY, and the limit is stated here because a
+   * reader would otherwise infer more than it gives. An effect declaring
+   * "3 companies created" is satisfied by a handler that deletes three deals
+   * and spends 3 -- measured, not theorised. What a step READS is constrained,
+   * by `sources`; what it WRITES is not, and no arithmetic could constrain it.
    */
   spend: (n: number) => void;
 }
@@ -179,12 +234,62 @@ export type EffectHandlers<E extends PlannedEffect, C> = {
 
 /** What the executor did, for the log and for the tests. */
 export interface ApplyOutcome {
-  /** How many effects were dispatched. Always equal to plan.effects.length. */
+  /**
+   * How many effects were dispatched -- their handler was called and returned.
+   *
+   * NOT THE SAME AS "HAPPENED", which is why `realised` exists beside it.
+   */
   readonly dispatched: number;
-  /** The total of every `spend`, across every effect. */
+  /**
+   * How many of those are actually in the world.
+   *
+   * A PREPARATORY EFFECT IS NOT REALISED UNTIL ITS CONSUMER COMPLETES. On a
+   * plan that ran to the end these are equal, because the executor refuses a
+   * plan whose preparation has no consumer. On a FAILURE they are not, and the
+   * difference is the whole point: a restore that dispatched `destroy-schema`
+   * and then failed in `load-dump` destroyed nothing, because the destruction
+   * was a preamble inside the transaction that rolled back.
+   */
+  readonly realised: number;
+  /**
+   * The total of every `spend`, across every effect.
+   *
+   * IT COUNTS ACCOUNTING, NOT REALISATION, and it counts QUANTITY, NOT
+   * IDENTITY -- see ApplyContext.spend.
+   */
   readonly spent: number;
   /** The ids of every member that was opened, in the order they were opened. */
   readonly opened: readonly string[];
+  /** The ops of the effects that dispatched but are not realised, in plan order. */
+  readonly unrealised: readonly string[];
+}
+
+/**
+ * A handler failed, and this is what had happened when it did.
+ *
+ * ONLY THE HANDLER'S OWN FAILURES. The frame's refusals -- PlanExceededError
+ * and services/intake.ts's IntakeRefError -- travel unwrapped, because "the
+ * step exceeded its plan" is a different category from "the work failed" and a
+ * caller has to be able to act on the difference.
+ *
+ * THE ERROR CARRIES THE PARTIAL OUTCOME BECAUSE THE ALTERNATIVE IS A LOG THAT
+ * LIES. Without it a caller catching a mid-plan failure has no honest account
+ * of how far the run got, and the temptation is to infer it from the plan --
+ * which would report a destruction the transaction rolled back. `cause` is the
+ * handler's own error, unwrapped, so the caller's rollback and its own error
+ * handling are unaffected; the message quotes it so a `toThrow` on the original
+ * text still matches.
+ */
+export class PlanApplyError extends Error {
+  constructor(
+    readonly op: string,
+    readonly outcome: ApplyOutcome,
+    override readonly cause: unknown,
+  ) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`the ${op} step failed: ${detail}`);
+    this.name = "PlanApplyError";
+  }
 }
 
 export interface ApplyPlanOptions<E extends PlannedEffect, C> {
@@ -234,8 +339,38 @@ export async function applyPlan<E extends PlannedEffect, C>(
     );
   }
 
+  // A PREPARATION WITH NO CONSUMER IS A MALFORMED PLAN, and it is refused
+  // BEFORE anything dispatches. Without this an effect could leave its work on
+  // the carrier for a step that is not in the plan -- a restore's DROP preamble
+  // assembled and never run -- and the plan would still report success.
+  plan.effects.forEach((effect, index) => {
+    if (effect.realisedBy === undefined) return;
+    const consumer = plan.effects.findIndex(
+      (later, at) => at > index && later.op === effect.realisedBy,
+    );
+    if (consumer === -1) {
+      throw new PlanRefusedError(
+        "unrealised-preparation",
+        `the ${effect.op} step only prepares work for ${JSON.stringify(effect.realisedBy)}, `
+        + "and no later effect performs it",
+      );
+    }
+  });
+
   const opened: string[] = [];
   let spentTotal = 0;
+  let dispatched = 0;
+  // Every effect that has dispatched, in plan order, with the op it is waiting
+  // on. An entry stays here until that op completes.
+  const awaiting: { op: string; realisedBy: string }[] = [];
+  /** The outcome as it stands right now -- for the error, and for the return. */
+  const snapshot = (): ApplyOutcome => ({
+    dispatched,
+    realised: dispatched - awaiting.length,
+    spent: spentTotal,
+    opened: [...opened],
+    unrealised: awaiting.map((entry) => entry.op),
+  });
 
   for (const effect of plan.effects) {
     const allowed = new Set<StagedMemberRef>(effect.sources ?? []);
@@ -305,6 +440,19 @@ export async function applyPlan<E extends PlannedEffect, C>(
     }
     try {
       await handler(effect, ctx);
+    } catch (error) {
+      live = false;
+      // THE FRAME'S OWN REFUSALS ARE NOT HANDLER FAILURES AND ARE NOT WRAPPED.
+      // "This step read a member its effect does not name" is a bug in the
+      // step, in a category of its own, and a caller must be able to tell it
+      // apart from "the load failed". Wrapping them would also hide the shape
+      // the containment tests and the mutation set assert on.
+      if (error instanceof PlanExceededError || error instanceof IntakeRefError) throw error;
+      // Everything else is the handler's own failure, and THE PARTIAL OUTCOME
+      // TRAVELS WITH IT. `spent` for this effect is deliberately NOT added: the
+      // step did not finish, so what it accounted for is not an account of
+      // anything.
+      throw new PlanApplyError(effect.op, snapshot(), error);
     } finally {
       live = false;
     }
@@ -317,9 +465,18 @@ export async function applyPlan<E extends PlannedEffect, C>(
       );
     }
     spentTotal += spent;
+    dispatched += 1;
+    // This effect realises every earlier preparation that named its op, and is
+    // itself unrealised until its own consumer runs.
+    for (let at = awaiting.length - 1; at >= 0; at -= 1) {
+      if (awaiting[at]?.realisedBy === effect.op) awaiting.splice(at, 1);
+    }
+    if (effect.realisedBy !== undefined) {
+      awaiting.push({ op: effect.op, realisedBy: effect.realisedBy });
+    }
   }
 
-  return { dispatched: plan.effects.length, spent: spentTotal, opened };
+  return snapshot();
 }
 
 /**
@@ -380,23 +537,60 @@ export interface NewPlanInput<E extends PlannedEffect> {
  * refused" as a VALUE -- no archive extracted, no database touched, nothing
  * destroyed to find out.
  */
+/**
+ * One effect, copied and frozen, `sources` included.
+ *
+ * THE ARRAY HAS TO BE FROZEN SEPARATELY. Object.freeze is shallow, so an effect
+ * frozen without this keeps a live `sources` array -- and a step's reading
+ * rights are exactly that array, so a caller who could push into it could give
+ * a handler a member the operator never saw listed.
+ */
+function freezeEffect<E extends PlannedEffect>(effect: E): E {
+  const copy: PlannedEffect = { ...effect };
+  if (copy.sources !== undefined) {
+    (copy as { sources: readonly StagedMemberRef[] }).sources = Object.freeze([...copy.sources]);
+  }
+  return Object.freeze(copy) as E;
+}
+
 export function newPlan<E extends PlannedEffect>(input: NewPlanInput<E>): Plan<E> {
   const now = input.now ?? new Date();
   const refusal = input.refusal ?? null;
-  return {
+  // A REFUSAL CARRIES NO EFFECTS, whatever it was handed. Belt to the
+  // executor's braces: a caller that built effects and then discovered the
+  // refusal must not be able to publish both, because a page rendering a
+  // refusal beside a list of destructions is a page nobody can act on.
+  const effects = refusal === null ? (input.effects ?? []) : [];
+  return Object.freeze({
     id: randomUUID(),
     kind: input.kind,
     createdAt: now,
     expiresAt: new Date(now.getTime() + (input.ttlMs ?? PLAN_TTL_MS)),
-    source: input.source,
-    // A REFUSAL CARRIES NO EFFECTS, whatever it was handed. Belt to the
-    // executor's braces: a caller that built effects and then discovered the
-    // refusal must not be able to publish both, because a page rendering a
-    // refusal beside a list of destructions is a page nobody can act on.
-    effects: refusal === null ? (input.effects ?? []) : [],
-    findings: input.findings ?? [],
-    refusal,
-  };
+    source: Object.freeze({ ...input.source }),
+    // COPIED AND FROZEN, AND THIS IS THE PROPERTY THE PHASE RESTS ON RATHER
+    // THAN A TIDINESS PASS. `map` IS THE COPY -- it builds a new array, so the
+    // plan never aliases the one the caller passed in. An explicit spread
+    // beside it looked like a second guarantee and was in fact unreachable
+    // code: mutating it away failed nothing, which is the definition of
+    // defence that is not an instrument.
+    //
+    // "The preview cannot lie because it is the same object apply is handed"
+    // was held by CONVENTION until this line, and the module below says in its
+    // own words that a property held by convention erodes at the first
+    // inconvenient Tuesday. It was demonstrated: `readonly` is compile-time
+    // only, the store hands back the live object, and a caller that kept a
+    // reference to the array it passed in could push onto it AFTER the page had
+    // rendered the preview. One harmless row was previewed and "DROP
+    // EVERYTHING" ran.
+    //
+    // The copy defeats the retained reference; the freezes defeat a write
+    // through the plan itself. Three levels, because Object.freeze is shallow
+    // and a frozen array of live effects would still let a destroy be edited
+    // into an insert between preview and apply.
+    effects: Object.freeze(effects.map(freezeEffect)) as readonly E[],
+    findings: Object.freeze((input.findings ?? []).map((f) => Object.freeze({ ...f }))),
+    refusal: refusal === null ? null : Object.freeze({ ...refusal }),
+  });
 }
 
 /** What the source summary looks like for a staged intake. */
@@ -410,7 +604,17 @@ export function planSource(file: IntakeFile, payload: StagedPayload): PlanSource
   };
 }
 
-/** One held plan and the staging it was built from. */
+/**
+ * One held plan and the staging it was built from.
+ *
+ * THERE IS NO OPERATOR ON THIS TYPE, AND THE ROUTES TASK MUST ADD ONE. A plan
+ * is addressable by `planId` alone, so nothing here binds it to the person who
+ * uploaded the archive: any authenticated caller holding the id could apply
+ * somebody else's restore. It is not exploitable as it stands -- the id is a v4
+ * UUID and the store holds one session at a time -- but that is an accident of
+ * capacity, not a control. The store will not do it for whoever writes the
+ * routes, so they have to.
+ */
 export interface IntakeSession<E extends PlannedEffect = PlannedEffect> {
   readonly plan: Plan<E>;
   readonly payload: StagedPayload;
@@ -439,6 +643,12 @@ export interface IntakeSession<E extends PlannedEffect = PlannedEffect> {
  */
 export class IntakeSessionStore {
   readonly #sessions = new Map<string, IntakeSession>();
+  /**
+   * The sessions currently inside `use`. Not addressable, not sweepable, and
+   * not forgotten: `close` disposes of them, which is what makes a shutdown
+   * during a restore leave nothing decrypted on the disk.
+   */
+  readonly #inFlight = new Map<string, IntakeSession>();
   readonly #capacity: number;
   readonly #now: () => Date;
   readonly #timer: NodeJS.Timeout | null;
@@ -482,17 +692,46 @@ export class IntakeSessionStore {
   }
 
   /**
-   * Take the session out of the store, so it can be applied exactly once.
+   * Run `body` against the held session, once, and delete its staged files
+   * however that turns out.
    *
-   * REMOVED BEFORE THE WORK STARTS, not after it succeeds. A second apply of
-   * the same plan is a double restore, and the window in which that is possible
-   * should not include the whole duration of the first one.
+   * THIS REPLACED A `take()` THAT ORPHANED A DECRYPTED BACKUP. That method
+   * removed the session from the map and handed it over; nothing disposed of
+   * it, so `sweep` and `close` could no longer reach it and the only remaining
+   * net was a boot-time sweep that has no production caller yet. What was left
+   * in $data_dir was an unpacked backup with mail.key IN THE CLEAR -- against
+   * the one discipline this whole spine is built on.
+   *
+   * So the lifetime is not the caller's to remember. It is a scope:
+   *
+   *   - REMOVED FROM THE MAP BEFORE THE WORK STARTS, which is what `take` got
+   *     right. A second apply of the same plan is a double restore, and the
+   *     window in which that is possible must not span the first one.
+   *   - HELD IN FLIGHT WHILE `body` RUNS, so `close` can still reach it if the
+   *     process is shut down mid-restore.
+   *   - DISPOSED IN A `finally`, so a throw from apply -- which is the ordinary
+   *     failure, not the exotic one -- deletes the staging on its way out.
+   *
+   * Returns undefined without running anything when the id is unknown or has
+   * expired. The body's own value is returned otherwise, so the route can send
+   * a response built from it.
    */
-  take(planId: string): IntakeSession | undefined {
+  async use<T>(
+    planId: string, body: (session: IntakeSession) => Promise<T>,
+  ): Promise<T | undefined> {
     void this.sweep();
     const session = this.#sessions.get(planId);
-    if (session !== undefined) this.#sessions.delete(planId);
-    return session;
+    if (session === undefined) return undefined;
+    this.#sessions.delete(planId);
+    this.#inFlight.set(planId, session);
+    try {
+      return await body(session);
+    } finally {
+      this.#inFlight.delete(planId);
+      try {
+        await session.payload.dispose();
+      } catch { /* an undeletable staging is not a reason to lose the outcome */ }
+    }
   }
 
   /** Drop a session and delete its staged files. Idempotent. */
@@ -502,6 +741,11 @@ export class IntakeSessionStore {
     this.#sessions.delete(planId);
     await session.payload.dispose();
     return true;
+  }
+
+  /** How many sessions are inside `use` right now. For the tests. */
+  get inFlight(): number {
+    return this.#inFlight.size;
   }
 
   /** Delete every expired session's staged files. Never throws. */
@@ -524,14 +768,22 @@ export class IntakeSessionStore {
     return this.#sessions.size;
   }
 
-  /** Drop everything and stop the timer. For shutdown and for tests. */
+  /**
+   * Drop everything and stop the timer. For shutdown and for tests.
+   *
+   * BOTH MAPS, and the in-flight one is the reason this matters: a process shut
+   * down in the middle of a restore would otherwise leave a decrypted backup in
+   * $data_dir with nothing left holding a reference to it.
+   */
   async close(): Promise<void> {
     if (this.#timer !== null) clearInterval(this.#timer);
-    for (const [id, session] of [...this.#sessions]) {
-      this.#sessions.delete(id);
-      try {
-        await session.payload.dispose();
-      } catch { /* as above */ }
+    for (const map of [this.#sessions, this.#inFlight]) {
+      for (const [id, session] of [...map]) {
+        map.delete(id);
+        try {
+          await session.payload.dispose();
+        } catch { /* as above */ }
+      }
     }
   }
 }

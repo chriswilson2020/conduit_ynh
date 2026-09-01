@@ -48,6 +48,12 @@ export interface FixtureMember {
   /** Path inside the archive, e.g. "files/ab12". */
   name: string;
   content: Buffer | string;
+  /**
+   * The unix mode, INCLUDING the file type bits, for the zip writer only --
+   * e.g. 0o120777 for a symlink whose content is its target. Omitted for an
+   * ordinary file.
+   */
+  mode?: number;
 }
 
 /**
@@ -93,20 +99,34 @@ export async function writeSevenZip(options: {
  */
 export async function writeTraversalSevenZip(options: {
   archivePath: string;
-  /** The directory 7z is run from; the member is named relative to it. */
+  /** The directory 7z is run from; the members are named relative to it. */
   cwd: string;
-  /** e.g. "../../escaped.txt", relative to cwd and pointing outside it. */
-  relativeMember: string;
+  /**
+   * Members to store verbatim, relative to cwd. One ending in "/" is created as
+   * an EMPTY DIRECTORY, which is how a fixture isolates the path rule from the
+   * kind rule -- an escaping directory full of escaping files would be refused
+   * for its files and prove nothing about its directory.
+   */
+  relativeMembers: readonly string[];
   passphrase: string;
 }): Promise<void> {
-  const { archivePath, cwd, relativeMember, passphrase } = options;
-  const target = path.join(cwd, relativeMember);
-  await mkdir(path.dirname(target), { recursive: true });
-  await writeFile(target, "escaped");
+  const { archivePath, cwd, relativeMembers, passphrase } = options;
+  for (const member of relativeMembers) {
+    const target = path.join(cwd, member);
+    if (member.endsWith("/")) {
+      await mkdir(target, { recursive: true });
+    } else {
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, "escaped");
+    }
+  }
   const code = await new Promise<number>((resolve, reject) => {
     const child = spawn(
       "7z",
-      ["a", "-t7z", "-p", "-mhe=on", "-mx=1", "-bd", "-y", "-spf", "--", archivePath, relativeMember],
+      [
+        "a", "-t7z", "-p", "-mhe=on", "-mx=1", "-bd", "-y", "-spf", "--", archivePath,
+        ...relativeMembers.map((member) => member.replace(/\/$/, "")),
+      ],
       { cwd, stdio: ["pipe", "ignore", "ignore"] },
     );
     child.on("error", reject);
@@ -128,13 +148,14 @@ export async function writeTraversalSevenZip(options: {
  * idea, neither of them a refusal, which is why the spine decides it from the
  * index instead.
  *
- * `-snl` IS TRIED FIRST AND IS NOT COSMETIC. 7-Zip's own Linux builds (21.02
- * and later) FOLLOW a symlink on the way in unless that switch is given, so a
- * fixture without it produces an archive with no link in it on those builds --
- * which is exactly what happened: this fixture built without `-snl`, staged
- * cleanly on the CI runner, and the test asserting a refusal failed because
- * there was nothing to refuse. p7zip 16.02 does not know the switch and exits
- * non-zero on it, hence the fallback rather than a version check.
+ * `-snl` IS TRIED FIRST AND IS NOT COSMETIC, AND THE BEHAVIOUR IS PER BUILD
+ * RATHER THAN UNIVERSAL. The deploy target (7-Zip 26.02 via p7zip 16.02) stores
+ * symlinks WITHOUT the switch -- measured -- and the CI runner's build did not:
+ * this fixture built there without `-snl`, staged cleanly, and the test
+ * asserting a refusal failed because there was nothing to refuse. So the switch
+ * is asked for and the plain form is the fallback, rather than either being
+ * declared correct; a build that rejects the switch outright (p7zip 16.02 exits
+ * non-zero on an unknown one) still gets the form that works for it.
  *
  * The caller is expected to VERIFY what was stored -- see readSevenZipIndex --
  * rather than assume this worked, because the point of the fixture is the link
@@ -221,7 +242,14 @@ export async function writeZip(options: {
 }): Promise<void> {
   const zip = new yazl.ZipFile();
   for (const member of options.members) {
-    zip.addBuffer(Buffer.from(member.content), member.name);
+    // `mode` IS WHAT LETS A ZIP FIXTURE CARRY A SYMLINK. yazl writes it into the
+    // external file attributes, which is the only place a zip records a unix
+    // file type -- so `0o120777` produces a member `7z x` recreates as a link,
+    // and a member `7z l -slt` describes with an EMPTY DOS field. That empty
+    // field is the shape that got past the index rule, and no fixture could
+    // reach it before this option was used.
+    zip.addBuffer(Buffer.from(member.content), member.name,
+      member.mode === undefined ? undefined : { mode: member.mode });
   }
   zip.end();
   await pipeline(zip.outputStream, createWriteStream(options.zipPath));

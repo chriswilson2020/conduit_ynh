@@ -8,7 +8,7 @@ import { destructiveEffects, planIsApplicable, plannedTotal } from "@conduit/sha
 import type { PlanFindingView, PlanSourceView } from "@conduit/shared";
 import {
   applyPlan, newPlan, planSource, planView, IntakeSessionStore,
-  PlanExceededError, PlanRefusedError,
+  PlanApplyError, PlanExceededError, PlanRefusedError,
   type ApplyContext, type Plan, type PlannedEffect,
 } from "./intake-plan.js";
 import {
@@ -69,6 +69,11 @@ afterEach(async () => {
   await rm(scratch, { recursive: true, force: true });
 });
 
+/** The intake work directories currently in $data_dir. */
+async function intakeWorkDirs(): Promise<string[]> {
+  return (await readdir(dataDir)).filter((entry) => entry.startsWith(INTAKE_WORK_PREFIX));
+}
+
 async function land(content: Buffer | string, filename: string): Promise<IntakeFile> {
   return await receiveIntake({
     dataDir, source: Readable.from([Buffer.from(content)]), filename,
@@ -121,7 +126,9 @@ describe("applyPlan", () => {
       },
     });
     expect(seen).toEqual(["a", "b"]);
-    expect(outcome).toEqual({ dispatched: 2, spent: 5, opened: [] });
+    expect(outcome).toEqual({
+      dispatched: 2, realised: 2, spent: 5, opened: [], unrealised: [],
+    });
   });
 
   // A REFUSAL IS A PLAN, AND IT IS INERT. This is what makes "a corrupted
@@ -456,6 +463,123 @@ describe("applyPlan", () => {
     });
   });
 
+  // WHAT A PREPARATORY EFFECT NEEDED, and none of it is hypothetical: restore
+  // must drop the schema and load the dump inside ONE psql transaction, so the
+  // destroy step can only leave a preamble on the carrier.
+  describe("an effect that only prepares", () => {
+    const preparation = (): TestEffect[] => [
+      effect({
+        op: "count-things", subject: "public", unit: "schema", destroys: true,
+        realisedBy: "read-thing",
+      }),
+      effect({ op: "read-thing", subject: "database.sql", unit: "table" }),
+    ];
+
+    it("is refused before anything dispatches when nothing realises it", async () => {
+      let ran = false;
+      const plan = newPlan<TestEffect>({
+        kind: "restore", source: SOURCE,
+        effects: [effect({
+          op: "count-things", subject: "public", destroys: true, realisedBy: "read-thing",
+        })],
+      });
+      const error = await rejection(applyPlan({
+        plan, reader: await oneMember(), carrier: null,
+        handlers: {
+          "count-things": async (_e, ctx) => { ran = true; ctx.spend(1); },
+          "read-thing": async () => { /* */ },
+        },
+      }));
+      expect(error).toBeInstanceOf(PlanRefusedError);
+      expect((error as PlanRefusedError).code).toBe("unrealised-preparation");
+      expect(ran, "a preamble must not be assembled for a step that is not there").toBe(false);
+    });
+
+    // ORDER MATTERS: a consumer EARLIER in the plan cannot realise a
+    // preparation that has not happened yet.
+    it("is refused when its consumer runs before it", async () => {
+      const plan = newPlan<TestEffect>({
+        kind: "restore", source: SOURCE,
+        effects: [
+          effect({ op: "read-thing", subject: "database.sql" }),
+          effect({ op: "count-things", subject: "public", realisedBy: "read-thing" }),
+        ],
+      });
+      const error = await rejection(applyPlan({
+        plan, reader: await oneMember(), carrier: null,
+        handlers: {
+          "count-things": async (_e, ctx) => { ctx.spend(1); },
+          "read-thing": async (_e, ctx) => { ctx.spend(1); },
+        },
+      }));
+      expect((error as PlanRefusedError).code).toBe("unrealised-preparation");
+    });
+
+    it("is realised once its consumer completes", async () => {
+      const plan = newPlan<TestEffect>({
+        kind: "restore", source: SOURCE, effects: preparation(),
+      });
+      const outcome = await applyPlan({
+        plan, reader: await oneMember(), carrier: null,
+        handlers: {
+          "count-things": async (_e, ctx) => { ctx.spend(1); },
+          "read-thing": async (_e, ctx) => { ctx.spend(1); },
+        },
+      });
+      expect(outcome.dispatched).toBe(2);
+      expect(outcome.realised).toBe(2);
+      expect(outcome.unrealised).toEqual([]);
+    });
+
+    // THE REPORT THAT WOULD OTHERWISE HAVE LIED, and it lies inside the blast
+    // radius the spec calls the worst outcome this app can produce: a destroy
+    // that dispatched, and a load that failed, and a transaction that rolled
+    // the destroy back.
+    it("is NOT realised when its consumer fails, and the failure says so", async () => {
+      const plan = newPlan<TestEffect>({
+        kind: "restore", source: SOURCE, effects: preparation(),
+      });
+      const error = await rejection(applyPlan({
+        plan, reader: await oneMember(), carrier: null,
+        handlers: {
+          "count-things": async (_e, ctx) => { ctx.spend(1); },
+          "read-thing": async () => { throw new Error("the load failed"); },
+        },
+      }));
+      expect(error).toBeInstanceOf(PlanApplyError);
+      const applyError = error as PlanApplyError;
+      expect(applyError.op).toBe("read-thing");
+      expect(applyError.outcome.dispatched, "the destroy step did run").toBe(1);
+      expect(applyError.outcome.realised, "and nothing it prepared reached the world").toBe(0);
+      expect(applyError.outcome.unrealised).toEqual(["count-things"]);
+      expect((applyError.cause as Error).message).toBe("the load failed");
+    });
+  });
+
+  // A LIMIT, NOT A GUARD, and it is written down because a reader would
+  // otherwise infer more from the accounting than it gives. The count says HOW
+  // MUCH; nothing in the frame says WHAT. `sources` constrains what a step
+  // READS; nothing constrains what it writes, and no arithmetic could.
+  it("binds quantity and never identity", async () => {
+    const plan = newPlan<TestEffect>({
+      kind: "import-csv", source: SOURCE,
+      effects: [effect({ op: "count-things", subject: "companies", count: 3, unit: "row" })],
+    });
+    const whatItActuallyDid: string[] = [];
+    const outcome = await applyPlan({
+      plan, reader: await oneMember(), carrier: null,
+      handlers: {
+        "count-things": async (_e, ctx) => {
+          // The plan said three companies created. This deletes three deals.
+          for (let n = 0; n < 3; n += 1) { whatItActuallyDid.push("deleted a deal"); ctx.spend(1); }
+        },
+        "read-thing": async () => { /* */ },
+      },
+    });
+    expect(outcome.spent).toBe(3);
+    expect(whatItActuallyDid).toHaveLength(3);
+  });
+
   it("throws out, so the caller's transaction is the thing that rolls back", async () => {
     // The frame opens no transaction: it guarantees only that a failure leaves
     // through the caller's own wrapper. This is that guarantee, asserted.
@@ -563,6 +687,86 @@ describe("planView", () => {
 // WHERE A PLAN WAITS. The mechanism that keeps the plan from travelling.
 // ---------------------------------------------------------------------------
 
+// THE PROPERTY THE WHOLE PHASE RESTS ON, AND IT WAS HELD BY CONVENTION.
+// "The preview cannot lie because it is the same object apply is handed" is
+// worth nothing if that object can be edited after the preview is rendered.
+describe("a plan is a value", () => {
+  it("does not change when the caller mutates the array it passed in", async () => {
+    const effects: TestEffect[] = [effect({ op: "count-things", subject: "one harmless row" })];
+    const plan = newPlan<TestEffect>({ kind: "restore", source: SOURCE, effects });
+
+    // Exactly what a caller that kept its own reference can do, and did.
+    effects.push(effect({
+      op: "count-things", subject: "DROP EVERYTHING", destroys: true, unit: "schema",
+    }));
+
+    expect(plan.effects).toHaveLength(1);
+    expect(planView(plan).effects.map((e) => e.subject)).toEqual(["one harmless row"]);
+
+    const ran: string[] = [];
+    await applyPlan({
+      plan, reader: await oneMember(), carrier: null,
+      handlers: {
+        "count-things": async (e, ctx) => { ran.push(e.subject); ctx.spend(e.count); },
+        "read-thing": async () => { /* */ },
+      },
+    });
+    expect(ran, "apply must run the previewed plan, not the caller's array").toEqual([
+      "one harmless row",
+    ]);
+  });
+
+  it("is frozen at every level a write could reach", async () => {
+    const payload = await oneMember();
+    const plan = newPlan<TestEffect>({
+      kind: "restore", source: SOURCE,
+      effects: [effect({ op: "read-thing", sources: [payload.members[0]!.ref] })],
+      findings: [{ severity: "note", code: "x", message: "y" }],
+    });
+    expect(Object.isFrozen(plan)).toBe(true);
+    expect(Object.isFrozen(plan.effects)).toBe(true);
+    expect(Object.isFrozen(plan.effects[0])).toBe(true);
+    // Object.freeze is SHALLOW, so the sources array needs its own -- a step's
+    // reading rights are exactly that array.
+    expect(Object.isFrozen(plan.effects[0]?.sources)).toBe(true);
+    expect(Object.isFrozen(plan.findings)).toBe(true);
+    expect(Object.isFrozen(plan.source)).toBe(true);
+    await payload.dispose();
+  });
+
+  // ESM IS STRICT MODE, so a write to a frozen object throws rather than being
+  // silently dropped. This is what a mutation between preview and apply now
+  // meets.
+  it("throws on a write through the plan itself", () => {
+    const plan = newPlan<TestEffect>({
+      kind: "restore", source: SOURCE, effects: [effect({ op: "count-things" })],
+    });
+    expect(() => {
+      (plan.effects as TestEffect[]).push(effect({ op: "count-things" }));
+    }).toThrow(TypeError);
+    expect(() => {
+      (plan.effects[0] as { destroys: boolean }).destroys = true;
+    }).toThrow(TypeError);
+    expect(() => {
+      (plan as { refusal: unknown }).refusal = null;
+    }).toThrow(TypeError);
+  });
+
+  // WHAT THE STORE HANDS BACK IS THE SAME FROZEN OBJECT, so the round trip
+  // through it cannot reintroduce the hole.
+  it("stays frozen through the store", async () => {
+    const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
+    const plan = newPlan<TestEffect>({
+      kind: "restore", source: SOURCE, effects: [effect({ op: "count-things" })],
+    });
+    const id = store.hold({ plan, payload: await oneMember() });
+    const back = store.get(id)?.plan;
+    expect(back).toBe(plan);
+    expect(Object.isFrozen(back?.effects)).toBe(true);
+    await store.close();
+  });
+});
+
 describe("IntakeSessionStore", () => {
   const heldPlan = (): Plan<TestEffect> => newPlan<TestEffect>({
     kind: "restore", source: SOURCE, effects: [effect({ op: "count-things" })],
@@ -591,13 +795,63 @@ describe("IntakeSessionStore", () => {
     await store.close();
   });
 
-  it("takes a session out before the work starts, so it cannot be applied twice", async () => {
+  it("runs a session once, and it cannot be applied twice", async () => {
     const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
     const id = store.hold({ plan: heldPlan(), payload: await oneMember() });
-    expect(store.take(id)).toBeDefined();
-    expect(store.take(id)).toBeUndefined();
+    let ran = 0;
+    expect(await store.use(id, async () => { ran += 1; return "done"; })).toBe("done");
+    // Gone from the map BEFORE the body ran, so a second call finds nothing --
+    // and finding nothing must not run the body.
+    expect(await store.use(id, async () => { ran += 1; return "again"; })).toBeUndefined();
+    expect(ran).toBe(1);
     expect(store.get(id)).toBeUndefined();
     await store.close();
+  });
+
+  // THE ORPHAN THIS REPLACED. `take()` removed the session from the map and
+  // handed it over with nothing disposing of it, so sweep and close could no
+  // longer reach it -- an unpacked backup with mail.key in the clear, left in
+  // $data_dir against the one discipline this spine is built on.
+  it("deletes the staged files when the body succeeds", async () => {
+    const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
+    const id = store.hold({ plan: heldPlan(), payload: await oneMember() });
+    await store.use(id, async () => Promise.resolve(null));
+    expect(await intakeWorkDirs()).toEqual([]);
+    await store.close();
+  });
+
+  // AND THE ORDINARY FAILURE, WHICH IS THE ONE THAT MATTERS. Apply throwing is
+  // not the exotic path; it is what a failed restore does.
+  it("deletes the staged files when the body throws, and lets the error out", async () => {
+    const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
+    const id = store.hold({ plan: heldPlan(), payload: await oneMember() });
+    await expect(store.use(id, async () => {
+      await Promise.resolve();
+      throw new Error("the load failed");
+    })).rejects.toThrow("the load failed");
+    expect(await intakeWorkDirs()).toEqual([]);
+    expect(store.inFlight).toBe(0);
+    await store.close();
+  });
+
+  // A SHUTDOWN DURING A RESTORE. The session is no longer in the addressable
+  // map, and close must still reach it -- otherwise the process exits leaving a
+  // decrypted backup behind with nothing holding a reference to it.
+  it("close deletes a session that is still inside use", async () => {
+    const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
+    const id = store.hold({ plan: heldPlan(), payload: await oneMember() });
+    let release: (() => void) = () => { /* replaced below */ };
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const running = store.use(id, async () => { await held; return null; });
+    // Wait until the body is actually running.
+    for (let attempt = 0; attempt < 200 && store.inFlight === 0; attempt += 1) {
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    expect(store.inFlight).toBe(1);
+    await store.close();
+    expect(await intakeWorkDirs()).toEqual([]);
+    release();
+    await running;
   });
 
   // EXPIRY IS THE CREDENTIAL DISCIPLINE, not housekeeping. What expires is a

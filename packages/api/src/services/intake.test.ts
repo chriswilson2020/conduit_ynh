@@ -8,7 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import {
-  archiveMemberProblem, parseArchiveIndex, receiveIntake, safeFilename,
+  archiveMemberProblem, archivePathProblem, attributeFlags, attributeMode,
+  parseArchiveIndex, receiveIntake, safeFilename,
   sevenZipExtractArgs, sevenZipListArgs, stageArchive, stagedPathProblem, stageVerbatim,
   sweepAbandonedIntakes, StagedMemberRef,
   DEFAULT_MAX_TEXT_BYTES, INTAKE_WORK_PREFIX,
@@ -199,11 +200,49 @@ describe("archiveMemberProblem", () => {
     expect(archiveMemberProblem(entry({ path: "files/ab12" }))).toBeNull();
   });
 
-  // A zip written by an ordinary tool carries no unix mode at all, so the rule
-  // has to accept an empty one rather than treating "unknown" as "hostile".
-  it("accepts a zip member, which carries no unix mode", () => {
+  // THE FOUR SHAPES `Attributes` ACTUALLY TAKES, all measured on the deploy
+  // target in one run. The earlier version of this file called " -rw-r--r--" a
+  // member that "carries no unix mode at all" -- it misread the format. The
+  // LEADING SPACE is the empty DOS field and `-rw-r--r--` IS the mode, which is
+  // precisely why a positional reader walked a ZIP symlink straight through.
+  it("reads the mode out of every shape 7z prints it in", () => {
+    expect(attributeMode("A -rw-r--r--")).toBe("-rw-r--r--");      // 7z: DOS, then mode
+    expect(attributeMode(" lrwxrwxrwx")).toBe("lrwxrwxrwx");        // ZIP: empty DOS field
+    expect(attributeMode("V 01800000 0rw-------")).toBe("0rw-------"); // ZIP: three tokens
+    expect(attributeMode("D drwxr-xr-x")).toBe("drwxr-xr-x");
+    expect(attributeMode("A")).toBe("");                            // no unix mode at all
+    expect(attributeMode("")).toBe("");
+  });
+
+  it("reads the DOS flags without mistaking the mode or the hex for one", () => {
+    expect(attributeFlags("A -rw-r--r--")).toBe("A");
+    expect(attributeFlags("D drwxr-xr-x")).toBe("D");
+    expect(attributeFlags(" lrwxrwxrwx")).toBe("");
+    expect(attributeFlags("V 01800000 0rw-------")).toBe("V");
+  });
+
+  it("accepts a member whose mode carries no file-type bits", () => {
+    // "0rw-------" is what a ZIP member written without unix type bits reports
+    // -- an entirely ordinary file. A rule that demanded a leading "-" refused
+    // it, which would have refused an operator's export.
+    expect(archiveMemberProblem(entry({ attributes: "V 01800000 0rw-------" }))).toBeNull();
     expect(archiveMemberProblem(entry({ attributes: " -rw-r--r--" }))).toBeNull();
+    expect(archiveMemberProblem(entry({ attributes: "A" }))).toBeNull();
     expect(archiveMemberProblem(entry({ attributes: "" }))).toBeNull();
+  });
+
+  // THE DEFECT THIS FILE SHIPPED. A ZIP member written on unix carries no DOS
+  // flags, so 7z prints two spaces and a positional split calls the mode "".
+  it("refuses a ZIP symlink, whose DOS field is empty", () => {
+    expect(archiveMemberProblem(entry({ path: "files/evil", attributes: " lrwxrwxrwx" })))
+      .toContain("symbolic link");
+  });
+
+  it("refuses a ZIP fifo, socket and device, which the same hole swallowed", () => {
+    for (const mode of ["prw-r--r--", "srwxrwxrwx", "crw-rw-rw-", "brw-rw-rw-"]) {
+      expect(archiveMemberProblem(entry({ attributes: ` ${mode}` })), mode)
+        .toMatch(/named pipe|socket|character device|block device/);
+    }
   });
 
   it("refuses an absolute path", () => {
@@ -233,10 +272,10 @@ describe("archiveMemberProblem", () => {
     expect(archiveMemberProblem(entry({ attributes: "A lrwxrwxrwx" }))).toContain("symbolic link");
   });
 
-  it("refuses a device, a socket and a fifo", () => {
+  it("refuses a device, a socket and a fifo in the 7z form too", () => {
     for (const mode of ["crw-rw-rw-", "srwxrwxrwx", "prw-r--r--"]) {
       expect(archiveMemberProblem(entry({ attributes: `A ${mode}` })), mode)
-        .toContain("not a plain file");
+        .toMatch(/named pipe|socket|character device/);
     }
   });
 
@@ -250,6 +289,22 @@ describe("archiveMemberProblem", () => {
   it("refuses an impossible size", () => {
     expect(archiveMemberProblem(entry({ bytes: -1 }))).toContain("impossible size");
     expect(archiveMemberProblem(entry({ bytes: Number.NaN }))).toContain("impossible size");
+  });
+});
+
+describe("archivePathProblem", () => {
+  // A DIRECTORY MEMBER STILL HAS A PATH. The kind rule skips directories -- a
+  // real backup carries a `files` entry -- and filtering before checking let
+  // `../../escapedir/` reach 7z with nothing having looked at it.
+  it("refuses an escaping directory member, trailing slash and all", () => {
+    expect(archivePathProblem("../../escapedir/")).toContain("'..'");
+    expect(archivePathProblem("/absdir/")).toContain("absolute");
+    expect(archivePathProblem("files/../../x/")).toContain("'..'");
+  });
+
+  it("accepts an ordinary directory member", () => {
+    expect(archivePathProblem("files/")).toBeNull();
+    expect(archivePathProblem("files")).toBeNull();
   });
 });
 
@@ -320,6 +375,67 @@ describe("receiveIntake", () => {
     expect((await stat(path.dirname(file.path))).mode & 0o777).toBe(0o700);
     expect(path.basename(path.dirname(file.path)).startsWith(INTAKE_WORK_PREFIX)).toBe(true);
     await file.dispose();
+  });
+
+  // THE TWO MECHANISMS THAT KEEP THIS FILE AT 0600 MASKED EACH OTHER, AND SO
+  // NEITHER WAS GUARDED. Mutating the creation mode to 0644 alone was not
+  // caught -- the chmod after the last chunk fixed it. Removing that chmod
+  // alone was not caught either -- the creation mode had already made it 0600.
+  // Only both together failed, so "there is no instant at which this file is
+  // wider than 0600" was prose. These two tests separate them.
+
+  it("is already 0600 while the bytes are still arriving", async () => {
+    // The creation mode on its own, measured DURING the write. A source that
+    // waits after its first chunk gives the test a window in which only
+    // createWriteStream's own mode can have applied.
+    // A source that pushes one chunk and then waits to be ended, so the file
+    // exists and the pipeline is open while the mode is read.
+    const source = new Readable({ read() { /* ended below */ } });
+    source.push(Buffer.alloc(1024, 7));
+
+    const landing = receiveIntake({ dataDir, source, filename: "backup.7z" });
+    let uploadPath = "";
+    for (let attempt = 0; attempt < 200 && uploadPath === ""; attempt += 1) {
+      const dirs = await workDirs();
+      if (dirs[0] !== undefined) {
+        const candidate = path.join(dataDir, dirs[0], "upload");
+        if (await stat(candidate).then(() => true, () => false)) uploadPath = candidate;
+      }
+      if (uploadPath === "") await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(uploadPath, "the upload should exist while the stream is open").not.toBe("");
+    const modeDuring = (await stat(uploadPath)).mode & 0o777;
+
+    source.push(null);
+    const file = await landing;
+    expect(modeDuring, "0600 from the moment the file exists, not from the end").toBe(0o600);
+    await file.dispose();
+  });
+
+  it("is 0600 even under a umask that would have stripped the owner's bits", async () => {
+    // The chmod on its own. A umask can only NARROW a requested mode, so the
+    // file is never WIDER than 0600 -- but 0o400 in the umask makes it 0200,
+    // which is not the mode this discipline claims and is not one the staging
+    // can read back. The chmod after the last chunk is the only thing that
+    // settles it, and this is the only condition under which that line does
+    // anything at all.
+    //
+    // 0o400 AND NOT 0o200, measured: stripping the WRITE bit makes the open
+    // itself fail with EACCES, so there is nothing left for a chmod to fix.
+    const previous = process.umask(0o400);
+    try {
+      const file = await land("secret bytes");
+      expect((await stat(file.path)).mode & 0o777).toBe(0o600);
+      // AND THE DIRECTORY, which the same umask narrows to 0300 -- traversable
+      // by name, but not readable, so the recursive remove in `dispose` fails
+      // with EACCES and the credential store cannot be deleted at all. Found by
+      // this test rather than reasoned about.
+      expect((await stat(path.dirname(file.path))).mode & 0o777).toBe(0o700);
+      await file.dispose();
+      expect(await workDirs()).toEqual([]);
+    } finally {
+      process.umask(previous);
+    }
   });
 
   it("reports the size and the digest of what actually arrived", async () => {
@@ -755,7 +871,7 @@ describe("stageArchive, on an encrypted .7z", () => {
     await writeTraversalSevenZip({
       archivePath,
       cwd: path.join(cwd, "a", "b"),
-      relativeMember: "../../escaped.txt",
+      relativeMembers: ["../../escaped.txt"],
       passphrase: PASSPHRASE,
     });
     const file = await landFile(archivePath, "b.7z");
@@ -781,9 +897,20 @@ describe("stageArchive, on an encrypted .7z", () => {
     // The archive itself is far smaller than what it claims -- which is the
     // whole reason the claim is what gets checked.
     expect(file.bytes).toBeLessThan(1024 * 1024);
-    await expect(stageArchive({
-      file, passphrase: PASSPHRASE, limits: { maxStagedBytes: 1024 * 1024 },
-    })).rejects.toBeInstanceOf(IntakeTooLargeError);
+    // BEFORE EXTRACTION, AND SAID SO DIRECTLY. There is a second size bound
+    // AFTER extraction, and the two masked each other: mutating this one away
+    // left the bomb refused by the other and nothing failed. The hook is the
+    // discriminator -- it does not run at all if the refusal came first.
+    let extracted = false;
+    const error = await rejection(stageArchive({
+      file,
+      passphrase: PASSPHRASE,
+      limits: { maxStagedBytes: 1024 * 1024 },
+      onExtracted: async () => { extracted = true; await Promise.resolve(); },
+    }));
+    expect(error).toBeInstanceOf(IntakeTooLargeError);
+    expect(extracted, "a bomb must be refused from its index, not after unpacking").toBe(false);
+    expect(error.message).toContain("unpacked size");
     expect(await readdir(path.dirname(file.path))).toEqual(["upload"]);
     await file.dispose();
   }, 60_000);
@@ -888,6 +1015,147 @@ describe("stageArchive, on an unencrypted .zip", () => {
     const file = await land(randomBytes(2048), { filename: "notes.txt" });
     await expect(stageArchive({ file, passphrase: null }))
       .rejects.toBeInstanceOf(IntakeArchiveError);
+    await file.dispose();
+  }, 60_000);
+
+  // THE DEFECT THIS SUITE SHIPPED, END TO END, IN THE CONTAINER THE IMPORT
+  // PIPELINE ACTUALLY USES. A zip symlink's `Attributes` is " lrwxrwxrwx" --
+  // one token after a trim, because a member written on unix carries no DOS
+  // flags -- and the positional reader called that "no mode" and let it past.
+  // 7z then recreated the link. The refusal came only from the post-extraction
+  // lstat, while this module's own words said it came from the index.
+  it7z("refuses a ZIP symlink FROM THE INDEX, with nothing extracted", async () => {
+    const zipPath = path.join(scratch, "evil.zip");
+    await writeZip({
+      zipPath,
+      members: [
+        { name: "manifest.json", content: JSON.stringify({ formatVersion: 1 }) },
+        // A symlink's content IS its target. 0o120777 is S_IFLNK | 0777, and
+        // yazl writes it into the external file attributes.
+        { name: "files/evil", content: "/etc/passwd", mode: 0o120777 },
+      ],
+    });
+    // The fixture's own premise: 7z must report this as a link.
+    const stored = await readSevenZipIndex(zipPath, null);
+    expect(
+      stored.map((member) => member.attributes).join("|"),
+      JSON.stringify(stored),
+    ).toMatch(/\blrwxrwxrwx/);
+
+    const file = await landFile(zipPath, "export.zip");
+    const error = await rejection(stageArchive({ file, passphrase: null }));
+    expect(error).toBeInstanceOf(IntakeShapeError);
+    expect(error.message).toContain("symbolic link");
+    // FROM THE INDEX: no staging directory was created at all, so 7z never got
+    // the chance to write the link.
+    expect(await readdir(path.dirname(file.path))).toEqual(["upload"]);
+    await file.dispose();
+  }, 60_000);
+
+  it7z("refuses a ZIP fifo, which the same hole swallowed", async () => {
+    const zipPath = path.join(scratch, "fifo.zip");
+    await writeZip({
+      zipPath,
+      members: [
+        { name: "manifest.json", content: "{}" },
+        { name: "files/pipe", content: "", mode: 0o010644 },
+      ],
+    });
+    const file = await landFile(zipPath, "export.zip");
+    const error = await rejection(stageArchive({ file, passphrase: null }));
+    expect(error).toBeInstanceOf(IntakeShapeError);
+    expect(error.message).toContain("named pipe");
+    expect(await readdir(path.dirname(file.path))).toEqual(["upload"]);
+    await file.dispose();
+  }, 60_000);
+
+  // A DIRECTORY MEMBER IS FILTERED OUT OF THE KIND CHECK, so before the path
+  // rule was moved ahead of that filter this reached `7z x` unlooked-at. No
+  // escape was reproduced -- 7-Zip sanitises it -- and relying on that is
+  // exactly the position this module refuses to take.
+  it7z("refuses an escaping DIRECTORY member, which no rule used to look at", async () => {
+    // BUILT WITH 7z RATHER THAN yazl, because yazl refuses the path outright
+    // ("invalid relative path") -- a good library declining to write a bad
+    // archive, and therefore useless as a fixture for one. `7z a -spf` writes
+    // it without complaint.
+    const zipPath = path.join(scratch, "escdir.7z");
+    const cwd = path.join(await mkdtemp(path.join(scratch, "escdirpay-")), "a", "b");
+    await mkdir(cwd, { recursive: true });
+    await writeTraversalSevenZip({
+      archivePath: zipPath,
+      cwd,
+      // An EMPTY escaping directory beside an ordinary file: the only thing in
+      // the archive that any rule could object to is the directory's path.
+      relativeMembers: ["../../escapedir/", "manifest.json"],
+      passphrase: PASSPHRASE,
+    });
+    const stored = await readSevenZipIndex(zipPath, PASSPHRASE);
+    expect(
+      stored.map((member) => member.path),
+      "the fixture must actually carry the escaping directory",
+    ).toContain("../../escapedir");
+    const file = await landFile(zipPath, "b.7z");
+    const error = await rejection(stageArchive({ file, passphrase: PASSPHRASE }));
+    expect(error).toBeInstanceOf(IntakeShapeError);
+    expect(error.message).toContain("'..'");
+    expect(await readdir(path.dirname(file.path))).toEqual(["upload"]);
+    await file.dispose();
+  }, 60_000);
+
+  // THE SECOND LAYER'S ABSOLUTE CEILING, reached the only way it can be: an
+  // index whose claim is under the cap and a payload that lands over it. The
+  // pre-extraction bound catches everything an honest index declares, so
+  // without this the post-extraction ceiling was unreachable and untested.
+  it7z("refuses a payload that unpacked past the absolute ceiling", async () => {
+    const zipPath = path.join(scratch, "ceiling.zip");
+    await writeZip({
+      zipPath,
+      members: [
+        { name: "manifest.json", content: "{}" },
+        { name: "companies.csv", content: "name\r\nAcme\r\n" },
+      ],
+    });
+    const file = await landFile(zipPath, "export.zip");
+    const error = await rejection(stageArchive({
+      file,
+      passphrase: null,
+      // Above what the index claims (a few bytes), below what lands.
+      limits: { maxStagedBytes: 4096 },
+      onExtracted: async (destination) => {
+        await writeFile(path.join(destination, "companies.csv"), randomBytes(64 * 1024));
+      },
+    }));
+    expect(error).toBeInstanceOf(IntakeTooLargeError);
+    expect(error.message).toContain("unpacked payload");
+    expect(await readdir(path.dirname(file.path))).toEqual(["upload"]);
+    await file.dispose();
+  }, 60_000);
+
+  // THE SIZE RULE'S SECOND LAYER. The symlink rule got two because an index is
+  // "a claim about an archive and not the archive"; the size rule had one until
+  // this. 7z could not be made to under-report -- the reviewer tried, and a lie
+  // in the zip headers truncated extraction to the lie -- so the hook is what
+  // creates the state, exactly as it does for "listed but did not arrive".
+  it7z("refuses a payload that unpacked past what its index claimed", async () => {
+    const zipPath = path.join(scratch, "grow.zip");
+    await writeZip({
+      zipPath,
+      members: [
+        { name: "manifest.json", content: "{}" },
+        { name: "companies.csv", content: "name\r\nAcme\r\n" },
+      ],
+    });
+    const file = await landFile(zipPath, "export.zip");
+    const error = await rejection(stageArchive({
+      file,
+      passphrase: null,
+      onExtracted: async (destination) => {
+        await writeFile(path.join(destination, "companies.csv"), randomBytes(64 * 1024));
+      },
+    }));
+    expect(error).toBeInstanceOf(IntakeArchiveError);
+    expect(error.message).toContain("claimed");
+    expect(await readdir(path.dirname(file.path))).toEqual(["upload"]);
     await file.dispose();
   }, 60_000);
 });

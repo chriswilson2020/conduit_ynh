@@ -443,6 +443,14 @@ export async function receiveIntake(options: ReceiveIntakeOptions): Promise<Inta
   }
 
   const work = await mkdtemp(path.join(dataDir, INTAKE_WORK_PREFIX));
+  // mkdtemp ASKS FOR 0700 AND THE UMASK MAY NARROW IT, which is not the harmless
+  // direction it sounds like. Found by the test that runs this under
+  // `umask 0400`: the directory comes out 0300, the process can still traverse
+  // it by name but cannot readdir it, and `dispose` -- a recursive remove --
+  // fails with EACCES. A credential store that cannot be deleted is the exact
+  // failure this whole module exists to prevent, so the mode is asserted here
+  // rather than requested and hoped for.
+  await chmod(work, 0o700);
   const uploadPath = path.join(work, UPLOAD_NAME);
   let disposed = false;
   const dispose = async (): Promise<void> => {
@@ -627,29 +635,80 @@ export function parseArchiveIndex(listing: string): ArchiveIndexEntry[] {
 }
 
 /**
- * Whether an index entry names a directory rather than a file.
+ * A ten-character unix mode token: one type character and nine permission
+ * characters.
  *
- * BOTH SIGNALS, BECAUSE THE TWO CONTAINERS DISAGREE. A `.7z` reports
- * "D drwxr-xr-x"; a `.zip` written by an ordinary tool may carry no unix mode
- * at all and mark a directory only by a trailing slash. Directories are SKIPPED
- * rather than refused -- a real Conduit backup contains a `files` entry, and
- * refusing it would refuse every backup ever taken.
+ * MATCHED BY SHAPE RATHER THAN BY POSITION, and that is a repair rather than a
+ * preference. `7z l -slt` writes `Attributes` as a DOS field then a unix field,
+ * and EITHER MAY BE ABSENT, so the token index is not the field index.
+ * Measured on the deploy target, all four shapes from one run:
+ *
+ *   "A -rw-r--r--" ........... 7z member: DOS flags, then the mode
+ *   " lrwxrwxrwx" ............ ZIP symlink: EMPTY DOS field, then the mode.
+ *                              Splitting on whitespace gives ONE token, so a
+ *                              positional reader calls the mode "" and the
+ *                              symlink an ordinary file.
+ *   " prw-r--r--" ............ ZIP fifo, same shape, same hole.
+ *   "V 01800000 0rw-------" .. ZIP member written with no unix type bits (a
+ *                              Python `writestr`, among others): THREE tokens,
+ *                              and a positional reader takes the DOS hex as the
+ *                              mode and refuses a perfectly ordinary file.
+ *
+ * The permission tail is what identifies the token: nine characters drawn from
+ * the `rwxsStT-` set. Nothing else 7z prints in this field looks like that.
  */
-function isDirectoryEntry(entry: ArchiveIndexEntry): boolean {
-  if (entry.path.endsWith("/")) return true;
-  const [flags = "", mode = ""] = entry.attributes.trim().split(/\s+/);
-  return flags.includes("D") || mode.startsWith("d");
+const MODE_TOKEN = /^.[rwxsStT-]{9}$/;
+
+/** The unix mode 7z reported for this member, or "" when it reported none. */
+export function attributeMode(attributes: string): string {
+  return attributes.trim().split(/\s+/).find((token) => MODE_TOKEN.test(token)) ?? "";
 }
 
 /**
- * WHY THIS MEMBER CANNOT BE UNPACKED, OR NULL. Decided from the INDEX, before
- * a byte is extracted, which is the whole point of listing first.
+ * The DOS attribute letters 7z reported, concatenated. "D" is a directory.
+ *
+ * Every token that is NOT the mode and is made only of capitals -- so the
+ * `01800000` hex above contributes nothing, and neither does the mode itself.
+ */
+export function attributeFlags(attributes: string): string {
+  return attributes.trim().split(/\s+/)
+    .filter((token) => !MODE_TOKEN.test(token) && /^[A-Z]+$/.test(token))
+    .join("");
+}
+
+/**
+ * Whether an index entry names a directory rather than a file.
+ *
+ * THREE SIGNALS, BECAUSE THE CONTAINERS DISAGREE AND SO DO THE WRITERS. A
+ * `.7z` reports "D drwxr-xr-x"; a `.zip` may report the DOS bit, the mode, or
+ * only a trailing slash. Directories are SKIPPED rather than refused -- a real
+ * Conduit backup contains a `files` entry, and refusing it would refuse every
+ * backup ever taken -- but they are NOT skipped before their PATH is checked;
+ * see stageArchive.
+ */
+function isDirectoryEntry(entry: ArchiveIndexEntry): boolean {
+  if (entry.path.endsWith("/")) return true;
+  if (attributeFlags(entry.attributes).includes("D")) return true;
+  return attributeMode(entry.attributes).startsWith("d");
+}
+
+/**
+ * WHY THIS PATH CANNOT BE UNPACKED, OR NULL. Decided from the INDEX, before a
+ * byte is extracted, which is the whole point of listing first.
+ *
+ * SEPARATE FROM THE KIND RULE BELOW BECAUSE IT APPLIES TO MORE MEMBERS.
+ * Directories are skipped by the kind rule -- a real backup has a `files`
+ * entry -- but a DIRECTORY MEMBER STILL HAS A PATH, and `../../escapedir/`
+ * reaching `7z x` unchecked was a class of member neither layer looked at.
+ * stageArchive now runs this over every index entry and the kind rule over the
+ * files. No escape was reproduced (7-Zip sanitises both), and that is not the
+ * standard this module holds itself to.
  *
  * PURE AND EXPORTED so every hostile shape is a unit test rather than an
  * archive somebody has to craft -- though intake.test.ts crafts them too,
  * because a rule agreeing with itself is not evidence.
  *
- * The four refusals, each measured on the deploy target rather than assumed:
+ * The three refusals, each measured on the deploy target rather than assumed:
  *
  *   AN ABSOLUTE PATH, and a Windows drive letter with it. 7z's own `a` strips
  *   these, so they cannot arrive from an archive Conduit wrote -- which is
@@ -658,31 +717,59 @@ function isDirectoryEntry(entry: ArchiveIndexEntry): boolean {
  *
  *   A `..` COMPONENT. `7z a -spf` stores `../../data/manifest.json` verbatim
  *   -- measured -- so a `..` member is a thing an attacker can build with the
- *   stock binary and nothing else.
- *
- *   A SYMLINK. This is the one that would have been missed. 7z preserves
- *   symlinks and recreates them: an archive carrying `files/link -> /etc/passwd`
- *   extracted, on this build, to a link 7z had re-rooted inside the destination
- *   -- and a RELATIVE link escaping the destination made `7z x` exit 2 while
- *   still writing an empty file in its place. Two different behaviours for the
- *   same idea, neither of them a refusal. Deciding it here makes it one.
+ *   stock binary and nothing else. The trailing slash a directory entry may
+ *   carry is stripped first, so `a/../b/` is judged on its components rather
+ *   than on its punctuation.
  *
  *   AN EMPTY OR DOT PATH, which no legitimate member has and which would
  *   resolve to the staging directory itself.
  */
-export function archiveMemberProblem(entry: ArchiveIndexEntry): string | null {
-  const name = entry.path;
+export function archivePathProblem(name: string): string | null {
   if (name === "" || name === "." || name === "..") return "it has no usable name";
   if (name.startsWith("/") || name.startsWith("\\")) return "it is an absolute path";
   if (/^[A-Za-z]:/.test(name)) return "it carries a drive letter";
-  const parts = name.split(/[/\\]/);
+  const parts = name.replace(/\/$/, "").split(/[/\\]/);
   if (parts.includes("..")) return "it points outside the archive with '..'";
-  const [flags = "", mode = ""] = entry.attributes.trim().split(/\s+/);
-  if (mode.startsWith("l") || flags.includes("L")) {
-    return "it is a symbolic link, and this unpacks only plain files";
-  }
-  if (mode !== "" && !mode.startsWith("-") && !mode.startsWith("d")) {
-    return `it is not a plain file (mode ${mode})`;
+  return null;
+}
+
+/**
+ * WHY THIS MEMBER'S KIND CANNOT BE UNPACKED, and the refused types named rather
+ * than inferred.
+ *
+ * A SYMLINK IS THE ONE THAT WOULD HAVE BEEN MISSED, TWICE. 7z preserves
+ * symlinks and recreates them: an archive carrying `files/link -> /etc/passwd`
+ * extracted to a link 7z had re-rooted inside the destination, and a RELATIVE
+ * link escaping the destination made `7z x` exit 2 while still writing a file
+ * in its place. Two behaviours for one idea, neither of them a refusal.
+ *
+ * The second miss was this rule's own: reading the mode by POSITION meant a ZIP
+ * symlink, whose DOS field is empty, was read as having no mode at all and
+ * waved through. See MODE_TOKEN for the four shapes that field takes.
+ *
+ * THE TYPE CHARACTER IS READ AS A TYPE, NOT AS "NOT A DASH". An earlier version
+ * refused every mode that did not begin `-` or `d`, which refuses the
+ * `0rw-------` that a ZIP member written without unix type bits reports -- an
+ * entirely ordinary file, measured on the deploy target. So the refused set is
+ * enumerated: a type character this code has never seen is not a reason to
+ * reject an operator's only backup.
+ */
+const REFUSED_TYPES: Record<string, string> = {
+  l: "it is a symbolic link, and this unpacks only plain files",
+  b: "it is a block device",
+  c: "it is a character device",
+  p: "it is a named pipe",
+  s: "it is a socket",
+};
+
+export function archiveMemberProblem(entry: ArchiveIndexEntry): string | null {
+  const pathProblem = archivePathProblem(entry.path);
+  if (pathProblem !== null) return pathProblem;
+  const mode = attributeMode(entry.attributes);
+  const refused = REFUSED_TYPES[mode.slice(0, 1)];
+  if (refused !== undefined) return `${refused} (mode ${mode})`;
+  if (attributeFlags(entry.attributes).includes("L")) {
+    return "it is a reparse point or a link";
   }
   if (!Number.isFinite(entry.bytes) || entry.bytes < 0) return "it declares an impossible size";
   return null;
@@ -816,6 +903,14 @@ export async function stageArchive(options: StageArchiveOptions): Promise<Staged
   }
 
   const index = parseArchiveIndex(listing.stdout);
+  // EVERY ENTRY'S PATH, INCLUDING THE DIRECTORIES. The kind rule below skips
+  // directories -- a real backup carries a `files` entry -- but a directory
+  // member still has a path, and filtering before checking let
+  // `../../escapedir/` reach `7z x` unlooked-at.
+  for (const entry of index) {
+    const problem = archivePathProblem(entry.path);
+    if (problem !== null) throw new IntakeShapeError(entry.path, problem);
+  }
   const files = index.filter((entry) => !isDirectoryEntry(entry));
   if (files.length === 0) {
     throw new IntakeArchiveError("the archive holds no files");
@@ -881,6 +976,23 @@ export async function stageArchive(options: StageArchiveOptions): Promise<Staged
       paths.set(ref, full);
       members.push({ ref, name, bytes: info.size });
       stagedBytes += info.size;
+    }
+    // WHAT ACTUALLY LANDED, NOT ONLY WHAT WAS CLAIMED. The symlink rule got two
+    // layers because an index is a claim about an archive and not the archive;
+    // the size rule had only one until this. Both bounds are re-applied to the
+    // bytes on the disk: the absolute ceiling, and the archive's own claim,
+    // which the disk pre-flight was computed from. An extraction that produced
+    // more than its index promised has already spent the difference, so this
+    // cannot prevent it -- what it does is stop the plan being built on a
+    // payload nobody bounded, and make the lie loud.
+    if (stagedBytes > limits.maxStagedBytes) {
+      throw new IntakeTooLargeError(limits.maxStagedBytes, "the unpacked payload");
+    }
+    if (stagedBytes > claimedBytes) {
+      throw new IntakeArchiveError(
+        `the archive unpacked to ${String(stagedBytes)} bytes after its index `
+        + `claimed ${String(claimedBytes)}`,
+      );
     }
   } catch (error) {
     // A REFUSAL LEAVES NOTHING HALF-STAGED. Everything above this point refuses
