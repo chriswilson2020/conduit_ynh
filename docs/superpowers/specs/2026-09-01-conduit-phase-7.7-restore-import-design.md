@@ -19,15 +19,19 @@ He rejected "only onto an empty install" (makes restore a migration tool rather 
 
 ---
 
-## RECOMMENDATION: split this phase, and ship restore first
+## SCOPE: both, in one phase. Chris's decision stands.
 
-**7.7 = restore. 7.8 = the two importers.**
+I recommended splitting this — restore as 7.7, the importers as 7.8 — and **Chris rejected
+it.** His original decision of 30 Aug was both, and it holds.
 
-The reasoning is the same one that split 7.6 from 7.7 and was right then. **Restore is what makes the backups we just shipped worth having** — until it exists, v1.3.0 produces artefacts nobody can consume. The importers are valuable but independent: nothing about reading a foreign CSV depends on restore existing, and vice versa.
+**Recording why the recommendation was wrong to press, because the reasoning was thin.** The
+split would not have reduced the work; it would have ordered it into two releases. The real
+argument was that restore deserves undivided review attention — and that is satisfied by
+*sequencing within one phase* rather than by splitting the release. **Restore is built and
+reviewed first regardless**, because the importers cannot be exercised without something to
+import into.
 
-They are also different risks. Restore destroys data by design; an importer that goes wrong adds rows you can archive. Bundling them means the careful review restore needs gets spread across a column-mapping UI as well.
-
-**This is a scope change to a decision Chris made, so it needs his word.** If he wants both in 7.7, the plan grows a second half rather than changing shape.
+So: one phase, one release, restore first.
 
 ---
 
