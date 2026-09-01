@@ -118,32 +118,96 @@ export async function writeTraversalSevenZip(options: {
 }
 
 /**
- * Write a `.7z` whose `files/` directory holds a symlink.
+ * Write a `.7z` whose `files/` directory holds symlinks -- one absolute, one
+ * relative and escaping.
  *
- * 7z PRESERVES SYMLINKS AND RECREATES THEM -- measured on the deploy target,
- * where an absolute link came back re-rooted inside the destination and a
- * relative one escaping the destination made `7z x` exit 2 while still writing
- * a file in its place. Two behaviours for one idea, neither of them a refusal,
- * which is why the spine decides it from the index instead.
+ * 7z PRESERVES SYMLINKS AND RECREATES THEM -- measured on the deploy target
+ * (7-Zip 26.02 via p7zip 16.02), where the absolute link came back re-rooted
+ * inside the destination and the relative one escaping the destination made
+ * `7z x` exit 2 while still writing a file in its place. Two behaviours for one
+ * idea, neither of them a refusal, which is why the spine decides it from the
+ * index instead.
+ *
+ * `-snl` IS TRIED FIRST AND IS NOT COSMETIC. 7-Zip's own Linux builds (21.02
+ * and later) FOLLOW a symlink on the way in unless that switch is given, so a
+ * fixture without it produces an archive with no link in it on those builds --
+ * which is exactly what happened: this fixture built without `-snl`, staged
+ * cleanly on the CI runner, and the test asserting a refusal failed because
+ * there was nothing to refuse. p7zip 16.02 does not know the switch and exits
+ * non-zero on it, hence the fallback rather than a version check.
+ *
+ * The caller is expected to VERIFY what was stored -- see readSevenZipIndex --
+ * rather than assume this worked, because the point of the fixture is the link
+ * and an archive that quietly lost it proves nothing.
  */
 export async function writeSymlinkSevenZip(options: {
   archivePath: string;
   workDir: string;
-  linkName: string;
-  linkTarget: string;
   passphrase: string;
 }): Promise<void> {
-  const { archivePath, workDir, linkName, linkTarget, passphrase } = options;
+  const { archivePath, workDir, passphrase } = options;
   const dir = path.join(workDir, "files");
   await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, "aaaa"), "real");
-  await rm(path.join(dir, linkName), { force: true });
-  await symlink(linkTarget, path.join(dir, linkName));
-  const code = await runSevenZip(
-    ["a", "-t7z", "-p", "-mhe=on", "-mx=1", "-bd", "-y", "--", archivePath, path.resolve(dir)],
-    passphrase,
-  );
+  await rm(path.join(dir, "abs"), { force: true });
+  await rm(path.join(dir, "escape"), { force: true });
+  await symlink("/etc/passwd", path.join(dir, "abs"));
+  await symlink("../../../../etc/passwd", path.join(dir, "escape"));
+
+  const base = ["a", "-t7z", "-p", "-mhe=on", "-mx=1", "-bd", "-y"];
+  const inputs = ["--", archivePath, path.resolve(dir)];
+  let code = await runSevenZip([...base, "-snl", ...inputs], passphrase);
+  if (code !== 0) {
+    await rm(archivePath, { force: true });
+    code = await runSevenZip([...base, ...inputs], passphrase);
+  }
   if (code !== 0) throw new Error(`7z a exited ${String(code)} building ${archivePath}`);
+}
+
+/** One member of an archive, as `7z l -slt` reports it. For fixture checks. */
+export interface IndexedMember { path: string; attributes: string }
+
+/**
+ * What an archive ACTUALLY holds, read back with `7z l -slt`.
+ *
+ * A FIXTURE THAT IS NOT VERIFIED IS NOT A FIXTURE. The symlink archive above is
+ * the case in point: it was built, it exited 0, and on one platform it carried
+ * no symlink at all -- so the test that depended on it was asserting a refusal
+ * of something that was not there. This is how a test checks its own premise
+ * and says what it found when the premise fails.
+ */
+export async function readSevenZipIndex(
+  archivePath: string, passphrase: string | null,
+): Promise<IndexedMember[]> {
+  const listing = await new Promise<string>((resolve, reject) => {
+    const child = spawn("7z", ["l", "-slt", "-bd", "-y", "--", archivePath], {
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    let out = "";
+    child.stdout.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+    child.on("error", reject);
+    child.on("close", () => { resolve(out); });
+    if (passphrase !== null) child.stdin.write(passphrase);
+    child.stdin.end();
+  });
+  const lines = listing.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === "----------");
+  if (start === -1) return [];
+  const members: IndexedMember[] = [];
+  let current: Partial<IndexedMember> = {};
+  const flush = (): void => {
+    if (current.path !== undefined) {
+      members.push({ path: current.path, attributes: current.attributes ?? "" });
+    }
+    current = {};
+  };
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() === "") { flush(); continue; }
+    if (line.startsWith("Path = ")) { flush(); current.path = line.slice(7); }
+    else if (line.startsWith("Attributes = ")) { current.attributes = line.slice(13); }
+  }
+  flush();
+  return members;
 }
 
 /**

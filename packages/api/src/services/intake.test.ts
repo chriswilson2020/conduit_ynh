@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -15,7 +17,8 @@ import {
   type ArchiveIndexEntry, type IntakeFile,
 } from "./intake.js";
 import {
-  digestOf, writeSevenZip, writeSymlinkSevenZip, writeTraversalSevenZip, writeZip, HAVE_7Z,
+  digestOf, readSevenZipIndex, writeSevenZip, writeSymlinkSevenZip, writeTraversalSevenZip,
+  writeZip, HAVE_7Z,
 } from "../test/archives.js";
 
 // THE SPINE'S FIRST TWO STAGES, AND THE DISCIPLINES THEY EXIST TO HOLD.
@@ -688,16 +691,59 @@ describe("stageArchive, on an encrypted .7z", () => {
     await writeSymlinkSevenZip({
       archivePath,
       workDir: await mkdtemp(path.join(scratch, "sympay-")),
-      linkName: "escape",
-      linkTarget: "../../../../etc/passwd",
       passphrase: PASSPHRASE,
     });
+
+    // WHAT THIS BUILD OF 7z ACTUALLY STORED, read back before anything is
+    // asserted about it. "The archive was written" does not mean "the archive
+    // holds a link": 7-Zip's own Linux builds follow a symlink on the way in
+    // unless `-snl` is given, and the unix mode that reveals one in the index
+    // is an extension rather than a guarantee. An archive that lost the link
+    // would stage cleanly and make this test pass by asserting a refusal that
+    // never happened -- which is exactly how it failed on the CI runner before
+    // this was here.
+    const stored = await readSevenZipIndex(archivePath, PASSPHRASE);
+    const indexShowsLink = stored.some((member) => /\bl[rwxst-]{9}/.test(member.attributes));
+
     const file = await landFile(archivePath, "b.7z");
     const error = await rejection(stageArchive({ file, passphrase: PASSPHRASE }));
+    expect(error, JSON.stringify(stored)).toBeInstanceOf(IntakeShapeError);
+    // NOTHING SURVIVES EITHER WAY. Whichever layer refused it, the staging is
+    // gone and only the upload is left for the caller to dispose of.
+    expect(await readdir(path.dirname(file.path))).toEqual(["upload"]);
+
+    if (indexShowsLink) {
+      // The cheap layer: refused from the INDEX, so no staging directory was
+      // ever created and 7z never got the chance to recreate the link.
+      expect(error.message).toContain("symbolic link");
+    } else {
+      // The other layer, on a build whose index does not admit to the link:
+      // caught by lstat after extraction, which asks what the member IS rather
+      // than what it points at.
+      expect(error.message, JSON.stringify(stored)).toContain("did not unpack as a plain file");
+    }
+    await file.dispose();
+  }, 60_000);
+
+  // THE SECOND LAYER ON ITS OWN, on every platform rather than only on one
+  // whose 7z hides the link. Without this the lstat rule would be exercised by
+  // whichever build happened to run it, which is not an instrument.
+  it7z("refuses a member that turns out to be a symlink after extraction", async () => {
+    const { archivePath } = await backupArchive();
+    const file = await landFile(archivePath, "b.7z");
+    const error = await rejection(stageArchive({
+      file,
+      passphrase: PASSPHRASE,
+      onExtracted: async (destination) => {
+        // A member the index called an ordinary file, replaced by a link to a
+        // real file outside the staging. `stat` would follow it and report a
+        // regular file; `lstat` reports the link.
+        await rm(path.join(destination, "manifest.json"), { force: true });
+        await symlink("/etc/passwd", path.join(destination, "manifest.json"));
+      },
+    }));
     expect(error).toBeInstanceOf(IntakeShapeError);
-    expect(error.message).toContain("symbolic link");
-    // The refusal happened from the INDEX: no staging directory was created,
-    // so 7z never got the chance to recreate the link.
+    expect(error.message).toContain("did not unpack as a plain file");
     expect(await readdir(path.dirname(file.path))).toEqual(["upload"]);
     await file.dispose();
   }, 60_000);

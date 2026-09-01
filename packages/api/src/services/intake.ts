@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { chmod, mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -49,6 +49,15 @@ import { DISK_MARGIN_BYTES, freeSpaceBytes, SEVEN_ZIP_PACKAGE } from "./backup.j
 // the disk before a single member is written. An archive whose members are not
 // plain relative files is refused from the same listing, before extraction,
 // because 7z will happily recreate a symlink.
+//
+// THAT LAST RULE HAS TWO LAYERS, AND THE SECOND WAS PAID FOR. The index is
+// where a symlink is caught cheaply -- before anything is written -- but only
+// where the index says so, and the unix mode in `Attributes` is an extension
+// rather than a guarantee. A build whose archive omits it would present a
+// stored link as an ordinary member. So the post-extraction check uses `lstat`
+// and not `stat`: it asks what the member IS, not what it points at.
+
+
 
 /**
  * Where an intake unpacks, and how a sweep recognises one.
@@ -852,7 +861,14 @@ export async function stageArchive(options: StageArchiveOptions): Promise<Staged
       if (placement !== null) throw new IntakeShapeError(entry.path, placement);
       let info;
       try {
-        info = await stat(full);
+        // lstat, NOT stat, AND THAT IS THE SECOND LINE OF DEFENCE RATHER THAN A
+        // STYLE CHOICE. archiveMemberProblem refuses a symlink from the index,
+        // but only where the index SAYS so: the unix mode in `Attributes` is an
+        // extension, and a build that omits it would present a stored link as
+        // an ordinary member. `stat` follows the link and reports the TARGET --
+        // so a link to /etc/passwd would pass isFile() and be staged as a
+        // member. `lstat` reports the link itself, whatever any index claimed.
+        info = await lstat(full);
       } catch {
         throw new IntakeArchiveError(
           `the archive listed ${JSON.stringify(entry.path)} but did not produce it`,
