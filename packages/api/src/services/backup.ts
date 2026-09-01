@@ -1205,9 +1205,12 @@ export interface DumpWithInventory {
  * been shown breaking on its own.
  *
  * THE EXPORTING TRANSACTION MUST OUTLIVE THE IMPORT, so it is held open across
- * the whole of pg_dump rather than closed once the id is in hand: an exported
- * snapshot is importable only until the transaction that exported it ends, and
- * there is no way from here to observe the instant pg_dump imports it. The cost
+ * the whole of pg_dump rather than closed once the id is in hand. That an
+ * exported snapshot is importable only until the exporting transaction ends is
+ * PostgreSQL's documented rule rather than something measured here -- nothing
+ * in this module rests on it, because the transaction is held for the whole
+ * dump either way, and there is no way from here to observe the instant
+ * pg_dump imports it even if we wanted to close earlier. The cost
  * is one idle REPEATABLE READ transaction for the length of the dump, which is
  * the same length pg_dump already holds one of its own for, against the same
  * database.

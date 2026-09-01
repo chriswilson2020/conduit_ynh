@@ -273,10 +273,15 @@ export const RESTORE_REFUSALS = {
    * Refusing costs nothing recoverable: it happens at inspect, with nothing
    * written and nothing destroyed, and the archive is still openable by hand.
    *
-   * It cannot refuse a legitimate FUTURE backup by mistake, either: a manifest
-   * written by a later Conduit is refused by `newerApp` before this is reached,
-   * so the only archives that arrive here with an unreadable inventory are ones
-   * no Conduit wrote as they stand.
+   * It is very unlikely to refuse a legitimate FUTURE backup by mistake, and
+   * the qualifier is deliberate. A manifest written by a later Conduit -- one
+   * that had added, say, an "approximate" label -- is normally refused by
+   * `newerApp` before this is reached. NORMALLY, not always: compareAppVersions
+   * answers null for an `appVersion` it cannot order, and `newerApp` then does
+   * not fire. Every version Conduit's release process writes is an orderable
+   * `major.minor.patch`, so the gap needs a manifest no release produced -- and
+   * a refusal is still the safe side of it, because the alternative is checking
+   * counts against a guarantee this build cannot evaluate.
    */
   inventoryUnreadable: "inventory-unreadable",
 } as const;
