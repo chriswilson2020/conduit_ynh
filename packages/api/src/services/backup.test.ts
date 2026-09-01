@@ -729,9 +729,25 @@ describe("backup secrecy of arguments", () => {
   // THE SCANNER, SHOWN FINDING SOMETHING, before it is trusted to find
   // nothing. A /proc sweep that silently returned "" would pass the real test
   // below for ever.
+  //
+  // THE INPUT IS INCOMPRESSIBLE, AND THAT IS THE WHOLE POINT OF IT. This is a
+  // race -- the sweep has to happen while the child is still alive -- and it
+  // was a 90 MILLISECOND race until 7.7 measured it, because 8MB of the same
+  // byte is one enormous LZMA match and `-mx=9` disposes of it almost
+  // instantly. Measured on the deploy target:
+  //
+  //   8MB of "x" ......... 0.09s   <- the window the sweep had to fit inside
+  //   8MB of random ...... 0.76s
+  //   16MB of random ..... 1.53s   <- what it uses now
+  //
+  // against a sweep of 1.5-2.6ms over an idle box's four processes -- and a CI
+  // runner has far more of them, which is where it eventually lost the coin
+  // toss and failed a run with the control reporting "false". Nothing about the
+  // scanner or the archive changed; the child now simply lives long enough to
+  // be seen, by a margin of thirty to a hundred sweeps rather than two.
   it7zProc("the /proc scan can see a passphrase that IS on a command line", async () => {
     const dir = await mkdtemp(path.join(scratch, "control-"));
-    await writeFile(path.join(dir, "a.txt"), "x".repeat(8 * 1024 * 1024));
+    await writeFile(path.join(dir, "a.txt"), randomBytes(16 * 1024 * 1024));
     const marker = `CONTROL-${randomUUID()}`;
     const child = spawn("7z", [
       "a", "-t7z", `-p${marker}`, "-mhe=on", "-mx=9", "-bd", "-y", "--",
