@@ -607,17 +607,33 @@ export function planSource(file: IntakeFile, payload: StagedPayload): PlanSource
 /**
  * One held plan and the staging it was built from.
  *
- * THERE IS NO OPERATOR ON THIS TYPE, AND THE ROUTES TASK MUST ADD ONE. A plan
- * is addressable by `planId` alone, so nothing here binds it to the person who
- * uploaded the archive: any authenticated caller holding the id could apply
- * somebody else's restore. It is not exploitable as it stands -- the id is a v4
- * UUID and the store holds one session at a time -- but that is an accident of
- * capacity, not a control. The store will not do it for whoever writes the
- * routes, so they have to.
+ * THE OPERATOR IS ON THIS TYPE, AND IT IS REQUIRED RATHER THAN OPTIONAL.
+ * Until 7.7's routes task there was no owner here at all: a plan was addressable
+ * by `planId` alone, so nothing bound it to the person who uploaded the archive
+ * and any authenticated caller holding the id could apply somebody else's
+ * restore. That was never exploitable as it stood -- the id is a v4 UUID and the
+ * store holds one session at a time -- but an accident of capacity is not a
+ * control, and the capacity is a constructor argument.
+ *
+ * IT IS CHECKED BY THE STORE RATHER THAN BY THE ROUTE, which is the whole
+ * reason it lives here. `get`, `use` and `discard` all take the caller's
+ * identity and answer "no such plan" when it does not match -- so the two
+ * importers that arrive later inherit the binding instead of each remembering
+ * to write it, and a route that forgets to pass an owner does not compile.
  */
 export interface IntakeSession<E extends PlannedEffect = PlannedEffect> {
   readonly plan: Plan<E>;
   readonly payload: StagedPayload;
+  /**
+   * The username that uploaded this. Compared exactly, never displayed.
+   *
+   * The identity SSOwat established for the upload request -- routes/index.ts's
+   * `requireUser`, never anything from a body or a query. On a box where a local
+   * process can set Ynh-User for itself that identity is only as good as the
+   * perimeter, which is true of every route here and is why the restore is also
+   * behind re-authentication.
+   */
+  readonly owner: string;
 }
 
 /**
@@ -630,6 +646,11 @@ export interface IntakeSession<E extends PlannedEffect = PlannedEffect> {
  * plan stays here, the page gets a rendering and an id, and apply is addressed
  * by the id. What apply consumes is byte-for-byte the object inspect produced,
  * because it IS that object.
+ *
+ * AND IT IS ADDRESSED BY AN ID PLUS AN OWNER, never by the id alone. Every
+ * lookup here takes the caller's identity and answers "no such plan" when it
+ * does not match, so a plan id is not a bearer token for somebody else's
+ * restore. See IntakeSession.owner.
  *
  * ONE AT A TIME BY DEFAULT, and for the disk reason services/backup.ts's
  * MAX_CONCURRENT_BACKUPS gives: a held session is an unpacked install sitting
@@ -685,10 +706,19 @@ export class IntakeSessionStore {
     return session.plan.id;
   }
 
-  /** The held session, or undefined when the id is unknown or has expired. */
-  get(planId: string): IntakeSession | undefined {
+  /**
+   * The held session, or undefined when the id is unknown, has expired, or
+   * belongs to somebody else.
+   *
+   * ONE ANSWER FOR ALL THREE, and that is deliberate rather than lazy. A caller
+   * who learned that a plan exists but is not theirs would have learned that
+   * somebody is mid-restore and what their plan id is; "no such plan" tells them
+   * nothing they did not bring with them.
+   */
+  get(planId: string, owner: string): IntakeSession | undefined {
     void this.sweep();
-    return this.#sessions.get(planId);
+    const session = this.#sessions.get(planId);
+    return session !== undefined && session.owner === owner ? session : undefined;
   }
 
   /**
@@ -712,16 +742,18 @@ export class IntakeSessionStore {
    *   - DISPOSED IN A `finally`, so a throw from apply -- which is the ordinary
    *     failure, not the exotic one -- deletes the staging on its way out.
    *
-   * Returns undefined without running anything when the id is unknown or has
-   * expired. The body's own value is returned otherwise, so the route can send
-   * a response built from it.
+   * Returns undefined without running anything when the id is unknown, has
+   * expired, or belongs to somebody else -- and in the last case NOTHING IS
+   * DISPOSED, because the plan is still its owner's to apply or cancel. The
+   * body's own value is returned otherwise, so the route can send a response
+   * built from it.
    */
   async use<T>(
-    planId: string, body: (session: IntakeSession) => Promise<T>,
+    planId: string, owner: string, body: (session: IntakeSession) => Promise<T>,
   ): Promise<T | undefined> {
     void this.sweep();
     const session = this.#sessions.get(planId);
-    if (session === undefined) return undefined;
+    if (session === undefined || session.owner !== owner) return undefined;
     this.#sessions.delete(planId);
     this.#inFlight.set(planId, session);
     try {
@@ -734,10 +766,14 @@ export class IntakeSessionStore {
     }
   }
 
-  /** Drop a session and delete its staged files. Idempotent. */
-  async discard(planId: string): Promise<boolean> {
+  /**
+   * Drop a session and delete its staged files. Idempotent, and refused for
+   * anyone but its owner: cancelling somebody else's restore is a denial of
+   * service, not a tidy-up.
+   */
+  async discard(planId: string, owner: string): Promise<boolean> {
     const session = this.#sessions.get(planId);
-    if (session === undefined) return false;
+    if (session === undefined || session.owner !== owner) return false;
     this.#sessions.delete(planId);
     await session.payload.dispose();
     return true;

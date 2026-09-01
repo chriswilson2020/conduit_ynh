@@ -1981,6 +1981,7 @@ describe("apply cannot exceed the plan", () => {
       const work = await scratchDir("count");
       const archive = await realBackup(source, work);
       const staged = await stageAndInspect(archive, target);
+      const targetKeyBefore = await readFile(target.mailKeyPath);
 
       // The plan's count is what the dump itself says it will create. An
       // effect claiming one more table than the dump has is the shape a load
@@ -2011,6 +2012,13 @@ describe("apply cannot exceed the plan", () => {
       expect(message).toContain(`now holds ${String(load.count)}`);
       expect(message).toContain("has HAPPENED");
       expect(message).toContain(safetyPathOf(staged.plan));
+      // AND IT SAYS mail.key WAS NOT REPLACED, which this message did not until
+      // 7.7's routes task and RestoreInventoryMismatchError's already did. Both
+      // throw from the LOAD handler, so the key step and the migrations never
+      // run: telling an operator "the restore has HAPPENED" without that leaves
+      // them hunting a mail connection bug that points nowhere near the cause.
+      expect(message).toContain("mail.key was NOT replaced");
+      expect((await readFile(target.mailKeyPath)).equals(targetKeyBefore)).toBe(true);
       // And the partial outcome travels with it.
       expect((failure as PlanApplyError).outcome.unrealised).toEqual(["destroy-schema"]);
     });

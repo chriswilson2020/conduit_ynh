@@ -15,6 +15,8 @@ import {
   createPortalVerifier, createFixedPasswordVerifier,
 } from "./services/reauth.js";
 import type { ReauthVerifier } from "./services/reauth.js";
+import { IntakeSessionStore } from "./services/intake-plan.js";
+import { WriteGate, isWriteMethod } from "./services/write-gate.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -76,12 +78,19 @@ export interface BuildAppOptions {
    * finding.
    */
   reauthVerifier?: ReauthVerifier;
+  /**
+   * Test-only overrides for the two 7.7 bounds that would otherwise make a test
+   * upload 8GiB or wait fifteen seconds. See CrmRouteDeps for both; never set
+   * outside a test.
+   */
+  restoreMaxUploadBytes?: number;
+  restoreDrainTimeoutMs?: number;
 }
 
 export async function buildApp(
   {
     config, db, dataDir = "./data", webRoot, multipartFileSizeLimit, mail, loggerStream,
-    reauthVerifier,
+    reauthVerifier, restoreMaxUploadBytes, restoreDrainTimeoutMs,
   }: BuildAppOptions,
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -127,6 +136,42 @@ export async function buildApp(
   });
 
   app.decorateRequest("user", null);
+
+  // 7.7's "refuse new writes", and the two hooks that make it one mechanism
+  // rather than a per-route habit. See services/write-gate.ts for why the
+  // METHOD is what decides and not a list of routes.
+  //
+  // REGISTERED BEFORE THE AUTH HOOK BELOW, AND THAT ORDER IS LOAD-BEARING.
+  // Resolving an identity WRITES to the database on a cache miss (see
+  // createUserResolver); during a restore that write would block behind the
+  // DROP SCHEMA's ACCESS EXCLUSIVE lock, so a gate placed after it would hang
+  // exactly the requests it exists to refuse in a millisecond. The cost is that
+  // an unauthenticated caller is also told a restore is running, which behind
+  // SSOwat is nobody, and which is cheaper than the alternative.
+  const writeGate = new WriteGate();
+  app.addHook("onRequest", async (request, reply) => {
+    if (!isWriteMethod(request.method)) return;
+    if (writeGate.admit(request.id)) return;
+    // 503 with Retry-After, which is what it is: the install is temporarily
+    // unable to accept a change and will be able to again shortly.
+    void reply.header("Retry-After", "30");
+    return reply.code(503).send({
+      error: "restore_in_progress",
+      message: writeGate.reason
+        ?? "this install is not accepting changes at the moment; try again shortly",
+    });
+  });
+  // BOTH, because neither covers the other: `onResponse` runs when a response
+  // has been sent, and `onRequestAbort` is the only hook a client that hangs up
+  // mid-request reaches. `finish` is idempotent, so a request that reaches both
+  // -- or that was refused above and never admitted -- costs nothing.
+  app.addHook("onResponse", async (request) => { writeGate.finish(request.id); });
+  app.addHook("onRequestAbort", async (request) => { writeGate.finish(request.id); });
+
+  // Built here rather than inside registerCrmRoutes for the reason the ticket
+  // store is: it has to be the same map across two requests. Closed on shutdown
+  // by the onClose hook below.
+  const intakeSessions = new IntakeSessionStore();
 
   // One resolver per app instance, so its cache lives as long as the process.
   // Without it every request would write a row — see createUserResolver.
@@ -202,7 +247,23 @@ export async function buildApp(
     // registered the routes twice.
     reauthTickets: new ReauthTickets(),
     reauthThrottle: new ReauthThrottle(),
+    // ONE PER APP, for the reason the two above are: the plan id that
+    // POST /api/restore/inspect returns has to resolve in
+    // POST /api/restore/apply, and a store built inside a register call would
+    // be a different map on every registration.
+    intakeSessions,
+    writeGate,
+    restoreMaxUploadBytes,
+    restoreDrainTimeoutMs,
   });
+
+  // WHAT A SHUTDOWN MUST NOT LEAVE BEHIND. A held session is a DECRYPTED backup
+  // in $data_dir -- mail.key in the clear -- and the store's own `close`
+  // disposes of the in-flight ones as well as the waiting ones, which is what
+  // makes a shutdown during a restore leave nothing readable on the disk. It
+  // also stops the sweep timer, so a test that builds twenty apps does not
+  // leave twenty intervals behind.
+  app.addHook("onClose", async () => { await intakeSessions.close(); });
 
   if (webRoot === undefined) {
     app.setNotFoundHandler(async (request, reply) => {

@@ -22,7 +22,10 @@ import { registerDocumentRoutes } from "./documents.js";
 import { registerExportRoutes } from "./export.js";
 import { registerBackupRoutes } from "./backup.js";
 import { registerReauthRoutes } from "./reauth.js";
+import { registerRestoreRoutes } from "./restore.js";
 import type { ReauthTickets, ReauthThrottle, ReauthVerifier } from "../services/reauth.js";
+import type { IntakeSessionStore } from "../services/intake-plan.js";
+import type { WriteGate } from "../services/write-gate.js";
 
 export { mapDomainError, requireUser } from "./helpers.js";
 
@@ -112,15 +115,43 @@ export interface CrmRouteDeps {
    * server's own account password.
    */
   reauthThrottle: ReauthThrottle;
+  /**
+   * Where an uploaded backup's plan waits while a person looks at it. ONE
+   * INSTANCE PER APP, for the same reason the ticket store is: the id returned
+   * by POST /api/restore/inspect has to resolve in POST /api/restore/apply, and
+   * a store built inside a register call would be a new one each time. What it
+   * holds is a DECRYPTED backup on disk, so app.ts also closes it on shutdown.
+   */
+  intakeSessions: IntakeSessionStore;
+  /**
+   * The "refuse new writes" half of the restore's step 5. One instance per app,
+   * shared by the onRequest hook that refuses and the apply route that closes
+   * it -- see services/write-gate.ts.
+   */
+  writeGate: WriteGate;
+  /**
+   * Test-only override for the restore upload's size cap, so a 413-path test
+   * can upload a few KB rather than 8GiB. Defaults to
+   * DEFAULT_MAX_UPLOAD_BYTES. Same precedent, and the same warning, as
+   * multipartFileSizeLimit above: never set outside a test.
+   */
+  restoreMaxUploadBytes?: number;
+  /**
+   * Test-only override for how long a restore waits for in-flight writes to
+   * finish before refusing to start. Defaults to
+   * DEFAULT_DRAIN_TIMEOUT_MS. Exists so the timeout path can be proved without
+   * holding a suite open for fifteen seconds; never set outside a test.
+   */
+  restoreDrainTimeoutMs?: number;
 }
 
 /**
  * Wires the hardened CRM/PM services (plus the plain user listing) into HTTP:
  * companies, contacts, notes, files, events, search, pipelines/deals (Phase
  * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5),
- * documents plus the issuer profile (Phase 7), and the data export, the
- * encrypted backup, its pre-flight and the re-authentication that gates both
- * downloads (Phase 7.6).
+ * documents plus the issuer profile (Phase 7), the data export, the encrypted
+ * backup, its pre-flight and the re-authentication that gates both downloads
+ * (Phase 7.6), and the restore's upload/preview/apply family (Phase 7.7).
  *
  * THIS LIST IS EXHAUSTIVE BY CONSTRUCTION -- it is the register calls below,
  * in words -- so a family added without a line here is a list that has started
@@ -159,4 +190,5 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerExportRoutes(app, deps);
   registerBackupRoutes(app, deps);
   registerReauthRoutes(app, deps);
+  registerRestoreRoutes(app, deps);
 }

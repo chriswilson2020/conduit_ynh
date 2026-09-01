@@ -180,22 +180,23 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 // operator is told about it through a plan FINDING rather than through an
 // effect that could be skipped.
 //
-// ======================= WHAT THE ROUTES TASK MUST ADD =====================
+// ======================= WHERE THE GUARD LIVES, AND WHY ====================
 //
-// Re-authentication and the typed install name are the guard, and they are not
-// here: this module applies a plan somebody else decided to apply. The routes
-// task owns both, owns binding a plan to the operator who uploaded it (see
-// IntakeSession's own note), and owns calling sweepAbandonedIntakes at boot.
+// Re-authentication and the typed install name are the guard, and they are NOT
+// here: this module applies a plan somebody else decided to apply. They live in
+// routes/restore.ts, together with binding a plan to the operator who uploaded
+// it (see IntakeSession.owner) and the boot call to sweepAbandonedIntakes.
 //
-// AND IT OWNS THE OTHER SECOND WRITER, which is not the sync. The spec's step 5
-// says "stop the mail sync AND REFUSE NEW WRITES"; only the first half exists,
-// here, and the second half has no home in a service that cannot see a request.
-// The argument is the one this module already makes: a restore is only true if
-// nothing else is writing, and an operator with a browser open in another tab
-// is exactly as much a second writer as the sync engine. Nothing implements it
-// today.
+// SO DOES THE OTHER SECOND WRITER, which is not the sync. The spec's step 5
+// says "stop the mail sync AND REFUSE NEW WRITES". The first half is here; the
+// second cannot be, because a service handed a database and a plan cannot see
+// that a browser in another tab is posting a company. The argument is the one
+// this module already makes -- a restore is only true if nothing else is
+// writing -- and services/write-gate.ts is where it is carried out: writes are
+// refused by HTTP method for the duration, and the apply route WAITS for the
+// writes already in flight to finish before this function is called at all.
 //
-// TWO SMALLER THINGS THE ROUTES WILL TRIP OVER:
+// TWO SMALLER THINGS THE ROUTES TRIP OVER, both of them still true:
 //
 //   mail-crypto.ts's key cache is keyed by the PATH STRING it was given, not by
 //   a resolved path, whatever its own comment says -- so forgetMailKey only
@@ -510,6 +511,13 @@ export class RestoreMailKeyError extends Error {
  * tables the two disagree about a restore that worked perfectly. That direction
  * shows up as a COUNT mismatch with nothing missing, which is why both are
  * reported and why this says what happened rather than accusing anyone.
+ *
+ * AND IT SAYS mail.key WAS NOT REPLACED, for the reason
+ * RestoreInventoryMismatchError does: both throw from the LOAD handler, so the
+ * key step and the migrations never run. Telling an operator "the restore has
+ * HAPPENED" while leaving out that this install still holds its own mail
+ * encryption key is how the symptom -- no mail account will connect, or every
+ * stored password suddenly does -- ends up pointing nowhere near the cause.
  */
 export class RestoreUnexpectedResultError extends Error {
   constructor(
@@ -525,7 +533,9 @@ export class RestoreUnexpectedResultError extends Error {
       + `${String(actualTables)}`
       + (missingTables.length === 0 ? ""
         : `, and these are not there at all: ${missingTables.slice(0, 10).join(", ")}`)
-      + ". The restore has HAPPENED -- check the data before using this install."
+      + ". The restore has HAPPENED -- check the data before using this install. mail.key was "
+      + "NOT replaced and no migrations were run, so this install still holds its own mail "
+      + "encryption key."
       + (safetyBackupPath === null ? ""
         : ` A safety backup of the previous state is at ${safetyBackupPath}. To go back:\n`
           + recoveryCommands.map((line) => `  ${line}`).join("\n")),

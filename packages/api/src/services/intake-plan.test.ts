@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -83,6 +83,11 @@ async function land(content: Buffer | string, filename: string): Promise<IntakeF
 const SOURCE: PlanSourceView = {
   filename: "b.7z", bytes: 10, sha256: "0".repeat(64), stagedBytes: 10, memberCount: 1,
 };
+
+/** Who uploaded the archive in these cases. See IntakeSession.owner. */
+const OWNER = "chris";
+/** Somebody else with a session on the same install. */
+const STRANGER = "sam";
 
 // ---------------------------------------------------------------------------
 // THE CONTAINMENT PROPERTY. Synthetic effects, no archive, no database: the
@@ -759,8 +764,8 @@ describe("a plan is a value", () => {
     const plan = newPlan<TestEffect>({
       kind: "restore", source: SOURCE, effects: [effect({ op: "count-things" })],
     });
-    const id = store.hold({ plan, payload: await oneMember() });
-    const back = store.get(id)?.plan;
+    const id = store.hold({ plan, payload: await oneMember(), owner: OWNER });
+    const back = store.get(id, OWNER)?.plan;
     expect(back).toBe(plan);
     expect(Object.isFrozen(back?.effects)).toBe(true);
     await store.close();
@@ -776,8 +781,8 @@ describe("IntakeSessionStore", () => {
     const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
     const payload = await oneMember();
     const plan = heldPlan();
-    const id = store.hold({ plan, payload });
-    expect(store.get(id)?.plan).toBe(plan);
+    const id = store.hold({ plan, payload, owner: OWNER });
+    expect(store.get(id, OWNER)?.plan).toBe(plan);
     await store.close();
   });
 
@@ -785,8 +790,8 @@ describe("IntakeSessionStore", () => {
     const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
     const first = await oneMember();
     const second = await oneMember();
-    store.hold({ plan: heldPlan(), payload: first });
-    expect(() => store.hold({ plan: heldPlan(), payload: second }))
+    store.hold({ plan: heldPlan(), payload: first, owner: OWNER });
+    expect(() => store.hold({ plan: heldPlan(), payload: second, owner: OWNER }))
       .toThrow(PlanRefusedError);
     // AND IT DISPOSED OF NOTHING. A store that evicted somebody's in-flight
     // restore to make room would be worse than a refusal.
@@ -797,14 +802,14 @@ describe("IntakeSessionStore", () => {
 
   it("runs a session once, and it cannot be applied twice", async () => {
     const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
-    const id = store.hold({ plan: heldPlan(), payload: await oneMember() });
+    const id = store.hold({ plan: heldPlan(), payload: await oneMember(), owner: OWNER });
     let ran = 0;
-    expect(await store.use(id, async () => { ran += 1; return "done"; })).toBe("done");
+    expect(await store.use(id, OWNER, async () => { ran += 1; return "done"; })).toBe("done");
     // Gone from the map BEFORE the body ran, so a second call finds nothing --
     // and finding nothing must not run the body.
-    expect(await store.use(id, async () => { ran += 1; return "again"; })).toBeUndefined();
+    expect(await store.use(id, OWNER, async () => { ran += 1; return "again"; })).toBeUndefined();
     expect(ran).toBe(1);
-    expect(store.get(id)).toBeUndefined();
+    expect(store.get(id, OWNER)).toBeUndefined();
     await store.close();
   });
 
@@ -814,8 +819,8 @@ describe("IntakeSessionStore", () => {
   // $data_dir against the one discipline this spine is built on.
   it("deletes the staged files when the body succeeds", async () => {
     const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
-    const id = store.hold({ plan: heldPlan(), payload: await oneMember() });
-    await store.use(id, async () => Promise.resolve(null));
+    const id = store.hold({ plan: heldPlan(), payload: await oneMember(), owner: OWNER });
+    await store.use(id, OWNER, async () => Promise.resolve(null));
     expect(await intakeWorkDirs()).toEqual([]);
     await store.close();
   });
@@ -824,8 +829,8 @@ describe("IntakeSessionStore", () => {
   // not the exotic path; it is what a failed restore does.
   it("deletes the staged files when the body throws, and lets the error out", async () => {
     const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
-    const id = store.hold({ plan: heldPlan(), payload: await oneMember() });
-    await expect(store.use(id, async () => {
+    const id = store.hold({ plan: heldPlan(), payload: await oneMember(), owner: OWNER });
+    await expect(store.use(id, OWNER, async () => {
       await Promise.resolve();
       throw new Error("the load failed");
     })).rejects.toThrow("the load failed");
@@ -839,10 +844,10 @@ describe("IntakeSessionStore", () => {
   // decrypted backup behind with nothing holding a reference to it.
   it("close deletes a session that is still inside use", async () => {
     const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
-    const id = store.hold({ plan: heldPlan(), payload: await oneMember() });
+    const id = store.hold({ plan: heldPlan(), payload: await oneMember(), owner: OWNER });
     let release: (() => void) = () => { /* replaced below */ };
     const held = new Promise<void>((resolve) => { release = resolve; });
-    const running = store.use(id, async () => { await held; return null; });
+    const running = store.use(id, OWNER, async () => { await held; return null; });
     // Wait until the body is actually running.
     for (let attempt = 0; attempt < 200 && store.inFlight === 0; attempt += 1) {
       await new Promise((r) => setTimeout(r, 2));
@@ -866,23 +871,74 @@ describe("IntakeSessionStore", () => {
         now: clock, ttlMs: 60_000,
       }),
       payload,
+      owner: OWNER,
     });
     expect((await readdir(dataDir)).filter((e) => e.startsWith(INTAKE_WORK_PREFIX))).toHaveLength(1);
     clock = new Date(clock.getTime() + 61_000);
     expect(await store.sweep()).toBe(1);
-    expect(store.get(id)).toBeUndefined();
+    expect(store.get(id, OWNER)).toBeUndefined();
     expect((await readdir(dataDir)).filter((e) => e.startsWith(INTAKE_WORK_PREFIX))).toEqual([]);
     await store.close();
   });
 
+  // THE BINDING 7.7's ROUTES TASK ADDED, and the reason it is HERE rather than
+  // in the route: the store is the shared spine's, so the two importers that
+  // come next inherit the check instead of each remembering to write it.
+  //
+  // Before it, a plan was addressable by `planId` alone -- any authenticated
+  // caller holding the id could apply somebody else's restore. The id is a v4
+  // UUID and the store holds one session, so it was never exploitable; an
+  // accident of capacity is not a control, and the capacity is a constructor
+  // argument.
+  describe("a plan is bound to the operator who uploaded it", () => {
+    it("does not hand a stranger the session, and says only that there is none", async () => {
+      const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
+      const id = store.hold({ plan: heldPlan(), payload: await oneMember(), owner: OWNER });
+      // The SAME answer the unknown id gets, so nothing is learned from the
+      // difference between "not yours" and "not there".
+      expect(store.get(id, STRANGER)).toBeUndefined();
+      expect(store.get(randomUUID(), OWNER)).toBeUndefined();
+      expect(store.get(id, OWNER)?.plan.id).toBe(id);
+      await store.close();
+    });
+
+    it("will not run a stranger's apply, and does not dispose of the staging either", async () => {
+      const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
+      const id = store.hold({ plan: heldPlan(), payload: await oneMember(), owner: OWNER });
+      let ran = 0;
+      expect(await store.use(id, STRANGER, async () => { ran += 1; return "done"; }))
+        .toBeUndefined();
+      expect(ran).toBe(0);
+      // AND THE PLAN IS STILL ITS OWNER'S. A refused caller that had disposed
+      // of the staging would have destroyed the upload it was not allowed to
+      // apply -- the denial of service the check exists to prevent, reached
+      // through the check itself.
+      expect(store.size).toBe(1);
+      expect((await intakeWorkDirs()).length).toBe(1);
+      expect(await store.use(id, OWNER, async () => { ran += 1; return "done"; })).toBe("done");
+      expect(ran).toBe(1);
+      await store.close();
+    });
+
+    it("will not let a stranger cancel it", async () => {
+      const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
+      const id = store.hold({ plan: heldPlan(), payload: await oneMember(), owner: OWNER });
+      expect(await store.discard(id, STRANGER)).toBe(false);
+      expect((await intakeWorkDirs()).length).toBe(1);
+      expect(await store.discard(id, OWNER)).toBe(true);
+      expect(await intakeWorkDirs()).toEqual([]);
+      await store.close();
+    });
+  });
+
   it("deletes the staged files on discard and on close", async () => {
     const store = new IntakeSessionStore({ sweepIntervalMs: 0 });
-    const id = store.hold({ plan: heldPlan(), payload: await oneMember() });
-    expect(await store.discard(id)).toBe(true);
-    expect(await store.discard(id)).toBe(false);
+    const id = store.hold({ plan: heldPlan(), payload: await oneMember(), owner: OWNER });
+    expect(await store.discard(id, OWNER)).toBe(true);
+    expect(await store.discard(id, OWNER)).toBe(false);
     expect((await readdir(dataDir)).filter((e) => e.startsWith(INTAKE_WORK_PREFIX))).toEqual([]);
 
-    store.hold({ plan: heldPlan(), payload: await oneMember() });
+    store.hold({ plan: heldPlan(), payload: await oneMember(), owner: OWNER });
     await store.close();
     expect((await readdir(dataDir)).filter((e) => e.startsWith(INTAKE_WORK_PREFIX))).toEqual([]);
   });

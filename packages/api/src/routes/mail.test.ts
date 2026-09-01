@@ -53,6 +53,12 @@ beforeEach(async () => {
   manager = {
     get: (id) => syncs.get(id),
     syncNow: (id) => { syncNowCalls.push(id); return Promise.resolve(); },
+    // 7.7 widened this slice with the pair the restore uses to stop the second
+    // writer. No mail route calls either, so they are here to satisfy the
+    // contract rather than to be exercised; routes/restore.test.ts is where
+    // they are actually asserted against.
+    stop: () => Promise.resolve(),
+    start: () => Promise.resolve(),
   };
 });
 afterEach(async () => {
@@ -707,6 +713,8 @@ describe("mail folder routes", () => {
       syncManager: () => ({
         get: (id) => syncs.get(id),
         syncNow: () => { throw new Error("engine exploded"); },
+        stop: () => Promise.resolve(),
+        start: () => Promise.resolve(),
       }),
     });
     const second = await makeAccount(throwing, { label: "Side", email: "side@example.com" });

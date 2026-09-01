@@ -39,9 +39,9 @@ import { DISK_MARGIN_BYTES, freeSpaceBytes, SEVEN_ZIP_PACKAGE } from "./backup.j
 //     test can assert.
 //   - REMOVED ON EVERY EXIT PATH -- success, refusal, failure and an abandoned
 //     upload alike. The one path no `finally` can cover is a SIGKILL, and
-//     sweepAbandonedIntakes is what will cover that, once the route family of a
-//     later task calls it at boot; see its own comment for why nothing has been
-//     missed in the meantime.
+//     sweepAbandonedIntakes is what covers that, called at boot by
+//     routes/restore.ts the way services/backup.ts's sweep is called by
+//     routes/backup.ts.
 //
 // AND FROM A SECOND: LIMITS COME BEFORE UNPACKING. A 2,207-byte archive listing
 // 4,194,304 bytes of content is not a hypothetical -- it is measured, below --
@@ -253,13 +253,10 @@ function formatMiB(bytes: number): string {
  * uploaded backup archive and its decrypted contents -- mail.key in the clear
  * -- so this is the more valuable of the two sweeps, not the lesser.
  *
- * NO PRODUCTION CALLER YET, and that is stated rather than hidden. The routes
- * this spine serves arrive in a later task of this phase, and the function that
- * registers them MUST call this at registration, the way registerBackupRoutes
- * calls its own. Nothing has been missed in the meantime: no route can create
- * an intake work directory yet, so there is nothing for a boot-time sweep to
- * find, and every exit path a running process has is covered by the disposers
- * below.
+ * CALLED AT REGISTRATION BY routes/restore.ts, the way registerBackupRoutes
+ * calls its own, and that call is the only net under a work directory a crash
+ * left behind. Every other exit path a running process has is covered by the
+ * disposers below and by IntakeSessionStore's `use`, `sweep` and `close`.
  *
  * Never throws: a sweep that cannot read $data_dir is not a reason to fail an
  * intake that has not started yet.
@@ -431,7 +428,7 @@ export interface ReceiveIntakeOptions {
  *
  * THE DIGEST COSTS NOTHING EXTRA because it is taken from the same chunks on
  * their way to the file. It is what lets the preview identify the file the
- * operator uploaded, and what a later task can compare against a manifest.
+ * operator uploaded, and what services/restore.ts compares against a manifest.
  */
 export async function receiveIntake(options: ReceiveIntakeOptions): Promise<IntakeFile> {
   const {

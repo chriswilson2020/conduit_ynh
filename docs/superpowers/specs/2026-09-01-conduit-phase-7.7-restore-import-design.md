@@ -100,8 +100,23 @@ the thing being previewed is destruction.
 5. **Stop the mail sync** and refuse new writes. *(Corrected during 7.7 Task 2: the
    sync is stopped **before** the safety backup, not after it -- a backup taken while
    the second writer is running is an undo to a state that stopped being true a moment
-   later. **"Refuse new writes" is still unimplemented**: it has no home in the engine,
-   which cannot see a request, and it belongs to the routes task.)*
+   later.)*
+
+   *(**"Refuse new writes" landed in 7.7 Task 3**, the routes task, because it needs
+   to see a request. `services/write-gate.ts` refuses every unsafe HTTP method for
+   the duration -- the METHOD and not a list of routes, so a route added later cannot
+   forget to be covered -- and the hook is registered BEFORE the identity hook,
+   because resolving a user writes to the database on a cache miss and that write
+   would block behind the restore's own `DROP SCHEMA`. Reads are not refused: step 5
+   says writes, and a page that could not report what was happening would be worse
+   than useless during the one operation an operator watches.*
+
+   *Closing the gate stops the NEXT write and says nothing about one already inside a
+   handler with a transaction open, so the apply route also **waits** for the writes
+   already in flight, bounded at 15s. **A wait that runs out refuses the restore**: a
+   restore that did not start is recoverable by pressing the button again, and one
+   that destroyed the database under a live writer is not. An in-flight write is
+   never killed -- it finishes normally and the restore is what gives way.)*
 6. **Load the blobs, then the dump, then `mail.key`.** *(Corrected during 7.7 Task 2.
    This step originally read "load the dump, then the blobs, then `mail.key`", which
    contradicted this document's own failure analysis below -- "database LAST, so a crash
@@ -148,6 +163,31 @@ the thing being previewed is destruction.
 ### The guard
 
 Chris's ruling: **type the install's name to confirm.** Plus re-authentication, plus a plain statement of what is about to be destroyed — row counts from the live database, so the operator sees what they are replacing rather than an abstraction.
+
+> **WHAT "THE INSTALL'S NAME" IS, decided in 7.7 Task 3 and recorded here because
+> it is a ruling being carried out rather than an implementation detail. It is THE
+> DATABASE THIS INSTALL IS CONNECTED TO** -- `conduit` on a stock YunoHost
+> install, `conduit__2` on a second instance, which is the name YunoHost itself
+> uses for the install. The reasoning at length is in `routes/restore.ts`'s
+> `installName`. In short: the organisation profile's name is EMPTY on a fresh
+> install, which is exactly the install a recovery restore runs against; the
+> hostname does not tell two instances on one box apart, and two tabs on one box
+> is the confusion that actually happens; the app version and the base path are
+> the same on every install of a release. The database name is the only candidate
+> that names the object the restore actually destroys, cannot be empty (the
+> process would not have booted without it), and is NOT IN THE ARCHIVE -- so a
+> wrong or hostile backup cannot supply its own confirmation.
+>
+> **It does not tell two BOXES apart**, each running one stock Conduit, and that
+> is stated rather than papered over with a composite name nobody would recognise
+> as their install's. Re-authentication (a different box, a different password)
+> and the archive passphrase stand behind it.
+>
+> **RE-AUTHENTICATION IS ON BOTH REQUESTS**, the preview and the apply. A ticket
+> is single-use by design, so one cannot span a person reading a destruction list
+> -- and it should not: what the gate proves is that the operator is at the
+> keyboard NOW, and the moment that matters is the one where the database goes.
+> The page therefore asks for the password twice and has to say why.
 
 ---
 
