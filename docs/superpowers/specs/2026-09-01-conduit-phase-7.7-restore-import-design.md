@@ -123,6 +123,24 @@ the thing being previewed is destruction.
 - **If the rollback also fails**, be very loud, name the safety backup's location on disk, and give the exact command to restore it by hand. **A silent half-restore is the worst outcome this app can produce** and it must be impossible to reach without a message.
 - The blobs are content-addressed and immutable, so writing them is idempotent and re-runnable. Order matters: **database last**, so a crash mid-blob leaves a consistent database referencing files that exist.
 
+> **ADDED 1 Sep, and it closes a hole this section did not know it had.** Everything above
+> verifies the restore against the archive it loaded. That cannot catch a backup that was
+> **already wrong when it was taken** -- every witness in the chain is derived from
+> `database.sql`, which is the file the load consumed. Since v1.4.0 the backup's
+> `manifest.json` carries an **inventory** of what the database HELD (tables, exact row
+> counts, measured from the catalogue in the dump's own snapshot -- see 7.6's spec), and the
+> restore compares its result against that too.
+>
+> **It is a report, not a prevention**, and that is decided rather than conceded: by the time
+> rows can be counted the transaction has committed, so there is no rollback left to take.
+> The answer is the one every other post-commit failure here gives -- say which tables
+> disagree and by how much, name the safety backup, print the commands that put the install
+> back -- and it **stops the plan**, so `mail.key` is not replaced and no migrations run on
+> top of a restore that has just proved it can surprise us.
+>
+> **A backup with no inventory still restores**, with the check reported as *not made*. Chris
+> has v1.3.0 backups; a restore that refused them would be worse than the gap it closes.
+
 ### The item this phase must not get wrong
 
 **An unlisted `files/` member is EXTRA, not DAMAGE.** The backup manifest's member list is the blob walk's snapshot, and `7z` reads the directory again when it runs — so an upload landing between the two puts a member in the archive the manifest does not list. That is harmless: blobs are content-addressed and immutable, so it is a whole file rather than a partial one. **A restore that treated "in the archive, not in the manifest" as corruption would reject a perfectly good backup.** The opposite skew needs no handling: a blob deleted in that window makes `7z` exit non-zero, which already fails the backup.

@@ -71,7 +71,7 @@ round-trip unchanged.
 | `database.sql` | A plain-text `pg_dump` of the whole database: every company, contact, deal, project, task, note, meeting and document, and every mail message body. Readable in any text editor; restorable with `psql`. |
 | `mail.key` | The 32-byte AES-256-GCM key that Conduit's stored mail passwords are encrypted with. **Without this file a restored install cannot read a single mail account's password.** |
 | `files/` | The blob store, exactly as it sits on the server: every uploaded file, every issued quote PDF, and every mail attachment. Each is named by the SHA-256 of its own contents. |
-| `manifest.json` | What this archive is, and a SHA-256 for every other member. |
+| `manifest.json` | What this archive is, a SHA-256 for every other member, and an **inventory** of what the database held -- every table and its exact row count. |
 
 `files/` uses content addressing, so the names in it are digests rather than
 `Invoice.pdf`. That is what the server stores; the human names live in the
@@ -85,14 +85,21 @@ Settings page and it exists for exactly that.
 {
   "formatVersion": 1,
   "kind": "backup",
-  "appVersion": "1.3.0",
+  "appVersion": "1.4.0",
   "schemaVersion": "0012_misty_phantom_reporter",
   "migrationPosition": 13,
-  "generatedAt": "2026-08-31T09:15:00.000Z",
+  "generatedAt": "2026-09-01T09:15:00.000Z",
   "postgres": {
     "serverVersion": "15.19",
     "pgDumpVersion": "pg_dump (PostgreSQL) 15.19 (Debian 15.19-0+deb12u1)",
     "pgDumpArgs": ["--no-owner", "--no-privileges", "--format=plain"]
+  },
+  "inventory": {
+    "consistency": "shared-snapshot",
+    "tables": [
+      { "table": "drizzle.__drizzle_migrations", "rows": 13 },
+      { "table": "public.companies", "rows": 42 }
+    ]
   },
   "encryption": {
     "container": "7z",
@@ -113,6 +120,69 @@ Conduit, or one carrying more migrations than the running build ships, is
 refused outright, because its data may use columns that build does not have. A
 backup from an **older** one is accepted, and its schema is brought up to date
 after the dump loads.
+
+### `inventory` -- what the database held, recorded separately from the dump
+
+`inventory` lists **every table the database held and exactly how many rows was
+in each**, and it is there so that a restore can check its result against
+something **other than the file it just loaded**.
+
+That distinction is the whole reason the field exists. A restore already
+compares the database it produced against the tables `database.sql` declares --
+but `database.sql` is the file the restore consumed, so a backup that was
+already wrong at the moment it was written restores perfectly against its own
+description, reports success, and nobody finds out. The inventory is measured
+from PostgreSQL's own catalogue while the backup is being taken, so it is a
+second, independent witness: if the two disagree, the restore says so and names
+the tables.
+
+**The counts are exact.** They are `count(*)`, never `pg_stat_user_tables` and
+never `reltuples`. The planner's estimates read identically before and after a
+full replacement, which makes them useless for exactly the failure this is here
+to catch.
+
+**The counts and the dump come from one snapshot of the database, and this is
+the part that had to be measured rather than assumed.** `pg_dump` takes its own
+snapshot, so counting rows in a separate query counts a database that may have
+moved in between -- and an inventory that disagreed with its own dump would
+make a perfectly good backup fail its restore, loudly, over an install that had
+just been replaced. So Conduit opens a `REPEATABLE READ` transaction, exports
+its snapshot with `pg_export_snapshot()`, counts every table inside it, and
+hands the same snapshot to `pg_dump --snapshot`. Measured on PostgreSQL 15.19
+with a third session writing in the middle:
+
+| | `public.t` | `public.u` | `public.v` |
+|---|---|---|---|
+| counted in the exporting transaction | 500 | 7 | did not exist |
+| *concurrent writer:* | +500 rows | -3 rows | `CREATE TABLE` |
+| `pg_dump --snapshot=<id>` | 500 | 7 | absent |
+| `pg_dump` with its own snapshot | **1000** | **4** | **present** |
+
+The last row is the control: without the shared snapshot the two halves of a
+backup genuinely do disagree, on nothing more exotic than somebody saving a
+company while the backup runs. `consistency` records which guarantee applies;
+`"shared-snapshot"` is the one above, and it is the only value Conduit writes.
+A restore refuses an inventory labelled anything else rather than checking
+counts it cannot interpret.
+
+The `--snapshot` flag is **not** listed in `pgDumpArgs`. That field records the
+flags that decide what is *in* the file; the snapshot id decides only which
+instant was read, and it is a transaction identifier that means nothing once
+the backup has finished.
+
+**Absent is not empty, and a reader must not treat them alike.**
+
+| What the manifest has | What it means | What a restore does |
+|---|---|---|
+| no `inventory` key at all | the backup predates this field -- **Conduit 1.3.0 and earlier** | restores normally, and reports the check as **not made** |
+| `"inventory": { ..., "tables": [] }` | the database held **no tables** | checks, and fails if the restored database has any |
+| an `inventory` that is not one of those | the manifest is damaged | **refuses**, before anything is destroyed |
+
+**A backup taken before this field existed still restores.** That is a
+requirement, not a courtesy: a restore that rejected every archive written by an
+earlier Conduit would be worse than the gap it closes. What such a backup loses
+is the check, not the data, and the restore preview says so in words rather than
+passing a check it never made.
 
 ---
 
@@ -169,3 +239,8 @@ optional and there is no way to ask for an unencrypted one.
 catches a damaged or truncated download. `manifest.json` carries a SHA-256 per
 member on top of that, so a member can be checked individually against what the
 server actually read.
+
+Neither of those says whether the *contents* are right, only whether the bytes
+survived the trip. That is what the `inventory` above is for, and a restore is
+where it gets used: it is the only record in the archive that was not derived
+from `database.sql`.

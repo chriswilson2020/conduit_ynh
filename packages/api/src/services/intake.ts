@@ -134,6 +134,12 @@ export const DEFAULT_MAX_MEMBERS = 250_000;
  * and cannot be assumed small -- but a member being read into a string as
  * though it were a manifest, that turns out to be a 4GB pg_dump, is a heap
  * exhaustion with a stack trace pointing at the wrong line.
+ *
+ * SINCE v1.4.0 IT ALSO CARRIES ONE ENTRY PER TABLE (the inventory -- see
+ * services/backup.ts), and that term does NOT move this number: it grows with
+ * the SCHEMA rather than with the install, twenty-seven entries of a few dozen
+ * bytes against a blob list that reaches hundreds of thousands. The bound is
+ * still the blob term.
  */
 export const DEFAULT_MAX_TEXT_BYTES = 64 * 1024 * 1024;
 

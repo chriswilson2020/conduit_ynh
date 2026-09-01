@@ -242,6 +242,46 @@ describe("docs/backup-format.md", () => {
       .toEqual(["--no-owner", "--no-privileges", "--format=plain"]);
   }, 120_000);
 
+  // THE INVENTORY IS A CHANGE TO WHAT THE FORMAT *IS*, so the page has to carry
+  // it and the page's claims have to be checked against a real archive rather
+  // than against the code that wrote one. Three separate claims are made here
+  // and each one is load-bearing for a different reader.
+  it7z("describes the inventory the archive actually carries", async () => {
+    const backup = await realBackup();
+    const { root } = await open7z(backup.path);
+    const manifest = JSON.parse(
+      await readFile(path.join(root, "manifest.json"), "utf8"),
+    ) as { inventory?: { consistency?: string; tables?: { table: string; rows: number }[] } };
+
+    // 1. The archive really carries one, and it is labelled with the guarantee
+    //    the page names.
+    expect(manifest.inventory?.consistency).toBe("shared-snapshot");
+    expect(doc).toContain("`\"shared-snapshot\"` is the one above");
+    // The company realBackup() creates is in it, counted exactly.
+    const companies = manifest.inventory?.tables
+      ?.find((one) => one.table === "public.companies");
+    expect(companies?.rows).toBe(1);
+
+    // 2. The page says the counts are exact and says what it refuses, because
+    //    an estimate would pass the check it exists to fail.
+    expect(doc).toContain("**The counts are exact.**");
+    expect(doc).toContain("never `pg_stat_user_tables`");
+    expect(doc).toContain("never `reltuples`");
+
+    // 3. The page carries the snapshot measurement and its CONTROL. Without
+    //    the control the table is a claim that the flag does something; with
+    //    it, it is a measurement of what happens without the flag.
+    expect(doc).toContain("pg_export_snapshot()");
+    expect(doc).toContain("pg_dump --snapshot");
+    expect(doc).toContain("| `pg_dump` with its own snapshot | **1000** | **4** | **present** |");
+
+    // 4. And the distinction a reader of this format has to be able to make.
+    expect(doc).toContain("**Absent is not empty, and a reader must not treat them alike.**");
+    expect(doc).toContain("no `inventory` key at all");
+    expect(doc).toContain("**Conduit 1.3.0 and earlier**");
+    expect(doc).toContain("A backup taken before this field existed still restores.");
+  }, 120_000);
+
   it7z("names the file the way the page says it is named", async () => {
     const backup = await realBackup();
     expect(doc).toContain("`conduit-backup-YYYY-MM-DD.7z`");

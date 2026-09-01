@@ -20,7 +20,7 @@ import { saveBlob } from "./blobs.js";
 import { attachFile } from "./files.js";
 import { createCompany } from "./companies.js";
 import {
-  buildBackup, libpqEnvironment, pgDumpVersion, type BackupManifest,
+  buildBackup, libpqEnvironment, measureInventory, pgDumpVersion, type BackupManifest,
 } from "./backup.js";
 import {
   decryptCredentials, encryptCredentials, forgetMailKey, loadMailKey,
@@ -31,10 +31,12 @@ import {
 } from "./intake.js";
 import { newPlan, PlanApplyError, PlanExceededError, PlanRefusedError } from "./intake-plan.js";
 import {
-  applyRestore, compareAppVersions, describeDatabaseShape, inspectRestore, readDumpLine,
+  applyRestore, compareAppVersions, compareInventory, describeDatabaseShape, inspectRestore,
+  readDumpLine, readInventory,
   proveArchiveOpens, psqlLoadArgs, psqlVersion, recoveryCommands, sameShape,
   RESTORE_FINDINGS, RESTORE_REFUSALS,
-  RestoreDatabaseChangedError, RestoreHalfAppliedError, RestoreLoadFailedError,
+  RestoreDatabaseChangedError, RestoreHalfAppliedError, RestoreInventoryMismatchError,
+  RestoreLoadFailedError,
   RestoreMigrationError, RestoreSafetyBackupError, RestoreUnexpectedMigrationsError,
   RestoreUnexpectedResultError,
   type DatabaseShape, type RestoreEffect, type RestorePlan, type SafetyBackupEffect,
@@ -506,6 +508,89 @@ describe("shape comparison", () => {
     const base = shape(["drizzle", "public"], ["100", "200"]);
     expect(sameShape(base, shape(["drizzle", "public", "extra"], ["100", "200"]))).toBe(false);
     expect(sameShape(base, shape(["drizzle", "public"], ["100", "200", "300"]))).toBe(false);
+  });
+});
+
+// THE FIFTH INSTRUMENT, READ AS A VALUE. services/backup.ts records what the
+// database HELD; this is restore deciding what that record means before any of
+// it touches a database.
+describe("reading a backup's inventory", () => {
+  const good = { consistency: "shared-snapshot", tables: [{ table: "public.a", rows: 1 }] };
+
+  // THE DISTINCTION THE WHOLE BACKWARD-COMPATIBILITY STORY RESTS ON. A v1.3.0
+  // manifest has no `inventory` key; a manifest saying the database held
+  // nothing has one with an empty list. If these collapsed, either every old
+  // backup would be refused or every old backup would silently pass a check it
+  // never made.
+  it("tells an absent inventory from an inventory of nothing", () => {
+    expect(readInventory(undefined)).toEqual({ kind: "absent" });
+    // A writer that emitted an explicit null said the same thing as one that
+    // omitted the key: `undefined` cannot survive JSON at all.
+    expect(readInventory(null)).toEqual({ kind: "absent" });
+    expect(readInventory({ consistency: "shared-snapshot", tables: [] }))
+      .toEqual({ kind: "present", tables: [] });
+  });
+
+  // THE INSTRUMENT SHOWN NOT TO REFUSE EVERYTHING, before it is trusted to
+  // refuse anything. A reader that answered "unreadable" to all of these would
+  // pass every line below it and refuse every real backup.
+  it("accepts the shape services/backup.ts writes", () => {
+    expect(readInventory(good)).toEqual({ kind: "present", tables: good.tables });
+  });
+
+  it("refuses every shape it could not check, and says which", () => {
+    const why = (raw: unknown): string => {
+      const read = readInventory(raw);
+      if (read.kind !== "unreadable") throw new Error(`expected a refusal, got ${read.kind}`);
+      return read.why;
+    };
+    expect(why(42)).toContain("not an object");
+    // An array is an object to typeof, and is not an inventory.
+    expect(why([])).toContain("not an object");
+    expect(why({ tables: [] })).toContain("how its counts were taken");
+    // A LABEL THIS BUILD CANNOT EVALUATE IS NOT A LABEL IT MAY IGNORE. Counts
+    // taken some other way are not comparable with counts taken this way.
+    expect(why({ ...good, consistency: "approximate" })).toContain("approximate");
+    expect(why({ consistency: "shared-snapshot" })).toContain("does not list any tables");
+    expect(why({ ...good, tables: [{ table: "public.a" }] })).toContain("whole number of rows");
+    expect(why({ ...good, tables: [{ table: "public.a", rows: -1 }] }))
+      .toContain("whole number of rows");
+    expect(why({ ...good, tables: [{ table: "public.a", rows: 1.5 }] }))
+      .toContain("whole number of rows");
+    expect(why({ ...good, tables: [{ table: "", rows: 1 }] })).toContain("no table name");
+    expect(why({ ...good, tables: [{ table: "public.a", rows: 1 }, { table: "public.a", rows: 2 }] }))
+      .toContain("twice");
+  });
+});
+
+describe("comparing an inventory with a restored database", () => {
+  const recorded = [{ table: "public.a", rows: 3 }, { table: "public.b", rows: 0 }];
+
+  it("agrees with itself", () => {
+    expect(compareInventory(recorded, recorded)).toEqual([]);
+    // Order is not a disagreement; the comparison is by name.
+    expect(compareInventory(recorded, [...recorded].reverse())).toEqual([]);
+  });
+
+  it("finds a count that moved, and a table that did not arrive", () => {
+    expect(compareInventory(recorded, [{ table: "public.a", rows: 2 }, recorded[1]!]))
+      .toEqual([{ table: "public.a", recorded: 3, restored: 2 }]);
+    expect(compareInventory(recorded, [recorded[0]!]))
+      .toEqual([{ table: "public.b", recorded: 0, restored: null }]);
+  });
+
+  // BOTH DIRECTIONS, and this is the one a one-sided comparison misses. `every`
+  // over the RECORDED list is vacuously satisfied by a database holding
+  // everything the backup listed plus a table nobody ever recorded -- the same
+  // prefix mask sameList exists to close two describes above.
+  it("finds a table the restored database has and the backup never recorded", () => {
+    expect(compareInventory(recorded, [...recorded, { table: "public.c", rows: 9 }]))
+      .toEqual([{ table: "public.c", recorded: null, restored: 9 }]);
+    // And a database that is empty where the backup recorded everything.
+    expect(compareInventory(recorded, [])).toEqual([
+      { table: "public.a", recorded: 3, restored: null },
+      { table: "public.b", recorded: 0, restored: null },
+    ]);
   });
 });
 
@@ -1029,6 +1114,20 @@ describe("restoring onto a different install", () => {
         sql`SELECT count(*)::text AS count FROM drizzle.__drizzle_migrations`,
       );
       expect(Number(applied[0]?.count)).toBe(journal.position);
+      // WHY THE INVENTORY CHECK RUNS BEFORE THE MIGRATIONS AND NOT AFTER, said
+      // as a measurement rather than as an ordering the reader has to trust.
+      // The inventory describes the backup's schema; migrating forward CHANGES
+      // the database it describes, and here it changes it by exactly one row of
+      // drizzle bookkeeping. A check placed one step later would fail this
+      // perfectly good restore, so the number that would have been compared is
+      // asserted to be the wrong one.
+      const load = effectFor(staged.plan, "load-dump") as RestoreEffect & {
+        inventory: readonly { table: string; rows: number }[] | null;
+      };
+      const recordedBookkeeping = load.inventory
+        ?.find((one) => one.table === "drizzle.__drizzle_migrations")?.rows;
+      expect(recordedBookkeeping).toBe(journal.position - 1);
+      expect(recordedBookkeeping).not.toBe(Number(applied[0]?.count));
       // And the data that was there before the migration survived it.
       const rows = await restored.db.execute<{ name: string }>(sql`SELECT name FROM companies`);
       expect(rows.map((row) => row.name)).toEqual(["Ancient Holdings"]);
@@ -1121,6 +1220,8 @@ describe("restoring onto a different install", () => {
       expect(rows.length).toBeGreaterThan(2);
       const edited = `${head}${rows.slice(0, -1).join("\n")}${tail}`;
       await writeFile(dumpPath, edited);
+      const inventory = manifest.inventory;
+      if (inventory === undefined) throw new Error("the real backup carried no inventory");
       return {
         ...manifest,
         migrationPosition: journal.position - 1,
@@ -1128,6 +1229,19 @@ describe("restoring onto a different install", () => {
         members: manifest.members.map((member) => member.path === "database.sql"
           ? { ...member, bytes: Buffer.byteLength(edited), sha256: digestOf(edited) }
           : member),
+        // THE MANIFEST HAS TO DESCRIBE THE ARCHIVE IT IS IN, and since v1.4.0
+        // that includes what the database held. The edit above removed a
+        // bookkeeping row from the dump, so the fixture is an OLDER backup and
+        // its inventory says so -- for exactly the reason the digest above is
+        // recomputed. Left alone, the inventory check fires first and this test
+        // never reaches the migration failure it is about, which is the check
+        // doing its job rather than a fixture detail.
+        inventory: {
+          ...inventory,
+          tables: inventory.tables.map((one) =>
+            one.table === "drizzle.__drizzle_migrations"
+              ? { ...one, rows: one.rows - 1 } : one),
+        },
       };
     });
     const staged = await stageAndInspect(archive, target);
@@ -1845,6 +1959,16 @@ describe("the plan the operator is shown", () => {
     // schema to the destruction after the preview had been rendered.
     const destroy = effectFor(plan, "destroy-schema") as { schemas: readonly string[] };
     expect(Object.isFrozen(destroy.schemas)).toBe(true);
+    // AND THE INVENTORY, for the same reason and one level deeper. Object.freeze
+    // is shallow, so a frozen list of live objects is a list whose row counts a
+    // caller could still edit after the preview was rendered -- which is the
+    // preview lying about the check it promised.
+    const load = effectFor(plan, "load-dump") as {
+      inventory: readonly { rows: number }[] | null;
+    };
+    if (load.inventory === null) throw new Error("the plan carried no inventory to freeze");
+    expect(Object.isFrozen(load.inventory)).toBe(true);
+    expect(Object.isFrozen(load.inventory[0])).toBe(true);
   });
 });
 
@@ -1955,4 +2079,228 @@ describe("apply cannot exceed the plan", () => {
       expect(outcome.opened).toContain("database.sql");
       expect(outcome.opened).not.toContain("manifest.json");
     });
+});
+
+// ===========================================================================
+// THE RESULT AGAINST THE INVENTORY -- the fifth instrument, and the only one
+// whose witness is not the dump the load consumed.
+//
+// The block above proves the result matches what `database.sql` DECLARED. That
+// can only ever catch a load that diverged from its own file; it is blind to a
+// backup that was already wrong when it was written, because the file it checks
+// against is the file it loaded. These check the result against what
+// manifest.json says the database HELD.
+// ===========================================================================
+
+describe("the inventory the backup records", () => {
+  // ONE DEFINITION OF "A TABLE", ACROSS TWO MODULES. measureInventory reads the
+  // catalogue for services/backup.ts and describeDatabaseShape reads it for the
+  // failure path; if their predicates ever drift, a perfectly good restore
+  // reports a table present in one list and missing from the other.
+  it("agrees with the database measurement about what a table is", async () => {
+    const install = await makeInstall("invsame");
+    const inventory = await measureInventory(install.handle.db);
+    const shape = await describeDatabaseShape(install.handle.db);
+    expect(inventory.map((one) => one.table)).toEqual([...shape.tableNames].sort());
+    expect(inventory.length).toBe(shape.tables);
+  });
+
+  // BACKWARD COMPATIBILITY, AND IT IS A REQUIREMENT RATHER THAN A COURTESY.
+  // Chris has v1.3.0 backups on disk. A restore that refused them would be
+  // worse than the gap the inventory closes.
+  itRestore("restores a backup that records none, with the check reported as NOT MADE",
+    async () => {
+      const source = await makeInstall("srcnoinv");
+      await seed(source, ["Acme", "Globex"]);
+      const sourceCounts = await rowCounts(source.url);
+      const target = await makeInstall("dstnoinv");
+
+      // A v1.3.0-era archive: the key is not in the manifest at all. Composed
+      // from a real backup rather than hand-built, so everything else about it
+      // is exactly what services/backup.ts writes.
+      const archive = await alteredBackup(source, async (_dir, manifest) => {
+        const older = { ...manifest };
+        delete older.inventory;
+        return older;
+      });
+
+      const staged = await stageAndInspect(archive, target);
+      expect(staged.plan.refusal).toBeNull();
+      const finding = staged.plan.findings
+        .find((f) => f.code === RESTORE_FINDINGS.inventoryMissing);
+      // A WARNING, NOT A NOTE. A safety check that will not be made is
+      // something to weigh before replacing an install.
+      expect(finding?.severity).toBe("warning");
+      expect(finding?.message).toContain("does not record what its database held");
+      // NULL ON THE EFFECT, never an empty list standing in for it.
+      const load = effectFor(staged.plan, "load-dump") as RestoreEffect & {
+        inventory: readonly unknown[] | null;
+      };
+      expect(load.inventory).toBeNull();
+      expect(load.detail).toContain("records no row counts");
+
+      const outcome = await runRestore(staged, target);
+      expect(outcome.realised).toBe(outcome.dispatched);
+      expect(outcome.unrealised).toEqual([]);
+      expect(await rowCounts(target.url)).toEqual(sourceCounts);
+    });
+
+  // "ABSENT" AND "AN INVENTORY OF NOTHING" ARE DIFFERENT MANIFESTS, and this is
+  // the pair that proves this code treats them differently. The test above
+  // removes the key and the restore succeeds; this one leaves the key with an
+  // empty list, which is a positive claim that the database held no tables --
+  // and the restored database holds all of them, so it fails.
+  itRestore("checks an inventory of nothing rather than skipping it", async () => {
+    const source = await makeInstall("srcemptyinv");
+    await seed(source, ["Acme"]);
+    const target = await makeInstall("dstemptyinv");
+
+    const archive = await alteredBackup(source, async (_dir, manifest) => ({
+      ...manifest,
+      inventory: { consistency: "shared-snapshot", tables: [] },
+    }));
+
+    const staged = await stageAndInspect(archive, target);
+    expect(staged.plan.refusal).toBeNull();
+    // No "not made" finding: a claim WAS made, and it will be checked.
+    expect(staged.plan.findings.map((f) => f.code))
+      .not.toContain(RESTORE_FINDINGS.inventoryMissing);
+
+    const failure = await rejection(runRestore(staged, target));
+    const cause = (failure as PlanApplyError).cause;
+    expect(cause).toBeInstanceOf(RestoreInventoryMismatchError);
+    expect((cause as Error).message).toContain("the backup does not list it");
+  });
+
+  // THE MISMATCH, WITH THE SAME WEIGHT AS EVERY OTHER POST-COMMIT FAILURE.
+  itRestore("reports a disagreement, names the safety backup and prints the way back",
+    async () => {
+      const source = await makeInstall("srcbadinv");
+      await seed(source, ["Acme", "Globex", "Initech"]);
+      const target = await makeInstall("dstbadinv");
+      const targetKeyBefore = await readFile(target.mailKeyPath);
+
+      // The backup claims seven more companies than its own dump carries --
+      // which is what an archive that was already wrong when it was written
+      // looks like from the restore's side.
+      const archive = await alteredBackup(source, async (_dir, manifest) => {
+        const inventory = manifest.inventory;
+        if (inventory === undefined) throw new Error("the real backup carried no inventory");
+        return {
+          ...manifest,
+          inventory: {
+            ...inventory,
+            tables: inventory.tables.map((one) => one.table === "public.companies"
+              ? { ...one, rows: one.rows + 7 } : one),
+          },
+        };
+      });
+
+      const staged = await stageAndInspect(archive, target);
+      expect(staged.plan.refusal).toBeNull();
+
+      const failure = await rejection(runRestore(staged, target));
+      const cause = (failure as PlanApplyError).cause;
+      expect(cause).toBeInstanceOf(RestoreInventoryMismatchError);
+      // WHICH LAYER FIRED. The result matched the tables the DUMP declared --
+      // the fourth instrument passed -- and only the comparison against the
+      // backup's own record of the database caught this. Two checks that could
+      // not be told apart would be one check with a spare.
+      expect(cause).not.toBeInstanceOf(RestoreUnexpectedResultError);
+
+      const message = (cause as Error).message;
+      expect(message).toContain("public.companies: the backup recorded 10 row(s)");
+      expect(message).toContain("this database holds 3");
+      expect(message).toContain("has HAPPENED");
+      // THE SAFETY BACKUP AND THE COMMANDS, exactly as RestoreHalfAppliedError
+      // gives them: the person reading this has an install they cannot trust.
+      expect(message).toContain(safetyPathOf(staged.plan));
+      expect(message).toContain("7z x -o");
+      expect(message).toContain("--single-transaction");
+      expect((await stat(safetyPathOf(staged.plan))).isFile()).toBe(true);
+
+      // AND THE PLAN STOPPED. mail.key is not replaced, so a suspect restore is
+      // not followed by an irreversible key swap.
+      expect((await readFile(target.mailKeyPath)).equals(targetKeyBefore)).toBe(true);
+      expect(message).toContain("mail.key was NOT replaced");
+      expect((failure as PlanApplyError).outcome.unrealised).toEqual(["destroy-schema"]);
+    });
+
+  // AN INVENTORY THAT CANNOT BE READ IS REFUSED, WITH NOTHING WRITTEN. Ignoring
+  // it would be a restore whose safety check silently did not happen, which is
+  // the shape of every silent half-restore this module has had.
+  itRestore("refuses an unreadable inventory before anything is destroyed", async () => {
+    const source = await makeInstall("srcbrokeninv");
+    await seed(source, ["Acme"]);
+    const target = await makeInstall("dstbrokeninv");
+    await seed(target, ["Still Here Ltd"]);
+    const before = await rowCounts(target.url);
+
+    const archive = await alteredBackup(source, async (_dir, manifest) => ({
+      ...manifest,
+      inventory: { consistency: "shared-snapshot", tables: [{ table: "public.companies" }] },
+    } as unknown as BackupManifest));
+
+    const staged = await stageAndInspect(archive, target);
+    expect(staged.plan.refusal?.code).toBe(RESTORE_REFUSALS.inventoryUnreadable);
+    expect(staged.plan.refusal?.message).toContain("whole number of rows");
+    // A REFUSAL IS A PLAN WITH NO EFFECTS. Nothing was destroyed and nothing
+    // can be: applying it is refused by the frame.
+    expect(staged.plan.effects).toEqual([]);
+    await expect(runRestore(staged, target)).rejects.toBeInstanceOf(PlanRefusedError);
+    expect(await rowCounts(target.url)).toEqual(before);
+  });
+
+  // A LABEL THIS BUILD CANNOT EVALUATE, at the archive rather than at the
+  // value. The counts might be perfectly good; what is missing is any basis for
+  // comparing them, and a restore does not guess on that path.
+  itRestore("refuses an inventory whose consistency it does not understand", async () => {
+    const source = await makeInstall("srcunkinv");
+    await seed(source, ["Acme"]);
+    const target = await makeInstall("dstunkinv");
+
+    const archive = await alteredBackup(source, async (_dir, manifest) => {
+      const inventory = manifest.inventory;
+      if (inventory === undefined) throw new Error("the real backup carried no inventory");
+      return { ...manifest, inventory: { ...inventory, consistency: "best-effort" } };
+    });
+
+    const staged = await stageAndInspect(archive, target);
+    expect(staged.plan.refusal?.code).toBe(RESTORE_REFUSALS.inventoryUnreadable);
+    expect(staged.plan.refusal?.message).toContain("best-effort");
+  });
+
+  // THE ORDINARY CASE, SAID OUT LOUD: a real backup restored onto a different
+  // install passes the inventory check, and the check was really made rather
+  // than skipped. Without this the whole block could be green over a comparison
+  // that never runs.
+  itRestore("passes on a real backup, and the check was actually made", async () => {
+    const source = await makeInstall("srcgoodinv");
+    await seed(source, ["Acme", "Globex"]);
+    const target = await makeInstall("dstgoodinv");
+    const archive = await realBackup(source, await scratchDir("goodinv"));
+
+    const staged = await stageAndInspect(archive, target);
+    expect(staged.plan.findings.map((f) => f.code))
+      .not.toContain(RESTORE_FINDINGS.inventoryMissing);
+    const load = effectFor(staged.plan, "load-dump") as RestoreEffect & {
+      inventory: readonly { table: string; rows: number }[] | null;
+    };
+    if (load.inventory === null) throw new Error("the plan carried no inventory to check");
+    // The plan really carries the source's own numbers, and says so to the
+    // operator before anything runs.
+    const companies = load.inventory.find((one) => one.table === "public.companies");
+    expect(companies?.rows).toBe(2);
+    expect(load.detail).toContain("row(s) its database held");
+
+    const outcome = await runRestore(staged, target);
+    expect(outcome.realised).toBe(outcome.dispatched);
+    // And the restored database really does hold what the backup recorded.
+    const restored = createDatabase(target.url, 1);
+    try {
+      expect(await measureInventory(restored.db)).toEqual([...load.inventory]);
+    } finally {
+      await restored.close();
+    }
+  });
 });

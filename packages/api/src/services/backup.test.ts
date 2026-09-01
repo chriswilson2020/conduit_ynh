@@ -11,6 +11,8 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { sql } from "drizzle-orm";
+import { createDatabase } from "../db/client.js";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { TEST_DATABASE_URL } from "../test/global-setup.js";
 import { resolveUser } from "../users.js";
@@ -19,9 +21,11 @@ import { attachFile } from "./files.js";
 import { createCompany } from "./companies.js";
 import { mailAccounts, mailAttachments, mailMessages, mailThreads } from "../db/schema.js";
 import {
-  buildBackup, freeSpaceBytes, majorVersion, pgDumpInvocation, requiredFreeBytes,
+  buildBackup, dumpWithInventory, freeSpaceBytes, majorVersion, measureInventory,
+  pgDumpInvocation, requiredFreeBytes,
   sevenZipArgs, sweepAbandonedBackups, validatePassphrase,
-  BACKUP_FORMAT_VERSION, MAX_PASSPHRASE_LENGTH, PG_DUMP_PACKAGE, SEVEN_ZIP_PACKAGE,
+  BACKUP_FORMAT_VERSION, INVENTORY_CONSISTENCY, MAX_PASSPHRASE_LENGTH, PG_DUMP_PACKAGE,
+  SEVEN_ZIP_PACKAGE,
   BackupDiskSpaceError, BackupFailedError, BackupKeyMissingError,
   BackupPassphraseError, BackupToolMissingError,
   type BackupManifest,
@@ -73,6 +77,21 @@ const HAVE_PSQL = await (async () => {
   }
 })();
 const it7zPsql = HAVE_7Z && HAVE_PSQL ? it : it.skip;
+
+/**
+ * pg_dump alone, for the inventory cases. They take a dump and read it back
+ * without ever building an archive, so 7z is not their dependency and a machine
+ * that has one and not the other should still run them.
+ */
+const HAVE_PG_DUMP = await (async () => {
+  try {
+    await execFileAsync("pg_dump", ["--version"]);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+const itPgDump = HAVE_PG_DUMP ? it : it.skip;
 
 /**
  * Force a garbage collection, or fail loudly. Same reasoning as
@@ -142,6 +161,14 @@ async function run(options: RunOptions = {}) {
 }
 
 /** Build a backup and write it to `scratch`, returning its path and manifest. */
+/** How many companies the live database holds right now, over the pool. */
+async function countCompanies(): Promise<number> {
+  const rows = await handle.db.execute<{ count: string }>(
+    sql`SELECT count(*)::text AS count FROM public.companies`,
+  );
+  return Number(rows[0]?.count ?? "0");
+}
+
 async function writeArchive(options: RunOptions = {}): Promise<{ path: string; manifest: BackupManifest }> {
   const archive = await run(options);
   const target = path.join(scratch, archive.filename);
@@ -373,6 +400,141 @@ describe("backup archive", () => {
       keyDerivation: "SHA-256, 2^19 (524288) iterations",
     });
   }, 120_000);
+});
+
+// ===========================================================================
+// THE INVENTORY, AND THE ONE PROPERTY THAT MAKES IT WORTH RECORDING.
+//
+// An inventory that can disagree with the dump beside it is worse than no
+// inventory: a restore would report a perfectly good backup as a failure, at
+// the loudest volume this product has, over an install that had just been
+// replaced. So the consistency is PROVED here rather than argued, by writing to
+// the database in exactly the window the shared snapshot exists to close.
+// ===========================================================================
+
+/**
+ * How many rows each COPY block in a dump actually carries.
+ *
+ * WRITTEN HERE RATHER THAN REUSED FROM services/restore.ts, deliberately. This
+ * is the independent reader in a test whose whole subject is whether two
+ * measurements of one database agree; borrowing the production parser would
+ * mean a bug in it could make both sides wrong in the same direction and the
+ * test green. pg_dump escapes a backslash in COPY data, so a data line can
+ * never be the bare `\.` terminator.
+ */
+function copyRowCounts(dump: string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  let table: string | null = null;
+  let rows = 0;
+  for (const line of dump.split("\n")) {
+    if (table === null) {
+      const start = /^COPY (\S+) \(.*\) FROM stdin;$/.exec(line);
+      if (start !== null) { table = start[1] ?? ""; rows = 0; }
+      continue;
+    }
+    if (line === "\\.") { counts[table] = rows; table = null; continue; }
+    rows += 1;
+  }
+  return counts;
+}
+
+describe("backup inventory", () => {
+  itPgDump("counts every table in the same snapshot the dump is taken from", async () => {
+    // Rows that exist before the snapshot, through the real service.
+    for (const name of ["Alpha", "Beta", "Gamma"]) {
+      await createCompany(handle.db, actorId, { name });
+    }
+    const before = await countCompanies();
+    expect(before).toBe(3);
+
+    // A SECOND CONNECTION, so the write really is another session's. The
+    // holder transaction has one of the pool's connections for the whole of
+    // this; a writer sharing that pool would be a writer this test could
+    // starve rather than race.
+    const writer = createDatabase(TEST_DATABASE_URL, 1);
+    const dumpPath = path.join(scratch, "snapshot-check.sql");
+    let inventory;
+    try {
+      ({ inventory } = await dumpWithInventory({
+        db: handle.db,
+        databaseUrl: TEST_DATABASE_URL,
+        dumpPath,
+        // THE RACE, MADE REAL AND MADE DETERMINISTIC. This lands after the
+        // snapshot is exported and before a single row is counted, which is
+        // the window an ordinary "somebody saved a company while the backup
+        // ran" occupies. A correct run cannot see it; each mutation sees it in
+        // a different direction.
+        afterSnapshot: async () => {
+          const actor = await resolveUser(writer.db, {
+            username: "chris", email: null, fullName: null,
+          });
+          for (const name of ["Delta", "Epsilon"]) {
+            await createCompany(writer.db, actor.id, { name });
+          }
+        },
+      }));
+    } finally {
+      await writer.close();
+    }
+
+    // THE INSTRUMENT, SHOWN NOT TO BE VACUOUS. If afterSnapshot never ran, the
+    // equality below would hold trivially and prove nothing at all.
+    expect(await countCompanies()).toBe(5);
+
+    const recorded = Object.fromEntries(
+      inventory.tables.map((one) => [one.table, one.rows]),
+    );
+    expect(inventory.consistency).toBe(INVENTORY_CONSISTENCY);
+    // The inventory saw the snapshot, not the database as it now is.
+    expect(recorded["public.companies"]).toBe(3);
+
+    // AND THE DUMP SAW THE SAME SNAPSHOT. Every table, not just the one that
+    // moved: this is the whole claim the manifest makes, checked table by
+    // table against an independent read of the file.
+    const dumped = copyRowCounts(await readFile(dumpPath, "utf8"));
+    expect(dumped).toEqual(recorded);
+  }, 120_000);
+
+  it7z("records the inventory in the manifest, and it is what the database holds",
+    async () => {
+      await createCompany(handle.db, actorId, { name: "Inventoried Ltd" });
+      const { manifest } = await writeArchive();
+
+      const inventory = manifest.inventory;
+      if (inventory === undefined) throw new Error("the manifest carries no inventory");
+      expect(inventory.consistency).toBe("shared-snapshot");
+      const recorded = Object.fromEntries(inventory.tables.map((one) => [one.table, one.rows]));
+      expect(recorded["public.companies"]).toBe(await countCompanies());
+      // The bookkeeping table lives in another schema, and the inventory is
+      // schema-qualified precisely so the two cannot be confused.
+      expect(Object.keys(recorded)).toContain("drizzle.__drizzle_migrations");
+      // Sorted, so two manifests of the same database compare as text.
+      expect(inventory.tables.map((one) => one.table))
+        .toEqual([...inventory.tables.map((one) => one.table)].sort());
+    }, 120_000);
+
+  // WHY THE COUNTS ARE count(*) AND NEVER THE PLANNER'S. This project has
+  // already been bitten: services/restore.ts refuses pg_stat_user_tables
+  // because its estimates read identically before and after a full
+  // replacement. This is the same refusal, measured on the writing side --
+  // freshly inserted rows that no ANALYZE has seen are invisible to reltuples
+  // and exact in the inventory.
+  it("counts exactly, where the catalogue's own estimate does not", async () => {
+    await handle.db.execute(sql`ANALYZE public.companies`);
+    for (const name of ["One", "Two", "Three", "Four"]) {
+      await createCompany(handle.db, actorId, { name });
+    }
+    const estimate = await handle.db.execute<{ reltuples: string }>(sql`
+      SELECT c.reltuples::text AS reltuples FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relname = 'companies'
+    `);
+    const tables = await measureInventory(handle.db);
+    const companies = tables.find((one) => one.table === "public.companies");
+    expect(companies?.rows).toBe(4);
+    // The estimate is whatever the last ANALYZE saw, which is not 4.
+    expect(Number(estimate[0]?.reltuples ?? "0")).not.toBe(4);
+  });
 });
 
 // THE INVERTED SAFETY TEST. export.test.ts proves these four are ABSENT from

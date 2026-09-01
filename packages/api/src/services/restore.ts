@@ -10,9 +10,11 @@ import { sql } from "drizzle-orm";
 import type { PlanFindingView, PlanRefusalView } from "@conduit/shared";
 import { createDatabase, runMigrations, type Database } from "../db/client.js";
 import {
-  buildBackup, freeSpaceBytes, libpqEnvironment, majorVersion, sevenZipVersion,
-  BACKUP_FORMAT_VERSION, DISK_MARGIN_BYTES, PG_DUMP_PACKAGE, SEVEN_ZIP_PACKAGE,
-  type BackupManifest,
+  buildBackup, freeSpaceBytes, libpqEnvironment, majorVersion, measureInventory,
+  sevenZipVersion,
+  BACKUP_FORMAT_VERSION, DISK_MARGIN_BYTES, INVENTORY_CONSISTENCY, PG_DUMP_PACKAGE,
+  SEVEN_ZIP_PACKAGE,
+  type BackupInventoryTable, type BackupManifest,
 } from "./backup.js";
 import { forgetMailKey } from "./mail-crypto.js";
 import { readMigrationJournal } from "./migration-journal.js";
@@ -77,8 +79,8 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 // another, because the class was never addressed. The class is: A RESTORE IS
 // NOT VERIFIED UNTIL THE RESULT IS COMPARED WITH WHAT WAS PROMISED.
 //
-// So there are now four instruments, three of them about the process and ONE
-// about the result, and the last is the only one that closes the class:
+// So there are now five instruments, three of them about the process and TWO
+// about the result, and only the last two close the class:
 //
 //   THE FLAGS decide whether a failed statement rolls the transaction back.
 //   THE SOURCE decides whether psql was handed the whole dump -- see
@@ -88,26 +90,35 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 //     see ALLOWED_META_COMMANDS. Without this the other two are worthless:
 //     measured, a `\q` makes psql commit a prefix and exit 0 having been handed
 //     every byte.
-//   THE RESULT -- the tables that are actually in the database afterwards,
-//     BY NAME, against the tables the dump declared -- decides whether the
-//     restore did what the preview said. See LoadDumpEffect.tables. And, on the
-//     failure path, the IDENTITY of every table (pg_class.oid, not a count)
-//     decides whether the rollback held. See DatabaseShape.
+//   THE RESULT AGAINST THE DUMP -- the tables that are actually in the database
+//     afterwards, BY NAME, against the tables the dump declared -- decides
+//     whether the restore did what the preview said. See LoadDumpEffect.tables.
+//     And, on the failure path, the IDENTITY of every table (pg_class.oid, not
+//     a count) decides whether the rollback held. See DatabaseShape.
+//   THE RESULT AGAINST THE INVENTORY -- the tables and EXACT ROW COUNTS in the
+//     database afterwards, against what the backup recorded the database
+//     HOLDING when it was taken. See LoadDumpEffect.inventory.
 //
 // Never pg_stat_user_tables, whose estimates read identically before and after
 // a full replacement -- and, for exactly the same reason, never a table count.
 //
-// WHAT IS STILL NOT CLOSED, AND CANNOT BE FROM HERE. The result is compared
-// against the DUMP, which is the file the load consumed. A manifest that lies
-// about its own archive is caught only as far as the digests reach: every
-// listed member's bytes are verified, and the two members a restore cannot do
-// without must now be LISTED and not merely present -- but nothing signs the
-// manifest, and nothing in format version 1 records an inventory of the
-// database's contents. The complete answer is a backup format that records what
-// the database HELD (tables, and row counts per table) and a restore that
-// checks the restored database against THAT. It is a change to
-// services/backup.ts's format and to docs/backup-format.md, additive and
-// backward compatible, and it is 7.6's to make rather than this task's.
+// WHY THE FIFTH EXISTS WHEN THE FOURTH LOOKS LIKE ENOUGH, said here because
+// this is where the fourth was declared to close the class and it did not. The
+// fourth compares the result against the DUMP, and the dump is THE SAME FILE
+// THE LOAD CONSUMED. Every witness in the chain -- the exit code, the byte
+// count, the allowed meta-commands, the table names -- is derived from that one
+// artefact, so a backup that was ALREADY WRONG at the moment it was written
+// restores perfectly against its own description and nothing notices. The fifth
+// is the only witness that is not the dump: services/backup.ts measures the
+// live database's tables and row counts from the CATALOGUE, in the same MVCC
+// snapshot pg_dump reads, and records them in manifest.json.
+//
+// AND IT IS OPTIONAL, WHICH IS NOT A WEAKNESS BUT THE POINT. Chris has v1.3.0
+// backups on disk and they have no inventory. A restore that refused them would
+// be worse than the gap it closes, so an archive with no `inventory` key is
+// restored with the check reported as NOT MADE -- a plan finding an operator
+// reads, never a silent pass. "Absent" and "an inventory of nothing" are
+// different manifests and are treated differently; see readInventory.
 //
 // ================ THE ATOMIC ACT THE OPERATOR SEES AS TWO ==================
 //
@@ -252,6 +263,22 @@ export const RESTORE_REFUSALS = {
   memberCorrupt: "member-corrupt",
   /** The dump carries a psql meta-command that could stop it part way. */
   dumpMetaCommand: "dump-meta-command",
+  /**
+   * The manifest HAS an inventory and it cannot be read as one.
+   *
+   * REFUSED RATHER THAN IGNORED, and the choice is the conservative one in both
+   * directions it could go wrong. Ignoring it would turn a damaged manifest into
+   * a restore whose safety check silently did not happen -- the exact shape of
+   * `Array.isArray(x) ? x : []`, which was a silent half-restore one field over.
+   * Refusing costs nothing recoverable: it happens at inspect, with nothing
+   * written and nothing destroyed, and the archive is still openable by hand.
+   *
+   * It cannot refuse a legitimate FUTURE backup by mistake, either: a manifest
+   * written by a later Conduit is refused by `newerApp` before this is reached,
+   * so the only archives that arrive here with an unreadable inventory are ones
+   * no Conduit wrote as they stand.
+   */
+  inventoryUnreadable: "inventory-unreadable",
 } as const;
 
 /** Findings a restore plan can carry. Notes and warnings; never refusals. */
@@ -268,6 +295,13 @@ export const RESTORE_FINDINGS = {
   restartRequired: "restart-required",
   /** The backup's schema is older and will be migrated forward. */
   olderSchema: "older-schema",
+  /**
+   * THE BACKUP RECORDS NO INVENTORY, so the restored result cannot be checked
+   * against what the database held. A v1.3.0-era archive. A warning rather than
+   * a note: a safety check that will not be made is something the operator
+   * should weigh before replacing an install, not a footnote.
+   */
+  inventoryMissing: "inventory-missing",
 } as const;
 
 /** A tool the restore needs is not installed. The message names the package. */
@@ -492,6 +526,80 @@ export class RestoreUnexpectedResultError extends Error {
           + recoveryCommands.map((line) => `  ${line}`).join("\n")),
     );
     this.name = "RestoreUnexpectedResultError";
+  }
+}
+
+/** One table the restored database does not agree with the backup about. */
+export interface InventoryDisagreement {
+  /** Schema-qualified, as both the manifest and the catalogue name it. */
+  readonly table: string;
+  /** What the backup recorded the database holding, or null when it listed none. */
+  readonly recorded: number | null;
+  /** What the restored database holds, or null when the table is not there. */
+  readonly restored: number | null;
+}
+
+/**
+ * THE LOAD COMMITTED, AND THE RESTORED DATABASE IS NOT WHAT THE BACKUP SAYS THE
+ * ORIGINAL HELD.
+ *
+ * THE ONLY FAILURE IN THIS MODULE WHOSE WITNESS IS NOT THE DUMP.
+ * RestoreUnexpectedResultError, one class up, compares the result against the
+ * tables `database.sql` declares -- which is the file the load consumed, so it
+ * cannot see a backup that was wrong before it was ever restored. This compares
+ * the result against `manifest.json`'s inventory, which services/backup.ts
+ * measured from the live catalogue in the same snapshot pg_dump read.
+ *
+ * IT IS A REPORT, NOT A PREVENTION, AND THAT IS DECIDED RATHER THAN CONCEDED.
+ * By the time rows can be counted the transaction has committed: the operator's
+ * database is already gone. There is no rollback left to take, and inventing
+ * one -- reloading the safety backup automatically -- would mean answering a
+ * failed restore with a second unattended destructive act on an install that
+ * has just proved it can surprise us. So the answer is the one every other
+ * post-commit failure here gives: say exactly what disagreed, name the safety
+ * backup, and print the commands that put the install back, so the person
+ * decides.
+ *
+ * AND IT STOPS THE PLAN, which is the other half of the decision. Throwing here
+ * means mail.key is NOT replaced and the migrations do NOT run, so a suspect
+ * restore is not followed by an irreversible key swap. The cost is stated in
+ * the message rather than left to be discovered: the restored database's stored
+ * mail passwords are under the BACKUP's key and the old key is still on disk,
+ * which is the same residual window RestoreMailKeyError describes from the
+ * other direction.
+ *
+ * IT NAMES THE TABLES AND BOTH NUMBERS. "The counts do not match" sends an
+ * operator through twenty-seven tables; "companies: the backup recorded 42 rows
+ * and this database holds 41" ends the search.
+ */
+export class RestoreInventoryMismatchError extends Error {
+  constructor(
+    readonly disagreements: readonly InventoryDisagreement[],
+    readonly safetyBackupPath: string | null,
+    readonly recoveryCommands: readonly string[],
+  ) {
+    const describe = (one: InventoryDisagreement): string =>
+      one.restored === null
+        ? `${one.table} is not in the restored database at all (the backup recorded `
+          + `${String(one.recorded ?? 0)} row(s))`
+        : one.recorded === null
+          ? `${one.table} holds ${String(one.restored)} row(s) and the backup does not list it`
+          : `${one.table}: the backup recorded ${String(one.recorded)} row(s) and this `
+            + `database holds ${String(one.restored)}`;
+    super(
+      "the backup loaded and was committed, but the restored database is not what the backup "
+      + "recorded the original holding: "
+      + disagreements.slice(0, 10).map(describe).join("; ")
+      + (disagreements.length > 10
+        ? `; and ${String(disagreements.length - 10)} more` : "")
+      + ". The restore has HAPPENED -- check the data before using this install. mail.key was "
+      + "NOT replaced and no migrations were run, so this install still holds its own mail "
+      + "encryption key."
+      + (safetyBackupPath === null ? ""
+        : ` A safety backup of the previous state is at ${safetyBackupPath}. To go back:\n`
+          + recoveryCommands.map((line) => `  ${line}`).join("\n")),
+    );
+    this.name = "RestoreInventoryMismatchError";
   }
 }
 
@@ -926,6 +1034,119 @@ async function readDumpContents(stream: Readable): Promise<DumpContents> {
   return { tables, forbidden };
 }
 
+/** What a manifest's `inventory` field turned out to be. */
+export type InventoryRead =
+  | { kind: "absent" }
+  | { kind: "unreadable"; why: string }
+  | { kind: "present"; tables: BackupInventoryTable[] };
+
+/**
+ * READ manifest.json's INVENTORY, AND TELL THE THREE CASES APART.
+ *
+ * THE WHOLE FUNCTION IS THE DISTINCTION BETWEEN "NO INVENTORY" AND "AN
+ * INVENTORY OF NOTHING", which is the thing a reader of this format has to be
+ * able to do:
+ *
+ *   the key is not there ...... ABSENT. A v1.3.0-era backup. The check is
+ *                               reported as NOT MADE, and the restore proceeds.
+ *   "tables": [] .............. PRESENT, and a positive claim that the database
+ *                               held no tables. The check IS made, against an
+ *                               empty list, and a restored database with tables
+ *                               in it fails it.
+ *   anything else ............. UNREADABLE. Refused, with nothing written.
+ *
+ * `null` COUNTS AS ABSENT, and that is not sloppiness about JSON. `undefined`
+ * cannot survive a round trip through JSON at all, so a writer that meant "no
+ * inventory" and emitted `"inventory": null` has said the same thing as one
+ * that omitted the key; treating the two differently would refuse an archive
+ * over a serialiser's choice.
+ *
+ * PURE, SO EVERY CASE IS A VALUE. No archive, no database, no destruction --
+ * the whole table above is assertable without any of them.
+ */
+export function readInventory(raw: unknown): InventoryRead {
+  if (raw === undefined || raw === null) return { kind: "absent" };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return { kind: "unreadable", why: "it is not an object" };
+  }
+  const inventory = raw as { consistency?: unknown; tables?: unknown };
+  // THE CONSISTENCY LABEL IS CHECKED, NOT READ PAST. The counts are only
+  // comparable if they were taken from the dump's own snapshot, and this build
+  // knows exactly one way that is true. A label it does not recognise is a
+  // claim it cannot evaluate, and the safe answer to a claim you cannot
+  // evaluate, on the path that replaces a database, is to stop.
+  if (typeof inventory.consistency !== "string") {
+    return { kind: "unreadable", why: "it does not say how its counts were taken" };
+  }
+  if (inventory.consistency !== INVENTORY_CONSISTENCY) {
+    return {
+      kind: "unreadable",
+      why: `its counts are labelled "${inventory.consistency}", which this version of `
+        + "Conduit does not know how to check",
+    };
+  }
+  if (!Array.isArray(inventory.tables)) {
+    return { kind: "unreadable", why: "it does not list any tables" };
+  }
+  const tables: BackupInventoryTable[] = [];
+  const seen = new Set<string>();
+  for (const entry of inventory.tables as unknown[]) {
+    if (typeof entry !== "object" || entry === null) {
+      return { kind: "unreadable", why: "one of its entries is not a table" };
+    }
+    const { table, rows } = entry as { table?: unknown; rows?: unknown };
+    if (typeof table !== "string" || table === "") {
+      return { kind: "unreadable", why: "one of its entries has no table name" };
+    }
+    // Number.isSafeInteger, not Number.isInteger: a row count beyond 2^53 could
+    // not be compared with a measured one anyway, and a manifest carrying one
+    // is not a manifest this can check.
+    if (typeof rows !== "number" || !Number.isSafeInteger(rows) || rows < 0) {
+      return {
+        kind: "unreadable",
+        why: `it does not record a whole number of rows for ${table}`,
+      };
+    }
+    // TWO ENTRIES FOR ONE TABLE CANNOT BOTH BE CHECKED, and picking one would be
+    // picking which claim to ignore.
+    if (seen.has(table)) {
+      return { kind: "unreadable", why: `it lists ${table} twice` };
+    }
+    seen.add(table);
+    tables.push({ table, rows });
+  }
+  return { kind: "present", tables };
+}
+
+/**
+ * WHERE THE BACKUP'S RECORD AND THE RESTORED DATABASE DISAGREE.
+ *
+ * BOTH DIRECTIONS, and both are failures. A table the backup recorded that is
+ * not in the restored database is the obvious one; a table in the restored
+ * database that the backup never recorded is the same failure wearing the other
+ * hat, because it means the load produced something the backup did not
+ * describe. An earlier shape of this compared only the recorded side, and
+ * `every` over the recorded list is vacuously satisfied by a database holding
+ * everything plus more -- the prefix mask this project has now paid for four
+ * times.
+ *
+ * PURE AND EXPORTED, so the comparison is assertable without a restore.
+ */
+export function compareInventory(
+  recorded: readonly BackupInventoryTable[],
+  restored: readonly BackupInventoryTable[],
+): InventoryDisagreement[] {
+  const recordedRows = new Map(recorded.map((one) => [one.table, one.rows]));
+  const restoredRows = new Map(restored.map((one) => [one.table, one.rows]));
+  const disagreements: InventoryDisagreement[] = [];
+  for (const table of [...new Set([...recordedRows.keys(), ...restoredRows.keys()])].sort()) {
+    const was = recordedRows.get(table) ?? null;
+    const now = restoredRows.get(table) ?? null;
+    if (was !== now) disagreements.push({ table, recorded: was, restored: now });
+  }
+  return disagreements;
+}
+
 /** SHA-256 of a stream, without holding it. */
 async function digestOfStream(stream: Readable): Promise<string> {
   const hash = createHash("sha256");
@@ -986,6 +1207,23 @@ export interface LoadDumpEffect extends PlannedEffect {
    * which one is missing.
    */
   readonly tables: readonly string[];
+  /**
+   * What the backup recorded the database HOLDING -- tables and exact row
+   * counts -- or NULL when the backup recorded nothing.
+   *
+   * THE WITNESS THAT IS NOT THE DUMP. `tables` above is read out of
+   * `database.sql`, which is the file the load consumes; this comes from
+   * `manifest.json`, which services/backup.ts measured against the live
+   * catalogue. A backup that was wrong when it was written passes the first and
+   * fails this one.
+   *
+   * NULL IS "NOT RECORDED", AND AN EMPTY ARRAY IS "NOTHING WAS THERE". They
+   * cannot be the same value or a v1.3.0 archive would silently pass a check it
+   * never made. On the plan for the same reason every other decision is: apply
+   * may do nothing inspect did not describe, and "verify these row counts" is
+   * work.
+   */
+  readonly inventory: readonly BackupInventoryTable[] | null;
 }
 
 export interface ReplaceMailKeyEffect extends PlannedEffect {
@@ -1189,6 +1427,20 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
     });
   }
 
+  // THE INVENTORY, READ FROM THE MANIFEST ALONE, so an archive that cannot be
+  // checked is refused before 300MB of blobs are hashed. See readInventory for
+  // the three cases and why "absent" is not "empty".
+  const inventory = readInventory(manifest.inventory);
+  if (inventory.kind === "unreadable") {
+    return refuse(options, {
+      code: RESTORE_REFUSALS.inventoryUnreadable,
+      message: "this backup records what its database held, and that record cannot be read: "
+        + `${inventory.why}. It is refused rather than ignored, because ignoring it would `
+        + "restore without the one check that can tell whether the result matches what was "
+        + "backed up. Nothing has been changed.",
+    });
+  }
+
   // THE MEMBER LIST IS A LIST, and a manifest whose `members` is missing or is
   // not an array described nothing. It used to be read as
   // `Array.isArray(...) ? ... : []`, which turned "this manifest makes no
@@ -1339,6 +1591,21 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
     });
   }
 
+  // THE CHECK THAT WILL NOT BE MADE, SAID OUT LOUD. A backup taken by Conduit
+  // 1.3.0 records no inventory, and this restore is the one that closes the
+  // hole -- so the operator is told the difference rather than left to assume
+  // every check ran. Reported as NOT MADE, never as passed.
+  if (inventory.kind === "absent") {
+    findings.push({
+      severity: "warning",
+      code: RESTORE_FINDINGS.inventoryMissing,
+      message: "this backup does not record what its database held when it was taken, so the "
+        + "restored result cannot be checked against it. Backups taken by Conduit 1.4.0 and "
+        + "later carry that record; this one was written by an earlier version. The restore "
+        + "itself is unaffected -- what is missing is a check, not data.",
+    });
+  }
+
   findings.push({
     severity: "note",
     code: RESTORE_FINDINGS.mailSyncPauses,
@@ -1368,6 +1635,9 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
       });
   }
   const dumpTables = dump.tables.length;
+  const inventoryRows = inventory.kind === "present"
+    ? inventory.tables.reduce((total, one) => total + one.rows, 0)
+    : 0;
   const stamp = now.toISOString().replace(/[:.]/g, "-").replace(/-\d{3}Z$/, "Z");
   const archivePath = path.join(dataDir, `conduit-safety-backup-${stamp}.7z`);
 
@@ -1421,12 +1691,22 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
       destroys: false,
       detail: `${String(dumpTables)} table(s) from the backup replace what was there. The `
         + `whole ${String(dumpEntry.bytes)} bytes must reach the loader, and the tables that `
-        + "arrive are counted afterwards rather than taken from an exit code.",
+        + "arrive are counted afterwards rather than taken from an exit code."
+        + (inventory.kind === "present"
+          ? ` The backup also records the ${String(inventoryRows)} row(s) its database held `
+            + `across ${String(inventory.tables.length)} table(s), and the restored database `
+            + "is counted against that."
+          : " This backup records no row counts to check the result against."),
       sources: [dumpMember.ref],
       dumpBytes: dumpEntry.bytes,
       // FROZEN HERE for the reason `schemas` is: newPlan freezes what it knows
       // about, and restore's own arrays are not among them.
       tables: Object.freeze([...dump.tables]),
+      // NULL WHEN THE BACKUP RECORDED NONE, never an empty array standing in
+      // for it. See LoadDumpEffect.inventory.
+      inventory: inventory.kind === "present"
+        ? Object.freeze(inventory.tables.map((one) => Object.freeze({ ...one })))
+        : null,
     },
     {
       op: "replace-mail-key",
@@ -1787,6 +2067,41 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
           effect.count, loaded.tables, missing, safetyBackupPath,
           recoveryCommands(safetyBackupPath, databaseUrl, [...loaded.schemas]),
         );
+      }
+
+      // AND NOW THE SAME QUESTION ASKED OF A DIFFERENT WITNESS. The check above
+      // compares the result with the DUMP, which is the file this load just
+      // consumed -- so it cannot see a backup that was already wrong when it was
+      // written. This compares the result with what the backup RECORDED THE
+      // DATABASE HOLDING, measured from the live catalogue at backup time in the
+      // dump's own snapshot.
+      //
+      // SECOND, NOT FIRST, and the order is chosen rather than incidental. The
+      // dump check is free -- `loaded` is already in hand -- while this one
+      // counts every row in every table, so a restore that produced the wrong
+      // TABLES says so without first counting rows in them. The two are
+      // separable in what they can see, not only in what they cost: a backup
+      // whose inventory disagrees with its own dump passes the first check and
+      // fails this one, and a load that lost a table the dump declared fails the
+      // first and never reaches this one.
+      //
+      // NULL IS "THE BACKUP RECORDED NONE", and it is the v1.3.0 case. Skipping
+      // is what backward compatibility means here; the operator was told at
+      // preview time that this check would not be made.
+      if (effect.inventory !== null) {
+        // MEASURED WITH THE SAME FUNCTION THAT WROTE IT, so the two sides of the
+        // comparison cannot drift into disagreeing about what a table is. This
+        // runs BEFORE migrate-forward, deliberately: the inventory describes the
+        // backup's schema, and a database already migrated past it would be
+        // compared against a record of something else.
+        const restored = await measureInventory(db);
+        const disagreements = compareInventory(effect.inventory, restored);
+        if (disagreements.length > 0) {
+          throw new RestoreInventoryMismatchError(
+            disagreements, safetyBackupPath,
+            recoveryCommands(safetyBackupPath, databaseUrl, [...loaded.schemas]),
+          );
+        }
       }
       ctx.spend(effect.count);
     },
