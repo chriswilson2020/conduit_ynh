@@ -1349,6 +1349,40 @@ describe("replacing mail.key without a window", () => {
 });
 
 describe("the safety backup", () => {
+  // THE NAME MUST BE UNIQUE TO A PLAN, NOT TO A SECOND, and a CI run is what
+  // proved it was not. The archive is written with `wx`, so two plans made
+  // inside the same second name the same file and the second write fails with
+  // EEXIST -- which is reported as "the restore did not start", naming a file
+  // the operator never created. The sequence that reaches it is the ordinary
+  // one: a restore that fails fast, and a second attempt. It never showed on
+  // the dev server, where the gap between two attempts happened to cross a
+  // second boundary; a faster machine crossed nothing.
+  //
+  // NO ARCHIVE AND NO DATABASE IN THIS CASE. The property is a property of the
+  // NAME, and the two clocks below are a millisecond apart inside one second --
+  // which is the whole of what a whole-second stamp cannot tell apart.
+  it7z("names a different file for two plans made inside one second", async () => {
+    const source = await makeInstall("srcstamp");
+    const target = await makeInstall("dststamp");
+    const work = await scratchDir("stamp");
+    const archive = await realBackup(source, work);
+
+    const first = await stageAndInspect(archive, target, {
+      now: new Date("2026-09-01T10:00:00.100Z"),
+    });
+    const second = await stageAndInspect(archive, target, {
+      now: new Date("2026-09-01T10:00:00.900Z"),
+    });
+    try {
+      expect(safetyPathOf(first.plan)).not.toBe(safetyPathOf(second.plan));
+      // And the name is still something a person can read in an `ls`.
+      expect(safetyPathOf(first.plan)).toContain("conduit-safety-backup-2026-09-01T10-00-00");
+    } finally {
+      await first.payload.dispose();
+      await second.payload.dispose();
+    }
+  });
+
   itRestore("exists, is 0600, and opens with the operator's passphrase", async () => {
     const source = await makeInstall("srcsafe");
     await seed(source, ["Acme"]);

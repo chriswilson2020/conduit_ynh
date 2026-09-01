@@ -1653,7 +1653,18 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
   const inventoryRows = inventory.kind === "present"
     ? inventory.tables.reduce((total, one) => total + one.rows, 0)
     : 0;
-  const stamp = now.toISOString().replace(/[:.]/g, "-").replace(/-\d{3}Z$/, "Z");
+  // THE MILLISECONDS ARE IN THE NAME, AND THEY WERE PUT BACK AFTER A CI RUN
+  // REFUSED A PERFECTLY GOOD RESTORE. This stamp used to be trimmed to whole
+  // seconds, which reads better and is wrong: the safety backup is written with
+  // `wx`, so a second plan made inside the same second produces the SAME path
+  // and the write fails with EEXIST -- reported as RestoreSafetyBackupError,
+  // which says the restore did not start and names a file the operator did not
+  // create. The sequence that reaches it is the ordinary one: a restore that
+  // fails fast, and a second attempt. On the dev server the gap between two
+  // attempts crossed a second boundary and it never showed; on a faster machine
+  // it did not. `wx` STAYS -- truncating what might be somebody's only undo is
+  // exactly what it exists to prevent -- so the name is what has to be unique.
+  const stamp = now.toISOString().replace(/[:.]/g, "-");
   const archivePath = path.join(dataDir, `conduit-safety-backup-${stamp}.7z`);
 
   const effects: RestoreEffect[] = [

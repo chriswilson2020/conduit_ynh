@@ -163,8 +163,21 @@ export async function buildApp(
   });
   // BOTH, because neither covers the other: `onResponse` runs when a response
   // has been sent, and `onRequestAbort` is the only hook a client that hangs up
-  // mid-request reaches. `finish` is idempotent, so a request that reaches both
-  // -- or that was refused above and never admitted -- costs nothing.
+  // on a real socket reaches. `finish` is idempotent, so a request that reaches
+  // both -- or that was refused above and never admitted -- costs nothing.
+  //
+  // WHICH OF THEM THE SUITE ACTUALLY EXERCISES, MEASURED RATHER THAN ASSUMED,
+  // because a leak here would refuse every later restore with "requests were
+  // still writing" and that was the first suspect in a red CI run. Against
+  // Fastify 5 with an in-process injection whose payload stream is destroyed
+  // mid-body: onRequest, the raw `close`, onResponse and onError all fire, and
+  // `onRequestAbort` does NOT. So the count comes back on that path through
+  // onResponse, and the second hook is here for the socket the suite cannot
+  // produce rather than for anything a test covers.
+  //
+  // routes/restore.test.ts's "does not go on counting an upload the client
+  // abandoned" is what holds the property, and it is an instrument rather than
+  // a hope: removing the line below makes it fail.
   app.addHook("onResponse", async (request) => { writeGate.finish(request.id); });
   app.addHook("onRequestAbort", async (request) => { writeGate.finish(request.id); });
 

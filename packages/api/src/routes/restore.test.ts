@@ -1198,7 +1198,7 @@ describe("a restore that runs", () => {
       if (write.statusCode === 503) refusedDuring = true;
     }
     const response = await applying;
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode, response.body).toBe(200);
     expect(refusedDuring, "writes must be refused while the restore runs").toBe(true);
 
     const body = response.json() as { restored: boolean; message: string; unrealised: string[] };
@@ -1239,11 +1239,11 @@ describe("a restore that runs", () => {
     const first = await applyRestoreRequest(app, {
       planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
     });
-    expect(first.statusCode).toBe(200);
+    expect(first.statusCode, first.body).toBe(200);
     const second = await applyRestoreRequest(app, {
       planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
     });
-    expect(second.statusCode).toBe(404);
+    expect(second.statusCode, second.body).toBe(404);
   }, 300_000);
 
   // A LOAD THAT FAILS AND ROLLS BACK. The operator is exactly where they
@@ -1270,7 +1270,7 @@ describe("a restore that runs", () => {
     const response = await applyRestoreRequest(app, {
       planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
     });
-    expect(response.statusCode).toBe(409);
+    expect(response.statusCode, response.body).toBe(409);
     const body = response.json() as { error: string; restored: boolean; message: string };
     expect(body.error).toBe("restore_load_failed");
     expect(body.restored).toBe(false);
@@ -1345,20 +1345,67 @@ describe("descriptors and the staged archive", () => {
       };
     });
     const failing = await previewOf(app, broken);
-    expect((await applyRestoreRequest(app, {
+    const failed = await applyRestoreRequest(app, {
       planId: failing.planId, passphrase: PASSPHRASE, confirmName: target.name,
-    })).statusCode).toBe(409);
+    });
+    // THE BODY RIDES ON EVERY ASSERTION ABOUT THIS ROUTE, and that is not
+    // decoration: a bare status told a CI failure that a restore answered 503
+    // and nothing about which of the four 503s it was, which cost a round trip
+    // to find out. This endpoint's whole job is to say what state the install
+    // is in; a test that throws that away is asking the wrong question.
+    expect(failed.statusCode, failed.body).toBe(409);
     expect(await intakeDescriptors(), "a failed restore must not leak a descriptor").toBe(0);
     expect(await intakeWorkDirs(target)).toEqual([]);
 
     // SUCCESS.
     const good = await previewOf(app, archive);
-    expect((await applyRestoreRequest(app, {
+    const succeeded = await applyRestoreRequest(app, {
       planId: good.planId, passphrase: PASSPHRASE, confirmName: target.name,
-    })).statusCode).toBe(200);
+    });
+    expect(succeeded.statusCode, succeeded.body).toBe(200);
     expect(await intakeDescriptors(), "a finished restore must not leak a descriptor").toBe(0);
     expect(await intakeWorkDirs(target)).toEqual([]);
   }, 600_000);
+
+  // WHAT CI FOUND AND THE DEV SERVER HID. An aborted upload is a WRITE that was
+  // admitted through the gate and may never produce a response -- so if the only
+  // thing that decrements the in-flight count is the response, the count never
+  // comes back and every later restore refuses to start with "requests were
+  // still writing". Refusing forever is the safe direction of a leak and it is
+  // still a denial of the one operation this whole phase exists for.
+  //
+  // THE DRAIN TIMEOUT IS SHORT HERE ON PURPOSE, so the case answers in
+  // milliseconds either way: with the leak it is a 503 after 300ms, without it
+  // the restore starts.
+  itRestore("does not go on counting an upload the client abandoned", async () => {
+    const source = await makeInstall("src");
+    await seed(source, ["Northwind Traders"]);
+    const target = await makeInstall("dst");
+    const app = await appFor(target, { restoreDrainTimeoutMs: 300 });
+    const archive = await realBackup(source, await scratchDir("archive"));
+
+    const headers = await reauthed(app, chris);
+    const prologue = upload({ content: Buffer.alloc(0), passphrase: PASSPHRASE }).payload;
+    const aborted = new Readable({
+      read() {
+        this.push(prologue.subarray(0, prologue.length - `--${BOUNDARY}--\r\n`.length));
+        this.push(Buffer.alloc(256 * 1024, 3));
+        this.destroy(new Error("the client went away"));
+      },
+    });
+    await app.inject({
+      method: "POST", url: "/api/restore/inspect",
+      headers: { "content-type": `multipart/form-data; boundary=${BOUNDARY}`, ...headers },
+      payload: aborted,
+    }).catch(() => undefined);
+
+    const plan = await previewOf(app, archive);
+    const response = await applyRestoreRequest(app, {
+      planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
+    });
+    expect(response.body).not.toContain("restore_writes_in_flight");
+    expect(response.statusCode, response.body).toBe(200);
+  }, 300_000);
 
   // A SHUTDOWN WITH A PREVIEW STILL OPEN. What is in $data_dir at that moment
   // is a decrypted backup -- mail.key in the clear -- and the process must not
