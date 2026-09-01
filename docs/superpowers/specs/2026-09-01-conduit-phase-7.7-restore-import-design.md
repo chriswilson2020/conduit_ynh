@@ -1,6 +1,6 @@
 # Conduit Phase 7.7 — Restore and import
 
-**Status:** spec, awaiting Chris's approval. **Nothing may be built until he signs off** — this is the phase 7.6 was split away from precisely because a bad restore loses everything.
+**Status:** approved by Chris, 1 Sep, with the scope kept whole. Restore is built and reviewed first within the phase.
 
 **Baseline:** `origin/main` at `254ce50`, v1.3.0 shipped. **2742 unit (2741 + 1 skipped), 184 e2e.**
 
@@ -98,4 +98,4 @@ Chris's ruling: **type the install's name to confirm.** Plus re-authentication, 
 2. **Restoring onto the same install can pass while a real restore fails** — identical paths, identical `mail.key`, identical schema. The definition of done requires a second install for that reason.
 3. **`mail.key` replacement is irreversible in effect**: restoring an old key strands mail passwords encrypted under the current one. The manifest must be checked and the operator told.
 4. **The upload is a credential store** with the same disciplines as the backup's temp file, in a direction that has not been built before.
-5. **Scope.** If the importers stay in this phase, restore's review attention is split across a column-mapping UI. Hence the recommended split.
+5. **Scope is the real schedule risk, and it is accepted rather than mitigated.** Restore and two importers is the largest phase since Phase 7. The mitigation is sequencing -- restore built and reviewed to completion before an importer is started -- not a smaller phase.
