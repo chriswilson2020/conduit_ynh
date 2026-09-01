@@ -22,6 +22,17 @@ export {
 // is sent and services/backup.ts refuses one that arrives anyway, and those two
 // refusals have to be the same sentence rather than two that agree today.
 export { MAX_PASSPHRASE_LENGTH, passphraseProblem } from "./passphrase.js";
+// 7.7's plan -- what a restore or an import is about to do, as a value. Here
+// for the same reason as the rule above: the page renders the plan and the
+// engine builds it, and a preview of a DESTRUCTIVE operation that disagreed
+// with what runs is the worst failure this application has available to it.
+export {
+  destructiveEffects, planIsApplicable, plannedTotal,
+} from "./plan.js";
+export type {
+  PlanEffectView, PlanFindingView, PlanKind, PlanRefusalView, PlanSourceView,
+  PlanUnit, PlanView,
+} from "./plan.js";
 
 export const userSchema = z.object({
   id: z.uuid(),

@@ -1,0 +1,169 @@
+import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { promisify } from "node:util";
+import yazl from "yazl";
+import { createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * ARCHIVE FIXTURES FOR 7.7's SPINE, BUILT BY THE SAME BINARY AN OPERATOR HAS.
+ *
+ * services/intake.ts reads archives with `7z`, so a fixture written by a
+ * hand-rolled writer here would share every assumption the reader makes and
+ * prove nothing. These drive `7z` itself (and, for the export half, the `yazl`
+ * that services/export.ts already ships), so what is staged in a test is the
+ * same bytes an operator would hand over.
+ *
+ * Probed rather than assumed, on backup.test.ts's precedent: a developer on
+ * macOS has no /usr/bin/7z and should see a visible skip rather than a red
+ * suite. The dev server and the CI runner both have it, which is where the
+ * archive path has to hold.
+ */
+export const HAVE_7Z = await (async () => {
+  try {
+    await execFileAsync("7z", ["i"]);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+/** Run 7z with a passphrase on stdin -- the shape the spine measured. */
+async function runSevenZip(args: readonly string[], passphrase: string | null): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const child = spawn("7z", args, { stdio: ["pipe", "ignore", "ignore"] });
+    child.on("error", reject);
+    child.on("close", (code) => { resolve(code ?? -1); });
+    if (passphrase !== null) child.stdin.write(passphrase);
+    child.stdin.end();
+  });
+}
+
+/** One file to put in a fixture archive. */
+export interface FixtureMember {
+  /** Path inside the archive, e.g. "files/ab12". */
+  name: string;
+  content: Buffer | string;
+}
+
+/**
+ * Write a `.7z` with `-mhe=on`, exactly as services/backup.ts does.
+ *
+ * ABSOLUTE INPUTS, because that is what makes the layout a property of the
+ * format rather than of the deployment -- 7z strips the parent of an absolute
+ * input and keeps a bare relative one as written, which is the bug 7.6 shipped
+ * and then fixed with path.resolve. A fixture that used relative inputs would
+ * produce an archive one directory deeper than any real backup.
+ */
+export async function writeSevenZip(options: {
+  archivePath: string;
+  workDir: string;
+  members: readonly FixtureMember[];
+  passphrase: string;
+  /** Extra roots to add after the members, e.g. a directory holding a symlink. */
+  extraInputs?: readonly string[];
+}): Promise<void> {
+  const { archivePath, workDir, members, passphrase } = options;
+  const roots = new Set<string>();
+  for (const member of members) {
+    const full = path.join(workDir, member.name);
+    await mkdir(path.dirname(full), { recursive: true });
+    await writeFile(full, member.content);
+    const top = member.name.split("/")[0] ?? member.name;
+    roots.add(path.resolve(path.join(workDir, top)));
+  }
+  const inputs = [...roots, ...(options.extraInputs ?? []).map((i) => path.resolve(i))];
+  const code = await runSevenZip(
+    ["a", "-t7z", "-p", "-mhe=on", "-mx=1", "-bd", "-y", "--", archivePath, ...inputs],
+    passphrase,
+  );
+  if (code !== 0) throw new Error(`7z a exited ${String(code)} building ${archivePath}`);
+}
+
+/**
+ * Write a `.7z` carrying a member whose stored path escapes with `..`.
+ *
+ * `-spf` (store FULL paths) is what makes this possible, and it is the reason
+ * archiveMemberProblem refuses a `..` component rather than trusting 7z to
+ * sanitise: the stock binary will write one, on request, with no warning.
+ */
+export async function writeTraversalSevenZip(options: {
+  archivePath: string;
+  /** The directory 7z is run from; the member is named relative to it. */
+  cwd: string;
+  /** e.g. "../../escaped.txt", relative to cwd and pointing outside it. */
+  relativeMember: string;
+  passphrase: string;
+}): Promise<void> {
+  const { archivePath, cwd, relativeMember, passphrase } = options;
+  const target = path.join(cwd, relativeMember);
+  await mkdir(path.dirname(target), { recursive: true });
+  await writeFile(target, "escaped");
+  const code = await new Promise<number>((resolve, reject) => {
+    const child = spawn(
+      "7z",
+      ["a", "-t7z", "-p", "-mhe=on", "-mx=1", "-bd", "-y", "-spf", "--", archivePath, relativeMember],
+      { cwd, stdio: ["pipe", "ignore", "ignore"] },
+    );
+    child.on("error", reject);
+    child.on("close", (code) => { resolve(code ?? -1); });
+    child.stdin.write(passphrase);
+    child.stdin.end();
+  });
+  if (code !== 0) throw new Error(`7z a -spf exited ${String(code)}`);
+}
+
+/**
+ * Write a `.7z` whose `files/` directory holds a symlink.
+ *
+ * 7z PRESERVES SYMLINKS AND RECREATES THEM -- measured on the deploy target,
+ * where an absolute link came back re-rooted inside the destination and a
+ * relative one escaping the destination made `7z x` exit 2 while still writing
+ * a file in its place. Two behaviours for one idea, neither of them a refusal,
+ * which is why the spine decides it from the index instead.
+ */
+export async function writeSymlinkSevenZip(options: {
+  archivePath: string;
+  workDir: string;
+  linkName: string;
+  linkTarget: string;
+  passphrase: string;
+}): Promise<void> {
+  const { archivePath, workDir, linkName, linkTarget, passphrase } = options;
+  const dir = path.join(workDir, "files");
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, "aaaa"), "real");
+  await rm(path.join(dir, linkName), { force: true });
+  await symlink(linkTarget, path.join(dir, linkName));
+  const code = await runSevenZip(
+    ["a", "-t7z", "-p", "-mhe=on", "-mx=1", "-bd", "-y", "--", archivePath, path.resolve(dir)],
+    passphrase,
+  );
+  if (code !== 0) throw new Error(`7z a exited ${String(code)} building ${archivePath}`);
+}
+
+/**
+ * Write a plain `.zip` with yazl -- the same library services/export.ts uses,
+ * so an "import Conduit's own export" fixture is built by the code that writes
+ * the real thing rather than by an approximation of it.
+ */
+export async function writeZip(options: {
+  zipPath: string;
+  members: readonly FixtureMember[];
+}): Promise<void> {
+  const zip = new yazl.ZipFile();
+  for (const member of options.members) {
+    zip.addBuffer(Buffer.from(member.content), member.name);
+  }
+  zip.end();
+  await pipeline(zip.outputStream, createWriteStream(options.zipPath));
+}
+
+/** The SHA-256 of a buffer, as a blob's filename is in Conduit's blob store. */
+export function digestOf(content: Buffer | string): string {
+  return createHash("sha256").update(content).digest("hex");
+}

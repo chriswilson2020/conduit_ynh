@@ -118,8 +118,13 @@ const WORK_PREFIX = ".backup-work-";
  * fits EXACTLY from leaving a live server with zero free blocks, where the
  * next write from any other part of the system -- the journal, Postgres's WAL,
  * an upload -- is the one that fails.
+ *
+ * EXPORTED FOR 7.7's INTAKE, which makes the same demand for the same reason
+ * before it unpacks an archive (services/intake.ts). One number rather than
+ * two that agree today: the argument above is about the machine, not about
+ * which direction the bytes are travelling in.
  */
-const DISK_MARGIN_BYTES = 64 * 1024 * 1024;
+export const DISK_MARGIN_BYTES = 64 * 1024 * 1024;
 
 /** One archive member, as the manifest records it. */
 export interface BackupManifestMember {
@@ -297,10 +302,19 @@ export { MAX_PASSPHRASE_LENGTH } from "@conduit/shared";
  *
  * (The read side is not symmetric, and it is worth knowing: `7z x -p` reading
  * from a pipe does NOT work on p7zip 16.02 -- it fails with "Cannot open
- * encrypted archive. Wrong password?". Conduit only ever writes, and a human
- * extracting types into a terminal or a dialog, so the asymmetry costs
- * nothing here; the test that opens an archive passes -p<value> on a command
- * line, where the passphrase is a fixture rather than a secret.)
+ * encrypted archive. Wrong password?". The test that opens an archive here
+ * passes -p<value> on a command line, where the passphrase is a fixture rather
+ * than a secret.
+ *
+ * SINCE 7.7 THE REST OF THAT SENTENCE IS KNOWN, and it is the opposite of what
+ * this comment used to imply. The obvious conclusion from the line above --
+ * that reading an archive must therefore put the passphrase in argv -- is
+ * FALSE. `7z x` with NO `-p` AT ALL prompts and reads that prompt from stdin,
+ * which a pipe satisfies exactly as a terminal does; a bare `-p` on extraction
+ * means the EMPTY passphrase. Measured as a 2x2 over the flag and the trailing
+ * newline, and recorded in full on services/intake.ts's sevenZipExtractArgs,
+ * which is where the read side now lives. The passphrase reaches argv on
+ * neither side.)
  */
 export function sevenZipArgs(archivePath: string, inputs: readonly string[]): string[] {
   return [
