@@ -264,6 +264,65 @@ export async function downloadArchive(options: {
 }
 
 /**
+ * POST a multipart body carrying a re-authentication ticket. 7.7'S UPLOAD.
+ *
+ * WHY NOT postForm: that one sends no ticket, and every route in the restore
+ * family refuses without one. Why not downloadArchive: this answers with JSON
+ * rather than bytes.
+ *
+ * THE ORDER OF THE PARTS IS THE CALLER'S RESPONSIBILITY AND IT IS A REAL
+ * CONTRACT. routes/restore.ts requires the passphrase field BEFORE the file,
+ * because Fastify's multipart parser is streaming and a field declared after
+ * the file part has not been seen when `request.file()` resolves. FormData
+ * preserves insertion order and fetch serialises it in that order, so
+ * `append("passphrase", ...)` before `append("file", ...)` is what satisfies
+ * it -- see queries.ts's inspectRestore, which is the only caller.
+ *
+ * NO Content-Type HEADER, for the reason postForm gives: the browser derives it
+ * from the FormData including the multipart boundary, and setting it by hand
+ * omits the boundary and the server fails to parse the body.
+ */
+export async function postFormWithTicket(
+  path: string, ticket: string, form: FormData,
+): Promise<unknown> {
+  const response = await fetch(apiUrl(path), {
+    method: "POST",
+    headers: { Accept: "application/json", [REAUTH_HEADER]: ticket },
+    body: form,
+  });
+  if (!response.ok) {
+    throw await toApiError(response, `POST ${path} failed with ${response.status}`);
+  }
+  return await response.json();
+}
+
+/**
+ * POST a JSON body carrying a re-authentication ticket. 7.7's apply.
+ *
+ * A SECOND TICKET, NOT THE PREVIEW'S. A ticket is single-use by design, so the
+ * one spent on the preview cannot reach here -- and should not: what it proves
+ * is that the operator was at the keyboard when it was minted, and the moment
+ * that matters is this one. See routes/restore.ts's apply handler.
+ */
+export async function postJsonWithTicket<T>(
+  path: string, ticket: string, body: unknown,
+): Promise<T> {
+  const response = await fetch(apiUrl(path), {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      [REAUTH_HEADER]: ticket,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw await toApiError(response, `POST ${path} failed with ${response.status}`);
+  }
+  return (await response.json()) as T;
+}
+
+/**
  * Hand a blob to the browser as a saved file.
  *
  * THE ANCHOR IS PUT IN THE DOCUMENT, and that is not superstition. Chromium

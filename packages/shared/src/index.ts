@@ -33,6 +33,15 @@ export type {
   PlanEffectView, PlanFindingView, PlanKind, PlanRefusalView, PlanSourceView,
   PlanUnit, PlanView,
 } from "./plan.js";
+// 7.7's confirmation rule, here for the reason the passphrase rule above is:
+// the page refuses a mistyped install name before it spends a single-use
+// ticket, and routes/restore.ts refuses one that arrives anyway. One function,
+// two callers -- not two comparisons that agree today.
+export { installNameMatches } from "./install-name.js";
+// IN SCOPE, not merely re-exported: the zod schema at the foot of this file is
+// held against this type by the compiler, and a `export type ... from` does not
+// bring the name into this module.
+import type { PlanView } from "./plan.js";
 
 export const userSchema = z.object({
   id: z.uuid(),
@@ -3111,3 +3120,125 @@ export const backupPreflightSchema = z.object({
   timeoutSeconds: z.number().int().positive(),
 });
 export type BackupPreflight = z.infer<typeof backupPreflightSchema>;
+
+/**
+ * POST /api/restore/inspect's answer, PARSED RATHER THAN CAST.
+ *
+ * WHY THIS ONE IS PARSED WHEN A CAST WOULD COMPILE. Every other response in
+ * this file is parsed because a shape mismatch is contract drift worth
+ * reporting; this one is parsed because THE PAGE RENDERS IT AS A CONFIRMATION
+ * THAT DESTRUCTION IS ABOUT TO HAPPEN. A malformed plan that reached the
+ * confirmation as `undefined` effects and a missing refusal would render as
+ * "nothing will be destroyed" beside a button that destroys everything. There
+ * is no cheaper way to be sure the object under the operator's eyes is the
+ * object the server built.
+ *
+ * THE SCHEMA AND plan.ts's TYPES ARE HELD TOGETHER BY THE COMPILER, not by
+ * whoever edits one of them -- see planViewSchemaAgreesWithPlanView below. A
+ * field added to PlanView and not to this schema would be silently dropped from
+ * the value the page renders, which on this page is the failure mode that
+ * matters.
+ */
+export const planEffectViewSchema = z.object({
+  op: z.string(),
+  subject: z.string(),
+  count: z.number().int().nonnegative(),
+  unit: z.enum(["row", "file", "table", "schema", "key", "migration"]),
+  destroys: z.boolean(),
+  detail: z.string(),
+}).readonly();
+
+export const planFindingViewSchema = z.object({
+  severity: z.enum(["note", "warning"]),
+  code: z.string(),
+  message: z.string(),
+}).readonly();
+
+export const planRefusalViewSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+}).readonly();
+
+export const planSourceViewSchema = z.object({
+  filename: z.string(),
+  bytes: z.number().int().nonnegative(),
+  sha256: z.string(),
+  stagedBytes: z.number().int().nonnegative(),
+  memberCount: z.number().int().nonnegative(),
+}).readonly();
+
+export const planViewSchema = z.object({
+  planId: z.string(),
+  kind: z.enum(["restore", "import-export", "import-csv"]),
+  createdAt: z.string(),
+  expiresAt: z.string(),
+  source: planSourceViewSchema,
+  effects: z.array(planEffectViewSchema).readonly(),
+  findings: z.array(planFindingViewSchema).readonly(),
+  refusal: planRefusalViewSchema.nullable(),
+}).readonly();
+
+/**
+ * THE INSTRUMENT THAT KEEPS THE SCHEMA ABOVE AND plan.ts's TYPES FROM DRIFTING.
+ *
+ * Assignability BOTH WAYS, because neither direction sees what the other does.
+ * WHAT EACH ONE CATCHES WAS MEASURED, by making the mutation and reading which
+ * line the compiler named -- a type-level guard nobody has watched fail is the
+ * same nothing a vacuous assertion is, and a tuple `[true, true]` was the first
+ * draft and had to go: it reported both failures at one line and column with
+ * one sentence, so the error could not say which direction had broken.
+ *
+ *   PARSED -> PlanView fails when the schema DROPS a field the type has, or
+ *   WIDENS one. This is the direction that fails silently at runtime, and it is
+ *   the reason the guard exists at all: zod strips what it was not told about,
+ *   so the page would render a plan missing exactly the field somebody had just
+ *   added for it to render. Measured: adding a field to PlanView alone, and
+ *   relaxing `unit` to z.string(), both fail here.
+ *
+ *   PlanView -> PARSED fails when the schema declares a field the type does
+ *   NOT, or NARROWS one -- drift the other way, where the parse would reject a
+ *   body the type says is legal. Measured: adding a field to this schema alone
+ *   fails here and NOT above.
+ */
+type ParsedIsUsableAsPlanView = z.infer<typeof planViewSchema> extends PlanView ? true : false;
+type PlanViewIsUsableAsParsed = PlanView extends z.infer<typeof planViewSchema> ? true : false;
+const parsedPlanIsUsableAsAPlanView: ParsedIsUsableAsPlanView = true;
+const aPlanViewIsUsableAsAParsedPlan: PlanViewIsUsableAsParsed = true;
+// Referenced so neither constant is dead code to a linter; they exist for the
+// two type annotations above and have no runtime meaning.
+export const PLAN_VIEW_SCHEMA_AGREES =
+  parsedPlanIsUsableAsAPlanView && aPlanViewIsUsableAsAParsedPlan;
+
+/**
+ * What the preview answers with, beside the plan.
+ *
+ * `installName` IS NULLABLE BECAUSE THE SERVER'S ANSWER IS. routes/restore.ts
+ * refuses to invent one when it cannot name the database, and a page that
+ * defaulted it to a constant would print a confirmation string every caller can
+ * type. Null here means the apply route will answer 503, and the page says so
+ * rather than offering a field nothing can satisfy.
+ */
+export const restoreInspectionSchema = z.object({
+  plan: planViewSchema,
+  installName: z.string().nullable(),
+});
+export type RestoreInspection = z.infer<typeof restoreInspectionSchema>;
+
+/**
+ * What POST /api/restore/apply answers when the restore finished.
+ *
+ * `restored: true` IS A LITERAL, NOT A BOOLEAN. Every failure body on that
+ * route that carries the field at all carries `restored: false`, and those
+ * arrive as a non-2xx and therefore as an ApiError rather than through here. A
+ * 200 that said `restored: false` would be a contract this client does not
+ * understand, and the honest response to it is the shape error rather than a
+ * success banner.
+ */
+export const restoreOutcomeSchema = z.object({
+  restored: z.literal(true),
+  dispatched: z.number().int().nonnegative(),
+  realised: z.number().int().nonnegative(),
+  unrealised: z.array(z.string()).readonly(),
+  message: z.string(),
+});
+export type RestoreOutcome = z.infer<typeof restoreOutcomeSchema>;

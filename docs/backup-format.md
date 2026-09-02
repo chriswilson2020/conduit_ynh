@@ -76,8 +76,45 @@ round-trip unchanged.
 `files/` uses content addressing, so the names in it are digests rather than
 `Invoice.pdf`. That is what the server stores; the human names live in the
 database next to the row that points at each one. **If you want files you can
-browse by name, take an export instead** -- it is the other half of Conduit's
-Settings page and it exists for exactly that.
+browse by name, take an export instead** -- it is the readable half of
+Conduit's Settings page and it exists for exactly that.
+
+---
+
+## Putting one back
+
+**Since v1.4.0 Conduit restores its own backups**, from
+**Settings -> Export, backup and restore**. Upload the `.7z`, type the
+passphrase, and Conduit opens it on the server and shows you a preview of
+exactly what a restore would do -- what it will destroy, counted in rows and
+tables from the live database, and what it will put in their place. Nothing is
+changed until you confirm.
+
+**Confirming means typing this install's name**, which is the database this
+Conduit is connected to (`conduit` on a stock YunoHost install, `conduit__2` on
+a second instance). The page prints it next to the field: it is a check that you
+meant this install, not a password. **You are asked for your YunoHost password
+twice** -- once for the preview and once at the moment the database is replaced
+-- because a password confirmation here is good for one request and proves only
+that you are at the keyboard now.
+
+**A restore replaces everything.** There is no way to restore part of a backup
+and no way to pull one record out of one. Before it destroys anything, Conduit
+writes a full backup of the install as it is -- encrypted with the same
+passphrase you just typed, so it adds nothing new to lose -- and refuses to
+start if that backup cannot be written and reopened.
+
+**Restart Conduit afterwards, and know that nothing makes you.** The running
+process keeps its own caches and connections, and the failure is not
+self-announcing: for about a minute after a restore, changes fail because the
+process is still holding accounts from the install that was replaced; then that
+cache expires and changes quietly start working again with the process still
+holding stale state. A change that fails is not the signal to restart, and a
+change that works is not the all-clear.
+
+**You do not need any of this to get your data back.** A backup is a plain
+`.7z`; `7z x` and `psql` will always be enough, which is the whole reason the
+format is what it is.
 
 ### `manifest.json`
 

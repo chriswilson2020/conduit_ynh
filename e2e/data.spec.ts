@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,9 +10,13 @@ import type { Page } from "@playwright/test";
 const execFileAsync = promisify(execFile);
 
 /**
- * PHASE 7.6'S JOURNEY: the Settings page where the two artefacts are told
- * apart, the re-authentication gate in front of both, and -- the half that
- * matters -- that going round the page does not get you an archive.
+ * PHASE 7.6'S JOURNEY: the Settings page where the artefacts are told apart,
+ * the re-authentication gate in front of them, and -- the half that matters --
+ * that going round the page does not get you an archive.
+ *
+ * IT SAID "THE TWO ARTEFACTS" UNTIL 7.7 PUT A THIRD ON THE PAGE. The restore
+ * journeys are at the foot of this file, under their own header; everything
+ * between here and there is still about the two downloads.
  *
  * WHAT ONLY THIS FILE CAN SAY. The unit suites already prove the archives
  * (services/export.test.ts, services/backup.test.ts), the gate's arithmetic
@@ -157,8 +162,11 @@ test.describe("Settings -> Export and backup", () => {
  * THE FOURTH SETTINGS TAB, ON A PHONE.
  *
  * 7.6 is the first phase to make that row overflow at a phone width -- three
- * tabs fit and four do not -- so "Export and backup" is the first tab that has
- * to be scrolled to before it can be touched. e2e/documents.spec.ts's phone
+ * tabs fit and four do not -- so the fourth is the first tab that has to be
+ * scrolled to before it can be touched. 7.7 RENAMED IT AND MADE IT LONGER
+ * ("Export, backup and restore"), which moves it further off the end of the
+ * row rather than back onto it, so the property below is the same one and the
+ * margin is smaller. e2e/documents.spec.ts's phone
  * journey holds every settings tab to the 44px floor and to being wholly in the
  * viewport; this asserts the same property and, when it fails, SAYS WHY IN
  * NUMBERS.
@@ -184,7 +192,7 @@ test.describe("the settings tabs on a phone", () => {
     await page.goto(route);
     const nav = page.getByTestId("settings-nav");
     await expect(nav).toBeVisible();
-    const tab = nav.getByRole("link", { name: "Export and backup", exact: true });
+    const tab = nav.getByRole("link", { name: "Export, backup and restore", exact: true });
 
     const natural = await tab.boundingBox();
     expect(natural?.height ?? 0, "touch height").toBeGreaterThanOrEqual(44);
@@ -429,5 +437,564 @@ test.describe("the pre-flight warning", () => {
     await page.getByTestId("backup-passphrase").fill(PASSPHRASE);
     await page.getByTestId("backup-passphrase-repeat").fill(PASSPHRASE);
     await expect(page.getByTestId("backup-download")).toBeEnabled();
+  });
+});
+
+/**
+ * PHASE 7.7'S JOURNEY: THE THIRD THING ON THIS PAGE, AND THE ONE THAT DESTROYS.
+ *
+ * WHAT ONLY THIS FILE CAN SAY, and it is a narrower list than 7.6's because the
+ * engine is covered so thoroughly elsewhere. routes/restore.test.ts drives
+ * every guard, every refusal and REAL applies -- against scratch databases it
+ * creates and drops, never against the suite's own. services/restore.test.ts
+ * drives the load, the rollback and the inventory check. What is untested
+ * anywhere else is that the SURFACE is wired to it: that a person can choose a
+ * backup, be asked for their password, read a plan the SERVER built, type this
+ * install's name, and have the request that goes back carry an id and nothing
+ * else.
+ *
+ * WHY THERE IS NO REAL APPLY HERE, SAID PLAINLY RATHER THAN LEFT AS A GAP. The
+ * app under test runs against conduit_test -- the suite's own database, shared
+ * with every other spec file. A real apply would drop and reload it mid-run.
+ * routes/restore.test.ts installs a guard called `assertScratch` for exactly
+ * this reason, and its comment says what happens without one: "a test that
+ * reached for the shared handle by accident would take the whole suite's
+ * database with it, and the symptom would be forty unrelated files failing
+ * afterwards." Writing the same mistake into an e2e where no guard can catch it
+ * would be worse, not better.
+ *
+ * SO THE APPLY REQUEST IS REAL AND ONLY THE DESTRUCTION IS NOT. The journey
+ * below drives the page's own Restore button against the REAL route with the
+ * REAL second ticket, and lands on the real 400 from the passphrase proof --
+ * which routes/restore.ts raises BEFORE the line its own comment draws
+ * ("nothing below this line can refuse without consuming the plan"). So the
+ * whole chain runs -- second prompt, second ticket, the three-field body, the
+ * guard order, the refusal, the preview surviving -- with nothing destroyed.
+ * The two things that can only happen after that line, a finished restore and a
+ * half-applied one, are driven against a stubbed route, because the alternative
+ * is not "a better test" but "no suite".
+ *
+ * IT NEEDS 7z, pg_dump AND psql. The preview is real: it takes a backup through
+ * the page, uploads it back, and the server decrypts it, unpacks it and
+ * measures the LIVE database to build the plan. inspectRestore probes for psql
+ * before it will plan anything, so the restore half needs one more binary than
+ * 7.6's half did. All three are on the runner (.github/workflows/test.yml).
+ */
+
+/** A plan the server did not build, for the two states a real run must not reach. */
+const STUB_PLAN = {
+  planId: "33333333-3333-4333-8333-333333333333",
+  kind: "restore",
+  createdAt: "2026-09-01T10:00:00.000Z",
+  expiresAt: "2026-09-01T10:30:00.000Z",
+  source: {
+    filename: "conduit-backup-2026-09-01.7z",
+    bytes: 4096,
+    sha256: "b".repeat(64),
+    stagedBytes: 8192,
+    memberCount: 4,
+  },
+  effects: [
+    {
+      op: "safety-backup", subject: "this install", count: 1, unit: "file", destroys: false,
+      detail: "A backup of this install as it is now is written first.",
+    },
+    {
+      op: "destroy-schema", subject: "public, drizzle", count: 2, unit: "schema", destroys: true,
+      detail: "Everything in this database is dropped: 14204 row(s) in 27 table(s) across "
+        + "2 schema(s).",
+    },
+    {
+      op: "load-dump", subject: "the backup's database", count: 27, unit: "table", destroys: false,
+      detail: "27 table(s) from the backup replace what was there.",
+    },
+    {
+      op: "replace-mail-key", subject: "mail.key", count: 1, unit: "key", destroys: true,
+      detail: "The backup's mail encryption key replaces this install's.",
+    },
+  ],
+  findings: [
+    {
+      severity: "warning", code: "restart-required",
+      message: "restart Conduit once the restore finishes. The running process holds "
+        + "connections and caches for the install that was replaced.",
+    },
+  ],
+  refusal: null,
+};
+
+/** The name the app under test answers with: playwright.config.ts's database. */
+const INSTALL_NAME = "conduit_test";
+
+/**
+ * Get a plan on screen without a server building one.
+ *
+ * ONLY `inspect` IS STUBBED. The re-authentication round trip stays real, so
+ * these tests still prove the ticket is minted and carried; what they do not
+ * prove is the plan, which the journey above proves for real.
+ */
+async function previewWithStub(
+  page: Page, planOverrides: Record<string, unknown> = {},
+): Promise<void> {
+  await page.route("**/api/restore/inspect", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        plan: { ...STUB_PLAN, ...planOverrides }, installName: INSTALL_NAME,
+      }),
+    });
+  });
+  await openDataSettings(page);
+  await page.getByTestId("restore-file").setInputFiles({
+    name: "conduit-backup-2026-09-01.7z",
+    mimeType: "application/x-7z-compressed",
+    buffer: Buffer.from([0x37, 0x7a, 0xbc, 0xaf]),
+  });
+  await page.getByTestId("restore-passphrase").fill(PASSPHRASE);
+  await page.getByTestId("restore-preview").click();
+  await expect(page.getByTestId("reauth-dialog")).toBeVisible();
+  await page.getByTestId("reauth-password").fill(REAUTH_PASSWORD);
+  await page.getByTestId("reauth-confirm").click();
+  await expect(page.getByTestId("restore-plan")).toBeVisible();
+}
+
+test.describe("Settings -> restore", () => {
+  test("reads as a third thing and not as a fourth download", async ({ page }) => {
+    await openDataSettings(page);
+
+    // 7.7's spec: the page must not let somebody reach for one thing when they
+    // meant a restore. The lead of the page now points down at it and says what
+    // it is, and the section says it again in its own words.
+    await expect(page.getByTestId("data-lead")).toContainText("it destroys everything");
+
+    const section = page.getByTestId("restore-section");
+    await expect(section.getByTestId("restore-lead"))
+      .toContainText("The two above take data out of Conduit");
+    await expect(section.getByTestId("restore-lead")).toContainText("not a third download");
+
+    // The limitation, in the same weight the export's and the backup's are in.
+    await expect(section.getByTestId("restore-limitation"))
+      .toContainText("nothing selective about it");
+    // And the thing a person reaching for the wrong tool needs told.
+    await expect(section.getByTestId("restore-limitation"))
+      .toContainText("load a spreadsheet");
+    // The undo, and its condition.
+    await expect(section.getByTestId("restore-undo"))
+      .toContainText("only an undo while you still have it");
+
+    // NOT A REPLACEMENT FOR yunohost backup, now said from the restore side too.
+    await expect(page.getByTestId("data-yunohost"))
+      .toContainText("cannot install Conduit");
+  });
+
+  test("explains the two password prompts BEFORE the first one appears", async ({ page }) => {
+    await openDataSettings(page);
+    const note = page.getByTestId("restore-two-prompts");
+    await expect(note).toContainText("asked for your password twice");
+    // The reason, which is the part that stops a second prompt reading as a bug.
+    await expect(note).toContainText("good for exactly one request");
+    await expect(note).toContainText("at the keyboard");
+
+    // BEFORE, in the document as well as on the screen, the same property 7.6's
+    // no-recovery warning is held to.
+    const order = await page.evaluate(() => {
+      const notice = document.querySelector('[data-testid="restore-two-prompts"]');
+      const field = document.querySelector('[data-testid="restore-file"]');
+      if (notice === null || field === null) return "missing";
+      // eslint-disable-next-line no-bitwise
+      return (notice.compareDocumentPosition(field) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+        ? "warning first" : "field first";
+    });
+    expect(order).toBe("warning first");
+  });
+
+  test("never disables the preview button without saying why beside it", async ({ page }) => {
+    await openDataSettings(page);
+    const button = page.getByTestId("restore-preview");
+    const blocked = page.getByTestId("restore-preview-blocked");
+
+    await expect(button).toBeDisabled();
+    await expect(blocked).toContainText("Choose a backup file");
+
+    await page.getByTestId("restore-file").setInputFiles({
+      name: "conduit-backup-2026-09-01.7z",
+      mimeType: "application/x-7z-compressed",
+      buffer: Buffer.from([0x37, 0x7a]),
+    });
+    await expect(button).toBeDisabled();
+    await expect(blocked).toContainText("Fill in the passphrase");
+
+    // The same shared rule the backup form enforces, at the same moment: a
+    // control character is refused HERE, with the reason, rather than as a 400
+    // that says "validation".
+    await page.getByTestId("restore-passphrase").click();
+    await page.keyboard.insertText("abc\u0007def");
+    await expect(page.getByTestId("restore-form-problem"))
+      .toContainText("7z reads it up to the first line break");
+    await expect(button).toBeDisabled();
+
+    await page.getByTestId("restore-passphrase").fill(PASSPHRASE);
+    await expect(button).toBeEnabled();
+    await expect(blocked).toHaveCount(0);
+  });
+
+  test("BYPASSING THE GATE FAILS on both routes, and there is no GET to leak a passphrase into a log", async ({ page }) => {
+    await openDataSettings(page);
+    const bare = await page.evaluate(async () => {
+      const form = new FormData();
+      form.append("passphrase", "correct horse");
+      form.append("file", new File([new Uint8Array([0x37, 0x7a])], "b.7z"));
+      const inspect = await fetch("/api/restore/inspect", { method: "POST", body: form });
+      const apply = await fetch("/api/restore/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          planId: "00000000-0000-4000-8000-000000000000",
+          passphrase: "correct horse",
+          confirmName: "conduit_test",
+        }),
+      });
+      // There must be no GET in this family: nginx writes a query string to its
+      // access log verbatim and the browser keeps it in history.
+      const get = await fetch("/api/restore/inspect", { headers: { Accept: "application/json" } });
+      return {
+        inspect: inspect.status, inspectBody: await inspect.text(),
+        apply: apply.status, applyBody: await apply.text(),
+        get: get.status,
+      };
+    });
+    // The attacker's request, made from inside a session that is already
+    // authenticated -- which is exactly the position the gate exists for.
+    expect(bare.inspect).toBe(401);
+    expect(bare.inspectBody).toContain("reauth_required");
+    expect(bare.apply).toBe(401);
+    expect(bare.applyBody).toContain("reauth_required");
+    expect(bare.get).toBe(404);
+  });
+
+  test("previews a REAL backup, refuses a wrong confirmation, and keeps the upload", async ({ page }) => {
+    const scratch = await mkdtemp(path.join(os.tmpdir(), "conduit-e2e-restore-"));
+    try {
+      await openDataSettings(page);
+
+      // A REAL BACKUP, taken through this page a moment earlier, so what is
+      // uploaded is the artefact the other half of the page produces.
+      await page.getByTestId("backup-passphrase").fill(PASSPHRASE);
+      await page.getByTestId("backup-passphrase-repeat").fill(PASSPHRASE);
+      const download = await downloadThrough(page, "backup-download", REAUTH_PASSWORD);
+      const saved = path.join(scratch, "to-restore.7z");
+      await download.saveAs(saved);
+
+      await page.getByTestId("restore-file").setInputFiles(saved);
+      await page.getByTestId("restore-passphrase").fill(PASSPHRASE);
+      await page.getByTestId("restore-preview").click();
+
+      // THE FIRST PROMPT, and it says why there will be a second.
+      await expect(page.getByTestId("reauth-dialog")).toBeVisible();
+      await expect(page.getByTestId("reauth-reason"))
+        .toContainText("Nothing is changed and nothing is destroyed by this step");
+      await expect(page.getByTestId("reauth-reason")).toContainText("once more");
+      await page.getByTestId("reauth-password").fill(REAUTH_PASSWORD);
+      await page.getByTestId("reauth-confirm").click();
+
+      const plan = page.getByTestId("restore-plan");
+      await expect(plan).toBeVisible({ timeout: 120_000 });
+
+      // WHAT THE SERVER SAID ABOUT THE FILE, not what the page knows about it.
+      const source = page.getByTestId("restore-plan-source");
+      await expect(source).toContainText("to-restore.7z");
+      // THE DIGEST IS CHECKED AGAINST THE BYTES ON DISK, and a review is why:
+      // this was a bare /[0-9a-f]{64}/, which a hard-coded constant would have
+      // satisfied. The archive is right there, so the assertion can be the real
+      // one -- the server hashed what the browser uploaded, and it is this file.
+      const digest = createHash("sha256").update(await readFile(saved)).digest("hex");
+      await expect(source).toContainText(digest);
+      // AND THE MEMBER COUNT, which the same review found being described in a
+      // comment and asserted nowhere. A real backup carries database.sql,
+      // mail.key, manifest.json and the blob store, so it is never one member
+      // and never zero -- and it is the server's count of what it staged.
+      const members = await source.textContent() ?? "";
+      expect(members).toMatch(/Members:\s*[1-9]/);
+
+      // THE DESTRUCTION LIST, WITH TABLES AND ROWS. The spec asks for row counts
+      // from the LIVE database "so the operator sees what they are replacing
+      // rather than an abstraction" -- so this asserts the numbers are there,
+      // not merely a list of names. Neither figure is computed by the page.
+      const destruction = page.getByTestId("restore-destruction");
+      await expect(destruction).toContainText("What this destroys");
+      const schemas = destruction.getByTestId("restore-destroys-destroy-schema");
+      await expect(schemas).toContainText("public");
+      await expect(schemas).toContainText(/\d+ row\(s\) in \d+ table\(s\)/);
+      // mail.key is the other destructive effect and must not be quietly folded
+      // into the first: it is a REPLACEMENT and it is irreversible in effect.
+      await expect(destruction.getByTestId("restore-destroys-replace-mail-key")).toBeVisible();
+
+      // AND THE NON-DESTRUCTIVE STEPS ARE MARKED AS SUCH, from the plan's own
+      // flag rather than from anything the page inferred about the operation.
+      await expect(page.getByTestId("restore-effect-safety-backup"))
+        .toHaveAttribute("data-destroys", "no");
+      await expect(page.getByTestId("restore-effect-load-dump"))
+        .toHaveAttribute("data-destroys", "no");
+      await expect(page.getByTestId("restore-effect-destroy-schema"))
+        .toHaveAttribute("data-destroys", "yes");
+
+      // The server's own restart finding, rendered as a warning.
+      await expect(page.getByTestId("restore-finding-restart-required"))
+        .toHaveAttribute("data-severity", "warning");
+
+      // THE NAME IS PRINTED, because it is a deliberateness check and not a
+      // secret. Read from the page rather than hard-coded, which is also what a
+      // person does.
+      const name = (await page.getByTestId("restore-install-name").textContent() ?? "").trim();
+      expect(name).toMatch(/^[A-Za-z0-9_]+$/);
+
+      const apply = page.getByTestId("restore-apply");
+      const blocked = page.getByTestId("restore-apply-blocked");
+      await expect(apply).toBeDisabled();
+      await expect(blocked).toContainText("archive passphrase again");
+
+      await page.getByTestId("restore-confirm-passphrase").fill(PASSPHRASE);
+      await page.getByTestId("restore-confirm-name").fill(`${name}x`);
+      await expect(apply).toBeDisabled();
+      await expect(blocked).toContainText(`Type ${name} exactly`);
+
+      // TRIMMED AND OTHERWISE EXACT, from the ONE comparison both sides use.
+      await page.getByTestId("restore-confirm-name").fill(`  ${name}  `);
+      await expect(apply).toBeEnabled();
+
+      // NOW THE REAL APPLY REQUEST, aimed at the one refusal that happens before
+      // anything can be consumed or destroyed: the name is right and the
+      // passphrase is not. This is the page's own button, the real second
+      // ticket, and the real guard chain.
+      await page.getByTestId("restore-confirm-passphrase").fill("not the passphrase");
+      await apply.click();
+      await expect(page.getByTestId("reauth-dialog")).toBeVisible();
+      // THE SECOND PROMPT SAYS WHAT IT IS FOR, and it is not the first one's
+      // sentence.
+      await expect(page.getByTestId("reauth-reason"))
+        .toContainText("This is the one that destroys");
+      await expect(page.getByTestId("reauth-reason")).toContainText("was spent on the preview");
+      await page.getByTestId("reauth-password").fill(REAUTH_PASSWORD);
+      await page.getByTestId("reauth-confirm").click();
+
+      const error = page.getByTestId("restore-error");
+      await expect(error).toContainText("not the passphrase this backup was opened with");
+      // A REFUSED CONFIRMATION LEAVES THE PLAN REUSABLE. This is the property
+      // that saves a three-gigabyte re-upload, and it is the reason
+      // applyKeptThePreview exists at all.
+      await expect(error).toContainText("your upload is still here");
+      await expect(plan).toBeVisible();
+      await expect(page.getByTestId("restore-confirm-name")).toHaveValue(`  ${name}  `);
+
+      // A retype is all it costs, and the button comes back.
+      await page.getByTestId("restore-confirm-passphrase").fill(PASSPHRASE);
+      await expect(apply).toBeEnabled();
+
+      // AND THE OPERATOR CAN WALK AWAY, deleting the decrypted archive now
+      // rather than in half an hour.
+      await page.getByTestId("restore-cancel").click();
+      await expect(plan).toHaveCount(0);
+      await expect(page.getByTestId("restore-upload")).toBeVisible();
+
+      // THE CANCEL REALLY FREED THE SLOT, and this is what discriminates that
+      // from a page that merely stopped rendering the plan. The server allows
+      // exactly one preview at a time; a second inspect while one is held
+      // answers 409 restore_busy. This one is refused for the right reason
+      // instead -- the file is not an archive.
+      const after = await page.evaluate(async () => {
+        const minted = await fetch("/api/reauth", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: "e2e-reauth-password" }),
+        });
+        const { ticket } = (await minted.json()) as { ticket: string };
+        const form = new FormData();
+        form.append("passphrase", "correct horse");
+        form.append("file", new File([new Uint8Array([1, 2, 3, 4])], "not-a-backup.7z"));
+        const response = await fetch("/api/restore/inspect", {
+          method: "POST", headers: { "X-Conduit-Reauth": ticket }, body: form,
+        });
+        return { status: response.status, body: await response.text() };
+      });
+      expect(after.body).not.toContain("restore_busy");
+      expect(after.status).toBe(400);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("a backup it cannot restore is shown as refused, with nothing to confirm", async ({ page }) => {
+    // A REFUSAL IS STILL A PLAN and is rendered through the same path -- which
+    // is the design decision @conduit/shared's plan.ts is built on. What must
+    // NOT happen is a confirmation appearing under it.
+    await previewWithStub(page, {
+      effects: [],
+      refusal: {
+        code: "newer-app",
+        message: "this backup was written by Conduit 9.9.9, which is newer than this "
+          + "install. Its data may use columns this build does not have.",
+      },
+    });
+    await expect(page.getByTestId("restore-refusal")).toContainText("newer than this install");
+    await expect(page.getByTestId("restore-apply")).toHaveCount(0);
+    await expect(page.getByTestId("restore-confirm-name")).toHaveCount(0);
+    // And the destruction list says so rather than being absent.
+    await expect(page.getByTestId("restore-destruction"))
+      .toContainText("Nothing in this plan destroys anything");
+  });
+
+  test("sends back an ID AND NOTHING ELSE, and is honest that nothing enforces the restart", async ({ page }) => {
+    await previewWithStub(page);
+
+    let sent: { method: string; ticket: string | undefined; body: unknown } | null = null;
+    await page.route("**/api/restore/apply", async (route) => {
+      const request = route.request();
+      sent = {
+        method: request.method(),
+        ticket: request.headers()["x-conduit-reauth"],
+        body: request.postDataJSON(),
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          restored: true, dispatched: 4, realised: 4, unrealised: [],
+          message: "the backup has been restored. Restart Conduit now: this process holds "
+            + "connections and caches belonging to the install that was replaced.",
+        }),
+      });
+    });
+
+    await page.getByTestId("restore-confirm-name").fill(INSTALL_NAME);
+    await page.getByTestId("restore-confirm-passphrase").fill(PASSPHRASE);
+    await page.getByTestId("restore-apply").click();
+    await expect(page.getByTestId("reauth-dialog")).toBeVisible();
+    await page.getByTestId("reauth-password").fill(REAUTH_PASSWORD);
+    await page.getByTestId("reauth-confirm").click();
+
+    await expect(page.getByTestId("restore-outcome")).toBeVisible();
+
+    // THE PLAN DOES NOT TRAVEL. Three fields, one of them an id, and no
+    // description of the work -- because a client that could describe the work
+    // could describe different work. A page that had reconstructed the plan and
+    // posted it back would fail here.
+    const request = sent as unknown as { method: string; ticket?: string; body: Record<string, unknown> } | null;
+    expect(request).not.toBeNull();
+    expect(request?.method).toBe("POST");
+    expect(request?.ticket ?? "").toMatch(/^[0-9a-f]{64}$/);
+    expect(Object.keys(request?.body ?? {}).sort())
+      .toEqual(["confirmName", "passphrase", "planId"]);
+    expect(request?.body.planId).toBe(STUB_PLAN.planId);
+
+    // THE RESTART ADVICE, AND THE CLAIM THIS PHASE MEASURED AND WITHDREW. It
+    // was believed that the app could not serve writes after a restore, so an
+    // operator would find out. Measured: they fail for about sixty seconds --
+    // the identity cache's TTL -- and then silently start working again with
+    // the process still holding stale state. So the page must say that a
+    // working write proves nothing, and must not imply anything is enforcing
+    // the restart, because nothing is.
+    const restart = page.getByTestId("restore-restart");
+    await expect(restart).toContainText("nothing here will make you");
+    await expect(restart).toContainText("about a minute");
+    await expect(restart).toContainText("quietly start working again");
+    await expect(restart).toContainText("is not evidence you can skip it");
+    // The unit is named from the install's name, which under YunoHost is the
+    // app id, the system user and the database all at once.
+    await expect(restart).toContainText(`systemctl restart ${INSTALL_NAME}`);
+
+    // The preview is gone on the server the moment apply took it, so the page
+    // stops offering it.
+    await expect(page.getByTestId("restore-plan")).toHaveCount(0);
+  });
+
+  test("passes a half-applied restore's own words through WHOLE, and drops the preview", async ({ page }) => {
+    await previewWithStub(page);
+    // The narrow exception to every other 5xx in this application: these
+    // messages name the safety backup's path and print the commands that put
+    // the install back, and a paraphrase would throw away the only thing
+    // between an operator and a broken database.
+    const message = "THE RESTORE HAS HAPPENED and this database is not what it was. A safety "
+      + "backup of the install as it was is at "
+      + "/var/lib/conduit/conduit-safety-backup-2026-09-01T10-00-00-000Z.7z. Put it back by "
+      + "hand with: 7z x -p'<your passphrase>' -o/tmp/undo -- <that file> && psql -f "
+      + "/tmp/undo/database.sql";
+    await page.route("**/api/restore/apply", async (route) => {
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: "restore_half_applied",
+          message,
+          safetyBackupPath: "/var/lib/conduit/conduit-safety-backup-2026-09-01T10-00-00-000Z.7z",
+          recoveryCommands: ["7z x ...", "psql -f ..."],
+          restored: false,
+          unrealised: ["load-dump"],
+        }),
+      });
+    });
+
+    await page.getByTestId("restore-confirm-name").fill(INSTALL_NAME);
+    await page.getByTestId("restore-confirm-passphrase").fill(PASSPHRASE);
+    await page.getByTestId("restore-apply").click();
+    await page.getByTestId("reauth-password").fill(REAUTH_PASSWORD);
+    await page.getByTestId("reauth-confirm").click();
+
+    const error = page.getByTestId("restore-error");
+    await expect(error).toContainText("conduit-safety-backup-2026-09-01T10-00-00-000Z.7z");
+    await expect(error).toContainText("psql -f");
+    await expect(error).toContainText("THE RESTORE HAS HAPPENED");
+    // The plan was taken by the apply and disposed of in a `finally`, so the
+    // page must not leave a button pointing at an id that will answer 404.
+    await expect(page.getByTestId("restore-plan")).toHaveCount(0);
+    await expect(page.getByTestId("restore-apply")).toHaveCount(0);
+  });
+});
+
+/**
+ * THE RESTORE SURFACE AT A PHONE WIDTH.
+ *
+ * The page's own phone journey above holds the settings tab row to the touch
+ * floor. This holds the thing the tab leads to: 7.7 adds the longest form on
+ * this page and the widest control row, and both have to work on the device an
+ * operator is most likely to be holding when they find out they need a restore.
+ */
+test.describe("the restore surface on a phone", () => {
+  test.use(IPHONE_13);
+
+  test("reads and confirms at 390, with nothing off the side", async ({ page }) => {
+    await previewWithStub(page);
+
+    // NOTHING OFF THE SIDE. The confirmation is three controls in one row; at
+    // this width they wrap rather than push the page wider. One pixel of
+    // tolerance, the same the page-overflow assertions elsewhere in this suite
+    // allow for sub-pixel layout.
+    const overflow = await page.evaluate(() =>
+      document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow, "pixels the page overflows horizontally").toBeLessThanOrEqual(1);
+
+    const viewport = page.viewportSize();
+    if (viewport === null) throw new Error("no viewport");
+
+    await page.getByTestId("restore-confirm-name").fill(INSTALL_NAME);
+    await page.getByTestId("restore-confirm-passphrase").fill(PASSPHRASE);
+
+    // EVERY CONTROL IN THE SEQUENCE IS A 44px TARGET AND WHOLLY IN THE
+    // VIEWPORT. A confirmation somebody cannot finish on a phone is a
+    // confirmation they will finish on a laptop later, or not at all.
+    for (const id of ["restore-confirm-name", "restore-confirm-passphrase", "restore-apply", "restore-cancel"]) {
+      const control = page.getByTestId(id);
+      await control.scrollIntoViewIfNeeded();
+      const box = await control.boundingBox();
+      if (box === null) throw new Error(`no geometry for ${id}`);
+      expect(box.height, `${id} touch height`).toBeGreaterThanOrEqual(44);
+      const outside = Math.max(0, (box.x + box.width) - viewport.width) + Math.max(0, -box.x);
+      expect(outside, `pixels of ${id} outside the viewport`).toBe(0);
+    }
+
+    // AND THE DESTRUCTION LIST IS STILL READABLE rather than clipped: the
+    // numbers are the whole point of it.
+    await expect(page.getByTestId("restore-destroys-destroy-schema"))
+      .toContainText(/\d+ row\(s\) in \d+ table\(s\)/);
   });
 });

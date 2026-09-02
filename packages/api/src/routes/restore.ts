@@ -3,7 +3,15 @@ import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import type { MultipartFile } from "@fastify/multipart";
 import { z } from "zod";
-import { MAX_PASSPHRASE_LENGTH, passphraseProblem, type PlanView } from "@conduit/shared";
+// installNameMatches MOVED TO @conduit/shared IN 7.7 TASK 4 and did not change
+// on the way. The page has to be able to say "that is not the name" before it
+// spends a re-authentication ticket -- a ticket is single-use, so a typo would
+// otherwise cost the operator their password again -- and two implementations
+// of one comparison is the shape this phase's review found five defects in.
+// One function, two callers. The 400 below is still the control.
+import {
+  MAX_PASSPHRASE_LENGTH, installNameMatches, passphraseProblem, type PlanView,
+} from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
 import { requireUser, parseOrReject } from "./helpers.js";
 import { requireReauth } from "./reauth.js";
@@ -145,24 +153,6 @@ export function installName(databaseUrl: string): string | null {
   } catch {
     return null;
   }
-}
-
-/**
- * How the operator's typing is compared with the install's name.
- *
- * TRIMMED AND OTHERWISE EXACT. Surrounding whitespace is dropped because a
- * copy-paste picks it up and refusing that teaches the operator nothing; case
- * is not folded and nothing else is normalised, because every relaxation makes
- * the string easier to produce without having read it, which is the entire
- * property being bought.
- *
- * NOT A TIMING-SAFE COMPARISON, and that is a statement rather than an
- * oversight: the name is PRINTED ON THE PAGE next to the field. It is a
- * deliberateness check, not a secret, and treating it as one would suggest to
- * the next reader that it is.
- */
-function nameMatches(typed: string, expected: string): boolean {
-  return typed.trim() === expected;
 }
 
 /**
@@ -501,7 +491,7 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
       });
     }
 
-    if (!nameMatches(body.confirmName, expectedName)) {
+    if (!installNameMatches(body.confirmName, expectedName)) {
       return reply.code(400).send({
         error: "restore_name_mismatch",
         message: `type this install's name exactly to confirm: ${expectedName}`,
@@ -530,8 +520,6 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
           + "already used successfully.",
       });
     }
-
-    // --- nothing below this line can refuse without consuming the plan ---
 
     // REFUSE NEW WRITES, THEN WAIT FOR THE ONES ALREADY RUNNING. Before the
     // safety backup rather than after it, for the reason services/restore.ts
@@ -576,6 +564,20 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
       });
     }
 
+    // --- nothing below this line can refuse without consuming the plan ---
+    //
+    // MOVED DOWN IN 7.7 TASK 4, BECAUSE IT WAS TWO REFUSALS TOO HIGH. It sat
+    // above the write-gate block, and both answers that block can give --
+    // `restore_in_progress` when the gate is already closed, and
+    // `restore_writes_in_flight` when the drain runs out -- return without ever
+    // reaching `intakeSessions.use`, so the plan is still there and the
+    // operator's upload is still on disk. That is not a nicety: it is what
+    // makes "try again in a moment", which the second of those two messages
+    // says in as many words, an instruction somebody can actually follow. The
+    // page reads this line as its authority for which failures leave a preview
+    // usable (pages/settings-data-lib.ts's APPLY_KEEPS_THE_PREVIEW), so a
+    // marker in the wrong place is a marker that would have made the page throw
+    // away a recoverable upload.
     const manager = deps.syncManager();
     const sync: RestoreSyncControl | null = manager === null
       ? null

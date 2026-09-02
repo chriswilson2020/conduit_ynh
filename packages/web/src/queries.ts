@@ -30,6 +30,8 @@ import {
   noteSchema,
   orgProfileSchema,
   reauthTicketSchema,
+  restoreInspectionSchema,
+  restoreOutcomeSchema,
   pipelineSchema,
   pipelineWithStagesSchema,
   projectSchema,
@@ -91,7 +93,7 @@ import {
 } from "@conduit/shared";
 import {
   ApiError, ResponseShapeError, deleteJson, deleteRequest, downloadArchive, getJson,
-  patchJson, postForm, postJson, putJson, saveBlob,
+  patchJson, postForm, postFormWithTicket, postJson, postJsonWithTicket, putJson, saveBlob,
 } from "./api";
 
 const companyListSchema = listResponseSchema(companySchema);
@@ -1967,7 +1969,8 @@ export function useSaveDocumentTemplate() {
 /**
  * PHASE 7.6: THE TWO DOWNLOADS, AND THE GATE IN FRONT OF THEM.
  *
- * Read Settings -> Export and backup (pages/settings-data.tsx) alongside these.
+ * Read Settings -> Export, backup and restore (pages/settings-data.tsx)
+ * alongside these.
  * The shape is unusual for this file and the reason is worth stating: nothing
  * here caches, and nothing here belongs in a query cache. A ticket is
  * single-use, an archive is hundreds of megabytes, and a passphrase must not
@@ -2057,4 +2060,84 @@ export function useDownloadBackup() {
       return archive.filename;
     },
   });
+}
+
+/**
+ * PHASE 7.7: THE RESTORE, AND WHY NOT ONE OF THESE IS A MUTATION EITHER.
+ *
+ * Read Settings -> Export, backup and restore (pages/settings-data.tsx)
+ * alongside these. The argument requestReauthTicket's own comment makes applies
+ * to all three and applies harder: TanStack Query v5 keeps a mutation's
+ * `variables` in the shared queryClient's mutation cache after it settles,
+ * surviving the observer unsubscribing. For the restore those variables are the
+ * ARCHIVE PASSPHRASE, and -- for the preview -- the File handle to a decrypted
+ * backup's container. There is no cache to invalidate here, no retry that would
+ * be safe (apply destroys a database; a refetch on window focus would be
+ * unthinkable), and nothing worth keeping. So they are plain functions, the
+ * passphrase is an argument that goes out of scope with the call, and the page
+ * tracks "in flight" with a boolean it owns.
+ */
+
+/**
+ * Upload a backup and get back what restoring it WOULD do. Spends a ticket.
+ *
+ * NOTHING IS WRITTEN AND NOTHING IS DESTROYED by this call -- but the archive
+ * IS decrypted onto the server's disk for the life of the plan, which is why
+ * cancelRestore exists and why the page offers it.
+ *
+ * THE PASSPHRASE PART IS APPENDED FIRST, AND THAT IS A CONTRACT RATHER THAN A
+ * STYLE. Fastify's multipart parser is streaming: a field declared after the
+ * file part has not been seen when the route's `request.file()` resolves, so a
+ * body with the passphrase last reads as a body with NO passphrase and is
+ * refused. FormData preserves insertion order and fetch serialises it in that
+ * order, so these two lines are load-bearing and must not be reordered.
+ */
+export async function inspectRestore(
+  input: { ticket: string; file: File; passphrase: string },
+) {
+  const form = new FormData();
+  form.append("passphrase", input.passphrase);
+  form.append("file", input.file);
+  return parseWith(
+    restoreInspectionSchema,
+    await postFormWithTicket("/restore/inspect", input.ticket, form),
+    "restore preview",
+  );
+}
+
+/**
+ * Destroy this install's database and put the backup in its place. Spends a
+ * SECOND ticket.
+ *
+ * `planId` IS THE ONLY DESCRIPTION OF THE WORK THAT TRAVELS. The plan is held
+ * on the server and this client could not describe different work if it wanted
+ * to -- see @conduit/shared's plan.ts. `confirmName` is what the operator
+ * typed; the server compares it with the same installNameMatches this page
+ * used to enable the button, and its 400 is the control.
+ */
+export async function applyRestore(
+  input: { ticket: string; planId: string; passphrase: string; confirmName: string },
+) {
+  return parseWith(
+    restoreOutcomeSchema,
+    await postJsonWithTicket<unknown>("/restore/apply", input.ticket, {
+      planId: input.planId,
+      passphrase: input.passphrase,
+      confirmName: input.confirmName,
+    }),
+    "restore outcome",
+  );
+}
+
+/**
+ * Throw the preview away, and with it the decrypted archive on the server.
+ *
+ * NOT BEHIND THE GATE, and that is the conservative direction rather than the
+ * lax one: what this does is DELETE a staged credential store, and the failure
+ * mode of making it harder to reach is a decrypted backup sitting in $data_dir
+ * for the rest of the plan's half hour. The route binds it to its owner, so it
+ * is not a way to cancel somebody else's restore.
+ */
+export async function cancelRestore(planId: string): Promise<void> {
+  await deleteRequest(`/restore/${planId}`);
 }

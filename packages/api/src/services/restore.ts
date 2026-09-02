@@ -239,6 +239,65 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 /** The apt package that provides psql. The same one that provides pg_dump. */
 export const PSQL_PACKAGE = PG_DUMP_PACKAGE;
 
+/**
+ * WHAT nginx HAS TO LET THROUGH FOR A RESTORE, AND IT IS NOT WHAT IT LETS
+ * THROUGH FOR EVERYTHING ELSE.
+ *
+ * 7.6 raised the read timeout for the backup route and said in conf/nginx.conf
+ * why it was scoped rather than global. Restore needs the same treatment twice
+ * over and for a reason 7.6 did not have: it is the first route in this
+ * application that receives something large, and the app's own location block
+ * carries `client_max_body_size 50M` -- a bound written for a mail attachment.
+ *
+ * MEASURED AGAINST THE APP'S OWN CEILING RATHER THAN GUESSED. services/intake.ts
+ * accepts an upload of up to DEFAULT_MAX_UPLOAD_BYTES, and a backup is roughly
+ * the size of the install. At 50M, every restore of a real install would be
+ * refused BY nginx -- which answers its own HTML 413 that this application
+ * never sees, so the operator gets an unstyled proxy error where the page had
+ * promised a message naming the limit. The bound below is asserted against
+ * DEFAULT_MAX_UPLOAD_BYTES by restore-nginx.test.ts, so the day somebody raises
+ * one and not the other is the day a test fails rather than a restore does.
+ *
+ * WHY THE PROXY MUST NOT BUFFER THE REQUEST, AND THIS IS THE PART THAT IS ABOUT
+ * A CREDENTIAL AND NOT ABOUT SIZE. nginx buffers a request body to disk by
+ * default, in its own client_body_temp_path. The preview's body is multipart
+ * and the PASSPHRASE FIELD COMES FIRST IN IT -- routes/restore.ts requires that
+ * order for the streaming parser -- so a buffered body is the archive's
+ * passphrase written to a file this application does not own, cannot chmod and
+ * does not delete. 7.6's rule is that the passphrase is never stored, logged or
+ * written to disk; `proxy_request_buffering off` is what keeps that true of the
+ * deployment and not merely of the process. The archive is then written exactly
+ * once, by receiveIntake, at 0600 inside $data_dir.
+ *
+ * BOTH ROUTES, AND THE APPLY ONE IS NOT AN AFTERTHOUGHT. Apply's body is three
+ * short fields, so it needs no size at all -- but it takes a whole safety
+ * backup before it destroys anything, which costs what the backup route costs,
+ * and then loads a dump on top. It is the longest single request this
+ * application has.
+ */
+export const RESTORE_PROXY_READ_TIMEOUT_SECONDS = 3600;
+
+/**
+ * `client_max_body_size` for the preview, as nginx spells it.
+ *
+ * A STRING BECAUSE nginx TAKES ONE, and the test parses it back to bytes rather
+ * than matching the characters: `9g` and `9216m` are the same directive and a
+ * guard that accepted only one spelling would be asserting about typography.
+ *
+ * ABOVE THE APP'S CEILING RATHER THAN EQUAL TO IT, AND A REVIEW IS WHY. The two
+ * numbers measure different things: DEFAULT_MAX_UPLOAD_BYTES bounds the FILE
+ * PART (routes/restore.ts hands it to `request.file`'s `fileSize` limit), and
+ * nginx's directive bounds the WHOLE REQUEST BODY -- the multipart preamble,
+ * the `passphrase` field, every boundary and every part header as well. Set
+ * equal, a file of exactly the app's ceiling is refused BY NGINX with its own
+ * HTML 413 a few hundred bytes over, which is the precise failure the block
+ * exists to prevent. The margin is a whole GiB rather than a tight arithmetic
+ * one because the alternative is arithmetic over a moving target, which is this
+ * project's named recurring failure; restore-nginx.test.ts asserts a STRICT
+ * inequality so the two can never be brought level again by accident.
+ */
+export const RESTORE_CLIENT_MAX_BODY_SIZE = "9g";
+
 /** 8KB of a child's stderr: enough to diagnose it, short enough to log. */
 const STDERR_CAP_BYTES = 8 * 1024;
 
@@ -1417,9 +1476,18 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
     });
   }
 
-  // AN EXPORT IS NOT A BACKUP, and the manifest says which it is precisely so
-  // this does not have to be inferred from a member list. Restoring an export
-  // would replace the database with one that has no mail and no credentials.
+  // AN EXPORT IS NOT A BACKUP, and this is decided from the manifest rather
+  // than inferred from a member list. Restoring an export would replace the
+  // database with one that has no mail and no credentials.
+  //
+  // THE COMPARISON IS POSITIVE AND THE ABSENCE IS WHAT REFUSES AN EXPORT, said
+  // plainly because this comment used to read as though services/export.ts
+  // wrote `kind: "export"`. IT DOES NOT -- its ExportManifest has no `kind`
+  // field at all -- so an export is refused here by not saying "backup", which
+  // is the stricter behaviour and the one to keep: every archive whose manifest
+  // does not positively declare itself a Conduit backup is refused, not merely
+  // the ones this project happens to write. The message below names an export
+  // because that is overwhelmingly what somebody will have handed it.
   if (manifest.kind !== "backup") {
     return refuse(options, {
       code: RESTORE_REFUSALS.notABackup,

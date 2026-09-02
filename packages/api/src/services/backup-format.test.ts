@@ -185,6 +185,42 @@ describe("docs/backup-format.md", () => {
     expect(doc).toContain("This does not replace `yunohost backup`.");
   });
 
+  /**
+   * 7.7 ADDED A THIRD THING TO A PAGE THIS DOCUMENT DESCRIBED AS TWO, and a
+   * symbol grep cannot see a sentence -- which is why this is a test rather
+   * than a note. Until v1.4.0 the only way to put a backup back was `7z x` and
+   * `psql` by hand; a document that still implied that would send an operator
+   * to a terminal past the surface built for them.
+   */
+  it("says Conduit can now restore its own backups, and what that costs", () => {
+    expect(doc).toContain("Since v1.4.0 Conduit restores its own backups");
+    // The tab, by the name it now carries. A page that named the old one would
+    // send somebody looking for something that is not in the navigation.
+    expect(doc).toContain("Settings -> Export, backup and restore");
+    expect(doc).toContain("A restore replaces everything.");
+    // The confirmation is a deliberateness check and the document must not
+    // dress it up as a secret, because the page does not either.
+    expect(doc).toContain("typing this install's name");
+  });
+
+  /**
+   * THE CLAIM 7.7 MEASURED AND WITHDREW, kept honest here as well as on the
+   * page. The earlier belief was that the app cannot serve writes after a
+   * restore, so an operator would discover the need to restart. Measured: they
+   * fail for about sixty seconds -- the identity cache's TTL -- and then
+   * silently start working again while the process still holds stale state. A
+   * document that let a working write read as an all-clear would be worse than
+   * one that said nothing.
+   */
+  it("does not let a working write read as an all-clear after a restore", () => {
+    // Short enough not to span the document's own line wrapping, which is what
+    // made the first version of this assertion fail against text that was
+    // right there. A guard that reads prose has to read it the way it is
+    // written, not the way it was drafted.
+    expect(doc).toContain("is not the all-clear");
+    expect(doc).toContain("nothing makes you");
+  });
+
   it7z("lists exactly the members a real backup contains", async () => {
     const backup = await realBackup();
     const { members } = await open7z(backup.path);

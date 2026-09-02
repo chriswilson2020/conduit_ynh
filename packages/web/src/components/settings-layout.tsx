@@ -69,8 +69,15 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
         <Link to="/settings/org" className={tabClass} activeProps={{ className: activeTabClass }}>
           Organisation
         </Link>
+        {/*
+          RENAMED IN 7.7, AND IT IS A PROSE SWEEP RATHER THAN A PREFERENCE. The
+          tab said "Export and backup" while the page behind it gained a third
+          thing that is neither -- and the one 7.7's spec says a person must not
+          reach for by mistake. A label that did not mention it would be the
+          navigation quietly disagreeing with the page.
+        */}
         <Link to="/settings/data" className={tabClass} activeProps={{ className: activeTabClass }}>
-          Export and backup
+          Export, backup and restore
         </Link>
       </nav>
       {children}
