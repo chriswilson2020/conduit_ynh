@@ -127,7 +127,33 @@ test.describe.serial("CRM journey", () => {
     // Still open, and nothing saved yet -- the first keystroke used to commit.
     await expect(page.getByTestId("salutation")).toHaveText(/Other/);
 
+    // THE COMMIT IS FIRE-AND-FORGET AND THE RELOAD USED TO RACE IT.
+    //
+    // Measured 2 Sep over 401 CI attempts: the assertion below failed 3 times in
+    // 135, one run in 45, passing on retry every time -- so no run ever went red
+    // and nothing ever explained it. `useUpdateContact` is a plain useMutation
+    // over patchJson with nothing awaiting it, and `page.reload()` followed the
+    // keypress immediately: the PATCH was either cancelled by the navigation or
+    // landed in the blind window after the reload's GET.
+    //
+    // NOT the Radix focus-restoration race the backlog blamed. That is the
+    // mechanism of this test's FIRST half. It cannot explain a missing box after
+    // a reload, because the box renders only under OTHER_OPTION -- so an absence
+    // sustained for the whole 5s poll proves the reloaded page read
+    // `salutation === null`, which is a write that never landed rather than one
+    // rendered late.
+    //
+    // Waiter built BEFORE the keypress, because one created after it could miss
+    // a response that had already arrived. Same shape as the pipelines wait
+    // further down this file.
+    const saved = page.waitForResponse(
+      (response) =>
+        response.url().includes(`/contacts/${contactId}`)
+        && response.request().method() === "PATCH"
+        && response.ok(),
+    );
     await page.keyboard.press("Enter");
+    await saved;
     await page.reload();
     await expect(page.getByTestId("salutation-other")).toHaveValue("Drs");
 
