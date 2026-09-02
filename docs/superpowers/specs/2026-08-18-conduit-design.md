@@ -100,9 +100,15 @@ entirely.
 encrypted backup are gated by a re-authentication check, and what it mints is a single-use
 ticket held in memory with a five-minute lifetime — session storage and expiry, in the
 narrow. There is still no cookie, nothing is signed, there is no logout, and no password is
-stored: the check itself is a bind against YunoHost's own portal API. The sentence above is
-still the right description of how a REQUEST is authenticated; it is no longer a complete
-description of what the app keeps.
+stored: the check itself is an LDAP simple bind against YunoHost's own directory. The sentence
+above is still the right description of how a REQUEST is authenticated; it is no longer a
+complete description of what the app keeps.
+
+**It went through the portal API until v1.4.1 and that was the wrong door**, for a reason worth
+keeping here rather than only in a release note: the portal's job is to MINT A SESSION, and it
+charged rent for one Conduit never wanted — a domain ACL evaluated against the request's `Host`
+header, which over loopback is `127.0.0.1:6788` and belongs to nobody. It refused every correct
+password. A simple bind asks the one question this gate actually has.
 
 The security boundary is that **the app binds to `127.0.0.1` only**, so nothing can reach it without
 passing through nginx and SSOwat. This is the standard YunoHost trust model, and it is worth stating
