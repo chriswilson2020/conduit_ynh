@@ -315,6 +315,18 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
     // told to finish or cancel it rather than after spending ten minutes
     // uploading. `hold` refuses again below, which is what actually holds when
     // two callers race; this is the message that is worth reading.
+    //
+    // IT DOES TELL CALLER B THAT CALLER A HAS AN UPLOAD WAITING, which is the
+    // one thing the "no such plan" answer elsewhere in this file exists to
+    // avoid, and it is kept deliberately: a control refused for a reason
+    // nobody can see is what this codebase has now declined to ship four
+    // times, and the reason here is a capacity of one. It names nobody, and
+    // the plan itself stays unreachable without its id and its owner.
+    //
+    // `size` EXCLUDES SESSIONS INSIDE `use`, so during an apply this check
+    // reads zero and the capacity-of-one invariant rests entirely on the write
+    // gate refusing POSTs for the duration. That is a real dependency between
+    // two mechanisms and it is written down rather than relied on quietly.
     if (intakeSessions.size > 0) {
       return reply.code(409).send({
         error: "restore_busy",

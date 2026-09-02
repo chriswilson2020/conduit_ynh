@@ -196,7 +196,7 @@ export async function buildApp(
   // hook, before the route's own try/catch around its read-only probe ever runs.
   const UNAUTHENTICATED_ROUTES = new Set(["/api/health"]);
 
-  app.addHook("onRequest", async (request) => {
+  app.addHook("onRequest", async (request, reply) => {
     // routeOptions.url is the matched route's registered pattern (e.g. "/api/health"),
     // populated because onRequest runs after routing -- not request.url, which is the
     // raw path. It is undefined when no route matched. Those requests are served by
@@ -207,7 +207,45 @@ export async function buildApp(
     const matched = request.routeOptions.url;
     if (matched === undefined || UNAUTHENTICATED_ROUTES.has(matched)) return;
     const identity = identityFromHeaders(request.headers, config.devUser);
-    request.user = identity === null ? null : await users.resolve(identity);
+    if (identity === null) {
+      request.user = null;
+      return;
+    }
+    // WHILE A RESTORE IS RUNNING, RESOLVING AN IDENTITY MAY NOT WRITE, and this
+    // is the hole the gate above cannot see: `resolve` is an UPSERT, so a plain
+    // GET from a username this process has not met INSERTS a users row. The
+    // method says the request is safe and it is not.
+    //
+    // IT IS NOT A RACE THAT A SMALL WINDOW MAKES UNLIKELY -- that was the first
+    // version of this reasoning and it was measured false. PostgreSQL QUEUES a
+    // write blocked by the restore's `DROP SCHEMA` lock and releases it at
+    // COMMIT, so the insert is DELIVERED INTO the restored data rather than
+    // having to arrive in some narrow gap. Measured on two scratch installs
+    // with ordinary reads from fresh identities every 3ms: 79 rows landed, and
+    // the row count check that follows the load then told the operator their
+    // successful restore had gone wrong, at the loudest volume this product
+    // has, with mail.key left unreplaced.
+    //
+    // SO A CACHE MISS IS REFUSED RATHER THAN RESOLVED. A username this process
+    // has never seen is, during a restore, an identity the restored database
+    // will not have either -- refusing it is the honest answer and not a
+    // workaround. `cached` never writes and deliberately ignores the TTL, so
+    // the operator watching a restore that runs longer than a minute is not
+    // evicted from their own page. See UserResolver.cached.
+    if (writeGate.refusing) {
+      const known = users.cached(identity);
+      if (known === null) {
+        void reply.header("Retry-After", "30");
+        return reply.code(503).send({
+          error: "restore_in_progress",
+          message: writeGate.reason
+            ?? "this install is not accepting new sessions at the moment; try again shortly",
+        });
+      }
+      request.user = known;
+      return;
+    }
+    request.user = await users.resolve(identity);
   });
 
   app.get("/api/health", async (request, reply) => {

@@ -180,6 +180,24 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 // operator is told about it through a plan FINDING rather than through an
 // effect that could be skipped.
 //
+// AND STOPPING IT IS BEST-EFFORT, WHERE STOPPING HTTP IS NOT. The asymmetry is
+// named here rather than left for a reader to infer from two files:
+// services/write-gate.ts REFUSES the restore when in-flight writes will not
+// drain inside its bound, and mail-sync.ts's `stop()` races a 15s deadline,
+// logs "gave up waiting for syncs to stop, abandoning them", and RESOLVES --
+// so `sync.stop()` below can return having stopped nothing, and this function
+// proceeds. A wedged sync is then a second writer inside the restore, and its
+// writes land the way every blocked write does: queued behind the DROP
+// SCHEMA's lock and released at COMMIT, into the restored data.
+//
+// IT IS NOT CLOSED HERE BECAUSE THE SIGNAL DOES NOT EXIST. RestoreSyncControl
+// takes `() => Promise<void>`, because that is what SyncManager offers; making
+// the restore refuse on a sync that would not stop means `stop()` reporting
+// whether it did, which is a change to the sync engine's contract rather than
+// to this module. The exposure is narrower than the HTTP one it mirrors -- a
+// wedged sync means an IMAP connection that has stopped answering, so it is
+// usually writing nothing -- and that is a reason to rank it, not to omit it.
+//
 // ======================= WHERE THE GUARD LIVES, AND WHY ====================
 //
 // Re-authentication and the typed install name are the guard, and they are NOT
@@ -1197,6 +1215,33 @@ export interface DestroySchemaEffect extends PlannedEffect {
   readonly op: "destroy-schema";
   /** The schemas measured at preview time, in the order they will be dropped. */
   readonly schemas: readonly string[];
+  /**
+   * Every table measured at preview time, schema-qualified and sorted.
+   *
+   * THE SCHEMA LIST ALONE WAS NOT THE THING THE OPERATOR WAS SHOWN, and that
+   * gap was measured rather than argued: a table created between the preview
+   * and the apply was DESTROYED while the preview said 27 and the database held
+   * 28, RestoreDatabaseChangedError did not fire, and the answer was 200. The
+   * re-measure now compares this list too, so the one effect marked
+   * `destroys: true` is checked against the whole of what was previewed rather
+   * than against the coarser half of it.
+   */
+  readonly tableNames: readonly string[];
+  /**
+   * How many rows those tables held when the preview was taken.
+   *
+   * THE SPEC'S GUARD REQUIREMENT, WHICH NOTHING IMPLEMENTED UNTIL NOW: "a plain
+   * statement of what is about to be destroyed -- row counts from the live
+   * database, so the operator sees what they are replacing rather than an
+   * abstraction". A table count is the abstraction that sentence refuses.
+   *
+   * IT IS SHOWN AND NEVER ENFORCED, and the difference matters. Rows change
+   * every time anybody uses the install, so refusing a restore because the
+   * number moved would refuse every restore; the SHAPE is what must not have
+   * changed, and that is what the re-measure compares. This is the sentence
+   * under the confirmation, not a lock.
+   */
+  readonly rows: number;
 }
 
 export interface LoadDumpEffect extends PlannedEffect {
@@ -1637,6 +1682,15 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
   // --- the effects, in the order they run ---
 
   const shape = await describeDatabaseShape(db);
+  // WHAT THE OPERATOR IS ABOUT TO REPLACE, COUNTED. The spec asks for "row
+  // counts from the live database, so the operator sees what they are replacing
+  // rather than an abstraction", and until now the preview carried only a table
+  // count -- which is the abstraction that sentence names. THE SAME FUNCTION
+  // services/backup.ts USES, so the number under the confirmation and the number
+  // a backup records cannot drift into meaning different things, and so a
+  // restore that shows "14,204 rows" is showing what the archive would record.
+  const liveInventory = await measureInventory(db);
+  const liveRows = liveInventory.reduce((total, one) => total + one.rows, 0);
   const dump = await readDumpContents(await payload.open(dumpMember.ref));
   // A DUMP THAT CAN TELL psql TO STOP IS REFUSED, and this is what makes every
   // other instrument mean something -- see ALLOWED_META_COMMANDS. Refused
@@ -1696,9 +1750,10 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
       count: shape.schemas.length,
       unit: "schema",
       destroys: true,
-      detail: `Everything in this database is dropped: ${String(shape.tables)} table(s) across `
-        + `${String(shape.schemas.length)} schema(s). This happens in the same transaction as `
-        + "the load below, so if the load fails nothing here is destroyed.",
+      detail: `Everything in this database is dropped: ${String(liveRows)} row(s) in `
+        + `${String(shape.tables)} table(s) across ${String(shape.schemas.length)} schema(s). `
+        + "This happens in the same transaction as the load below, so if the load fails "
+        + "nothing here is destroyed.",
       // FROZEN HERE BECAUSE THE SPINE CANNOT DO IT. newPlan copies and freezes
       // every effect and knows to freeze `sources` as well, because Object.freeze
       // is shallow -- but `schemas` is restore's own array on restore's own
@@ -1707,6 +1762,12 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
       // preview had been rendered, which is the exact escape newPlan's own
       // comment describes for `sources`.
       schemas: Object.freeze([...shape.schemas]),
+      // FROZEN FOR THE REASON `schemas` IS: newPlan freezes what it knows about,
+      // and restore's own arrays are not among them. This one is compared at
+      // apply time, so a caller who could edit it after the preview had been
+      // rendered could widen what the re-measure agrees to destroy.
+      tableNames: Object.freeze([...shape.tableNames]),
+      rows: liveRows,
       realisedBy: "load-dump",
     },
     {
@@ -1984,12 +2045,35 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
       // the list the operator was shown.
       const current = await shapeOf(db);
       const planned = [...effect.schemas];
-      if (current.schemas.length !== planned.length
-        || !current.schemas.every((name, at) => planned[at] === name)) {
+      // BOTH LISTS, THROUGH THE ONE HELPER. The schema comparison was hand-rolled
+      // here and checked the schemas alone, which let a table created between the
+      // preview and the apply be destroyed with the answer still 200 -- measured.
+      // `sameList` is the module's own repair for exactly this shape of bug (see
+      // its comment), so there is one place for it to be wrong instead of two
+      // more.
+      if (!sameList(current.schemas, planned)) {
         throw new RestoreDatabaseChangedError(
           `this database no longer looks the way the preview described it: it had `
           + `${planned.join(", ")} and now has ${current.schemas.join(", ")}. Nothing has been `
           + "changed. Take the preview again.",
+        );
+      }
+      if (!sameList(current.tableNames, effect.tableNames)) {
+        // THE TABLES THAT DIFFER, NOT A COUNT. "It said 27 and there are 28"
+        // sends an operator through the whole schema; naming the tables ends
+        // the search, and it is the same choice RestoreUnexpectedResultError
+        // makes one step later.
+        const plannedTables = new Set(effect.tableNames);
+        const appeared = current.tableNames.filter((name) => !plannedTables.has(name));
+        const currentTables = new Set(current.tableNames);
+        const gone = effect.tableNames.filter((name) => !currentTables.has(name));
+        throw new RestoreDatabaseChangedError(
+          "this database no longer holds the tables the preview described: it said "
+          + `${String(effect.tableNames.length)} and it now has `
+          + `${String(current.tableNames.length)}`
+          + (appeared.length === 0 ? "" : `, with ${appeared.slice(0, 10).join(", ")} added`)
+          + (gone.length === 0 ? "" : `, with ${gone.slice(0, 10).join(", ")} gone`)
+          + ". Nothing has been changed. Take the preview again.",
         );
       }
       // THE PREAMBLE, NOT THE DESTRUCTION. This effect only prepares -- see

@@ -1951,6 +1951,78 @@ describe("a database that moved between the preview and the apply", () => {
     expect((failure as PlanApplyError).outcome.unrealised).toEqual([]);
     expect(await rowCounts(target.url)).toEqual(before);
   });
+
+  /**
+   * A TABLE, NOT A SCHEMA, AND THE GUARD USED TO WAVE IT THROUGH.
+   *
+   * The re-measure compared the schema list only, while the sentence the
+   * operator read said how many TABLES would be dropped. Measured before the
+   * repair: the preview said "27 table(s) across 2 schema(s)", the database
+   * held 28 at apply time, the extra table was DESTROYED, and the answer was
+   * 200. Narrow to reach and it is the one effect marked `destroys: true`.
+   */
+  itRestore("refuses a table that appeared after the preview, having destroyed nothing",
+    async () => {
+      const source = await makeInstall("srctable");
+      await seed(source, ["Acme"]);
+      const target = await makeInstall("dsttable");
+      await seed(target, ["Untouched"]);
+      const before = await rowCounts(target.url);
+
+      const work = await scratchDir("movedtable");
+      const archive = await realBackup(source, work);
+      const staged = await stageAndInspect(archive, target);
+
+      // No new SCHEMA -- the coarser check must stay satisfied, or this case
+      // would pass on the guard it is not testing.
+      await target.handle.db.execute(sql.raw('CREATE TABLE public."late_arrival" (id integer)'));
+
+      const failure = await rejection(runRestore(staged, target));
+      const cause = (failure as PlanApplyError).cause;
+      expect(cause).toBeInstanceOf(RestoreDatabaseChangedError);
+      // IT NAMES THE TABLE. "It said 27 and there are 28" sends an operator
+      // through the whole schema.
+      expect((cause as Error).message).toContain("late_arrival");
+      expect((cause as Error).message).toContain("added");
+      expect((failure as PlanApplyError).outcome.unrealised).toEqual([]);
+      // NOTHING WAS DESTROYED, the newcomer included.
+      expect(await rowCounts(target.url)).toEqual({ ...before, late_arrival: 0 });
+    });
+});
+
+describe("what the preview says is about to be destroyed", () => {
+  /**
+   * THE SPEC'S GUARD REQUIREMENT, WHICH NOTHING IMPLEMENTED UNTIL 7.7's
+   * CORRECTION ROUND: "a plain statement of what is about to be destroyed --
+   * ROW COUNTS FROM THE LIVE DATABASE, so the operator sees what they are
+   * replacing rather than an abstraction". `inspectRestore` measured only
+   * schemas and a table count, which is the abstraction that sentence refuses.
+   */
+  itRestore("counts the live rows, and says the number in the sentence a person reads",
+    async () => {
+      const source = await makeInstall("srcrows");
+      const target = await makeInstall("dstrows");
+      await seed(target, ["One", "Two", "Three"]);
+      const work = await scratchDir("rows");
+      const archive = await realBackup(source, work);
+      const staged = await stageAndInspect(archive, target);
+      try {
+        const destroy = effectFor(staged.plan, "destroy-schema") as { rows: number };
+        // MEASURED WITH THE SAME FUNCTION services/backup.ts USES, so the number
+        // under the confirmation and the number an archive records cannot drift
+        // into meaning different things.
+        const live = await measureInventory(target.handle.db);
+        const total = live.reduce((sum, one) => sum + one.rows, 0);
+        expect(total).toBeGreaterThan(0);
+        expect(destroy.rows).toBe(total);
+        // AND IT REACHES THE OPERATOR. A number on an effect nobody renders is
+        // not a statement of what is about to be destroyed.
+        expect(effectFor(staged.plan, "destroy-schema").detail)
+          .toContain(`${String(total)} row(s)`);
+      } finally {
+        await staged.payload.dispose();
+      }
+    });
 });
 
 describe("the plan the operator is shown", () => {

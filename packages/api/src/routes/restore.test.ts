@@ -226,6 +226,19 @@ async function seed(install: Install, names: readonly string[]): Promise<void> {
   for (const name of names) await createCompany(install.handle.db, actor.id, { name });
 }
 
+/** How many users a database holds, read over a FRESH connection. */
+async function userCount(url: string): Promise<number> {
+  const handle = createDatabase(url, 1);
+  try {
+    const rows = await handle.db.execute<{ count: string }>(
+      sql`SELECT count(*)::text AS count FROM users`,
+    );
+    return Number(rows[0]?.count ?? "0");
+  } finally {
+    await handle.close();
+  }
+}
+
 /** Company names in a database, read over a FRESH connection. */
 async function companyNames(url: string): Promise<string[]> {
   const handle = createDatabase(url, 1);
@@ -929,6 +942,14 @@ describe("POST /api/restore/apply -- the guards in front of the destruction", ()
   // THE PLAN IS BOUND TO THE OPERATOR WHO UPLOADED IT. Everything else about
   // sam's request is perfect: a real session, a real ticket, the right name and
   // the right passphrase.
+  //
+  // WHICH LAYER ANSWERS, SAID PLAINLY BECAUSE THIS CASE CANNOT TELL. The route
+  // looks the session up with `get` before it consumes it with `use`, and both
+  // compare the owner -- so `get` answers first and this case stays green with
+  // `use`'s check removed. It is an instrument for the ROUTE passing an
+  // identity at all, and not for either comparison; the two are separately
+  // broken and separately caught in intake-plan.test.ts, which is where the
+  // binding lives. Reading this as covering `use` would over-credit it.
   itRestore("will not let another account apply chris's plan, or cancel it", async () => {
     const response = await applyRestoreRequest(app, {
       planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
@@ -1120,6 +1141,80 @@ describe("refusing new writes for the duration of a restore", () => {
     expect(after.statusCode).toBe(201);
   }, 180_000);
 
+  /**
+   * THE GET THAT WRITES, AND THE MECHANISM THAT DELIVERS IT INTO THE RESTORE.
+   *
+   * `resolve` is an UPSERT, so an ordinary read from a username this process
+   * has not met INSERTS a users row. The first version of this module called
+   * that a sub-millisecond window and said the operator was "by definition
+   * cached". Both were false. PostgreSQL QUEUES a write blocked by the
+   * restore's `DROP SCHEMA` lock and RELEASES IT AT COMMIT, so the insert is
+   * delivered INTO the restored data -- the arrival window is the whole of
+   * destroy-and-load, not the instructions after it.
+   *
+   * WHAT THIS CASE DOES IS THE MECHANISM, NOT A TIMING GUESS. It issues reads
+   * from a FRESH identity every time, for the whole life of the apply request,
+   * and then asks the two questions that matter: did the restore report
+   * success, and does the restored database hold exactly the users the backup
+   * recorded. Without the refusal in app.ts's identity hook the apply answers
+   * 500 restore_inventory_mismatch -- "public.users: the backup recorded 1
+   * row(s) and this database holds N" -- with mail.key left unreplaced and the
+   * safety backup offered as the way out of a restore that WORKED.
+   *
+   * THE PROBE IS RATE-LIMITED AND CAPPED, and neither is a timing assumption.
+   * An unthrottled loop injects fast enough to exhaust the worker's heap before
+   * the restore finishes -- measured, as an out-of-memory crash rather than a
+   * failure. 3ms is the interval the reviewer's own reproduction used, and the
+   * cap is a ceiling on allocation, not a deadline: the loop still ENDS when
+   * the apply promise settles, so nothing here waits on a clock for its answer.
+   */
+  itRestore("a read from an unknown identity cannot land a row inside the restore", async () => {
+    const source = await makeInstall("src");
+    await seed(source, ["Northwind Traders"]);
+    const target = await makeInstall("dst");
+    await seed(target, ["Something Else Ltd"]);
+    const app = await appFor(target);
+    const archive = await realBackup(source, await scratchDir("archive"));
+    const expectedUsers = await userCount(source.url);
+    const plan = await previewOf(app, archive);
+    const headers = await reauthed(app, chris);
+
+    const applying = app.inject({
+      method: "POST", url: "/api/restore/apply", headers,
+      payload: { planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name },
+    });
+    let settled = false;
+    void applying.then(() => { settled = true; }, () => { settled = true; });
+
+    let reads = 0;
+    let refused = 0;
+    while (!settled && reads < 2_000) {
+      const stranger = `probe-${randomUUID()}`;
+      const read = await app.inject({
+        method: "GET", url: "/api/companies",
+        headers: {
+          "ynh-user": stranger,
+          "ynh-user-email": `${stranger}@example.com`,
+          "ynh-user-fullname": "Probe",
+        },
+      });
+      reads += 1;
+      if (read.statusCode === 503) refused += 1;
+      await new Promise((resolve) => setTimeout(resolve, 3));
+    }
+
+    const response = await applying;
+    expect(response.statusCode, response.body).toBe(200);
+    // THE GUARD ACTUALLY FIRED. Without this the case could pass on a restore
+    // so fast that no read arrived during it, which is the vacuous version.
+    expect(reads).toBeGreaterThan(0);
+    expect(refused, "a read from an unknown identity must be refused during a restore")
+      .toBeGreaterThan(0);
+    // AND NOTHING LANDED. This is the assertion the mechanism defeats: read
+    // over a fresh connection, against what the backup recorded.
+    expect(await userCount(target.url)).toBe(expectedUsers);
+  }, 300_000);
+
   // READS ARE NOT REFUSED, and that is the spec's own word: step 5 says refuse
   // new WRITES. A page that could not even report what was happening would be
   // worse than useless during the one operation an operator watches.
@@ -1153,9 +1248,17 @@ describe("refusing new writes for the duration of a restore", () => {
     let settled = false;
     void applying.then(() => { settled = true; }, () => { settled = true; });
 
+    // RATE-LIMITED AND CAPPED for the reason the queued-write case is: an
+    // unthrottled inject loop that never meets its exit condition exhausts the
+    // worker's heap, and a mutation then shows up as an out-of-memory crash
+    // rather than as the assertion below failing. Measured, on the mutation
+    // that makes the cache lookup answer nothing. The loop still ends when the
+    // apply settles, so there is no clock in the result.
     let sawRefusedWrite = false;
     let sawAllowedRead = false;
-    while (!settled && !(sawRefusedWrite && sawAllowedRead)) {
+    let probes = 0;
+    while (!settled && !(sawRefusedWrite && sawAllowedRead) && probes < 400) {
+      probes += 1;
       const write = await app.inject({
         method: "POST", url: "/api/companies", headers: chris, payload: { name: `p-${randomUUID()}` },
       });
@@ -1164,6 +1267,7 @@ describe("refusing new writes for the duration of a restore", () => {
         const read = await app.inject({ method: "GET", url: "/api/companies", headers: chris });
         if (read.statusCode === 200) sawAllowedRead = true;
       }
+      await new Promise((resolve) => setTimeout(resolve, 3));
     }
     expect(sawRefusedWrite).toBe(true);
     expect(sawAllowedRead).toBe(true);
@@ -1220,13 +1324,19 @@ describe("a restore that runs", () => {
     expect(await readFile(target.mailKeyPath)).toEqual(await readFile(source.mailKeyPath));
     // The staging is gone, and so is the plan.
     expect(await intakeWorkDirs(target)).toEqual([]);
-    // AND THE GATE IS OPEN AGAIN -- but NOT that the write succeeds, which is
-    // the finding this assertion was rewritten around. After a restore this
-    // process holds a user-resolver cache, a connection pool and a mail key
-    // belonging to the install that was REPLACED: the cached user id is not in
-    // the restored database, so an ordinary write fails on its foreign key.
-    // That is not the gate, and it is exactly why the answer above tells the
-    // operator to restart Conduit. What is asserted here is the gate alone.
+    // AND THE GATE IS OPEN AGAIN -- but NOT that the write succeeds, and the
+    // reason has been CORRECTED after a reviewer measured it. Immediately after
+    // a restore this process still holds a user-resolver entry, a pool and a
+    // mail key belonging to the install that was REPLACED, so a write fails on
+    // the foreign key of a user id the restored database does not have.
+    //
+    // IT DOES NOT STAY THAT WAY. The resolver's TTL is 60 seconds, after which
+    // the upsert re-binds the username to the restored row's id and the same
+    // request answers 201 -- measured. So "writes fail" is NOT the signal that
+    // a restart is needed: the process becomes silently usable again while
+    // still holding stale state, and "Restart Conduit now" is advice with
+    // nothing enforcing it. The Settings page must not be built on the failure.
+    // What is asserted here is the gate alone.
     const after = await app.inject({
       method: "POST", url: "/api/companies", headers: chris, payload: { name: "After" },
     });

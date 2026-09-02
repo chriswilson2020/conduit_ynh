@@ -26,30 +26,43 @@
  * the DROP SCHEMA's ACCESS EXCLUSIVE lock -- so a gate placed after the auth
  * hook would hang the very requests it exists to refuse quickly.
  *
- * WHAT THE METHOD CANNOT SEE, NAMED RATHER THAN LEFT TO BE FOUND: a GET that
- * writes. This application has exactly one, and it is the identity resolution
- * named in the paragraph above -- a read from an identity that is not in
- * createUserResolver's cache INSERTS a users row. Reads
- * are admitted (the spec's step 5 says writes, and a page that could not report
- * what was happening would be worse than useless during the one operation an
- * operator watches), so such a request can insert a row while a restore runs.
+ * WHAT THE METHOD CANNOT SEE: A GET THAT WRITES. This application has exactly
+ * one -- the identity resolution named in the paragraph above, whose `resolve`
+ * is an UPSERT, so a read from a username this process has not met INSERTS a
+ * users row. Reads are admitted (the spec's step 5 says writes, and a page that
+ * could not report what was happening would be worse than useless during the
+ * one operation an operator watches), so the method alone does not stop it.
  *
- * THE WINDOW THAT MATTERS IS SUB-MILLISECOND AND THE CONSEQUENCE IS A FALSE
- * ALARM, not damage. Before the load's COMMIT the row is inside what the
- * transaction replaces; after the inventory has been counted it is an ordinary
- * row in a restored install. Between the two -- the few instructions between
- * COMMIT and measureInventory -- an extra users row would make the inventory
- * check report a disagreement about a restore that worked, at the loudest
- * volume this product has. It needs a request from an identity the running
- * process has never seen, inside that window, and the operator watching the
- * restore is by definition cached.
+ * THIS PARAGRAPH USED TO SAY THE WINDOW WAS SUB-MILLISECOND AND THE OPERATOR
+ * WAS "BY DEFINITION CACHED". BOTH HALVES WERE FALSE AND BOTH WERE MEASURED
+ * FALSE, which is why the correction is written at this length rather than
+ * quietly fixed:
  *
- * IT IS NOT CLOSED HERE BECAUSE BOTH WAYS OF CLOSING IT ARE WORSE. Refusing
- * reads contradicts step 5 and blinds the page; making identity resolution
- * refuse to write while the gate is closed changes what authentication means
- * during a restore, in a file this task has no business editing. It is written
- * down instead, the way services/restore.ts writes down its own residual
- * window around mail.key.
+ *   - POSTGRESQL DOES NOT MAKE THE WRITE RACE THE WINDOW. It QUEUES a write
+ *     blocked by the restore's `DROP SCHEMA` ACCESS EXCLUSIVE lock and releases
+ *     it at COMMIT -- so the insert is DELIVERED INTO the restored data rather
+ *     than needing to arrive in the gap after it. The arrival window is the
+ *     whole duration of destroy-and-load, not the instructions after it.
+ *     Measured on two scratch installs with ordinary `GET /api/companies` from
+ *     fresh identities every 3ms: 79 rows landed, and the restore -- which had
+ *     worked -- was reported to the operator as an inventory mismatch, with
+ *     mail.key left unreplaced and the safety backup offered as the way out.
+ *   - THE OPERATOR IS NOT BY DEFINITION CACHED. createUserResolver's TTL is
+ *     60 seconds, so any restore longer than a minute re-resolves the person
+ *     watching it -- and `resolveUser` INSERTS when that username is absent from
+ *     the restored data, which is the spec's own definition-of-done case:
+ *     restoring a backup onto a DIFFERENT install.
+ *
+ * SO IT IS CLOSED AT THE ONE FUNCTION THAT DOES IT, in app.ts's identity hook:
+ * while this gate is refusing, an identity is taken from the resolver's cache
+ * or the request is refused, and nothing is written. Three answers were weighed
+ * and the other two were rejected on evidence. Excluding `users` from the row
+ * count comparison would blind the only witness in the archive that is not
+ * derived from the dump, permanently, for a table that holds the operator's own
+ * accounts. Subtracting a measured delta would be arithmetic over a moving
+ * target -- this project's recurring failure, named in its own conventions --
+ * and would mask a real mismatch of the same size. Refusing the write is the
+ * only one that makes the restored data actually true.
  *
  * DRAINING IS THE HALF THAT IS EASY TO LEAVE OUT. Closing the gate stops the
  * NEXT write; it says nothing about the one that is already inside a handler
@@ -58,6 +71,23 @@
  * bounded, and a wait that runs out REFUSES THE RESTORE rather than proceeding:
  * a restore that did not start is recoverable by pressing the button again, and
  * a restore that destroyed the database under a live writer is not.
+ *
+ * WHAT THE DRAIN CANNOT TELL APART, recorded because it is a denial of recovery
+ * rather than a risk to data: `onRequest` runs before the body is read, so an
+ * authenticated client holding a slow POST open keeps the in-flight count above
+ * zero for as long as it likes, and every restore refuses to start. That is the
+ * safe direction of the bound working, and it is still somebody unable to
+ * recover their install until the process is restarted.
+ *
+ * AND THE ASYMMETRY WITH THE OTHER SECOND WRITER. This gate REFUSES the restore
+ * when HTTP writes will not drain; the mail sync is stopped BEST-EFFORT --
+ * mail-sync.ts's `stop()` races a 15s deadline, logs that it gave up and
+ * abandons the syncs, and services/restore.ts proceeds either way. So a wedged
+ * sync survives into the restore, and its writes land through exactly the
+ * lock-queue mechanism described above. Closing it means `stop()` reporting
+ * whether it actually stopped, which is a change to the sync engine's contract
+ * and not to this file; it is named in services/restore.ts too so neither side
+ * can be read as complete on its own.
  *
  * IT IS PER PROCESS, which is the whole deployment -- one systemd unit, one
  * node process (conf/systemd.service). Nothing here would survive being run
