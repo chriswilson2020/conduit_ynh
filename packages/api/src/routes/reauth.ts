@@ -28,9 +28,14 @@ export const REAUTH_HEADER = "x-conduit-reauth";
 
 const reauthRequestSchema = z.object({
   password: z.string()
+    // NOT THE ONLY THING STOPPING AN EMPTY PASSWORD, and it must not become so:
+    // an empty simple bind is an unauthenticated bind rather than a failed one,
+    // so createLdapVerifier refuses it for itself before it opens a socket.
+    // This line is here to give the person at the keyboard a message.
     .min(1, "a password is required")
     // A bound on what is JSON-parsed and handed to an LDAP bind, not a claim
-    // about passwords. YunoHost's own portal does not accept anything near it.
+    // about passwords: it stops a caller writing a megabyte into a BER octet
+    // string, and no password YunoHost will set comes anywhere near it.
     .max(1024, "that is not a password"),
 });
 
@@ -115,10 +120,10 @@ export function registerReauthRoutes(
       ok = await reauthVerifier(user.username, body.password);
     } catch (error) {
       // A THROW IS NOT A WRONG PASSWORD -- see ReauthVerifier's doc comment.
-      // The portal being down is an operator's problem with a fix, and telling
-      // the person at the keyboard to retype would be a lie. The attempt taken
-      // above is given back, because nothing was tested: an outage must not
-      // push somebody towards a lockout.
+      // The directory being down is an operator's problem with a fix, and
+      // telling the person at the keyboard to retype would be a lie. The
+      // attempt taken above is given back, because nothing was tested: an
+      // outage must not push somebody towards a lockout.
       reauthThrottle.release(user.username);
       request.log.error({ err: error }, "re-authentication could not be checked");
       return reply.code(503).send({

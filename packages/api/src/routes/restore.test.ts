@@ -203,7 +203,7 @@ async function appFor(install: Install, options: AppOptions = {}): Promise<Fasti
     defaultCurrency: "EUR",
     mailKeyPath: install.mailKeyPath,
     mailTlsRejectUnauthorized: true,
-    portalApiUrl: "http://127.0.0.1:6788",
+    ldapUrl: "ldap://127.0.0.1:389",
     reauthPassword: null,
   };
   const app = await buildApp({
@@ -1021,7 +1021,7 @@ describe("POST /api/restore/apply -- the guards in front of the destruction", ()
         databaseUrl: "postgres://user:pw@127.0.0.1:5432",
         basePath: "/", version: APP_VERSION, devUser: null, dataDir: elsewhere,
         defaultCurrency: "EUR", mailKeyPath: path.join(elsewhere, "mail.key"),
-        mailTlsRejectUnauthorized: true, portalApiUrl: "http://127.0.0.1:6788",
+        mailTlsRejectUnauthorized: true, ldapUrl: "ldap://127.0.0.1:389",
         reauthPassword: null,
       },
       db: target.handle.db, dataDir: elsewhere, reauthVerifier: testReauthVerifier(),

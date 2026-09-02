@@ -1,5 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -35,7 +36,7 @@ const config: Config = {
   defaultCurrency: "EUR",
   mailKeyPath: "unused-in-tests",
   mailTlsRejectUnauthorized: true,
-  portalApiUrl: "http://127.0.0.1:6788",
+  ldapUrl: "ldap://127.0.0.1:389",
   reauthPassword: null,
 };
 
@@ -51,25 +52,33 @@ const sam = {
 };
 
 /**
- * Is a REAL YunoHost portal API listening where config.ts expects one?
+ * Is a REAL LDAP directory listening where config.ts expects one?
  *
  * Probed rather than assumed, on the precedent of this suite's 7z and
  * WeasyPrint gates. The dev server is a YunoHost box and answers; a CI runner
- * and a developer's laptop are not and skip visibly.
+ * and a developer's laptop are not, and skip visibly.
  *
- * WHY IT IS WORTH A PROBE AT ALL: every other test of the portal verifier
- * points it at a stub or at a closed port, so the one path that runs in
- * production -- a real bind against a real portal -- had never been exercised
- * by anything. A review established it works; this is what keeps that true.
+ * WHY IT IS WORTH A PROBE AT ALL: every other test of the verifier points it at
+ * a fixture or at a closed port, so the one path that runs in production -- a
+ * real bind against a real directory -- would otherwise be exercised by
+ * nothing. That is exactly how the portal version of this shipped broken.
+ *
+ * A BARE TCP CONNECT, NOT A BIND, and deliberately not the verifier itself.
+ * This answers "am I on a YunoHost box", and nothing else; whether the thing
+ * listening behaves is the gated test's question. A probe that used the code
+ * under test would turn a broken verifier into a silent skip, which is the
+ * failure mode this whole task exists to stop repeating.
  */
-const PORTAL_URL = "http://127.0.0.1:6788";
-const HAVE_PORTAL = await fetch(new URL("/login", PORTAL_URL), {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ credentials: "conduit-probe-no-such-user:x" }),
-  signal: AbortSignal.timeout(2_000),
-}).then((response) => response.status === 401, () => false);
-const itPortal = HAVE_PORTAL ? it : it.skip;
+const LDAP_URL = "ldap://127.0.0.1:389";
+const HAVE_DIRECTORY = await new Promise<boolean>((resolve) => {
+  const socket = net.connect({ host: "127.0.0.1", port: 389 });
+  const settle = (answer: boolean): void => { socket.destroy(); resolve(answer); };
+  socket.setTimeout(2_000);
+  socket.once("connect", () => { settle(true); });
+  socket.once("timeout", () => { settle(false); });
+  socket.once("error", () => { settle(false); });
+});
+const itDirectory = HAVE_DIRECTORY ? it : it.skip;
 
 let dataDir: string;
 
@@ -221,10 +230,12 @@ describe("POST /api/reauth", () => {
   });
 
   it("bounds a burst against a fast verifier too", async () => {
-    // The deploy target's portal answers a bad bind in 1.5-1.7ms, so the
-    // window is small there -- but "small" is not "bounded", and the window is
-    // attacker-influenceable: the portal API is publicly reachable, so loading
-    // it widens the gap for a simultaneous burst here.
+    // The deploy target's directory refuses a bad bind in 4.7-10.5ms end to
+    // end, process startup included (measured 2 Sep with ldapwhoami), so the
+    // window is small there -- but "small" is not "bounded", and it is still
+    // attacker-influenceable at one remove: the SSO portal is publicly
+    // reachable and binds THIS SAME slapd, so loading the portal widens the
+    // gap for a simultaneous burst here.
     let reached = 0;
     const fast: ReauthVerifier = () => { reached += 1; return Promise.resolve(false); };
     const a = await app(fast);
@@ -234,7 +245,7 @@ describe("POST /api/reauth", () => {
     expect(reached).toBe(5);
   });
 
-  it("leaves no lockout behind after a burst against a broken portal", async () => {
+  it("leaves no lockout behind after a burst against a broken directory", async () => {
     /*
      * WHAT AN OUTAGE COSTS, STATED PRECISELY, because the obvious assertion is
      * wrong and was written first.
@@ -248,8 +259,8 @@ describe("POST /api/reauth", () => {
      * the absence of the property.
      *
      * What must be true is the thing an operator would actually feel: when the
-     * portal comes back, the account is not locked out by an outage it had no
-     * part in. Every reservation was released, so the counter is clear.
+     * directory comes back, the account is not locked out by an outage it had
+     * no part in. Every reservation was released, so the counter is clear.
      */
     let broken = true;
     const flaky: ReauthVerifier = (_user, password) =>
@@ -261,8 +272,8 @@ describe("POST /api/reauth", () => {
       method: "POST", url: "/api/reauth", headers: chris,
       payload: { password: TEST_REAUTH_PASSWORD },
     })));
-    // Some got as far as the portal and some were refused while those were in
-    // flight. Neither count is the property; that both codes appear is what
+    // Some got as far as the directory and some were refused while those were
+    // in flight. Neither count is the property; that both codes appear is what
     // shows the burst really did contend, so the assertion after it is not
     // passing on an empty run.
     expect(answers.some((r) => r.statusCode === 503)).toBe(true);
@@ -289,9 +300,9 @@ describe("POST /api/reauth", () => {
   });
 
   it("answers 503, not 401, when the password could not be checked at all", async () => {
-    // The portal being down is not evidence about the password, and telling the
-    // operator to retype would send them looking in the wrong place.
-    const broken: ReauthVerifier = () => Promise.reject(new Error("portal is down"));
+    // The directory being down is not evidence about the password, and telling
+    // the operator to retype would send them looking in the wrong place.
+    const broken: ReauthVerifier = () => Promise.reject(new Error("the directory is down"));
     const response = await (await app(broken)).inject({
       method: "POST", url: "/api/reauth", headers: chris,
       payload: { password: TEST_REAUTH_PASSWORD },
@@ -339,20 +350,20 @@ describe("POST /api/reauth", () => {
  * root and it was the one part of this feature nothing looked at.
  */
 describe("buildApp's default re-authentication verifier", () => {
-  it("does NOT agree by default: with no fixed password it really asks the portal", async () => {
-    // Port 1 on loopback, where nothing listens, so this is deterministic on
-    // a runner AND on the dev server -- which is itself a YunoHost box with a
-    // real portal API on 6788 that would answer 401 and hide the difference.
+  it("does NOT agree by default: with no fixed password it really asks the directory", async () => {
+    // Port 1 on loopback, where nothing listens, so this is deterministic on a
+    // runner AND on the dev server -- which is itself a YunoHost box with a
+    // real directory on 389 that would answer 49 and hide the difference.
     const a = await buildApp({
-      config: { ...config, portalApiUrl: "http://127.0.0.1:1" },
+      config: { ...config, ldapUrl: "ldap://127.0.0.1:1" },
       db: handle.db, dataDir,
     });
     const response = await a.inject({
       method: "POST", url: "/api/reauth", headers: chris, payload: { password: "anything" },
     });
-    // The portal could not be reached, so the password could not be CHECKED.
-    // What matters most is the half-assertion after it: whatever this is, it
-    // is not a ticket.
+    // The directory could not be reached, so the password could not be
+    // CHECKED. What matters most is the half-assertion after it: whatever this
+    // is, it is not a ticket.
     expect(response.statusCode).toBe(503);
     expect(response.statusCode).not.toBe(200);
     expect(response.body).not.toContain("ticket");
@@ -403,19 +414,30 @@ describe("buildApp's default re-authentication verifier", () => {
   /**
    * THE PATH THAT ACTUALLY RUNS IN PRODUCTION, against the real thing.
    *
-   * Every other test here points the verifier at a stub or at a closed port.
-   * This one lets the default composition-root wiring reach the portal API on
+   * Every other test here points the verifier at a fixture or at a closed port.
+   * This one lets the default composition-root wiring reach the directory on
    * the box it is running on and asserts what a wrong password does: a clean
    * 401 reauth_failed, not a 503 and not a ticket. Skipped where there is no
-   * portal.
+   * directory.
    *
-   * The username is one that does not exist, and the portal answers the same
-   * "Invalid password" either way -- so this tests nobody's credentials and
-   * enumerates nothing.
+   * WHAT THE PORTAL VERSION OF THIS TEST FAILED TO SAY, because it is the
+   * reason v1.4.1 exists: it asserted exactly this, it passed, and the gate
+   * was refusing every CORRECT password at the same time. A refusal is a weak
+   * instrument -- it can be right for the wrong reason. What makes it worth
+   * keeping is the one thing it does pin down: that the real thing was reached
+   * and answered, so a 503 and a 401 are distinguishable here. The success path
+   * cannot be tested from a suite, because it needs a real account's real
+   * password; services/reauth.test.ts covers it against a directory that
+   * implements the same rules.
+   *
+   * The username is one that does not exist, and a directory answers 49 for
+   * that exactly as it does for a wrong password -- measured on the deploy
+   * target on 2 Sep -- so this tests nobody's credentials and enumerates
+   * nothing.
    */
-  itPortal("refuses a wrong password against the REAL portal, through the default wiring", async () => {
+  itDirectory("refuses a wrong password against the REAL directory, through the default wiring", async () => {
     const a = await buildApp({
-      config: { ...config, portalApiUrl: PORTAL_URL },
+      config: { ...config, ldapUrl: LDAP_URL },
       db: handle.db, dataDir,
     });
     const response = await a.inject({
@@ -427,10 +449,10 @@ describe("buildApp's default re-authentication verifier", () => {
       },
       payload: { password: "definitely-not-the-password" },
     });
-    // 401, which means the portal was REACHED and answered. A 503 here would
-    // mean the verifier could not talk to it, and the assertion below is what
-    // tells those two apart -- they are the two states this whole seam exists
-    // to keep separate.
+    // 401, which means the directory was REACHED and answered. A 503 here
+    // would mean the verifier could not talk to it, and the assertion below is
+    // what tells those two apart -- they are the two states this whole seam
+    // exists to keep separate.
     expect(response.statusCode).toBe(401);
     expect(response.json()).toMatchObject({ error: "reauth_failed" });
   });

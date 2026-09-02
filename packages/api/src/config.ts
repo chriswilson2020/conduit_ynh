@@ -26,13 +26,18 @@ const envSchema = z.object({
   // a boolean coercion so that a typo ("true", "yes") fails SAFE: only the
   // exact string "0" disables verification.
   MAIL_TLS_REJECT_UNAUTHORIZED: z.string().default("1"),
-  // Where YunoHost's portal API listens. 7.6's two downloads re-check the
-  // operator's password against it (services/reauth.ts), and the default is
-  // where every YunoHost 12 box puts it -- measured on the deploy target:
-  // /etc/nginx/conf.d/yunohost_api.conf.inc proxies /yunohost/portalapi/ to
-  // 127.0.0.1:6788. Configurable rather than hard-coded because a test needs
-  // to point it somewhere else, not because a deployment is expected to.
-  CONDUIT_PORTAL_API_URL: z.url().default("http://127.0.0.1:6788"),
+  // Where YunoHost's LDAP directory listens. The re-authentication gate binds
+  // it to check the operator's password (services/reauth.ts), and the default
+  // is where every YunoHost 12 box puts it -- measured on the deploy target,
+  // where slapd listens on 127.0.0.1:389 and nowhere else. Configurable rather
+  // than hard-coded because a test needs to point it somewhere else, not
+  // because a deployment is expected to.
+  //
+  // IT REPLACED CONDUIT_PORTAL_API_URL in v1.4.1 and NEITHER IS IN conf/.env,
+  // so no packaging change came with the swap: an install that never set the
+  // old one has nothing to unset, and one that did is simply ignoring a
+  // variable now.
+  CONDUIT_LDAP_URL: z.url().default("ldap://127.0.0.1:389"),
   // A FIXED PASSWORD FOR THE RE-AUTHENTICATION GATE, FOR DEVELOPMENT AND CI
   // ONLY, refused below when NODE_ENV=production exactly as CONDUIT_DEV_USER
   // is. Neither a developer's machine nor a GitHub runner has a YunoHost
@@ -59,8 +64,8 @@ export interface Config {
   /** Whether the IMAP/SMTP adapters verify server certificates. False only in
    * CI (MAIL_TLS_REJECT_UNAUTHORIZED=0), never in a real deployment. */
   mailTlsRejectUnauthorized: boolean;
-  /** YunoHost's portal API, which 7.6's re-authentication gate binds against. */
-  portalApiUrl: string;
+  /** YunoHost's LDAP directory, which the re-authentication gate binds against. */
+  ldapUrl: string;
   /** A fixed re-authentication password. Never set in production; see the
    * schema entry and the guard in parseConfig. */
   reauthPassword: string | null;
@@ -113,7 +118,7 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     defaultCurrency: value.DEFAULT_CURRENCY,
     mailKeyPath: value.MAIL_KEY_PATH ?? path.join(value.DATA_DIR, "mail.key"),
     mailTlsRejectUnauthorized: value.MAIL_TLS_REJECT_UNAUTHORIZED !== "0",
-    portalApiUrl: value.CONDUIT_PORTAL_API_URL,
+    ldapUrl: value.CONDUIT_LDAP_URL,
     reauthPassword: value.CONDUIT_REAUTH_PASSWORD ?? null,
   };
 }

@@ -133,7 +133,7 @@ function config(basePath = "/"): Config {
     nodeEnv: "test", port: 0, databaseUrl: "unused-in-tests", basePath,
     version: "0.1.0-test", devUser: null, dataDir, defaultCurrency: "EUR",
     mailKeyPath: keyPath, mailTlsRejectUnauthorized: true,
-    portalApiUrl: "http://127.0.0.1:6788", reauthPassword: null,
+    ldapUrl: "ldap://127.0.0.1:389", reauthPassword: null,
   };
 }
 

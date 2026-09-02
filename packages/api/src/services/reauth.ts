@@ -1,4 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { Client, DN, InvalidCredentialsError } from "ldapts";
 
 /**
  * RE-AUTHENTICATION FOR THE TWO 7.6 DOWNLOADS. Chris approved it on 31 Aug.
@@ -22,8 +23,18 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
  *
  * THE VERIFIER IS INJECTED, and that is the same seam mail-send's
  * transportFactory uses, for the same reason: how a credential is checked is
- * the composition root's decision (server.ts), not this module's and not a
- * route's. Production wires createPortalVerifier; a test wires a function.
+ * the composition root's decision -- buildApp's, in app.ts, which is where the
+ * two-branch choice below is actually made -- not this module's and not a
+ * route's. Production wires createLdapVerifier; a test wires a function.
+ *
+ * WHAT IT USED TO WIRE, AND WHY THAT IS WORTH A LINE HERE. Until v1.4.1 this
+ * asked YunoHost's portal API over loopback, and the portal answered a SECOND
+ * question nobody asked it -- whether the account was allowed on the domain in
+ * the request's Host header, which over loopback is 127.0.0.1:6788 and is
+ * allowed to nobody. Every correct password came back refused. See
+ * createLdapVerifier for the whole of it; the shape of this module did not
+ * change, and that the seam absorbed the swap is the evidence it was drawn in
+ * the right place.
  */
 
 /**
@@ -36,89 +47,213 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
  * refusal for every false.
  *
  * A THROWN ERROR IS NOT `false`. False means "checked, and wrong"; a throw
- * means the check could not be made (the portal API is down, the network
- * refused). The route answers those differently on purpose: a 401 tells the
- * operator to retype, and a 503 tells them the thing that checks passwords is
- * not answering, which is not a fact about their typing.
+ * means the check could not be made (the directory is down, the connection was
+ * refused, it answered something that is not an answer). The route treats those
+ * differently on purpose: a 401 tells the operator to retype, and a 503 tells
+ * them the thing that checks passwords is not answering, which is not a fact
+ * about their typing.
  */
 export type ReauthVerifier = (username: string, password: string) => Promise<boolean>;
 
 /**
- * How long the portal API is given to answer.
+ * How long the whole check is given, connect to unbind.
  *
- * It binds an LDAP bind, which is local and fast; nginx's own portal location
- * allows 30s (measured in /etc/nginx/conf.d/yunohost_api.conf.inc on the
- * deploy target) and this is deliberately shorter, because a person is
- * watching a spinner over it and a re-auth that hangs for half a minute is one
- * they will click again.
+ * A BUDGET FOR THE OPERATION, NOT FOR ONE ROUND TRIP, and that is why it is
+ * spent by a deadline around the whole thing rather than only by ldapts's own
+ * per-message timeout. A connect, a bind and a whoami all have to finish before
+ * there is anything to say, so three separate five-second limits would be a
+ * fifteen-second wait wearing a five-second label. The per-message option is
+ * set to the same number as a backstop, because it is what makes ldapts destroy
+ * its own socket rather than leave one for the `finally` to find.
+ *
+ * FIVE RATHER THAN THE PORTAL'S TEN, and the ten is worth explaining before it
+ * is discarded: it was sized against the 30s nginx allows its own portal
+ * location, for a request that went through HTTP. That hop is gone. What is
+ * left is a socket on the same machine -- measured on the deploy target on
+ * 2 Sep, fourteen runs of ldapwhoami, each a whole connect, bind, whoami and
+ * unbind with process startup on top, took 4.7-12.4ms. Five seconds is four
+ * hundred times the slowest of those: a bound on a directory that has stopped
+ * answering, not a limit anything healthy can reach.
  */
-export const PORTAL_TIMEOUT_MS = 10_000;
+export const LDAP_TIMEOUT_MS = 5_000;
 
 /**
- * Check a password against YunoHost's own portal API.
+ * RFC 4532's "Who am I?" extended operation.
  *
- * THIS IS THE SAME DOOR THE SSO PORTAL USES, which is the whole argument for
- * it: Conduit does not store a password, cannot store one, and must not start.
- * `POST /login` on the portal API (127.0.0.1:6788, proxied publicly at
- * /yunohost/portalapi/ -- see YunoHost's own nginx include) takes
- * `{"credentials": "user:password"}`, performs an LDAP simple bind as that
- * user, and answers 200 or 401. Measured on the deploy target: a bad pair
- * returns 401 with the body "Invalid password".
- *
- * IT IS CALLED OVER LOOPBACK, NOT THROUGH NGINX, and that has one consequence
- * worth stating rather than discovering. YunoHost's fail2ban `yunohost-portal`
- * jail reads nginx's access and error logs; a request that never reaches nginx
- * writes nothing there and so is never counted. That is NOT a hole this
- * function opens -- YunoHost's own authenticator carries the comment "FIXME
- * FIXME FIXME : this should be properly logged and caught by Fail2ban" on
- * exactly this path, so a failed portal login is uncounted through nginx too --
- * but it does mean nothing upstream is throttling guesses. ReauthThrottle
- * below is this app's own answer to that, and it is not optional.
- *
- * THE USERNAME IS NEVER THE CLIENT'S ON THE WAY IN. The route passes the
- * identity SSOwat established for the request rather than anything from the
- * body -- though on a box where a LOCAL process can set Ynh-User itself (this
- * app binds loopback and nginx forwards $http_ynh_user, so with no proxy in
- * front the header is whatever the caller says), that identity is only as good
- * as the perimeter. ReauthThrottle is what bounds the consequence.
- *
- * IT LEAVES LITTER, AND THAT IS WORTH NAMING RATHER THAN DISCOVERING. A
- * successful bind makes the portal issue a session: moulinette's login handler
- * calls set_session_cookie, which mints a three-day JWT AND touches a file
- * under /var/cache/yunohost-portal/sessions/. Conduit discards the Set-Cookie,
- * so the session is never usable -- but the file stays, because purging only
- * runs inside get_session_cookie, which nothing here calls. One small file per
- * successful re-authentication, cleared the next time somebody uses the portal
- * itself. Litter rather than a hole, and the price of using the same door the
- * SSO portal uses instead of binding LDAP directly.
+ * The same question YunoHost's own authenticator asks one line after its bind
+ * (ldap_ynhuser.py: `who = con.whoami_s()[3:]`), and for the same reason.
  */
-export function createPortalVerifier(
-  portalApiUrl: string,
-  timeoutMs: number = PORTAL_TIMEOUT_MS,
+const WHOAMI_OID = "1.3.6.1.4.1.4203.1.11.3";
+
+/**
+ * The DN an account binds as.
+ *
+ * `uid={username},ou=users,dc=yunohost,dc=org` is YunoHost's own USERDN
+ * constant, read at ldap_ynhuser.py:62 on the deploy target at 12.1.40.1 --
+ * not inferred -- and `ou=users,dc=yunohost,dc=org` answered an anonymous base
+ * search there on 2 Sep.
+ *
+ * BUILT WITH ldapts's DN RATHER THAN INTERPOLATED, and that is the whole
+ * function. The username arrives in the Ynh-User header, which any local
+ * process on this box can set to anything at all (see ReauthThrottle below,
+ * which is bounded for the same reason), so it is attacker-shaped input going
+ * into a structured string. `RDN.toString` escapes what a DN needs escaped --
+ * `, + " \ < > ; =` and a leading `#`, and it quotes a value with a leading or
+ * trailing space -- so a username of `admin,ou=x` becomes ONE RDN whose value
+ * contains a comma, not two RDNs naming somewhere else in the tree.
+ *
+ * YUNOHOST ESCAPES THIS VALUE WITH `escape_filter_chars` (ldap_ynhuser.py:209),
+ * WHICH IS THE WRONG ESCAPER. That one is for a search filter: it escapes
+ * `* ( ) \ NUL` and leaves a comma completely alone. Do not copy it because it
+ * is what upstream does.
+ */
+function userDn(username: string): DN {
+  return new DN({ uid: username, ou: "users", dc: ["yunohost", "org"] });
+}
+
+/**
+ * Check a password by binding to YunoHost's directory as that account.
+ *
+ * IT ASKS THE SMALLEST QUESTION THAT ANSWERS THE ONE WE HAVE. Conduit does not
+ * store a password, cannot store one, and must not start; an LDAP simple bind
+ * is "is this the password of this account" and returns nothing else. It is the
+ * same operation the SSO portal runs internally, minus the session, minus the
+ * domain ACL, minus the HTTP.
+ *
+ * IT REPLACED A CALL TO THE PORTAL API AND THAT IS WHY THIS RELEASE EXISTS.
+ * `POST /login` on the portal (127.0.0.1:6788) bound successfully and THEN
+ * asked `user_is_allowed_on_domain(username, request.get_header("host"))`
+ * (ldap_ynhuser.py:251). Over loopback that header is `127.0.0.1:6788`, the
+ * function walks up looking for a parent domain, runs out of dots and answers
+ * False -- so every correct password came back 401, indistinguishable from a
+ * wrong one because moulinette answers both with the same status. Conduit was
+ * using a session-minting endpoint as a password oracle and paying for it with
+ * an ACL that was never its question. The bind has no such second question, and
+ * the ACL is redundant here anyway: SSOwat applied it before the request
+ * reached this app.
+ *
+ * NOTHING UPSTREAM IS COUNTING THE FAILURES. YunoHost's fail2ban jails read
+ * nginx's logs and this never reaches nginx -- and its own authenticator
+ * carries "FIXME FIXME FIXME : this should be properly logged and caught by
+ * Fail2ban" on precisely this path, so a failed login is uncounted through the
+ * portal too. ReauthThrottle below is this app's own answer to that and it is
+ * not optional.
+ *
+ * THE USERNAME IS NEVER THE CLIENT'S ON THE WAY IN: the route passes the
+ * identity SSOwat established, never anything from the body. On a box where a
+ * local process can set Ynh-User itself, that identity is only as good as the
+ * perimeter -- which is why the DN is escaped rather than interpolated, and why
+ * the throttle is keyed on it.
+ */
+export function createLdapVerifier(
+  ldapUrl: string,
+  timeoutMs: number = LDAP_TIMEOUT_MS,
 ): ReauthVerifier {
   return async (username, password) => {
-    const response = await fetch(new URL("/login", portalApiUrl), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      // The colon split is the portal's own format, and the password is what
-      // may contain one: moulinette splits on the FIRST colon (its login
-      // handler does `credentials.split(":", 1)`), so a password containing
-      // colons survives and a username containing one is not a thing YunoHost
-      // allows.
-      body: JSON.stringify({ credentials: `${username}:${password}` }),
-      // Bounded so a portal that accepts the connection and then says nothing
-      // cannot hold this request open. Injectable ONLY so a test can prove the
-      // bound exists without waiting ten seconds for it.
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (response.status === 401) return false;
-    if (!response.ok) {
-      // NOT `false`. A 500 from the portal, or a 502 because it is not
-      // running, is not evidence about this password -- see ReauthVerifier.
-      throw new Error(`the portal API answered ${String(response.status)}`);
+    // AN EMPTY PASSWORD IS NOT A FAILED BIND, IT IS A DIFFERENT OPERATION, and
+    // this line is the only thing standing between the two.
+    //
+    // A simple bind that names a DN and sends nothing is RFC 4513 s5.1.2's
+    // unauthenticated authentication mechanism. What a directory does with it
+    // is a matter of ITS configuration: OpenLDAP refuses unless `allow
+    // bind_anon_dn` is set -- measured on the deploy target, slapd 2.5.13,
+    // which answers 53 "unauthenticated bind (DN with no password) disallowed"
+    // -- and succeeds AS ANONYMOUS the moment somebody sets it. Neither answer
+    // is one this code can rely on, because that line lives in a file Conduit
+    // does not own: on the first box an empty password would be a 503 with the
+    // throttle attempt handed back, and on the second it would be a bind that
+    // threw no exception at all.
+    //
+    // NOT LEFT TO reauthRequestSchema's .min(1). Depending on a caller having
+    // validated its input is the exact arrangement that let the portal bug
+    // exist, and this function is exported.
+    if (password.length === 0) return false;
+
+    const dn = userDn(username);
+    // connectTimeout as well as timeout: unbind() below returns early on a
+    // socket that never finished connecting, so without it a black-holed
+    // address would leave one open behind the deadline.
+    const client = new Client({ url: ldapUrl, timeout: timeoutMs, connectTimeout: timeoutMs });
+    try {
+      return await withinBudget(checkBind(client, dn, password), timeoutMs);
+    } finally {
+      // ON EVERY EXIT PATH, the throwing ones included -- and swallowing what
+      // it throws is deliberate rather than lazy: the answer is already
+      // decided by the time this runs, an unbind that failed has nothing to
+      // add to it, and ldapts destroys the socket in its own finally either
+      // way. Letting this throw would replace a "wrong password" with a 503.
+      try {
+        await client.unbind();
+      } catch { /* see above */ }
     }
-    return true;
   };
+}
+
+/**
+ * Bind, then confirm the directory agrees about who bound.
+ *
+ * THE SECOND QUESTION IS NOT CEREMONY. YunoHost asks it too, and it is the line
+ * of defence behind the empty-password guard: a bind that succeeded as
+ * ANYBODY ELSE -- as anonymous, or through a proxy that rewrote the identity --
+ * has proved nothing about this account, and "no exception was thrown" is not
+ * the same fact as "this password is that account's".
+ */
+async function checkBind(client: Client, dn: DN, password: string): Promise<boolean> {
+  try {
+    await client.bind(dn, password);
+  } catch (error) {
+    // 49, and ONLY 49, is "checked, and wrong" -- see ReauthVerifier. A
+    // directory that is shutting down (51), read-only, or unwilling (53) has
+    // told us nothing about this password, and answering false would send the
+    // operator away to retype one that was right. That was this bug.
+    //
+    // An account that does not exist answers 49 as well, measured against the
+    // deploy target on 2 Sep with uid=conduit-probe-no-such-user. That is what
+    // keeps this from being a user enumerator, and it is the directory's
+    // property rather than this code's.
+    if (error instanceof InvalidCredentialsError) return false;
+    throw error;
+  }
+
+  const { value } = await client.exop(WHOAMI_OID);
+  // RFC 4532 answers an anonymous session with an ABSENT value, so undefined is
+  // "nobody" rather than a parse failure.
+  if (value === undefined || !value.startsWith("dn:")) return false;
+  // Case-insensitively, because slapd answers with its own normalised spelling
+  // of the DN and `uid` is caseIgnoreMatch in RFC 4519: UID=Chris and uid=chris
+  // are the same entry, and refusing the correct password over an attribute
+  // type's capitalisation would be this release's own bug repeated.
+  //
+  // toLowerCase, NOT toLocaleLowerCase, and this release knows why (Task 5b):
+  // case folding is not the same operation in every language. It is safe here
+  // for a reason narrower than that, and the reason is worth stating rather
+  // than rediscovering -- a username that folds differently in the directory
+  // than in JavaScript cannot reach this line at all, because YunoHost names
+  // match ^[a-z0-9_.]+$ and anything else fails the bind above with 49 before
+  // there is a whoami to compare.
+  return value.slice("dn:".length).toLowerCase() === dn.toString().toLowerCase();
+}
+
+/**
+ * `work`, or a throw once `ms` have passed.
+ *
+ * A LOSING PROMISE HERE IS NOT AN UNHANDLED REJECTION: Promise.race subscribes
+ * to both, so the bind that the caller's `finally` is about to cut the socket
+ * out from under has its rejection observed and dropped.
+ */
+async function withinBudget<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => { reject(new Error(`the directory did not answer within ${String(ms)}ms`)); },
+      ms,
+    );
+  });
+  try {
+    return await Promise.race([work, expiry]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -127,7 +262,7 @@ export function createPortalVerifier(
  * FOR DEVELOPMENT AND CI ONLY, and config.ts refuses to boot with it set under
  * NODE_ENV=production -- the same guard, in the same place, that CONDUIT_DEV_USER
  * has carried since Phase 0. It exists because neither a developer's machine
- * nor a GitHub runner has a YunoHost portal to bind against, and a gate that
+ * nor a GitHub runner has a YunoHost directory to bind against, and a gate that
  * cannot be exercised anywhere but the deploy target is a gate nobody proves.
  *
  * The comparison is timing-safe. That is close to pointless for a fixture, and
@@ -292,11 +427,11 @@ interface AttemptRecord { failures: number; until: number }
  * THAN BELT-AND-BRACES.
  *
  * The measurement that makes it so: YunoHost's fail2ban jails read nginx's
- * logs, and this app talks to the portal API over loopback, so nothing there
- * counts a failure. Worse, YunoHost's own ldap_ynhuser authenticator carries a
- * FIXME on the INVALID_CREDENTIALS path itself saying failed logins are not
- * caught by fail2ban -- so there is no upstream throttle to inherit even
- * through the portal's public path.
+ * logs, and this app binds the directory on loopback, so nothing there counts a
+ * failure. Nor is that an artefact of skipping the portal -- YunoHost's own
+ * ldap_ynhuser authenticator carries a FIXME on the INVALID_CREDENTIALS path
+ * itself saying failed logins are not caught by fail2ban, so there was no
+ * upstream throttle to inherit through the portal's public path either.
  *
  * Without this, /api/reauth would be an unmetered oracle for guessing the
  * account password of a YunoHost server, reachable by anyone holding a session
@@ -330,7 +465,7 @@ export class ReauthThrottle {
    * against the real server with requests written in one synchronous pass: at a
    * 3ms check 6 got through, at 25ms 63 did, and at 100ms ALL TWO HUNDRED did
    * with not a single 429. The leak is a linear function of how long one check
-   * takes -- and the check is an LDAP bind against a portal an attacker can
+   * takes -- and the check is an LDAP bind against a directory an attacker can
    * load from outside, so the window is not even fixed.
    *
    * Node runs one turn of the event loop at a time, so a method that reads and
@@ -352,10 +487,11 @@ export class ReauthThrottle {
   /**
    * Give back an attempt that tested nothing.
    *
-   * For the one path where the password was never checked at all: the portal
-   * could not be reached. A caller who gets a 503 has learned nothing about
-   * their password and must not be pushed towards a lockout by an outage --
-   * routes/reauth.ts answers those differently for the same reason.
+   * For the one path where the password was never checked at all: the
+   * directory could not be reached, or refused to answer the question. A caller
+   * who gets a 503 has learned nothing about their password and must not be
+   * pushed towards a lockout by an outage -- routes/reauth.ts answers those
+   * differently for the same reason.
    */
   release(username: string, now: number = Date.now()): void {
     const record = this.attempts.get(username);

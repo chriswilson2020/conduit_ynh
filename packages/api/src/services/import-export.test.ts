@@ -56,7 +56,7 @@ const config: Config = {
   defaultCurrency: "EUR",
   mailKeyPath: "unused-in-tests",
   mailTlsRejectUnauthorized: true,
-  portalApiUrl: "http://127.0.0.1:6788",
+  ldapUrl: "ldap://127.0.0.1:389",
   reauthPassword: null,
 };
 
