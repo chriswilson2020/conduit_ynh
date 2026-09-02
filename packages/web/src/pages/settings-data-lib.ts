@@ -459,12 +459,23 @@ export function restoreProblem(error: unknown, phase: "preview" | "apply"): stri
     case "reauth_failed":
       return "That password was not accepted. Nothing was uploaded, changed or destroyed.";
     case "reauth_throttled":
-    case "restore_busy":
     case "restore_writes_in_flight":
     case "restore_in_progress":
-      // The server's own sentence is the actionable one in all four: how long
-      // to wait, how many requests were still writing, what to cancel first.
+      // The server's own sentence is the actionable one in all three: how long
+      // to wait, and how many requests were still writing.
       return error.message;
+    case "restore_busy":
+      // THE ONE STATE THIS PAGE CANNOT GET ITSELF OUT OF, so it says what is
+      // true rather than repeating an instruction that may be impossible. The
+      // server says "apply or cancel it first" -- and a preview is reachable
+      // only through the id the page that made it is holding, which a reload or
+      // a second tab does not have. There is no route that cancels "whatever is
+      // waiting", deliberately: it is addressed by id and bound to its owner.
+      // So the honest answer is the other exit, which always works.
+      return `${error.message} If that preview was made in another tab, or before this page `
+        + "was reloaded, this page has no way to cancel it -- a preview is reachable only "
+        + "from the page that made it. It is deleted on its own within half an hour, and a "
+        + "restart of Conduit clears it immediately.";
     case "reauth_unavailable":
       return "Your password could not be checked right now, so nothing happened. That is a "
         + "server problem rather than a wrong password; try again shortly.";

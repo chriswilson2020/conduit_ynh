@@ -513,13 +513,31 @@ describe("restoreProblem", () => {
 
   it("passes the server's own actionable sentence through where it has one", () => {
     for (const code of [
-      "restore_busy", "restore_writes_in_flight", "restore_in_progress", "reauth_throttled",
+      "restore_writes_in_flight", "restore_in_progress", "reauth_throttled",
       "restore_archive_refused", "too_large", "restore_disk_space", "restore_tool_missing",
       "restore_unnameable", "validation",
     ]) {
       expect(restoreProblem(apiError(code, "the server's own words"), "preview"), code)
         .toBe("the server's own words");
     }
+  });
+
+  it("NAMES THE OTHER EXIT when a preview this page cannot reach is in the way", () => {
+    // The one state the surface cannot get itself out of. A preview is
+    // addressed by an id, bound to its owner, and held only by the page that
+    // made it -- so after a reload, or from a second tab, "apply or cancel it
+    // first" is an instruction nobody can follow. Repeating it alone would be a
+    // refusal with no way out; the expiry and the restart are the ways out that
+    // always work.
+    const answer = restoreProblem(
+      apiError("restore_busy", "another backup is already uploaded and waiting for a decision; "
+        + "apply or cancel it first", 409),
+      "preview",
+    );
+    expect(answer).toContain("apply or cancel it first");
+    expect(answer).toContain("no way to cancel it");
+    expect(answer).toContain("within half an hour");
+    expect(answer).toContain("restart of Conduit clears it");
   });
 
   it("explains an expired preview rather than echoing a bare 404", () => {
