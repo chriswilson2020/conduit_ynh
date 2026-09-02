@@ -7,9 +7,11 @@ Everything here has evidence attached — a file and line, a measurement, or the
 found it. Items without evidence are marked as judgement rather than fact. Where one item
 blocks another, that is stated rather than left to be rediscovered.
 
-Current shipped version: **v1.3.0**. In flight: **nothing**; next is **Phase 7.7**, restore
-and import, whose decisions are already recorded in 7.6's spec and which therefore needs a
-plan rather than a spec. All of 7.6 shipped and its record is below.
+Current shipped version: **v1.3.0**. **In flight: Phase 7.7 -- its RESTORE half is complete**
+(shared spine, engine, backup inventory, route guards, Settings page), and both importers
+remain. **v1.4.1 is planned and waiting behind it**, in
+`docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`, holding what 7.7 surfaced and
+deliberately did not fix -- Chris asked for it as a point release straight after v1.4.0.
 
 **v1.3.0 changes behaviour on a path Chris uses without thinking, and that is the first thing
 in its notes rather than a footnote: both downloads now ask for the password again.**
@@ -24,7 +26,8 @@ in its notes rather than a footnote: both downloads now ask for the password aga
 | ~~**v1.2.1**~~ | The reply signature, the Mail tab composing to nobody, the GIF undercharge Chris moved in, and the first deliberate sweep for assertions that cannot fail | **SHIPPED 31 Aug** |
 | ~~**v1.2.2**~~ | The MAIL template feature removed, table included (the QUOTE template stayed); the five lists given the loading branch their siblings have; and the Dovecot IDLE burst diagnosed -- **the answer was NO**, so nothing was reordered. **Ships `0012`, a `DROP TABLE`** | **SHIPPED 31 Aug** |
 | ~~**7.6 → v1.3.0**~~ | Export (plain ZIP, readable, not restorable) and backup (AES-256 `.7z`, exact, not readable), told apart on a Settings page, **both behind a password re-prompt**. No schema change | **SHIPPED 31 Aug** |
-| **7.7** | Restore and import, with its decisions already recorded in 7.6's spec | **NEXT.** Decided and specced-by-reference; needs a plan. Five carry-forward items below, one of which it must not get wrong |
+| **7.7 → v1.4.0** | Restore and import | **IN FLIGHT.** Restore is built and reviewed -- four adversarial rounds, three of which found a path to a silent half-restore. Both importers remain |
+| **v1.4.1** | Six hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, and two decisions for Chris | **PLANNED**, straight after v1.4.0 |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
 | **Phase 4.4** | Mail filing power tools: per-message selection, arbitrary folder moves, folder management, bulk unhide, live inbox beyond page one | Unspecced. Overlaps "emailing a quote" below |
 
@@ -750,6 +753,40 @@ found by SQL.
   members rather than tables. That asymmetry is the point: the exact half picks up new
   entities for free and the readable half does not, and a timesheet trapped in the app is the
   failure this bullet was always about.
+
+---
+
+## Surfaced during Phase 7.7, scheduled into v1.4.1
+
+Full detail and task shapes in `docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`.
+Listed here so the backlog is the one place to look.
+
+**THE ONE THAT CHANGED MEANING RATHER THAN BEING FOUND: re-auth tickets are fungible across
+every gated route.** A ticket minted to download a backup is a live authorisation to destroy
+the entire database for five minutes. Harmless while both gated operations were downloads;
+restore is what made it matter. Two riders: the 64-ticket ceiling evicts across accounts, and
+a password change does not invalidate outstanding tickets.
+
+- **The mail sync is stopped best-effort while HTTP writes are refused.** `stop()` abandons
+  after 15s and `applyRestore` proceeds. The sync is the writer that moves data with nobody
+  touching a browser -- and Postgres **queues** a write blocked by `DROP SCHEMA` and releases
+  it at COMMIT, so an abandoned sync's write lands *inside* the window rather than racing it.
+- **`scripts/remote.sh` deletes `data/` on every sync**, taking `mail.key`, surfacing as a
+  download that never arrives. Two red runs, two agents, two phases. Its incremental-build
+  claim is also false -- `rsync -a` preserves mtimes, so `tsc -b` re-emits stale declarations.
+- **A third e2e intermittent, now seen twice**: `crm.spec.ts`'s salutation "Other..." journey,
+  `salutation-other` missing after `page.reload()`. The Radix focus-restoration race
+  `ui/input.tsx` documents. **Two distinct undocumented e2e intermittents appeared in four CI
+  runs on this branch**, which is itself the finding.
+- **`DialogDescription` silently drops every prop but `children`** and TypeScript will not
+  catch it -- excess-property checks are skipped for hyphenated JSX attributes.
+- **`plannedTotal(plan, "row")` returns 0 for every restore plan.** No consumer today; its own
+  doc invites one. **Check before scheduling -- if an importer reached for it, it is live.**
+- **One vitest run of four reported `Errors 1 error` with exit 0 and no failing test.** Never
+  reproduced. Recorded rather than explained.
+- **Two decisions that are Chris's:** whether a future backup recording `approximate` row
+  counts should be refused or degrade to "check not made"; and whether a control character in
+  a passphrase should be named by the route rather than mis-explained.
 
 ---
 
