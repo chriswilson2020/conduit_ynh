@@ -196,11 +196,37 @@ describe("docs/backup-format.md", () => {
     expect(doc).toContain("Since v1.4.0 Conduit restores its own backups");
     // The tab, by the name it now carries. A page that named the old one would
     // send somebody looking for something that is not in the navigation.
-    expect(doc).toContain("Settings -> Export, backup and restore");
+    expect(doc).toContain("Settings -> Export, import, backup and restore");
     expect(doc).toContain("A restore replaces everything.");
     // The confirmation is a deliberateness check and the document must not
     // dress it up as a secret, because the page does not either.
     expect(doc).toContain("typing this install's name");
+  });
+
+  /**
+   * THE SWEEP 7.7'S ROUTES TASK OWED THIS DOCUMENT.
+   *
+   * v1.4.0 put two IMPORTERS on the same Settings page as the restore, and this
+   * file described a page with one way in. A document that named only the
+   * restore would leave a reader holding a spreadsheet with the one control
+   * that would destroy their data as the only candidate on offer -- which is
+   * the exact confusion 7.7's spec forbids the page from allowing, said in the
+   * place somebody reads BEFORE they open the page.
+   *
+   * IT IS A TEST AND NOT A NOTE for this file's own stated reason: a symbol
+   * grep cannot see a sentence, and nothing else in the tree would have failed
+   * for a paragraph that had quietly stopped being true.
+   */
+  it("says an import is not a restore, and that neither importer reads a backup", () => {
+    expect(doc).toContain("A backup is not what the importers read");
+    expect(doc).toContain("An import adds records and changes nothing");
+    // The asymmetry, from the document's side: services/import-export.ts
+    // refuses anything whose manifest says "backup" and services/import-csv.ts
+    // refuses an archive outright.
+    expect(doc).toContain("Neither importer will touch a backup");
+    // And the sentence the whole page exists for, which the arrival of a way IN
+    // makes easier rather than harder to lose.
+    expect(doc).toContain("the only artefact that can put an install back");
   });
 
   /**

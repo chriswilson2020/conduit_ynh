@@ -79,18 +79,20 @@ export interface BuildAppOptions {
    */
   reauthVerifier?: ReauthVerifier;
   /**
-   * Test-only overrides for the two 7.7 bounds that would otherwise make a test
-   * upload 8GiB or wait fifteen seconds. See CrmRouteDeps for both; never set
-   * outside a test.
+   * Test-only overrides for the three 7.7 bounds that would otherwise make a
+   * test upload 8GiB (twice over: the restore's preview and the two importers'
+   * uploads are separate caps) or wait fifteen seconds. See CrmRouteDeps for
+   * all three; never set outside a test.
    */
   restoreMaxUploadBytes?: number;
+  importMaxUploadBytes?: number;
   restoreDrainTimeoutMs?: number;
 }
 
 export async function buildApp(
   {
     config, db, dataDir = "./data", webRoot, multipartFileSizeLimit, mail, loggerStream,
-    reauthVerifier, restoreMaxUploadBytes, restoreDrainTimeoutMs,
+    reauthVerifier, restoreMaxUploadBytes, importMaxUploadBytes, restoreDrainTimeoutMs,
   }: BuildAppOptions,
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -305,6 +307,7 @@ export async function buildApp(
     intakeSessions,
     writeGate,
     restoreMaxUploadBytes,
+    importMaxUploadBytes,
     restoreDrainTimeoutMs,
   });
 

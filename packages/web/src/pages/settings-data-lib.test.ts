@@ -526,16 +526,23 @@ describe("restoreProblem", () => {
   it("NAMES THE OTHER EXIT when a preview this page cannot reach is in the way", () => {
     // The one state the surface cannot get itself out of. A preview is
     // addressed by an id, bound to its owner, and held only by the page that
-    // made it -- so after a reload, or from a second tab, "apply or cancel it
+    // made it -- so after a reload, or from a second tab, "finish or cancel it
     // first" is an instruction nobody can follow. Repeating it alone would be a
     // refusal with no way out; the expiry and the restart are the ways out that
     // always work.
+    //
+    // THE FIXTURE IS THE SERVER'S CURRENT SENTENCE, and it changed in 7.7's
+    // routes task: the store is shared with two importers now, so what is
+    // waiting may not be a backup and the message names no artefact. Nothing
+    // this function does depends on the words -- it branches on the code -- but
+    // a fixture quoting a sentence the server no longer writes is a fixture
+    // that has started documenting the past.
     const answer = restoreProblem(
-      apiError("restore_busy", "another backup is already uploaded and waiting for a decision; "
-        + "apply or cancel it first", 409),
+      apiError("restore_busy", "another upload is already waiting for a decision on this "
+        + "install; finish or cancel it first", 409),
       "preview",
     );
-    expect(answer).toContain("apply or cancel it first");
+    expect(answer).toContain("finish or cancel it first");
     expect(answer).toContain("no way to cancel it");
     expect(answer).toContain("within half an hour");
     expect(answer).toContain("restart of Conduit clears it");

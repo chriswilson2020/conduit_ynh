@@ -924,7 +924,7 @@ test.describe("The line-item editor on a phone", () => {
     // backup and restore" when the page behind it gained a third thing -- and
     // the name is written out here because `exact: true` means this list is a
     // guard on the label as well as on the geometry.
-    for (const name of ["Mail accounts", "Templates", "Organisation", "Export, backup and restore"]) {
+    for (const name of ["Mail accounts", "Templates", "Organisation", "Export, import, backup and restore"]) {
       await expectTouchTarget(nav.getByRole("link", { name, exact: true }));
     }
     const navOverflowX = await nav.evaluate((element) => getComputedStyle(element).overflowX);

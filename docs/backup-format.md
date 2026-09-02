@@ -84,7 +84,7 @@ Conduit's Settings page and it exists for exactly that.
 ## Putting one back
 
 **Since v1.4.0 Conduit restores its own backups**, from
-**Settings -> Export, backup and restore**. Upload the `.7z`, type the
+**Settings -> Export, import, backup and restore**. Upload the `.7z`, type the
 passphrase, and Conduit opens it on the server and shows you a preview of
 exactly what a restore would do -- what it will destroy, counted in rows and
 tables from the live database, and what it will put in their place. Nothing is
@@ -115,6 +115,23 @@ change that works is not the all-clear.
 **You do not need any of this to get your data back.** A backup is a plain
 `.7z`; `7z x` and `psql` will always be enough, which is the whole reason the
 format is what it is.
+
+### A backup is not what the importers read
+
+Since v1.4.0 the same page also has two **importers**, and they are a different
+thing in a different direction. **An import adds records and changes nothing
+that is already there**; a restore replaces everything.
+**Neither importer will touch a backup**: one reads Conduit's own **export**
+(the readable `.zip` from the same page, which carries no credentials, no mail
+and no database dump) and the other reads a **foreign CSV** out of a spreadsheet
+or another CRM. A `.7z`
+uploaded to either import control is refused by name rather than half-read,
+because a backup that reached an insert path would be an operator who typed a
+passphrase into the one control that has no use for one.
+
+**So a backup is still the only artefact that can put an install back**, and an
+export is still not one -- three years of tidy CSV exports is no way to recover
+a Conduit.
 
 ### `manifest.json`
 

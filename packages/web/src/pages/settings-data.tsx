@@ -12,6 +12,7 @@ import {
 // settings-data-lib.ts, which is where the branching on `code` belongs.
 import { ApiError } from "../api";
 import { SettingsLayout } from "../components/settings-layout";
+import { ImportSection } from "./settings-import";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import {
@@ -26,8 +27,8 @@ import {
 import type { BackupFormState, RestoreFormState } from "./settings-data-lib";
 
 /**
- * SETTINGS -> EXPORT, BACKUP AND RESTORE. Phase 7.6 Task 3, and Phase 7.7's
- * restore surface.
+ * SETTINGS -> EXPORT, IMPORT, BACKUP AND RESTORE. Phase 7.6 Task 3, and Phase
+ * 7.7's restore and import surfaces.
  *
  * THE PAGE'S JOB IS TO STOP SOMEBODY CONFUSING THE ARTEFACTS, and that is a
  * written requirement of both specs rather than a matter of layout. Two
@@ -39,24 +40,37 @@ import type { BackupFormState, RestoreFormState } from "./settings-data-lib";
  *
  *   EXPORT is readable and portable and CANNOT be restored.
  *   BACKUP is exact and encrypted and CANNOT be read.
- *   RESTORE is neither of those. It is the other direction.
+ *   IMPORT adds records from a file and CANNOT bring an install back.
+ *   RESTORE is none of those. It replaces everything.
  *
- * THE THIRD ONE IS NOT A THIRD DOWNLOAD AND THE PAGE MUST NOT LET IT READ AS
- * ONE. 7.7's spec says in as many words that the Settings page must not let
- * somebody reach for one thing when they meant a restore, and the danger runs
- * the way round that a fourth button in a row of three would create: the two
- * above copy data OUT and cost nothing if pressed by mistake, and this one
- * destroys every row in the database. So it is a separate section, below a
- * rule, with its own heading, its own colour and a sequence -- upload, read a
- * preview, type the install's name, type a password twice -- that cannot be
- * completed by clicking in the same place twice.
+ * FIVE ARTEFACTS IN THREE DIRECTIONS, AND THE PAGE IS ORDERED BY WHAT THEY
+ * COST IF PRESSED BY MISTAKE. The two downloads copy data OUT and cost nothing.
+ * The two imports put data IN and cost rows an operator can archive. The
+ * restore replaces every row in the database, and the only way back is a safety
+ * backup. So the page reads downwards from harmless to irreversible, and the
+ * one at the bottom is a separate section, below a rule, with its own heading,
+ * its own colour and a sequence -- upload, read a preview, type the install's
+ * name, type a password twice -- that cannot be completed by clicking in the
+ * same place twice.
+ *
+ * THE IMPORT SECTION IS ABOVE THE RESTORE AND THAT IS THE REQUIREMENT RATHER
+ * THAN THE LAYOUT. 7.7's spec says the page must not let somebody reach for one
+ * thing when they meant a restore, and the pair that is easiest to confuse is
+ * the one it added: both take an upload, both show a preview, and only one of
+ * them destroys. Putting the additive one first means an operator looking for
+ * "get my data in" meets it and never has to consider the other; the restore's
+ * own copy then points back UP at it for anybody who arrived at the wrong one.
+ * pages/settings-import.tsx carries the rest of that argument.
  *
  * SIX THINGS ON THIS PAGE ARE REQUIREMENTS RATHER THAN STYLING, each written
  * beside the code that implements it:
  *
  *   1. RE-AUTHENTICATION before either download and before BOTH halves of a
  *      restore (ReauthDialog, and the gate on the server that is the actual
- *      control -- routes/reauth.ts).
+ *      control -- routes/reauth.ts). NOT before an import, and routes/import.ts
+ *      argues that at length rather than leaving it to be noticed: an import
+ *      neither exfiltrates nor destroys, and a fifth gated route would widen
+ *      what one fungible ticket authorises.
  *   2. Both downloads issued with fetch() and a blob, never a link (api.ts's
  *      downloadArchive).
  *   3. The pre-flight warning before a long backup (PreflightNotice), the half
@@ -175,18 +189,31 @@ export function SettingsDataPage() {
   const [previewing, setPreviewing] = useState(false);
   const [applying, setApplying] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  /**
+   * WHETHER THE IMPORT SECTION IS DOING SOMETHING.
+   *
+   * ONE BOOLEAN AND NOT ITS FIVE FLAGS. That section owns its own stages --
+   * reading columns, previewing, applying, cancelling -- and which of them is
+   * running is its business; what this page needs is the single fact the
+   * one-thing-at-a-time rule below is built on. Lifting the five would have
+   * been this page re-implementing a state machine it does not render.
+   */
+  const [importing, setImporting] = useState(false);
 
   /**
-   * ONE OPERATION AT A TIME ACROSS ALL FOUR, and the reason is the same one
-   * 7.6 gave for the two downloads: they contend for the same disk. A restore
-   * preview writes an upload into $data_dir and unpacks it there, which is the
-   * same disk a backup is being built on. The server enforces its own
-   * single-flight per route; this is what stops the page offering a button that
-   * would meet a legitimate 503, and every control that goes dark because of it
-   * says so beside itself.
+   * ONE OPERATION AT A TIME ACROSS ALL SIX, and the reason is the same one 7.6
+   * gave for the two downloads: they contend for the same disk. A restore
+   * preview and both import previews write an upload into $data_dir and unpack
+   * it there, which is the same disk a backup is being built on -- and the two
+   * previews contend for something narrower still, because
+   * services/intake-plan.ts holds ONE session for the whole install and refuses
+   * the second with a 409. The server enforces its own single-flight per route;
+   * this is what stops the page offering a button that would meet a legitimate
+   * refusal, and every control that goes dark because of it says so beside
+   * itself.
    */
   const busy = checking || exportDownload.isPending || backupDownload.isPending
-    || previewing || applying || cancelling;
+    || previewing || applying || cancelling || importing;
   const formProblem = backupFormProblem(form, touched);
   const backupReady = canSubmitBackup(form);
 
@@ -424,7 +451,7 @@ export function SettingsDataPage() {
    * that left behind is the worst one this surface can produce: a decrypted
    * backup sitting in $data_dir for the rest of its half hour, `intakeSessions`
    * still holding it, every new preview answered with "another backup is
-   * already uploaded and waiting for a decision; apply or cancel it first" --
+   * already waiting for a decision on this install; finish or cancel it first" --
    * and no Cancel button anywhere, because the page had just removed it.
    */
   async function discardPreview() {
@@ -485,13 +512,19 @@ export function SettingsDataPage() {
             describing the restore here, because the restore's own section is
             where it is explained and this is a paragraph about the two things
             above it.
+            AND THE SENTENCE BEFORE IT ARRIVED WITH THE IMPORTERS, for the same
+            reason again: the page gained two more things that go the OTHER way,
+            and a lead that named only the destructive one would leave an
+            operator looking for "put a spreadsheet in" with the restore as the
+            only candidate on offer.
           */}
           <p data-testid="data-lead" className="text-sm text-slate-600">
             Two downloads that look alike and are not. An export is readable and cannot be
             restored. A backup can be restored and cannot be read. Three years of tidy CSV
             exports is no way to put Conduit back -- only a backup is. Take both, and keep
-            both. Putting one back is further down this page, and it is not a download: it
-            destroys everything that is here now.
+            both. Further down this page are the two ways of putting data IN, and they are
+            not the same as each other: an import ADDS records from a file and changes nothing
+            that is here, and a restore REPLACES everything that is here.
           </p>
         </div>
 
@@ -522,6 +555,14 @@ export function SettingsDataPage() {
           onChange={(next) => { setTouched(true); setDone(null); setForm(next); }}
           onDownload={() => { setTouched(true); openPrompt("backup"); }}
         />
+
+        {/*
+          THE FOURTH AND FIFTH ARTEFACTS, ABOVE THE SIXTH. See this module's
+          header for why the order is the requirement: the additive tool is met
+          first, so an operator looking for "get my data in" never has to
+          consider the one that destroys.
+        */}
+        <ImportSection busy={busy} onRunning={setImporting} />
 
         <RestoreSection
           form={restoreForm}
@@ -1081,15 +1122,23 @@ function RestoreSection(props: {
       <div className="flex flex-col gap-2">
         <h2 className="text-sm font-semibold text-red-900">Restore -- putting a backup back</h2>
         {/*
-          THE PARAGRAPH THAT MAKES THIS DIFFERENT IN KIND. The two things above
-          copy data OUT and cost nothing if pressed by mistake. This one is the
-          other direction and it is not recoverable by pressing it again.
+          THE PARAGRAPH THAT MAKES THIS DIFFERENT IN KIND, REWRITTEN BY 7.7'S
+          ROUTES TASK AND NOT MERELY EXTENDED. It said "the two above take data
+          out of Conduit", which stopped being true the moment the import
+          section landed between them and this one -- and it stopped being true
+          in the direction that matters, because the pair a person can now
+          confuse is an import and a restore rather than a download and a
+          restore. Both take an upload and both show a preview; only one of them
+          destroys, and this is where that is said.
         */}
         <p data-testid="restore-lead" className="text-sm text-red-900">
-          The two above take data out of Conduit. This one puts a backup in, and the way it
-          does that is by destroying everything that is here first. It is not a third
-          download and it does not behave like one: there is a preview you have to read, this
-          install&apos;s name to type out, and your password twice.
+          This is not an import. An import adds records and leaves everything else alone; this
+          puts a backup in by destroying everything that is here first, all of it, and the only
+          way back is the safety backup Conduit writes as it starts. If what you want is to add
+          a spreadsheet&apos;s contacts or another Conduit&apos;s records, that is the Import
+          section above and it cannot lose anything. This one does not behave like a download or
+          like an import: there is a preview you have to read, this install&apos;s name to type
+          out, and your password twice.
         </p>
       </div>
 
@@ -1105,8 +1154,10 @@ function RestoreSection(props: {
         Every company, contact, deal, project, task, note, meeting, document, stored file and
         mail message in this install is dropped, and the backup&apos;s are put in their place.
         There is no way to restore part of a backup and no way to pick one record out of one.
-        If what you want is to load a spreadsheet, or another CRM&apos;s data, or one deal you
-        deleted last week, this is not the tool and using it would lose everything else.
+        If what you want is to load a spreadsheet, or another CRM&apos;s data, use the Import
+        section above -- it adds records and cannot lose any. If what you want is one deal you
+        deleted last week, there is no tool for that here, and using this one would lose
+        everything else to get it back.
       </Limitation>
 
       <Limitation

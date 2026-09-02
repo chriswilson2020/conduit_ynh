@@ -3,7 +3,7 @@ import type { BackupPreflight, PlanUnit, PlanView } from "@conduit/shared";
 import { ApiError, ResponseShapeError } from "../api";
 
 /**
- * The Settings -> Export, backup and restore page's pure logic, kept out of the
+ * The Settings -> Export, import, backup and restore page's pure logic, kept out of the
  * page so it can be unit-tested without a DOM -- the same split
  * settings-mail-lib.ts and inbox-lib.ts already make, and for the same reason:
  * this package's vitest environment is `node`, so what is not extracted is only
@@ -507,7 +507,7 @@ export function restoreProblem(error: unknown, phase: "preview" | "apply"): stri
     case "restore_busy":
       // THE ONE STATE THIS PAGE CANNOT GET ITSELF OUT OF, so it says what is
       // true rather than repeating an instruction that may be impossible. The
-      // server says "apply or cancel it first" -- and a preview is reachable
+      // server says "finish or cancel it first" -- and a preview is reachable
       // only through the id the page that made it is holding, which a reload or
       // a second tab does not have. There is no route that cancels "whatever is
       // waiting", deliberately: it is addressed by id and bound to its owner.

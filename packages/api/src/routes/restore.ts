@@ -313,6 +313,17 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
     // times, and the reason here is a capacity of one. It names nobody, and
     // the plan itself stays unreachable without its id and its owner.
     //
+    // AND IT NO LONGER SAYS WHAT IS WAITING, WHICH IS A CORRECTION AND NOT A
+    // SOFTENING. This sentence read "another BACKUP is already uploaded and
+    // waiting for a decision" and was true for as long as a restore was the
+    // only thing that could hold a session. routes/import.ts made two more,
+    // and the store is one store -- so what is waiting may now be an export
+    // import or a mapped spreadsheet, and naming a backup would send an
+    // operator hunting for a restore to cancel that does not exist. The
+    // message is corrected in the commit that made it wrong rather than
+    // filed. That it reveals somebody has an upload AT ALL is the separate
+    // v1.4.1 item and is unchanged.
+    //
     // `size` EXCLUDES SESSIONS INSIDE `use`, so during an apply this check
     // reads zero and the capacity-of-one invariant rests entirely on the write
     // gate refusing POSTs for the duration. That is a real dependency between
@@ -320,8 +331,8 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
     if (intakeSessions.size > 0) {
       return reply.code(409).send({
         error: "restore_busy",
-        message: "another backup is already uploaded and waiting for a decision; "
-          + "apply or cancel it first",
+        message: "another upload is already waiting for a decision on this install; "
+          + "finish or cancel it first",
       });
     }
 

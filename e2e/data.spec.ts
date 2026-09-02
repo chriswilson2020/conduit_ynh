@@ -169,12 +169,13 @@ test.describe("Settings -> Export and backup", () => {
  * 7.6 is the first phase to make that row overflow at a phone width -- three
  * tabs fit and four do not -- so the fourth is the first tab that has to be
  * scrolled to before it can be touched. 7.7 RENAMED IT AND MADE IT LONGER
- * ("Export, backup and restore"), which moves it further off the end of the
- * row rather than back onto it, so the property below is the same one and the
- * margin is smaller. e2e/documents.spec.ts's phone
- * journey holds every settings tab to the 44px floor and to being wholly in the
- * viewport; this asserts the same property and, when it fails, SAYS WHY IN
- * NUMBERS.
+ * TWICE: first to "Export, backup and restore" when the restore landed, then to
+ * "Export, import, backup and restore" when the two importers did. Each rename
+ * moves it further off the end of the row rather than back onto it, so the
+ * property below is the same one every time and the margin is smaller every
+ * time. e2e/documents.spec.ts's phone journey holds every settings tab to the
+ * 44px floor and to being wholly in the viewport; this asserts the same
+ * property and, when it fails, SAYS WHY IN NUMBERS.
  *
  * The message is the point. The shared helper's failure is a bare viewport
  * ratio, and a ratio on its own cannot distinguish a row that did not scroll
@@ -197,7 +198,7 @@ test.describe("the settings tabs on a phone", () => {
     await page.goto(route);
     const nav = page.getByTestId("settings-nav");
     await expect(nav).toBeVisible();
-    const tab = nav.getByRole("link", { name: "Export, backup and restore", exact: true });
+    const tab = nav.getByRole("link", { name: "Export, import, backup and restore", exact: true });
 
     const natural = await tab.boundingBox();
     expect(natural?.height ?? 0, "touch height").toBeGreaterThanOrEqual(44);
@@ -598,19 +599,36 @@ test.describe("Settings -> restore", () => {
     // 7.7's spec: the page must not let somebody reach for one thing when they
     // meant a restore. The lead of the page now points down at it and says what
     // it is, and the section says it again in its own words.
-    await expect(page.getByTestId("data-lead")).toContainText("it destroys everything");
+    //
+    // THE SENTENCES MOVED WHEN THE IMPORTERS LANDED, and the PROPERTY did not.
+    // The lead used to end "it destroys everything that is here now" about the
+    // one way in; there are now three ways in and two of them are additive, so
+    // the lead names the contrast instead of one half of it. What is asserted
+    // is the same requirement: this page's opening paragraph says, before any
+    // button, that one of the things below replaces everything.
+    await expect(page.getByTestId("data-lead")).toContainText("an import ADDS records");
+    await expect(page.getByTestId("data-lead"))
+      .toContainText("a restore REPLACES everything that is here");
 
     const section = page.getByTestId("restore-section");
+    // AND THE SECTION'S OWN LEAD NAMES THE THING IT IS MOST CONFUSED WITH.
+    // "The two above take data out of Conduit" stopped being true the moment
+    // the import section landed between them, and it stopped being true in the
+    // direction that matters: the pair a person can now confuse is an import
+    // and a restore, because both take an upload and both show a preview.
+    await expect(section.getByTestId("restore-lead")).toContainText("This is not an import");
     await expect(section.getByTestId("restore-lead"))
-      .toContainText("The two above take data out of Conduit");
-    await expect(section.getByTestId("restore-lead")).toContainText("not a third download");
+      .toContainText("destroying everything that is here first");
 
     // The limitation, in the same weight the export's and the backup's are in.
     await expect(section.getByTestId("restore-limitation"))
       .toContainText("nothing selective about it");
-    // And the thing a person reaching for the wrong tool needs told.
+    // And the thing a person reaching for the wrong tool needs told -- which is
+    // now a place to go rather than only a warning, because the tool exists.
     await expect(section.getByTestId("restore-limitation"))
       .toContainText("load a spreadsheet");
+    await expect(section.getByTestId("restore-limitation"))
+      .toContainText("Import section above");
     // The undo, and its condition.
     await expect(section.getByTestId("restore-undo"))
       .toContainText("only an undo while you still have it");
@@ -1155,5 +1173,474 @@ test.describe("the restore surface on a phone", () => {
     // numbers are the whole point of it.
     await expect(page.getByTestId("restore-destroys-destroy-schema"))
       .toContainText(/\d+ row\(s\) in \d+ table\(s\)/);
+  });
+});
+
+/**
+ * PHASE 7.7'S LAST SURFACE: THE TWO IMPORTERS.
+ *
+ * WHAT ONLY THIS FILE CAN SAY. routes/import.test.ts proves every guard on the
+ * six routes -- who may import, what travels, what a second upload is told,
+ * what is left on the disk -- and settings-import-lib.test.ts proves the words
+ * and the two "does this failure leave the operator's work" decisions. What is
+ * untested anywhere else is that the SURFACE is wired to all of it: that a
+ * person can choose a spreadsheet, be shown their own column names, say what
+ * each one holds, read what that would create, press a button and find the
+ * records in Conduit.
+ *
+ * THE FOREIGN IMPORTER IS EXERCISED FOR REAL, END TO END, because it can be:
+ * every row it creates is new, so nothing has to be deleted to make room.
+ *
+ * THE EXACT IMPORTER IS EXERCISED FOR REAL ONLY AS FAR AS ITS PREVIEW, and that
+ * is a limit of the fixture rather than of the code, said here rather than left
+ * to look like a gap. The only real export this suite can obtain is an export
+ * of the install it is running against -- so every id in it is already here,
+ * and the honest answer the importer gives is "there is nothing to add". That
+ * refusal IS the journey for the limitation requirement, because the seven
+ * sheet-by-sheet findings are pushed before it and travel with it. The
+ * CREATING path needs an archive whose rows are absent from the install, which
+ * means deleting rows, which this application deliberately cannot do -- so it
+ * is proved at the route (routes/import.test.ts imports a real export into an
+ * emptied install and checks the ids came back) and the page's half of it is
+ * driven here against a stub.
+ */
+
+/** A CSV whose rows cannot collide with a previous run of this suite. */
+function foreignCsv(tag: string): string {
+  return [
+    "Given name,Family name,E-mail Address,Notes",
+    `Ada,Lovelace ${tag},ada.${tag}@example.com,first programmer`,
+    `Alan,Turing ${tag},alan.${tag}@example.com,`,
+  ].join("\r\n");
+}
+
+async function chooseCsv(page: Page, csv: string, filename = "contacts.csv"): Promise<void> {
+  await page.getByTestId("import-csv-file").setInputFiles({
+    name: filename, mimeType: "text/csv", buffer: Buffer.from(csv, "utf8"),
+  });
+}
+
+/** Upload a CSV and get to the mapping step. */
+async function readColumns(page: Page, csv: string): Promise<void> {
+  await chooseCsv(page, csv);
+  await page.getByTestId("import-csv-columns").click();
+  await expect(page.getByTestId("import-csv-mapping")).toBeVisible({ timeout: 60_000 });
+}
+
+test.describe("Settings -> import", () => {
+  test("reads as a way IN, and the restore points back at it", async ({ page }) => {
+    await openDataSettings(page);
+
+    // THE PAGE'S LEAD NOW NAMES BOTH DIRECTIONS. It described two downloads and
+    // one destruction; a lead that named only the destructive way in would
+    // leave somebody holding a spreadsheet with the restore as the only
+    // candidate on offer.
+    await expect(page.getByTestId("data-lead")).toContainText("an import ADDS records");
+    await expect(page.getByTestId("data-lead")).toContainText("a restore REPLACES everything");
+
+    // THE SECTION SAYS WHAT IT IS IN ITS FIRST SENTENCE.
+    const section = page.getByTestId("import-section");
+    await expect(section.getByTestId("import-lead")).toContainText("ADD rows to this install");
+    await expect(section.getByTestId("import-lead"))
+      .toContainText("Nothing that is already here is changed");
+    await expect(section.getByTestId("import-lead")).toContainText("restore below");
+
+    // EACH ARTEFACT STATES WHAT IT CANNOT DO, in the same component and the
+    // same weight the export's and the backup's do -- which is the requirement
+    // rather than the styling, and is now asserted on all five.
+    await expect(section.getByTestId("import-export-limitation"))
+      .toContainText("Not deals, tasks, projects, notes, meetings, documents or files");
+    await expect(section.getByTestId("import-csv-limitation"))
+      .toContainText("One file creates one kind of record");
+
+    // AND THE RESTORE POINTS BACK UP HERE, which it could not do before this
+    // section existed. Its limitation used to end "this is not the tool" with
+    // nowhere to send anybody.
+    await expect(page.getByTestId("restore-lead")).toContainText("This is not an import");
+    await expect(page.getByTestId("restore-lead")).toContainText("Import section above");
+    await expect(page.getByTestId("restore-limitation")).toContainText("Import section above");
+
+    // THE ORDER IS THE REQUIREMENT: harmless, additive, irreversible. Somebody
+    // scrolling for "get my data in" meets the import first.
+    const order = await page.evaluate(() => {
+      const importing = document.querySelector('[data-testid="import-section"]');
+      const restore = document.querySelector('[data-testid="restore-section"]');
+      if (importing === null || restore === null) return "missing";
+      // eslint-disable-next-line no-bitwise
+      return (importing.compareDocumentPosition(restore) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+        ? "import first" : "restore first";
+    });
+    expect(order).toBe("import first");
+  });
+
+  test("never disables an import control without saying why beside it", async ({ page }) => {
+    await openDataSettings(page);
+    for (const [button, blocked] of [
+      ["import-export-preview", "import-export-blocked"],
+      ["import-csv-columns", "import-csv-blocked"],
+    ] as const) {
+      await expect(page.getByTestId(button)).toBeDisabled();
+      await expect(page.getByTestId(blocked)).toContainText("Choose a file to enable this");
+    }
+
+    await chooseCsv(page, foreignCsv("blocked"));
+    await expect(page.getByTestId("import-csv-columns")).toBeEnabled();
+    await expect(page.getByTestId("import-csv-blocked")).toHaveCount(0);
+  });
+
+  test("IMPORTS A SPREADSHEET END TO END, mapping included", async ({ page }) => {
+    const tag = `e2e${String(Date.now())}`;
+    const csv = foreignCsv(tag);
+    await openDataSettings(page);
+    await readColumns(page, csv);
+
+    // WHAT IS IN THE FILE, from the server rather than from the browser: the
+    // operator's own column names and the values underneath them, which are
+    // what a person actually reads to decide what a column is.
+    // THE LIST, NOT THE BUTTON. The upload stage's button and the mapping
+    // stage's column list are two different testids on purpose: they are never
+    // on screen together, but a single name shared by a control and a container
+    // is a locator that silently means one thing today and the other tomorrow.
+    const columns = page.getByTestId("import-csv-column-list");
+    await expect(columns.getByTestId("import-csv-column-0")).toContainText("Given name");
+    await expect(columns.getByTestId("import-csv-column-0")).toContainText("Ada");
+    await expect(columns.getByTestId("import-csv-column-3")).toContainText("Notes");
+    await expect(columns.getByTestId("import-csv-column-3")).toContainText("first programmer");
+
+    // AND CONDUIT'S GUESS IS THE STARTING POINT AND NOT THE DECISION. "Given
+    // name", "Family name" and "E-mail Address" are spellings the reader knows;
+    // "Notes" is one it has nowhere to put, and it is left unmapped rather than
+    // guessed at.
+    await expect(page.getByTestId("import-csv-field-0")).toHaveValue("contact.first_name");
+    await expect(page.getByTestId("import-csv-field-1")).toHaveValue("contact.last_name");
+    await expect(page.getByTestId("import-csv-field-2")).toHaveValue("contact.email");
+    await expect(page.getByTestId("import-csv-field-3")).toHaveValue("");
+
+    // THE OWNER IS A MAPPING CONTROL AND ITS DEFAULT IS NOBODY, which is the
+    // answer that cannot be wrong.
+    await expect(page.getByTestId("import-csv-owner")).toHaveValue("");
+
+    await page.getByTestId("import-csv-preview").click();
+    const plan = page.getByTestId("import-plan");
+    await expect(plan).toBeVisible({ timeout: 60_000 });
+    await expect(plan).toHaveAttribute("data-kind", "csv");
+
+    // WHAT IT ADDS, FROM THE PLAN. Nothing on this page counted it.
+    await expect(page.getByTestId("import-creates-insert-csv-contacts"))
+      .toContainText("2 rows");
+    await expect(page.getByTestId("import-creates-insert-csv-contacts"))
+      .toHaveAttribute("data-destroys", "no");
+    // AND THE SENTENCE THAT ANSWERS "will this delete what I have?" without an
+    // operator having to reason about it.
+    await expect(page.getByTestId("import-creates"))
+      .toContainText("No record already in this install is changed");
+    // The unmapped column is reported rather than silently dropped.
+    await expect(page.getByTestId("import-finding-column-unmapped")).toContainText("Notes");
+
+    await page.getByTestId("import-apply").click();
+    await expect(page.getByTestId("import-outcome")).toBeVisible({ timeout: 120_000 });
+    await expect(page.getByTestId("import-outcome")).toContainText("2 rows were added");
+    // The preview is gone on the server the moment apply took it, so the page
+    // stops offering it.
+    await expect(page.getByTestId("import-plan")).toHaveCount(0);
+
+    // AND THE RECORDS ARE IN CONDUIT, which is the only assertion in this file
+    // that the import actually happened rather than merely reported that it
+    // had.
+    await page.goto("/contacts");
+    await expect(page.getByRole("cell", { name: `Ada Lovelace ${tag}` })).toBeVisible();
+    await expect(page.getByRole("cell", { name: `Alan Turing ${tag}` })).toBeVisible();
+
+    // A SECOND IMPORT OF THE SAME FILE ADDS NOTHING, and says so rather than
+    // creating two of everybody -- which is the duplicate rule working through
+    // the whole surface rather than in a unit test.
+    await openDataSettings(page);
+    await readColumns(page, csv);
+    await page.getByTestId("import-csv-preview").click();
+    await expect(page.getByTestId("import-refusal")).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByTestId("import-refusal")).toContainText("nothing in this file to add");
+    // THE BUTTON STAYS, DISABLED, WITH THE REASON BESIDE IT. The restore's own
+    // journey had to be written this way round after a review: a control that
+    // VANISHES is its own kind of unexplained, and the rule this page is built
+    // on is that nothing is off without a visible reason -- not that nothing is
+    // ever off.
+    await expect(page.getByTestId("import-apply")).toBeDisabled();
+    await expect(page.getByTestId("import-apply-blocked"))
+      .toContainText("nothing here to import");
+    await page.getByTestId("import-cancel").click();
+    await expect(page.getByTestId("import-plan")).toHaveCount(0);
+  });
+
+  test("DISABLES THE MAPPING ON THE SHARED RULE, with that rule's own sentence", async ({ page }) => {
+    // ONE FUNCTION, BOTH SIDES. csvMappingProblem is what this control is
+    // disabled on and what services/import-csv.ts refuses an arriving mapping
+    // with, so the two refusals read as one answer. What this journey adds to
+    // the unit test is that the sentence is ON THE SCREEN beside the dead
+    // button rather than merely returned by a function.
+    await openDataSettings(page);
+    await readColumns(page, foreignCsv("mapping"));
+
+    // Map a company field beside the contact ones: one file creates one kind
+    // of record.
+    await page.getByTestId("import-csv-field-3").selectOption("company.name");
+    await expect(page.getByTestId("import-csv-preview")).toBeDisabled();
+    await expect(page.getByTestId("import-csv-mapping-blocked"))
+      .toContainText("mapped to both companies and contacts");
+    // The refusal names the way out rather than being a dead end.
+    await expect(page.getByTestId("import-csv-mapping-blocked"))
+      .toContainText("import the companies first");
+
+    // Take the required field away instead.
+    await page.getByTestId("import-csv-field-3").selectOption("");
+    await page.getByTestId("import-csv-field-0").selectOption("");
+    await expect(page.getByTestId("import-csv-preview")).toBeDisabled();
+    await expect(page.getByTestId("import-csv-mapping-blocked")).toContainText("First name");
+
+    // And two columns fighting over a field that holds one value.
+    await page.getByTestId("import-csv-field-0").selectOption("contact.first_name");
+    await page.getByTestId("import-csv-field-3").selectOption("contact.last_name");
+    await expect(page.getByTestId("import-csv-preview")).toBeDisabled();
+    await expect(page.getByTestId("import-csv-mapping-blocked")).toContainText("Last name");
+
+    await page.getByTestId("import-csv-field-3").selectOption("");
+    await expect(page.getByTestId("import-csv-preview")).toBeEnabled();
+    await expect(page.getByTestId("import-csv-mapping-blocked")).toHaveCount(0);
+  });
+
+  test("KEEPS THE MAPPING when the world moves between preview and apply", async ({ page }) => {
+    // THE DECISION services/import-csv.ts LEFT TO THIS TASK, in its own words:
+    // "a routes task should keep the operator's mapping in front of them across
+    // a refused apply, because nothing about the mapping became untrue -- only
+    // the counts did."
+    //
+    // THE APPLY IS STUBBED AND THE REST IS REAL. Making a real row appear
+    // between a preview and an apply from inside a browser journey would mean a
+    // second writer this suite has no way to be; what is under test here is
+    // what the PAGE does with the answer, and the answer's shape is held to the
+    // server's by routes/import.test.ts, which produces this exact 409 from a
+    // real race.
+    await openDataSettings(page);
+    await readColumns(page, foreignCsv("changed"));
+    await page.getByTestId("import-csv-field-3").selectOption("contact.job_title");
+    await page.getByTestId("import-csv-preview").click();
+    await expect(page.getByTestId("import-plan")).toBeVisible({ timeout: 60_000 });
+
+    let stubbedPlanId = "";
+    await page.route("**/api/import/csv/apply", async (route) => {
+      stubbedPlanId = (route.request().postDataJSON() as { planId: string }).planId;
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: "import_csv_changed",
+          imported: false,
+          message: "the preview said 2 contacts would be created and 1 were, because this "
+            + "install changed while the preview was open. Nothing has been imported, and the "
+            + "column mapping is unaffected. Take a fresh preview of the same file.",
+        }),
+      });
+    });
+    await page.getByTestId("import-apply").click();
+
+    const error = page.getByTestId("import-error");
+    await expect(error).toContainText("the column mapping is unaffected");
+    await expect(error).toContainText("Nothing has been imported");
+
+    // THE PLAN IS GONE, because the server consumed it and disposed of the
+    // upload in a `finally`; a button pointing at that id would answer 404 and
+    // read as a second, different failure.
+    await expect(page.getByTestId("import-plan")).toHaveCount(0);
+
+    // AND THE MAPPING IS STILL ON THE SCREEN, with every choice the operator
+    // made -- including the one they made by hand, which is the one that would
+    // have cost them their time.
+    await expect(page.getByTestId("import-csv-mapping")).toBeVisible();
+    await expect(page.getByTestId("import-csv-field-3")).toHaveValue("contact.job_title");
+    await expect(page.getByTestId("import-csv-field-0")).toHaveValue("contact.first_name");
+
+    // THE STUB HAS TO FINISH WHAT THE REAL SERVER WOULD HAVE DONE, and a run
+    // that did not caught this: intercepting the apply means the request never
+    // reached the route, so the plan is STILL HELD on the server -- while the
+    // page, correctly, has stopped offering it. That is a state a real
+    // `import_csv_changed` cannot produce (it is thrown from inside
+    // `intakeSessions.use`, which disposes in a `finally`), and leaving it
+    // would make the re-preview below meet a 409 for a reason this journey is
+    // not about. Deleting it here is the stub being faithful rather than the
+    // test working around the app.
+    expect(stubbedPlanId).toMatch(/^[0-9a-f-]{36}$/);
+    const released = await page.request.delete(`/api/import/${stubbedPlanId}`);
+    expect(released.status()).toBe(204);
+
+    // One press re-plans it, against the same file the browser still holds.
+    await page.unroute("**/api/import/csv/apply");
+    await page.getByTestId("import-csv-preview").click();
+    await expect(page.getByTestId("import-plan")).toBeVisible({ timeout: 60_000 });
+    await page.getByTestId("import-cancel").click();
+    await expect(page.getByTestId("import-plan")).toHaveCount(0);
+  });
+
+  test("SHOWS WHAT AN EXPORT CANNOT BRING BACK, sheet by sheet, in its preview", async ({ page }) => {
+    // THE LIMITATION HAS TO BE VISIBLE BEFORE THE IMPORT, not discovered in an
+    // empty deals list afterwards. This uploads a REAL export of the install
+    // this suite is running against, taken through the page's own download a
+    // moment earlier -- so what is under test is the whole chain: the archive
+    // 7.6 writes, the intake that unpacks it, the digest sweep, and the
+    // findings on the screen.
+    const scratch = await mkdtemp(path.join(os.tmpdir(), "conduit-e2e-import-"));
+    try {
+      await openDataSettings(page);
+      const download = await downloadThrough(page, "export-download", REAUTH_PASSWORD);
+      const saved = path.join(scratch, "conduit-export.zip");
+      await download.saveAs(saved);
+
+      await page.getByTestId("import-export-file").setInputFiles(saved);
+      await page.getByTestId("import-export-preview").click();
+      const plan = page.getByTestId("import-plan");
+      await expect(plan).toBeVisible({ timeout: 120_000 });
+      await expect(plan).toHaveAttribute("data-kind", "export");
+
+      // THE HEADLINE, AND THEN THE SPECIFIC GAPS. A count alone would pass on
+      // seven copies of one sentence.
+      await expect(page.getByTestId("import-finding-partial-import"))
+        .toContainText("imports companies and contacts from an export");
+      const findings = page.getByTestId("import-findings");
+      for (const sheet of ["deals.csv", "tasks.csv", "projects.csv", "notes.csv",
+        "meetings.csv", "documents.csv", "files.csv"]) {
+        await expect(findings, `no finding names ${sheet}`).toContainText(sheet);
+      }
+      // Each one says WHAT is missing rather than only that it is skipped.
+      await expect(findings).toContainText("position");
+
+      // AND THE HONEST ANSWER FOR AN EXPORT OF THIS VERY INSTALL: every id in
+      // it is already here, so there is nothing to add and the page says so
+      // instead of offering a button that would do nothing.
+      await expect(page.getByTestId("import-refusal"))
+        .toContainText("already in this install");
+      await expect(page.getByTestId("import-apply")).toBeDisabled();
+      await expect(page.getByTestId("import-apply-blocked"))
+        .toContainText("nothing here to import");
+      // A refusal is not held, so there is no expiry paragraph promising to
+      // delete something that is already gone.
+      await expect(page.getByTestId("import-expiry")).toHaveCount(0);
+      await page.getByTestId("import-cancel").click();
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("SAYS ONE UPLOAD AT A TIME, on every other control, rather than meeting a 409", async ({ page }) => {
+    // services/intake-plan.ts holds ONE session for the whole install, shared
+    // with the restore. A page that offered the other buttons would be offering
+    // a button whose only possible answer is a refusal.
+    await openDataSettings(page);
+    await readColumns(page, foreignCsv("busy"));
+    await page.getByTestId("import-csv-preview").click();
+    await expect(page.getByTestId("import-plan")).toBeVisible({ timeout: 60_000 });
+
+    await expect(page.getByTestId("import-export-preview")).toBeDisabled();
+    await expect(page.getByTestId("import-export-blocked"))
+      .toContainText("A preview is already waiting below");
+    // AND IT NAMES THE RESTORE, because that is the control an operator would
+    // otherwise reach for next and be refused by the same slot.
+    await expect(page.getByTestId("import-export-blocked")).toContainText("restore");
+
+    // AND THE MAPPING STEP'S OWN BUTTON, which is the one a review found live.
+    // A successful preview does not unmount the mapping step -- the plan card
+    // renders BESIDE it, so the operator can still see what they mapped and so
+    // it is already there if a changed-world refusal drops them back onto it.
+    // That left "Preview what this creates" pressable under a plan that was
+    // already waiting, and its only possible answer was the 409 this page
+    // exists to say out loud rather than meet.
+    await expect(page.getByTestId("import-csv-preview")).toBeDisabled();
+    await expect(page.getByTestId("import-csv-mapping-blocked"))
+      .toContainText("A preview is already waiting below");
+
+    await page.getByTestId("import-cancel").click();
+    await expect(page.getByTestId("import-plan")).toHaveCount(0);
+    await expect(page.getByTestId("import-export-blocked"))
+      .toContainText("Choose a file to enable this");
+  });
+
+  test("REFUSES A BACKUP AND AN ARCHIVE at the two import controls", async ({ page }) => {
+    // The asymmetry, guarded from the import side. An operator who typed a
+    // passphrase into an importer has reached for the wrong control at the one
+    // moment they needed the right one.
+    await openDataSettings(page);
+    await page.getByTestId("import-csv-file").setInputFiles({
+      name: "conduit-backup.7z",
+      mimeType: "application/x-7z-compressed",
+      buffer: Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0, 0]),
+    });
+    await page.getByTestId("import-csv-columns").click();
+    await expect(page.getByTestId("import-csv-refusal")).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByTestId("import-csv-refusal")).toContainText("not a CSV");
+    // AND IT NAMES THE TWO CONTROLS THAT DO TAKE ONE, so a refusal is not a
+    // dead end.
+    await expect(page.getByTestId("import-csv-refusal")).toContainText("Restore");
+    await page.getByTestId("import-csv-restart").click();
+    await expect(page.getByTestId("import-csv-file")).toHaveValue("");
+  });
+});
+
+/**
+ * THE IMPORT SURFACE AT A PHONE WIDTH.
+ *
+ * The mapping step is the widest control this application has -- a header, its
+ * sample values and a picker, once per column -- and an operator with a
+ * spreadsheet to load is exactly as likely to be holding a phone as anybody
+ * else. What this holds is the same pair the restore's phone journey does:
+ * nothing off the side, and every control in the sequence a 44px target wholly
+ * inside the viewport.
+ */
+test.describe("the import surface on a phone", () => {
+  test.use(IPHONE_13);
+
+  test("maps and previews at 390, with nothing off the side", async ({ page }) => {
+    await openDataSettings(page);
+    await readColumns(page, foreignCsv("phone"));
+
+    const overflow = await page.evaluate(() =>
+      document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow, "pixels the page overflows horizontally").toBeLessThanOrEqual(1);
+
+    const viewport = page.viewportSize();
+    if (viewport === null) throw new Error("no viewport");
+
+    for (const id of [
+      "import-csv-field-0", "import-csv-field-3", "import-csv-owner",
+      "import-csv-preview", "import-csv-restart",
+    ]) {
+      const control = page.getByTestId(id);
+      await control.scrollIntoViewIfNeeded();
+      const box = await control.boundingBox();
+      if (box === null) throw new Error(`no geometry for ${id}`);
+      expect(box.height, `${id} touch height`).toBeGreaterThanOrEqual(44);
+      const outside = Math.max(0, (box.x + box.width) - viewport.width) + Math.max(0, -box.x);
+      expect(outside, `pixels of ${id} outside the viewport`).toBe(0);
+    }
+
+    // AND THE PREVIEW IS STILL READABLE rather than clipped: its counts are the
+    // whole point of it.
+    await page.getByTestId("import-csv-preview").click();
+    await expect(page.getByTestId("import-plan")).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByTestId("import-creates-insert-csv-contacts")).toContainText("2 rows");
+    const after = await page.evaluate(() =>
+      document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(after, "pixels the page overflows with a plan on screen").toBeLessThanOrEqual(1);
+
+    for (const id of ["import-apply", "import-cancel"]) {
+      const control = page.getByTestId(id);
+      await control.scrollIntoViewIfNeeded();
+      const box = await control.boundingBox();
+      if (box === null) throw new Error(`no geometry for ${id}`);
+      expect(box.height, `${id} touch height`).toBeGreaterThanOrEqual(44);
+      const outside = Math.max(0, (box.x + box.width) - viewport.width) + Math.max(0, -box.x);
+      expect(outside, `pixels of ${id} outside the viewport`).toBe(0);
+    }
+
+    // The upload is deleted rather than left to the half hour, which is also
+    // what leaves the next journey a free slot.
+    await page.getByTestId("import-cancel").click();
+    await expect(page.getByTestId("import-plan")).toHaveCount(0);
   });
 });

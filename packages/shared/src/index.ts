@@ -53,6 +53,10 @@ export { installNameMatches } from "./install-name.js";
 // held against this type by the compiler, and a `export type ... from` does not
 // bring the name into this module.
 import type { PlanView } from "./plan.js";
+// The same arrangement for 7.7's OTHER rendered value, and for the same reason:
+// csvMappingViewSchema at the foot of this file is held against this type by
+// the compiler rather than by whoever edits one of the two.
+import type { CsvMappingView } from "./import-mapping.js";
 
 export const userSchema = z.object({
   id: z.uuid(),
@@ -3283,3 +3287,119 @@ export const restoreOutcomeSchema = z.object({
   message: z.string(),
 });
 export type RestoreOutcome = z.infer<typeof restoreOutcomeSchema>;
+
+/**
+ * PHASE 7.7'S LAST TWO ARTEFACTS: what the two importers answer with.
+ *
+ * PARSED FOR THE REASON restoreInspectionSchema IS PARSED, WITH THE DANGER
+ * POINTING THE OTHER WAY. A restore preview is parsed because a malformed plan
+ * would render as "nothing will be destroyed" beside a button that destroys
+ * everything. An import preview is parsed because a malformed plan would render
+ * as "nothing will be created" beside a button that creates -- and, more to the
+ * point on this pipeline, because the MAPPING VIEW is what the one interactive
+ * control in the whole spine is built out of. A `targets` array that arrived as
+ * `undefined` would be a picker with no options and no explanation, which is
+ * the disabled-for-an-invisible-reason failure this page exists not to ship.
+ */
+export const csvImportFieldSchema = z.enum([
+  "company.name", "company.domain", "company.website", "company.phone",
+  "company.address", "company.industry",
+  "contact.first_name", "contact.last_name", "contact.email", "contact.phone",
+  "contact.job_title", "contact.salutation", "contact.pronouns", "contact.company_name",
+]);
+
+export const csvImportFieldDefSchema = z.object({
+  field: csvImportFieldSchema,
+  entity: z.enum(["company", "contact"]),
+  label: z.string(),
+  required: z.boolean(),
+  repeatable: z.boolean(),
+  hint: z.string(),
+}).readonly();
+
+export const csvColumnViewSchema = z.object({
+  index: z.number().int().nonnegative(),
+  header: z.string(),
+  samples: z.array(z.string()).readonly(),
+  filled: z.number().int().nonnegative(),
+  suggestion: csvImportFieldSchema.nullable(),
+}).readonly();
+
+export const csvDialectViewSchema = z.object({
+  delimiter: z.string(),
+  delimiterName: z.string(),
+  sniffed: z.boolean(),
+}).readonly();
+
+export const csvMappingViewSchema = z.object({
+  source: planSourceViewSchema,
+  dialect: csvDialectViewSchema,
+  columns: z.array(csvColumnViewSchema).readonly(),
+  targets: z.array(csvImportFieldDefSchema).readonly(),
+  sampled: z.number().int().nonnegative(),
+  findings: z.array(planFindingViewSchema).readonly(),
+  refusal: planRefusalViewSchema.nullable(),
+}).readonly();
+
+/**
+ * THE INSTRUMENT THAT KEEPS THE SCHEMA ABOVE AND import-mapping.ts's TYPES FROM
+ * DRIFTING, on planViewSchemaAgreesWithPlanView's exact precedent and for the
+ * exact reason -- including that the two directions are two constants rather
+ * than one tuple, so a failure names which way the drift went.
+ *
+ * MEASURED RATHER THAN ASSUMED, the same way its sibling was. Relaxing
+ * `suggestion` to z.string().nullable() fails the first line and not the
+ * second; adding a field to this schema alone fails the second and not the
+ * first; deleting `targets` from the schema fails the first.
+ */
+type ParsedIsUsableAsCsvMappingView =
+  z.infer<typeof csvMappingViewSchema> extends CsvMappingView ? true : false;
+type CsvMappingViewIsUsableAsParsed =
+  CsvMappingView extends z.infer<typeof csvMappingViewSchema> ? true : false;
+const parsedMappingIsUsableAsAMappingView: ParsedIsUsableAsCsvMappingView = true;
+const aMappingViewIsUsableAsAParsedMapping: CsvMappingViewIsUsableAsParsed = true;
+export const CSV_MAPPING_VIEW_SCHEMA_AGREES =
+  parsedMappingIsUsableAsAMappingView && aMappingViewIsUsableAsAParsedMapping;
+
+/** POST /api/import/csv/inspect's answer: what is in this file? */
+export const csvInspectionSchema = z.object({ mapping: csvMappingViewSchema });
+export type CsvInspection = z.infer<typeof csvInspectionSchema>;
+
+/**
+ * What both importers' preview routes answer with.
+ *
+ * NO `installName` BESIDE IT, and the absence is the point rather than an
+ * omission. A restore is confirmed by typing the name of the database it
+ * destroys; an import destroys nothing, so there is nothing to confirm by
+ * name and a field asking for one would be teaching the reflex that the
+ * restore's field depends on being unusual.
+ */
+export const importInspectionSchema = z.object({ plan: planViewSchema });
+export type ImportInspection = z.infer<typeof importInspectionSchema>;
+
+/**
+ * What an apply answers when the rows are in.
+ *
+ * `imported: true` IS A LITERAL, on restoreOutcomeSchema's precedent: every
+ * failure body carries `imported: false` and arrives as a non-2xx, so a 200
+ * saying otherwise is a contract this client does not understand and the honest
+ * response is a shape error rather than a success banner.
+ *
+ * THERE IS NO `unrealised` HERE AND ITS ABSENCE IS A FACT ABOUT IMPORTS RATHER
+ * THAN AN OMISSION. A restore needs that field because its destroy step is a
+ * PREPARATION -- it satisfies its accounting before anything is destroyed, so
+ * `dispatched` and `realised` can differ and the difference is the only honest
+ * answer to "did the destruction happen". Neither importer has a preparatory
+ * effect: every effect does its own work, services/intake-plan.ts refuses a
+ * plan whose preparation has no consumer, and a failure answers a non-2xx and
+ * never reaches this shape at all. The field would be `[]` on every response
+ * this schema can ever parse.
+ */
+export const importOutcomeSchema = z.object({
+  imported: z.literal(true),
+  dispatched: z.number().int().nonnegative(),
+  realised: z.number().int().nonnegative(),
+  spent: z.number().int().nonnegative(),
+  message: z.string(),
+});
+export type ImportOutcome = z.infer<typeof importOutcomeSchema>;

@@ -226,11 +226,17 @@ import type { IntakeFile, StagedMemberRef, StagedPayload } from "./intake.js";
 // APPEAR ON A RECORD'S TIMELINE, THAT IS A MIGRATION AND IT IS CHRIS'S TO ASK
 // FOR -- this task stops here rather than writing one.
 //
-// NO OWNER. `owner_user_id` is a Conduit user's uuid and no foreign file has
-// one, so every row arrives unowned and a finding says so. Letting the operator
+// NO OWNER COLUMN, AND SINCE 7.7'S ROUTES TASK, AN OWNER. `owner_user_id` is a
+// Conduit user's uuid and no foreign file has one, so it cannot be a column --
+// which is what the paragraph here used to say, ending "letting the operator
 // pick an owner for the whole import is a good affordance and it is a MAPPING
 // CONTROL rather than a column, so it belongs to the routes task; nothing here
-// forecloses it.
+// forecloses it". The routes task took that up: @conduit/shared's
+// CsvMapping.owner carries one id for the whole import, routes/import.ts proves
+// it names a user before this module reads a byte, ResolvedCsvMapping FREEZES
+// it onto the effect, and writeBatch is the only place it is applied. An import
+// that does not use it still creates unowned rows, which is the default because
+// it is the answer that cannot be wrong.
 //
 // NO WRITE GATE AND NO SAFETY BACKUP. Both belong to restore, on the spec's own
 // rule: an import that goes wrong adds rows an operator can archive.
@@ -299,7 +305,10 @@ export const CSV_IMPORT_FINDINGS = {
   noKey: "no-duplicate-key",
   /** Contacts whose company name matched nothing, or matched more than one. */
   companyUnlinked: "company-unlinked",
-  /** Every imported row arrives with no owner. */
+  /**
+   * Who the imported rows belong to: the owner chosen at the mapping step, or
+   * nobody. ONE CODE FOR BOTH ANSWERS, so the preview always says which.
+   */
   ownerUnknown: "owner-unknown",
 } as const;
 
@@ -733,6 +742,23 @@ export interface ResolvedCsvMapping {
   readonly delimiter: string;
   /** field -> the column indexes mapped to it, ascending. */
   readonly columns: readonly (readonly [CsvImportField, readonly number[]])[];
+  /**
+   * The Conduit user every row created by this effect is owned by, or null.
+   *
+   * FROZEN ONTO THE EFFECT AT PLAN TIME, on `companyByName`'s argument exactly:
+   * the operator read a preview that said who these rows would belong to, and
+   * re-reading the request at apply would let that change after they agreed to
+   * it. It is one uuid rather than a per-row value because it is a decision
+   * about the import and not a column -- see @conduit/shared's CsvMapping.owner.
+   *
+   * NOT VALIDATED HERE. routes/import.ts proves the id names a user before it
+   * calls this, which is earlier and cheaper than a refusal plan. What happens
+   * if a caller drives this module directly with an id that names nobody is an
+   * INSERT that violates the foreign key, inside the one transaction, which
+   * rolls the whole import back -- an honest failure rather than a wrong row,
+   * and it is written down rather than left to be discovered.
+   */
+  readonly owner: string | null;
 }
 
 interface CsvEffectBase extends PlannedEffect {
@@ -800,6 +826,16 @@ export interface PlanCsvImportOptions {
   db: Database;
   /** What the operator decided at the mapping step. */
   mapping: CsvMapping;
+  /**
+   * The user every imported row is owned by, ALREADY PROVED TO EXIST, or null.
+   *
+   * TWO FIELDS RATHER THAN AN ID, and the label is what makes the finding worth
+   * reading: "every row is assigned to sam" is a sentence an operator checks,
+   * and "every row is assigned to 0f3c..." is one they scroll past. The caller
+   * has the username in hand because it had to look the row up to validate the
+   * id at all, so this costs nothing and is not a second query.
+   */
+  owner?: { readonly id: string; readonly label: string } | null;
   now?: Date;
 }
 
@@ -819,7 +855,7 @@ export interface PlanCsvImportOptions {
  * able to answer "is this a repeat of an earlier row?" at all.
  */
 export async function planCsvImport(options: PlanCsvImportOptions): Promise<CsvImportPlan> {
-  const { file, payload, db, mapping, now = new Date() } = options;
+  const { file, payload, db, mapping, owner = null, now = new Date() } = options;
   const findings: PlanFindingView[] = [];
   const member = payload.members[0];
 
@@ -868,7 +904,7 @@ export async function planCsvImport(options: PlanCsvImportOptions): Promise<CsvI
   // here would import the wrong kind of row.
   if (entity === null) throw new Error("a mapping with no single entity passed csvMappingProblem");
 
-  const resolved = resolveMapping(mapping, entity, delimiter);
+  const resolved = resolveMapping(mapping, entity, delimiter, owner?.id ?? null);
   findings.push({
     severity: "note",
     code: CSV_IMPORT_FINDINGS.dialect,
@@ -944,12 +980,27 @@ export async function planCsvImport(options: PlanCsvImportOptions): Promise<CsvI
     });
   }
   if (scan.willInsert > 0) {
-    findings.push({
-      severity: "note",
-      code: CSV_IMPORT_FINDINGS.ownerUnknown,
-      message: "imported rows arrive with no owner. A spreadsheet has no Conduit user in it, so "
-        + "nothing here can be assigned on the operator's behalf.",
-    });
+    // THE FINDING SAYS WHAT WILL BE TRUE OF THE ROWS, WHICHEVER WAY IT WENT.
+    // Emitting it only for the unowned case was the first version and it was
+    // wrong in the direction that matters: an operator who picked the wrong
+    // name in the picker would have had NOTHING in the preview to check it
+    // against, and "no owner" is exactly the state they were trying to avoid.
+    // One code, two sentences, and the preview always answers the question.
+    findings.push(owner === null
+      ? {
+        severity: "note",
+        code: CSV_IMPORT_FINDINGS.ownerUnknown,
+        message: "imported rows arrive with no owner. A spreadsheet has no Conduit user in "
+          + "it, so nothing in the file can say who these belong to -- choose an owner at "
+          + "the mapping step if they should all belong to somebody.",
+      }
+      : {
+        severity: "note",
+        code: CSV_IMPORT_FINDINGS.ownerUnknown,
+        message: `every row created by this import is owned by ${owner.label}. That is the `
+          + "one owner chosen at the mapping step, not anything read out of the file: a "
+          + "spreadsheet has no Conduit user in it.",
+      });
   }
 
   if (scan.willInsert === 0) {
@@ -1086,7 +1137,9 @@ async function insertRows(
   let inserted = 0;
   const flush = async (): Promise<void> => {
     if (batch.length === 0) return;
-    inserted += await writeBatch(ctx.carrier.tx, effect.op, batch.splice(0, batch.length));
+    inserted += await writeBatch(
+      ctx.carrier.tx, effect.op, batch.splice(0, batch.length), effect.mapping.owner,
+    );
   };
 
   await streamRows({
@@ -1115,15 +1168,27 @@ async function insertRows(
 
 /** One batch of rows, written. Returns how many landed. */
 async function writeBatch(
-  tx: Database, op: CsvImportEffect["op"], rows: readonly BuiltRow[],
+  tx: Database, op: CsvImportEffect["op"], rows: readonly BuiltRow[], owner: string | null,
 ): Promise<number> {
+  // THE OWNER IS APPLIED HERE AND NOT IN buildRow, and that is the whole reason
+  // adding it cost one argument rather than a second pass over decision 1.
+  // buildRow's subject is "what does this ROW say", and the owner is the same
+  // for every row in the import -- it came from the mapping step and not from
+  // any cell. Threading it through buildRow would have made a per-row function
+  // depend on a value no row can carry, and would have put the plan's frozen
+  // answer inside the function that has to give the SAME answer at plan time
+  // and at apply time over the same bytes.
   if (op === "insert-csv-companies") {
-    const values = rows.map((row) => row.company).filter((row) => row !== null);
+    const values = rows
+      .map((row) => (row.company === null ? null : { ...row.company, ownerUserId: owner }))
+      .filter((row) => row !== null);
     if (values.length === 0) return 0;
     return (await tx.insert(companies).values(values).returning({ id: companies.id })).length;
   }
   const values = rows
-    .map((row) => (row.contact === null ? null : { ...row.contact, companyId: row.companyId }))
+    .map((row) => (row.contact === null
+      ? null
+      : { ...row.contact, companyId: row.companyId, ownerUserId: owner }))
     .filter((row) => row !== null);
   if (values.length === 0) return 0;
   return (await tx.insert(contacts).values(values).returning({ id: contacts.id })).length;
@@ -1640,7 +1705,7 @@ function describeKey(entity: CsvImportEntity, key: string): string {
 
 /** Turn a mapping into the form buildRow reads, with the columns in file order. */
 function resolveMapping(
-  mapping: CsvMapping, entity: CsvImportEntity, delimiter: string,
+  mapping: CsvMapping, entity: CsvImportEntity, delimiter: string, owner: string | null,
 ): ResolvedCsvMapping {
   const byField = new Map<CsvImportField, number[]>();
   for (const entry of [...mapping.entries].sort((a, b) => a.column - b.column)) {
@@ -1655,6 +1720,7 @@ function resolveMapping(
       ([field, at]) => Object.freeze([field, Object.freeze([...at])]) as
         readonly [CsvImportField, readonly number[]],
     )),
+    owner,
   });
 }
 

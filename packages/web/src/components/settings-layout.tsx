@@ -58,8 +58,33 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
         scroll-padding did not, and neither did anything the browser could do on
         its own.
         `pr-1` is already in the stylesheet, so this adds no rule to it.
+
+        `scroll-pr-1` ARRIVED IN 7.7'S ROUTES TASK, AND IT IS THE DIRECTIVE THAT
+        ACTUALLY MOVES THIS ONE -- which means the sentence above about
+        scroll-padding is no longer true and is corrected here rather than left
+        standing. The label grew again when the two importers landed on the page
+        behind it ("Export, backup and restore" -> "Export, import, backup and
+        restore"), and e2e/documents.spec.ts's `toBeInViewport({ ratio: 1 })`
+        went red at a ratio of 0.9998771548271179: about three HUNDREDTHS of a
+        pixel of the tab clipped by the nav's own right edge.
+
+        MEASURED, at 390px with this label, by driving the real page and reading
+        an IntersectionObserver: padding-right at 0px, 4px, 8px and 16px all
+        produce the IDENTICAL 0.99988 and the identical scrollLeft of 240,
+        against a maximum of 248. scroll-padding-right at 1px or 4px produces
+        exactly 1. So trailing padding is not what is short here and never could
+        be: the browser scrolls the minimum it thinks is needed, that minimum is
+        240.03125, and it lands on 240. Padding changes how far the row COULD
+        scroll and not how far this call DOES. scroll-padding is the property
+        that changes the target, which is why it is the one that works.
+
+        `pr-1` IS KEPT RATHER THAN REPLACED, deliberately. The 0.9888 the
+        paragraph above records was measured against a shorter label that no
+        longer exists, so this task cannot reproduce the case that class was
+        added for -- and removing a control on the strength of a measurement of
+        a different string is how a fix becomes a regression two phases later.
       */}
-      <nav data-testid="settings-nav" className="flex gap-1 overflow-x-auto border-b border-slate-200 pr-1">
+      <nav data-testid="settings-nav" className="flex gap-1 overflow-x-auto scroll-pr-1 border-b border-slate-200 pr-1">
         <Link to="/settings/mail" className={tabClass} activeProps={{ className: activeTabClass }}>
           Mail accounts
         </Link>
@@ -70,14 +95,24 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
           Organisation
         </Link>
         {/*
-          RENAMED IN 7.7, AND IT IS A PROSE SWEEP RATHER THAN A PREFERENCE. The
-          tab said "Export and backup" while the page behind it gained a third
-          thing that is neither -- and the one 7.7's spec says a person must not
-          reach for by mistake. A label that did not mention it would be the
-          navigation quietly disagreeing with the page.
+          RENAMED IN 7.7, TWICE, AND IT IS A PROSE SWEEP RATHER THAN A
+          PREFERENCE. The tab said "Export and backup" while the page behind it
+          gained a third thing that is neither -- and the one 7.7's spec says a
+          person must not reach for by mistake. The routes task then put two
+          IMPORTERS on the same page, and the same rule applies again in the
+          same direction: a label that did not mention them would send somebody
+          looking for "put a spreadsheet in" to a tab that names only the way
+          out and the way back. A label that did not mention a thing on the page
+          would be the navigation quietly disagreeing with it.
+          IT IS THE LONGEST LABEL IN THIS ROW AND THAT IS PAID FOR RATHER THAN
+          ignored: the row already overflows at a phone width, so e2e/data.spec.ts
+          holds this tab to the 44px touch floor and to being WHOLLY in the
+          viewport once scrolled to, and e2e/documents.spec.ts holds every tab
+          to the same. Making it longer moves it further off the end of the row,
+          not off the assertions.
         */}
         <Link to="/settings/data" className={tabClass} activeProps={{ className: activeTabClass }}>
-          Export, backup and restore
+          Export, import, backup and restore
         </Link>
       </nav>
       {children}

@@ -23,6 +23,7 @@ import { registerExportRoutes } from "./export.js";
 import { registerBackupRoutes } from "./backup.js";
 import { registerReauthRoutes } from "./reauth.js";
 import { registerRestoreRoutes } from "./restore.js";
+import { registerImportRoutes } from "./import.js";
 import type { ReauthTickets, ReauthThrottle, ReauthVerifier } from "../services/reauth.js";
 import type { IntakeSessionStore } from "../services/intake-plan.js";
 import type { WriteGate } from "../services/write-gate.js";
@@ -137,6 +138,13 @@ export interface CrmRouteDeps {
    */
   restoreMaxUploadBytes?: number;
   /**
+   * Test-only override for the import uploads' size cap, so a 413-path test can
+   * upload a few KB rather than 8GiB. Defaults to DEFAULT_MAX_UPLOAD_BYTES.
+   * Same precedent, and the same warning, as multipartFileSizeLimit and
+   * restoreMaxUploadBytes above: never set outside a test.
+   */
+  importMaxUploadBytes?: number;
+  /**
    * Test-only override for how long a restore waits for in-flight writes to
    * finish before refusing to start. Defaults to
    * DEFAULT_DRAIN_TIMEOUT_MS. Exists so the timeout path can be proved without
@@ -151,7 +159,8 @@ export interface CrmRouteDeps {
  * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5),
  * documents plus the issuer profile (Phase 7), the data export, the encrypted
  * backup, its pre-flight and the re-authentication that gates both downloads
- * (Phase 7.6), and the restore's upload/preview/apply family (Phase 7.7).
+ * (Phase 7.6), and the restore's upload/preview/apply family and the two
+ * importers' (Phase 7.7).
  *
  * THIS LIST IS EXHAUSTIVE BY CONSTRUCTION -- it is the register calls below,
  * in words -- so a family added without a line here is a list that has started
@@ -191,4 +200,5 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerBackupRoutes(app, deps);
   registerReauthRoutes(app, deps);
   registerRestoreRoutes(app, deps);
+  registerImportRoutes(app, deps);
 }

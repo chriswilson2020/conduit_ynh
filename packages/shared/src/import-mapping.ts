@@ -100,8 +100,13 @@ export interface CsvImportFieldDef {
  * pipeline, a stage or a fractional position, and NONE of those is a thing a
  * spreadsheet from another CRM can supply -- see services/import-csv.ts.
  *
- * `owner_user_id` IS ABSENT ON PURPOSE. It is a uuid of a Conduit user, and no
- * foreign file has one. Imported rows arrive unowned and the plan says so.
+ * `owner_user_id` IS ABSENT FROM THIS LIST ON PURPOSE, AND IS NOT ABSENT FROM
+ * THE MAPPING STEP. It is a uuid of a Conduit user and no foreign file has one,
+ * so it cannot be a COLUMN; it is a decision about the whole import instead --
+ * see CsvMapping.owner, which routes/import.ts added in 7.7's routes task on
+ * services/import-csv.ts's own reading that this is "a MAPPING CONTROL rather
+ * than a column". An import that does not use it creates unowned rows and the
+ * plan says so.
  */
 export const CSV_IMPORT_FIELDS: readonly CsvImportFieldDef[] = [
   {
@@ -300,6 +305,31 @@ export interface CsvMapping {
    * ITS OWN. Absent means "use what was sniffed".
    */
   readonly delimiter?: string;
+  /**
+   * The Conduit user every imported row is owned by, or absent for none.
+   *
+   * A MAPPING CONTROL AND NOT A COLUMN, which is services/import-csv.ts's own
+   * word for it: `owner_user_id` is a uuid of a Conduit user and NO FOREIGN
+   * FILE HAS ONE, so it cannot be a column of the file and it can be a decision
+   * about the whole import. It lives on this type rather than beside it for the
+   * reason `delimiter` does -- both are things the operator decided at the
+   * mapping step that are not "this column is that field", and a request that
+   * carried them separately would be two halves of one decision travelling
+   * apart.
+   *
+   * csvMappingProblem DOES NOT VALIDATE IT, deliberately, and the omission is
+   * the same one `delimiter` gets: this function's whole subject is whether the
+   * COLUMNS can be used, it is pure, and whether a uuid names a user is a
+   * question only the database can answer. routes/import.ts checks it against
+   * `users` before it reads a byte of the file, which is both cheaper than a
+   * refusal plan and earlier than one.
+   *
+   * ABSENT MEANS UNOWNED, which is what every row imported before this control
+   * existed got. It is the default because it is the answer that cannot be
+   * wrong: an operator who did not choose has not said that these four thousand
+   * contacts are Sam's.
+   */
+  readonly owner?: string;
 }
 
 /**

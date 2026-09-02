@@ -4,12 +4,15 @@ import {
   bulkThreadResultSchema,
   companySchema,
   contactSchema,
+  csvInspectionSchema,
   dealSchema,
   documentSchema,
   documentTemplateSchema,
   eventSchema,
   fileMetaSchema,
   funnelRowSchema,
+  importInspectionSchema,
+  importOutcomeSchema,
   ganttPayloadSchema,
   listResponseSchema,
   mailAccountFolderSchema,
@@ -45,6 +48,7 @@ import {
   type Company,
   type Contact,
   type CreateCompanyInput,
+  type CsvMapping,
   type CreateContactInput,
   type CreateDealInput,
   type CreateNoteInput,
@@ -1969,7 +1973,7 @@ export function useSaveDocumentTemplate() {
 /**
  * PHASE 7.6: THE TWO DOWNLOADS, AND THE GATE IN FRONT OF THEM.
  *
- * Read Settings -> Export, backup and restore (pages/settings-data.tsx)
+ * Read Settings -> Export, import, backup and restore (pages/settings-data.tsx)
  * alongside these.
  * The shape is unusual for this file and the reason is worth stating: nothing
  * here caches, and nothing here belongs in a query cache. A ticket is
@@ -2065,7 +2069,7 @@ export function useDownloadBackup() {
 /**
  * PHASE 7.7: THE RESTORE, AND WHY NOT ONE OF THESE IS A MUTATION EITHER.
  *
- * Read Settings -> Export, backup and restore (pages/settings-data.tsx)
+ * Read Settings -> Export, import, backup and restore (pages/settings-data.tsx)
  * alongside these. The argument requestReauthTicket's own comment makes applies
  * to all three and applies harder: TanStack Query v5 keeps a mutation's
  * `variables` in the shared queryClient's mutation cache after it settles,
@@ -2140,4 +2144,117 @@ export async function applyRestore(
  */
 export async function cancelRestore(planId: string): Promise<void> {
   await deleteRequest(`/restore/${planId}`);
+}
+
+/**
+ * PHASE 7.7'S OTHER HALF: THE TWO IMPORTERS, AND WHY THESE ARE PLAIN FUNCTIONS
+ * TOO.
+ *
+ * Read Settings -> Export, import, backup and restore
+ * (pages/settings-data.tsx and pages/settings-import.tsx) alongside these. The
+ * argument the restore's block above makes is thinner here -- there is no
+ * passphrase in any of these bodies -- but two of its three reasons survive
+ * whole. TanStack Query keeps a mutation's `variables` in the shared cache
+ * after it settles, and for these the variables are a File handle to somebody's
+ * entire contact list. And there is no retry that would be safe: an apply that
+ * a refetch-on-focus repeated would be a second import of the same file, which
+ * is exactly the duplicate the engines refuse to create by hand.
+ *
+ * NO TICKET ON ANY OF THEM, and routes/import.ts argues that at length rather
+ * than leaving it to be noticed. An import neither exfiltrates nor destroys; a
+ * fifth gated route would widen what one fungible ticket authorises; and three
+ * password prompts to load a spreadsheet teaches the reflex the gate exists to
+ * defeat.
+ */
+
+/**
+ * Upload a Conduit export and get back what importing it WOULD create.
+ *
+ * THE ARCHIVE IS UNPACKED ONTO THE SERVER'S DISK for the life of the plan,
+ * which is why cancelImport exists and why the page offers it. It carries no
+ * credentials -- services/export.ts writes none -- so this is the operator's
+ * own data rather than a credential store; the handling is identical either
+ * way, because receiveIntake is the only way in.
+ */
+export async function inspectExportImport(input: { file: File }) {
+  const form = new FormData();
+  form.append("file", input.file);
+  return parseWith(
+    importInspectionSchema, await postForm("/import/export/inspect", form), "import preview",
+  );
+}
+
+/**
+ * READ THE COLUMNS OF A FOREIGN FILE. The one interactive step in the spine.
+ *
+ * NOTHING IS HELD BY THIS CALL -- routes/import.ts's decision 2 -- so there is
+ * no id in the answer and nothing to cancel. What comes back identifies the
+ * upload to a PERSON ("contacts.csv, 1.2 MB") and carries the digest the next
+ * call has to quote.
+ */
+export async function inspectCsvImport(input: { file: File; delimiter?: string }) {
+  const form = new FormData();
+  // THE FIELD BEFORE THE FILE, and it is a contract rather than a style:
+  // Fastify's multipart parser is streaming, so a field declared after the file
+  // part has not been seen when the route's `request.file()` resolves. FormData
+  // preserves insertion order and fetch serialises it in that order, so this
+  // ordering is load-bearing and must not be rearranged.
+  if (input.delimiter !== undefined) form.append("delimiter", input.delimiter);
+  form.append("file", input.file);
+  return parseWith(
+    csvInspectionSchema, await postForm("/import/csv/inspect", form), "column mapping",
+  );
+}
+
+/**
+ * THE SAME FILE AGAIN, WITH WHAT THE OPERATOR DECIDED ABOUT ITS COLUMNS.
+ *
+ * SENT TWICE ON PURPOSE. routes/import.ts's decision 2 carries the argument:
+ * the mapping step holds nothing on the server, so a person can read a column
+ * list for as long as they like without occupying the one intake slot the whole
+ * install shares. The cost is one more upload of a file the browser still has.
+ *
+ * `sha256` IS THE SERVER'S OWN DIGEST OF THE BYTES THE COLUMNS WERE READ FROM,
+ * echoed back untouched. A mapping is a list of column POSITIONS, so applying
+ * one to a different file with the same number of columns would import every
+ * value into the wrong field with a preview that read perfectly. The page never
+ * computes this; it quotes what the mapping step reported.
+ */
+export async function planCsvImport(
+  input: { file: File; mapping: CsvMapping; sha256: string },
+) {
+  const form = new FormData();
+  form.append("mapping", JSON.stringify(input.mapping));
+  form.append("sha256", input.sha256);
+  form.append("file", input.file);
+  return parseWith(
+    importInspectionSchema, await postForm("/import/csv/plan", form), "import preview",
+  );
+}
+
+/**
+ * Add the rows the preview described.
+ *
+ * `planId` IS THE ONLY DESCRIPTION OF THE WORK THAT TRAVELS, and the route's
+ * body schema is strict so a client that tried to send more is told rather than
+ * quietly stripped. The plan is held on the server; what apply consumes is the
+ * object the operator read.
+ */
+export async function applyImport(input: { planId: string; kind: "export" | "csv" }) {
+  return parseWith(
+    importOutcomeSchema,
+    await postJson<unknown>(`/import/${input.kind}/apply`, { planId: input.planId }),
+    "import outcome",
+  );
+}
+
+/**
+ * Throw the preview away, and with it the staged upload on the server.
+ *
+ * ONE ROUTE FOR BOTH IMPORTERS, because a delete takes no description of any
+ * work and the store does not care which pipeline filled it. It is bound to its
+ * owner, so it is not a way to cancel somebody else's import.
+ */
+export async function cancelImport(planId: string): Promise<void> {
+  await deleteRequest(`/import/${planId}`);
 }
