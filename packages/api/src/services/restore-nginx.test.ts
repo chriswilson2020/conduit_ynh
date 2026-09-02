@@ -159,8 +159,30 @@ describe("conf/nginx.conf's restore preview location", () => {
     const block = directives(locationBody(conf, INSPECT));
     expect(block).toContain("proxy_request_buffering off;");
     // An unbuffered body that arrives chunked cannot be forwarded over the
-    // HTTP/1.0 nginx speaks upstream by default.
-    expect(block).toContain("proxy_http_version 1.1;");
+    // HTTP/1.0 nginx speaks upstream by default, so proxy_http_version 1.1 is
+    // required here -- and the include above is what supplies it. See the next
+    // test for why this block must not say so a second time.
+    expect(block).toContain("include proxy_params_with_auth;");
+  });
+
+  it("DOES NOT RESTATE proxy_http_version, which nginx rejects as a duplicate", () => {
+    // THE INCLUDE ALREADY SETS IT. proxy_params_with_auth carries
+    // `proxy_http_version 1.1;` at line 12 of YunoHost's own template, and an
+    // include is inlined where it appears -- so a second one at this level is
+    // "proxy_http_version directive is duplicate" and nginx refuses to load the
+    // WHOLE configuration. That is not this route failing; that is every site
+    // on the box failing, at the next reload or reboot.
+    //
+    // THIS ASSERTION EXISTS BECAUSE ITS OPPOSITE PASSED. Until v1.4.0 the test
+    // above asserted the PRESENCE of `proxy_http_version 1.1;` in this block,
+    // and it passed -- against the string. The same file, rendered the way
+    // ynh_config_add_nginx renders it and handed to `nginx -t` on the deploy
+    // target, was rejected with [emerg]. A guard that reads source can only
+    // check what somebody thought to ask it, so the ask was wrong, not the
+    // guard; nothing here can replace running the parser, and the release
+    // procedure now does.
+    const block = directives(locationBody(conf, INSPECT));
+    expect(block).not.toContain("proxy_http_version");
   });
 
   it("waits for the unpack, which happens after the last byte arrives", () => {
