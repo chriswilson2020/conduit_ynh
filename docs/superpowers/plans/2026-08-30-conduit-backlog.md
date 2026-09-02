@@ -7,17 +7,15 @@ Everything here has evidence attached — a file and line, a measurement, or the
 found it. Items without evidence are marked as judgement rather than fact. Where one item
 blocks another, that is stated rather than left to be rediscovered.
 
-Current shipped version: **v1.3.0**. **In flight: Phase 7.7 -- restore and BOTH importers are
-now built** (shared spine, engine, backup inventory, route guards, Settings page; the exact
-importer for Conduit's own export; the forgiving one for a foreign CSV). **What remains is the
-HTTP surface and the page for the two importers** -- neither has a route, which is stated in
-each module's own header rather than left to be discovered. **v1.4.1 is planned and waiting
-behind it**, in `docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`, holding what
-7.7 surfaced and deliberately did not fix -- Chris asked for it as a point release straight
-after v1.4.0.
+Current shipped version: **v1.4.0**, released 2 Sep. **Nothing is in flight.** **Next is
+v1.4.1**, in `docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`, holding what 7.7
+surfaced and deliberately did not fix -- Chris asked for it as a point release straight after
+v1.4.0, and it is now the thing to start.
 
-**v1.3.0 changes behaviour on a path Chris uses without thinking, and that is the first thing
-in its notes rather than a footnote: both downloads now ask for the password again.**
+**v1.4.0 is the release that makes v1.3.0's backups worth having: a backup can be put back.**
+That is the first line of its notes rather than a footnote. The second is what it costs -- a
+restore replaces everything, and its safety backup is locked with the passphrase of the
+archive being restored, which has no recovery path.
 
 ---
 
@@ -29,10 +27,92 @@ in its notes rather than a footnote: both downloads now ask for the password aga
 | ~~**v1.2.1**~~ | The reply signature, the Mail tab composing to nobody, the GIF undercharge Chris moved in, and the first deliberate sweep for assertions that cannot fail | **SHIPPED 31 Aug** |
 | ~~**v1.2.2**~~ | The MAIL template feature removed, table included (the QUOTE template stayed); the five lists given the loading branch their siblings have; and the Dovecot IDLE burst diagnosed -- **the answer was NO**, so nothing was reordered. **Ships `0012`, a `DROP TABLE`** | **SHIPPED 31 Aug** |
 | ~~**7.6 → v1.3.0**~~ | Export (plain ZIP, readable, not restorable) and backup (AES-256 `.7z`, exact, not readable), told apart on a Settings page, **both behind a password re-prompt**. No schema change | **SHIPPED 31 Aug** |
-| **7.7 → v1.4.0** | Restore and import | **IN FLIGHT.** Restore is built and reviewed -- four adversarial rounds, three of which found a path to a silent half-restore. Both importers are now built as services; **neither has a route or a page yet**, and that is the remaining work |
-| **v1.4.1** | Six hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, and two decisions for Chris | **PLANNED**, straight after v1.4.0 |
+| ~~**7.7 → v1.4.0**~~ | Restore (preview, safety backup, apply) and two importers -- the exact one reading Conduit's own export, the forgiving one reading a foreign CSV. **Seven nginx location blocks, one of which did not parse until the release checked it.** No schema change | **SHIPPED 2 Sep** |
+| **v1.4.1** | Now seven hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, **the `lower()`/`toLowerCase()` collation gap**, and the decisions for Chris | **NEXT**, straight after v1.4.0 |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
 | **Phase 4.4** | Mail filing power tools: per-message selection, arbitrary folder moves, folder management, bulk unhide, live inbox beyond page one | Unspecced. Overlaps "emailing a quote" below |
+
+---
+
+## 7.7 -> v1.4.0 -- SHIPPED 2 Sep. Retired here, and what the release itself found
+
+Tag `v1.4.0` at `61c0f9d`. Release run `33642741974`; asset
+`conduit-1.4.0.tar.gz`, 1,427,025 bytes, digest
+`57bf5eab639ecc41b41c3ed40b83310df694fcb3b13a78c324220224a2988e20`, verified twice and both
+checks shown failing first. Manifest pointed at it in `2793a02`. CI `33641670816` on the
+bumped branch: **3353 passed, 1 skipped (3354), 91 test files, 206 e2e. Attempt 1, both jobs,
+no `flaky` line anywhere.** **Neither the Dovecot IDLE burst nor the dnd-kit keyboard drag
+fired**, said explicitly because a retry would have been.
+
+**No schema change.** The last is still v1.2.2's `0012`.
+
+**7.7 HAS A SPEC AND NO PLAN FILE**, unlike every phase before it --
+`docs/superpowers/specs/2026-09-01-conduit-phase-7.7-restore-import-design.md` is the design
+authority, the module headers carry the as-built record, and **this section is the closing
+summary rather than a pointer to per-task DONE blocks that do not exist.**
+
+**Stylesheet, from inside the published tarball:** `index-umayxJSb.css`, the only css in the
+archive, **35,632 bytes**, sha256 `06e01af3...837b`.
+
+**THE RULE COUNT, WITH ITS DEFINITION, because the two spellings differ by a constant and
+neither is wrong.** Counting every block whose prelude is a selector rather than an at-rule,
+at any nesting depth: **482**. Counting that plus the file's **49 `@property` blocks**:
+**531**. The gap between the two definitions is exactly those 49, which is why 519 -> 531 and
+470 -> 482 are the same change (+12) described twice. Quote either, but say which.
+
+### THE RELEASE'S OWN CHECK FOUND A DEFECT, AND IT WAS THE ONE THAT BREAKS A SITE
+
+**`conf/nginx.conf` did not parse.** Rendered the way `ynh_config_add_nginx` renders it and
+handed to `nginx -t` on the deploy target -- which nothing in this project had ever done --
+both install shapes were rejected:
+
+```
+[emerg] "proxy_http_version" directive is duplicate in rendered-root.conf:138
+```
+
+The restore preview block declared `proxy_http_version 1.1;` **and** included
+`proxy_params_with_auth`, which sets it at line 12 of YunoHost's own template. An include is
+inlined where it appears, so the second one is a duplicate at the same level, and nginx
+refuses to load the WHOLE configuration -- every site on the box, at the next reload or
+reboot, with `ynh_config_add_nginx`'s own reload as the first casualty.
+
+**THE GUARD ASSERTED THE PRESENCE OF THE BUG AND PASSED.** `restore-nginx.test.ts` ended its
+buffering test with `expect(block).toContain("proxy_http_version 1.1;")`. It was **not**
+vacuous -- it failed correctly when the line was removed. It was a CORRECT assertion of the
+WRONG PROPERTY, which is a failure mode this project has not catalogued before: the existing
+rule is "an instrument that has never been shown to fail is not yet an instrument", and this
+instrument had been shown to fail. **The rule it needs is different: a guard that reads source
+is standing in for a parser, and the substitution itself has to be tested at least once.**
+Fixed in `2dd1607`; the assertion is now of the directive's ABSENCE, shown red with the
+duplicate put back and green without it, against both vitest and `nginx -t`.
+
+**THE RENDERED CHECK IS NOW PART OF THE RELEASE PROCEDURE**, with what it does and does not
+cover stated: both shapes (`path=/` and `path=/conduit`) render with zero placeholders left,
+all **eight** exact-match location blocks parse, and three negative controls -- a dropped
+brace, an unknown directive, and `9gigabytes` -- each exit non-zero. **It does NOT cover
+collisions with the neighbouring YunoHost locations** in the same server block; those files
+are root-only on the deploy target and could not be read unprivileged.
+
+**AND THE BLOCK COUNT IN THE HANDOFF WAS SEVEN, WHICH IS RIGHT ABOUT THE RELEASE AND WRONG
+ABOUT THE FILE.** 7.7 adds seven exact-match blocks -- the restore preview and apply, and five
+import routes -- to 7.6's one, which is eight. Recorded because the enumeration and the number
+disagreed in the same sentence, and the enumeration was the correct half.
+
+### The dependency surface, measured
+
+A clean `npm ci --omit=dev` into a scratch tree on the dev server installs `yazl` 3.3.1 and
+its transitive `buffer-crc32` 1.0.0, and does **not** install `@types/yazl` -- in a
+`node_modules/@types` that DOES exist and holds three other entries, so the absence is
+`--omit=dev` working rather than the directory never having been created. `p7zip-full` stays
+in `resources.apt` and is now load-bearing on both paths rather than only the backup's.
+
+### The lockfile decoys, which have swapped sides again
+
+Before the bump: **one** `"1.4.0"` (`expect-type`, a vitest dependency sitting on the incoming
+side before the release happened) and **eight** `"1.3.0"`. After it: **four** and **five**
+(four `libbase64` pins and `tinyexec`). Neither count falls to 0, neither rises to 3, and
+**the diff is three lines**, all workspace `version` fields. Third release running where the
+count check would have misled and the diff did not.
 
 ---
 
@@ -792,6 +872,60 @@ a password change does not invalidate outstanding tickets.
 - **Two decisions that are Chris's:** whether a future backup recording `approximate` row
   counts should be refused or degrade to "check not made"; and whether a control character in
   a passphrase should be named by the route rather than mis-explained.
+
+### Added by 7.7's last round, after the list above was written
+
+- **`lower()` IN SQL IS NOT `toLowerCase()` IN JAVASCRIPT, AND ON THE COMPANY KEY THAT IS
+  LIVE.** The forgiving importer's duplicate probe normalises candidate keys in JavaScript and
+  finds stored ones with `lower(...)` in SQL. Measured on the deploy target (PostgreSQL 15.19,
+  en_GB.UTF-8): `SELECT lower(U&'\0130')` returns **one** character, `'\u0130'.toLowerCase()`
+  returns **two** -- an `i` and a combining dot above. So a key holding U+0130 normalises
+  differently on the two sides and the failure is a **missed duplicate**, which is the one
+  outcome the probe exists to prevent. It is also locale-dependent on the SQL side and nothing
+  pins the install's locale. **Out of reach for contacts, live for companies:** a contact's key
+  is an email and `contactEmailSchema` rejects non-ASCII outright, but a company's key is
+  `domain`, which is **free text with no format check at all** -- so a Turkish or Azerbaijani
+  domain reaches it today. Recorded rather than fixed because the fix is a collation decision
+  that belongs with the schema's owner: fold the key in ONE language (probe with a normalised
+  literal instead of `lower(...)`), or state a collation the install must have. Both are wider
+  than an importer. Header in `services/import-csv.ts`.
+- **ROWS CAN ARRIVE ALREADY ARCHIVED AND NO FINDING SAYS HOW MANY.** A crafted export sets
+  `archived_at`, so the preview's count is correct and the lists the operator then looks at are
+  shorter than it. **It is a finding `services/import-export.ts` should emit** and does not.
+  Costs confusion rather than data, which is why it was recorded rather than fixed in flight.
+  Named in `routes/import.ts`'s header.
+- **WHAT AN IMPORT LEAKS IS FOUR THINGS, NOT ONE, AND A REVIEW HAD TO COUNT THEM.** Without
+  writing anything, a caller with a file learns: **existence** ("is this address one of your
+  contacts", "is this domain one of your companies", a thousand at a time, from the duplicate
+  counts and their worked examples); **ambiguity** (the company-name finding distinguishes "no
+  company answers to this name" from "more than one does"); and **membership in `users` twice
+  over** (the exact importer's `ownerUnknown` counts how many of an archive's owner ids this
+  install has, and the route's `import_owner_unknown` answers it for one id directly). **The
+  conclusion survived the recount and the number did not** -- the paragraph had said "the one
+  thing", and a number that is wrong is how the next reader decides the paragraph was not worth
+  checking. Still not a privilege escalation: companies, contacts and users have no visibility
+  scoping at all, so every oracle bottoms out in a list the caller can already fetch in full.
+  **The day Conduit grows a user who may import but may not read, this and the import gate must
+  be reconsidered together.**
+- **THE WRITE QUESTION THE RE-AUTH ARGUMENT NEVER ASKED, added after a review asked it.** The
+  case for leaving the import routes ungated is entirely about DESTROYING and EXFILTRATING --
+  and an import **writes**. Asked properly, the answer is not nothing: the exact importer sets
+  `companies.id`, `contacts.id`, `custom`, `created_at`, `updated_at` and `archived_at` from an
+  archive the caller authored, **none of the six is accepted by either create schema**, and
+  there is no DELETE route for either table. So it is the only write path in the application
+  for those columns and its rows cannot be removed through the API. **It does not change the
+  answer** -- none of the six is a privilege; an id is a uuid, the timestamps are display,
+  `custom` is a jsonb bag no authorisation decision reads, and `archived_at` only hides a row.
+  **It would change the answer for any future column that DID carry privilege**, which is why
+  the question is now written beside the conclusion instead of being absent from it.
+
+**AND ONE ITEM CLOSES RATHER THAN MOVING.** `plannedTotal(plan, "row")` is struck through
+above and in the v1.4.1 plan. **It was never a defect.** The 0 was a restore plan having no
+`row` effects, not the function failing to add them up; the exact importer is the first
+pipeline whose effects carry that unit, and it checked before relying -- four companies and
+two contacts answer `plannedTotal(view, "row") === 6` and `plannedTotal(view, "file") === 0`.
+The assertion lives in `services/import-export.test.ts` rather than in a note, so the next
+pipeline inherits an instrument instead of a claim. Nothing carries into v1.4.1 from it.
 
 ---
 
