@@ -45,11 +45,10 @@ const keyCache = new Map<string, Buffer>();
  * dedicated handling.
  *
  * The returned Buffer is cached and shared across every caller for a given
- * keyPath (see keyCache above) -- treat it as read-only, and note there is no
- * invalidation: if mail.key is replaced on disk after the first successful
- * load (key rotation, or a restore from backup with a different key), this
- * process keeps using the OLD in-memory key until it restarts. Rotating the
- * key is a restart-the-server operation, not a live one.
+ * keyPath (see keyCache above) -- treat it as read-only. The cache is dropped
+ * only by forgetMailKey, which is the one caller that replaces the file
+ * underneath it; for everything else, rotating the key is still a
+ * restart-the-server operation rather than a live one.
  */
 export function loadMailKey(keyPath: string): Buffer {
   const cached = keyCache.get(keyPath);
@@ -69,6 +68,25 @@ export function loadMailKey(keyPath: string): Buffer {
   }
   keyCache.set(keyPath, raw);
   return raw;
+}
+
+/**
+ * Drop the memoised key for `keyPath`, so the next loadMailKey reads the file.
+ *
+ * EXISTS FOR EXACTLY ONE CALLER: services/restore.ts, which replaces the file
+ * on disk. Without it a restored install decrypts with the key it happened to
+ * have loaded before the restore -- so every mail password would fail to
+ * decrypt until somebody restarted the server, and the symptom (an account
+ * that will not connect) points nowhere near the cause.
+ *
+ * IT IS NOT A ROTATION MECHANISM. It repairs THIS process's view of a file
+ * that has already been replaced; it does nothing about the connections, the
+ * caches and the in-flight work that a restore also invalidates, which is why
+ * the restore plan still carries a "restart the server" finding. Idempotent,
+ * and a no-op for a path that was never loaded.
+ */
+export function forgetMailKey(keyPath: string): void {
+  keyCache.delete(keyPath);
 }
 
 /**

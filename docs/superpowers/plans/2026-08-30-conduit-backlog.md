@@ -7,9 +7,14 @@ Everything here has evidence attached — a file and line, a measurement, or the
 found it. Items without evidence are marked as judgement rather than fact. Where one item
 blocks another, that is stated rather than left to be rediscovered.
 
-Current shipped version: **v1.3.0**. In flight: **nothing**; next is **Phase 7.7**, restore
-and import, whose decisions are already recorded in 7.6's spec and which therefore needs a
-plan rather than a spec. All of 7.6 shipped and its record is below.
+Current shipped version: **v1.3.0**. **In flight: Phase 7.7 -- restore and BOTH importers are
+now built** (shared spine, engine, backup inventory, route guards, Settings page; the exact
+importer for Conduit's own export; the forgiving one for a foreign CSV). **What remains is the
+HTTP surface and the page for the two importers** -- neither has a route, which is stated in
+each module's own header rather than left to be discovered. **v1.4.1 is planned and waiting
+behind it**, in `docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`, holding what
+7.7 surfaced and deliberately did not fix -- Chris asked for it as a point release straight
+after v1.4.0.
 
 **v1.3.0 changes behaviour on a path Chris uses without thinking, and that is the first thing
 in its notes rather than a footnote: both downloads now ask for the password again.**
@@ -24,7 +29,8 @@ in its notes rather than a footnote: both downloads now ask for the password aga
 | ~~**v1.2.1**~~ | The reply signature, the Mail tab composing to nobody, the GIF undercharge Chris moved in, and the first deliberate sweep for assertions that cannot fail | **SHIPPED 31 Aug** |
 | ~~**v1.2.2**~~ | The MAIL template feature removed, table included (the QUOTE template stayed); the five lists given the loading branch their siblings have; and the Dovecot IDLE burst diagnosed -- **the answer was NO**, so nothing was reordered. **Ships `0012`, a `DROP TABLE`** | **SHIPPED 31 Aug** |
 | ~~**7.6 → v1.3.0**~~ | Export (plain ZIP, readable, not restorable) and backup (AES-256 `.7z`, exact, not readable), told apart on a Settings page, **both behind a password re-prompt**. No schema change | **SHIPPED 31 Aug** |
-| **7.7** | Restore and import, with its decisions already recorded in 7.6's spec | **NEXT.** Decided and specced-by-reference; needs a plan. Five carry-forward items below, one of which it must not get wrong |
+| **7.7 → v1.4.0** | Restore and import | **IN FLIGHT.** Restore is built and reviewed -- four adversarial rounds, three of which found a path to a silent half-restore. Both importers are now built as services; **neither has a route or a page yet**, and that is the remaining work |
+| **v1.4.1** | Six hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, and two decisions for Chris | **PLANNED**, straight after v1.4.0 |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
 | **Phase 4.4** | Mail filing power tools: per-message selection, arbitrary folder moves, folder management, bulk unhide, live inbox beyond page one | Unspecced. Overlaps "emailing a quote" below |
 
@@ -750,6 +756,162 @@ found by SQL.
   members rather than tables. That asymmetry is the point: the exact half picks up new
   entities for free and the readable half does not, and a timesheet trapped in the app is the
   failure this bullet was always about.
+
+---
+
+## Surfaced during Phase 7.7, scheduled into v1.4.1
+
+Full detail and task shapes in `docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`.
+Listed here so the backlog is the one place to look.
+
+**THE ONE THAT CHANGED MEANING RATHER THAN BEING FOUND: re-auth tickets are fungible across
+every gated route.** A ticket minted to download a backup is a live authorisation to destroy
+the entire database for five minutes. Harmless while both gated operations were downloads;
+restore is what made it matter. Two riders: the 64-ticket ceiling evicts across accounts, and
+a password change does not invalidate outstanding tickets.
+
+- **The mail sync is stopped best-effort while HTTP writes are refused.** `stop()` abandons
+  after 15s and `applyRestore` proceeds. The sync is the writer that moves data with nobody
+  touching a browser -- and Postgres **queues** a write blocked by `DROP SCHEMA` and releases
+  it at COMMIT, so an abandoned sync's write lands *inside* the window rather than racing it.
+- **`scripts/remote.sh` deletes `data/` on every sync**, taking `mail.key`, surfacing as a
+  download that never arrives. Two red runs, two agents, two phases. Its incremental-build
+  claim is also false -- `rsync -a` preserves mtimes, so `tsc -b` re-emits stale declarations.
+- **A third e2e intermittent, now seen twice**: `crm.spec.ts`'s salutation "Other..." journey,
+  `salutation-other` missing after `page.reload()`. The Radix focus-restoration race
+  `ui/input.tsx` documents. **Two distinct undocumented e2e intermittents appeared in four CI
+  runs on this branch**, which is itself the finding.
+- **`DialogDescription` silently drops every prop but `children`** and TypeScript will not
+  catch it -- excess-property checks are skipped for hyphenated JSX attributes.
+- ~~**`plannedTotal(plan, "row")` returns 0 for every restore plan.**~~ **CLOSED by 7.7's exact
+  importer, with no change to the function.** It is the first pipeline whose effects carry the
+  `row` unit, and it checked before relying: six rows across two effects total six.
+  `services/import-export.test.ts` holds the assertion.
+- **One vitest run of four reported `Errors 1 error` with exit 0 and no failing test.** Never
+  reproduced. Recorded rather than explained.
+- **Two decisions that are Chris's:** whether a future backup recording `approximate` row
+  counts should be refused or degrade to "check not made"; and whether a control character in
+  a passphrase should be named by the route rather than mis-explained.
+
+---
+
+## THE EXPORT IS NOT A COMPLETE DESCRIPTION OF THE DATA, and the exact importer is where that stopped being an abstraction
+
+**Found by 7.7's exact importer, which is the first thing that ever tried to read the export
+back.** It imports **two of the nine sheets** -- companies and contacts -- and the other seven
+are refused per-sheet with a finding naming exactly what is missing. **The shortfall is in the
+export format, not in the importer**, and closing it is a change to a versioned artefact
+Chris lives with, so it is his decision rather than an implementer's.
+
+Read against `db/schema.ts`, sheet by sheet:
+
+| sheet | what the export does not carry |
+|---|---|
+| `deals.csv` | `position` (NOT NULL, no default) and the `pipelines` / `stages` rows `pipeline_id` and `stage_id` point at. **There is no pipelines.csv or stages.csv at all.** |
+| `tasks.csv` | `position`, same as deals; and links to deals and projects, which are not imported |
+| `projects.csv` | `deal_id` points at deals |
+| `notes.csv` | `author_user_id` is NOT NULL against `users`, **and the export carries no users** -- only ids and a denormalised username |
+| `meetings.csv` | `owner_user_id`, same gap; and attendees are exported as **display names in one cell**, so the archive cannot say whether an attendee was a contact, a user or a guest -- the exact three-way distinction `meeting_attendees_exactly_one` requires |
+| `documents.csv` | there is **no `document_line_items` sheet**, so an imported quote would print a frozen total over an empty table |
+| `files.csv` | `uploader_user_id` is NOT NULL against `users`. The blobs themselves ARE in the archive |
+
+**Companies and contacts are the closure that is left**, and they are a closure rather than a
+convenient pair: a contact points at a company, which is in the export; a company points at
+nothing that is not either in the export or nullable. `owner_user_id` is the one exception and
+it is nullable -- an owner this install has never seen is dropped to NULL, counted, and named
+in the preview before anything is applied.
+
+**The fix shape is a `formatVersion` 2** carrying `users`, `pipelines`, `stages`, the
+fractional positions, `meeting_attendees` as data rather than as names, and
+`document_line_items`. Every finding the importer emits about a sheet it skipped names the
+specific missing thing, so the format change already has a specification.
+
+**Two adjacent notes, both recorded rather than fixed:**
+
+- **`text()` maps NULL and the empty string to the same cell**, so a column that genuinely
+  held `""` comes back NULL. The export cannot tell them apart and neither can any reader; the
+  choice matches what every create/update service actually writes, which is never `""`.
+- **The importer writes no `events` rows**, deliberately: an import is a bulk load of history
+  that happened elsewhere, so "created" stamped at import time would be a lie on every row --
+  and `events_verb_valid` has no verb for it, which would make one a migration.
+
+---
+
+## THE FORGIVING IMPORTER'S THREE DECISIONS, and the one question they leave for Chris
+
+**Built by 7.7's last engine, `services/import-csv.ts`.** Chris's decision of 30 Aug asked for
+"a forgiving, interactive CSV importer for foreign data (another CRM, a spreadsheet, Outlook)
+with column mapping and a preview". It is the only pipeline in the phase with an interactive
+step between inspect and plan, because **the mapping is a human decision that cannot exist
+before the headers do** -- `@conduit/shared`'s `import-mapping.ts` is that step as a value the
+page can render, and `csvMappingProblem` is the one rule the page disables its control with
+and the server refuses an arriving mapping with.
+
+**1. A BAD ROW IS REPORTED AND SKIPPED; THE IMPORT IS STILL ALL OR NOTHING.** "Forgiving" and
+"a partial failure must not leave half a spreadsheet loaded" look like they pull against each
+other and do not: they are about different MOMENTS. Every reason a row cannot be imported is
+found by reading the file at PLAN time, counted, named in the preview and excluded from the
+effect's count -- so nothing is written to be half written. A failure AFTER the operator says
+yes is one transaction, rolled back whole. The resolution only holds because plan catches
+everything the database would refuse, which is why `buildRow` checks the NOT NULLs, both
+`contacts_*_length` CHECKs, the email format `db/schema.ts` says the input schemas own, and
+the NUL Postgres refuses at the type (`22021`, which has no CHECK to name it).
+
+**2. DUPLICATES ARE MATCHED ON EMAIL FOR CONTACTS AND DOMAIN FOR COMPANIES**, case-folded, and
+a match is SKIPPED rather than merged or overwritten. A name is not a key -- two people are
+called John Smith and there are two companies genuinely called Acme, which is the same case
+the exact importer names when it argues for keeping the export's ids. **Normalisation is
+`trim` and `toLowerCase` and nothing else**, because the rule runs in two languages (JS for
+the candidates, `lower(...)` in SQL for the stored ones) and a cleverer one would drift. The
+cost is named rather than hidden: `www.acme.com` in the file and `acme.com` in Conduit are two
+companies. **An archived row counts as present.**
+
+**3. A COUNT THAT MOVES BETWEEN PREVIEW AND APPLY ROLLS THE WHOLE IMPORT BACK** -- the same
+answer the exact importer gave, and it was RECONSIDERED rather than copied. The argument for
+differing is real (an operator loses five minutes of mapping, not just a re-upload), and it
+loses anyway: importing "as many as still fit" means spending less than the effect's count,
+which the frame exists to forbid, and a foreign file has no id to reconcile the difference
+against afterwards.
+
+### What 200,000 rows cost, measured on the deploy target
+
+A 14.1MB foreign CSV of 200,000 contacts written by Python's `csv` module, on the deploy
+target (Debian 12, PostgreSQL 15.19, two cores, 3.8GB and no swap):
+
+| stage | time | resident |
+|---|---|---|
+| ingest + stage | 0.05s | -- |
+| mapping step | 0.07s | not sampled; the step never yields |
+| plan | 2.58s | peak 261MB |
+| apply | 43.91s | **PEAK 280MB**, 200,000 rows |
+
+**The peak barely moved between plan and apply**, and that 19MB is what the batching exists to
+produce: apply holds one batch and one statement's parameters, not one import. **The mapping
+step is instant on a 14MB file**, which is the whole point of reading a bounded prefix -- the
+one stage a person waits in front of does not grow with the file. **Apply is twice the exact
+importer's 21.5s for the same row count**, and the reason is named rather than hidden: at this
+size it runs **four hundred duplicate probes inside the transaction**, one per batch, where the
+exact importer needs none at all because a PRIMARY KEY answers its question for free -- plus
+two `text[]` columns per row. That is the price of matching on something other than a key.
+
+### What is left for Chris, and it is a migration
+
+**An import does not appear on any record's timeline**, for the exact importer's reason:
+`events_verb_valid` has no verb for one, and adding one is a migration. If an imported
+company should show "imported from contacts.csv" in its rail, that is a schema change and it
+is Chris's to ask for. Both importers stop short of it deliberately.
+
+### Two things the foreign importer does NOT do, with the reason on each
+
+- **It never creates a company from a contact import.** `contact.company_name` LINKS to a
+  company already here whose name matches exactly, ignoring case, and links to nothing when
+  the name matches none or more than one; both counts are in the preview. Creating one would
+  mean minting a company from a NAME, and "Acme", "Acme Ltd" and "ACME" in one column become
+  three companies with no number in the preview able to say they should have been one. The
+  workflow is two passes and the refusal message says so.
+- **Imported rows arrive with no owner.** A spreadsheet has no Conduit user in it. Letting the
+  operator pick one owner for a whole import is a good affordance and a MAPPING CONTROL rather
+  than a column, so it belongs to the routes task; nothing in the service forecloses it.
 
 ---
 

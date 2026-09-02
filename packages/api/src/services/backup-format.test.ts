@@ -185,6 +185,68 @@ describe("docs/backup-format.md", () => {
     expect(doc).toContain("This does not replace `yunohost backup`.");
   });
 
+  /**
+   * 7.7 ADDED A THIRD THING TO A PAGE THIS DOCUMENT DESCRIBED AS TWO, and a
+   * symbol grep cannot see a sentence -- which is why this is a test rather
+   * than a note. Until v1.4.0 the only way to put a backup back was `7z x` and
+   * `psql` by hand; a document that still implied that would send an operator
+   * to a terminal past the surface built for them.
+   */
+  it("says Conduit can now restore its own backups, and what that costs", () => {
+    expect(doc).toContain("Since v1.4.0 Conduit restores its own backups");
+    // The tab, by the name it now carries. A page that named the old one would
+    // send somebody looking for something that is not in the navigation.
+    expect(doc).toContain("Settings -> Export, import, backup and restore");
+    expect(doc).toContain("A restore replaces everything.");
+    // The confirmation is a deliberateness check and the document must not
+    // dress it up as a secret, because the page does not either.
+    expect(doc).toContain("typing this install's name");
+  });
+
+  /**
+   * THE SWEEP 7.7'S ROUTES TASK OWED THIS DOCUMENT.
+   *
+   * v1.4.0 put two IMPORTERS on the same Settings page as the restore, and this
+   * file described a page with one way in. A document that named only the
+   * restore would leave a reader holding a spreadsheet with the one control
+   * that would destroy their data as the only candidate on offer -- which is
+   * the exact confusion 7.7's spec forbids the page from allowing, said in the
+   * place somebody reads BEFORE they open the page.
+   *
+   * IT IS A TEST AND NOT A NOTE for this file's own stated reason: a symbol
+   * grep cannot see a sentence, and nothing else in the tree would have failed
+   * for a paragraph that had quietly stopped being true.
+   */
+  it("says an import is not a restore, and that neither importer reads a backup", () => {
+    expect(doc).toContain("A backup is not what the importers read");
+    expect(doc).toContain("An import adds records and changes nothing");
+    // The asymmetry, from the document's side: services/import-export.ts
+    // refuses anything whose manifest says "backup" and services/import-csv.ts
+    // refuses an archive outright.
+    expect(doc).toContain("Neither importer will touch a backup");
+    // And the sentence the whole page exists for, which the arrival of a way IN
+    // makes easier rather than harder to lose.
+    expect(doc).toContain("the only artefact that can put an install back");
+  });
+
+  /**
+   * THE CLAIM 7.7 MEASURED AND WITHDREW, kept honest here as well as on the
+   * page. The earlier belief was that the app cannot serve writes after a
+   * restore, so an operator would discover the need to restart. Measured: they
+   * fail for about sixty seconds -- the identity cache's TTL -- and then
+   * silently start working again while the process still holds stale state. A
+   * document that let a working write read as an all-clear would be worse than
+   * one that said nothing.
+   */
+  it("does not let a working write read as an all-clear after a restore", () => {
+    // Short enough not to span the document's own line wrapping, which is what
+    // made the first version of this assertion fail against text that was
+    // right there. A guard that reads prose has to read it the way it is
+    // written, not the way it was drafted.
+    expect(doc).toContain("is not the all-clear");
+    expect(doc).toContain("nothing makes you");
+  });
+
   it7z("lists exactly the members a real backup contains", async () => {
     const backup = await realBackup();
     const { members } = await open7z(backup.path);
@@ -240,6 +302,46 @@ describe("docs/backup-format.md", () => {
     expect(doc).toContain('"--no-owner", "--no-privileges", "--format=plain"');
     expect(backup.manifest.postgres.pgDumpArgs)
       .toEqual(["--no-owner", "--no-privileges", "--format=plain"]);
+  }, 120_000);
+
+  // THE INVENTORY IS A CHANGE TO WHAT THE FORMAT *IS*, so the page has to carry
+  // it and the page's claims have to be checked against a real archive rather
+  // than against the code that wrote one. Three separate claims are made here
+  // and each one is load-bearing for a different reader.
+  it7z("describes the inventory the archive actually carries", async () => {
+    const backup = await realBackup();
+    const { root } = await open7z(backup.path);
+    const manifest = JSON.parse(
+      await readFile(path.join(root, "manifest.json"), "utf8"),
+    ) as { inventory?: { consistency?: string; tables?: { table: string; rows: number }[] } };
+
+    // 1. The archive really carries one, and it is labelled with the guarantee
+    //    the page names.
+    expect(manifest.inventory?.consistency).toBe("shared-snapshot");
+    expect(doc).toContain("`\"shared-snapshot\"` is the one above");
+    // The company realBackup() creates is in it, counted exactly.
+    const companies = manifest.inventory?.tables
+      ?.find((one) => one.table === "public.companies");
+    expect(companies?.rows).toBe(1);
+
+    // 2. The page says the counts are exact and says what it refuses, because
+    //    an estimate would pass the check it exists to fail.
+    expect(doc).toContain("**The counts are exact.**");
+    expect(doc).toContain("never `pg_stat_user_tables`");
+    expect(doc).toContain("never `reltuples`");
+
+    // 3. The page carries the snapshot measurement and its CONTROL. Without
+    //    the control the table is a claim that the flag does something; with
+    //    it, it is a measurement of what happens without the flag.
+    expect(doc).toContain("pg_export_snapshot()");
+    expect(doc).toContain("pg_dump --snapshot");
+    expect(doc).toContain("| `pg_dump` with its own snapshot | **1000** | **4** | **present** |");
+
+    // 4. And the distinction a reader of this format has to be able to make.
+    expect(doc).toContain("**Absent is not empty, and a reader must not treat them alike.**");
+    expect(doc).toContain("no `inventory` key at all");
+    expect(doc).toContain("**Conduit 1.3.0 and earlier**");
+    expect(doc).toContain("A backup taken before this field existed still restores.");
   }, 120_000);
 
   it7z("names the file the way the page says it is named", async () => {

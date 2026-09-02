@@ -187,6 +187,23 @@ interface TicketRecord { username: string; expiresAt: number }
  * IN MEMORY, PER PROCESS, and that is the whole deployment: one systemd unit,
  * one node process (conf/systemd.service). A restart invalidates every
  * outstanding ticket, which is the correct behaviour rather than a limitation.
+ *
+ * TWO THINGS 7.7 MADE TRUE THAT WERE HARMLESS IN 7.6, RECORDED RATHER THAN
+ * FIXED HERE, because both are changes to shipped 7.6 surface and neither is
+ * reachable without a credential this app never sees:
+ *
+ *   A TICKET IS FUNGIBLE ACROSS EVERY GATED ROUTE. One minted to download a
+ *   backup is a live authorisation to DESTROY THE DATABASE for five minutes,
+ *   because `redeem` binds a ticket to an account and not to an operation.
+ *   Minting one still requires the password, so the exposure is a ticket
+ *   stolen from a page rather than an escalation any caller can arrange. The
+ *   fix, when it is taken, is a scope argument on `issue` and `redeem` and
+ *   three call sites; it is named here so it is not rediscovered.
+ *
+ *   MAX_OUTSTANDING_TICKETS IS GLOBAL AND EVICTS THE OLDEST regardless of
+ *   whose it is, so a second account asking for 64 tickets can evict the
+ *   operator's fresh one -- now on the recovery path, where the answer is a
+ *   401 telling them to type their password again rather than anything worse.
  */
 export class ReauthTickets {
   private readonly tickets = new Map<string, TicketRecord>();

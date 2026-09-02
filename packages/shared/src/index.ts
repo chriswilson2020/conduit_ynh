@@ -22,6 +22,41 @@ export {
 // is sent and services/backup.ts refuses one that arrives anyway, and those two
 // refusals have to be the same sentence rather than two that agree today.
 export { MAX_PASSPHRASE_LENGTH, passphraseProblem } from "./passphrase.js";
+// 7.7's plan -- what a restore or an import is about to do, as a value. Here
+// for the same reason as the rule above: the page renders the plan and the
+// engine builds it, and a preview of a DESTRUCTIVE operation that disagreed
+// with what runs is the worst failure this application has available to it.
+export {
+  destructiveEffects, planIsApplicable, plannedTotal,
+} from "./plan.js";
+export type {
+  PlanEffectView, PlanFindingView, PlanKind, PlanRefusalView, PlanSourceView,
+  PlanUnit, PlanView,
+} from "./plan.js";
+// 7.7's ONE INTERACTIVE STEP: the column mapping for a foreign CSV. Here for
+// the plan's own reason and one more of its own -- csvMappingProblem is the
+// single rule the page disables its control with and services/import-csv.ts
+// refuses an arriving mapping with, on the passphraseProblem precedent.
+export {
+  csvImportField, csvMappingEntity, csvMappingProblem, CSV_IMPORT_FIELDS,
+} from "./import-mapping.js";
+export type {
+  CsvColumnView, CsvDialectView, CsvImportEntity, CsvImportField, CsvImportFieldDef,
+  CsvMapping, CsvMappingEntry, CsvMappingFinding, CsvMappingRefusal, CsvMappingView,
+} from "./import-mapping.js";
+// 7.7's confirmation rule, here for the reason the passphrase rule above is:
+// the page refuses a mistyped install name before it spends a single-use
+// ticket, and routes/restore.ts refuses one that arrives anyway. One function,
+// two callers -- not two comparisons that agree today.
+export { installNameMatches } from "./install-name.js";
+// IN SCOPE, not merely re-exported: the zod schema at the foot of this file is
+// held against this type by the compiler, and a `export type ... from` does not
+// bring the name into this module.
+import type { PlanView } from "./plan.js";
+// The same arrangement for 7.7's OTHER rendered value, and for the same reason:
+// csvMappingViewSchema at the foot of this file is held against this type by
+// the compiler rather than by whoever edits one of the two.
+import type { CsvMappingView } from "./import-mapping.js";
 
 export const userSchema = z.object({
   id: z.uuid(),
@@ -119,9 +154,24 @@ const cappedNullableString = (max: number, what: string) =>
     })
     .nullable();
 
+/**
+ * THE ONE RULE FOR WHAT COUNTS AS AN EMAIL ADDRESS ON A CONTACT.
+ *
+ * NAMED AND EXPORTED RATHER THAN SPELLED `z.email()` AT EACH USE, because
+ * db/schema.ts's `contacts.emails` says in its own words that the format is
+ * validated here and that "any future direct-write path (import, seed) must go
+ * through those schemas to keep this guarantee". 7.7's foreign CSV importer is
+ * exactly that path, and it needs the rule for ONE VALUE at a time -- it drops
+ * an unusable address and keeps the person rather than parsing a whole contact
+ * and losing them. Referencing this is what keeps that a use of the rule rather
+ * than a second copy of it.
+ */
+export const contactEmailSchema = z.email();
+
 export const contactSchema = z.object({
   id: z.uuid(), firstName: z.string().min(1), lastName: nullableString,
-  companyId: z.uuid().nullable(), emails: z.array(z.email()), phones: z.array(z.string().min(1)),
+  companyId: z.uuid().nullable(),
+  emails: z.array(contactEmailSchema), phones: z.array(z.string().min(1)),
   jobTitle: nullableString,
   // Both optional, both free text, and NEITHER IS EVER INFERRED -- not from the
   // name, not from each other, not from anything. A blank stays blank and renders
@@ -136,7 +186,7 @@ export type Contact = z.infer<typeof contactSchema>;
 export const createContactInputSchema = z.object({
   firstName: z.string().min(1), lastName: nullableString.optional(),
   companyId: z.uuid().nullable().optional(),
-  emails: z.array(z.email()).optional(), phones: z.array(z.string().min(1)).optional(),
+  emails: z.array(contactEmailSchema).optional(), phones: z.array(z.string().min(1)).optional(),
   jobTitle: nullableString.optional(),
   salutation: cappedNullableString(CONTACT_FIELD_CAPS.salutation, "salutation").optional(),
   pronouns: cappedNullableString(CONTACT_FIELD_CAPS.pronouns, "set of pronouns").optional(),
@@ -1666,6 +1716,21 @@ export type MeetingTaskCreateInput = z.infer<typeof meetingTaskCreateInputSchema
 const UNSTORABLE_TEXT = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
 /**
+ * Whether Postgres would refuse to store this string at all.
+ *
+ * THE PREDICATE IS EXPORTED AND THE PATTERN IS NOT, so there is one description
+ * of the rule and no way for a caller to end up holding a `RegExp` with state of
+ * its own. 7.7's foreign CSV importer is the caller that needed it: a NUL in
+ * somebody else's spreadsheet is not exotic, and a row carrying one has to be
+ * declined IN THE PREVIEW rather than reaching an INSERT inside a transaction
+ * that has already written thousands of rows -- where it arrives as `22021
+ * invalid byte sequence` and takes the whole import down with it.
+ */
+export function unstorableText(value: string): boolean {
+  return UNSTORABLE_TEXT.test(value);
+}
+
+/**
  * A user-supplied string bounded in length and refused if a column could not hold it.
  *
  * `min` is a PARAMETER rather than something a caller chains on afterwards, and that
@@ -3100,3 +3165,241 @@ export const backupPreflightSchema = z.object({
   timeoutSeconds: z.number().int().positive(),
 });
 export type BackupPreflight = z.infer<typeof backupPreflightSchema>;
+
+/**
+ * POST /api/restore/inspect's answer, PARSED RATHER THAN CAST.
+ *
+ * WHY THIS ONE IS PARSED WHEN A CAST WOULD COMPILE. Every other response in
+ * this file is parsed because a shape mismatch is contract drift worth
+ * reporting; this one is parsed because THE PAGE RENDERS IT AS A CONFIRMATION
+ * THAT DESTRUCTION IS ABOUT TO HAPPEN. A malformed plan that reached the
+ * confirmation as `undefined` effects and a missing refusal would render as
+ * "nothing will be destroyed" beside a button that destroys everything. There
+ * is no cheaper way to be sure the object under the operator's eyes is the
+ * object the server built.
+ *
+ * THE SCHEMA AND plan.ts's TYPES ARE HELD TOGETHER BY THE COMPILER, not by
+ * whoever edits one of them -- see planViewSchemaAgreesWithPlanView below. A
+ * field added to PlanView and not to this schema would be silently dropped from
+ * the value the page renders, which on this page is the failure mode that
+ * matters.
+ */
+export const planEffectViewSchema = z.object({
+  op: z.string(),
+  subject: z.string(),
+  count: z.number().int().nonnegative(),
+  unit: z.enum(["row", "file", "table", "schema", "key", "migration"]),
+  destroys: z.boolean(),
+  detail: z.string(),
+}).readonly();
+
+export const planFindingViewSchema = z.object({
+  severity: z.enum(["note", "warning"]),
+  code: z.string(),
+  message: z.string(),
+}).readonly();
+
+export const planRefusalViewSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+}).readonly();
+
+export const planSourceViewSchema = z.object({
+  filename: z.string(),
+  bytes: z.number().int().nonnegative(),
+  sha256: z.string(),
+  stagedBytes: z.number().int().nonnegative(),
+  memberCount: z.number().int().nonnegative(),
+}).readonly();
+
+export const planViewSchema = z.object({
+  planId: z.string(),
+  kind: z.enum(["restore", "import-export", "import-csv"]),
+  createdAt: z.string(),
+  expiresAt: z.string(),
+  source: planSourceViewSchema,
+  effects: z.array(planEffectViewSchema).readonly(),
+  findings: z.array(planFindingViewSchema).readonly(),
+  refusal: planRefusalViewSchema.nullable(),
+}).readonly();
+
+/**
+ * THE INSTRUMENT THAT KEEPS THE SCHEMA ABOVE AND plan.ts's TYPES FROM DRIFTING.
+ *
+ * Assignability BOTH WAYS, because neither direction sees what the other does.
+ * WHAT EACH ONE CATCHES WAS MEASURED, by making the mutation and reading which
+ * line the compiler named -- a type-level guard nobody has watched fail is the
+ * same nothing a vacuous assertion is, and a tuple `[true, true]` was the first
+ * draft and had to go: it reported both failures at one line and column with
+ * one sentence, so the error could not say which direction had broken.
+ *
+ *   PARSED -> PlanView fails when the schema DROPS a field the type has, or
+ *   WIDENS one. This is the direction that fails silently at runtime, and it is
+ *   the reason the guard exists at all: zod strips what it was not told about,
+ *   so the page would render a plan missing exactly the field somebody had just
+ *   added for it to render. Measured: adding a field to PlanView alone, and
+ *   relaxing `unit` to z.string(), both fail here.
+ *
+ *   PlanView -> PARSED fails when the schema declares a field the type does
+ *   NOT, or NARROWS one -- drift the other way, where the parse would reject a
+ *   body the type says is legal. Measured: adding a field to this schema alone
+ *   fails here and NOT above.
+ */
+type ParsedIsUsableAsPlanView = z.infer<typeof planViewSchema> extends PlanView ? true : false;
+type PlanViewIsUsableAsParsed = PlanView extends z.infer<typeof planViewSchema> ? true : false;
+const parsedPlanIsUsableAsAPlanView: ParsedIsUsableAsPlanView = true;
+const aPlanViewIsUsableAsAParsedPlan: PlanViewIsUsableAsParsed = true;
+// Referenced so neither constant is dead code to a linter; they exist for the
+// two type annotations above and have no runtime meaning.
+export const PLAN_VIEW_SCHEMA_AGREES =
+  parsedPlanIsUsableAsAPlanView && aPlanViewIsUsableAsAParsedPlan;
+
+/**
+ * What the preview answers with, beside the plan.
+ *
+ * `installName` IS NULLABLE BECAUSE THE SERVER'S ANSWER IS. routes/restore.ts
+ * refuses to invent one when it cannot name the database, and a page that
+ * defaulted it to a constant would print a confirmation string every caller can
+ * type. Null here means the apply route will answer 503, and the page says so
+ * rather than offering a field nothing can satisfy.
+ */
+export const restoreInspectionSchema = z.object({
+  plan: planViewSchema,
+  installName: z.string().nullable(),
+});
+export type RestoreInspection = z.infer<typeof restoreInspectionSchema>;
+
+/**
+ * What POST /api/restore/apply answers when the restore finished.
+ *
+ * `restored: true` IS A LITERAL, NOT A BOOLEAN. Every failure body on that
+ * route that carries the field at all carries `restored: false`, and those
+ * arrive as a non-2xx and therefore as an ApiError rather than through here. A
+ * 200 that said `restored: false` would be a contract this client does not
+ * understand, and the honest response to it is the shape error rather than a
+ * success banner.
+ */
+export const restoreOutcomeSchema = z.object({
+  restored: z.literal(true),
+  dispatched: z.number().int().nonnegative(),
+  realised: z.number().int().nonnegative(),
+  unrealised: z.array(z.string()).readonly(),
+  message: z.string(),
+});
+export type RestoreOutcome = z.infer<typeof restoreOutcomeSchema>;
+
+/**
+ * PHASE 7.7'S LAST TWO ARTEFACTS: what the two importers answer with.
+ *
+ * PARSED FOR THE REASON restoreInspectionSchema IS PARSED, WITH THE DANGER
+ * POINTING THE OTHER WAY. A restore preview is parsed because a malformed plan
+ * would render as "nothing will be destroyed" beside a button that destroys
+ * everything. An import preview is parsed because a malformed plan would render
+ * as "nothing will be created" beside a button that creates -- and, more to the
+ * point on this pipeline, because the MAPPING VIEW is what the one interactive
+ * control in the whole spine is built out of. A `targets` array that arrived as
+ * `undefined` would be a picker with no options and no explanation, which is
+ * the disabled-for-an-invisible-reason failure this page exists not to ship.
+ */
+export const csvImportFieldSchema = z.enum([
+  "company.name", "company.domain", "company.website", "company.phone",
+  "company.address", "company.industry",
+  "contact.first_name", "contact.last_name", "contact.email", "contact.phone",
+  "contact.job_title", "contact.salutation", "contact.pronouns", "contact.company_name",
+]);
+
+export const csvImportFieldDefSchema = z.object({
+  field: csvImportFieldSchema,
+  entity: z.enum(["company", "contact"]),
+  label: z.string(),
+  required: z.boolean(),
+  repeatable: z.boolean(),
+  hint: z.string(),
+}).readonly();
+
+export const csvColumnViewSchema = z.object({
+  index: z.number().int().nonnegative(),
+  header: z.string(),
+  samples: z.array(z.string()).readonly(),
+  filled: z.number().int().nonnegative(),
+  suggestion: csvImportFieldSchema.nullable(),
+}).readonly();
+
+export const csvDialectViewSchema = z.object({
+  delimiter: z.string(),
+  delimiterName: z.string(),
+  sniffed: z.boolean(),
+}).readonly();
+
+export const csvMappingViewSchema = z.object({
+  source: planSourceViewSchema,
+  dialect: csvDialectViewSchema,
+  columns: z.array(csvColumnViewSchema).readonly(),
+  targets: z.array(csvImportFieldDefSchema).readonly(),
+  sampled: z.number().int().nonnegative(),
+  findings: z.array(planFindingViewSchema).readonly(),
+  refusal: planRefusalViewSchema.nullable(),
+}).readonly();
+
+/**
+ * THE INSTRUMENT THAT KEEPS THE SCHEMA ABOVE AND import-mapping.ts's TYPES FROM
+ * DRIFTING, on planViewSchemaAgreesWithPlanView's exact precedent and for the
+ * exact reason -- including that the two directions are two constants rather
+ * than one tuple, so a failure names which way the drift went.
+ *
+ * MEASURED RATHER THAN ASSUMED, the same way its sibling was. Relaxing
+ * `suggestion` to z.string().nullable() fails the first line and not the
+ * second; adding a field to this schema alone fails the second and not the
+ * first; deleting `targets` from the schema fails the first.
+ */
+type ParsedIsUsableAsCsvMappingView =
+  z.infer<typeof csvMappingViewSchema> extends CsvMappingView ? true : false;
+type CsvMappingViewIsUsableAsParsed =
+  CsvMappingView extends z.infer<typeof csvMappingViewSchema> ? true : false;
+const parsedMappingIsUsableAsAMappingView: ParsedIsUsableAsCsvMappingView = true;
+const aMappingViewIsUsableAsAParsedMapping: CsvMappingViewIsUsableAsParsed = true;
+export const CSV_MAPPING_VIEW_SCHEMA_AGREES =
+  parsedMappingIsUsableAsAMappingView && aMappingViewIsUsableAsAParsedMapping;
+
+/** POST /api/import/csv/inspect's answer: what is in this file? */
+export const csvInspectionSchema = z.object({ mapping: csvMappingViewSchema });
+export type CsvInspection = z.infer<typeof csvInspectionSchema>;
+
+/**
+ * What both importers' preview routes answer with.
+ *
+ * NO `installName` BESIDE IT, and the absence is the point rather than an
+ * omission. A restore is confirmed by typing the name of the database it
+ * destroys; an import destroys nothing, so there is nothing to confirm by
+ * name and a field asking for one would be teaching the reflex that the
+ * restore's field depends on being unusual.
+ */
+export const importInspectionSchema = z.object({ plan: planViewSchema });
+export type ImportInspection = z.infer<typeof importInspectionSchema>;
+
+/**
+ * What an apply answers when the rows are in.
+ *
+ * `imported: true` IS A LITERAL, on restoreOutcomeSchema's precedent: every
+ * failure body carries `imported: false` and arrives as a non-2xx, so a 200
+ * saying otherwise is a contract this client does not understand and the honest
+ * response is a shape error rather than a success banner.
+ *
+ * THERE IS NO `unrealised` HERE AND ITS ABSENCE IS A FACT ABOUT IMPORTS RATHER
+ * THAN AN OMISSION. A restore needs that field because its destroy step is a
+ * PREPARATION -- it satisfies its accounting before anything is destroyed, so
+ * `dispatched` and `realised` can differ and the difference is the only honest
+ * answer to "did the destruction happen". Neither importer has a preparatory
+ * effect: every effect does its own work, services/intake-plan.ts refuses a
+ * plan whose preparation has no consumer, and a failure answers a non-2xx and
+ * never reaches this shape at all. The field would be `[]` on every response
+ * this schema can ever parse.
+ */
+export const importOutcomeSchema = z.object({
+  imported: z.literal(true),
+  dispatched: z.number().int().nonnegative(),
+  realised: z.number().int().nonnegative(),
+  spent: z.number().int().nonnegative(),
+  message: z.string(),
+});
+export type ImportOutcome = z.infer<typeof importOutcomeSchema>;

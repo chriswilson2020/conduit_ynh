@@ -55,6 +55,20 @@ export interface MailRouteSyncManager extends SendMailSyncManager {
     readonly stats: MailAccountSyncStats;
   } | undefined;
   /**
+   * Stop every account's sync, and start them again. WIDENED FOR THE RESTORE
+   * (Phase 7.7), which is the only caller: the sync is the second writer -- the
+   * one that can change the database with nobody touching a browser -- and a
+   * restore is only true if nothing else is writing. routes/restore.ts hands
+   * these two to services/restore.ts as its RestoreSyncControl, so the engine
+   * never imports the sync module and stays testable with a two-method stub.
+   *
+   * Both are on mail-sync.ts's SyncManager already and both are idempotent
+   * there; they are declared here so this slice is the one contract the route
+   * layer needs, rather than a second getter beside it.
+   */
+  stop(): Promise<void>;
+  start(): Promise<void>;
+  /**
    * Ask for a pass now. RESOLVES WHEN THE PASS IS REQUESTED, not when it
    * finishes (mail-sync.ts's syncNow), so callers treat it as
    * fire-and-forget and let the SSE hints report what came of it.

@@ -56,10 +56,50 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
         overflow, the last tab measured 0.9888 without this class and exactly
         1.000000 with it. Trailing padding was the only thing that moved it --
         scroll-padding did not, and neither did anything the browser could do on
-        its own.
+        its own. THAT LAST CLAUSE IS TRUE OF THE LABEL OF THE DAY AND FALSE OF
+        THIS ONE: see the correction below, which sweeps both properties
+        together and finds a conjunction rather than a substitution.
         `pr-1` is already in the stylesheet, so this adds no rule to it.
+
+        `scroll-pr-1` ARRIVED IN 7.7'S ROUTES TASK, AND THE TWO CLASSES ARE A
+        CONJUNCTION RATHER THAN A SUBSTITUTION. The label grew again when the
+        two importers landed on the page behind it ("Export, backup and restore"
+        -> "Export, import, backup and restore"), and
+        e2e/documents.spec.ts's `toBeInViewport({ ratio: 1 })` went red at a
+        ratio of about 0.9998: a few hundredths of a pixel of the tab clipped by
+        this container's own right edge.
+
+        MEASURED IN CHROMIUM AT 390px, against this stylesheet and this label,
+        by sweeping BOTH properties rather than one at a time -- which is the
+        mistake the first version of this paragraph made and the reason it drew
+        the wrong conclusion:
+
+          padding-right 0/1/4/8/16  +  scroll-padding-right 0  ->  ratio 0.99985
+          padding-right 0           +  scroll-padding-right 1/4/16 -> 0.99985
+          padding-right >= 1        +  scroll-padding-right >= 1  ->  1
+
+        NEITHER ALONE MOVES IT. The mechanism is why: the browser scrolls the
+        minimum it thinks is needed and lands a fraction of a pixel short, and
+        `scroll-padding` is what moves that target -- but it cannot scroll past
+        a `maxScroll` that only TRAILING PADDING extends. Padding supplies the
+        range; scroll-padding spends it. Take either away and the row cannot
+        reach the last tab's far edge.
+
+        SO THE PARAGRAPH ABOVE IS RIGHT AND INCOMPLETE, and the sentence this
+        one replaced -- "trailing padding is not what is short here and never
+        could be" -- was FALSE, and false in the direction that invites somebody
+        to delete `pr-1` as a keepsake. It is not a keepsake. It is half of a
+        working fix. The first measurement behind that sentence swept
+        padding-right while `pr-2` was on the element and scroll-padding while
+        `pr-2` was on it too, so it never saw either property alone and read a
+        conjunction as a substitution.
+
+        THE LABEL IS THE HALF THAT DOES NOT GIVE WAY. Shortening it would have
+        moved the arithmetic too, and a label that does not name a thing on the
+        page is the navigation quietly disagreeing with it -- which is the rule
+        this tab has now been renamed twice to keep.
       */}
-      <nav data-testid="settings-nav" className="flex gap-1 overflow-x-auto border-b border-slate-200 pr-1">
+      <nav data-testid="settings-nav" className="flex gap-1 overflow-x-auto scroll-pr-1 border-b border-slate-200 pr-1">
         <Link to="/settings/mail" className={tabClass} activeProps={{ className: activeTabClass }}>
           Mail accounts
         </Link>
@@ -69,8 +109,25 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
         <Link to="/settings/org" className={tabClass} activeProps={{ className: activeTabClass }}>
           Organisation
         </Link>
+        {/*
+          RENAMED IN 7.7, TWICE, AND IT IS A PROSE SWEEP RATHER THAN A
+          PREFERENCE. The tab said "Export and backup" while the page behind it
+          gained a third thing that is neither -- and the one 7.7's spec says a
+          person must not reach for by mistake. The routes task then put two
+          IMPORTERS on the same page, and the same rule applies again in the
+          same direction: a label that did not mention them would send somebody
+          looking for "put a spreadsheet in" to a tab that names only the way
+          out and the way back. A label that did not mention a thing on the page
+          would be the navigation quietly disagreeing with it.
+          IT IS THE LONGEST LABEL IN THIS ROW AND THAT IS PAID FOR RATHER THAN
+          ignored: the row already overflows at a phone width, so e2e/data.spec.ts
+          holds this tab to the 44px touch floor and to being WHOLLY in the
+          viewport once scrolled to, and e2e/documents.spec.ts holds every tab
+          to the same. Making it longer moves it further off the end of the row,
+          not off the assertions.
+        */}
         <Link to="/settings/data" className={tabClass} activeProps={{ className: activeTabClass }}>
-          Export and backup
+          Export, import, backup and restore
         </Link>
       </nav>
       {children}

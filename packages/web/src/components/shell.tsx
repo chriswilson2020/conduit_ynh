@@ -242,7 +242,18 @@ export function Shell({ children }: { children: ReactNode }) {
           beside a title, which is the shape both offenders below had, and its
           one horizontally-sensitive element -- the settings tab strip -- is a
           scroller of its own and so is ignored by the rule above and covered
-          by e2e/data.spec.ts instead. It found two offenders, both the same shape --
+          by e2e/data.spec.ts instead.
+
+          THAT PAGE GREW A SECTION IN 7.7 AND THE CLAIM ABOVE STILL HOLDS,
+          which is said here because "swept when it was added" is exactly the
+          sentence that goes stale without anybody noticing. The restore
+          surface is more cards in the same column, and its widest row -- three
+          controls at the foot of the confirmation -- is a `flex-wrap` row at
+          the FOOT of a card rather than an action group beside a title, so it
+          wraps below the breakpoint instead of forcing the page wider.
+          e2e/data.spec.ts drives it at a phone width as well as at desktop.
+
+          It found two offenders, both the same shape --
           a `shrink-0` action group beside a title that cannot shrink -- and
           both now wrap below the breakpoint: pages/deal-detail.tsx, fixed with
           this change, and pages/project-detail.tsx, which the first sweep

@@ -37,6 +37,13 @@ const reauthRequestSchema = z.object({
 /**
  * ONE REFUSAL FOR EVERY WRONG ANSWER.
  *
+ * AND IT NO LONGER SAYS "DOWNLOAD". This endpoint was written for 7.6's two
+ * downloads and 7.7 put it in front of the RESTORE as well -- so mistyping a
+ * password on the most dangerous operation in the product answered that a
+ * download had not started, which is a true sentence about the wrong thing. The
+ * call sites were added and the prose was not: a symbol grep cannot see a
+ * sentence.
+ *
  * The message does not say whether the account exists, whether the password
  * was close, or how many attempts remain -- the last of those is the one that
  * feels helpful and is not: telling a guesser they have three tries left tells
@@ -45,7 +52,7 @@ const reauthRequestSchema = z.object({
  */
 const REFUSED = {
   error: "reauth_failed",
-  message: "that password was not accepted; the download was not started",
+  message: "that password was not accepted; nothing was started",
 } as const;
 
 /**
@@ -116,7 +123,7 @@ export function registerReauthRoutes(
       request.log.error({ err: error }, "re-authentication could not be checked");
       return reply.code(503).send({
         error: "reauth_unavailable",
-        message: "the password could not be checked right now, so the download was not started",
+        message: "the password could not be checked right now, so nothing was started",
       });
     }
 
@@ -137,10 +144,20 @@ export function registerReauthRoutes(
 }
 
 /**
- * THE GATE ON A DOWNLOAD. Returns true when the caller may proceed; otherwise
+ * THE GATE. Returns true when the caller may proceed; otherwise
  * it has already written the 401 and the caller must return immediately -- the
  * same contract requireUser has, and deliberately the same shape so the two
  * read as one pair of lines at the top of a handler.
+ *
+ * IT GUARDS 7.6's TWO DOWNLOADS AND 7.7's RESTORE, and the wording is
+ * deliberately neutral between them: the same refusal is read by somebody who
+ * mistyped a password before exporting their CRM and by somebody who mistyped
+ * it before replacing it.
+ *
+ * AND ON THE RESTORE IT IS THE ONLY REAL BARRIER. The typed install name is
+ * printed on the page next to the field -- it is a deliberateness check, not a
+ * secret -- so it stops a reflexive click and nothing else. Against a stolen
+ * session this endpoint is what stands there.
  *
  * WHAT MAKES THIS A GATE RATHER THAN A PROMPT: it is here, on the server, and
  * it consumes a ticket that only a verified password can mint. A page that
@@ -174,7 +191,7 @@ export function requireReauth(
   if (!deps.reauthTickets.redeem(ticket, user.username)) {
     void reply.code(401).send({
       error: "reauth_required",
-      message: "confirm your password before downloading; this download carries the whole database",
+      message: "confirm your password to continue; this operation reaches the whole database",
     });
     return false;
   }

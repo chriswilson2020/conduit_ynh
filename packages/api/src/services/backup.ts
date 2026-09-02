@@ -42,6 +42,21 @@ import { readMigrationJournal } from "./migration-journal.js";
 // do that, and a test in backup.test.ts opens a real archive with 7z and
 // compares the contents, so the documentation cannot drift from the writer.
 //
+// WHAT THE ARCHIVE RECORDS ABOUT THE DATABASE, AND WHY IT IS NOT JUST THE DUMP
+// (v1.4.0). The manifest carries an INVENTORY: every table the database held,
+// by name, with its EXACT row count. It exists because restore's own result
+// check compares the restored database against the tables `database.sql`
+// declares -- and that is the same file the load consumed, so a backup that was
+// already wrong at the moment it was written restores "successfully" into a
+// wrong state with nothing to notice. The inventory is the independent witness:
+// measured from the catalogue, not read out of the file it travels with.
+//
+// It is only worth anything if it AGREES with the dump, and agreeing is the
+// hard part rather than the obvious one -- pg_dump takes its own snapshot, so
+// counting separately counts a database that may have moved. See
+// dumpWithInventory for the measurement, the shared snapshot, and the control
+// that shows the race is real.
+//
 // WHAT IT COSTS, HANDLED HERE RATHER THAN DISCOVERED LATER: 7z cannot be
 // driven as a pipe. It seeks to write its headers, and with -mhe=on the
 // header block is only final once the archive is. So the backup builds to a
@@ -54,8 +69,28 @@ import { readMigrationJournal } from "./migration-journal.js";
  * manifest, which every reader tolerates.
  *
  * 7.7's restore branches on this rather than guessing from what it finds.
+ *
+ * NOT BUMPED BY THE INVENTORY (v1.4.0), AND THAT IS A REQUIREMENT RATHER THAN
+ * AN OPINION. `inventory` is a new manifest FIELD; no member is renamed, none
+ * is removed, and the dump's own flags are unchanged. And restore compares this
+ * number with `!==` -- an exact equality, not a floor -- so bumping it would
+ * make this build refuse every backup Chris has already taken. A format whose
+ * additive change breaks its own predecessors is not additive.
  */
 export const BACKUP_FORMAT_VERSION = 1;
+
+/**
+ * How an inventory's row counts relate to the dump beside them. ONE VALUE
+ * TODAY, and it is a value rather than a boolean because the honest
+ * alternatives are not a yes/no: a future backup that could not share a
+ * snapshot should be able to say what it did instead rather than lie by
+ * omission.
+ *
+ * "shared-snapshot" means the counts were taken inside the SAME MVCC snapshot
+ * pg_dump read, by exporting it from a REPEATABLE READ transaction and handing
+ * it to `pg_dump --snapshot`. See dumpWithInventory.
+ */
+export const INVENTORY_CONSISTENCY = "shared-snapshot";
 
 /**
  * The apt package that provides /usr/bin/7z. Named in the failure message
@@ -118,8 +153,61 @@ const WORK_PREFIX = ".backup-work-";
  * fits EXACTLY from leaving a live server with zero free blocks, where the
  * next write from any other part of the system -- the journal, Postgres's WAL,
  * an upload -- is the one that fails.
+ *
+ * EXPORTED FOR 7.7's INTAKE, which makes the same demand for the same reason
+ * before it unpacks an archive (services/intake.ts). One number rather than
+ * two that agree today: the argument above is about the machine, not about
+ * which direction the bytes are travelling in.
  */
-const DISK_MARGIN_BYTES = 64 * 1024 * 1024;
+export const DISK_MARGIN_BYTES = 64 * 1024 * 1024;
+
+/** One table, and exactly how many rows it held. */
+export interface BackupInventoryTable {
+  /** Schema-qualified, e.g. "public.companies". */
+  table: string;
+  /**
+   * EXACT. `count(*)`, never pg_stat_user_tables and never reltuples.
+   *
+   * This project has already been bitten by the estimate: the planner's
+   * statistics read IDENTICALLY before and after a full replacement, which is
+   * why services/restore.ts's own measurement refuses them. An inventory made
+   * of estimates would be a check that passes over the failure it exists for.
+   */
+  rows: number;
+}
+
+/**
+ * WHAT THE DATABASE HELD WHEN THE BACKUP WAS TAKEN.
+ *
+ * THE WITNESS THAT IS NOT THE DUMP. Restore already compares the restored
+ * database against the tables `database.sql` declares -- but that is the same
+ * file the load consumed, so a backup that was ALREADY WRONG when it was
+ * written restores "successfully" into a wrong state and nothing notices. This
+ * is the independent record: the tables that were in the database, by name,
+ * with their exact row counts, measured from the catalogue rather than read out
+ * of the file.
+ *
+ * ABSENT MEANS NOT RECORDED. EMPTY MEANS NOTHING WAS THERE. That distinction is
+ * load-bearing and it is the reason `tables` is not allowed to be optional
+ * inside a present `inventory`: a v1.3.0 backup has no `inventory` key at all
+ * and a restore reports the check as NOT MADE, while an inventory with
+ * `"tables": []` is a positive claim that the database held no tables and a
+ * restore checks it. `Array.isArray(x) ? x : []` is exactly the collapse that
+ * turned "this manifest makes no claims" into "its zero claims all hold" one
+ * field over, in services/restore.ts's member list, and it was a silent
+ * half-restore. It is not repeated here.
+ */
+export interface BackupInventory {
+  /**
+   * How these counts relate to the dump. See INVENTORY_CONSISTENCY.
+   *
+   * RECORDED RATHER THAN ASSUMED, so a reader never has to take the
+   * consistency on trust from the version number that happened to write it.
+   */
+  consistency: string;
+  /** Every ordinary and partitioned table, sorted by name. */
+  tables: BackupInventoryTable[];
+}
 
 /** One archive member, as the manifest records it. */
 export interface BackupManifestMember {
@@ -150,12 +238,31 @@ export interface BackupManifest {
    * parsing the SQL: `serverVersion` is what was dumped, `pgDumpVersion` is
    * what dumped it, and `pgDumpArgs` is how -- so a restore knows whether the
    * file carries ownership and privilege statements before it runs one.
+   *
+   * `pgDumpArgs` IS THE FLAGS THAT DECIDE WHAT IS IN THE FILE, and since
+   * v1.4.0 it is no longer the whole command line. A `--snapshot=<id>` is
+   * passed too (see dumpWithInventory), and it is deliberately not recorded
+   * here: it changes WHICH MVCC snapshot was read, never which statements come
+   * out, and the id itself is a transaction triple that means nothing once the
+   * exporting session has ended. What a reader needs from it -- that the dump
+   * and the inventory saw one snapshot -- is `inventory.consistency`, which is
+   * a claim rather than an ephemeral identifier.
    */
   postgres: {
     serverVersion: string;
     pgDumpVersion: string;
     pgDumpArgs: string[];
   };
+  /**
+   * WHAT THE DATABASE HELD, independently of the dump. OPTIONAL BECAUSE
+   * v1.3.0 BACKUPS EXIST AND MUST STILL RESTORE.
+   *
+   * Absent -- the key is not in the JSON at all -- is a v1.3.0-era archive, and
+   * a restore reports the check as NOT MADE rather than as passed. Present with
+   * an empty `tables` is a positive claim that there was nothing to record. See
+   * BackupInventory for why those two must not collapse into one.
+   */
+  inventory?: BackupInventory;
   /**
    * What it takes to open this file, recorded INSIDE the file for the reader
    * who already has it open and outside it in docs/backup-format.md for the
@@ -297,10 +404,19 @@ export { MAX_PASSPHRASE_LENGTH } from "@conduit/shared";
  *
  * (The read side is not symmetric, and it is worth knowing: `7z x -p` reading
  * from a pipe does NOT work on p7zip 16.02 -- it fails with "Cannot open
- * encrypted archive. Wrong password?". Conduit only ever writes, and a human
- * extracting types into a terminal or a dialog, so the asymmetry costs
- * nothing here; the test that opens an archive passes -p<value> on a command
- * line, where the passphrase is a fixture rather than a secret.)
+ * encrypted archive. Wrong password?". The test that opens an archive here
+ * passes -p<value> on a command line, where the passphrase is a fixture rather
+ * than a secret.
+ *
+ * SINCE 7.7 THE REST OF THAT SENTENCE IS KNOWN, and it is the opposite of what
+ * this comment used to imply. The obvious conclusion from the line above --
+ * that reading an archive must therefore put the passphrase in argv -- is
+ * FALSE. `7z x` with NO `-p` AT ALL prompts and reads that prompt from stdin,
+ * which a pipe satisfies exactly as a terminal does; a bare `-p` on extraction
+ * means the EMPTY passphrase. Measured as a 2x2 over the flag and the trailing
+ * newline, and recorded in full on services/intake.ts's sevenZipExtractArgs,
+ * which is where the read side now lives. The passphrase reaches argv on
+ * neither side.)
  */
 export function sevenZipArgs(archivePath: string, inputs: readonly string[]): string[] {
   return [
@@ -318,7 +434,8 @@ export function sevenZipArgs(archivePath: string, inputs: readonly string[]): st
 }
 
 /**
- * How pg_dump is invoked: the arguments, and separately the environment.
+ * A DATABASE_URL as the libpq environment variables every postgres client
+ * binary reads.
  *
  * THE DATABASE PASSWORD GOES IN THE ENVIRONMENT, NOT THE ARGUMENT LIST, and
  * the split is the whole reason this is a function rather than three lines at
@@ -329,10 +446,13 @@ export function sevenZipArgs(archivePath: string, inputs: readonly string[]): st
  * PGPASSWORD is only set when the URL carries one -- the deploy target's
  * DATABASE_URL does (conf/.env), the test database's socket URL does not, and
  * an empty PGPASSWORD is not the same as an absent one to libpq.
+ *
+ * ONE READER, TWO CONSUMERS, on migration-journal.ts's precedent. 7.7's
+ * restore drives `psql` and needs exactly this environment for exactly this
+ * reason; a second copy of the derivation would be a copy that drifts silently,
+ * and the direction it would drift in is a password reaching a command line.
  */
-export function pgDumpInvocation(
-  databaseUrl: string,
-): { args: string[]; env: Record<string, string> } {
+export function libpqEnvironment(databaseUrl: string): Record<string, string> {
   const url = new URL(databaseUrl);
   const env: Record<string, string> = {};
   // A URL's components are percent-encoded; libpq wants the decoded values.
@@ -342,7 +462,14 @@ export function pgDumpInvocation(
   if (url.password !== "") env.PGPASSWORD = decodeURIComponent(url.password);
   const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
   if (database !== "") env.PGDATABASE = database;
-  return { args: [...PG_DUMP_ARGS], env };
+  return env;
+}
+
+/** How pg_dump is invoked: the arguments, and separately the environment. */
+export function pgDumpInvocation(
+  databaseUrl: string,
+): { args: string[]; env: Record<string, string> } {
+  return { args: [...PG_DUMP_ARGS], env: libpqEnvironment(databaseUrl) };
 }
 
 /**
@@ -840,7 +967,12 @@ export async function buildBackup(options: BuildBackupOptions): Promise<BackupAr
 
   try {
     const dumpPath = path.join(work, "database.sql");
-    const dumpDigest = await runPgDump(databaseUrl, dumpPath);
+    // THE DUMP AND THE RECORD OF WHAT IT CAME OUT OF, FROM ONE SNAPSHOT. Not
+    // two steps that agree today: see dumpWithInventory for the measurement
+    // that says they would not.
+    const { sha256: dumpDigest, inventory } = await dumpWithInventory({
+      db, databaseUrl, dumpPath,
+    });
     const dumpBytes = (await stat(dumpPath)).size;
 
     const members: BackupManifestMember[] = [
@@ -860,6 +992,7 @@ export async function buildBackup(options: BuildBackupOptions): Promise<BackupAr
       migrationPosition: journal.position,
       generatedAt: now.toISOString(),
       postgres: { serverVersion, pgDumpVersion: pgDump, pgDumpArgs: [...PG_DUMP_ARGS] },
+      inventory,
       encryption: {
         container: "7z",
         cipher: "AES-256",
@@ -974,6 +1107,171 @@ async function digestOf(filePath: string): Promise<string> {
 }
 
 /**
+ * Anything that can run a query. The pool, or one transaction on it.
+ *
+ * THE INVENTORY HAS TO BE COUNTABLE INSIDE A TRANSACTION, which is the whole
+ * point of it, so measureInventory cannot take a `Database` and be done.
+ */
+type QueryRunner = Pick<Database, "execute">;
+
+/**
+ * EVERY TABLE AND EXACTLY HOW MANY ROWS IT HOLDS, from the catalogue.
+ *
+ * THE TABLE LIST COMES FROM postgres, NEVER FROM A CALLER, and that is what
+ * makes this safe to run over a restored database whose table names arrived
+ * inside an archive an operator uploaded. Nothing from a manifest reaches this
+ * query: the names are read out of pg_class and quoted by postgres's own
+ * `format('%I')`, so there is no identifier for anybody to inject into. The
+ * comparison against a manifest happens afterwards, in TypeScript, between two
+ * lists of strings.
+ *
+ * `query_to_xml` IS HOW A `count(*)` PER TABLE BECOMES ONE ROUND TRIP. It runs
+ * the generated SQL and returns its result as XML, so the whole inventory is a
+ * single statement -- which is not a performance nicety here but a correctness
+ * one: on the backup side every count must land in ONE transaction's snapshot,
+ * and a loop of statements from Node would be a loop of chances to get that
+ * wrong.
+ *
+ * THE SAME PREDICATE AS services/restore.ts's describeDatabaseShape, and
+ * deliberately so: `left(nspname, 3) <> 'pg_'` rather than `NOT LIKE 'pg\_%'`,
+ * because `_` is a LIKE wildcard and the escaping is one more thing to get
+ * wrong. The two must agree on what a table is, or a perfectly good restore
+ * would report a table missing from one list and present in the other.
+ *
+ * relkind 'r' AND 'p', matching that function. A partitioned parent and its
+ * partitions are therefore counted separately, so a database with partitions
+ * has its rows counted twice in the TOTAL -- and per table each figure is still
+ * exact, which is what the comparison actually uses. Conduit ships no
+ * partitioned table today; this is written down so that the day one arrives the
+ * behaviour is a decision rather than a surprise.
+ */
+export async function measureInventory(db: QueryRunner): Promise<BackupInventoryTable[]> {
+  const rows = await db.execute<{ name: string; rows: string | null }>(sql`
+    SELECT n.nspname || '.' || c.relname AS name,
+           (xpath('/row/c/text()',
+                  query_to_xml(format('SELECT count(*) AS c FROM %I.%I', n.nspname, c.relname),
+                               false, true, '')))[1]::text AS rows
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p')
+      AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
+    ORDER BY 1
+  `);
+  return rows.map((row) => ({ table: row.name, rows: Number(row.rows ?? "0") }));
+}
+
+export interface DumpWithInventory {
+  /** SHA-256 of the dump file, hashed as it was written. */
+  sha256: string;
+  /** What the database held in the snapshot the dump was taken from. */
+  inventory: BackupInventory;
+}
+
+/**
+ * TAKE THE DUMP AND THE INVENTORY OUT OF ONE SNAPSHOT.
+ *
+ * THE PROBLEM THIS SOLVES, BECAUSE IT IS THE ONLY HARD PART. pg_dump opens its
+ * own transaction and takes its own MVCC snapshot. Counting rows separately --
+ * before it, after it, or beside it -- counts a database that may have moved,
+ * and an inventory that disagrees with the dump it travels with is worse than
+ * no inventory at all: a restore would report a perfectly good backup as a
+ * failed one, at the loudest volume this product has, over an install that had
+ * just been replaced.
+ *
+ * SO THE SNAPSHOT IS SHARED, AND IT WAS MEASURED BEFORE IT WAS DESIGNED
+ * AROUND. On the deploy target (PostgreSQL 15.19, Debian 12), with a holder
+ * session in REPEATABLE READ exporting its snapshot and a third session writing
+ * in between:
+ *
+ *   counted in the holder ....... t=500  u=7   (v did not exist)
+ *   concurrent writer ........... +500 rows in t, -3 in u, CREATE TABLE v
+ *   pg_dump --snapshot=<id> ..... t=500  u=7   v absent   <- AGREES
+ *   pg_dump with its own ........ t=1000 u=4   v present  <- the race, real
+ *
+ * The last line is the control, and it is why this function exists: without the
+ * shared snapshot the two halves of a backup genuinely do disagree, on an
+ * ordinary write that arrives while the backup runs.
+ *
+ * THE ORDER IS EXPORT, THEN COUNT, THEN DUMP. The export takes the
+ * transaction's snapshot; every count after it in the SAME REPEATABLE READ
+ * transaction reads that same snapshot; pg_dump imports it by id.
+ *
+ * THE ISOLATION LEVEL IS NOT DECORATION, AND THAT WAS MEASURED TOO -- by
+ * mutation rather than by the probe above, which only exercised the flag.
+ * Deleting `isolationLevel` makes each count take a fresh snapshot of its own,
+ * and backup.test.ts's consistency case fails with the INVENTORY five rows
+ * ahead of the dump; deleting `--snapshot` fails the same case with the DUMP
+ * two rows ahead of the inventory. Two halves of one guarantee, and each has
+ * been shown breaking on its own.
+ *
+ * THE EXPORTING TRANSACTION MUST OUTLIVE THE IMPORT, so it is held open across
+ * the whole of pg_dump rather than closed once the id is in hand. That an
+ * exported snapshot is importable only until the exporting transaction ends is
+ * PostgreSQL's documented rule rather than something measured here -- nothing
+ * in this module rests on it, because the transaction is held for the whole
+ * dump either way, and there is no way from here to observe the instant
+ * pg_dump imports it even if we wanted to close earlier. The cost
+ * is one idle REPEATABLE READ transaction for the length of the dump, which is
+ * the same length pg_dump already holds one of its own for, against the same
+ * database.
+ */
+export async function dumpWithInventory(options: {
+  db: Database;
+  databaseUrl: string;
+  dumpPath: string;
+  /**
+   * Runs immediately after the snapshot is exported and BEFORE the counts, so a
+   * test can write to the database in the window the shared snapshot exists to
+   * close.
+   *
+   * IT IS THE ONLY WAY TO PROVE EITHER HALF, and it proves both from one place.
+   * A write landing here is invisible to a correct run and visible to each
+   * mutation, in opposite directions: drop `--snapshot` and the DUMP grows past
+   * the inventory; drop the REPEATABLE READ and the INVENTORY grows past the
+   * dump. Production passes nothing.
+   */
+  afterSnapshot?: () => Promise<void>;
+}): Promise<DumpWithInventory> {
+  const { db, databaseUrl, dumpPath, afterSnapshot } = options;
+  return await db.transaction(async (tx) => {
+    const exported = await tx.execute<{ id: string | null }>(
+      sql`SELECT pg_export_snapshot() AS id`,
+    );
+    const snapshotId = exported[0]?.id ?? null;
+    // NO SILENT FALLBACK TO AN UNSHARED DUMP, on the precedent
+    // BackupKeyMissingError sets two hundred lines above: the failure an
+    // operator must not be allowed to have is the silent one. A backup that
+    // quietly dropped its inventory would look exactly like a v1.3.0 archive,
+    // and the day it was restored the check would report itself "not made" with
+    // nobody able to say why.
+    //
+    // THIS IS A MESSAGE, NOT AN INSTRUMENT, AND IT IS LABELLED AS ONE. No
+    // fixture can make pg_export_snapshot answer nothing, so no test can show
+    // this branch failing -- and the correctness it looks like it protects is
+    // already held by pg_dump, measured on the deploy target: `--snapshot=`
+    // exits 1 with `could not read file "pg_snapshots/": Is a directory`, and
+    // `--snapshot=not-a-snapshot` exits 1 with `invalid snapshot identifier`.
+    // Either way the backup fails rather than half-succeeding. What this buys
+    // is the sentence an operator reads instead of that one.
+    if (snapshotId === null || snapshotId === "") {
+      throw new BackupFailedError(
+        "the database would not export a snapshot, so the backup's dump and its record of "
+        + "what the database held could not be taken from the same instant",
+      );
+    }
+    // BEFORE THE COUNTS, NOT AFTER THEM, AND THE DIFFERENCE WAS MEASURED. With
+    // this line below measureInventory the counts ran before the write and the
+    // dump ran after it, so only the DUMP's half of the guarantee was under
+    // test: deleting `isolationLevel` changed nothing any test could see, and
+    // the mutation survived. Here it exercises both halves at once.
+    if (afterSnapshot !== undefined) await afterSnapshot();
+    const tables = await measureInventory(tx);
+    const sha256 = await runPgDump(databaseUrl, dumpPath, snapshotId);
+    return { sha256, inventory: { consistency: INVENTORY_CONSISTENCY, tables } };
+  }, { isolationLevel: "repeatable read" });
+}
+
+/**
  * Dump the database to `dumpPath`, returning the dump's SHA-256.
  *
  * HASHED ON THE WAY PAST rather than in a second read: the bytes are already
@@ -981,9 +1279,20 @@ async function digestOf(filePath: string): Promise<string> {
  * and a 50MB dump re-read to hash it is 50MB of disk for nothing. Nothing is
  * buffered -- the pipeline's back-pressure is what keeps a dump of any size
  * costing one 64KB chunk of memory.
+ *
+ * `snapshotId` IS NOT OPTIONAL, and that is the guard rather than a signature
+ * preference. A default would make "dump whatever you can see" the thing that
+ * happens when a caller forgets, and what a caller forgets here is the one
+ * property the inventory rests on. Every dump this module writes shares a
+ * snapshot with the counts recorded beside it.
  */
-async function runPgDump(databaseUrl: string, dumpPath: string): Promise<string> {
+async function runPgDump(
+  databaseUrl: string, dumpPath: string, snapshotId: string,
+): Promise<string> {
   const { args, env } = pgDumpInvocation(databaseUrl);
+  // AFTER pgDumpInvocation RATHER THAN INSIDE IT, so the manifest's pgDumpArgs
+  // stays the fixed list that describes the FILE. See BackupManifest.postgres.
+  args.push(`--snapshot=${snapshotId}`);
   const child = spawn("pg_dump", args, {
     stdio: ["ignore", "pipe", "pipe"],
     // The password rides in here, where /proc/<pid>/environ is readable only

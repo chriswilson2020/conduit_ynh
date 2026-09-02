@@ -1,0 +1,223 @@
+# Conduit Phase 7.7 — Restore and import
+
+**Status:** approved by Chris, 1 Sep, with the scope kept whole. Restore is built and reviewed first within the phase.
+
+**Baseline:** `origin/main` at `254ce50`, v1.3.0 shipped. **2742 unit (2741 + 1 skipped), 184 e2e.**
+
+**Target release:** v1.4.0.
+
+---
+
+## The decisions Chris already made, on 30 Aug
+
+Recorded in 7.6's spec so they could not drift while this waited:
+
+1. **Restore replaces everything, heavily guarded** — confirmed by typing the install's name, and preceded by an automatic backup so a mistaken restore is itself undoable.
+2. **Import means both** — a forgiving, interactive CSV importer for foreign data (another CRM, a spreadsheet, Outlook) with column mapping and a preview, **and** an exact importer for Conduit's own export.
+
+He rejected "only onto an empty install" (makes restore a migration tool rather than a recovery tool) and "merge into what is there" (ID collisions, partial failures, no answer for a row in both).
+
+---
+
+## SCOPE: both, in one phase. Chris's decision stands.
+
+I recommended splitting this — restore as 7.7, the importers as 7.8 — and **Chris rejected
+it.** His original decision of 30 Aug was both, and it holds.
+
+**Recording why the recommendation was wrong to press, because the reasoning was thin.** The
+split would not have reduced the work; it would have ordered it into two releases. The real
+argument was that restore deserves undivided review attention — and that is satisfied by
+*sequencing within one phase* rather than by splitting the release. **Restore is built and
+reviewed first regardless**, because the importers cannot be exercised without something to
+import into.
+
+So: one phase, one release, restore first.
+
+---
+
+## THE SHARED SPINE — designed before either half, on Chris's argument
+
+**Chris, 1 Sep:** *"Both mechanisms may use similar elements... You implement one then start the
+other and realise you should have implemented it differently to do the other part and you waste
+my tokens getting there and tying yourself in a knot."*
+
+He is right, and the first attempt at this phase was stopped mid-task because of it. Restore
+and both importers are the same pipeline with different last steps:
+
+| | ingest | stage | inspect | **plan** | apply |
+|---|---|---|---|---|---|
+| Restore | upload `.7z` | `7z x` + passphrase | manifest, versions, journal | what will be DESTROYED and replaced | safety backup, then load |
+| Import (own export) | upload `.zip` | unzip | manifest, `formatVersion`, declared transform | what will be CREATED and skipped | insert |
+| Import (foreign CSV) | upload `.csv` | none | sniff headers, delimiter, encoding | mapping applied, rows, errors | insert |
+
+**The last column differs. The first four do not.** Building restore's apply path first and
+retrofitting the rest is exactly the knot.
+
+### The one decision that makes the spine hold: THE PLAN IS A VALUE
+
+`inspect` produces a **plan object**; the UI renders it; `apply` consumes it and may do nothing
+the plan did not describe. Three consequences, and they are the reason to do it this way:
+
+- **The preview cannot lie.** It is not a second implementation that predicts what apply will
+  do — it is the same object apply is given.
+- **Apply cannot surprise.** Anything not in the plan is a bug with an obvious shape.
+- **Every hard case is testable without executing it.** A plan for a corrupted archive, a
+  newer schema, a 200,000-row CSV — all assertable as values, no database required.
+
+Chris made the preview a requirement for import. It is the right guard for restore too, where
+the thing being previewed is destruction.
+
+### What the spine owns, so neither half re-invents it
+
+- **The uploaded file is a credential store from the moment it lands** — `0600`, inside
+  `$data_dir`, **never `/tmp`**, deleted on every exit path including failure and abort, proved
+  by counting descriptors as v1.3.0 did.
+- **Size and shape limits before unpacking**, so a hostile archive cannot fill the disk.
+- **Validate before mutate, always.** Every refusal happens with nothing written.
+- **Apply runs in one transaction** and rolls back as a unit; if the rollback itself fails, the
+  failure is loud and names what to do by hand.
+
+### What stays different, and must not be generalised
+
+- **Only restore takes a safety backup.** An import that goes wrong adds rows the operator can
+  archive; a restore that goes wrong has already destroyed them.
+- **Only restore replaces `mail.key`**, and that is irreversible in effect.
+- **Only the foreign CSV importer has an interactive step** between inspect and plan — the
+  column mapping. The other two produce their plan without asking anything.
+
+---
+
+## Restore — the architecture
+
+### The operational problem, which shapes everything
+
+**Conduit cannot drop the database it is connected to.** A restore therefore cannot be "recreate the database and load the dump". The workable sequence, in order:
+
+1. **Re-authenticate**, as v1.3.0 requires for the downloads. Restore is strictly more dangerous.
+2. **Upload the `.7z` and take the passphrase.** The upload is a credential store on disk the moment it lands — same discipline as the backup's temp file: `0600`, inside `$data_dir`, never `/tmp`, deleted on every exit path.
+3. **Decrypt and validate BEFORE touching anything.** Extract to a temp directory; read `manifest.json`; check the app version, the schema version and the migration journal position. **A backup from a NEWER Conduit than the running one is refused** — its dump may reference columns this code does not have. A backup from an OLDER one is accepted and migrated forward after load.
+4. **Take a safety backup**, using the same passphrase the operator just typed for the restore. They demonstrably have it, so this adds no new thing to lose. **If the safety backup fails, the restore does not start.**
+5. **Stop the mail sync** and refuse new writes. *(Corrected during 7.7 Task 2: the
+   sync is stopped **before** the safety backup, not after it -- a backup taken while
+   the second writer is running is an undo to a state that stopped being true a moment
+   later.)*
+
+   *(**"Refuse new writes" landed in 7.7 Task 3**, the routes task, because it needs
+   to see a request. `services/write-gate.ts` refuses every unsafe HTTP method for
+   the duration -- the METHOD and not a list of routes, so a route added later cannot
+   forget to be covered -- and the hook is registered BEFORE the identity hook,
+   because resolving a user writes to the database on a cache miss and that write
+   would block behind the restore's own `DROP SCHEMA`. Reads are not refused: step 5
+   says writes, and a page that could not report what was happening would be worse
+   than useless during the one operation an operator watches.*
+
+   *Closing the gate stops the NEXT write and says nothing about one already inside a
+   handler with a transaction open, so the apply route also **waits** for the writes
+   already in flight, bounded at 15s. **A wait that runs out refuses the restore**: a
+   restore that did not start is recoverable by pressing the button again, and one
+   that destroyed the database under a live writer is not. An in-flight write is
+   never killed -- it finishes normally and the restore is what gives way.)*
+6. **Load the blobs, then the dump, then `mail.key`.** *(Corrected during 7.7 Task 2.
+   This step originally read "load the dump, then the blobs, then `mail.key`", which
+   contradicted this document's own failure analysis below -- "database LAST, so a crash
+   mid-blob leaves a consistent database referencing files that exist". Blobs are
+   content-addressed and additive, so writing them first is safe and re-runnable.
+   `mail.key` stays **after** the database, and deliberately: it is a REPLACEMENT, so a
+   key installed before a load that then rolled back would strand every stored mail
+   password under a key no longer on disk -- the exact state the rollback exists to
+   prevent. The residual window is the mirror case, and is named in `services/restore.ts`.)*
+7. **Run migrations forward** if the backup's schema version is older.
+8. **Restart the sync. Invalidate every re-auth ticket** — the in-memory map dies with the process anyway, but say so rather than relying on it.
+
+### Failure in the middle is the whole design problem
+
+**Steps 6–7 are where "you have neither" lives.** The answer:
+
+- **Restore inside one transaction** where possible, so a failed load rolls back to the pre-restore state rather than a half-loaded one. `pg_dump`'s plain SQL can be wrapped; this must be verified rather than assumed.
+- **If the load fails and the rollback succeeds**, the operator is exactly where they started and is told so.
+- **If the rollback also fails**, be very loud, name the safety backup's location on disk, and give the exact command to restore it by hand. **A silent half-restore is the worst outcome this app can produce** and it must be impossible to reach without a message.
+- The blobs are content-addressed and immutable, so writing them is idempotent and re-runnable. Order matters: **database last**, so a crash mid-blob leaves a consistent database referencing files that exist.
+
+> **ADDED 1 Sep, and it closes a hole this section did not know it had.** Everything above
+> verifies the restore against the archive it loaded. That cannot catch a backup that was
+> **already wrong when it was taken** -- every witness in the chain is derived from
+> `database.sql`, which is the file the load consumed. Since v1.4.0 the backup's
+> `manifest.json` carries an **inventory** of what the database HELD (tables, exact row
+> counts, measured from the catalogue in the dump's own snapshot -- see 7.6's spec), and the
+> restore compares its result against that too.
+>
+> **It is a report, not a prevention**, and that is decided rather than conceded: by the time
+> rows can be counted the transaction has committed, so there is no rollback left to take.
+> The answer is the one every other post-commit failure here gives -- say which tables
+> disagree and by how much, name the safety backup, print the commands that put the install
+> back -- and it **stops the plan**, so `mail.key` is not replaced and no migrations run on
+> top of a restore that has just proved it can surprise us.
+>
+> **A backup with no inventory still restores**, with the check reported as *not made*. Chris
+> has v1.3.0 backups; a restore that refused them would be worse than the gap it closes.
+
+### The item this phase must not get wrong
+
+**An unlisted `files/` member is EXTRA, not DAMAGE.** The backup manifest's member list is the blob walk's snapshot, and `7z` reads the directory again when it runs — so an upload landing between the two puts a member in the archive the manifest does not list. That is harmless: blobs are content-addressed and immutable, so it is a whole file rather than a partial one. **A restore that treated "in the archive, not in the manifest" as corruption would reject a perfectly good backup.** The opposite skew needs no handling: a blob deleted in that window makes `7z` exit non-zero, which already fails the backup.
+
+### The guard
+
+Chris's ruling: **type the install's name to confirm.** Plus re-authentication, plus a plain statement of what is about to be destroyed — row counts from the live database, so the operator sees what they are replacing rather than an abstraction.
+
+> **WHAT "THE INSTALL'S NAME" IS, decided in 7.7 Task 3 and recorded here because
+> it is a ruling being carried out rather than an implementation detail. It is THE
+> DATABASE THIS INSTALL IS CONNECTED TO** -- `conduit` on a stock YunoHost
+> install, `conduit__2` on a second instance, which is the name YunoHost itself
+> uses for the install. The reasoning at length is in `routes/restore.ts`'s
+> `installName`. In short: the organisation profile's name is EMPTY on a fresh
+> install, which is exactly the install a recovery restore runs against; the
+> hostname does not tell two instances on one box apart, and two tabs on one box
+> is the confusion that actually happens; the app version and the base path are
+> the same on every install of a release. The database name is the only candidate
+> that names the object the restore actually destroys, cannot be empty (the
+> process would not have booted without it), and is NOT IN THE ARCHIVE -- so a
+> wrong or hostile backup cannot supply its own confirmation.
+>
+> **It does not tell two BOXES apart**, each running one stock Conduit, and that
+> is stated rather than papered over with a composite name nobody would recognise
+> as their install's. Re-authentication (a different box, a different password)
+> and the archive passphrase stand behind it.
+>
+> **RE-AUTHENTICATION IS ON BOTH REQUESTS**, the preview and the apply. A ticket
+> is single-use by design, so one cannot span a person reading a destruction list
+> -- and it should not: what the gate proves is that the operator is at the
+> keyboard NOW, and the moment that matters is the one where the database goes.
+> The page therefore asks for the password twice and has to say why.
+
+---
+
+## Import — two importers, deliberately not one
+
+**Foreign CSV** — forgiving and interactive. Upload, map columns to fields, preview what will be created, then commit. Must handle: a header row it does not recognise, missing required fields, duplicate detection against what is already there, and a partial failure that does not leave half a spreadsheet loaded.
+
+**Conduit's own export** — exact. It reads `manifest.json`'s `formatVersion`, which exists for this. **It must reverse the declared cell transform**: v1.3.0's export prefixes cells beginning `=` or `@` with an apostrophe so a spreadsheet cannot execute them, doubles a leading apostrophe so the transform is invertible, and records it in `manifest.json` as a named versioned entry. `csv.ts` exports `unescapeCellValue` for exactly this.
+
+**Neither importer restores.** The export has no mail bodies, no credentials and no `mail.key` — that asymmetry is deliberate and this phase must not blur it. **The Settings page must not let someone reach for an import when they meant a restore.**
+
+---
+
+## Definition of done
+
+- A backup taken on a populated install, restored onto a **different** install, and the data verified equal — not a round trip on the same box, which can pass while a real restore fails.
+- A restore from an **older** schema version migrated forward and verified.
+- A restore from a **newer** version refused with a clear message.
+- A deliberately corrupted archive refused **before** anything is destroyed.
+- A failed load rolled back, with the operator demonstrably where they started.
+- The safety backup proved to exist and to open, before the restore proceeds.
+- An archive carrying an unlisted `files/` member restored **successfully**.
+- Every guard mutation-tested, and every instrument shown to fail before being trusted.
+
+---
+
+## Risks
+
+1. **This is the most dangerous code in the product.** The guard against a mistaken restore is a name typed by a person; the guard against a *broken* restore is the safety backup, and it is only real if it is verified before the destructive step rather than after.
+2. **Restoring onto the same install can pass while a real restore fails** — identical paths, identical `mail.key`, identical schema. The definition of done requires a second install for that reason.
+3. **`mail.key` replacement is irreversible in effect**: restoring an old key strands mail passwords encrypted under the current one. The manifest must be checked and the operator told.
+4. **The upload is a credential store** with the same disciplines as the backup's temp file, in a direction that has not been built before.
+5. **Scope is the real schedule risk, and it is accepted rather than mitigated.** Restore and two importers is the largest phase since Phase 7. The mitigation is sequencing -- restore built and reviewed to completion before an importer is started -- not a smaller phase.

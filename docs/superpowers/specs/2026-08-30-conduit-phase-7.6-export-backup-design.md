@@ -91,6 +91,28 @@ Everything needed to reconstruct the install: a `pg_dump` of the database, the b
 `mail.key`, and a manifest recording the app version, schema version and migration journal
 position.
 
+> **AMENDED 1 Sep, during 7.7, and it is a change to the FORMAT rather than to a consumer of
+> it.** The manifest also records an **inventory**: every table the database held, by name,
+> with its **exact** row count. 7.7's restore verifies its result against the tables the dump
+> declares -- and the dump is the file the load consumed, so a backup that was already wrong
+> when it was written restores perfectly against its own description and nothing notices. The
+> inventory is the independent witness, measured from PostgreSQL's catalogue rather than read
+> out of `database.sql`.
+>
+> **The counts and the dump come out of one snapshot**, and that was measured before it was
+> designed around: Conduit exports a snapshot from a `REPEATABLE READ` transaction, counts
+> inside it, and hands it to `pg_dump --snapshot`. Verified on PostgreSQL 15.19 with a
+> concurrent writer, against a control that shows the two halves genuinely disagreeing
+> without it. An inventory that could disagree with its own dump would be worse than none: it
+> would fail a good backup's restore, loudly, over an install that had just been replaced.
+>
+> **`formatVersion` is NOT bumped**, deliberately. This adds a manifest field; it renames no
+> member, removes none, and does not change the dump's own flags -- which is exactly the line
+> `BACKUP_FORMAT_VERSION`'s own note draws. And restore compares that number with `!==`, so
+> bumping it would refuse every backup Chris has already taken. **A backup with no inventory
+> still restores**, with the check reported as *not made*. `docs/backup-format.md` carries the
+> whole of it, including how a reader tells "no inventory" from "an inventory of nothing".
+
 ### Encryption -- decided by Chris, 30 Aug: **AES-256 `.7z`**
 
 The brainstorm requirement was that a backup be openable without Conduit, and my first draft

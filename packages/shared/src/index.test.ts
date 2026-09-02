@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { randomUUID } from "node:crypto";
 import {
+  CSV_IMPORT_FIELDS,
+  csvImportFieldSchema,
   userSchema,
   meResponseSchema,
   healthResponseSchema,
@@ -2193,5 +2195,49 @@ describe("renderInputCost", () => {
     // exists for. One CJK character is three bytes and one string index.
     const html = "<p>\u6f22\u5b57</p>";
     expect(renderInputCost(html).markupBytes).toBe(html.length + 4);
+  });
+});
+
+describe("csvImportFieldSchema", () => {
+  /**
+   * THE PINNING A COMMENT PROMISED AND NOBODY WROTE.
+   *
+   * `csvImportFieldSchema` is a hand-written list of the fourteen fields, and
+   * routes/import.ts's mapping schema and csvMappingViewSchema's `targets` both
+   * parse against it. CSV_IMPORT_FIELDS is the list the PICKER is built from
+   * and the one csvImportField resolves. They must be the same set.
+   *
+   * THE COMPILER DOES NOT COVER THIS EDGE. CSV_MAPPING_VIEW_SCHEMA_AGREES holds
+   * the enum against the CsvImportField UNION, which is a TYPE; the members of
+   * CSV_IMPORT_FIELDS are a runtime array, and no assignability check can see
+   * what is in it. import-mapping.test.ts holds the array against the union.
+   * This is the third edge of that triangle, and until it existed the two lists
+   * could disagree with every test green.
+   *
+   * WHAT IT COSTS WHEN THEY DISAGREE, which is why it is a test and not a
+   * comment: the mapping step's `targets` come from CSV_IMPORT_FIELDS, so the
+   * picker offers the field; the page's Continue control reads
+   * csvMappingProblem, which never consults this schema, so it stays enabled;
+   * and the plan route then answers 400 with a zod message about a field the
+   * operator picked from a list Conduit had just shown them.
+   *
+   * SORTED, because neither list's ORDER is load-bearing -- the picker renders
+   * CSV_IMPORT_FIELDS in its own order and zod does not care -- and a test that
+   * failed on a reordering would be asserting something no caller depends on.
+   */
+  it("offers exactly the fields CSV_IMPORT_FIELDS does, and no others", () => {
+    expect([...csvImportFieldSchema.options].sort())
+      .toEqual(CSV_IMPORT_FIELDS.map((def) => def.field).sort());
+  });
+
+  it("accepts every one of them and refuses anything else", () => {
+    // The other half: an enum with the right MEMBERSHIP could still be built so
+    // loosely that it accepted a field nobody offers.
+    for (const def of CSV_IMPORT_FIELDS) {
+      expect(csvImportFieldSchema.safeParse(def.field).success, def.field).toBe(true);
+    }
+    for (const bad of ["company.vat", "contact.email ", "COMPANY.NAME", "", "email"]) {
+      expect(csvImportFieldSchema.safeParse(bad).success, bad).toBe(false);
+    }
   });
 });

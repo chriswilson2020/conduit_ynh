@@ -117,6 +117,16 @@ there is no extraction path anywhere in `packages/api/src`. So the message a per
 wrong passphrase is **the extractor's**, not Conduit's, and there is nothing in this codebase
 that could leak whether a passphrase was close, because nothing here ever compares one.
 
+> **Superseded in part, 1 Sep, by 7.7 Task 1.** The paragraph above is kept as the record of
+> what was true at v1.3.0. Two of its sentences are not true any more: `packages/api/src` now
+> has an extraction path (`services/intake.ts`), so `7z l` and `7z x` join `7z i` and `7z a`.
+> **The conclusion still holds and is now stronger.** With `-mhe=on` the header is encrypted
+> and sits at the END of the archive, so a wrong passphrase and a damaged header fail at the
+> same point in the same code path with the same sentence -- asserted in `intake.test.ts`
+> rather than argued -- and Conduit still never compares a passphrase to anything. Damage to
+> the compressed body is distinguishable, and should be: by then the passphrase has already
+> been proved correct.
+
 **THE EXCEL VISUAL COULD NOT BE COMPLETED AND IS OUTSTANDING.** Screen access was declined
 and the agent correctly did not route around it. What exists instead is byte-level proof,
 re-run at release time rather than quoted from a transcript: the exported `companies.csv`

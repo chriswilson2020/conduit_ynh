@@ -65,6 +65,27 @@ interface CacheEntry {
 
 export interface UserResolver {
   resolve(identity: Identity): Promise<User>;
+  /**
+   * The user this process has already resolved for this username, or null --
+   * WITHOUT WRITING ANYTHING.
+   *
+   * IT EXISTS FOR ONE CALLER AND ONE MOMENT: a request arriving while a restore
+   * is replacing the database (see services/write-gate.ts). `resolve` is an
+   * UPSERT, so a read from an identity this process has not seen INSERTS a
+   * users row -- and PostgreSQL does not merely let that race the restore, it
+   * QUEUES the insert behind the restore's `DROP SCHEMA` lock and releases it
+   * at COMMIT, landing it inside the restored data. Measured: 79 rows arrived
+   * that way during one restore, and the row count check that follows the load
+   * then reported a mismatch against a restore that had worked perfectly.
+   *
+   * EXPIRY IS DELIBERATELY IGNORED HERE, which is the one place this differs
+   * from `resolve`. The TTL exists to refresh cosmetic LDAP attributes; a
+   * restore that runs longer than a minute would otherwise evict the operator
+   * who is watching it and lock them out of their own page at the moment they
+   * most need to see it. A stale display name for the length of a restore is
+   * not a risk; refusing the person running it is.
+   */
+  cached(identity: Identity): User | null;
   /** Number of entries currently cached. Exposed for tests. */
   size(): number;
   clear(): void;
@@ -106,6 +127,9 @@ export function createUserResolver(db: Database, ttlMs: number = DEFAULT_TTL_MS)
       const user = await resolveUser(db, identity);
       cache.set(identity.username, { user, expiresAt: now + ttlMs });
       return user;
+    },
+    cached(identity: Identity): User | null {
+      return cache.get(identity.username)?.user ?? null;
     },
     size(): number {
       return cache.size;

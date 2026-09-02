@@ -22,6 +22,45 @@ import { csvDocument } from "./csv.js";
 // words next to both buttons. Two similar-looking downloads is exactly how
 // someone ends up with three years of tidy CSVs and no way to put Conduit back.
 //
+// SINCE 7.7 THAT CLAIM HAS A LITERAL COUNTERPART, and it is worth saying here
+// because "not restorable" used to be an abstraction and is not any more. The
+// same Settings page now RESTORES, and what it restores is a `.7z` carrying
+// database.sql, mail.key and the blob store -- none of which is in this file.
+// An archive written here that reached the restore is refused before anything
+// is touched, by services/restore.ts's RESTORE_REFUSALS.notABackup.
+//
+// HOW THAT REFUSAL ACTUALLY FIRES, written down because it is not what it
+// looks like. The check is `manifest.kind !== "backup"`, and ExportManifest
+// below HAS NO `kind` FIELD -- so what refuses an export is the field being
+// ABSENT, not a declaration of what it is. That is the stricter of the two
+// behaviours (anything whose manifest does not positively say "backup" is
+// refused) and it needs no change; it is recorded here because a reader of
+// either module could reasonably infer that this file writes `kind: "export"`,
+// and it does not. Adding one would be a change to a versioned format that
+// 7.7's exact importer reads, so it is a decision rather than a tidy-up.
+// (It said "7.8's" until that importer was built, in 7.7, alongside restore.)
+//
+// SINCE 7.7 THIS ARCHIVE HAS A READER: services/import-export.ts. Two things
+// there are worth knowing here, because both are properties of what this file
+// WRITES rather than of what that file reads:
+//
+//   THE MANIFEST'S ABSENT `kind` IS WHAT THE IMPORTER REFUSES A BACKUP ON, from
+//   the other side -- `manifest.kind === "backup"` sends the operator to
+//   Restore. The two refusals are a matched pair and neither is a default.
+//
+//   THE EXPORT IS NOT A COMPLETE DESCRIPTION OF THE DATA, and the importer is
+//   what made that concrete. It reads TWO of the nine sheets. The other seven
+//   name rows whose NOT NULL columns or foreign keys are not in this archive at
+//   all -- there is no pipelines.csv, no stages.csv, no users, no fractional
+//   `position`, no document_line_items, and meeting attendees are flattened to
+//   display names. That is a gap in this format rather than in the reader; the
+//   list is in services/import-export.ts's header and in the backlog, and
+//   closing it is a formatVersion 2.
+//
+// The page draws the same line in words, because the failure being designed
+// against is somebody reaching for the wrong artefact at the moment they most
+// need the right one.
+//
 // WHAT IS DELIBERATELY ABSENT, and none of it is an oversight:
 //
 //   - NO CREDENTIALS. mail_accounts is never queried, so no encrypted password
