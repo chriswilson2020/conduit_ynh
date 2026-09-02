@@ -2,8 +2,8 @@ import { eq } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { MultipartFile } from "@fastify/multipart";
 import { z } from "zod";
-import { CSV_IMPORT_FIELDS } from "@conduit/shared";
-import type { CsvImportField, CsvMappingView, PlanView } from "@conduit/shared";
+import { csvImportFieldSchema } from "@conduit/shared";
+import type { CsvMappingView, PlanView } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
 import { requireUser, parseOrReject } from "./helpers.js";
 import { users } from "../db/schema.js";
@@ -245,20 +245,6 @@ const applyRequestSchema = z.strictObject({
 const planIdParamSchema = z.object({ planId: z.uuid("that is not a plan id") });
 
 /**
- * Every field a column may be mapped onto, AS A SCHEMA DERIVED FROM THE LIST
- * THE PICKER IS BUILT FROM.
- *
- * NOT A SECOND LIST OF FOURTEEN STRINGS. @conduit/shared's CSV_IMPORT_FIELDS is
- * what the mapping step offers, what csvImportField resolves and what
- * csvMappingProblem reasons about; a hand-written enum here would be a fifth
- * copy of it and the one that drifted would refuse a mapping the page had just
- * offered.
- */
-const csvImportFieldSchema = z.enum(
-  CSV_IMPORT_FIELDS.map((def) => def.field) as [CsvImportField, ...CsvImportField[]],
-);
-
-/**
  * WHAT THE OPERATOR DECIDED, ARRIVING FROM A CLIENT.
  *
  * THE ONE THING IN THE WHOLE SPINE THAT TRAVELS AND IS ACTED ON -- and
@@ -280,6 +266,12 @@ const csvImportFieldSchema = z.enum(
 const csvMappingSchema = z.strictObject({
   entries: z.array(z.strictObject({
     column: z.int().nonnegative("a column is identified by its position, from 0"),
+    // EVERY FIELD A COLUMN MAY BE MAPPED ONTO, AND NOT A SECOND LIST OF
+    // FOURTEEN STRINGS. @conduit/shared owns the one enum -- the same one the
+    // mapping view's `targets` are parsed against -- and it is held to
+    // CsvImportField by the compiler (see csvMappingViewSchemaAgrees). A copy
+    // here would be the fifth spelling of that list, and the one that drifted
+    // would refuse a mapping the page had just offered.
     field: csvImportFieldSchema,
   })),
   delimiter: z.enum(FOREIGN_CSV_DELIMITERS).optional(),
