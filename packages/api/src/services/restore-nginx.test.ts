@@ -23,10 +23,14 @@ import {
  *   application.
  *
  *   THE REQUEST BUFFERING. Off, and not for speed: the preview's multipart body
- *   carries the archive passphrase in its FIRST field, so a buffered body is
- *   that passphrase written to a file in nginx's client_body_temp_path. 7.6's
- *   rule is that the passphrase is never written to disk, and a rule the
- *   deployment breaks is not a rule.
+ *   carries the archive passphrase in its FIRST field, so a buffered body puts
+ *   that passphrase on disk in the clear. 7.6's rule is that the passphrase is
+ *   never written to disk, and a rule the deployment breaks is not a rule.
+ *   MEASURED, and narrower than an earlier version of this said: nginx writes
+ *   the body to a file it creates and unlinks in the same call -- 0600, link
+ *   count 0, never named, freed at the end of the request -- so the exposure is
+ *   the passphrase in disk blocks for the length of the upload rather than a
+ *   file left behind. See services/restore.ts's constant for the measurement.
  *
  *   THE WAIT, on BOTH routes. The preview decrypts and unpacks before it
  *   answers; the apply takes a whole safety backup before it destroys anything.
@@ -149,9 +153,9 @@ describe("conf/nginx.conf's restore preview location", () => {
 
   it("DOES NOT BUFFER THE REQUEST, because the passphrase is in it", () => {
     // The preview's body is multipart with the passphrase FIRST. Buffered, that
-    // is the archive's passphrase written to a file Conduit does not own,
-    // cannot chmod and does not delete -- 7.6's rule broken by the deployment
-    // rather than by the process.
+    // is the archive's passphrase in disk blocks for the length of the upload
+    // -- 7.6's rule broken by the deployment rather than by the process. The
+    // file itself is unlinked as it is created; see the header.
     const block = directives(locationBody(conf, INSPECT));
     expect(block).toContain("proxy_request_buffering off;");
     // An unbuffered body that arrives chunked cannot be forwarded over the

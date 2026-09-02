@@ -155,7 +155,23 @@ export function SettingsDataPage() {
    */
   const [confirmPassphrase, setConfirmPassphrase] = useState("");
   const [restoreError, setRestoreError] = useState<string | null>(null);
-  const [outcome, setOutcome] = useState<RestoreOutcome | null>(null);
+  /**
+   * WHAT A FINISHED RESTORE LEFT BEHIND, WITH THE NAME IT RAN AGAINST.
+   *
+   * THE PAIR IS ONE PIECE OF STATE BECAUSE THE INVARIANT IS STRUCTURAL, and a
+   * review is what turned a guard into this. An apply cannot start unless
+   * `installName` is a string -- restoreConfirmBlocked refuses outright when the
+   * server could not name its database -- so a finished restore always has one.
+   * RestartAdvice used to take `string | null` and guard on it, which meant its
+   * null branch was unreachable through the page AND unfailable: deleting the
+   * guard changed nothing any test could see, and so would putting back the
+   * invented `?? "conduit"` constant that this branch has already had to
+   * remove once. Carrying the name WITH the outcome makes the impossible state
+   * unrepresentable instead of merely unvisited, and the guard disappears.
+   */
+  const [outcome, setOutcome] = useState<{
+    result: RestoreOutcome; installName: string;
+  } | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [applying, setApplying] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -276,25 +292,30 @@ export function SettingsDataPage() {
       });
       setPreview(answer);
       setInstallName(answer.installName);
-      // THE PASSPHRASE IS CLEARED THE MOMENT IT HAS BEEN USED, for the reason
-      // the backup form's is: there is no reason for it to outlive the request
-      // it was typed for, and the confirmation below asks for it again on
-      // purpose.
+      // THE WHOLE FORM GOES, AND WHICH HALF SURVIVES DEPENDS ON WHETHER THE
+      // CARD SURVIVES -- which a review had to point out, because the comment
+      // that used to be here reasoned about the wrong path and reached the
+      // opposite conclusion.
       //
-      // THE FILE IS NOT CLEARED, AND THAT IS A FIX RATHER THAN AN OMISSION. A
-      // file input is uncontrolled -- React cannot empty one by re-rendering --
-      // so clearing this half of the state would leave the chosen filename on
-      // screen with `file: null` behind it, and after a Cancel the operator
-      // would be told to "choose a backup file" while looking at the name of
-      // the one they chose. That is precisely the disabled-control-with-an
-      // -invisible-reason this page exists not to ship. Keeping it also means a
-      // cancelled preview can be retried without finding the file again, and it
-      // costs nothing: the archive is encrypted and the secret that opens it is
-      // the line above.
-      setRestoreForm((current) => ({ ...current, passphrase: "" }));
+      // A file input is uncontrolled: React cannot empty one by re-rendering.
+      // So on the PREVIEW FAILURE path below, where RestoreUploadCard stays
+      // mounted and the input keeps its selection, clearing `file` would leave
+      // the chosen name on screen with `file: null` behind it -- and that is
+      // where the old comment's reasoning belongs, and where it now is.
+      //
+      // THIS path is the opposite, and it is the ONLY place the form is
+      // emptied. A preview REPLACES the upload card with the plan card, so the
+      // input is unmounted; when a Cancel or a finished restore brings the card
+      // back it is a NEW input holding no selection. Keeping `file` in state
+      // across that would leave the page believing it had a file the operator
+      // can no longer see -- "fill in the passphrase to enable this" over an
+      // input reading "no file chosen" -- and Preview would silently re-upload
+      // the previous archive. Emptying it here covers both ways back, because
+      // nothing between here and either of them can touch an unmounted form.
+      setRestoreForm(EMPTY_RESTORE_FORM);
       // Untouched again, so the upload card does not greet a returning operator
-      // with a red "type a passphrase" for a form they have not come back to
-      // yet. The button is still off, and restorePreviewBlocked says why.
+      // with a red "choose a backup" for a form they have not come back to yet.
+      // The button is still off, and restorePreviewBlocked says why.
       setRestoreTouched(false);
       setTypedName("");
       setConfirmPassphrase("");
@@ -304,8 +325,13 @@ export function SettingsDataPage() {
       // THE PASSPHRASE GOES ON THE FAILING PATH TOO, and a review found it
       // staying. The rule this field's own comment states is that a passphrase
       // does not outlive the request it was typed for, and a refused archive is
-      // a request that is over. The file is kept, so a second try is a retype
-      // rather than a re-choose.
+      // a request that is over.
+      //
+      // THE FILE STAYS, AND ONLY ON THIS PATH. Nothing replaced the upload card
+      // here, so the input still holds the operator's selection -- and clearing
+      // the state behind it would show them a filename above "choose a backup
+      // file to enable this", which is a disabled control whose visible reason
+      // is false. A second try is then a retype rather than a re-choose.
       setRestoreForm((current) => ({ ...current, passphrase: "" }));
       setRestoreTouched(false);
     } finally {
@@ -329,7 +355,13 @@ export function SettingsDataPage() {
   async function confirmAndApply(event: FormEvent) {
     event.preventDefault();
     const held = preview;
-    if (held === null) return;
+    // THE NAME IS READ HERE AND CARRIED, not looked up again afterwards. It is
+    // non-null by construction -- restoreConfirmBlocked will not enable the
+    // button without one -- and taking it now is what lets the outcome hold it
+    // as a plain string. The early return is the compiler's proof, not a guard
+    // against something that happens.
+    const ranAgainst = installName;
+    if (held === null || ranAgainst === null) return;
     setRestoreError(null);
     setChecking(true);
     try {
@@ -343,13 +375,15 @@ export function SettingsDataPage() {
         passphrase: confirmPassphrase,
         confirmName: typedName,
       });
-      setOutcome(result);
+      setOutcome({ result, installName: ranAgainst });
       // The preview is gone on the server the moment apply took it, so the page
-      // stops offering it. The install's name is kept -- the restart advice
-      // below names the systemd unit with it.
+      // stops offering it.
       setPreview(null);
       setTypedName("");
       setConfirmPassphrase("");
+      // The upload form was emptied when the preview succeeded and could not
+      // have been refilled since -- see the cancel path for the mutation that
+      // established it.
     } catch (error) {
       closePrompt();
       setRestoreError(restoreProblem(error, "apply"));
@@ -404,11 +438,17 @@ export function SettingsDataPage() {
       if (!(error instanceof ApiError) || error.code !== "restore_plan_unknown") {
         // NAMES THIS REQUEST rather than borrowing the preview's words, which
         // told the operator to try something that was not what had failed.
+        // NO CLAIM ABOUT WHAT HAS OR HAS NOT BEEN RESTORED, and a review took
+        // one out of here. This said "Nothing has been restored", and the
+        // likeliest reason a Cancel fails is app.ts's write gate refusing every
+        // write for the duration of a restore -- so the one moment that
+        // sentence appeared was the one moment a restore WAS running, possibly
+        // started from another tab. It said the opposite of what was happening.
         setRestoreError(
-          `The upload could not be deleted, so it is still on the server: `
-          + `${restoreProblem(error, "preview")} Nothing has been restored. `
-          + `Try Cancel again in a moment; if it keeps failing the upload is `
-          + `deleted on its own when this preview expires.`,
+          `The upload could not be deleted, so it is still on the server. `
+          + `${restoreProblem(error, "preview")} Try Cancel again in a moment; `
+          + `if it keeps failing the upload is deleted on its own when this `
+          + `preview expires.`,
         );
         setCancelling(false);
         return;
@@ -417,6 +457,13 @@ export function SettingsDataPage() {
     setPreview(null);
     setTypedName("");
     setConfirmPassphrase("");
+    // THE UPLOAD FORM IS ALREADY EMPTY HERE AND IS NOT CLEARED AGAIN. A
+    // mutation is what settled that: a `setRestoreForm(EMPTY_RESTORE_FORM)` on
+    // this path could be deleted with every test still green, because the
+    // preview that produced this plan emptied the form when it succeeded and
+    // the upload card has been unmounted ever since -- so there is nothing that
+    // could have put a file back. A branch no test can reach is not a defence,
+    // it is a line that makes the next reader think one exists.
     setCancelling(false);
   }
 
@@ -1011,7 +1058,8 @@ function RestoreSection(props: {
   typedName: string;
   confirmPassphrase: string;
   error: string | null;
-  outcome: RestoreOutcome | null;
+  /** The finished restore and the install's name it ran against. See the state. */
+  outcome: { result: RestoreOutcome; installName: string } | null;
   onChange: (next: RestoreFormState) => void;
   onPreview: () => void;
   onTypedName: (value: string) => void;
@@ -1104,7 +1152,9 @@ function RestoreSection(props: {
         </p>
       )}
 
-      {outcome !== null && <RestoreOutcomeCard outcome={outcome} installName={installName} />}
+      {outcome !== null && (
+        <RestoreOutcomeCard outcome={outcome.result} installName={outcome.installName} />
+      )}
 
       {preview === null
         ? (
@@ -1266,7 +1316,12 @@ function RestorePlanCard(props: {
   const applicable = planIsApplicable(plan);
   const confirmBlocked = restoreConfirmBlocked({
     plan, installName, typedName, passphrase: confirmPassphrase,
+    busy, running: applying || cancelling,
   });
+  // CANCEL IS NOT GATED ON THE FORM, only on `busy`. It is not waiting for a
+  // name or a passphrase, and disabling it for a half-typed confirmation would
+  // take the delete-the-credential-store control away from somebody in the
+  // middle of deciding not to use it.
   // A FIXED LOCALE AND A FIXED ZONE, and the ZONE is the half a review found
   // missing. This is a time printed beside a fact about a file on a server;
   // pinning the locale fixes only the FORMAT, and two operators in different
@@ -1336,9 +1391,34 @@ function RestorePlanCard(props: {
 
       {plan.findings.length > 0 && (
         <ul data-testid="restore-findings" className="flex flex-col gap-2">
-          {plan.findings.map((finding) => (
+          {/*
+            THE INDEX IS IN THE KEY HERE FOR THE REASON IT IS IN THE TWO EFFECT
+            LISTS, AND WITH LESS WARRANT TO LEAVE IT OUT. A review found this
+            list keyed on `finding.code` alone while both of its neighbours had
+            already been corrected: same shape, same server-built array, same
+            hazard: React drops a duplicate-keyed child when a list
+            RECONCILES, so a finding the server chose to show would go missing
+            from the preview of a destruction with nothing on screen to say one
+            had.
+            IT IS CLOSED BY CONSTRUCTION AND NOT BY A TEST, which is worth
+            saying because a reader will look for one. A duplicate key survives
+            a FIRST mount, React's warning is compiled out of the production
+            bundle the journeys drive, and this card unmounts between previews
+            so no reconciliation of this list is reachable today. What holds it
+            is the shape of the two effect lists below, which had the same
+            correction for the same reason.
+            IT IS LATENT TODAY AND WILL NOT STAY THAT WAY. services/restore.ts
+            pushes seven findings with seven distinct codes -- but PlanEffectView
+            at least documents `op` as unique within a restore plan today, and
+            PlanFindingView documents `code` only as "a stable identifier, so a
+            test can assert a finding without matching prose". @conduit/shared's
+            PlanKind already reserves `import-csv`, whose findings are precisely
+            the ones that repeat: one per bad row, one per unmapped column, one
+            per duplicate. This list renders all three kinds.
+          */}
+          {plan.findings.map((finding, index) => (
             <li
-              key={finding.code}
+              key={`${finding.code}-${String(index)}`}
               data-testid={`restore-finding-${finding.code}`}
               data-severity={finding.severity}
               className={finding.severity === "warning"
@@ -1520,7 +1600,15 @@ function RestorePlanCard(props: {
               </>
             )}
           <div className="flex flex-wrap items-center justify-end gap-3">
-            {confirmBlocked !== null && !applying && (
+            {/*
+              ONE REASON FOR THE WHOLE ROW, and it is no longer gated on
+              `!applying`: restoreConfirmBlocked answers null while this
+              confirmation is what is running, so the gate is inside the
+              function where the two other callers can see it. Un-gated here,
+              the span now appears for the case it used to hide -- both controls
+              dark because something else on the page is running.
+            */}
+            {confirmBlocked !== null && (
               <span data-testid="restore-apply-blocked" className="text-xs text-red-800">
                 {confirmBlocked}
               </span>
@@ -1553,7 +1641,19 @@ function RestorePlanCard(props: {
       )}
 
       {!applicable && (
-        <div className="flex justify-end">
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          {/*
+            THE REFUSAL BRANCH HAS ONE CONTROL AND IT NEEDS THE SAME REASON. A
+            review found the applicable branch's two buttons going dark
+            unexplained; this one is the same button under a plan that cannot
+            run, and `busy` turns it off in exactly the same circumstances.
+          */}
+          {busy && !cancelling && (
+            <span data-testid="restore-apply-blocked" className="text-xs text-slate-500">
+              One thing at a time. Nothing here can be pressed until the operation already
+              running has finished.
+            </span>
+          )}
           <Button variant="outline" data-testid="restore-cancel" disabled={busy} onClick={onDiscard}>
             {cancelling ? "Clearing..." : "Clear this preview"}
           </Button>
@@ -1565,7 +1665,7 @@ function RestorePlanCard(props: {
 
 /** What happened, and the one thing left to do. */
 function RestoreOutcomeCard(
-  { outcome, installName }: { outcome: RestoreOutcome; installName: string | null },
+  { outcome, installName }: { outcome: RestoreOutcome; installName: string },
 ) {
   return (
     <div
@@ -1617,7 +1717,7 @@ function RestoreOutcomeCard(
  * Conduit now" and left it there would be implying that something had been
  * arranged. Nothing has been.
  */
-function RestartAdvice({ installName }: { installName: string | null }) {
+function RestartAdvice({ installName }: { installName: string }) {
   return (
     <div data-testid="restore-restart" className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
       <p className="font-semibold">Restart Conduit now, and nothing here will make you.</p>
@@ -1634,29 +1734,34 @@ function RestartAdvice({ installName }: { installName: string | null }) {
         it.
       </p>
       {/*
-        THE COMMAND IS OFFERED ONLY WHERE THE NAME IS KNOWN, and only as what it
-        is. A review caught two overclaims here.
-        THE FIRST WAS A CONSTANT. This read `installName ?? "conduit"`, which is
-        the one thing routes/restore.ts refuses to do with this value: it
-        answers 503 rather than invent a name, because "a constant is a
+        THE COMMAND IS UNCONDITIONAL NOW, AND THAT IS THE FIX RATHER THAN A
+        RELAXATION. Two overclaims were removed from this passage and the second
+        removal left a guard behind that no test could ever have noticed losing.
+        THE FIRST OVERCLAIM WAS A CONSTANT. This read `installName ?? "conduit"`,
+        which is the one thing routes/restore.ts refuses to do with this value:
+        it answers 503 rather than invent a name, because "a constant is a
         confirmation everybody can type" -- and a constant printed as a command
         is a wrong command with the server's authority behind it.
-        THE SECOND WAS THE UNIT. `installName` is documented as exactly one
-        thing, the database this install is connected to. Under YunoHost that IS
-        the app's instance id, and the systemd unit, the system user and the
-        database all carry it (conf/systemd.service templates all three from
-        __APP__). On anything else it is a database name that may have nothing
-        to do with a service name -- so the sentence says which install it is
-        true of instead of stating it flatly.
+        THE SECOND WAS THE UNIT. `installName` is exactly one thing, the
+        database this install is connected to. Under YunoHost that IS the app's
+        instance id, and the systemd unit, the system user and the database all
+        carry it (conf/systemd.service templates all three from __APP__). On
+        anything else it is a database name that may have nothing to do with a
+        service name -- so the sentence says which install it is true of rather
+        than stating it flatly.
+        AND THEN A `{installName !== null && ...}` GUARD SAT HERE, unreachable
+        and unfailable: an apply cannot start without a name, so the false
+        branch never rendered, and deleting the guard -- or putting the invented
+        constant back -- changed nothing any suite could see. The type carries
+        the invariant instead: this component takes a string, and the state that
+        feeds it holds the outcome and the name it ran against as one value.
       */}
-      {installName !== null && (
-        <p className="mt-1">
-          On a YunoHost install the service carries the same name as the database, so this is
-          the command:{" "}
-          <code className="font-mono">sudo systemctl restart {installName}</code>. Elsewhere,
-          restart it however you normally do.
-        </p>
-      )}
+      <p className="mt-1">
+        On a YunoHost install the service carries the same name as the database, so this is
+        the command:{" "}
+        <code className="font-mono">sudo systemctl restart {installName}</code>. Elsewhere,
+        restart it however you normally do.
+      </p>
       {/*
         WHAT WAS DELETED HERE WAS A SENTENCE SAYING MAIL SYNC WAS ALREADY BACK.
         services/restore.ts restarts it with `await sync?.start()` inside a

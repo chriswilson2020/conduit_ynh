@@ -328,7 +328,30 @@ export function restoreConfirmBlocked(input: {
   installName: string | null;
   typedName: string;
   passphrase: string;
+  /** Anything at all is running on this page. */
+  busy: boolean;
+  /** THIS confirmation is what is running: the apply, or the cancel. */
+  running: boolean;
 }): string | null {
+  // THE BUSY ARM COMES FIRST, AND IT IS THE ONE A REVIEW FOUND MISSING. This
+  // function used to take no `busy` at all, while its sibling
+  // restorePreviewBlocked had an explicit arm for it -- so with a plan on
+  // screen, starting an export (the two buttons above stay live) turned BOTH
+  // "Restore, replacing everything" and "Cancel and delete the upload" off with
+  // nothing on screen explaining either.
+  //
+  // THE CANCEL IS THE ONE THAT MATTERS. It is the control that deletes a
+  // decrypted credential store from the server, and it going dark unexplained
+  // is the worst instance on this page of the failure this page exists not to
+  // ship. The reason covers both controls, because `busy` is why both are off.
+  //
+  // `running` IS SILENT because the buttons say it themselves -- "Restoring..."
+  // and "Deleting..." -- and restore-running says the rest.
+  if (input.running) return null;
+  if (input.busy) {
+    return "One thing at a time. Nothing here can be pressed until the operation already "
+      + "running has finished.";
+  }
   if (input.installName === null) {
     return "This install's database cannot be named from its configuration, so a restore "
       + "cannot be confirmed by typing it. Nothing typed here will work, and an "
@@ -427,6 +450,23 @@ export function applyKeptThePreview(error: unknown): boolean {
  * is honest. During an apply nobody knows, and a page that said "nothing
  * happened" would be guessing about a database.
  */
+/**
+ * Two sentences, joined so they read as two.
+ *
+ * A REVIEW FOUND THE RUN-ON, and it is worth a function because every place
+ * this page appends to a server message has the same shape and the server's
+ * messages do not all end in a full stop. routes/restore.ts's name mismatch
+ * ends with the install's name, so the page was rendering
+ * "...confirm: conduit_test Nothing has been changed", which reads as one
+ * sentence about a name that is not one. Both tests used `toContain`, so
+ * neither could see it.
+ */
+function twoSentences(first: string, second: string): string {
+  const trimmed = first.trimEnd();
+  const ends = /[.!?]$/.test(trimmed);
+  return `${trimmed}${ends ? "" : "."} ${second}`;
+}
+
 export function restoreProblem(error: unknown, phase: "preview" | "apply"): string {
   // THE ONE SENTENCE THAT MATTERS WHEN NOBODY KNOWS WHAT HAPPENED, and every
   // path that cannot say more ends here.
@@ -449,7 +489,7 @@ export function restoreProblem(error: unknown, phase: "preview" | "apply"): stri
   // successful HTTP response from a route that has just been running a restore.
   // The shape is worth naming, but not on its own.
   if (error instanceof ResponseShapeError) {
-    return phase === "preview" ? error.message : `${error.message} ${unknownOutcome}`;
+    return phase === "preview" ? error.message : twoSentences(error.message, unknownOutcome);
   }
   if (!(error instanceof ApiError)) return unknownOutcome;
   switch (error.code) {
@@ -472,10 +512,13 @@ export function restoreProblem(error: unknown, phase: "preview" | "apply"): stri
       // a second tab does not have. There is no route that cancels "whatever is
       // waiting", deliberately: it is addressed by id and bound to its owner.
       // So the honest answer is the other exit, which always works.
-      return `${error.message} If that preview was made in another tab, or before this page `
-        + "was reloaded, this page has no way to cancel it -- a preview is reachable only "
-        + "from the page that made it. It is deleted on its own within half an hour, and a "
-        + "restart of Conduit clears it immediately.";
+      return twoSentences(
+        error.message,
+        "If that preview was made in another tab, or before this page was reloaded, this "
+        + "page has no way to cancel it -- a preview is reachable only from the page that "
+        + "made it. It is deleted on its own within half an hour, and a restart of Conduit "
+        + "clears it immediately.",
+      );
     case "reauth_unavailable":
       return "Your password could not be checked right now, so nothing happened. That is a "
         + "server problem rather than a wrong password; try again shortly.";
@@ -494,12 +537,12 @@ export function restoreProblem(error: unknown, phase: "preview" | "apply"): stri
       // Echoed rather than rewritten -- the name mismatch's body carries the
       // name -- with the one fact the server's sentence does not carry: the
       // upload survived, so this is a retype and not a re-upload.
-      return `${error.message} Nothing has been changed, and your upload is still here.`;
+      return twoSentences(error.message, "Nothing has been changed, and your upload is still here.");
     case "restore_safety_backup_failed":
-      return `${error.message} The restore did NOT start, so nothing has been destroyed.`;
+      return twoSentences(error.message, "The restore did NOT start, so nothing has been destroyed.");
     case "restore_database_changed":
     case "restore_load_failed":
-      return `${error.message} Your database is exactly as it was.`;
+      return twoSentences(error.message, "Your database is exactly as it was.");
     case "restore_half_applied":
     case "restore_unexpected_result":
     case "restore_inventory_mismatch":
@@ -511,8 +554,11 @@ export function restoreProblem(error: unknown, phase: "preview" | "apply"): stri
       // put the install back.
       return error.message;
     case "restore_failed":
-      return `${error.message} Do not start another restore until somebody has read that `
-        + "log: this page cannot tell you what state the database is in.";
+      return twoSentences(
+        error.message,
+        "Do not start another restore until somebody has read that log: this page cannot "
+        + "tell you what state the database is in.",
+      );
     case "unauthenticated":
       // routes/helpers.ts's requireUser, which runs before everything else in
       // both handlers. Its own message is about a missing SSOwat header and
@@ -536,7 +582,7 @@ export function restoreProblem(error: unknown, phase: "preview" | "apply"): stri
       // the outcome is unknown.
       return error.message === error.code
         ? unknownOutcome
-        : `${error.message} ${unknownOutcome}`;
+        : twoSentences(error.message, unknownOutcome);
   }
 }
 

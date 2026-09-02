@@ -6,6 +6,11 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { test, expect, devices } from "@playwright/test";
 import type { Page } from "@playwright/test";
+// TYPE ONLY, and it is the coupling a review found missing. The fixture below
+// is a PlanView the server did not build; in a file whose subject is a page
+// that must render exactly what the server sent, a fixture free to drift from
+// that shape is the one uncoupled pair on the branch.
+import type { PlanView } from "@conduit/shared";
 
 const execFileAsync = promisify(execFile);
 
@@ -453,15 +458,31 @@ test.describe("the pre-flight warning", () => {
  * install's name, and have the request that goes back carry an id and nothing
  * else.
  *
- * WHY THERE IS NO REAL APPLY HERE, SAID PLAINLY RATHER THAN LEFT AS A GAP. The
- * app under test runs against conduit_test -- the suite's own database, shared
- * with every other spec file. A real apply would drop and reload it mid-run.
- * routes/restore.test.ts installs a guard called `assertScratch` for exactly
- * this reason, and its comment says what happens without one: "a test that
- * reached for the shared handle by accident would take the whole suite's
- * database with it, and the symptom would be forty unrelated files failing
- * afterwards." Writing the same mistake into an e2e where no guard can catch it
- * would be worse, not better.
+ * WHY THERE IS NO REAL APPLY HERE, AND THE TWO REASONS THAT ACTUALLY BITE. The
+ * first draft of this paragraph said a real apply "would take the whole suite's
+ * database with it", and a review was right that that is the weakest argument
+ * available: the journey backs conduit_test up and would restore it from a dump
+ * of itself, so the rows come back. What does not come back is everything else.
+ *
+ *   THE OTHER SPEC FILES ARE IN THAT DATABASE AT THE SAME TIME.
+ *   `test.describe.configure({ mode: "serial" })` orders THIS file and nothing
+ *   else; CI runs one worker, but a developer's default is several, and a
+ *   `DROP SCHEMA ... CASCADE` under a concurrently running spec takes it out
+ *   with a failure that looks like anything but its cause.
+ *
+ *   AND THE PROCESS WOULD BE POISONED FOR A MINUTE AFTERWARDS -- which is the
+ *   very thing RestartAdvice on the page under test documents. After a real
+ *   apply the app holds identity state belonging to the install that was
+ *   replaced, so writes fail for about sixty seconds and then start working
+ *   again. Every spec that ran in that window would fail for a reason nothing
+ *   in the suite could explain, and the suite has no way to restart the server
+ *   between files.
+ *
+ * routes/restore.test.ts refuses the same thing from the other direction, with
+ * a guard called `assertScratch`: every app that can reach applyRestore is
+ * built against a scratch database created for the case and dropped after it.
+ * There is no equivalent guard available to a Playwright spec, which is the
+ * argument for not needing one.
  *
  * SO THE APPLY REQUEST IS REAL AND ONLY THE DESTRUCTION IS NOT. The journey
  * below drives the page's own Restore button against the REAL route with the
@@ -481,7 +502,15 @@ test.describe("the pre-flight warning", () => {
  * 7.6's half did. All three are on the runner (.github/workflows/test.yml).
  */
 
-/** A plan the server did not build, for the two states a real run must not reach. */
+/**
+ * A plan the server did not build, for the states a real run must not reach.
+ *
+ * `satisfies PlanView` RATHER THAN A BARE OBJECT. It cannot drift in the
+ * direction that would matter at runtime -- restoreInspectionSchema.parse runs
+ * over it in the page -- but the compiler is what says so, and the shared module
+ * two files away holds its own schema against the same type in both directions
+ * for exactly this reason.
+ */
 const STUB_PLAN = {
   planId: "33333333-3333-4333-8333-333333333333",
   kind: "restore",
@@ -521,7 +550,7 @@ const STUB_PLAN = {
     },
   ],
   refusal: null,
-};
+} satisfies PlanView;
 
 /** The name the app under test answers with: playwright.config.ts's database. */
 const INSTALL_NAME = "conduit_test";
@@ -534,15 +563,18 @@ const INSTALL_NAME = "conduit_test";
  * prove is the plan, which the journey above proves for real.
  */
 async function previewWithStub(
-  page: Page, planOverrides: Record<string, unknown> = {},
+  page: Page,
+  planOverrides: Record<string, unknown> = {},
+  // NULLABLE, because the server's answer is: routes/restore.ts refuses to
+  // invent a name it cannot read from its own configuration, and the page has a
+  // whole branch for that which no journey reached until a review said so.
+  installName: string | null = INSTALL_NAME,
 ): Promise<void> {
   await page.route("**/api/restore/inspect", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({
-        plan: { ...STUB_PLAN, ...planOverrides }, installName: INSTALL_NAME,
-      }),
+      body: JSON.stringify({ plan: { ...STUB_PLAN, ...planOverrides }, installName }),
     });
   });
   await openDataSettings(page);
@@ -729,6 +761,14 @@ test.describe("Settings -> restore", () => {
       // mail.key is the other destructive effect and must not be quietly folded
       // into the first: it is a REPLACEMENT and it is irreversible in effect.
       await expect(destruction.getByTestId("restore-destroys-replace-mail-key")).toBeVisible();
+      // AND ONLY WHAT DESTROYS IS IN THE BOX. destructiveEffects is a shared
+      // helper written so the confirmation cannot disagree with the list below
+      // it; swapping it for plan.effects would put the safety backup and the
+      // load under a heading that says "What this destroys", and a review found
+      // that nothing would have noticed.
+      await expect(destruction.getByTestId("restore-destroys-safety-backup")).toHaveCount(0);
+      await expect(destruction.getByTestId("restore-destroys-load-dump")).toHaveCount(0);
+      await expect(destruction.locator("li")).toHaveCount(2);
 
       // AND THE NON-DESTRUCTIVE STEPS ARE MARKED AS SUCH, from the plan's own
       // flag rather than from anything the page inferred about the operation.
@@ -842,6 +882,125 @@ test.describe("Settings -> restore", () => {
     // And the destruction list says so rather than being absent.
     await expect(page.getByTestId("restore-destruction"))
       .toContainText("Nothing in this plan destroys anything");
+    // AND THE EXPIRY PARAGRAPH IS NOT THERE, which is the assertion this test
+    // was missing and a review found. A refusal is not HELD: routes/restore.ts
+    // disposes of the staging before it writes the answer, so the archive is
+    // already gone and the plan id resolves to nothing. A paragraph promising
+    // to delete it in half an hour is the page predicting server state instead
+    // of rendering it -- a defect this branch has already repaired once, with
+    // nothing holding the repair.
+    await expect(page.getByTestId("restore-expiry")).toHaveCount(0);
+  });
+
+  test("RENDERS EVERY FINDING THE SERVER SENT, codes repeated or not", async ({ page }) => {
+    // WHAT THIS HOLDS: nothing filters, slices or de-duplicates the findings on
+    // the way to the screen. A finding the server chose to show is shown.
+    //
+    // WHAT IT CANNOT HOLD, SAID RATHER THAN IMPLIED. The list is keyed by React
+    // on `${finding.code}-${index}` because keying on the code alone is a
+    // reconciliation hazard -- PlanFindingView documents `code` only as "a
+    // stable identifier, so a test can assert a finding without matching
+    // prose", and the CSV importer PlanKind already reserves emits one finding
+    // per bad row and one per unmapped column. But that hazard is NOT visible
+    // here and this test was written believing it would be: mutating the key
+    // back to the bare code leaves this green. React renders duplicate-keyed
+    // children on a FIRST mount and only drops them when the list reconciles,
+    // its warning is compiled out of the production bundle this suite drives,
+    // and the plan card unmounts between previews so no reconciliation of this
+    // list is reachable from the page at all. The key is right by construction
+    // and by consistency with the two effect lists beside it; no instrument in
+    // this suite can see it, and inventing one that passed for another reason
+    // would be worse than saying so.
+    await previewWithStub(page, {
+      findings: [
+        { severity: "warning", code: "row-refused", message: "row 12 has no company name" },
+        { severity: "warning", code: "row-refused", message: "row 40 has no company name" },
+        { severity: "note", code: "row-refused", message: "row 41 was a duplicate" },
+      ],
+    });
+    const findings = page.getByTestId("restore-findings");
+    await expect(findings.locator("li")).toHaveCount(3);
+    await expect(findings).toContainText("row 12");
+    await expect(findings).toContainText("row 40");
+    await expect(findings).toContainText("row 41");
+  });
+
+  test("REFUSES TO OFFER A CONFIRMATION when the server cannot name its own database", async ({ page }) => {
+    // routes/restore.ts answers 503 to any apply it cannot name an install for,
+    // and refuses to fall back to a constant because "a constant is a
+    // confirmation everybody can type". The page has to refuse in the same
+    // direction rather than showing a field nobody can satisfy. Nothing
+    // rendered this branch before a review pointed out that no journey ever
+    // supplied a null name.
+    await previewWithStub(page, {}, null);
+    await expect(page.getByTestId("restore-unnameable"))
+      .toContainText("cannot be named from its configuration");
+    await expect(page.getByTestId("restore-unnameable")).toContainText("administrator");
+    // NO FIELDS, because there is no string that would satisfy them -- a box
+    // with "that is not the name" under it would send somebody hunting for a
+    // spelling that does not exist.
+    await expect(page.getByTestId("restore-confirm-name")).toHaveCount(0);
+    await expect(page.getByTestId("restore-confirm-passphrase")).toHaveCount(0);
+    // THE BUTTON STAYS, DISABLED, WITH THE REASON BESIDE IT -- and this
+    // assertion was written the other way round first, which was the test being
+    // wrong rather than the page. A control that VANISHES is its own kind of
+    // unexplained: the rule this page is built on is that nothing is off
+    // without a visible reason, not that nothing is ever off.
+    await expect(page.getByTestId("restore-apply")).toBeDisabled();
+    await expect(page.getByTestId("restore-apply-blocked"))
+      .toContainText("cannot be named from its configuration");
+    // But the upload can still be got rid of, which is the whole reason the
+    // cancel is not behind the same gate.
+    await expect(page.getByTestId("restore-cancel")).toBeEnabled();
+  });
+
+  test("CLEARS THE FILE AFTER A CANCEL, so the reason beside the dark button is true", async ({ page }) => {
+    // The upload card is unmounted by a preview and REMOUNTED by a cancel, so
+    // its file input comes back empty. Form state that survived would leave the
+    // page believing it held a file nobody can see -- "Fill in the passphrase
+    // to enable this" over an input reading "No file chosen" -- and Preview
+    // would silently re-upload the previous archive.
+    await previewWithStub(page);
+    await page.getByTestId("restore-cancel").click();
+    await expect(page.getByTestId("restore-upload")).toBeVisible();
+    await expect(page.getByTestId("restore-file")).toHaveValue("");
+    await expect(page.getByTestId("restore-preview-blocked"))
+      .toContainText("Choose a backup file");
+    await expect(page.getByTestId("restore-preview")).toBeDisabled();
+  });
+
+  test("SAYS WHY when Apply and Cancel go dark for something happening elsewhere", async ({ page }) => {
+    // With a plan on screen the two downloads above are still live, and both of
+    // these controls read `busy`. A review found them going dark with nothing
+    // beside them -- and the Cancel is the control that deletes a decrypted
+    // credential store from the server, which makes it the worst instance on
+    // this page of the failure this page exists not to ship.
+    await previewWithStub(page);
+    // A COMPLETE CONFIRMATION FIRST, so the baseline is a live row with nothing
+    // to explain. Without this the span is already showing "type the archive
+    // passphrase again", and the assertion below would pass on the wrong
+    // sentence.
+    await page.getByTestId("restore-confirm-name").fill(INSTALL_NAME);
+    await page.getByTestId("restore-confirm-passphrase").fill(PASSPHRASE);
+    await expect(page.getByTestId("restore-apply")).toBeEnabled();
+    await expect(page.getByTestId("restore-apply-blocked")).toHaveCount(0);
+
+    // The export is held open so `busy` stays true while the assertions run.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await page.route("**/api/export", async (route) => {
+      await held;
+      await route.fulfill({ status: 200, contentType: "application/zip", body: "PK" });
+    });
+    await page.getByTestId("export-download").click();
+    await page.getByTestId("reauth-password").fill(REAUTH_PASSWORD);
+    await page.getByTestId("reauth-confirm").click();
+
+    const blocked = page.getByTestId("restore-apply-blocked");
+    await expect(blocked).toContainText("One thing at a time");
+    await expect(page.getByTestId("restore-apply")).toBeDisabled();
+    await expect(page.getByTestId("restore-cancel")).toBeDisabled();
+    release();
   });
 
   test("sends back an ID AND NOTHING ELSE, and is honest that nothing enforces the restart", async ({ page }) => {

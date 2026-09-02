@@ -262,12 +262,24 @@ export const PSQL_PACKAGE = PG_DUMP_PACKAGE;
  * A CREDENTIAL AND NOT ABOUT SIZE. nginx buffers a request body to disk by
  * default, in its own client_body_temp_path. The preview's body is multipart
  * and the PASSPHRASE FIELD COMES FIRST IN IT -- routes/restore.ts requires that
- * order for the streaming parser -- so a buffered body is the archive's
- * passphrase written to a file this application does not own, cannot chmod and
- * does not delete. 7.6's rule is that the passphrase is never stored, logged or
- * written to disk; `proxy_request_buffering off` is what keeps that true of the
- * deployment and not merely of the process. The archive is then written exactly
- * once, by receiveIntake, at 0600 inside $data_dir.
+ * order for the streaming parser -- so a buffered body puts the archive's
+ * passphrase on disk in the clear. 7.6's rule is that the passphrase is never
+ * stored, logged or written to disk; `proxy_request_buffering off` is what
+ * keeps that true of the deployment and not merely of the process. The archive
+ * is then written exactly once, by receiveIntake, at 0600 inside $data_dir.
+ *
+ * AND THE EXPOSURE IS NARROWER THAN THIS COMMENT FIRST CLAIMED, said at length
+ * because the overstatement was the kind a reader checks and then discounts the
+ * whole directive over. It said "a file this application does not own, cannot
+ * chmod and does not delete". Measured on the deploy target with a real
+ * multipart body: client_body_temp_path stays EMPTY, and what exists is one
+ * open descriptor in an nginx worker to an ALREADY-UNLINKED file, mode 0600,
+ * link count 0, whose first bytes are the passphrase. nginx creates and unlinks
+ * in one call, so it never has a name and the inode is freed at the end of the
+ * request. The real exposure is the passphrase sitting in disk blocks for the
+ * length of the upload -- readable from a crash, a disk image or the raw device
+ * -- which is a passphrase written to disk, which the rule forbids. The
+ * directive is right; the reason is this one.
  *
  * BOTH ROUTES, AND THE APPLY ONE IS NOT AN AFTERTHOUGHT. Apply's body is three
  * short fields, so it needs no size at all -- but it takes a whole safety

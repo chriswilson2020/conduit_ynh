@@ -363,6 +363,7 @@ describe("restorePreviewBlocked", () => {
 describe("restoreConfirmBlocked", () => {
   const base = {
     plan: restorePlan(), installName: INSTALL, typedName: INSTALL, passphrase: "correct horse",
+    busy: false, running: false,
   };
 
   it("lets a complete, correct confirmation through", () => {
@@ -577,6 +578,7 @@ describe("planCountLabel", () => {
 describe("restoreConfirmBlocked, and the rule that was missing from it", () => {
   const base = {
     plan: restorePlan(), installName: INSTALL, typedName: INSTALL, passphrase: "correct horse",
+    busy: false, running: false,
   };
 
   it("APPLIES THE SHARED PASSPHRASE RULE TO THE CONFIRMATION FIELD TOO", () => {
@@ -678,5 +680,64 @@ describe("restoreProblem and a 200 that could not be parsed", () => {
   it("leaves the preview's shape error as itself, because nothing was at stake", () => {
     const answer = restoreProblem(new ResponseShapeError("Unexpected response shape"), "preview");
     expect(answer).toBe("Unexpected response shape");
+  });
+});
+
+describe("restoreConfirmBlocked, and the two controls that used to go dark in silence", () => {
+  const ready = {
+    plan: restorePlan(), installName: INSTALL, typedName: INSTALL,
+    passphrase: "correct horse", busy: false, running: false,
+  };
+
+  it("EXPLAINS BOTH CONTROLS when something else on the page is running", () => {
+    // This function used to take no `busy` at all while its sibling
+    // restorePreviewBlocked had an explicit arm for it. With a plan on screen
+    // the two downloads above stay live, so starting an export turned BOTH
+    // "Restore, replacing everything" and "Cancel and delete the upload" off
+    // with nothing beside either -- and the Cancel is the control that deletes
+    // a decrypted credential store.
+    const answer = restoreConfirmBlocked({ ...ready, busy: true }) ?? "";
+    expect(answer).toContain("One thing at a time");
+    expect(answer).toContain("Nothing here can be pressed");
+  });
+
+  it("SAYS NOTHING while the confirmation itself is what is running", () => {
+    // The buttons say it: "Restoring..." and "Deleting...", with restore-running
+    // underneath. A second sentence repeating them would be noise at the one
+    // moment the operator is watching the screen hardest.
+    expect(restoreConfirmBlocked({ ...ready, busy: true, running: true })).toBeNull();
+  });
+
+  it("puts the busy reason AHEAD of the form's, because it explains more", () => {
+    // A half-typed confirmation while an export runs is two reasons at once,
+    // and only one of them is why Cancel is off.
+    const answer = restoreConfirmBlocked({
+      ...ready, typedName: "wrong", passphrase: "", busy: true,
+    }) ?? "";
+    expect(answer).toContain("One thing at a time");
+    expect(answer).not.toContain("archive passphrase again");
+  });
+});
+
+describe("twoSentences, through the messages that append to the server's", () => {
+  it("DOES NOT RUN TWO SENTENCES TOGETHER when the server's does not end in one", () => {
+    // routes/restore.ts's name mismatch ends with the install's name and no
+    // full stop, so the page was rendering "...confirm: conduit_test Nothing
+    // has been changed" -- one sentence about a name that is not one. Both
+    // tests used toContain, so neither could see it.
+    const answer = restoreProblem(
+      apiError("restore_name_mismatch", "type this install's name exactly to confirm: conduit"),
+      "apply",
+    );
+    expect(answer).toContain("confirm: conduit. Nothing has been changed");
+    expect(answer).not.toContain("conduit Nothing");
+  });
+
+  it("adds no second full stop when the server's message already ends in one", () => {
+    const answer = restoreProblem(
+      apiError("restore_passphrase_mismatch", "that is not the passphrase."), "apply",
+    );
+    expect(answer).toContain("passphrase. Nothing has been changed");
+    expect(answer).not.toContain("passphrase.. ");
   });
 });
