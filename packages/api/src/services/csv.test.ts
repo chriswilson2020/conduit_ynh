@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { Readable } from "node:stream";
 import {
-  CSV_BOM, CSV_EOL, csvCell, csvDocument, csvRecords, csvRow, escapeCellValue, unescapeCellValue,
-  CsvParseError,
+  CSV_BOM, CSV_EOL, csvCell, csvDocument, csvRecords, csvRow, delimiterName, escapeCellValue,
+  foreignCsvRecords, sniffCsvDelimiter, unescapeCellValue,
+  CsvParseError, type ForeignCsvRepair,
 } from "./csv.js";
 
 // The dialect's rules, each one broken on purpose somewhere below. A rule that
@@ -344,5 +345,237 @@ describe("csvRecords", () => {
     let seen = 0;
     for await (const _ of records) seen += 1;
     expect(seen).toBe(201);
+  });
+});
+
+// --- the forgiving reader (7.7's foreign CSV importer) ---------------------
+//
+// EVERY CASE BELOW IS ONE csvRecords THROWS ON, which is the whole difference
+// between the two readers and is why they are two. The strict one reads a file
+// THIS MODULE WROTE whose bytes have already been checked against a SHA-256;
+// this one reads a file somebody else's spreadsheet wrote, where a lone line
+// feed is not damage, it is Tuesday.
+
+/** Read a whole document with the forgiving reader, collecting its repairs. */
+async function readForeign(
+  text: string, delimiter = ",", maxRecordChars?: number,
+): Promise<{ records: string[][]; repairs: ForeignCsvRepair[] }> {
+  const repairs: ForeignCsvRepair[] = [];
+  const records: string[][] = [];
+  const source = Readable.from([Buffer.from(text, "utf8")]);
+  for await (const record of foreignCsvRecords(source, {
+    delimiter, maxRecordChars, onRepair: (repair) => repairs.push(repair),
+  })) {
+    records.push(record.fields);
+  }
+  return { records, repairs };
+}
+
+describe("foreignCsvRecords", () => {
+  it("reads back everything csvDocument writes, so the two readers cannot drift apart", async () => {
+    // THE ONE ASSERTION THAT PINS THIS READER TO THE WRITER. It shares no code
+    // with csvRecords on purpose -- it describes a WIDER dialect -- so what
+    // stops a change to the writer from producing a file this cannot follow is
+    // this test and nothing else. The values are the awkward ones: a quote, a
+    // comma, an embedded CRLF, a formula lead and an apostrophe.
+    const header = ["name", "note"];
+    const rows = [
+      ["Acme, Ltd", 'he said "hello"'],
+      ["Two\r\nlines", "=1+1"],
+      ["'already quoted", ""],
+      ["M\u00FCller & S\u00F6hne", "\u00C5rhus"],
+    ];
+    const { records, repairs } = await readForeign(csvDocument(header, rows).toString("utf8"));
+    expect(repairs).toEqual([]);
+    // THE CELL TRANSFORM IS NOT REVERSED, so the two values csvCell escaped
+    // arrive WITH their apostrophes. That is correct for this reader and is the
+    // whole reason services/import-export.ts exists.
+    expect(records).toEqual([
+      header,
+      ["Acme, Ltd", 'he said "hello"'],
+      ["Two\r\nlines", "'=1+1"],
+      ["''already quoted", ""],
+      ["M\u00FCller & S\u00F6hne", "\u00C5rhus"],
+    ]);
+  });
+
+  it("reads a file separated by semicolons, which is what a European Excel writes", async () => {
+    const { records } = await readForeign("naam;plaats\r\nAcme;Amsterdam\r\n", ";");
+    expect(records).toEqual([["naam", "plaats"], ["Acme", "Amsterdam"]]);
+  });
+
+  it("reads a file whose records end in a bare line feed", async () => {
+    const { records, repairs } = await readForeign("a,b\nx,y\nz,w\n");
+    expect(records).toEqual([["a", "b"], ["x", "y"], ["z", "w"]]);
+    // NOT A REPAIR. A lone LF is what every Unix tool produces and it is
+    // unambiguous; reporting it would fill a preview with noise.
+    expect(repairs).toEqual([]);
+  });
+
+  it("reads a file whose records end in a bare carriage return", async () => {
+    const { records, repairs } = await readForeign("a,b\rx,y\rz,w\r");
+    expect(records).toEqual([["a", "b"], ["x", "y"], ["z", "w"]]);
+    expect(repairs).toEqual([]);
+  });
+
+  it("reads a file with no newline at the end, which is the commonest shape of all", async () => {
+    const { records, repairs } = await readForeign("a,b\r\nx,y");
+    expect(records).toEqual([["a", "b"], ["x", "y"]]);
+    expect(repairs).toEqual([]);
+  });
+
+  it("drops a blank record but keeps the record numbers pointing at the right lines", async () => {
+    const repairs: ForeignCsvRepair[] = [];
+    const numbers: number[] = [];
+    const source = Readable.from([Buffer.from("a,b\r\n\r\nx,y\r\n\r\n", "utf8")]);
+    for await (const record of foreignCsvRecords(source, {
+      delimiter: ",", onRepair: (repair) => repairs.push(repair),
+    })) {
+      numbers.push(record.record);
+    }
+    // The header is 1, the blank line is 2, and `x,y` is on line 3 of the file
+    // -- which is what a person reads out of a spreadsheet's row gutter.
+    expect(numbers).toEqual([1, 3]);
+    expect(repairs).toEqual([]);
+  });
+
+  it("keeps a quote inside an unquoted value as text, and says it repaired one", async () => {
+    const { records, repairs } = await readForeign('name\r\nBob "Bobby" Smith\r\n');
+    expect(records[1]).toEqual(['Bob "Bobby" Smith']);
+    expect(repairs.map((repair) => repair.record)).toEqual([2, 2]);
+    expect(repairs[0]?.reason).toMatch(/quote appeared inside an unquoted value/);
+  });
+
+  it("keeps text after a closing quote, which is what Python and Excel both do", async () => {
+    const { records, repairs } = await readForeign('name,city\r\n"Acme" Inc,Delft\r\n');
+    expect(records[1]).toEqual(["Acme Inc", "Delft"]);
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]?.reason).toMatch(/text after its closing quote/);
+  });
+
+  it("closes a record the file ended in the middle of, and reports the repair", async () => {
+    // REFUSING WOULD THROW AWAY EVERY GOOD ROW IN FRONT OF IT, which is the
+    // opposite of what this reader is for. The rows before the damage are
+    // returned; the last one is what the file had.
+    const { records, repairs } = await readForeign('a\r\nfine\r\n"never closed');
+    expect(records).toEqual([["a"], ["fine"], ["never closed"]]);
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]?.record).toBe(3);
+    expect(repairs[0]?.reason).toMatch(/ends inside a quoted value/);
+  });
+
+  it("does not desynchronise on a record with the wrong number of fields", async () => {
+    // A RAGGED RECORD IS NOT THIS READER'S PROBLEM, and the reason it can be
+    // left to the importer is exactly this: records are delimited by newlines,
+    // so a short one is short and the next one is unaffected.
+    const { records } = await readForeign("a,b,c\r\nx,y\r\np,q,r,s\r\n1,2,3\r\n");
+    expect(records).toEqual([
+      ["a", "b", "c"], ["x", "y"], ["p", "q", "r", "s"], ["1", "2", "3"],
+    ]);
+  });
+
+  it("consumes a BOM at the very start and keeps one anywhere else", async () => {
+    const { records } = await readForeign(`${CSV_BOM}name,note\r\nx,a${CSV_BOM}b\r\n`);
+    expect(records[0]?.[0]).toBe("name");
+    expect(records[1]?.[1]).toBe(`a${CSV_BOM}b`);
+  });
+
+  it("reassembles a multi-byte character split across two chunks", async () => {
+    const bytes = Buffer.from("name\r\nM\u00FCller\r\n", "utf8");
+    const at = bytes.indexOf(0xc3) + 1;
+    const repairs: ForeignCsvRepair[] = [];
+    const records: string[][] = [];
+    const source = Readable.from([bytes.subarray(0, at), bytes.subarray(at)]);
+    for await (const record of foreignCsvRecords(source, {
+      delimiter: ",", onRepair: (repair) => repairs.push(repair),
+    })) {
+      records.push(record.fields);
+    }
+    expect(records[1]).toEqual(["M\u00FCller"]);
+    expect(repairs).toEqual([]);
+  });
+
+  it("refuses a record longer than the bound -- the one thing it will not forgive", async () => {
+    // A MEMORY BOUND AND NOT A JUDGEMENT ABOUT THE DATA. An unterminated quote
+    // near the top of a 45MB sheet turns the whole remainder into one value,
+    // and a reader that streamed it into one string would have bought nothing.
+    await expect(readForeign(`a\r\n"${"x".repeat(5000)}`, ",", 1000))
+      .rejects.toThrow(/longer than the 1000 characters/);
+  });
+
+  it("charges a swallowed line feed to no record, so CRLF costs what LF costs", async () => {
+    // THE BOUND IS PER RECORD AND MUST NOT DEPEND ON THE LINE ENDING. The LF of
+    // a CRLF is swallowed by the pending carriage return and charged to
+    // nothing; if it were charged to the record AFTER it, the same data would
+    // fit under one bound as a Unix file and not as a Windows one, which is a
+    // bound nobody could reason about.
+    const four = "abcd";
+    for (const eol of ["\r\n", "\n"]) {
+      const text = `${four}${eol}${four}${eol}${four}${eol}`;
+      // Five: the four characters plus the one terminator each record is
+      // charged, whichever terminator it is.
+      expect((await readForeign(text, ",", 5)).records).toHaveLength(3);
+      await expect(readForeign(text, ",", 4)).rejects.toThrow(/longer than the 4 characters/);
+    }
+  });
+});
+
+describe("sniffCsvDelimiter", () => {
+  it("picks the comma for a comma file", () => {
+    expect(sniffCsvDelimiter("name,city\r\nAcme,Delft\r\n")).toBe(",");
+  });
+
+  it("picks the semicolon for a European Excel file", () => {
+    expect(sniffCsvDelimiter("naam;plaats\r\nAcme;Amsterdam\r\n")).toBe(";");
+  });
+
+  it("picks the tab for a tab file", () => {
+    expect(sniffCsvDelimiter("name\tcity\r\nAcme\tDelft\r\n")).toBe("\t");
+  });
+
+  it("reads a semicolon file whose values are full of commas", () => {
+    const sample = 'company;city\r\n"Acme, Inc.";"Amsterdam, NH"\r\n"B, C, D";"Delft"\r\n';
+    expect(sniffCsvDelimiter(sample)).toBe(";");
+  });
+
+  it("is not fooled by a delimiter that only appears inside quoted values", () => {
+    // THE CASE THAT RULES OUT COUNTING OCCURRENCES, and it has to be built so
+    // that the wrong answer WINS rather than merely ties. Read as semicolons
+    // with the quoting ignored, this file looks like three consistent columns
+    // and beats the comma's two; read properly, the semicolons in the data are
+    // all inside one quoted value and only the header has any, so the records
+    // disagree and the semicolon is dropped.
+    const sample = 'name;x,note;y\r\nAcme,"a;b;c"\r\nNile,"d;e;f"\r\n';
+    expect(sniffCsvDelimiter(sample)).toBe(",");
+  });
+
+  it("does not pick a delimiter the data records disagree about", () => {
+    // THREE FIELDS ON THE HEADER AND ONE ON EVERY ROW IS NOT A SEMICOLON FILE,
+    // however much it would outscore the comma's two. Built so the majority
+    // check is what decides it: without that check the semicolon wins on its
+    // header alone.
+    const sample = "a;b;c,city\r\nAcme,Delft\r\nB,Delft\r\nC,Delft\r\n";
+    expect(sniffCsvDelimiter(sample)).toBe(",");
+  });
+
+  it("answers the comma for a single-column file, where every candidate ties", () => {
+    expect(sniffCsvDelimiter("name\r\nAcme\r\n")).toBe(",");
+  });
+
+  it("answers the comma for an empty sample rather than throwing", () => {
+    expect(sniffCsvDelimiter("")).toBe(",");
+  });
+});
+
+describe("delimiterName", () => {
+  it("names each candidate in words a person reads", () => {
+    expect(delimiterName(",")).toBe("comma");
+    expect(delimiterName(";")).toBe("semicolon");
+    expect(delimiterName("\t")).toBe("tab");
+    expect(delimiterName("|")).toBe("pipe");
+  });
+
+  it("quotes anything else rather than pretending to have a word for it", () => {
+    expect(delimiterName("~")).toBe('"~"');
   });
 });

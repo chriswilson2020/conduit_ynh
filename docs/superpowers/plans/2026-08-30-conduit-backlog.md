@@ -7,11 +7,14 @@ Everything here has evidence attached — a file and line, a measurement, or the
 found it. Items without evidence are marked as judgement rather than fact. Where one item
 blocks another, that is stated rather than left to be rediscovered.
 
-Current shipped version: **v1.3.0**. **In flight: Phase 7.7 -- its RESTORE half is complete**
-(shared spine, engine, backup inventory, route guards, Settings page), and both importers
-remain. **v1.4.1 is planned and waiting behind it**, in
-`docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`, holding what 7.7 surfaced and
-deliberately did not fix -- Chris asked for it as a point release straight after v1.4.0.
+Current shipped version: **v1.3.0**. **In flight: Phase 7.7 -- restore and BOTH importers are
+now built** (shared spine, engine, backup inventory, route guards, Settings page; the exact
+importer for Conduit's own export; the forgiving one for a foreign CSV). **What remains is the
+HTTP surface and the page for the two importers** -- neither has a route, which is stated in
+each module's own header rather than left to be discovered. **v1.4.1 is planned and waiting
+behind it**, in `docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`, holding what
+7.7 surfaced and deliberately did not fix -- Chris asked for it as a point release straight
+after v1.4.0.
 
 **v1.3.0 changes behaviour on a path Chris uses without thinking, and that is the first thing
 in its notes rather than a footnote: both downloads now ask for the password again.**
@@ -26,7 +29,7 @@ in its notes rather than a footnote: both downloads now ask for the password aga
 | ~~**v1.2.1**~~ | The reply signature, the Mail tab composing to nobody, the GIF undercharge Chris moved in, and the first deliberate sweep for assertions that cannot fail | **SHIPPED 31 Aug** |
 | ~~**v1.2.2**~~ | The MAIL template feature removed, table included (the QUOTE template stayed); the five lists given the loading branch their siblings have; and the Dovecot IDLE burst diagnosed -- **the answer was NO**, so nothing was reordered. **Ships `0012`, a `DROP TABLE`** | **SHIPPED 31 Aug** |
 | ~~**7.6 → v1.3.0**~~ | Export (plain ZIP, readable, not restorable) and backup (AES-256 `.7z`, exact, not readable), told apart on a Settings page, **both behind a password re-prompt**. No schema change | **SHIPPED 31 Aug** |
-| **7.7 → v1.4.0** | Restore and import | **IN FLIGHT.** Restore is built and reviewed -- four adversarial rounds, three of which found a path to a silent half-restore. Both importers remain |
+| **7.7 → v1.4.0** | Restore and import | **IN FLIGHT.** Restore is built and reviewed -- four adversarial rounds, three of which found a path to a silent half-restore. Both importers are now built as services; **neither has a route or a page yet**, and that is the remaining work |
 | **v1.4.1** | Six hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, and two decisions for Chris | **PLANNED**, straight after v1.4.0 |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
 | **Phase 4.4** | Mail filing power tools: per-message selection, arbitrary folder moves, folder management, bulk unhide, live inbox beyond page one | Unspecced. Overlaps "emailing a quote" below |
@@ -831,6 +834,84 @@ specific missing thing, so the format change already has a specification.
 - **The importer writes no `events` rows**, deliberately: an import is a bulk load of history
   that happened elsewhere, so "created" stamped at import time would be a lie on every row --
   and `events_verb_valid` has no verb for it, which would make one a migration.
+
+---
+
+## THE FORGIVING IMPORTER'S THREE DECISIONS, and the one question they leave for Chris
+
+**Built by 7.7's last engine, `services/import-csv.ts`.** Chris's decision of 30 Aug asked for
+"a forgiving, interactive CSV importer for foreign data (another CRM, a spreadsheet, Outlook)
+with column mapping and a preview". It is the only pipeline in the phase with an interactive
+step between inspect and plan, because **the mapping is a human decision that cannot exist
+before the headers do** -- `@conduit/shared`'s `import-mapping.ts` is that step as a value the
+page can render, and `csvMappingProblem` is the one rule the page disables its control with
+and the server refuses an arriving mapping with.
+
+**1. A BAD ROW IS REPORTED AND SKIPPED; THE IMPORT IS STILL ALL OR NOTHING.** "Forgiving" and
+"a partial failure must not leave half a spreadsheet loaded" look like they pull against each
+other and do not: they are about different MOMENTS. Every reason a row cannot be imported is
+found by reading the file at PLAN time, counted, named in the preview and excluded from the
+effect's count -- so nothing is written to be half written. A failure AFTER the operator says
+yes is one transaction, rolled back whole. The resolution only holds because plan catches
+everything the database would refuse, which is why `buildRow` checks the NOT NULLs, both
+`contacts_*_length` CHECKs, the email format `db/schema.ts` says the input schemas own, and
+the NUL Postgres refuses at the type (`22021`, which has no CHECK to name it).
+
+**2. DUPLICATES ARE MATCHED ON EMAIL FOR CONTACTS AND DOMAIN FOR COMPANIES**, case-folded, and
+a match is SKIPPED rather than merged or overwritten. A name is not a key -- two people are
+called John Smith and there are two companies genuinely called Acme, which is the same case
+the exact importer names when it argues for keeping the export's ids. **Normalisation is
+`trim` and `toLowerCase` and nothing else**, because the rule runs in two languages (JS for
+the candidates, `lower(...)` in SQL for the stored ones) and a cleverer one would drift. The
+cost is named rather than hidden: `www.acme.com` in the file and `acme.com` in Conduit are two
+companies. **An archived row counts as present.**
+
+**3. A COUNT THAT MOVES BETWEEN PREVIEW AND APPLY ROLLS THE WHOLE IMPORT BACK** -- the same
+answer the exact importer gave, and it was RECONSIDERED rather than copied. The argument for
+differing is real (an operator loses five minutes of mapping, not just a re-upload), and it
+loses anyway: importing "as many as still fit" means spending less than the effect's count,
+which the frame exists to forbid, and a foreign file has no id to reconcile the difference
+against afterwards.
+
+### What 200,000 rows cost, measured on the deploy target
+
+A 14.1MB foreign CSV of 200,000 contacts written by Python's `csv` module, on the deploy
+target (Debian 12, PostgreSQL 15.19, two cores, 3.8GB and no swap):
+
+| stage | time | resident |
+|---|---|---|
+| ingest + stage | 0.05s | -- |
+| mapping step | 0.07s | not sampled; the step never yields |
+| plan | 2.58s | peak 261MB |
+| apply | 43.91s | **PEAK 280MB**, 200,000 rows |
+
+**The peak barely moved between plan and apply**, and that 19MB is what the batching exists to
+produce: apply holds one batch and one statement's parameters, not one import. **The mapping
+step is instant on a 14MB file**, which is the whole point of reading a bounded prefix -- the
+one stage a person waits in front of does not grow with the file. **Apply is twice the exact
+importer's 21.5s for the same row count**, and the reason is named rather than hidden: at this
+size it runs **four hundred duplicate probes inside the transaction**, one per batch, where the
+exact importer needs none at all because a PRIMARY KEY answers its question for free -- plus
+two `text[]` columns per row. That is the price of matching on something other than a key.
+
+### What is left for Chris, and it is a migration
+
+**An import does not appear on any record's timeline**, for the exact importer's reason:
+`events_verb_valid` has no verb for one, and adding one is a migration. If an imported
+company should show "imported from contacts.csv" in its rail, that is a schema change and it
+is Chris's to ask for. Both importers stop short of it deliberately.
+
+### Two things the foreign importer does NOT do, with the reason on each
+
+- **It never creates a company from a contact import.** `contact.company_name` LINKS to a
+  company already here whose name matches exactly, ignoring case, and links to nothing when
+  the name matches none or more than one; both counts are in the preview. Creating one would
+  mean minting a company from a NAME, and "Acme", "Acme Ltd" and "ACME" in one column become
+  three companies with no number in the preview able to say they should have been one. The
+  workflow is two passes and the refusal message says so.
+- **Imported rows arrive with no owner.** A spreadsheet has no Conduit user in it. Letting the
+  operator pick one owner for a whole import is a good affordance and a MAPPING CONTROL rather
+  than a column, so it belongs to the routes task; nothing in the service forecloses it.
 
 ---
 

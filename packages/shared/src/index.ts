@@ -33,6 +33,17 @@ export type {
   PlanEffectView, PlanFindingView, PlanKind, PlanRefusalView, PlanSourceView,
   PlanUnit, PlanView,
 } from "./plan.js";
+// 7.7's ONE INTERACTIVE STEP: the column mapping for a foreign CSV. Here for
+// the plan's own reason and one more of its own -- csvMappingProblem is the
+// single rule the page disables its control with and services/import-csv.ts
+// refuses an arriving mapping with, on the passphraseProblem precedent.
+export {
+  csvImportField, csvMappingEntity, csvMappingProblem, CSV_IMPORT_FIELDS,
+} from "./import-mapping.js";
+export type {
+  CsvColumnView, CsvDialectView, CsvImportEntity, CsvImportField, CsvImportFieldDef,
+  CsvMapping, CsvMappingEntry, CsvMappingFinding, CsvMappingRefusal, CsvMappingView,
+} from "./import-mapping.js";
 // 7.7's confirmation rule, here for the reason the passphrase rule above is:
 // the page refuses a mistyped install name before it spends a single-use
 // ticket, and routes/restore.ts refuses one that arrives anyway. One function,
@@ -139,9 +150,24 @@ const cappedNullableString = (max: number, what: string) =>
     })
     .nullable();
 
+/**
+ * THE ONE RULE FOR WHAT COUNTS AS AN EMAIL ADDRESS ON A CONTACT.
+ *
+ * NAMED AND EXPORTED RATHER THAN SPELLED `z.email()` AT EACH USE, because
+ * db/schema.ts's `contacts.emails` says in its own words that the format is
+ * validated here and that "any future direct-write path (import, seed) must go
+ * through those schemas to keep this guarantee". 7.7's foreign CSV importer is
+ * exactly that path, and it needs the rule for ONE VALUE at a time -- it drops
+ * an unusable address and keeps the person rather than parsing a whole contact
+ * and losing them. Referencing this is what keeps that a use of the rule rather
+ * than a second copy of it.
+ */
+export const contactEmailSchema = z.email();
+
 export const contactSchema = z.object({
   id: z.uuid(), firstName: z.string().min(1), lastName: nullableString,
-  companyId: z.uuid().nullable(), emails: z.array(z.email()), phones: z.array(z.string().min(1)),
+  companyId: z.uuid().nullable(),
+  emails: z.array(contactEmailSchema), phones: z.array(z.string().min(1)),
   jobTitle: nullableString,
   // Both optional, both free text, and NEITHER IS EVER INFERRED -- not from the
   // name, not from each other, not from anything. A blank stays blank and renders
@@ -156,7 +182,7 @@ export type Contact = z.infer<typeof contactSchema>;
 export const createContactInputSchema = z.object({
   firstName: z.string().min(1), lastName: nullableString.optional(),
   companyId: z.uuid().nullable().optional(),
-  emails: z.array(z.email()).optional(), phones: z.array(z.string().min(1)).optional(),
+  emails: z.array(contactEmailSchema).optional(), phones: z.array(z.string().min(1)).optional(),
   jobTitle: nullableString.optional(),
   salutation: cappedNullableString(CONTACT_FIELD_CAPS.salutation, "salutation").optional(),
   pronouns: cappedNullableString(CONTACT_FIELD_CAPS.pronouns, "set of pronouns").optional(),
@@ -1684,6 +1710,21 @@ export type MeetingTaskCreateInput = z.infer<typeof meetingTaskCreateInputSchema
  * business on a quote.
  */
 const UNSTORABLE_TEXT = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+
+/**
+ * Whether Postgres would refuse to store this string at all.
+ *
+ * THE PREDICATE IS EXPORTED AND THE PATTERN IS NOT, so there is one description
+ * of the rule and no way for a caller to end up holding a `RegExp` with state of
+ * its own. 7.7's foreign CSV importer is the caller that needed it: a NUL in
+ * somebody else's spreadsheet is not exotic, and a row carrying one has to be
+ * declined IN THE PREVIEW rather than reaching an INSERT inside a transaction
+ * that has already written thousands of rows -- where it arrives as `22021
+ * invalid byte sequence` and takes the whole import down with it.
+ */
+export function unstorableText(value: string): boolean {
+  return UNSTORABLE_TEXT.test(value);
+}
 
 /**
  * A user-supplied string bounded in length and refused if a column could not hold it.
