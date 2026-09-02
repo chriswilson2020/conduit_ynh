@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -961,6 +962,69 @@ describe("records this importer declines, one arm at a time", () => {
       expect(plan.effects[0]?.count).toBe(1);
     });
   }
+});
+
+// --- descriptors -----------------------------------------------------------
+
+describe("the streams this module opens", () => {
+  // /proc is the only way for a process to count its own open descriptors, and
+  // it is Linux-only -- the same probe services/export.test.ts uses for the
+  // same discipline. The dev server and the CI runner both have it.
+  const HAVE_PROC = existsSync("/proc/self/fd");
+  const itFd = HAVE_PROC ? it7z : it.skip;
+
+  async function openDescriptors(): Promise<number> {
+    return (await readdir("/proc/self/fd")).length;
+  }
+
+  itFd("closes every member it reads, on the path that finishes", async () => {
+    // THE ONE NEW THING THIS MODULE DOES TO THE FILESYSTEM is open staged
+    // members: once per listed member for the digest sweep, once per sheet at
+    // inspect, and once per sheet again at apply. Every one of them is a
+    // descriptor on a file inside a credential store, and 7.6 measured what
+    // happens when a read stream is detached rather than destroyed -- five
+    // abandoned downloads, five descriptors held for ever, and every file
+    // operation in the app failing once they ran out.
+    await createCompany(db, actorId, { name: "Acme" });
+    await createContact(db, actorId, { firstName: "Ada" });
+    const archive = await exportArchive();
+
+    // One cycle first, so nothing lazily-initialised is counted as a leak.
+    await emptyInstallWithOperator();
+    const warm = await planFor(archive);
+    await applyImport({ plan: warm.plan, payload: warm.payload, db });
+
+    const before = await openDescriptors();
+    for (let n = 0; n < 5; n += 1) {
+      await emptyInstallWithOperator();
+      const { plan, payload } = await planFor(archive);
+      await applyImport({ plan, payload, db });
+    }
+    expect(await openDescriptors()).toBeLessThanOrEqual(before);
+  });
+
+  itFd("closes the member it was reading when a parse abandons it", async () => {
+    // THE PATH THAT LEAKS IF ANYTHING DOES. Every other read runs to the end of
+    // its stream, which closes it; this one throws from inside the generator
+    // half way through a member and never asks for another byte.
+    await createCompany(db, actorId, { name: "Acme" });
+    await createContact(db, actorId, { firstName: "Ada" });
+    const members = await membersOf(await exportArchive());
+    await emptyInstallWithOperator();
+    const sheet = (members.get("companies.csv") ?? Buffer.alloc(0)).toString("utf8");
+    replaceMember(members, "companies.csv", Buffer.from(`${sheet}"never closed\r\n`, "utf8"));
+    const broken = await zipOf(members);
+
+    const warm = await planFor(broken);
+    expect(warm.plan.refusal?.code).toBe(IMPORT_REFUSALS.sheetUnreadable);
+
+    const before = await openDescriptors();
+    for (let n = 0; n < 5; n += 1) {
+      const { plan } = await planFor(broken);
+      expect(plan.refusal?.code).toBe(IMPORT_REFUSALS.sheetUnreadable);
+    }
+    expect(await openDescriptors()).toBeLessThanOrEqual(before);
+  });
 });
 
 // --- the environment this suite depends on ---------------------------------
