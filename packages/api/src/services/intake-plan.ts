@@ -67,10 +67,23 @@ import type { IntakeFile, StagedMemberRef, StagedPayload, StagedReader } from ".
 //   inspect that counted rows, or checked a CSV row against existing records
 //   for duplicates, read a database that can change before apply runs. For
 //   restore that is harmless: the row counts are there so an operator sees what
-//   they are replacing. For the CSV importer's duplicate detection it is a real
+//   they are replacing. For an importer's duplicate detection it is a real
 //   semantic, and the importer has to decide whether a row that became a
 //   duplicate in the meantime is inserted anyway. IntakeSessionStore's TTL is
 //   what bounds the window; it does not close it.
+//
+//   THE FIRST IMPORTER HAS NOW ANSWERED IT, and the answer is recorded here
+//   rather than only where it was made, because the next one will face the same
+//   question. services/import-export.ts REFUSES THE WHOLE IMPORT: each insert
+//   is ON CONFLICT DO NOTHING and counts what landed, and a count that differs
+//   from the preview's -- in either direction, a row that became a duplicate or
+//   one that stopped being one -- rolls the transaction back with nothing
+//   imported and says to take a fresh preview. It is the reversible side: the
+//   cost is one re-upload of a file the operator still has, against a preview
+//   that said 104 and an install that got 103 with no record of which one is
+//   missing. The mechanism above is what forces the choice to be explicit --
+//   a short import means spending less than the effect's count, which this
+//   frame already refuses.
 //
 //   TWO EFFECTS CAN BE ONE ATOMIC ACT. Restore has to drop the schema and load
 //   the dump inside ONE psql transaction, but the operator has to SEE those as

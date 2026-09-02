@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { Readable } from "node:stream";
 import {
-  CSV_BOM, CSV_EOL, csvCell, csvDocument, csvRow, escapeCellValue, unescapeCellValue,
+  CSV_BOM, CSV_EOL, csvCell, csvDocument, csvRecords, csvRow, escapeCellValue, unescapeCellValue,
+  CsvParseError,
 } from "./csv.js";
 
 // The dialect's rules, each one broken on purpose somewhere below. A rule that
@@ -196,5 +198,151 @@ describe("csvDocument", () => {
     const bytes = csvDocument(["n"], [["\u00FC"]]);
     // BOM(3) + "n" + CRLF(2) + the two bytes of u-umlaut + CRLF(2)
     expect(bytes.byteLength).toBe(3 + 1 + 2 + 2 + 2);
+  });
+});
+
+// --- the reader (7.7) -----------------------------------------------------
+//
+// EVERY CASE HERE IS DRIVEN THROUGH csvDocument WHERE IT CAN BE, so the reader
+// is asserted against the writer's real output rather than against a string a
+// test author believed the writer produces. The refusals are the exception, by
+// necessity: the writer cannot produce a malformed file, so those are written
+// by hand -- and each one is a shape this reader must never guess at.
+
+/** Read every record out of a buffer, in one chunk. */
+async function readAll(bytes: Buffer | string, chunkSize?: number): Promise<string[][]> {
+  const buffer = typeof bytes === "string" ? Buffer.from(bytes, "utf8") : bytes;
+  const source = chunkSize === undefined
+    ? Readable.from([buffer])
+    : Readable.from((function* split() {
+      for (let at = 0; at < buffer.length; at += chunkSize) {
+        yield buffer.subarray(at, at + chunkSize);
+      }
+    })());
+  const records: string[][] = [];
+  for await (const record of csvRecords(source)) records.push(record);
+  return records;
+}
+
+describe("csvRecords", () => {
+  it("reads back exactly what csvDocument wrote", async () => {
+    const header = ["id", "name", "note"];
+    const rows = [
+      ["1", "Acme Ltd", "ordinary"],
+      ["2", "Acme, Ltd", "the delimiter, inside a value"],
+      ["3", 'the "big" one', "an embedded quote"],
+      ["4", "line one\nline two", "an embedded line feed"],
+      ["5", "line one\r\nline two", "an embedded CRLF"],
+      ["6", "M\u00FCller GmbH", "an accent"],
+      ["7", "", "an empty value"],
+      ["8", "a\tb", "a tab"],
+    ];
+    expect(await readAll(csvDocument(header, rows))).toEqual([header, ...rows]);
+  });
+
+  it("round-trips a value the formula guard rewrote, through the declared inverse", async () => {
+    // The writer escapes; the reader gives back what the writer was handed;
+    // unescapeCellValue is what turns one into the other. The importer applies
+    // it only when manifest.json declares the transform -- see
+    // services/import-export.ts -- which is why it is not applied here.
+    const values = ["=1+1", "@here", "'already quoted", "+31 6 12345678", "plain"];
+    const records = await readAll(csvDocument(["v"], values.map((v) => [v])));
+    expect(records.slice(1).map((r) => r[0])).toEqual(
+      values.map((v) => escapeCellValue(v)),
+    );
+    expect(records.slice(1).map((r) => unescapeCellValue(r[0] ?? ""))).toEqual(values);
+  });
+
+  it("consumes the byte order mark and does not put it in the first cell", async () => {
+    const records = await readAll(csvDocument(["id"], [["1"]]));
+    expect(records[0]).toEqual(["id"]);
+    expect(records[0]?.[0]?.startsWith(CSV_BOM)).toBe(false);
+  });
+
+  it("keeps a U+FEFF that is inside a value rather than at the start of the file", async () => {
+    // A zero-width no-break space is a legal, if unkind, thing to have in a
+    // name. Only the document's very first character is a byte order mark.
+    const records = await readAll(csvDocument(["n"], [[`a${CSV_BOM}b`]]));
+    expect(records[1]).toEqual([`a${CSV_BOM}b`]);
+  });
+
+  it("reassembles an accented character split across two chunks", async () => {
+    // One byte at a time cuts every two-byte character in half, which is
+    // exactly what a socket does to a large member and what StringDecoder is
+    // here for. Without it the cell would carry replacement characters.
+    const records = await readAll(csvDocument(["n"], [["M\u00FCller GmbH"]]), 1);
+    expect(records[1]).toEqual(["M\u00FCller GmbH"]);
+  });
+
+  it("reassembles a character outside the basic plane split across chunks", async () => {
+    const rocket = "\u{1F680}";
+    expect(await readAll(csvDocument(["n"], [[rocket]]), 1)).toEqual([["n"], [rocket]]);
+  });
+
+  it("reads a header-only document as one record", async () => {
+    expect(await readAll(csvDocument(["id", "name"], []))).toEqual([["id", "name"]]);
+  });
+
+  it("yields nothing at all for an empty stream", async () => {
+    expect(await readAll("")).toEqual([]);
+  });
+
+  it("reads a quoted empty field as an empty string", async () => {
+    expect(await readAll(`a,b\r\n"",x\r\n`)).toEqual([["a", "b"], ["", "x"]]);
+  });
+
+  it("refuses a line feed outside a quoted field", async () => {
+    await expect(readAll("a,b\n1,2\r\n")).rejects.toThrow(CsvParseError);
+    await expect(readAll("a,b\n1,2\r\n")).rejects.toThrow(/line feed outside a quoted field/);
+  });
+
+  it("refuses a carriage return that is not followed by a line feed", async () => {
+    await expect(readAll("a,b\r1,2\r\n")).rejects.toThrow(/not followed by a line feed/);
+  });
+
+  it("refuses a quote in the middle of an unquoted field", async () => {
+    await expect(readAll('a\r\nx"y\r\n')).rejects.toThrow(/quote appeared inside an unquoted field/);
+  });
+
+  it("refuses a quoted field that ends in the middle of a value", async () => {
+    await expect(readAll('a\r\n"x"y\r\n')).rejects.toThrow(/ended in the middle of a value/);
+  });
+
+  it("refuses a file that ends inside a quoted field", async () => {
+    await expect(readAll('a\r\n"x')).rejects.toThrow(/ended inside a quoted field/);
+  });
+
+  it("refuses a file whose last record has no CRLF", async () => {
+    await expect(readAll("a\r\nx")).rejects.toThrow(/without terminating its last record/);
+  });
+
+  it("refuses a file that ends on a bare carriage return", async () => {
+    await expect(readAll("a\r\nx\r")).rejects.toThrow(/ended after a carriage return/);
+  });
+
+  it("names the record number where the parse lost its place", async () => {
+    // Record 1 is the header, so the third line is record 3 -- what a person
+    // reads out of a spreadsheet's row gutter.
+    const error = await readAll("a\r\nok\r\nx\"y\r\n").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(CsvParseError);
+    expect((error as CsvParseError).record).toBe(3);
+  });
+
+  it("refuses a record longer than the bound, rather than buffering the whole file", async () => {
+    // An unterminated quote is what makes this reachable: everything after it
+    // is one field. The bound is what stops a 100MB member becoming a 100MB
+    // string.
+    const source = Readable.from([Buffer.from(`a\r\n"${"x".repeat(5000)}`, "utf8")]);
+    const records = csvRecords(source, { maxRecordChars: 1000 });
+    await expect((async () => { for await (const _ of records) { /* drain */ } })())
+      .rejects.toThrow(/longer than the 1000 characters/);
+  });
+
+  it("counts each record's length on its own, so a long file of short records is fine", async () => {
+    const rows = Array.from({ length: 200 }, (_, n) => [String(n)]);
+    const records = csvRecords(Readable.from([csvDocument(["n"], rows)]), { maxRecordChars: 40 });
+    let seen = 0;
+    for await (const _ of records) seen += 1;
+    expect(seen).toBe(201);
   });
 });

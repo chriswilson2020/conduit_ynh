@@ -780,13 +780,57 @@ a password change does not invalidate outstanding tickets.
   runs on this branch**, which is itself the finding.
 - **`DialogDescription` silently drops every prop but `children`** and TypeScript will not
   catch it -- excess-property checks are skipped for hyphenated JSX attributes.
-- **`plannedTotal(plan, "row")` returns 0 for every restore plan.** No consumer today; its own
-  doc invites one. **Check before scheduling -- if an importer reached for it, it is live.**
+- ~~**`plannedTotal(plan, "row")` returns 0 for every restore plan.**~~ **CLOSED by 7.7's exact
+  importer, with no change to the function.** It is the first pipeline whose effects carry the
+  `row` unit, and it checked before relying: six rows across two effects total six.
+  `services/import-export.test.ts` holds the assertion.
 - **One vitest run of four reported `Errors 1 error` with exit 0 and no failing test.** Never
   reproduced. Recorded rather than explained.
 - **Two decisions that are Chris's:** whether a future backup recording `approximate` row
   counts should be refused or degrade to "check not made"; and whether a control character in
   a passphrase should be named by the route rather than mis-explained.
+
+---
+
+## THE EXPORT IS NOT A COMPLETE DESCRIPTION OF THE DATA, and the exact importer is where that stopped being an abstraction
+
+**Found by 7.7's exact importer, which is the first thing that ever tried to read the export
+back.** It imports **two of the nine sheets** -- companies and contacts -- and the other seven
+are refused per-sheet with a finding naming exactly what is missing. **The shortfall is in the
+export format, not in the importer**, and closing it is a change to a versioned artefact
+Chris lives with, so it is his decision rather than an implementer's.
+
+Read against `db/schema.ts`, sheet by sheet:
+
+| sheet | what the export does not carry |
+|---|---|
+| `deals.csv` | `position` (NOT NULL, no default) and the `pipelines` / `stages` rows `pipeline_id` and `stage_id` point at. **There is no pipelines.csv or stages.csv at all.** |
+| `tasks.csv` | `position`, same as deals; and links to deals and projects, which are not imported |
+| `projects.csv` | `deal_id` points at deals |
+| `notes.csv` | `author_user_id` is NOT NULL against `users`, **and the export carries no users** -- only ids and a denormalised username |
+| `meetings.csv` | `owner_user_id`, same gap; and attendees are exported as **display names in one cell**, so the archive cannot say whether an attendee was a contact, a user or a guest -- the exact three-way distinction `meeting_attendees_exactly_one` requires |
+| `documents.csv` | there is **no `document_line_items` sheet**, so an imported quote would print a frozen total over an empty table |
+| `files.csv` | `uploader_user_id` is NOT NULL against `users`. The blobs themselves ARE in the archive |
+
+**Companies and contacts are the closure that is left**, and they are a closure rather than a
+convenient pair: a contact points at a company, which is in the export; a company points at
+nothing that is not either in the export or nullable. `owner_user_id` is the one exception and
+it is nullable -- an owner this install has never seen is dropped to NULL, counted, and named
+in the preview before anything is applied.
+
+**The fix shape is a `formatVersion` 2** carrying `users`, `pipelines`, `stages`, the
+fractional positions, `meeting_attendees` as data rather than as names, and
+`document_line_items`. Every finding the importer emits about a sheet it skipped names the
+specific missing thing, so the format change already has a specification.
+
+**Two adjacent notes, both recorded rather than fixed:**
+
+- **`text()` maps NULL and the empty string to the same cell**, so a column that genuinely
+  held `""` comes back NULL. The export cannot tell them apart and neither can any reader; the
+  choice matches what every create/update service actually writes, which is never `""`.
+- **The importer writes no `events` rows**, deliberately: an import is a bulk load of history
+  that happened elsewhere, so "created" stamped at import time would be a lie on every row --
+  and `events_verb_valid` has no verb for it, which would make one a migration.
 
 ---
 

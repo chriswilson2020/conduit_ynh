@@ -949,9 +949,16 @@ describe("IntakeSessionStore", () => {
 // one pipeline, and only the last column differs.
 //
 // The inspectors below are DELIBERATELY THIN. They are not restore and they are
-// not the importers -- those are later tasks of this phase. They are the
-// smallest thing that answers the question this task exists to answer: does the
-// shape fit, or does building the second half force the first to be rebuilt?
+// not the importers -- services/restore.ts and services/import-export.ts are,
+// and both were built after this file. They are the smallest thing that answers
+// the question this task existed to answer: does the shape fit, or does building
+// the second half force the first to be rebuilt?
+//
+// THEY STAY THIN NOW THAT TWO OF THE THREE ARE REAL. What they hold to account
+// is the FRAME, over three shapes at once, and a copy of the real inspectors
+// would test those instead -- with their suites already doing it better. The
+// answer, recorded because it was the question: the shape fitted. The exact
+// importer needed no change to this module.
 // ---------------------------------------------------------------------------
 
 /** Shape 1: restore, from an encrypted `.7z`. Its last column DESTROYS. */

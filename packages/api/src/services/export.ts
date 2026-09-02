@@ -37,7 +37,25 @@ import { csvDocument } from "./csv.js";
 // refused) and it needs no change; it is recorded here because a reader of
 // either module could reasonably infer that this file writes `kind: "export"`,
 // and it does not. Adding one would be a change to a versioned format that
-// 7.8's exact importer reads, so it is a decision rather than a tidy-up.
+// 7.7's exact importer reads, so it is a decision rather than a tidy-up.
+// (It said "7.8's" until that importer was built, in 7.7, alongside restore.)
+//
+// SINCE 7.7 THIS ARCHIVE HAS A READER: services/import-export.ts. Two things
+// there are worth knowing here, because both are properties of what this file
+// WRITES rather than of what that file reads:
+//
+//   THE MANIFEST'S ABSENT `kind` IS WHAT THE IMPORTER REFUSES A BACKUP ON, from
+//   the other side -- `manifest.kind === "backup"` sends the operator to
+//   Restore. The two refusals are a matched pair and neither is a default.
+//
+//   THE EXPORT IS NOT A COMPLETE DESCRIPTION OF THE DATA, and the importer is
+//   what made that concrete. It reads TWO of the nine sheets. The other seven
+//   name rows whose NOT NULL columns or foreign keys are not in this archive at
+//   all -- there is no pipelines.csv, no stages.csv, no users, no fractional
+//   `position`, no document_line_items, and meeting attendees are flattened to
+//   display names. That is a gap in this format rather than in the reader; the
+//   list is in services/import-export.ts's header and in the backlog, and
+//   closing it is a formatVersion 2.
 //
 // The page draws the same line in words, because the failure being designed
 // against is somebody reaching for the wrong artefact at the moment they most

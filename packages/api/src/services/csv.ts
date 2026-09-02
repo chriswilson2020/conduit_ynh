@@ -1,5 +1,8 @@
-// The CSV dialect the export writes. RFC 4180, and every part of it is a
-// decision rather than a default -- see the 7.6 spec's Export section.
+import { StringDecoder } from "node:string_decoder";
+
+// The CSV dialect the export writes AND READS BACK. RFC 4180, and every part
+// of it is a decision rather than a default -- see the 7.6 spec's Export
+// section.
 //
 // THE ONE AUDIENCE IS A SPREADSHEET. The export exists so an operator can open
 // their data in Excel; nothing else consumes it, and the backup (Task 2) is the
@@ -11,6 +14,24 @@
 // The dialect lives in its own module, apart from the row-building in
 // export.ts, because it is the part with rules -- and a rule nobody can break
 // on purpose in a test is a rule nobody knows is there.
+//
+// SINCE 7.7 THIS MODULE ALSO READS, and the reader lives here rather than in
+// the importer for the reason unescapeCellValue already lived here: a parser
+// written next door would be a SECOND description of the dialect, and the day
+// the two disagreed the file nobody could open would be the operator's only
+// copy of their data. csvRecords below is the inverse of csvDocument, and
+// csv.test.ts asserts the round trip over the writer's own output rather than
+// over strings a reader hand-wrote to suit itself.
+//
+// THE READER IS STRICT WHERE THE WRITER IS SPECIFIC, and that is the whole
+// difference between it and the forgiving sniffer 7.7's OTHER importer needs.
+// This one reads a file THIS MODULE WROTE, whose bytes have already been
+// checked against a SHA-256 in manifest.json before a record is parsed. So a
+// lone LF outside quotes, a quote in the middle of an unquoted field, a record
+// with a different number of fields from the header -- none of them can occur
+// in an undamaged export, and every one of them means the parse has lost its
+// place. Guessing at that point would misassign every column of every row that
+// followed, silently. It throws instead.
 
 /**
  * U+FEFF, encoded UTF-8 as EF BB BF, at the very start of the file.
@@ -149,4 +170,178 @@ export function csvDocument(header: readonly string[], rows: readonly (readonly 
   const parts = [CSV_BOM + csvRow(header)];
   for (const row of rows) parts.push(csvRow(row));
   return Buffer.from(parts.join(""), "utf8");
+}
+
+// --- Reading the dialect back (7.7) --------------------------------------
+
+/**
+ * The parse lost its place, and the record number where it happened.
+ *
+ * A THROW RATHER THAN A SKIPPED ROW, and the difference is not squeamishness.
+ * Every condition that raises this means the parser no longer knows which
+ * character belongs to which column -- so the NEXT row would be misassigned
+ * too, and the one after that, with a plausible-looking company name landing in
+ * `domain` and nothing on screen to say so. A file this reader cannot follow is
+ * one the importer must refuse whole.
+ *
+ * `record` COUNTS FROM 1 AND THE HEADER IS RECORD 1, because that is what a
+ * person looking at the file in a spreadsheet sees in the row gutter.
+ */
+export class CsvParseError extends Error {
+  constructor(readonly record: number, message: string) {
+    super(`the CSV could not be read at record ${String(record)}: ${message}`);
+    this.name = "CsvParseError";
+  }
+}
+
+/**
+ * The most characters one record may hold before the reader gives up.
+ *
+ * 8 MILLION, AND IT BOUNDS MEMORY RATHER THAN PLAUSIBILITY. The reader streams
+ * precisely so a 100MB sheet never exists as a string -- but an unterminated
+ * quote turns the WHOLE REMAINDER of the file into one field, so without a
+ * bound the streaming buys nothing against exactly the malformed input it
+ * exists to survive. Well above anything the writer produces: the largest cell
+ * this export has is a meeting's sanitised HTML, and eight million characters
+ * is a document nobody typed.
+ */
+export const DEFAULT_MAX_RECORD_CHARS = 8_000_000;
+
+/**
+ * THE INVERSE OF csvDocument, ONE RECORD AT A TIME.
+ *
+ * STREAMING, AND THAT IS A REQUIREMENT RATHER THAN A REFINEMENT. A sheet is
+ * read twice by the importer -- once to build the plan, once to apply it -- and
+ * services/intake.ts's readText refuses a member over 64MB for the reason its
+ * own comment gives. 200,000 notes rows are 103MB of CSV (measured in 7.6, see
+ * services/export.ts), so the only way to read this install's own export back
+ * is a record at a time, with nothing but the current record resident.
+ *
+ * THE BOM IS CONSUMED ONLY AT THE VERY START OF THE DOCUMENT. csvDocument emits
+ * exactly one, before the header; a U+FEFF anywhere else is a character in
+ * somebody's data -- a legal, if unkind, thing to type -- and is kept.
+ *
+ * THE CELL TRANSFORM IS NOT REVERSED HERE, deliberately. unescapeCellValue is
+ * applied by the importer, and only when manifest.json DECLARES the transform
+ * -- see services/import-export.ts. A reader that always un-escaped would
+ * silently eat a leading apostrophe out of an archive that never added one.
+ *
+ * Accepts an async iterable of Buffers (a staged member's read stream) or of
+ * strings (a test's literal). A multi-byte character split across two Buffers
+ * is reassembled by StringDecoder, so no chunking makes this see half of one.
+ */
+export async function* csvRecords(
+  source: AsyncIterable<Buffer | string>,
+  options: { maxRecordChars?: number } = {},
+): AsyncGenerator<string[]> {
+  const maxRecordChars = options.maxRecordChars ?? DEFAULT_MAX_RECORD_CHARS;
+  const decoder = new StringDecoder("utf8");
+
+  let record: string[] = [];
+  let field = "";
+  let recordChars = 0;
+  let recordNumber = 1;
+  /** Whether any character of the document has been seen. For the BOM only. */
+  let started = false;
+  let inQuotes = false;
+  /** Inside a quoted field, having just read a `"` whose meaning is undecided. */
+  let quotePending = false;
+  /** Outside quotes, having just read a `\r` that must be followed by `\n`. */
+  let crPending = false;
+  /** The current field opened with a quote. */
+  let fieldQuoted = false;
+  /** Anything at all has been consumed into the current field. */
+  let fieldConsumed = false;
+
+  const fail = (message: string): never => {
+    throw new CsvParseError(recordNumber, message);
+  };
+
+  function* consume(text: string): Generator<string[]> {
+    for (const ch of text) {
+      if (!started) {
+        started = true;
+        if (ch === CSV_BOM) continue;
+      }
+      recordChars += 1;
+      if (recordChars > maxRecordChars) {
+        fail(
+          `it is longer than the ${String(maxRecordChars)} characters this reader accepts, `
+          + "which usually means a quoted field was never closed",
+        );
+      }
+      if (crPending) {
+        crPending = false;
+        if (ch !== "\n") {
+          fail("a carriage return outside a quoted field was not followed by a line feed");
+        }
+        record.push(field);
+        field = "";
+        fieldQuoted = false;
+        fieldConsumed = false;
+        recordChars = 0;
+        yield record;
+        record = [];
+        recordNumber += 1;
+        continue;
+      }
+      if (quotePending) {
+        quotePending = false;
+        if (ch === '"') { field += '"'; continue; }
+        // The quote closed the field. Only a delimiter or a record terminator
+        // may follow it; anything else means these bytes were not written by
+        // csvCell, whose escaping is the only thing this reader undoes.
+        inQuotes = false;
+        if (ch === ",") {
+          record.push(field);
+          field = "";
+          fieldQuoted = false;
+          fieldConsumed = false;
+          continue;
+        }
+        if (ch === "\r") { crPending = true; continue; }
+        fail("a quoted field ended in the middle of a value");
+      }
+      if (inQuotes) {
+        if (ch === '"') { quotePending = true; continue; }
+        field += ch;
+        continue;
+      }
+      if (ch === '"') {
+        if (fieldConsumed || fieldQuoted) fail("a quote appeared inside an unquoted field");
+        inQuotes = true;
+        fieldQuoted = true;
+        fieldConsumed = true;
+        continue;
+      }
+      if (ch === ",") {
+        record.push(field);
+        field = "";
+        fieldQuoted = false;
+        fieldConsumed = false;
+        continue;
+      }
+      if (ch === "\r") { crPending = true; continue; }
+      if (ch === "\n") fail("a line feed outside a quoted field was not preceded by a carriage return");
+      field += ch;
+      fieldConsumed = true;
+    }
+  }
+
+  for await (const chunk of source) {
+    yield* consume(typeof chunk === "string" ? chunk : decoder.write(chunk));
+  }
+  yield* consume(decoder.end());
+
+  // THE END OF THE FILE IS A STATE THIS HAS TO CHECK, and it is the one a
+  // truncated download reaches. csvDocument terminates EVERY record with CRLF,
+  // so a well-formed document ends with the parser idle: no open quote, no
+  // pending carriage return, and no half-built record. Anything else is a file
+  // that stopped early, and saying so is the difference between an import that
+  // refuses and one that silently loses its last rows.
+  if (inQuotes && !quotePending) fail("the file ended inside a quoted field");
+  if (crPending) fail("the file ended after a carriage return with no line feed");
+  if (quotePending || fieldConsumed || record.length > 0) {
+    fail("the file ended without terminating its last record");
+  }
 }
