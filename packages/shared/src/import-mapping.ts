@@ -350,6 +350,17 @@ export function csvMappingProblem(
   mapping: CsvMapping, columnCount: number,
 ): string | null {
   const { entries } = mapping;
+  // THIS BRANCH IS UNREACHABLE IN EFFECT AND IS KEPT DELIBERATELY, which is the
+  // opposite of what this project usually does with one and therefore needs a
+  // reason. With no entries the loop below does not run, `entities` is empty,
+  // `entity` is undefined, and the fall-through returns the IDENTICAL sentence
+  // -- so `if (false)` here leaves every test green, and a reviewer measured
+  // exactly that. It is not a defence that looks like one: it is the same
+  // answer given earlier, and deleting it would put the empty-mapping case
+  // three screens further down behind a comment about entity counts, where the
+  // next reader of "why does an empty mapping say that" would not find it.
+  // Recorded rather than removed; the sentence is stated once and returned
+  // twice, and the two are held together by being the same string literal.
   if (entries.length === 0) {
     return "map at least one column before importing.";
   }

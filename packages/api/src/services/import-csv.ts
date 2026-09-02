@@ -138,6 +138,34 @@ import type { IntakeFile, StagedMemberRef, StagedPayload } from "./intake.js";
 //    preview's counts and normalise their own column, which is a thing they can
 //    do and this code cannot do for them safely.
 //
+//    AND `toLowerCase` IS NOT `lower()`, WHICH THE PARAGRAPH ABOVE IMPLIED AND
+//    A REVIEW MEASURED. The argument for a simple rule survives; the claim that
+//    THIS rule is the same rule in both languages does not. On the deploy
+//    target (PostgreSQL 15.19, en_GB.UTF-8):
+//
+//      SELECT lower(U&'\0130')  ->  'i'         ONE character
+//      '\u0130'.toLowerCase()   ->  'i\u0307'    TWO -- i, then a combining
+//                                                dot above
+//
+//    (U+0130 is the Turkish dotted capital I. Written as escapes because this
+//    file is ASCII, which is the project's rule and is also what stopped the
+//    two spellings above from looking identical in a terminal.)
+//
+//    So a key containing that character is normalised differently on the two
+//    sides, and the failure is a MISSED duplicate -- the outcome this whole
+//    section exists to prevent. It is also LOCALE-DEPENDENT on the SQL side and
+//    nothing here pins the database's locale.
+//
+//    IT IS OUT OF REACH FOR CONTACTS AND LIVE FOR COMPANIES. A contact's key is
+//    an email address and contactEmailSchema rejects non-ASCII outright, so no
+//    such key can be built. A company's key is `domain`, which is free text
+//    with no format check at all -- so this is reachable today with a Turkish
+//    or Azerbaijani domain, and it is recorded rather than fixed because the
+//    fix is a decision about collation that belongs with the person who owns
+//    the schema: either fold the key in ONE language (probe with a normalised
+//    literal rather than `lower(...)`) or state a collation the install must
+//    have. Both are wider than an importer.
+//
 //    AND THE GAP THAT CANNOT BE CLOSED HERE: the probe reads COMMITTED rows, so
 //    another session inserting the same address between the probe and the
 //    INSERT produces a duplicate. Closing it would need a unique index on

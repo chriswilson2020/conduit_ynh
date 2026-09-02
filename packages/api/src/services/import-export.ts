@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { inArray } from "drizzle-orm";
+import { unstorableText } from "@conduit/shared";
 import type { PlanFindingView, PlanRefusalView } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { companies, contacts, users } from "../db/schema.js";
@@ -465,6 +466,51 @@ const CONTACT_COLUMNS = [
 /** A row built from one record, or the reason it could not be. */
 type Built<T> = { row: T } | { reason: string };
 
+/**
+ * THE CHARACTERS POSTGRES WILL NOT STORE, CHECKED ON EVERY CELL OF A RECORD
+ * BEFORE ANY OF IT IS READ.
+ *
+ * ITS ABSENCE WAS A DEFECT AND THIS IS WHAT IT COST, said plainly because the
+ * shape is the one this whole design exists to prevent. `unstorableText` is
+ * @conduit/shared's rule for a value a text column cannot hold, and
+ * services/import-csv.ts calls checking it MANDATORY -- its header lists "the
+ * NUL that no CHECK describes because Postgres refuses it at the type" among
+ * the constraints buildRow must catch, and its suite proves it with a control
+ * that shows Postgres refusing one. This module checked the uuids, the two
+ * 64-character caps, the timestamps and the JSON-ness of `custom`, AND NOT
+ * THIS. So a record carrying a NUL was counted by the preview as a row that
+ * would be created, and the INSERT then failed with `22021 null character not
+ * permitted` -- or, for one inside `custom`, `22P05 unsupported Unicode escape
+ * sequence` -- part way through a transaction. The whole import rolled back, so
+ * nothing was half-written; what was wrong is that THE PREVIEW LIED, which is
+ * the one failure the plan-as-a-value design exists to make impossible.
+ *
+ * IT IS REACHABLE BY ANY AUTHENTICATED CALLER. The manifest is inside the
+ * archive, so its digests can be made consistent with a doctored sheet;
+ * services/csv.ts passes a NUL through in both bare and quoted cells and
+ * `unescapeCellValue` keeps it.
+ *
+ * EVERY CELL, AND THE RAW CELL RATHER THAN THE PARSED VALUE. A NUL inside a
+ * JSON string survives `JSON.parse` and only fails at the jsonb cast, and one
+ * inside an `emails` cell survives the split -- so checking the columns before
+ * they are interpreted is the only sweep that covers all of them with one line.
+ *
+ * AND THE RECORD IS REFUSED RATHER THAN REPAIRED, which is where this differs
+ * from its sibling on purpose. services/import-csv.ts DROPS an unstorable
+ * optional value and keeps the row, because losing a person over a typo in a
+ * spreadsheet is not forgiving. This importer's whole contract is EXACTNESS --
+ * it restores ids, timestamps and `custom` as the export recorded them -- so an
+ * "exact" import that silently dropped a value would not be one. The record is
+ * named in the preview as one that will not be imported, and the operator finds
+ * out before they commit rather than afterwards.
+ */
+function unstorableColumn(cells: Cells, columns: readonly string[]): string | null {
+  for (const column of columns) {
+    if (unstorableText(cells(column))) return column;
+  }
+  return null;
+}
+
 interface CompanyInsert {
   id: string;
   name: string;
@@ -544,6 +590,10 @@ function readCustom(value: string): Record<string, unknown> | "bad" {
  * transaction rather than as a finding in a preview.
  */
 function buildCompany(cells: Cells, knownOwners: ReadonlySet<string>): Built<CompanyInsert> {
+  const unstorable = unstorableColumn(cells, COMPANY_COLUMNS);
+  if (unstorable !== null) {
+    return { reason: `its ${unstorable} holds a character the database cannot store` };
+  }
   const id = cells("id");
   if (!UUID.test(id)) return { reason: "its id is not a uuid" };
   const name = cells("name");
@@ -584,6 +634,10 @@ function buildCompany(cells: Cells, knownOwners: ReadonlySet<string>): Built<Com
 
 /** ONE CONTACT ROW, OR WHY THERE IS NOT ONE. See buildCompany. */
 function buildContact(cells: Cells, knownOwners: ReadonlySet<string>): Built<ContactInsert> {
+  const unstorable = unstorableColumn(cells, CONTACT_COLUMNS);
+  if (unstorable !== null) {
+    return { reason: `its ${unstorable} holds a character the database cannot store` };
+  }
   const id = cells("id");
   if (!UUID.test(id)) return { reason: "its id is not a uuid" };
   const firstName = cells("first_name");
@@ -605,6 +659,10 @@ function buildContact(cells: Cells, knownOwners: ReadonlySet<string>): Built<Con
   // the INSERT would be a 23514 in the middle of a transaction that has already
   // written thousands of rows -- so it is a record this importer declines,
   // named in the preview, rather than a constraint violation nobody previewed.
+  // THE OTHER CONSTRAINT OF THAT KIND IS unstorableColumn ABOVE, and this
+  // comment used to read as though these two caps were the whole of it. They
+  // are the ones a CHECK describes; the NUL is the one Postgres refuses at the
+  // type, which is why it needs a sweep rather than a per-column length test.
   const salutation = cells("salutation");
   if (salutation.length > CONTACT_FIELD_MAX) return { reason: "its salutation is longer than 64 characters" };
   const pronouns = cells("pronouns");

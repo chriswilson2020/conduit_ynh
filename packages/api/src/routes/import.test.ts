@@ -209,22 +209,38 @@ async function planCsv(
   app: FastifyInstance,
   csv: string,
   mapping: CsvMapping,
-  overrides: { sha256?: string; filename?: string; headers?: Record<string, string> } = {},
+  overrides: {
+    sha256?: string;
+    filename?: string;
+    headers?: Record<string, string>;
+    /** Send the mapping with its `delimiter` stripped, as a client could. */
+    omitDelimiter?: boolean;
+  } = {},
 ) {
+  const sent = overrides.omitDelimiter === true
+    ? { ...mapping, delimiter: undefined }
+    : mapping;
   return await postUpload(
     app,
     "/api/import/csv/plan",
     upload({
       content: csv,
       filename: overrides.filename ?? "contacts.csv",
-      fields: { mapping: JSON.stringify(mapping), sha256: overrides.sha256 ?? digestOf(csv) },
+      fields: { mapping: JSON.stringify(sent), sha256: overrides.sha256 ?? digestOf(csv) },
     }),
     overrides.headers ?? chris,
   );
 }
 
-/** The three-column contact mapping every CSV case below uses. */
+/**
+ * The three-column contact mapping every CSV case below uses.
+ *
+ * IT CARRIES A DELIMITER, because the plan route requires one. See the
+ * "a mapping is a decision about a PARSE" case for why that field is not
+ * optional, and `planCsv`'s `omitDelimiter` for how the refusal is exercised.
+ */
 const NAME_AND_EMAIL: CsvMapping = {
+  delimiter: ",",
   entries: [
     { column: 0, field: "contact.first_name" },
     { column: 1, field: "contact.last_name" },
@@ -437,6 +453,34 @@ describe("what travels", () => {
     expect(body.plan.effects[0]?.op).toBe("insert-csv-contacts");
   });
 
+  it("ROUTES ONLY THE EXACT PATHS THE PROXY MATCHES, so a trailing slash is a 404", async () => {
+    // WHAT THIS IS REALLY ABOUT IS conf/nginx.conf, and a review is why it is
+    // asserted here rather than assumed there. Every one of the five import
+    // blocks -- and the restore's two -- is a `location =`, an EXACT match. If
+    // Fastify were built with `ignoreTrailingSlash: true`, then
+    // `/api/import/csv/inspect/` would reach this handler while matching NO
+    // nginx block, so it would fall through to the app's own `location
+    // __PATH__/`: 50M instead of 9g, 300s instead of an hour, and -- on the
+    // restore preview, which is the one that matters -- REQUEST BUFFERING BACK
+    // ON, which puts the archive passphrase into disk blocks. Every nginx test
+    // in this repository would stay green through that change, because they all
+    // read the config file and none of them reads the router.
+    //
+    // Fastify's default is `false` and app.ts does not set it, so what this
+    // pins is a default the deployment depends on. `initialConfig` is Fastify's
+    // own read-back of the options it booted with, which is the router's answer
+    // rather than a grep of the source.
+    const app = await appFor();
+    expect(app.initialConfig.ignoreTrailingSlash ?? false).toBe(false);
+    for (const url of [
+      "/api/import/csv/inspect/", "/api/import/csv/plan/", "/api/import/export/inspect/",
+      "/api/import/csv/apply/", "/api/import/export/apply/",
+    ]) {
+      const response = await app.inject({ method: "POST", url, headers: chris });
+      expect(response.statusCode, url).toBe(404);
+    }
+  });
+
   it("has no GET that applies a plan or takes an upload", async () => {
     const app = await appFor();
     for (const url of [
@@ -557,6 +601,70 @@ describe("the mapping step", () => {
     expect(await stagedDirectories()).toEqual([]);
   });
 
+  it("REQUIRES THE DELIMITER, because a mapping is a decision about a PARSE", async () => {
+    // THE HOLE THE DIGEST DOES NOT CLOSE, and this module's header used to
+    // claim it did. The `sha256` pins the BYTES; it says nothing about how they
+    // were split. With `delimiter` optional, planCsvImport fell back to
+    // re-sniffing, so a mapping made at a semicolon-overridden mapping step and
+    // sent without one was planned against a different parse of the same file.
+    const app = await appFor();
+    // MEASURED, AND CHOSEN FOR THE PROPERTY THAT MAKES IT INVISIBLE: this file
+    // yields TWO columns under a comma AND under a semicolon, with entirely
+    // different contents. csvMappingProblem(mapping, 2) returns null for both,
+    // so neither side of the one shared rule can tell them apart.
+    const csv = "Name;Town,Country\r\nAcme;Delft,NL\r\n";
+
+    const sniffed = await postUpload(
+      app, "/api/import/csv/inspect", upload({ content: csv, filename: "companies.csv" }),
+    );
+    const guess = (sniffed.json() as {
+      mapping: { dialect: { delimiter: string; sniffed: boolean }; columns: unknown[] };
+    }).mapping;
+    // THE SNIFF GETS IT WRONG, which is the whole reason the operator can
+    // overrule it -- and the whole reason the overrule must travel.
+    expect(guess.dialect.delimiter).toBe(",");
+    expect(guess.dialect.sniffed).toBe(true);
+    expect(guess.columns).toHaveLength(2);
+
+    const chosen = await postUpload(
+      app, "/api/import/csv/inspect",
+      upload({ content: csv, filename: "companies.csv", fields: { delimiter: ";" } }),
+    );
+    const semi = (chosen.json() as {
+      mapping: { columns: { header: string }[]; dialect: { delimiter: string } };
+    }).mapping;
+    expect(semi.dialect.delimiter).toBe(";");
+    // TWO COLUMNS EITHER WAY, and different ones. This is the assertion that
+    // makes the rest of the case necessary rather than theoretical.
+    expect(semi.columns.map((column) => column.header)).toEqual(["Name", "Town,Country"]);
+
+    const asCompany: CsvMapping = {
+      delimiter: ";",
+      entries: [{ column: 0, field: "company.name" }],
+    };
+
+    // A CLIENT THAT LEAVES IT OUT IS TOLD, rather than silently re-sniffed.
+    const without = await planCsv(app, csv, asCompany, { omitDelimiter: true });
+    expect(without.statusCode).toBe(400);
+    expect(without.json()).toMatchObject({ error: "validation" });
+    expect((without.json() as { message: string }).message).toContain("separator");
+    expect(await stagedDirectories()).toEqual([]);
+
+    // AND WITH IT, THE OPERATOR'S PARSE IS WHAT RUNS. Under the sniffed comma
+    // this company would have been created as "Acme;Delft" -- silently, behind
+    // a preview that read perfectly.
+    const planned = await planCsv(app, csv, asCompany);
+    expect(planned.statusCode).toBe(200);
+    const { plan } = planned.json() as { plan: PlanView };
+    const applied = await app.inject({
+      method: "POST", url: "/api/import/csv/apply", headers: chris,
+      payload: { planId: plan.planId },
+    });
+    expect(applied.statusCode).toBe(200);
+    const rows = await db.select({ name: companies.name }).from(companies);
+    expect(rows).toEqual([{ name: "Acme" }]);
+  });
+
   it("REFUSES A MAPPING BUILT AGAINST A DIFFERENT FILE, by the digest", async () => {
     // A mapping is a list of COLUMN POSITIONS, so applying one to a different
     // file with the same number of columns imports every value into the wrong
@@ -654,6 +762,7 @@ describe("the mapping step", () => {
     const app = await appFor();
     const csv = contactsCsv([["Ada", "Lovelace", "ada@example.com"]]);
     const bothEntities: CsvMapping = {
+      delimiter: ",",
       entries: [
         { column: 0, field: "contact.first_name" },
         { column: 1, field: "company.name" },
@@ -673,6 +782,7 @@ describe("the mapping step", () => {
     const app = await appFor();
     const csv = contactsCsv([["Ada", "Lovelace", "ada@example.com"]]);
     const response = await planCsv(app, csv, {
+      delimiter: ",",
       entries: [
         { column: 0, field: "contact.first_name" },
         { column: 7, field: "contact.email" },

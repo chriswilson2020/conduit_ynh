@@ -74,14 +74,57 @@ import {
  * application, and a plan is bound to the operator who uploaded it
  * (IntakeSession.owner).
  *
- * THE ONE THING AN IMPORT LEAKS, SAID RATHER THAN LEFT TO BE FOUND. A preview
- * reports how many of the file's rows are ALREADY HERE, and names worked
- * examples. Somebody who can upload a file can therefore ask "is this address
- * one of your contacts?" a thousand times at once. That is an oracle, and it is
- * not a privilege escalation: the caller is an authenticated Conduit user who
- * can read /api/contacts directly and get the same answer more easily and in
- * full. If Conduit ever grows a user who may import but may not read, this
- * paragraph is the note that says the two must be reconsidered together.
+ * AND THE QUESTION THE ARGUMENT ABOVE NEVER ASKS, ADDED AFTER A REVIEW ASKED
+ * IT: everything above is about DESTROYING and EXFILTRATING, and an import
+ * WRITES. It is worth asking what it can write that nothing else can, because
+ * the answer is not nothing. The exact importer sets `companies.id`,
+ * `contacts.id`, `custom`, `created_at`, `updated_at` and `archived_at` from an
+ * archive the caller authored, and NONE of those six is accepted by either
+ * create schema -- `custom` is marked "deferred" in @conduit/shared and the
+ * rest are the database's to mint. There is also no DELETE route for either
+ * table. So this is the only write path in the application for those columns,
+ * and rows it creates cannot be removed through the API.
+ *
+ * IT DOES NOT CHANGE THE ANSWER, and the reason is that none of the six is a
+ * PRIVILEGE. An id is a uuid; the timestamps are display; `custom` is a jsonb
+ * bag no authorisation decision reads; `archived_at` only hides a row. The
+ * worst an authored archive achieves is rows with chosen ids and chosen dates,
+ * which an operator can archive -- the same disposal every other import has.
+ * What it would change is the answer for any future column that DID carry
+ * privilege, which is why the question is now written down beside the
+ * conclusion instead of being absent from it.
+ *
+ * ONE VISIBLE CONSEQUENCE IS NOT REPORTED AND SHOULD BE. A crafted export can
+ * create rows that arrive ALREADY ARCHIVED, and no finding says how many -- so
+ * the preview's count is right and what the operator then sees in their lists
+ * is smaller than it. That is a finding services/import-export.ts should emit,
+ * it is recorded here rather than added because it is the engine's to write,
+ * and it costs an operator confusion rather than data.
+ *
+ * WHAT AN IMPORT LEAKS IS AT LEAST FOUR THINGS, AND A REVIEW COUNTED THEM
+ * BECAUSE THIS PARAGRAPH SAID "THE ONE THING". The conclusion survived the
+ * recount; the number did not, and a number that is wrong is how the next
+ * reader decides the paragraph was not worth checking. A caller with a file
+ * gets, without writing anything:
+ *
+ *   - EXISTENCE, from the duplicate counts and their worked examples: "is this
+ *     address one of your contacts", "is this domain one of your companies",
+ *     a thousand at a time;
+ *   - AMBIGUITY, from the company-name finding, which distinguishes "no company
+ *     answers to this name" from "more than one does";
+ *   - MEMBERSHIP IN `users`, twice over -- the exact importer's ownerUnknown
+ *     finding counts how many of an archive's owner ids this install has, and
+ *     this route's `import_owner_unknown` answers the same question for one id
+ *     directly.
+ *
+ * IT IS STILL NOT A PRIVILEGE ESCALATION, and that is the part that decided the
+ * gate. Companies, contacts and users have NO visibility scoping in this
+ * application at all: every authenticated caller can read all three tables
+ * whole through /api/companies, /api/contacts and /api/users. Every oracle above
+ * bottoms out in a list they can already fetch, more easily and in full. If
+ * Conduit ever grows a user who may import but may not read, this paragraph is
+ * the note that says the two must be reconsidered together -- and the count is
+ * four, not one.
  *
  * ========== 2. THE MAPPING STEP HOLDS NOTHING, AND THE FILE IS SENT ==========
  * ========== AGAIN WITH THE MAPPING                                 ==========
@@ -116,14 +159,23 @@ import {
  *     hold would have saved an upload on every path except the one the whole
  *     question was about.
  *
- * AND THE RE-SEND IS CHECKED RATHER THAN TRUSTED. The plan request carries the
- * `sha256` the mapping step reported for the bytes it read, and this route
- * refuses a mapping whose digest does not match the file that arrived with it.
- * A mapping is a list of COLUMN POSITIONS, so applying one to a different file
- * with the same number of columns would put a postcode in a phone number with
- * nothing on screen to say so. It also makes "the mapping step happened at all"
- * a fact this route can check, which is the one thing a hold would have given
- * it for free.
+ * AND THE RE-SEND IS CHECKED RATHER THAN TRUSTED, IN TWO PLACES, BECAUSE A
+ * MAPPING IS A DECISION ABOUT A PARSE AND NOT ONLY ABOUT SOME BYTES.
+ *
+ *   THE BYTES: the plan request carries the `sha256` the mapping step reported
+ *   for what it read, and this route refuses a mapping whose digest does not
+ *   match the file that arrived with it. A mapping is a list of COLUMN
+ *   POSITIONS, so applying one to a different file with the same number of
+ *   columns would put a postcode in a phone number with nothing on screen to
+ *   say so. It also makes "the mapping step happened at all" a fact this route
+ *   can check, which is the one thing a hold would have given it for free.
+ *
+ *   THE PARSE: the delimiter is REQUIRED. This paragraph claimed the digest
+ *   closed "a mapping built against a different upload" and a review found the
+ *   half it does not close -- the same bytes split a different way. See
+ *   csvMappingSchema for the measured file that yields two columns under both a
+ *   comma and a semicolon, with different contents, and that csvMappingProblem
+ *   cannot tell apart.
  *
  * ================= 3. THE CAPACITY STAYS AT ONE ==========================
  *
@@ -253,9 +305,26 @@ const planIdParamSchema = z.object({ planId: z.uuid("that is not a plan id") });
  * a second implementation of inspect; this is a DECISION ONLY A PERSON CAN
  * MAKE, and it is validated on arrival like any other input.
  *
- * THE DELIMITER IS THE READER'S OWN CLOSED SET, imported rather than restated,
- * so an operator cannot overrule the sniff with a character
- * services/csv.ts cannot count fields on.
+ * THE DELIMITER IS REQUIRED, AND IT IS THE ONE FIELD THE DIGEST DOES NOT COVER.
+ * This module's decision 2 says the `sha256` closes "a mapping built against a
+ * different upload", and it does -- for the BYTES. It does not close a mapping
+ * built against a different PARSE of the same bytes, and the two are not the
+ * same thing. Measured:
+ *
+ *     Name;Town,Country\r\nAcme;Delft,NL\r\n
+ *
+ * sniffs as a COMMA, yields TWO columns under both `,` and `;` with entirely
+ * different contents, and csvMappingProblem(mapping, 2) returns null under
+ * both. So a mapping made at a semicolon-overridden mapping step and sent
+ * without a delimiter would have been planned against the comma parse, and
+ * `Acme;Delft` would have been imported as the company name -- silently,
+ * behind a preview that read perfectly. Optional-and-re-sniffed was a hole the
+ * shipped page happened not to walk into, because it always echoes
+ * `view.dialect.delimiter`; a client is not the guard.
+ *
+ * THE VALUE IS THE READER'S OWN CLOSED SET, imported rather than restated, so
+ * an operator cannot overrule the sniff with a character services/csv.ts cannot
+ * count fields on.
  *
  * WHAT IS NOT CHECKED HERE IS THE COLUMNS, deliberately. csvMappingProblem is
  * the one rule both sides use and it needs the file's column count, which does
@@ -268,13 +337,35 @@ const csvMappingSchema = z.strictObject({
     column: z.int().nonnegative("a column is identified by its position, from 0"),
     // EVERY FIELD A COLUMN MAY BE MAPPED ONTO, AND NOT A SECOND LIST OF
     // FOURTEEN STRINGS. @conduit/shared owns the one enum -- the same one the
-    // mapping view's `targets` are parsed against -- and it is held to
-    // CsvImportField by the compiler (see csvMappingViewSchemaAgrees). A copy
-    // here would be the fifth spelling of that list, and the one that drifted
-    // would refuse a mapping the page had just offered.
+    // mapping view's `targets` are parsed against.
+    //
+    // WHAT HOLDS IT, NAMED ACCURATELY AFTER A REVIEW FOUND THIS COMMENT CITING
+    // A GUARD BY A NAME THAT DOES NOT EXIST. It said "see
+    // csvMappingViewSchemaAgrees", which greps to exactly one hit: itself.
+    // There are two real gates and they catch different drift:
+    //
+    //   THE COMPILER, via @conduit/shared's CSV_MAPPING_VIEW_SCHEMA_AGREES,
+    //   holds the enum against the CsvImportField UNION in both directions.
+    //   `npm run typecheck` runs it and CI runs that -- measured: deleting
+    //   "contact.pronouns" from the enum fails tsc at the union-to-parsed
+    //   constant. But VITEST DOES NOT TYPECHECK, so the whole test suite is
+    //   green under that deletion, which is how a reviewer came to believe
+    //   nothing held it at all.
+    //
+    //   A TEST, in @conduit/shared's index.test.ts, holds the enum against
+    //   CSV_IMPORT_FIELDS -- the RUNTIME array the picker is built from, which
+    //   the compiler cannot see the members of. That is the edge nothing
+    //   covered: an enum and a table that disagree would offer Pronouns in
+    //   `targets` and then answer 400 for the field the operator just picked.
+    //
+    // A copy of the list here would be a fifth spelling of it, and the one that
+    // drifted would refuse a mapping the page had just offered.
     field: csvImportFieldSchema,
   })),
-  delimiter: z.enum(FOREIGN_CSV_DELIMITERS).optional(),
+  delimiter: z.enum(
+    FOREIGN_CSV_DELIMITERS,
+    "say which separator the columns were read with: the mapping step reports it",
+  ),
   owner: z.uuid("that is not a user id").optional(),
 });
 

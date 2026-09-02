@@ -118,6 +118,28 @@ function nginxSizeBytes(value: string): number | null {
   }
 }
 
+/**
+ * What a `client_max_body_size` actually PERMITS, in bytes.
+ *
+ * `0` IS NOT ZERO. nginx documents it as "disables checking of client request
+ * body size" -- it is the widest possible setting, not the narrowest -- and a
+ * review found that reading it as the number zero made the apply blocks'
+ * assertion vacuous: `0 < 8 GiB` is green, so a block that had quietly become
+ * UNLIMITED passed the test that exists to prove it is bounded. The parser
+ * above is right about the syntax and this is right about the meaning, which is
+ * why they are two functions: nginxSizeBytes is what the file says, and this is
+ * what nginx does with it.
+ *
+ * IT IS THE SAME CLASS OF DEFECT THE `?? ` DEFAULTS PRODUCED, one layer along,
+ * and services/restore-nginx.test.ts's own docstring is about the first one --
+ * which is exactly why this one was worth looking for.
+ */
+function nginxBodyLimitBytes(value: string): number | null {
+  const bytes = nginxSizeBytes(value);
+  if (bytes === null) return null;
+  return bytes === 0 ? Number.POSITIVE_INFINITY : bytes;
+}
+
 const conf = await readFile(CONF, "utf8");
 
 describe("this file's own nginx size parser", () => {
@@ -135,6 +157,15 @@ describe("this file's own nginx size parser", () => {
     expect(nginxSizeBytes("9gb")).toBeNull();
     expect(nginxSizeBytes("")).toBeNull();
     expect(nginxSizeBytes("large")).toBeNull();
+  });
+
+  it("READS `0` AS UNLIMITED, which is what nginx does with it", () => {
+    // The distinction the apply blocks' bound rests on. Without it a block that
+    // had become unlimited would satisfy "smaller than the app's ceiling".
+    expect(nginxSizeBytes("0")).toBe(0);
+    expect(nginxBodyLimitBytes("0")).toBe(Number.POSITIVE_INFINITY);
+    expect(nginxBodyLimitBytes("50M")).toBe(52_428_800);
+    expect(nginxBodyLimitBytes("9gb")).toBeNull();
   });
 });
 
@@ -155,7 +186,7 @@ describe("conf/nginx.conf's import upload locations", () => {
       const block = directives(locationBody(conf, header));
       const declared = /client_max_body_size\s+(\S+);/.exec(block)?.[1];
       expect(declared, `${route} declares no client_max_body_size`).toBeDefined();
-      const bytes = nginxSizeBytes(declared ?? "");
+      const bytes = nginxBodyLimitBytes(declared ?? "");
       expect(bytes, `client_max_body_size ${String(declared)} is not an nginx size`)
         .not.toBeNull();
       // AGAINST THE APP'S OWN CEILING, not against a number repeated here.
@@ -177,18 +208,6 @@ describe("conf/nginx.conf's import upload locations", () => {
       expect(block).toContain(`proxy_read_timeout ${String(IMPORT_PROXY_READ_TIMEOUT_SECONDS)};`);
     });
 
-    it(`${route} BUFFERS ITS REQUEST BODY, because there is no passphrase in it`, () => {
-      // THE ASSERTION WITH NO TWIN NEXT DOOR, and it is written as an assertion
-      // rather than left implicit because "the directive is absent" and "nobody
-      // thought about it" look identical in a config file. Copying the restore
-      // preview's `proxy_request_buffering off` here would put a slow uploader
-      // into the app's in-flight write set for as long as they trickle, which
-      // is what stops a restore from starting -- bought for nothing, because
-      // neither importer's body carries a secret.
-      const block = directives(locationBody(conf, header));
-      expect(block).not.toContain("proxy_request_buffering");
-    });
-
     it(`${route} proxies to itself and carries the identity headers`, () => {
       // An exact-match location replaces the WHOLE matched URI with the
       // proxy_pass URI, so this string is what makes a sub-path install reach
@@ -199,6 +218,7 @@ describe("conf/nginx.conf's import upload locations", () => {
       expect(block).toContain(`proxy_pass http://127.0.0.1:__PORT__${route};`);
       expect(block).toContain("include proxy_params_with_auth;");
     });
+
   }
 });
 
@@ -214,19 +234,53 @@ describe("conf/nginx.conf's import apply locations", () => {
       expect(block).toContain("include proxy_params_with_auth;");
     });
 
-    it(`${route} does NOT accept a large body, because it does not take one`, () => {
-      // WRITTEN THE WAY THE RESTORE'S REVIEW LEFT ITS TWIN: no `?? ` defaults,
-      // because an absent directive gave `undefined -> nginxSizeBytes("") ->
-      // null -> 0`, and `0 < 8GiB` is green. That version passed if the block
-      // lost the directive entirely and if somebody wrote an unparseable `8gb`.
+    it(`${route} GETS NO SPECIAL CAPACITY AT ALL: the app's own 50M, exactly`, () => {
+      // "SMALLER THAN 8 GiB" WAS THREE HOLES WIDE, and a review measured all
+      // three green: `0`, which nginx reads as UNLIMITED and this file used to
+      // read as the number zero; `4g`, which is smaller than the app's ceiling
+      // and forty times what this route can use; and simply a different number
+      // nobody could explain later. The honest claim is not a bound, it is that
+      // these routes are NOT TUNED -- their whole body is one uuid, and the
+      // app's block already carries the right number.
+      //
+      // WRITTEN WITHOUT `?? ` DEFAULTS, which is the shape the restore's own
+      // review had to remove from its twin: an absent directive gave
+      // `undefined -> nginxSizeBytes("") -> null -> 0`, and `0 < 8 GiB` is
+      // green, so the test passed when the block lost the directive entirely.
       const block = directives(locationBody(conf, header));
       const declared = /client_max_body_size\s+(\S+);/.exec(block)?.[1];
       expect(declared, `${route} declares no client_max_body_size`).toBeDefined();
-      const bytes = nginxSizeBytes(declared ?? "");
-      expect(bytes, `client_max_body_size ${String(declared)} is not an nginx size`)
+      expect(declared, `${route} should carry the app's own 50M`).toBe("50M");
+      const limit = nginxBodyLimitBytes(declared ?? "");
+      expect(limit, `client_max_body_size ${String(declared)} is not an nginx size`)
         .not.toBeNull();
-      expect(bytes ?? 0).toBeLessThan(DEFAULT_MAX_UPLOAD_BYTES);
-      expect(declared).not.toBe(IMPORT_CLIENT_MAX_BODY_SIZE);
+      // AND THE MEANING, not only the spelling: `0` would satisfy every
+      // less-than in this file and permit everything.
+      expect(limit ?? 0).toBeLessThan(DEFAULT_MAX_UPLOAD_BYTES);
+      expect(limit).not.toBe(Number.POSITIVE_INFINITY);
+    });
+  }
+});
+
+describe("every import location, receiving or not", () => {
+  // THE ASSERTION THAT USED TO LIVE INSIDE THE RECEIVING LOOP, and a review
+  // found the gap: `proxy_request_buffering off` added to an APPLY block was
+  // green, because nothing outside that loop looked. It is written as an
+  // assertion rather than left implicit because "the directive is absent" and
+  // "nobody thought about it" look identical in a config file.
+  //
+  // WHY IT MUST STAY ABSENT. It is off for the restore preview only because
+  // that body's FIRST FIELD IS THE ARCHIVE PASSPHRASE, and a buffered body puts
+  // a passphrase into disk blocks. No import body carries a secret, and turning
+  // buffering off puts a trickling client into the app's in-flight write set
+  // for as long as it trickles -- which is what services/write-gate.ts names as
+  // a denial of recovery, because a restore refuses to start while that count
+  // is above zero. Copying the directive would buy nothing and cost that.
+  for (const header of [...RECEIVING, ...APPLYING]) {
+    const route = header.replace("location = __PATH__", "").replace(" {", "");
+    it(`${route} buffers its request body, because there is no passphrase in it`, () => {
+      const block = directives(locationBody(conf, header));
+      expect(block).not.toContain("proxy_request_buffering");
     });
   }
 });

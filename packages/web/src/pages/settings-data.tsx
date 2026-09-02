@@ -557,10 +557,14 @@ export function SettingsDataPage() {
         />
 
         {/*
-          THE FOURTH AND FIFTH ARTEFACTS, ABOVE THE SIXTH. See this module's
+          THE FOURTH AND FIFTH ARTEFACTS, ABOVE THE THIRD. See this module's
           header for why the order is the requirement: the additive tool is met
           first, so an operator looking for "get my data in" never has to
           consider the one that destroys.
+          "ABOVE THE SIXTH" IS WHAT THIS SAID, and there is no sixth -- the
+          header forty lines up counts five and is right. The restore is the
+          THIRD artefact by age and the LAST by position, which is exactly the
+          confusion a number was the wrong way to express.
         */}
         <ImportSection busy={busy} onRunning={setImporting} />
 

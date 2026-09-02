@@ -56,33 +56,48 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
         overflow, the last tab measured 0.9888 without this class and exactly
         1.000000 with it. Trailing padding was the only thing that moved it --
         scroll-padding did not, and neither did anything the browser could do on
-        its own.
+        its own. THAT LAST CLAUSE IS TRUE OF THE LABEL OF THE DAY AND FALSE OF
+        THIS ONE: see the correction below, which sweeps both properties
+        together and finds a conjunction rather than a substitution.
         `pr-1` is already in the stylesheet, so this adds no rule to it.
 
-        `scroll-pr-1` ARRIVED IN 7.7'S ROUTES TASK, AND IT IS THE DIRECTIVE THAT
-        ACTUALLY MOVES THIS ONE -- which means the sentence above about
-        scroll-padding is no longer true and is corrected here rather than left
-        standing. The label grew again when the two importers landed on the page
-        behind it ("Export, backup and restore" -> "Export, import, backup and
-        restore"), and e2e/documents.spec.ts's `toBeInViewport({ ratio: 1 })`
-        went red at a ratio of 0.9998771548271179: about three HUNDREDTHS of a
-        pixel of the tab clipped by the nav's own right edge.
+        `scroll-pr-1` ARRIVED IN 7.7'S ROUTES TASK, AND THE TWO CLASSES ARE A
+        CONJUNCTION RATHER THAN A SUBSTITUTION. The label grew again when the
+        two importers landed on the page behind it ("Export, backup and restore"
+        -> "Export, import, backup and restore"), and
+        e2e/documents.spec.ts's `toBeInViewport({ ratio: 1 })` went red at a
+        ratio of about 0.9998: a few hundredths of a pixel of the tab clipped by
+        this container's own right edge.
 
-        MEASURED, at 390px with this label, by driving the real page and reading
-        an IntersectionObserver: padding-right at 0px, 4px, 8px and 16px all
-        produce the IDENTICAL 0.99988 and the identical scrollLeft of 240,
-        against a maximum of 248. scroll-padding-right at 1px or 4px produces
-        exactly 1. So trailing padding is not what is short here and never could
-        be: the browser scrolls the minimum it thinks is needed, that minimum is
-        240.03125, and it lands on 240. Padding changes how far the row COULD
-        scroll and not how far this call DOES. scroll-padding is the property
-        that changes the target, which is why it is the one that works.
+        MEASURED IN CHROMIUM AT 390px, against this stylesheet and this label,
+        by sweeping BOTH properties rather than one at a time -- which is the
+        mistake the first version of this paragraph made and the reason it drew
+        the wrong conclusion:
 
-        `pr-1` IS KEPT RATHER THAN REPLACED, deliberately. The 0.9888 the
-        paragraph above records was measured against a shorter label that no
-        longer exists, so this task cannot reproduce the case that class was
-        added for -- and removing a control on the strength of a measurement of
-        a different string is how a fix becomes a regression two phases later.
+          padding-right 0/1/4/8/16  +  scroll-padding-right 0  ->  ratio 0.99985
+          padding-right 0           +  scroll-padding-right 1/4/16 -> 0.99985
+          padding-right >= 1        +  scroll-padding-right >= 1  ->  1
+
+        NEITHER ALONE MOVES IT. The mechanism is why: the browser scrolls the
+        minimum it thinks is needed and lands a fraction of a pixel short, and
+        `scroll-padding` is what moves that target -- but it cannot scroll past
+        a `maxScroll` that only TRAILING PADDING extends. Padding supplies the
+        range; scroll-padding spends it. Take either away and the row cannot
+        reach the last tab's far edge.
+
+        SO THE PARAGRAPH ABOVE IS RIGHT AND INCOMPLETE, and the sentence this
+        one replaced -- "trailing padding is not what is short here and never
+        could be" -- was FALSE, and false in the direction that invites somebody
+        to delete `pr-1` as a keepsake. It is not a keepsake. It is half of a
+        working fix. The first measurement behind that sentence swept
+        padding-right while `pr-2` was on the element and scroll-padding while
+        `pr-2` was on it too, so it never saw either property alone and read a
+        conjunction as a substitution.
+
+        THE LABEL IS THE HALF THAT DOES NOT GIVE WAY. Shortening it would have
+        moved the arithmetic too, and a label that does not name a thing on the
+        page is the navigation quietly disagreeing with it -- which is the rule
+        this tab has now been renamed twice to keep.
       */}
       <nav data-testid="settings-nav" className="flex gap-1 overflow-x-auto scroll-pr-1 border-b border-slate-200 pr-1">
         <Link to="/settings/mail" className={tabClass} activeProps={{ className: activeTabClass }}>

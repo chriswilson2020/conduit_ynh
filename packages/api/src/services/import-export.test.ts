@@ -822,6 +822,138 @@ describe("findings", () => {
     expect(await db.select({ id: companies.id }).from(companies)).toHaveLength(1);
   });
 
+  it7z("REFUSES A RECORD CARRYING A CHARACTER POSTGRES WILL NOT STORE", async () => {
+    // THE DEFECT THIS CLOSES, said plainly because the shape is the one the
+    // whole plan-as-a-value design exists to prevent. buildCompany checked the
+    // uuid, the name, the JSON-ness of `custom` and the timestamps -- and not
+    // @conduit/shared's unstorableText, which services/import-csv.ts calls
+    // mandatory and proves with a control. So a doctored export produced a
+    // preview saying "2 companies are created" and an apply that failed with
+    // 22021 part way through the transaction. Nothing was half-written, because
+    // the whole import rolls back -- but THE PREVIEW LIED, and that is the
+    // failure this file exists to make impossible.
+    //
+    // ANY AUTHENTICATED CALLER CAN BUILD ONE: the manifest lives inside the
+    // archive, so replaceMember keeps its digests consistent, exactly as it
+    // does for every other doctored-archive case above.
+    await createCompany(db, actorId, { name: "Acme" });
+    await createCompany(db, actorId, { name: "Beta" });
+    const members = await membersOf(await exportArchive());
+    await emptyInstallWithOperator();
+    const sheet = (members.get("companies.csv") ?? Buffer.alloc(0)).toString("utf8");
+    const lines = sheet.split("\r\n");
+    // Into the NAME of the first record, which is a bare cell -- services/csv.ts
+    // passes a NUL through in a bare cell and in a quoted one, and
+    // unescapeCellValue keeps it.
+    const poisoned = (lines[1] ?? "").replace(/,(Acme|Beta),/, ",Ac\u0000me,");
+    expect(poisoned).not.toBe(lines[1]);
+    replaceMember(
+      members, "companies.csv",
+      Buffer.from([lines[0], poisoned, lines[2], ""].join("\r\n"), "utf8"),
+    );
+
+    const { plan, payload } = await planFor(await zipOf(members));
+    // THE PREVIEW COUNTS ONE, NOT TWO. Without the check it counted two and the
+    // apply below threw.
+    expect(plan.effects[0]?.count).toBe(1);
+    const bad = plan.findings.find((f) => f.code === IMPORT_FINDINGS.rowUnreadable);
+    expect(bad?.severity).toBe("warning");
+    expect(bad?.message).toContain("companies.csv record 2");
+    expect(bad?.message).toContain("holds a character the database cannot store");
+    // AND IT NAMES THE COLUMN, so an operator can find it in their own file
+    // rather than being told a record number and nothing else.
+    expect(bad?.message).toContain("name");
+
+    // AND THE APPLY GOES THROUGH. This is the half that matters: the preview's
+    // count is what the executor budgets the handler against, so a record the
+    // plan counted and the INSERT refused is an accounting failure inside a
+    // transaction rather than a finding on a page.
+    await applyImport({ plan, payload, db });
+    const rows = await db.select({ name: companies.name }).from(companies);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.name).not.toContain("\u0000");
+  });
+
+  it7z("refuses one hiding inside `custom`, which survives JSON.parse", async () => {
+    // THE CELL AND NOT THE PARSED VALUE, which is why the sweep runs over the
+    // raw columns. A NUL inside a JSON string parses perfectly and only fails
+    // at the jsonb cast, with 22P05 rather than 22021 -- a different SQLSTATE
+    // from a different layer, and just as unpreviewed. readCustom's own check
+    // is about JSON-ness and cannot see it.
+    await createCompany(db, actorId, { name: "Acme" });
+    const members = await membersOf(await exportArchive());
+    await emptyInstallWithOperator();
+    const sheet = (members.get("companies.csv") ?? Buffer.alloc(0)).toString("utf8");
+    replaceMember(
+      members, "companies.csv",
+      Buffer.from(editCell(sheet, "custom", '"{""a"":""x\u0000y""}"'), "utf8"),
+    );
+
+    const { plan } = await planFor(await zipOf(members));
+    // Every record is refused, so there is nothing to add and the plan says so
+    // rather than offering an import that would fail.
+    expect(plan.refusal?.code).toBe(IMPORT_REFUSALS.nothingToImport);
+    const bad = plan.findings.find((f) => f.code === IMPORT_FINDINGS.rowUnreadable);
+    expect(bad?.message).toContain("custom");
+    expect(bad?.message).toContain("holds a character the database cannot store");
+  });
+
+  it7z("REFUSES ONE IN A CONTACT TOO, which is the half a mutation found untested", async () => {
+    // BOTH BUILDERS, BECAUSE THERE ARE TWO OF THEM. The first version of this
+    // fix was proved only against companies.csv -- and deleting the sweep from
+    // buildContact left the whole suite GREEN, which is the two-layer shape
+    // this branch has already paid for six times. One test per builder, and the
+    // mutation that removes either is red.
+    //
+    // A CONTACT ALSO REACHES A COLUMN A COMPANY HAS NOT: `emails` is a text[],
+    // and a NUL survives readList's split into an array element, so the failure
+    // would arrive from the array cast rather than from a scalar one.
+    await createCompany(db, actorId, { name: "Acme" });
+    await createContact(db, actorId, { firstName: "Ada", emails: ["ada@example.com"] });
+    await createContact(db, actorId, { firstName: "Alan", emails: ["alan@example.com"] });
+    const members = await membersOf(await exportArchive());
+    await emptyInstallWithOperator();
+    const sheet = (members.get("contacts.csv") ?? Buffer.alloc(0)).toString("utf8");
+    const lines = sheet.split("\r\n");
+    const poisoned = (lines[1] ?? "").replace(/,(Ada|Alan),/, ",A\u0000da,");
+    expect(poisoned).not.toBe(lines[1]);
+    replaceMember(
+      members, "contacts.csv",
+      Buffer.from([lines[0], poisoned, lines[2], lines[3] ?? ""].join("\r\n"), "utf8"),
+    );
+
+    const { plan, payload } = await planFor(await zipOf(members));
+    const contactEffect = plan.effects.find((effect) => effect.op === "insert-contacts");
+    expect(contactEffect?.count).toBe(1);
+    const bad = plan.findings.find(
+      (f) => f.code === IMPORT_FINDINGS.rowUnreadable && f.message.includes("contacts.csv"),
+    );
+    expect(bad?.message).toContain("holds a character the database cannot store");
+
+    await applyImport({ plan, payload, db });
+    expect(await db.select({ id: contacts.id }).from(contacts)).toHaveLength(1);
+  });
+
+  it("is what Postgres itself refuses, which is the layer underneath", async () => {
+    // THE SECOND LAYER, SHOWN FIRING -- the control services/import-csv.test.ts
+    // has for the forgiving engine and this file did not have for the exact
+    // one. Without the check above, this is what an import meets: in the middle
+    // of a transaction that has already written thousands of rows, with a
+    // SQLSTATE and no record number.
+    const text = await db.insert(companies).values({ name: "Ac\u0000me" })
+      .catch((e: unknown) => e);
+    expect(text).toBeInstanceOf(Error);
+    expect(((text as Error).cause as { code?: string }).code).toBe("22021");
+
+    // AND THE OTHER ONE, which is the reason the sweep covers `custom` too.
+    // A different SQLSTATE from a different layer of the same INSERT.
+    const json = await db.insert(companies)
+      .values({ name: "Fine", custom: { a: "x\u0000y" } })
+      .catch((e: unknown) => e);
+    expect(json).toBeInstanceOf(Error);
+    expect(((json as Error).cause as { code?: string }).code).toBe("22P05");
+  });
+
   it7z("caps the extra-member notes too, and totals them", async () => {
     // The same bound on the other repeating code. Eleven is one past the cap,
     // which is what makes the summary line reachable.
