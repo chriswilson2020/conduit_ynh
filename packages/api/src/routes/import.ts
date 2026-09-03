@@ -101,12 +101,14 @@ import {
  * privilege, which is why the question is now written down beside the
  * conclusion instead of being absent from it.
  *
- * ONE VISIBLE CONSEQUENCE IS NOT REPORTED AND SHOULD BE. A crafted export can
- * create rows that arrive ALREADY ARCHIVED, and no finding says how many -- so
- * the preview's count is right and what the operator then sees in their lists
- * is smaller than it. That is a finding services/import-export.ts should emit,
- * it is recorded here rather than added because it is the engine's to write,
- * and it costs an operator confusion rather than data.
+ * ONE VISIBLE CONSEQUENCE WAS NOT REPORTED AND NOW IS. An export can carry rows
+ * that arrive ALREADY ARCHIVED -- a crafted one, and equally an ordinary one
+ * taken from an install that archives things -- so the preview's count was
+ * right and what the operator then saw in their lists was smaller than it, with
+ * nothing anywhere to explain the difference. v1.4.1 added the finding, in
+ * services/import-export.ts where it belongs (IMPORT_FINDINGS.arrivesArchived):
+ * it was the engine's to write, because the engine is what reads `archived_at`
+ * and what knows which rows are actually being inserted.
  *
  * WHAT AN IMPORT LEAKS IS AT LEAST FOUR THINGS, AND A REVIEW COUNTED THEM
  * BECAUSE THIS PARAGRAPH SAID "THE ONE THING". The conclusion survived the

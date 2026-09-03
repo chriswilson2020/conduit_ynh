@@ -15,7 +15,7 @@ import { HAVE_7Z, writeZip } from "../test/archives.js";
 import { reauthedHeaders, testReauthVerifier } from "../test/reauth.js";
 import { resolveUser } from "../users.js";
 import { createCompany, archiveCompany } from "./companies.js";
-import { createContact } from "./contacts.js";
+import { archiveContact, createContact } from "./contacts.js";
 import { receiveIntake, stageArchive, type IntakeFile, type StagedPayload } from "./intake.js";
 import { planView, PlanApplyError, PlanExceededError } from "./intake-plan.js";
 import {
@@ -430,6 +430,65 @@ describe("identity", () => {
     const { plan } = await planFor(archive);
     expect(plan.refusal?.code).toBe(IMPORT_REFUSALS.nothingToImport);
     expect(plan.effects).toHaveLength(0);
+  });
+
+  // THE ROWS THAT ARRIVE AND ARE NOT THERE. An export carries `archived_at`,
+  // so an install that archives things produces an archive whose rows are
+  // created by an import and then absent from every list the operator looks at.
+  // The effect's count stays right and the lists stay shorter than it, which
+  // reads as lost data until somebody works out that it is not.
+  //
+  // THE COUNTS ARE ASSERTED SEPARATELY, because one number satisfying both
+  // would prove nothing: three companies are created and ONE of them is
+  // archived, so a finding that echoed the effect's count would be visibly
+  // wrong here.
+  it7z("says how many rows arrive already archived", async () => {
+    const archivedCompany = await createCompany(db, actorId, { name: "Acme" });
+    const alreadyHere = await createCompany(db, actorId, { name: "Beta" });
+    await createCompany(db, actorId, { name: "Gamma" });
+    await createCompany(db, actorId, { name: "Delta" });
+    const archivedContact = await createContact(db, actorId, { firstName: "Ada" });
+    await archiveCompany(db, actorId, archivedCompany.id);
+    // ARCHIVED IN THE EXPORT *AND* ALREADY IN THE INSTALL, which is the row the
+    // count must not include: it is not imported at all, so counting it would
+    // put a number in the preview that no part of the import acts on -- the
+    // exclusion countUnowned makes for the same reason, and nothing else here
+    // would notice if it were dropped.
+    await archiveCompany(db, actorId, alreadyHere.id);
+    await archiveContact(db, actorId, archivedContact.id);
+    const archive = await exportArchive();
+    await emptyInstallWithOperator();
+    await db.insert(companies).values({ id: alreadyHere.id, name: "Beta, still here" });
+
+    const { plan, payload } = await planFor(archive);
+    const archived = plan.findings.filter((f) => f.code === IMPORT_FINDINGS.arrivesArchived);
+    expect(archived.map((f) => f.severity)).toEqual(["note", "note"]);
+    expect(archived[0]?.message).toContain("1 of these companies were archived");
+    expect(archived[0]?.message).toContain("do not appear in your lists");
+    expect(archived[1]?.message).toContain("1 of these contacts were archived");
+    // The effect still promises what it writes; the finding explains the gap
+    // rather than closing it. Three inserts (Acme, Gamma, Delta) of the four
+    // companies the export carries, and exactly one of the three is archived.
+    const companyEffect = plan.effects.find((effect) => effect.op === "insert-companies");
+    expect(companyEffect?.count).toBe(3);
+
+    await applyImport({ plan, payload, db });
+    const rows = await db.select().from(companies).orderBy(companies.name);
+    expect(rows.filter((row) => row.archivedAt !== null).map((row) => row.name)).toEqual(["Acme"]);
+  });
+
+  // AND IT IS SILENT WHEN THERE IS NOTHING TO SAY. A finding on every import
+  // would be noise, and a count of zero would be a sentence about nothing --
+  // this is what stops the case above passing for a finding that is always
+  // emitted.
+  it7z("says nothing about archiving when no row arrives archived", async () => {
+    await createCompany(db, actorId, { name: "Acme" });
+    await createContact(db, actorId, { firstName: "Ada" });
+    const archive = await exportArchive();
+    await emptyInstallWithOperator();
+
+    const { plan } = await planFor(archive);
+    expect(findingCodes(plan)).not.toContain(IMPORT_FINDINGS.arrivesArchived);
   });
 
   it7z("imports a row whose owner this install has never seen, with no owner", async () => {

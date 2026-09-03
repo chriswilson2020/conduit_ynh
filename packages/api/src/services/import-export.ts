@@ -271,6 +271,19 @@ export const IMPORT_FINDINGS = {
   rowUnreadable: "row-unreadable",
   /** Rows that will arrive with no owner, because the user is not here. */
   ownerUnknown: "owner-unknown",
+  /**
+   * Rows that arrive ALREADY ARCHIVED, and are therefore not in the lists the
+   * operator looks at next.
+   *
+   * WHY IT IS WORTH A FINDING AT ALL, since nothing is wrong with the data: the
+   * effect's count is the number of rows this import CREATES, and it is
+   * correct. What the operator then sees in Companies and Contacts is smaller
+   * than it, with nothing anywhere to explain the difference -- and "the import
+   * said 400 and I can see 380" is a report about lost data until somebody
+   * works out that it is not. Conduit never expunges, so an archived row is
+   * present, findable and one click from being unarchived.
+   */
+  arrivesArchived: "arrives-archived",
 } as const;
 
 /**
@@ -441,6 +454,13 @@ interface SheetScan {
    */
   readonly ids: string[];
   readonly owners: string[];
+  /**
+   * Whether each valid record arrives already archived, in the same order as
+   * `ids`. A THIRD PARALLEL ARRAY, for the reason the second one exists: the
+   * question is "how many of the rows that WILL be inserted are archived", and
+   * that needs the flag zipped against the id. One boolean per record.
+   */
+  readonly archived: boolean[];
   /** Distinct company ids named by the sheet's valid rows. Contacts only. */
   readonly companyLinks: Set<string>;
   readonly bad: BadRecord[];
@@ -1052,6 +1072,8 @@ export async function inspectImport(options: InspectImportOptions): Promise<Impo
   pushBadFindings(findings, CONTACTS_MEMBER, contactScan);
   pushOwnerFindings(findings, "companies", countUnowned(companyScan, knownOwners, companiesHere));
   pushOwnerFindings(findings, "contacts", countUnowned(contactScan, knownOwners, contactsHere));
+  pushArchivedFindings(findings, "companies", countArchived(companyScan, companiesHere));
+  pushArchivedFindings(findings, "contacts", countArchived(contactScan, contactsHere));
 
   findings.push({
     severity: "warning",
@@ -1138,7 +1160,7 @@ async function scanSheet(
   ref: StagedMemberRef,
   required: readonly string[],
   unescape: boolean,
-  build: (cells: Cells, owners: ReadonlySet<string>) => Built<{ id: string }>,
+  build: (cells: Cells, owners: ReadonlySet<string>) => Built<{ id: string; archivedAt: Date | null }>,
   linkColumn: string | null,
 ): Promise<SheetScan> {
   // EMPTY ON PURPOSE. The scan asks whether a record is USABLE, and that
@@ -1148,6 +1170,7 @@ async function scanSheet(
   const noOwnersYet = new Set<string>();
   const ids: string[] = [];
   const owners: string[] = [];
+  const archived: boolean[] = [];
   const interned = new Map<string, string>();
   const companyLinks = new Set<string>();
   const bad: BadRecord[] = [];
@@ -1163,6 +1186,7 @@ async function scanSheet(
       continue;
     }
     ids.push(built.row.id);
+    archived.push(built.row.archivedAt !== null);
     const owner = cells("owner_user_id");
     const seen = interned.get(owner);
     if (seen === undefined) interned.set(owner, owner);
@@ -1172,7 +1196,7 @@ async function scanSheet(
       if (link !== "") companyLinks.add(link);
     }
   }
-  return { records, ids, owners, companyLinks, bad, badCount };
+  return { records, ids, owners, archived, companyLinks, bad, badCount };
 }
 
 /**
@@ -1218,6 +1242,23 @@ function countUnowned(
   return unowned;
 }
 
+/**
+ * How many rows that WILL be inserted arrive already archived.
+ *
+ * THE SAME SHAPE AND THE SAME EXCLUSION AS countUnowned, and for the same
+ * reason: a row already here is not imported at all, so counting it would put a
+ * number in the preview that no part of the import acts on.
+ */
+function countArchived(scan: SheetScan, alreadyHere: ReadonlySet<string>): number {
+  let archived = 0;
+  for (let at = 0; at < scan.ids.length; at += 1) {
+    if (scan.archived[at] !== true) continue;
+    if (alreadyHere.has(scan.ids[at] ?? "")) continue;
+    archived += 1;
+  }
+  return archived;
+}
+
 /** Every distinct owner id a scan's valid rows named. */
 function distinctOwners(scan: SheetScan): string[] {
   return [...new Set(scan.owners.filter((owner) => owner !== ""))];
@@ -1249,6 +1290,29 @@ function pushBadFindings(findings: PlanFindingView[], member: string, scan: Shee
         + "those above; the first few are listed.",
     });
   }
+}
+
+/**
+ * SAY HOW MANY OF THE ROWS THIS CREATES ARRIVE ARCHIVED.
+ *
+ * A NOTE RATHER THAN A WARNING, and the line is the one the other findings
+ * already draw: a warning is something to WEIGH before saying yes, and nothing
+ * here is a reason to stop. It explains an arithmetic the operator would
+ * otherwise do themselves, wrongly.
+ *
+ * THE NUMBER THE EFFECT PROMISES IS STILL THE NUMBER IT WRITES. This finding
+ * changes no count anywhere -- it says where those rows went.
+ */
+function pushArchivedFindings(findings: PlanFindingView[], subject: string, archived: number): void {
+  if (archived === 0) return;
+  findings.push({
+    severity: "note",
+    code: IMPORT_FINDINGS.arrivesArchived,
+    message: `${String(archived)} of these ${subject} were archived when the export was taken `
+      + "and arrive archived, so they are created but do not appear in your lists. Nothing is "
+      + "lost -- unarchiving one is a single click -- but the number this import creates is "
+      + `larger than the number of ${subject} you will see afterwards.`,
+  });
 }
 
 function pushOwnerFindings(findings: PlanFindingView[], subject: string, unresolved: number): void {
