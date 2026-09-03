@@ -120,6 +120,12 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 // reads, never a silent pass. "Absent" and "an inventory of nothing" are
 // different manifests and are treated differently; see readInventory.
 //
+// SINCE v1.4.1 THE SAME IS TRUE OF AN INVENTORY THIS BUILD CANNOT EVALUATE --
+// counts carrying a consistency label it does not know, which is what a backup
+// from a LATER Conduit looks like from here. It was refused until Chris decided
+// otherwise on 2 Sep; the argument, and the line between "a later writer" and
+// "damage", are in readInventory where the decision is implemented.
+//
 // ================ THE ATOMIC ACT THE OPERATOR SEES AS TWO ==================
 //
 // Destroy-schema and load-dump are ONE psql transaction. The operator has to
@@ -375,15 +381,14 @@ export const RESTORE_REFUSALS = {
    * Refusing costs nothing recoverable: it happens at inspect, with nothing
    * written and nothing destroyed, and the archive is still openable by hand.
    *
-   * It is very unlikely to refuse a legitimate FUTURE backup by mistake, and
-   * the qualifier is deliberate. A manifest written by a later Conduit -- one
-   * that had added, say, an "approximate" label -- is normally refused by
-   * `newerApp` before this is reached. NORMALLY, not always: compareAppVersions
-   * answers null for an `appVersion` it cannot order, and `newerApp` then does
-   * not fire. Every version Conduit's release process writes is an orderable
-   * `major.minor.patch`, so the gap needs a manifest no release produced -- and
-   * a refusal is still the safe side of it, because the alternative is checking
-   * counts against a guarantee this build cannot evaluate.
+   * IT CANNOT REFUSE A LEGITIMATE FUTURE BACKUP ANY MORE, and that is the
+   * change v1.4.1 made rather than a property this always had. A manifest
+   * written by a later Conduit -- one that had added, say, an "approximate"
+   * label -- used to land HERE, refused, on the argument that a guarantee this
+   * build cannot evaluate must not be read past. It now degrades to a finding
+   * instead (see readInventory and RESTORE_FINDINGS.inventoryUncheckable),
+   * because the two cases are not the same case: an unknown label is a later
+   * writer, and everything left in this refusal is DAMAGE.
    */
   inventoryUnreadable: "inventory-unreadable",
 } as const;
@@ -409,6 +414,19 @@ export const RESTORE_FINDINGS = {
    * should weigh before replacing an install, not a footnote.
    */
   inventoryMissing: "inventory-missing",
+  /**
+   * THE BACKUP RECORDS AN INVENTORY THIS BUILD CANNOT CHECK -- counts labelled
+   * with a consistency it has never heard of, which is what a backup written by
+   * a LATER Conduit looks like from here.
+   *
+   * The same severity and the same class of message as inventoryMissing,
+   * because from the operator's side they are the same fact: the cross-check
+   * will not be made. They are separate codes because the reasons differ and
+   * the message has to say which -- "your backup is older than this install"
+   * and "your backup is newer than this install" send a person to different
+   * places.
+   */
+  inventoryUncheckable: "inventory-uncheckable",
 } as const;
 
 /** A tool the restore needs is not installed. The message names the package. */
@@ -1153,6 +1171,7 @@ async function readDumpContents(stream: Readable): Promise<DumpContents> {
 /** What a manifest's `inventory` field turned out to be. */
 export type InventoryRead =
   | { kind: "absent" }
+  | { kind: "uncheckable"; why: string }
   | { kind: "unreadable"; why: string }
   | { kind: "present"; tables: BackupInventoryTable[] };
 
@@ -1169,7 +1188,31 @@ export type InventoryRead =
  *                               held no tables. The check IS made, against an
  *                               empty list, and a restored database with tables
  *                               in it fails it.
+ *   a label this build does
+ *   not know how to check ..... UNCHECKABLE. The counts may be perfectly good;
+ *                               what is missing is any basis for comparing
+ *                               them. Reported as NOT MADE, and the restore
+ *                               proceeds. See below.
  *   anything else ............. UNREADABLE. Refused, with nothing written.
+ *
+ * AN UNKNOWN CONSISTENCY LABEL DEGRADES RATHER THAN REFUSING, which is Chris's
+ * decision of 2 Sep and reverses what this function did in v1.4.0. The reasoning
+ * is his and is worth carrying rather than re-deriving: THE INVENTORY IS A
+ * CROSS-CHECK, NOT THE DATA, and the moment it matters is a recovery -- where
+ * being refused your only backup is a far worse outcome than restoring with one
+ * check unmade and being told so in words. What made the old refusal look safe
+ * was that its cost is invisible from here: it happens at inspect with nothing
+ * written, which is cheap in every scenario except the one this route exists
+ * for.
+ *
+ * DAMAGE IS STILL REFUSED, and the line between the two is not arbitrary. A
+ * manifest that does not say how its counts were taken, or whose entries are
+ * not tables, is a manifest something has CORRUPTED -- and reading past
+ * corruption is how a silent half-restore starts. A manifest that names a
+ * consistency this build has never heard of is a manifest a LATER CONDUIT
+ * WROTE, which is a different thing entirely: nothing about it is damaged, and
+ * the only honest answer is that this build cannot evaluate the guarantee it
+ * claims.
  *
  * `null` COUNTS AS ABSENT, and that is not sloppiness about JSON. `undefined`
  * cannot survive a round trip through JSON at all, so a writer that meant "no
@@ -1196,7 +1239,7 @@ export function readInventory(raw: unknown): InventoryRead {
   }
   if (inventory.consistency !== INVENTORY_CONSISTENCY) {
     return {
-      kind: "unreadable",
+      kind: "uncheckable",
       why: `its counts are labelled "${inventory.consistency}", which this version of `
         + "Conduit does not know how to check",
     };
@@ -1757,6 +1800,23 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
         + "itself is unaffected -- what is missing is a check, not data.",
     });
   }
+  // AND THE OTHER WAY A CHECK GOES UNMADE: the record is there and this build
+  // cannot evaluate what it claims. Said in the same words for the same reason
+  // -- an operator weighing a recovery needs to know which checks will run, and
+  // "could not be made" is the only honest answer here. It is a WARNING and it
+  // names the archive's own label, because the next thing that person may want
+  // to do is restore this backup on the Conduit that wrote it.
+  if (inventory.kind === "uncheckable") {
+    findings.push({
+      severity: "warning",
+      code: RESTORE_FINDINGS.inventoryUncheckable,
+      message: "this backup records what its database held, and THAT CHECK CANNOT BE MADE by "
+        + `this install: ${inventory.why}. The restore itself is unaffected and the counts may `
+        + "be perfectly good -- what is missing is any basis for comparing them, so the "
+        + "restored database will not be counted against them. A backup labelled this way was "
+        + "written by a newer Conduit than this one.",
+    });
+  }
 
   findings.push({
     severity: "note",
@@ -1875,7 +1935,14 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
           ? ` The backup also records the ${String(inventoryRows)} row(s) its database held `
             + `across ${String(inventory.tables.length)} table(s), and the restored database `
             + "is counted against that."
-          : " This backup records no row counts to check the result against."),
+          // THREE CASES, NOT TWO. "Records no row counts" was written when the
+          // only alternative to a checkable inventory was an absent one, and it
+          // is a false sentence about an archive that records counts this build
+          // cannot use.
+          : inventory.kind === "uncheckable"
+            ? " The row counts this backup records are labelled in a way this install cannot "
+              + "check, so the restored database is not counted against them."
+            : " This backup records no row counts to check the result against."),
       sources: [dumpMember.ref],
       dumpBytes: dumpEntry.bytes,
       // FROZEN HERE for the reason `schemas` is: newPlan freezes what it knows

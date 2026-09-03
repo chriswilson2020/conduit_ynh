@@ -9,7 +9,7 @@ import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
 import { sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
-import type { PlanView, ReauthScope } from "@conduit/shared";
+import { passphraseProblem, type PlanView, type ReauthScope } from "@conduit/shared";
 import { buildApp } from "../app.js";
 import { createDatabase, runMigrations, type DatabaseHandle } from "../db/client.js";
 import { openTestDatabase } from "../test/db.js";
@@ -990,6 +990,32 @@ describe("POST /api/restore/apply -- the guards in front of the destruction", ()
     expect((response.json() as { error: string }).error).toBe("restore_passphrase_mismatch");
     await expectNothingDestroyed();
   });
+
+  // DECISION 4: A CHARACTER THE RULE FORBIDS IS NAMED AS ONE, and the case is
+  // written as the CONTRAST with the one above because that is the whole
+  // defect. Both requests carry a passphrase the proof will not accept, and
+  // until v1.4.1 both got the same answer -- "that is not the passphrase this
+  // backup was opened with" -- which is true of the first and blames the
+  // operator's memory for the second, over a character they cannot see.
+  //
+  // THE VALIDATION ERROR IS THE POINT, not merely a 400: the two are told apart
+  // by `error`, and the message has to be the rule's own sentence rather than a
+  // second one that agrees with it.
+  itRestore("names a control character in the passphrase instead of blaming the operator",
+    async () => {
+      for (const passphrase of [`${PASSPHRASE}\nrest`, `${PASSPHRASE}\r`, `two\tparts`]) {
+        const response = await applyRestoreRequest(app, {
+          planId: plan.planId, passphrase, confirmName: target.name,
+        });
+        const body = response.json() as { error: string; message: string };
+        expect(response.statusCode, JSON.stringify(passphrase)).toBe(400);
+        expect(body.error, JSON.stringify(passphrase)).toBe("validation");
+        expect(body.error).not.toBe("restore_passphrase_mismatch");
+        expect(body.message).toBe(passphraseProblem(passphrase));
+        expect(body.message).toContain("7z reads it up to the first line break");
+      }
+      await expectNothingDestroyed();
+    });
 
   // THE PLAN IS BOUND TO THE OPERATOR WHO UPLOADED IT. Everything else about
   // sam's request is perfect: a real session, a real ticket, the right name and

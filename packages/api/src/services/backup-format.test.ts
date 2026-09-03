@@ -342,6 +342,19 @@ describe("docs/backup-format.md", () => {
     expect(doc).toContain("no `inventory` key at all");
     expect(doc).toContain("**Conduit 1.3.0 and earlier**");
     expect(doc).toContain("A backup taken before this field existed still restores.");
+
+    // 5. THE FOURTH ROW OF THAT TABLE, AND THE PAGE HAD IT WRONG UNTIL v1.4.1.
+    //    It said a label this build does not know is REFUSED, which was true of
+    //    v1.4.0 and is the behaviour Chris reversed: the inventory is a
+    //    cross-check and the moment it matters is a recovery. A published
+    //    format page that describes the opposite of what the code does is worse
+    //    than one that omits the case, so the correction is pinned here.
+    expect(doc).toContain("a `consistency` this build does not know");
+    expect(doc).toContain("the backup was written by a **newer Conduit**");
+    expect(doc).not.toContain("A restore refuses an inventory labelled anything else");
+    // ... and the line that is NOT crossed, which the same paragraph has to
+    // keep saying or the page reads as "anything goes".
+    expect(doc).toContain("**A damaged manifest is still refused**");
   }, 120_000);
 
   it7z("names the file the way the page says it is named", async () => {

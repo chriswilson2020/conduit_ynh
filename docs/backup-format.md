@@ -139,9 +139,9 @@ a Conduit.
 {
   "formatVersion": 1,
   "kind": "backup",
-  "appVersion": "1.4.0",
-  "schemaVersion": "0012_misty_phantom_reporter",
-  "migrationPosition": 13,
+  "appVersion": "1.4.1",
+  "schemaVersion": "0013_wide_wolverine",
+  "migrationPosition": 14,
   "generatedAt": "2026-09-01T09:15:00.000Z",
   "postgres": {
     "serverVersion": "15.19",
@@ -151,7 +151,7 @@ a Conduit.
   "inventory": {
     "consistency": "shared-snapshot",
     "tables": [
-      { "table": "drizzle.__drizzle_migrations", "rows": 13 },
+      { "table": "drizzle.__drizzle_migrations", "rows": 14 },
       { "table": "public.companies", "rows": 42 }
     ]
   },
@@ -216,8 +216,13 @@ The last row is the control: without the shared snapshot the two halves of a
 backup genuinely do disagree, on nothing more exotic than somebody saving a
 company while the backup runs. `consistency` records which guarantee applies;
 `"shared-snapshot"` is the one above, and it is the only value Conduit writes.
-A restore refuses an inventory labelled anything else rather than checking
-counts it cannot interpret.
+A restore that meets any other label does not check the counts against it and
+says so: the label names a guarantee this build cannot evaluate, and a check it
+cannot make is one it reports as **not made** rather than one it fails or
+silently passes. Until Conduit 1.4.1 it refused such an archive outright. That
+was the wrong side to err on, and the reason is what the field is FOR: the
+moment an inventory matters is a recovery, where being refused your only backup
+is far worse than restoring with one check unmade and being told so.
 
 The `--snapshot` flag is **not** listed in `pgDumpArgs`. That field records the
 flags that decide what is *in* the file; the snapshot id decides only which
@@ -230,6 +235,7 @@ the backup has finished.
 |---|---|---|
 | no `inventory` key at all | the backup predates this field -- **Conduit 1.3.0 and earlier** | restores normally, and reports the check as **not made** |
 | `"inventory": { ..., "tables": [] }` | the database held **no tables** | checks, and fails if the restored database has any |
+| a `consistency` this build does not know | the backup was written by a **newer Conduit** | restores normally, and reports the check as **not made**, naming the label |
 | an `inventory` that is not one of those | the manifest is damaged | **refuses**, before anything is destroyed |
 
 **A backup taken before this field existed still restores.** That is a
@@ -237,6 +243,19 @@ requirement, not a courtesy: a restore that rejected every archive written by an
 earlier Conduit would be worse than the gap it closes. What such a backup loses
 is the check, not the data, and the restore preview says so in words rather than
 passing a check it never made.
+
+**And so does one written by a Conduit newer than the install reading it, as far
+as the inventory is concerned.** The two are the same fact from opposite ends --
+a cross-check that will not be made -- and the preview says which, because an
+operator holding a backup their install cannot fully check should know whether
+to look for an upgrade or not. (The rest of the manifest still applies: a backup
+whose `appVersion` or `migrationPosition` is ahead of the install is refused for
+a different and unrelated reason, which is that its DATA may not fit.)
+
+**A damaged manifest is still refused**, and the line between the two is worth
+stating: an unknown label is a later writer, while an entry with no table name
+or no row count is corruption -- and reading past corruption on the path that
+replaces a database is how a silent half-restore starts.
 
 ---
 

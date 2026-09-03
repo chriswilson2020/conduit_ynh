@@ -243,12 +243,39 @@ function fieldValue(field: MultipartFile["fields"][string]): string | undefined 
  *
  * `strictObject` rather than the ordinary strip: see this module's header. The
  * plan does not travel, and a client that tried to send one is told so.
+ *
+ * THE PASSPHRASE RULE IS APPLIED HERE, NOT ONLY ITS BOUNDS, and that is
+ * v1.4.1's decision 4. Until then this schema checked the length and nothing
+ * else, so a passphrase carrying a control character fell through to
+ * `proofAccepts` -- which compares a scrypt digest, cannot match, and answered
+ * "that is not the passphrase this backup was opened with". A TRUE sentence
+ * about a DIFFERENT fact: the proof was minted from a passphrase that had
+ * already passed the rule, so a rule-breaking one can only ever be
+ * mis-explained here, never accepted. It is the inspect route's own check
+ * arriving one route late -- see the passphraseProblem call in the inspect
+ * handler, which has always run.
+ *
+ * WHY THAT MATTERS ENOUGH TO BE A DECISION rather than a tidy-up: this release
+ * exists because of Task 0, which was an evening spent on an error message that
+ * blamed the operator's typing for an ACL. Shipping a second message that
+ * blames the operator for a character they cannot see would be indefensible.
+ *
+ * THE BOUNDS STAY ALONGSIDE IT even though passphraseProblem checks the length
+ * too. They are ordered first on purpose, so a megabyte of body is refused by a
+ * length check rather than by a regex over the whole of it.
  */
 const applyRequestSchema = z.strictObject({
   planId: z.uuid("that is not a plan id"),
   passphrase: z.string()
     .min(1, "the archive's passphrase is required")
-    .max(MAX_PASSPHRASE_LENGTH, `the passphrase must be at most ${String(MAX_PASSPHRASE_LENGTH)} characters`),
+    .max(MAX_PASSPHRASE_LENGTH, `the passphrase must be at most ${String(MAX_PASSPHRASE_LENGTH)} characters`)
+    .superRefine((value, ctx) => {
+      const problem = passphraseProblem(value);
+      // THE RULE'S OWN SENTENCE, not a restatement of it. passphraseProblem
+      // says what 7z would DO with the character, which is the only form of
+      // this message a person can act on.
+      if (problem !== null) ctx.addIssue({ code: "custom", message: problem });
+    }),
   confirmName: z.string().max(256, "that is not this install's name"),
 });
 
