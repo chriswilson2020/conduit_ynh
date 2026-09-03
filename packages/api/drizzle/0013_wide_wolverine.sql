@@ -21,8 +21,8 @@
 --   contacts  ..... 107.6ms ->  12.3ms
 --
 -- WHAT THEY COST, so the trade is legible: 7,960kB and 18MB respectively at
--- 200,000 rows -- the GIN index is LARGER than the table it indexes -- plus
--- maintenance on every insert and update of those two tables.
+-- 200,000 rows of each -- against tables of 22MB and 29MB -- plus maintenance on
+-- every insert and update of those two tables.
 --
 -- ===================== CREATE INDEX, NOT CONCURRENTLY =====================
 --
@@ -35,9 +35,12 @@
 -- SO SAY WHAT A PLAIN CREATE INDEX DOES, because on a big enough table it is
 -- the whole story: it takes a SHARE lock on the table for the duration.
 -- READS ARE UNAFFECTED; every INSERT, UPDATE and DELETE against `companies` or
--- `contacts` WAITS. The two indexes below took 381ms and 2,550ms at 200,000
--- rows, so on a table of that size an upgrade blocks writes for about three
--- seconds.
+-- `contacts` WAITS. MEASURED BY RUNNING THIS FILE, statement by statement,
+-- against a scratch database carrying the REAL migrated schema with 200,000
+-- companies and 200,000 contacts in it: the function 1.2ms, the btree index
+-- 415ms, the GIN index 2,523ms. So on tables that size an upgrade blocks writes
+-- for about three seconds. On an empty database the whole journal, this file
+-- included, runs in 251ms.
 --
 -- WHY THAT IS ACCEPTABLE HERE, AND IT IS NOT A GENERAL LICENCE:
 --
@@ -45,10 +48,13 @@
 --     runMigrations and only then builds the app and starts the sync, so there
 --     is no request to block and no sync running -- the lock is contended by
 --     nothing. On an upgrade the app is stopped anyway.
---   * THE TABLES ARE SMALL. This is a self-hosted CRM for one organisation;
---     the deploy target's companies and contacts are in the thousands. 200,000
---     is the synthetic worst case the importer was measured against, not an
---     install anybody has.
+--   * THE TABLES ARE SMALL, and the qualifier is deliberate: nobody counted the
+--     live install's rows for this, because that is Chris's data and reading it
+--     was not necessary. What IS known is the shape of the product -- a
+--     self-hosted CRM for one organisation -- and that 200,000 is the synthetic
+--     worst case the importer was measured against rather than an install
+--     anybody has. Three seconds is the bound at that size, and the bound
+--     shrinks with the table.
 --   * A SLOW BOOT IS VISIBLE AND SURVIVABLE, where a half-built index would
 --     not be. If the index build fails, the transaction rolls back, the
 --     migration is not recorded, and the next boot tries again.
@@ -82,6 +88,7 @@
 -- nor index) into a v1.4.1 install runs migrate-forward afterwards, which
 -- applies this file to the restored database. Both directions were reasoned
 -- from services/restore.ts's own order rather than assumed.
+--
 -- ============== DELIBERATELY NOT IDEMPOTENT, AND THAT WAS MEASURED =========
 --
 -- The first draft of this file wrote `CREATE OR REPLACE FUNCTION` and

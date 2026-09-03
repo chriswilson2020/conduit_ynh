@@ -2058,3 +2058,106 @@ describe("salutation and pronouns (0011)", () => {
     expect(bare).toMatchObject({ salutation: null, pronouns: null });
   });
 });
+
+// ============================================================================
+
+describe("the duplicate probe's indexes (0013)", () => {
+  /** Which of 0013's indexes this database has, by name, sorted. */
+  async function indexNames(scratch: DatabaseHandle): Promise<string[]> {
+    const rows = await scratch.db.execute<{ indexname: string }>(sql`
+      SELECT indexname FROM pg_indexes
+      WHERE schemaname = 'public'
+        AND indexname IN ('companies_domain_lower_idx', 'contacts_emails_lower_idx')
+      ORDER BY indexname
+    `);
+    return rows.map((row) => row.indexname);
+  }
+
+  /** The plan for one query, as one string. */
+  async function planFor(scratch: DatabaseHandle, query: Parameters<typeof scratch.db.execute>[0]):
+  Promise<string> {
+    const rows = await scratch.db.execute<Record<string, string>>(query);
+    return rows.map((row) => Object.values(row).join(" ")).join("\n");
+  }
+
+  /**
+   * THE MIGRATION MEETS A DATABASE THAT ALREADY HAS ROWS IN IT, which is the
+   * only state it will ever run in on an install that matters, and the one a
+   * fresh `migrate()` in global-setup never exercises.
+   *
+   * AND IT ASSERTS WHAT THE INDEXES ARE FOR, rather than that they exist. The
+   * expression in the migration and the expression in services/import-csv.ts's
+   * probe have to be THE SAME EXPRESSION or the index is dead weight -- and a
+   * dead index is invisible from a passing import, visible only from a slow
+   * one. `enable_seqscan = off` is what makes that assertable on two rows: it
+   * does not make the planner lie, it removes the cheaper-than-anything option
+   * a tiny table always has, leaving the question "IS there an index scan for
+   * this shape at all".
+   */
+  it("applies migration 0013 to a populated pre-0013 database, and the probe's own questions can use what it built", async () => {
+    await withPreMigrationDatabase("0013", async (scratch) => {
+      // The old shape, with rows in it -- and mixed case on both keys, because
+      // the case fold is the whole reason these indexes are functional ones.
+      await scratch.db.execute(sql`
+        INSERT INTO companies (name, domain) VALUES ('Acme', 'ACME.example')
+      `);
+      await scratch.db.execute(sql`
+        INSERT INTO contacts (first_name, emails) VALUES ('Ada', ARRAY['Ada@Example.com'])
+      `);
+
+      // PIN THE PREMISE. Without this every assertion below would also pass
+      // against a database that had been fully migrated all along.
+      expect(await indexNames(scratch)).toEqual([]);
+      const before = await scratch.db.execute<{ n: number }>(sql`
+        SELECT count(*)::int AS n FROM pg_proc WHERE proname = 'conduit_lower_emails'
+      `);
+      expect(before[0]?.n).toBe(0);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      expect(await indexNames(scratch))
+        .toEqual(["companies_domain_lower_idx", "contacts_emails_lower_idx"]);
+      // The rows an operator already had are still there, unchanged. An index
+      // build touches no data, and this is the cheapest possible statement of
+      // that for somebody reading a migration that runs against live rows.
+      const kept = await scratch.db.execute<{ name: string; domain: string }>(sql`
+        SELECT name, domain FROM companies
+      `);
+      expect(kept).toEqual([{ name: "Acme", domain: "ACME.example" }]);
+
+      // AND THE TWO QUESTIONS THE PROBE ASKS, SHAPED AS IT SHAPES THEM. If
+      // either expression drifts from the migration's, the index stops being
+      // reachable and this goes red -- which is the only warning there would be.
+      //
+      // THE `Index Cond` IS THE ASSERTION AND THE INDEX'S NAME IS NOT, which a
+      // mutation had to teach this case. With `enable_seqscan = off` the
+      // planner will walk ANY index end to end rather than scan the heap, so a
+      // btree on `domain` -- an index that answers nothing this query asks --
+      // still put `companies_domain_lower_idx` in the plan and the first
+      // version of this test went green over it. The condition is what says the
+      // index was USED for the question rather than as a cheaper table.
+      await scratch.db.execute(sql`SET enable_seqscan = off`);
+      const domainPlan = await planFor(scratch, sql`
+        EXPLAIN SELECT DISTINCT lower(domain) AS key FROM companies
+        WHERE lower(domain) IN ('acme.example')
+      `);
+      expect(domainPlan).toContain("companies_domain_lower_idx");
+      expect(domainPlan).toContain("Index Cond: (lower(domain) = 'acme.example'::text)");
+      const emailPlan = await planFor(scratch, sql`
+        EXPLAIN SELECT 1 FROM contacts
+        WHERE conduit_lower_emails(emails) && ARRAY['ada@example.com']
+      `);
+      expect(emailPlan).toContain("contacts_emails_lower_idx");
+      expect(emailPlan).toContain("Index Cond: (conduit_lower_emails(emails) &&");
+      await scratch.db.execute(sql`SET enable_seqscan = on`);
+
+      // The fold itself, since an index is only as good as the function under
+      // it: the stored spelling and the probe's candidate meet in the middle.
+      const folded = await scratch.db.execute<{ hit: number }>(sql`
+        SELECT count(*)::int AS hit FROM contacts
+        WHERE conduit_lower_emails(emails) && ARRAY['ada@example.com']
+      `);
+      expect(folded[0]?.hit).toBe(1);
+    });
+  }, 30000);
+});
