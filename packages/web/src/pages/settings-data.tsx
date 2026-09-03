@@ -994,18 +994,21 @@ function ReauthDialog(props: {
           and an operator who thinks a prompt is a glitch is an operator who
           stops reading prompts.
         */}
-        <DialogDescription>
-          {/*
-            THE TESTID IS ON A SPAN INSIDE, NOT ON DialogDescription, AND A
-            FAILING TEST IS WHAT FOUND THAT IT HAD TO BE. That component takes
-            `{ children }` and nothing else, so any other prop is dropped -- and
-            TypeScript does not catch it, because it skips excess-property
-            checking for a JSX attribute whose name is not a valid identifier,
-            which `data-testid` is not. So it compiled, rendered, and had no
-            testid on it. Wrapping the text is the narrow fix; widening a shared
-            dialog primitive for one caller is not.
-          */}
-          <span data-testid="reauth-reason">{reauthReason(pending)}</span>
+        {/*
+          THE TESTID IS ON THE DESCRIPTION ITSELF AGAIN, AND THE ROUND TRIP IS
+          WORTH ONE COMMENT. It was here originally, silently did nothing, and
+          cost a red e2e: DialogDescription took `{ children }` and dropped
+          every other prop, and TypeScript does not catch that -- it skips
+          excess-property checking for a JSX attribute whose name is not a valid
+          identifier, which `data-testid` is not. The narrow fix was to wrap the
+          text in a `<span>` and testid THAT, on the argument that widening a
+          shared dialog primitive for one caller was too much. v1.4.1 widened it
+          anyway (the trap was the primitive's, not this caller's) and
+          components/ui/ui.test.ts now holds a guard that a passed prop
+          actually arrives -- so the wrapper has nothing left to do.
+        */}
+        <DialogDescription data-testid="reauth-reason">
+          {reauthReason(pending)}
         </DialogDescription>
         <form className="mt-4 flex flex-col gap-3" onSubmit={onSubmit}>
           <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
