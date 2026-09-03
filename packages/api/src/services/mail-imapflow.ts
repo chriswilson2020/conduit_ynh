@@ -40,6 +40,14 @@ import {
 // 15s, so past that they are also the only thing standing between a stuck
 // socket and a connection leaked for the process's lifetime.
 //
+// WHICH MAKES SOCKET_TIMEOUT_MS SOMEBODY ELSE'S NUMBER AS WELL, as of v1.4.1: a
+// restore REFUSES TO START over a sync it could not stop, and it waits
+// mail-sync.ts's RESTORE_STOP_TIMEOUT_MS rather than the shutdown's 15s so that
+// the ordinary wedge unwinds inside the wait instead of costing an operator
+// their recovery. That is only true while the restore's bound is the longer of
+// the two, so mail-imapflow.test.ts asserts it -- raising this one alone fails a
+// test rather than turning into a refused restore months later.
+//
 // imapflow's own defaults (90s connect, 5min socket) are far too generous for
 // that: a poll interval is 5 minutes, so a default socket timeout means one
 // dead connection can occupy a whole interval doing nothing.
@@ -58,7 +66,7 @@ const GREETING_TIMEOUT_MS = 15_000;
  * not to make it long: a NAT that drops idle flows sooner than this would
  * otherwise silently stop delivering new-mail pushes.
  */
-const SOCKET_TIMEOUT_MS = 120_000;
+export const SOCKET_TIMEOUT_MS = 120_000;
 
 /** The only folder IDLE is ever run on (mail-imap.ts's `idle` contract). */
 const INBOX = "INBOX";

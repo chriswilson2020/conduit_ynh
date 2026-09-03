@@ -33,8 +33,10 @@ import {
   RestoreLoadFailedError, RestoreMailKeyError, RestoreMigrationError,
   RestoreSafetyBackupError, RestoreToolMissingError, RestoreUnexpectedMigrationsError,
   RestoreUnexpectedResultError,
-  type RestoreEffect, type RestorePlan, type RestoreSyncControl,
+  type RestoreEffect, type RestorePlan,
 } from "../services/restore.js";
+import { RESTORE_STOP_TIMEOUT_MS } from "../services/mail-sync.js";
+import type { SyncStopResult } from "../services/mail-sync.js";
 
 /**
  * THE HTTP SURFACE OF THE MOST DANGEROUS OPERATION IN THIS PRODUCT, AND EVERY
@@ -52,7 +54,14 @@ import {
  *   2. THE TYPED INSTALL NAME -- Chris's own ruling. See `installName`.
  *   3. THE PLAN BOUND TO THE OPERATOR WHO UPLOADED IT. The store does the
  *      comparison (IntakeSession.owner); this is what gives it the identity.
- *   4. REFUSING NEW WRITES for the duration. See services/write-gate.ts.
+ *   4. STOPPING BOTH SECOND WRITERS for the duration, AND REFUSING THE RESTORE
+ *      WHEN EITHER WILL NOT STOP. New HTTP writes are refused and the ones in
+ *      flight are drained (services/write-gate.ts); the mail sync is stopped
+ *      and its answer is read (services/mail-sync.ts's stop, which reports
+ *      rather than resolves as of v1.4.1). The second half of that used to be
+ *      neither here nor honest -- see the apply handler, where the argument for
+ *      refusing, and for refusing HERE rather than one line lower, is written
+ *      out.
  *
  * THE PLAN NEVER TRAVELS, AND THAT IS ENFORCED BY THE SHAPE OF THIS FILE
  * RATHER THAN ASSERTED BY IT. Inspect answers with a RENDERING of the plan
@@ -581,6 +590,87 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
       });
     }
 
+    // AND NOW THE OTHER SECOND WRITER, ON THE SAME STANDARD AND IN THE SAME
+    // PLACE. Until v1.4.1 this was a `sync.stop()` inside applyRestore whose
+    // answer was a `Promise<void>`: mail-sync.ts raced a 15s deadline, logged
+    // "gave up waiting for syncs to stop, abandoning them", and RESOLVED, and
+    // the engine restored over whatever was still running. So the weaker of
+    // this route's two standards guarded the more dangerous writer -- an
+    // operator who has walked away from a browser cannot write, and an
+    // abandoned sync can.
+    //
+    // WHY THAT IS FATAL RATHER THAN UNLUCKY, and it is the measurement in
+    // services/write-gate.ts's header rather than an inference: PostgreSQL does
+    // not make a blocked write race the destruction window. It QUEUES a write
+    // blocked by the restore's `DROP SCHEMA` and releases it at COMMIT, so an
+    // abandoned sync's INSERT is DELIVERED INTO the restored data. What the
+    // operator then sees is either an inventory mismatch on a restore that
+    // worked -- pointed at the recovery commands, mail.key unreplaced -- or, if
+    // the row lands a moment later, nothing at all, and rows from the install
+    // they just replaced sitting in the one they restored.
+    //
+    // SO IT REFUSES, AND ABOVE THE LINE, WHICH IS THE HALF THAT COST THE
+    // THINKING. Refusing is the obvious symmetry with the drain and it is also
+    // the frightening direction: a restore is the RECOVERY path, and refusing
+    // somebody their backup because a mailbox is unwell is its own way to fail
+    // them. Three things answer that, and none of them is "proceed anyway":
+    //
+    //   - THE REFUSAL IS CHEAP TO RETRY, because it happens before
+    //     `intakeSessions.use` and therefore before the staging is disposed of.
+    //     The operator presses the button again. One line lower, inside
+    //     applyRestore, the same refusal would have cost them a multi-gigabyte
+    //     re-upload -- and a wedged sync is a condition somebody retries into,
+    //     so they would have paid it more than once.
+    //   - THE WAIT IS SET AGAINST WHAT A WEDGE ACTUALLY COSTS.
+    //     RESTORE_STOP_TIMEOUT_MS is longer than the adapter's own socket
+    //     timeout, so the ordinary stuck operation unwinds inside the wait and
+    //     no refusal happens at all. A shutdown keeps the short bound; it has
+    //     systemd to answer to and this does not.
+    //   - AND WHAT IS BEING PROTECTED IS THE DATA, NOT A CROSS-CHECK. Chris's
+    //     inventory ruling earlier in v1.4.1 went the other way -- a backup
+    //     whose row counts are approximate DEGRADES to "check not made" rather
+    //     than being refused -- and the difference is the whole reason it does
+    //     not apply here. An inventory is a witness; a sync is a WRITER.
+    //     Tolerating a missing witness costs a check. Tolerating this one costs
+    //     the restored database.
+    //
+    // Rejected, so it is not re-proposed: terminating the sync's database
+    // sessions instead of waiting for it. The sync writes through the same pool
+    // that serves the page the operator is watching, so `pg_terminate_backend`
+    // has nothing to aim at that is not also aimed at them.
+    const manager = deps.syncManager();
+    if (manager !== null) {
+      // A STOP THAT THREW IS NOT A STOP. Same discipline as ReauthVerifier's
+      // throw/false split: this proceeds on a POSITIVE answer, and "the check
+      // could not be made" is refused exactly like "it did not stop".
+      let stopped: SyncStopResult;
+      try {
+        stopped = await manager.stop({ timeoutMs: RESTORE_STOP_TIMEOUT_MS });
+      } catch (error) {
+        request.log.error({ err: error }, "the mail sync could not be stopped for a restore");
+        stopped = { stopped: false, abandoned: 0 };
+      }
+      if (!stopped.stopped) {
+        // STARTED AGAIN ON THE WAY OUT, for the reason the `finally` below
+        // gives: an install left with no sync receives no mail and says
+        // nothing about it. mail-sync.ts's start() will not put a second loop
+        // on a mailbox one of the abandoned ones is still reading.
+        await startSyncAgain(manager, request.log);
+        writeGate.resume();
+        return reply.code(503).send({
+          error: "restore_sync_running",
+          message: stopped.abandoned === 0
+            ? "the mail sync could not be stopped, so the restore did not start. Nothing has "
+              + "been changed and your upload is still here. The server log has the detail."
+            : `${String(stopped.abandoned)} mail account sync(s) had not stopped when the `
+              + "restore asked them to, so it did not start. Nothing has been changed. A sync "
+              + "that is inside a network operation stops on its own within about two minutes; "
+              + "your upload is still here, so try again then.",
+          ...stopped.abandoned === 0 ? {} : { stillSyncing: stopped.abandoned },
+        });
+      }
+    }
+
     // --- nothing below this line can refuse without consuming the plan ---
     //
     // MOVED DOWN IN 7.7 TASK 4, BECAUSE IT WAS TWO REFUSALS TOO HIGH. It sat
@@ -595,18 +685,16 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
     // usable (pages/settings-data-lib.ts's APPLY_KEEPS_THE_PREVIEW), so a
     // marker in the wrong place is a marker that would have made the page throw
     // away a recoverable upload.
-    const manager = deps.syncManager();
-    const sync: RestoreSyncControl | null = manager === null
-      ? null
-      : { stop: () => manager.stop(), start: () => manager.start() };
-
+    //
+    // AND THE SYNC IS ALREADY STOPPED BY HERE, which is why its own refusal is
+    // written above rather than beside this one.
     try {
       const outcome = await intakeSessions.use(body.planId, user.username, async (held) => {
         return await applyRestore({
           plan: held.plan as RestorePlan,
           payload: held.payload,
           db, databaseUrl, dataDir, mailKeyPath, appVersion,
-          passphrase: body.passphrase, sync,
+          passphrase: body.passphrase,
         });
       });
       if (outcome === undefined) {
@@ -629,21 +717,35 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
     } catch (error) {
       return restoreFailure(request.log, reply, error);
     } finally {
-      // ADMITTED AGAIN WHATEVER HAPPENED. A failed restore that left the gate
-      // closed would be an install that answers 503 to every write until
-      // somebody restarts it -- and the failure paths below are exactly the
-      // ones where an operator needs the install to keep working.
+      // BOTH WRITERS ARE LET GO AGAIN WHATEVER HAPPENED, and the sync's half
+      // used to live inside applyRestore's own `finally`. The reason is the
+      // same for both and it is not tidiness: a failed restore that left the
+      // gate closed is an install answering 503 to every write, and one that
+      // left the sync stopped is an install silently receiving no mail --
+      // discovered days later, with nothing on screen to connect it to the
+      // restore. The failure paths are exactly where an operator needs the
+      // install to keep working.
       //
-      // AND THIS ONE REALLY CAN LIVE IN THE `finally`, WHERE THE PREVIEW'S
-      // DISPOSAL COULD NOT, because the difference is whether it yields.
-      // `reply.send()` schedules the response and returns, so the question is
-      // what runs before the event loop can deliver it: `discard` awaits an
-      // `rm` and therefore hands control back -- which is how a caller came to
-      // see a refusal while the decrypted archive was still on disk -- and
-      // `resume` is synchronous, so it completes in the same continuation as
-      // the `return` that triggered it. There is no instant at which an answer
-      // has gone out and the gate is still shut.
+      // ADMITTED AGAIN WHATEVER HAPPENED, AND THIS ONE REALLY CAN LIVE IN THE
+      // `finally`, WHERE THE PREVIEW'S DISPOSAL COULD NOT, because the
+      // difference is whether it yields. `reply.send()` schedules the response
+      // and returns, so the question is what runs before the event loop can
+      // deliver it: `discard` awaits an `rm` and therefore hands control back
+      // -- which is how a caller came to see a refusal while the decrypted
+      // archive was still on disk -- and `resume` is synchronous, so it
+      // completes in the same continuation as the `return` that triggered it.
+      // There is no instant at which an answer has gone out and the gate is
+      // still shut.
+      //
+      // WHICH IS ALSO WHY THE SYNC IS RESTARTED AFTER IT AND NOT BEFORE. That
+      // one awaits, so putting it first would reintroduce exactly the yield the
+      // paragraph above rules out, and the answer could go out through a gate
+      // that was still refusing. Nothing is bought by the other order: the
+      // restore is over either way, and a few milliseconds with writes admitted
+      // and the sync not yet running is the state this install is in after
+      // every ordinary boot.
       writeGate.resume();
+      await startSyncAgain(manager, request.log);
     }
   });
 
@@ -671,6 +773,33 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
     }
     return reply.code(204).send();
   });
+}
+
+/**
+ * Put the mail sync back, on every path that took it away.
+ *
+ * IT NEVER THROWS, for the reason the write gate's `resume` never does: it runs
+ * where a throw would replace the message an operator needs -- one that may name
+ * a safety backup and print the commands that put their install back -- with one
+ * about the mail engine. It does now SAY SO, which the version inside
+ * applyRestore did not: that one swallowed the failure into a bare `catch {}`,
+ * so an install that came out of a restore with no sync running left no trace
+ * of why anywhere.
+ *
+ * Null is the ordinary no-engine deployment (NODE_ENV=test, or no IMAP
+ * adapter), not a failure -- the same answer `deps.syncManager` gives every
+ * other consumer.
+ */
+async function startSyncAgain(
+  manager: { start: () => Promise<void> } | null,
+  log: { error: (context: object, message: string) => void },
+): Promise<void> {
+  if (manager === null) return;
+  try {
+    await manager.start();
+  } catch (error) {
+    log.error({ err: error }, "the mail sync could not be started again after a restore");
+  }
 }
 
 /**

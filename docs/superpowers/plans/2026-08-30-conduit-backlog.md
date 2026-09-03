@@ -859,10 +859,19 @@ password change DOES invalidate YunoHost's own sessions (`user.py:608`, `portal.
 merely no worse than the cookie. See the task for the argument against putting an LDAP query
 inside `redeem`.
 
-- **The mail sync is stopped best-effort while HTTP writes are refused.** `stop()` abandons
-  after 15s and `applyRestore` proceeds. The sync is the writer that moves data with nobody
-  touching a browser -- and Postgres **queues** a write blocked by `DROP SCHEMA` and releases
-  it at COMMIT, so an abandoned sync's write lands *inside* the window rather than racing it.
+- ~~**The mail sync is stopped best-effort while HTTP writes are refused.**~~ **CLOSED in
+  v1.4.1's Task 2, by the sync engine's contract rather than the restore's.** `stop()` returns
+  a `SyncStopResult` -- deliberately the shape of write-gate's `DrainResult` -- and
+  `routes/restore.ts` refuses the restore on either second writer. **The whole scope moved out
+  of `applyRestore` and above the line that consumes the plan**, which is the half that took
+  the thinking: refusing on the RECOVERY path is only defensible if the refusal is cheap to
+  retry, and one line lower it would have cost the operator a multi-gigabyte re-upload every
+  time. The restore also waits longer than a shutdown does (150s against 15s, set above the
+  adapter's own 120s socket timeout and pinned by a test), so the ordinary wedge unwinds inside
+  the wait. **Two further defects fell out of building it**: an abandoned `stop()` was not
+  inert -- a second `stop()` would have answered "stopped" with the same loop still running,
+  defeating the retry the refusal invites -- and `start()` after one created a SECOND
+  `AccountSync` on a live mailbox.
 - **`scripts/remote.sh` deletes `data/` on every sync**, taking `mail.key`, surfacing as a
   download that never arrives. Two red runs, two agents, two phases. Its incremental-build
   claim is also false -- `rsync -a` preserves mtimes, so `tsc -b` re-emits stale declarations.

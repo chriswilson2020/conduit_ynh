@@ -1015,13 +1015,7 @@ describe("restoring onto a different install", () => {
     const staged = await stageAndInspect(archive, target);
     expect(staged.plan.refusal).toBeNull();
 
-    const stops: string[] = [];
-    const outcome = await runRestore(staged, target, {
-      sync: {
-        stop: async () => { stops.push("stop"); },
-        start: async () => { stops.push("start"); },
-      },
-    });
+    const outcome = await runRestore(staged, target);
 
     // EVERY EFFECT DISPATCHED AND EVERY EFFECT REALISED. On a plan that ran to
     // the end these are equal, because the executor refuses a plan whose
@@ -1029,7 +1023,6 @@ describe("restoring onto a different install", () => {
     expect(outcome.dispatched).toBe(staged.plan.effects.length);
     expect(outcome.realised).toBe(outcome.dispatched);
     expect(outcome.unrealised).toEqual([]);
-    expect(stops).toEqual(["stop", "start"]);
 
     // THE DATA, TABLE BY TABLE, EXACT. Not an exit code.
     expect(await rowCounts(target.url)).toEqual(sourceCounts);
@@ -1859,50 +1852,19 @@ describe("a load that fails", () => {
       expect((cause as Error).message).toContain("the connection went away");
     });
 
-  // A SYNC THAT THROWS ON THE WAY DOWN IS STILL STARTED AGAIN, and it was not
-  // until this test existed: the stop sat OUTSIDE the try, so a throwing stop
-  // skipped the finally entirely and left the install silently receiving no
-  // mail -- the exact failure the comment beside it forbids, one line above the
-  // comment. Nothing else in the suite calls a sync that refuses to stop.
-  itRestore("restarts the mail sync even when stopping it threw", async () => {
-    const source = await makeInstall("srcsyncthrow");
-    await seed(source, ["Acme"]);
-    const target = await makeInstall("dstsyncthrow");
-    const work = await scratchDir("syncthrow");
-    const archive = await realBackup(source, work);
-    const staged = await stageAndInspect(archive, target);
-
-    const events: string[] = [];
-    const failure = await rejection(runRestore(staged, target, {
-      sync: {
-        stop: async () => {
-          events.push("stop");
-          throw new Error("the sync would not stop");
-        },
-        start: async () => { events.push("start"); },
-      },
-    }));
-    expect(failure.message).toContain("would not stop");
-    // Stopped, threw, and STARTED ANYWAY.
-    expect(events).toEqual(["stop", "start"]);
-  });
-
-  itRestore("restarts the mail sync even when the restore fails", async () => {
-    const source = await makeInstall("srcsync");
-    await seed(source, ["Acme"]);
-    const target = await makeInstall("dstsync");
-    const archive = await backupWithBrokenDump(source);
-    const staged = await stageAndInspect(archive, target);
-
-    const events: string[] = [];
-    await rejection(runRestore(staged, target, {
-      sync: {
-        stop: async () => { events.push("stop"); },
-        start: async () => { events.push("start"); },
-      },
-    }));
-    expect(events).toEqual(["stop", "start"]);
-  });
+  // THE THREE MAIL-SYNC CASES THAT USED TO LIVE HERE MOVED TO
+  // routes/restore.test.ts IN v1.4.1'S TASK 2, WITH THE SCOPE THEY WERE ABOUT.
+  // They are named here rather than deleted quietly, because one of them --
+  // "a sync that throws on the way down is still started again" -- found a real
+  // bug the first time it was written and must not be lost in a move: it is
+  // "starts it again when stopping it THREW, and does not restore" over there
+  // now, and it asserts one thing more than it used to, since a stop that threw
+  // is a stop that did not happen and the restore no longer runs after one.
+  //
+  // WHY THEY COULD NOT STAY: applyRestore has no sync any more. Stopping the
+  // second writer became a decision -- refuse or proceed -- and a decision needs
+  // the place where a refusal can still be cheap, which is above
+  // `intakeSessions.use`. See this module's header.
 });
 
 // ===========================================================================

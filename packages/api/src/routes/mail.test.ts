@@ -57,7 +57,7 @@ beforeEach(async () => {
     // writer. No mail route calls either, so they are here to satisfy the
     // contract rather than to be exercised; routes/restore.test.ts is where
     // they are actually asserted against.
-    stop: () => Promise.resolve(),
+    stop: () => Promise.resolve({ stopped: true, abandoned: 0 }),
     start: () => Promise.resolve(),
   };
 });
@@ -713,7 +713,7 @@ describe("mail folder routes", () => {
       syncManager: () => ({
         get: (id) => syncs.get(id),
         syncNow: () => { throw new Error("engine exploded"); },
-        stop: () => Promise.resolve(),
+        stop: () => Promise.resolve({ stopped: true, abandoned: 0 }),
         start: () => Promise.resolve(),
       }),
     });

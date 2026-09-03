@@ -13,6 +13,7 @@ import {
 import { openBlob } from "../services/blobs.js";
 import { decodeLastMessageAtCursor } from "../services/pagination.js";
 import type { SendMailSyncManager } from "../services/mail-send.js";
+import type { SyncStopOptions, SyncStopResult } from "../services/mail-sync.js";
 import { sendMail } from "../services/mail-send.js";
 import { defaultTestConnectionDeps } from "../services/mail-imapflow.js";
 import {
@@ -58,15 +59,21 @@ export interface MailRouteSyncManager extends SendMailSyncManager {
    * Stop every account's sync, and start them again. WIDENED FOR THE RESTORE
    * (Phase 7.7), which is the only caller: the sync is the second writer -- the
    * one that can change the database with nobody touching a browser -- and a
-   * restore is only true if nothing else is writing. routes/restore.ts hands
-   * these two to services/restore.ts as its RestoreSyncControl, so the engine
-   * never imports the sync module and stays testable with a two-method stub.
+   * restore is only true if nothing else is writing.
+   *
+   * `stop` RETURNS AN ANSWER RATHER THAN A RESOLUTION (v1.4.1's Task 2), and
+   * this slice is where a route sees it. It used to be `Promise<void>`, which
+   * resolves identically whether every sync stopped or every sync was
+   * abandoned past mail-sync.ts's deadline -- and routes/restore.ts, holding
+   * exactly that promise, restored over whatever was still writing. The
+   * decision now sits in that handler, next to the write gate's, because it is
+   * the same decision about the same restore.
    *
    * Both are on mail-sync.ts's SyncManager already and both are idempotent
    * there; they are declared here so this slice is the one contract the route
    * layer needs, rather than a second getter beside it.
    */
-  stop(): Promise<void>;
+  stop(options?: SyncStopOptions): Promise<SyncStopResult>;
   start(): Promise<void>;
   /**
    * Ask for a pass now. RESOLVES WHEN THE PASS IS REQUESTED, not when it

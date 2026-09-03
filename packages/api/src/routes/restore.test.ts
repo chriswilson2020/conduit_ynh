@@ -24,7 +24,10 @@ import { forgetMailKey } from "../services/mail-crypto.js";
 import { INTAKE_WORK_PREFIX } from "../services/intake.js";
 import { ReauthTickets } from "../services/reauth.js";
 import type { ReauthVerifier } from "../services/reauth.js";
+import { RESTORE_STOP_TIMEOUT_MS } from "../services/mail-sync.js";
+import type { SyncStopOptions, SyncStopResult } from "../services/mail-sync.js";
 import { installName } from "./restore.js";
+import type { MailRouteSyncManager } from "./mail.js";
 import type { Config } from "../config.js";
 
 // THE ROUTES THAT DECIDE A RESTORE MAY HAPPEN, AND EVERY WAY OF GETTING PAST
@@ -184,10 +187,39 @@ function assertScratch(url: string): void {
   }
 }
 
+/**
+ * THE OTHER SECOND WRITER, AS A STUB THAT CAN REFUSE TO STOP.
+ *
+ * A stand-in that always succeeds is what let the re-auth gate ship broken
+ * (Task 0), so this one answers whatever the case sets: stopped, abandoned, or
+ * a `stop()` that throws. Nothing here syncs anything -- `get` is the
+ * best-effort seam every caller already treats as optional -- because what is
+ * under test is the decision the route takes on the ANSWER, not the engine.
+ */
+class FakeSyncManager implements MailRouteSyncManager {
+  /** "stop"/"start", in the order they were called. */
+  readonly events: string[] = [];
+  /** The deadline each stop was given, so the restore's own bound is visible. */
+  readonly deadlines: (number | undefined)[] = [];
+  outcome: SyncStopResult = { stopped: true, abandoned: 0 };
+  stopFailure: Error | null = null;
+
+  get(): undefined { return undefined; }
+  syncNow(): Promise<void> { return Promise.resolve(); }
+  stop(options: SyncStopOptions = {}): Promise<SyncStopResult> {
+    this.events.push("stop");
+    this.deadlines.push(options.timeoutMs);
+    if (this.stopFailure !== null) return Promise.reject(this.stopFailure);
+    return Promise.resolve(this.outcome);
+  }
+  start(): Promise<void> { this.events.push("start"); return Promise.resolve(); }
+}
+
 interface AppOptions {
   verifier?: ReauthVerifier;
   restoreMaxUploadBytes?: number;
   restoreDrainTimeoutMs?: number;
+  syncManager?: MailRouteSyncManager | null;
 }
 
 async function appFor(install: Install, options: AppOptions = {}): Promise<FastifyInstance> {
@@ -213,6 +245,15 @@ async function appFor(install: Install, options: AppOptions = {}): Promise<Fasti
     reauthVerifier: options.verifier ?? testReauthVerifier(),
     restoreMaxUploadBytes: options.restoreMaxUploadBytes,
     restoreDrainTimeoutMs: options.restoreDrainTimeoutMs,
+    // OMITTED ENTIRELY WHEN NO CASE ASKED FOR ONE, which is how every other
+    // test in this file runs: `mail` absent is the no-engine deployment, and
+    // app.ts's own fallback is what makes `syncManager()` answer null there.
+    ...options.syncManager === undefined ? {} : {
+      mail: {
+        syncManager: () => options.syncManager ?? null,
+        transportFactory: () => { throw new Error("nothing in this file sends mail"); },
+      },
+    },
   });
   apps.push(app);
   return app;
@@ -1413,6 +1454,128 @@ describe("a restore that runs", () => {
     expect(after.statusCode).toBe(201);
     expect(await intakeWorkDirs(target)).toEqual([]);
   }, 300_000);
+});
+
+// ---------------------------------------------------------------------------
+// The other second writer
+// ---------------------------------------------------------------------------
+
+/**
+ * THE SYNC IS STOPPED WHERE THE WRITES ARE, AND REFUSED THE SAME WAY.
+ *
+ * v1.4.0 stopped it inside services/restore.ts, could not tell a stop from an
+ * abandonment, and destroyed the database either way. Both halves moved: the
+ * engine reports (services/mail-sync.ts), and the decision is taken here --
+ * ABOVE the line this handler draws, so a refusal costs a click rather than a
+ * three-gigabyte re-upload. The last case is the one that proves the placement
+ * rather than merely the refusal.
+ */
+describe("stopping the mail sync for a restore", () => {
+  itRestore("stops it before the restore and starts it again after", async () => {
+    const source = await makeInstall("srcsyncok");
+    await seed(source, ["Northwind Traders"]);
+    const target = await makeInstall("dstsyncok");
+    await seed(target, ["Something Else Ltd"]);
+    const manager = new FakeSyncManager();
+    const app = await appFor(target, { syncManager: manager });
+    const archive = await realBackup(source, await scratchDir("syncok"));
+    const plan = await previewOf(app, archive);
+
+    const response = await applyRestoreRequest(app, {
+      planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(manager.events).toEqual(["stop", "start"]);
+    // AND IT WAITED THE RESTORE'S BOUND, NOT THE SHUTDOWN'S. A restore is
+    // about to take a whole backup and load a dump over it; refusing after
+    // fifteen seconds a sync would have finished unwinding in ninety would be
+    // a refusal bought with nothing.
+    expect(manager.deadlines).toEqual([RESTORE_STOP_TIMEOUT_MS]);
+    expect(await companyNames(target.url)).toEqual(["Northwind Traders"]);
+  }, 300_000);
+
+  itRestore("starts it again when stopping it THREW, and does not restore", async () => {
+    const source = await makeInstall("srcsyncthrew");
+    await seed(source, ["Northwind Traders"]);
+    const target = await makeInstall("dstsyncthrew");
+    await seed(target, ["Something Else Ltd"]);
+    const manager = new FakeSyncManager();
+    manager.stopFailure = new Error("the sync engine fell over");
+    const app = await appFor(target, { syncManager: manager });
+    const archive = await realBackup(source, await scratchDir("syncthrew"));
+    const plan = await previewOf(app, archive);
+
+    const response = await applyRestoreRequest(app, {
+      planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
+    });
+    // A stop that threw is not a stop. "It could not be checked" is refused
+    // exactly like "it did not stop": the whole point is that the restore
+    // proceeds only on a POSITIVE answer.
+    expect(response.statusCode, response.body).toBe(503);
+    expect(response.json()).toMatchObject({ error: "restore_sync_running" });
+    expect(manager.events).toEqual(["stop", "start"]);
+    expect(await companyNames(target.url)).toEqual(["Something Else Ltd"]);
+    // The gate did not stay shut behind the refusal.
+    const after = await app.inject({
+      method: "POST", url: "/api/companies", headers: chris, payload: { name: "After" },
+    });
+    expect(after.statusCode).toBe(201);
+  }, 300_000);
+
+  /**
+   * THE CASE THIS TASK EXISTS FOR, AND IT ASSERTS THE PLACEMENT AS WELL AS THE
+   * REFUSAL.
+   *
+   * A sync that would not stop is a writer this restore cannot see, and
+   * services/write-gate.ts has the measurement that makes it fatal rather than
+   * unlucky: PostgreSQL QUEUES a write blocked by `DROP SCHEMA` and releases it
+   * at COMMIT, so an abandoned sync's INSERT is delivered INTO the restored
+   * data instead of losing a race with it.
+   *
+   * So the restore does not start -- and then the SAME preview is applied again
+   * against a sync that stops, and succeeds. That second half is the argument
+   * for refusing here rather than inside applyRestore: `intakeSessions.use`
+   * disposes of the staging in a `finally`, so a refusal one line lower would
+   * have cost the operator their whole upload for a condition that clears
+   * itself in about two minutes.
+   */
+  itRestore("refuses when the sync will not stop, and the preview survives the refusal",
+    async () => {
+      const source = await makeInstall("srcsyncwedged");
+      await seed(source, ["Northwind Traders"]);
+      const target = await makeInstall("dstsyncwedged");
+      await seed(target, ["Something Else Ltd"]);
+      const manager = new FakeSyncManager();
+      manager.outcome = { stopped: false, abandoned: 2 };
+      const app = await appFor(target, { syncManager: manager });
+      const archive = await realBackup(source, await scratchDir("syncwedged"));
+      const plan = await previewOf(app, archive);
+
+      const refused = await applyRestoreRequest(app, {
+        planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
+      });
+      expect(refused.statusCode, refused.body).toBe(503);
+      expect(refused.json()).toMatchObject({
+        error: "restore_sync_running", stillSyncing: 2,
+      });
+      // NOTHING WAS DESTROYED, and no safety backup was taken either: this
+      // refusal is above everything that writes.
+      expect(await companyNames(target.url)).toEqual(["Something Else Ltd"]);
+      expect(await readFile(target.mailKeyPath))
+        .not.toEqual(await readFile(source.mailKeyPath));
+      // THE UPLOAD IS STILL THERE. One staging directory, the same plan id.
+      expect(await intakeWorkDirs(target)).toHaveLength(1);
+
+      // AND PRESSING THE BUTTON AGAIN WORKS, which is the whole reason the
+      // refusal lives above the line rather than inside the engine.
+      manager.outcome = { stopped: true, abandoned: 0 };
+      const applied = await applyRestoreRequest(app, {
+        planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
+      });
+      expect(applied.statusCode, applied.body).toBe(200);
+      expect(await companyNames(target.url)).toEqual(["Northwind Traders"]);
+      expect(manager.events).toEqual(["stop", "start", "stop", "start"]);
+    }, 300_000);
 });
 
 // ---------------------------------------------------------------------------

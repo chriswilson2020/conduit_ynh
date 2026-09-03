@@ -4,9 +4,10 @@ import {
   ImapIdleUnsupportedError, ImapflowClient,
   buildImapOptions, buildSmtpOptions, continueWalk, createImapClientFactory,
   defaultTestConnectionDeps, imapVerify, nextWalk, normalizeMailError, readFetchedSource,
-  readFolderListing, requireSearchUids, smtpVerify,
+  readFolderListing, requireSearchUids, smtpVerify, SOCKET_TIMEOUT_MS,
   type ImapflowListEntry,
 } from "./mail-imapflow.js";
+import { RESTORE_STOP_TIMEOUT_MS } from "./mail-sync.js";
 
 /**
  * Construction, option mapping and error classification only. Everything this
@@ -57,6 +58,17 @@ describe("buildImapOptions", () => {
     // Under the 5-minute poll interval: a connection that died between
     // passes must be noticed by the next one, not outlive it.
     expect(options.socketTimeout).toBeLessThan(300_000);
+  });
+
+  // TWO CONSTANTS IN TWO MODULES THAT HAVE TO KEEP THEIR ORDER, pinned the way
+  // restore-nginx.test.ts pins its pair rather than left to a comment. A
+  // restore refuses to start over a mail sync it could not stop, and it waits
+  // RESTORE_STOP_TIMEOUT_MS for one -- so the day the socket timeout is raised
+  // past it is the day an ordinary wedged socket starts costing an operator
+  // their recovery, silently. A strict inequality here is what makes that a red
+  // test instead.
+  it("leaves a restore's own stop deadline longer than a wedged socket costs", () => {
+    expect(SOCKET_TIMEOUT_MS).toBeLessThan(RESTORE_STOP_TIMEOUT_MS);
   });
 
   it("silences imapflow's own logger", () => {
