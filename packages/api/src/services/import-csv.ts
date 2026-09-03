@@ -127,44 +127,36 @@ import type { IntakeFile, StagedMemberRef, StagedPayload } from "./intake.js";
 //    Creating a second one beside them is the outcome that cannot be undone
 //    without work; un-archiving is one click.
 //
-//    NORMALISATION IS `trim` AND `toLowerCase` AND NOTHING ELSE, and the reason
-//    is that the same rule has to run in TWO LANGUAGES. The candidate keys come
-//    from JavaScript and the stored ones are found with `lower(...)` in SQL; a
-//    cleverer rule (strip `https://`, strip a leading `www.`, fold a Gmail
-//    plus-address) would have to be written twice and would drift, and the half
-//    that drifted would silently merge two records or silently fail to. THE
-//    COST IS NAMED RATHER THAN HIDDEN: `www.acme.com` in the file and
-//    `acme.com` in Conduit are two companies. An operator can see that from the
-//    preview's counts and normalise their own column, which is a thing they can
-//    do and this code cannot do for them safely.
+//    NORMALISATION IS `trim` AND ONE CASE FOLD AND NOTHING ELSE. A cleverer
+//    rule (strip `https://`, strip a leading `www.`, fold a Gmail plus-address)
+//    would be a second rule to keep in step with the first, and the half that
+//    drifted would silently merge two records or silently fail to. THE COST IS
+//    NAMED RATHER THAN HIDDEN: `www.acme.com` in the file and `acme.com` in
+//    Conduit are two companies. An operator can see that from the preview's
+//    counts and normalise their own column, which is a thing they can do and
+//    this code cannot do for them safely.
 //
-//    AND `toLowerCase` IS NOT `lower()`, WHICH THE PARAGRAPH ABOVE IMPLIED AND
-//    A REVIEW MEASURED. The argument for a simple rule survives; the claim that
-//    THIS rule is the same rule in both languages does not. On the deploy
-//    target (PostgreSQL 15.19, en_GB.UTF-8):
+//    AND THE FOLD HAPPENS IN ONE LANGUAGE, WHICH IT DID NOT UNTIL v1.4.1. This
+//    paragraph used to say the rule was `trim` and `toLowerCase`, run in TWO
+//    languages -- JavaScript for the candidates, `lower(...)` in SQL for the
+//    stored rows -- and a review measured that those are not the same function.
+//    On the deploy target (PostgreSQL 15.19), `lower(chr(304))` is ONE
+//    character and `'\u0130'.toLowerCase()` is TWO. The failure was a MISSED
+//    duplicate, which is the outcome this whole section exists to prevent, and
+//    it was LIVE for companies: `domain` is free text with no format check at
+//    all, so a Turkish or Azerbaijani domain reached it. (Out of reach for
+//    contacts, whose key is an email that `contactEmailSchema` holds to ASCII
+//    -- but the fix is applied to both, because "that column happens to be
+//    ASCII" is not a property anything checks.)
 //
-//      SELECT lower(U&'\0130')  ->  'i'         ONE character
-//      '\u0130'.toLowerCase()   ->  'i\u0307'    TWO -- i, then a combining
-//                                                dot above
-//
-//    (U+0130 is the Turkish dotted capital I. Written as escapes because this
-//    file is ASCII, which is the project's rule and is also what stopped the
-//    two spellings above from looking identical in a terminal.)
-//
-//    So a key containing that character is normalised differently on the two
-//    sides, and the failure is a MISSED duplicate -- the outcome this whole
-//    section exists to prevent. It is also LOCALE-DEPENDENT on the SQL side and
-//    nothing here pins the database's locale.
-//
-//    IT IS OUT OF REACH FOR CONTACTS AND LIVE FOR COMPANIES. A contact's key is
-//    an email address and contactEmailSchema rejects non-ASCII outright, so no
-//    such key can be built. A company's key is `domain`, which is free text
-//    with no format check at all -- so this is reachable today with a Turkish
-//    or Azerbaijani domain, and it is recorded rather than fixed because the
-//    fix is a decision about collation that belongs with the person who owns
-//    the schema: either fold the key in ONE language (probe with a normalised
-//    literal rather than `lower(...)`) or state a collation the install must
-//    have. Both are wider than an importer.
+//    CHRIS'S DECISION, 2 Sep: FOLD THE KEY IN ONE LANGUAGE. The raw value goes
+//    to the database and `lower()` folds the candidate and the stored column in
+//    the same query, so the two sides cannot disagree; the folded key comes
+//    back and is what this module holds from then on. The alternative -- stating
+//    a collation the install must have -- was rejected because it makes
+//    correctness a property of the database with nothing checking it, failing
+//    silently in the direction of missed duplicates. See probeKeys, and see
+//    streamRows for why the IN-FILE repeat check had to move to the same fold.
 //
 //    AND THE GAP THAT CANNOT BE CLOSED HERE: the probe reads COMMITTED rows, so
 //    another session inserting the same address between the probe and the
@@ -210,7 +202,7 @@ import type { IntakeFile, StagedMemberRef, StagedPayload } from "./intake.js";
 // THE PEAK BARELY MOVED BETWEEN PLAN AND APPLY, and that 19MB is the number the
 // batching exists to produce: what apply holds over the plan is one batch of
 // rows and one statement's parameters, not one import. What is resident at all
-// is the set of keys the FILE has used -- one lowercased address per row --
+// is the set of keys the FILE has used -- one folded address per row --
 // which is the price of answering "is this a repeat of an earlier row?".
 //
 // THE MAPPING STEP IS INSTANT ON A 14MB FILE AND THAT IS THE POINT OF THE
@@ -226,6 +218,22 @@ import type { IntakeFile, StagedMemberRef, StagedPayload } from "./intake.js";
 // matching on something other than a key, and it is what the operator is
 // buying. The company-name resolution is NOT part of it: those queries are the
 // plan's, and apply reads the frozen answers.
+//
+// THOSE FOUR HUNDRED PROBES NOW HAVE AN INDEX TO USE, which is v1.4.1's
+// migration 0013 and Chris's decision 3 -- taken against the recommendation to
+// leave it, and recorded that way. Measured on a scratch database of 200,001
+// companies and 200,000 contacts, one batch of 500 candidate keys:
+//
+//   companies, with lower(domain) indexed .......   5.3ms   (was 76.5ms)
+//   contacts, with the folded emails indexed ....  12.3ms   (was 107.6ms)
+//
+// Four hundred batches is therefore about 2.1s against 30s of the 43.91s above.
+// WHAT IT COSTS THE REST OF THE INSTALL, so the trade is visible from here: two
+// more indexes to maintain on every company and contact write, 8MB and 18MB
+// respectively at 200,000 rows -- the GIN one is larger than the table it
+// indexes. Nothing on a request path was measured to be slower; nothing on a
+// request path was measured at all, which is the honest version of that
+// sentence.
 //
 // ==================== ONE IMPORT WRITES ONE KIND OF ROW ===================
 //
@@ -1250,7 +1258,15 @@ interface BuiltRow {
   readonly record: number;
   readonly company: CompanyValues | null;
   readonly contact: ContactValues | null;
-  /** The duplicate keys this row claims, lowercased. Empty when it has none. */
+  /**
+   * The duplicate keys this row claims, AS THE FILE SPELLS THEM. Empty when it
+   * has none.
+   *
+   * RAW RATHER THAN LOWERCASED SINCE v1.4.1, and the change is the whole of
+   * decision 2. Folding here would mean folding in JavaScript, and the stored
+   * side can only be folded in SQL -- see probeKeys for what the two folds
+   * disagree about and which duplicate went missing because of it.
+   */
   readonly keys: readonly string[];
   /** The lowercased company name this row asked to be linked to, or "". */
   readonly companyName: string;
@@ -1438,13 +1454,27 @@ async function streamRows(input: StreamRowsInput): Promise<void> {
   /**
    * Decide a batch against the database, then hand the survivors on.
    *
-   * ONE QUERY PER BATCH FOR THE KEYS, AND ONE FOR THE COMPANY NAMES. A row
-   * reaches here only once its in-file check has passed, so a key an earlier
-   * row of this file already claimed is never asked about.
+   * ONE QUERY PER BATCH FOR THE KEYS, AND ONE FOR THE COMPANY NAMES.
+   *
+   * THE IN-FILE CHECK HAPPENS HERE RATHER THAN AS EACH ROW IS READ, AND IT
+   * MOVED FOR THE REASON THE PROBE MOVED: the key a row claims is not known
+   * until it has been FOLDED, and the fold is SQL's -- see probeKeys. Doing it
+   * at read time meant folding in JavaScript, which is the defect. Nothing else
+   * about it changed: the rows are still walked in file order, the FIRST row
+   * with a given key still decides, and a repeat is still reported before the
+   * install is consulted.
+   *
+   * AND IT HAS TO BE THE SAME FOLD AS THE PROBE'S, WHICH IS WHY BOTH READ
+   * `answer.key`. If `seen` folded one way and the probe another, then at APPLY
+   * -- where rows written by an earlier batch ARE visible to the probe -- a row
+   * the plan counted as an insert could come back "already here", the counts
+   * would disagree, and intake-plan.ts would roll the whole import back and
+   * invite a retry that fails identically. That is not a hypothetical: two
+   * spellings of one Turkish domain, 500 rows apart, would have done it.
    */
   const settle = async (): Promise<void> => {
     if (pending.length === 0) return;
-    const present = await existingKeys(db, mapping.entity, [
+    const answers = await probeKeys(db, mapping.entity, [
       ...new Set(pending.flatMap((row) => row.keys)),
     ]);
     if (resolveLinks) {
@@ -1456,9 +1486,25 @@ async function streamRows(input: StreamRowsInput): Promise<void> {
       for (const name of ambiguous) ambiguousNames.add(name);
     }
     for (const row of pending) {
-      const hit = row.keys.find((key) => present.has(key));
+      // A key the probe did not answer for is a key nothing can be said about,
+      // and treating that as "not a duplicate" is the safe direction: the row
+      // is created, which is what a row with no key gets anyway.
+      const folded = row.keys.map((raw) => answers.get(raw)).filter((one) => one !== undefined);
+      const repeat = folded.find((one) => seen.has(one.key));
+      if (repeat !== undefined) {
+        input.onRepeat?.({ record: row.record, reason: describeKey(mapping.entity, repeat.key) });
+        continue;
+      }
+      // CLAIMED BEFORE THE INSTALL IS CONSULTED, which is where v1.4.0 claimed
+      // it too -- a key went into `seen` when its row was QUEUED, so a row that
+      // turned out to be already here still spoke for its key. Keep that: two
+      // file rows carrying one address are one thing to say about, and the
+      // second of them is a repeat of the first rather than a second copy of
+      // the same news about the install.
+      for (const one of folded) seen.add(one.key);
+      const hit = folded.find((one) => one.present);
       if (hit !== undefined) {
-        input.onHere?.({ record: row.record, reason: describeKey(mapping.entity, hit) });
+        input.onHere?.({ record: row.record, reason: describeKey(mapping.entity, hit.key) });
         continue;
       }
       if (row.companyName !== "") {
@@ -1486,12 +1532,8 @@ async function streamRows(input: StreamRowsInput): Promise<void> {
         input.onSkip?.({ record: record.record, reason: built.reason });
         continue;
       }
-      const repeat = built.row.keys.find((key) => seen.has(key));
-      if (repeat !== undefined) {
-        input.onRepeat?.({ record: record.record, reason: describeKey(mapping.entity, repeat) });
-        continue;
-      }
-      for (const key of built.row.keys) seen.add(key);
+      // NO IN-FILE CHECK HERE ANY MORE: it needs the folded key, and the fold
+      // is the batch's to ask for. See settle.
       pending.push(built.row);
       if (pending.length >= IMPORT_BATCH_ROWS) await settle();
     }
@@ -1600,7 +1642,8 @@ function buildRow(
           industry: optional("company.industry"),
         },
         contact: null,
-        keys: domain === null ? [] : [domain.toLowerCase()],
+        // RAW. The fold is the probe's, in SQL, once -- see probeKeys.
+        keys: domain === null ? [] : [domain],
         companyName: "",
         companyId: null,
         link: "none",
@@ -1652,7 +1695,10 @@ function buildRow(
         emails,
         phones,
       },
-      keys: emails.map((email) => email.toLowerCase()),
+      // RAW, for the reason the company key above is raw. The fold that
+      // decides whether two of these are the same address is SQL's, and it is
+      // applied to the stored ones by the same call in the same query.
+      keys: [...emails],
       // A company name that cannot be stored cannot match one that is stored,
       // so it asks for no link rather than for a link to nothing.
       companyName: unstorableText(companyName) ? "" : companyName.toLowerCase(),
@@ -1664,36 +1710,113 @@ function buildRow(
 
 // --- asking the database ---------------------------------------------------
 
+/** One candidate key, folded, and whether this install already holds it. */
+interface ProbeAnswer {
+  /** The key as the FOLD saw it -- what `seen` holds and what findings print. */
+  readonly key: string;
+  /** True when a row already in this install carries the same folded key. */
+  readonly present: boolean;
+}
+
 /**
- * Which of these keys this install already holds.
+ * FOLD THESE CANDIDATE KEYS AND SAY WHICH ONES THIS INSTALL ALREADY HOLDS.
  *
- * `lower(...)` IN SQL AND `toLowerCase()` IN JAVASCRIPT ARE THE WHOLE
- * NORMALISATION, on purpose -- see decision 2. Anything more would be one rule
- * written twice in two languages.
+ * ONE QUESTION, ONE ROUND TRIP, AND -- SINCE v1.4.1 -- ONE LANGUAGE.
+ *
+ * WHAT WAS WRONG, MEASURED RATHER THAN REASONED. The candidates were folded
+ * with JavaScript's `toLowerCase()` and the stored rows with SQL's `lower()`,
+ * and those are not the same function. On the deploy target (PostgreSQL 15.19,
+ * en_US.UTF-8 on `conduit_test`, en_GB.UTF-8 on the install):
+ *
+ *   lower(chr(304))          ->  'i'          ONE character
+ *   'İ'.toLowerCase()   ->  'i̇'    TWO -- i, then a combining dot
+ *
+ * (U+0130 is the Turkish dotted capital I, written as an escape because the two
+ * spellings are indistinguishable in a terminal.) So a stored company domain
+ * carrying that character folded to something the probe never asked about, and
+ * the answer was a MISSED DUPLICATE -- the one outcome this probe exists to
+ * prevent. Reachable today: `domain` is free text with no format check at all.
+ * Out of reach for contacts, whose key is an email and whose
+ * `contactEmailSchema` rejects non-ASCII outright -- but the fix is the same
+ * one and is applied to both, because "that column happens to be ASCII" is not
+ * a property anything here checks.
+ *
+ * SO THE FOLD HAPPENS EXACTLY ONCE, IN SQL, AND NOTHING IS EVER COMPARED
+ * ACROSS THE TWO LANGUAGES. The RAW value goes down; `lower()` is applied to
+ * the candidate and to the stored column by the same call to the same function
+ * in the same database; and the folded key comes back for the caller to hold.
+ * The alternative Chris rejected was to state a collation the install must
+ * have, which makes correctness a property of the database with nothing
+ * checking it, failing silently in the direction of missed duplicates.
+ *
+ * THE KEY THE CALLER HOLDS IS THE ONE THAT CAME BACK, and that is not a detail:
+ * `seen` (is this a repeat of an earlier row of this FILE?) and this probe (is
+ * it already in the install?) must fold identically, or plan and apply stop
+ * agreeing. See streamRows for what breaks when they do not.
+ *
+ * BOTH QUERIES ARE SHAPED SO A SEQ SCAN IS THE WORST CASE RATHER THAN THE
+ * PER-ROW ONE, and the shape was chosen by measurement rather than taste. On
+ * 200,001 rows, one batch of 500 candidates:
+ *
+ *   companies, this shape, with 0013's index ...........    5.3ms
+ *   companies, this shape, no index ....................   76.5ms
+ *   companies, EXISTS() per candidate, with the index ..    6.6ms
+ *   companies, EXISTS() per candidate, NO index ........ 25,694ms
+ *
+ * The obvious correlated `EXISTS (SELECT 1 ... WHERE lower(domain) = lower(raw))`
+ * is a hair faster with the index and three hundred times slower without one,
+ * because it asks the question 500 times instead of once. This shape asks once
+ * and lets the planner choose; migration 0013 is what makes that choice a good
+ * one.
  *
  * AN EMPTY LIST ASKS NOTHING AT ALL rather than sending a query whose answer is
  * already known, which matters here because a whole batch of rows with no key
  * is an ordinary shape: a contact sheet with no email column.
  */
-async function existingKeys(
-  db: Database, entity: CsvImportEntity, keys: readonly string[],
-): Promise<Set<string>> {
-  const found = new Set<string>();
-  if (keys.length === 0) return found;
-  const list = sql.join(keys.map((key) => sql`${key}`), sql`, `);
+async function probeKeys(
+  db: Database, entity: CsvImportEntity, raws: readonly string[],
+): Promise<Map<string, ProbeAnswer>> {
+  const answers = new Map<string, ProbeAnswer>();
+  if (raws.length === 0) return answers;
+  // `::text` ON EVERY LITERAL. A bare VALUES list of parameters has no type
+  // Postgres can infer, and `lower()` over an unknown is an error rather than a
+  // guess.
+  const list = sql.join(raws.map((raw) => sql`(${raw}::text)`), sql`, `);
+  const candidates = sql`
+    SELECT c.raw AS raw, lower(c.raw) AS key FROM (VALUES ${list}) AS c(raw)
+  `;
   const rows = entity === "company"
-    ? await db.execute<{ key: string }>(sql`
-        SELECT DISTINCT lower(${companies.domain}) AS key
-        FROM ${companies}
-        WHERE lower(${companies.domain}) IN (${list})
+    ? await db.execute<{ raw: string; key: string; present: boolean }>(sql`
+        WITH candidates AS (${candidates}),
+        hits AS (
+          SELECT DISTINCT lower(${companies.domain}) AS key
+          FROM ${companies}
+          WHERE lower(${companies.domain}) IN (SELECT key FROM candidates)
+        )
+        SELECT candidates.raw AS raw, candidates.key AS key,
+               hits.key IS NOT NULL AS present
+        FROM candidates LEFT JOIN hits ON hits.key = candidates.key
       `)
-    : await db.execute<{ key: string }>(sql`
-        SELECT DISTINCT lower(e) AS key
-        FROM ${contacts}, unnest(${contacts.emails}) AS e
-        WHERE lower(e) IN (${list})
+    // THE ARRAY IS MATCHED WHOLE, NOT UNNESTED, AND THAT IS WHAT THE GIN INDEX
+    // NEEDS. `FROM contacts, unnest(emails) AS e WHERE lower(e) IN (...)` --
+    // v1.4.0's shape -- cannot use any index at all, because the value being
+    // compared does not exist until the row has been read. `&&` against the
+    // same expression 0013 indexes is an index scan; the unnest below then only
+    // has to say WHICH of a matched row's addresses matched.
+    : await db.execute<{ raw: string; key: string; present: boolean }>(sql`
+        WITH candidates AS (${candidates}),
+        hits AS (
+          SELECT DISTINCT e AS key
+          FROM ${contacts}, unnest(conduit_lower_emails(${contacts.emails})) AS e
+          WHERE conduit_lower_emails(${contacts.emails})
+                && (SELECT array_agg(key) FROM candidates)
+        )
+        SELECT candidates.raw AS raw, candidates.key AS key,
+               hits.key IS NOT NULL AS present
+        FROM candidates LEFT JOIN hits ON hits.key = candidates.key
       `);
-  for (const row of rows) found.add(row.key);
-  return found;
+  for (const row of rows) answers.set(row.raw, { key: row.key, present: row.present });
+  return answers;
 }
 
 /**
@@ -1702,6 +1825,27 @@ async function existingKeys(
  * Fills `into` for every name exactly one company answers to, and RETURNS the
  * names more than one answers to -- two different sentences for the operator,
  * and only one of them is fixed by importing the companies first.
+ *
+ * THIS ONE STILL FOLDS IN TWO LANGUAGES, AND IT IS LEFT THAT WAY DELIBERATELY
+ * RATHER THAN OVERLOOKED. The names arriving here were folded by
+ * `toLowerCase()` in buildRow and the stored ones are folded by `lower()`
+ * below, which is exactly the disagreement probeKeys was rewritten to remove --
+ * so a company called "İstanbul Ltd" does not match a file row naming it.
+ *
+ * WHY IT IS NOT THE SAME DEFECT, WHICH IS THE WHOLE REASON IT COULD WAIT:
+ *
+ *   * ITS FAILURE IS A MISSED LINK, NOT A DUPLICATE ROW. The contact is still
+ *     created, with no company; the preview COUNTS that as
+ *     `companyMisses` and says so. Nothing is silently merged and nothing is
+ *     silently duplicated.
+ *   * IT CANNOT MAKE PLAN AND APPLY DISAGREE. `companyByName` is filled at plan
+ *     time and FROZEN into the effect; apply reads the frozen answers and asks
+ *     nothing. Both phases therefore see the same folds, whatever they are.
+ *
+ * Fixing it means keying `companyByName` by the RAW spelling (apply cannot fold
+ * a name -- it has no database round trip to fold it with), which is a change to
+ * what the effect freezes. Recorded here rather than done, because v1.4.1's
+ * decision 2 is about the duplicate probe and this is a different value.
  */
 async function resolveCompanies(
   db: Database, names: readonly string[], into: Map<string, string>,

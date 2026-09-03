@@ -622,10 +622,60 @@ describe("duplicate detection", () => {
       .toMatch(/2 of the rows being created have no email address/);
   });
 
+  // ONE FOLD, IN ONE LANGUAGE -- decision 2, and the case that was a live
+  // missed duplicate until v1.4.1.
+  //
+  // U+0130 is the Turkish dotted capital I, and it is where PostgreSQL's
+  // `lower()` and JavaScript's `toLowerCase()` stop agreeing: PostgreSQL
+  // answers ONE character (an `i`) and JavaScript answers TWO (an `i` and a
+  // combining dot above). v1.4.0 folded the file's key in JavaScript and the
+  // stored one in SQL, so it asked about a key no row could carry and CREATED A
+  // SECOND COPY of a company it already had -- the one outcome the probe exists
+  // to prevent, and reachable because `domain` is free text with no format
+  // check at all.
+  //
+  // WRITTEN AS AN ESCAPE, deliberately: the two spellings are indistinguishable
+  // in a terminal, which is how a reader of this file would lose the point of
+  // it, and this project's sources are ASCII.
+  itPy("finds a duplicate whose key JavaScript and SQL fold differently", async () => {
+    const domain = "\u0130stanbul.example";
+    await createCompany(db, actorId, { name: "Istanbul Ltd", domain });
+    const bytes = await foreign([
+      ["Company Name", "Domain"], ["Istanbul Limited", domain], ["Nile", "nile.example"],
+    ]);
+    const { plan } = await planFor(bytes, map([0, "company.name"], [1, "company.domain"]));
+    expect(plan.effects[0]?.count).toBe(1);
+    // AND THE KEY IT NAMES IS THE FOLD THAT DECIDED, rather than the file's own
+    // spelling: one character, because that is what the database made of it.
+    expect(findings(plan, CSV_IMPORT_FINDINGS.duplicateHere)[0])
+      .toMatch(/row 2 is already in this install \(the domain istanbul.example\)/);
+  });
+
+  // THE SAME DISAGREEMENT ON THE IN-FILE HALF, and it is the half that would
+  // have broken an import outright rather than quietly duplicating a row.
+  // `seen` folded in JavaScript and the probe folded in SQL, so at APPLY --
+  // where rows an earlier batch wrote ARE visible to the probe -- these two rows
+  // would have been counted as two inserts by the plan and settled as one
+  // insert and one "already here"; the counts would have disagreed, and
+  // intake-plan.ts would have rolled the whole import back and invited a retry
+  // that failed the same way. Both folds are now one fold, so they cannot
+  // drift.
+  itPy("treats two spellings of one such key as one row of the file", async () => {
+    const bytes = await foreign([
+      ["Company Name", "Domain"],
+      ["Istanbul Limited", "\u0130stanbul.example"],
+      ["Istanbul Ltd", "istanbul.example"],
+    ]);
+    const { plan } = await planFor(bytes, map([0, "company.name"], [1, "company.domain"]));
+    expect(plan.effects[0]?.count).toBe(1);
+    expect(findings(plan, CSV_IMPORT_FINDINGS.duplicateInFile)[0])
+      .toMatch(/row 3 repeats an earlier row of this file \(the domain istanbul.example\)/);
+  });
+
   itPy("does not normalise beyond case, and the preview shows what that costs", async () => {
     // THE COST OF DECISION 2, ASSERTED RATHER THAN ONLY WRITTEN DOWN.
     // `www.acme.com` and `acme.com` are two companies here, because a cleverer
-    // rule would have to be written twice -- once in SQL and once here.
+    // rule would be a second rule to keep in step with the first.
     await createCompany(db, actorId, { name: "Acme", domain: "acme.example" });
     const bytes = await foreign([["Company Name", "Domain"], ["Acme", "www.acme.example"]]);
     const { plan } = await planFor(bytes, map([0, "company.name"], [1, "company.domain"]));
