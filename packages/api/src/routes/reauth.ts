@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
-import type { User } from "@conduit/shared";
+import { reauthScopeSchema } from "@conduit/shared";
+import type { ReauthScope, User } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
 import { requireUser, parseOrReject } from "./helpers.js";
 import { REAUTH_TICKET_TTL_MS } from "../services/reauth.js";
@@ -37,6 +38,19 @@ const reauthRequestSchema = z.object({
     // about passwords: it stops a caller writing a megabyte into a BER octet
     // string, and no password YunoHost will set comes anywhere near it.
     .max(1024, "that is not a password"),
+  // WHAT THE TICKET WILL BE PROOF FOR, and it is REQUIRED. The caller chooses
+  // it, which is not the weakness it looks like: minting anything at all costs
+  // a password check, so a caller who can choose a scope could have minted
+  // that scope anyway. What the field buys is that the ticket the PAGE minted
+  // for a download cannot be spent on a restore by anybody who takes it off
+  // that page -- the proof is for the operation the operator was answering
+  // for, and for nothing else.
+  //
+  // NO DEFAULT, deliberately: a default would open one of the four gates for
+  // every caller who never named it. An absent or unknown scope is a 400, and
+  // a client that has not been taught to ask for one gets no ticket rather
+  // than a ticket for something it did not mean.
+  scope: reauthScopeSchema,
 });
 
 /**
@@ -142,7 +156,7 @@ export function registerReauthRoutes(
 
     reauthThrottle.succeed(user.username);
     return {
-      ticket: reauthTickets.issue(user.username),
+      ticket: reauthTickets.issue(user.username, body.scope),
       expiresInSeconds: Math.floor(REAUTH_TICKET_TTL_MS / 1000),
     };
   });
@@ -169,14 +183,23 @@ export function registerReauthRoutes(
  * simply ASKED before calling the endpoint would stop nobody -- the endpoint
  * is one fetch away, and an attacker holding the session is not going to use
  * the page. Proving that is the point of the bypass tests: a request with no
- * ticket, an invented one, an expired one, a spent one, or one belonging to
- * another account all get 401 and no bytes.
+ * ticket, an invented one, an expired one, a spent one, one belonging to
+ * another account, or one minted for another operation all get 401 and no
+ * bytes.
+ *
+ * EACH ROUTE NAMES THE OPERATION IT IS, AND THAT IS THE v1.4.1 FIX. The scope
+ * is a required argument rather than something read off the request, because
+ * the thing being asserted is what THIS route is -- a value taken from the
+ * caller would be the caller telling the gate what to compare against, which
+ * compares nothing. A route added later cannot forget it: there is no default
+ * and the compiler asks.
  */
 export function requireReauth(
   request: FastifyRequest,
   reply: FastifyReply,
   user: User,
   deps: Pick<CrmRouteDeps, "reauthTickets">,
+  scope: ReauthScope,
 ): boolean {
   const header = request.headers[REAUTH_HEADER];
   // WHAT A REPEATED HEADER ACTUALLY DOES HERE, corrected after a review found
@@ -193,7 +216,7 @@ export function requireReauth(
   // absent header becomes "", which redeem refuses like any other miss -- so
   // there is no separate empty-string check to get wrong.
   const ticket = typeof header === "string" ? header : "";
-  if (!deps.reauthTickets.redeem(ticket, user.username)) {
+  if (!deps.reauthTickets.redeem(ticket, user.username, scope)) {
     void reply.code(401).send({
       error: "reauth_required",
       message: "confirm your password to continue; this operation reaches the whole database",

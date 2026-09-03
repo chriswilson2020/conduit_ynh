@@ -299,7 +299,7 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
   app.post("/api/restore/inspect", async (request, reply) => {
     const user = requireUser(request, reply);
     if (user === null) return;
-    if (!requireReauth(request, reply, user, deps)) return;
+    if (!requireReauth(request, reply, user, deps, "restore-preview")) return;
 
     // BEFORE THE UPLOAD, so an operator whose previous preview is still open is
     // told to finish or cancel it rather than after spending ten minutes
@@ -465,6 +465,12 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
    * to say why; that is the conservative side of a decision that only goes one
    * way.
    *
+   * AND SINCE v1.4.1 THE SECOND PROOF IS A DIFFERENT KIND OF PROOF, not just a
+   * second one. `restore-apply` is its own scope, so a preview's ticket cannot
+   * be spent here even before single-use gets a chance to refuse it -- which
+   * matters because single-use is a property of what the operator's page does
+   * with a ticket, and the scope is a property of what the ticket IS.
+   *
    * THE ORDER OF THE GUARDS IS THE DESIGN. Everything that can refuse without
    * consuming anything runs first -- the session is looked up but NOT taken, so
    * a mistyped name or passphrase leaves the operator with their upload and a
@@ -474,7 +480,7 @@ export function registerRestoreRoutes(app: FastifyInstance, deps: CrmRouteDeps):
   app.post("/api/restore/apply", async (request, reply) => {
     const user = requireUser(request, reply);
     if (user === null) return;
-    if (!requireReauth(request, reply, user, deps)) return;
+    if (!requireReauth(request, reply, user, deps, "restore-apply")) return;
 
     const body = parseOrReject(applyRequestSchema, request.body, reply);
     if (body === undefined) return;

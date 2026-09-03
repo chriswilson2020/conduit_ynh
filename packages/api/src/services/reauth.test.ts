@@ -10,57 +10,144 @@ import type { FakeDirectory, FakeDirectoryOptions } from "../test/ldap-directory
 describe("ReauthTickets", () => {
   it("issues a ticket that redeems once, for the account it was issued to", () => {
     const tickets = new ReauthTickets();
-    const token = tickets.issue("chris");
-    expect(tickets.redeem(token, "chris")).toBe(true);
+    const token = tickets.issue("chris", "export");
+    expect(tickets.redeem(token, "chris", "export")).toBe(true);
     // SINGLE USE. The second attempt is the whole property: a ticket that
     // survived its use would be a bearer token for every download until it
     // expired.
-    expect(tickets.redeem(token, "chris")).toBe(false);
+    expect(tickets.redeem(token, "chris", "export")).toBe(false);
   });
 
   it("refuses a ticket presented for another account, and spends it anyway", () => {
     const tickets = new ReauthTickets();
-    const token = tickets.issue("chris");
-    expect(tickets.redeem(token, "sam")).toBe(false);
+    const token = tickets.issue("chris", "export");
+    expect(tickets.redeem(token, "sam", "export")).toBe(false);
     // A ticket that has been offered to the wrong account is burnt, not left
     // live for the right one -- see redeem's doc comment.
-    expect(tickets.redeem(token, "chris")).toBe(false);
+    expect(tickets.redeem(token, "chris", "export")).toBe(false);
+  });
+
+  /**
+   * THE DEFECT v1.4.1 EXISTS TO CLOSE, AT THE SMALLEST SCALE IT HAS.
+   *
+   * Before this release a ticket was bound to an ACCOUNT and not to an
+   * operation, so the line below returned true: a proof minted to download a
+   * backup opened the route that DESTROYS THE DATABASE, for five minutes.
+   * routes/reauth.test.ts runs the same property over all four gates through
+   * real requests; this is the one line of it.
+   */
+  it("refuses a ticket minted for another operation, and spends that too", () => {
+    const tickets = new ReauthTickets();
+    const token = tickets.issue("chris", "backup");
+    expect(tickets.redeem(token, "chris", "restore-apply")).toBe(false);
+    expect(tickets.redeem(token, "chris", "backup")).toBe(false);
+  });
+
+  it("tells the restore's two halves apart, which is the pair that is easiest to call one", () => {
+    // A preview uploads and decrypts; an apply destroys. They are one section
+    // on the page and one word in conversation, and a scope that folded them
+    // together would leave the most dangerous route in the product reachable
+    // with the proof taken for the safest half of it.
+    const tickets = new ReauthTickets();
+    const preview = tickets.issue("chris", "restore-preview");
+    expect(tickets.redeem(preview, "chris", "restore-apply")).toBe(false);
+    const apply = tickets.issue("chris", "restore-apply");
+    expect(tickets.redeem(apply, "chris", "restore-preview")).toBe(false);
   });
 
   it("refuses an invented ticket", () => {
     const tickets = new ReauthTickets();
-    tickets.issue("chris");
-    expect(tickets.redeem("f".repeat(64), "chris")).toBe(false);
-    expect(tickets.redeem("", "chris")).toBe(false);
+    tickets.issue("chris", "export");
+    expect(tickets.redeem("f".repeat(64), "chris", "export")).toBe(false);
+    expect(tickets.redeem("", "chris", "export")).toBe(false);
   });
 
   it("refuses a ticket after its lifetime, and keeps it before", () => {
     const tickets = new ReauthTickets();
     const issuedAt = 1_000_000;
-    const token = tickets.issue("chris", issuedAt);
+    const token = tickets.issue("chris", "export", issuedAt);
     // One millisecond short of the deadline: still good.
-    expect(tickets.redeem(token, "chris", issuedAt + REAUTH_TICKET_TTL_MS - 1)).toBe(true);
+    expect(tickets.redeem(token, "chris", "export", issuedAt + REAUTH_TICKET_TTL_MS - 1)).toBe(true);
 
-    const other = tickets.issue("chris", issuedAt);
-    expect(tickets.redeem(other, "chris", issuedAt + REAUTH_TICKET_TTL_MS)).toBe(false);
+    const other = tickets.issue("chris", "export", issuedAt);
+    expect(tickets.redeem(other, "chris", "export", issuedAt + REAUTH_TICKET_TTL_MS)).toBe(false);
   });
 
   it("does not grow without bound when tickets are minted in a loop", () => {
     const tickets = new ReauthTickets();
-    const first = tickets.issue("chris");
-    for (let i = 0; i < 200; i += 1) tickets.issue("chris");
+    const first = tickets.issue("chris", "export");
+    for (let i = 0; i < 200; i += 1) tickets.issue("chris", "export");
     // The bound is 64; what matters is that it is BOUNDED, and that the oldest
     // went rather than the newest -- dropping the newest would let a flood lock
     // out the person actually waiting on one.
     expect(tickets.size()).toBeLessThanOrEqual(64);
-    expect(tickets.redeem(first, "chris")).toBe(false);
+    expect(tickets.redeem(first, "chris", "export")).toBe(false);
+  });
+
+  /**
+   * THE SECOND 7.6 ITEM THIS RELEASE CLOSES, AND IT IS ON THE RECOVERY PATH.
+   *
+   * The bound used to be global and evicted the OLDEST outstanding ticket
+   * whoever it belonged to, so a second account minting in a loop could
+   * silently take the operator's fresh ticket out of the map while they were
+   * reading a destruction list -- and what they would then see is a 401 asking
+   * them to type their password again, at the worst possible moment, with
+   * nothing anywhere saying why.
+   *
+   * Sixty-five mints by an attacker, against one by the operator.
+   */
+  it("does not let one account's flood evict another account's ticket", () => {
+    const tickets = new ReauthTickets();
+    const operator = tickets.issue("chris", "restore-apply");
+    for (let i = 0; i < 65; i += 1) tickets.issue("mallory", "export");
+    expect(tickets.redeem(operator, "chris", "restore-apply")).toBe(true);
+  });
+
+  it("bounds one account's own tickets by dropping ITS oldest", () => {
+    // The per-account cap is what the flood above actually meets. The account
+    // doing the minting loses its own oldest ticket, which is the same rule
+    // the global bound always had, applied where it belongs.
+    const tickets = new ReauthTickets();
+    const first = tickets.issue("mallory", "export");
+    for (let i = 0; i < 20; i += 1) tickets.issue("mallory", "export");
+    expect(tickets.redeem(first, "mallory", "export")).toBe(false);
+    expect(tickets.size()).toBeLessThanOrEqual(64);
+  });
+
+  it("evicts the account holding the MOST when the map itself is full", () => {
+    // THE PRESSURE CASE, and the one a per-account cap alone does not answer.
+    // Eight accounts at their cap fill the global ceiling exactly, so the next
+    // mint has to take something from somebody -- and the operator's single,
+    // OLDEST ticket is what a bound that evicted by age would take.
+    //
+    // Every one of these mints costs a password check the attacker has to
+    // pass, so this is eight compromised accounts rather than a loop.
+    const tickets = new ReauthTickets();
+    const operator = tickets.issue("chris", "restore-apply");
+    for (let account = 0; account < 8; account += 1) {
+      for (let i = 0; i < 8; i += 1) tickets.issue(`flood${String(account)}`, "export");
+    }
+    expect(tickets.size()).toBeLessThanOrEqual(64);
+    expect(tickets.redeem(operator, "chris", "restore-apply")).toBe(true);
+  });
+
+  it("still bounds the map when far more accounts mint than it can hold", () => {
+    // The global ceiling is a memory bound rather than a policy, and it has to
+    // hold even where the fairness above cannot: forty accounts sharing
+    // sixty-four slots means somebody's one ticket goes, and no eviction rule
+    // can say otherwise. What must not happen is the map growing.
+    const tickets = new ReauthTickets();
+    for (let account = 0; account < 40; account += 1) {
+      for (let i = 0; i < 10; i += 1) tickets.issue(`user${String(account)}`, "export");
+    }
+    expect(tickets.size()).toBeLessThanOrEqual(64);
   });
 
   it("forgets expired tickets rather than counting them for ever", () => {
     const tickets = new ReauthTickets();
     const at = 5_000;
-    tickets.issue("chris", at);
-    tickets.issue("chris", at);
+    tickets.issue("chris", "export", at);
+    tickets.issue("chris", "export", at);
     expect(tickets.size(at)).toBe(2);
     expect(tickets.size(at + REAUTH_TICKET_TTL_MS)).toBe(0);
   });

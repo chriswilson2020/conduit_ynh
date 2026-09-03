@@ -116,7 +116,7 @@ function post(
   if (headers !== undefined) {
     return a.inject({ method: "POST", url: "/api/backup", headers, payload: { passphrase } });
   }
-  return reauthedHeaders(a, authHeaders).then((fresh) =>
+  return reauthedHeaders(a, authHeaders, "backup").then((fresh) =>
     a.inject({ method: "POST", url: "/api/backup", headers: fresh, payload: { passphrase } }));
 }
 
@@ -148,7 +148,7 @@ describe("POST /api/backup", () => {
       // would stop asserting anything about validation at all.
       const response = await a.inject({
         method: "POST", url: "/api/backup",
-        headers: await reauthedHeaders(a, authHeaders), payload,
+        headers: await reauthedHeaders(a, authHeaders, "backup"), payload,
       });
       expect(response.statusCode, JSON.stringify(payload)).toBe(400);
       expect(response.json()).toMatchObject({ error: "validation" });
@@ -232,8 +232,8 @@ describe("POST /api/backup", () => {
     // read, so awaiting the first would release its slot before the second ran.
     // Both tickets minted up front, so neither request waits on a round trip
     // the other could finish inside.
-    const firstHeaders = await reauthedHeaders(a, authHeaders);
-    const secondHeaders = await reauthedHeaders(a, authHeaders);
+    const firstHeaders = await reauthedHeaders(a, authHeaders, "backup");
+    const secondHeaders = await reauthedHeaders(a, authHeaders, "backup");
     const [one, two] = await Promise.all([
       post(a, PASSPHRASE, firstHeaders), post(a, PASSPHRASE, secondHeaders),
     ]);
@@ -290,7 +290,7 @@ describe("POST /api/backup", () => {
     });
     const response = await a.inject({
       method: "POST", url: "/api/backup",
-      headers: await reauthedHeaders(a, authHeaders), payload: { passphrase: marker },
+      headers: await reauthedHeaders(a, authHeaders, "backup"), payload: { passphrase: marker },
     });
     expect(response.statusCode).toBe(200);
     // The instrument, shown working: the logger really did capture this

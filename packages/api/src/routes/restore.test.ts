@@ -9,7 +9,7 @@ import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
 import { sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
-import type { PlanView } from "@conduit/shared";
+import type { PlanView, ReauthScope } from "@conduit/shared";
 import { buildApp } from "../app.js";
 import { createDatabase, runMigrations, type DatabaseHandle } from "../db/client.js";
 import { openTestDatabase } from "../test/db.js";
@@ -351,10 +351,21 @@ function upload(options: {
   };
 }
 
-/** Mint one ticket through the real endpoint, for the identity in `headers`. */
-async function ticket(app: FastifyInstance, headers: Record<string, string>): Promise<string> {
+/**
+ * Mint one ticket through the real endpoint, for the identity in `headers` and
+ * for one operation.
+ *
+ * THE SCOPE IS NAMED AT EVERY CALL AND HAS NO DEFAULT. A ticket is proof for
+ * one operation since v1.4.1, and the two restore routes are the pair that
+ * defect was sharpest between -- so a helper that guessed would be the one
+ * place in this file able to hide it.
+ */
+async function ticket(
+  app: FastifyInstance, headers: Record<string, string>, scope: ReauthScope,
+): Promise<string> {
   const response = await app.inject({
-    method: "POST", url: "/api/reauth", headers, payload: { password: TEST_REAUTH_PASSWORD },
+    method: "POST", url: "/api/reauth", headers,
+    payload: { password: TEST_REAUTH_PASSWORD, scope },
   });
   if (response.statusCode !== 200) {
     throw new Error(`could not mint a ticket: ${String(response.statusCode)} ${response.body}`);
@@ -364,9 +375,9 @@ async function ticket(app: FastifyInstance, headers: Record<string, string>): Pr
 
 /** `headers` plus a freshly minted, single-use ticket. One call, one request. */
 async function reauthed(
-  app: FastifyInstance, headers: Record<string, string>,
+  app: FastifyInstance, headers: Record<string, string>, scope: ReauthScope,
 ): Promise<Record<string, string>> {
-  return { ...headers, "x-conduit-reauth": await ticket(app, headers) };
+  return { ...headers, "x-conduit-reauth": await ticket(app, headers, scope) };
 }
 
 /** Upload an archive and get the preview back. */
@@ -374,7 +385,7 @@ async function inspect(
   app: FastifyInstance, archivePath: string,
   options: { headers?: Record<string, string>; passphrase?: string } = {},
 ): Promise<{ statusCode: number; body: string; json: () => unknown }> {
-  const headers = options.headers ?? await reauthed(app, chris);
+  const headers = options.headers ?? await reauthed(app, chris, "restore-preview");
   const form = upload({
     content: await readFile(archivePath), passphrase: options.passphrase ?? PASSPHRASE,
   });
@@ -398,7 +409,7 @@ async function applyRestoreRequest(
   body: Record<string, unknown>,
   options: { headers?: Record<string, string> } = {},
 ) {
-  const headers = options.headers ?? await reauthed(app, chris);
+  const headers = options.headers ?? await reauthed(app, chris, "restore-apply");
   return await app.inject({ method: "POST", url: "/api/restore/apply", headers, payload: body });
 }
 
@@ -508,8 +519,8 @@ describe("re-authentication gates both restore routes", () => {
 
   /** Every bypass attempt is run against both routes. */
   const routes = [
-    { what: "inspect", url: "/api/restore/inspect" },
-    { what: "apply", url: "/api/restore/apply" },
+    { what: "inspect", url: "/api/restore/inspect", scope: "restore-preview" },
+    { what: "apply", url: "/api/restore/apply", scope: "restore-apply" },
   ] as const;
 
   async function attempt(
@@ -523,7 +534,7 @@ describe("re-authentication gates both restore routes", () => {
       : await app.inject({ method: "POST", url: `${url}${query}`, headers, payload: applyBody });
   }
 
-  describe.each(routes)("bypassing the gate on $what", ({ url }) => {
+  describe.each(routes)("bypassing the gate on $what", ({ url, scope }) => {
     it("fails with no ticket at all", async () => {
       const response = await attempt(url, chris);
       expect(response.statusCode).toBe(401);
@@ -542,7 +553,7 @@ describe("re-authentication gates both restore routes", () => {
     });
 
     it("fails on a ticket that has already been spent", async () => {
-      const spent = await ticket(app, chris);
+      const spent = await ticket(app, chris, scope);
       const first = await attempt(url, { ...chris, "x-conduit-reauth": spent });
       // The first got PAST the gate -- it fails for its own reasons (the body
       // is not an archive, the plan id is unknown) and that is the point: if it
@@ -555,7 +566,7 @@ describe("re-authentication gates both restore routes", () => {
     });
 
     it("fails on another account's ticket", async () => {
-      const theirs = await ticket(app, sam);
+      const theirs = await ticket(app, sam, scope);
       const response = await attempt(url, { ...chris, "x-conduit-reauth": theirs });
       expect(response.statusCode).toBe(401);
       expect(response.json()).toMatchObject({ error: "reauth_required" });
@@ -565,15 +576,15 @@ describe("re-authentication gates both restore routes", () => {
       // The SAME class the app uses, constructed with a lifetime of nothing,
       // rather than a stub that says no.
       const expired = new ReauthTickets(0);
-      const token = expired.issue("chris");
-      expect(expired.redeem(token, "chris")).toBe(false);
+      const token = expired.issue("chris", scope);
+      expect(expired.redeem(token, "chris", scope)).toBe(false);
       const response = await attempt(url, { ...chris, "x-conduit-reauth": token });
       expect(response.statusCode).toBe(401);
     });
 
     it("fails when a junk value rides alongside a real ticket, in either order", async () => {
       for (const order of ["junk-first", "ticket-first"] as const) {
-        const real = await ticket(app, chris);
+        const real = await ticket(app, chris, scope);
         const value = order === "junk-first" ? `junk, ${real}` : `${real}, junk`;
         const response = await attempt(url, { ...chris, "x-conduit-reauth": value });
         expect(response.statusCode, order).toBe(401);
@@ -590,7 +601,7 @@ describe("re-authentication gates both restore routes", () => {
     // string to its access log verbatim and the browser keeps it in history,
     // which is the whole reason v1.3.0 made the backup a POST.
     it("fails when the ticket is put in the query string", async () => {
-      const real = await ticket(app, chris);
+      const real = await ticket(app, chris, scope);
       const response = await attempt(
         url, chris, `?x-conduit-reauth=${real}&ticket=${real}&reauth=${real}`,
       );
@@ -599,7 +610,7 @@ describe("re-authentication gates both restore routes", () => {
     });
 
     it("fails when the ticket is put in a cookie", async () => {
-      const real = await ticket(app, chris);
+      const real = await ticket(app, chris, scope);
       const response = await attempt(url, {
         ...chris, cookie: `x-conduit-reauth=${real}; other=1`,
       });
@@ -613,7 +624,7 @@ describe("re-authentication gates both restore routes", () => {
     // because the failure would be a gate that refuses the operator who did
     // everything right -- and because the only way to find out is to look.
     it("accepts the ticket whatever case the header name is written in", async () => {
-      const real = await ticket(app, chris);
+      const real = await ticket(app, chris, scope);
       const response = await attempt(url, { ...chris, "X-CONDUIT-REAUTH": real });
       expect(response.body).not.toContain("reauth_required");
     });
@@ -719,7 +730,7 @@ describe("POST /api/restore/inspect", () => {
     const form = upload({ content: Buffer.from("hello, not a 7z"), passphrase: PASSPHRASE });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(app, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(app, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     expect(response.statusCode).toBe(400);
     expect(await intakeWorkDirs(target)).toEqual([]);
@@ -729,7 +740,7 @@ describe("POST /api/restore/inspect", () => {
     const form = upload({ content: Buffer.from("anything") });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(app, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(app, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     expect(response.statusCode).toBe(400);
     expect((response.json() as { message: string }).message).toContain("passphrase is required");
@@ -751,7 +762,7 @@ describe("POST /api/restore/inspect", () => {
     });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(app, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(app, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     // Past the passphrase rule and refused by the archive, which is the only
     // way to see that the field was read at all.
@@ -765,7 +776,7 @@ describe("POST /api/restore/inspect", () => {
     });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(app, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(app, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     expect(response.statusCode).toBe(400);
     expect((response.json() as { message: string }).message).toContain('named "file"');
@@ -774,7 +785,7 @@ describe("POST /api/restore/inspect", () => {
   itArchive("refuses a request that is not multipart at all", async () => {
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: await reauthed(app, chris), payload: { passphrase: PASSPHRASE },
+      headers: await reauthed(app, chris, "restore-preview"), payload: { passphrase: PASSPHRASE },
     });
     expect(response.statusCode).toBe(400);
   });
@@ -792,7 +803,7 @@ describe("POST /api/restore/inspect", () => {
     const form = upload({ content: Buffer.alloc(16 * 1024, 7), passphrase: PASSPHRASE });
     const response = await small.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(small, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(small, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     expect(response.statusCode).toBe(413);
     expect((response.json() as { error: string }).error).toBe("too_large");
@@ -953,7 +964,7 @@ describe("POST /api/restore/apply -- the guards in front of the destruction", ()
   itRestore("will not let another account apply chris's plan, or cancel it", async () => {
     const response = await applyRestoreRequest(app, {
       planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
-    }, { headers: await reauthed(app, sam) });
+    }, { headers: await reauthed(app, sam, "restore-apply") });
     expect(response.statusCode).toBe(404);
     expect((response.json() as { error: string }).error).toBe("restore_plan_unknown");
 
@@ -1092,12 +1103,12 @@ describe("refusing new writes for the duration of a restore", () => {
     const plan = await previewOf(app, archive);
     // Minted BEFORE the verifier is armed, because apply redeems a ticket
     // rather than checking a password.
-    const applyHeaders = await reauthed(app, chris);
+    const applyHeaders = await reauthed(app, chris, "restore-apply");
 
     armed = true;
     const blockedWrite = app.inject({
       method: "POST", url: "/api/reauth", headers: chris,
-      payload: { password: TEST_REAUTH_PASSWORD },
+      payload: { password: TEST_REAUTH_PASSWORD, scope: "export" },
     });
     await hasEntered;
 
@@ -1177,7 +1188,7 @@ describe("refusing new writes for the duration of a restore", () => {
     const archive = await realBackup(source, await scratchDir("archive"));
     const expectedUsers = await userCount(source.url);
     const plan = await previewOf(app, archive);
-    const headers = await reauthed(app, chris);
+    const headers = await reauthed(app, chris, "restore-apply");
 
     const applying = app.inject({
       method: "POST", url: "/api/restore/apply", headers,
@@ -1233,12 +1244,12 @@ describe("refusing new writes for the duration of a restore", () => {
     const app = await appFor(target, { verifier, restoreDrainTimeoutMs: 2_000 });
     const archive = await realBackup(source, await scratchDir("archive"));
     const plan = await previewOf(app, archive);
-    const applyHeaders = await reauthed(app, chris);
+    const applyHeaders = await reauthed(app, chris, "restore-apply");
 
     armed = true;
     const blockedWrite = app.inject({
       method: "POST", url: "/api/reauth", headers: chris,
-      payload: { password: TEST_REAUTH_PASSWORD },
+      payload: { password: TEST_REAUTH_PASSWORD, scope: "export" },
     });
     await hasEntered;
     const applying = app.inject({
@@ -1290,7 +1301,7 @@ describe("a restore that runs", () => {
     const app = await appFor(target);
     const archive = await realBackup(source, await scratchDir("archive"));
     const plan = await previewOf(app, archive);
-    const headers = await reauthed(app, chris);
+    const headers = await reauthed(app, chris, "restore-apply");
 
     const applying = app.inject({
       method: "POST", url: "/api/restore/apply", headers,
@@ -1432,7 +1443,7 @@ describe("descriptors and the staged archive", () => {
     // ABORT: the client goes away in the middle of the upload. Five times,
     // because one leaked descriptor is easy to miss and five is not.
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      const headers = await reauthed(app, chris);
+      const headers = await reauthed(app, chris, "restore-preview");
       const prologue = upload({ content: Buffer.alloc(0), passphrase: PASSPHRASE }).payload;
       const source$ = new Readable({
         read() {
@@ -1501,7 +1512,7 @@ describe("descriptors and the staged archive", () => {
     const app = await appFor(target, { restoreDrainTimeoutMs: 300 });
     const archive = await realBackup(source, await scratchDir("archive"));
 
-    const headers = await reauthed(app, chris);
+    const headers = await reauthed(app, chris, "restore-preview");
     const prologue = upload({ content: Buffer.alloc(0), passphrase: PASSPHRASE }).payload;
     const aborted = new Readable({
       read() {

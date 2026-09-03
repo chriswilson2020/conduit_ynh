@@ -95,7 +95,7 @@ afterAll(async () => { await handle.close(); });
 /** The bytes GET /api/export answers with, through the real re-auth gate. */
 async function exportArchive(): Promise<Buffer> {
   const app = await buildApp({ config, db, dataDir, reauthVerifier: testReauthVerifier() });
-  const headers = await reauthedHeaders(app, authHeaders);
+  const headers = await reauthedHeaders(app, authHeaders, "export");
   const response = await app.inject({ method: "GET", url: "/api/export", headers });
   expect(response.statusCode).toBe(200);
   return response.rawPayload;

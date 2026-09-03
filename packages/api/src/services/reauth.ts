@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { Client, DN, InvalidCredentialsError } from "ldapts";
+import type { ReauthScope } from "@conduit/shared";
 
 /**
  * RE-AUTHENTICATION FOR THE TWO 7.6 DOWNLOADS. Chris approved it on 31 Aug.
@@ -289,16 +290,41 @@ export function createFixedPasswordVerifier(expected: string): ReauthVerifier {
 export const REAUTH_TICKET_TTL_MS = 5 * 60 * 1000;
 
 /**
- * How many tickets may be outstanding before the oldest are dropped.
+ * How many tickets one ACCOUNT may have outstanding.
  *
- * A BOUND, NOT A POLICY. Tickets expire on their own and the sweep below
- * removes them lazily, but "lazily" is doing work only when something calls in
- * -- and an authenticated caller can ask for tickets in a loop. This is what
- * stops that being an unbounded map in a process with 3.8GB and no swap.
+ * THE BOUND THAT DOES THE WORK, and it is per-account since v1.4.1 for a
+ * reason that showed up on the recovery path. The global ceiling below used to
+ * be the only one, and it evicted the oldest ticket in the map whoever owned
+ * it -- so a second account minting in a loop could take the operator's fresh
+ * ticket out from under them while they read a destruction list, and what they
+ * would see for it is a 401 asking them to type their password again, at the
+ * worst possible moment, with nothing anywhere saying why.
+ *
+ * EIGHT IS GENEROUS ON PURPOSE. The page mints one and spends it on the very
+ * next call, so the steady state is one; eight leaves room for a prompt
+ * abandoned and reopened several times over five minutes without any operator
+ * ever meeting this line. It is a ceiling for a loop, not a budget for a
+ * session.
+ */
+const MAX_TICKETS_PER_ACCOUNT = 8;
+
+/**
+ * How many tickets may be outstanding in total.
+ *
+ * A MEMORY BOUND, NOT A POLICY -- the policy is the per-account cap above.
+ * Tickets expire on their own and the sweep below removes them lazily, but
+ * "lazily" is doing work only when something calls in. This is what stops the
+ * map growing without limit in a process with 3.8GB and no swap.
+ *
+ * WHAT IT COSTS TO REACH IT IS PASSWORDS. Nothing mints without a successful
+ * credential check, so filling this needs eight accounts whose passwords the
+ * caller knows, not a loop -- which is why the cap above is the one that
+ * actually meets a flood, and why this one can afford to evict carefully
+ * rather than quickly.
  */
 const MAX_OUTSTANDING_TICKETS = 64;
 
-interface TicketRecord { username: string; expiresAt: number }
+interface TicketRecord { username: string; scope: ReauthScope; expiresAt: number }
 
 /**
  * ONE-USE TICKETS, AND WHY THE DOWNLOADS DO NOT JUST CARRY THE PASSWORD.
@@ -319,26 +345,52 @@ interface TicketRecord { username: string; expiresAt: number }
  * another. There is one user on this install today and that is not a reason to
  * skip it.
  *
+ * AND BOUND TO ONE OPERATION SINCE v1.4.1, WHICH IS THE MOST SERIOUS THING
+ * THAT RELEASE FIXED. Until then `redeem` compared an account and nothing
+ * else, so every gated route spent every other gate's tickets: one minted to
+ * download a backup was a live authorisation to DESTROY THE DATABASE for five
+ * minutes. Minting still needed the password, so the exposure was a ticket
+ * stolen from a page rather than an escalation any caller could arrange -- and
+ * the fix was a scope on `issue` and `redeem` and four call sites, which is
+ * small enough that shipping without it would have been a choice rather than
+ * an oversight. The scope names an OPERATION rather than a route, so the
+ * restore's two halves are two scopes: a preview's proof does not open the
+ * apply.
+ *
  * IN MEMORY, PER PROCESS, and that is the whole deployment: one systemd unit,
  * one node process (conf/systemd.service). A restart invalidates every
  * outstanding ticket, which is the correct behaviour rather than a limitation.
  *
- * TWO THINGS 7.7 MADE TRUE THAT WERE HARMLESS IN 7.6, RECORDED RATHER THAN
- * FIXED HERE, because both are changes to shipped 7.6 surface and neither is
- * reachable without a credential this app never sees:
+ * A PASSWORD CHANGE DOES NOT REVOKE AN OUTSTANDING TICKET, and v1.4.1 looked
+ * at that and left it. The reasoning is worth carrying, because the obvious
+ * summary of it was wrong.
  *
- *   A TICKET IS FUNGIBLE ACROSS EVERY GATED ROUTE. One minted to download a
- *   backup is a live authorisation to DESTROY THE DATABASE for five minutes,
- *   because `redeem` binds a ticket to an account and not to an operation.
- *   Minting one still requires the password, so the exposure is a ticket
- *   stolen from a page rather than an escalation any caller can arrange. The
- *   fix, when it is taken, is a scope argument on `issue` and `redeem` and
- *   three call sites; it is named here so it is not rediscovered.
+ * There is no event HERE to revoke on: Conduit has no password to change, the
+ * credential lives in YunoHost's directory, and this app only ever asks it a
+ * question. The only signal available is the directory's own `pwdChangedTime`,
+ * which would put an LDAP query inside `redeem` -- an async, fallible round
+ * trip on the critical path of every gated operation, whose failure mode is
+ * refusing a RESTORE because the directory is unwell. That trade is the wrong
+ * way round on the recovery path.
  *
- *   MAX_OUTSTANDING_TICKETS IS GLOBAL AND EVICTS THE OLDEST regardless of
- *   whose it is, so a second account asking for 64 tickets can evict the
- *   operator's fresh one -- now on the recovery path, where the answer is a
- *   401 telling them to type their password again rather than anything worse.
+ * WHAT IT WOULD BUY WAS THEN MEASURED RATHER THAN ASSUMED, and the comfortable
+ * answer -- that the session cookie outlives a password change anyway, so the
+ * ticket is not the weak link -- IS FALSE. YunoHost invalidates
+ * a user's portal sessions the moment `userPassword` changes, on both paths:
+ * `yunohost/user.py:608` for an admin's `user update`, and
+ * `yunohost/portal.py:331` for the operator changing their own, each calling
+ * `invalidate_all_sessions_for_user`, which unlinks the session files under
+ * /var/cache/yunohost-portal/sessions. Read on the deploy target at yunohost
+ * 12.1.40.1 with yunohost-portal 12.1.2.
+ *
+ * SO THE TICKET OUTLIVES THE PASSWORD BUT NOT THE PERIMETER. Every gated route
+ * runs requireUser first, and that identity is the one SSOwat establishes from
+ * a session that no longer exists -- so over the network a ticket minted with
+ * the old password cannot even be presented. What is left is a local process
+ * that sets Ynh-User for itself, which is the same worst case this module
+ * already names twice, holding a five-minute proof it could not mint again.
+ * That is the residue, it is small, and it is written down rather than closed
+ * by making the recovery path depend on a directory being up.
  */
 export class ReauthTickets {
   private readonly tickets = new Map<string, TicketRecord>();
@@ -346,42 +398,45 @@ export class ReauthTickets {
   constructor(private readonly ttlMs: number = REAUTH_TICKET_TTL_MS) {}
 
   /**
-   * A ticket for `username`, valid once.
+   * A ticket for `username` to do `scope`, valid once.
    *
    * 32 bytes of CSPRNG output, hex. Not a JWT and not derived from anything:
    * there is nothing to encode, and a value with structure invites somebody to
-   * read it.
+   * read it. The scope is remembered HERE rather than carried in the token for
+   * the same reason the username is -- a client that could read a scope out of
+   * a ticket is a client somebody would eventually let choose one.
+   *
+   * THE SCOPE IS A REQUIRED ARGUMENT AND WILL NOT BE GIVEN A DEFAULT. Whatever
+   * value a default took, one of the four gates would open for a caller who
+   * never asked for it, which is the fungible ticket back under a friendlier
+   * name.
    */
-  issue(username: string, now: number = Date.now()): string {
+  issue(username: string, scope: ReauthScope, now: number = Date.now()): string {
     this.sweep(now);
-    // The bound is enforced by dropping the OLDEST, which a Map gives for free
-    // in insertion order. Dropping the newest would let a flood lock out the
-    // person who is actually waiting on one.
-    while (this.tickets.size >= MAX_OUTSTANDING_TICKETS) {
-      const oldest = this.tickets.keys().next();
-      if (oldest.done === true) break;
-      this.tickets.delete(oldest.value);
-    }
+    this.makeRoom(username);
     const token = randomBytes(32).toString("hex");
-    this.tickets.set(token, { username, expiresAt: now + this.ttlMs });
+    this.tickets.set(token, { username, scope, expiresAt: now + this.ttlMs });
     return token;
   }
 
   /**
-   * Spend a ticket. True only if it exists, has not expired, and belongs to
-   * `username`.
+   * Spend a ticket. True only if it exists, has not expired, belongs to
+   * `username`, and was minted for `scope`.
    *
-   * THE DELETE HAPPENS ON EVERY PATH THAT FOUND A RECORD, including the two
-   * refusals. A ticket presented for the wrong account is a ticket that has
-   * been somewhere it should not have been, and leaving it live so the right
-   * account could still use it would be the wrong instinct.
+   * THE DELETE HAPPENS ON EVERY PATH THAT FOUND A RECORD, including all three
+   * refusals. A ticket presented for the wrong account or at the wrong gate is
+   * a ticket that has been somewhere it should not have been, and leaving it
+   * live so the right one could still take it would be the wrong instinct: it
+   * would let a stolen ticket be tried at every gate for the price of one.
    */
-  redeem(token: string, username: string, now: number = Date.now()): boolean {
+  redeem(
+    token: string, username: string, scope: ReauthScope, now: number = Date.now(),
+  ): boolean {
     const record = this.tickets.get(token);
     if (record === undefined) return false;
     this.tickets.delete(token);
     if (record.expiresAt <= now) return false;
-    return record.username === username;
+    return record.username === username && record.scope === scope;
   }
 
   /** Outstanding, unexpired tickets. Exposed so a test can see the sweep work. */
@@ -394,6 +449,76 @@ export class ReauthTickets {
     for (const [token, record] of this.tickets) {
       if (record.expiresAt <= now) this.tickets.delete(token);
     }
+  }
+
+  /**
+   * Make space for one more ticket for `username`, taking it from the account
+   * that can best afford it.
+   *
+   * TWO BOUNDS, AND THEY EVICT DIFFERENT THINGS ON PURPOSE.
+   *
+   * The per-account cap takes the minter's OWN oldest, which a Map gives for
+   * free in insertion order. Taking the newest instead would let a flood lock
+   * out the person actually waiting on one, which was the reason the original
+   * bound dropped the oldest and is unchanged.
+   *
+   * The global ceiling takes from whoever is holding the MOST, and that is the
+   * v1.4.1 fix rather than a flourish. Evicting by age alone -- which is what
+   * this did -- means the ticket most likely to go is the one that has been
+   * waiting longest for an operator to finish reading, and the account most
+   * likely to survive is the one minting fastest. Holding the most is the only
+   * thing here that distinguishes a flood from somebody using the page.
+   *
+   * WHAT IT DOES NOT PROMISE, said plainly because the tempting summary is
+   * false: an account holding ONE ticket can still lose it once every other
+   * holder also holds one -- 64 accounts, each of which has proved a password
+   * inside the last five minutes. No eviction rule can do better than that
+   * with a full map, and the answer at that point is a bigger ceiling rather
+   * than a cleverer rule.
+   */
+  private makeRoom(username: string): void {
+    while (this.countFor(username) >= MAX_TICKETS_PER_ACCOUNT) {
+      if (!this.dropOldestOf(username)) return;
+    }
+    while (this.tickets.size >= MAX_OUTSTANDING_TICKETS) {
+      const largest = this.largestHolder();
+      if (largest === null || !this.dropOldestOf(largest)) return;
+    }
+  }
+
+  private countFor(username: string): number {
+    let held = 0;
+    for (const record of this.tickets.values()) {
+      if (record.username === username) held += 1;
+    }
+    return held;
+  }
+
+  /** The account holding the most; ties go to whoever has held one longest. */
+  private largestHolder(): string | null {
+    const held = new Map<string, number>();
+    for (const record of this.tickets.values()) {
+      held.set(record.username, (held.get(record.username) ?? 0) + 1);
+    }
+    let chosen: string | null = null;
+    let most = 0;
+    // Insertion order, so the first account at the maximum is the one whose
+    // oldest ticket is oldest -- a deterministic tie-break rather than
+    // whichever the iterator happened to reach.
+    for (const [name, count] of held) {
+      if (count > most) { most = count; chosen = name; }
+    }
+    return chosen;
+  }
+
+  private dropOldestOf(username: string): boolean {
+    for (const [token, record] of this.tickets) {
+      if (record.username === username) {
+        this.tickets.delete(token);
+        return true;
+      }
+    }
+    return false;
   }
 }
 

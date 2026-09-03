@@ -844,11 +844,20 @@ found by SQL.
 Full detail and task shapes in `docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`.
 Listed here so the backlog is the one place to look.
 
-**THE ONE THAT CHANGED MEANING RATHER THAN BEING FOUND: re-auth tickets are fungible across
-every gated route.** A ticket minted to download a backup is a live authorisation to destroy
-the entire database for five minutes. Harmless while both gated operations were downloads;
-restore is what made it matter. Two riders: the 64-ticket ceiling evicts across accounts, and
-a password change does not invalidate outstanding tickets.
+~~**THE ONE THAT CHANGED MEANING RATHER THAN BEING FOUND: re-auth tickets are fungible across
+every gated route.**~~ **CLOSED in v1.4.1, Task 1.** A ticket carried an account and not an
+operation, so one minted to download a backup was a live authorisation to destroy the entire
+database for five minutes. Harmless while both gated operations were downloads; restore is
+what made it matter. A ticket now names one of four operations (`ReauthScope`) and is refused
+at every other gate -- **four call sites, not the three the task predicted: the restore is two
+of them, and that is the pair a single `restore` scope would have got wrong.** The first rider
+is closed with it: the 64-ticket ceiling is now a per-account cap of 8, and the global one
+evicts whoever holds the most instead of whatever is oldest. **The second rider is recorded
+rather than fixed, and the reason first given for it was measured and found false** -- a
+password change DOES invalidate YunoHost's own sessions (`user.py:608`, `portal.py:331` at
+12.1.40.1), which is what makes the surviving ticket unusable over the network rather than
+merely no worse than the cookie. See the task for the argument against putting an LDAP query
+inside `redeem`.
 
 - **The mail sync is stopped best-effort while HTTP writes are refused.** `stop()` abandons
   after 15s and `applyRestore` proceeds. The sync is the writer that moves data with nobody
