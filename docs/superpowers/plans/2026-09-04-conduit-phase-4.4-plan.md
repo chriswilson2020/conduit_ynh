@@ -1,0 +1,87 @@
+# Conduit Phase 4.4 → v1.6.0 — Implementation Plan
+
+**Spec:** `docs/superpowers/specs/2026-09-04-conduit-phase-4.4-mail-filing-design.md`, approved
+by Chris 4 Sep. Read it first; it carries the reasoning this plan does not repeat.
+
+**Baseline:** v1.5.0, shipped 4 Sep. Unit 3419 passed / 3 skipped, e2e 216, no `flaky` line.
+The suite runs in parallel now (a database per worker); CI's test step is ~151s.
+
+**Order is deliberate: cheapest and most-used first, riskiest last.** Task 4 is the one that can
+leave data inconsistent, and it should meet a codebase that already has this phase's other three
+landed and green rather than being entangled with them.
+
+---
+
+## Task 1: File into any folder, and unhide in bulk
+
+- [ ] **A fourth bulk action kind with a destination.** `bulkThreadActionInputSchema` already
+      carries an optional `folder`, and the move service already writes to the server and
+      compensates when it refuses. This is an action kind plus a picker, **not new machinery** --
+      if it turns out to need new machinery, that is a finding to report before building it.
+- [ ] It inherits the **50-thread cap**, for the reason the existing two have it: the request
+      waits on a real mail server, and bounding size rather than duration is what stops a timeout
+      producing the "claimed a move the server refused" state.
+- [ ] **Bulk unhide**, symmetric with `hide`. Hide is a row insert per thread; unhide is a
+      delete, so it takes the 200 cap rather than the 50.
+- [ ] The destination picker offers the account's known folders (`mail_account_folders`), which
+      includes folders whose sync is off -- **filing into a folder Conduit does not sync is
+      legitimate and must not be silently prevented.** Say what happens to a thread filed
+      somewhere unsynced, because it will vanish from Conduit's view.
+
+## Task 2: Per-message selection
+
+- [ ] **Its own `messageIds` path, not a widening of `threadIds`.** The spec's reasoning:
+      overloading one field to sometimes mean a different unit is exactly how 4.3's
+      folder-scoped rule became necessary.
+- [ ] **REPORT BEFORE BUILDING if this turns out to widen every bulk endpoint.** That is the
+      spec's Risk 2 and it is a real possibility; the answer might be a smaller surface than the
+      spec imagines.
+- [ ] A single message filed out of a thread leaves the thread intact. What the list then shows
+      for that thread is a decision to make explicitly, not a consequence to discover.
+
+## Task 3: Live inbox beyond page one
+
+- [ ] **`services/sse.ts` is the transport.** Not polling.
+- [ ] **New mail must not reorder the list under the reader.** Ordering is by `last_message_at`,
+      so a new message in an old thread moves it. Decide and write down what the reader sees --
+      an inserted row, a "3 new" affordance, or nothing until they ask.
+- [ ] **`inbox.tsx` has already ruled that state parallel to the URL is not kept**, which is why
+      scroll position is not restored across levels. That ruling stands unless this task
+      overturns it deliberately and says so.
+
+## Task 4: Folder management — CREATE, RENAME, DELETE. THE RISK IS HERE
+
+- [ ] Create and delete are ordinary. **Rename is a two-system write.**
+- [ ] **`folder` is a byte-compared key**: a plain `text` column on `mail_messages`, part of the
+      `mail_messages(account_id, folder, imap_uid)` index, and `folderNameSchema`'s comment says
+      an IMAP mailbox name "is compared byte for byte everywhere it is used downstream". Renaming
+      on the server leaves every stored message pointing at a name that no longer exists.
+- [ ] **IMAP rename first, then the local re-key in ONE transaction; on a failed re-key, rename
+      back.** The move service's discipline, not a new one. Chris approved this shape on 4 Sep.
+- [ ] **Delete must not become this product's first expunge.** The CRM archives rather than
+      expunges everywhere, and `mail_account_folders` rows are *never* deleted by existing
+      convention -- "a folder that vanishes from a later LIST keeps its row". **State in the UI,
+      before it happens, what becomes of the mail stored from that folder.**
+- [ ] A folder with mail in it, and a folder with children, are two separate refusals or two
+      separate warnings. IMAP servers differ on both; find out what this one does rather than
+      assuming.
+
+---
+
+## Definition of done
+
+- Threads file into any folder from the list in one gesture; unhide works in bulk.
+- A single message can be filed independently of its thread.
+- New mail appears without a reload and without moving the reader's place.
+- Folders create, rename and delete, with rename provably atomic across IMAP and the database.
+- Full unit and e2e green, counts accounted for.
+
+---
+
+## Explicitly NOT in this phase
+
+- **Phase 8** (M365 via Graph, Gmail XOAUTH2). Still trigger-based.
+- **"Emailing a quote"**, which the backlog notes overlaps this phase. It is a document concern
+  wearing a mail costume and it does not become cheaper by being done here.
+- **The dnd-kit keyboard-drag intermittent** (1 in 33). Waiting for its next sighting, which now
+  carries a Playwright trace because v1.4.1 changed the artifact upload to `always()`.
