@@ -1628,7 +1628,10 @@ test.describe.serial("Mail journey", () => {
     await expect(bPage.getByTestId("bulk-trash")).toBeDisabled();
     // Filing is a server move too, so the owner-only rule takes it as well
     // (Phase 4.4) -- a colleague must never reorganise your mailbox, whichever
-    // folder they were reorganising it into.
+    // folder they were reorganising it into. B is over-determined here (they
+    // own no mail account of their own either, which alone would empty the
+    // picker); the unit suite is where the two reasons are told apart, and
+    // what matters on this screen is that the control is not offered.
     await expect(bPage.getByTestId("bulk-file")).toBeDisabled();
     await expect(bPage.getByTestId("bulk-hide")).toBeEnabled();
     await expect(bPage.getByTestId("bulk-owner-blocked"))

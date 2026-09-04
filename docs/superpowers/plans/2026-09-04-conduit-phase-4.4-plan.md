@@ -12,20 +12,28 @@ landed and green rather than being entangled with them.
 
 ---
 
-## Task 1: File into any folder, and unhide in bulk
+## Task 1: File into any folder, and unhide in bulk — LANDED
 
-- [ ] **A fourth bulk action kind with a destination.** `bulkThreadActionInputSchema` already
+**Correction found while building it, and Tasks 2 and 4 read the same schema so it is here
+rather than only in the report: `bulkThreadActionInputSchema.folder` is the SOURCE, not the
+destination.** Both this plan's first bullet and the spec's section 1 describe it as the
+destination the new action already had. It is not -- present means folder-scoped, naming the
+VIEW the selection was made in (4.3's ruling). `file` therefore carries a second field,
+`targetFolder`, required for that action and rejected on every other; reusing `folder` would
+have destroyed the folder-scoped ruling. Still an action kind plus a picker, as the bullet says.
+
+- [x] **A fourth bulk action kind with a destination.** `bulkThreadActionInputSchema` already
       carries an optional `folder`, and the move service already writes to the server and
       compensates when it refuses. This is an action kind plus a picker, **not new machinery** --
       if it turns out to need new machinery, that is a finding to report before building it.
-- [ ] It inherits the **50-thread cap**, for the reason the existing two have it: the request
+- [x] It inherits the **50-thread cap**, for the reason the existing two have it: the request
       waits on a real mail server, and bounding size rather than duration is what stops a timeout
       producing the "claimed a move the server refused" state.
-- [ ] **Bulk unhide**, symmetric with `hide`. Hide is a row insert per thread; unhide is a
+- [x] **Bulk unhide**, symmetric with `hide`. Hide is a row insert per thread; unhide is a
       delete, so it takes the 200 cap rather than the 50.
-- [ ] The destination picker offers the account's known folders (`mail_account_folders`),
+- [x] The destination picker offers the account's known folders (`mail_account_folders`),
       **including ones whose sync is off.**
-- [ ] **FILING INTO AN UNSYNCED FOLDER TURNS ITS SYNC ON. It does not warn, and it does not
+- [x] **FILING INTO AN UNSYNCED FOLDER TURNS ITS SYNC ON. It does not warn, and it does not
       refuse.** Corrected 4 Sep after Chris rejected the first version of this line, which said
       to allow the move and warn that the thread would then vanish from Conduit's view. He was
       right and the reason is worth keeping: **a warning there is an admission that the design is
@@ -35,9 +43,17 @@ landed and green rather than being entangled with them.
       statement is the whole job; asking the operator to restate it in a dialog is not. The
       machinery already exists (`setFolderSyncEnabled`, the same call `PATCH
       /api/mail/accounts/:id/folders` makes), so this is a call, not a mechanism.
-- [ ] **Say what happened, after the fact and quietly** -- "Filed into Clients, and Conduit is
+- [x] **Say what happened, after the fact and quietly** -- "Filed into Clients, and Conduit is
       now syncing that folder" -- because enabling a sync is a real consequence and an operator
       should not discover it from a bandwidth graph. That is a notification, not a gate.
+- [x] **The two-system write is answered by ORDERING, not by hoping.** The sync switch runs
+      BEFORE the optimistic write and the queued MOVE. After a successful move, a failed switch
+      would leave mail filed into a folder Conduit does not watch -- the vanishing thread this
+      rule exists to prevent, reached by accident instead of by warning. Before it, the only
+      reachable failure is the harmless one (a folder syncing that need not be, one click to
+      undo in the picker), and a throw lands before anything has moved, so the request did
+      nothing rather than half of something. Pinned by observation rather than argument: the
+      test fake reads the folder row from inside `moveMessages`.
 
 ## Task 2: Per-message selection
 

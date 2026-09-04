@@ -34,6 +34,17 @@ move service already writes to the server and compensates on refusal. **This is 
 kind and a destination picker, not new machinery.** It inherits the 50-thread cap for the same
 reason the other two have it.
 
+> **Correction, 4 Sep, from building it.** The paragraph above is wrong about one thing, and it
+> matters for Tasks 2 and 4, which read the same schema. **`folder` is the SOURCE, not the
+> destination** -- its own comment says so: present means folder-scoped, and it names the VIEW
+> the selection was made in (4.3's selection-granularity ruling). Filing out of the INBOX view
+> into Clients has to say both which folder the selection was made in and which folder the mail
+> is going to, so `file` needed a second field, `targetFolder`, required for that action and
+> rejected on every other. Reusing `folder` as the destination would have destroyed the
+> folder-scoped ruling this phase is built on top of. The rest of the paragraph holds: it is
+> still an action kind plus a picker, and the move service resolves the named destination per
+> account exactly where it used to read a column.
+
 ---
 
 ## 2. Bulk unhide, and per-message selection
