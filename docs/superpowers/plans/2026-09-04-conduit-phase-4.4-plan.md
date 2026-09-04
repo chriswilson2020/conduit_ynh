@@ -23,10 +23,21 @@ landed and green rather than being entangled with them.
       producing the "claimed a move the server refused" state.
 - [ ] **Bulk unhide**, symmetric with `hide`. Hide is a row insert per thread; unhide is a
       delete, so it takes the 200 cap rather than the 50.
-- [ ] The destination picker offers the account's known folders (`mail_account_folders`), which
-      includes folders whose sync is off -- **filing into a folder Conduit does not sync is
-      legitimate and must not be silently prevented.** Say what happens to a thread filed
-      somewhere unsynced, because it will vanish from Conduit's view.
+- [ ] The destination picker offers the account's known folders (`mail_account_folders`),
+      **including ones whose sync is off.**
+- [ ] **FILING INTO AN UNSYNCED FOLDER TURNS ITS SYNC ON. It does not warn, and it does not
+      refuse.** Corrected 4 Sep after Chris rejected the first version of this line, which said
+      to allow the move and warn that the thread would then vanish from Conduit's view. He was
+      right and the reason is worth keeping: **a warning there is an admission that the design is
+      wrong.** It offers the operator a choice between two bad outcomes -- lose the thread, or
+      don't file it where it belongs -- and calls that informed consent.
+      **Filing a thread into a folder IS the statement that the folder matters.** Acting on that
+      statement is the whole job; asking the operator to restate it in a dialog is not. The
+      machinery already exists (`setFolderSyncEnabled`, the same call `PATCH
+      /api/mail/accounts/:id/folders` makes), so this is a call, not a mechanism.
+- [ ] **Say what happened, after the fact and quietly** -- "Filed into Clients, and Conduit is
+      now syncing that folder" -- because enabling a sync is a real consequence and an operator
+      should not discover it from a bandwidth graph. That is a notification, not a gate.
 
 ## Task 2: Per-message selection
 
