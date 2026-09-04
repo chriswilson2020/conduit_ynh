@@ -55,27 +55,75 @@ have destroyed the folder-scoped ruling. Still an action kind plus a picker, as 
       nothing rather than half of something. Pinned by observation rather than argument: the
       test fake reads the folder row from inside `moveMessages`.
 
-## Task 2: Per-message selection, and filing from inside a conversation
+## Task 2: Per-message selection, and filing from inside a conversation — LANDED
 
 **Chris added the second half on 4 Sep**, answering the question Task 1 left open. It is folded
 in here rather than given its own task because it lands on the same surface -- the conversation
 view -- and two agents editing that in sequence would be two chances to disagree about it.
 
-- [ ] **FILE A WHOLE THREAD FROM INSIDE THE CONVERSATION.** Task 1 built filing on the list only,
+**Risk 2 did not materialise, and the phrase it is written in overstates the surface. "Every
+bulk endpoint" is a set of SIZE ONE:** `POST /api/mail/threads/bulk` is the only bulk endpoint
+in the app (the spec's section 2 says "every bulk endpoint currently takes `threadIds`", which
+is true of the one that exists). So the choice was never "widen them all"; it was one new
+endpoint beside one old one, and the new one is strictly NARROWER.
+
+**The second finding is the opposite of what the spec expected.** Section 2 calls per-message
+selection "not small". The CONTRACT was the thread-shaped part; the MACHINERY was already
+message-granular and needed nothing. Everything downstream of collection in `mail-move.ts` --
+`fileTargetsOf`, `enableTargetSync`, `applyOptimisticMove`, `queueMoves`, `revertMove`,
+`groupForQueue` -- operates on `Candidate` rows that are individual messages already, and is
+reused unchanged. What was actually built is a second collection, a second entry point, and a
+narrower schema.
+
+- [x] **FILE A WHOLE THREAD FROM INSIDE THE CONVERSATION.** Task 1 built filing on the list only,
       because the definition of done said "from the list". Reading a thread and wanting to file
       it currently means going back to the list first, finding it again, and selecting it -- three
       steps to undo one navigation. The action already exists; this is a second entrance to it.
-- [ ] **The same rule applies: an unsynced destination has its sync switched on**, in the same
+      **No server change at all**: the conversation's picker sends the same one-thread, no-folder
+      request the Archive and Trash buttons beside it already send, and whole-thread `file` was
+      already covered by a Task 1 test.
+- [x] **The same rule applies: an unsynced destination has its sync switched on**, in the same
       order (before the move is queued), for the reason Task 1 records. Do not reimplement that
-      decision -- call the same path.
-- [ ] **Its own `messageIds` path, not a widening of `threadIds`.** The spec's reasoning:
+      decision -- call the same path. **Both new paths call `enableTargetSync`**, and the
+      per-message one is pinned by observation the same way (the test fake reads the folder row
+      from inside the request).
+- [x] **Its own `messageIds` path, not a widening of `threadIds`.** The spec's reasoning:
       overloading one field to sometimes mean a different unit is exactly how 4.3's
-      folder-scoped rule became necessary.
-- [ ] **REPORT BEFORE BUILDING if this turns out to widen every bulk endpoint.** That is the
-      spec's Risk 2 and it is a real possibility; the answer might be a smaller surface than the
-      spec imagines.
-- [ ] A single message filed out of a thread leaves the thread intact. What the list then shows
+      folder-scoped rule became necessary. It is narrower on four axes, each enforced by a type
+      or a schema rather than by a comment: **the three MOVE kinds only** (a hide is one
+      `mail_thread_hides` row per THREAD, so there is no per-message one to offer -- `MoveAction`
+      is now an alias of `BulkMessageActionKind` so neither set can grow without the other
+      answering); **no source `folder`** (the ids ARE the scope, and the input is `.strict()` so
+      a body carrying one is rejected rather than stripped); **no `out_of_scope`** (a named
+      message has no scope to fall outside of, so every skip is a NOTED one -- the narrower enum
+      plus a generic on `Outcomes` make it unrepresentable, and `tsc` rejects a test that even
+      compares against it); and **results keyed on `messageId`**, because two messages of one
+      conversation can genuinely land differently.
+- [x] **REPORT BEFORE BUILDING if this turns out to widen every bulk endpoint.** See above: it
+      does not, and the reason is worth keeping -- the answer was a SMALLER surface than the
+      spec imagines, exactly as the bullet allowed for.
+- [x] A single message filed out of a thread leaves the thread intact. What the list then shows
       for that thread is a decision to make explicitly, not a consequence to discover.
+      **The decision: the thread is untouched and is LISTED IN BOTH FOLDER VIEWS AT ONCE.** The
+      `mail_threads` row is not written -- not its subject, not its links, and not
+      `last_message_at`, because filing is not receiving and nothing about it may reorder the
+      list. What changes is only which folder views the thread appears in, and that follows 4.1's
+      existing rule unchanged: a thread is "in" a folder when any of its messages is (the folder
+      EXISTS in `mail-threads.ts`). So it stays in the source view while it still has a message
+      there, leaves that view when the filed message was the last one, and appears in the
+      destination view alongside. **The alternatives were rejected**: moving the thread with the
+      message means splitting the conversation, which destroys the reply chain threading exists
+      for; a thread-level "partially filed" mark would be a new fact with no reader, since the
+      folder views already say it truthfully per message. **This is not a new rule -- it is 4.3's
+      folder-scoped shape, which per-message filing simply makes happen ON PURPOSE rather than
+      by accident of how mail arrived.** Asserted through `listThreads` itself rather than a
+      re-implementation of its filter, and end to end against Dovecot.
+
+**One pre-existing bug found and fixed while building it.** `queueMoves` keyed its failures by
+THREAD, so when two chunks of one thread both failed the second overwrote the first in the map
+and the LAST refusal's text was reported -- while `Outcomes` documents, in as many words, that
+the FIRST is. Keying per message (which the new path needs anyway) makes the promise true.
+Nothing covered the difference; a test now does.
 
 ## Task 3: Live inbox beyond page one
 

@@ -63,6 +63,25 @@ endpoint currently takes `threadIds`.
 `messageIds` path is honest; overloading `threadIds` to sometimes mean messages is how the
 folder-scoped rule became necessary in the first place.
 
+> **Correction, 4 Sep, from building it.** Two things above are wrong, and both make this item
+> sound bigger than it is.
+>
+> **"Every bulk endpoint currently takes `threadIds`" is a claim about ONE endpoint.**
+> `POST /api/mail/threads/bulk` is the only bulk endpoint in the app. Risk 2 below asks for a
+> report if per-message selection "widens every bulk endpoint"; it cannot, because there is
+> nothing to widen but the one, and the answer built instead is a second endpoint that is
+> strictly NARROWER than it -- the three MOVE kinds only (a hide is a row per THREAD, so there
+> is no per-message one), no source `folder` (a message id IS the scope), no `out_of_scope` (a
+> named message has no scope to fall outside of), and results keyed on `messageId` because two
+> messages of one conversation can land differently.
+>
+> **"Not small" is right about the CONTRACT and wrong about the MACHINERY.** Everything
+> downstream of collection in `mail-move.ts` already operates on individual messages
+> (`Candidate` rows), so the destination resolution, the sync switch, the optimistic write, the
+> queued MOVE and the compensating revert were all reused unchanged. What per-message selection
+> actually needed was a second collection, a second entry point and a narrower schema -- not new
+> move machinery.
+
 ---
 
 ## 3. Live inbox beyond page one
