@@ -282,8 +282,11 @@ export function InboxPage() {
    * Task 2's was two move paths gated only on their own mutation, overlapping
    * on the same rows; the answer there was one `busy` for both. This is the
    * same shape at one remove: the two panes' moves are still gated separately
-   * (see the findings), so a reader CAN archive from the conversation while a
-   * bulk request is queued behind an account's serial sync loop -- and a
+   * -- `busy` here disables the filters and the rail, and the conversation's
+   * own buttons are gated on ITS mutations -- so a reader CAN archive from the
+   * conversation while a bulk request is queued behind an account's serial
+   * sync loop. (Whether the two panes should share one gate is a wider
+   * question than this task; what is closed here is the LIST moving.) And a
    * re-snapshot at that moment would change which rows are listed underneath a
    * request that named the old ones, shrinking the bar's count (or unmounting
    * the bar) mid-flight and leaving the outcome to be read against a view that

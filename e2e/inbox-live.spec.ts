@@ -115,7 +115,6 @@ interface MailStub {
   /** Set to park the bulk response; call release() to answer it. */
   holdBulk: boolean;
   release: () => void;
-  bulkArrived: () => boolean;
 }
 
 /**
@@ -127,14 +126,12 @@ interface MailStub {
  */
 async function stubMail(page: Page, seeds: Seed[]): Promise<MailStub> {
   let releaseBulk = () => {};
-  let arrived = false;
   const stub: MailStub = {
     threads: [...seeds],
     live: false,
     bulkThreadIds: [],
     holdBulk: false,
     release: () => releaseBulk(),
-    bulkArrived: () => arrived,
   };
 
   await page.route((url) => url.pathname === "/api/mail/accounts", async (route: Route) => {
@@ -181,7 +178,6 @@ async function stubMail(page: Page, seeds: Seed[]): Promise<MailStub> {
   });
 
   await page.route((url) => url.pathname === "/api/mail/threads/bulk", async (route: Route) => {
-    arrived = true;
     const body = route.request().postDataJSON() as { threadIds: string[] };
     stub.bulkThreadIds = body.threadIds;
     if (stub.holdBulk) {
