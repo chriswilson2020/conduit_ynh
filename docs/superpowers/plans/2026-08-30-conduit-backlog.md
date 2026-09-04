@@ -136,17 +136,29 @@ well as in the plan.
 
 ### The five carry-forward items
 
-**1. THE EXCEL VISUAL IS OUTSTANDING, and it needs a human with a screen.** Task 4's "an
-export opened in a spreadsheet with accented characters intact" was never done: screen access
-was declined and the agent correctly did not route around it rather than inventing a
-substitute and calling it the same thing. Byte-level proof stands in its place and was re-run
-at release time -- the artefact starts `EF BB BF`, and the same bytes without the BOM read as
-cp1252 split every umlaut into two characters. The two files are prepared and differ only in
-those three bytes: `t1-proof/excel/companies-WITH-BOM.csv` and
-`t1-proof/excel/companies-NO-BOM.csv` in the session scratchpad, with `t1-bomproof.py` beside
-them. **Judgement, not fact:** the BOM is almost certainly right, because the byte-level
-behaviour is not in doubt; what is unproven is the last inch, that a real Excel on a real
-machine renders it the way the bytes predict.
+~~**1. THE EXCEL VISUAL IS OUTSTANDING, and it needs a human with a screen.**~~ **-- CLOSED
+4 Sep on Chris's instruction, and it was the wrong question for three releases.**
+
+It was carried as "verify accented characters render", and **that half was never actually
+open**: `services/csv.ts` emits the UTF-8 BOM, a byte-level test asserts it, the artefact
+starts `EF BB BF`, and whether Excel honours a BOM is a fact about Excel rather than about
+this install. Watching somebody open the file would have added nothing to it. The item stayed
+open for three releases because nobody re-read what it was asking for.
+
+**WHAT NO TEST HERE CAN SETTLE IS THE DELIMITER, and that is a different thing entirely.**
+Conduit writes RFC 4180: comma-separated. Excel does not take the delimiter from the file --
+it takes it from the system LIST SEPARATOR, which is `;` in Dutch and German locales. So on a
+Dutch Windows machine a double-clicked export lands every row in column A, with the BOM
+working perfectly and the encoding perfectly correct. **The deploy target's operator is in the
+Netherlands on a `.de` domain**, which makes this likely rather than theoretical for the exact
+audience the export exists for.
+
+**CHRIS'S DECISION, 4 Sep: LEAVE IT AS IT IS.** The file stays standards-correct. Recorded
+rather than deleted so it is not rediscovered as a bug -- the workaround is `Data -> From
+Text/CSV` instead of a double-click. Two alternatives were put to him and declined: a leading
+`sep=,` line, which Excel honours but which pollutes the file for every other reader
+**including Conduit's own exact importer**, and semicolons, which would break RFC 4180 and
+every non-European Excel.
 
 **2. THE PORTAL SESSION LITTER.** Every successful re-authentication makes YunoHost's portal
 mint a session it did not need to: moulinette's login handler calls `set_session_cookie`,
@@ -1709,6 +1721,19 @@ Ordered by how much more expensive each gets if retrofitted rather than designed
 ---
 
 ## Resolved and applied
+
+**`._*` FILES ON THE v1.4.1 INSTALL -- CLOSED 4 Sep, no action.** v1.4.1's tarball was built on
+a Mac, against this repository's own instruction not to (`scripts/make-release.sh`'s header says
+"meant to run on the Debian build server, never on a Mac"), and carried 14 AppleDouble companion
+files plus 588 `Ignoring unknown extended header keyword` warnings that opened the upgrade.
+`ynh_setup_source` runs a plain `tar --extract` with no filtering
+(`helpers.v2.1.d/sources`, at 12.1.40.1), **so the files are on the install** -- read out of the
+helper rather than from the install directory, which the deploy user deliberately cannot list.
+They are inert: drizzle chooses migrations from `meta/_journal.json`, never from a directory
+listing. **And the next release removes them for nothing**, because the upgrade's
+`ynh_setup_source --keep=".env"` replaces the tree. The script is fixed (588 warnings -> 0,
+companions gone, measured by extracting both artefacts on the deploy target); the residue needs
+no cleanup.
 
 *(This section was "Resolved, pending application" while its one item waited on the 7.5
 worktree. The item shipped in v1.2.0 and the section is kept only for the reasoning.)*
