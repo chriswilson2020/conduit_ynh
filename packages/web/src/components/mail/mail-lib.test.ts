@@ -7,6 +7,7 @@ import {
   bulkActionBlocked,
   bulkErrorMessage,
   bulkOwnershipBlocked,
+  fileTargetsBlocked,
   bulkPendingLabel,
   BULK_TIMEOUT_MESSAGE,
   isThreadGone,
@@ -952,13 +953,40 @@ describe("bulkActionBlocked", () => {
   it("permits a selection inside each action's own cap", () => {
     expect(bulkActionBlocked("archive", 50)).toBeNull();
     expect(bulkActionBlocked("trash", 1)).toBeNull();
+    expect(bulkActionBlocked("file", 50)).toBeNull();
     expect(bulkActionBlocked("hide", 200)).toBeNull();
+    // `unhide` is a local row DELETE and takes hide's outer bound, not the
+    // mail server's 50 -- the case a `!== "hide"` test would have got wrong.
+    expect(bulkActionBlocked("unhide", 200)).toBeNull();
   });
 
   it("refuses more threads than the server would accept, per action", () => {
     expect(bulkActionBlocked("archive", 51)).toContain("50");
     expect(bulkActionBlocked("trash", 51)).toContain("50");
+    expect(bulkActionBlocked("file", 51)).toContain("50");
     expect(bulkActionBlocked("hide", 201)).toContain("200");
+    expect(bulkActionBlocked("unhide", 201)).toContain("200");
+  });
+});
+
+// The destination picker's own disabled state (Phase 4.4). Two causes, two
+// remedies, two sentences -- and neither is a tooltip, for the same reason as
+// every other note on this bar.
+describe("fileTargetsBlocked", () => {
+  it("offers the picker only when the list is scoped to one account with folders", () => {
+    expect(fileTargetsBlocked(true, 3)).toBeNull();
+  });
+
+  // A folder name is per mailbox: "Clients" on one account and "Clients" on
+  // another are different folders that may not both exist, so a picker built
+  // while every account is in view would be offering one account's names as
+  // everyone's.
+  it("explains that filing needs one account in view", () => {
+    expect(fileTargetsBlocked(false, 12)).toContain("single account");
+  });
+
+  it("explains an account that has no folders listed yet", () => {
+    expect(fileTargetsBlocked(true, 0)).toContain("sync pass");
   });
 });
 
@@ -985,15 +1013,25 @@ describe("bulkOwnershipBlocked", () => {
   // Settings: the mailbox can be another user's.
   it("phrases the rule as the spec words it, with no Settings pointer", () => {
     expect(NOT_OWNER_EXPLANATION)
-      .toBe("only the mailbox owner can archive or trash \u2014 Hide in CRM is available to everyone");
+      .toBe("only the mailbox owner can file, archive or trash \u2014 Hide in CRM is available to everyone");
     expect(NOT_OWNER_EXPLANATION).not.toContain("your account");
     expect(NOT_OWNER_EXPLANATION).not.toContain("Settings");
   });
 
   // Hide in CRM is exactly what every viewer keeps -- an unowned selection
-  // must never grey it out.
-  it("never blocks hide", () => {
+  // must never grey it out. Nor its inverse: unhiding is the same per-viewer
+  // filing act run backwards.
+  it("never blocks the CRM-side pair", () => {
     expect(bulkOwnershipBlocked("hide", 50)).toBeNull();
+    expect(bulkOwnershipBlocked("unhide", 50)).toBeNull();
+  });
+
+  // `file` is a server MOVE, so it takes the owner-only rule exactly as
+  // Archive and Trash do -- a colleague must never reorganise your mailbox,
+  // whichever folder they were reorganising it into.
+  it("blocks filing on an unowned selection", () => {
+    expect(bulkOwnershipBlocked("file", 1))
+      .toBe(`1 selected conversation is in a mailbox you don't own: ${NOT_OWNER_EXPLANATION}.`);
   });
 });
 
@@ -1172,6 +1210,51 @@ describe("summarizeBulkResult", () => {
   it("uses the action's own verb", () => {
     expect(summarizeBulkResult("trash", [ok("1")]).headline).toBe("1 moved to Trash.");
     expect(summarizeBulkResult("hide", [ok("1"), ok("2")]).headline).toBe("2 hidden.");
+    // Phase 4.4's pair. The verbs come off a Record over the kind enum now:
+    // the if-chain this replaced ended in "archived", so a bulk unhide would
+    // have been summarised as "2 archived" with nothing to say otherwise.
+    expect(summarizeBulkResult("unhide", [ok("1"), ok("2")]).headline).toBe("2 unhidden.");
+    // Filing names the folder, because it is the only part of the action the
+    // user chose.
+    expect(summarizeBulkResult("file", [ok("1")], { targetFolder: "Clients" }).headline)
+      .toBe("1 filed into “Clients”.");
+  });
+
+  // The quiet notification the filing rule owes the operator. Filing into an
+  // unsynced folder turns that folder's sync ON without asking (api:
+  // mail-move.ts) -- a warning beforehand was rejected as a choice between two
+  // bad outcomes dressed as consent -- so what is left is to SAY it
+  // afterwards, and to say it first among the notes because it is the one
+  // sentence describing a lasting change rather than one about these threads.
+  it("leads with the sync note when filing switched a folder's sync on", () => {
+    const summary = summarizeBulkResult("file", [ok("1"), skip("2", "awaiting_reconciliation")], {
+      targetFolder: "Clients", syncEnabled: "Clients",
+    });
+    expect(summary.headline).toBe("1 filed into “Clients”, 1 skipped.");
+    expect(summary.notes[0]).toBe("Conduit is now syncing “Clients”.");
+    expect(summary.notes).toHaveLength(2);
+  });
+
+  it("says nothing about syncing when the response reports none switched", () => {
+    const summary = summarizeBulkResult("file", [ok("1")], { targetFolder: "Clients" });
+    // The note follows the SERVER'S answer, never an assumption from the
+    // action: most filings go into folders that were already syncing, and a
+    // sentence attached to all of them would be noise.
+    expect(summary.notes).toEqual([]);
+  });
+
+  // unknown_target is `file`'s own failure and deliberately NOT no_target: the
+  // remedy is a different folder, not a Settings page, so the summary must not
+  // offer the link that no_target does.
+  it("explains a destination the account does not have, with no Settings pointer", () => {
+    const summary = summarizeBulkResult("file", [fail("1", "unknown_target"), fail("2", "unknown_target")], {
+      targetFolder: "Clients",
+    });
+    expect(summary.notes).toEqual([
+      "2 could not be filed: “Clients” is not a folder on every selected"
+      + " conversation's mail account.",
+    ]);
+    expect(summary.settingsLink).toBe(false);
   });
 
   // Every branch keys off the `reason` CODE. Nothing here may ever match on
@@ -1223,7 +1306,7 @@ describe("summarizeBulkResult", () => {
       "1 will complete after the next sync pass.",
       "1 belongs to an archived mail account"
       + " \u2014 its mail can be moved again once its owner unarchives it.",
-      "1 skipped: only the mailbox owner can archive or trash"
+      "1 skipped: only the mailbox owner can file, archive or trash"
       + " \u2014 Hide in CRM is available to everyone.",
     ]);
   });
@@ -1236,7 +1319,7 @@ describe("summarizeBulkResult", () => {
     const summary = summarizeBulkResult("archive", [skip("1", "not_owner"), skip("2", "not_owner")]);
     expect(summary.headline).toBe("Nothing archived, 2 skipped.");
     expect(summary.notes).toEqual([
-      "2 skipped: only the mailbox owner can archive or trash"
+      "2 skipped: only the mailbox owner can file, archive or trash"
       + " \u2014 Hide in CRM is available to everyone.",
     ]);
     // Another user's sharing is not fixable in the viewer's Settings.
@@ -1323,6 +1406,16 @@ describe("bulkPendingLabel", () => {
     expect(bulkPendingLabel("archive", 3)).toBe("Archiving 3 conversations\u2026");
     expect(bulkPendingLabel("trash", 2)).toBe("Moving 2 conversations to Trash\u2026");
     expect(bulkPendingLabel("hide", 1)).toBe("Hiding 1 conversation\u2026");
+    expect(bulkPendingLabel("unhide", 4)).toBe("Unhiding 4 conversations\u2026");
+  });
+
+  // Filing is the one whose pending line is incomplete without the folder --
+  // and this request is the one that can hold the connection open longest, so
+  // the line has the most work to do.
+  it("names the destination while a filing is in flight", () => {
+    expect(bulkPendingLabel("file", 2, "Clients"))
+      .toBe("Filing 2 conversations into \u201cClients\u201d\u2026");
+    expect(bulkPendingLabel("file", 1)).toBe("Filing 1 conversation\u2026");
   });
 });
 

@@ -1699,14 +1699,16 @@ export function useUnreadMailCountsByFolder() {
 }
 
 /**
- * The bulk thread actions (Phase 4.1): Trash and Archive MOVE messages on the
- * IMAP server, "Hide in CRM" sets the CRM-side thread archive.
+ * The bulk thread actions: Trash, Archive and File (Phase 4.4) MOVE messages
+ * on the IMAP server, "Hide in CRM" and its inverse set and clear the
+ * CRM-side, per-viewer hide row.
  *
  * `folder` carries the move service's two modes and the caller decides which:
  * PRESENT means folder-scoped (a multi-select made in a folder view acts only
  * on the messages in THAT folder), ABSENT means whole-thread (the conversation
  * view's single-thread buttons). See bulk-bar.tsx for the ruling on the
- * unfiltered list.
+ * unfiltered list. `targetFolder` is a DIFFERENT field and a different
+ * question -- where the mail is going, for `file` alone.
  *
  * ALWAYS 200 when the request was valid: per-thread failures ride inside the
  * body, so a caller must read `results` rather than trusting the absence of a
@@ -1729,6 +1731,16 @@ export function useBulkThreadAction() {
       void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
       void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
       void queryClient.invalidateQueries({ queryKey: ["search"] });
+      // Filing can have switched a folder's sync ON (api: mail-move.ts), which
+      // changes what the sidebar shows and what the picker says about it. The
+      // server publishes its own folders hint from that write, so this is the
+      // belt to that braces: a client whose SSE stream is down still sees the
+      // switch it just caused. Every accountId's, because the response says
+      // WHICH folder was enabled but not on which accounts, and a bulk
+      // selection can span several.
+      if (input.action === "file") {
+        void queryClient.invalidateQueries({ queryKey: ["mail-folders"] });
+      }
       // Each touched thread's own detail entry: the conversation on screen may
       // be one of them, and its messages' folders have just changed.
       for (const threadId of input.threadIds) {

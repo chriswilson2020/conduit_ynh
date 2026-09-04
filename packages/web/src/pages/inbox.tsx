@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { clsx } from "clsx";
 import type { BulkThreadActionKind } from "@conduit/shared";
-import { useBulkThreadAction, useMailAccounts } from "../queries";
+import { useBulkThreadAction, useMailAccounts, useMailFolders } from "../queries";
 import { useLatest } from "../hooks";
 import { useIsMobile } from "../use-is-mobile";
 import { inboxStackView } from "./inbox-lib";
@@ -236,7 +236,46 @@ export function InboxPage() {
    */
   const bulk = useBulkThreadAction();
   const pendingAction = bulk.isPending ? bulk.variables?.action ?? null : null;
+  const pendingTarget = bulk.isPending ? bulk.variables?.targetFolder ?? null : null;
   const busy = pendingAction !== null;
+
+  /**
+   * WHOSE folders the bulk bar's "File into…" picker offers.
+   *
+   * A folder name is per mailbox -- "Clients" on one account and "Clients" on
+   * another are different folders that may not both exist -- so the picker
+   * needs exactly one account to name folders from, and says so instead of
+   * offering a list when it has none (mail-lib's fileTargetsBlocked).
+   *
+   * A SINGLE OWN ACCOUNT COUNTS AS PICKED, even though the filter reads "All
+   * accounts", and that case is not a nicety: with one account the filter
+   * select is not RENDERED AT ALL (see filterAccounts below), so "pick a
+   * single account above" would point at a control that does not exist, and
+   * the only way to reach the picker would be to click a folder in the rail
+   * first. For that user the two readings of "all accounts" are the same set.
+   * From `ownActive` rather than filterAccounts because filing is a server
+   * move and those are owner-only (Phase 4.2): another user's shared mailbox
+   * is never a destination this viewer can file into.
+   */
+  const fileAccountId = accountId !== ALL_ACCOUNTS ? accountId
+    : ownActive.length === 1 ? ownActive[0]?.id ?? "" : "";
+
+  /**
+   * What that picker offers.
+   *
+   * UNSELECTABLE FOLDERS ARE DROPPED, sync-off ones deliberately KEPT.
+   * A \Noselect row is a hierarchy node holding no messages: it cannot
+   * receive mail and the API refuses it (unknown_target), so offering it would
+   * be offering a failure. A folder whose sync is off is the opposite case --
+   * it is exactly what this feature is for, and filing into it turns its sync
+   * on (api: mail-move.ts). Nothing here says so beforehand; the result does,
+   * afterwards.
+   */
+  const folderList = useMailFolders(fileAccountId);
+  const fileTargets = useMemo(
+    () => (folderList.data ?? []).filter((row) => row.selectable).map((row) => row.folder),
+    [folderList.data],
+  );
 
   // Reference-guarded so a re-render that produced the same rows cannot loop
   // through this back into a new state object. Both fields compare: a refetch
@@ -269,22 +308,36 @@ export function InboxPage() {
    * retry -- for `trash` a blind second attempt would move whatever is now in
    * the source folder -- so the hook refetches from onSettled instead.
    */
-  const runBulk = useCallback((action: BulkThreadActionKind) => {
+  const runBulk = useCallback((action: BulkThreadActionKind, targetFolder?: string) => {
     if (selectedThreads.length === 0) return;
     handleOutcome(null);
+    const crmSide = action === "hide" || action === "unhide";
     bulk.mutate(
       {
         threadIds: [...selectedThreads],
-        // `hide` ignores folder server-side either way; sending it only for the
-        // two move actions keeps the request saying exactly what it means. With
-        // no folder filter there is no folder view, so the request carries the
-        // whole-thread mode instead (see BulkBarProps.folder).
-        ...(folder !== null && action !== "hide" ? { folder } : {}),
+        // `hide`/`unhide` ignore folder server-side either way; sending it only
+        // for the move actions keeps the request saying exactly what it means.
+        // With no folder filter there is no folder view, so the request carries
+        // the whole-thread mode instead (see BulkBarProps.folder).
+        ...(folder !== null && !crmSide ? { folder } : {}),
+        // The DESTINATION, which is a different field from the source above and
+        // valid only for `file` -- the shared schema rejects it on anything
+        // else rather than ignoring it.
+        ...(action === "file" && targetFolder !== undefined ? { targetFolder } : {}),
         action,
       },
       {
         onSuccess: (result) => {
-          handleOutcome({ kind: "summary", summary: summarizeBulkResult(action, result.results) });
+          handleOutcome({
+            kind: "summary",
+            summary: summarizeBulkResult(action, result.results, {
+              targetFolder: targetFolder ?? null,
+              // The server's answer, not an assumption: it is present only
+              // when a folder's sync was actually switched on by this request
+              // (api: mail-move.ts's enableTargetSync).
+              syncEnabled: result.syncEnabled ?? null,
+            }),
+          });
           clearSelection();
         },
         // A throw is not necessarily a failed action: a proxy 504 means the
@@ -671,6 +724,10 @@ export function InboxPage() {
               unowned={unownedSelected}
               capped={selection.capped}
               pendingAction={pendingAction}
+              pendingTarget={pendingTarget}
+              folders={fileTargets}
+              accountScoped={fileAccountId !== ""}
+              hiddenView={hidden}
               onRun={runBulk}
               onClear={clearSelection}
             />

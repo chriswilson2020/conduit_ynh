@@ -1189,12 +1189,25 @@ export const threadListFiltersSchema = z.object({
 });
 export type ThreadListFilters = z.infer<typeof threadListFiltersSchema>;
 
-// The three bulk/single-thread mail actions (Phase 4.1). trash/archive MOVE
-// the underlying messages server-side (api: services/mail-move.ts); hide is
-// the CRM-side, PER-ACTOR filing act (one mail_thread_hides row per thread
-// for the requesting user, Phase 4.3) applied in bulk, named "Hide in CRM"
-// in the UI so it is never confused with the other two (spec).
-export const bulkThreadActionKindSchema = z.enum(["trash", "archive", "hide"]);
+// The bulk/single-thread mail actions. Three MOVE the underlying messages
+// server-side (api: services/mail-move.ts) and two are the CRM-side,
+// PER-ACTOR filing act (one mail_thread_hides row per thread for the
+// requesting user, Phase 4.3):
+//
+// - trash/archive (Phase 4.1): move to the OWNING ACCOUNT'S configured
+//   trash_folder/archive_folder -- a destination the request never names.
+// - file (Phase 4.4): move to a destination the request DOES name
+//   (`targetFolder` below). The fourth kind exists because filing mail is
+//   mostly not trash or archive, it is "put this in Clients", and the first
+//   two have no way to say so.
+// - hide/unhide: the CRM-side pair, named "Hide in CRM" in the UI so it is
+//   never confused with the IMAP moves. `unhide` (Phase 4.4) is `hide`'s
+//   inverse -- a hide-row DELETE where hide is an INSERT -- and exists in
+//   bulk because without it fifty threads hide in one gesture and unhide in
+//   fifty.
+export const bulkThreadActionKindSchema = z.enum([
+  "trash", "archive", "hide", "unhide", "file",
+]);
 export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
 
 // POST /api/mail/threads/bulk body (Task 4). folder is OPTIONAL and carries
@@ -1208,32 +1221,88 @@ export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
 // folder and those in the account's sent folder (archiving a conversation
 // must never empty Sent). Either way, trash/archive target the owning
 // account's trash_folder/archive_folder (spec: "only Trash/Archive targets
-// in v0.6.0"); `hide` ignores folder entirely in both modes -- it is the
-// per-actor CRM-side filing act (mail_thread_hides, Phase 4.3), which has
-// no concept of an IMAP folder at all.
+// in v0.6.0"); `hide`/`unhide` ignore folder entirely in both modes -- they
+// are the per-actor CRM-side filing act (mail_thread_hides, Phase 4.3),
+// which has no concept of an IMAP folder at all.
+//
+// `folder` IS THE SOURCE, NEVER THE DESTINATION, and Phase 4.4's `file`
+// action is where that stopped being an academic distinction. Both the 4.4
+// spec and its plan describe this field as the destination the new action
+// already had ("bulkThreadActionInputSchema already carries an optional
+// folder") -- it does not, and reusing it that way would have destroyed
+// 4.3's folder-scoped selection ruling, since filing out of the INBOX view
+// into Clients has to say BOTH which folder the selection was made in and
+// which folder the mail is going to. Hence `targetFolder`, a second field
+// rather than a second meaning on the first. It is REQUIRED for `file` and
+// REJECTED for every other kind (the superRefine below): trash/archive read
+// their destination off the account, and hide/unhide have none, so a
+// targetFolder on any of them is a request whose sender misunderstands what
+// it is asking for -- better a 400 than a silently ignored field.
+
 // threadIds capped at 200: large enough for a full page of multi-select,
 // small enough that one request's per-account IMAP MOVE queueing stays
 // bounded; `.min(1)` because a bulk action against zero threads is not a
 // request, it's a bug in whatever sent it.
 //
-// 200 is the OUTER bound, and only `hide` reaches it. trash/archive wait on
-// a real mail server -- each queued MOVE runs on its account's serial sync
-// loop -- so the route applies a tighter per-action cap of 50 to those two
-// and rejects a larger request with the uniform 400 (api: routes/mail.ts's
-// bulk endpoint, Task 4 ruling). The CHECK lives there rather than in this
-// schema because it is a property of the ACTION, not of the body shape, and
-// this schema is also what the whole-thread single-id callers parse through
-// -- but the NUMBER lives here, next to the outer bound it tightens, because
-// the web client mirrors it too (web: mail-lib's select-all cap and its
-// per-action disable), and three copies of 50 in three packages is three
-// chances for the client to build a request the server answers with a 400.
+// 200 is the OUTER bound, and only the CRM-side pair reaches it. The three
+// MOVE kinds wait on a real mail server -- each queued MOVE runs on its
+// account's serial sync loop -- so the route applies a tighter per-action cap
+// of 50 to those and rejects a larger request with the uniform 400 (api:
+// routes/mail.ts's bulk endpoint, Task 4 ruling). The CHECK lives there
+// rather than in this schema because it is a property of the ACTION, not of
+// the body shape, and this schema is also what the whole-thread single-id
+// callers parse through -- but the NUMBERS live here, next to the outer bound
+// they tighten, because the web client mirrors them too (web: mail-lib's
+// select-all cap and its per-action disable), and three copies of 50 in three
+// packages is three chances for the client to build a request the server
+// answers with a 400.
 export const BULK_THREAD_ACTION_CAP = 200;
 export const MOVE_ACTION_THREAD_CAP = 50;
+
+// The cap per action, as a Record over the kind enum rather than as the
+// "everything except hide" test the route used to make. That negation was
+// correct while `hide` was the only CRM-side kind and became a latent bug the
+// moment 4.4 added a second one: `unhide` would have inherited the 50 by
+// falling on the wrong side of a `!== "hide"`, silently, with nothing to fail.
+// A Record is what makes a new kind a COMPILE error until someone decides
+// which side of the wait it is on -- the same reasoning as web mail-lib's
+// REASON_NOTES table, and the reason this replaces the client's own copy of
+// it rather than joining it.
+export const BULK_ACTION_THREAD_CAPS: Record<BulkThreadActionKind, number> = {
+  trash: MOVE_ACTION_THREAD_CAP,
+  archive: MOVE_ACTION_THREAD_CAP,
+  // Files into an arbitrary folder, so it waits on the server exactly as the
+  // other two moves do and takes their cap for exactly their reason.
+  file: MOVE_ACTION_THREAD_CAP,
+  hide: BULK_THREAD_ACTION_CAP,
+  // A hide-row DELETE. Local, no mailbox, nothing to wait on -- so it takes
+  // the outer bound, symmetric with the INSERT it undoes.
+  unhide: BULK_THREAD_ACTION_CAP,
+};
 
 export const bulkThreadActionInputSchema = z.object({
   threadIds: z.array(z.uuid()).min(1).max(BULK_THREAD_ACTION_CAP),
   folder: folderNameSchema.optional(),
+  targetFolder: folderNameSchema.optional(),
   action: bulkThreadActionKindSchema,
+}).superRefine((v, ctx) => {
+  // Enforced structurally rather than left to the service, for the same
+  // reason bulkThreadResultItemSchema correlates its own flags: a `file` with
+  // no destination has no defensible default (the account's Archive is a
+  // different action the caller could have asked for), and the honest answer
+  // to a request that does not say where is a 400 at the door.
+  if (v.action === "file" && v.targetFolder === undefined) {
+    ctx.addIssue({
+      code: "custom", path: ["targetFolder"],
+      message: "targetFolder is required when action is file",
+    });
+  }
+  if (v.action !== "file" && v.targetFolder !== undefined) {
+    ctx.addIssue({
+      code: "custom", path: ["targetFolder"],
+      message: "targetFolder is only valid when action is file",
+    });
+  }
 });
 export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
 
@@ -1266,12 +1335,25 @@ export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
 //   MOVE out would leave the CRM claiming a move that never happened.
 // - no_target: trash_folder/archive_folder is NULL for that account, the
 //   spec's "detect this for me" state. Fixable in Settings, or by waiting for
-//   a discovery pass.
+//   a discovery pass. NEVER produced by `file`, which names its own
+//   destination -- see unknown_target.
 // - not_found: no such thread id.
 // - server_refused: the queued IMAP MOVE was rejected; the optimistic rows
 //   have been put back. `error` carries the server's text.
+// - unknown_target (Phase 4.4, `file` only): the named destination is not a
+//   folder this message's account has -- either the account never had it, or
+//   the picker's list is stale against a folder renamed on the server. Its
+//   own code rather than a second meaning on no_target, because the two have
+//   different remedies and the client BRANCHES on that: no_target offers
+//   "Open Settings -> Mail", which is the wrong place to send someone whose
+//   only problem is that the second account in a mixed selection has no
+//   folder called Clients (web: summarizeBulkResult's settingsLink). It also
+//   covers a \Noselect destination -- a hierarchy node holding no messages,
+//   which cannot receive mail and is refused BEFORE the optimistic write
+//   rather than being left to the server (see api: mail-move.ts's
+//   fileTargetsOf).
 export const bulkThreadFailureReasonSchema = z.enum([
-  "no_sync", "no_target", "not_found", "server_refused",
+  "no_sync", "no_target", "not_found", "server_refused", "unknown_target",
 ]);
 export type BulkThreadFailureReason = z.infer<typeof bulkThreadFailureReasonSchema>;
 
@@ -1364,6 +1446,29 @@ const bulkThreadResultItemSchema = z.object({
 });
 export const bulkThreadResultSchema = z.object({
   results: z.array(bulkThreadResultItemSchema),
+  // Phase 4.4, `file` only: the destination folder whose sync THIS REQUEST
+  // switched on, absent when it switched none on.
+  //
+  // FILING INTO A FOLDER IS THE STATEMENT THAT THE FOLDER MATTERS, so filing
+  // into one whose sync is off turns that sync on (api: mail-move.ts). It
+  // does not warn and it does not refuse: the rejected alternative was to
+  // allow the move and warn that the thread would then vanish from Conduit's
+  // view, which is not informed consent -- it is a choice between losing the
+  // thread and not filing it where it belongs, dressed as one.
+  //
+  // This field exists so the consequence is still SAID, after the fact:
+  // enabling a sync is real (bandwidth, storage, a folder Conduit now walks
+  // every pass) and nobody should discover it from a graph. A notification,
+  // not a gate -- the client renders "Filed into Clients, and Conduit is now
+  // syncing that folder" beside the per-thread summary.
+  //
+  // ONE NAME, not one per account: the destination is a single string for the
+  // whole request, so every account this turned on turned on THAT folder, and
+  // the sentence is true of each. Present when at least one was switched;
+  // absent when the folder was already synced everywhere it mattered, when it
+  // is INBOX or a Sent folder (always synced, never toggleable), or when
+  // nothing was filed at all.
+  syncEnabled: z.string().min(1).optional(),
 });
 export type BulkThreadResult = z.infer<typeof bulkThreadResultSchema>;
 

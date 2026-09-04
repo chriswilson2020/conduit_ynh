@@ -1,23 +1,47 @@
-import { and, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type {
   BulkThreadActionInput, BulkThreadFailureReason, BulkThreadResult, BulkThreadSkipReason,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
+import { mailAccountFolders, mailAccounts, mailMessages, mailThreads } from "../db/schema.js";
 import { NotFoundError } from "./errors.js";
-import { folderKey } from "./mail-folders.js";
+import { folderKey, isLocked, setFolderSyncEnabled } from "./mail-folders.js";
 import { consoleSyncLogger, type SyncLogger } from "./mail-imap.js";
 import { UID_CHUNK, chunked } from "./mail-sync.js";
-import { hideThread, visibleMessageSelfContained, visibleThreads } from "./mail-threads.js";
+import {
+  hideThread, unhideThread, visibleMessageSelfContained, visibleThreads,
+} from "./mail-threads.js";
 import { publish } from "./sse.js";
 
 /**
- * The bulk thread actions (Phase 4.1): Trash and Archive MOVE the underlying
- * messages on the IMAP server, "Hide in CRM" writes the ACTOR'S OWN
- * mail_thread_hides rows (per-user since Phase 4.3 -- it files the threads
- * out of the actor's views and nobody else's). One entry point,
- * `moveThreads`, because the three arrive on one endpoint and the client
- * wants one per-thread answer whichever it asked for.
+ * The bulk thread actions. Three MOVE the underlying messages on the IMAP
+ * server -- Trash and Archive (Phase 4.1) to a folder the OWNING ACCOUNT
+ * names, File (Phase 4.4) to one the REQUEST names -- and "Hide in CRM" and
+ * its inverse write and delete the ACTOR'S OWN mail_thread_hides rows
+ * (per-user since Phase 4.3 -- they file the threads out of the actor's views
+ * and nobody else's). One entry point, `moveThreads`, because all five arrive
+ * on one endpoint and the client wants one per-thread answer whichever it
+ * asked for.
+ *
+ * ---------------------------------------------------------------------------
+ * FILING INTO AN UNSYNCED FOLDER TURNS ITS SYNC ON (Phase 4.4)
+ * ---------------------------------------------------------------------------
+ * It does not warn and it does not refuse. The rejected design was to allow
+ * the move and warn the operator that the thread would then vanish from
+ * Conduit's view; that is not informed consent, it is a choice between two bad
+ * outcomes -- lose the thread, or do not file it where it belongs -- offered
+ * as if it were one. A warning there is an admission that the design is wrong.
+ *
+ * FILING A THREAD INTO A FOLDER IS THE STATEMENT THAT THE FOLDER MATTERS, and
+ * acting on that statement is the job; asking the operator to restate it in a
+ * dialog is not. The machinery already existed -- setFolderSyncEnabled, the
+ * same call PATCH /api/mail/accounts/:id/folders makes -- so this is a call
+ * (enableTargetSync), not a mechanism.
+ *
+ * What it owes in return is a word afterwards, quietly: enabling a sync is a
+ * real consequence and nobody should discover it from a bandwidth graph. The
+ * response carries `syncEnabled` for that sentence, and the summary log line
+ * carries it for the operator who asks later. A notification, not a gate.
  *
  * ---------------------------------------------------------------------------
  * WHAT A MOVE ACTUALLY IS HERE
@@ -462,11 +486,115 @@ type AccountState =
   | { kind: "refused"; scope: AccountScope; error: string; reason: BulkThreadFailureReason }
   | { kind: "unmovable"; scope: AccountScope };
 
+/** The three kinds that MOVE mail. hide/unhide are the CRM-side pair and never
+ * reach any of the machinery below. */
+type MoveAction = "trash" | "archive" | "file";
+
+/**
+ * The `file` action's destination AS ONE ACCOUNT HAS IT (Phase 4.4).
+ *
+ * A bulk selection can span accounts, and a folder name is per-mailbox: "put
+ * these in Clients" is a different mailbox on each account and may not exist
+ * on all of them. So the destination is resolved PER ACCOUNT, and an account
+ * that cannot receive it refuses only its own messages -- every other account
+ * in the same request files normally, which is the partial-success shape the
+ * bulk contract already promises.
+ *
+ * `enableSync` is the filing rule's whole mechanism: filing into a folder IS
+ * the statement that the folder matters, so a destination whose sync is off is
+ * switched ON rather than warned about (see moveThreads). It is false for a
+ * folder already syncing and for a LOCKED one -- INBOX and the account's Sent
+ * folder are always walked, and setFolderSyncEnabled refuses to toggle them in
+ * either direction, so asking it to would turn filing into the Inbox into a
+ * 409 for no reason at all.
+ */
+type FileTarget =
+  | { kind: "usable"; folder: string; enableSync: boolean }
+  | { kind: "unusable"; error: string };
+
+/**
+ * Where `file` may put mail on each of these accounts.
+ *
+ * MATCHED BYTE FOR BYTE against the stored folder name, exactly as
+ * setFolderSyncEnabled matches its own PATCH target and as UNIQUE
+ * (account_id, folder) matches it in the database. The picker renders straight
+ * from listAccountFolders, so the name a real client sends back is the one
+ * this table holds; a hand-written request spelling it differently gets the
+ * unknown_target refusal rather than a fuzzy match, which is the safer answer
+ * for a mutation that decides which mailbox a user's mail lands in. That
+ * exactness is also what lets the enable step below pass `targetFolder`
+ * straight through: it IS the stored name, so the two lookups cannot disagree.
+ *
+ * A \Noselect destination is refused HERE rather than left to the server. It
+ * is a hierarchy node holding no messages, so the IMAP MOVE would fail and the
+ * compensation would put the rows back -- an honest outcome, but one reached
+ * after an optimistic write, a round trip and a revert, reported as
+ * `server_refused` with whatever words that server chose. Refusing it before
+ * the write costs one already-fetched column and gives the operator the reason
+ * in the app's own words. It also keeps the enable step's precondition true:
+ * setFolderSyncEnabled refuses an unselectable folder, so a filing that got
+ * that far would 409 mid-request.
+ */
+async function fileTargetsOf(
+  db: Database,
+  accounts: readonly { id: string; label: string; sentFolder: string }[],
+  targetFolder: string | undefined,
+): Promise<Map<string, FileTarget>> {
+  const targets = new Map<string, FileTarget>();
+  // Unreachable: the shared schema requires a destination for `file` and the
+  // route parses through it. Answered rather than asserted, and answered as a
+  // refusal so a body that somehow arrived without one cannot file mail
+  // somewhere nobody named.
+  if (targetFolder === undefined) {
+    for (const account of accounts) {
+      targets.set(account.id, { kind: "unusable", error: "no destination folder was given" });
+    }
+    return targets;
+  }
+  const rows = accounts.length === 0 ? [] : await db.select({
+    accountId: mailAccountFolders.accountId,
+    folder: mailAccountFolders.folder,
+    syncEnabled: mailAccountFolders.syncEnabled,
+    selectable: mailAccountFolders.selectable,
+  }).from(mailAccountFolders).where(and(
+    inArray(mailAccountFolders.accountId, accounts.map((account) => account.id)),
+    eq(mailAccountFolders.folder, targetFolder),
+  ));
+  const byAccount = new Map(rows.map((row) => [row.accountId, row]));
+  for (const account of accounts) {
+    const row = byAccount.get(account.id);
+    if (row === undefined) {
+      targets.set(account.id, {
+        kind: "unusable",
+        error: `account "${account.label}" has no folder named "${targetFolder}"`
+          + " -- pick one of its own folders, or wait for a sync pass to discover it",
+      });
+      continue;
+    }
+    if (!row.selectable) {
+      targets.set(account.id, {
+        kind: "unusable",
+        error: `folder "${targetFolder}" on account "${account.label}" holds no messages`
+          + " on the server (\\Noselect) and cannot be filed into",
+      });
+      continue;
+    }
+    targets.set(account.id, {
+      kind: "usable",
+      folder: row.folder,
+      enableSync: !row.syncEnabled && !isLocked(row.folder, account.sentFolder),
+    });
+  }
+  return targets;
+}
+
 /**
  * One account's state for this action.
  *
- * TARGET RESOLUTION IS A COLUMN READ, not a search. mail-folders.ts already
- * did the work at discovery: it prefers a LISTING-classified folder over a
+ * TARGET RESOLUTION IS A COLUMN READ for trash/archive, not a search (`file`
+ * is the exception -- it names its own, resolved per account by fileTargetsOf
+ * above). mail-folders.ts already did the work at discovery for the other two:
+ * it prefers a LISTING-classified folder over a
  * name-matched one, skips unselectable mailboxes, and fills
  * trash_folder/archive_folder only while they are NULL, so a user's override
  * always wins. NULL therefore means "nothing has ever classified one" -- the
@@ -502,21 +630,50 @@ function accountStateOf(
     id: string; label: string; archivedAt: Date | null; sentFolder: string;
     trashFolder: string | null; archiveFolder: string | null;
   },
-  action: "trash" | "archive",
+  action: MoveAction,
   syncManager: MoveSyncManager | null,
+  fileTarget: FileTarget | undefined,
 ): AccountState {
-  const raw = action === "trash" ? account.trashFolder : account.archiveFolder;
+  // `file` names its own destination and the other two read theirs off a
+  // column, so the two arrive here already resolved into the same shape: a
+  // folder name or nothing, with the sentence explaining nothing.
+  const raw = action === "trash" ? account.trashFolder
+    : action === "archive" ? account.archiveFolder
+      : fileTarget?.kind === "usable" ? fileTarget.folder : null;
   const trimmed = (raw ?? "").trim();
   const targetFolder = trimmed.length === 0 ? null : trimmed;
   const scope: AccountScope = { sentFolder: account.sentFolder.trim(), targetFolder };
   if (account.archivedAt !== null) return { kind: "unmovable", scope };
-  const role = action === "trash" ? "Trash" : "Archive";
-  if (targetFolder === null) {
+  if (action === "file") {
+    // The two file-specific refusals, both carrying the reason a Settings
+    // link cannot fix (shared: unknown_target). fileTargetsOf produced the
+    // sentence; this only decides where it lands. `undefined` is unreachable
+    // -- collectCandidates resolves a target for every account it reads --
+    // and answers defensively rather than asserting, as Outcomes.list does.
+    if (fileTarget === undefined || fileTarget.kind === "unusable") {
+      return {
+        kind: "refused", scope,
+        error: fileTarget?.error ?? `account "${account.label}" has no such folder`,
+        reason: "unknown_target",
+      };
+    }
+  } else if (targetFolder === null) {
+    const role = action === "trash" ? "Trash" : "Archive";
     return {
       kind: "refused",
       scope,
       error: `account "${account.label}" has no ${role} folder yet`
         + " -- set one in Settings, or wait for a sync pass to detect it",
+      reason: "no_target",
+    };
+  }
+  // Unreachable past both branches above: `file` has a usable target and the
+  // other two have a non-null column. Narrowing for the `ready` state below,
+  // which carries a non-null folder.
+  if (targetFolder === null) {
+    return {
+      kind: "refused", scope,
+      error: `account "${account.label}" has no target folder for this action`,
       reason: "no_target",
     };
   }
@@ -537,10 +694,13 @@ function accountStateOf(
  * Apply one bulk action to `input.threadIds`, returning one result per
  * requested thread.
  *
- * `hide` is the per-actor Hide-in-CRM (mail_thread_hides rows for the ACTOR
- * alone, Phase 4.3) applied in bulk and touches no mailbox -- and nobody
- * else's view. `trash`/`archive` MOVE messages, in the two modes
- * `bulkThreadActionInputSchema.folder` selects:
+ * `hide`/`unhide` are the per-actor Hide-in-CRM pair (mail_thread_hides rows
+ * for the ACTOR alone, Phase 4.3) applied in bulk and touch no mailbox -- and
+ * nobody else's view. `trash`/`archive`/`file` MOVE messages, in the two modes
+ * `bulkThreadActionInputSchema.folder` selects -- and note that `folder` is
+ * the SOURCE in both modes, never the destination: `file` names its own in
+ * `targetFolder`, which is why it is a second field rather than a second
+ * meaning on the first (shared: bulkThreadActionInputSchema):
  *
  * - FOLDER-SCOPED (`folder` present -- the list multi-select): only each
  *   thread's messages currently in THAT folder, the view the selection was
@@ -576,11 +736,11 @@ function accountStateOf(
  * the compensation exists to prevent.
  *
  * What Task 4's route does about that, per the coordinator's ruling, is cap
- * the SIZE of the wait rather than its duration: trash/archive take at most 50
- * thread ids per request (hide keeps the contract's 200, since it touches no
- * mailbox), and the endpoint documents that a proxy 504 means the answer was
- * lost, NOT that the move failed -- the work continues on the loop, and the
- * client should refetch rather than retry blindly.
+ * the SIZE of the wait rather than its duration: the three MOVE kinds take at
+ * most 50 thread ids per request (hide and unhide keep the contract's 200,
+ * since they touch no mailbox), and the endpoint documents that a proxy 504
+ * means the answer was lost, NOT that the move failed -- the work continues on
+ * the loop, and the client should refetch rather than retry blindly.
  */
 export async function moveThreads(
   db: Database, actorId: string, input: BulkThreadActionInput, deps: MoveThreadsDeps,
@@ -593,19 +753,54 @@ export async function moveThreads(
   const outcomes = new Outcomes();
   let messages = 0;
   let refusedAccounts = 0;
+  /** The destination folder this request switched syncing on for, or null --
+   * see the filing rule below, and shared's bulkThreadResultSchema.syncEnabled
+   * for what the client does with it. */
+  let syncEnabled: string | null = null;
 
-  if (input.action === "hide") {
-    await hideThreads(db, actorId, unique, outcomes);
+  if (input.action === "hide" || input.action === "unhide") {
+    await setHiddenThreads(db, actorId, unique, input.action === "hide", outcomes);
   } else {
-    // `action` is narrowed to the two MOVE kinds by the branch above, and is
+    // `action` is narrowed to the three MOVE kinds by the branch above, and is
     // passed on explicitly so nothing downstream has to re-establish it.
     const collected = await collectCandidates(
-      db, actorId, { folder: input.folder, action: input.action }, unique, deps.syncManager, outcomes,
+      db, actorId,
+      { folder: input.folder, targetFolder: input.targetFolder, action: input.action },
+      unique, deps.syncManager, outcomes,
     );
     const { candidates } = collected;
     messages = candidates.length;
     refusedAccounts = collected.refusedAccounts;
     if (candidates.length > 0) {
+      // THE SYNC SWITCH COMES BEFORE THE MOVE, and the order is the whole
+      // answer to a two-system write.
+      //
+      // Filing into a folder whose sync is off turns that sync ON (the Phase
+      // 4.4 rule: filing into a folder IS the statement that the folder
+      // matters). That makes this two writes -- a local sync_enabled flip and
+      // a mail-server MOVE -- and the interesting question is which failure
+      // the ordering leaves possible. Done AFTER a successful move, a failed
+      // flip would leave mail filed into a folder Conduit does not watch:
+      // precisely the vanishing thread the rule exists to prevent, arrived at
+      // by accident instead of by warning. Done FIRST, the only reachable
+      // failure is the harmless one -- sync switched on for a folder the move
+      // then failed to put anything in, which costs one folder's backfill and
+      // is undone with one click in the picker.
+      //
+      // It is also the failure that ends the request: a throw here happens
+      // before applyOptimisticMove, so nothing has moved, nothing has been
+      // claimed, and the 500 describes a request that did nothing rather than
+      // one that did half of something. Its own refusals (a locked or
+      // unselectable folder, an unknown name) are all excluded upstream by
+      // fileTargetsOf, so what is left to throw is a database that has gone
+      // away -- which is not a fact about one thread and has no honest
+      // per-thread `reason` to carry, the same judgement setHiddenThreads
+      // makes about a non-NotFoundError.
+      if (input.action === "file" && collected.enableSyncFor.length > 0) {
+        syncEnabled = await enableTargetSync(
+          db, actorId, collected.enableSyncFor, input.targetFolder,
+        );
+      }
       await applyOptimisticMove(db, candidates);
       const failures = await queueMoves(db, candidates, logger);
       // Every failure out of the queue is the same kind: the mail server said
@@ -624,26 +819,90 @@ export async function moveThreads(
   // One line per bulk action, and the counts come off the ANSWERS (see
   // Outcomes.tally) so they describe what the caller was actually told.
   // `folder` is logged as received even for `hide`, which ignores it: what the
-  // request said is the useful thing to have in the journal.
+  // request said is the useful thing to have in the journal. `syncEnabled` is
+  // there because it is the one thing this endpoint does that OUTLIVES the
+  // request -- an operator asking "why is Conduit suddenly walking Clients"
+  // should find the answer in the journal, not infer it from traffic.
   logger.info(
     {
       actorId, action: input.action, folder: input.folder ?? null,
+      targetFolder: input.targetFolder ?? null, syncEnabled,
       threads: unique.length, messages, refusedAccounts, ...outcomes.tally(),
     },
     "mail-move: bulk action",
   );
-  return { results: outcomes.list(requested) };
+  // Absent rather than null when nothing was switched on: the field is a
+  // notification the client renders when it is there, and an always-present
+  // null is a shape every reader has to test before ignoring.
+  return syncEnabled === null
+    ? { results: outcomes.list(requested) }
+    : { results: outcomes.list(requested), syncEnabled };
 }
 
 /**
- * "Hide in CRM": one hide row per thread FOR THE ACTOR (Phase 4.3 -- the
- * bulk action files the conversations out of the actor's own views and
- * nobody else's), one thread at a time.
+ * Turn the `file` destination's sync ON for each account that is about to
+ * receive mail there, and report the folder if any switch actually flipped.
+ *
+ * DELEGATED TO setFolderSyncEnabled, the same call PATCH
+ * /api/mail/accounts/:id/folders makes, rather than an UPDATE of its own: the
+ * ownership check, the locked/unselectable refusals, the same-value no-op and
+ * the folders SSE hint are all rules about this switch, and a second writer
+ * that knew only some of them would be a second, quieter answer to the same
+ * question. The Phase 4.4 rule is a CALL, not a mechanism.
+ *
+ * The name it passes is the request's own `targetFolder`, which fileTargetsOf
+ * matched byte for byte against the stored row -- so it is that row's name and
+ * the lookup cannot miss.
+ *
+ * `enabled` comes back false from a same-value PATCH, so the reported name is
+ * true of at least one real flip. Every account here is one fileTargetsOf
+ * found sync-OFF and unlocked, so in practice each flips; the OR is what keeps
+ * the sentence honest if one of them was switched on by another tab in the
+ * meantime.
+ *
+ * NO SYNC PASS IS REQUESTED, and that is the one place this deliberately
+ * differs from the PATCH route, which calls syncNow. There a switched-on
+ * folder has nothing else to make it move, so waiting a poll interval (five
+ * minutes, mail-sync's DEFAULT_POLL_INTERVAL_MS) means a click with no visible
+ * effect. Here the filing itself is the effect: the rows are already in the
+ * database with the destination folder on them, visible in the list
+ * immediately, and the next pass restores their UIDs exactly as it does after
+ * a trash or an archive. Adding syncNow would mean widening MoveSyncManager
+ * for a five-minute head start on a backfill nobody is watching.
+ */
+async function enableTargetSync(
+  db: Database, actorId: string, accountIds: readonly string[], targetFolder: string | undefined,
+): Promise<string | null> {
+  // Unreachable (the schema requires a destination for `file`), and the
+  // defensive answer is "switched nothing on", which is true.
+  if (targetFolder === undefined) return null;
+  let flipped = false;
+  for (const accountId of accountIds) {
+    const result = await setFolderSyncEnabled(db, actorId, accountId, {
+      folder: targetFolder, syncEnabled: true,
+    });
+    flipped ||= result.enabled;
+  }
+  return flipped ? targetFolder : null;
+}
+
+/**
+ * "Hide in CRM" and its inverse: one hide row per thread FOR THE ACTOR (Phase
+ * 4.3 -- the bulk action files the conversations out of the actor's own views
+ * and nobody else's), one thread at a time.
+ *
+ * ONE FUNCTION FOR BOTH DIRECTIONS (Phase 4.4 added `unhide`), because every
+ * sentence below is true of both: the same visibility gate, the same
+ * per-thread NotFoundError, the same batched hint, the same idempotence. The
+ * only asymmetry is in mail-threads' setHidden -- hide is an INSERT ... ON
+ * CONFLICT DO NOTHING and unhide a DELETE ... RETURNING -- and that is
+ * precisely the difference this level should not be restating.
  *
  * Delegated to mail-threads.ts rather than reimplemented in bulk, because that
- * function owns the idempotence (hiding an already-hidden thread is a no-op
- * that still succeeds) and the SSE hint. `folder` is ignored entirely in both
- * modes: a CRM-side filing act has no concept of an IMAP folder.
+ * function owns the idempotence (hiding an already-hidden thread, or unhiding
+ * one that was never hidden, is a no-op that still succeeds) and the SSE hint.
+ * `folder` is ignored entirely in both modes: a CRM-side filing act has no
+ * concept of an IMAP folder.
  *
  * Sequential, and one failure does not stop the rest: an unknown id fails ITS
  * thread and the others still hide, which is the partial-failure shape the
@@ -654,32 +913,50 @@ export async function moveThreads(
  * database went away mid-batch) is not a fact about one thread, has no
  * honest `reason` code to carry, and is re-thrown to become the 500 it is.
  *
- * ONE SSE HINT FOR THE BATCH, not one per thread: hideThread's own hint is
- * suppressed and this publishes a single frame carrying every hidden thread's
+ * ONE SSE HINT FOR THE BATCH, not one per thread: the per-thread hint is
+ * suppressed and this publishes a single frame carrying every touched thread's
  * keys, so hiding 200 threads costs one invalidation round instead of 200.
  * The trade, stated because the single-thread path does not make it: that path
- * publishes only when the actor's hide row was actually WRITTEN, and this
- * cannot tell -- hideThread is idempotent and reports the thread either way --
- * so a bulk hide of threads that were all already hidden publishes one hint
- * where the per-thread path would have published none. One redundant refetch
- * round per request the user explicitly made is a better trade than 200
- * frames.
+ * publishes only when the actor's hide row was actually WRITTEN or REMOVED,
+ * and this cannot tell -- setHidden is idempotent and reports the thread
+ * either way -- so a bulk unhide of threads that were none of them hidden
+ * publishes one hint where the per-thread path would have published none. One
+ * redundant refetch round per request the user explicitly made is a better
+ * trade than 200 frames.
  */
-async function hideThreads(
-  db: Database, actorId: string, threadIds: readonly string[], outcomes: Outcomes,
+async function setHiddenThreads(
+  db: Database, actorId: string, threadIds: readonly string[], hidden: boolean, outcomes: Outcomes,
 ): Promise<void> {
-  const hidden = new Set<string>();
+  const touched = new Set<string>();
   for (const threadId of threadIds) {
     try {
-      await hideThread(db, actorId, threadId, { publishHint: false });
+      await (hidden
+        ? hideThread(db, actorId, threadId, { publishHint: false })
+        : unhideThread(db, actorId, threadId, { publishHint: false }));
       outcomes.succeed(threadId);
-      hidden.add(threadId);
+      touched.add(threadId);
     } catch (error) {
       if (!(error instanceof NotFoundError)) throw error;
       outcomes.fail(threadId, error.message, "not_found");
     }
   }
-  if (hidden.size > 0) publishMoveHints(hidden);
+  if (touched.size > 0) publishMoveHints(touched);
+}
+
+/** What collectCandidates hands back: the work, the refusal count for the log
+ * line, and (Phase 4.4) the accounts whose `file` destination this request is
+ * about to start syncing. */
+interface CollectedCandidates {
+  candidates: Candidate[];
+  refusedAccounts: number;
+  enableSyncFor: string[];
+}
+
+/** A fresh empty answer per call, never one shared constant: the arrays are
+ * the caller's to hold, and a module-level literal handed out twice is one
+ * accidental push away from a bug nothing local would explain. */
+function emptyCollection(): CollectedCandidates {
+  return { candidates: [], refusedAccounts: 0, enableSyncFor: [] };
 }
 
 /**
@@ -705,11 +982,11 @@ async function hideThreads(
 async function collectCandidates(
   db: Database,
   actorId: string,
-  request: { folder: string | undefined; action: "trash" | "archive" },
+  request: { folder: string | undefined; targetFolder: string | undefined; action: MoveAction },
   threadIds: readonly string[],
   syncManager: MoveSyncManager | null,
   outcomes: Outcomes,
-): Promise<{ candidates: Candidate[]; refusedAccounts: number }> {
+): Promise<CollectedCandidates> {
   const { folder: viewFolder, action } = request;
   // THE VISIBILITY GATE, folded into the requested-threads read -- one
   // statement for the whole request, never a per-thread resolution loop. A
@@ -731,7 +1008,7 @@ async function collectCandidates(
       outcomes.fail(threadId, new NotFoundError("mail thread", threadId).message, "not_found");
     }
   }
-  if (known.size === 0) return { candidates: [], refusedAccounts: 0 };
+  if (known.size === 0) return emptyCollection();
 
   // Rows awaiting reconciliation (NULL imap_uid) are FETCHED and dropped in the
   // loop below, not filtered out in SQL. They used to be filtered here, on the
@@ -758,7 +1035,7 @@ async function collectCandidates(
   }).from(mailMessages).where(
     and(inArray(mailMessages.threadId, [...known]), visibleMessageSelfContained(actorId, "record")),
   );
-  if (messages.length === 0) return { candidates: [], refusedAccounts: 0 };
+  if (messages.length === 0) return emptyCollection();
 
   const accountIds = [...new Set(messages.map((row) => row.accountId))];
   const accountRows = await db.select({
@@ -768,14 +1045,27 @@ async function collectCandidates(
     trashFolder: mailAccounts.trashFolder, archiveFolder: mailAccounts.archiveFolder,
   }).from(mailAccounts).where(inArray(mailAccounts.id, accountIds));
 
+  // ONE READ FOR EVERY ACCOUNT IN THE REQUEST, beside the accounts read
+  // rather than per row -- and only for `file`, which is the only action whose
+  // destination is not a column of the row already fetched.
+  const fileTargets = action === "file"
+    ? await fileTargetsOf(db, accountRows, request.targetFolder)
+    : new Map<string, FileTarget>();
+
   const states = new Map<string, AccountState>();
   // Kept beside `states` rather than inside AccountState: whose mailbox this
   // is has nothing to do with what the account can carry out, and the
   // ownership drop below needs it for every state kind alike.
   const ownerOf = new Map<string, string>();
+  /** Accounts whose `file` destination is a folder Conduit is not syncing --
+   * narrowed to the ones that actually contribute a candidate before anything
+   * is switched on (see the return below). */
+  const syncOff = new Set<string>();
   for (const account of accountRows) {
-    states.set(account.id, accountStateOf(account, action, syncManager));
+    states.set(account.id, accountStateOf(account, action, syncManager, fileTargets.get(account.id)));
     ownerOf.set(account.id, account.userId);
+    const target = fileTargets.get(account.id);
+    if (target?.kind === "usable" && target.enableSync) syncOff.add(account.id);
   }
   /** Accounts whose refusal actually FIRED -- see the count returned below. */
   const refused = new Set<string>();
@@ -874,7 +1164,20 @@ async function collectCandidates(
   // state: after the ordering fix above, an account that refuses but had
   // nothing in scope affects no thread, and logging it as a refusal would send
   // an operator looking for a failure the caller was never told about.
-  return { candidates, refusedAccounts: refused.size };
+  //
+  // `enableSyncFor` is narrowed the same way and for the same reason: an
+  // account whose destination folder is not synced but which contributed NO
+  // candidate had nothing filed into it, and turning its sync on would be a
+  // consequence with no cause -- bandwidth spent because a thread the user
+  // ticked happened to carry a message on a mailbox the action then skipped.
+  // The rule is "filing into a folder turns its sync on", and an account that
+  // filed nothing did not file into it.
+  const contributing = new Set(candidates.map((row) => row.accountId));
+  return {
+    candidates,
+    refusedAccounts: refused.size,
+    enableSyncFor: [...syncOff].filter((accountId) => contributing.has(accountId)),
+  };
 }
 
 /**

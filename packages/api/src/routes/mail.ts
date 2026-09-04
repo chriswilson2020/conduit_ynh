@@ -3,7 +3,7 @@ import { z } from "zod";
 import {
   mailAccountCreateInputSchema, mailAccountUpdateInputSchema, mailAccountUpdatePasswordFieldsSchema,
   mailAccountTestInputSchema, mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
-  bulkThreadActionInputSchema, folderPatchInputSchema, MOVE_ACTION_THREAD_CAP,
+  bulkThreadActionInputSchema, folderPatchInputSchema, BULK_ACTION_THREAD_CAPS,
   type MailAccountSyncStats,
 } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
@@ -528,10 +528,20 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   });
 
   /**
-   * The bulk thread actions: Trash and Archive MOVE messages on the IMAP
-   * server, "Hide in CRM" writes the ACTOR'S own per-user hide rows
+   * The bulk thread actions: Trash, Archive and File MOVE messages on the IMAP
+   * server -- the first two to a folder the OWNING ACCOUNT names, File (Phase
+   * 4.4) to one the REQUEST names in `targetFolder` -- while "Hide in CRM" and
+   * its inverse write and delete the ACTOR'S own per-user hide rows
    * (mail_thread_hides, Phase 4.3 -- nobody else's views change;
-   * services/mail-move.ts owns all three).
+   * services/mail-move.ts owns all five).
+   *
+   * FILING INTO A FOLDER CONDUIT IS NOT SYNCING TURNS THAT SYNC ON, without
+   * warning and without refusing (the Phase 4.4 rule -- see mail-move.ts's
+   * header for why a warning there would be an admission that the design is
+   * wrong). It is the one side effect of this route that outlives the request,
+   * so the response says which folder it was (`syncEnabled`) for the client to
+   * show after the fact, and the service's summary log line records it for
+   * whoever asks later.
    *
    * AUTH-ONLY at the route, BY DESIGN -- the real gates live in the service,
    * in a fixed order. Thread ids of other users' private threads ARE
@@ -576,10 +586,10 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     if (user === null) return;
     const input = parseOrReject(bulkThreadActionInputSchema, request.body, reply);
     if (input === undefined) return;
-    // The shared schema's 200 is the outer bound and only `hide` may reach it:
-    // hiding is one CRM-side hide-row insert per thread (the actor's own
-    // mail_thread_hides row), while trash/archive each
-    // wait on a real mail server. Capping the two MOVE actions lower is the
+    // The shared schema's 200 is the outer bound and only the CRM-side pair
+    // may reach it: hiding and unhiding are one hide-row insert or delete per
+    // thread (the actor's own mail_thread_hides row), while trash/archive/file
+    // each wait on a real mail server. Capping the MOVE actions lower is the
     // ruling's answer to that wait -- bound the SIZE of the request rather than
     // its duration, since a timeout would produce exactly the "claimed a move
     // the server refused" state the move service's compensation exists to
@@ -589,14 +599,23 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     // account's serial loop is already doing -- and a user who has pressed "load
     // more" once can still select everything on screen and act on it in one
     // gesture. Enforced HERE rather than in the schema because it is a
-    // property of the ACTION, not of the body shape; the NUMBER lives in
-    // @conduit/shared beside that schema, because the web client mirrors it (its
-    // select-all cap) and a client-side copy that drifted would build requests
-    // this line answers with a 400.
-    if (input.action !== "hide" && input.threadIds.length > MOVE_ACTION_THREAD_CAP) {
+    // property of the ACTION, not of the body shape; the NUMBERS live in
+    // @conduit/shared beside that schema, because the web client mirrors them
+    // (its select-all cap) and a client-side copy that drifted would build
+    // requests this line answers with a 400.
+    //
+    // READ OFF A TABLE, not off an `action !== "hide"` test, which is what
+    // this line used to be. That negation was right while `hide` was the only
+    // action waiting on nothing, and would have silently handed Phase 4.4's
+    // `unhide` -- a local row DELETE -- the mail server's cap, with no test to
+    // notice. BULK_ACTION_THREAD_CAPS is a Record over the kind enum, so the
+    // next kind cannot be added without someone deciding which side of the
+    // wait it is on.
+    const cap = BULK_ACTION_THREAD_CAPS[input.action];
+    if (input.threadIds.length > cap) {
       return reply.code(400).send({
         error: "validation",
-        message: `${input.action} accepts at most ${MOVE_ACTION_THREAD_CAP} threads per request`
+        message: `${input.action} accepts at most ${cap} threads per request`
           + ` (received ${input.threadIds.length})`,
       });
     }

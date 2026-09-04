@@ -1934,7 +1934,7 @@ describe("mail bulk thread action route", () => {
     await a.close();
   });
 
-  it("caps trash and archive at 50 threads while hide keeps the shared schema's 200", async () => {
+  it("caps the three server moves at 50 threads while hide and unhide keep the shared schema's 200", async () => {
     const a = await app();
     const ids = Array.from({ length: 51 }, () => randomUUID());
 
@@ -1946,12 +1946,27 @@ describe("mail bulk thread action route", () => {
         message: `${action} accepts at most 50 threads per request (received 51)`,
       });
     }
+    // `file` (Phase 4.4) waits on the same serial loop as the other two, so it
+    // takes the same cap for the same reason.
+    const overFileCap = await bulk(a, {
+      threadIds: ids, folder: "INBOX", targetFolder: "Clients", action: "file",
+    });
+    expect(overFileCap.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(overFileCap.json())).toEqual({
+      error: "validation",
+      message: "file accepts at most 50 threads per request (received 51)",
+    });
 
-    // hide waits on nothing but the database, so it keeps the outer bound.
-    // (Every id here is unknown, which is a per-thread failure, not a 400.)
-    const hide = await bulk(a, { threadIds: ids, action: "hide" });
-    expect(hide.statusCode).toBe(200);
-    expect(bulkThreadResultSchema.parse(hide.json()).results).toHaveLength(51);
+    // hide and unhide wait on nothing but the database, so they keep the outer
+    // bound. (Every id here is unknown, which is a per-thread failure, not a
+    // 400.) UNHIDE IS THE ONE THAT USED TO BE GUESSED: the check was once
+    // `action !== "hide"`, which would have handed a local row DELETE the mail
+    // server's cap purely because it was not spelled "hide".
+    for (const action of ["hide", "unhide"] as const) {
+      const response = await bulk(a, { threadIds: ids, action });
+      expect(response.statusCode).toBe(200);
+      expect(bulkThreadResultSchema.parse(response.json()).results).toHaveLength(51);
+    }
 
     // Both caps bracketed on the passing side too, so neither is off by one:
     // exactly 50 moves, and exactly 200 hides.
@@ -1960,17 +1975,92 @@ describe("mail bulk thread action route", () => {
     });
     expect(atMoveCap.statusCode).toBe(200);
     expect(bulkThreadResultSchema.parse(atMoveCap.json()).results).toHaveLength(50);
-    const atSharedCap = await bulk(a, {
-      threadIds: Array.from({ length: 200 }, () => randomUUID()), action: "hide",
-    });
-    expect(atSharedCap.statusCode).toBe(200);
-    expect(bulkThreadResultSchema.parse(atSharedCap.json()).results).toHaveLength(200);
+    for (const action of ["hide", "unhide"] as const) {
+      const atSharedCap = await bulk(a, {
+        threadIds: Array.from({ length: 200 }, () => randomUUID()), action,
+      });
+      expect(atSharedCap.statusCode).toBe(200);
+      expect(bulkThreadResultSchema.parse(atSharedCap.json()).results).toHaveLength(200);
+    }
 
     // The shared cap still holds above it, for every action.
     const tooMany = await bulk(a, {
       threadIds: Array.from({ length: 201 }, () => randomUUID()), action: "hide",
     });
     expect(tooMany.statusCode).toBe(400);
+    await a.close();
+  });
+
+  // The destination is a SECOND field, and the schema's correlation with the
+  // action is enforced at the door rather than half-honoured downstream --
+  // both directions, because a silently ignored targetFolder is how a caller
+  // comes to believe it filed something.
+  it("400s a file with no destination, and a destination on any other action", async () => {
+    const a = await app();
+    const ids = [randomUUID()];
+
+    const noTarget = await bulk(a, { threadIds: ids, folder: "INBOX", action: "file" });
+    expect(noTarget.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(noTarget.json()).message).toContain("targetFolder is required");
+
+    for (const action of ["trash", "archive", "hide", "unhide"] as const) {
+      const response = await bulk(a, { threadIds: ids, targetFolder: "Clients", action });
+      expect(response.statusCode).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).message)
+        .toContain("targetFolder is only valid when action is file");
+    }
+    await a.close();
+  });
+
+  it("files into a folder the request names, turning that folder's sync on and saying so", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    // The case the whole rule is about: a folder Conduit knows and is NOT
+    // syncing. The picker offers it precisely so it can be filed into.
+    await seedFolder(account.id, "Clients", { syncEnabled: false });
+    const threadId = await seedThread({ subject: "File me", lastMessageAt: new Date("2026-08-04T10:00:00Z") });
+    const messageId = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-04T10:00:00Z"), imapUid: 71,
+    });
+
+    const response = await bulk(a, {
+      threadIds: [threadId], folder: "INBOX", targetFolder: "Clients", action: "file",
+    });
+
+    expect(response.statusCode).toBe(200);
+    // No warning, no gate, no second request: filing into the folder IS the
+    // instruction, and the response reports the consequence after the fact.
+    expect(bulkThreadResultSchema.parse(response.json())).toEqual({
+      results: [{ threadId, ok: true }], syncEnabled: "Clients",
+    });
+    expect(await messageRow(messageId)).toMatchObject({ folder: "Clients", imapUid: null });
+    expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [71], targetFolder: "Clients" }]);
+    const [folderRow] = await handle.db.select().from(mailAccountFolders).where(and(
+      eq(mailAccountFolders.accountId, account.id), eq(mailAccountFolders.folder, "Clients"),
+    ));
+    expect(folderRow?.syncEnabled).toBe(true);
+    await a.close();
+  });
+
+  it("unhides in bulk, removing the requesting user's own hide rows", async () => {
+    const a = await app();
+    const { account } = await readyAccount(a);
+    const first = await seedThread({ subject: "One", lastMessageAt: new Date("2026-08-04T10:00:00Z") });
+    await seedMessage(first, account.id, { sentAt: new Date("2026-08-04T10:00:00Z"), imapUid: 81 });
+    const second = await seedThread({ subject: "Two", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(second, account.id, { sentAt: new Date("2026-08-03T10:00:00Z"), imapUid: 82 });
+
+    expect((await bulk(a, { threadIds: [first, second], action: "hide" })).statusCode).toBe(200);
+    expect(await handle.db.select().from(mailThreadHides)).toHaveLength(2);
+
+    // The inverse, in one gesture rather than in two: fifty threads hide in
+    // one click and used to need fifty to come back.
+    const response = await bulk(a, { threadIds: [first, second], action: "unhide" });
+    expect(response.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(response.json())).toEqual({
+      results: [{ threadId: first, ok: true }, { threadId: second, ok: true }],
+    });
+    expect(await handle.db.select().from(mailThreadHides)).toHaveLength(0);
     await a.close();
   });
 

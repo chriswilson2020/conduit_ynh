@@ -62,6 +62,7 @@ import {
   bulkThreadSkipReasonSchema,
   BULK_THREAD_ACTION_CAP,
   MOVE_ACTION_THREAD_CAP,
+  BULK_ACTION_THREAD_CAPS,
   meetingSchema,
   meetingDetailSchema,
   meetingAttendeeSchema,
@@ -1355,12 +1356,48 @@ describe("threadListFiltersSchema", () => {
 });
 
 describe("bulkThreadActionKindSchema and bulkThreadActionInputSchema", () => {
-  it("accepts each of the three action kinds, folder-scoped (folder present)", () => {
-    for (const action of ["trash", "archive", "hide"] as const) {
+  it("accepts each destination-free action kind, folder-scoped (folder present)", () => {
+    for (const action of ["trash", "archive", "hide", "unhide"] as const) {
       expect(bulkThreadActionKindSchema.parse(action)).toBe(action);
       const input = { threadIds: [uuid1], folder: "INBOX", action };
       expect(bulkThreadActionInputSchema.parse(input)).toEqual(input);
     }
+  });
+
+  // Phase 4.4. `folder` is the SOURCE (the view the selection was made in)
+  // and `targetFolder` the DESTINATION, and this case is the one that needs
+  // both at once: filing out of the INBOX view into Clients.
+  it("accepts file with both a source folder and a destination", () => {
+    const input = { threadIds: [uuid1], folder: "INBOX", targetFolder: "Clients", action: "file" as const };
+    expect(bulkThreadActionInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects file with no destination -- there is no defensible default", () =>
+    expect(() =>
+      bulkThreadActionInputSchema.parse({ threadIds: [uuid1], folder: "INBOX", action: "file" }),
+    ).toThrow(/targetFolder is required/));
+
+  // A targetFolder on any other kind is a request whose sender misunderstands
+  // it: trash/archive read their destination off the ACCOUNT, hide/unhide have
+  // none at all. Rejected rather than ignored -- a silently dropped field is
+  // how a caller comes to believe it filed something.
+  it("rejects a destination on every kind that does not take one", () => {
+    for (const action of ["trash", "archive", "hide", "unhide"] as const) {
+      expect(() =>
+        bulkThreadActionInputSchema.parse({ threadIds: [uuid1], targetFolder: "Clients", action }),
+      ).toThrow(/targetFolder is only valid when action is file/);
+    }
+  });
+
+  it("trims a present destination and rejects a blank one", () => {
+    expect(
+      bulkThreadActionInputSchema.parse(
+        { threadIds: [uuid1], targetFolder: "  Clients  ", action: "file" },
+      ).targetFolder,
+    ).toBe("Clients");
+    expect(() =>
+      bulkThreadActionInputSchema.parse({ threadIds: [uuid1], targetFolder: "   ", action: "file" }),
+    ).toThrow();
   });
 
   // The whole-thread mode (single-thread conversation/record-tab buttons):
@@ -1408,6 +1445,19 @@ describe("bulkThreadActionKindSchema and bulkThreadActionInputSchema", () => {
   it("exports the caps the route and the web client both key on", () => {
     expect(BULK_THREAD_ACTION_CAP).toBe(200);
     expect(MOVE_ACTION_THREAD_CAP).toBe(50);
+  });
+
+  // The table, not the "everything except hide" test the route used to make.
+  // `unhide` is the case that negation would have got wrong: it is CRM-side,
+  // waits on nothing, and belongs on hide's side of the line -- which the
+  // Record states and a `!== "hide"` silently denied.
+  it("caps every action kind, with the two CRM-side ones on the outer bound", () => {
+    expect(BULK_ACTION_THREAD_CAPS).toEqual({
+      trash: 50, archive: 50, file: 50, hide: 200, unhide: 200,
+    });
+    // Every kind the enum has, so a new one cannot join without a cap.
+    expect(Object.keys(BULK_ACTION_THREAD_CAPS).sort())
+      .toEqual([...bulkThreadActionKindSchema.options].sort());
   });
 });
 
@@ -1471,7 +1521,7 @@ describe("bulkThreadResultSchema", () => {
     // Pinned so a rename cannot quietly land without the client that
     // branches on these being updated with it.
     expect(bulkThreadFailureReasonSchema.options)
-      .toEqual(["no_sync", "no_target", "not_found", "server_refused"]);
+      .toEqual(["no_sync", "no_target", "not_found", "server_refused", "unknown_target"]);
     // archived_account, not_owner, awaiting_reconciliation, already_in_target
     // are in SKIP_REASON_RANK's precedence order (api: mail-move.ts) -- see
     // that table's own comment for why not_owner sits second; out_of_scope
@@ -1480,6 +1530,31 @@ describe("bulkThreadResultSchema", () => {
     // noteSkip/skip).
     expect(bulkThreadSkipReasonSchema.options)
       .toEqual(["archived_account", "not_owner", "awaiting_reconciliation", "already_in_target", "out_of_scope"]);
+  });
+
+  // Phase 4.4's unknown_target is a FAILURE (the account has no such folder,
+  // so nothing was filed), never a skip -- the same either/or every other
+  // reason is held to.
+  it("accepts unknown_target as a failure reason, and refuses it as a skip", () => {
+    const failure = {
+      threadId: uuid1, ok: false,
+      error: 'account "Work" has no folder named "Clients"', reason: "unknown_target" as const,
+    };
+    expect(bulkThreadResultSchema.parse({ results: [failure] })).toEqual({ results: [failure] });
+    expect(() => bulkThreadResultSchema.parse({
+      results: [{ threadId: uuid1, ok: true, skipped: true, reason: "unknown_target" }],
+    })).toThrow();
+  });
+
+  // The quiet notification the filing rule owes the operator: enabling a
+  // folder's sync is a real consequence, so the response says which folder it
+  // was, and says nothing at all when it enabled none.
+  it("carries the folder whose sync the request switched on, and omits it otherwise", () => {
+    expect(bulkThreadResultSchema.parse({
+      results: [{ threadId: uuid1, ok: true }], syncEnabled: "Clients",
+    }).syncEnabled).toBe("Clients");
+    expect("syncEnabled" in bulkThreadResultSchema.parse({ results: [{ threadId: uuid1, ok: true }] }))
+      .toBe(false);
   });
 
   it("rejects error present alongside ok: true", () =>

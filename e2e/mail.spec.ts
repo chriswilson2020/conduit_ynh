@@ -107,6 +107,24 @@ const JUNK_FOLDER = "Junk";
 const TRASH_FOLDER = "Trash";
 const ARCHIVE_FOLDER = "Archive";
 
+/**
+ * Phase 4.4's filing destination, and the ONE fixture folder this spec makes
+ * for itself (seedMailbox creates it over IMAP rather than start-dovecot.sh
+ * declaring it, because it is this journey's alone and nothing else asserts
+ * against it).
+ *
+ * IT HAS TO BE A FOLDER CONDUIT IS NOT SYNCING, which is the whole point:
+ * filing into one turns its sync on, and a destination that was already
+ * syncing could not tell that rule working from that rule missing. Junk and
+ * trash are the only two roles the CRM leaves switched OFF on first sight, and
+ * the fixture Junk mailbox is already spoken for by the Settings-picker test
+ * earlier in this journey -- so this one is named to be classified junk by
+ * mail-folders.ts's NAME heuristic (no SPECIAL-USE attribute is set on it, and
+ * imapflow resolves competing \Junk claims to a single winner, which must stay
+ * the fixture Junk).
+ */
+const SPAM_FOLDER = "Spam";
+
 test.describe.serial("Mail journey", () => {
   // Playwright's default test timeout is 30s, which is LESS than the sync
   // budget below -- so without this the deadline in pollWithReload could
@@ -186,6 +204,9 @@ test.describe.serial("Mail journey", () => {
    * describe the same conversations afterwards as before. */
   let archiveSubjects: [string, string] = ["", ""];
   let trashSubject = "";
+  /** Phase 4.4: the one filed into an arbitrary folder, which is also what
+   * turns that folder's sync on. */
+  let fileSubject = "";
 
   /**
    * The Phase 4.3 fixtures, per-attempt for the same unrecoverability
@@ -465,6 +486,11 @@ test.describe.serial("Mail journey", () => {
 
     return [
       message(junkSubject, JUNK_FOLDER, new Date(now - 5 * MINUTE_MS)),
+      // OLDER THAN THE ARCHIVE PAIR, deliberately: the shift-range above takes
+      // every row BETWEEN the two it is given, so a fourth INBOX fixture must
+      // not be able to sort between them. now - 4s is outside the three-second
+      // window the comment above reserves for exactly that.
+      message(fileSubject, INBOX_FOLDER, new Date(now - 4_000)),
       message(archiveSubjects[0], INBOX_FOLDER, new Date(now - 3_000)),
       message(archiveSubjects[1], INBOX_FOLDER, new Date(now - 2_000)),
       message(trashSubject, INBOX_FOLDER, new Date(now - 1_000)),
@@ -483,6 +509,12 @@ test.describe.serial("Mail journey", () => {
    */
   async function seedMailbox(): Promise<void> {
     await withImap(async (client) => {
+      // Phase 4.4's filing destination, made before the account exists so the
+      // very first pass discovers it -- unsynced, because its name classifies
+      // junk (see SPAM_FOLDER). A retry finds it already there, which is not
+      // an error: the folder is per-run, while the mail_account_folders rows
+      // that decide its sync state belong to the account this attempt creates.
+      await client.mailboxCreate(SPAM_FOLDER).catch(() => undefined);
       for (const fixture of fixtures()) {
         await client.append(fixture.folder, fixture.raw, [], fixture.date);
       }
@@ -665,6 +697,7 @@ test.describe.serial("Mail journey", () => {
     junkSubject = `Newsletter ${attemptId}`;
     archiveSubjects = [`Invoice ${attemptId}`, `Shipping ${attemptId}`];
     trashSubject = `Offer ${attemptId}`;
+    fileSubject = `Contract ${attemptId}`;
 
     // The Phase 4.3 set (see the declarations above). No subject here is a
     // substring of another, because threadRow matches by hasText.
@@ -1436,6 +1469,77 @@ test.describe.serial("Mail journey", () => {
     await expect(page.getByTestId("trash-chip")).toBeVisible();
   });
 
+  /**
+   * Phase 4.4, and the rule this whole task turns on: FILING INTO A FOLDER
+   * CONDUIT IS NOT SYNCING TURNS THAT SYNC ON. No warning, no confirm, no
+   * second request -- filing a thread into a folder IS the statement that the
+   * folder matters, and the app's job is to act on it and then say what it
+   * did.
+   *
+   * The destination is chosen so the rule has something to prove: SPAM_FOLDER
+   * classifies junk by name, so the CRM leaves it switched off on first sight
+   * (see that constant), and the picker offers it anyway -- offering only
+   * folders Conduit already syncs would make this feature useless for exactly
+   * the folders people file into.
+   */
+  test("files a conversation into an unsynced folder, which starts syncing because of it", async () => {
+    await page.goto("/mail");
+    const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
+    await inboxRow.click();
+    // Same reason the trash test asserts this: a click that did not land
+    // leaves the list in "All mail", which is a different (whole-thread)
+    // request -- and, for filing, a view with no single account, where the
+    // picker is deliberately disabled.
+    await expect(inboxRow).toHaveAttribute("aria-current", "true");
+    await expect(threadRow(fileSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    // The folder is NOT in the rail yet -- an unsynced folder with nothing
+    // unread in it has no row -- which is what makes its arrival below mean
+    // something.
+    await expect(page.getByTestId(`folder-${SPAM_FOLDER}`)).toHaveCount(0);
+
+    await tickThread(fileSubject);
+    await expect(page.getByTestId("bulk-count")).toHaveText("1 selected");
+
+    // PICKING THE FOLDER IS THE GESTURE. There is no second button to press:
+    // the choice is the instruction, the same single click the other three
+    // actions take.
+    await page.getByTestId("bulk-file").click();
+    await page.getByRole("option", { name: SPAM_FOLDER, exact: true }).click();
+
+    await expect(page.getByTestId("bulk-result"))
+      .toContainText(`1 filed into “${SPAM_FOLDER}”`, { timeout: BULK_TIMEOUT_MS });
+    // The consequence, said AFTER the fact and quietly -- a notification, not
+    // a gate. Enabling a sync is real (a folder Conduit now walks every pass),
+    // and nobody should have to discover it from a bandwidth graph.
+    await expect(page.getByTestId("bulk-result"))
+      .toContainText(`Conduit is now syncing “${SPAM_FOLDER}”`);
+
+    // Out of the folder it was filed from...
+    await expect(threadRow(fileSubject)).toHaveCount(0, { timeout: REFETCH_TIMEOUT_MS });
+    // ...really on the server, asked of Dovecot rather than of the app that
+    // says it put it there...
+    await expect.poll(() => subjectsIn(SPAM_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(fileSubject);
+    // ...and the conversation is still reachable rather than having quietly
+    // left the CRM's view, which is the outcome the rule exists to prevent.
+    await expect(page.getByTestId(`folder-${SPAM_FOLDER}`))
+      .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    await page.getByTestId(`folder-${SPAM_FOLDER}`).click();
+    await expect(threadRow(fileSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    // THE SWITCH ITSELF, read where a user would read it. The rail row above
+    // is suggestive rather than conclusive -- a folder holding unread mail
+    // gets a row whether or not it syncs -- so the claim is settled against
+    // the Settings picker, which renders sync_enabled directly. The picker
+    // and the filing rule write the same column through the same call
+    // (setFolderSyncEnabled), and this is where that shows.
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await expect(page.getByTestId(`folder-picker-${SPAM_FOLDER}`))
+      .toBeChecked({ timeout: REFETCH_TIMEOUT_MS });
+  });
+
   // -- Phase 4.2: private by default, the deal link as the sharing act, the
   //    Settings toggle, owner-only moves -- all from user B's own context ----
 
@@ -1522,9 +1626,13 @@ test.describe.serial("Mail journey", () => {
     await expect(bPage.getByTestId("bulk-count")).toHaveText("1 selected");
     await expect(bPage.getByTestId("bulk-archive")).toBeDisabled();
     await expect(bPage.getByTestId("bulk-trash")).toBeDisabled();
+    // Filing is a server move too, so the owner-only rule takes it as well
+    // (Phase 4.4) -- a colleague must never reorganise your mailbox, whichever
+    // folder they were reorganising it into.
+    await expect(bPage.getByTestId("bulk-file")).toBeDisabled();
     await expect(bPage.getByTestId("bulk-hide")).toBeEnabled();
     await expect(bPage.getByTestId("bulk-owner-blocked"))
-      .toContainText("only the mailbox owner can archive or trash");
+      .toContainText("only the mailbox owner can file, archive or trash");
     await bPage.getByTestId("bulk-clear").click();
 
     // The conversation view agrees with the bar, and stays open for the next
@@ -1778,6 +1886,18 @@ test.describe.serial("Mail journey", () => {
     await expect(threadRow(hideSubject).getByTestId("hidden-chip")).toBeVisible();
     await expect(threadRow(hideSubject).getByTestId("hidden-chip")).toContainText("Hidden");
     await expect(threadRow(aliceSubject)).toHaveCount(0);
+
+    // Phase 4.4: in the Hidden view the bulk bar's CRM-side button is the
+    // INVERSE, swapped rather than added -- the same choice the conversation
+    // makes from a thread's own hiddenAt. Exactly one of the pair is the
+    // useful gesture for a selection here, and rendering both would put a
+    // permanent no-op beside the one the user wants. Asserted without running
+    // it: the next test needs this thread still hidden, and unhide's behaviour
+    // is pinned in the unit and route suites.
+    await tickThread(hideSubject);
+    await expect(page.getByTestId("bulk-unhide")).toBeEnabled();
+    await expect(page.getByTestId("bulk-hide")).toHaveCount(0);
+    await page.getByTestId("bulk-clear").click();
   });
 
   test("unhides from the conversation, restoring A's inbox, and re-privatizes the mailbox", async () => {

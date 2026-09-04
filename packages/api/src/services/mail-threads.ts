@@ -1279,11 +1279,11 @@ async function setHidden(
 export interface HideThreadOptions {
   /**
    * false to leave the SSE hint to the caller. The one caller that does is the
-   * bulk "Hide in CRM" path (services/mail-move.ts), which hides up to 200
-   * threads in a request and publishes ONE frame carrying all their keys
-   * instead of 200 -- the per-publish subscriber fan-out is what that saves.
-   * Defaults to true, so every single-thread caller keeps the behaviour it
-   * has.
+   * bulk "Hide in CRM" path (services/mail-move.ts), which hides or unhides up
+   * to 200 threads in a request and publishes ONE frame carrying all their
+   * keys instead of 200 -- the per-publish subscriber fan-out is what that
+   * saves. Defaults to true, so every single-thread caller keeps the behaviour
+   * it has.
    */
   publishHint?: boolean;
 }
@@ -1296,8 +1296,13 @@ export function hideThread(
 ): Promise<MailThread> {
   return setHidden(db, userId, id, true, options.publishHint ?? true);
 }
-export function unhideThread(db: Database, userId: string, id: string): Promise<MailThread> {
-  return setHidden(db, userId, id, false, true);
+/** The conversation's Unhide button and the bulk path's per-thread step
+ * (Phase 4.4 gave it the same hint option hideThread has, for the same
+ * batched-frame reason). */
+export function unhideThread(
+  db: Database, userId: string, id: string, options: HideThreadOptions = {},
+): Promise<MailThread> {
+  return setHidden(db, userId, id, false, options.publishHint ?? true);
 }
 
 // --- Attachments -----------------------------------------------------------

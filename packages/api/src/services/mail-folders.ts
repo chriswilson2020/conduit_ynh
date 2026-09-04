@@ -613,8 +613,14 @@ async function mustGetOwnedAccount(
  *
  * Compared on folderKey, so "inbox" and "INBOX" are one mailbox (RFC 3501) while
  * "Sent" and "sent" stay two.
+ *
+ * Exported for mail-move.ts's `file` action (Phase 4.4), which turns a
+ * destination folder's sync ON as part of filing into it and must not offer
+ * setFolderSyncEnabled a folder it refuses in both directions. One copy of the
+ * lock rule, read by whoever needs it, rather than a second derivation that
+ * could disagree with the one the picker is greyed out by.
  */
-function isLocked(folder: string, sentFolder: string): boolean {
+export function isLocked(folder: string, sentFolder: string): boolean {
   const key = folderKey(folder);
   return key === INBOX || key === folderKey(sentFolder);
 }

@@ -3,7 +3,7 @@ import type {
   MailUnreadFolderCount, SpecialUse,
 } from "@conduit/shared";
 import {
-  BULK_THREAD_ACTION_CAP, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
+  BULK_ACTION_THREAD_CAPS, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
   MOVE_ACTION_THREAD_CAP,
 } from "@conduit/shared";
 import { ApiError, ResponseShapeError } from "../../api";
@@ -844,15 +844,6 @@ export interface ThreadSelection {
  */
 export const SELECT_ALL_CAP = MOVE_ACTION_THREAD_CAP;
 
-/** Per-action request caps, mirroring the API: the shared schema's outer bound,
- * which only `hide` may reach, and the route's tighter one for the two actions
- * that wait on a real mail server. Both numbers come from @conduit/shared. */
-const BULK_ACTION_CAPS: Record<BulkThreadActionKind, number> = {
-  trash: MOVE_ACTION_THREAD_CAP,
-  archive: MOVE_ACTION_THREAD_CAP,
-  hide: BULK_THREAD_ACTION_CAP,
-};
-
 export function emptySelection(key: string): ThreadSelection {
   return { key, ids: new Set(), anchor: null, capped: null };
 }
@@ -1005,9 +996,39 @@ export function selectedThreadIds(
  * beats a red error after the click.
  */
 export function bulkActionBlocked(action: BulkThreadActionKind, count: number): string | null {
-  const cap = BULK_ACTION_CAPS[action];
+  // The API's own table, imported rather than mirrored: it used to be a copy
+  // of the same Record in this file, which is one more place for the numbers
+  // to drift and one more place a new action kind has to be remembered.
+  const cap = BULK_ACTION_THREAD_CAPS[action];
   if (count <= cap) return null;
   return `Select ${cap} conversations or fewer for this action (${count} selected).`;
+}
+
+/**
+ * Why the destination picker cannot be offered, or null when it can.
+ *
+ * TWO CAUSES, TWO SENTENCES, because they have two different remedies and a
+ * greyed control with no explanation is the thing this bar has been at pains
+ * not to be (see BulkBlockedNote).
+ *
+ * The account one is the interesting decision. A folder name is PER MAILBOX:
+ * "Clients" on one account and "Clients" on another are different folders that
+ * may not both exist, so a picker built while the list is showing every
+ * account would be offering one account's folders as if they were everyone's.
+ * The API handles the mixed case honestly either way -- it resolves the
+ * destination per account and refuses only the accounts that lack it
+ * (unknown_target) -- so this is a UI decision about what a list of folder
+ * names can truthfully mean, not a server limitation.
+ */
+export function fileTargetsBlocked(accountScoped: boolean, folderCount: number): string | null {
+  if (!accountScoped) {
+    return "Pick a single account above to file into one of its folders.";
+  }
+  if (folderCount === 0) {
+    return "This account has no folders to file into yet — they appear once a sync pass has"
+      + " listed them.";
+  }
+  return null;
 }
 
 /**
@@ -1020,7 +1041,20 @@ export function bulkActionBlocked(action: BulkThreadActionKind, count: number): 
  * can be ANOTHER user's, whose sharing is not the viewer's to change.
  */
 export const NOT_OWNER_EXPLANATION =
-  "only the mailbox owner can archive or trash \u2014 Hide in CRM is available to everyone";
+  "only the mailbox owner can file, archive or trash \u2014 Hide in CRM is available to everyone";
+
+/**
+ * Which actions the owner-only move rule applies to -- a Record over the kind
+ * enum rather than an `action === "hide"` test, so a new kind is a compile
+ * error here until someone decides whether it touches a mailbox.
+ *
+ * `file` (Phase 4.4) is a server MOVE and takes the rule; `unhide` is the CRM
+ * side and does not, symmetric with `hide` -- both are exactly the actions
+ * every viewer keeps.
+ */
+const NEEDS_OWNERSHIP: Record<BulkThreadActionKind, boolean> = {
+  trash: true, archive: true, file: true, hide: false, unhide: false,
+};
 
 /**
  * Why the two MOVE actions cannot be sent for this selection, or null when
@@ -1046,7 +1080,7 @@ export const NOT_OWNER_EXPLANATION =
 export function bulkOwnershipBlocked(
   action: BulkThreadActionKind, unowned: number,
 ): string | null {
-  if (action === "hide" || unowned <= 0) return null;
+  if (!NEEDS_OWNERSHIP[action] || unowned <= 0) return null;
   const what = unowned === 1 ? "1 selected conversation is" : `${unowned} selected conversations are`;
   return `${what} in a mailbox you don't own: ${NOT_OWNER_EXPLANATION}.`;
 }
@@ -1071,14 +1105,32 @@ export function selectionLabel(count: number, capped: number | null): string {
     : `${count} of ${capped} selected (per-request limit)`;
 }
 
+/** How each action reads while it is still running -- present participle, from
+ * a Record over the kind enum for the same compile-nudge reason as every other
+ * table in this file. */
+const PENDING_VERBS: Record<BulkThreadActionKind, string> = {
+  trash: "Moving", archive: "Archiving", file: "Filing", hide: "Hiding", unhide: "Unhiding",
+};
+
 /** How each action reads while it is still running. Present tense and the
  * count, so a bar that is waiting on a mail server says what it is waiting
- * for rather than only greying out. */
-export function bulkPendingLabel(action: BulkThreadActionKind, count: number): string {
+ * for rather than only greying out. `targetFolder` names the destination for
+ * `file`, which is the one action whose sentence is incomplete without it --
+ * "Filing 3 conversations..." leaves out the only part the user chose. */
+export function bulkPendingLabel(
+  action: BulkThreadActionKind, count: number, targetFolder?: string | null,
+): string {
   const noun = count === 1 ? "conversation" : "conversations";
-  const verb = action === "hide" ? "Hiding" : action === "trash" ? "Moving" : "Archiving";
-  const tail = action === "trash" ? " to Trash" : "";
-  return `${verb} ${count} ${noun}${tail}\u2026`;
+  const tail = action === "trash" ? " to Trash"
+    : action === "file" && targetFolder != null ? ` into ${quoted(targetFolder)}` : "";
+  return `${PENDING_VERBS[action]} ${count} ${noun}${tail}\u2026`;
+}
+
+/** A folder name in the copy, always quoted: mailbox names are arbitrary
+ * strings ("Clients 2026", "re: urgent") and an unquoted one runs into the
+ * sentence around it. */
+function quoted(folder: string): string {
+  return `\u201c${folder}\u201d`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,15 +1299,41 @@ export interface BulkActionSummary {
   settingsLink: boolean;
 }
 
-/** How each action reads in a past-tense summary. */
-function actionVerb(action: BulkThreadActionKind): string {
-  if (action === "hide") return "hidden";
-  return action === "trash" ? "moved to Trash" : "archived";
+/**
+ * How each action reads in a past-tense summary, as a Record over the kind
+ * enum -- the same reason REASON_NOTES below is one. The if-chain this
+ * replaced ended `: "archived"`, so Phase 4.4's two new kinds would have
+ * summarised a bulk unhide as "3 archived" with nothing failing to say so.
+ *
+ * `file` is a function rather than a string because its sentence names the
+ * folder the user picked, which is the only part of it they chose.
+ */
+const PAST_VERBS: Record<BulkThreadActionKind, string | ((folder: string | null) => string)> = {
+  trash: "moved to Trash",
+  archive: "archived",
+  hide: "hidden",
+  unhide: "unhidden",
+  file: (folder) => (folder === null ? "filed" : `filed into ${quoted(folder)}`),
+};
+
+function actionVerb(action: BulkThreadActionKind, targetFolder: string | null): string {
+  const verb = PAST_VERBS[action];
+  return typeof verb === "string" ? verb : verb(targetFolder);
 }
 
-/** The folder an action targets, for the no_target note. */
+/**
+ * The folder an action targets, for the no_target note.
+ *
+ * ONLY EVER ASKED ABOUT trash/archive: no_target is the "this account's
+ * Trash/Archive column is NULL" refusal, and the API cannot produce it for
+ * `file` (which names its own destination -- an unusable one is
+ * unknown_target) or for the CRM-side pair (which has no folder at all). The
+ * fallback is therefore unreachable rather than a default, and says so.
+ */
 function actionTarget(action: BulkThreadActionKind): string {
-  return action === "trash" ? "Trash" : "Archive";
+  if (action === "trash") return "Trash";
+  if (action === "archive") return "Archive";
+  return "target";
 }
 
 /** At most this many distinct server refusal strings are shown, each trimmed to
@@ -1274,6 +1352,8 @@ function truncate(text: string): string {
 interface BulkNoteContext {
   action: BulkThreadActionKind;
   refusals: readonly string[];
+  /** `file`'s destination, for the notes that have to name it. */
+  targetFolder: string | null;
 }
 
 /**
@@ -1338,15 +1418,37 @@ const REASON_NOTES: Record<BulkThreadResultReason, ((count: number, context: Bul
   not_owner: (count) => `${count} skipped: ${NOT_OWNER_EXPLANATION}.`,
   already_in_target: null,
   out_of_scope: null,
+  // Phase 4.4. Deliberately NOT a Settings pointer, unlike no_target above:
+  // the account simply has no folder by that name, and the remedies are to
+  // pick a different one or to make it in the mail client -- neither of which
+  // is in Conduit's Settings. It names the folder rather than the account
+  // because a mixed selection can produce several, and the folder is the one
+  // thing all of them have in common.
+  unknown_target: (count, { targetFolder }) => `${count} could not be filed: `
+    + `${targetFolder === null ? "that folder" : quoted(targetFolder)}`
+    + " is not a folder on every selected conversation's mail account.",
 };
+
+/** What the summary needs from the REQUEST and the response envelope, as
+ * opposed to from the per-thread results: the destination the user picked, and
+ * the folder the server says it started syncing because of it. Both absent for
+ * every action but `file`. */
+export interface BulkSummaryOptions {
+  targetFolder?: string | null;
+  /** The response's own `syncEnabled` (shared: bulkThreadResultSchema). */
+  syncEnabled?: string | null;
+}
 
 /**
  * What to tell the user about one bulk response. Counting and copy both run
  * off REASON_NOTES above, which is where every per-reason decision lives.
  */
 export function summarizeBulkResult(
-  action: BulkThreadActionKind, results: readonly BulkResultItem[],
+  action: BulkThreadActionKind,
+  results: readonly BulkResultItem[],
+  options: BulkSummaryOptions = {},
 ): BulkActionSummary {
+  const targetFolder = options.targetFolder ?? null;
   let moved = 0;
   let skipped = 0;
   let failed = 0;
@@ -1362,13 +1464,23 @@ export function summarizeBulkResult(
       && !refusals.includes(result.error)) refusals.push(result.error);
   }
 
-  const verb = actionVerb(action);
+  const verb = actionVerb(action, targetFolder);
   const parts = [moved > 0 ? `${moved} ${verb}` : `Nothing ${verb}`];
   if (skipped > 0) parts.push(`${skipped} skipped`);
   if (failed > 0) parts.push(`${failed} failed`);
 
-  const context: BulkNoteContext = { action, refusals };
+  const context: BulkNoteContext = { action, refusals, targetFolder };
   const notes: string[] = [];
+  // THE SYNC NOTE COMES FIRST, before every per-reason note. It is the one
+  // sentence here that describes a change to the app's ongoing behaviour
+  // rather than to the threads just acted on: filing into a folder Conduit
+  // was not syncing turns that sync ON (api: mail-move.ts), and the whole
+  // reason the response carries the folder name is so this can be said
+  // afterwards instead of being discovered from a bandwidth graph. Said, not
+  // asked: a confirmation here would be the warning that ruling rejected.
+  if (options.syncEnabled != null) {
+    notes.push(`Conduit is now syncing ${quoted(options.syncEnabled)}.`);
+  }
   // Insertion order of the table IS the display order.
   for (const [reason, note] of Object.entries(REASON_NOTES) as
     [BulkThreadResultReason, (typeof REASON_NOTES)[BulkThreadResultReason]][]) {
