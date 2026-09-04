@@ -36,6 +36,35 @@ else
     psql_base=(psql -d conduit_test)
 fi
 
+# REFUSES WHILE A RUN IS LIVE, and does not rely on noticing that by accident.
+#
+# The DROPs below would mostly fail on their own against a running suite, since
+# PostgreSQL refuses to drop a database with clients attached -- but "mostly" is
+# the wrong word for a script whose whole job is DROP DATABASE. Between two test
+# files a worker's database has no connections at all, and that gap is exactly
+# long enough to lose one.
+#
+# global-setup.ts takes this same session advisory lock for the length of a run
+# (see its RUN_LOCK), so asking for it is asking "is a suite running right now".
+# The lock is released when this psql session ends a moment later, which is
+# correct: it is a check, not a claim.
+free="$("${psql_base[@]}" -tAc \
+    "SELECT pg_try_advisory_lock(hashtextextended('conduit-test-databases', 0))" || echo unreachable)"
+case "$free" in
+t) ;;
+f)
+    echo "a vitest run is using these databases right now -- refusing to drop anything" >&2
+    exit 1
+    ;;
+*)
+    # Distinguished from the busy case on purpose: psql has already printed why
+    # it could not connect, and "a run is using them" would be a second,
+    # invented explanation on top of the real one.
+    echo "could not ask the server whether a run is in progress -- nothing dropped" >&2
+    exit 1
+    ;;
+esac
+
 # The prefixes, mirroring packages/api/src/test/databases.ts. `starts_with`, not
 # LIKE: `_` is a single-character wildcard in LIKE and these names are full of
 # them, so `LIKE 'conduit_test_w%'` also matches things like `conduit_tests_w1`.
@@ -49,9 +78,15 @@ WHERE starts_with(datname, current_database() || '_w')
 ORDER BY datname
 SQL
 
-mapfile -t doomed < <("${psql_base[@]}" -tAc "$QUERY")
+# A while-read loop rather than `mapfile`, which is bash 4+: the shebang here is
+# `env bash` and macOS still ships bash 3.2, so this script has to run on the
+# laptop the repository is edited from as well as on the server it is aimed at.
+doomed=()
+while IFS= read -r line; do
+    [ -n "$line" ] && doomed+=("$line")
+done < <("${psql_base[@]}" -tAc "$QUERY")
 
-if [ "${#doomed[@]}" -eq 0 ] || [ -z "${doomed[0]}" ]; then
+if [ "${#doomed[@]}" -eq 0 ]; then
     echo "no test databases to drop"
     exit 0
 fi

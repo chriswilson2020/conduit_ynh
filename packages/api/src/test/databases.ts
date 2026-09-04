@@ -162,7 +162,8 @@ function resolveWorkerUrl(): string {
 // So the prefixes live here, together, where the fact that they must not overlap
 // is visible -- and scratchPrefixOverlaps() proves it rather than asserting it.
 // The shared `conduit_scratch_` stem is also what makes a leak cheap to clear:
-// one `DROP DATABASE` sweep over `conduit_scratch_%` covers all four suites.
+// one `starts_with(datname, 'conduit_scratch_')` covers all four suites, which
+// is what scripts/drop-test-databases.sh sweeps.
 
 export const SCRATCH_DATABASE_PREFIXES = {
   /** services/restore.test.ts: an install to restore a backup onto. */

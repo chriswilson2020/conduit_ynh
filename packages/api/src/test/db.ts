@@ -43,5 +43,68 @@ export async function truncateAll(handle: DatabaseHandle): Promise<void> {
   );
   if (rows.length === 0) return;
   const tables = rows.map((row) => `"${row.tablename}"`).join(", ");
-  await handle.db.execute(sql.raw(`TRUNCATE TABLE ${tables} RESTART IDENTITY CASCADE`));
+  try {
+    await handle.db.execute(sql.raw(`TRUNCATE TABLE ${tables} RESTART IDENTITY CASCADE`));
+  } catch (cause) {
+    throw new Error(explainTruncateFailure(cause), { cause });
+  }
+}
+
+/**
+ * THE DETAIL LINE, KEPT, BECAUSE LAST TIME IT WAS THROWN AWAY.
+ *
+ * On 2 Sep a run on the dev server died here with `PostgresError 40P01`
+ * (deadlock detected) in mail-move.test.ts. Two write-ups exist and they
+ * disagree about what the other lock holder was: the intermittent-rates report
+ * calls it "a database with other work on it", i.e. another process; the v1.4.1
+ * plan calls it "the OTHER connection of the max: 2 pool", i.e. this same file.
+ * Neither cites the raw error, because nobody has it. PostgreSQL says exactly
+ * which it was, in the DETAIL line -- "Process 123 waits for AccessExclusiveLock
+ * on relation X of database Y; blocked by process 456" -- and postgres.js puts
+ * that on `error.detail`, a property beside the message rather than in it, which
+ * is why the reporter printed the one and not the other.
+ *
+ * Folding it into the message costs nothing on a passing run and means the next
+ * sighting settles the question instead of adding a third opinion. The same
+ * reasoning as the CI workflow's "upload the Playwright report on green runs
+ * too": the evidence is produced either way, and the only decision is whether it
+ * survives being produced.
+ *
+ * DEMONSTRATED rather than assumed -- see the commit message for the transcript:
+ * a session holding `LOCK TABLE ... IN ROW SHARE MODE` in the reverse order to
+ * this TRUNCATE's makes PostgreSQL abort one side, and the message this builds
+ * carries the code and both PIDs where the bare error carried neither.
+ */
+function explainTruncateFailure(cause: unknown): string {
+  // WALKS `cause`, AND THE FIRST VERSION DID NOT -- which the demonstration
+  // caught and no amount of reading would have. drizzle does not rethrow
+  // postgres.js's error; it wraps it in a DrizzleQueryError whose own message is
+  // "Failed query: TRUNCATE TABLE ..." and which carries no `code` and no
+  // `detail` of its own. Reading those off the caught object produced exactly
+  // the message this function exists to replace, with the interesting half still
+  // one level down.
+  interface Layer {
+    message?: string; code?: string; detail?: string; hint?: string; cause?: unknown;
+  }
+  let deepest = "";
+  const parts: string[] = [];
+  let current: unknown = cause;
+  for (let depth = 0; depth < 5 && typeof current === "object" && current !== null; depth += 1) {
+    const layer = current as Layer;
+    if (layer.message !== undefined) deepest = layer.message;
+    if (layer.code !== undefined) parts.push(`code ${layer.code}`);
+    // The line that answers the whole question: PostgreSQL names both processes
+    // and both lock modes here, and nowhere else.
+    if (layer.detail !== undefined) parts.push(`detail: ${layer.detail}`);
+    if (layer.hint !== undefined) parts.push(`hint: ${layer.hint}`);
+    current = layer.cause;
+  }
+  // Which database, because now that every worker has its own, "whose truncate"
+  // and "whose other connection" are different questions with different answers,
+  // and the name is what tells them apart.
+  parts.push(`database: ${TEST_DATABASE_URL}`);
+  // The innermost message leads: PostgreSQL's "deadlock detected" is the useful
+  // sentence, and drizzle's wrapper is a hundred characters of table list in
+  // front of it.
+  return `truncateAll failed: ${deepest === "" ? String(cause) : deepest} | ${parts.join(" | ")}`;
 }
