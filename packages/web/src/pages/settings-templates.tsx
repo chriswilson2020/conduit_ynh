@@ -16,7 +16,7 @@ import { Textarea } from "../components/ui/textarea";
  */
 export function SettingsTemplatesPage() {
   return (
-    <SettingsLayout>
+    <SettingsLayout title="Templates">
       <DocumentTemplateEditor />
     </SettingsLayout>
   );

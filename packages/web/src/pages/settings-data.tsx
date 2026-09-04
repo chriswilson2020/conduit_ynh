@@ -511,7 +511,7 @@ export function SettingsDataPage() {
   }
 
   return (
-    <SettingsLayout>
+    <SettingsLayout title="Export, import, backup and restore">
       <div data-testid="data-settings" className="flex max-w-3xl flex-col gap-6">
         <div className="flex flex-col gap-2">
           <h2 className="text-sm font-semibold text-slate-900">Export and backup</h2>

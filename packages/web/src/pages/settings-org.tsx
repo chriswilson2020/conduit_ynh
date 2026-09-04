@@ -149,7 +149,7 @@ export function SettingsOrgPage() {
   const pending = save.isPending;
 
   return (
-    <SettingsLayout>
+    <SettingsLayout title="Organisation">
       <form data-testid="org-settings" onSubmit={handleSubmit} className="flex max-w-2xl flex-col gap-4">
         <h2 className="text-sm font-semibold text-slate-900">Organisation</h2>
         <p className="text-xs text-slate-500">
