@@ -1,9 +1,10 @@
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
   mailAccountCreateInputSchema, mailAccountUpdateInputSchema, mailAccountUpdatePasswordFieldsSchema,
   mailAccountTestInputSchema, mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
   bulkThreadActionInputSchema, bulkMessageActionInputSchema, folderPatchInputSchema,
+  folderCreateInputSchema, folderRenameInputSchema, folderDeleteInputSchema,
   BULK_ACTION_THREAD_CAPS,
   type MailAccountSyncStats,
 } from "@conduit/shared";
@@ -14,7 +15,7 @@ import {
 import { openBlob } from "../services/blobs.js";
 import { decodeLastMessageAtCursor } from "../services/pagination.js";
 import type { SendMailSyncManager } from "../services/mail-send.js";
-import type { SyncStopOptions, SyncStopResult } from "../services/mail-sync.js";
+import type { ImapFolderListing, SyncStopOptions, SyncStopResult } from "../services/mail-sync.js";
 import { sendMail } from "../services/mail-send.js";
 import { defaultTestConnectionDeps } from "../services/mail-imapflow.js";
 import {
@@ -25,7 +26,9 @@ import {
   hideThread, unhideThread, unreadThreadCount, unreadCountsByFolder,
   getAttachmentBlob, toMessage,
 } from "../services/mail-threads.js";
-import { listAccountFolders, setFolderSyncEnabled } from "../services/mail-folders.js";
+import {
+  createFolder, deleteFolder, listAccountFolders, renameFolder, setFolderSyncEnabled,
+} from "../services/mail-folders.js";
 import { moveMessages, moveThreads } from "../services/mail-move.js";
 
 /**
@@ -54,6 +57,22 @@ export interface MailRouteSyncManager extends SendMailSyncManager {
      * claiming a move that never happened (see accountStateOf).
      */
     moveMessages(folder: string, uids: readonly number[], targetFolder: string): Promise<void>;
+    /**
+     * The four folder commands (Phase 4.4 Task 4), widened onto this slice for
+     * exactly the reason `moveMessages` was: one getter then also satisfies
+     * mail-folders.ts's FolderSyncManager, so the three folder routes hand this
+     * value straight to that service rather than the router carrying a third
+     * manager beside the other two.
+     *
+     * Not best-effort either, and for a sharper version of the move service's
+     * reason: a missing sync means Conduit cannot reach the mail server at all,
+     * and the local half of a folder command is a change to records describing
+     * a mailbox nobody changed (see folderSyncOf).
+     */
+    listFolders(): Promise<ImapFolderListing[]>;
+    createMailbox(folder: string): Promise<void>;
+    renameMailbox(folder: string, newFolder: string): Promise<void>;
+    deleteMailboxIfEmpty(folder: string): Promise<number>;
     readonly stats: MailAccountSyncStats;
   } | undefined;
   /**
@@ -261,6 +280,34 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   // --- Folders -------------------------------------------------------------
 
   /**
+   * Ask for a sync pass after a folder command, and do not wait for it.
+   *
+   * The PATCH handler's enable branch does this inline and this is the same
+   * thing three call sites deep, so it is one function: syncNow resolves when
+   * the pass is REQUESTED (the loop may be mid-backfill), the client learns
+   * what came of it from the SSE hints the pass publishes, and a rejection is
+   * logged and swallowed because the write this route came to make has already
+   * landed. The `try` around the `void` is the same belt and braces the two
+   * inline copies carry: syncNow is documented to reject rather than throw, and
+   * a fake that throws must not take the request with it.
+   */
+  function requestPassAfterFolderCommand(
+    request: FastifyRequest, accountId: string, folder: string,
+  ): void {
+    const onFailure = (error: unknown): void => {
+      request.log.warn(
+        { err: error, accountId, folder },
+        "mail: could not request a sync pass after a folder command",
+      );
+    };
+    try {
+      void syncManager()?.syncNow(accountId).catch(onFailure);
+    } catch (error) {
+      onFailure(error);
+    }
+  }
+
+  /**
    * The account's discovered folders, for the Settings picker and the inbox
    * sidebar (Phase 4.1).
    *
@@ -343,6 +390,110 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
       }
     }
     return result.folder;
+  });
+
+  /**
+   * Create, rename and delete a MAILBOX ON THE SERVER (Phase 4.4 Task 4).
+   *
+   * Owner-only like every other folder route above, through the same
+   * mustGetOwnedAccount check inside the service -- and more obviously so:
+   * these change another person's mail server, and only its owner may.
+   *
+   * ALL THREE ARE POST, and rename and delete deliberately do not name the
+   * folder in the path. An IMAP mailbox name is arbitrary user text -- it can
+   * carry the hierarchy separator, spaces and any non-ASCII the server's
+   * namespace allows -- and a name in a URL is a name in every access log and
+   * proxy trace between here and the browser. Same reasoning as the
+   * test-connection route below being POST despite reading nothing. It is also
+   * why DELETE-the-verb is not used: the name has to travel in a body, and a
+   * body on DELETE is a thing HTTP declines to define.
+   *
+   * NO REQUEST CAP HERE, unlike the bulk routes. Each of these is ONE mailbox
+   * command, so there is no size to bound -- but they do wait on the account's
+   * serial sync loop exactly as a bulk move does, so a folder command issued
+   * against an account mid-backfill waits for that backfill, and a proxy 504
+   * means the ANSWER was lost rather than that the command failed.
+   */
+  app.post("/api/mail/accounts/:id/folders", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(folderCreateInputSchema, request.body, reply);
+    if (input === undefined) return;
+    try {
+      const folder = await createFolder(db, user.id, params.id, input, {
+        syncManager: syncManager(), logger: request.log,
+      });
+      void reply.code(201);
+      return folder;
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
+  });
+
+  /**
+   * Rename, with the two-system write mail-folders.ts's renameFolder argues.
+   *
+   * A SYNC PASS IS ASKED FOR AFTERWARDS, and not waited on, exactly as the
+   * PATCH above does when it enables a folder. The re-key has already made
+   * Conduit's own records right; what a pass adds is the server's opinion of
+   * the new name -- its SPECIAL-USE classification, which the rename
+   * deliberately does not guess (see renameFolder) -- and it costs nothing to
+   * ask for it now rather than in five minutes. A rejection is logged and
+   * swallowed for that route's reason: a sync engine having a bad day must not
+   * turn a completed rename into a 500.
+   */
+  app.post("/api/mail/accounts/:id/folders/rename", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(folderRenameInputSchema, request.body, reply);
+    if (input === undefined) return;
+    let result;
+    try {
+      result = await renameFolder(db, user.id, params.id, input, {
+        syncManager: syncManager(), logger: request.log,
+      });
+    } catch (error) {
+      mapDomainError(reply, error);
+      return;
+    }
+    requestPassAfterFolderCommand(request, params.id, input.folder);
+    return result;
+  });
+
+  /**
+   * Delete, which deletes no mail: mail-folders.ts's deleteFolder refuses a
+   * folder the server says still holds any, and keeps every message Conduit
+   * had already stored from it.
+   *
+   * THE PASS MATTERS MORE HERE THAN ANYWHERE ELSE ON THIS ROUTER. The deleted
+   * folder's row survives (rows in that table are never deleted), and what
+   * makes the clients stop offering it is going STALE -- its
+   * last_discovered_at standing still while every re-sighted folder's moves on.
+   * Only a pass moves the others. Without this call the row would go on looking
+   * live, and filable-into, until the poll interval came round.
+   */
+  app.post("/api/mail/accounts/:id/folders/delete", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(folderDeleteInputSchema, request.body, reply);
+    if (input === undefined) return;
+    let result;
+    try {
+      result = await deleteFolder(db, user.id, params.id, input, {
+        syncManager: syncManager(), logger: request.log,
+      });
+    } catch (error) {
+      mapDomainError(reply, error);
+      return;
+    }
+    requestPassAfterFolderCommand(request, params.id, input.folder);
+    return result;
   });
 
   // POST, not GET, despite reading nothing: the body carries credentials for

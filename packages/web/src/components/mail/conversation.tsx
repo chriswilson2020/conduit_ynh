@@ -40,6 +40,7 @@ import {
   singleOwnAccount,
   subjectLabel,
   summarizeBulkResult,
+  fileTargetNames,
   toggleMessageSelected,
   THREAD_GONE_MESSAGE,
   type BulkActionSummary,
@@ -80,10 +81,10 @@ export interface ConversationProps {
  */
 function useFileTargets(accountId: string): string[] {
   const { data } = useMailFolders(accountId);
-  return useMemo(
-    () => (data ?? []).filter((row) => row.selectable).map((row) => row.folder),
-    [data],
-  );
+  // fileTargetNames rather than a filter written here, so this picker, the
+  // list's and the sidebar all drop the same rows for the same reasons -- see
+  // that function for which two, and for why a sync-OFF folder is not one.
+  return useMemo(() => fileTargetNames(data ?? []), [data]);
 }
 
 /**

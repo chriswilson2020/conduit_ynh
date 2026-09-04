@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   backupPreflightSchema,
   bulkThreadResultSchema,
@@ -65,6 +65,13 @@ import {
   type DocumentType,
   type IssueQuoteInput,
   type FolderPatchInput,
+  folderRenameResultSchema,
+  folderDeleteResultSchema,
+  type FolderCreateInput,
+  type FolderRenameInput,
+  type FolderRenameResult,
+  type FolderDeleteInput,
+  type FolderDeleteResult,
   type GanttPayload,
   type MailAccountCreateInput,
   type MailAccountFolder,
@@ -1493,6 +1500,73 @@ export function useSetFolderSync() {
       void queryClient.invalidateQueries({ queryKey: ["mail-folders", accountId] });
       void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
       void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
+    },
+  });
+}
+
+/**
+ * The three folder COMMANDS (Phase 4.4 Task 4): create, rename and delete a
+ * mailbox on the server.
+ *
+ * ONE INVALIDATION SET FOR ALL THREE, written once here rather than three
+ * times, because all three change the same three things: which folders this
+ * account has, which folder every stored message says it is in (a rename
+ * re-keys them), and therefore the per-folder unread badges. `mail-accounts` is
+ * in it too, and only these hooks need it: a rename can rewrite the account's
+ * own sent/trash/archive columns, which the settings form renders.
+ *
+ * All three are POST, including delete: an IMAP mailbox name is arbitrary user
+ * text and belongs in a body rather than in a URL and every access log along
+ * the way (see the shared folderRenameInputSchema).
+ */
+function invalidateFolderCommand(queryClient: QueryClient, accountId: string): void {
+  void queryClient.invalidateQueries({ queryKey: ["mail-folders", accountId] });
+  void queryClient.invalidateQueries({ queryKey: ["mail-accounts"] });
+  void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
+  void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
+}
+
+export function useCreateFolder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ accountId, input }: { accountId: string; input: FolderCreateInput }) =>
+      parseWith(
+        mailAccountFolderSchema,
+        await postJson<unknown>(`/mail/accounts/${accountId}/folders`, input),
+        "mail folder",
+      ),
+    onSuccess: (_folder: MailAccountFolder, { accountId }) => {
+      invalidateFolderCommand(queryClient, accountId);
+    },
+  });
+}
+
+export function useRenameFolder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ accountId, input }: { accountId: string; input: FolderRenameInput }) =>
+      parseWith(
+        folderRenameResultSchema,
+        await postJson<unknown>(`/mail/accounts/${accountId}/folders/rename`, input),
+        "folder rename",
+      ),
+    onSuccess: (_result: FolderRenameResult, { accountId }) => {
+      invalidateFolderCommand(queryClient, accountId);
+    },
+  });
+}
+
+export function useDeleteFolder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ accountId, input }: { accountId: string; input: FolderDeleteInput }) =>
+      parseWith(
+        folderDeleteResultSchema,
+        await postJson<unknown>(`/mail/accounts/${accountId}/folders/delete`, input),
+        "folder delete",
+      ),
+    onSuccess: (_result: FolderDeleteResult, { accountId }) => {
+      invalidateFolderCommand(queryClient, accountId);
     },
   });
 }

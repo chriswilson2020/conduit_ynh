@@ -8,8 +8,8 @@ import {
 import { ArchivedError, MailIngestError, NotFoundError } from "./errors.js";
 import {
   consoleSyncLogger, systemClock as systemSyncClock,
-  type ImapClient, type ImapClientFactory, type ImapMessageDescriptor,
-  type IngestMessageFn, type SyncClock, type SyncLogger,
+  type ImapClient, type ImapClientFactory, type ImapFolderListing,
+  type ImapMessageDescriptor, type IngestMessageFn, type SyncClock, type SyncLogger,
 } from "./mail-imap.js";
 import { getAccountCredentialsAsSystem, setAccountChangedHook } from "./mail-accounts.js";
 import { INBOX, discoverFolders, folderKey, publishFoldersHint } from "./mail-folders.js";
@@ -211,10 +211,19 @@ export class SyncUnavailableError extends Error {
   }
 }
 
+/**
+ * `unknown` on both the run's result and the resolve's argument, rather than
+ * a generic parameter: the queue is one heterogeneous array, so a `T` here
+ * would have to be existential to survive being stored. The type safety lives
+ * one level up in enqueueResult, which is generic and is the only thing that
+ * ever constructs one of these -- the pairing of a run's return with its
+ * resolve's argument is guaranteed there and cannot be got wrong from outside,
+ * because nothing outside can push.
+ */
 interface QueuedTask {
   readonly label: string;
-  run(client: ImapClient, account: MailAccountRow): Promise<void>;
-  resolve(): void;
+  run(client: ImapClient, account: MailAccountRow): Promise<unknown>;
+  resolve(value: unknown): void;
   reject(error: unknown): void;
 }
 
@@ -465,6 +474,71 @@ export class AccountSync {
     });
   }
 
+  /**
+   * One LIST, queued (services/mail-folders.ts's rename and delete -- Phase
+   * 4.4 Task 4). Same queue and same contract as the three above.
+   *
+   * THE SERVER'S LISTING, NOT mail_account_folders, and the difference is the
+   * point of the call existing. The table holds every folder ever seen, so it
+   * cannot answer "does this mailbox still exist" or "what are its children
+   * RIGHT NOW", and both of those decide whether a rename or a delete is safe.
+   * It also carries the hierarchy DELIMITER, which nothing stores: renaming a
+   * folder means re-keying its descendants, and a descendant is a stored name
+   * that begins with the folder plus that delimiter. Guessing it is not a near
+   * miss -- Dovecot reports "." for a Maildir++ layout and "/" for an fs one
+   * (mail-folders.ts's lastPathSegment says the same about classification).
+   */
+  listFolders(): Promise<ImapFolderListing[]> {
+    return this.enqueueResult("listFolders", (client) => client.list());
+  }
+
+  /** Queue a CREATE (services/mail-folders.ts's createFolder). */
+  createMailbox(folder: string): Promise<void> {
+    return this.enqueue("createMailbox", (client) => client.createMailbox(folder));
+  }
+
+  /**
+   * Queue a RENAME (services/mail-folders.ts's renameFolder).
+   *
+   * REJECTS on failure and the caller must handle it, for the same reason
+   * moveMessages does and more sharply: renameFolder's whole design is that
+   * the server moves first and the database follows, so a floating rejection
+   * here would be a rename Conduit believed happened and no mailbox to match.
+   */
+  renameMailbox(folder: string, newFolder: string): Promise<void> {
+    return this.enqueue("renameMailbox", (client) => client.renameMailbox(folder, newFolder));
+  }
+
+  /**
+   * Queue "count `folder`, and DELETE it only if the count is zero" -- the
+   * count is returned either way, and a non-empty folder is left alone.
+   *
+   * THE COUNT AND THE DELETE ARE ONE QUEUED TASK BECAUSE THEY HAVE TO BE.
+   * Deleting a mailbox destroys the messages in it and no server refuses that
+   * (mail-imap.ts's deleteMailbox), so the count is the only thing standing
+   * between a click and destroyed mail -- and a count read on an EARLIER visit
+   * to this loop is a count from before whatever arrived since. Two calls from
+   * the service would be two visits with another request's queued work free to
+   * land between them.
+   *
+   * What it cannot close is the window INSIDE the visit: IMAP has no
+   * conditional delete, so a message arriving between the STATUS and the
+   * DELETE is destroyed by it. That window is one round trip on a folder an
+   * operator is deliberately removing, which is as tight as the protocol
+   * allows and is stated rather than hidden.
+   *
+   * The POLICY stays in the service: this returns the count and says nothing
+   * about what a non-zero one means, so the sentence the operator reads is
+   * written where every other refusal's sentence is.
+   */
+  async deleteMailboxIfEmpty(folder: string): Promise<number> {
+    return await this.enqueueResult("deleteMailboxIfEmpty", async (client) => {
+      const messages = await client.messageCount(folder);
+      if (messages === 0) await client.deleteMailbox(folder);
+      return messages;
+    });
+  }
+
   /** Abort the current wait, let the loop unwind, disconnect. Idempotent,
    * and safe to call before start(). */
   async stop(): Promise<void> {
@@ -548,10 +622,31 @@ export class AccountSync {
     label: string,
     run: (client: ImapClient, account: MailAccountRow) => Promise<void>,
   ): Promise<void> {
+    return this.enqueueResult(label, run);
+  }
+
+  /**
+   * enqueue, for the queued calls that ANSWER something (Phase 4.4's
+   * listFolders and deleteMailboxIfEmpty). Identical in every other respect --
+   * same queue, same fast rejection during a backoff, same interrupt.
+   *
+   * `enqueue` is kept as the void-returning name because that is what its
+   * dozen call sites read as, and because "await this and carry on" and "await
+   * this FOR its answer" are different enough at a call site to be worth
+   * different verbs.
+   */
+  private enqueueResult<T>(
+    label: string,
+    run: (client: ImapClient, account: MailAccountRow) => Promise<T>,
+  ): Promise<T> {
     const unavailable = this.whyUnavailable();
     if (unavailable !== null) return Promise.reject(unavailable);
-    return new Promise<void>((resolve, reject) => {
-      this.queue.push({ label, run, resolve, reject });
+    return new Promise<T>((resolve, reject) => {
+      // The cast is where the existential in QueuedTask is discharged, and it
+      // is safe by construction: this closure's `run` and this closure's
+      // `resolve` are the same T, and drainQueue only ever pairs a task's own
+      // run with its own resolve.
+      this.queue.push({ label, run, resolve: resolve as (value: unknown) => void, reject });
       // interrupt, NOT wake: the loop should come back and run this task
       // now, but queued work must not drag a whole pass along behind it.
       // Task 7 calls markSeen once per thread the user opens, and a
@@ -577,8 +672,7 @@ export class AccountSync {
       try {
         const account = await this.loadAccount();
         const client = await this.ensureConnected(account);
-        await task.run(client, account);
-        task.resolve();
+        task.resolve(await task.run(client, account));
       } catch (error) {
         this.logger.warn(
           { accountId: this.accountId, task: task.label, err: errorText(error) },

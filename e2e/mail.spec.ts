@@ -233,6 +233,19 @@ test.describe.serial("Mail journey", () => {
    */
   let convFileSubject = "";
   let splitSubject = "";
+  /**
+   * Phase 4.4 Task 4's folder, before and after its rename.
+   *
+   * PER ATTEMPT, unlike every other folder constant in this file, and that is
+   * forced rather than tidy: these two are the only mailboxes this spec CREATES
+   * through the app, and a CREATE of a name that already exists is refused. A
+   * fixed name would pass once and then fail every retry and every later run
+   * against the same Dovecot, because the mailbox the first attempt made is
+   * still sitting there. The delete leg removes the second name; the first is
+   * gone by then because the rename moved it.
+   */
+  let madeFolder = "";
+  let renamedFolder = "";
 
   /**
    * The Phase 4.3 fixtures, per-attempt for the same unrecoverability
@@ -677,6 +690,13 @@ test.describe.serial("Mail journey", () => {
     }
   }
 
+  /** Every mailbox the server LISTs. The only way to ask "is this folder gone"
+   * of the server rather than of the CRM, which is exactly the question the
+   * delete leg has to answer -- Conduit deliberately keeps its own row. */
+  async function listFolders(): Promise<string[]> {
+    return await withImap(async (client) => (await client.list()).map((entry) => entry.path));
+  }
+
   /** Every subject currently in `folder`, straight off the server. Read-only,
    * so this cannot be what marks a fixture \Seen. */
   async function subjectsIn(folder: string): Promise<string[]> {
@@ -849,6 +869,10 @@ test.describe.serial("Mail journey", () => {
     // rows and failed the sync test three retries deep.
     convFileSubject = `Statement ${attemptId}`;
     splitSubject = `Proposal ${attemptId}`;
+    // No space in either: these two are folder NAMES rather than subjects, and
+    // a name is what the picker's data-testid is built from.
+    madeFolder = `Retainers-${attemptId}`;
+    renamedFolder = `Clients-Retainers-${attemptId}`;
 
     // The Phase 4.3 set (see the declarations above). No subject here is a
     // substring of another, because threadRow matches by hasText.
@@ -1839,6 +1863,123 @@ test.describe.serial("Mail journey", () => {
     await page.getByTestId(`folder-${CLIENTS_FOLDER}`).click();
     await loadAllThreadsOn(page);
     await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+  });
+
+  // -- Phase 4.4 Task 4: folder management, against the real server ---------
+
+  test("makes a folder from Settings, and it is on the server and filable into", async () => {
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await page.getByTestId(`folder-create-input-${accountId}`).fill(madeFolder);
+    await page.getByTestId(`folder-create-${accountId}`).click();
+
+    // BORN SYNCING, unlike a folder Conduit merely discovers: making one here
+    // is the statement that it matters, so its box is ticked from the start.
+    const box = page.getByTestId(`folder-picker-${madeFolder}`);
+    await expect(box).toBeChecked({ timeout: REFETCH_TIMEOUT_MS });
+    // And it really is a mailbox: asked of Dovecot, not of the CRM.
+    await expect.poll(() => subjectsIn(madeFolder), { timeout: REFETCH_TIMEOUT_MS }).toEqual([]);
+
+    // It is offered as a filing destination straight away -- the create
+    // invalidates the folders query the picker reads. `fileSubject` is a
+    // single message, and single is what makes the rename's "1 stored message
+    // moved with it" exact rather than approximate.
+    await page.goto("/mail");
+    await page.getByTestId(`folder-${SPAM_FOLDER}`).click();
+    await loadAllThreadsOn(page);
+    await tickThread(fileSubject);
+    await page.getByTestId("bulk-file").click();
+    await page.getByRole("option", { name: madeFolder, exact: true }).click();
+    await expect(page.getByTestId("bulk-result"))
+      .toContainText("1 filed", { timeout: BULK_TIMEOUT_MS });
+    await expect.poll(() => subjectsIn(madeFolder), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(fileSubject);
+  });
+
+  test("renames it, and the stored mail moves with it on BOTH sides", async () => {
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await expect(page.getByTestId(`folder-picker-${madeFolder}`))
+      .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+
+    await page.getByTestId(`folder-rename-${madeFolder}`).click();
+    await page.getByTestId(`folder-rename-input-${madeFolder}`).fill(renamedFolder);
+    await page.getByTestId(`folder-rename-save-${madeFolder}`).click();
+
+    // The row is RE-KEYED IN PLACE: the new name appears and the old one is
+    // gone entirely, rather than a second row arriving beside a stale first.
+    // That is the whole difference between renaming through Conduit and
+    // renaming in another client, and it is what stops the filing picker
+    // going on offering a folder that is not there.
+    await expect(page.getByTestId(`folder-picker-${renamedFolder}`))
+      .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    await expect(page.getByTestId(`folder-picker-${madeFolder}`)).toHaveCount(0);
+    // Said afterwards, because a rename silently re-keys stored mail and an
+    // operator who is not told finds out from a search that stops matching.
+    await expect(page.getByText(/1 stored message moved with it/)).toBeVisible();
+
+    // THE SERVER MOVED TOO, and the message went with the mailbox.
+    await expect.poll(() => subjectsIn(renamedFolder), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(fileSubject);
+
+    // AND THE DATABASE AGREES: the conversation is listed under the NEW folder
+    // and under no other. A re-key that had missed mail_messages would leave
+    // this view empty while the server held the mail.
+    await page.goto("/mail");
+    await page.getByTestId(`folder-${renamedFolder}`).click();
+    await loadAllThreadsOn(page);
+    await expect(threadRow(fileSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+  });
+
+  test("REFUSES to delete it while it still holds mail, then deletes it once empty", async () => {
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await expect(page.getByTestId(`folder-picker-${renamedFolder}`))
+      .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+
+    await page.getByTestId(`folder-delete-${renamedFolder}`).click();
+    // WHAT HAPPENS IS SAID BEFORE IT HAPPENS -- the spec's requirement, and the
+    // sentence that keeps this from being the product's first expunge.
+    await expect(page.getByText(/Every message Conduit has already stored from it is KEPT/))
+      .toBeVisible();
+    await page.getByTestId("folder-delete-confirm").click();
+
+    // Refused BY THE SERVER'S OWN COUNT, and the folder is still there. No mail
+    // server refuses this for us: Dovecot deletes a full mailbox without
+    // complaint, so this refusal is the only thing between a click and
+    // destroyed mail.
+    await expect(page.getByRole("alert"))
+      .toContainText(/still holds 1 message on the mail server/, { timeout: BULK_TIMEOUT_MS });
+    expect(await subjectsIn(renamedFolder)).toContain(fileSubject);
+
+    // The way out is the app's own filing action, one gesture long.
+    await page.goto("/mail");
+    await page.getByTestId(`folder-${renamedFolder}`).click();
+    await loadAllThreadsOn(page);
+    await tickThread(fileSubject);
+    await page.getByTestId("bulk-file").click();
+    await page.getByRole("option", { name: ARCHIVE_FOLDER, exact: true }).click();
+    await expect(page.getByTestId("bulk-result"))
+      .toContainText("1 filed", { timeout: BULK_TIMEOUT_MS });
+    await expect.poll(() => subjectsIn(renamedFolder), { timeout: REFETCH_TIMEOUT_MS }).toEqual([]);
+
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await page.getByTestId(`folder-delete-${renamedFolder}`).click();
+    await page.getByTestId("folder-delete-confirm").click();
+
+    // Gone from the server...
+    await expect(page.getByText(/Deleted from the mail server/))
+      .toBeVisible({ timeout: BULK_TIMEOUT_MS });
+    await expect.poll(async () => (await listFolders()).includes(renamedFolder), {
+      timeout: REFETCH_TIMEOUT_MS,
+    }).toBe(false);
+    // ...and the ROW SURVIVES, switched off, because rows in that table are
+    // never deleted and the mail Conduit stored from this folder still has to
+    // have a folder to be listed under. The mail is still there, too.
+    const box = page.getByTestId(`folder-picker-${renamedFolder}`);
+    await expect(box).toBeVisible();
+    await expect(box).not.toBeChecked();
   });
 
   // -- Phase 4.2: private by default, the deal link as the sharing act, the

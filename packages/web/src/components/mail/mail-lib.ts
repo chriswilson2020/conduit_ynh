@@ -1436,6 +1436,42 @@ const INBOX_NAME = "INBOX";
  * folder deleted or renamed on the server. With one row, or with a set that has
  * never been re-discovered, nothing is behind and nothing is stale.
  */
+/**
+ * The folder names a thread or a message may be FILED into (Phase 4.4).
+ *
+ * TWO EXCLUSIONS, AND THEY ARE THERE FOR DIFFERENT REASONS:
+ *
+ * - `\Noselect` -- a hierarchy node holding no messages. The API refuses it
+ *   (`unknown_target`), so offering it would be offering a failure.
+ * - STALE -- a folder the LAST DISCOVERY PASS DID NOT RE-SIGHT. This one was
+ *   missing until Task 4 and it is the second of the two things the earlier
+ *   tasks left: rows in mail_account_folders are never deleted, so a folder
+ *   renamed or removed on the server keeps its row for ever, and the picker
+ *   went on offering it. Filing into it fails at IMAP -- late, after an
+ *   optimistic write, a round trip and a compensating revert, and reported in
+ *   the mail server's words rather than the app's. The sidebar and the settings
+ *   picker have greyed these on exactly this basis since 4.1; this is that rule
+ *   reaching the third surface that needed it.
+ *
+ * WHAT IS DELIBERATELY KEPT: a folder whose SYNC IS OFF. That is not a mistake
+ * to filter out, it is what the feature is for -- filing into such a folder
+ * turns its sync on (api: mail-move.ts's enableTargetSync).
+ *
+ * Staleness is `lastDiscoveredAt < newestDiscovery(...)` -- the same comparison
+ * buildFolderRows makes, against the same newest value -- because the newest
+ * discovery among an account's folders IS the moment of its last successful
+ * LIST. It needs no account row and no clock, and it says exactly "the last
+ * pass looked and did not find this one".
+ */
+export function fileTargetNames(
+  folders: readonly { folder: string; selectable: boolean; lastDiscoveredAt: string }[],
+): string[] {
+  const newest = newestDiscovery(folders);
+  return folders
+    .filter((row) => row.selectable && !(row.lastDiscoveredAt < newest))
+    .map((row) => row.folder);
+}
+
 export function newestDiscovery(folders: readonly { lastDiscoveredAt: string }[]): string {
   return folders.reduce<string>(
     (max, row) => (row.lastDiscoveredAt > max ? row.lastDiscoveredAt : max), "",

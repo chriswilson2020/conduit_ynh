@@ -1,14 +1,19 @@
 import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { clsx } from "clsx";
-import type { MailAccountTestResult, MailAccountWithSyncStats, MailSecurity } from "@conduit/shared";
+import type {
+  MailAccountFolder, MailAccountTestResult, MailAccountWithSyncStats, MailSecurity,
+} from "@conduit/shared";
 import { relativeTime } from "../lib";
 import {
   useArchiveMailAccount,
+  useCreateFolder,
   useCreateMailAccount,
+  useDeleteFolder,
   useMailAccounts,
   useMailFolders,
   useMe,
+  useRenameFolder,
   useSetFolderSync,
   useTestMailAccount,
   useUnarchiveMailAccount,
@@ -22,6 +27,10 @@ import {
   buildTestInput,
   buildUpdatePatch,
   dovecotPreset,
+  folderCommandReasons,
+  folderDeleteBlocked,
+  folderDeleteWarning,
+  folderRenameBlocked,
   initialFormState,
   validateForm,
   type AccountFormState,
@@ -448,61 +457,26 @@ function FolderPicker({ account }: { account: MailAccountWithSyncStats }) {
       )}
 
       <ul className="flex flex-col gap-1">
-        {(folders ?? []).map((folder) => {
-          // Locked (INBOX and the account's Sent folder) and `\Noselect` rows
-          // are both refused by the API in BOTH directions -- the switch is not
-          // real either way -- so the checkbox is disabled and says why rather
-          // than sending a request that comes back 409.
-          const why = folder.locked
-            ? "Always synced: the CRM needs INBOX and Sent for sending and direction"
-            : !folder.selectable
-              ? "This folder holds no messages (\\Noselect)"
-              : undefined;
-          const stale = folder.lastDiscoveredAt < newest;
-          return (
-            <li key={folder.id}>
-              <label
-                className={clsx(
-                  // A list row, and the label IS the row: it wraps the 13px
-                  // box and the folder name, so flooring it here is what makes
-                  // the whole row tappable rather than the checkbox alone.
-                  "flex items-center gap-2 text-sm max-md:min-h-11",
-                  why === undefined ? "text-slate-700" : "text-slate-400",
-                )}
-                title={why}
-              >
-                <input
-                  type="checkbox"
-                  data-testid={`folder-picker-${folder.folder}`}
-                  checked={folder.syncEnabled}
-                  // Only the row being toggled waits, not the whole list: one
-                  // PATCH is one folder, and freezing eleven other checkboxes
-                  // while a slow server answers for the twelfth turns a
-                  // curation pass into a queue.
-                  disabled={why !== undefined
-                    || (setSync.isPending && setSync.variables?.input.folder === folder.folder)}
-                  onChange={(event) => setSync.mutate({
-                    accountId: account.id,
-                    // BY NAME, byte for byte as the endpoint listed it: that is
-                    // how UNIQUE (account_id, folder) matches it server-side.
-                    input: { folder: folder.folder, syncEnabled: event.target.checked },
-                  })}
-                  className="h-4 w-4"
-                />
-                <span className={clsx("truncate", stale && "italic")}>{folder.folder}</span>
-                {folder.specialUse !== null && (
-                  <span className="shrink-0 text-[11px] uppercase text-slate-400">{folder.specialUse}</span>
-                )}
-                {stale && (
-                  <span className="shrink-0 text-[11px] text-slate-400" title="Not seen in the last sync">
-                    not seen in the last sync
-                  </span>
-                )}
-              </label>
-            </li>
-          );
-        })}
+        {(folders ?? []).map((folder) => (
+          // KEYED ON THE ROW ID, NOT THE NAME, and after this task that is
+          // load-bearing rather than conventional: a rename RE-KEYS the row in
+          // place (api: renameFolder), so the id survives it and React keeps
+          // this row's component instance -- which is what lets the rename's
+          // own "N messages moved with it" still be on screen to render once
+          // the list comes back under its new name. Keying on the name would
+          // unmount the row that made the request and remount an idle one.
+          <li key={folder.id}>
+            <FolderRow
+              account={account}
+              folder={folder}
+              stale={folder.lastDiscoveredAt < newest}
+              setSync={setSync}
+            />
+          </li>
+        ))}
       </ul>
+
+      <NewFolderForm account={account} />
 
       <MoveTargets
         account={account}
@@ -515,6 +489,296 @@ function FolderPicker({ account }: { account: MailAccountWithSyncStats }) {
         folderNames={(folders ?? []).filter((row) => row.selectable).map((row) => row.folder)}
       />
     </div>
+  );
+}
+
+/**
+ * One folder: its sync checkbox, and the two commands that change the mailbox
+ * itself (Phase 4.4 Task 4).
+ *
+ * A COMPONENT PER ROW because a row now has state of its own -- whether it is
+ * being renamed, and whether its delete confirmation is open -- and hoisting
+ * either into the picker would make it "the row being renamed", which is one
+ * more thing to keep in step with a list that refetches under it.
+ *
+ * The two commands are on every row rather than behind a per-account edit mode:
+ * they are refused per FOLDER, for reasons that differ per folder (INBOX, a
+ * move target, a hierarchy node, a folder the server has stopped listing), and
+ * a mode would have to explain all four in one sentence somewhere else.
+ */
+function FolderRow({ account, folder, stale, setSync }: {
+  account: MailAccountWithSyncStats;
+  folder: MailAccountFolder;
+  stale: boolean;
+  setSync: ReturnType<typeof useSetFolderSync>;
+}) {
+  const [renaming, setRenaming] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const rename = useRenameFolder();
+  const remove = useDeleteFolder();
+  const returnFocus = useDialogReturnFocus();
+
+  // Locked (INBOX and the account's Sent folder) and `\Noselect` rows are both
+  // refused by the API in BOTH directions -- the switch is not real either way
+  // -- so the checkbox is disabled and says why rather than sending a request
+  // that comes back 409.
+  const why = folder.locked
+    ? "Always synced: the CRM needs INBOX and Sent for sending and direction"
+    : !folder.selectable
+      ? "This folder holds no messages (\\Noselect)"
+      : undefined;
+  const renameBlocked = folderRenameBlocked(folder, { stale });
+  const deleteBlocked = folderDeleteBlocked(folder, account, { stale });
+  const reasons = folderCommandReasons(folder, account, { stale });
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <label
+          className={clsx(
+            // A list row, and the label IS the row: it wraps the 13px box and
+            // the folder name, so flooring it here is what makes the whole row
+            // tappable rather than the checkbox alone.
+            "flex min-w-0 flex-1 items-center gap-2 text-sm max-md:min-h-11",
+            why === undefined ? "text-slate-700" : "text-slate-400",
+          )}
+          title={why}
+        >
+          <input
+            type="checkbox"
+            data-testid={`folder-picker-${folder.folder}`}
+            checked={folder.syncEnabled}
+            // Only the row being toggled waits, not the whole list: one PATCH
+            // is one folder, and freezing eleven other checkboxes while a slow
+            // server answers for the twelfth turns a curation pass into a
+            // queue.
+            disabled={why !== undefined
+              || (setSync.isPending && setSync.variables?.input.folder === folder.folder)}
+            onChange={(event) => setSync.mutate({
+              accountId: account.id,
+              // BY NAME, byte for byte as the endpoint listed it: that is how
+              // UNIQUE (account_id, folder) matches it server-side.
+              input: { folder: folder.folder, syncEnabled: event.target.checked },
+            })}
+            className="h-4 w-4"
+          />
+          <span className={clsx("truncate", stale && "italic")}>{folder.folder}</span>
+          {folder.specialUse !== null && (
+            <span className="shrink-0 text-[11px] uppercase text-slate-400">{folder.specialUse}</span>
+          )}
+          {stale && (
+            <span className="shrink-0 text-[11px] text-slate-400" title="Not seen in the last sync">
+              not seen in the last sync
+            </span>
+          )}
+        </label>
+        {/* A blocked command shows no button and says why, as text, below the
+            row -- this codebase's rule for a blocked reason (bulk-bar.tsx): a
+            `title` is invisible to touch and silent to a screen reader, and an
+            unexplained missing button is worse than either. */}
+        {renameBlocked === null && !renaming && (
+          <Button
+            variant="ghost" className="shrink-0 px-2 py-1 text-xs"
+            data-testid={`folder-rename-${folder.folder}`}
+            onClick={() => { rename.reset(); setRenaming(true); }}
+          >
+            Rename
+          </Button>
+        )}
+        {deleteBlocked === null && (
+          <Button
+            variant="ghost" className="shrink-0 px-2 py-1 text-xs text-red-600"
+            data-testid={`folder-delete-${folder.folder}`}
+            onClick={(event) => {
+              remove.reset();
+              returnFocus.capture(event.currentTarget);
+              setConfirmingDelete(true);
+            }}
+          >
+            Delete
+          </Button>
+        )}
+      </div>
+
+      {reasons.map((reason) => (
+        <p key={reason} className="pl-6 text-xs text-slate-400">{reason}</p>
+      ))}
+
+      {renaming && (
+        <RenameFolderForm
+          accountId={account.id}
+          folder={folder.folder}
+          rename={rename}
+          onClose={() => setRenaming(false)}
+        />
+      )}
+      {/* The one thing the rename says AFTERWARDS, and it has to: renaming a
+          folder silently re-keys every message stored under it, and an operator
+          who is not told is left to notice by searching for something that
+          stops matching. */}
+      {rename.isSuccess && !renaming && rename.variables.accountId === account.id
+        && rename.data.folder.folder === folder.folder && (
+        <p className="text-xs text-slate-500">
+          {`Renamed. ${String(rename.data.messages)} stored `}
+          {rename.data.messages === 1 ? "message" : "messages"}
+          {` moved with it, across ${String(rename.data.folders)} `}
+          {rename.data.folders === 1 ? "folder" : "folders"}.
+        </p>
+      )}
+      {remove.isSuccess && remove.variables.accountId === account.id
+        && remove.variables.input.folder === folder.folder && (
+        <p className="text-xs text-slate-500">
+          {`Deleted from the mail server. Conduit kept ${String(remove.data.messages)} stored `}
+          {remove.data.messages === 1 ? "message" : "messages"} from it.
+        </p>
+      )}
+
+      <Dialog
+        open={confirmingDelete}
+        onOpenChange={(open) => { if (!open) setConfirmingDelete(false); }}
+      >
+        <DialogContent onCloseAutoFocus={returnFocus.restore}>
+          <div className="flex flex-col gap-3">
+            <DialogTitle>{`Delete "${folder.folder}"?`}</DialogTitle>
+            {folderDeleteWarning(folder.folder).map((line) => (
+              <p key={line} className="text-sm text-slate-600">{line}</p>
+            ))}
+            {remove.isError && (
+              <p role="alert" className="text-sm text-red-600">{remove.error.message}</p>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setConfirmingDelete(false)}>Cancel</Button>
+              <Button
+                variant="danger"
+                data-testid="folder-delete-confirm"
+                disabled={remove.isPending}
+                onClick={() => remove.mutate(
+                  { accountId: account.id, input: { folder: folder.folder } },
+                  // Closed only on SUCCESS: a refusal ("still holds 12
+                  // messages") belongs where the question was asked, not
+                  // stranded behind a dialog that has just shut.
+                  { onSuccess: () => setConfirmingDelete(false) },
+                )}
+              >
+                {remove.isPending ? "Deleting..." : "Delete the folder"}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+/** The inline rename editor. A form so Enter submits, and `autoFocus` because
+ * below the breakpoint DialogContent's injected Close is otherwise the first
+ * tabbable thing on screen (dialog.tsx's hazard note) -- the same discipline
+ * applied to an inline editor costs nothing and means the keyboard lands where
+ * the eye does. */
+function RenameFolderForm({ accountId, folder, rename, onClose }: {
+  accountId: string;
+  folder: string;
+  rename: ReturnType<typeof useRenameFolder>;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState(folder);
+  const trimmed = name.trim();
+
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    if (trimmed === "" || trimmed === folder) return;
+    rename.mutate(
+      { accountId, input: { folder, newFolder: trimmed } },
+      { onSuccess: onClose },
+    );
+  }
+
+  return (
+    <form onSubmit={submit} className="flex flex-col gap-1 pl-6">
+      <div className="flex items-center gap-2">
+        <Input
+          autoFocus
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          data-testid={`folder-rename-input-${folder}`}
+          disabled={rename.isPending}
+          className="h-8 flex-1 text-sm"
+          aria-label={`New name for ${folder}`}
+        />
+        <Button
+          type="submit" className="shrink-0 px-2 py-1 text-xs"
+          data-testid={`folder-rename-save-${folder}`}
+          // Same name is not a no-op that quietly succeeds: the shared schema
+          // rejects it outright, so the control refuses it before the request.
+          disabled={rename.isPending || trimmed === "" || trimmed === folder}
+        >
+          {rename.isPending ? "Renaming..." : "Save"}
+        </Button>
+        <Button
+          variant="ghost" className="shrink-0 px-2 py-1 text-xs"
+          disabled={rename.isPending} onClick={onClose}
+        >
+          Cancel
+        </Button>
+      </div>
+      <p className="text-xs text-slate-400">
+        The folder is renamed on the mail server, and every message Conduit stored from it {"—"}
+        and from any folder inside it {"—"} moves with it. Type the full path to move it
+        somewhere else in the hierarchy.
+      </p>
+      {rename.isError && (
+        <p role="alert" className="text-sm text-red-600">{rename.error.message}</p>
+      )}
+    </form>
+  );
+}
+
+/** Make a folder on the mail server. Inline rather than in a dialog: it is one
+ * field, it belongs at the foot of the list it adds to, and the list is where
+ * the result appears. */
+function NewFolderForm({ account }: { account: MailAccountWithSyncStats }) {
+  const [name, setName] = useState("");
+  const create = useCreateFolder();
+  const trimmed = name.trim();
+
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    if (trimmed === "") return;
+    create.mutate(
+      { accountId: account.id, input: { folder: trimmed } },
+      { onSuccess: () => setName("") },
+    );
+  }
+
+  return (
+    <form onSubmit={submit} className="flex flex-col gap-1 border-t border-slate-100 pt-2">
+      <div className="flex items-center gap-2">
+        <Input
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          placeholder="New folder name"
+          data-testid={`folder-create-input-${account.id}`}
+          disabled={create.isPending}
+          className="h-8 flex-1 text-sm"
+          aria-label="New folder name"
+        />
+        <Button
+          type="submit" className="shrink-0 px-2 py-1 text-xs"
+          data-testid={`folder-create-${account.id}`}
+          disabled={create.isPending || trimmed === ""}
+        >
+          {create.isPending ? "Creating..." : "Create"}
+        </Button>
+      </div>
+      <p className="text-xs text-slate-400">
+        Made on the mail server and synced from the start {"—"} unlike a folder Conduit
+        merely discovers, one you make here is one you have asked for. Use the server{"’"}s
+        own separator for a folder inside another, as the names above spell it.
+      </p>
+      {create.isError && (
+        <p role="alert" className="text-sm text-red-600">{create.error.message}</p>
+      )}
+    </form>
   );
 }
 

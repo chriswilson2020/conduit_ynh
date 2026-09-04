@@ -349,6 +349,93 @@ export interface ImapClient {
    */
   move(folder: string, uids: number[], targetFolder: string): Promise<void>;
   /**
+   * CREATE `folder`. Phase 4.4's folder management -- the first commands in
+   * this interface that change the server's MAILBOX TOPOLOGY rather than
+   * where a message sits inside it.
+   *
+   * A NAME THAT ALREADY EXISTS MUST BE A THROW, and this is `move`'s
+   * falsy-return trap in a second place. imapflow's `mailboxCreate` does not
+   * reject when the server answers ALREADYEXISTS: it resolves with
+   * `{ path, created: false }` (observed against Dovecot 2.3.19 -- creating an
+   * existing "Taken" returned exactly that). An adapter passing that through
+   * as success would let Conduit stamp a fresh folder row -- its own
+   * sync_enabled, its own first-sight defaults -- over a mailbox that was
+   * already there and may already hold mail. Turn `created: false` into a
+   * thrown error naming the folder.
+   *
+   * A DEEP NAME AUTO-CREATES ITS PARENTS, and they arrive UNUSABLE. Creating
+   * "A/B/C" when neither "A" nor "A/B" exists succeeds and leaves both of them
+   * listed as `\NonExistent \HasChildren \Noselect` (observed, same server).
+   * Nothing here has to do anything about that -- discovery records them as
+   * unselectable rows, which is what they are, and every write path already
+   * refuses an unselectable folder -- but a caller expecting "one create, one
+   * new mailbox" is wrong about servers.
+   */
+  createMailbox(folder: string): Promise<void>;
+  /**
+   * RENAME `folder` to `newFolder`.
+   *
+   * THIS IS A SUBTREE RENAME AND THE CALLER MUST TREAT IT AS ONE. RFC 3501
+   * 6.3.5 requires inferior hierarchical names to be renamed with their
+   * parent, and Dovecot 2.3.19 does exactly that: renaming "Parent" to
+   * "Renamed" moved "Parent/Child" to "Renamed/Child" in the same command
+   * (observed). A caller that re-keys only the exact name leaves every
+   * descendant's stored mail pointing at a mailbox that no longer exists.
+   *
+   * UIDVALIDITY SURVIVES IT, on that server: a folder renamed with a message
+   * in it came back with the same UIDVALIDITY and its UIDs intact (observed).
+   * That is what lets mail-folders.ts re-key the sync cursor rather than
+   * discard it -- and where a server does NOT preserve it, the existing
+   * UIDVALIDITY-mismatch path re-walks the folder, so the caller is right
+   * either way rather than only on Dovecot.
+   *
+   * Two refusals seen from Dovecot, both as thrown errors and both worth
+   * knowing because the service refuses them EARLIER with better sentences:
+   * "Target mailbox already exists", and "Renaming INBOX isn't supported".
+   */
+  renameMailbox(folder: string, newFolder: string): Promise<void>;
+  /**
+   * DELETE `folder`. **THIS DESTROYS THE MESSAGES IN IT, ON THE SERVER,
+   * IRREVERSIBLY**, and no server refusal stands between a caller and that:
+   * Dovecot 2.3.19 deleted a mailbox holding a message without complaint and
+   * the message was gone (observed). Callers must decide for themselves
+   * whether the mailbox is empty; `messageCount` below is how, and
+   * AccountSync.deleteMailboxIfEmpty is the only caller because it puts the
+   * two in one visit to the loop.
+   *
+   * A PARENT WITH CHILDREN IS NOT DELETED, AND THE RESULT IS A TRAP. RFC 3501
+   * 6.3.4 lets a server keep the name as a placeholder, and Dovecot does:
+   * after deleting "P2" while "P2/Kid" existed, P2's own message was destroyed
+   * and P2 STAYED IN LIST -- carrying `\HasChildren` and, on that version,
+   * NEITHER `\Noselect` NOR `\NonExistent`. So the listing says an ordinary
+   * selectable folder while STATUS answers false and APPEND answers "Mailbox
+   * doesn't exist" (all observed together). Discovery would go on re-sighting
+   * it as live and the walk would open it and fail the pass, every pass. That
+   * is why mail-folders.ts refuses to delete a folder with children rather
+   * than finding out what each server does with it.
+   */
+  deleteMailbox(folder: string): Promise<void>;
+  /**
+   * How many messages `folder` holds ON THE SERVER (IMAP STATUS MESSAGES).
+   *
+   * Separate from `status()` rather than a second field on it, deliberately.
+   * `status()` runs on every folder of every pass and its own comment defends
+   * carrying UIDVALIDITY alone; this runs on the rare, deliberate delete. The
+   * two ask the same command for different reasons and neither should pay for
+   * the other's.
+   *
+   * NOT answerable from mail_messages: Conduit holds only what it has SYNCED,
+   * and a folder whose sync is off can hold thousands of messages it has never
+   * seen. Counting rows would let exactly the unsynced folders -- the ones a
+   * user is most likely to tidy up -- be deleted full.
+   *
+   * A falsy return is a throw, per RETURN-VALUE DISCIPLINE: imapflow's
+   * `status` answers `false` for a mailbox that does not exist (observed), and
+   * reading that as zero would make "the folder is already gone" and "the
+   * folder is empty" the same answer to the question that guards a delete.
+   */
+  messageCount(folder: string): Promise<number>;
+  /**
    * Blocks until the server reports new mail, or `signal` aborts.
    *
    * No folder parameter: only INBOX is ever idled (spec -- IDLE is for

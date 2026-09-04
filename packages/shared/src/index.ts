@@ -921,6 +921,96 @@ export const folderPatchInputSchema = z.object({
 });
 export type FolderPatchInput = z.infer<typeof folderPatchInputSchema>;
 
+// --- Folder management (Phase 4.4 Task 4) -----------------------------------
+//
+// Create, rename and delete a mailbox ON THE SERVER, which is what makes these
+// three different in kind from the toggle above: that one writes a Conduit
+// preference about a folder the server already has, and these three change
+// what the server has. Every one of them is therefore a TWO-SYSTEM write, and
+// the api service (mail-folders.ts) is where the ordering that makes each of
+// them safe is argued.
+//
+// THREE BODIES, THREE ENDPOINTS, rather than more fields on
+// folderPatchInputSchema. Phase 4.4 learned this twice already -- `folder`
+// meaning source-or-destination depending on the action (Task 1's correction)
+// and `threadIds` meaning threads-or-messages (Task 2's ruling) -- and both
+// times the answer was a separate, narrower shape. A `newFolder` bolted onto
+// the patch schema would make `syncEnabled` meaningless for half the requests
+// that carry it, which is the same mistake one field wide.
+//
+// `.strict()` on all three, matching bulkMessageActionInputSchema's reasoning:
+// a body carrying a field this shape does not have is a caller who has
+// misunderstood which endpoint they are talking to, and rejecting says so
+// where silently stripping would let them believe it scoped something.
+
+// POST /api/mail/accounts/:id/folders -- CREATE one mailbox.
+export const folderCreateInputSchema = z.object({
+  folder: folderNameSchema,
+}).strict();
+export type FolderCreateInput = z.infer<typeof folderCreateInputSchema>;
+
+// POST /api/mail/accounts/:id/folders/rename.
+//
+// POST rather than PATCH-with-a-name-in-the-path, and the same for delete
+// below, for the reason the test-connection route is already POST: an IMAP
+// mailbox name is arbitrary user text -- it can contain the path separator,
+// spaces, and any non-ASCII the server's namespace allows -- and a name in a
+// URL is a name in every access log and proxy trace between here and the
+// browser. It is also the reason neither takes a `:folder` path parameter:
+// the name is data, and data belongs in the body.
+export const folderRenameInputSchema = z.object({
+  folder: folderNameSchema, newFolder: folderNameSchema,
+}).strict().refine((input) => input.folder !== input.newFolder, {
+  // Rejected in the SCHEMA rather than as a service conflict, because it is a
+  // malformed request and not a state clash: there is no folder arrangement
+  // that would make renaming a folder to its own name meaningful. Compared
+  // AFTER folderNameSchema's trim (both fields parse through it), so " Sent "
+  // and "Sent" are caught as the same name rather than sent to a mail server
+  // that would refuse them as a collision.
+  path: ["newFolder"],
+  message: "the new name is the same as the current one",
+});
+export type FolderRenameInput = z.infer<typeof folderRenameInputSchema>;
+
+// POST /api/mail/accounts/:id/folders/delete.
+export const folderDeleteInputSchema = z.object({
+  folder: folderNameSchema,
+}).strict();
+export type FolderDeleteInput = z.infer<typeof folderDeleteInputSchema>;
+
+// What a rename actually moved. Both counts cover the folder AND every
+// descendant of it, because an IMAP RENAME is a SUBTREE rename -- verified
+// against Dovecot 2.3, which renames "Parent" and "Parent/Child" together
+// (api: renameFolder, and the integration test that pins it) -- so a rename
+// that re-keyed only the exact name would leave every child's stored mail
+// pointing at a name the server no longer has.
+//
+// The counts are on the wire because the UI says them afterwards. Renaming a
+// folder silently moves potentially thousands of stored messages, and "Renamed
+// to Clients; 412 stored messages moved with it" is the difference between an
+// operator who knows what happened and one who finds out from a search that
+// stops matching.
+export const folderRenameResultSchema = z.object({
+  folder: mailAccountFolderSchema,
+  /** mail_messages rows re-keyed. */
+  messages: z.number().int().nonnegative(),
+  /** Folder rows re-keyed: the folder itself plus each descendant. */
+  folders: z.number().int().nonnegative(),
+});
+export type FolderRenameResult = z.infer<typeof folderRenameResultSchema>;
+
+// What a delete left behind. `folder` is the row, WHICH STILL EXISTS: this
+// table's rows are never deleted (api: db/schema.ts, "a folder that vanishes
+// from a later LIST keeps its row"), and a Conduit-driven delete is not the
+// exception that proves it. `messages` is the count of stored messages Conduit
+// KEPT -- the promise the confirmation made beforehand, restated as a fact
+// afterwards.
+export const folderDeleteResultSchema = z.object({
+  folder: mailAccountFolderSchema,
+  messages: z.number().int().nonnegative(),
+});
+export type FolderDeleteResult = z.infer<typeof folderDeleteResultSchema>;
+
 export const mailThreadSchema = z.object({
   id: z.uuid(),
   // No .min(1): a thread's subject derives from its first message's

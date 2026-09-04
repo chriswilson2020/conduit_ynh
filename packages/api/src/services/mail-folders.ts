@@ -1,9 +1,17 @@
 import { and, asc, eq, isNull, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
-import type { FolderPatchInput, MailAccountFolder, SpecialUse } from "@conduit/shared";
+import type {
+  FolderCreateInput, FolderDeleteInput, FolderDeleteResult, FolderPatchInput, FolderRenameInput,
+  FolderRenameResult, MailAccountFolder, SpecialUse,
+} from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { mailAccountFolders, mailAccounts, type MailAccountFolderRow } from "../db/schema.js";
-import { ConflictError, NotFoundError } from "./errors.js";
-import type { ImapFolderListing } from "./mail-imap.js";
+import {
+  mailAccountFolders, mailAccounts, mailFolderState, mailMessages,
+  type MailAccountFolderRow,
+} from "../db/schema.js";
+import {
+  ConflictError, MailFolderCommandError, MailFolderRenameFailedError, NotFoundError,
+} from "./errors.js";
+import { consoleSyncLogger, type ImapFolderListing, type SyncLogger } from "./mail-imap.js";
 import { publish } from "./sse.js";
 
 /**
@@ -593,12 +601,30 @@ export function publishFoldersHint(accountId: string): void {
  */
 async function mustGetOwnedAccount(
   db: Database, actorId: string, accountId: string,
-): Promise<{ id: string; sentFolder: string }> {
+): Promise<OwnedAccount> {
   const [row] = await db.select({
     id: mailAccounts.id, userId: mailAccounts.userId, sentFolder: mailAccounts.sentFolder,
+    // Untrimmed, unlike sentFolder: the folder COMMANDS below compare these
+    // against a name the server listed, and they also have to REWRITE them, so
+    // they need the value as stored rather than as read. See renameFolder's
+    // note on what a stored " Archive " costs.
+    rawSentFolder: mailAccounts.sentFolder,
+    trashFolder: mailAccounts.trashFolder, archiveFolder: mailAccounts.archiveFolder,
+    archivedAt: mailAccounts.archivedAt,
   }).from(mailAccounts).where(eq(mailAccounts.id, accountId));
   if (row === undefined || row.userId !== actorId) throw new NotFoundError("mail account", accountId);
-  return { id: row.id, sentFolder: row.sentFolder.trim() };
+  return { ...row, sentFolder: row.sentFolder.trim() };
+}
+
+interface OwnedAccount {
+  id: string;
+  /** Trimmed -- what isLocked and the picker compare against. */
+  sentFolder: string;
+  /** As stored, for the folder commands that rewrite it. */
+  rawSentFolder: string;
+  trashFolder: string | null;
+  archiveFolder: string | null;
+  archivedAt: Date | null;
 }
 
 /**
@@ -746,4 +772,783 @@ export async function setFolderSyncEnabled(
     folder: toAccountFolder(updated, account.sentFolder),
     enabled: input.syncEnabled,
   };
+}
+
+// --- Folder management (Phase 4.4 Task 4) -----------------------------------
+//
+// Create, rename and delete a mailbox ON THE SERVER. Everything above this line
+// records what the server already has; everything below changes it, and each of
+// the three is therefore a TWO-SYSTEM WRITE. The ordering that makes each one
+// safe is argued at its own function, but the shape they share is stated once
+// here:
+//
+//   THE SERVER GOES FIRST, AND THE LOCAL WRITE FOLLOWS.
+//
+// That is the move service's discipline (mail-move.ts), for the move service's
+// reason: the CRM must never claim something the mail server refused. It has
+// one consequence per command, and they are not equally bad, which is why they
+// are worth listing together:
+//
+// - CREATE: a refused CREATE writes nothing. A successful CREATE whose row
+//   insert then fails leaves a mailbox on the server that Conduit has not
+//   recorded -- which is the ORDINARY state of every folder made in any other
+//   mail client, and discovery records it within one poll interval. There is
+//   no bad state here to compensate for.
+// - DELETE: a refused (or skipped) DELETE writes nothing. A successful DELETE
+//   whose local write then fails leaves a folder row that still says
+//   sync_enabled -- harmless, because the walk drives off what discovery
+//   RE-SIGHTED (see FolderDiscovery.folders) and a deleted folder is never in
+//   that set again. Also nothing to compensate.
+// - RENAME is the one that can leave the two systems disagreeing, and the only
+//   one with a compensating action. See renameFolder.
+//
+// THE OTHER ORDER WAS CONSIDERED FOR RENAME AND REJECTED, and the reason is
+// specific rather than stylistic. The attractive version is "open a
+// transaction, re-key inside it, do the IMAP RENAME while it is still open,
+// COMMIT only if the server agreed" -- which would make a failed re-key
+// UNREACHABLE rather than compensated, exactly the improvement Task 1 found for
+// the filing rule's sync switch. IT DEADLOCKS. The IMAP call is queued on the
+// account's serial sync loop and waits for that loop to reach it, which can be
+// a whole first backfill (mail-move.ts's "THE RETURNED PROMISE WAITS FOR THE
+// SERVER"); the open transaction meanwhile holds row locks on every
+// mail_messages row of the folder being renamed. If the pass the loop is
+// running is ingesting into that folder, the pass blocks on those locks, the
+// loop never reaches the queued RENAME, and the transaction never commits.
+// That is not a contrived case -- it is renaming a busy folder while its own
+// folder is syncing. So the transaction cannot span the IMAP call, and what is
+// left is the spec's order with every REACHABLE local failure moved in FRONT of
+// the server call, which is what renameFolder does.
+
+/**
+ * The slice of one AccountSync these commands use. Structural rather than the
+ * class, for mail-move.ts's MoveSyncAccount's reason: a test can hand in a
+ * server that refuses a rename without standing up a sync engine.
+ *
+ * All four go through the account's SERIAL QUEUE, so a folder command can never
+ * overlap a pass -- which matters more here than for a move, because these
+ * change the set of folders a pass walks.
+ */
+export interface FolderSyncAccount {
+  /** LIST. The server's answer, which mail_account_folders cannot give -- see
+   * AccountSync.listFolders. */
+  listFolders(): Promise<ImapFolderListing[]>;
+  createMailbox(folder: string): Promise<void>;
+  renameMailbox(folder: string, newFolder: string): Promise<void>;
+  /** Counts, and deletes ONLY if the count is zero; returns the count either
+   * way. One queued task, deliberately -- see
+   * AccountSync.deleteMailboxIfEmpty. */
+  deleteMailboxIfEmpty(folder: string): Promise<number>;
+}
+
+export interface FolderSyncManager {
+  get(accountId: string): FolderSyncAccount | undefined;
+}
+
+export interface FolderCommandDeps {
+  syncManager: FolderSyncManager | null;
+  /** Defaults to the console logger, like the sync engine's own. */
+  logger?: SyncLogger;
+}
+
+/**
+ * The account's live loop, or the refusal that says why there is not one.
+ *
+ * A MISSING LOOP IS A REFUSAL, NOT A BEST-EFFORT SKIP -- accountStateOf's
+ * ruling (mail-move.ts) applied to a different write. There the reason is that
+ * moving rows with nothing to carry the MOVE out leaves the CRM claiming a move
+ * that never happened; here it is sharper, because the local half of a folder
+ * command is a rename of records describing a mailbox nobody renamed.
+ *
+ * An ARCHIVED account is answered separately and first, because its loop is
+ * torn down deliberately and the remedy is a different page: "unarchive it"
+ * rather than "wait for it to come back".
+ */
+function folderSyncOf(
+  account: OwnedAccount, syncManager: FolderSyncManager | null,
+): FolderSyncAccount {
+  if (account.archivedAt !== null) {
+    throw new ConflictError(
+      "mail account", account.id,
+      "this account is archived, so Conduit is not connected to its mail server"
+        + " -- unarchive it in Settings before changing its folders",
+    );
+  }
+  const sync = syncManager?.get(account.id);
+  if (sync === undefined) {
+    throw new ConflictError(
+      "mail account", account.id,
+      "mail sync is not running for this account, so Conduit cannot reach its mail server",
+    );
+  }
+  return sync;
+}
+
+/** One folder command's failure, as the client should see it. Every call these
+ * three make to the server funnels through here, so no adapter error,
+ * SyncUnavailableError or SyncStoppedError escapes as a bare 500. */
+async function onServer<T>(action: string, folder: string, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    throw new MailFolderCommandError(action, folder, errorText(error), { cause: error });
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The server's hierarchy delimiter for one listed mailbox, spelled as a string
+ * so a flat namespace (RFC 3501 permits NIL) is the empty one rather than a
+ * separate case at every call site.
+ *
+ * PER ENTRY, off the listing, never a constant and never a guess: Dovecot
+ * reports "." for a Maildir++ layout and "/" for an fs one, both ordinary, and
+ * classification already refuses to guess it for the same reason
+ * (lastPathSegment). A rename needs it because a DESCENDANT is a stored name
+ * beginning with the folder plus this character -- guess it wrong and either
+ * every child is missed, or a sibling named "ClientsX" is treated as a child of
+ * "Clients".
+ */
+function delimiterOf(entry: ImapFolderListing): string {
+  return entry.delimiter ?? "";
+}
+
+/** Names under `folder` in `listed` -- the subtree an IMAP RENAME moves, and
+ * the one an IMAP DELETE refuses to remove. Byte-compared with the server's own
+ * delimiter, exactly as every other mailbox-name comparison here. */
+function descendantsOf(
+  listed: readonly ImapFolderListing[], folder: string, delimiter: string,
+): string[] {
+  if (delimiter.length === 0) return [];
+  const prefix = folder + delimiter;
+  return listed.filter((entry) => entry.folder.startsWith(prefix)).map((entry) => entry.folder);
+}
+
+/**
+ * `value` rewritten as if `folder` had been renamed to `newFolder`, or
+ * undefined when the rename does not touch it.
+ *
+ * The JavaScript half of the rule renamedSql applies to whole columns, and
+ * deliberately written with `startsWith`/`slice` rather than arithmetic on
+ * lengths: equality and prefix tests are exact in both languages, while the
+ * lengths are not -- see subtreeSql.
+ */
+function renamedInSubtree(
+  value: string | null, folder: string, delimiter: string, newFolder: string,
+): string | undefined {
+  if (value === null) return undefined;
+  if (value === folder) return newFolder;
+  if (delimiter.length > 0 && value.startsWith(folder + delimiter)) {
+    return newFolder + value.slice(folder.length);
+  }
+  return undefined;
+}
+
+/**
+ * "this column names `folder`, or something under it", in SQL.
+ *
+ * `char_length(<the parameter>)` rather than a length computed in JavaScript,
+ * and that is not defensive tidiness: `String.length` counts UTF-16 code units
+ * while Postgres counts CHARACTERS, so the two disagree on exactly the names
+ * this file calls ordinary -- folder names arrive already decoded out of
+ * modified UTF-7, and one containing a character outside the BMP measures one
+ * longer here than there. Letting Postgres measure its own parameter makes the
+ * two agree by construction rather than by everything happening to be ASCII.
+ *
+ * `left(...) = prefix` rather than `LIKE prefix || '%'`: a folder name is
+ * arbitrary user text and may contain `%`, `_` or a backslash, all of which
+ * LIKE reads as pattern syntax. Escaping them is a second rule to get right;
+ * not needing one is better.
+ */
+function subtreeSql(column: SQLWrapper, folder: string, delimiter: string): SQL {
+  if (delimiter.length === 0) return sql`${column} = ${folder}`;
+  const prefix = folder + delimiter;
+  return sql`(${column} = ${folder} or left(${column}, char_length(${prefix}::text)) = ${prefix})`;
+}
+
+/** renamedInSubtree, for a whole column. Only ever applied to rows subtreeSql
+ * already selected, so the substring always starts inside the value. */
+function renamedSql(column: SQLWrapper, folder: string, newFolder: string): SQL {
+  return sql`${newFolder} || substring(${column} from char_length(${folder}::text) + 1)`;
+}
+
+/**
+ * Create one mailbox on the server and record it (POST
+ * /api/mail/accounts/:id/folders).
+ *
+ * IT IS BORN SYNCING, and that is a deliberate departure from
+ * defaultSyncEnabled's first-sight rule rather than an oversight. That rule
+ * decides what to do with a folder Conduit DISCOVERED -- a mailbox that arrived
+ * with no statement of intent, where defaulting a Junk folder to off is the
+ * safe read. A folder the user made THROUGH CONDUIT arrives with the statement
+ * already made: it is Task 1's filing rule one gesture earlier ("filing a
+ * thread into a folder IS the statement that the folder matters"), and creating
+ * one is the same statement about the same folder. A folder created here and
+ * then not synced would be a control that visibly did nothing.
+ *
+ * The no-clobber rule then protects that value forever (discoverFolders'
+ * onConflictDoUpdate), which is exactly right: it was a user's choice, not a
+ * default.
+ *
+ * `special_use` is left NULL rather than classified here. Classification wants
+ * the server's own listing -- its SPECIAL-USE attribute first, then the name
+ * heuristics on the last path segment WITH THE SERVER'S DELIMITER -- and the
+ * next pass has all of that and applies it (special_use is one of the two
+ * columns the discovery upsert does update). Guessing it one poll interval
+ * early, from a name and no delimiter, would be a second classifier free to
+ * disagree with the one that matters.
+ */
+export async function createFolder(
+  db: Database, actorId: string, accountId: string, input: FolderCreateInput,
+  deps: FolderCommandDeps,
+): Promise<MailAccountFolder> {
+  const account = await mustGetOwnedAccount(db, actorId, accountId);
+  const [existing] = await db.select().from(mailAccountFolders).where(and(
+    eq(mailAccountFolders.accountId, accountId),
+    eq(mailAccountFolders.folder, input.folder),
+  ));
+  // Refused HERE rather than left to the server, even though the server refuses
+  // it too (the adapter turns imapflow's `created: false` into a throw). The
+  // row may be STALE -- a folder deleted or renamed outside Conduit keeps its
+  // row forever -- in which case the server would happily create the name again
+  // and leave one row describing two different mailboxes' history. Saying so is
+  // more useful than either outcome.
+  if (existing !== undefined) {
+    throw new ConflictError(
+      "mail folder", input.folder,
+      `Conduit already has a folder named "${input.folder}" on this account`
+        + " -- if it is shown as gone from the server, it is still holding the mail Conduit"
+        + " stored from it, so a new folder needs a different name",
+    );
+  }
+  const sync = folderSyncOf(account, deps.syncManager);
+
+  // The server first, so a refusal costs nothing locally.
+  await onServer("create", input.folder, () => sync.createMailbox(input.folder));
+
+  const now = new Date();
+  const [row] = await db.insert(mailAccountFolders).values({
+    accountId,
+    folder: input.folder,
+    specialUse: null,
+    syncEnabled: true,
+    // A mailbox the server has just CREATED is selectable by definition. (The
+    // \Noselect placeholders a deep name leaves behind for its missing parents
+    // are different rows, and discovery records those as what they are.)
+    selectable: true,
+    // Creating it IS sighting it: the server answered for this exact name a
+    // moment ago, which is more evidence than a LIST gives about any other row.
+    lastDiscoveredAt: now,
+  })
+    // A discovery pass can have raced us between the CREATE above and this
+    // insert -- the folder really is on the server by then, so a LIST in that
+    // window sees it. The user's intent wins: they asked for this folder, and
+    // they get it syncing.
+    .onConflictDoUpdate({
+      target: [mailAccountFolders.accountId, mailAccountFolders.folder],
+      set: { syncEnabled: true, selectable: true, lastDiscoveredAt: now, updatedAt: now },
+    })
+    .returning();
+  // Unreachable: an upsert always returns its row. Defensive rather than
+  // asserted, as setFolderSyncEnabled's own guard is.
+  if (row === undefined) throw new NotFoundError("mail folder", input.folder);
+  publishFoldersHint(accountId);
+  return toAccountFolder(row, account.sentFolder);
+}
+
+/**
+ * Rename one mailbox on the server and re-key everything Conduit stored under
+ * its name (POST /api/mail/accounts/:id/folders/rename).
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS THE PHASE'S RISK
+ * ---------------------------------------------------------------------------
+ * A FOLDER NAME IS A BYTE-COMPARED KEY, in SIX columns and not the three the
+ * spec counted: `folder` on mail_messages (and it is part of the
+ * mail_messages(account_id, folder, imap_uid) index), on mail_account_folders
+ * and on mail_folder_state -- plus sent_folder, trash_folder and archive_folder
+ * on mail_accounts, which hold folder NAMES just as literally and break just as
+ * completely. Renaming Archive on the server without rewriting
+ * archive_folder leaves every bulk Archive failing at the server; renaming Sent
+ * without rewriting sent_folder breaks the send path's APPEND and moves the
+ * `locked` rule off the folder it belongs to. So the re-key is all six.
+ *
+ * IT IS A SUBTREE RENAME. RFC 3501 6.3.5 requires inferior names to move with
+ * their parent and Dovecot 2.3 does exactly that (renaming "Parent" moved
+ * "Parent/Child" in the same command -- observed, and pinned by the integration
+ * test). A re-key of the exact name alone would leave every child's stored mail
+ * pointing at a mailbox that no longer exists, which is this function's own bug
+ * one level down.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ORDER, AND WHAT EACH FAILURE COSTS
+ * ---------------------------------------------------------------------------
+ * Checks, then the server's RENAME, then ONE transaction for all six columns,
+ * then -- only if that transaction failed -- a compensating RENAME back. (The
+ * order the transaction could not have, and why, is argued in this section's
+ * header comment: it deadlocks against the sync loop the RENAME is queued on.)
+ *
+ * The point of putting every check FIRST is that it moves the reachable local
+ * failures in front of the server call, where they cost nothing, and leaves the
+ * compensated window as small as it can be:
+ *
+ * - THE ACCOUNT, THE FOLDER, INBOX, THE SAME NAME TWICE, A MISSING LOOP,
+ *   AN ARCHIVED ACCOUNT: refused before anything happens. UNREACHABLE bad
+ *   state.
+ * - THE SERVER NO LONGER LISTS THE FOLDER: refused, from the LIST, before the
+ *   RENAME. Unreachable.
+ * - THE DESTINATION IS TAKEN -- on the server, or by a Conduit row the server
+ *   has stopped listing. The second is the interesting one: it is a UNIQUE
+ *   (account_id, folder) violation waiting to happen, and it is the ONLY
+ *   re-key failure this function can predict. Refusing it here is what turns
+ *   the most likely compensation into an unreachable one. Unreachable.
+ * - THE SERVER REFUSES THE RENAME: nothing has been written. Unreachable bad
+ *   state, reported as the 502 it is.
+ * - THE RE-KEY TRANSACTION FAILS: COMPENSATED. The server is renamed back and
+ *   the caller is told nothing changed. What is left to fail here, with the
+ *   collision predicted away, is the database going away mid-statement -- and a
+ *   statement timeout on a very large mail_messages update, which is why the
+ *   two small unique-constrained tables are written FIRST inside the
+ *   transaction: whatever is going to fail should fail before the expensive
+ *   statement rather than after it.
+ * - THE COMPENSATION ALSO FAILS: the one genuinely divergent state. Logged at
+ *   error with the account and both names, and reported to the caller in words
+ *   naming the fix, because nothing self-heals it: the messages' folder column
+ *   still says the old name, the old name is not on the server, and discovery
+ *   will simply record the new name as a new folder.
+ * - THE PROCESS DIES BETWEEN THE RENAME AND THE COMMIT: accepted, and it is the
+ *   hard-crash residual mail-move.ts already documents for the same reason
+ *   (making it impossible needs an outbox table and a resume path). Note what
+ *   it degrades to, which is not nothing: the state it leaves is EXACTLY the
+ *   state a rename done in another mail client leaves -- a stale row, a new
+ *   row next pass, messages under the old name -- which this codebase has
+ *   always had and which mail-folders' own header calls the accepted rename
+ *   hazard.
+ *
+ * THE ROW IS RE-KEYED IN PLACE, NOT REPLACED, and that is the other half of
+ * what this function is for. The header's rename hazard says a rename seen only
+ * through LIST produces a NEW row at its own first-sight default while the old
+ * one goes stale, so a user who had switched the folder OFF gets it back ON. A
+ * rename made THROUGH Conduit carries the identity across: same row, same
+ * sync_enabled, same created_at, and NO stale row left behind for the filing
+ * picker to go on offering. That is the one path this task can make correct,
+ * and it is correct because the rename is known to be a rename.
+ *
+ * `imap_uid` IS DELIBERATELY NOT NULLED. A move nulls it because a UID names a
+ * message IN A MAILBOX and the message changed mailbox; a rename changes the
+ * mailbox's NAME and moves no message, and Dovecot carries UIDVALIDITY and the
+ * UIDs across untouched (observed, and pinned). Nulling them would force a full
+ * re-walk of the folder and -- worse -- would make every message in it look
+ * like the "awaiting reconciliation" state that excludes a message from every
+ * move. On a server that does NOT preserve UIDVALIDITY, the existing mismatch
+ * path re-walks the folder and rewrites them, so keeping them is right there
+ * too rather than only on Dovecot.
+ */
+export async function renameFolder(
+  db: Database, actorId: string, accountId: string, input: FolderRenameInput,
+  deps: FolderCommandDeps,
+): Promise<FolderRenameResult> {
+  const logger = deps.logger ?? consoleSyncLogger;
+  const { folder, newFolder } = input;
+  const account = await mustGetOwnedAccount(db, actorId, accountId);
+  const [existing] = await db.select().from(mailAccountFolders).where(and(
+    eq(mailAccountFolders.accountId, accountId),
+    eq(mailAccountFolders.folder, folder),
+  ));
+  if (existing === undefined) throw new NotFoundError("mail folder", folder);
+  // INBOX is refused rather than attempted, and the server agrees ("Renaming
+  // INBOX isn't supported" -- Dovecot 2.3, observed). Refusing early is not
+  // just a better sentence: RFC 3501 6.3.5 gives RENAME INBOX special
+  // semantics -- the MESSAGES move to a new mailbox and INBOX itself stays,
+  // empty -- so on a server that does implement it, "rename" means something
+  // this function's re-key would describe wrongly in every column.
+  if (folderKey(folder) === INBOX) {
+    throw new ConflictError(
+      "mail folder", folder,
+      "INBOX cannot be renamed -- it is the one mailbox name IMAP reserves,"
+        + " and mail servers either refuse the rename or empty it into a new folder",
+    );
+  }
+  const sync = folderSyncOf(account, deps.syncManager);
+
+  // ONE LIST, and it answers three questions no local table can: does the
+  // server still have this folder, what is its delimiter (nothing stores one),
+  // and is the destination free. All three decide whether the RENAME below is
+  // safe, so they are read from the server rather than from rows that record
+  // what it looked like at some earlier pass.
+  const listed = await onServer("rename", folder, () => sync.listFolders());
+  const entry = listed.find((row) => row.folder === folder);
+  if (entry === undefined) {
+    throw new ConflictError(
+      "mail folder", folder,
+      `the mail server no longer has a folder named "${folder}"`
+        + " -- Conduit keeps the row so the mail it stored from that folder still has a home,"
+        + " but there is nothing left on the server to rename",
+    );
+  }
+  const delimiter = delimiterOf(entry);
+  // Refused before the server sees it, though Dovecot refuses it too ("Can't
+  // rename mailbox under its own child" -- observed). Worth its own check
+  // because the re-key would be quietly self-consistent if it ever ran: the
+  // prefix rewrite would take "A" to "A/B" and "A/x" to "A/B/x" without
+  // violating anything, so nothing downstream would notice the folder had
+  // swallowed itself.
+  if (delimiter.length > 0 && newFolder.startsWith(folder + delimiter)) {
+    throw new ConflictError(
+      "mail folder", newFolder,
+      `"${newFolder}" is inside "${folder}", and a folder cannot be moved into itself`,
+    );
+  }
+  const takenOnServer = listed.some((row) => row.folder === newFolder)
+    || descendantsOf(listed, newFolder, delimiter).length > 0;
+  if (takenOnServer) {
+    throw new ConflictError(
+      "mail folder", newFolder,
+      `the mail server already has a folder named "${newFolder}" on this account`,
+    );
+  }
+  // The predicted UNIQUE (account_id, folder) violation, refused where it is
+  // free instead of compensated where it is not. A row here that the server
+  // did NOT list is stale -- a folder renamed or deleted outside Conduit -- and
+  // it still holds that mailbox's stored mail, so merging this folder onto it
+  // would silently join two different folders' histories.
+  const collisions = await db.select({ folder: mailAccountFolders.folder })
+    .from(mailAccountFolders)
+    .where(and(
+      eq(mailAccountFolders.accountId, accountId),
+      subtreeSql(mailAccountFolders.folder, newFolder, delimiter),
+      // THE SOURCE'S OWN SUBTREE IS NOT A COLLISION WITH ITSELF. It matters
+      // for the one shape where the two overlap: promoting a child to its
+      // parent's level ("Clients/Acme" -> "Clients"), where every row under the
+      // source is about to BE the destination rather than block it. A row at
+      // the destination that is NOT in the source subtree still collides, which
+      // is the case that has to be caught -- and on a hierarchical server that
+      // one is usually caught above anyway, since a parent exists as at least a
+      // \Noselect placeholder and the server lists it.
+      sql`not ${subtreeSql(mailAccountFolders.folder, folder, delimiter)}`,
+    ));
+  if (collisions.length > 0) {
+    throw new ConflictError(
+      "mail folder", newFolder,
+      `Conduit still has a folder named "${newFolder}" on this account, holding the mail it`
+        + " stored from it. The mail server no longer lists that folder, but the stored mail is"
+        + " real -- pick another name",
+    );
+  }
+
+  // Everything predictable has been refused. From here the server is ahead of
+  // the database until the transaction below commits.
+  await onServer("rename", folder, () => sync.renameMailbox(folder, newFolder));
+
+  let result: {
+    messages: number; folders: number; row: MailAccountFolderRow; accountChanged: boolean;
+  };
+  try {
+    result = await rekeyRenamedFolder(db, account, folder, newFolder, delimiter);
+  } catch (error) {
+    // COMPENSATE. Not "log it and move on": the alternative to putting the
+    // server back is a mailbox whose name matches nothing Conduit stored, and
+    // the mail under the old name would be unreachable through every folder
+    // view the app has.
+    try {
+      await sync.renameMailbox(newFolder, folder);
+    } catch (compensationError) {
+      logger.error(
+        {
+          accountId, folder, newFolder,
+          err: errorText(error), compensationErr: errorText(compensationError),
+        },
+        "mail-folders: renamed on the server, could not re-key locally, and could not rename back"
+          + " -- this account's stored mail now names a folder the server does not have",
+      );
+      throw new MailFolderRenameFailedError(folder, newFolder, false, { cause: error });
+    }
+    logger.warn(
+      { accountId, folder, newFolder, err: errorText(error) },
+      "mail-folders: could not re-key a rename locally, so it was renamed back on the server",
+    );
+    throw new MailFolderRenameFailedError(folder, newFolder, true, { cause: error });
+  }
+
+  publishFoldersHint(accountId);
+  // The messages' folder changed, so every folder-filtered read is stale: the
+  // thread list's folder view, each thread's detail, and the per-folder unread
+  // badges. publishMoveHints' key set, minus `events` -- a rename touches no
+  // record timeline, because a thread's presence on a record has never depended
+  // on which folder its messages sit in.
+  //
+  // `mail-accounts` only when the account row actually moved with the folder,
+  // for fillMoveTargets' reason one level up: a hint nothing changed for makes
+  // every client refetch the state it already had.
+  publish({
+    keys: result.accountChanged
+      ? [["mail-threads"], ["mail-unread"], ["mail-accounts"]]
+      : [["mail-threads"], ["mail-unread"]],
+  });
+  logger.info(
+    {
+      actorId, accountId, folder, newFolder, delimiter,
+      messages: result.messages, folders: result.folders,
+    },
+    "mail-folders: renamed a folder",
+  );
+  return {
+    folder: toAccountFolder(result.row, renamedInSubtree(
+      account.rawSentFolder, folder, delimiter, newFolder,
+    )?.trim() ?? account.sentFolder),
+    messages: result.messages,
+    folders: result.folders,
+  };
+}
+
+/**
+ * The local half of a rename: all six folder-name columns, in ONE transaction,
+ * so the six either all describe the new name or all describe the old one.
+ *
+ * ORDERED SMALLEST-AND-CONSTRAINED FIRST. mail_account_folders and
+ * mail_folder_state both carry UNIQUE (account_id, folder) and both hold a
+ * handful of rows; mail_messages carries the volume. Running the two cheap
+ * constrained statements before the expensive unconstrained one means a
+ * failure that is going to happen happens BEFORE the long statement rather than
+ * after it -- which shortens the window in which the server is ahead of the
+ * database, and that window is the whole risk (see renameFolder).
+ *
+ * THE MESSAGE COUNT IS TAKEN, NOT RETURNED. `.returning()` on the mail_messages
+ * update would carry one id per row back over the wire for a folder that can
+ * hold tens of thousands; a `count(*)` inside the same transaction sees exactly
+ * the rows the update is about to take, because they are the same snapshot and
+ * the same predicate.
+ *
+ * `mail_accounts` is written only when one of its three folder columns is
+ * actually in the subtree. Without that guard a rename would bump the account's
+ * `updated_at` every time, turning "someone edited this account" into "someone
+ * renamed some folder" -- fillMoveTargets' reasoning about its own guard, for
+ * the same column.
+ *
+ * ONE ARTEFACT, STATED RATHER THAN FIXED: sent_folder is compared as STORED,
+ * so an account whose column holds " Archive " with the whitespace still on it
+ * is not rewritten by a rename of "Archive". That value is already a storage
+ * artefact every reader trims around (loadAccount, mustGetOwnedAccount,
+ * accountStateOf), and inventing a trim-and-rewrite here would be a second,
+ * quieter normalisation rule competing with normalizeSentFolder's.
+ */
+async function rekeyRenamedFolder(
+  db: Database, account: OwnedAccount, folder: string, newFolder: string, delimiter: string,
+): Promise<{
+  messages: number; folders: number; row: MailAccountFolderRow; accountChanged: boolean;
+}> {
+  const now = new Date();
+  const accountId = account.id;
+  const moveTargets = {
+    sentFolder: renamedInSubtree(account.rawSentFolder, folder, delimiter, newFolder),
+    trashFolder: renamedInSubtree(account.trashFolder, folder, delimiter, newFolder),
+    archiveFolder: renamedInSubtree(account.archiveFolder, folder, delimiter, newFolder),
+  };
+  const accountPatch = Object.fromEntries(
+    Object.entries(moveTargets).filter(([, value]) => value !== undefined),
+  );
+
+  return await db.transaction(async (tx) => {
+    const folders = await tx.update(mailAccountFolders)
+      .set({
+        folder: renamedSql(mailAccountFolders.folder, folder, newFolder),
+        updatedAt: now,
+      })
+      .where(and(
+        eq(mailAccountFolders.accountId, accountId),
+        subtreeSql(mailAccountFolders.folder, folder, delimiter),
+      ))
+      .returning();
+
+    await tx.update(mailFolderState)
+      .set({
+        folder: renamedSql(mailFolderState.folder, folder, newFolder),
+        updatedAt: now,
+      })
+      .where(and(
+        eq(mailFolderState.accountId, accountId),
+        subtreeSql(mailFolderState.folder, folder, delimiter),
+      ));
+
+    if (Object.keys(accountPatch).length > 0) {
+      await tx.update(mailAccounts)
+        .set({ ...accountPatch, updatedAt: now })
+        .where(eq(mailAccounts.id, accountId));
+    }
+
+    const messageScope = and(
+      eq(mailMessages.accountId, accountId),
+      subtreeSql(mailMessages.folder, folder, delimiter),
+    );
+    const [counted] = await tx.select({ n: sql<number>`count(*)::int` })
+      .from(mailMessages).where(messageScope);
+    await tx.update(mailMessages)
+      .set({
+        folder: renamedSql(mailMessages.folder, folder, newFolder),
+        updatedAt: now,
+      })
+      .where(messageScope);
+
+    const row = folders.find((candidate) => candidate.folder === newFolder);
+    // Unreachable: the folder's own row was read before the server call and
+    // this statement's predicate covers it. A throw here rolls the transaction
+    // back, which puts the caller on the compensating path -- the right place
+    // for "the database is not what this function was told it was".
+    if (row === undefined) throw new NotFoundError("mail folder", newFolder);
+    return {
+      messages: counted?.n ?? 0, folders: folders.length, row,
+      accountChanged: Object.keys(accountPatch).length > 0,
+    };
+  });
+}
+
+/**
+ * Delete one mailbox from the server (POST
+ * /api/mail/accounts/:id/folders/delete).
+ *
+ * ---------------------------------------------------------------------------
+ * THIS DOES NOT DELETE MAIL, AND THAT IS THE WHOLE DESIGN
+ * ---------------------------------------------------------------------------
+ * IMAP DELETE destroys the messages in the mailbox, and no server stands
+ * between a click and that: Dovecot 2.3 deleted a mailbox holding a message
+ * without complaint and the message was gone (observed, and pinned by the
+ * integration test). This CRM archives rather than expunges everywhere else,
+ * and a folder tool is not where that quietly stops being true. So:
+ *
+ * A FOLDER THE SERVER SAYS HOLDS MAIL IS REFUSED. Not warned about, not
+ * confirmed twice -- refused, with the count and with the way out. The way out
+ * is in the app and one gesture long: file the mail somewhere else (Phase 4.4's
+ * own filing action) and delete the folder when it is empty. Offering "delete
+ * N messages for ever?" instead would be Task 1's rejected warning in a worse
+ * place: a choice between two bad outcomes presented as informed consent.
+ *
+ * THE COUNT COMES FROM THE SERVER, never from mail_messages. Conduit holds only
+ * what it has synced, and a folder whose sync is off can hold thousands of
+ * messages it has never seen -- so counting rows would leave exactly the
+ * folders a user is most likely to tidy up deletable while full.
+ *
+ * A FOLDER WITH CHILDREN IS REFUSED TOO, and this one is not about mail at all.
+ * RFC 3501 6.3.4 lets a server keep the name as a placeholder, and Dovecot does
+ * -- but the placeholder it leaves is a trap: after deleting a parent with a
+ * child, the parent's own messages were destroyed and the parent STAYED IN LIST
+ * carrying `\HasChildren` and NEITHER `\Noselect` NOR `\NonExistent`, while
+ * STATUS answered false and APPEND answered "Mailbox doesn't exist" (all
+ * observed together). Discovery would go on recording that as a live selectable
+ * folder and the walk would open it and FAIL THE PASS -- every pass, for ever,
+ * which is the permanent backoff mail-folders' own header warns about. So the
+ * operator is asked to deal with the children first, which is a thing they can
+ * see and do.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT HAPPENS TO THE MAIL CONDUIT ALREADY STORED
+ * ---------------------------------------------------------------------------
+ * IT IS KEPT. Every mail_messages row from the folder survives untouched --
+ * still searchable, still on the records its thread is linked to -- and so does
+ * the mail_account_folders row, because rows in that table are never deleted
+ * (db/schema.ts) and a Conduit-driven delete is not the exception that proves
+ * it. The row is what gives those messages a folder to be listed under; delete
+ * it and they would be mail in a folder that does not exist.
+ *
+ * What the row gets is `sync_enabled = false`, which is simply true afterwards.
+ * It then goes STALE by the ordinary mechanism -- its last_discovered_at stands
+ * still while every re-sighted folder's moves on -- and the clients grey it out
+ * on that basis, which is why the route asks for a sync pass afterwards: it is
+ * what makes the row look gone within one pass instead of one poll interval.
+ *
+ * The count of what was kept is RETURNED, so the confirmation's promise ("the
+ * N messages Conduit stored stay") can be restated afterwards as a fact.
+ */
+export async function deleteFolder(
+  db: Database, actorId: string, accountId: string, input: FolderDeleteInput,
+  deps: FolderCommandDeps,
+): Promise<FolderDeleteResult> {
+  const logger = deps.logger ?? consoleSyncLogger;
+  const { folder } = input;
+  const account = await mustGetOwnedAccount(db, actorId, accountId);
+  const [existing] = await db.select().from(mailAccountFolders).where(and(
+    eq(mailAccountFolders.accountId, accountId),
+    eq(mailAccountFolders.folder, folder),
+  ));
+  if (existing === undefined) throw new NotFoundError("mail folder", folder);
+  if (folderKey(folder) === INBOX) {
+    throw new ConflictError(
+      "mail folder", folder,
+      "INBOX cannot be deleted -- it is the one mailbox every account has",
+    );
+  }
+  // The account's own move targets are refused by NAME rather than by
+  // special_use, because it is the COLUMN that would break: a deleted
+  // archive_folder leaves every bulk Archive on this account failing at the
+  // server with a sentence about a mailbox the user has forgotten deleting.
+  // The remedy is a different control on a different page, so the message says
+  // which one.
+  const role = folder === account.rawSentFolder.trim() ? "Sent"
+    : folder === account.trashFolder?.trim() ? "Trash"
+      : folder === account.archiveFolder?.trim() ? "Archive" : null;
+  if (role !== null) {
+    throw new ConflictError(
+      "mail folder", folder,
+      `"${folder}" is this account's ${role} folder`
+        + ` -- point ${role} at a different folder in Settings before deleting this one`,
+    );
+  }
+  const sync = folderSyncOf(account, deps.syncManager);
+
+  const listed = await onServer("delete", folder, () => sync.listFolders());
+  const entry = listed.find((row) => row.folder === folder);
+  if (entry === undefined) {
+    // Refused rather than treated as "already done". A delete that silently
+    // succeeds against a folder that was not there means something different
+    // from what the operator asked for, and the honest answer tells them what
+    // the row they are looking at actually is.
+    throw new ConflictError(
+      "mail folder", folder,
+      `the mail server no longer has a folder named "${folder}"`
+        + " -- Conduit keeps the row so the mail it stored from that folder still has a home,"
+        + " and there is nothing left on the server to delete",
+    );
+  }
+  const children = descendantsOf(listed, folder, delimiterOf(entry));
+  if (children.length > 0) {
+    throw new ConflictError(
+      "mail folder", folder,
+      `"${folder}" has ${children.length === 1 ? "a folder" : `${children.length} folders`}`
+        + ` inside it (${children.slice(0, 3).join(", ")}${children.length > 3 ? ", ..." : ""}).`
+        + " Delete or move those first: mail servers do not remove a folder that still has"
+        + " folders in it, and what they leave behind stops Conduit syncing this account",
+    );
+  }
+
+  // Counts and deletes in one visit to the loop -- see
+  // AccountSync.deleteMailboxIfEmpty for why those cannot be two calls. A
+  // non-zero answer means NOTHING WAS DELETED.
+  const onServerCount = await onServer("delete", folder, () => sync.deleteMailboxIfEmpty(folder));
+  if (onServerCount > 0) {
+    throw new ConflictError(
+      "mail folder", folder,
+      `"${folder}" still holds ${onServerCount} ${onServerCount === 1 ? "message" : "messages"}`
+        + " on the mail server, and Conduit does not delete mail."
+        + " File them into another folder first, then delete this one",
+    );
+  }
+
+  const now = new Date();
+  const [row] = await db.update(mailAccountFolders)
+    .set({ syncEnabled: false, updatedAt: now })
+    .where(eq(mailAccountFolders.id, existing.id))
+    .returning();
+  if (row === undefined) throw new NotFoundError("mail folder", folder);
+  const [counted] = await db.select({ n: sql<number>`count(*)::int` })
+    .from(mailMessages)
+    .where(and(eq(mailMessages.accountId, accountId), eq(mailMessages.folder, folder)));
+  const kept = counted?.n ?? 0;
+
+  publishFoldersHint(accountId);
+  logger.info(
+    { actorId, accountId, folder, keptMessages: kept },
+    "mail-folders: deleted a folder from the server, kept its stored mail",
+  );
+  return { folder: toAccountFolder(row, account.sentFolder), messages: kept };
 }

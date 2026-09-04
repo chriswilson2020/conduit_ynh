@@ -55,6 +55,11 @@ import {
   specialUseSchema,
   mailAccountFolderSchema,
   folderPatchInputSchema,
+  folderCreateInputSchema,
+  folderRenameInputSchema,
+  folderDeleteInputSchema,
+  folderRenameResultSchema,
+  folderDeleteResultSchema,
   bulkThreadActionKindSchema,
   bulkThreadActionInputSchema,
   bulkThreadResultSchema,
@@ -1078,6 +1083,50 @@ describe("folderPatchInputSchema", () => {
   it("trims a folder name and rejects a blank (whitespace-only) one", () => {
     expect(folderPatchInputSchema.parse({ folder: "  Archive  ", syncEnabled: true }).folder).toBe("Archive");
     expect(() => folderPatchInputSchema.parse({ folder: "   ", syncEnabled: true })).toThrow();
+  });
+});
+
+describe("the folder command schemas (Phase 4.4 Task 4)", () => {
+  it("trims both names and rejects blanks, like every other folder field", () => {
+    expect(folderCreateInputSchema.parse({ folder: "  Clients  " })).toEqual({ folder: "Clients" });
+    expect(folderRenameInputSchema.parse({ folder: " A ", newFolder: " B " }))
+      .toEqual({ folder: "A", newFolder: "B" });
+    expect(folderDeleteInputSchema.parse({ folder: " Clients " })).toEqual({ folder: "Clients" });
+    expect(() => folderCreateInputSchema.parse({ folder: "  " })).toThrow();
+    expect(() => folderDeleteInputSchema.parse({ folder: "" })).toThrow();
+  });
+
+  it("rejects a rename to the same name, comparing AFTER the trim", () => {
+    expect(() => folderRenameInputSchema.parse({ folder: "Sent", newFolder: "Sent" })).toThrow();
+    // The trim is what makes this the same request rather than a collision the
+    // mail server would have to refuse.
+    expect(() => folderRenameInputSchema.parse({ folder: "Sent", newFolder: " Sent " })).toThrow();
+    // Case is NOT sameness: RFC 3501 leaves every name but INBOX
+    // case-sensitive, so these are two different mailboxes.
+    expect(folderRenameInputSchema.parse({ folder: "Sent", newFolder: "sent" }).newFolder).toBe("sent");
+  });
+
+  it("REJECTS an unknown field rather than stripping it", () => {
+    // `.strict()`: a body carrying syncEnabled here is a caller who has
+    // confused this endpoint with the PATCH, and being told beats coming to
+    // believe it toggled something.
+    expect(() => folderCreateInputSchema.parse({ folder: "Clients", syncEnabled: true })).toThrow();
+    expect(() => folderRenameInputSchema.parse({ folder: "A", newFolder: "B", folderId: "x" })).toThrow();
+    expect(() => folderDeleteInputSchema.parse({ folder: "Clients", force: true })).toThrow();
+  });
+
+  it("carries the counts a rename and a delete answer with", () => {
+    const folder = {
+      id: uuid1, accountId: uuid2, folder: "Clients", specialUse: null,
+      syncEnabled: true, selectable: true, locked: false,
+      lastDiscoveredAt: now, createdAt: now, updatedAt: now,
+    };
+    // Both counts cover the subtree, because an IMAP RENAME is a subtree
+    // rename -- see the schema's own comment.
+    expect(folderRenameResultSchema.parse({ folder, messages: 412, folders: 3 }).messages).toBe(412);
+    expect(folderDeleteResultSchema.parse({ folder, messages: 0 }).messages).toBe(0);
+    expect(() => folderRenameResultSchema.parse({ folder, messages: -1, folders: 1 })).toThrow();
+    expect(() => folderDeleteResultSchema.parse({ folder })).toThrow();
   });
 });
 

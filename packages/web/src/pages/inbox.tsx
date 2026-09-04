@@ -22,6 +22,7 @@ import {
   extendThreadSelection,
   selectedThreadIds,
   selectionForKey,
+  fileTargetNames,
   summarizeBulkResult,
   toggleAllOnPage,
   toggleThreadSelected,
@@ -330,21 +331,13 @@ export function InboxPage() {
     : ownActive.length === 1 ? ownActive[0]?.id ?? "" : "";
 
   /**
-   * What that picker offers.
-   *
-   * UNSELECTABLE FOLDERS ARE DROPPED, sync-off ones deliberately KEPT.
-   * A \Noselect row is a hierarchy node holding no messages: it cannot
-   * receive mail and the API refuses it (unknown_target), so offering it would
-   * be offering a failure. A folder whose sync is off is the opposite case --
-   * it is exactly what this feature is for, and filing into it turns its sync
-   * on (api: mail-move.ts). Nothing here says so beforehand; the result does,
-   * afterwards.
+   * What that picker offers. UNSELECTABLE AND STALE FOLDERS ARE DROPPED,
+   * sync-off ones deliberately KEPT -- the rule and its reasons live in
+   * fileTargetNames, which the conversation's picker calls too so the two
+   * cannot drift.
    */
   const folderList = useMailFolders(fileAccountId);
-  const fileTargets = useMemo(
-    () => (folderList.data ?? []).filter((row) => row.selectable).map((row) => row.folder),
-    [folderList.data],
-  );
+  const fileTargets = useMemo(() => fileTargetNames(folderList.data ?? []), [folderList.data]);
 
   // Reference-guarded so a re-render that produced the same rows cannot loop
   // through this back into a new state object. Both fields compare: a refetch

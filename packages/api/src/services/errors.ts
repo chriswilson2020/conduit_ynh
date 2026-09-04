@@ -132,6 +132,72 @@ export class SmtpSendError extends Error {
   }
 }
 
+// Raised by mail-folders.ts when the MAIL SERVER refused a folder command
+// (CREATE/RENAME/DELETE), or when the account's sync loop refused to carry one
+// (it is in backoff, or it stopped). SmtpSendError's shape and SmtpSendError's
+// reason, one protocol over: the request was well-formed, this server did its
+// part, and the upstream refused -- so 502 `imap_failed`, never 500.
+//
+// It is also the error that says NOTHING WAS WRITTEN. Every folder command
+// runs the server side first precisely so that a refusal there costs nothing
+// locally, which makes this the safe failure and is why it can be echoed to
+// the client as-is: retrying is a reasonable thing to do, unlike the two
+// classes below it.
+//
+// `reason` is the adapter's normalized text (mail-imap.ts's `auth:` /
+// `connection:` prefixes where it could classify), truncated because it lands
+// in a dialog, and guaranteed credential-free by mail-imapflow.ts.
+export class MailFolderCommandError extends Error {
+  readonly reason: string;
+
+  static readonly MAX_REASON_LENGTH = 300;
+
+  constructor(action: string, folder: string, reason: string, options?: { cause?: unknown }) {
+    const truncated = reason.length > MailFolderCommandError.MAX_REASON_LENGTH
+      ? `${reason.slice(0, MailFolderCommandError.MAX_REASON_LENGTH)}...`
+      : reason;
+    super(`the mail server refused to ${action} the folder "${folder}": ${truncated}`, options);
+    this.reason = truncated;
+  }
+}
+
+// Raised by mail-folders.ts's renameFolder when the IMAP RENAME succeeded and
+// the local re-key did not. THE ONE ERROR IN THIS FILE THAT DESCRIBES A
+// HALF-DONE ACT, and `compensated` is the whole of the difference between its
+// two meanings:
+//
+// - `compensated: true` -- the compensating RENAME back succeeded, so both
+//   systems are at the old name again and nothing diverged. The rename did not
+//   happen; retrying it is safe.
+// - `compensated: false` -- the compensation ALSO failed. The server is at the
+//   new name and every stored message still points at the old one. Nothing
+//   self-heals this (see renameFolder), so the message tells the operator both
+//   names and says the fix is to rename it back in any mail client. The same
+//   facts are logged at error level with the account id beside them.
+//
+// Both are 500s at the route: the database failed, which is not something the
+// caller did wrong and not something a different request would avoid. The
+// message is ECHOED for both, which is a deliberate departure from
+// MailKeyMissingError's silence -- that one hides a filesystem path, and this
+// one carries only two folder names the account's owner chose.
+export class MailFolderRenameFailedError extends Error {
+  readonly compensated: boolean;
+
+  constructor(folder: string, newFolder: string, compensated: boolean, options?: { cause?: unknown }) {
+    super(
+      compensated
+        ? `renaming "${folder}" to "${newFolder}" failed while updating Conduit's own records,`
+          + " so the folder was renamed back on the server -- nothing changed, and it is safe to try again"
+        : `the folder was renamed to "${newFolder}" on the mail server, but Conduit could not update`
+          + ` its own records and could not rename it back. Conduit still has this account's mail filed`
+          + ` under "${folder}". Rename "${newFolder}" back to "${folder}" in any mail client to put the`
+          + " two back in step.",
+      options,
+    );
+    this.compensated = compensated;
+  }
+}
+
 // Every failure escaping mail-ingest.ts's ingestMessage, wrapped with the
 // context the sync loop needs to act on it: which account, which folder,
 // which UID. Task 5's poison-message contract depends on this -- a message

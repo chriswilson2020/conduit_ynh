@@ -10,6 +10,7 @@ import {
   bulkErrorMessage,
   bulkOwnershipBlocked,
   fileTargetsBlocked,
+  fileTargetNames,
   bulkPendingLabel,
   BULK_TIMEOUT_MESSAGE,
   isThreadGone,
@@ -1877,5 +1878,47 @@ describe("composerInitialFocus", () => {
     expect(composerInitialFocus({ to, subject: replySubject("") })).toBe("body");
     expect(composerInitialFocus({ to, subject: "   " })).toBe("subject");
     expect(composerInitialFocus({ to, subject: "" })).toBe("subject");
+  });
+});
+
+describe("fileTargetNames", () => {
+  const OLD = "2026-09-04T09:00:00.000Z";
+  const NEW = "2026-09-04T10:00:00.000Z";
+
+  function row(folder: string, over: { selectable?: boolean; lastDiscoveredAt?: string } = {}) {
+    return {
+      folder,
+      selectable: over.selectable ?? true,
+      lastDiscoveredAt: over.lastDiscoveredAt ?? NEW,
+    };
+  }
+
+  it("drops the folders the last discovery pass did not re-sight", () => {
+    // The second of the two things Tasks 1-3 left behind: rows here are never
+    // deleted, so a folder renamed or removed on the server keeps its row for
+    // ever and the picker went on offering it. Filing into it fails at IMAP,
+    // late, in the server's words rather than the app's.
+    expect(fileTargetNames([
+      row("INBOX"), row("Clients"), row("Gone", { lastDiscoveredAt: OLD }),
+    ])).toEqual(["INBOX", "Clients"]);
+  });
+
+  it("drops \\Noselect hierarchy nodes, which the API refuses as a destination", () => {
+    expect(fileTargetNames([row("Lists", { selectable: false }), row("Lists/Dev")]))
+      .toEqual(["Lists/Dev"]);
+  });
+
+  it("KEEPS a folder whose sync is off, which is what the feature is for", () => {
+    // Filing into one turns its sync on (api: enableTargetSync). Dropping these
+    // would remove the case Task 1 exists to serve, so nothing here reads
+    // syncEnabled at all -- and the type says so.
+    expect(fileTargetNames([row("INBOX"), row("Archive")])).toEqual(["INBOX", "Archive"]);
+  });
+
+  it("offers everything when no folder is newer than any other", () => {
+    // One pass, every row stamped alike: nothing is stale relative to a set
+    // whose newest value it shares, so a fresh account offers all of it.
+    expect(fileTargetNames([row("A"), row("B"), row("C")])).toEqual(["A", "B", "C"]);
+    expect(fileTargetNames([])).toEqual([]);
   });
 });

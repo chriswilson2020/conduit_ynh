@@ -184,6 +184,10 @@ class FakeImapClient implements ImapClient {
   statusError: Error | null = null;
   addFlagsError: Error | null = null;
   moveError: Error | null = null;
+  createMailboxError: Error | null = null;
+  renameMailboxError: Error | null = null;
+  deleteMailboxError: Error | null = null;
+  messageCountError: Error | null = null;
   idleError: Error | null = null;
   idleEntries = 0;
   /** uid -> how many more times fetchRaw should throw for it. */
@@ -379,6 +383,79 @@ class FakeImapClient implements ImapClient {
         target.messages.set(nextUid, message);
         nextUid += 1;
       }
+    });
+  }
+
+  /**
+   * The four mailbox-topology commands (Phase 4.4 Task 4), modelled on what
+   * Dovecot 2.3 was OBSERVED to do rather than on what the RFC permits -- the
+   * fake is only worth anything where it agrees with the server the product
+   * runs against.
+   *
+   * `listed` is the world these edit, not `folders`: `folders` is the message
+   * store, and a mailbox can exist with no messages in it. Both are kept in
+   * step so a create-then-append test does not have to know that.
+   */
+  async createMailbox(folder: string): Promise<void> {
+    await this.track({ op: "createMailbox", folder }, () => {
+      if (this.createMailboxError !== null) throw this.createMailboxError;
+      // The adapter turns imapflow's `created: false` into this. Modelled as a
+      // throw because that is what reaches every caller.
+      if (this.listed.some((entry) => entry.folder === folder)) {
+        throw new Error(`mailbox ${folder} already exists on the server`);
+      }
+      this.listed.push({ folder, selectable: true, delimiter: "/" });
+    });
+  }
+
+  /** Renames the folder AND EVERY DESCENDANT, which is what the server does
+   * (RFC 3501 6.3.5, and observed on Dovecot 2.3.19). A fake that renamed only
+   * the exact name would let a re-key that forgot descendants pass. */
+  async renameMailbox(folder: string, newFolder: string): Promise<void> {
+    await this.track({ op: "renameMailbox", folder }, () => {
+      if (this.renameMailboxError !== null) throw this.renameMailboxError;
+      if (!this.listed.some((entry) => entry.folder === folder)) {
+        throw new Error(`Command failed: Mailbox doesn't exist: ${folder}`);
+      }
+      if (this.listed.some((entry) => entry.folder === newFolder)) {
+        throw new Error("Command failed: Target mailbox already exists");
+      }
+      const prefix = `${folder}/`;
+      for (const entry of this.listed) {
+        if (entry.folder === folder) entry.folder = newFolder;
+        else if (entry.folder.startsWith(prefix)) {
+          entry.folder = newFolder + entry.folder.slice(folder.length);
+        }
+      }
+      for (const [name, store] of [...this.folders]) {
+        if (name !== folder && !name.startsWith(prefix)) continue;
+        this.folders.delete(name);
+        this.folders.set(newFolder + name.slice(folder.length), store);
+      }
+    });
+  }
+
+  /** Destroys the mailbox and its messages, with no refusal for a non-empty
+   * one -- the observed behaviour, and the reason the emptiness check has to
+   * be the caller's. */
+  async deleteMailbox(folder: string): Promise<void> {
+    await this.track({ op: "deleteMailbox", folder }, () => {
+      if (this.deleteMailboxError !== null) throw this.deleteMailboxError;
+      if (!this.listed.some((entry) => entry.folder === folder)) {
+        throw new Error(`Command failed: Mailbox doesn't exist: ${folder}`);
+      }
+      this.listed = this.listed.filter((entry) => entry.folder !== folder);
+      this.folders.delete(folder);
+    });
+  }
+
+  async messageCount(folder: string): Promise<number> {
+    return this.track({ op: "messageCount", folder }, () => {
+      if (this.messageCountError !== null) throw this.messageCountError;
+      if (this.missingFolders.has(folder) || !this.listed.some((e) => e.folder === folder)) {
+        throw new Error(`could not read the status of ${folder}`);
+      }
+      return this.folders.get(folder)?.messages.size ?? 0;
     });
   }
 
