@@ -63,6 +63,9 @@ import {
   BULK_THREAD_ACTION_CAP,
   MOVE_ACTION_THREAD_CAP,
   BULK_ACTION_THREAD_CAPS,
+  bulkMessageActionInputSchema,
+  bulkMessageResultSchema,
+  BULK_MESSAGE_ACTION_CAP,
   meetingSchema,
   meetingDetailSchema,
   meetingAttendeeSchema,
@@ -1573,6 +1576,133 @@ describe("bulkThreadResultSchema", () => {
         results: [{ threadId: uuid1, ok: false, skipped: true, error: "x", reason: "no_sync" }],
       }),
     ).toThrow());
+});
+
+describe("bulkMessageActionInputSchema (Phase 4.4 per-message selection)", () => {
+  // The three MOVE kinds and ONLY those. hide/unhide are absent by design and
+  // this is where that is pinned: a hide is one mail_thread_hides row per
+  // THREAD, so there is no per-message hide to ask for -- offering one would
+  // mean inventing a second visibility concept, not widening this one.
+  it("accepts the three move kinds and rejects both CRM-side ones", () => {
+    for (const action of ["trash", "archive"] as const) {
+      const input = { messageIds: [uuid1], action };
+      expect(bulkMessageActionInputSchema.parse(input)).toEqual(input);
+    }
+    const filed = { messageIds: [uuid1], targetFolder: "Clients", action: "file" as const };
+    expect(bulkMessageActionInputSchema.parse(filed)).toEqual(filed);
+    for (const action of ["hide", "unhide"]) {
+      expect(() => bulkMessageActionInputSchema.parse({ messageIds: [uuid1], action })).toThrow();
+    }
+  });
+
+  // THE SOURCE FOLDER HAS NO MEANING HERE, and rejecting it is how that gets
+  // said out loud. `folder` on the thread schema names the VIEW a selection was
+  // made in, because a thread's messages spread across folders and a thread id
+  // alone cannot say which of them was meant. A message id says it exactly.
+  // Accepting and ignoring the field is how a caller comes to believe it
+  // scoped something.
+  it("rejects a source folder -- a message id is already the exact scope", () => {
+    expect(() => bulkMessageActionInputSchema.parse(
+      { messageIds: [uuid1], folder: "INBOX", action: "archive" },
+    )).toThrow();
+  });
+
+  it("rejects file with no destination, and a destination on the other two", () => {
+    expect(() => bulkMessageActionInputSchema.parse({ messageIds: [uuid1], action: "file" }))
+      .toThrow(/targetFolder is required/);
+    for (const action of ["trash", "archive"] as const) {
+      expect(() => bulkMessageActionInputSchema.parse(
+        { messageIds: [uuid1], targetFolder: "Clients", action },
+      )).toThrow(/targetFolder is only valid when action is file/);
+    }
+  });
+
+  it("trims a present destination and rejects a blank one", () => {
+    expect(bulkMessageActionInputSchema.parse(
+      { messageIds: [uuid1], targetFolder: "  Clients  ", action: "file" },
+    ).targetFolder).toBe("Clients");
+    expect(() => bulkMessageActionInputSchema.parse(
+      { messageIds: [uuid1], targetFolder: "   ", action: "file" },
+    )).toThrow();
+  });
+
+  it("rejects an empty messageIds array and one over the cap, and accepts the cap itself", () => {
+    expect(() => bulkMessageActionInputSchema.parse({ messageIds: [], action: "archive" })).toThrow();
+    const over = Array.from({ length: BULK_MESSAGE_ACTION_CAP + 1 }, () => randomUUID());
+    expect(() => bulkMessageActionInputSchema.parse({ messageIds: over, action: "archive" })).toThrow();
+    const at = Array.from({ length: BULK_MESSAGE_ACTION_CAP }, () => randomUUID());
+    expect(bulkMessageActionInputSchema.parse({ messageIds: at, action: "archive" }).messageIds)
+      .toHaveLength(BULK_MESSAGE_ACTION_CAP);
+  });
+
+  // Pinned to its number, like the thread caps, because the web client mirrors
+  // it (the conversation's select-all) and a client-side copy that drifted
+  // would build requests the route answers with a 400.
+  it("exports the cap the route and the conversation view both key on", () =>
+    expect(BULK_MESSAGE_ACTION_CAP).toBe(50));
+});
+
+describe("bulkMessageResultSchema (Phase 4.4 per-message selection)", () => {
+  it("keys each result on messageId and carries the same ok/skipped/failed mix", () => {
+    const results = [
+      { messageId: uuid1, ok: true },
+      { messageId: uuid2, ok: true, skipped: true, reason: "already_in_target" as const },
+      { messageId: randomUUID(), ok: false, error: "the server said no", reason: "server_refused" as const },
+    ];
+    expect(bulkMessageResultSchema.parse({ results })).toEqual({ results });
+  });
+
+  // out_of_scope is the one skip reason this path CANNOT produce, and the enum
+  // says so rather than a comment: it means "the action never applied to this
+  // thread" -- every message sat in some other folder, or the conversation was
+  // nothing but Sent mail -- and a request that named a message by id leaves it
+  // no scope to fall outside of. Every skip here is one the service NOTED
+  // against the row it was looking at.
+  it("rejects out_of_scope, which no per-message request can reach", () => {
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true, skipped: true, reason: "out_of_scope" }],
+    })).toThrow();
+    for (const reason of
+      ["archived_account", "not_owner", "awaiting_reconciliation", "already_in_target"] as const) {
+      expect(bulkMessageResultSchema.parse({
+        results: [{ messageId: uuid1, ok: true, skipped: true, reason }],
+      }).results[0]?.reason).toBe(reason);
+    }
+  });
+
+  // The same correlations the thread result enforces, because they are
+  // properties of ONE answer rather than of the unit it is about -- and
+  // because a second, quieter copy of them is exactly how the two shapes would
+  // drift.
+  it("enforces the same flag correlations as the thread result", () => {
+    expect(() => bulkMessageResultSchema.parse({ results: [{ messageId: uuid1, ok: false }] })).toThrow();
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true, error: "should not be here" }],
+    })).toThrow();
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: false, skipped: true, error: "x", reason: "no_sync" }],
+    })).toThrow();
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true, skipped: true }],
+    })).toThrow(/reason is required/);
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true, reason: "already_in_target" }],
+    })).toThrow(/reason must be absent/);
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: false, error: "x", reason: "already_in_target" }],
+    })).toThrow(/failure must carry a failure reason/);
+  });
+
+  // Filing a single message out of a thread into an unsynced folder turns that
+  // folder's sync on for exactly the reason filing a whole thread does, so the
+  // notification rides this envelope too.
+  it("carries the folder whose sync the request switched on, and omits it otherwise", () => {
+    expect(bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true }], syncEnabled: "Clients",
+    }).syncEnabled).toBe("Clients");
+    expect("syncEnabled" in bulkMessageResultSchema.parse({ results: [{ messageId: uuid1, ok: true }] }))
+      .toBe(false);
+  });
 });
 
 describe("threadLinksInputSchema", () => {

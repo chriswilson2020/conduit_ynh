@@ -3,7 +3,8 @@ import { z } from "zod";
 import {
   mailAccountCreateInputSchema, mailAccountUpdateInputSchema, mailAccountUpdatePasswordFieldsSchema,
   mailAccountTestInputSchema, mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
-  bulkThreadActionInputSchema, folderPatchInputSchema, BULK_ACTION_THREAD_CAPS,
+  bulkThreadActionInputSchema, bulkMessageActionInputSchema, folderPatchInputSchema,
+  BULK_ACTION_THREAD_CAPS,
   type MailAccountSyncStats,
 } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
@@ -25,7 +26,7 @@ import {
   getAttachmentBlob, toMessage,
 } from "../services/mail-threads.js";
 import { listAccountFolders, setFolderSyncEnabled } from "../services/mail-folders.js";
-import { moveThreads } from "../services/mail-move.js";
+import { moveMessages, moveThreads } from "../services/mail-move.js";
 
 /**
  * The slice of mail-sync.ts's SyncManager the ROUTES use, declared here for
@@ -625,6 +626,59 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
         // when routes are registered (see CrmRouteDeps.syncManager). null is
         // an ordinary answer here and the service knows what to do with it --
         // every account refuses, and each refusal is reported per thread.
+        syncManager: syncManager(),
+        logger: request.log,
+      });
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
+  });
+
+  /**
+   * POST /api/mail/messages/bulk -- the per-message selection (Phase 4.4).
+   *
+   * A SEPARATE ROUTE FROM /threads/bulk, not a widened one, and this is the
+   * whole surface the ruling produces. Selection in this app has been per
+   * THREAD since 4.3, whose folder-scoped rule exists precisely because a
+   * thread id cannot say which of its spread-out messages a gesture meant.
+   * A message id says it exactly. Overloading `threadIds` to sometimes mean
+   * messages -- or teaching this body two units -- is how that scoping rule
+   * became necessary in the first place.
+   *
+   * It is deliberately NARROWER than the thread endpoint on three axes, each
+   * checked by the shared schema rather than here (see
+   * bulkMessageActionInputSchema): the three MOVE kinds only, since a hide is
+   * one mail_thread_hides row per THREAD and there is no per-message one; no
+   * source `folder`, since the ids are already the exact scope, and a body
+   * carrying one is REJECTED rather than quietly ignored; and results keyed on
+   * `messageId`, because two messages of one conversation can genuinely land
+   * differently and a thread-keyed answer would have to lie about one of them.
+   *
+   * NO CAP CHECK OF ITS OWN, unlike the thread endpoint above, and the absence
+   * is the point rather than an omission. That one needs a route-level check
+   * because its schema's 200 is an outer bound only the CRM-side pair may
+   * reach, so the real limit depends on the ACTION. Here every kind waits on a
+   * mail server, so there is one limit for all of them and it lives in the
+   * schema's own `.max()` (BULK_MESSAGE_ACTION_CAP) -- a second copy here
+   * would be two numbers to keep in step for no gain.
+   *
+   * Everything else is the thread endpoint's contract unchanged: always 200
+   * when the request itself was valid, per-message verdicts inside the body in
+   * request order, and A 504 FROM A PROXY DOES NOT MEAN THE ACTION FAILED --
+   * the queued MOVEs run on their accounts' serial sync loops and carry on
+   * after the client disconnects, so the answer is lost while the work lands.
+   * Refetch rather than retry.
+   */
+  app.post("/api/mail/messages/bulk", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const input = parseOrReject(bulkMessageActionInputSchema, request.body, reply);
+    if (input === undefined) return;
+    try {
+      return await moveMessages(db, user.id, input, {
+        // Resolved per request, never captured -- the manager does not exist
+        // when routes are registered (see CrmRouteDeps.syncManager), and null
+        // is an ordinary answer the service knows what to do with.
         syncManager: syncManager(),
         logger: request.log,
       });

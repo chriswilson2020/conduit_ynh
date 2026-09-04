@@ -7,8 +7,8 @@ import {
   mailAccountFolders, mailAccounts, mailMessages, mailThreadHides, mailThreads, projects,
 } from "../db/schema.js";
 import type { SyncLogger } from "./mail-imap.js";
-import { hideThread, unhideThread } from "./mail-threads.js";
-import { moveThreads, type MoveSyncAccount, type MoveSyncManager } from "./mail-move.js";
+import { hideThread, listThreads, unhideThread } from "./mail-threads.js";
+import { moveMessages, moveThreads, type MoveSyncAccount, type MoveSyncManager } from "./mail-move.js";
 import { subscribe } from "./sse.js";
 
 const handle = openTestDatabase();
@@ -134,6 +134,28 @@ async function folderRow(accountId: string, folder: string) {
   return row;
 }
 
+/** The mail_threads row itself, for the per-message assertions that a filed
+ * message leaves its CONVERSATION untouched -- subject, links and above all
+ * last_message_at, since filing is not receiving and nothing about it may
+ * reorder the list. */
+async function threadRow(threadId: string) {
+  const [row] = await handle.db.select().from(mailThreads).where(eq(mailThreads.id, threadId));
+  return row;
+}
+
+/**
+ * Does the THREAD LIST show this thread in that folder's view?
+ *
+ * Asked of listThreads itself rather than of a hand-written EXISTS: the whole
+ * question these tests settle is what a user sees after one message is filed
+ * out of a conversation, and a re-implementation of the folder filter here
+ * could agree with itself while disagreeing with the list.
+ */
+async function threadIsInFolder(threadId: string, folder: string): Promise<boolean> {
+  const { items } = await listThreads(handle.db, userId, { folder });
+  return items.some((row) => row.id === threadId);
+}
+
 async function messageRows(threadId?: string) {
   const rows = await handle.db.select({
     id: mailMessages.id, threadId: mailMessages.threadId, folder: mailMessages.folder,
@@ -184,6 +206,12 @@ class FakeSync implements MoveSyncAccount {
   /** 1-based index of the single call that should fail, or null. */
   failCall: number | null = null;
   failError = new Error("MOVE from INBOX to Archive was refused");
+  /**
+   * A DIFFERENT error per call, 1-based, for the tests that ask WHICH of
+   * several refusals a caller reports. `error` above cannot answer that: it
+   * throws one object for every call, so first and last are the same string.
+   */
+  readonly errorPerCall: (Error | undefined)[] = [];
   /** While set, every call parks on this after recording itself -- which is
    * how two bulk requests can be held in flight at once. */
   gate: Promise<void> | null = null;
@@ -200,6 +228,8 @@ class FakeSync implements MoveSyncAccount {
     const call = this.calls.push({ folder, uids: [...uids], targetFolder });
     if (this.beforeMove !== null) await this.beforeMove();
     if (this.gate !== null) await this.gate;
+    const perCall = this.errorPerCall[call - 1];
+    if (perCall !== undefined) throw perCall;
     if (this.error !== null) throw this.error;
     if (this.failCall === call) throw this.failError;
   }
@@ -857,6 +887,38 @@ describe("moveThreads: compensation", () => {
     ]);
     expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
       .toEqual([["Archive", null], ["Clients", 132]]);
+  });
+
+  it("reports the FIRST refusal's text when two of one thread's chunks both fail", async () => {
+    // Outcomes promises "the FIRST failure's message is the one reported", and
+    // until Phase 4.4 this path quietly delivered the LAST one instead: the
+    // queue's failures were keyed by THREAD, so a second failing chunk
+    // overwrote the first in the map before Outcomes ever saw it. Keying them
+    // per MESSAGE (which the per-message path needs anyway) made the promise
+    // true, and nothing covered the difference, so this is where it is pinned.
+    const accountId = await makeAccount();
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 141 });
+    await makeMessage({ threadId, accountId, folder: "Clients", imapUid: 142 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+    sync.errorPerCall.push(
+      new Error("first: MOVE from INBOX was refused"),
+      new Error("second: MOVE from Clients was refused"),
+    );
+
+    const result = await moveThreads(
+      handle.db, userId, { threadIds: [threadId], action: "archive" }, deps(manager),
+    );
+
+    expect(result.results).toEqual([{
+      threadId, ok: false, reason: "server_refused",
+      error: "first: MOVE from INBOX was refused",
+    }]);
+    // Both chunks were attempted and both were put back, so the thread is
+    // exactly where it started.
+    expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
+      .toEqual([["INBOX", 141], ["Clients", 142]]);
   });
 });
 
@@ -1710,6 +1772,473 @@ describe("moveThreads: file", () => {
     const [line] = logger.infos;
     expect(line?.details).toMatchObject({
       action: "file", folder: "INBOX", targetFolder: "Clients", syncEnabled: "Clients",
+    });
+  });
+});
+
+// --- Per-message selection (Phase 4.4 Task 2) -------------------------------
+
+describe("moveMessages: what a message id names", () => {
+  it("files ONE message out of a thread and leaves every other message where it was", async () => {
+    // The whole point of the second entry point. The thread is untouched: its
+    // other messages keep their folder and uid, and the row itself keeps its
+    // subject and last_message_at -- filing is not receiving, so nothing about
+    // this reorders the list.
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread("Quarterly review");
+    const filed = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 401 });
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 402 });
+    const before = await threadRow(threadId);
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+
+    const result = await moveMessages(
+      handle.db, userId, { messageIds: [filed], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([{ messageId: filed, ok: true }]);
+    expect(sync.calls).toEqual([{ folder: "INBOX", uids: [401], targetFolder: "Clients" }]);
+    expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
+      .toEqual([["Clients", null], ["INBOX", 402]]);
+    // THE THREAD SURVIVES INTACT. What the list shows for it now follows the
+    // existing folder rule -- a thread is "in" a folder when any of its
+    // messages is -- so it stays in the INBOX view (message 402 is still
+    // there) AND joins the Clients view. Listed in both at once, which is what
+    // a conversation spread across two mailboxes honestly is.
+    expect(await threadRow(threadId)).toEqual(before);
+  });
+
+  it("leaves the source folder's view only when the filed message was its last one", async () => {
+    // The other half of the same rule, asserted on the EXISTS the thread list
+    // actually uses rather than on prose about it.
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread();
+    const only = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 411 });
+    const manager = new FakeManager();
+    manager.for(accountId);
+
+    expect(await threadIsInFolder(threadId, "INBOX")).toBe(true);
+    await moveMessages(
+      handle.db, userId, { messageIds: [only], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(await threadIsInFolder(threadId, "INBOX")).toBe(false);
+    expect(await threadIsInFolder(threadId, "Clients")).toBe(true);
+    // And the thread row itself is still there: nothing about filing its last
+    // INBOX message deletes a conversation.
+    expect(await threadRow(threadId)).toBeDefined();
+  });
+
+  it("answers two messages of ONE thread independently", async () => {
+    // The case a threadId-keyed result cannot express, and therefore the
+    // reason this response is keyed on messageId at all: one moves, one is
+    // already where it was going.
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread();
+    const moving = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 421 });
+    const settled = await makeMessage({ threadId, accountId, folder: "Clients", imapUid: 422 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+
+    const result = await moveMessages(
+      handle.db, userId,
+      { messageIds: [moving, settled], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([
+      { messageId: moving, ok: true },
+      { messageId: settled, ok: true, skipped: true, reason: "already_in_target" },
+    ]);
+    expect(sync.calls).toEqual([{ folder: "INBOX", uids: [421], targetFolder: "Clients" }]);
+  });
+
+  it("moves a message OUT OF SENT when it was named by id", async () => {
+    // The deliberate difference from whole-thread mode, which excludes Sent so
+    // that archiving a CONVERSATION cannot empty it. Ticking one message you
+    // sent and filing it is an instruction about that message; carving it out
+    // would silently refuse the thing the user pointed at.
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread();
+    const sent = await makeMessage({ threadId, accountId, folder: "Sent", imapUid: 431 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+
+    const result = await moveMessages(
+      handle.db, userId, { messageIds: [sent], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([{ messageId: sent, ok: true }]);
+    expect(sync.calls).toEqual([{ folder: "Sent", uids: [431], targetFolder: "Clients" }]);
+  });
+
+  it("takes messages from several folders and several threads in one request", async () => {
+    // There is no view folder to be scoped to, so nothing here is filtered by
+    // where the messages happen to sit -- the ids ARE the scope.
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const first = await makeThread("one");
+    const second = await makeThread("two");
+    const a = await makeMessage({ threadId: first, accountId, folder: "INBOX", imapUid: 441 });
+    const b = await makeMessage({ threadId: second, accountId, folder: "Archive", imapUid: 442 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+
+    const result = await moveMessages(
+      handle.db, userId, { messageIds: [a, b], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([{ messageId: a, ok: true }, { messageId: b, ok: true }]);
+    expect(sync.calls).toEqual([
+      { folder: "INBOX", uids: [441], targetFolder: "Clients" },
+      { folder: "Archive", uids: [442], targetFolder: "Clients" },
+    ]);
+  });
+
+  it("sends trash and archive to the account's own columns, exactly as the thread path does", async () => {
+    const accountId = await makeAccount();
+    const threadId = await makeThread();
+    const toTrash = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 451 });
+    const toArchive = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 452 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+
+    await moveMessages(handle.db, userId, { messageIds: [toTrash], action: "trash" }, deps(manager));
+    await moveMessages(handle.db, userId, { messageIds: [toArchive], action: "archive" }, deps(manager));
+
+    expect(sync.calls).toEqual([
+      { folder: "INBOX", uids: [451], targetFolder: "Trash" },
+      { folder: "INBOX", uids: [452], targetFolder: "Archive" },
+    ]);
+  });
+
+  it("answers once per REQUESTED id, in order, duplicates included, and moves once", async () => {
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread();
+    const messageId = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 461 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+
+    const result = await moveMessages(
+      handle.db, userId,
+      { messageIds: [messageId, messageId], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([
+      { messageId, ok: true }, { messageId, ok: true },
+    ]);
+    expect(sync.calls).toEqual([{ folder: "INBOX", uids: [461], targetFolder: "Clients" }]);
+  });
+});
+
+describe("moveMessages: nothing to move", () => {
+  it("never answers out_of_scope -- a named message is always looked at", async () => {
+    // The contract's narrower skip enum, proved rather than asserted in a
+    // comment: every reachable no-op here carries a reason NOTED against the
+    // row, because there is no scope for the row to have fallen outside of.
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread();
+    const awaiting = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: null });
+    const settled = await makeMessage({ threadId, accountId, folder: "Clients", imapUid: 471 });
+    const manager = new FakeManager();
+    manager.for(accountId);
+
+    const result = await moveMessages(
+      handle.db, userId,
+      { messageIds: [awaiting, settled], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([
+      { messageId: awaiting, ok: true, skipped: true, reason: "awaiting_reconciliation" },
+      { messageId: settled, ok: true, skipped: true, reason: "already_in_target" },
+    ]);
+    // There is deliberately no `expect(... !== "out_of_scope")` line here: the
+    // first draft had one and it would not COMPILE, because BulkMessageResult's
+    // reason union does not contain that value, so tsc rejects the comparison
+    // as having no overlap. The narrower enum plus the narrower Outcomes
+    // generic make it unrepresentable rather than merely absent, which is a
+    // stronger guarantee than any assertion this test could make -- and the
+    // two reasons above are what proves the reachable half still answers.
+  });
+
+  it("skips a message on an ARCHIVED account rather than failing it", async () => {
+    const accountId = await makeAccount({ archivedAt: new Date("2026-09-01T09:00:00.000Z") });
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread();
+    const messageId = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 481 });
+    const manager = new FakeManager();
+    manager.for(accountId);
+
+    const result = await moveMessages(
+      handle.db, userId, { messageIds: [messageId], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([
+      { messageId, ok: true, skipped: true, reason: "archived_account" },
+    ]);
+    expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 481 });
+  });
+
+  it("fails a destination the account has no folder for, and moves nothing", async () => {
+    const accountId = await makeAccount({ label: "Work" });
+    const threadId = await makeThread();
+    const messageId = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 491 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+
+    const result = await moveMessages(
+      handle.db, userId, { messageIds: [messageId], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([{
+      messageId, ok: false, reason: "unknown_target",
+      error: 'account "Work" has no folder named "Clients"'
+        + " -- pick one of its own folders, or wait for a sync pass to discover it",
+    }]);
+    expect(sync.calls).toEqual([]);
+    expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 491 });
+  });
+
+  it("fails an account with no running sync loop, and writes nothing for it", async () => {
+    const accountId = await makeAccount({ label: "Work" });
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread();
+    const messageId = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 501 });
+
+    const result = await moveMessages(
+      handle.db, userId, { messageIds: [messageId], targetFolder: "Clients", action: "file" },
+      // A manager that knows nothing of this account: the loop is not running,
+      // and moving the row with nothing to carry the MOVE out would leave the
+      // CRM claiming a move that never happened.
+      deps(new FakeManager()),
+    );
+
+    expect(result.results).toEqual([{
+      messageId, ok: false, reason: "no_sync",
+      error: 'mail sync is not running for account "Work"',
+    }]);
+    expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 501 });
+  });
+});
+
+describe("moveMessages: visibility and ownership", () => {
+  it("answers an invisible message byte-for-byte like a nonexistent one", async () => {
+    // The thread gate's ruling, one level down. A distinguishable answer here
+    // would confirm that mail exists in a mailbox the actor may not know about
+    // -- and the account label in an unknown_target refusal is exactly the
+    // kind of fact that would leak through one.
+    const accountId = await makeAccount({ label: "Chris private" });
+    const threadId = await makeThread("private to chris");
+    const invisible = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 511 });
+    const manager = new FakeManager();
+    manager.for(accountId);
+    const missing = "00000000-0000-4000-8000-000000000009";
+
+    const result = await moveMessages(
+      handle.db, actorId, { messageIds: [invisible, missing], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    const [gated, unknown] = result.results;
+    expect(unknown).toEqual({
+      messageId: missing, ok: false, reason: "not_found",
+      error: `mail message ${missing} not found`,
+    });
+    // Substituting the id is the ONLY thing separating the two serialized
+    // answers: same keys, same order, same error text shape.
+    expect(JSON.stringify(gated).replaceAll(invisible, missing)).toBe(JSON.stringify(unknown));
+    expect((await messageRows(threadId))[0]).toMatchObject({ folder: "INBOX", imapUid: 511 });
+    expect(threadHints()).toHaveLength(0);
+  });
+
+  it("skips a message the actor can SEE but does not own, and files their own beside it", async () => {
+    // Move rights are owner-only (spec): a colleague must never reorganise
+    // your actual mailbox, however visible the conversation is to them. A
+    // project link is what makes chris's message visible to sam here.
+    const chrisAccount = await makeAccount();
+    const [project] = await handle.db.insert(projects).values({ name: "Rollout" }).returning();
+    const threadId = await makeThread();
+    await handle.db.update(mailThreads)
+      .set({ projectId: project!.id }).where(eq(mailThreads.id, threadId));
+    const chrisMessage = await makeMessage({
+      threadId, accountId: chrisAccount, folder: "INBOX", imapUid: 521,
+    });
+    const samAccount = await makeAccount({ userId: actorId, label: "Sams" });
+    await makeFolder({ accountId: samAccount, folder: "Clients", syncEnabled: true });
+    const samMessage = await makeMessage({
+      threadId, accountId: samAccount, folder: "INBOX", imapUid: 522,
+    });
+    const manager = new FakeManager();
+    manager.for(chrisAccount);
+    const samSync = manager.for(samAccount);
+
+    const result = await moveMessages(
+      handle.db, actorId,
+      { messageIds: [chrisMessage, samMessage], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([
+      { messageId: chrisMessage, ok: true, skipped: true, reason: "not_owner" },
+      { messageId: samMessage, ok: true },
+    ]);
+    // And the unowned account's own missing "Clients" folder never surfaces:
+    // ownership answers before any refusal can name a mailbox the actor has no
+    // rights over.
+    expect(samSync.calls).toEqual([{ folder: "INBOX", uids: [522], targetFolder: "Clients" }]);
+  });
+});
+
+describe("moveMessages: the filing rule and compensation", () => {
+  it("turns the destination folder's sync ON before the move is queued, and says so", async () => {
+    // Task 1's rule and Task 1's ORDERING, reached by calling the same path
+    // rather than by deciding again. Pinned by OBSERVATION: the fake reads the
+    // folder row from inside moveMessages, at the moment the server sees the
+    // request arrive.
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: false });
+    const threadId = await makeThread();
+    const messageId = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 531 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+    let enabledWhenQueued: boolean | undefined;
+    sync.beforeMove = async () => {
+      enabledWhenQueued = (await folderRow(accountId, "Clients"))?.syncEnabled;
+    };
+
+    const result = await moveMessages(
+      handle.db, userId, { messageIds: [messageId], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(enabledWhenQueued).toBe(true);
+    expect(result.syncEnabled).toBe("Clients");
+    expect((await folderRow(accountId, "Clients"))?.syncEnabled).toBe(true);
+  });
+
+  it("says nothing about sync when the destination was already syncing", async () => {
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread();
+    const messageId = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 541 });
+    const manager = new FakeManager();
+    manager.for(accountId);
+
+    const result = await moveMessages(
+      handle.db, userId, { messageIds: [messageId], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect("syncEnabled" in result).toBe(false);
+  });
+
+  it("does not switch sync on for an account whose only named message was skipped", async () => {
+    // "Filing into a folder turns its sync on", and an account that moved
+    // nothing did not file into it -- so its Clients folder must not start
+    // being walked because a message the user ticked happened to sit there and
+    // was then skipped.
+    //
+    // TWO ACCOUNTS, and the second one is what makes this test bite. With one
+    // account contributing nothing, `candidates.length > 0` short-circuits the
+    // whole sync step and the narrowing is never consulted -- the first
+    // version of this test had exactly that shape and survived deleting the
+    // filter it was written to protect. The moving account's own destination
+    // is already syncing, so anything that flips is the SKIPPED account's.
+    const moving = await makeAccount({ label: "Moves" });
+    const idle = await makeAccount({ label: "Idle" });
+    await makeFolder({ accountId: moving, folder: "Clients", syncEnabled: true });
+    await makeFolder({ accountId: idle, folder: "Clients", syncEnabled: false });
+    const threadId = await makeThread();
+    const moved = await makeMessage({ threadId, accountId: moving, folder: "INBOX", imapUid: 571 });
+    const awaiting = await makeMessage({
+      threadId, accountId: idle, folder: "INBOX", imapUid: null,
+    });
+    const manager = new FakeManager();
+    manager.for(moving);
+    manager.for(idle);
+
+    const result = await moveMessages(
+      handle.db, userId,
+      { messageIds: [moved, awaiting], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([
+      { messageId: moved, ok: true },
+      { messageId: awaiting, ok: true, skipped: true, reason: "awaiting_reconciliation" },
+    ]);
+    expect("syncEnabled" in result).toBe(false);
+    expect((await folderRow(idle, "Clients"))?.syncEnabled).toBe(false);
+  });
+
+  it("reverts the row and fails only that message when the server refuses", async () => {
+    const accountId = await makeAccount();
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: true });
+    const threadId = await makeThread();
+    // Two source folders, so the queue makes two calls and only the second is
+    // refused: the accepted one stays moved, which is the partial success the
+    // bulk contract promises and which a thread-keyed answer would have had to
+    // report as a single failure.
+    const kept = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 551 });
+    const refused = await makeMessage({ threadId, accountId, folder: "Archive", imapUid: 552 });
+    const manager = new FakeManager();
+    const sync = manager.for(accountId);
+    sync.failCall = 2;
+    sync.failError = new Error("MOVE from Archive to Clients was refused");
+
+    const result = await moveMessages(
+      handle.db, userId,
+      { messageIds: [kept, refused], targetFolder: "Clients", action: "file" },
+      deps(manager),
+    );
+
+    expect(result.results).toEqual([
+      { messageId: kept, ok: true },
+      {
+        messageId: refused, ok: false, reason: "server_refused",
+        error: "MOVE from Archive to Clients was refused",
+      },
+    ]);
+    expect((await messageRows(threadId)).map((row) => [row.folder, row.imapUid]))
+      .toEqual([["Clients", null], ["Archive", 552]]);
+  });
+
+  it("counts off the answers on its own summary line", async () => {
+    const accountId = await makeAccount({ label: "Work" });
+    await makeFolder({ accountId, folder: "Clients", syncEnabled: false });
+    const threadId = await makeThread();
+    const moved = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 561 });
+    const awaiting = await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: null });
+    const missing = "00000000-0000-4000-8000-000000000011";
+    const manager = new FakeManager();
+    manager.for(accountId);
+    const logger = new RecordingLogger();
+
+    await moveMessages(
+      handle.db, userId,
+      { messageIds: [moved, awaiting, missing], targetFolder: "Clients", action: "file" },
+      { syncManager: manager, logger },
+    );
+
+    const [line] = logger.infos;
+    expect(line?.message).toBe("mail-move: bulk message action");
+    expect(line?.details).toMatchObject({
+      action: "file", targetFolder: "Clients", syncEnabled: "Clients",
+      messages: 3, moved: 1, failed: 1, skipped: 1,
     });
   });
 });

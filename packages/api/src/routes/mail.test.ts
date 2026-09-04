@@ -11,6 +11,7 @@ import {
   mailThreadListItemSchema, mailThreadDetailSchema, markThreadReadResponseSchema,
   mailMessageSchema, mailUnreadCountSchema,
   mailUnreadFolderCountsSchema, mailAccountFolderSchema, bulkThreadResultSchema,
+  bulkMessageResultSchema, BULK_MESSAGE_ACTION_CAP,
   searchResultsSchema,
   type MailAccountCreateInput, type MailAccountSyncStats, type SendMailInput,
 } from "@conduit/shared";
@@ -2270,6 +2271,160 @@ describe("mail bulk thread action route", () => {
     const response = await a.inject({
       method: "POST", url: "/api/mail/threads/bulk",
       payload: { threadIds: [UNKNOWN_ID], action: "hide" },
+    });
+    expect(response.statusCode).toBe(401);
+    await a.close();
+  });
+});
+
+// --- Per-message selection (Phase 4.4 Task 2) -------------------------------
+
+describe("mail bulk MESSAGE action route", () => {
+  async function readyAccount(a: App, overrides: Partial<MailAccountCreateInput> = {}) {
+    const account = await makeAccount(a, overrides);
+    await setMoveTargets(account.id, { trashFolder: "Trash", archiveFolder: "Archive" });
+    const sync = new FakeAccountSync();
+    syncs.set(account.id, sync);
+    return { account, sync };
+  }
+
+  async function bulkMessages(a: App, payload: Record<string, unknown>) {
+    return a.inject({ method: "POST", url: "/api/mail/messages/bulk", headers: authHeaders, payload });
+  }
+
+  async function messageRow(id: string) {
+    const [row] = await handle.db.select().from(mailMessages).where(eq(mailMessages.id, id));
+    return row;
+  }
+
+  it("files ONE message of a conversation and leaves its siblings alone", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    await seedFolder(account.id, "Clients", { syncEnabled: true });
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const filed = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 71,
+    });
+    const kept = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T09:00:00Z"), imapUid: 72,
+    });
+
+    const response = await bulkMessages(a, {
+      messageIds: [filed], targetFolder: "Clients", action: "file",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(bulkMessageResultSchema.parse(response.json()))
+      .toEqual({ results: [{ messageId: filed, ok: true }] });
+    expect(await messageRow(filed)).toMatchObject({ folder: "Clients", imapUid: null });
+    expect(await messageRow(kept)).toMatchObject({ folder: "INBOX", imapUid: 72 });
+    expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [71], targetFolder: "Clients" }]);
+  });
+
+  it("answers per MESSAGE, so two messages of one thread can differ", async () => {
+    const a = await app();
+    const { account } = await readyAccount(a);
+    await seedFolder(account.id, "Clients", { syncEnabled: true });
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const moving = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 81,
+    });
+    const settled = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T09:00:00Z"), folder: "Clients", imapUid: 82,
+    });
+
+    const response = await bulkMessages(a, {
+      messageIds: [moving, settled], targetFolder: "Clients", action: "file",
+    });
+
+    expect(bulkMessageResultSchema.parse(response.json()).results).toEqual([
+      { messageId: moving, ok: true },
+      { messageId: settled, ok: true, skipped: true, reason: "already_in_target" },
+    ]);
+  });
+
+  it("turns the destination folder's sync on and says which folder, over the wire", async () => {
+    const a = await app();
+    const { account } = await readyAccount(a);
+    await seedFolder(account.id, "Clients", { syncEnabled: false });
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const messageId = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 91,
+    });
+
+    const response = await bulkMessages(a, {
+      messageIds: [messageId], targetFolder: "Clients", action: "file",
+    });
+
+    expect(bulkMessageResultSchema.parse(response.json()).syncEnabled).toBe("Clients");
+    const [row] = await handle.db.select().from(mailAccountFolders).where(and(
+      eq(mailAccountFolders.accountId, account.id), eq(mailAccountFolders.folder, "Clients"),
+    ));
+    expect(row?.syncEnabled).toBe(true);
+  });
+
+  // The narrowing this endpoint exists to keep. Each of these is a body whose
+  // sender misunderstands what it is asking for, and each gets a 400 at the
+  // door rather than a field quietly dropped -- a silently ignored `folder` is
+  // how a caller comes to believe it scoped something, and a silently ignored
+  // `hide` is how one comes to believe a message was filed out of its views.
+  it("rejects hide/unhide, a source folder, an over-cap list and a missing destination", async () => {
+    const a = await app();
+    const { account } = await readyAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const messageId = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 101,
+    });
+    for (const payload of [
+      { messageIds: [messageId], action: "hide" },
+      { messageIds: [messageId], action: "unhide" },
+      { messageIds: [messageId], folder: "INBOX", action: "archive" },
+      { messageIds: [messageId], action: "file" },
+      { messageIds: [messageId], targetFolder: "Clients", action: "archive" },
+      { messageIds: [], action: "archive" },
+      { messageIds: [messageId], threadIds: [threadId], action: "archive" },
+      {
+        messageIds: Array.from({ length: BULK_MESSAGE_ACTION_CAP + 1 }, () => randomUUID()),
+        action: "archive",
+      },
+    ]) {
+      const response = await bulkMessages(a, payload);
+      expect(response.statusCode).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    }
+    // And nothing moved on the way through all of that.
+    expect(await messageRow(messageId)).toMatchObject({ folder: "INBOX", imapUid: 101 });
+    await a.close();
+  });
+
+  it("accepts exactly the cap, since the schema's max IS this endpoint's only limit", async () => {
+    // The thread endpoint needs a route-level cap because its schema's 200 is
+    // an outer bound only hide/unhide may reach. Every kind here waits on a
+    // mail server, so one number covers them all and it lives in the schema.
+    const a = await app();
+    const { account } = await readyAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const first = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 111,
+    });
+    const messageIds = [
+      first,
+      ...Array.from({ length: BULK_MESSAGE_ACTION_CAP - 1 }, () => randomUUID()),
+    ];
+
+    const response = await bulkMessages(a, { messageIds, action: "archive" });
+
+    expect(response.statusCode).toBe(200);
+    expect(bulkMessageResultSchema.parse(response.json()).results)
+      .toHaveLength(BULK_MESSAGE_ACTION_CAP);
+    await a.close();
+  });
+
+  it("requires authentication", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/messages/bulk",
+      payload: { messageIds: [UNKNOWN_ID], action: "archive" },
     });
     expect(response.statusCode).toBe(401);
     await a.close();
