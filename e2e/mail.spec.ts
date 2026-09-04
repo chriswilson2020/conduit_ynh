@@ -690,6 +690,20 @@ test.describe.serial("Mail journey", () => {
     }
   }
 
+  /**
+   * Move every message out of `folder` and into `target`, over raw IMAP.
+   *
+   * The harness's way to reach an empty mailbox, not the app's -- see the
+   * delete case for why it must not be the app's there.
+   */
+  async function emptyOnServer(folder: string, target: string): Promise<void> {
+    await withImap(async (client) => {
+      const mailbox = await client.mailboxOpen(folder);
+      if (mailbox.exists > 0) await client.messageMove("1:*", target);
+      await client.mailboxClose();
+    });
+  }
+
   /** Every mailbox the server LISTs. The only way to ask "is this folder gone"
    * of the server rather than of the CRM, which is exactly the question the
    * delete leg has to answer -- Conduit deliberately keeps its own row. */
@@ -1881,19 +1895,26 @@ test.describe.serial("Mail journey", () => {
     await expect.poll(() => subjectsIn(madeFolder), { timeout: REFETCH_TIMEOUT_MS }).toEqual([]);
 
     // It is offered as a filing destination straight away -- the create
-    // invalidates the folders query the picker reads. `fileSubject` is a
-    // single message, and single is what makes the rename's "1 stored message
-    // moved with it" exact rather than approximate.
+    // invalidates the folders query the picker reads.
+    //
+    // `junkSubject` and not one of the already-filed fixtures, and the reason
+    // is worth keeping because it cost a CI run to find: a move NULLS the
+    // stored `imap_uid` and the next pass of the TARGET folder restores it, so
+    // a message that has just been filed is ineligible for a second move until
+    // that pass lands ("1 will complete after the next sync pass"). junkSubject
+    // was INGESTED by the pass that walked Junk and has never been moved, so
+    // its UID is real. It is also a single message, which is what makes the
+    // rename's "1 stored message moved with it" exact rather than approximate.
     await page.goto("/mail");
-    await page.getByTestId(`folder-${SPAM_FOLDER}`).click();
+    await page.getByTestId(`folder-${JUNK_FOLDER}`).click();
     await loadAllThreadsOn(page);
-    await tickThread(fileSubject);
+    await tickThread(junkSubject);
     await page.getByTestId("bulk-file").click();
     await page.getByRole("option", { name: madeFolder, exact: true }).click();
     await expect(page.getByTestId("bulk-result"))
       .toContainText("1 filed", { timeout: BULK_TIMEOUT_MS });
     await expect.poll(() => subjectsIn(madeFolder), { timeout: REFETCH_TIMEOUT_MS })
-      .toContain(fileSubject);
+      .toContain(junkSubject);
   });
 
   test("renames it, and the stored mail moves with it on BOTH sides", async () => {
@@ -1920,7 +1941,7 @@ test.describe.serial("Mail journey", () => {
 
     // THE SERVER MOVED TOO, and the message went with the mailbox.
     await expect.poll(() => subjectsIn(renamedFolder), { timeout: REFETCH_TIMEOUT_MS })
-      .toContain(fileSubject);
+      .toContain(junkSubject);
 
     // AND THE DATABASE AGREES: the conversation is listed under the NEW folder
     // and under no other. A re-key that had missed mail_messages would leave
@@ -1928,7 +1949,7 @@ test.describe.serial("Mail journey", () => {
     await page.goto("/mail");
     await page.getByTestId(`folder-${renamedFolder}`).click();
     await loadAllThreadsOn(page);
-    await expect(threadRow(fileSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await expect(threadRow(junkSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
   });
 
   test("REFUSES to delete it while it still holds mail, then deletes it once empty", async () => {
@@ -1952,17 +1973,18 @@ test.describe.serial("Mail journey", () => {
     // refusal has to be where the question was asked.
     await expect(page.getByRole("dialog").getByRole("alert"))
       .toContainText(/still holds 1 message on the mail server/, { timeout: BULK_TIMEOUT_MS });
-    expect(await subjectsIn(renamedFolder)).toContain(fileSubject);
+    expect(await subjectsIn(renamedFolder)).toContain(junkSubject);
 
-    // The way out is the app's own filing action, one gesture long.
-    await page.goto("/mail");
-    await page.getByTestId(`folder-${renamedFolder}`).click();
-    await loadAllThreadsOn(page);
-    await tickThread(fileSubject);
-    await page.getByTestId("bulk-file").click();
-    await page.getByRole("option", { name: ARCHIVE_FOLDER, exact: true }).click();
-    await expect(page.getByTestId("bulk-result"))
-      .toContainText("1 filed", { timeout: BULK_TIMEOUT_MS });
+    // THE APP'S way out is the filing action the refusal names, and this leg
+    // has already shown filing INTO this folder work. Emptying it again is done
+    // over RAW IMAP instead, deliberately: filing the message OUT would need
+    // its `imap_uid` back, and a move nulls that until the target folder's next
+    // pass re-sights it -- so routing the tidy-up through the app would make
+    // this delete case wait on a sync pass to test something that has nothing
+    // to do with one. Conduit is NOT told, which is better still: it goes on
+    // holding the stored message, so the count it reports below is the promise
+    // being kept rather than a coincidence.
+    await emptyOnServer(renamedFolder, ARCHIVE_FOLDER);
     await expect.poll(() => subjectsIn(renamedFolder), { timeout: REFETCH_TIMEOUT_MS }).toEqual([]);
 
     await page.goto("/settings/mail");
@@ -1970,8 +1992,9 @@ test.describe.serial("Mail journey", () => {
     await page.getByTestId(`folder-delete-${renamedFolder}`).click();
     await page.getByTestId("folder-delete-confirm").click();
 
-    // Gone from the server...
-    await expect(page.getByText(/Deleted from the mail server/))
+    // Gone from the server, and the count says what was KEPT rather than what
+    // was removed -- the promise the confirmation made, restated as a fact.
+    await expect(page.getByText(/Deleted from the mail server\. Conduit kept 1 stored message/))
       .toBeVisible({ timeout: BULK_TIMEOUT_MS });
     await expect.poll(async () => (await listFolders()).includes(renamedFolder), {
       timeout: REFETCH_TIMEOUT_MS,
