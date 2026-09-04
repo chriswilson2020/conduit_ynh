@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile,
 } from "node:fs/promises";
@@ -622,6 +622,12 @@ describe("staged member refs", () => {
 async function backupArchive(options: {
   extraBlob?: boolean;
   passphrase?: string;
+  // A CALLER THAT WANTS TWO ARCHIVES NEEDS TWO NAMES. `7z a` APPENDS to an
+  // existing file rather than replacing it, so a second call to the default name
+  // does not overwrite the first archive -- it tries to add members to it, with
+  // whatever passphrase it was given. The passphrase-in-argv case below builds
+  // two archives with two different passphrases and would have hit exactly that.
+  fileName?: string;
 } = {}): Promise<{ archivePath: string; blob: string; extra: string | null }> {
   const blobContent = randomBytes(512);
   const blob = digestOf(blobContent);
@@ -636,7 +642,7 @@ async function backupArchive(options: {
   if (options.extraBlob === true) {
     members.push({ name: `files/${extra}`, content: extraContent });
   }
-  const archivePath = path.join(scratch, "backup.7z");
+  const archivePath = path.join(scratch, options.fileName ?? "backup.7z");
   await writeSevenZip({
     archivePath,
     workDir: await mkdtemp(path.join(scratch, "payload-")),
@@ -743,7 +749,37 @@ describe("stageArchive, on an encrypted .7z", () => {
   // an instrument: it shows the same scan FINDING a passphrase when one is
   // passed as -p<value>, so a pass on the real path means the scan looked.
   it7zProc("never puts the passphrase on a command line", async () => {
-    const { archivePath } = await backupArchive();
+    // THE CONTROL GETS ITS OWN SECRET, AND THAT IS THE FIX FOR A TEST THAT WAS
+    // CATCHING ITSELF.
+    //
+    // The scan further down reads EVERY process on the machine. The control
+    // deliberately puts a passphrase in argv; while that was the same PASSPHRASE
+    // the scan then looks for, the control was a process the scan was entitled
+    // to find -- and did. Measured on the dev server, 4 Sep, on the SERIAL suite,
+    // so this predates file parallelism entirely:
+    //
+    //   AssertionError: the passphrase must never appear in any process's argv
+    //   Received: "/usr/lib/p7zip/7z l -bd -y -pcorrect horse battery staple
+    //              -- /tmp/conduit-intake-scratch-UlE2AQ/backup.7z"
+    //
+    // That argv is the CONTROL'S, not stageArchive's: `-- <scratch>/backup.7z` is
+    // the path only the control passes, and stageArchive never puts -p<value>
+    // anywhere. `control.kill()` had not stopped it, because Debian's /usr/bin/7z
+    // is a shell wrapper that does not exec -- the signal reaches the wrapper and
+    // the /usr/lib/p7zip/7z it started runs on. The test was racing its own
+    // leftovers, and lost.
+    //
+    // backup.test.ts's equivalent case already had the answer and this file did
+    // not borrow it: it watches for a `PASSPHRASE-${randomUUID()}` marker nothing
+    // else on the machine could hold. Same idea, mirrored -- the CONTROL takes
+    // the unique value, so a control that outlives its kill is invisible to the
+    // scan for the real one. It matters more now that test files run
+    // concurrently: seven suites share the "correct horse battery staple"
+    // literal, and a whole-machine scan for it was never safe beside them.
+    const controlMarker = `CONTROL-PASSPHRASE-${randomUUID()}`;
+    const { archivePath: controlArchive } = await backupArchive({
+      passphrase: controlMarker, fileName: "control.7z",
+    });
 
     // CONTROL: the same scan, against a 7z that IS given -p<value>. RETRIED,
     // because what is being observed is a process that lives for a few
@@ -755,22 +791,48 @@ describe("stageArchive, on an encrypted .7z", () => {
     // green one.
     let foundInControl = false;
     for (let round = 0; round < 5 && !foundInControl; round += 1) {
+      // detached, so the kill below takes THE WRAPPER AND THE BINARY IT STARTED.
+      // `child.kill()` signals only /usr/bin/7z, which is a shell script that
+      // does not exec; the /usr/lib/p7zip/7z behind it survives, which is how the
+      // sighting quoted above came to exist. Killing the process GROUP stops it.
+      // Hygiene rather than correctness now that the marker is unique -- but a
+      // shared dev server does not need this suite's orphans accumulating on it.
       const control = spawn(
-        "7z", ["l", "-bd", "-y", `-p${PASSPHRASE}`, "--", archivePath],
-        { stdio: "ignore" },
+        "7z", ["l", "-bd", "-y", `-p${controlMarker}`, "--", controlArchive],
+        { stdio: "ignore", detached: true },
       );
       for (let attempt = 0; attempt < 100 && !foundInControl; attempt += 1) {
         try {
           const cmdline = await readFile(`/proc/${String(control.pid)}/cmdline`, "utf8");
-          if (cmdline.split("\u0000").join(" ").includes(PASSPHRASE)) foundInControl = true;
+          if (cmdline.split("\u0000").join(" ").includes(controlMarker)) foundInControl = true;
         } catch { /* the child exited */ }
         if (!foundInControl) await new Promise((r) => setTimeout(r, 5));
       }
-      control.kill();
+      if (control.pid !== undefined) {
+        try { process.kill(-control.pid, "SIGKILL"); } catch { /* already gone */ }
+      }
     }
     expect(foundInControl, "the control must find a passphrase that IS in argv").toBe(true);
 
-    // The real path. Every 7z this process spawns, scanned while it runs.
+    // The real path, WITH A PASSPHRASE NO OTHER TEST CAN BE HOLDING.
+    //
+    // This scan reads every process on the machine, so what it looks for decides
+    // what it can be fooled by. Looking for the shared "correct horse battery
+    // staple" made three other suites into false positives the moment test files
+    // stopped running one at a time -- they hand 7z that exact literal in argv,
+    // legitimately, to open an archive they just wrote:
+    //
+    //   routes/backup.test.ts:98            7z x -p<PASSPHRASE> ...
+    //   services/backup-format.test.ts:125  7z x -p<PASSPHRASE> ...
+    //   services/backup.test.ts:191         7z x -p<passphrase> ...
+    //
+    // A run with any of those alongside this one would report a passphrase leak
+    // in stageArchive that stageArchive had nothing to do with -- a red test
+    // pointing at the wrong file, about security, which is the worst kind to
+    // send someone chasing. A per-run marker cannot be confused for anyone
+    // else's: if the scan sees it, this test's own code path put it there.
+    const realMarker = `INTAKE-PASSPHRASE-${randomUUID()}`;
+    const { archivePath } = await backupArchive({ passphrase: realMarker });
     const file = await landFile(archivePath, "b.7z");
     let leaked: string | null = null;
     const watcher = setInterval(() => {
@@ -778,11 +840,11 @@ describe("stageArchive, on an encrypted .7z", () => {
         for (const pid of await readdir("/proc").catch(() => [])) {
           if (!/^\d+$/.test(pid)) continue;
           const cmdline = await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
-          if (cmdline.includes(PASSPHRASE)) leaked = cmdline.split("\u0000").join(" ");
+          if (cmdline.includes(realMarker)) leaked = cmdline.split("\u0000").join(" ");
         }
       })();
     }, 3);
-    const payload = await stageArchive({ file, passphrase: PASSPHRASE });
+    const payload = await stageArchive({ file, passphrase: realMarker });
     clearInterval(watcher);
     expect(leaked, "the passphrase must never appear in any process's argv").toBeNull();
     await payload.dispose();

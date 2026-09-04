@@ -13,7 +13,9 @@ import { sql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { createDatabase, migrationsFolder, runMigrations, type DatabaseHandle } from "../db/client.js";
 import { openTestDatabase } from "../test/db.js";
-import { TEST_DATABASE_URL } from "../test/global-setup.js";
+import {
+  SCRATCH_DATABASE_PREFIXES, TEST_DATABASE_URL, withDatabaseName,
+} from "../test/databases.js";
 import { digestOf, HAVE_7Z } from "../test/archives.js";
 import { resolveUser } from "../users.js";
 import { saveBlob } from "./blobs.js";
@@ -89,8 +91,19 @@ interface Install {
 
 /** The control connection. Used ONLY to create and drop scratch databases. */
 const control = openTestDatabase();
-/** Every scratch database this file makes. Also what the boot sweep matches. */
-const SCRATCH_PREFIX = "conduit_restore_";
+/**
+ * Every scratch database this file makes. Also what the boot sweep matches.
+ *
+ * NAMED IN test/databases.ts RATHER THAN HERE, because the sweep below is a
+ * `DROP DATABASE` over everything that starts with it and this file is no longer
+ * the only one running when it fires. The comment that used to sit on that sweep
+ * -- "Nothing else in this repository creates this prefix" -- was already untrue
+ * when it was written: the old value was `conduit_restore_`, and both
+ * routes/restore.test.ts (`conduit_restore_routes_`) and backup.test.ts
+ * (`conduit_restore_<hex>`) sat underneath it. Serially that never showed,
+ * because a sweep only ever met databases from a finished run.
+ */
+const SCRATCH_PREFIX = SCRATCH_DATABASE_PREFIXES.restoreService;
 let installs: Install[] = [];
 let scratchDirs: string[] = [];
 
@@ -132,10 +145,17 @@ async function dropScratchDatabase(name: string): Promise<void> {
 
 // A RUN THAT DIED LEAVES DATABASES BEHIND, and the next run should not inherit
 // them: they cost disk on a shared dev server and they make a real leak
-// impossible to see. Nothing else in this repository creates this prefix.
+// impossible to see.
+//
+// `starts_with`, NOT `LIKE 'prefix%'`. In LIKE, `_` is a single-character
+// wildcard, and every prefix in this repository is full of them -- so
+// `LIKE 'conduit_scratch_restore_svc_%'` matches names that merely resemble it.
+// That was harmless while the prefixes overlapped anyway and nothing else ran at
+// the same time; with files running concurrently, a sweep is a DROP DATABASE
+// aimed at another worker's live database, so it has to mean exactly what it says.
 beforeAll(async () => {
   const stale = await control.db.execute<{ datname: string }>(sql`
-    SELECT datname FROM pg_database WHERE datname LIKE ${`${SCRATCH_PREFIX}%`}
+    SELECT datname FROM pg_database WHERE starts_with(datname, ${SCRATCH_PREFIX})
   `);
   for (const row of stale) await dropScratchDatabase(row.datname);
 });
@@ -200,7 +220,7 @@ async function makeInstall(
 ): Promise<Install> {
   const name = `${SCRATCH_PREFIX}${label}_${randomUUID().replace(/-/g, "")}`;
   await control.db.execute(sql.raw(`CREATE DATABASE "${name}"`));
-  const url = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${name}`);
+  const url = withDatabaseName(TEST_DATABASE_URL, name);
   const handle = createDatabase(url, 2);
   const dataDir = await mkdtemp(path.join(os.tmpdir(), `conduit-restore-${label}-data-`));
   const mailKeyPath = path.join(dataDir, "mail.key");

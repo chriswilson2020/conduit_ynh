@@ -14,7 +14,7 @@ import { promisify } from "node:util";
 import { sql } from "drizzle-orm";
 import { createDatabase } from "../db/client.js";
 import { openTestDatabase, truncateAll } from "../test/db.js";
-import { TEST_DATABASE_URL } from "../test/global-setup.js";
+import { SCRATCH_DATABASE_PREFIXES, TEST_DATABASE_URL } from "../test/databases.js";
 import { resolveUser } from "../users.js";
 import { saveBlob } from "./blobs.js";
 import { attachFile } from "./files.js";
@@ -612,7 +612,7 @@ describe("backup completeness", () => {
     await seedMail();
     const root = await extract((await writeArchive()).path);
 
-    const scratchDb = `conduit_restore_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const scratchDb = `${SCRATCH_DATABASE_PREFIXES.backupRoundTrip}${randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const { env } = pgDumpInvocation(TEST_DATABASE_URL);
     const psqlEnv = { ...process.env, ...env };
     const query = async (statement: string): Promise<string> => (

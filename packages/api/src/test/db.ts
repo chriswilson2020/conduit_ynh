@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import { createDatabase, type DatabaseHandle } from "../db/client.js";
-import { TEST_DATABASE_URL } from "./global-setup.js";
+import { TEST_DATABASE_URL } from "./databases.js";
 
 // max: 2, not 1 — a single test occasionally issues two queries concurrently (e.g. a
 // query racing a truncate in a differently-scoped connection), and with max: 1 the
@@ -8,11 +8,16 @@ import { TEST_DATABASE_URL } from "./global-setup.js";
 // 4: mail-ingest.test.ts's concurrency case needs two transactions genuinely open at
 // once to exercise the global ingest advisory lock — at max: 1 the second would wait
 // for a connection rather than for the lock, and the test would pass without proving
-// anything. Isolation between test
-// files does not come from connection limits, though: it relies on `fileParallelism:
-// false` in vitest.config.ts, which keeps files from truncating the shared database
-// out from under each other. If that ever gets flipped on for speed, this stops being
-// a loud error and becomes silent cross-file data races.
+// anything.
+//
+// ISOLATION BETWEEN TEST FILES NO LONGER COMES FROM RUNNING THEM ONE AT A TIME.
+// This comment used to end by warning that `fileParallelism: false` was the only
+// thing keeping two files from truncating the shared database out from under each
+// other, and that flipping it on for speed would turn a loud error into a silent
+// data race. It has now been flipped on, and the warning is answered rather than
+// ignored: TEST_DATABASE_URL names a database of this WORKER'S own
+// (packages/api/src/test/databases.ts), cloned from a migrated template before any
+// file runs. Two files running at once truncate two different databases.
 export function openTestDatabase(): DatabaseHandle {
   return createDatabase(TEST_DATABASE_URL, 2);
 }
