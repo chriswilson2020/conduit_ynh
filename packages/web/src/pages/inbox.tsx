@@ -455,6 +455,48 @@ export function InboxPage() {
    * and the browser cannot restore it for us either, since the document's
    * height changed underneath the position while the pane was hidden.
    * Predictable beats nearly-right here.
+   *
+   * ---------------------------------------------------------------------
+   * v1.5.0 GENERALISED THIS AND THEN COULD NOT DELETE IT. The app-wide rule
+   * (src/use-navigation-focus.ts) is this effect's answer -- the heading,
+   * tabIndex -1, for the reasons above -- applied to every route change. The
+   * release's plan expected this effect to go with it. IT COVERS TWO OF THIS
+   * PAGE'S FOUR LEVEL CHANGES THAT THE GENERAL RULE CANNOT SEE, and they are
+   * two different reasons rather than one:
+   *
+   *   THREADS -> FOLDERS is not a route change at all. `openFolders` is
+   *   `setFoldersOpen(true)` and nothing else; there is no navigate on that
+   *   path, so the router fires no event and a rule subscribed to the router
+   *   is not merely late, it is never called.
+   *
+   *   FOLDERS -> THREADS *is* one, and the general rule still declines it --
+   *   correctly. `backToThreads` navigates, and from the folder screen the
+   *   `?thread=` param is already absent, so it is a navigate to the identical
+   *   href; measured against @tanstack/react-router 1.170.30, that DOES fire
+   *   `onResolved` (with `hrefChanged: false`). But the general rule moves
+   *   focus only when the caret was LOST, and here it was not: Back and
+   *   Folders are the same Button relabelled, React reconciles it in place, so
+   *   the element the user just activated is still in the document and still
+   *   holds focus. The screen changed under it and nothing announced that.
+   *
+   * That second one is the case this comment has always said is the hardest --
+   * "one control silently becoming a different control" -- and the general
+   * rule's restraint, which is the right restraint everywhere else, is exactly
+   * what makes it blind to it. e2e/mobile.spec.ts's "drills out to the folders
+   * and back, moving focus to each destination" is the test that says so; it
+   * asserts both directions and it goes red without the effect below.
+   *
+   * The other two level changes -- either direction between THREADS and
+   * CONVERSATION -- are `?thread=` writes, which are real route changes, and
+   * the pane holding the focused element is hidden, so the caret really is on
+   * `<body>` by the time the router resolves. The general rule handles those
+   * and this effect gets there first; both send the caret to the same node, so
+   * the second is a focus() on the already-focused element, which is the
+   * no-op this comment describes three paragraphs up.
+   *
+   * SO IT STAYS, WHOLE. Narrowing it to just the two uncovered transitions
+   * means keying on something other than the level, and the paragraph above
+   * measured what that costs on this page.
    */
   useEffect(() => {
     if (!isMobile) return;
@@ -492,13 +534,16 @@ export function InboxPage() {
             {view.leading.label}
           </Button>
         )}
-        {/* tabIndex only below the breakpoint, so the desktop heading keeps
-            exactly the attributes it always had. -1 makes it a target for the
-            level effect's focus() without putting a heading into anyone's tab
-            order. */}
+        {/* tabIndex -1 AT BOTH WIDTHS SINCE v1.5.0, where it used to be
+            `isMobile ? -1 : undefined`. The app-wide navigation focus rule
+            (src/use-navigation-focus.ts) lands on this heading at any width,
+            and it sets the attribute itself for the thirteen pages that never
+            had one -- so a conditional here would be React removing, on a
+            width change, an attribute another module had just written. -1
+            still keeps the heading out of everyone's tab order. */}
         <h1
           ref={headingRef}
-          tabIndex={isMobile ? -1 : undefined}
+          tabIndex={-1}
           className="text-xl font-semibold text-slate-900"
         >
           {view.title}
