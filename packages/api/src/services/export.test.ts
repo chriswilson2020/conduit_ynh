@@ -74,7 +74,12 @@ const itZip = HAVE_UNZIP ? it : it.skip;
 function forceGc(): void {
   const gc = (globalThis as { gc?: () => void }).gc;
   if (gc === undefined) {
-    throw new Error("these bounds need --expose-gc; see poolOptions in vitest.config.ts");
+    // `test.execArgv`, not `poolOptions`, which this line named until now and
+    // which Vitest 4 removed -- vitest.config.ts says so on the very line that
+    // sets the flag. A pointer in an error message is only ever read by someone
+    // who has just hit the error, so it is the one place a stale name costs the
+    // most.
+    throw new Error("these bounds need --expose-gc; see test.execArgv in vitest.config.ts");
   }
   gc();
 }
