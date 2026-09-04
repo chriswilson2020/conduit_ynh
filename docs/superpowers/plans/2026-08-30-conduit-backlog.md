@@ -1692,6 +1692,24 @@ v1.1.0; the rest are enumerated at that fix.
 
 ## If it becomes a product
 
+**FOCUS AFTER NAVIGATION BELONGS HERE, and that is a scheduling decision taken 4 Sep rather
+than another deferral.** It has been "the biggest item on the deferred list" for three
+releases, which is a description that carried no information about when it would be done.
+Chris settled what nobody had asked: **he does not navigate Conduit by keyboard, and other
+people might.** So its cost today is zero and its cost the day this has a second user is
+immediate -- which makes it a product-readiness item with a trigger, not a bug competing with
+features for a slot.
+
+**The trigger is a second user, and it should go in BEFORE that user arrives**, because the
+first person to meet it will be someone with no idea the product works better with a mouse.
+
+Unchanged in substance: focus is lost after any navigation that unmounts the focused element;
+it is a route-change concern touching every page; and fixing the general case retires the
+hand-rolled special cases in `inbox.tsx` and `board.tsx` rather than adding a third. **The five
+dialog roots are one entrance to it and must not be fixed alone** -- that would make them the
+only navigations in the app that land anywhere, while row links remain the commoner path to the
+same pages.
+
 Ordered by how much more expensive each gets if retrofitted rather than designed in.
 
 1. **Data isolation.** Everything is shared by construction — one set of companies, one
