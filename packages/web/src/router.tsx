@@ -3,6 +3,7 @@ import { Link, Outlet, createRootRoute, createRoute, createRouter } from "@tanst
 import { App } from "./App";
 import { basePath } from "./api";
 import { Shell } from "./components/shell";
+import { useFocusAfterNavigation } from "./use-navigation-focus";
 import { BoardPage } from "./pages/board";
 import { CompaniesPage } from "./pages/companies";
 import { CompanyDetailPage } from "./pages/company-detail";
@@ -40,7 +41,15 @@ export const queryClient = new QueryClient({
   },
 });
 
+// THE ROOT ROUTE IS WHERE THE NAVIGATION FOCUS RULE IS MOUNTED, and it is the
+// only component that outlives every route change -- which is the requirement,
+// since a rule that unmounted with the page it was on could not put the caret
+// on the next one. It subscribes to the router rather than reading
+// `useLocation()` from here: see use-navigation-focus.ts for the measurement
+// that separates the two, and for why the difference is not a matter of a few
+// milliseconds.
 function RootComponent() {
+  useFocusAfterNavigation();
   return (
     <QueryClientProvider client={queryClient}>
       <Shell>
