@@ -654,6 +654,58 @@ describe("AccountSync: backfill and cursor", () => {
     expect(cursor?.lastSeenUid).toBe(120);
   });
 
+  /**
+   * THE SHORT BATCH ENDS THE PASS, and the count is the only witness.
+   *
+   * `syncFolder` breaks on `batch.length < BATCH_SIZE` after saving the
+   * cursor, one line below the break on an empty batch. Neither line is
+   * reachable from an outcome: delete the short-batch break and the loop
+   * simply asks once more, is handed nothing, and stops on the empty batch
+   * instead -- same messages, same cursor, same flags reconciled, one wasted
+   * FETCH per folder per pass. (Measured on 31 Aug 2026: with the line
+   * replaced by a comment, all 62 cases then in this file stayed green.
+   * Re-measured 1 Sep 2026 with this case present: it is the only red in the
+   * file -- 62 passed, this one failed on the count, at two INBOX fetches
+   * instead of one.)
+   *
+   * So this case asserts the ROUND TRIP rather than the mail. It is the only
+   * thing in the suite that reads the difference between "the folder is
+   * finished" and "the folder is finished, and we spent a command finding
+   * out" -- which is why the case above can claim a short third batch ends
+   * the folder without a fourth round trip while asserting only the first
+   * three windows.
+   */
+  it("ends the folder pass on the short batch, not on the empty one after it", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    const { sync, client } = makeSync(accountId);
+    const inbox = client.folder("INBOX");
+    // Fewer than BATCH_SIZE (50), so the first batch is already the last.
+    for (let uid = 1; uid <= 3; uid += 1) inbox.add(uid, rawMail({ messageId: `m${uid}@example.com` }));
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+
+    // The walk did finish -- this is not a pass that stopped early.
+    expect(await messageRows()).toHaveLength(3);
+    expect((await cursorFor(accountId, "INBOX"))?.lastSeenUid).toBe(3);
+
+    // And it finished in ONE fetch. Filtered by folder because a pass walks
+    // INBOX and Sent, and Sent's own empty first batch is not the subject.
+    const inboxFetches = client.opsOf("fetchNewer").filter((call) => call.folder === "INBOX");
+    expect(inboxFetches).toHaveLength(1);
+
+    // Not vacuous: that one call asked for a full batch from the bottom of
+    // the folder and was handed a short answer, which is the exact condition
+    // the break reads. Indexed through the parallel folder list rather than
+    // taken as options[0], so the assertion still names INBOX's window if the
+    // walk order ever changes.
+    const inboxWindows = client.fetchNewerOptions
+      .filter((_, index) => client.fetchNewerFolders[index] === "INBOX");
+    expect(inboxWindows).toHaveLength(1);
+    expect(inboxWindows[0]?.limit).toBe(50);
+    expect(inboxWindows[0]?.sinceUid).toBe(0);
+  });
+
   it("resumes from the last completed batch after a pass crashes mid-batch", async () => {
     const accountId = await makeAccount({ backfillDays: null });
     const { sync, client, clock } = makeSync(accountId);
