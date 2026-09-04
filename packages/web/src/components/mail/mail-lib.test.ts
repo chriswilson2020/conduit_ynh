@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import type { BulkThreadFailureReason, BulkThreadSkipReason } from "@conduit/shared";
-import { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
+import {
+  BULK_MESSAGE_ACTION_CAP, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
+} from "@conduit/shared";
 import { ApiError, ResponseShapeError } from "../../api";
 import {
   buildFolderRows,
@@ -13,9 +15,14 @@ import {
   isThreadGone,
   NOT_OWNER_EXPLANATION,
   THREAD_GONE_MESSAGE,
+  emptyMessageSelection,
   emptySelection,
   extendThreadSelection,
+  messageActionBlocked,
   messageIsInTrash,
+  selectedMessageIds,
+  singleOwnAccount,
+  toggleMessageSelected,
   moveTargetPatch,
   newestDiscovery,
   selectedThreadIds,
@@ -974,7 +981,39 @@ describe("bulkActionBlocked", () => {
 // every other note on this bar.
 describe("fileTargetsBlocked", () => {
   it("offers the picker only when the list is scoped to one account with folders", () => {
-    expect(fileTargetsBlocked(true, 3)).toBeNull();
+    expect(fileTargetsBlocked("list", true, 3)).toBeNull();
+  });
+
+  // Phase 4.4 Task 2. Three surfaces ask the same question and each has its
+  // own remedy, so each gets its own sentence -- pointing a reader at the
+  // list's account filter would be pointing at a control that is not on
+  // their screen.
+  it("names the remedy that belongs to each surface", () => {
+    // The list: pick one account in the filter above.
+    expect(fileTargetsBlocked("list", false, 0)).toContain("single account");
+    // The conversation header: there is no filter -- the thread simply reaches
+    // two of your mailboxes, and the way out is to file its messages instead.
+    const conversation = fileTargetsBlocked("conversation", false, 0);
+    expect(conversation).toContain("more than one of your mailboxes");
+    expect(conversation).toContain("file those");
+    expect(conversation).not.toContain("above");
+    // The message bar: untick until the selection is one mailbox's.
+    const messages = fileTargetsBlocked("messages", false, 0);
+    expect(messages).toContain("single mailbox");
+    expect(messages).not.toContain("above");
+    // Three distinct sentences, not one reused three times.
+    expect(new Set([fileTargetsBlocked("list", false, 0), conversation, messages]).size).toBe(3);
+  });
+
+  // The empty-folders half is the SAME sentence on every surface, and
+  // deliberately so: the cause and the remedy are identical wherever it is
+  // met -- this mailbox has nothing listed yet, and a sync pass is what fixes
+  // it.
+  it("words an account with no folders the same way on every surface", () => {
+    const wording = fileTargetsBlocked("list", true, 0);
+    expect(wording).toContain("sync pass");
+    expect(fileTargetsBlocked("conversation", true, 0)).toBe(wording);
+    expect(fileTargetsBlocked("messages", true, 0)).toBe(wording);
   });
 
   // A folder name is per mailbox: "Clients" on one account and "Clients" on
@@ -982,11 +1021,11 @@ describe("fileTargetsBlocked", () => {
   // while every account is in view would be offering one account's names as
   // everyone's.
   it("explains that filing needs one account in view", () => {
-    expect(fileTargetsBlocked(false, 12)).toContain("single account");
+    expect(fileTargetsBlocked("list", false, 12)).toContain("single account");
   });
 
   it("explains an account that has no folders listed yet", () => {
-    expect(fileTargetsBlocked(true, 0)).toContain("sync pass");
+    expect(fileTargetsBlocked("list", true, 0)).toContain("sync pass");
   });
 });
 
@@ -1032,6 +1071,95 @@ describe("bulkOwnershipBlocked", () => {
   it("blocks filing on an unowned selection", () => {
     expect(bulkOwnershipBlocked("file", 1))
       .toBe(`1 selected conversation is in a mailbox you don't own: ${NOT_OWNER_EXPLANATION}.`);
+  });
+});
+
+// --- Per-message selection, in the conversation (Phase 4.4 Task 2) ----------
+
+describe("messageActionBlocked", () => {
+  it("permits a selection up to the server's own cap", () => {
+    expect(messageActionBlocked(1)).toBeNull();
+    expect(messageActionBlocked(BULK_MESSAGE_ACTION_CAP)).toBeNull();
+  });
+
+  // ONE cap rather than a per-action Record, unlike the thread bar's: every
+  // kind this path offers waits on a mail server, so there is no CRM-side
+  // action to give a looser bound to.
+  it("refuses more messages than the route would accept, naming the number", () => {
+    expect(messageActionBlocked(BULK_MESSAGE_ACTION_CAP + 1))
+      .toContain(String(BULK_MESSAGE_ACTION_CAP));
+    expect(messageActionBlocked(BULK_MESSAGE_ACTION_CAP + 1)).toContain("messages");
+  });
+});
+
+describe("toggleMessageSelected and selectedMessageIds", () => {
+  it("ticks and unticks one message at a time", () => {
+    const empty = emptyMessageSelection();
+    const one = toggleMessageSelected(empty, "a");
+    expect([...one.ids]).toEqual(["a"]);
+    const two = toggleMessageSelected(one, "b");
+    expect([...two.ids].sort()).toEqual(["a", "b"]);
+    expect([...toggleMessageSelected(two, "a").ids]).toEqual(["b"]);
+  });
+
+  // A tick past the cap is REFUSED rather than swapping some other message
+  // out: the cap is a property of the request, and silently dropping one the
+  // user ticked earlier is worse than not adding this one. Reported through
+  // `capped` so the bar can explain a checkbox that did not tick.
+  it("refuses a tick past the cap and reports what was asked for", () => {
+    let state = emptyMessageSelection();
+    for (let i = 0; i < BULK_MESSAGE_ACTION_CAP; i += 1) {
+      state = toggleMessageSelected(state, `m${i}`);
+    }
+    expect(state.capped).toBeNull();
+    const overflowed = toggleMessageSelected(state, "one-too-many");
+    expect(overflowed.ids.size).toBe(BULK_MESSAGE_ACTION_CAP);
+    expect(overflowed.ids.has("one-too-many")).toBe(false);
+    expect(overflowed.capped).toBe(BULK_MESSAGE_ACTION_CAP + 1);
+    // Unticking always works, and clears the refusal: the selection is
+    // sendable again, so the bar must stop saying it is not.
+    expect(toggleMessageSelected(overflowed, "m0").capped).toBeNull();
+  });
+
+  // The filter is not tidiness. A refetch can drop a message out of the
+  // conversation -- filed elsewhere, or its account's visibility flipped --
+  // while its id sits in the selection, and sending an id for a row nobody can
+  // see any more would act on mail the user is not looking at.
+  it("returns the still-rendered ids only, in rendered order", () => {
+    const state = { ids: new Set(["c", "a", "gone"]), capped: null };
+    expect(selectedMessageIds(state, ["a", "b", "c"])).toEqual(["a", "c"]);
+  });
+});
+
+describe("singleOwnAccount", () => {
+  const own = new Set(["mine", "also-mine"]);
+
+  it("names the account when every owned message shares one", () => {
+    expect(singleOwnAccount(
+      [{ accountId: "mine" }, { accountId: "mine" }], own,
+    )).toBe("mine");
+  });
+
+  // A folder name is PER MAILBOX, so a picker built from two accounts would be
+  // offering one mailbox's names as both. "" is the no-single-account answer
+  // fileTargetsBlocked words for each surface.
+  it("answers nothing when the messages span two of the viewer's mailboxes", () => {
+    expect(singleOwnAccount(
+      [{ accountId: "mine" }, { accountId: "also-mine" }], own,
+    )).toBe("");
+  });
+
+  // Filing is a server MOVE and those are owner-only, so another user's shared
+  // mailbox is never a destination this viewer can file into -- and its
+  // messages must not COUNT either. Counting them would blank the picker for a
+  // conversation the viewer can file perfectly well.
+  it("ignores messages on accounts the viewer does not own", () => {
+    expect(singleOwnAccount(
+      [{ accountId: "mine" }, { accountId: "someone-elses" }], own,
+    )).toBe("mine");
+    // And a conversation with nothing of the viewer's own has no answer.
+    expect(singleOwnAccount([{ accountId: "someone-elses" }], own)).toBe("");
+    expect(singleOwnAccount([], own)).toBe("");
   });
 });
 
@@ -1257,6 +1385,28 @@ describe("summarizeBulkResult", () => {
     expect(summary.settingsLink).toBe(false);
   });
 
+  // Phase 4.4 Task 2. The counting and the copy serve both units, so the two
+  // notes whose sentences NAME the unit have to follow it -- and not_found's
+  // has to name the right SURFACE too, since the message path refreshes the
+  // open conversation while the thread path refreshes the list. Telling
+  // someone whose message vanished that "the list" was refreshed points them
+  // at a pane they were not looking at.
+  it("names messages, and the conversation, when the unit is a message", () => {
+    const summary = summarizeBulkResult(
+      "file", [fail("1", "unknown_target"), fail("2", "not_found")],
+      { targetFolder: "Clients", unit: "message" },
+    );
+    expect(summary.notes).toEqual([
+      "1 could not be found \u2014 the conversation has been refreshed.",
+      "1 could not be filed: \u201cClients\u201d is not a folder on every selected"
+      + " message's mail account.",
+    ]);
+    // And the default is still the thread surfaces, which are every caller
+    // but the conversation's message bar.
+    expect(summarizeBulkResult("trash", [fail("1", "not_found")]).notes)
+      .toEqual(["1 could not be found \u2014 the list has been refreshed."]);
+  });
+
   // Every branch keys off the `reason` CODE. Nothing here may ever match on
   // the free-text `error`, which is display-only (the house rule).
   it("explains each actionable reason once, with its count", () => {
@@ -1416,6 +1566,18 @@ describe("bulkPendingLabel", () => {
     expect(bulkPendingLabel("file", 2, "Clients"))
       .toBe("Filing 2 conversations into \u201cClients\u201d\u2026");
     expect(bulkPendingLabel("file", 1)).toBe("Filing 1 conversation\u2026");
+  });
+
+  // Phase 4.4 Task 2: the conversation's message bar waits on the same server
+  // for the same kinds, so only the NOUN differs. A parameter rather than a
+  // second table, because two tables saying the same thing about
+  // conversations and messages is two chances for them to drift.
+  it("counts messages when that is the unit, and defaults to conversations", () => {
+    expect(bulkPendingLabel("archive", 3, null, "message")).toBe("Archiving 3 messages\u2026");
+    expect(bulkPendingLabel("trash", 1, null, "message")).toBe("Moving 1 message to Trash\u2026");
+    expect(bulkPendingLabel("file", 2, "Clients", "message"))
+      .toBe("Filing 2 messages into \u201cClients\u201d\u2026");
+    expect(bulkPendingLabel("archive", 3, null)).toBe("Archiving 3 conversations\u2026");
   });
 });
 

@@ -198,7 +198,7 @@ function BulkBlockedNote({
   // where that case is settled.) Suppressed while the ownership note is up:
   // filing is owner-only too, so both would be showing and the ownership one
   // is the more specific answer.
-  const fileNote = ownerNote === null ? fileTargetsBlocked(accountScoped, folders.length) : null;
+  const fileNote = ownerNote === null ? fileTargetsBlocked("list", accountScoped, folders.length) : null;
   return (
     <>
       {capNote !== null && (
@@ -253,7 +253,7 @@ function FilePicker({
 }) {
   const blocked = bulkActionBlocked("file", count)
     ?? bulkOwnershipBlocked("file", unowned)
-    ?? fileTargetsBlocked(accountScoped, folders.length);
+    ?? fileTargetsBlocked("list", accountScoped, folders.length);
   return (
     <Select value="" onValueChange={(folder) => onRun("file", folder)} disabled={pending || blocked !== null}>
       <SelectTrigger

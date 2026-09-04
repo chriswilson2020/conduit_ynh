@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   backupPreflightSchema,
   bulkThreadResultSchema,
+  bulkMessageResultSchema,
   companySchema,
   contactSchema,
   csvInspectionSchema,
@@ -45,6 +46,7 @@ import {
   taskSchema,
   usersResponseSchema,
   type BulkThreadActionInput,
+  type BulkMessageActionInput,
   type Company,
   type Contact,
   type CreateCompanyInput,
@@ -1745,6 +1747,53 @@ export function useBulkThreadAction() {
       // be one of them, and its messages' folders have just changed.
       for (const threadId of input.threadIds) {
         void queryClient.invalidateQueries({ queryKey: ["mail-thread", threadId] });
+      }
+    },
+  });
+}
+
+/**
+ * The per-message actions (Phase 4.4 Task 2): Trash, Archive and File applied
+ * to individual messages of a conversation rather than to whole threads.
+ *
+ * ITS OWN HOOK AND ITS OWN ENDPOINT, matching the API's ruling: a message id is
+ * a different unit from a thread id, the response is keyed on `messageId`, and
+ * there is no `folder` because the ids ARE the scope. The two hooks share no
+ * body shape, which is the point -- one that took either would be the
+ * overloading the whole task exists to avoid.
+ *
+ * WHAT IT INVALIDATES IS DELIBERATELY THE SAME SET, minus the one key it cannot
+ * name. Filing a message changes which folder views its THREAD appears in (a
+ * thread is "in" a folder when any of its messages is), so the thread list and
+ * the unread counts move exactly as they do for a thread action -- filing one
+ * message out of an INBOX-only conversation removes that conversation from the
+ * INBOX view. The key it cannot name is the thread's own detail entry: the
+ * response carries message ids, not the threads they belong to. ["mail-thread"]
+ * as a PREFIX covers every open conversation instead, which is at most the one
+ * on screen and its capped/uncapped pair -- the coarser invalidation is the
+ * honest one here, since guessing the thread id client-side would mean trusting
+ * a cache to still hold rows the server has just moved.
+ */
+export function useBulkMessageAction() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: BulkMessageActionInput) =>
+      parseWith(
+        bulkMessageResultSchema,
+        await postJson<unknown>("/mail/messages/bulk", input),
+        "bulk message action result",
+      ),
+    onSettled: (_result, _error, input) => {
+      void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
+      void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
+      void queryClient.invalidateQueries({ queryKey: ["search"] });
+      void queryClient.invalidateQueries({ queryKey: ["mail-thread"] });
+      // Filing can have switched a folder's sync ON (api: mail-move.ts), which
+      // changes what the sidebar shows and what the picker offers. The server
+      // publishes its own folders hint from that write; this is the belt to
+      // that braces, for a client whose SSE stream is down.
+      if (input.action === "file") {
+        void queryClient.invalidateQueries({ queryKey: ["mail-folders"] });
       }
     },
   });

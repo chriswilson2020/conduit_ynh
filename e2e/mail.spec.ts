@@ -125,6 +125,20 @@ const ARCHIVE_FOLDER = "Archive";
  */
 const SPAM_FOLDER = "Spam";
 
+/**
+ * Phase 4.4 Task 2's destination, and the second fixture folder this spec
+ * makes for itself.
+ *
+ * A PLAIN, ORDINARY FOLDER, deliberately unlike SPAM_FOLDER above: nothing
+ * classifies "Clients", so the CRM syncs it from first sight and filing into
+ * it switches nothing on. That is what these two tests want -- they are about
+ * the two NEW ENTRANCES to filing (from inside a conversation, and per
+ * message), and the sync rule they both inherit is already proved by the test
+ * above through the same server call. A shared destination would also have let
+ * that test's assertions and these interfere.
+ */
+const CLIENTS_FOLDER = "Clients";
+
 test.describe.serial("Mail journey", () => {
   // Playwright's default test timeout is 30s, which is LESS than the sync
   // budget below -- so without this the deadline in pollWithReload could
@@ -207,6 +221,18 @@ test.describe.serial("Mail journey", () => {
   /** Phase 4.4: the one filed into an arbitrary folder, which is also what
    * turns that folder's sync on. */
   let fileSubject = "";
+  /**
+   * Phase 4.4 Task 2's two conversations, each a real two-message References
+   * chain because both tests turn on what happens to a thread's OTHER
+   * messages: one is filed WHOLE from inside itself, and one has a single
+   * message filed out of it while the rest stays put.
+   *
+   * Two threads rather than one reused, because these tests share a mailbox
+   * and run in order: filing the first one whole empties its INBOX copies,
+   * which is exactly the state the second test needs NOT to be in.
+   */
+  let convFileSubject = "";
+  let splitSubject = "";
 
   /**
    * The Phase 4.3 fixtures, per-attempt for the same unrecoverability
@@ -494,7 +520,58 @@ test.describe.serial("Mail journey", () => {
       message(archiveSubjects[0], INBOX_FOLDER, new Date(now - 3_000)),
       message(archiveSubjects[1], INBOX_FOLDER, new Date(now - 2_000)),
       message(trashSubject, INBOX_FOLDER, new Date(now - 1_000)),
+      ...task2Fixtures(now),
     ];
+  }
+
+  /**
+   * Phase 4.4 Task 2: two INBOX conversations of TWO messages each, threaded
+   * on a real References chain (what mail-ingest actually consults -- a shared
+   * subject is not a thread).
+   *
+   * Two messages is the minimum that can prove either half. Filing a whole
+   * conversation from inside it has to move BOTH; filing one message out of it
+   * has to move exactly one and leave the other where it was, which a
+   * one-message thread cannot distinguish from moving the thread.
+   *
+   * MINUTES OLD, not seconds, and outside the three-second window the archive
+   * pair reserves for its shift-range (see folderFixtures): these four must not
+   * be able to sort between those two.
+   */
+  function task2Fixtures(now: number): { raw: Buffer; date: Date; folder: string }[] {
+    const pair = (subject: string, at: number) => {
+      const rootId = `<${subject.replace(/[^a-z0-9]+/gi, "-")}-1@example.com>`;
+      const headers = (extra: string[], id: string, date: Date) => rfc822([
+        `From: Dana Renewals <dana-${runId}@example.com>`,
+        `To: Conduit <${USERNAME}>`,
+        ...extra,
+        `Message-ID: ${id}`,
+        `Date: ${date.toUTCString()}`,
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=utf-8",
+      ], `About ${subject}.`);
+      const firstAt = new Date(now - at);
+      const secondAt = new Date(now - at + 30_000);
+      return [
+        {
+          folder: INBOX_FOLDER, date: firstAt,
+          raw: headers([`Subject: ${subject}`], rootId, firstAt),
+        },
+        {
+          folder: INBOX_FOLDER, date: secondAt,
+          // "Re:" is stripped by normalizeSubject, so the THREAD is titled
+          // `subject` -- which is what threadRow matches on. The reply keeps
+          // the prefix on the SERVER, which is how subjectsIn below tells the
+          // two messages apart after one of them has moved.
+          raw: headers(
+            [`Subject: Re: ${subject}`, `In-Reply-To: ${rootId}`, `References: ${rootId}`],
+            `<${subject.replace(/[^a-z0-9]+/gi, "-")}-2@example.com>`,
+            secondAt,
+          ),
+        },
+      ];
+    };
+    return [...pair(convFileSubject, 9 * MINUTE_MS), ...pair(splitSubject, 7 * MINUTE_MS)];
   }
 
   /**
@@ -515,6 +592,9 @@ test.describe.serial("Mail journey", () => {
       // an error: the folder is per-run, while the mail_account_folders rows
       // that decide its sync state belong to the account this attempt creates.
       await client.mailboxCreate(SPAM_FOLDER).catch(() => undefined);
+      // Task 2's destination, for the same reason and with the same
+      // already-there-is-not-an-error tolerance.
+      await client.mailboxCreate(CLIENTS_FOLDER).catch(() => undefined);
       for (const fixture of fixtures()) {
         await client.append(fixture.folder, fixture.raw, [], fixture.date);
       }
@@ -698,6 +778,10 @@ test.describe.serial("Mail journey", () => {
     archiveSubjects = [`Invoice ${attemptId}`, `Shipping ${attemptId}`];
     trashSubject = `Offer ${attemptId}`;
     fileSubject = `Contract ${attemptId}`;
+    // No subject here is a substring of another (threadRow matches by hasText),
+    // and neither is a substring of the four above.
+    convFileSubject = `Renewal ${attemptId}`;
+    splitSubject = `Proposal ${attemptId}`;
 
     // The Phase 4.3 set (see the declarations above). No subject here is a
     // substring of another, because threadRow matches by hasText.
@@ -1538,6 +1622,124 @@ test.describe.serial("Mail journey", () => {
     await page.getByTestId(`folders-toggle-${accountId}`).click();
     await expect(page.getByTestId(`folder-picker-${SPAM_FOLDER}`))
       .toBeChecked({ timeout: REFETCH_TIMEOUT_MS });
+  });
+
+  /**
+   * Phase 4.4 Task 2, first half: FILING FROM INSIDE THE CONVERSATION.
+   *
+   * Task 1 built filing on the list only, so reading a thread and wanting to
+   * file it meant going back, finding it again and selecting it -- three steps
+   * to undo one navigation. This is a second ENTRANCE to that action, not a
+   * second implementation, and what the test proves is the wiring: the same
+   * endpoint, in the same whole-thread mode the Archive and Trash buttons
+   * beside it already use.
+   *
+   * WHOLE-THREAD IS THE ASSERTION THAT MATTERS. Both of this conversation's
+   * messages move, from one gesture, without either ever being selected --
+   * which is exactly what the list's folder-scoped selection could not do.
+   */
+  test("files a whole conversation from inside it, both messages at once", async () => {
+    await page.goto("/mail");
+    const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
+    await inboxRow.click();
+    await expect(inboxRow).toHaveAttribute("aria-current", "true");
+    await expect(threadRow(convFileSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    await threadRow(convFileSubject).click();
+    const conversation = page.getByTestId("conversation");
+    await expect(conversation).toBeVisible();
+    // The fixture really did thread: two messages, one conversation. Every
+    // claim below about "both" rests on this.
+    await expect(conversation.locator('[data-testid^="message-"]')).toHaveCount(2);
+
+    // PICKING THE FOLDER IS THE GESTURE, here as on the list's bar: no second
+    // button to press, because the choice is the instruction.
+    await page.getByTestId("conversation-file").click();
+    await page.getByRole("option", { name: CLIENTS_FOLDER, exact: true }).click();
+
+    await expect(page.getByTestId("conversation-move-result"))
+      .toContainText(`1 filed into \u201c${CLIENTS_FOLDER}\u201d`, { timeout: BULK_TIMEOUT_MS });
+
+    // ONE conversation filed, but BOTH its messages moved -- asked of Dovecot
+    // rather than of the app that says it moved them. The reply keeps its
+    // "Re:" on the server, which is what makes the pair nameable apart.
+    await expect.poll(() => subjectsIn(CLIENTS_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toEqual(expect.arrayContaining([convFileSubject, `Re: ${convFileSubject}`]));
+    // Plain, not polled: the poll above has already waited for the move to
+    // land, and a polled NEGATIVE would pass on its first attempt for a move
+    // that had not happened yet.
+    const inboxAfter = await subjectsIn(INBOX_FOLDER);
+    expect(inboxAfter).not.toContain(convFileSubject);
+    expect(inboxAfter).not.toContain(`Re: ${convFileSubject}`);
+  });
+
+  /**
+   * Phase 4.4 Task 2, second half: ONE MESSAGE FILED OUT OF A THREAD.
+   *
+   * Selection has been per THREAD since 4.3, and this is the gesture that is
+   * not expressible that way at all: file the first message of a conversation
+   * and leave the rest where it is. It goes to its own endpoint
+   * (/api/mail/messages/bulk) with its own results, keyed per message.
+   *
+   * WHAT THE APP SHOWS AFTERWARDS IS THE POINT OF THE LAST HALF OF THIS TEST,
+   * and it is a decision rather than a consequence: the thread is INTACT. Its
+   * row is untouched, the conversation still renders both messages (the
+   * conversation is not folder-scoped), and the thread is now listed in BOTH
+   * folder views at once -- because a thread is "in" a folder when any of its
+   * messages is, which is 4.1's existing rule and not a new one. The
+   * alternative would have been splitting the conversation, which destroys the
+   * reply chain threading exists for.
+   */
+  test("files ONE message out of a conversation, leaving the thread intact", async () => {
+    await page.goto("/mail");
+    const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
+    await inboxRow.click();
+    await expect(inboxRow).toHaveAttribute("aria-current", "true");
+    await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    await threadRow(splitSubject).click();
+    const conversation = page.getByTestId("conversation");
+    await expect(conversation.locator('[data-testid^="message-"]')).toHaveCount(2);
+
+    // The conversation renders oldest-first, so the first checkbox is the
+    // thread's root -- the one whose subject carries no "Re:", which is how
+    // the server-side assertions below tell which message moved.
+    await conversation.locator('[data-testid^="select-message-"]').first().check();
+    await expect(page.getByTestId("selection-count")).toHaveText("1 selected");
+
+    await page.getByTestId("selection-file").click();
+    await page.getByRole("option", { name: CLIENTS_FOLDER, exact: true }).click();
+
+    // "1 filed" counts a MESSAGE here, not a conversation -- the response is
+    // keyed per message, which is the whole reason this path is its own.
+    await expect(page.getByTestId("conversation-move-result"))
+      .toContainText(`1 filed into \u201c${CLIENTS_FOLDER}\u201d`, { timeout: BULK_TIMEOUT_MS });
+    // The bar goes with the selection it described: nothing may invite a blind
+    // retry of a move that has already landed.
+    await expect(page.getByTestId("selection-bar")).toHaveCount(0);
+
+    // EXACTLY ONE of the two moved, asked of the server. The root is in
+    // Clients; its reply is still in INBOX.
+    await expect.poll(() => subjectsIn(CLIENTS_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(splitSubject);
+    await expect.poll(() => subjectsIn(INBOX_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(`Re: ${splitSubject}`);
+    expect(await subjectsIn(INBOX_FOLDER)).not.toContain(splitSubject);
+
+    // THE THREAD IS INTACT. The conversation still holds both messages --
+    // filing one out of it moves mail between mailboxes, it does not split a
+    // conversation -- and the CRM has not expunged anything.
+    await expect(conversation.locator('[data-testid^="message-"]'))
+      .toHaveCount(2, { timeout: REFETCH_TIMEOUT_MS });
+
+    // AND IT IS NOW LISTED IN BOTH FOLDER VIEWS, which is the decision this
+    // test exists to pin. It stays in INBOX because its reply is still there,
+    // and it appears in Clients because its root now is. Neither is a special
+    // case: both fall out of the folder rule 4.1 already had.
+    await page.getByTestId(`folder-${INBOX_FOLDER}`).click();
+    await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await page.getByTestId(`folder-${CLIENTS_FOLDER}`).click();
+    await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
   });
 
   // -- Phase 4.2: private by default, the deal link as the sharing act, the

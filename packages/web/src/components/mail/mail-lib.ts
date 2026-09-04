@@ -4,7 +4,7 @@ import type {
 } from "@conduit/shared";
 import {
   BULK_ACTION_THREAD_CAPS, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
-  MOVE_ACTION_THREAD_CAP,
+  MOVE_ACTION_THREAD_CAP, BULK_MESSAGE_ACTION_CAP,
 } from "@conduit/shared";
 import { ApiError, ResponseShapeError } from "../../api";
 import { relativeTime } from "../../lib";
@@ -1019,11 +1019,30 @@ export function bulkActionBlocked(action: BulkThreadActionKind, count: number): 
  * destination per account and refuses only the accounts that lack it
  * (unknown_target) -- so this is a UI decision about what a list of folder
  * names can truthfully mean, not a server limitation.
+ *
+ * WHERE THE ONE ACCOUNT COMES FROM is the scope, and each has its own first
+ * sentence because each has its own remedy. In the LIST it is the account
+ * filter, so the answer is to pick one. In the CONVERSATION header there is no
+ * filter to pick from -- the account is whichever of the viewer's own mailboxes
+ * the thread's messages sit on, and a conversation that reaches two of them
+ * cannot be filed as a unit, so the remedy is to file the messages instead. In
+ * the message BAR the remedy is narrower still: untick until the selection is
+ * one mailbox's. A Record over the scope rather than an if-chain, for the same
+ * compile-nudge reason as every other table in this file.
  */
-export function fileTargetsBlocked(accountScoped: boolean, folderCount: number): string | null {
-  if (!accountScoped) {
-    return "Pick a single account above to file into one of its folders.";
-  }
+export type FileTargetScope = "list" | "conversation" | "messages";
+
+const NO_SINGLE_ACCOUNT: Record<FileTargetScope, string> = {
+  list: "Pick a single account above to file into one of its folders.",
+  conversation: "This conversation reaches more than one of your mailboxes, whose folders are"
+    + " different \u2014 select the messages you want and file those.",
+  messages: "Select messages from a single mailbox to file them into one of its folders.",
+};
+
+export function fileTargetsBlocked(
+  scope: FileTargetScope, accountScoped: boolean, folderCount: number,
+): string | null {
+  if (!accountScoped) return NO_SINGLE_ACCOUNT[scope];
   if (folderCount === 0) {
     return "This account has no folders to file into yet \u2014 they appear once a sync pass has"
       + " listed them.";
@@ -1085,6 +1104,127 @@ export function bulkOwnershipBlocked(
   return `${what} in a mailbox you don't own: ${NOT_OWNER_EXPLANATION}.`;
 }
 
+// ---------------------------------------------------------------------------
+// Per-message selection, in the conversation (Phase 4.4 Task 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the conversation holds while messages are ticked.
+ *
+ * NO ANCHOR AND NO RANGE, unlike ThreadSelection, and that is a decision about
+ * this surface rather than an unfinished copy of that one. A shift-range exists
+ * in the list because a folder view ACCUMULATES pages and can hold hundreds of
+ * rows the user would otherwise tick one at a time. A conversation renders one
+ * thread, capped at the newest 50 unless Show-earlier is pressed, all of it on
+ * one screen -- there is no long haul for a range to shorten.
+ *
+ * THERE IS NO SELECT-ALL HERE EITHER, for a stronger reason: filing the whole
+ * conversation is a DIFFERENT and better action that already exists one row
+ * above (the header picker, Task 2's first half). It sends whole-thread mode,
+ * which takes every message including any below the detail cap and carves out
+ * Sent; a select-all would send capped, message-scoped ids instead. Offering
+ * both would be offering a worse way to do the same thing, next to the better
+ * one.
+ */
+export interface MessageSelection {
+  ids: ReadonlySet<string>;
+  /** What the last gesture asked for when the cap refused it (cap + 1), else
+   * null -- the same reporting ThreadSelection.capped does. */
+  capped: number | null;
+}
+
+export function emptyMessageSelection(): MessageSelection {
+  return { ids: new Set(), capped: null };
+}
+
+/**
+ * Tick or untick one message. A tick past the cap is REFUSED rather than
+ * swapping some other message out, exactly as toggleThreadSelected refuses:
+ * the cap is a property of the request, and silently dropping a message the
+ * user ticked earlier is worse than not adding this one. Unticking always
+ * works, and clears the refusal because the selection is now sendable.
+ */
+export function toggleMessageSelected(
+  state: MessageSelection, messageId: string,
+): MessageSelection {
+  const ids = new Set(state.ids);
+  if (ids.has(messageId)) {
+    ids.delete(messageId);
+    return { ids, capped: null };
+  }
+  if (ids.size >= BULK_MESSAGE_ACTION_CAP) return { ids, capped: ids.size + 1 };
+  ids.add(messageId);
+  return { ids, capped: null };
+}
+
+/**
+ * The selected ids in rendered order, and ONLY the ones still rendered.
+ *
+ * The filter is selectedThreadIds' rule for selectedThreadIds' reason: a
+ * refetch can drop a message out of the conversation -- it was filed
+ * elsewhere, or its account's visibility flipped -- while its id sits in the
+ * selection, and sending an id for a row nobody can see any more would act on
+ * mail the user is not looking at.
+ */
+export function selectedMessageIds(
+  state: MessageSelection, order: readonly string[],
+): string[] {
+  return order.filter((id) => state.ids.has(id));
+}
+
+/**
+ * Why a per-message action cannot be sent as selected, or null when it can.
+ *
+ * The server's own number (BULK_MESSAGE_ACTION_CAP), imported rather than
+ * copied, for the reason SELECT_ALL_CAP imports its own: a local 50 that
+ * outlived a server-side change would build requests the route answers with a
+ * 400. ONE cap rather than a Record, because unlike the thread endpoint every
+ * kind this path offers waits on a mail server and takes the same bound.
+ */
+export function messageActionBlocked(count: number): string | null {
+  if (count <= BULK_MESSAGE_ACTION_CAP) return null;
+  return `Select ${BULK_MESSAGE_ACTION_CAP} messages or fewer for this action (${count} selected).`;
+}
+
+/**
+ * The ONE mailbox of the viewer's own that these messages sit on, or "" when it
+ * is not exactly one.
+ *
+ * Both halves of Task 2 need this and both need it for the same reason a
+ * folder picker always does: a folder name is PER MAILBOX, so "Clients" on one
+ * account and "Clients" on another are different folders that may not both
+ * exist, and a list of names built from two accounts would be one mailbox's
+ * names pretending to be both. The header picker asks it of the whole
+ * conversation's messages; the message bar asks it of the ticked ones, which is
+ * why unticking is a real remedy there and not in the header.
+ *
+ * OWN ACCOUNTS ONLY, because filing is a server MOVE and those are owner-only
+ * (Phase 4.2): another user's shared mailbox is never a destination this viewer
+ * can file into, so its messages must not count towards the answer either --
+ * counting them would blank the picker for a conversation the viewer can file
+ * perfectly well.
+ *
+ * KNOWN LIMIT, and it is the pre-existing one rather than a new one: the
+ * conversation renders at most the newest 50 messages, so a thread whose only
+ * message on a SECOND own account is older than that page will look
+ * single-account here. The header picker then files whole-thread anyway, the
+ * second account has no folder by that name, and the API answers
+ * unknown_target for it -- an honest partial failure the result summary
+ * reports. The list's picker has exactly this shape of gap (its account filter
+ * does not bound which accounts a selected thread's messages are on), and
+ * inventing a second, stricter answer here would make the two surfaces
+ * disagree about the same question.
+ */
+export function singleOwnAccount(
+  messages: readonly { accountId: string }[], ownAccountIds: ReadonlySet<string>,
+): string {
+  const owned = new Set<string>();
+  for (const message of messages) {
+    if (ownAccountIds.has(message.accountId)) owned.add(message.accountId);
+  }
+  return owned.size === 1 ? [...owned][0] ?? "" : "";
+}
+
 /**
  * What the bar says it is holding: "3 selected", or -- when the last gesture
  * asked for more rows than one request may carry -- "50 of 80 selected
@@ -1112,6 +1252,21 @@ const PENDING_VERBS: Record<BulkThreadActionKind, string> = {
   trash: "Moving", archive: "Archiving", file: "Filing", hide: "Hiding", unhide: "Unhiding",
 };
 
+/**
+ * What a selection is made OF, for the copy that has to name it.
+ *
+ * Phase 4.4 Task 2 introduced the second value, and the reason it is a
+ * parameter rather than a second set of copy is that only the NOUN differs:
+ * every sentence about a refusal, a cap, a pending wait or a sync switch is
+ * true of both units, and two tables saying the same thing about
+ * conversations and messages is two chances for them to drift apart.
+ */
+export type BulkUnit = "conversation" | "message";
+
+function unitNoun(unit: BulkUnit, count: number): string {
+  return count === 1 ? unit : `${unit}s`;
+}
+
 /** How each action reads while it is still running. Present tense and the
  * count, so a bar that is waiting on a mail server says what it is waiting
  * for rather than only greying out. `targetFolder` names the destination for
@@ -1119,8 +1274,9 @@ const PENDING_VERBS: Record<BulkThreadActionKind, string> = {
  * "Filing 3 conversations..." leaves out the only part the user chose. */
 export function bulkPendingLabel(
   action: BulkThreadActionKind, count: number, targetFolder?: string | null,
+  unit: BulkUnit = "conversation",
 ): string {
-  const noun = count === 1 ? "conversation" : "conversations";
+  const noun = unitNoun(unit, count);
   const tail = action === "trash" ? " to Trash"
     : action === "file" && targetFolder != null ? ` into ${quoted(targetFolder)}` : "";
   return `${PENDING_VERBS[action]} ${count} ${noun}${tail}\u2026`;
@@ -1273,7 +1429,14 @@ export function buildFolderRows(
 // Bulk action results
 // ---------------------------------------------------------------------------
 
-type BulkResultItem = BulkThreadResult["results"][number];
+/**
+ * One result row, MINUS its id: `threadId` and `messageId` are the only
+ * difference between the two response shapes, and everything this summary
+ * reads -- ok, skipped, error, reason -- is common to both. Written as an Omit
+ * so a message result satisfies it structurally and the whole counting-and-copy
+ * layer serves both paths without a second copy (Phase 4.4 Task 2).
+ */
+type BulkResultItem = Omit<BulkThreadResult["results"][number], "threadId">;
 
 export interface BulkActionSummary {
   /** Threads the action actually applied to. */
@@ -1354,6 +1517,9 @@ interface BulkNoteContext {
   refusals: readonly string[];
   /** `file`'s destination, for the notes that have to name it. */
   targetFolder: string | null;
+  /** Which unit these results are about, for the two notes below whose
+   * sentences name it (Phase 4.4 Task 2). */
+  unit: BulkUnit;
 }
 
 /**
@@ -1407,7 +1573,13 @@ const REASON_NOTES: Record<BulkThreadResultReason, ((count: number, context: Bul
     + " \u2014 it may be reconnecting or paused.",
   no_target: (count, { action }) => `${count} could not be moved: no ${actionTarget(action)} folder is set`
     + " for that account yet.",
-  not_found: (count) => `${count} could not be found \u2014 the list has been refreshed.`,
+  // Names WHAT was refreshed, because the two surfaces refresh different
+  // things: the thread list for a conversation, the open conversation for a
+  // message (queries.ts invalidates each path's own keys). Telling someone
+  // whose message vanished that "the list" was refreshed points them at a
+  // pane they were not looking at.
+  not_found: (count, { unit }) => `${count} could not be found \u2014 the`
+    + `${unit === "message" ? " conversation" : " list"} has been refreshed.`,
   server_refused: (count, { refusals }) => {
     const shown = refusals.slice(0, MAX_REFUSALS_SHOWN).map(truncate).join("; ");
     return `${count} ${count === 1 ? "was" : "were"} refused by the mail server: ${shown}.`;
@@ -1424,9 +1596,9 @@ const REASON_NOTES: Record<BulkThreadResultReason, ((count: number, context: Bul
   // is in Conduit's Settings. It names the folder rather than the account
   // because a mixed selection can produce several, and the folder is the one
   // thing all of them have in common.
-  unknown_target: (count, { targetFolder }) => `${count} could not be filed: `
+  unknown_target: (count, { targetFolder, unit }) => `${count} could not be filed: `
     + `${targetFolder === null ? "that folder" : quoted(targetFolder)}`
-    + " is not a folder on every selected conversation's mail account.",
+    + ` is not a folder on every selected ${unit}'s mail account.`,
 };
 
 /** What the summary needs from the REQUEST and the response envelope, as
@@ -1437,6 +1609,9 @@ export interface BulkSummaryOptions {
   targetFolder?: string | null;
   /** The response's own `syncEnabled` (shared: bulkThreadResultSchema). */
   syncEnabled?: string | null;
+  /** What these results are about. Defaults to the thread surfaces, which are
+   * every caller but the conversation's message bar. */
+  unit?: BulkUnit;
 }
 
 /**
@@ -1469,7 +1644,9 @@ export function summarizeBulkResult(
   if (skipped > 0) parts.push(`${skipped} skipped`);
   if (failed > 0) parts.push(`${failed} failed`);
 
-  const context: BulkNoteContext = { action, refusals, targetFolder };
+  const context: BulkNoteContext = {
+    action, refusals, targetFolder, unit: options.unit ?? "conversation",
+  };
   const notes: string[] = [];
   // THE SYNC NOTE COMES FIRST, before every per-reason note. It is the one
   // sentence here that describes a change to the app's ongoing behaviour
