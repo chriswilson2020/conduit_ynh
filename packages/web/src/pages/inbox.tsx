@@ -240,6 +240,72 @@ export function InboxPage() {
   const busy = pendingAction !== null;
 
   /**
+   * WHEN THE LIST TAKES A NEW SNAPSHOT (Phase 4.4 Task 3).
+   *
+   * The list holds still under mail arriving from elsewhere -- rows are
+   * refreshed where they stand and arrivals wait behind a count, which is
+   * thread-list.tsx's whole header comment. THE READER'S OWN WRITES ARE THE
+   * EXCEPTION, and they have to be: trash ten conversations and those rows are
+   * genuinely gone, and a list that held them would be showing mail that is no
+   * longer there. A nonce rather than a flag, so every write site can say "the
+   * list is now wrong" without agreeing on what the value means.
+   *
+   * EVERY WRITE ON THIS PAGE BUMPS IT, INCLUDING THE ONES INSIDE THE
+   * CONVERSATION, because "the reader's own gesture" is a fact about the
+   * reader and not about which pane they made it in. Archiving from the
+   * conversation header removes the thread from the folder view beside it, and
+   * a list that only noticed its own bulk bar would leave that row on screen.
+   *
+   * WHAT DELIBERATELY DOES NOT BUMP IT: marking a conversation read, which
+   * every click on a row does. It changes what a row SAYS, not whether it
+   * belongs, and the refresh in place already carries that -- the dot goes out
+   * where the row stands. Re-snapshotting there would re-order the list on
+   * every single click, which is the exact behaviour this task removed. The
+   * one case that costs is the Unread filter, where a read conversation no
+   * longer matches: its row stays, un-bolded, until something else refreshes.
+   * That is the better outcome anyway -- a reader working down an unread list
+   * has rows vanishing from under them on every click otherwise.
+   *
+   * ON FAILURE AS WELL AS SUCCESS. useBulkThreadAction's own comment says why:
+   * after this call the client's view of the mail is unknown either way (a
+   * proxy 504 means the answer was lost while the moves carry on), and the fix
+   * is to refetch.
+   */
+  const [refreshToken, setRefreshToken] = useState(0);
+  const refreshList = useCallback(() => setRefreshToken((n) => n + 1), []);
+
+  /**
+   * A WRITE FROM THE CONVERSATION DOES NOT RE-SNAPSHOT WHILE THE BULK BAR'S
+   * OWN REQUEST IS IN FLIGHT, and this is the hazard Task 2 found wearing
+   * different clothes.
+   *
+   * Task 2's was two move paths gated only on their own mutation, overlapping
+   * on the same rows; the answer there was one `busy` for both. This is the
+   * same shape at one remove: the two panes' moves are still gated separately
+   * (see the findings), so a reader CAN archive from the conversation while a
+   * bulk request is queued behind an account's serial sync loop -- and a
+   * re-snapshot at that moment would change which rows are listed underneath a
+   * request that named the old ones, shrinking the bar's count (or unmounting
+   * the bar) mid-flight and leaving the outcome to be read against a view that
+   * had already moved.
+   *
+   * Deferring costs nothing, because the bulk's OWN settle re-snapshots
+   * unconditionally a moment later and that snapshot carries both writes. The
+   * rule in one line: a write in flight owns the next snapshot.
+   *
+   * The liveness itself needs no such guard, and that is by construction
+   * rather than by luck: mail arriving from elsewhere can only refresh rows
+   * the list is already showing, never add, remove or re-order one
+   * (lib.ts's takeCursorPage), so `rows`, `selectedThreads` and
+   * `unownedSelected` below cannot move under a request that named them.
+   */
+  const busyRef = useLatest(busy);
+  const refreshFromConversation = useCallback(() => {
+    if (busyRef.current) return;
+    refreshList();
+  }, [busyRef, refreshList]);
+
+  /**
    * WHOSE folders the bulk bar's "File into…" picker offers.
    *
    * A folder name is per mailbox -- "Clients" on one account and "Clients" on
@@ -339,16 +405,18 @@ export function InboxPage() {
             }),
           });
           clearSelection();
+          refreshList();
         },
         // A throw is not necessarily a failed action: a proxy 504 means the
         // ANSWER was lost while the queued moves carry on (routes/mail.ts).
         onError: (error) => {
           handleOutcome({ kind: "failure", message: bulkErrorMessage(error) });
           clearSelection();
+          refreshList();
         },
       },
     );
-  }, [bulk, clearSelection, folder, handleOutcome, selectedThreads]);
+  }, [bulk, clearSelection, folder, handleOutcome, refreshList, selectedThreads]);
 
   // Stable, so the memoised rows in thread-list can bail out: a new closure
   // here every render would defeat their shallow comparison one prop before it
@@ -753,6 +821,10 @@ export function InboxPage() {
             // claiming one of the two.
             someSelected={selectedThreads.length > 0}
             onRowsChange={handleRows}
+            // See refreshToken's declaration above for what does and does not
+            // move this, and why the reader's own writes are the exception to
+            // a list that otherwise holds still.
+            refreshToken={refreshToken}
             // An inbox with no mail account is not an empty inbox, it is an
             // unconfigured one (spec: "Empty state points at Settings ->
             // Mail"), and that reading beats the hidden/unfiltered wording:
@@ -794,7 +866,16 @@ export function InboxPage() {
             // Keyed on the thread: the conversation's local state (expanded
             // messages, remote images, an open composer) belongs to one
             // thread, and a remount is the cleanest way to leave it behind.
-            <Conversation key={selectedId} threadId={selectedId} />
+            //
+            // The pane reports its own writes so the list beside it can take a
+            // new snapshot -- archiving, filing or hiding from in here changes
+            // which folder views the thread belongs to, and the list is
+            // holding still against everything it did not cause.
+            <Conversation
+              key={selectedId}
+              threadId={selectedId}
+              onThreadsChanged={refreshFromConversation}
+            />
           )}
         </div>
       </div>

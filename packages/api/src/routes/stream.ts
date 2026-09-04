@@ -12,8 +12,13 @@ const HEARTBEAT_MS = 25_000;
  * GET /api/stream -- one long-lived SSE connection per browser tab. Every hint
  * published via services/sse.ts's publish() (always AFTER the publishing
  * service's own transaction commits) is fanned out here as a `data:` frame; the
- * web client (a later task) parses each frame with sseHintSchema and invalidates
- * the named TanStack Query keys.
+ * web client (components/sse.tsx, mounted once at the Shell) parses each frame
+ * with sseHintSchema and invalidates the named TanStack Query keys.
+ *
+ * That parenthesis used to read "a later task", which it stopped being in the
+ * same phase and stayed for four more -- long enough that Phase 4.4 Task 3 was
+ * briefed as making the inbox live when the inbox had been live all along.
+ * A stale "not yet" is a worse comment than none: it is read as a fact.
  *
  * nginx's proxy_buffering is off for this app (conf/nginx.conf) -- that is what
  * lets both the heartbeat and hint frames reach the browser promptly in

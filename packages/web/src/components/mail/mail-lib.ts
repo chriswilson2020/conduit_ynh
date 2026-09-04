@@ -1290,6 +1290,94 @@ function quoted(folder: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Mail that has arrived behind the reader (Phase 4.4 Task 3)
+// ---------------------------------------------------------------------------
+
+/** All either side of the comparison needs: which conversation, and when its
+ * newest message landed. Structural rather than MailThreadListItem so a case
+ * can be stated in two fields (the same reason ReplySource is structural). */
+export interface ArrivalRow {
+  id: string;
+  lastMessageAt: string;
+}
+
+export interface PendingArrivals {
+  /** How many conversations the fetched page has that the list is not
+   * showing. Zero means there is nothing to offer the reader. */
+  count: number;
+  /**
+   * True when `count` is a FLOOR rather than a total -- every row of the
+   * fetched page is unseen AND the server said there is a page after it, so
+   * the arrivals may run past the only page that was looked at. Exact, not
+   * cautious: when the page is the whole list there can be nothing behind it,
+   * and the count is then the answer.
+   */
+  atLeast: boolean;
+}
+
+/**
+ * How much new mail is waiting behind a list that is deliberately holding
+ * still (see lib.ts's takeCursorPage and refreshCursorRows).
+ *
+ * `shown` is what the reader is looking at, in whatever order they are looking
+ * at it. `head` is the freshest page one, which the query layer keeps warm and
+ * which the list is NOT displaying; `headHasMore` is that fetch's own
+ * nextCursor, which is what tells an exact count from a floor.
+ *
+ * TWO EXCLUSIONS, AND THE SECOND ONE IS THE SUBTLE HALF.
+ *
+ * A conversation the list ALREADY SHOWS is never counted, however new its
+ * message is. Its row is refreshed where it stands -- new snippet, new time,
+ * unread dot back on -- so the mail is already on screen and an offer to
+ * "show" it would point at a row the reader can see. What is being withheld
+ * from them is the JUMP TO THE TOP, and nobody ever asked for that.
+ *
+ * A conversation OLDER THAN EVERY ROW ON SCREEN is never counted either, and
+ * this is what stops the count lying after a removal. Delete or file a row out
+ * of the list and the server closes the gap by pulling up the conversation
+ * that sat just past the bottom of the page -- an old thread, arriving in
+ * page one for the first time, which a plain "in the fetch and not on screen"
+ * test would announce as new mail. Mail that is genuinely new is newer than
+ * everything already listed; a row sliding up from below the floor is, by
+ * construction, older than the row that used to be the last one.
+ *
+ * The floor is the MINIMUM rather than the last row's, because the list's
+ * order is the order it was fetched in and a row refreshed in place can carry
+ * a timestamp newer than the rows above it.
+ *
+ * ISO strings compare as strings: every one of these comes from a Postgres
+ * timestamptz through toISOString(), so they are fixed-width, UTC and
+ * millisecond-precise, and lexical order is chronological order.
+ *
+ * AN EMPTY LIST HAS NOTHING TO PROTECT and counts nothing -- takeCursorPage
+ * shows those rows instead of holding them, and a count here would be an
+ * offer to reveal what is already on screen.
+ */
+export function pendingArrivals(
+  shown: readonly ArrivalRow[], head: readonly ArrivalRow[], headHasMore: boolean,
+): PendingArrivals {
+  if (shown.length === 0) return { count: 0, atLeast: false };
+  const listed = new Set(shown.map((row) => row.id));
+  let floor = shown[0]?.lastMessageAt ?? "";
+  for (const row of shown) if (row.lastMessageAt < floor) floor = row.lastMessageAt;
+  const count = head.filter(
+    (row) => !listed.has(row.id) && row.lastMessageAt > floor,
+  ).length;
+  return { count, atLeast: headHasMore && count > 0 && count === head.length };
+}
+
+/**
+ * The control's label. It says the number because "new mail" alone cannot tell
+ * a reader whether it is worth losing their place for, and it is phrased as an
+ * instruction because the thing is a button: a bare "3 new conversations"
+ * reads as a status line, and a status line that silently swallows clicks is
+ * worse than no affordance at all.
+ */
+export function newMailLabel({ count, atLeast }: PendingArrivals): string {
+  return `Show ${count}${atLeast ? "+" : ""} new ${unitNoun("conversation", count)}`;
+}
+
+// ---------------------------------------------------------------------------
 // Folder sidebar shaping
 // ---------------------------------------------------------------------------
 

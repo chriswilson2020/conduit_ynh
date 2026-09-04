@@ -50,6 +50,22 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 
 export interface ConversationProps {
   threadId: string;
+  /**
+   * Called after any write in here that changes WHICH conversations a list
+   * beside this pane should be showing -- the three server moves, the
+   * per-message moves, and the CRM-side hide/unhide (Phase 4.4 Task 3).
+   *
+   * The thread list holds still against everything the reader did not cause
+   * (thread-list.tsx's header), so a write made in this pane has to say so or
+   * the row it removed stays on screen. Called on FAILURE too, for
+   * useBulkThreadAction's stated reason: after one of these the client's view
+   * of the mail is unknown either way, and the fix is to refetch.
+   *
+   * NOT called for marking read, which every open does: that changes what a
+   * row says, not whether it belongs, and the list refreshes a row it is
+   * already showing without being asked.
+   */
+  onThreadsChanged?: () => void;
 }
 
 /**
@@ -79,7 +95,7 @@ function useFileTargets(accountId: string): string[] {
  * allowed, an open composer -- is about ONE conversation, and a remount is a
  * clearer reset than an effect per piece of state.
  */
-export function Conversation({ threadId }: ConversationProps) {
+export function Conversation({ threadId, onThreadsChanged }: ConversationProps) {
   // The capped page and, once Show-earlier asks, the uncapped view (Phase
   // 4.3 detail cap). Two cache entries under one ["mail-thread", id]
   // prefix, so every existing invalidation reaches whichever is showing.
@@ -291,15 +307,21 @@ export function Conversation({ threadId }: ConversationProps) {
         action,
       },
       {
-        onSuccess: (result) => setMoveSummary(summarizeBulkResult(action, result.results, {
-          targetFolder: targetFolder ?? null,
-          // The server's answer, not an assumption: present only when a
-          // folder's sync was actually switched on by this request.
-          syncEnabled: result.syncEnabled ?? null,
-        })),
+        onSuccess: (result) => {
+          setMoveSummary(summarizeBulkResult(action, result.results, {
+            targetFolder: targetFolder ?? null,
+            // The server's answer, not an assumption: present only when a
+            // folder's sync was actually switched on by this request.
+            syncEnabled: result.syncEnabled ?? null,
+          }));
+          onThreadsChanged?.();
+        },
         // A 504 means the answer was lost, not that the move failed -- the hook
         // has already refetched (see useBulkThreadAction).
-        onError: (moveError) => setMoveFailure(bulkErrorMessage(moveError)),
+        onError: (moveError) => {
+          setMoveFailure(bulkErrorMessage(moveError));
+          onThreadsChanged?.();
+        },
       },
     );
   }
@@ -339,10 +361,16 @@ export function Conversation({ threadId }: ConversationProps) {
             unit: "message",
           }));
           setSelection(emptyMessageSelection());
+          // Filing ONE message can be what takes the whole thread out of a
+          // folder view (a thread is "in" a folder when any of its messages
+          // is), so the list beside this pane needs a new snapshot exactly as
+          // it does for a whole-thread move.
+          onThreadsChanged?.();
         },
         onError: (moveError) => {
           setMoveFailure(bulkErrorMessage(moveError));
           setSelection(emptyMessageSelection());
+          onThreadsChanged?.();
         },
       },
     );
@@ -553,7 +581,13 @@ export function Conversation({ threadId }: ConversationProps) {
               variant="outline"
               data-testid="unhide-thread"
               disabled={unhide.isPending}
-              onClick={() => unhide.mutate(thread.id)}
+              // onSettled, not onSuccess: the pair is what decides whether the
+              // thread belongs in the default view or the Hidden one, so
+              // either outcome leaves a list beside this pane needing a fresh
+              // look. It runs after the hook's own invalidation (the mutation's
+              // options fire before the call site's), which is what
+              // thread-list's resnapshot needs to be waiting on.
+              onClick={() => unhide.mutate(thread.id, { onSettled: () => onThreadsChanged?.() })}
             >
               Unhide
             </Button>
@@ -562,7 +596,7 @@ export function Conversation({ threadId }: ConversationProps) {
               variant="outline"
               data-testid="hide-thread"
               disabled={hide.isPending}
-              onClick={() => hide.mutate(thread.id)}
+              onClick={() => hide.mutate(thread.id, { onSettled: () => onThreadsChanged?.() })}
             >
               Hide in CRM
             </Button>

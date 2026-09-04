@@ -260,6 +260,49 @@ test.describe.serial("Mail journey", () => {
   let hideMarker = "";
 
   /**
+   * Phase 4.4 Task 3's fixtures: enough conversations to push the reader PAST
+   * PAGE ONE, plus the two arrivals the live list has to treat differently.
+   *
+   * WHY A BACKLOG AT ALL. The whole task is that the list is live beyond page
+   * one -- before it, the observed query after "load more" was page TWO, so
+   * page one, where new mail lands, had no observer and never refetched. A
+   * journey that never pages proves the paging query alone, which is the case
+   * that already worked. Thirty is simply more than the list's 25.
+   *
+   * THEY ARE DAYS OLD AND ALREADY \Seen, which is what keeps them out of every
+   * earlier test's way on a retry: dated below every other fixture they cannot
+   * disturb page-one geography (the same trick the 4.3 fixtures use for the
+   * same reason, one order of magnitude further back), and flagged \Seen they
+   * cannot move the unread badge those tests count.
+   *
+   * EACH ATTEMPT'S SET IS NEWER THAN THE LAST'S (see backlogBaseMs), so this
+   * attempt's backlog always sits directly under the live fixtures rather than
+   * under a previous attempt's leftovers -- which is what keeps the target
+   * row's depth predictable however many attempts have run.
+   */
+  const BACKLOG_COUNT = 30;
+  /**
+   * Which backlog conversation the reply lands in, counted from the OLDEST.
+   * Low on purpose: the backlog is the bottom of the list, so a low index is
+   * deep, and the test asserts its actual depth rather than trusting this.
+   */
+  const BACKLOG_TARGET = 2;
+  let backlogPrefix = "";
+  let backlogBaseMs = 0;
+  /** A body marker, one alphanumeric token: it is read off the list ROW, whose
+   * snippet is the newest message's body -- so this appearing in place is the
+   * refresh happening without the row moving. */
+  let backlogReplyMarker = "";
+  /** The conversation that arrives while the reader is looking at the list and
+   * must NOT appear until they ask for it. */
+  let liveSubject = "";
+  /** The target row's testid, captured in one test and asserted in the next:
+   * after the reveal it takes the position the server has had it in all along. */
+  let targetRowId = "";
+  const backlogSubject = (index: number) => `${backlogPrefix} ${String(index).padStart(2, "0")}`;
+  const backlogId = (index: number) => `<backlog-${attemptTag}-${index}@example.com>`;
+
+  /**
    * The Phase 5 timeline fixture: one inbound message from a contact who
    * exists in the CRM before the first sync pass, so the auto-linker binds
    * the thread to her -- and to her ALONE. No deal, no project: under the
@@ -693,6 +736,19 @@ test.describe.serial("Mail journey", () => {
     return target.locator('[data-testid^="thread-row-"]').filter({ hasText: subject });
   }
 
+  /**
+   * Every visible thread row's testid, in the order they are painted.
+   *
+   * The Task 3 tests compare this array before and after new mail lands, which
+   * is the only assertion shape that says "nothing moved" rather than "the
+   * thing I thought about did not move": an inserted row, a removed one and a
+   * re-ordered one all change it, and a row REFRESHED in place does not.
+   */
+  async function rowIds(): Promise<string[]> {
+    return page.locator('[data-testid^="thread-row-"]')
+      .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-testid") ?? ""));
+  }
+
   async function idOf(locator: Locator, prefix: string): Promise<string> {
     const testId = await locator.getAttribute("data-testid");
     return (testId as string).replace(prefix, "");
@@ -805,6 +861,19 @@ test.describe.serial("Mail journey", () => {
     // One alphanumeric token, same reason as textMarker above: it travels
     // through websearch_to_tsquery as a single lexeme.
     hideMarker = `hidemarker${attemptId}`;
+
+    // The Phase 4.4 Task 3 set (see the declarations above). Two-digit indices
+    // so that no backlog subject is a substring of another -- `Backlog X 1`
+    // would match the row for `Backlog X 10` under threadRow's hasText, which
+    // is the bug the per-attempt naming rules above were written after.
+    backlogPrefix = `Backlog ${attemptId}`;
+    backlogReplyMarker = `backlogreply${attemptId}`;
+    liveSubject = `Latebreaking ${attemptId}`;
+    // Five days back on the first attempt, four on the second, three on the
+    // third: every attempt's backlog is NEWER than the previous attempt's and
+    // older than every other fixture in this file, which are minutes or hours
+    // old. Still well inside the account form's default 90-day backfill.
+    backlogBaseMs = Date.now() - (5 - testInfo.retry) * 24 * 60 * MINUTE_MS;
 
     // The Phase 5 set (see the declarations above for why the ADDRESS is
     // per-attempt and not merely per-run).
@@ -2318,5 +2387,158 @@ test.describe.serial("Mail journey", () => {
     // would prove nothing while moving state the earlier assertions describe.
     await panel.getByRole("button", { name: "Cancel" }).click();
     await expect(panel.getByTestId("link-search-contact")).toHaveCount(0);
+  });
+
+  // -- Phase 4.4 Task 3: the list is live, and it does not move ------------
+  //
+  // THESE THREE RUN LAST AND SHARE ONE PAGE, deliberately and in this order.
+  // Nothing between them navigates or reloads, because "without a reload" is
+  // the property: the reader loads a deep list once and everything after that
+  // has to reach them over SSE. A goto in the middle would reset the
+  // accumulation and prove the first page instead.
+
+  test("pages past the first page of a backlog deep enough to have one", async () => {
+    // Appended AFTER the account exists, unlike seedMailbox's fixtures: the
+    // incremental pass fetches by UID and only applies the backfill window
+    // while the cursor is still at zero (api: mail-sync.ts), so a message with
+    // an old INTERNALDATE arriving now is ingested on its UID and lands at the
+    // BOTTOM of the list -- which is exactly where a backlog belongs.
+    await withImap(async (client) => {
+      for (let index = 0; index < BACKLOG_COUNT; index += 1) {
+        await client.append(
+          INBOX_FOLDER,
+          rfc822([
+            `From: Backlog Sender <backlog-${attemptTag}@example.com>`,
+            `To: Conduit <${USERNAME}>`,
+            `Subject: ${backlogSubject(index)}`,
+            `Message-ID: ${backlogId(index)}`,
+            `Date: ${new Date(backlogBaseMs + index * MINUTE_MS).toUTCString()}`,
+            "Content-Type: text/plain; charset=utf-8",
+          ], `Backlog item ${index}.`),
+          // \Seen on purpose: the unread badge is counted exactly by earlier
+          // tests in this file, and on a retry these messages exist while
+          // those run.
+          ["\\Seen"],
+          new Date(backlogBaseMs + index * MINUTE_MS),
+        );
+      }
+    });
+
+    await page.goto("/mail");
+    // The RELOAD IS ALLOWED HERE and nowhere below: this is setup waiting on a
+    // background sync pass, not the property under test. Load-more runs inside
+    // the check because a reload resets the accumulation with it.
+    await pollWithReload(async () => {
+      await loadAllThreadsOn(page);
+      await expect(threadRow(backlogSubject(0))).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+    });
+
+    // The row the next test replies into, and PROOF THAT IT IS BEYOND PAGE ONE
+    // rather than a hope about how the fixtures stacked up. Page one is 25
+    // rows (thread-list.tsx's DEFAULT_LIMIT), so an index of 25 or more is a
+    // row only the accumulated pages are showing -- the rows that had no live
+    // query at all before this task.
+    targetRowId = (await threadRow(backlogSubject(BACKLOG_TARGET))
+      .getAttribute("data-testid")) as string;
+    expect((await rowIds()).indexOf(targetRowId)).toBeGreaterThanOrEqual(25);
+  });
+
+  /**
+   * The half that stops "does not move" from meaning "goes stale". New mail in
+   * a conversation the reader can SEE arrives where that conversation already
+   * is -- new snippet, unread again -- and the list does not re-order itself
+   * around it, even though the server now sorts that thread first.
+   *
+   * It also proves the cross-page refresh: the row being refreshed is beyond
+   * page one, and the only fetch carrying its new copy is page one's, because
+   * a conversation with new mail is by definition among the newest.
+   */
+  test("brings new mail to a listed conversation without moving its row", async () => {
+    const before = await rowIds();
+    await expect(page.getByTestId("thread-list-new-show")).toHaveCount(0);
+
+    await withImap(async (client) => {
+      await client.append(
+        INBOX_FOLDER,
+        rfc822([
+          `From: Backlog Sender <backlog-${attemptTag}@example.com>`,
+          `To: Conduit <${USERNAME}>`,
+          `Subject: Re: ${backlogSubject(BACKLOG_TARGET)}`,
+          `Message-ID: <backlog-reply-${attemptTag}@example.com>`,
+          `In-Reply-To: ${backlogId(BACKLOG_TARGET)}`,
+          `References: ${backlogId(BACKLOG_TARGET)}`,
+          `Date: ${new Date().toUTCString()}`,
+          "Content-Type: text/plain; charset=utf-8",
+        ], `Replying about the backlog ${backlogReplyMarker}.`),
+        [],
+        new Date(),
+      );
+    });
+
+    // NO RELOAD. The snippet is the newest message's body, so the marker
+    // appearing in this row IS the SSE hint arriving, the page-one refetch
+    // landing and the row being refreshed where it stands.
+    const target = threadRow(backlogSubject(BACKLOG_TARGET));
+    await expect(target).toContainText(backlogReplyMarker, { timeout: SYNC_TIMEOUT_MS });
+    // ...and the row is unread again, which is the other half of the copy
+    // being replaced rather than merely re-rendered.
+    await expect(target.getByRole("img", { name: "Unread" })).toBeVisible();
+
+    // NOTHING MOVED. Not the replied-to row, which the server now sorts first;
+    // not the rows it would have passed on its way there; and nothing was
+    // added or dropped anywhere in the list.
+    expect(await rowIds()).toEqual(before);
+    // And no offer to reveal it, because there is nothing to reveal: the mail
+    // is already on screen. A count here would point at a row the reader can
+    // see.
+    await expect(page.getByTestId("thread-list-new-show")).toHaveCount(0);
+  });
+
+  /**
+   * The other half: a conversation the reader CANNOT see is counted rather
+   * than inserted, and the reader decides when to lose their place.
+   */
+  test("counts a new conversation instead of showing it, until the reader asks", async () => {
+    const before = await rowIds();
+
+    await withImap(async (client) => {
+      await client.append(
+        INBOX_FOLDER,
+        rfc822([
+          `From: Helen Late <helen-${attemptTag}@example.com>`,
+          `To: Conduit <${USERNAME}>`,
+          `Subject: ${liveSubject}`,
+          `Message-ID: <late-${attemptTag}@example.com>`,
+          `Date: ${new Date().toUTCString()}`,
+          "Content-Type: text/plain; charset=utf-8",
+        ], "Something has just come up."),
+        [],
+        new Date(),
+      );
+    });
+
+    // NO RELOAD, again: this arriving is the liveness, and the exact wording
+    // is the count being right. Not "1+": that suffix is for a page one that
+    // is unseen all the way down with more behind it (mail-lib's
+    // pendingArrivals), and one arrival among twenty-five listed rows is not.
+    const show = page.getByTestId("thread-list-new-show");
+    await expect(show).toHaveText("Show 1 new conversation", { timeout: SYNC_TIMEOUT_MS });
+
+    // The reader's list is untouched while that offer stands -- same rows,
+    // same order -- and the new conversation is nowhere in it.
+    expect(await rowIds()).toEqual(before);
+    await expect(threadRow(liveSubject)).toHaveCount(0);
+
+    await show.click();
+    await expect(threadRow(liveSubject)).toHaveCount(1);
+    const after = await rowIds();
+    expect(after[0]).toBe(await threadRow(liveSubject).getAttribute("data-testid"));
+    // AND THE ROW FROM THE TEST ABOVE IS NOW SECOND, which is the whole point
+    // said backwards: the server has sorted that conversation first since its
+    // reply landed, and the list was holding it in place. Asking is what
+    // takes the server's order -- the reader's place is lost when they choose
+    // to lose it, and not before.
+    expect(after[1]).toBe(targetRowId);
+    await expect(show).toHaveCount(0);
   });
 });

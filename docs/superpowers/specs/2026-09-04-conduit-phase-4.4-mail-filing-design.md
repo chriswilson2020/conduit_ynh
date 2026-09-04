@@ -97,6 +97,25 @@ implementation:
   that state parallel to the URL is not kept. That ruling stands unless this phase overturns it
   deliberately.
 
+> **Correction, 4 Sep, from building it.** The opening sentence is wrong, and the way it is
+> wrong matters: **the list WAS live, on page one, and it was live by doing exactly what the
+> first bullet forbids.** `mail-ingest.ts` has published `["mail-threads"]` after every ingest
+> since Phase 4, `routes/stream.ts` fans it out and `components/sse.tsx` invalidates the key --
+> so page one refetched on new mail and the accumulator swapped the whole page for the server's
+> newest 25. Ordering is by `last_message_at`, so that is not an insertion, it is a re-order:
+> a reply to an old conversation moves a row from the middle of the list to the top and shifts
+> every row it passes. Risk 3 was not a risk to avoid, it was the shipped behaviour.
+>
+> What was genuinely missing is what the heading says: liveness BEYOND page one. After "load
+> more" the observed query is page TWO, so page one -- where every new message lands -- had no
+> observer and never refetched at all.
+>
+> So the two halves of the task needed OPPOSITE things, which is the part the section could not
+> have anticipated: **less** adoption on page one, and a **second observer** for everything
+> after it. The rest of the section holds: SSE is the transport (nothing was added to it), and
+> the `inbox.tsx` ruling stands unchanged -- holding the rows still means there is never a
+> scroll position to restore.
+
 ---
 
 ## 4. Folder management — AND THIS IS THE PHASE'S REAL RISK

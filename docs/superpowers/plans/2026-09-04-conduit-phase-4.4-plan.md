@@ -125,15 +125,67 @@ and the LAST refusal's text was reported -- while `Outcomes` documents, in as ma
 the FIRST is. Keying per message (which the new path needs anyway) makes the promise true.
 Nothing covered the difference; a test now does.
 
-## Task 3: Live inbox beyond page one
+## Task 3: Live inbox beyond page one — LANDED
 
-- [ ] **`services/sse.ts` is the transport.** Not polling.
-- [ ] **New mail must not reorder the list under the reader.** Ordering is by `last_message_at`,
-      so a new message in an old thread moves it. Decide and write down what the reader sees --
-      an inserted row, a "3 new" affordance, or nothing until they ask.
-- [ ] **`inbox.tsx` has already ruled that state parallel to the URL is not kept**, which is why
-      scroll position is not restored across levels. That ruling stands unless this task
-      overturns it deliberately and says so.
+**Correction found while building it, and it changes what this task WAS. The spec's section 3
+and this plan's own heading both read as "the list is not live yet". PAGE ONE WAS ALREADY LIVE,
+AND IT WAS LIVE BY DOING EXACTLY WHAT RISK 3 FORBIDS.** The whole transport was already in
+place: `mail-ingest.ts` publishes `["mail-threads"]` after every ingest, `routes/stream.ts` fans
+it out, and `components/sse.tsx` -- which routes/stream.ts's own comment still calls "a later
+task" -- invalidates the key. So page one refetched on new mail and `mergeCursorPage` swapped
+the whole page for the server's newest 25: rows moving under a reader mid-list, which is Risk 3
+happening rather than threatened. e2e/mail.spec.ts's `pollWithReload` says so in as many words:
+"The inbox IS live over SSE, so most of these pass on the first attempt."
+
+What was genuinely missing is what the heading says -- liveness BEYOND page one. After "load
+more" the observed query is page TWO, so page one, where every new message lands, had no
+observer and never refetched at all. **So this task was not "make it live". It was "make the
+liveness safe, and extend it past page one", and the two halves needed opposite things: less
+adoption on page one, and a second observer for everything after it.**
+
+- [x] **`services/sse.ts` is the transport.** Not polling. Nothing was added to the transport;
+      what changed is what the client DOES with a hint. Proved from the other side too: the new
+      e2e waits out a window with the list stale by a whole conversation and no hint sent, and
+      a `refetchInterval` on the list query turns that assertion red.
+- [x] **New mail must not reorder the list under the reader.** THE DECISION, written into
+      `thread-list.tsx`'s header with the alternatives it beat: **a row never moves, appears or
+      vanishes without the reader asking; a row that is already on screen is kept current where
+      it stands.** New mail in a conversation the reader can SEE arrives in place -- new
+      snippet, new time, unread dot back on, at the position it already occupies. New mail in
+      one they cannot see is counted behind a "Show 3 new conversations" control at the top of
+      the list, and nothing moves until that is pressed.
+      **The rejected alternatives are recorded in the same place**: inserting the rows (what the
+      code did before, and Risk 3 itself); freezing the list outright (one function shorter, and
+      wrong within a click -- opening a conversation marks it read, which invalidates the list,
+      so a list that adopted nothing would keep the bold unread row for the conversation being
+      read); refetching every accumulated page on each hint (the cursors are keyset positions in
+      an ordering that has moved, so rows fall between the pages and are shown nowhere); and
+      re-snapshotting on every hint (the reader's paging thrown away as well as their place).
+- [x] **THE READER'S OWN WRITES ARE THE EXCEPTION**, and they have to be: trash ten
+      conversations and those rows are genuinely gone. Every write on this page re-snapshots,
+      including the ones made inside the conversation pane, because "the reader's own gesture"
+      is a fact about the reader and not about which pane they made it in. Marking read
+      deliberately does NOT -- it changes what a row says, not whether it belongs, and
+      re-snapshotting there would re-order the list on every single click.
+- [x] **THE IN-FLIGHT BULK ACTION, checked rather than discovered** -- Task 2's finding one pane
+      wider. Two answers, and the first is the load-bearing one: liveness can no longer change
+      the list's MEMBERSHIP at all, so `rows`, `selectedThreads` and `unownedSelected` cannot
+      move under a request that named them, by construction rather than by timing. The second is
+      ordering: the re-snapshot after a bulk action FETCHES page one and only then starts over
+      from what came back, because the mutation hook has already invalidated `["mail-threads"]`
+      by the time the call site's callback runs -- adopting the cache there would put the rows
+      the reader just trashed straight back on screen. Both are pinned by an e2e that parks the
+      bulk response and lands new mail while it is parked.
+- [x] **`inbox.tsx` has already ruled that state parallel to the URL is not kept**, which is why
+      scroll position is not restored across levels. **THAT RULING STANDS AND IS NOT
+      OVERTURNED** -- and holding the rows still is what makes it free rather than a compromise:
+      the answer here is not to restore the reader's place after moving it, it is never to move
+      it. Nothing added by this task remembers an offset and nothing calls `scrollTo`.
+- [x] **A second e2e file, `e2e/inbox-live.spec.ts`, stubs the arrival.** mail.spec.ts's own
+      Task 3 leg is the end-to-end proof and can only run where Dovecot does; it is also a poor
+      place to show a claim FAILING (every mutation costs a mailbox seed, and a request still in
+      flight or an inbox with no mail at all cannot be arranged from outside). The stubbed file
+      runs anywhere in a few seconds and is what the mutation testing was done against.
 
 ## Task 4: Folder management — CREATE, RENAME, DELETE. THE RISK IS HERE
 

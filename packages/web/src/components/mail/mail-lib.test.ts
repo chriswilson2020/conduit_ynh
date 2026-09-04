@@ -25,6 +25,9 @@ import {
   toggleMessageSelected,
   moveTargetPatch,
   newestDiscovery,
+  newMailLabel,
+  pendingArrivals,
+  type ArrivalRow,
   selectedThreadIds,
   selectionForKey,
   selectionLabel,
@@ -1541,6 +1544,111 @@ describe("summarizeBulkResult", () => {
     const summary = summarizeBulkResult("archive", []);
     expect(summary).toMatchObject({ moved: 0, skipped: 0, failed: 0, notes: [], settingsLink: false });
     expect(summary.headline).toBe("Nothing archived.");
+  });
+});
+
+/**
+ * Phase 4.4 Task 3. The list holds still under the reader, so something has to
+ * say what is waiting -- and it has to be TRUE, because a count that announces
+ * new mail where there is none is the reader's place lost for nothing.
+ */
+describe("pendingArrivals", () => {
+  const row = (id: string, at: string): ArrivalRow => ({ id, lastMessageAt: at });
+  // One page of what the reader is looking at, newest first, as the list holds
+  // it. Times an hour apart so a "newer than the floor" case is unambiguous.
+  const shown = [
+    row("a", "2026-09-04T12:00:00.000Z"),
+    row("b", "2026-09-04T11:00:00.000Z"),
+    row("c", "2026-09-04T10:00:00.000Z"),
+  ];
+
+  it("counts a conversation that has arrived and is not on screen", () => {
+    const head = [row("new", "2026-09-04T13:00:00.000Z"), ...shown.slice(0, 2)];
+    expect(pendingArrivals(shown, head, false)).toEqual({ count: 1, atLeast: false });
+  });
+
+  // A reply to a conversation the reader can see is not something to reveal:
+  // its row is refreshed where it stands. What is withheld is the jump to the
+  // top, which nobody asked for.
+  it("does not count a conversation the list already shows, however new", () => {
+    const head = [row("c", "2026-09-04T13:00:00.000Z"), row("a", "2026-09-04T12:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false).count).toBe(0);
+  });
+
+  /**
+   * THE ONE THAT WOULD LIE. File or trash a row out of the list and the server
+   * pulls up whatever sat just past the bottom of the page. It is in the fetch
+   * and not on screen -- and it is not new mail, it is an old conversation
+   * that has moved into view. Being older than every row listed is what gives
+   * it away.
+   */
+  it("does not count an old conversation that has slid up from below the list", () => {
+    const head = [...shown, row("older", "2026-09-04T09:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false).count).toBe(0);
+  });
+
+  // The boundary itself is not new either. A row sharing the oldest listed
+  // row's timestamp is one the page break happened to fall beside, not mail
+  // that has arrived since -- which is always LATER than everything listed.
+  it("does not count a conversation exactly as old as the oldest on screen", () => {
+    expect(pendingArrivals(shown, [row("tie", "2026-09-04T10:00:00.000Z")], false).count).toBe(0);
+  });
+
+  // The floor is the OLDEST row on screen, not the last one: the list holds
+  // its fetched order, and a row refreshed in place can carry a timestamp
+  // newer than the rows above it.
+  it("takes the floor from the oldest row, not from the last one", () => {
+    const bumped = [
+      row("a", "2026-09-04T12:00:00.000Z"),
+      row("b", "2026-09-04T10:30:00.000Z"),
+      row("c", "2026-09-04T14:00:00.000Z"),
+    ];
+    // Older than `c`, which is last, and newer than `b`, which is the floor.
+    const head = [row("mid", "2026-09-04T11:00:00.000Z")];
+    expect(pendingArrivals(bumped, head, false).count).toBe(1);
+  });
+
+  // An empty list has no place to protect: adoptCursorPage shows those rows
+  // rather than holding them, so an offer here would point at what is already
+  // on screen.
+  it("counts nothing against an empty list", () => {
+    expect(pendingArrivals([], [row("new", "2026-09-04T13:00:00.000Z")], true))
+      .toEqual({ count: 0, atLeast: false });
+  });
+
+  it("reports a floor when every fetched row is unseen and there is a page behind it", () => {
+    const head = [row("n1", "2026-09-04T15:00:00.000Z"), row("n2", "2026-09-04T14:00:00.000Z")];
+    expect(pendingArrivals(shown, head, true)).toEqual({ count: 2, atLeast: true });
+  });
+
+  // ...and not when the page IS the whole list, because then there is nothing
+  // behind it for the count to be short of.
+  it("reports an exact count when the fetched page is the last one", () => {
+    const head = [row("n1", "2026-09-04T15:00:00.000Z"), row("n2", "2026-09-04T14:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false)).toEqual({ count: 2, atLeast: false });
+  });
+
+  // "Nothing is waiting" is never a floor: `count === head.length` is trivially
+  // true at zero, and an atLeast there would put a "+" on a control that is not
+  // even rendered -- or, worse, invite one to be.
+  it("reports no floor when nothing is waiting at all", () => {
+    expect(pendingArrivals(shown, [], true)).toEqual({ count: 0, atLeast: false });
+  });
+
+  it("reports an exact count when the fetched page still holds a row the list has", () => {
+    const head = [row("n1", "2026-09-04T15:00:00.000Z"), row("a", "2026-09-04T12:00:00.000Z")];
+    expect(pendingArrivals(shown, head, true)).toEqual({ count: 1, atLeast: false });
+  });
+});
+
+describe("newMailLabel", () => {
+  it("says how many, in the singular when there is one", () => {
+    expect(newMailLabel({ count: 1, atLeast: false })).toBe("Show 1 new conversation");
+    expect(newMailLabel({ count: 3, atLeast: false })).toBe("Show 3 new conversations");
+  });
+
+  it("marks a count that is only a floor", () => {
+    expect(newMailLabel({ count: 25, atLeast: true })).toBe("Show 25+ new conversations");
   });
 });
 
