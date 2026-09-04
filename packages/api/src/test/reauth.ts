@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import type { ReauthScope } from "@conduit/shared";
 import { createFixedPasswordVerifier } from "../services/reauth.js";
 import type { ReauthVerifier } from "../services/reauth.js";
 
@@ -24,20 +25,28 @@ export function testReauthVerifier(): ReauthVerifier {
 }
 
 /**
- * Mint one ticket, through the real endpoint, for the identity in `headers`.
+ * Mint one ticket, through the real endpoint, for the identity in `headers`
+ * and for one operation.
  *
  * THROUGH POST /api/reauth RATHER THAN OUT OF THE TICKET STORE, deliberately:
  * a helper that reached into ReauthTickets would let the download tests keep
  * passing if /api/reauth broke entirely, and would not exercise the binding
  * between the ticket and the account it was issued to.
+ *
+ * THE SCOPE HAS NO DEFAULT, and that is the point of it being a parameter
+ * rather than a field with a sensible value. v1.4.1 bound a ticket to the
+ * operation it was minted for; a helper that guessed the operation would let a
+ * test of the backup route quietly mint an export's ticket and still pass,
+ * which is the fungibility this release removed wearing a test's clothes.
  */
 export async function reauthTicket(
   app: FastifyInstance,
   headers: Record<string, string>,
+  scope: ReauthScope,
 ): Promise<string> {
   const response = await app.inject({
     method: "POST", url: "/api/reauth", headers,
-    payload: { password: TEST_REAUTH_PASSWORD },
+    payload: { password: TEST_REAUTH_PASSWORD, scope },
   });
   if (response.statusCode !== 200) {
     throw new Error(`could not mint a re-auth ticket: ${String(response.statusCode)} ${response.body}`);
@@ -46,7 +55,7 @@ export async function reauthTicket(
 }
 
 /**
- * `headers` plus a freshly minted, single-use ticket.
+ * `headers` plus a freshly minted, single-use ticket for `scope`.
  *
  * One call, one download. A caller that needs two requests to succeed calls
  * this twice, which is the contract rather than an inconvenience.
@@ -54,6 +63,7 @@ export async function reauthTicket(
 export async function reauthedHeaders(
   app: FastifyInstance,
   headers: Record<string, string>,
+  scope: ReauthScope,
 ): Promise<Record<string, string>> {
-  return { ...headers, "x-conduit-reauth": await reauthTicket(app, headers) };
+  return { ...headers, "x-conduit-reauth": await reauthTicket(app, headers, scope) };
 }

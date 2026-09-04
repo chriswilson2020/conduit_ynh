@@ -120,6 +120,12 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 // reads, never a silent pass. "Absent" and "an inventory of nothing" are
 // different manifests and are treated differently; see readInventory.
 //
+// SINCE v1.4.1 THE SAME IS TRUE OF AN INVENTORY THIS BUILD CANNOT EVALUATE --
+// counts carrying a consistency label it does not know, which is what a backup
+// from a LATER Conduit looks like from here. It was refused until Chris decided
+// otherwise on 2 Sep; the argument, and the line between "a later writer" and
+// "damage", are in readInventory where the decision is implemented.
+//
 // ================ THE ATOMIC ACT THE OPERATOR SEES AS TWO ==================
 //
 // Destroy-schema and load-dump are ONE psql transaction. The operator has to
@@ -170,33 +176,40 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 // runs is an undo to a state that stopped being true a moment later. pg_dump's
 // snapshot is internally consistent either way; what moves is everything the
 // sync writes between the snapshot and the destruction, which the undo loses.
+// That ordering is now routes/restore.ts's to keep, and it keeps it: the sync
+// is stopped before this function is called at all.
 //
 // ==================== WHAT IS NOT AN EFFECT, AND WHY =======================
 //
 // STOPPING AND RESTARTING THE SYNC IS A SCOPE, NOT AN EFFECT, for the same
 // reason the transaction is not one: an effect that fails mid-plan is never
 // undone, and a sync left stopped by a failed restore is an install that
-// silently receives no mail. It is a `try/finally` around applyPlan, and the
-// operator is told about it through a plan FINDING rather than through an
-// effect that could be skipped.
+// silently receives no mail. The operator is told about it through a plan
+// FINDING rather than through an effect that could be skipped.
 //
-// AND STOPPING IT IS BEST-EFFORT, WHERE STOPPING HTTP IS NOT. The asymmetry is
-// named here rather than left for a reader to infer from two files:
-// services/write-gate.ts REFUSES the restore when in-flight writes will not
-// drain inside its bound, and mail-sync.ts's `stop()` races a 15s deadline,
-// logs "gave up waiting for syncs to stop, abandoning them", and RESOLVES --
-// so `sync.stop()` below can return having stopped nothing, and this function
-// proceeds. A wedged sync is then a second writer inside the restore, and its
-// writes land the way every blocked write does: queued behind the DROP
-// SCHEMA's lock and released at COMMIT, into the restored data.
+// THAT SCOPE IS NO LONGER THIS FUNCTION'S, AND THE MOVE IS THE FIX RATHER THAN
+// A REORGANISATION (v1.4.1's Task 2). Until then it was a `try/finally` here
+// around a `stop()` that answered `Promise<void>` -- mail-sync.ts raced a 15s
+// deadline, logged "gave up waiting for syncs to stop, abandoning them", and
+// RESOLVED, so `sync.stop()` returned having stopped nothing and this function
+// carried on and dropped the schemas. Meanwhile services/write-gate.ts REFUSED
+// the same restore over an HTTP write it could not drain. The weaker of the two
+// standards guarded the more dangerous writer: a person who has walked away
+// from a browser cannot write, and an abandoned sync can.
 //
-// IT IS NOT CLOSED HERE BECAUSE THE SIGNAL DOES NOT EXIST. RestoreSyncControl
-// takes `() => Promise<void>`, because that is what SyncManager offers; making
-// the restore refuse on a sync that would not stop means `stop()` reporting
-// whether it did, which is a change to the sync engine's contract rather than
-// to this module. The exposure is narrower than the HTTP one it mirrors -- a
-// wedged sync means an IMAP connection that has stopped answering, so it is
-// usually writing nothing -- and that is a reason to rank it, not to omit it.
+// AND IT WAS NOT A NARROW EXPOSURE, WHICH IS WHAT THE OLD PARAGRAPH HERE
+// CLAIMED. It said a wedged sync means an IMAP connection that has stopped
+// answering, "so it is usually writing nothing". The write that matters is not
+// one the sync is waiting on -- it is the one already dispatched, and PostgreSQL
+// QUEUES a write blocked by `DROP SCHEMA` and releases it at COMMIT, so it is
+// delivered INTO the restored data rather than losing a race with it (measured;
+// see write-gate.ts). Nor is a wedged sync idle by definition: it exits at its
+// next `stopped` check, which can be one `ingestOne` away.
+//
+// SO `stop()` REPORTS NOW, AND routes/restore.ts DECIDES -- refusing the
+// restore, above the line that consumes the plan, so that the refusal costs a
+// click rather than a re-upload. The argument for refusing at all, on a path
+// that IS the recovery, is written where it is taken.
 //
 // ======================= WHERE THE GUARD LIVES, AND WHY ====================
 //
@@ -205,14 +218,19 @@ import type { IntakeFile, StagedPayload } from "./intake.js";
 // routes/restore.ts, together with binding a plan to the operator who uploaded
 // it (see IntakeSession.owner) and the boot call to sweepAbandonedIntakes.
 //
-// SO DOES THE OTHER SECOND WRITER, which is not the sync. The spec's step 5
-// says "stop the mail sync AND REFUSE NEW WRITES". The first half is here; the
-// second cannot be, because a service handed a database and a plan cannot see
-// that a browser in another tab is posting a company. The argument is the one
-// this module already makes -- a restore is only true if nothing else is
-// writing -- and services/write-gate.ts is where it is carried out: writes are
-// refused by HTTP method for the duration, and the apply route WAITS for the
-// writes already in flight to finish before this function is called at all.
+// SO DO BOTH SECOND WRITERS, AND ONE OF THEM ONLY SINCE v1.4.1. The spec's step
+// 5 says "stop the mail sync AND REFUSE NEW WRITES", and this module used to own
+// the first half and argue that it could not own the second: a service handed a
+// database and a plan cannot see that a browser in another tab is posting a
+// company. That argument was right and it was HALF the argument. Neither half
+// can be enforced from here, because enforcing means REFUSING, and a refusal
+// raised from inside this function has already cost the operator their upload --
+// intake-plan.ts's `use` disposes of the staging in a `finally`, and it must,
+// because what it is disposing of is a decrypted backup with mail.key in the
+// clear. So both halves live in routes/restore.ts: writes are refused by HTTP
+// method and drained (services/write-gate.ts), the sync is stopped and its
+// answer read (services/mail-sync.ts), and the restore does not reach this
+// function unless both really stopped.
 //
 // TWO SMALLER THINGS THE ROUTES TRIP OVER, both of them still true:
 //
@@ -363,15 +381,14 @@ export const RESTORE_REFUSALS = {
    * Refusing costs nothing recoverable: it happens at inspect, with nothing
    * written and nothing destroyed, and the archive is still openable by hand.
    *
-   * It is very unlikely to refuse a legitimate FUTURE backup by mistake, and
-   * the qualifier is deliberate. A manifest written by a later Conduit -- one
-   * that had added, say, an "approximate" label -- is normally refused by
-   * `newerApp` before this is reached. NORMALLY, not always: compareAppVersions
-   * answers null for an `appVersion` it cannot order, and `newerApp` then does
-   * not fire. Every version Conduit's release process writes is an orderable
-   * `major.minor.patch`, so the gap needs a manifest no release produced -- and
-   * a refusal is still the safe side of it, because the alternative is checking
-   * counts against a guarantee this build cannot evaluate.
+   * IT CANNOT REFUSE A LEGITIMATE FUTURE BACKUP ANY MORE, and that is the
+   * change v1.4.1 made rather than a property this always had. A manifest
+   * written by a later Conduit -- one that had added, say, an "approximate"
+   * label -- used to land HERE, refused, on the argument that a guarantee this
+   * build cannot evaluate must not be read past. It now degrades to a finding
+   * instead (see readInventory and RESTORE_FINDINGS.inventoryUncheckable),
+   * because the two cases are not the same case: an unknown label is a later
+   * writer, and everything left in this refusal is DAMAGE.
    */
   inventoryUnreadable: "inventory-unreadable",
 } as const;
@@ -397,6 +414,19 @@ export const RESTORE_FINDINGS = {
    * should weigh before replacing an install, not a footnote.
    */
   inventoryMissing: "inventory-missing",
+  /**
+   * THE BACKUP RECORDS AN INVENTORY THIS BUILD CANNOT CHECK -- counts labelled
+   * with a consistency it has never heard of, which is what a backup written by
+   * a LATER Conduit looks like from here.
+   *
+   * The same severity and the same class of message as inventoryMissing,
+   * because from the operator's side they are the same fact: the cross-check
+   * will not be made. They are separate codes because the reasons differ and
+   * the message has to say which -- "your backup is older than this install"
+   * and "your backup is newer than this install" send a person to different
+   * places.
+   */
+  inventoryUncheckable: "inventory-uncheckable",
 } as const;
 
 /** A tool the restore needs is not installed. The message names the package. */
@@ -1141,6 +1171,7 @@ async function readDumpContents(stream: Readable): Promise<DumpContents> {
 /** What a manifest's `inventory` field turned out to be. */
 export type InventoryRead =
   | { kind: "absent" }
+  | { kind: "uncheckable"; why: string }
   | { kind: "unreadable"; why: string }
   | { kind: "present"; tables: BackupInventoryTable[] };
 
@@ -1157,7 +1188,31 @@ export type InventoryRead =
  *                               held no tables. The check IS made, against an
  *                               empty list, and a restored database with tables
  *                               in it fails it.
+ *   a label this build does
+ *   not know how to check ..... UNCHECKABLE. The counts may be perfectly good;
+ *                               what is missing is any basis for comparing
+ *                               them. Reported as NOT MADE, and the restore
+ *                               proceeds. See below.
  *   anything else ............. UNREADABLE. Refused, with nothing written.
+ *
+ * AN UNKNOWN CONSISTENCY LABEL DEGRADES RATHER THAN REFUSING, which is Chris's
+ * decision of 2 Sep and reverses what this function did in v1.4.0. The reasoning
+ * is his and is worth carrying rather than re-deriving: THE INVENTORY IS A
+ * CROSS-CHECK, NOT THE DATA, and the moment it matters is a recovery -- where
+ * being refused your only backup is a far worse outcome than restoring with one
+ * check unmade and being told so in words. What made the old refusal look safe
+ * was that its cost is invisible from here: it happens at inspect with nothing
+ * written, which is cheap in every scenario except the one this route exists
+ * for.
+ *
+ * DAMAGE IS STILL REFUSED, and the line between the two is not arbitrary. A
+ * manifest that does not say how its counts were taken, or whose entries are
+ * not tables, is a manifest something has CORRUPTED -- and reading past
+ * corruption is how a silent half-restore starts. A manifest that names a
+ * consistency this build has never heard of is a manifest a LATER CONDUIT
+ * WROTE, which is a different thing entirely: nothing about it is damaged, and
+ * the only honest answer is that this build cannot evaluate the guarantee it
+ * claims.
  *
  * `null` COUNTS AS ABSENT, and that is not sloppiness about JSON. `undefined`
  * cannot survive a round trip through JSON at all, so a writer that meant "no
@@ -1184,7 +1239,7 @@ export function readInventory(raw: unknown): InventoryRead {
   }
   if (inventory.consistency !== INVENTORY_CONSISTENCY) {
     return {
-      kind: "unreadable",
+      kind: "uncheckable",
       why: `its counts are labelled "${inventory.consistency}", which this version of `
         + "Conduit does not know how to check",
     };
@@ -1745,6 +1800,23 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
         + "itself is unaffected -- what is missing is a check, not data.",
     });
   }
+  // AND THE OTHER WAY A CHECK GOES UNMADE: the record is there and this build
+  // cannot evaluate what it claims. Said in the same words for the same reason
+  // -- an operator weighing a recovery needs to know which checks will run, and
+  // "could not be made" is the only honest answer here. It is a WARNING and it
+  // names the archive's own label, because the next thing that person may want
+  // to do is restore this backup on the Conduit that wrote it.
+  if (inventory.kind === "uncheckable") {
+    findings.push({
+      severity: "warning",
+      code: RESTORE_FINDINGS.inventoryUncheckable,
+      message: "this backup records what its database held, and THAT CHECK CANNOT BE MADE by "
+        + `this install: ${inventory.why}. The restore itself is unaffected and the counts may `
+        + "be perfectly good -- what is missing is any basis for comparing them, so the "
+        + "restored database will not be counted against them. A backup labelled this way was "
+        + "written by a newer Conduit than this one.",
+    });
+  }
 
   findings.push({
     severity: "note",
@@ -1863,7 +1935,14 @@ export async function inspectRestore(options: InspectRestoreOptions): Promise<Re
           ? ` The backup also records the ${String(inventoryRows)} row(s) its database held `
             + `across ${String(inventory.tables.length)} table(s), and the restored database `
             + "is counted against that."
-          : " This backup records no row counts to check the result against."),
+          // THREE CASES, NOT TWO. "Records no row counts" was written when the
+          // only alternative to a checkable inventory was an absent one, and it
+          // is a false sentence about an archive that records counts this build
+          // cannot use.
+          : inventory.kind === "uncheckable"
+            ? " The row counts this backup records are labelled in a way this install cannot "
+              + "check, so the restored database is not counted against them."
+            : " This backup records no row counts to check the result against."),
       sources: [dumpMember.ref],
       dumpBytes: dumpEntry.bytes,
       // FROZEN HERE for the reason `schemas` is: newPlan freezes what it knows
@@ -1931,18 +2010,6 @@ async function digestOfFileOrNull(filePath: string): Promise<string | null> {
 
 // --- apply -----------------------------------------------------------------
 
-/**
- * The slice of mail-sync.ts's SyncManager a restore uses.
- *
- * Structural, on mail-send.ts's precedent: the restore never imports the sync
- * engine, so it stays testable with a two-method stub and there is no import
- * cycle between a service that replaces the database and one that reads it.
- */
-export interface RestoreSyncControl {
-  stop: () => Promise<void>;
-  start: () => Promise<void>;
-}
-
 export interface ApplyRestoreOptions {
   plan: RestorePlan;
   payload: StagedPayload;
@@ -1954,8 +2021,6 @@ export interface ApplyRestoreOptions {
   appVersion: string;
   /** The one the operator typed. Encrypts the safety backup; never stored. */
   passphrase: string;
-  /** The second writer. Stopped for the whole apply and started again after. */
-  sync?: RestoreSyncControl | null;
   now?: Date;
   freeBytes?: (dir: string) => Promise<number>;
   /**
@@ -1990,18 +2055,21 @@ export interface ApplyRestoreOptions {
 /**
  * APPLY A RESTORE PLAN. Nothing here decides to restore; it was decided.
  *
- * THE SYNC IS STOPPED AROUND THE WHOLE THING, IN A `finally`. It is not an
- * effect, because an effect that fails mid-plan is never undone and a sync left
- * stopped is an install that silently receives no mail. Stopping it before the
- * safety backup rather than after -- which is the other way round from the
- * spec's numbered list -- is deliberate: the sync is the second writer, and a
- * safety backup taken while it runs is an undo to a state that stopped being
- * true a moment later.
+ * NEITHER SECOND WRITER IS THIS FUNCTION'S ANY MORE, and that is v1.4.1's Task
+ * 2 rather than a tidy-up. Both are stopped by routes/restore.ts, before this
+ * is called and before the plan is consumed, and both refuse the restore when
+ * they will not stop. This one used to own the sync half -- `sync.stop()` in a
+ * try, `sync.start()` in a finally -- and the whole defect lived in the gap
+ * between those two lines: `stop()` answered with a `Promise<void>` that
+ * resolved whether it had stopped anything or not, and this function proceeded.
+ * The ordering it was written for is unchanged and is now the route's: the sync
+ * goes down BEFORE the safety backup, because an undo taken while a second
+ * writer runs is an undo to a state that stopped being true a moment later.
  */
 export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyOutcome> {
   const {
     plan, payload, db, databaseUrl, dataDir, mailKeyPath, appVersion, passphrase,
-    sync = null, now = new Date(),
+    now = new Date(),
     freeBytes = freeSpaceBytes,
     shapeOf = describeDatabaseShape,
     proveOpens = proveArchiveOpens,
@@ -2379,22 +2447,9 @@ export async function applyRestore(options: ApplyRestoreOptions): Promise<ApplyO
     },
   };
 
-  // INSIDE THE `try`, AND THAT IS THE WHOLE POINT OF THE `finally`. With the
-  // stop outside it, a sync that threw on the way down was never started again
-  // -- the exact failure the comment below forbids, one line above the comment.
-  try {
-    await sync?.stop();
-    return await applyPlan<RestoreEffect, RestoreCarrier>({
-      plan, reader: payload, handlers, carrier,
-    });
-  } finally {
-    // STARTED AGAIN WHATEVER HAPPENED. A failed restore that left the sync
-    // stopped would be an install quietly not receiving mail, discovered days
-    // later, with nothing on screen to connect it to the restore.
-    try {
-      await sync?.start();
-    } catch { /* a sync that will not restart is not a reason to lose the outcome */ }
-  }
+  return await applyPlan<RestoreEffect, RestoreCarrier>({
+    plan, reader: payload, handlers, carrier,
+  });
 }
 
 /**

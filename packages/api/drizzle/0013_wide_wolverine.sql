@@ -1,0 +1,116 @@
+-- THE FORGIVING IMPORTER'S DUPLICATE PROBE GETS AN INDEX TO USE.
+--
+-- Chris's decision 3, taken 2 Sep AGAINST the recommendation to leave it, and
+-- recorded that way because the recommendation may have been right: the cost it
+-- removes is a one-off on a file an operator uploads by hand, and the cost it
+-- adds lands on every company and contact write from here on. It is his call
+-- and this is it. WHAT IT MAKES FALSE: "v1.4.1 has no schema change." This is
+-- the release's only migration and the first since v1.2.2's `0012`.
+--
+-- WHAT services/import-csv.ts ASKS, once per 500-row batch, four hundred times
+-- in a 200,000-row import, inside the apply transaction:
+--
+--   companies: lower(domain) IN (<500 folded candidates>)
+--   contacts:  <the folded emails array> && ARRAY[<500 folded candidates>]
+--
+-- Neither could use an index before this. Measured on a scratch database of
+-- 200,001 companies and 200,000 contacts (PostgreSQL 15.19 on the deploy
+-- target), one batch of 500 candidates:
+--
+--   companies ....  76.5ms  ->   5.3ms
+--   contacts  ..... 107.6ms ->  12.3ms
+--
+-- WHAT THEY COST, so the trade is legible: 7,960kB and 18MB respectively at
+-- 200,000 rows of each -- against tables of 22MB and 29MB -- plus maintenance on
+-- every insert and update of those two tables.
+--
+-- ===================== CREATE INDEX, NOT CONCURRENTLY =====================
+--
+-- CREATE INDEX CONCURRENTLY IS NOT AVAILABLE TO THIS FILE AND CANNOT BE MADE
+-- AVAILABLE WITHOUT CHANGING HOW MIGRATIONS RUN. drizzle applies every pending
+-- migration inside ONE transaction (db/client.ts says so, and that is what
+-- makes a half-applied upgrade impossible), and CONCURRENTLY is refused inside
+-- a transaction block by PostgreSQL itself.
+--
+-- SO SAY WHAT A PLAIN CREATE INDEX DOES, because on a big enough table it is
+-- the whole story: it takes a SHARE lock on the table for the duration.
+-- READS ARE UNAFFECTED; every INSERT, UPDATE and DELETE against `companies` or
+-- `contacts` WAITS. MEASURED BY RUNNING THIS FILE, statement by statement,
+-- against a scratch database carrying the REAL migrated schema with 200,000
+-- companies and 200,000 contacts in it: the function 1.2ms, the btree index
+-- 415ms, the GIN index 2,523ms. So on tables that size an upgrade blocks writes
+-- for about three seconds. On an empty database the whole journal, this file
+-- included, runs in 251ms.
+--
+-- WHY THAT IS ACCEPTABLE HERE, AND IT IS NOT A GENERAL LICENCE:
+--
+--   * THE MIGRATIONS RUN BEFORE THE SERVER LISTENS. server.ts calls
+--     runMigrations and only then builds the app and starts the sync, so there
+--     is no request to block and no sync running -- the lock is contended by
+--     nothing. On an upgrade the app is stopped anyway.
+--   * THE TABLES ARE SMALL, and the qualifier is deliberate: nobody counted the
+--     live install's rows for this, because that is Chris's data and reading it
+--     was not necessary. What IS known is the shape of the product -- a
+--     self-hosted CRM for one organisation -- and that 200,000 is the synthetic
+--     worst case the importer was measured against rather than an install
+--     anybody has. Three seconds is the bound at that size, and the bound
+--     shrinks with the table.
+--   * A SLOW BOOT IS VISIBLE AND SURVIVABLE, where a half-built index would
+--     not be. If the index build fails, the transaction rolls back, the
+--     migration is not recorded, and the next boot tries again.
+--
+-- The day either table is genuinely large, the answer is not CONCURRENTLY in
+-- here -- it is a documented manual step, because CONCURRENTLY can leave an
+-- INVALID index behind on failure and nothing in this boot path could notice.
+--
+-- ==================== HAND-WRITTEN, AND NOT IN schema.ts ==================
+--
+-- Same arrangement as 0004's index block and 0009's, and for the same reason:
+-- drizzle's index() builder is unused throughout this project, and an
+-- expression index over a function it has never heard of could not be declared
+-- there anyway. The consequences 0004 records apply unchanged -- `drizzle-kit
+-- push` must never be introduced (it would DROP these, having no schema.ts
+-- record of them), and declaring either one via index() later means removing it
+-- from here first.
+--
+-- ================== WHY A FUNCTION, WHICH IS A REAL COST ==================
+--
+-- A GIN index over the folded emails needs an expression, and the obvious one
+-- cannot be indexed: `CREATE INDEX ... USING gin ((lower(emails::text)::text[]))`
+-- is refused with "functions in index expression must be marked IMMUTABLE"
+-- (measured, not assumed -- the array-to-text cast is not immutable). A named
+-- IMMUTABLE function is the way round it, and it is deliberately spelled with
+-- the `conduit_` prefix: it lands in `public` on the operator's own database,
+-- where every other name belongs to Conduit's tables.
+--
+-- IT TRAVELS WITH A BACKUP AND SURVIVES A RESTORE. pg_dump emits it like any
+-- other object, and restoring a v1.4.0 backup (which carries neither function
+-- nor index) into a v1.4.1 install runs migrate-forward afterwards, which
+-- applies this file to the restored database. Both directions were reasoned
+-- from services/restore.ts's own order rather than assumed.
+--
+-- ============== DELIBERATELY NOT IDEMPOTENT, AND THAT WAS MEASURED =========
+--
+-- The first draft of this file wrote `CREATE OR REPLACE FUNCTION` and
+-- `CREATE INDEX IF NOT EXISTS`, as insurance against a database that somehow
+-- already had them. That insurance is HARMFUL and a test caught it: a migration
+-- applied over objects that already exist means the bookkeeping and the schema
+-- disagree, and that has to be an ERROR rather than a shrug.
+--
+-- services/restore.test.ts's "says the database is restored when the migrations
+-- themselves fail" builds exactly that state on purpose -- it drops the last row
+-- from the dump's `drizzle.__drizzle_migrations`, so migrate-forward re-applies
+-- the last migration over a schema that already has its objects -- and asserts
+-- the restore reports RestoreMigrationError with the install named as
+-- restored-but-suspect. With IF NOT EXISTS the re-application SUCCEEDED, the
+-- error never happened, and the case went red. It was right to.
+--
+-- No legitimate path re-applies this file: drizzle records what it has applied,
+-- a v1.4.0 dump carries neither object, and a v1.4.1 dump carries both along
+-- with the bookkeeping row that says so.
+CREATE FUNCTION conduit_lower_emails(text[]) RETURNS text[]
+	LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+	AS $$ SELECT ARRAY(SELECT lower(e) FROM unnest($1) AS e) $$;
+--> statement-breakpoint
+CREATE INDEX "companies_domain_lower_idx" ON "companies" USING btree (lower("domain"));--> statement-breakpoint
+CREATE INDEX "contacts_emails_lower_idx" ON "contacts" USING gin (conduit_lower_emails("emails"));

@@ -176,7 +176,7 @@ export function registerBackupRoutes(app: FastifyInstance, deps: CrmRouteDeps): 
     // BEFORE THE BODY IS PARSED, so a caller with no ticket never gets a
     // validation message about the passphrase field -- which would be a small
     // free lesson in how to drive this endpoint.
-    if (!requireReauth(request, reply, user, deps)) return;
+    if (!requireReauth(request, reply, user, deps, "backup")) return;
 
     const body = parseOrReject(backupRequestSchema, request.body, reply);
     if (body === undefined) return;

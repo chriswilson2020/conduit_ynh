@@ -54,13 +54,20 @@ import {
  * can archive, which is the exact line 7.7's spec draws between the two halves
  * of this phase.
  *
- * AND ADDING A FIFTH GATED ROUTE WOULD MAKE THE GATE WEAKER, WHICH IS THE PART
- * THAT DECIDED IT. v1.4.1 records that a ticket is FUNGIBLE ACROSS EVERY GATED
- * ROUTE: /api/reauth mints one ticket and any gated route will spend it. So a
- * ticket the operator minted meaning "let me preview an import" is a ticket
- * that can be spent on a backup download. Every route added to that set widens
- * what one confirmation authorises, and the routes worth protecting are the
- * ones that lose by it.
+ * THE SECOND REASON THIS ARGUMENT USED TO GIVE IS NOW FALSE, AND IT IS
+ * CORRECTED HERE RATHER THAN LEFT TO BE INHERITED. It read: adding a fifth
+ * gated route would make the gate WEAKER, because a ticket was fungible across
+ * every gated route -- so one minted meaning "let me preview an import" could
+ * be spent on a backup download instead. v1.4.1 fixed exactly that. A ticket
+ * now carries the operation it was minted for (ReauthScope), so a fifth gated
+ * route would widen nothing: its tickets would open its own gate and no other.
+ *
+ * THE CONCLUSION DID NOT MOVE, WHICH IS WHY THE CORRECTION IS SAFE TO MAKE
+ * HERE. The first reason above -- an import neither exfiltrates nor destroys
+ * -- is what actually decides it, and the third below is what would decide it
+ * even if the first were closer. What is gone is a reason that has stopped
+ * being true, and leaving it standing would let the next reader weigh a fact
+ * this codebase no longer has.
  *
  * THE THIRD REASON IS HABITUATION, and it is the one a design review would
  * raise. The CSV pipeline is three requests -- read the columns, preview,
@@ -94,12 +101,14 @@ import {
  * privilege, which is why the question is now written down beside the
  * conclusion instead of being absent from it.
  *
- * ONE VISIBLE CONSEQUENCE IS NOT REPORTED AND SHOULD BE. A crafted export can
- * create rows that arrive ALREADY ARCHIVED, and no finding says how many -- so
- * the preview's count is right and what the operator then sees in their lists
- * is smaller than it. That is a finding services/import-export.ts should emit,
- * it is recorded here rather than added because it is the engine's to write,
- * and it costs an operator confusion rather than data.
+ * ONE VISIBLE CONSEQUENCE WAS NOT REPORTED AND NOW IS. An export can carry rows
+ * that arrive ALREADY ARCHIVED -- a crafted one, and equally an ordinary one
+ * taken from an install that archives things -- so the preview's count was
+ * right and what the operator then saw in their lists was smaller than it, with
+ * nothing anywhere to explain the difference. v1.4.1 added the finding, in
+ * services/import-export.ts where it belongs (IMPORT_FINDINGS.arrivesArchived):
+ * it was the engine's to write, because the engine is what reads `archived_at`
+ * and what knows which rows are actually being inserted.
  *
  * WHAT AN IMPORT LEAKS IS AT LEAST FOUR THINGS, AND A REVIEW COUNTED THEM
  * BECAUSE THIS PARAGRAPH SAID "THE ONE THING". The conclusion survived the

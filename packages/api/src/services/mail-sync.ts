@@ -98,7 +98,36 @@ const SEEN_FLAG = "\\Seen";
 /** How long SyncManager.stop() waits for its syncs before abandoning them.
  * Generous enough for any operation that is merely slow, short enough that a
  * systemd restart does not stall behind one wedged socket. */
-const STOP_TIMEOUT_MS = 15_000;
+export const STOP_TIMEOUT_MS = 15_000;
+
+/**
+ * The same wait, for a caller that is not a shutdown: the restore.
+ *
+ * THE FIFTEEN SECONDS ABOVE ARE A SHUTDOWN'S NUMBER AND WERE NEVER ANYBODY
+ * ELSE'S. They are chosen against systemd's patience -- a restart must not
+ * stall behind one wedged socket -- and past them the process is exiting, so
+ * an abandoned sync costs nothing. A restore is the opposite on both counts:
+ * nothing is waiting on it but the operator, and past the deadline an
+ * abandoned sync is a SECOND WRITER inside a `DROP SCHEMA` (see
+ * services/write-gate.ts for the measurement that makes that fatal rather than
+ * unlucky). So the restore refuses when this runs out, and the number is set
+ * so that it rarely has to.
+ *
+ * MEASURED AGAINST WHAT A WEDGED SYNC IS ACTUALLY WAITING ON, not picked as a
+ * round figure. Nothing in the ImapClient contract is cancellable except
+ * `idle()` (mail-imap.ts, CANCELLATION AND SHUTDOWN), so the real bound on a
+ * stuck operation is the adapter's own socket timeout -- 120s in
+ * mail-imapflow.ts -- plus the one `ingestOne` the loop may finish on its way
+ * past its next `stopped` check. This sits above that, so the ordinary wedge
+ * unwinds INSIDE the wait and the operator is never refused for a condition
+ * that was about to clear.
+ *
+ * NOT IMPORTED FROM THE ADAPTER, because the adapter is injected and a
+ * different one would bring its own timeouts; mail-imapflow.test.ts asserts
+ * the inequality instead, so raising one and not the other fails a test rather
+ * than a restore.
+ */
+export const RESTORE_STOP_TIMEOUT_MS = 150_000;
 
 // --- The IMAP seam ---------------------------------------------------------
 //
@@ -1311,6 +1340,40 @@ export interface SyncManagerOptions {
   ingest?: IngestMessageFn;
 }
 
+export interface SyncStopOptions {
+  /**
+   * How long to wait before abandoning what is left. Defaults to
+   * STOP_TIMEOUT_MS, which is the SHUTDOWN's number; a restore passes
+   * RESTORE_STOP_TIMEOUT_MS, which is a different question with a different
+   * cost of being wrong.
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * WHAT A STOP ACTUALLY ACHIEVED.
+ *
+ * DELIBERATELY THE SHAPE OF services/write-gate.ts's DrainResult -- a boolean
+ * that says whether the writer really stopped, and a count of what is still
+ * writing -- because the two are the same question asked of the two second
+ * writers, and a restore has to be able to treat them the same way. They were
+ * asked differently for a release: HTTP writes were refused when they would not
+ * drain, and the sync was abandoned and the restore carried on.
+ */
+export interface SyncStopResult {
+  /** True when every sync this manager owned actually stopped. */
+  readonly stopped: boolean;
+  /**
+   * Loops still running past the deadline, abandoned.
+   *
+   * NOT A DIAGNOSTIC. Each is a writer that can INSERT while a restore is
+   * dropping schemas, and PostgreSQL does not make it race the window: a write
+   * blocked by `DROP SCHEMA` is QUEUED and released at COMMIT, so it is
+   * delivered INTO the restored data. Measured; see write-gate.ts.
+   */
+  readonly abandoned: number;
+}
+
 /**
  * Owns one AccountSync per non-archived account, and is the thing routes and
  * mail-send reach through (`get(accountId)`) to queue `\Seen` write-backs and
@@ -1331,6 +1394,16 @@ export class SyncManager {
    * otherwise each tear down the old sync and create a new one, leaving TWO
    * AccountSyncs ingesting the same mailbox. */
   private readonly chain = new Map<string, Promise<void>>();
+  /**
+   * Syncs that were told to stop and had not stopped when a bound ran out.
+   *
+   * THEY ARE UNWINDING, NOT RUNNING FREE: each has `stopped = true` and exits
+   * at its next check, so what is left is whatever uncancellable operation it
+   * is already inside plus at most one `ingestOne`. That is the whole exposure
+   * -- and it is still a database write with nobody watching, which is why
+   * stop() reports them rather than logging them.
+   */
+  private readonly abandoned = new Set<AccountSync>();
   private unregisterHook: (() => void) | null = null;
   private started = false;
 
@@ -1427,6 +1500,13 @@ export class SyncManager {
 
   private ensureSync(accountId: string): void {
     if (this.syncs.has(accountId)) return;
+    // A LOOP THIS MANAGER GAVE UP WAITING FOR IS STILL A LOOP. Creating a
+    // second one here would put two AccountSyncs on one mailbox, which is the
+    // arrangement the whole design rules out by construction -- everything an
+    // AccountSync does to an account is serialised by there being exactly one
+    // of it, not by locking. stoppedAtLast creates the replacement when the
+    // old one is really gone.
+    if (this.isAbandoned(accountId)) return;
     const sync = new AccountSync({
       ...this.options,
       accountId,
@@ -1470,15 +1550,36 @@ export class SyncManager {
   }
 
   /**
-   * Stop every sync, BOUNDED. server.ts awaits this before `app.close()`, so
-   * an unbounded wait here would hold the HTTP listener open for as long as
-   * one wedged network operation took to notice -- and nothing except
-   * `idle()` in the ImapClient contract is cancellable, so "as long as it
-   * takes" is the adapter's socket timeout, not ours. Past the deadline the
-   * remaining syncs are abandoned: each has already been told to stop and
-   * will unwind on its own, and the process is on its way out regardless.
+   * Stop every sync, BOUNDED, AND SAY WHETHER IT WORKED.
+   *
+   * server.ts awaits this before `app.close()`, so an unbounded wait here would
+   * hold the HTTP listener open for as long as one wedged network operation
+   * took to notice -- and nothing except `idle()` in the ImapClient contract is
+   * cancellable, so "as long as it takes" is the adapter's socket timeout, not
+   * ours. Past the deadline the remaining syncs are abandoned: each has already
+   * been told to stop and will unwind on its own.
+   *
+   * THE RETURN VALUE IS THE WHOLE OF v1.4.1'S TASK 2, and it exists because a
+   * `Promise<void>` that resolves identically whether every sync stopped or
+   * every sync was abandoned was READ AS AN ANSWER by a caller it was never
+   * written for. services/restore.ts stopped the second writer, got that
+   * resolution back, and destroyed the database either way -- while
+   * services/write-gate.ts REFUSED the same restore over an HTTP write it could
+   * not drain. The weaker standard guarded the more dangerous writer: a person
+   * who has walked away from a browser cannot write, and an abandoned sync can.
+   * Reporting is this module's half of the fix; what to do about it is the
+   * caller's, and routes/restore.ts argues its answer where it takes it.
+   *
+   * ABANDONED SYNCS ARE REMEMBERED UNTIL THEY REALLY STOP, which is the half a
+   * single boolean would have lost. A caller that refuses on this answer gets
+   * pressed again a moment later -- that is what a refusal on a recovery path
+   * is for -- and a manager that emptied its map on the first call would answer
+   * "stopped" to the second with the same loop still running. So they stay in
+   * `abandoned`: counted by every later stop(), and NOT replaced by a fresh
+   * loop when start() runs, because two AccountSyncs on one mailbox is the one
+   * thing this design rules out by construction.
    */
-  async stop(): Promise<void> {
+  async stop(options: SyncStopOptions = {}): Promise<SyncStopResult> {
     this.started = false;
     this.unregisterHook?.();
     this.unregisterHook = null;
@@ -1492,32 +1593,79 @@ export class SyncManager {
     // without a bound simply moved the unbounded wait one step earlier: the
     // 15s cap was there while nothing needed capping.
     //
-    // Snapshotting the syncs INSIDE the chain, rather than before it, is what
-    // keeps the ordering meaningful: a reconcile that ran to completion
-    // during the drain may have replaced a sync, and the replacement is the
-    // one that needs stopping.
-    let stopped = this.syncs.size;
+    // WHAT IS STILL RUNNING, PER SYNC, RATHER THAN ONE AGGREGATE PROMISE.
+    // `Promise.allSettled` over every stop tells a caller only that all of
+    // them finished or that some number did not, and the number this used to
+    // log was `syncs.size` read BEFORE any of them was asked -- so it counted
+    // what was there rather than what was left. Each sync now takes itself out
+    // of this set when its own stop() resolves, which makes the size at the
+    // deadline the honest count of loops still running.
+    //
+    // SEEDED WITH WHAT AN EARLIER STOP ABANDONED, and populated BEFORE the
+    // chain drain as well as after it: if the drain itself wedges (a reconcile
+    // awaiting a teardown that will not finish), no sync is ever asked to stop,
+    // and every one of them is still running when the deadline fires. Reporting
+    // them as stopped because we never got as far as asking is precisely the
+    // lie this method exists to stop telling.
+    const outstanding = new Set<AccountSync>(this.abandoned);
+    for (const sync of this.syncs.values()) outstanding.add(sync);
     const stopping = Promise.allSettled(chains).then(async () => {
-      const syncs = [...this.syncs.values()];
+      // Snapshotting the syncs INSIDE the chain, as well as before it, is
+      // what keeps the ordering meaningful: a reconcile that ran to completion
+      // during the drain may have replaced a sync, and the replacement is the
+      // one that needs stopping. The one it replaced is already stopped, so
+      // asking it twice costs nothing.
+      for (const sync of this.syncs.values()) outstanding.add(sync);
       this.syncs.clear();
-      stopped = syncs.length;
-      await Promise.allSettled(syncs.map((sync) => sync.stop()));
+      await Promise.allSettled([...outstanding].map(async (sync) => {
+        try {
+          await sync.stop();
+        } finally {
+          outstanding.delete(sync);
+          this.stoppedAtLast(sync);
+        }
+      }));
     });
     const clock = this.options.clock ?? systemSyncClock;
     const deadline = new AbortController();
-    const timeout = clock.wait(STOP_TIMEOUT_MS, deadline.signal);
+    const timeoutMs = options.timeoutMs ?? STOP_TIMEOUT_MS;
+    const timeout = clock.wait(timeoutMs, deadline.signal);
     const winner = await Promise.race([stopping.then(() => "stopped" as const), timeout.then(() => "timeout" as const)]);
     // Releases whichever lost. `stopping` never rejects (every await inside
     // it is an allSettled) and is deliberately not awaited on the timeout
     // path -- that is the whole point of the bound.
     deadline.abort();
     await timeout;
-    if (winner === "timeout") {
-      this.logger.warn(
-        { accounts: stopped, timeoutMs: STOP_TIMEOUT_MS },
-        "mail-sync: gave up waiting for syncs to stop, abandoning them",
-      );
-    }
+    if (winner === "stopped") return { stopped: true, abandoned: 0 };
+    for (const sync of outstanding) this.abandoned.add(sync);
+    this.logger.warn(
+      { accounts: outstanding.size, timeoutMs },
+      "mail-sync: gave up waiting for syncs to stop, abandoning them",
+    );
+    return { stopped: false, abandoned: outstanding.size };
+  }
+
+  /**
+   * An abandoned sync finally unwound. Take it off the books, and give its
+   * account a loop again if the manager is running.
+   *
+   * THE RE-ENSURE IS WHAT MAKES THE start() GUARD SAFE RATHER THAN QUIET. A
+   * start() that skipped an abandoned account and left it there would be an
+   * install silently receiving no mail for that account until somebody
+   * restarted the process -- trading a duplicate loop for a missing one, which
+   * is the worse of the two. Guarded on `started`, so a shutdown's abandoned
+   * syncs resurrect nothing on their way out.
+   */
+  private stoppedAtLast(sync: AccountSync): void {
+    if (!this.abandoned.delete(sync)) return;
+    if (!this.started || this.isAbandoned(sync.accountId)) return;
+    this.ensureSync(sync.accountId);
+  }
+
+  /** Whether a loop for this account is still unwinding after being abandoned. */
+  private isAbandoned(accountId: string): boolean {
+    for (const sync of this.abandoned) if (sync.accountId === accountId) return true;
+    return false;
   }
 }
 

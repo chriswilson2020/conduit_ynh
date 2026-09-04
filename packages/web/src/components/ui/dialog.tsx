@@ -339,10 +339,44 @@ export function SheetBody({ children }: { children: ReactNode }) {
   return <div className="flex-1 overflow-y-auto p-4">{children}</div>;
 }
 
-export function DialogTitle({ children }: { children: ReactNode }) {
-  return <RadixDialog.Title className="text-lg font-semibold text-slate-900">{children}</RadixDialog.Title>;
+/**
+ * A DIALOG'S TITLE AND ITS DESCRIPTION, AND THEY TAKE THE PROPS THEY LOOK LIKE
+ * THEY TAKE. Both used to be typed `{ children: ReactNode }` and rendered
+ * exactly that, dropping every other prop on the floor.
+ *
+ * THE REASON THAT SURVIVED A COMPILER, A REVIEW AND A TEST SUITE: TypeScript
+ * SKIPS EXCESS-PROPERTY CHECKING FOR A JSX ATTRIBUTE WHOSE NAME IS NOT A VALID
+ * IDENTIFIER. `data-testid` is not one, so
+ * `<DialogDescription data-testid="x">` compiled, rendered, and put no testid
+ * anywhere -- and the e2e that addressed it went red for a reason nothing in
+ * the source pointed at. settings-data.tsx paid for it once, in a comment that
+ * had to explain why its testid sits on a `<span>` inside.
+ *
+ * `className` IS MERGED RATHER THAN REPLACED, on the same reasoning as
+ * DialogContent's width: these two carry the app's dialog typography, and a
+ * caller adding a margin should not silently lose the type scale. A caller that
+ * genuinely wants different type can still say so -- Tailwind's later utility
+ * wins -- which is the ordinary override this file's other surfaces offer.
+ *
+ * THE GUARD IS A TEST THAT A PASSED PROP ARRIVES, in ui.test.ts, and it is
+ * there because the thing that failed here was a compiler check that looked
+ * like a guard and was not one.
+ */
+type TitleProps = ComponentPropsWithoutRef<typeof RadixDialog.Title>;
+type DescriptionProps = ComponentPropsWithoutRef<typeof RadixDialog.Description>;
+
+export function DialogTitle({ children, className, ...rest }: TitleProps) {
+  return (
+    <RadixDialog.Title className={clsx("text-lg font-semibold text-slate-900", className)} {...rest}>
+      {children}
+    </RadixDialog.Title>
+  );
 }
 
-export function DialogDescription({ children }: { children: ReactNode }) {
-  return <RadixDialog.Description className="mt-1 text-sm text-slate-500">{children}</RadixDialog.Description>;
+export function DialogDescription({ children, className, ...rest }: DescriptionProps) {
+  return (
+    <RadixDialog.Description className={clsx("mt-1 text-sm text-slate-500", className)} {...rest}>
+      {children}
+    </RadixDialog.Description>
+  );
 }

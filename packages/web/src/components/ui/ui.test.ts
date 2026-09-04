@@ -1,6 +1,8 @@
 import { readFileSync, readdirSync } from "node:fs";
+import type { ReactElement } from "react";
 import { describe, it, expect } from "vitest";
 import { withoutComments } from "../../test/source";
+import { DialogDescription, DialogTitle } from "./dialog";
 
 /**
  * What components/ui promises below the breakpoint, guarded the only way a
@@ -349,5 +351,71 @@ describe("the 44px touch floor", () => {
     expect(list).not.toMatch(/(?<!max-md:)\boverflow-x-auto\b/);
     expect(trigger).toContain("max-md:shrink-0");
     expect(trigger).not.toContain("overflow-x-auto");
+  });
+});
+
+/**
+ * THE ONE GUARD IN THIS FILE THAT IS NOT A SOURCE READER, and it is here
+ * because a source reader is what let the defect ship.
+ *
+ * `DialogDescription` and `DialogTitle` were typed `{ children: ReactNode }`
+ * and rendered exactly that. Every other prop was dropped, and TYPESCRIPT DID
+ * NOT CATCH IT: excess-property checking is skipped for a JSX attribute whose
+ * name is not a valid identifier, so `<DialogDescription data-testid="x">`
+ * compiles against a signature that has no idea what `data-testid` is. It
+ * rendered, it had no testid, and an e2e went red pointing nowhere near the
+ * cause. Measured again while fixing it, against the narrow signature: `tsc
+ * --noEmit -p packages/web` reports NOTHING for that attribute and reports
+ * `TS2322` for a `title="x"` on the same element -- the identifier-named prop
+ * is checked and the hyphenated one is not.
+ *
+ * SO THE ASSERTION IS THAT THE PROP ARRIVES, not that the source spells
+ * `...rest`. A component can spell the spread and still lose a prop (destructure
+ * it into a name nothing uses -- which is exactly what `input.tsx`'s ref guard
+ * three blocks up exists to catch), and the whole item is here because a check
+ * that LOOKED like a guard was not one.
+ *
+ * CALLED RATHER THAN RENDERED, and the reason is the environment rather than
+ * taste: this package has no testing-library and vitest runs it under `node`
+ * with no DOM, and Radix's own Description reads a context that only exists
+ * inside a `<Dialog>` -- so it cannot be rendered standalone even with one.
+ * Both components are plain functions with no hooks, so calling one is exactly
+ * what React does to it, and the element it returns carries the props Radix
+ * would receive. That is the seam that broke; the spread from Radix's own
+ * primitive onto the DOM node is Radix's contract, not this file's.
+ */
+describe("a dialog's title and description", () => {
+  /** What React would hand the element these components return. */
+  const propsOf = (element: ReactElement): Record<string, unknown> =>
+    element.props as Record<string, unknown>;
+
+  // A VARIABLE, NOT AN INLINE OBJECT, and that is not a style choice: excess
+  // property checking applies to a FRESH object literal, so writing this inline
+  // would be a compile error against the very narrowing this test exists to
+  // detect -- and the test would then be red for the wrong reason on the broken
+  // version and uncompilable on it.
+  const testid = { "data-testid": "reauth-reason", children: "Why you are asked again" };
+
+  it("passes a testid through to the element that renders", () => {
+    expect(propsOf(DialogDescription(testid))["data-testid"]).toBe("reauth-reason");
+    expect(propsOf(DialogTitle(testid))["data-testid"]).toBe("reauth-reason");
+  });
+
+  // THE PROP THAT ARRIVES MUST NOT COST THE CHILDREN OR THE TYPE SCALE. A
+  // spread that overwrote `children`, or a className that replaced the app's
+  // dialog typography instead of extending it, would satisfy the case above
+  // and break every dialog in the app.
+  it("keeps its children and its own type scale while merging a caller's class", () => {
+    // A variable again, for the reason above: this whole block has to COMPILE
+    // against the narrow signature or the mutation cannot be watched failing.
+    const classed = { ...testid, className: "text-red-600" };
+    const description = propsOf(DialogDescription(classed));
+    expect(description.children).toBe("Why you are asked again");
+    expect(description.className).toContain("text-sm");
+    expect(description.className).toContain("text-red-600");
+    const title = propsOf(DialogTitle(classed));
+    expect(title.children).toBe("Why you are asked again");
+    expect(title.className).toContain("text-lg");
+    expect(title.className).toContain("text-red-600");
   });
 });

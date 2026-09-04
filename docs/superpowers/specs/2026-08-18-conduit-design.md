@@ -100,9 +100,22 @@ entirely.
 encrypted backup are gated by a re-authentication check, and what it mints is a single-use
 ticket held in memory with a five-minute lifetime — session storage and expiry, in the
 narrow. There is still no cookie, nothing is signed, there is no logout, and no password is
-stored: the check itself is a bind against YunoHost's own portal API. The sentence above is
-still the right description of how a REQUEST is authenticated; it is no longer a complete
-description of what the app keeps.
+stored: the check itself is an LDAP simple bind against YunoHost's own directory. The sentence
+above is still the right description of how a REQUEST is authenticated; it is no longer a
+complete description of what the app keeps.
+
+**A ticket names ONE operation as well as one account, since v1.4.1.** It bound only an
+account until then, so the four gated routes spent each other's tickets and one minted to
+download a backup was a live authorisation to destroy the database for five minutes. The
+scope is `export`, `backup`, `restore-preview` or `restore-apply` — the restore's two halves
+are two of them deliberately — and `POST /api/reauth` refuses to mint without one rather than
+defaulting, because any default would open one of the four gates for a caller who never asked.
+
+**It went through the portal API until v1.4.1 and that was the wrong door**, for a reason worth
+keeping here rather than only in a release note: the portal's job is to MINT A SESSION, and it
+charged rent for one Conduit never wanted — a domain ACL evaluated against the request's `Host`
+header, which over loopback is `127.0.0.1:6788` and belongs to nobody. It refused every correct
+password. A simple bind asks the one question this gate actually has.
 
 The security boundary is that **the app binds to `127.0.0.1` only**, so nothing can reach it without
 passing through nginx and SSOwat. This is the standard YunoHost trust model, and it is worth stating
@@ -113,19 +126,21 @@ app ever needs to defend against hostile local processes, that is a change of th
 tweak.
 
 **7.6 made that limit consequential without changing it.** `POST /api/reauth` checks a
-password against YunoHost's portal, and the account it checks is the one in `Ynh-User` — so
+password against YunoHost's directory, and the account it checks is the one in `Ynh-User` — so
 a local process that sets the header freely can ask this app to test passwords for *any*
-account on the box. Nothing upstream counts those attempts: the portal call goes over
+account on the box. Nothing upstream counts those attempts: the bind goes over
 loopback, YunoHost's fail2ban jails read nginx's logs, and YunoHost's own authenticator
-carries a `FIXME` saying failed logins are not caught by fail2ban at all. The per-account
+carries a `FIXME` saying failed logins are not caught by fail2ban at all. **That last point
+did not change with the door**: it was true through the portal too, so there was never an
+upstream throttle to inherit. The per-account
 throttle in `services/reauth.ts` is the whole of what bounds it, which is why its check and
 its count are one synchronous step rather than a read either side of an `await`.
 
 A dev-only fake-user env var (`CONDUIT_DEV_USER`) stands in for the header when running off-YunoHost.
 It hard-fails at boot when `NODE_ENV=production`. **7.6 added a second variable of exactly
-this kind and with exactly this guard**: `CONDUIT_REAUTH_PASSWORD` replaces the portal bind
+this kind and with exactly this guard**: `CONDUIT_REAUTH_PASSWORD` replaces the LDAP bind
 with a fixed value so the re-authentication gate can be exercised on a machine with no
-YunoHost portal, and `parseConfig` refuses to boot with it set in production for the same
+YunoHost directory, and `parseConfig` refuses to boot with it set in production for the same
 reason. They are a family of two now, not a single flag.
 
 ### Subpath support

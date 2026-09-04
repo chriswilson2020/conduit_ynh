@@ -57,7 +57,7 @@ beforeEach(async () => {
     // writer. No mail route calls either, so they are here to satisfy the
     // contract rather than to be exercised; routes/restore.test.ts is where
     // they are actually asserted against.
-    stop: () => Promise.resolve(),
+    stop: () => Promise.resolve({ stopped: true, abandoned: 0 }),
     start: () => Promise.resolve(),
   };
 });
@@ -133,7 +133,7 @@ function config(basePath = "/"): Config {
     nodeEnv: "test", port: 0, databaseUrl: "unused-in-tests", basePath,
     version: "0.1.0-test", devUser: null, dataDir, defaultCurrency: "EUR",
     mailKeyPath: keyPath, mailTlsRejectUnauthorized: true,
-    portalApiUrl: "http://127.0.0.1:6788", reauthPassword: null,
+    ldapUrl: "ldap://127.0.0.1:389", reauthPassword: null,
   };
 }
 
@@ -713,7 +713,7 @@ describe("mail folder routes", () => {
       syncManager: () => ({
         get: (id) => syncs.get(id),
         syncNow: () => { throw new Error("engine exploded"); },
-        stop: () => Promise.resolve(),
+        stop: () => Promise.resolve({ stopped: true, abandoned: 0 }),
         start: () => Promise.resolve(),
       }),
     });

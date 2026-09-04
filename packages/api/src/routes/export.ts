@@ -59,7 +59,7 @@ export function registerExportRoutes(app: FastifyInstance, deps: CrmRouteDeps): 
     // BEFORE THE CONCURRENCY SLOT, deliberately. A caller with no ticket must
     // not be able to occupy the one export slot, or refusing them would still
     // have cost every other caller the feature.
-    if (!requireReauth(request, reply, user, deps)) return;
+    if (!requireReauth(request, reply, user, deps, "export")) return;
 
     if (exportsInFlight >= MAX_CONCURRENT_EXPORTS) {
       // 503 with its own code, matching the shape documents.ts answers for a

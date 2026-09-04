@@ -548,9 +548,6 @@ describe("reading a backup's inventory", () => {
     // An array is an object to typeof, and is not an inventory.
     expect(why([])).toContain("not an object");
     expect(why({ tables: [] })).toContain("how its counts were taken");
-    // A LABEL THIS BUILD CANNOT EVALUATE IS NOT A LABEL IT MAY IGNORE. Counts
-    // taken some other way are not comparable with counts taken this way.
-    expect(why({ ...good, consistency: "approximate" })).toContain("approximate");
     expect(why({ consistency: "shared-snapshot" })).toContain("does not list any tables");
     expect(why({ ...good, tables: [{ table: "public.a" }] })).toContain("whole number of rows");
     expect(why({ ...good, tables: [{ table: "public.a", rows: -1 }] }))
@@ -560,6 +557,35 @@ describe("reading a backup's inventory", () => {
     expect(why({ ...good, tables: [{ table: "", rows: 1 }] })).toContain("no table name");
     expect(why({ ...good, tables: [{ table: "public.a", rows: 1 }, { table: "public.a", rows: 2 }] }))
       .toContain("twice");
+  });
+
+  // CHRIS'S DECISION 1, AT THE VALUE. A label this build cannot evaluate is not
+  // damage and is not refused: it is a check that will not be made, which is a
+  // different answer from both "unreadable" and "absent" and has to stay
+  // distinguishable from them -- the message an operator reads is chosen from
+  // it. The `why` is the same sentence the refusal used to carry, because what
+  // changed is what Conduit DOES about it, not what it knows.
+  it("degrades a consistency label it cannot check, rather than refusing it", () => {
+    const read = readInventory({ ...good, consistency: "approximate" });
+    expect(read.kind).toBe("uncheckable");
+    expect(read.kind === "uncheckable" && read.why).toContain("approximate");
+    expect(read.kind === "uncheckable" && read.why).toContain("does not know how to check");
+  });
+
+  // AND THE LINE THAT DECISION DRAWS, asserted rather than left to the comment.
+  // A LATER WRITER degrades; DAMAGE is still refused. If the tolerance leaked
+  // into the entry checks, an inventory whose rows are missing would be
+  // "uncheckable" too -- and a restore would then be told it could skip the
+  // check over a manifest that had simply been corrupted.
+  it("tolerates a label it does not know and still refuses a manifest that is broken", () => {
+    // The same archive, unknown label AND a damaged entry: the label is read
+    // first, so this is the case that says which answer wins.
+    expect(readInventory({ consistency: "approximate", tables: [{ table: "public.a" }] }).kind)
+      .toBe("uncheckable");
+    // ... and the known label with the same damaged entry is still a refusal.
+    expect(readInventory({ ...good, tables: [{ table: "public.a" }] }).kind).toBe("unreadable");
+    expect(readInventory({ tables: [] }).kind).toBe("unreadable");
+    expect(readInventory(42).kind).toBe("unreadable");
   });
 });
 
@@ -1015,13 +1041,7 @@ describe("restoring onto a different install", () => {
     const staged = await stageAndInspect(archive, target);
     expect(staged.plan.refusal).toBeNull();
 
-    const stops: string[] = [];
-    const outcome = await runRestore(staged, target, {
-      sync: {
-        stop: async () => { stops.push("stop"); },
-        start: async () => { stops.push("start"); },
-      },
-    });
+    const outcome = await runRestore(staged, target);
 
     // EVERY EFFECT DISPATCHED AND EVERY EFFECT REALISED. On a plan that ran to
     // the end these are equal, because the executor refuses a plan whose
@@ -1029,7 +1049,6 @@ describe("restoring onto a different install", () => {
     expect(outcome.dispatched).toBe(staged.plan.effects.length);
     expect(outcome.realised).toBe(outcome.dispatched);
     expect(outcome.unrealised).toEqual([]);
-    expect(stops).toEqual(["stop", "start"]);
 
     // THE DATA, TABLE BY TABLE, EXACT. Not an exit code.
     expect(await rowCounts(target.url)).toEqual(sourceCounts);
@@ -1859,50 +1878,19 @@ describe("a load that fails", () => {
       expect((cause as Error).message).toContain("the connection went away");
     });
 
-  // A SYNC THAT THROWS ON THE WAY DOWN IS STILL STARTED AGAIN, and it was not
-  // until this test existed: the stop sat OUTSIDE the try, so a throwing stop
-  // skipped the finally entirely and left the install silently receiving no
-  // mail -- the exact failure the comment beside it forbids, one line above the
-  // comment. Nothing else in the suite calls a sync that refuses to stop.
-  itRestore("restarts the mail sync even when stopping it threw", async () => {
-    const source = await makeInstall("srcsyncthrow");
-    await seed(source, ["Acme"]);
-    const target = await makeInstall("dstsyncthrow");
-    const work = await scratchDir("syncthrow");
-    const archive = await realBackup(source, work);
-    const staged = await stageAndInspect(archive, target);
-
-    const events: string[] = [];
-    const failure = await rejection(runRestore(staged, target, {
-      sync: {
-        stop: async () => {
-          events.push("stop");
-          throw new Error("the sync would not stop");
-        },
-        start: async () => { events.push("start"); },
-      },
-    }));
-    expect(failure.message).toContain("would not stop");
-    // Stopped, threw, and STARTED ANYWAY.
-    expect(events).toEqual(["stop", "start"]);
-  });
-
-  itRestore("restarts the mail sync even when the restore fails", async () => {
-    const source = await makeInstall("srcsync");
-    await seed(source, ["Acme"]);
-    const target = await makeInstall("dstsync");
-    const archive = await backupWithBrokenDump(source);
-    const staged = await stageAndInspect(archive, target);
-
-    const events: string[] = [];
-    await rejection(runRestore(staged, target, {
-      sync: {
-        stop: async () => { events.push("stop"); },
-        start: async () => { events.push("start"); },
-      },
-    }));
-    expect(events).toEqual(["stop", "start"]);
-  });
+  // THE THREE MAIL-SYNC CASES THAT USED TO LIVE HERE MOVED TO
+  // routes/restore.test.ts IN v1.4.1'S TASK 2, WITH THE SCOPE THEY WERE ABOUT.
+  // They are named here rather than deleted quietly, because one of them --
+  // "a sync that throws on the way down is still started again" -- found a real
+  // bug the first time it was written and must not be lost in a move: it is
+  // "starts it again when stopping it THREW, and does not restore" over there
+  // now, and it asserts one thing more than it used to, since a stop that threw
+  // is a stop that did not happen and the restore no longer runs after one.
+  //
+  // WHY THEY COULD NOT STAY: applyRestore has no sync any more. Stopping the
+  // second writer became a decision -- refuse or proceed -- and a decision needs
+  // the place where a refusal can still be cheap, which is above
+  // `intakeSessions.use`. See this module's header.
 });
 
 // ===========================================================================
@@ -2365,13 +2353,21 @@ describe("the inventory the backup records", () => {
     expect(await rowCounts(target.url)).toEqual(before);
   });
 
-  // A LABEL THIS BUILD CANNOT EVALUATE, at the archive rather than at the
-  // value. The counts might be perfectly good; what is missing is any basis for
-  // comparing them, and a restore does not guess on that path.
-  itRestore("refuses an inventory whose consistency it does not understand", async () => {
+  // A LABEL THIS BUILD CANNOT EVALUATE, AT THE ARCHIVE RATHER THAN AT THE
+  // VALUE, AND IT NO LONGER REFUSES -- Chris's decision 1, end to end. v1.4.0
+  // stopped here with `inventoryUnreadable`; the counts might be perfectly good
+  // and the archive is somebody's only backup, so it is restored with the
+  // cross-check reported as NOT MADE.
+  //
+  // THE WORDS ARE PART OF THE DECISION AND ARE ASSERTED AS SUCH. "Degrades
+  // silently" and "degrades" differ by exactly this finding, and a restore that
+  // skipped a check without saying so would be the silent pass every other
+  // instrument in this module exists to prevent.
+  itRestore("restores an inventory whose consistency it cannot check, and says so", async () => {
     const source = await makeInstall("srcunkinv");
     await seed(source, ["Acme"]);
     const target = await makeInstall("dstunkinv");
+    await seed(target, ["Replaced Ltd"]);
 
     const archive = await alteredBackup(source, async (_dir, manifest) => {
       const inventory = manifest.inventory;
@@ -2380,8 +2376,33 @@ describe("the inventory the backup records", () => {
     });
 
     const staged = await stageAndInspect(archive, target);
-    expect(staged.plan.refusal?.code).toBe(RESTORE_REFUSALS.inventoryUnreadable);
-    expect(staged.plan.refusal?.message).toContain("best-effort");
+    expect(staged.plan.refusal).toBeNull();
+    const finding = staged.plan.findings
+      .find((one) => one.code === RESTORE_FINDINGS.inventoryUncheckable);
+    expect(finding?.severity).toBe("warning");
+    expect(finding?.message).toContain("CANNOT BE MADE");
+    expect(finding?.message).toContain("best-effort");
+    // NOT the older-backup sentence: this archive is NEWER than this build, and
+    // sending its owner looking for an upgrade rather than a downgrade is the
+    // whole reason the two findings are separate codes.
+    expect(staged.plan.findings.map((one) => one.code))
+      .not.toContain(RESTORE_FINDINGS.inventoryMissing);
+
+    // The check is not merely unreported -- it is not made. A load-dump effect
+    // carrying the counts would compare them.
+    const load = effectFor(staged.plan, "load-dump") as RestoreEffect & {
+      inventory: readonly { table: string; rows: number }[] | null;
+    };
+    expect(load.inventory).toBeNull();
+    expect(load.detail).toContain("cannot check");
+
+    // AND IT REALLY RESTORES. The point of the decision is the recovery that
+    // now happens, not the finding that describes it.
+    const sourceCounts = await rowCounts(source.url);
+    const outcome = await runRestore(staged, target);
+    expect(outcome.realised).toBe(outcome.dispatched);
+    expect(outcome.unrealised).toEqual([]);
+    expect(await rowCounts(target.url)).toEqual(sourceCounts);
   });
 
   // THE ORDINARY CASE, SAID OUT LOUD: a real backup restored onto a different

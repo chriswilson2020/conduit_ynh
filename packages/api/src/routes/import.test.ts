@@ -48,7 +48,7 @@ const config: Config = {
   defaultCurrency: "EUR",
   mailKeyPath: "unused-in-tests",
   mailTlsRejectUnauthorized: true,
-  portalApiUrl: "http://127.0.0.1:6788",
+  ldapUrl: "ldap://127.0.0.1:389",
   reauthPassword: null,
 };
 
@@ -167,7 +167,7 @@ function upload(options: {
 
 /** The bytes GET /api/export answers with, through the real re-auth gate. */
 async function exportArchive(app: FastifyInstance): Promise<Buffer> {
-  const headers = await reauthedHeaders(app, chris);
+  const headers = await reauthedHeaders(app, chris, "export");
   const response = await app.inject({ method: "GET", url: "/api/export", headers });
   expect(response.statusCode).toBe(200);
   return response.rawPayload;
@@ -282,9 +282,11 @@ describe("who may import", () => {
    * THE DECISION, AS AN ASSERTION RATHER THAN AS A COMMENT.
    *
    * routes/import.ts argues at length that an import is NOT behind the
-   * re-authentication gate: it neither exfiltrates nor destroys, a fifth gated
-   * route widens what one fungible ticket authorises, and three prompts to load
-   * a spreadsheet teaches the reflex the gate exists to defeat. A decision
+   * re-authentication gate: it neither exfiltrates nor destroys, and three
+   * prompts to load a spreadsheet teaches the reflex the gate exists to
+   * defeat. (It used to argue a third thing -- that a fifth gated route widens
+   * what one fungible ticket authorises -- and v1.4.1 scoped tickets, so that
+   * one is gone rather than quietly weakened.) A decision
    * recorded only in prose is a decision the next `requireReauth` copy-paste
    * silently reverses, so this is the instrument: a session with NO TICKET AT
    * ALL gets a preview.

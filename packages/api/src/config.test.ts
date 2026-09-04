@@ -70,21 +70,31 @@ describe("parseConfig", () => {
     );
   });
 
-  it("leaves reauthPassword null when unset, so the real portal check is used", () => {
+  it("leaves reauthPassword null when unset, so the real directory check is used", () => {
     expect(parseConfig(valid).reauthPassword).toBeNull();
   });
 
-  it("defaults the portal API to where YunoHost 12 puts it", () => {
-    // Measured on the deploy target: /etc/nginx/conf.d/yunohost_api.conf.inc
-    // proxies /yunohost/portalapi/ to 127.0.0.1:6788.
-    expect(parseConfig(valid).portalApiUrl).toBe("http://127.0.0.1:6788");
+  it("defaults the directory to where YunoHost 12 puts it", () => {
+    // Measured on the deploy target: slapd listens on 127.0.0.1:389 and on
+    // nothing else. The scheme matters as much as the port -- ldap:// is what
+    // ldapts reads to decide it is not opening a TLS connection.
+    expect(parseConfig(valid).ldapUrl).toBe("ldap://127.0.0.1:389");
   });
 
-  it("carries through an explicit CONDUIT_PORTAL_API_URL and refuses a non-URL", () => {
-    expect(parseConfig({ ...valid, CONDUIT_PORTAL_API_URL: "http://127.0.0.1:9999" }).portalApiUrl)
-      .toBe("http://127.0.0.1:9999");
-    expect(() => parseConfig({ ...valid, CONDUIT_PORTAL_API_URL: "not a url" }))
-      .toThrow(/CONDUIT_PORTAL_API_URL/);
+  it("carries through an explicit CONDUIT_LDAP_URL and refuses a non-URL", () => {
+    expect(parseConfig({ ...valid, CONDUIT_LDAP_URL: "ldap://127.0.0.1:9999" }).ldapUrl)
+      .toBe("ldap://127.0.0.1:9999");
+    expect(() => parseConfig({ ...valid, CONDUIT_LDAP_URL: "not a url" }))
+      .toThrow(/CONDUIT_LDAP_URL/);
+  });
+
+  it("has no CONDUIT_PORTAL_API_URL left to honour", () => {
+    // v1.4.1 retired it with the portal call it configured. An install that
+    // still sets it in an env file is setting a variable nothing reads, which
+    // is the harmless half of the swap -- but a config that silently kept
+    // ACCEPTING it would be the sort of half-removal that reads as support.
+    expect(parseConfig({ ...valid, CONDUIT_PORTAL_API_URL: "http://127.0.0.1:6788" }))
+      .not.toHaveProperty("portalApiUrl");
   });
 
   it("defaults DATA_DIR to ./data when unset", () => {

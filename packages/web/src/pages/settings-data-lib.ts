@@ -421,6 +421,11 @@ const APPLY_KEEPS_THE_PREVIEW: ReadonlySet<string> = new Set([
   // and the second one's own message says to try again in a moment -- which is
   // only true if the preview is still there to try it with.
   "restore_in_progress", "restore_writes_in_flight",
+  // The mail sync would not stop, so the restore did not start. Same line of
+  // the same handler, and the same reason it is above it: a wedged sync clears
+  // itself in about two minutes, and a refusal somebody is meant to WAIT OUT
+  // and retry must not cost them the upload each time they do.
+  "restore_sync_running",
 ]);
 
 /**
@@ -501,8 +506,10 @@ export function restoreProblem(error: unknown, phase: "preview" | "apply"): stri
     case "reauth_throttled":
     case "restore_writes_in_flight":
     case "restore_in_progress":
-      // The server's own sentence is the actionable one in all three: how long
-      // to wait, and how many requests were still writing.
+    case "restore_sync_running":
+      // The server's own sentence is the actionable one in all four: how long
+      // to wait, and how many requests -- or mail account syncs -- were still
+      // writing when the restore asked them to stop.
       return error.message;
     case "restore_busy":
       // THE ONE STATE THIS PAGE CANNOT GET ITSELF OUT OF, so it says what is

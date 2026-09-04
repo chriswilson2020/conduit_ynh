@@ -287,8 +287,22 @@ jobs:
         run: npm run build
       - name: Run Playwright smoke tests
         run: npx playwright test
+      # ALWAYS, NOT ON FAILURE, AND THE DIFFERENCE IS THE ONLY REASON THE THREE
+      # KNOWN INTERMITTENTS HAVE NEVER BEEN EXPLAINED.
+      #
+      # Playwright retries twice in CI, so an intermittent produces a run that
+      # is GREEN with a `flaky` line in its log -- and `failure()` is false, so
+      # the report naming what actually happened is written on the runner and
+      # thrown away. Measured 2 Sep while harvesting rates: the artifacts API
+      # returns total_count 0 for all three sightings of the caret intermittent,
+      # so every one of them cost a retry and left nothing behind. The evidence
+      # that would settle them has been produced and discarded on every run this
+      # repository has ever had.
+      #
+      # The cost is a report uploaded on green runs too. At seven days'
+      # retention that is the cheapest instrument in this file.
       - name: Upload Playwright report
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report

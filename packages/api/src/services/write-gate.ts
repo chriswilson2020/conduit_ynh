@@ -79,15 +79,21 @@
  * safe direction of the bound working, and it is still somebody unable to
  * recover their install until the process is restarted.
  *
- * AND THE ASYMMETRY WITH THE OTHER SECOND WRITER. This gate REFUSES the restore
- * when HTTP writes will not drain; the mail sync is stopped BEST-EFFORT --
- * mail-sync.ts's `stop()` races a 15s deadline, logs that it gave up and
- * abandons the syncs, and services/restore.ts proceeds either way. So a wedged
- * sync survives into the restore, and its writes land through exactly the
- * lock-queue mechanism described above. Closing it means `stop()` reporting
- * whether it actually stopped, which is a change to the sync engine's contract
- * and not to this file; it is named in services/restore.ts too so neither side
- * can be read as complete on its own.
+ * THE OTHER SECOND WRITER IS NOW HELD TO THIS FILE'S STANDARD, AND FOR A
+ * RELEASE IT WAS NOT. This gate refuses the restore when HTTP writes will not
+ * drain; the mail sync was stopped BEST-EFFORT -- mail-sync.ts's `stop()` raced
+ * a 15s deadline, logged that it gave up, abandoned the syncs and RESOLVED, and
+ * services/restore.ts proceeded either way. A wedged sync therefore survived
+ * into the restore, and its writes landed through exactly the lock-queue
+ * mechanism measured above: queued behind `DROP SCHEMA`, released at COMMIT,
+ * delivered into the restored data. The asymmetry was backwards -- the writer
+ * that needs nobody at a keyboard was the one that could not refuse.
+ *
+ * CLOSED IN v1.4.1 BY THE SYNC ENGINE'S CONTRACT, not by anything here:
+ * `stop()` returns a SyncStopResult, deliberately the shape of DrainResult
+ * below, and routes/restore.ts takes both answers in the same place and refuses
+ * on either. This paragraph stays because the two halves are still described in
+ * two files and neither should read as complete on its own.
  *
  * IT IS PER PROCESS, which is the whole deployment -- one systemd unit, one
  * node process (conf/systemd.service). Nothing here would survive being run

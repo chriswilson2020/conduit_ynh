@@ -100,6 +100,13 @@ async function main(): Promise<void> {
         // Sync first: it holds IMAP connections and database work of its
         // own, and stopping it before the pool closes is what keeps a
         // shutdown from racing a pass mid-transaction.
+        //
+        // THE ANSWER IS DELIBERATELY NOT READ HERE, which is worth a line
+        // because reading it is the whole of v1.4.1's Task 2 one caller over.
+        // A restore refuses over a sync that would not stop; a shutdown has
+        // nothing to refuse. The process is exiting, `stop()` has already
+        // logged what it abandoned, and the alternative -- waiting longer --
+        // is the systemd stall the bound exists to prevent.
         if (syncManager !== null) await syncManager.stop();
         await app.close();
         await close();

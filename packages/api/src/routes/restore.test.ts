@@ -9,7 +9,7 @@ import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
 import { sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
-import type { PlanView } from "@conduit/shared";
+import { passphraseProblem, type PlanView, type ReauthScope } from "@conduit/shared";
 import { buildApp } from "../app.js";
 import { createDatabase, runMigrations, type DatabaseHandle } from "../db/client.js";
 import { openTestDatabase } from "../test/db.js";
@@ -24,7 +24,10 @@ import { forgetMailKey } from "../services/mail-crypto.js";
 import { INTAKE_WORK_PREFIX } from "../services/intake.js";
 import { ReauthTickets } from "../services/reauth.js";
 import type { ReauthVerifier } from "../services/reauth.js";
+import { RESTORE_STOP_TIMEOUT_MS } from "../services/mail-sync.js";
+import type { SyncStopOptions, SyncStopResult } from "../services/mail-sync.js";
 import { installName } from "./restore.js";
+import type { MailRouteSyncManager } from "./mail.js";
 import type { Config } from "../config.js";
 
 // THE ROUTES THAT DECIDE A RESTORE MAY HAPPEN, AND EVERY WAY OF GETTING PAST
@@ -184,10 +187,39 @@ function assertScratch(url: string): void {
   }
 }
 
+/**
+ * THE OTHER SECOND WRITER, AS A STUB THAT CAN REFUSE TO STOP.
+ *
+ * A stand-in that always succeeds is what let the re-auth gate ship broken
+ * (Task 0), so this one answers whatever the case sets: stopped, abandoned, or
+ * a `stop()` that throws. Nothing here syncs anything -- `get` is the
+ * best-effort seam every caller already treats as optional -- because what is
+ * under test is the decision the route takes on the ANSWER, not the engine.
+ */
+class FakeSyncManager implements MailRouteSyncManager {
+  /** "stop"/"start", in the order they were called. */
+  readonly events: string[] = [];
+  /** The deadline each stop was given, so the restore's own bound is visible. */
+  readonly deadlines: (number | undefined)[] = [];
+  outcome: SyncStopResult = { stopped: true, abandoned: 0 };
+  stopFailure: Error | null = null;
+
+  get(): undefined { return undefined; }
+  syncNow(): Promise<void> { return Promise.resolve(); }
+  stop(options: SyncStopOptions = {}): Promise<SyncStopResult> {
+    this.events.push("stop");
+    this.deadlines.push(options.timeoutMs);
+    if (this.stopFailure !== null) return Promise.reject(this.stopFailure);
+    return Promise.resolve(this.outcome);
+  }
+  start(): Promise<void> { this.events.push("start"); return Promise.resolve(); }
+}
+
 interface AppOptions {
   verifier?: ReauthVerifier;
   restoreMaxUploadBytes?: number;
   restoreDrainTimeoutMs?: number;
+  syncManager?: MailRouteSyncManager | null;
 }
 
 async function appFor(install: Install, options: AppOptions = {}): Promise<FastifyInstance> {
@@ -203,7 +235,7 @@ async function appFor(install: Install, options: AppOptions = {}): Promise<Fasti
     defaultCurrency: "EUR",
     mailKeyPath: install.mailKeyPath,
     mailTlsRejectUnauthorized: true,
-    portalApiUrl: "http://127.0.0.1:6788",
+    ldapUrl: "ldap://127.0.0.1:389",
     reauthPassword: null,
   };
   const app = await buildApp({
@@ -213,6 +245,15 @@ async function appFor(install: Install, options: AppOptions = {}): Promise<Fasti
     reauthVerifier: options.verifier ?? testReauthVerifier(),
     restoreMaxUploadBytes: options.restoreMaxUploadBytes,
     restoreDrainTimeoutMs: options.restoreDrainTimeoutMs,
+    // OMITTED ENTIRELY WHEN NO CASE ASKED FOR ONE, which is how every other
+    // test in this file runs: `mail` absent is the no-engine deployment, and
+    // app.ts's own fallback is what makes `syncManager()` answer null there.
+    ...options.syncManager === undefined ? {} : {
+      mail: {
+        syncManager: () => options.syncManager ?? null,
+        transportFactory: () => { throw new Error("nothing in this file sends mail"); },
+      },
+    },
   });
   apps.push(app);
   return app;
@@ -351,10 +392,21 @@ function upload(options: {
   };
 }
 
-/** Mint one ticket through the real endpoint, for the identity in `headers`. */
-async function ticket(app: FastifyInstance, headers: Record<string, string>): Promise<string> {
+/**
+ * Mint one ticket through the real endpoint, for the identity in `headers` and
+ * for one operation.
+ *
+ * THE SCOPE IS NAMED AT EVERY CALL AND HAS NO DEFAULT. A ticket is proof for
+ * one operation since v1.4.1, and the two restore routes are the pair that
+ * defect was sharpest between -- so a helper that guessed would be the one
+ * place in this file able to hide it.
+ */
+async function ticket(
+  app: FastifyInstance, headers: Record<string, string>, scope: ReauthScope,
+): Promise<string> {
   const response = await app.inject({
-    method: "POST", url: "/api/reauth", headers, payload: { password: TEST_REAUTH_PASSWORD },
+    method: "POST", url: "/api/reauth", headers,
+    payload: { password: TEST_REAUTH_PASSWORD, scope },
   });
   if (response.statusCode !== 200) {
     throw new Error(`could not mint a ticket: ${String(response.statusCode)} ${response.body}`);
@@ -364,9 +416,9 @@ async function ticket(app: FastifyInstance, headers: Record<string, string>): Pr
 
 /** `headers` plus a freshly minted, single-use ticket. One call, one request. */
 async function reauthed(
-  app: FastifyInstance, headers: Record<string, string>,
+  app: FastifyInstance, headers: Record<string, string>, scope: ReauthScope,
 ): Promise<Record<string, string>> {
-  return { ...headers, "x-conduit-reauth": await ticket(app, headers) };
+  return { ...headers, "x-conduit-reauth": await ticket(app, headers, scope) };
 }
 
 /** Upload an archive and get the preview back. */
@@ -374,7 +426,7 @@ async function inspect(
   app: FastifyInstance, archivePath: string,
   options: { headers?: Record<string, string>; passphrase?: string } = {},
 ): Promise<{ statusCode: number; body: string; json: () => unknown }> {
-  const headers = options.headers ?? await reauthed(app, chris);
+  const headers = options.headers ?? await reauthed(app, chris, "restore-preview");
   const form = upload({
     content: await readFile(archivePath), passphrase: options.passphrase ?? PASSPHRASE,
   });
@@ -398,7 +450,7 @@ async function applyRestoreRequest(
   body: Record<string, unknown>,
   options: { headers?: Record<string, string> } = {},
 ) {
-  const headers = options.headers ?? await reauthed(app, chris);
+  const headers = options.headers ?? await reauthed(app, chris, "restore-apply");
   return await app.inject({ method: "POST", url: "/api/restore/apply", headers, payload: body });
 }
 
@@ -508,8 +560,8 @@ describe("re-authentication gates both restore routes", () => {
 
   /** Every bypass attempt is run against both routes. */
   const routes = [
-    { what: "inspect", url: "/api/restore/inspect" },
-    { what: "apply", url: "/api/restore/apply" },
+    { what: "inspect", url: "/api/restore/inspect", scope: "restore-preview" },
+    { what: "apply", url: "/api/restore/apply", scope: "restore-apply" },
   ] as const;
 
   async function attempt(
@@ -523,7 +575,7 @@ describe("re-authentication gates both restore routes", () => {
       : await app.inject({ method: "POST", url: `${url}${query}`, headers, payload: applyBody });
   }
 
-  describe.each(routes)("bypassing the gate on $what", ({ url }) => {
+  describe.each(routes)("bypassing the gate on $what", ({ url, scope }) => {
     it("fails with no ticket at all", async () => {
       const response = await attempt(url, chris);
       expect(response.statusCode).toBe(401);
@@ -542,7 +594,7 @@ describe("re-authentication gates both restore routes", () => {
     });
 
     it("fails on a ticket that has already been spent", async () => {
-      const spent = await ticket(app, chris);
+      const spent = await ticket(app, chris, scope);
       const first = await attempt(url, { ...chris, "x-conduit-reauth": spent });
       // The first got PAST the gate -- it fails for its own reasons (the body
       // is not an archive, the plan id is unknown) and that is the point: if it
@@ -555,7 +607,7 @@ describe("re-authentication gates both restore routes", () => {
     });
 
     it("fails on another account's ticket", async () => {
-      const theirs = await ticket(app, sam);
+      const theirs = await ticket(app, sam, scope);
       const response = await attempt(url, { ...chris, "x-conduit-reauth": theirs });
       expect(response.statusCode).toBe(401);
       expect(response.json()).toMatchObject({ error: "reauth_required" });
@@ -565,15 +617,15 @@ describe("re-authentication gates both restore routes", () => {
       // The SAME class the app uses, constructed with a lifetime of nothing,
       // rather than a stub that says no.
       const expired = new ReauthTickets(0);
-      const token = expired.issue("chris");
-      expect(expired.redeem(token, "chris")).toBe(false);
+      const token = expired.issue("chris", scope);
+      expect(expired.redeem(token, "chris", scope)).toBe(false);
       const response = await attempt(url, { ...chris, "x-conduit-reauth": token });
       expect(response.statusCode).toBe(401);
     });
 
     it("fails when a junk value rides alongside a real ticket, in either order", async () => {
       for (const order of ["junk-first", "ticket-first"] as const) {
-        const real = await ticket(app, chris);
+        const real = await ticket(app, chris, scope);
         const value = order === "junk-first" ? `junk, ${real}` : `${real}, junk`;
         const response = await attempt(url, { ...chris, "x-conduit-reauth": value });
         expect(response.statusCode, order).toBe(401);
@@ -590,7 +642,7 @@ describe("re-authentication gates both restore routes", () => {
     // string to its access log verbatim and the browser keeps it in history,
     // which is the whole reason v1.3.0 made the backup a POST.
     it("fails when the ticket is put in the query string", async () => {
-      const real = await ticket(app, chris);
+      const real = await ticket(app, chris, scope);
       const response = await attempt(
         url, chris, `?x-conduit-reauth=${real}&ticket=${real}&reauth=${real}`,
       );
@@ -599,7 +651,7 @@ describe("re-authentication gates both restore routes", () => {
     });
 
     it("fails when the ticket is put in a cookie", async () => {
-      const real = await ticket(app, chris);
+      const real = await ticket(app, chris, scope);
       const response = await attempt(url, {
         ...chris, cookie: `x-conduit-reauth=${real}; other=1`,
       });
@@ -613,7 +665,7 @@ describe("re-authentication gates both restore routes", () => {
     // because the failure would be a gate that refuses the operator who did
     // everything right -- and because the only way to find out is to look.
     it("accepts the ticket whatever case the header name is written in", async () => {
-      const real = await ticket(app, chris);
+      const real = await ticket(app, chris, scope);
       const response = await attempt(url, { ...chris, "X-CONDUIT-REAUTH": real });
       expect(response.body).not.toContain("reauth_required");
     });
@@ -719,7 +771,7 @@ describe("POST /api/restore/inspect", () => {
     const form = upload({ content: Buffer.from("hello, not a 7z"), passphrase: PASSPHRASE });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(app, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(app, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     expect(response.statusCode).toBe(400);
     expect(await intakeWorkDirs(target)).toEqual([]);
@@ -729,7 +781,7 @@ describe("POST /api/restore/inspect", () => {
     const form = upload({ content: Buffer.from("anything") });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(app, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(app, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     expect(response.statusCode).toBe(400);
     expect((response.json() as { message: string }).message).toContain("passphrase is required");
@@ -751,7 +803,7 @@ describe("POST /api/restore/inspect", () => {
     });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(app, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(app, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     // Past the passphrase rule and refused by the archive, which is the only
     // way to see that the field was read at all.
@@ -765,7 +817,7 @@ describe("POST /api/restore/inspect", () => {
     });
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(app, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(app, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     expect(response.statusCode).toBe(400);
     expect((response.json() as { message: string }).message).toContain('named "file"');
@@ -774,7 +826,7 @@ describe("POST /api/restore/inspect", () => {
   itArchive("refuses a request that is not multipart at all", async () => {
     const response = await app.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: await reauthed(app, chris), payload: { passphrase: PASSPHRASE },
+      headers: await reauthed(app, chris, "restore-preview"), payload: { passphrase: PASSPHRASE },
     });
     expect(response.statusCode).toBe(400);
   });
@@ -792,7 +844,7 @@ describe("POST /api/restore/inspect", () => {
     const form = upload({ content: Buffer.alloc(16 * 1024, 7), passphrase: PASSPHRASE });
     const response = await small.inject({
       method: "POST", url: "/api/restore/inspect",
-      headers: { ...await reauthed(small, chris), ...form.headers }, payload: form.payload,
+      headers: { ...await reauthed(small, chris, "restore-preview"), ...form.headers }, payload: form.payload,
     });
     expect(response.statusCode).toBe(413);
     expect((response.json() as { error: string }).error).toBe("too_large");
@@ -939,6 +991,32 @@ describe("POST /api/restore/apply -- the guards in front of the destruction", ()
     await expectNothingDestroyed();
   });
 
+  // DECISION 4: A CHARACTER THE RULE FORBIDS IS NAMED AS ONE, and the case is
+  // written as the CONTRAST with the one above because that is the whole
+  // defect. Both requests carry a passphrase the proof will not accept, and
+  // until v1.4.1 both got the same answer -- "that is not the passphrase this
+  // backup was opened with" -- which is true of the first and blames the
+  // operator's memory for the second, over a character they cannot see.
+  //
+  // THE VALIDATION ERROR IS THE POINT, not merely a 400: the two are told apart
+  // by `error`, and the message has to be the rule's own sentence rather than a
+  // second one that agrees with it.
+  itRestore("names a control character in the passphrase instead of blaming the operator",
+    async () => {
+      for (const passphrase of [`${PASSPHRASE}\nrest`, `${PASSPHRASE}\r`, `two\tparts`]) {
+        const response = await applyRestoreRequest(app, {
+          planId: plan.planId, passphrase, confirmName: target.name,
+        });
+        const body = response.json() as { error: string; message: string };
+        expect(response.statusCode, JSON.stringify(passphrase)).toBe(400);
+        expect(body.error, JSON.stringify(passphrase)).toBe("validation");
+        expect(body.error).not.toBe("restore_passphrase_mismatch");
+        expect(body.message).toBe(passphraseProblem(passphrase));
+        expect(body.message).toContain("7z reads it up to the first line break");
+      }
+      await expectNothingDestroyed();
+    });
+
   // THE PLAN IS BOUND TO THE OPERATOR WHO UPLOADED IT. Everything else about
   // sam's request is perfect: a real session, a real ticket, the right name and
   // the right passphrase.
@@ -953,7 +1031,7 @@ describe("POST /api/restore/apply -- the guards in front of the destruction", ()
   itRestore("will not let another account apply chris's plan, or cancel it", async () => {
     const response = await applyRestoreRequest(app, {
       planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
-    }, { headers: await reauthed(app, sam) });
+    }, { headers: await reauthed(app, sam, "restore-apply") });
     expect(response.statusCode).toBe(404);
     expect((response.json() as { error: string }).error).toBe("restore_plan_unknown");
 
@@ -1021,7 +1099,7 @@ describe("POST /api/restore/apply -- the guards in front of the destruction", ()
         databaseUrl: "postgres://user:pw@127.0.0.1:5432",
         basePath: "/", version: APP_VERSION, devUser: null, dataDir: elsewhere,
         defaultCurrency: "EUR", mailKeyPath: path.join(elsewhere, "mail.key"),
-        mailTlsRejectUnauthorized: true, portalApiUrl: "http://127.0.0.1:6788",
+        mailTlsRejectUnauthorized: true, ldapUrl: "ldap://127.0.0.1:389",
         reauthPassword: null,
       },
       db: target.handle.db, dataDir: elsewhere, reauthVerifier: testReauthVerifier(),
@@ -1092,12 +1170,12 @@ describe("refusing new writes for the duration of a restore", () => {
     const plan = await previewOf(app, archive);
     // Minted BEFORE the verifier is armed, because apply redeems a ticket
     // rather than checking a password.
-    const applyHeaders = await reauthed(app, chris);
+    const applyHeaders = await reauthed(app, chris, "restore-apply");
 
     armed = true;
     const blockedWrite = app.inject({
       method: "POST", url: "/api/reauth", headers: chris,
-      payload: { password: TEST_REAUTH_PASSWORD },
+      payload: { password: TEST_REAUTH_PASSWORD, scope: "export" },
     });
     await hasEntered;
 
@@ -1177,7 +1255,7 @@ describe("refusing new writes for the duration of a restore", () => {
     const archive = await realBackup(source, await scratchDir("archive"));
     const expectedUsers = await userCount(source.url);
     const plan = await previewOf(app, archive);
-    const headers = await reauthed(app, chris);
+    const headers = await reauthed(app, chris, "restore-apply");
 
     const applying = app.inject({
       method: "POST", url: "/api/restore/apply", headers,
@@ -1233,12 +1311,12 @@ describe("refusing new writes for the duration of a restore", () => {
     const app = await appFor(target, { verifier, restoreDrainTimeoutMs: 2_000 });
     const archive = await realBackup(source, await scratchDir("archive"));
     const plan = await previewOf(app, archive);
-    const applyHeaders = await reauthed(app, chris);
+    const applyHeaders = await reauthed(app, chris, "restore-apply");
 
     armed = true;
     const blockedWrite = app.inject({
       method: "POST", url: "/api/reauth", headers: chris,
-      payload: { password: TEST_REAUTH_PASSWORD },
+      payload: { password: TEST_REAUTH_PASSWORD, scope: "export" },
     });
     await hasEntered;
     const applying = app.inject({
@@ -1290,7 +1368,7 @@ describe("a restore that runs", () => {
     const app = await appFor(target);
     const archive = await realBackup(source, await scratchDir("archive"));
     const plan = await previewOf(app, archive);
-    const headers = await reauthed(app, chris);
+    const headers = await reauthed(app, chris, "restore-apply");
 
     const applying = app.inject({
       method: "POST", url: "/api/restore/apply", headers,
@@ -1405,6 +1483,128 @@ describe("a restore that runs", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The other second writer
+// ---------------------------------------------------------------------------
+
+/**
+ * THE SYNC IS STOPPED WHERE THE WRITES ARE, AND REFUSED THE SAME WAY.
+ *
+ * v1.4.0 stopped it inside services/restore.ts, could not tell a stop from an
+ * abandonment, and destroyed the database either way. Both halves moved: the
+ * engine reports (services/mail-sync.ts), and the decision is taken here --
+ * ABOVE the line this handler draws, so a refusal costs a click rather than a
+ * three-gigabyte re-upload. The last case is the one that proves the placement
+ * rather than merely the refusal.
+ */
+describe("stopping the mail sync for a restore", () => {
+  itRestore("stops it before the restore and starts it again after", async () => {
+    const source = await makeInstall("srcsyncok");
+    await seed(source, ["Northwind Traders"]);
+    const target = await makeInstall("dstsyncok");
+    await seed(target, ["Something Else Ltd"]);
+    const manager = new FakeSyncManager();
+    const app = await appFor(target, { syncManager: manager });
+    const archive = await realBackup(source, await scratchDir("syncok"));
+    const plan = await previewOf(app, archive);
+
+    const response = await applyRestoreRequest(app, {
+      planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(manager.events).toEqual(["stop", "start"]);
+    // AND IT WAITED THE RESTORE'S BOUND, NOT THE SHUTDOWN'S. A restore is
+    // about to take a whole backup and load a dump over it; refusing after
+    // fifteen seconds a sync would have finished unwinding in ninety would be
+    // a refusal bought with nothing.
+    expect(manager.deadlines).toEqual([RESTORE_STOP_TIMEOUT_MS]);
+    expect(await companyNames(target.url)).toEqual(["Northwind Traders"]);
+  }, 300_000);
+
+  itRestore("starts it again when stopping it THREW, and does not restore", async () => {
+    const source = await makeInstall("srcsyncthrew");
+    await seed(source, ["Northwind Traders"]);
+    const target = await makeInstall("dstsyncthrew");
+    await seed(target, ["Something Else Ltd"]);
+    const manager = new FakeSyncManager();
+    manager.stopFailure = new Error("the sync engine fell over");
+    const app = await appFor(target, { syncManager: manager });
+    const archive = await realBackup(source, await scratchDir("syncthrew"));
+    const plan = await previewOf(app, archive);
+
+    const response = await applyRestoreRequest(app, {
+      planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
+    });
+    // A stop that threw is not a stop. "It could not be checked" is refused
+    // exactly like "it did not stop": the whole point is that the restore
+    // proceeds only on a POSITIVE answer.
+    expect(response.statusCode, response.body).toBe(503);
+    expect(response.json()).toMatchObject({ error: "restore_sync_running" });
+    expect(manager.events).toEqual(["stop", "start"]);
+    expect(await companyNames(target.url)).toEqual(["Something Else Ltd"]);
+    // The gate did not stay shut behind the refusal.
+    const after = await app.inject({
+      method: "POST", url: "/api/companies", headers: chris, payload: { name: "After" },
+    });
+    expect(after.statusCode).toBe(201);
+  }, 300_000);
+
+  /**
+   * THE CASE THIS TASK EXISTS FOR, AND IT ASSERTS THE PLACEMENT AS WELL AS THE
+   * REFUSAL.
+   *
+   * A sync that would not stop is a writer this restore cannot see, and
+   * services/write-gate.ts has the measurement that makes it fatal rather than
+   * unlucky: PostgreSQL QUEUES a write blocked by `DROP SCHEMA` and releases it
+   * at COMMIT, so an abandoned sync's INSERT is delivered INTO the restored
+   * data instead of losing a race with it.
+   *
+   * So the restore does not start -- and then the SAME preview is applied again
+   * against a sync that stops, and succeeds. That second half is the argument
+   * for refusing here rather than inside applyRestore: `intakeSessions.use`
+   * disposes of the staging in a `finally`, so a refusal one line lower would
+   * have cost the operator their whole upload for a condition that clears
+   * itself in about two minutes.
+   */
+  itRestore("refuses when the sync will not stop, and the preview survives the refusal",
+    async () => {
+      const source = await makeInstall("srcsyncwedged");
+      await seed(source, ["Northwind Traders"]);
+      const target = await makeInstall("dstsyncwedged");
+      await seed(target, ["Something Else Ltd"]);
+      const manager = new FakeSyncManager();
+      manager.outcome = { stopped: false, abandoned: 2 };
+      const app = await appFor(target, { syncManager: manager });
+      const archive = await realBackup(source, await scratchDir("syncwedged"));
+      const plan = await previewOf(app, archive);
+
+      const refused = await applyRestoreRequest(app, {
+        planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
+      });
+      expect(refused.statusCode, refused.body).toBe(503);
+      expect(refused.json()).toMatchObject({
+        error: "restore_sync_running", stillSyncing: 2,
+      });
+      // NOTHING WAS DESTROYED, and no safety backup was taken either: this
+      // refusal is above everything that writes.
+      expect(await companyNames(target.url)).toEqual(["Something Else Ltd"]);
+      expect(await readFile(target.mailKeyPath))
+        .not.toEqual(await readFile(source.mailKeyPath));
+      // THE UPLOAD IS STILL THERE. One staging directory, the same plan id.
+      expect(await intakeWorkDirs(target)).toHaveLength(1);
+
+      // AND PRESSING THE BUTTON AGAIN WORKS, which is the whole reason the
+      // refusal lives above the line rather than inside the engine.
+      manager.outcome = { stopped: true, abandoned: 0 };
+      const applied = await applyRestoreRequest(app, {
+        planId: plan.planId, passphrase: PASSPHRASE, confirmName: target.name,
+      });
+      expect(applied.statusCode, applied.body).toBe(200);
+      expect(await companyNames(target.url)).toEqual(["Northwind Traders"]);
+      expect(manager.events).toEqual(["stop", "start", "stop", "start"]);
+    }, 300_000);
+});
+
+// ---------------------------------------------------------------------------
 // The credential store, counted rather than asserted
 // ---------------------------------------------------------------------------
 
@@ -1432,7 +1632,7 @@ describe("descriptors and the staged archive", () => {
     // ABORT: the client goes away in the middle of the upload. Five times,
     // because one leaked descriptor is easy to miss and five is not.
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      const headers = await reauthed(app, chris);
+      const headers = await reauthed(app, chris, "restore-preview");
       const prologue = upload({ content: Buffer.alloc(0), passphrase: PASSPHRASE }).payload;
       const source$ = new Readable({
         read() {
@@ -1501,7 +1701,7 @@ describe("descriptors and the staged archive", () => {
     const app = await appFor(target, { restoreDrainTimeoutMs: 300 });
     const archive = await realBackup(source, await scratchDir("archive"));
 
-    const headers = await reauthed(app, chris);
+    const headers = await reauthed(app, chris, "restore-preview");
     const prologue = upload({ content: Buffer.alloc(0), passphrase: PASSPHRASE }).payload;
     const aborted = new Readable({
       read() {

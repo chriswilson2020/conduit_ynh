@@ -12,7 +12,7 @@ import type { SendMailTransportFactory } from "./services/mail-send.js";
 import type { MailRouteSyncManager } from "./routes/mail.js";
 import {
   ReauthTickets, ReauthThrottle,
-  createPortalVerifier, createFixedPasswordVerifier,
+  createLdapVerifier, createFixedPasswordVerifier,
 } from "./services/reauth.js";
 import type { ReauthVerifier } from "./services/reauth.js";
 import { IntakeSessionStore } from "./services/intake-plan.js";
@@ -289,7 +289,7 @@ export async function buildApp(
       ?? createSmtpTransportFactory({ rejectUnauthorized: config.mailTlsRejectUnauthorized }),
     reauthVerifier: reauthVerifier ?? (
       config.reauthPassword === null
-        ? createPortalVerifier(config.portalApiUrl)
+        ? createLdapVerifier(config.ldapUrl)
         : createFixedPasswordVerifier(config.reauthPassword)
     ),
     // ONE INSTANCE EACH, PER APP, and that is what makes the gate work at all:

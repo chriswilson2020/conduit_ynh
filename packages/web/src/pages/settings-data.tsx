@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { MAX_PASSPHRASE_LENGTH, destructiveEffects, planIsApplicable } from "@conduit/shared";
-import type { RestoreInspection, RestoreOutcome } from "@conduit/shared";
+import type { ReauthScope, RestoreInspection, RestoreOutcome } from "@conduit/shared";
 import {
   applyRestore, cancelRestore, inspectRestore, requestReauthTicket,
   useBackupPreflight, useDownloadBackup, useDownloadExport,
@@ -69,8 +69,11 @@ import type { BackupFormState, RestoreFormState } from "./settings-data-lib";
  *      restore (ReauthDialog, and the gate on the server that is the actual
  *      control -- routes/reauth.ts). NOT before an import, and routes/import.ts
  *      argues that at length rather than leaving it to be noticed: an import
- *      neither exfiltrates nor destroys, and a fifth gated route would widen
- *      what one fungible ticket authorises.
+ *      neither exfiltrates nor destroys, and three password prompts to load a
+ *      spreadsheet would teach an operator to type their password at any
+ *      prompt this application shows them. Each of the four prompts mints a
+ *      ticket for ITS operation only (ReauthScope), so what one confirmation
+ *      authorises is the thing the operator was reading about.
  *   2. Both downloads issued with fetch() and a blob, never a link (api.ts's
  *      downloadArchive).
  *   3. The pre-flight warning before a long backup (PreflightNotice), the half
@@ -106,8 +109,15 @@ import type { BackupFormState, RestoreFormState } from "./settings-data-lib";
  * minutes earlier when they started reading. The cost is that the page asks for
  * the password twice, so the page says why, twice: in the section's own copy
  * and again in each prompt.
+ *
+ * IT IS ReauthScope ITSELF SINCE v1.4.1, not a local type that happens to have
+ * the same four names. A ticket is now minted FOR one operation, and the
+ * operation it is minted for is this value -- the one the dialog is open for
+ * and whose reason the operator just read. Spelling it twice would let the
+ * prompt and the proof drift apart, which is precisely the drift the scope
+ * exists to stop.
  */
-type Pending = "export" | "backup" | "restore-preview" | "restore-apply";
+type Pending = ReauthScope;
 
 export function SettingsDataPage() {
   const preflight = useBackupPreflight();
@@ -270,7 +280,10 @@ export function SettingsDataPage() {
       // very next call; it is never held in state, so there is nothing on this
       // page for a second click to reuse. The password is a local const and an
       // argument, and nothing keeps a copy of either.
-      const { ticket } = await requestReauthTicket(password);
+      //
+      // AND IT IS MINTED FOR `which`, which is the prompt the operator
+      // answered: a ticket taken off this page cannot be spent on a restore.
+      const { ticket } = await requestReauthTicket(password, which);
       closePrompt();
       const filename = which === "export"
         ? await exportDownload.mutateAsync(ticket)
@@ -310,7 +323,7 @@ export function SettingsDataPage() {
     setOutcome(null);
     setChecking(true);
     try {
-      const { ticket } = await requestReauthTicket(password);
+      const { ticket } = await requestReauthTicket(password, "restore-preview");
       closePrompt();
       setChecking(false);
       setPreviewing(true);
@@ -392,7 +405,10 @@ export function SettingsDataPage() {
     setRestoreError(null);
     setChecking(true);
     try {
-      const { ticket } = await requestReauthTicket(password);
+      // THE SCOPE THAT MATTERS MOST, and the one the preview's ticket does not
+      // carry: nothing minted for reading a plan can reach the request that
+      // destroys the database.
+      const { ticket } = await requestReauthTicket(password, "restore-apply");
       closePrompt();
       setChecking(false);
       setApplying(true);
@@ -978,18 +994,21 @@ function ReauthDialog(props: {
           and an operator who thinks a prompt is a glitch is an operator who
           stops reading prompts.
         */}
-        <DialogDescription>
-          {/*
-            THE TESTID IS ON A SPAN INSIDE, NOT ON DialogDescription, AND A
-            FAILING TEST IS WHAT FOUND THAT IT HAD TO BE. That component takes
-            `{ children }` and nothing else, so any other prop is dropped -- and
-            TypeScript does not catch it, because it skips excess-property
-            checking for a JSX attribute whose name is not a valid identifier,
-            which `data-testid` is not. So it compiled, rendered, and had no
-            testid on it. Wrapping the text is the narrow fix; widening a shared
-            dialog primitive for one caller is not.
-          */}
-          <span data-testid="reauth-reason">{reauthReason(pending)}</span>
+        {/*
+          THE TESTID IS ON THE DESCRIPTION ITSELF AGAIN, AND THE ROUND TRIP IS
+          WORTH ONE COMMENT. It was here originally, silently did nothing, and
+          cost a red e2e: DialogDescription took `{ children }` and dropped
+          every other prop, and TypeScript does not catch that -- it skips
+          excess-property checking for a JSX attribute whose name is not a valid
+          identifier, which `data-testid` is not. The narrow fix was to wrap the
+          text in a `<span>` and testid THAT, on the argument that widening a
+          shared dialog primitive for one caller was too much. v1.4.1 widened it
+          anyway (the trap was the primitive's, not this caller's) and
+          components/ui/ui.test.ts now holds a guard that a passed prop
+          actually arrives -- so the wrapper has nothing left to do.
+        */}
+        <DialogDescription data-testid="reauth-reason">
+          {reauthReason(pending)}
         </DialogDescription>
         <form className="mt-4 flex flex-col gap-3" onSubmit={onSubmit}>
           <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">

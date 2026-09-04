@@ -283,7 +283,7 @@ test.describe("the re-authentication gate", () => {
       const minted = await fetch("/api/reauth", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: "e2e-reauth-password" }),
+        body: JSON.stringify({ password: "e2e-reauth-password", scope: "export" }),
       });
       const { ticket } = (await minted.json()) as { ticket: string };
       const first = await fetch("/api/export", { headers: { "X-Conduit-Reauth": ticket } });
@@ -295,6 +295,39 @@ test.describe("the re-authentication gate", () => {
     expect(replay.first).toBe(200);
     expect(replay.second).toBe(401);
     expect(replay.body).toContain("reauth_required");
+  });
+
+  /**
+   * A DOWNLOAD'S PROOF WILL NOT DESTROY THE DATABASE. v1.4.1's headline defect,
+   * asserted through a real browser against a real server rather than only at
+   * the route: before it, this ticket -- minted for an export, from inside an
+   * authenticated session, exactly as the page mints one -- was a live
+   * authorisation to run the restore for the next five minutes.
+   *
+   * THE APPLY BODY IS DELIBERATELY EMPTY. The gate runs before the body is
+   * parsed and before any plan is looked up, so nothing here can destroy
+   * anything even if the assertion fails: what a spent-scope ticket would get
+   * is a 400 about the body, and the assertion tells that from the 401 the
+   * gate answers.
+   */
+  test("BYPASSING IT SIDEWAYS FAILS: a download's ticket cannot reach the restore", async ({ page }) => {
+    await openDataSettings(page);
+    const crossed = await page.evaluate(async () => {
+      const minted = await fetch("/api/reauth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: "e2e-reauth-password", scope: "export" }),
+      });
+      const { ticket } = (await minted.json()) as { ticket: string };
+      const applied = await fetch("/api/restore/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Conduit-Reauth": ticket },
+        body: JSON.stringify({}),
+      });
+      return { status: applied.status, body: await applied.text() };
+    });
+    expect(crossed.status).toBe(401);
+    expect(crossed.body).toContain("reauth_required");
   });
 });
 
@@ -864,7 +897,7 @@ test.describe("Settings -> restore", () => {
         const minted = await fetch("/api/reauth", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password: "e2e-reauth-password" }),
+          body: JSON.stringify({ password: "e2e-reauth-password", scope: "restore-preview" }),
         });
         const { ticket } = (await minted.json()) as { ticket: string };
         const form = new FormData();

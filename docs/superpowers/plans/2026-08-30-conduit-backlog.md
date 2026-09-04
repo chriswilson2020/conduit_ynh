@@ -28,7 +28,7 @@ archive being restored, which has no recovery path.
 | ~~**v1.2.2**~~ | The MAIL template feature removed, table included (the QUOTE template stayed); the five lists given the loading branch their siblings have; and the Dovecot IDLE burst diagnosed -- **the answer was NO**, so nothing was reordered. **Ships `0012`, a `DROP TABLE`** | **SHIPPED 31 Aug** |
 | ~~**7.6 → v1.3.0**~~ | Export (plain ZIP, readable, not restorable) and backup (AES-256 `.7z`, exact, not readable), told apart on a Settings page, **both behind a password re-prompt**. No schema change | **SHIPPED 31 Aug** |
 | ~~**7.7 → v1.4.0**~~ | Restore (preview, safety backup, apply) and two importers -- the exact one reading Conduit's own export, the forgiving one reading a foreign CSV. **Seven nginx location blocks, one of which did not parse until the release checked it.** No schema change | **SHIPPED 2 Sep** |
-| **v1.4.1** | Now seven hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, **the `lower()`/`toLowerCase()` collation gap**, and the decisions for Chris | **NEXT**, straight after v1.4.0 |
+| **v1.4.1** | Opened by a live defect (the re-auth gate refusing the correct password), then the seven hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, the `lower()`/`toLowerCase()` fold gap, and Chris's four decisions. **Ships `0013`, two functional indexes and one IMMUTABLE function** -- "no schema change" stopped being true when he took decision 3 | **IN FLIGHT** |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
 | **Phase 4.4** | Mail filing power tools: per-message selection, arbitrary folder moves, folder management, bulk unhide, live inbox beyond page one | Unspecced. Overlaps "emailing a quote" below |
 
@@ -844,16 +844,34 @@ found by SQL.
 Full detail and task shapes in `docs/superpowers/plans/2026-09-02-conduit-v1.4.1-cleanup.md`.
 Listed here so the backlog is the one place to look.
 
-**THE ONE THAT CHANGED MEANING RATHER THAN BEING FOUND: re-auth tickets are fungible across
-every gated route.** A ticket minted to download a backup is a live authorisation to destroy
-the entire database for five minutes. Harmless while both gated operations were downloads;
-restore is what made it matter. Two riders: the 64-ticket ceiling evicts across accounts, and
-a password change does not invalidate outstanding tickets.
+~~**THE ONE THAT CHANGED MEANING RATHER THAN BEING FOUND: re-auth tickets are fungible across
+every gated route.**~~ **CLOSED in v1.4.1, Task 1.** A ticket carried an account and not an
+operation, so one minted to download a backup was a live authorisation to destroy the entire
+database for five minutes. Harmless while both gated operations were downloads; restore is
+what made it matter. A ticket now names one of four operations (`ReauthScope`) and is refused
+at every other gate -- **four call sites, not the three the task predicted: the restore is two
+of them, and that is the pair a single `restore` scope would have got wrong.** The first rider
+is closed with it: the 64-ticket ceiling is now a per-account cap of 8, and the global one
+evicts whoever holds the most instead of whatever is oldest. **The second rider is recorded
+rather than fixed, and the reason first given for it was measured and found false** -- a
+password change DOES invalidate YunoHost's own sessions (`user.py:608`, `portal.py:331` at
+12.1.40.1), which is what makes the surviving ticket unusable over the network rather than
+merely no worse than the cookie. See the task for the argument against putting an LDAP query
+inside `redeem`.
 
-- **The mail sync is stopped best-effort while HTTP writes are refused.** `stop()` abandons
-  after 15s and `applyRestore` proceeds. The sync is the writer that moves data with nobody
-  touching a browser -- and Postgres **queues** a write blocked by `DROP SCHEMA` and releases
-  it at COMMIT, so an abandoned sync's write lands *inside* the window rather than racing it.
+- ~~**The mail sync is stopped best-effort while HTTP writes are refused.**~~ **CLOSED in
+  v1.4.1's Task 2, by the sync engine's contract rather than the restore's.** `stop()` returns
+  a `SyncStopResult` -- deliberately the shape of write-gate's `DrainResult` -- and
+  `routes/restore.ts` refuses the restore on either second writer. **The whole scope moved out
+  of `applyRestore` and above the line that consumes the plan**, which is the half that took
+  the thinking: refusing on the RECOVERY path is only defensible if the refusal is cheap to
+  retry, and one line lower it would have cost the operator a multi-gigabyte re-upload every
+  time. The restore also waits longer than a shutdown does (150s against 15s, set above the
+  adapter's own 120s socket timeout and pinned by a test), so the ordinary wedge unwinds inside
+  the wait. **Two further defects fell out of building it**: an abandoned `stop()` was not
+  inert -- a second `stop()` would have answered "stopped" with the same loop still running,
+  defeating the retry the refusal invites -- and `start()` after one created a SECOND
+  `AccountSync` on a live mailbox.
 - **`scripts/remote.sh` deletes `data/` on every sync**, taking `mail.key`, surfacing as a
   download that never arrives. Two red runs, two agents, two phases. Its incremental-build
   claim is also false -- `rsync -a` preserves mtimes, so `tsc -b` re-emits stale declarations.

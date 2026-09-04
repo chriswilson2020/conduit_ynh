@@ -3123,12 +3123,40 @@ export const documentTemplateInputSchema = z.object({
 export type DocumentTemplateInput = z.infer<typeof documentTemplateInputSchema>;
 
 /**
+ * WHAT A TICKET IS PROOF FOR. POST /api/reauth's body carries one of these and
+ * the ticket it mints spends at that gate and no other.
+ *
+ * IT IS HERE RATHER THAN SPELLED TWICE, and that is the opposite of the
+ * decision made for the header name (see the web's api.ts): a header name is a
+ * transport detail neither side parses, and a mismatch there shows up as a 401
+ * the round trip catches. This is a value the client SENDS and the server
+ * VALIDATES, so a mismatch would be a 400 nobody sees until an operator meets
+ * it -- and the four names below have to agree with the four gated routes
+ * exactly. One spelling, checked by the compiler on both sides.
+ *
+ * WHY FOUR AND NOT ONE PER FILE: the restore is two operations, not one. A
+ * preview uploads and decrypts an archive; an apply destroys the database. A
+ * ticket for the first must not open the second, which is the whole reason
+ * this type exists -- see ReauthTickets in the API's services/reauth.ts for
+ * what was true before it did.
+ */
+export const reauthScopeSchema = z.enum([
+  "export", "backup", "restore-preview", "restore-apply",
+]);
+export type ReauthScope = z.infer<typeof reauthScopeSchema>;
+
+/**
  * POST /api/reauth's answer: a single-use ticket for one download.
  *
  * NOTHING ABOUT THE USER IS IN IT. The ticket is opaque -- 32 random bytes as
  * hex -- and the server remembers which account it belongs to; a client that
  * could read an identity out of it would be a client somebody would eventually
  * trust to.
+ *
+ * NOR THE SCOPE IT WAS MINTED FOR, for the same reason and one more: the
+ * caller asked for it, so echoing it back tells them nothing they did not just
+ * say, and a client that read a scope out of a ticket would be a client
+ * somebody would eventually let CHOOSE one.
  */
 export const reauthTicketSchema = z.object({
   ticket: z.string().min(1),

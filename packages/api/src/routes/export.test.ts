@@ -46,7 +46,7 @@ const config: Config = {
   // against and no fixed password is set either, so the default verifier is a
   // REAL one that cannot succeed -- a test that needs the re-authentication
   // gate to open hands buildApp its own. Nothing passes the gate by forgetting.
-  portalApiUrl: "http://127.0.0.1:6788",
+  ldapUrl: "ldap://127.0.0.1:389",
   reauthPassword: null,
 };
 
@@ -105,7 +105,7 @@ describe("GET /api/export", () => {
   it("answers a zip with an attachment disposition and nosniff", async () => {
     const a = await app();
     const response = await a.inject({
-      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, authHeaders),
+      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, authHeaders, "export"),
     });
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toBe("application/zip");
@@ -126,7 +126,7 @@ describe("GET /api/export", () => {
 
     const a = await app();
     const response = await a.inject({
-      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, authHeaders),
+      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, authHeaders, "export"),
     });
     expect(response.statusCode).toBe(200);
 
@@ -170,8 +170,8 @@ describe("GET /api/export", () => {
     // carries it, so the two concurrent requests cannot share one -- and the
     // minting has to happen before either starts, or awaiting it would let the
     // first export finish and release its slot.
-    const firstHeaders = await reauthedHeaders(a, authHeaders);
-    const secondHeaders = await reauthedHeaders(a, authHeaders);
+    const firstHeaders = await reauthedHeaders(a, authHeaders, "export");
+    const secondHeaders = await reauthedHeaders(a, authHeaders, "export");
     const first = a.inject({ method: "GET", url: "/api/export", headers: firstHeaders });
     const second = a.inject({ method: "GET", url: "/api/export", headers: secondHeaders });
     const [one, two] = await Promise.all([first, second]);
@@ -184,7 +184,7 @@ describe("GET /api/export", () => {
     // THE SLOT COMES BACK. A guard that never releases turns one export into a
     // permanently broken route, which is worse than the problem it solves.
     const afterwards = await a.inject({
-      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, authHeaders),
+      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, authHeaders, "export"),
     });
     expect(afterwards.statusCode).toBe(200);
   });
@@ -199,7 +199,7 @@ describe("GET /api/export", () => {
       "ynh-user": "sam", "ynh-user-email": "sam@example.com", "ynh-user-fullname": "Sam",
     };
     const theirs = await a.inject({
-      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, samHeaders),
+      method: "GET", url: "/api/export", headers: await reauthedHeaders(a, samHeaders, "export"),
     });
     expect(theirs.statusCode).toBe(200);
     const root = await extractResponse("theirs", theirs.rawPayload);

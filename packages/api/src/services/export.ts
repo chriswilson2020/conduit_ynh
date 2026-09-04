@@ -141,7 +141,7 @@ export interface ExportManifest {
   appVersion: string;
   /**
    * The migration journal position: the tag of the last migration in
-   * packages/api/drizzle/meta/_journal.json, e.g. "0012_misty_phantom_reporter".
+   * packages/api/drizzle/meta/_journal.json, e.g. "0013_wide_wolverine".
    * That names the shape the columns below were read out of.
    */
   schemaVersion: string;

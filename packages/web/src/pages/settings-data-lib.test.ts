@@ -423,7 +423,7 @@ describe("applyKeptThePreview", () => {
       "reauth_required", "reauth_failed", "reauth_throttled", "reauth_unavailable",
       "validation", "restore_unnameable",
       "restore_name_mismatch", "restore_passphrase_mismatch",
-      "restore_in_progress", "restore_writes_in_flight",
+      "restore_in_progress", "restore_writes_in_flight", "restore_sync_running",
     ]) {
       expect(applyKeptThePreview(apiError(code)), code).toBe(true);
     }
@@ -514,7 +514,8 @@ describe("restoreProblem", () => {
 
   it("passes the server's own actionable sentence through where it has one", () => {
     for (const code of [
-      "restore_writes_in_flight", "restore_in_progress", "reauth_throttled",
+      "restore_writes_in_flight", "restore_in_progress", "restore_sync_running",
+      "reauth_throttled",
       "restore_archive_refused", "too_large", "restore_disk_space", "restore_tool_missing",
       "restore_unnameable", "validation",
     ]) {

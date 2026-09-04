@@ -82,6 +82,7 @@ import {
   type PipelineScope,
   type Project,
   type ProjectStatus,
+  type ReauthScope,
   type SendMailInput,
   type ShiftResult,
   type Stage,
@@ -1999,7 +2000,14 @@ export function useBackupPreflight() {
 }
 
 /**
- * Exchange the operator's password for a single-use download ticket.
+ * Exchange the operator's password for a single-use ticket for ONE operation.
+ *
+ * THE SCOPE IS THE PROMPT'S OWN STATE, PASSED THROUGH RATHER THAN DECIDED
+ * HERE. The page already knows which prompt the operator answered -- it is the
+ * `Pending` value the dialog is open for -- and handing that same value to the
+ * mint is what makes the ticket unable to do anything else. Deriving it here
+ * from the path about to be called would be a second source of truth for a
+ * question already answered on screen.
  *
  * A PLAIN FUNCTION, NOT A MUTATION, AND THAT IS THE WHOLE POINT OF IT.
  *
@@ -2019,9 +2027,9 @@ export function useBackupPreflight() {
  * and the only copy that outlives it is the page's own field state, which
  * closing the prompt clears.
  */
-export async function requestReauthTicket(password: string) {
+export async function requestReauthTicket(password: string, scope: ReauthScope) {
   return parseWith(
-    reauthTicketSchema, await postJson<unknown>("/reauth", { password }), "reauth ticket",
+    reauthTicketSchema, await postJson<unknown>("/reauth", { password, scope }), "reauth ticket",
   );
 }
 
@@ -2161,10 +2169,12 @@ export async function cancelRestore(planId: string): Promise<void> {
  * is exactly the duplicate the engines refuse to create by hand.
  *
  * NO TICKET ON ANY OF THEM, and routes/import.ts argues that at length rather
- * than leaving it to be noticed. An import neither exfiltrates nor destroys; a
- * fifth gated route would widen what one fungible ticket authorises; and three
- * password prompts to load a spreadsheet teaches the reflex the gate exists to
- * defeat.
+ * than leaving it to be noticed. An import neither exfiltrates nor destroys,
+ * and three password prompts to load a spreadsheet teaches the reflex the gate
+ * exists to defeat. That argument used to have a third leg -- a fifth gated
+ * route would widen what one FUNGIBLE ticket authorised -- and v1.4.1 removed
+ * the fungibility, so it is gone from there and from here rather than left
+ * standing where it would still read as true.
  */
 
 /**

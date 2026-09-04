@@ -15,6 +15,7 @@ import { ingestMessage } from "./mail-ingest.js";
 import { moveThreads } from "./mail-move.js";
 import {
   AccountSync, SyncManager, SyncStoppedError, SyncUnavailableError, startSyncManager,
+  RESTORE_STOP_TIMEOUT_MS, STOP_TIMEOUT_MS,
   type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
   type ImapFolderListing, type ImapMessageDescriptor, type IngestMessageFn,
   type SyncClock, type SyncLogger,
@@ -29,7 +30,7 @@ let dataDir: string;
 let hints: SseHint[];
 let unsubscribe: () => void;
 /** Everything a test started, stopped in afterEach so no loop outlives its case. */
-let running: { stop(): Promise<void> }[];
+let running: { stop(): Promise<unknown> }[];
 /** When the current case's BODY began, for waitFor's budget. See that function. */
 let caseStartedAt = 0;
 
@@ -2204,6 +2205,119 @@ describe("SyncManager", () => {
     release();
     await reconcile;
   });
+
+  // WHAT stop() REPORTS, AND WHY IT HAS TO REPORT ANYTHING.
+  //
+  // The bound above is right for a shutdown and was read as an answer by a
+  // caller it was never written for: services/restore.ts stopped the second
+  // writer, got back a `Promise<void>` that resolves identically whether every
+  // sync stopped or every sync was abandoned, and destroyed the database. So
+  // the three cases below are the contract, and the middle one is the one with
+  // teeth -- a refusal that a retry can talk its way past is not a refusal.
+  it("reports that it stopped, when it actually stopped", async () => {
+    const manager = makeManager();
+    await manager.start();
+    const accountId = await makeAccount();
+    await waitFor(() => manager.get(accountId) !== undefined, "the account's sync");
+
+    expect(await manager.stop()).toEqual({ stopped: true, abandoned: 0 });
+  });
+
+  it("reports the syncs it ABANDONED rather than resolving as though they had stopped",
+    async () => {
+      const clock = new ManualClock();
+      const manager = makeManager(clock);
+      await manager.start();
+      const accountId = await makeAccount();
+      await waitFor(() => manager.get(accountId) !== undefined, "the account's sync");
+      await waitFor(() => (manager.get(accountId)?.stats.passes ?? 0) >= 1, "its first pass");
+
+      // A socket that will not go away, which is the only thing the 15s bound
+      // was ever written for: nothing in the ImapClient contract is cancellable
+      // except idle(), so a wedged operation holds the loop until the adapter's
+      // own timeout fires and the loop's teardown cannot finish before it.
+      let release = (): void => { /* replaced below */ };
+      const wedge = new Promise<void>((resolve) => { release = resolve; });
+      for (const client of clients) client.disconnectGate = wedge;
+
+      const stopping = manager.stop();
+      await waitFor(() => clock.pendingCount() > 0, "the stop deadline");
+      clock.fire();
+      expect(await stopping).toEqual({ stopped: false, abandoned: 1 });
+
+      // AND IT SAYS SO AGAIN, WHICH IS THE HALF A SECOND CALL COULD LOSE. A
+      // caller that refuses on this answer gets pressed again a moment later --
+      // that is what a refusal on a recovery path is FOR -- and a manager that
+      // answered "stopped" the second time, having emptied its own map on the
+      // first, would hand the restore a green light with the same loop still
+      // running. The abandoned sync is remembered until it really stops.
+      const again = manager.stop();
+      await waitFor(() => clock.pendingCount() > 0, "the second stop's deadline");
+      clock.fire();
+      expect(await again).toEqual({ stopped: false, abandoned: 1 });
+
+      // And when it finally unwinds, the answer changes on its own -- without
+      // resurrecting anything, because nobody started this manager again.
+      release();
+      expect(await manager.stop()).toEqual({ stopped: true, abandoned: 0 });
+      expect(manager.get(accountId)).toBeUndefined();
+    });
+
+  // THE HALF THAT MAKES A RESTORE'S REFUSAL SURVIVABLE. routes/restore.ts
+  // refuses on an abandoned sync and then starts the manager again, because an
+  // install left with no sync receives no mail and says nothing about it -- so
+  // start() has to be safe in exactly the state stop() just left behind. The
+  // design's whole serialisation argument is that there is ONE AccountSync per
+  // account: everything it does to one mailbox is ordered by there being one of
+  // it, not by locking.
+  it("does not put a second loop on a mailbox an abandoned one is still reading", async () => {
+    const clock = new ManualClock();
+    const manager = makeManager(clock);
+    await manager.start();
+    const accountId = await makeAccount();
+    await waitFor(() => manager.get(accountId) !== undefined, "the account's sync");
+    await waitFor(() => (manager.get(accountId)?.stats.passes ?? 0) >= 1, "its first pass");
+    const original = manager.get(accountId);
+
+    let release = (): void => { /* replaced below */ };
+    const wedge = new Promise<void>((resolve) => { release = resolve; });
+    for (const client of clients) client.disconnectGate = wedge;
+
+    const stopping = manager.stop();
+    await waitFor(() => clock.pendingCount() > 0, "the stop deadline");
+    clock.fire();
+    expect((await stopping).stopped).toBe(false);
+
+    // The caller carries on -- refused the restore, put the sync back.
+    await manager.start();
+    expect(manager.get(accountId)).toBeUndefined();
+
+    // AND THE ACCOUNT IS NOT LEFT WITHOUT ONE EITHER, which is the trade a bare
+    // guard would have made: the replacement is created when the old loop is
+    // really gone, not left for a process restart to notice.
+    release();
+    await waitFor(() => manager.get(accountId) !== undefined, "the replacement sync");
+    expect(manager.get(accountId)).not.toBe(original);
+    expect(original?.stats.stopped).toBe(true);
+  });
+
+  it("waits as long as the caller asks, because a restore can afford what a shutdown cannot",
+    async () => {
+      const clock = new ManualClock();
+      const shutdown = makeManager(clock);
+      await shutdown.start();
+      await shutdown.stop();
+      expect(clock.requested).toEqual([STOP_TIMEOUT_MS]);
+
+      const slower = new ManualClock();
+      const restore = makeManager(slower);
+      await restore.start();
+      await restore.stop({ timeoutMs: RESTORE_STOP_TIMEOUT_MS });
+      expect(slower.requested).toEqual([RESTORE_STOP_TIMEOUT_MS]);
+      // The number is not a round one: it has to outlast the adapter's own
+      // socket timeout, which is what a wedged sync is actually waiting on.
+      expect(RESTORE_STOP_TIMEOUT_MS).toBeGreaterThan(STOP_TIMEOUT_MS);
+    });
 });
 
 describe("startSyncManager", () => {
