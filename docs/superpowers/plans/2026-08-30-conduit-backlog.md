@@ -28,7 +28,7 @@ archive being restored, which has no recovery path.
 | ~~**v1.2.2**~~ | The MAIL template feature removed, table included (the QUOTE template stayed); the five lists given the loading branch their siblings have; and the Dovecot IDLE burst diagnosed -- **the answer was NO**, so nothing was reordered. **Ships `0012`, a `DROP TABLE`** | **SHIPPED 31 Aug** |
 | ~~**7.6 → v1.3.0**~~ | Export (plain ZIP, readable, not restorable) and backup (AES-256 `.7z`, exact, not readable), told apart on a Settings page, **both behind a password re-prompt**. No schema change | **SHIPPED 31 Aug** |
 | ~~**7.7 → v1.4.0**~~ | Restore (preview, safety backup, apply) and two importers -- the exact one reading Conduit's own export, the forgiving one reading a foreign CSV. **Seven nginx location blocks, one of which did not parse until the release checked it.** No schema change | **SHIPPED 2 Sep** |
-| **v1.4.1** | Opened by a live defect (the re-auth gate refusing the correct password), then the seven hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, the `lower()`/`toLowerCase()` fold gap, and Chris's four decisions. **Ships `0013`, two functional indexes and one IMMUTABLE function** -- "no schema change" stopped being true when he took decision 3 | **IN FLIGHT** |
+| ~~**v1.4.1**~~ | Opened by a live defect (the re-auth gate refusing the correct password), then the seven hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, the `lower()`/`toLowerCase()` fold gap, and Chris's four decisions. **Ships `0013`, two functional indexes and one IMMUTABLE function** -- "no schema change" stopped being true when he took decision 3 | **SHIPPED 4 Sep**, upgraded on the deploy target, `NRestarts=0` |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
 | **Phase 4.4** | Mail filing power tools: per-message selection, arbitrary folder moves, folder management, bulk unhide, live inbox beyond page one | Unspecced. Overlaps "emailing a quote" below |
 
@@ -1303,7 +1303,37 @@ uncatchable by design.
 
 ---
 
-## Intermittents -- FIVE now, and every rate below is measured rather than remembered
+## Intermittents -- SUPERSEDED 4 Sep by a complete harvest. Read that first.
+
+> **`docs/superpowers/reports/2026-09-02-intermittent-rates.md` replaces the arithmetic below**,
+> and it is not a refinement of it -- it is the first harvest that enumerated ATTEMPTS through
+> `/actions/runs/<id>/attempts/<A>/jobs` rather than runs, so it can see a first attempt that a
+> re-run hid. 401 attempts, 18 Aug - 2 Sep, 801 job logs.
+>
+> **The headline is that there are THREE, not five, and every flaky line in this repository's
+> history is now accounted for** -- 36 instances across 35 of 400 attempts, all of them one of
+> the three, and **there is no fifth unexplained e2e intermittent.** Nobody could say that
+> before; the count of five was an accumulation of sightings, not a measurement.
+>
+> | | rate | note |
+> |---|---|---|
+> | `crm.spec.ts` "Other..." caret | 1 in 45 (3/135) | **FIXED in v1.4.1**, not filed |
+> | dnd-kit keyboard drag | 1 in 33 (8/266) | roughly TRIPLE its published 1.1% |
+> | Dovecot IDLE burst | 0 in 55 since v1.2.2 | the fix held |
+>
+> **And the caret's cause was not what this file said it was.** It was attributed to the Radix
+> focus-restoration race; that is the mechanism of the test's FIRST half and cannot explain a
+> missing box after a reload, because the box renders only under `OTHER_OPTION` -- so an absence
+> sustained for the whole 5s poll proves the reloaded page read `salutation === null`. A
+> fire-and-forget PATCH the reload raced. **A wrong named mechanism is worse than "unknown"**,
+> which is why this note leads with it.
+>
+> **Why none of it was knowable sooner, in one word: `failure()`.** `test.yml` uploaded the
+> Playwright report under `if: failure()`, which is false on exactly the green-with-a-flaky-line
+> runs that carry the evidence -- the artifacts API returns `total_count: 0` for all three caret
+> sightings. v1.4.1 changed it to `always()`, and the first green run under it kept its report.
+
+## The older harvest, kept for its method and its denominators
 
 **v1.2.1 Task 4 harvested 313 workflow runs, 18-31 Aug** -- every run of `test.yml` GitHub
 still holds. 284 on `main`, the merged phase and version branches and the release tags; 13 on
