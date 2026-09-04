@@ -161,7 +161,42 @@ NODE
 
 echo "Creating tarball..."
 cd "$ROOT/release"
-tar czf "conduit-${VERSION}.tar.gz" conduit
+
+# A TARBALL BUILT ON A MAC MAKES GNU tar TALK, AND THIS IS WHAT IT SAYS.
+#
+# macOS's /usr/bin/tar is bsdtar, and it records two things GNU tar has never
+# heard of: Apple extended attributes (LIBARCHIVE.xattr.com.apple.provenance,
+# stamped on anything a browser or an installer touched) and BSD file flags
+# (SCHILY.fflags). Debian's GNU tar answers each one with
+#
+#   tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+#   tar: Ignoring unknown extended header keyword 'SCHILY.fflags'
+#
+# ONCE PER FILE, so an upgrade opens with a screen and a half of warnings before
+# it says anything true. Measured on the deploy target during v1.4.1's upgrade,
+# 4 Sep 2026: harmless -- "ignoring the KEYWORD", not the file, and the install
+# that followed ran -- but it is noise in the one place an operator is watching
+# for trouble, and noise is where a real warning goes to hide. This release was
+# an entire evening spent on a message that blamed the wrong thing.
+#
+# THE HEADER OF THIS SCRIPT ALREADY SAID NOT TO DO THIS -- "meant to run on the
+# Debian build server, never on a Mac" -- and v1.4.1 was built on a Mac anyway,
+# which is the argument for making the script produce a clean artefact wherever
+# it runs rather than for writing the instruction a second time.
+#
+# The flags are bsdtar's and GNU tar rejects them outright, so they are applied
+# only when bsdtar is what we have. COPYFILE_DISABLE additionally stops the
+# ._AppleDouble companion files, which are a different mechanism and would
+# otherwise ride along as real entries rather than as headers.
+tar_flags=()
+if tar --version 2>/dev/null | grep -qi bsdtar; then
+  tar_flags=(--no-xattrs --no-fflags --no-mac-metadata)
+fi
+# `-czf`, NOT the bare `czf` this line carried for four releases. tar accepts an
+# undashed option bundle only as its FIRST argument; with a long option ahead of
+# it, `czf` becomes an operand and tar answers "Must specify one of -c, -r, -t,
+# -u, -x". Found by running it.
+COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -czf "conduit-${VERSION}.tar.gz" conduit
 
 # sha256sum is Linux-only, which is fine: this script is meant to run on the
 # Debian build server, never on a Mac. shasum -a 256 is the macOS/BSD
