@@ -1692,16 +1692,18 @@ v1.1.0; the rest are enumerated at that fix.
 
 ## If it becomes a product
 
-**FOCUS AFTER NAVIGATION BELONGS HERE, and that is a scheduling decision taken 4 Sep rather
-than another deferral.** It has been "the biggest item on the deferred list" for three
-releases, which is a description that carried no information about when it would be done.
-Chris settled what nobody had asked: **he does not navigate Conduit by keyboard, and other
-people might.** So its cost today is zero and its cost the day this has a second user is
-immediate -- which makes it a product-readiness item with a trigger, not a bug competing with
-features for a slot.
+~~**FOCUS AFTER NAVIGATION BELONGS HERE**~~ **-- MOVED OUT AGAIN THE SAME DAY. It is NEXT, and
+this paragraph is kept only so the reasoning that was wrong is visible.**
 
-**The trigger is a second user, and it should go in BEFORE that user arrives**, because the
-first person to meet it will be someone with no idea the product works better with a mouse.
+I filed it here on 4 Sep as product-readiness triggered by a second user, on the argument that
+Chris does not navigate by keyboard so its cost today is zero. **He overruled it within the
+hour, and the overruling is better reasoning than the filing was:** "I don't use the keyboard
+but others might" is an argument for fixing it, not for waiting. A trigger that fires when a
+stranger meets the defect is a trigger that fires too late to help them, and "we knew, and
+scheduled it behind four other things" is not a position worth being in. **Deferring it a
+fourth time was the path of least resistance dressed as a decision.**
+
+**Order set by Chris, 4 Sep: focus first, then Phase 4.4.** Phase 10 waits.
 
 Unchanged in substance: focus is lost after any navigation that unmounts the focused element;
 it is a route-change concern touching every page; and fixing the general case retires the
