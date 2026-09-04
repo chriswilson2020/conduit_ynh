@@ -1661,6 +1661,34 @@ describe("moveThreads: file", () => {
     expect((await folderRow(accountId, "Clients"))?.syncEnabled).toBe(false);
   });
 
+  // The ownership-before-refusal ordering, restated for `file` because its
+  // refusal says MORE than the other two do: unknown_target's sentence names
+  // the account's label AND asserts which folders that mailbox does not have.
+  // Given about a mailbox the actor has no rights over, that is a fact about
+  // someone else's folder tree, arrived at by ticking a row. The row loop
+  // settles ownership first, so the refusal never fires for an unowned
+  // account; this is the test that says so rather than leaving it to the
+  // reading order.
+  it("never names an unowned account's missing folder -- ownership answers first", async () => {
+    const accountId = await makeAccount({ visibility: "shared", label: "Chris's mailbox" });
+    const threadId = await makeThread();
+    await makeMessage({ threadId, accountId, folder: "INBOX", imapUid: 351 });
+
+    const result = await moveThreads(
+      handle.db, actorId,
+      { threadIds: [threadId], folder: "INBOX", targetFolder: "Clients", action: "file" },
+      deps(new FakeManager()),
+    );
+
+    // The account genuinely has no "Clients" row, so the refusal WOULD fire on
+    // an owned account -- which is what makes this discriminating rather than
+    // vacuous (the test above, with the folder present, cannot tell the
+    // orderings apart).
+    expect(result.results).toEqual([{ threadId, ok: true, skipped: true, reason: "not_owner" }]);
+    expect(JSON.stringify(result)).not.toContain("Chris's mailbox");
+    expect(JSON.stringify(result)).not.toContain("Clients");
+  });
+
   it("records the destination and the sync switch on the summary line", async () => {
     const accountId = await makeAccount();
     await makeFolder({ accountId, folder: "Clients", syncEnabled: false });

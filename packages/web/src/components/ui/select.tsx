@@ -82,9 +82,29 @@ export function SelectContent({
         position={position}
         onCloseAutoFocus={onCloseAutoFocus}
         sideOffset={position === "popper" ? 4 : undefined}
-        className="overflow-hidden rounded-md border border-slate-200 bg-white shadow-md"
+        className={clsx(
+          "overflow-hidden rounded-md border border-slate-200 bg-white shadow-md",
+          // A LONG LIST MUST SCROLL RATHER THAN RUN OFF THE SCREEN, and until
+          // v1.6.0 it did neither: "popper" anchors the panel under the
+          // trigger and lets it grow to whatever its items need, so the
+          // options past the bottom of the window were rendered, focusable and
+          // UNCLICKABLE. Found by CI rather than by reading -- Phase 4.4's
+          // "File into…" picker offers every folder an account has, and
+          // Playwright spent 90 seconds retrying a click on an option it could
+          // see, reporting "element is outside of the viewport" after each of
+          // 178 scroll attempts, because there was nothing to scroll.
+          //
+          // --radix-select-content-available-height is Radix's own measurement
+          // of the room left below the trigger, published ONLY for "popper"
+          // (item-aligned positioning clamps itself and grows its own scroll
+          // buttons), which is why this is conditional rather than a constant.
+          // Every existing caller of this component has a handful of options
+          // and is unchanged by it: the cap only binds on a list that would
+          // otherwise have overflowed.
+          position === "popper" && "max-h-[var(--radix-select-content-available-height)]",
+        )}
       >
-        <RadixSelect.Viewport className="p-1">{children}</RadixSelect.Viewport>
+        <RadixSelect.Viewport className="overflow-y-auto p-1">{children}</RadixSelect.Viewport>
       </RadixSelect.Content>
     </RadixSelect.Portal>
   );
