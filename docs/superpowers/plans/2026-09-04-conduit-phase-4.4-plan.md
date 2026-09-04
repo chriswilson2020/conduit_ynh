@@ -55,8 +55,19 @@ have destroyed the folder-scoped ruling. Still an action kind plus a picker, as 
       nothing rather than half of something. Pinned by observation rather than argument: the
       test fake reads the folder row from inside `moveMessages`.
 
-## Task 2: Per-message selection
+## Task 2: Per-message selection, and filing from inside a conversation
 
+**Chris added the second half on 4 Sep**, answering the question Task 1 left open. It is folded
+in here rather than given its own task because it lands on the same surface -- the conversation
+view -- and two agents editing that in sequence would be two chances to disagree about it.
+
+- [ ] **FILE A WHOLE THREAD FROM INSIDE THE CONVERSATION.** Task 1 built filing on the list only,
+      because the definition of done said "from the list". Reading a thread and wanting to file
+      it currently means going back to the list first, finding it again, and selecting it -- three
+      steps to undo one navigation. The action already exists; this is a second entrance to it.
+- [ ] **The same rule applies: an unsynced destination has its sync switched on**, in the same
+      order (before the move is queued), for the reason Task 1 records. Do not reimplement that
+      decision -- call the same path.
 - [ ] **Its own `messageIds` path, not a widening of `threadIds`.** The spec's reasoning:
       overloading one field to sometimes mean a different unit is exactly how 4.3's
       folder-scoped rule became necessary.
