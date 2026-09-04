@@ -451,6 +451,18 @@ export function Conversation({ threadId }: ConversationProps) {
   );
   const selectedIds = selectedMessageIds(selection, messageOrder);
   const messagePending = moveMessages.isPending ? moveMessages.variables?.action ?? null : null;
+  /**
+   * ONE BUSY FLAG FOR BOTH MOVE PATHS, not one each.
+   *
+   * The two act on OVERLAPPING ROWS by construction -- the header's buttons
+   * move every message of this thread, the bar's move some of them -- so
+   * gating each on only its own mutation would let a user start a whole-thread
+   * Archive and then file one of its messages while the first is still queued
+   * behind the account's serial sync loop. That is the inbox's recorded hazard
+   * (two moves of overlapping rows, the second acting on whatever the first
+   * left behind), reachable here without even clearing a selection.
+   */
+  const busy = move.isPending || moveMessages.isPending;
 
   return (
     <div data-testid="conversation" className="flex min-w-0 flex-col gap-3">
@@ -499,7 +511,7 @@ export function Conversation({ threadId }: ConversationProps) {
               <Button
                 variant="outline"
                 data-testid="conversation-archive"
-                disabled={move.isPending}
+                disabled={busy}
                 onClick={() => runMove("archive")}
               >
                 Archive
@@ -507,7 +519,7 @@ export function Conversation({ threadId }: ConversationProps) {
               <Button
                 variant="outline"
                 data-testid="conversation-trash"
-                disabled={move.isPending}
+                disabled={busy}
                 onClick={() => runMove("trash")}
               >
                 Trash
@@ -524,7 +536,7 @@ export function Conversation({ threadId }: ConversationProps) {
                 label="File into folder"
                 folders={threadFolders}
                 blocked={threadFileNote}
-                disabled={move.isPending}
+                disabled={busy}
                 onPick={(folder) => runMove("file", folder)}
               />
             </>
@@ -640,6 +652,7 @@ export function Conversation({ threadId }: ConversationProps) {
         <MessageBar
           count={selectedIds.length}
           capped={selection.capped}
+          busy={busy}
           pendingAction={messagePending}
           pendingTarget={moveMessages.variables?.targetFolder ?? null}
           folders={messageFolders}
@@ -668,6 +681,11 @@ export function Conversation({ threadId }: ConversationProps) {
             // same rule.
             selectable={ownAccountIds.has(message.accountId)}
             selected={selection.ids.has(message.id)}
+            // Ticking is disabled while EITHER move runs, as the list's
+            // checkboxes are: changing the selection mid-flight is how the
+            // inbox once produced two moves of overlapping rows, the second
+            // acting on whatever the first had left behind.
+            selectionDisabled={busy}
             onSelect={selectMessage}
           />
         ))}
@@ -693,7 +711,8 @@ export function Conversation({ threadId }: ConversationProps) {
  * one row (or, for remoteImages, deliberately for all of them).
  */
 const Message = memo(function Message({
-  message, expanded, onToggle, remoteImages, inTrash, selectable, selected, onSelect,
+  message, expanded, onToggle, remoteImages, inTrash, selectable, selected, selectionDisabled,
+  onSelect,
 }: {
   message: MailMessageWithAttachments;
   expanded: boolean;
@@ -707,6 +726,8 @@ const Message = memo(function Message({
    * owner-only rule). False renders no checkbox at all. */
   selectable: boolean;
   selected: boolean;
+  /** A move is in flight, so the selection must not change under it. */
+  selectionDisabled: boolean;
   /** Takes the id, so every row shares ONE stable callback -- see onToggle. */
   onSelect: (messageId: string) => void;
 }) {
@@ -734,6 +755,7 @@ const Message = memo(function Message({
             type="checkbox"
             data-testid={`select-message-${message.id}`}
             checked={selected}
+            disabled={selectionDisabled}
             onChange={() => onSelect(message.id)}
             className="size-4 rounded border-slate-300"
           />
@@ -844,10 +866,20 @@ const Message = memo(function Message({
  * every such assertion.
  */
 function MessageBar({
-  count, capped, pendingAction, pendingTarget, folders, blockedFile, blockedCap, onRun, onClear,
+  count, capped, busy, pendingAction, pendingTarget, folders, blockedFile, blockedCap,
+  onRun, onClear,
 }: {
   count: number;
   capped: number | null;
+  /**
+   * EITHER move path is in flight -- this one or the header's whole-thread
+   * one. Separate from `pendingAction` because the two answer different
+   * questions: this decides what responds, while that one decides what the
+   * pending LINE says, and a whole-thread Archive running above has no
+   * sentence to contribute here. Both are needed because the two paths act on
+   * overlapping rows (see the conversation's `busy`).
+   */
+  busy: boolean;
   pendingAction: BulkMessageActionKind | null;
   pendingTarget: string | null;
   folders: readonly string[];
@@ -857,7 +889,7 @@ function MessageBar({
   onClear: () => void;
 }) {
   const pending = pendingAction !== null;
-  const disabled = pending || blockedCap !== null;
+  const disabled = busy || blockedCap !== null;
   return (
     <div
       data-testid="selection-bar"
@@ -887,10 +919,10 @@ function MessageBar({
           label="File messages into folder"
           folders={folders}
           blocked={blockedCap ?? blockedFile}
-          disabled={pending}
+          disabled={busy}
           onPick={(folder) => onRun("file", folder)}
         />
-        <Button variant="ghost" data-testid="selection-clear" onClick={onClear} disabled={pending}>
+        <Button variant="ghost" data-testid="selection-clear" onClick={onClear} disabled={busy}>
           Clear
         </Button>
       </div>
@@ -905,10 +937,10 @@ function MessageBar({
           {bulkPendingLabel(pendingAction, count, pendingTarget, "message")}
         </p>
       )}
-      {!pending && blockedCap !== null && (
+      {!busy && blockedCap !== null && (
         <p data-testid="selection-blocked" className="text-xs text-amber-700">{blockedCap}</p>
       )}
-      {!pending && blockedCap === null && blockedFile !== null && (
+      {!busy && blockedCap === null && blockedFile !== null && (
         <p data-testid="selection-file-blocked" className="text-xs text-amber-700">{blockedFile}</p>
       )}
     </div>
