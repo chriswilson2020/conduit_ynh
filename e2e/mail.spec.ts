@@ -1948,7 +1948,9 @@ test.describe.serial("Mail journey", () => {
     // server refuses this for us: Dovecot deletes a full mailbox without
     // complaint, so this refusal is the only thing between a click and
     // destroyed mail.
-    await expect(page.getByRole("alert"))
+    // Scoped to the dialog: the settings page can carry other alerts, and the
+    // refusal has to be where the question was asked.
+    await expect(page.getByRole("dialog").getByRole("alert"))
       .toContainText(/still holds 1 message on the mail server/, { timeout: BULK_TIMEOUT_MS });
     expect(await subjectsIn(renamedFolder)).toContain(fileSubject);
 

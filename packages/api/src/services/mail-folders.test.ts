@@ -1201,6 +1201,57 @@ describe("folder management", () => {
       expect(sync.mailboxes.has("Projects")).toBe(true);
     });
 
+    it("matches descendants by PREFIX, which a folder name with LIKE syntax in it defeats", async () => {
+      // A LIKE pattern built from an unescaped folder name reads `_` as "any
+      // one character", so a SIBLING falls inside a pattern it has no business
+      // matching -- and both would then re-key onto the same name, which is a
+      // UNIQUE violation as well as wrong. `left(...) = prefix` has no
+      // metacharacters, which is why there is no escaping rule here to get
+      // right. (A `%` in a name does the same thing one wildcard wider.)
+      const accountId = await seedAccount({
+        INBOX: 0, A_B: 0, "A_B/Kid": 0, AxB: 0, "AxB/Kid": 0,
+      });
+      await seedMessage(accountId, "A_B/Kid", 1);
+      await seedMessage(accountId, "AxB/Kid", 2);
+
+      const result = await renameFolder(
+        handle.db, userId, accountId, { folder: "A_B", newFolder: "Clients" }, deps(),
+      );
+
+      expect(result).toMatchObject({ messages: 1, folders: 2 });
+      expect((await foldersOfMessages(accountId)).map((row) => row.folder))
+        .toEqual(["Clients/Kid", "AxB/Kid"]);
+      expect((await rowsOf(accountId)).map((row) => row.folder))
+        .toEqual(["AxB", "AxB/Kid", "Clients", "Clients/Kid", "INBOX"]);
+    });
+
+    it("promotes a child onto its parent's name when nothing else holds it", async () => {
+      // A server that lists a child WITHOUT a placeholder for its parent.
+      // Dovecot is not one -- it lists `\NonExistent \Noselect` for the parent,
+      // which the destination check catches first -- but nothing in RFC 3501
+      // requires a server to synthesise one, and on such a server this is a
+      // legitimate rename. Every row it moves is UNDER the source, so counting
+      // those as being in the destination's way would refuse the rename because
+      // of the very rows it is about to rewrite. BOTH the server check and the
+      // stored-row check have to say so; saying it in only one is what one of
+      // this task's surviving mutants found.
+      const accountId = await makeAccount({ sentFolder: "Sent" });
+      sync = new FakeFolderSync({ INBOX: 0, "Clients/Acme": 0, "Clients/Acme/Old": 0 });
+      await discoverFolders(handle.db, accountId, [
+        listing("INBOX"), listing("Clients/Acme"), listing("Clients/Acme/Old"),
+      ], PASS_ONE);
+      hints = [];
+      await seedMessage(accountId, "Clients/Acme", 1);
+
+      const result = await renameFolder(
+        handle.db, userId, accountId, { folder: "Clients/Acme", newFolder: "Clients" }, deps(),
+      );
+
+      expect(result).toMatchObject({ messages: 1, folders: 2 });
+      expect((await rowsOf(accountId)).map((row) => row.folder))
+        .toEqual(["Clients", "Clients/Old", "INBOX"]);
+    });
+
     it("promotes a child to a free name without calling its own rows a collision", async () => {
       // The one shape where the source subtree and the destination subtree
       // overlap. Every row under "Clients/Acme" is about to BE the destination,

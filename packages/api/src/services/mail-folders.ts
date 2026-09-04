@@ -915,9 +915,11 @@ function delimiterOf(entry: ImapFolderListing): string {
   return entry.delimiter ?? "";
 }
 
-/** Names under `folder` in `listed` -- the subtree an IMAP RENAME moves, and
- * the one an IMAP DELETE refuses to remove. Byte-compared with the server's own
- * delimiter, exactly as every other mailbox-name comparison here. */
+/** Names under `folder` in `listed`: the folders a DELETE has to refuse to
+ * remove. Byte-compared with the server's own delimiter, exactly as every other
+ * mailbox-name comparison here. (The rename's own subtree test is inline, in
+ * renameFolder, because it needs the same rule applied to the SOURCE as well as
+ * to the destination -- see inSourceSubtree.) */
 function descendantsOf(
   listed: readonly ImapFolderListing[], folder: string, delimiter: string,
 ): string[] {
@@ -1201,8 +1203,17 @@ export async function renameFolder(
       `"${newFolder}" is inside "${folder}", and a folder cannot be moved into itself`,
     );
   }
-  const takenOnServer = listed.some((row) => row.folder === newFolder)
-    || descendantsOf(listed, newFolder, delimiter).length > 0;
+  // A name in the SOURCE'S OWN SUBTREE is not in the destination's way: it is
+  // about to BE the destination. It matters for one shape -- promoting a child
+  // onto its parent's name -- and it has to be said in BOTH the server check
+  // here and the stored-row check below, because a rename either one refuses is
+  // refused. (Saying it in only one is what one of this task's two surviving
+  // mutants found.)
+  const inSourceSubtree = (name: string): boolean => name === folder
+    || (delimiter.length > 0 && name.startsWith(folder + delimiter));
+  const takenOnServer = listed.some((row) => !inSourceSubtree(row.folder)
+    && (row.folder === newFolder
+      || (delimiter.length > 0 && row.folder.startsWith(newFolder + delimiter))));
   if (takenOnServer) {
     throw new ConflictError(
       "mail folder", newFolder,
@@ -1219,14 +1230,9 @@ export async function renameFolder(
     .where(and(
       eq(mailAccountFolders.accountId, accountId),
       subtreeSql(mailAccountFolders.folder, newFolder, delimiter),
-      // THE SOURCE'S OWN SUBTREE IS NOT A COLLISION WITH ITSELF. It matters
-      // for the one shape where the two overlap: promoting a child to its
-      // parent's level ("Clients/Acme" -> "Clients"), where every row under the
-      // source is about to BE the destination rather than block it. A row at
-      // the destination that is NOT in the source subtree still collides, which
-      // is the case that has to be caught -- and on a hierarchical server that
-      // one is usually caught above anyway, since a parent exists as at least a
-      // \Noselect placeholder and the server lists it.
+      // inSourceSubtree above, in SQL. A row at the destination that is NOT in
+      // the source subtree still collides, which is the case that has to be
+      // caught.
       sql`not ${subtreeSql(mailAccountFolders.folder, folder, delimiter)}`,
     ));
   if (collisions.length > 0) {
