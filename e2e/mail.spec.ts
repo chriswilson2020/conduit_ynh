@@ -540,8 +540,9 @@ test.describe.serial("Mail journey", () => {
    */
   function task2Fixtures(now: number): { raw: Buffer; date: Date; folder: string }[] {
     const pair = (subject: string, at: number) => {
-      const rootId = `<${subject.replace(/[^a-z0-9]+/gi, "-")}-1@example.com>`;
-      const headers = (extra: string[], id: string, date: Date) => rfc822([
+      const slug = subject.replace(/[^a-z0-9]+/gi, "-");
+      const rootId = `<${slug}-1@example.com>`;
+      const message = (extra: string[], id: string, date: Date, body: string) => rfc822([
         `From: Dana Renewals <dana-${runId}@example.com>`,
         `To: Conduit <${USERNAME}>`,
         ...extra,
@@ -549,24 +550,29 @@ test.describe.serial("Mail journey", () => {
         `Date: ${date.toUTCString()}`,
         "MIME-Version: 1.0",
         "Content-Type: text/plain; charset=utf-8",
-      ], `About ${subject}.`);
+      ], body);
       const firstAt = new Date(now - at);
       const secondAt = new Date(now - at + 30_000);
       return [
         {
           folder: INBOX_FOLDER, date: firstAt,
-          raw: headers([`Subject: ${subject}`], rootId, firstAt),
+          raw: message([`Subject: ${subject}`], rootId, firstAt, `Opening ${subject}.`),
         },
         {
           folder: INBOX_FOLDER, date: secondAt,
           // "Re:" is stripped by normalizeSubject, so the THREAD is titled
           // `subject` -- which is what threadRow matches on. The reply keeps
-          // the prefix on the SERVER, which is how subjectsIn below tells the
-          // two messages apart after one of them has moved.
-          raw: headers(
+          // the prefix on the SERVER, which is how subjectsIn tells the two
+          // messages apart after one of them has moved.
+          //
+          // ITS BODY DIFFERS FROM THE ROOT'S, which is not decoration: the
+          // list row's snippet is the NEWEST message's body, so two messages
+          // sharing one body would leave nothing on screen to say whether the
+          // reply had been ingested yet -- the very thing the sync test waits
+          // on before the badge-delta test runs.
+          raw: message(
             [`Subject: Re: ${subject}`, `In-Reply-To: ${rootId}`, `References: ${rootId}`],
-            `<${subject.replace(/[^a-z0-9]+/gi, "-")}-2@example.com>`,
-            secondAt,
+            `<${slug}-2@example.com>`, secondAt, `Replying about ${subject}.`,
           ),
         },
       ];
@@ -778,9 +784,14 @@ test.describe.serial("Mail journey", () => {
     archiveSubjects = [`Invoice ${attemptId}`, `Shipping ${attemptId}`];
     trashSubject = `Offer ${attemptId}`;
     fileSubject = `Contract ${attemptId}`;
-    // No subject here is a substring of another (threadRow matches by hasText),
-    // and neither is a substring of the four above.
-    convFileSubject = `Renewal ${attemptId}`;
+    // No subject here is a substring of another, NOR OF ANY PER-RUN ONE, which
+    // is the half that is easy to miss: threadRow matches by hasText, and
+    // `attemptId` is `runId` plus a suffix, so a `Word ${attemptId}` fixture
+    // silently CONTAINS the `Word ${runId}` one declared at the top of this
+    // file. The first draft of this line was `Renewal ${attemptId}` against
+    // aliceSubject's `Renewal ${runId}`, which made Alice's thread match two
+    // rows and failed the sync test three retries deep.
+    convFileSubject = `Statement ${attemptId}`;
     splitSubject = `Proposal ${attemptId}`;
 
     // The Phase 4.3 set (see the declarations above). No subject here is a
@@ -995,6 +1006,17 @@ test.describe.serial("Mail journey", () => {
       // other fixture, so one still trickling in after this test would move
       // the badge between the next test's before-read and its delta.
       await expect(threadRow(timelineSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+      // Phase 4.4 Task 2's two conversations, waited for here for the badge
+      // reason above -- they arrive unread like every other fixture. Both are
+      // two-message chains, and the SECOND message is what these assert on
+      // (the row's snippet is the newest body): a thread whose reply had not
+      // landed yet would file or split only half of itself later, and the
+      // tests that do would fail describing the wrong thing.
+      for (const subject of [convFileSubject, splitSubject]) {
+        await expect(threadRow(subject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+        await expect(threadRow(subject))
+          .toContainText(`Replying about ${subject}`, { timeout: ATTEMPT_TIMEOUT_MS });
+      }
     });
 
     aliceThreadId = await idOf(threadRow(aliceSubject), "thread-row-");
@@ -1643,6 +1665,11 @@ test.describe.serial("Mail journey", () => {
     const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
     await inboxRow.click();
     await expect(inboxRow).toHaveAttribute("aria-current", "true");
+    // These fixtures are MINUTES old, not seconds like the archive/trash trio
+    // above, so on a retry -- where the mailbox also holds every earlier
+    // attempt's threads -- they can sit past the list's first page. Same
+    // reason the sync test loads all before reading the 4.3 rows.
+    await loadAllThreadsOn(page);
     await expect(threadRow(convFileSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
 
     await threadRow(convFileSubject).click();
@@ -1695,6 +1722,7 @@ test.describe.serial("Mail journey", () => {
     const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
     await inboxRow.click();
     await expect(inboxRow).toHaveAttribute("aria-current", "true");
+    await loadAllThreadsOn(page);
     await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
 
     await threadRow(splitSubject).click();
@@ -1737,8 +1765,10 @@ test.describe.serial("Mail journey", () => {
     // and it appears in Clients because its root now is. Neither is a special
     // case: both fall out of the folder rule 4.1 already had.
     await page.getByTestId(`folder-${INBOX_FOLDER}`).click();
+    await loadAllThreadsOn(page);
     await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
     await page.getByTestId(`folder-${CLIENTS_FOLDER}`).click();
+    await loadAllThreadsOn(page);
     await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
   });
 
