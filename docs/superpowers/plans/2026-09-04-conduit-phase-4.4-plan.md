@@ -187,22 +187,99 @@ adoption on page one, and a second observer for everything after it.**
       flight or an inbox with no mail at all cannot be arranged from outside). The stubbed file
       runs anywhere in a few seconds and is what the mutation testing was done against.
 
-## Task 4: Folder management — CREATE, RENAME, DELETE. THE RISK IS HERE
+## Task 4: Folder management — CREATE, RENAME, DELETE. THE RISK IS HERE — LANDED
 
-- [ ] Create and delete are ordinary. **Rename is a two-system write.**
-- [ ] **`folder` is a byte-compared key**: a plain `text` column on `mail_messages`, part of the
-      `mail_messages(account_id, folder, imap_uid)` index, and `folderNameSchema`'s comment says
-      an IMAP mailbox name "is compared byte for byte everywhere it is used downstream". Renaming
-      on the server leaves every stored message pointing at a name that no longer exists.
-- [ ] **IMAP rename first, then the local re-key in ONE transaction; on a failed re-key, rename
-      back.** The move service's discipline, not a new one. Chris approved this shape on 4 Sep.
-- [ ] **Delete must not become this product's first expunge.** The CRM archives rather than
-      expunges everywhere, and `mail_account_folders` rows are *never* deleted by existing
-      convention -- "a folder that vanishes from a later LIST keeps its row". **State in the UI,
-      before it happens, what becomes of the mail stored from that folder.**
-- [ ] A folder with mail in it, and a folder with children, are two separate refusals or two
-      separate warnings. IMAP servers differ on both; find out what this one does rather than
-      assuming.
+**Correction found while building it, and it is the same KIND of error the other three found:
+the spec undercounts what a rename has to re-key. "A plain `text` column on `mail_messages`
+(and on `mail_account_folders`, and on a third table)" counts THREE and the answer is SIX.**
+The three it names are right -- `mail_folder_state` is the third. What it misses is that
+`mail_accounts` holds folder NAMES in three columns of its own -- `sent_folder`,
+`trash_folder`, `archive_folder` -- and they break exactly as completely and rather less
+visibly: rename Archive on the server without rewriting `archive_folder` and every bulk
+Archive on that account fails at the server, against a mailbox nobody can see is gone. The
+re-key is all six, in one transaction.
+
+**Second correction, and it changes what a rename IS: an IMAP RENAME is a SUBTREE rename.**
+RFC 3501 6.3.5 requires inferior names to move with their parent, and Dovecot 2.3 does exactly
+that -- renaming `Parent` moved `Parent/Child` in the same command (observed, and pinned by an
+integration test). Neither the spec nor this plan says so, and a re-key of the exact name alone
+would leave every child's stored mail pointing at a mailbox that no longer exists -- this
+task's own bug, one level down. So the re-key is a PREFIX rewrite using the server's own
+DELIMITER, which nothing stores and which a rename therefore LISTs for.
+
+- [x] Create and delete are ordinary. **Rename is a two-system write.**
+- [x] **`folder` is a byte-compared key** -- see the correction above for the real count.
+- [x] **IMAP rename first, then the local re-key in ONE transaction; on a failed re-key, rename
+      back.** Chris's shape, kept -- and sharpened by moving every PREDICTABLE local failure in
+      FRONT of the server call, which is what shrinks the compensated window to the
+      unpredictable ones. The load-bearing one is the destination collision: a
+      `mail_account_folders` row at the new name is a UNIQUE (account_id, folder) violation
+      waiting to happen and the ONE re-key failure this code can foresee, so refusing it before
+      the RENAME turns the most likely compensation into an unreachable state.
+- [x] **A BETTER ORDERING WAS LOOKED FOR, FOUND, AND REJECTED -- with a reason worth keeping.**
+      The Task 1-shaped improvement is to hold ONE transaction open across the IMAP call and
+      COMMIT only if the server agreed, which makes a failed re-key UNREACHABLE rather than
+      compensated. **It deadlocks.** The IMAP call is queued on the account's serial sync loop
+      and waits for that loop to reach it -- a whole first backfill, in the worst case -- while
+      the open transaction holds row locks on every `mail_messages` row of the folder being
+      renamed. If the pass the loop is running is ingesting into that folder, the pass blocks on
+      those locks, the loop never reaches the queued RENAME, and the transaction never commits.
+      Not contrived: it is renaming a busy folder while its own folder is syncing.
+- [x] **THE ROW IS RE-KEYED IN PLACE, which is the fix for the first thing the earlier tasks
+      left.** The rename hazard mail-folders' own header describes -- a new row at a fresh
+      default beside a stale old one, and a user's sync toggle silently undone -- is what
+      LIST-only rename DETECTION can do. A rename made THROUGH Conduit knows it is a rename, so
+      the row keeps its id, its `sync_enabled` and its `created_at`, and **no stale row is left
+      for the filing picker to go on offering.**
+- [x] **`imap_uid` is deliberately NOT nulled.** A move nulls it because the message changed
+      mailbox; a rename changes the mailbox's NAME and moves no message, and Dovecot carries
+      UIDVALIDITY and the UIDs across untouched (observed, pinned). Nulling them would force a
+      full re-walk AND make every message in the folder look like the awaiting-reconciliation
+      state that excludes it from every move.
+- [x] **Postgres measures its own parameters.** The prefix rewrite asks for
+      `char_length(<the parameter>)` rather than being handed a JavaScript length:
+      `String.length` counts UTF-16 code units and Postgres counts characters, so the two
+      disagree on any name with a character outside the BMP -- ordinary here, since names arrive
+      already decoded out of modified UTF-7. `left(...) = prefix` rather than `LIKE`, so a name
+      containing `%` or `_` needs no escaping rule to get right.
+- [x] **Delete did not become this product's first expunge, and it took a REFUSAL to stop it.**
+      DOVECOT DESTROYS A NON-EMPTY MAILBOX WITHOUT COMPLAINT (observed: a folder holding one
+      message was deleted and the message was gone). There is no server-side refusal to lean on,
+      so Conduit's own is the only thing between a click and destroyed mail: **a folder the
+      server says still holds any is refused**, with the count and with the way out -- file the
+      mail elsewhere, which is this phase's own Task 1, then delete. The count comes from the
+      SERVER, never from `mail_messages`: Conduit holds only what it has synced, so counting
+      rows would leave exactly the unsynced folders a user is most likely to tidy up deletable
+      while full.
+- [x] **`mail_account_folders` rows are still never deleted.** A deleted folder's row survives
+      with `sync_enabled = false` -- it is what gives the kept messages a folder to be listed
+      under -- and goes stale by the ordinary mechanism, which is why the route asks for a pass
+      afterwards. **The UI says all of this BEFORE it happens**: what leaves, what stays ("every
+      message Conduit has already stored from it is KEPT -- still searchable, still on the
+      records its conversations are linked to"), and that a folder still holding mail is refused
+      rather than emptied. No count in that sentence, deliberately: Conduit's own number would
+      understate an unsynced folder by however much it has never seen, and the server's real one
+      arrives in the refusal.
+- [x] **A folder with mail and a folder with children are two separate refusals, and the second
+      is not about mail at all.** Deleting a parent with a child destroyed the parent's own mail
+      and LEFT THE PARENT IN LIST -- carrying `\HasChildren` and NEITHER `\Noselect` NOR
+      `\NonExistent` -- while STATUS answered false and APPEND answered "Mailbox doesn't exist"
+      (all observed together). Discovery would go on recording that as a live selectable folder,
+      the walk would open it, and the pass would fail. Every pass. That is a permanently
+      backed-off account, which is why children are refused rather than attempted.
+- [x] **The second thing the earlier tasks left is fixed too**: the filing picker now drops
+      folders the last discovery pass did not re-sight -- the staleness rule the sidebar and the
+      settings picker have both used since 4.1. Filing into a vanished folder used to fail at
+      IMAP, late, after an optimistic write and a compensating revert, in the mail server's
+      words rather than the app's.
+
+**43 mutations, 43 killed -- but only after two survived and one of those was a real bug.** The
+server-side destination check counted the SOURCE'S OWN CHILDREN as folders in the destination's
+way, so promoting a child onto its parent's name was refused because of the very rows it was
+about to rewrite; the stored-row check already excluded them and the server check did not. The
+other survivor was a claim with no test behind it (`left(...)` rather than `LIKE`), now pinned
+by a folder named `A_B` beside a sibling `AxB`. The two adapter guards were mutated against a
+real Dovecot rather than a fake, and each is killed by its own integration case.
 
 ---
 

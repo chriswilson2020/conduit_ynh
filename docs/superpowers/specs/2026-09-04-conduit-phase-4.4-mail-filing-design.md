@@ -146,6 +146,44 @@ in Conduit must therefore not delete that row either, and **must state what happ
 stored from it.** Deleting mail is not something this product does elsewhere: the CRM archives
 rather than expunges, and that principle should not be quietly broken by a folder tool.
 
+> **Correction, 4 Sep, from building it.** Four things. The first two change what a rename HAS
+> to do rather than how it should do it.
+>
+> **"A plain `text` column on `mail_messages` (and on `mail_account_folders`, and on a third
+> table)" counts THREE and the answer is SIX.** The three are right -- `mail_folder_state` is
+> the third -- but `mail_accounts` holds folder NAMES in three columns of its own:
+> `sent_folder`, `trash_folder` and `archive_folder`. They break exactly as completely and
+> rather less visibly: rename Archive on the server without rewriting `archive_folder`, and
+> every bulk Archive on that account fails at the server against a mailbox nobody can see is
+> gone. The re-key is all six, in one transaction.
+>
+> **AN IMAP RENAME IS A SUBTREE RENAME, which this section does not say.** RFC 3501 6.3.5
+> requires inferior hierarchical names to move with their parent, and Dovecot 2.3 does exactly
+> that (renaming "Parent" moved "Parent/Child" in the same command -- observed, and pinned by an
+> integration test). So the re-key is a PREFIX rewrite, not an exact-name one: a re-key of the
+> exact name alone leaves every child's stored mail pointing at a mailbox that no longer exists,
+> which is this section's own hazard one level down. It needs the server's hierarchy DELIMITER,
+> which no table stores and which varies per server, so a rename LISTs for it.
+>
+> **The recommended ordering is kept, and sharpened: every PREDICTABLE local failure moves in
+> FRONT of the server call.** The load-bearing one is a `mail_account_folders` row at the
+> destination name -- a UNIQUE (account_id, folder) violation waiting to happen, and the one
+> re-key failure this code can foresee -- so refusing it before the RENAME turns the most likely
+> compensation into an unreachable state. The obviously better ordering was looked for and
+> REJECTED, with a reason worth recording: holding ONE transaction open across the IMAP call and
+> committing only if the server agreed would make a failed re-key unreachable rather than
+> compensated, and it DEADLOCKS -- the IMAP call queues on the account's serial sync loop while
+> the open transaction holds row locks that loop's own pass needs.
+>
+> **Delete needed a REFUSAL, not only a sentence.** "Must state what happens to messages" is
+> necessary and not sufficient: DOVECOT DESTROYS A NON-EMPTY MAILBOX WITHOUT COMPLAINT
+> (observed, and pinned), so there is no server-side refusal to lean on and Conduit's own is the
+> only thing between a click and destroyed mail. A folder the server says still holds any is
+> refused -- with the count, and pointing at this phase's own filing action as the way out. A
+> folder with CHILDREN is refused too, and that one is not about mail at all: the placeholder
+> Dovecot leaves behind stays in LIST looking selectable while SELECT fails, which would fail
+> every sync pass for ever.
+
 ---
 
 ## Definition of done
