@@ -945,6 +945,39 @@ describe("folder management", () => {
       expect(folder.specialUse).toBeNull();
     });
 
+    it("does not make every OTHER folder look stale by being newer than all of them", async () => {
+      // Staleness is read by COMPARISON against the newest of an account's
+      // folders, so a row stamped with `now` would be newer than anything a
+      // pass has stamped -- and every other folder would read as stale until
+      // the next one. Creating a folder would appear to delete the rest: gone
+      // from the filing picker, gone from the sidebar, italic in Settings.
+      const accountId = await seedAccount();
+      const before = await rowsOf(accountId);
+      const passAt = before[0]!.lastDiscoveredAt;
+
+      const folder = await createFolder(handle.db, userId, accountId, { folder: "Clients" }, deps());
+
+      expect(folder.lastDiscoveredAt).toBe(passAt.toISOString());
+      const after = await rowsOf(accountId);
+      // Every row shares one moment, so nothing is behind the newest.
+      expect(new Set(after.map((row) => row.lastDiscoveredAt.getTime())))
+        .toEqual(new Set([passAt.getTime()]));
+      // Which is exactly the condition every client's staleness rule reads --
+      // "behind the newest of this account's folders" (web: fileTargetNames,
+      // buildFolderRows, and the settings picker) -- so none of them drops or
+      // greys anything because a folder was created.
+      const newestAfter = Math.max(...after.map((row) => row.lastDiscoveredAt.getTime()));
+      expect(after.filter((row) => row.lastDiscoveredAt.getTime() < newestAfter)).toEqual([]);
+    });
+
+    it("falls back to the moment of creation on an account no pass has listed yet", async () => {
+      const accountId = await makeAccount({ sentFolder: "Sent" });
+      sync = new FakeFolderSync({ INBOX: 0 });
+      const folder = await createFolder(handle.db, userId, accountId, { folder: "Clients" }, deps());
+      // No pass to share a moment with, so its own is the only honest answer.
+      expect(new Date(folder.lastDiscoveredAt).getTime()).toBeGreaterThan(PASS_TWO.getTime());
+    });
+
     it("refuses a name Conduit already has, without asking the server", async () => {
       const accountId = await seedAccount();
       await expect(createFolder(handle.db, userId, accountId, { folder: "Projects" }, deps()))

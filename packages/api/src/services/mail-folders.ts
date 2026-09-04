@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
 import type {
   FolderCreateInput, FolderDeleteInput, FolderDeleteResult, FolderPatchInput, FolderRenameInput,
   FolderRenameResult, MailAccountFolder, SpecialUse,
@@ -1031,6 +1031,29 @@ export async function createFolder(
   await onServer("create", input.folder, () => sync.createMailbox(input.folder));
 
   const now = new Date();
+  // STAMPED WITH THE LAST PASS'S MOMENT, NOT THIS ONE, and getting that wrong
+  // breaks every OTHER folder rather than this one.
+  //
+  // `last_discovered_at` is only ever read by COMPARISON: a folder is stale
+  // when its value is behind the newest of the account's folders, which is how
+  // the sidebar, the settings picker and the filing picker all decide whether
+  // to grey a row out or drop it. Stamping a newly created folder with `now`
+  // makes it the newest by a margin no pass has yet closed -- so until the next
+  // pass runs, EVERY OTHER FOLDER ON THE ACCOUNT reads as stale: dropped from
+  // the filing picker, dropped from the sidebar if it has nothing unread, and
+  // italicised in Settings. Creating a folder would appear to delete the rest.
+  //
+  // Sharing the last pass's moment says the true thing instead -- "as of
+  // everything Conduit last knew about this mailbox, this folder exists" -- and
+  // leaves every comparison exactly where it was. `now` only when there is no
+  // pass to share, which is an account whose first LIST has not landed.
+  // The COLUMN, ordered, rather than a `max()` in a raw fragment: a hand-written
+  // aggregate bypasses drizzle's column mapper, so the timestamp comes back as
+  // the driver's string and the insert below then calls toISOString on it.
+  const [newest] = await db.select({ at: mailAccountFolders.lastDiscoveredAt })
+    .from(mailAccountFolders).where(eq(mailAccountFolders.accountId, accountId))
+    .orderBy(desc(mailAccountFolders.lastDiscoveredAt)).limit(1);
+  const discoveredAt = newest?.at ?? now;
   const [row] = await db.insert(mailAccountFolders).values({
     accountId,
     folder: input.folder,
@@ -1040,17 +1063,17 @@ export async function createFolder(
     // \Noselect placeholders a deep name leaves behind for its missing parents
     // are different rows, and discovery records those as what they are.)
     selectable: true,
-    // Creating it IS sighting it: the server answered for this exact name a
-    // moment ago, which is more evidence than a LIST gives about any other row.
-    lastDiscoveredAt: now,
+    lastDiscoveredAt: discoveredAt,
   })
     // A discovery pass can have raced us between the CREATE above and this
     // insert -- the folder really is on the server by then, so a LIST in that
     // window sees it. The user's intent wins: they asked for this folder, and
-    // they get it syncing.
+    // they get it syncing. `lastDiscoveredAt` is deliberately NOT in the set:
+    // a pass that has already stamped this row saw the real thing, and its
+    // moment is better than the one derived above.
     .onConflictDoUpdate({
       target: [mailAccountFolders.accountId, mailAccountFolders.folder],
-      set: { syncEnabled: true, selectable: true, lastDiscoveredAt: now, updatedAt: now },
+      set: { syncEnabled: true, selectable: true, updatedAt: now },
     })
     .returning();
   // Unreachable: an upsert always returns its row. Defensive rather than
