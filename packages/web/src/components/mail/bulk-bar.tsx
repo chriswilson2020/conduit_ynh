@@ -261,7 +261,7 @@ function FilePicker({
         ariaLabel="File into folder"
         className="w-auto min-w-44 disabled:cursor-not-allowed disabled:opacity-50"
       >
-        <SelectValue placeholder="File into…" />
+        <SelectValue placeholder={"File into\u2026"} />
       </SelectTrigger>
       <SelectContent position="popper">
         {folders.map((folder) => (

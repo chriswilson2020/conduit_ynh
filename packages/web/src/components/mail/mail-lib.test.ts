@@ -1217,7 +1217,7 @@ describe("summarizeBulkResult", () => {
     // Filing names the folder, because it is the only part of the action the
     // user chose.
     expect(summarizeBulkResult("file", [ok("1")], { targetFolder: "Clients" }).headline)
-      .toBe("1 filed into “Clients”.");
+      .toBe("1 filed into \u201cClients\u201d.");
   });
 
   // The quiet notification the filing rule owes the operator. Filing into an
@@ -1230,8 +1230,8 @@ describe("summarizeBulkResult", () => {
     const summary = summarizeBulkResult("file", [ok("1"), skip("2", "awaiting_reconciliation")], {
       targetFolder: "Clients", syncEnabled: "Clients",
     });
-    expect(summary.headline).toBe("1 filed into “Clients”, 1 skipped.");
-    expect(summary.notes[0]).toBe("Conduit is now syncing “Clients”.");
+    expect(summary.headline).toBe("1 filed into \u201cClients\u201d, 1 skipped.");
+    expect(summary.notes[0]).toBe("Conduit is now syncing \u201cClients\u201d.");
     expect(summary.notes).toHaveLength(2);
   });
 
@@ -1251,7 +1251,7 @@ describe("summarizeBulkResult", () => {
       targetFolder: "Clients",
     });
     expect(summary.notes).toEqual([
-      "2 could not be filed: “Clients” is not a folder on every selected"
+      "2 could not be filed: \u201cClients\u201d is not a folder on every selected"
       + " conversation's mail account.",
     ]);
     expect(summary.settingsLink).toBe(false);

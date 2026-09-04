@@ -1508,12 +1508,12 @@ test.describe.serial("Mail journey", () => {
     await page.getByRole("option", { name: SPAM_FOLDER, exact: true }).click();
 
     await expect(page.getByTestId("bulk-result"))
-      .toContainText(`1 filed into “${SPAM_FOLDER}”`, { timeout: BULK_TIMEOUT_MS });
+      .toContainText(`1 filed into \u201c${SPAM_FOLDER}\u201d`, { timeout: BULK_TIMEOUT_MS });
     // The consequence, said AFTER the fact and quietly -- a notification, not
     // a gate. Enabling a sync is real (a folder Conduit now walks every pass),
     // and nobody should have to discover it from a bandwidth graph.
     await expect(page.getByTestId("bulk-result"))
-      .toContainText(`Conduit is now syncing “${SPAM_FOLDER}”`);
+      .toContainText(`Conduit is now syncing \u201c${SPAM_FOLDER}\u201d`);
 
     // Out of the folder it was filed from...
     await expect(threadRow(fileSubject)).toHaveCount(0, { timeout: REFETCH_TIMEOUT_MS });

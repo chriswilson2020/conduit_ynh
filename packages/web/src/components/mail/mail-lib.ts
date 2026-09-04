@@ -1025,7 +1025,7 @@ export function fileTargetsBlocked(accountScoped: boolean, folderCount: number):
     return "Pick a single account above to file into one of its folders.";
   }
   if (folderCount === 0) {
-    return "This account has no folders to file into yet — they appear once a sync pass has"
+    return "This account has no folders to file into yet \u2014 they appear once a sync pass has"
       + " listed them.";
   }
   return null;
