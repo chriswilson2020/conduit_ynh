@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
+import { TEST_WORKER_COUNT } from "./packages/api/src/test/databases.js";
 
 export default defineConfig({
   resolve: {
@@ -18,10 +19,25 @@ export default defineConfig({
   test: {
     include: ["packages/*/src/**/*.test.ts"],
     environment: "node",
-    // Test files run one at a time. The database-backed tests share a single
-    // PostgreSQL database and truncate it between cases, so running two files
-    // concurrently would have them deleting each other's rows.
-    fileParallelism: false,
+    // TEST FILES RUN CONCURRENTLY AGAIN, AND THE REASON THEY COULD NOT IS GONE.
+    //
+    // What used to stand here: "Test files run one at a time. The database-backed
+    // tests share a single PostgreSQL database and truncate it between cases, so
+    // running two files concurrently would have them deleting each other's rows."
+    // True, and it cost the whole suite: 92 files, 417s of test time measured on
+    // the dev server, on runners with idle cores.
+    //
+    // They no longer share a database. global-setup.ts migrates one TEMPLATE and
+    // clones it per worker (packages/api/src/test/databases.ts); a worker's files
+    // truncate that worker's own copy and nobody else's. `fileParallelism: true`
+    // is Vitest's default, but it is written out because the line it replaces was
+    // load-bearing and a reader arriving from that comment needs to see the answer
+    // and not an absence.
+    fileParallelism: true,
+    // maxWorkers pins what VITEST_POOL_ID counts up to, which is exactly how many
+    // databases global-setup.ts creates. Both numbers come from TEST_WORKER_COUNT
+    // so they cannot drift apart; see that constant for why it is capped at 4.
+    maxWorkers: TEST_WORKER_COUNT,
     globalSetup: ["./packages/api/src/test/global-setup.ts"],
     // Only reaches pool workers, not globalSetup — which runs in the main
     // process and sets its own PGHOST fallback. See test/global-setup.ts.

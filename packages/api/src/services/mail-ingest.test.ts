@@ -7,7 +7,7 @@ import type { MailAddress, SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 // The UTC-boundary test opens its own handle at a non-UTC session time zone;
 // see it for why the zone cannot ride the shared pool.
-import { TEST_DATABASE_URL } from "../test/global-setup.js";
+import { TEST_DATABASE_URL } from "../test/databases.js";
 import { createDatabase } from "../db/client.js";
 import { resolveUser } from "../users.js";
 import { events, mailAccounts, mailAttachments, mailMessages, mailThreadHides, mailThreads } from "../db/schema.js";

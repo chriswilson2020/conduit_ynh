@@ -71,6 +71,21 @@ import type { RefObject } from "react";
  * five here would make them the only navigations in the app that land
  * somewhere, which is a worse kind of inconsistent than landing nowhere. It is
  * recorded in the backlog as one item about routing.
+ *
+ * THAT ITEM IS v1.5.0 AND THE FIVE ARE CLOSED, without a line changing in this
+ * file or in any of them. src/use-navigation-focus.ts moves the caret to the
+ * destination's first visible `<h1>` after any route change that left it on
+ * `<body>` -- which is exactly the condition the paragraph above describes --
+ * so those five now land somewhere along with every row link in the app,
+ * rather than being the only navigations that do. Asserted in
+ * e2e/navigation-focus.spec.ts ("lands on the new record's heading when a
+ * create dialog navigates to it"), and mutation-tested: with that rule
+ * unmounted, the create dialog is back on `<body>` and the assertion is red.
+ *
+ * NOTHING HERE DEFERS TO IT. The two questions stay separate on purpose: this
+ * file owns where a DIALOG's close puts the caret, and answers it from the
+ * opener, which is better than a heading whenever the opener is still there.
+ * The navigation rule only ever sees the cases this one has declined.
  */
 
 /**

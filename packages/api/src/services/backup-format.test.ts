@@ -9,7 +9,7 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { openTestDatabase, truncateAll } from "../test/db.js";
-import { TEST_DATABASE_URL } from "../test/global-setup.js";
+import { TEST_DATABASE_URL } from "../test/databases.js";
 import { resolveUser } from "../users.js";
 import { saveBlob } from "./blobs.js";
 import { attachFile } from "./files.js";

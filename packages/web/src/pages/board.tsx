@@ -120,6 +120,21 @@ export function BoardPage() {
    * same target and the same reasoning as pages/inbox.tsx's, so a phone user
    * meets one rule on both surfaces rather than two. See the stage view's own
    * comment for what makes the move a focus event at all.
+   *
+   * THIS IS NOT A ROUTE-CHANGE EFFECT AND NEVER WAS, which v1.5.0's plan
+   * expected it to be: it names this page as one of two carrying a hand-rolled
+   * version of the navigation focus rule, to be deleted along with
+   * pages/inbox.tsx's. There is no effect here to delete. This ref is the
+   * `fallback` argument to `useDialogReturnFocus` in StageView below -- it is
+   * where the MOVE SHEET's close puts the caret when the card it was opened
+   * from has left this stage, and components/ui/dialog-focus.ts owns that
+   * question, which the same spec puts explicitly out of scope and says does
+   * not change. Removing it would send that close to the shared `<main>`
+   * landmark and turn e2e/mobile.spec.ts's "creates a deal in the stage on
+   * screen and moves it with the Move action" red.
+   *
+   * The only thing v1.5.0 changed on this page is the heading's tabIndex,
+   * which is now unconditional -- see the `<h1>` below.
    */
   const headingRef = useRef<HTMLHeadingElement>(null);
 
@@ -277,13 +292,15 @@ export function BoardPage() {
           <Link to="/pipelines" className="text-xs font-medium text-slate-500 hover:text-slate-700">
             {"\u2190"} Pipelines
           </Link>
-          {/* tabIndex only below the breakpoint, so the desktop heading keeps
-              exactly the attributes it always had. -1 makes it a target for
-              the stage view's post-move focus() without putting a heading into
-              anyone's tab order. Same shape as pages/inbox.tsx's. */}
+          {/* tabIndex -1 AT BOTH WIDTHS SINCE v1.5.0, for the reason
+              pages/inbox.tsx's identical heading gives: the app-wide
+              navigation focus rule (src/use-navigation-focus.ts) writes this
+              attribute itself on pages that lack it, so a conditional here
+              would have React removing it again on a width change. -1 still
+              keeps the heading out of everyone's tab order. */}
           <h1
             ref={headingRef}
-            tabIndex={isMobile ? -1 : undefined}
+            tabIndex={-1}
             className="text-xl font-semibold text-slate-900"
           >
             {pipeline.name}

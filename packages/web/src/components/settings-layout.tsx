@@ -32,11 +32,37 @@ const activeTabClass =
  * each has its own URL, back/forward works, and a bookmark lands on the right
  * one. A Tabs component would own that selection state locally and fight the
  * router for it.
+ *
+ * ---------------------------------------------------------------------------
+ * `title` IS REQUIRED, AND IT IS THE PANEL'S `<h1>` -- v1.5.0, Chris's
+ * decision. Until then these four routes had no heading of their own: the area
+ * name that now renders as a `<p>` was an `<h1>`, and it was the only one on
+ * any of them -- so switching from Mail accounts to Export announced
+ * "Settings", the name of the place the reader was already in. The app-wide
+ * navigation focus rule (src/use-navigation-focus.ts) lands on
+ * the first visible `<h1>`, so on these routes it would have announced the area
+ * four times over and the destination never.
+ *
+ * IT LIVES HERE RATHER THAN IN THE FOUR PAGES, and that is the part worth
+ * defending. The rule's "first visible `<h1>`" is only well defined while there
+ * is exactly ONE per route, and four pages each remembering to render one --
+ * and a fifth page, later, remembering too -- is a rule kept by habit. A
+ * required prop on the frame they all already render inside is the same rule
+ * kept by the compiler: a settings page cannot exist without a title, and it
+ * cannot accidentally grow a second `<h1>` above its own.
+ *
+ * SO "Settings" IS NO LONGER A HEADING. It stays on the page, because it is
+ * what says which area these tabs belong to, but it is a styled `<p>`: two
+ * `<h1>`s here would make "first visible" a coin toss between the area and the
+ * page, which is the one thing that rule cannot tolerate. The type moved and
+ * the weight came down with it -- an eyebrow above the tabs rather than a title
+ * over them -- so the `text-xl` slot belongs to the heading that now names the
+ * destination.
  */
-export function SettingsLayout({ children }: { children: ReactNode }) {
+export function SettingsLayout({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div className="flex flex-col gap-6">
-      <h1 className="text-xl font-semibold text-slate-900">Settings</h1>
+      <p className="text-sm font-medium text-slate-500">Settings</p>
       {/*
         THE TRAILING PADDING IS WHAT MAKES THE LAST TAB REACHABLE, and it arrived
         with 7.6's fourth tab: three tabs do not overflow this row at a phone
@@ -130,6 +156,13 @@ export function SettingsLayout({ children }: { children: ReactNode }) {
           Export, import, backup and restore
         </Link>
       </nav>
+      {/* BELOW THE TABS, NOT ABOVE THEM. Above, it would read as the title of
+          the whole area and the tabs as its contents, which is what "Settings"
+          was doing and is exactly the announcement Chris's decision is about.
+          Below, it names the panel the tabs have selected -- and it agrees with
+          the active tab's label on purpose, so a reader arriving by keyboard is
+          told the same thing the highlight is telling everyone else. */}
+      <h1 className="text-xl font-semibold text-slate-900">{title}</h1>
       {children}
     </div>
   );

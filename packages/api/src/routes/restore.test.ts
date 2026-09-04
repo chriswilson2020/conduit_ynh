@@ -13,7 +13,9 @@ import { passphraseProblem, type PlanView, type ReauthScope } from "@conduit/sha
 import { buildApp } from "../app.js";
 import { createDatabase, runMigrations, type DatabaseHandle } from "../db/client.js";
 import { openTestDatabase } from "../test/db.js";
-import { TEST_DATABASE_URL } from "../test/global-setup.js";
+import {
+  SCRATCH_DATABASE_PREFIXES, TEST_DATABASE_URL, withDatabaseName,
+} from "../test/databases.js";
 import { digestOf, HAVE_7Z } from "../test/archives.js";
 import { TEST_REAUTH_PASSWORD, testReauthVerifier } from "../test/reauth.js";
 import { resolveUser } from "../users.js";
@@ -68,7 +70,11 @@ const itFd = HAVE_7Z && HAVE_PSQL && HAVE_PG_DUMP && HAVE_PROC ? it : it.skip;
 
 const PASSPHRASE = "correct horse battery staple";
 const APP_VERSION = "1.4.0";
-const SCRATCH_PREFIX = "conduit_restore_routes_";
+// Named in test/databases.ts, alongside the other three suites that create
+// databases of their own, because the beforeAll below drops everything starting
+// with it and the files now run at the same time. See that module for the
+// overlap this replaces.
+const SCRATCH_PREFIX = SCRATCH_DATABASE_PREFIXES.restoreRoutes;
 
 const chris = {
   "ynh-user": "chris",
@@ -120,9 +126,13 @@ async function dropScratchDatabase(name: string): Promise<void> {
   }
 }
 
+// `starts_with` rather than `LIKE 'prefix%'`, for the reason
+// services/restore.test.ts's sweep gives: `_` is a LIKE wildcard and these
+// prefixes are full of them, so LIKE matches more than the name it was given --
+// which is a DROP DATABASE that can now reach another worker's live database.
 beforeAll(async () => {
   const stale = await control.db.execute<{ datname: string }>(sql`
-    SELECT datname FROM pg_database WHERE datname LIKE ${`${SCRATCH_PREFIX}%`}
+    SELECT datname FROM pg_database WHERE starts_with(datname, ${SCRATCH_PREFIX})
   `);
   for (const row of stale) await dropScratchDatabase(row.datname);
 });
@@ -155,7 +165,7 @@ async function scratchDir(label: string): Promise<string> {
 async function makeInstall(label: string): Promise<Install> {
   const name = `${SCRATCH_PREFIX}${label}_${randomUUID().replace(/-/g, "")}`;
   await control.db.execute(sql.raw(`CREATE DATABASE "${name}"`));
-  const url = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${name}`);
+  const url = withDatabaseName(TEST_DATABASE_URL, name);
   const handle = createDatabase(url, 2);
   const dataDir = await mkdtemp(path.join(os.tmpdir(), `conduit-restore-route-${label}-data-`));
   const mailKeyPath = path.join(dataDir, "mail.key");

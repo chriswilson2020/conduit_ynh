@@ -6,7 +6,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { openTestDatabase, truncateAll } from "../test/db.js";
-import { TEST_DATABASE_URL } from "../test/global-setup.js";
+import { TEST_DATABASE_URL } from "../test/databases.js";
 import { buildApp } from "../app.js";
 import { testReauthVerifier, reauthedHeaders } from "../test/reauth.js";
 import { createCompany } from "../services/companies.js";

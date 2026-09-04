@@ -10,7 +10,9 @@ import {
   CONTACT_FIELD_CAPS, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
-import { TEST_DATABASE_URL } from "../test/global-setup.js";
+import {
+  SCRATCH_DATABASE_PREFIXES, TEST_DATABASE_URL, withDatabaseName,
+} from "../test/databases.js";
 import { seededQuoteTemplate } from "../test/seed-template.js";
 import { resolveUser } from "../users.js";
 import { createCompany } from "../services/companies.js";
@@ -80,7 +82,7 @@ async function withPreMigrationDatabase(
   if (boundary === undefined) throw new Error(`could not find a ${tag} migration in the journal`);
   const preEntries = journal.entries.filter((e) => e.idx < boundary.idx);
   const tmpFolder = mkdtempSync(path.join(tmpdir(), `conduit-pre${tag}-`));
-  const dbName = `conduit_test_upgrade_${randomUUID().replace(/-/g, "")}`;
+  const dbName = `${SCRATCH_DATABASE_PREFIXES.schemaUpgrade}${randomUUID().replace(/-/g, "")}`;
 
   // CREATE DATABASE and every subsequent step live inside the try so the
   // finally below always runs cleanup, including on a failure between
@@ -99,7 +101,7 @@ async function withPreMigrationDatabase(
     );
 
     await handle.db.execute(sql.raw(`CREATE DATABASE "${dbName}"`));
-    const scratchUrl = TEST_DATABASE_URL.replace(/\/[^/]*$/, `/${dbName}`);
+    const scratchUrl = withDatabaseName(TEST_DATABASE_URL, dbName);
     scratch = createDatabase(scratchUrl, 1);
 
     // Old state: everything strictly before `tag` applied.

@@ -67,7 +67,7 @@ export function SettingsMailPage() {
   const others = data?.others ?? [];
 
   return (
-    <SettingsLayout>
+    <SettingsLayout title="Mail accounts">
       <div data-testid="mail-settings" className="flex flex-col gap-4">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-slate-900">Your mail accounts</h2>
