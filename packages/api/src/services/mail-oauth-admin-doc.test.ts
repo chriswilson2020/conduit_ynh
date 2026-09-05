@@ -418,7 +418,9 @@ describe("doc/ADMIN.md", () => {
  *     one. An empty render is dropped rather than shown blank.
  *
  * WHERE IT IS SHOWN, which is what its shape has to answer to. Three surfaces,
- * not one:
+ * not one -- the two rendered ones read from yunohost-admin at tag
+ * debian/12.1.15, which is that repository's nearest tag at or below the 12.1.17
+ * this manifest requires, since it stops at 12.1.15 and then jumps to 13.0.0:
  *   - the webadmin, immediately after the install, as a modal that cannot be
  *     cancelled -- yunohost-admin AppInstall.vue passes the hydrated text to
  *     modalConfirm with `{ markdown: true, cancelable: false }`, under a title
