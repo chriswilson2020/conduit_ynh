@@ -189,7 +189,9 @@ function useMeetingList(links: RecordLinks): MeetingListState {
   const key = identityKey({ ...links, archived });
   const [pages, setPages] = useState<CursorPages<Meeting>>(() => emptyCursorPages<Meeting>(key));
   const cursor = cursorForKey(pages, key);
-  const { data, isLoading, isError, isFetching, refetch } = useMeetings({ ...links, archived, cursor });
+  const {
+    data, isLoading, isError, isFetching, isStale, refetch,
+  } = useMeetings({ ...links, archived, cursor });
   // Page one, whatever page the reader is on: the only writer of refreshed
   // rows, the source of the arrivals count, and what makes this list live past
   // page one at all. On page one it hashes to the query above and shares its
@@ -197,21 +199,24 @@ function useMeetingList(links: RecordLinks): MeetingListState {
   const head = useMeetings({ ...links, archived });
   const headData = head.data;
 
-  // ONLY EVER ADDS A PAGE, AND ONLY FROM A FETCH THAT HAS SETTLED --
-  // timeline.tsx's copy of this effect carries the reasoning for both halves,
-  // including why `data` arriving with isFetching still true must not be held.
-  // `pages` has to be a dependency: a re-snapshot replaces the accumulator
-  // without changing the data, the key or the cursor, and an effect blind to
-  // it would show the old rows until something else moved. Safe because
-  // takeCursorPage settles.
+  // ONLY EVER ADDS A PAGE, AND ONLY ONE THE QUERY STILL CALLS CURRENT --
+  // timeline.tsx's copy of this effect carries the reasoning for every part of
+  // that, including why the accumulator is not a dependency here and is one in
+  // the inbox, and why isStale rather than isFetching (this tab is the reason).
   useEffect(() => {
-    if (!data || isFetching) return;
+    if (!data || isStale) return;
     setPages((current) => takeCursorPage(current, key, cursor, data.items, data.nextCursor));
-  }, [data, isFetching, cursor, key, pages]);
+  }, [data, isStale, cursor, key]);
 
   // ...AND PAGE ONE IS THE ONLY THING THAT REFRESHES WHAT IS ON SCREEN. Two
   // fetches writing row objects would hand out different objects for any row
   // they both covered and rewrite each other's, from an effect, for ever.
+  //
+  // `pages` IS a dependency here, unlike in the take above: this one is about
+  // the rows the accumulator holds, so a page arriving from "load more" is a
+  // new set of rows to bring up to date against a head that has not itself
+  // changed. Safe because refreshCursorRows returns the same record when it
+  // replaces nothing.
   useEffect(() => {
     if (!headData) return;
     setPages((current) => refreshCursorRows(current, key, headData.items));

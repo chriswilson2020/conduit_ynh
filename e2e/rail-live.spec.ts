@@ -476,6 +476,42 @@ test("keeps the Meetings tab live past page one too", async ({ page }, info) => 
 });
 
 /**
+ * A REMOUNT TAKES THE FRESHEST PAGE, NOT THE ONE THE CACHE WAS LEFT HOLDING.
+ *
+ * The rail's tabs are Radix tabs, which unmount the inactive one -- so leaving
+ * this tab throws the accumulator away and leaves only React Query's cache
+ * entry, which anything happening in the meantime marks out of date without
+ * refetching (nothing is observing it). Coming back, the query hands that
+ * stale entry over while it revalidates, and a list that took THAT and then
+ * held it would be frozen on a page it already knew was wrong.
+ *
+ * Nothing was on screen for the return to disturb, so the right answer is
+ * simply the current page one, with nothing to offer and nothing to click.
+ */
+test("takes the freshest page when the tab comes back, not the cache it left", async ({ page }, info) => {
+  const companyId = await makeCompany(page, uniqueName("tab return", info.retry));
+  const stub: RailStub = { events: [], meetings: seedRows(3, (n) => `Meeting ${n}`), live: [] };
+  await stubRail(page, companyId, stub);
+  await page.goto(`/companies/${companyId}`);
+  await page.getByTestId("meetings-tab").click();
+  await expect(page.locator('[data-testid^="meeting-row-"]')).toHaveCount(3);
+
+  await page.getByRole("tab", { name: "Timeline" }).click();
+  await expect(page.getByTestId("timeline")).toBeVisible();
+
+  stub.meetings = [arrival("Logged while away"), ...stub.meetings];
+  stub.live = ["meetings"];
+  // The hint cannot refetch a query nobody is observing; what it does is mark
+  // it out of date, which is exactly the state this test is about.
+  await page.waitForTimeout(QUIET_MS);
+
+  await page.getByTestId("meetings-tab").click();
+  await expect(page.getByTestId(`meeting-row-${rowId(90)}`)).toBeVisible();
+  await expect(page.locator('[data-testid^="meeting-row-"]')).toHaveCount(4);
+  await expect(page.getByTestId("meetings-new-show")).toHaveCount(0);
+});
+
+/**
  * THE READER'S OWN WRITE IS NOT HELD BACK, AND THE ORDER OF THE RE-SNAPSHOT IS
  * WHAT MAKES THAT TRUE. "Log a meeting" invalidates ["meetings"] as it
  * settles, so a fetch is already in flight and the cache still holds the page
@@ -503,3 +539,4 @@ test("shows a meeting the reader logs themselves, at once", async ({ page }, inf
   // Their own write is not an arrival to be offered: it is already here.
   await expect(page.getByTestId("meetings-new-show")).toHaveCount(0);
 });
+

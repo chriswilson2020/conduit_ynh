@@ -155,7 +155,7 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
   const key = identityKey({ companyId, contactId, dealId, projectId, taskId });
   const [pages, setPages] = useState<CursorPages<Event>>(() => emptyCursorPages<Event>(key));
   const cursor = cursorForKey(pages, key);
-  const { data, isLoading, isError, isFetching, refetch } = useEvents({
+  const { data, isLoading, isError, isFetching, isStale, refetch } = useEvents({
     companyId, contactId, dealId, projectId, taskId, cursor,
   });
   // Page one, whatever page the reader is on. See the header.
@@ -175,36 +175,46 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
    * is already held (see the header), a held page is simply final until the
    * reader asks for a new snapshot.
    *
-   * ...AND ONLY FROM A FETCH THAT HAS SETTLED. `data` while `isFetching` is a
-   * CACHE ENTRY, not an answer: React Query hands back what it has while it
-   * revalidates. Taking that and then holding it locks in a page that was
-   * already known to be out of date, and it is not a corner case -- this rail
-   * lives in Radix tabs, which unmount the inactive one, so the ordinary
-   * "write a note on the Notes tab, then look at the Timeline" gesture
-   * remounts this component over a cache entry the write has just
-   * invalidated. Before the hold, the fresh page simply replaced the stale
-   * one; with it, the reader's own note would have been held behind a count
-   * for ever. (e2e/crm.spec.ts walks exactly that, and caught exactly this.)
+   * ...AND ONLY A PAGE THE QUERY STILL CALLS CURRENT. `data` while `isStale`
+   * is a CACHE ENTRY, not an answer: React Query hands back what it has while
+   * it revalidates. Taking that and then holding it locks in a page already
+   * known to be out of date, and it is not a corner case -- this rail lives in
+   * Radix tabs, which unmount the inactive one, so the ordinary "write a note
+   * on the Notes tab, then look at the Timeline" gesture remounts this
+   * component over a cache entry the write has just invalidated. Before the
+   * hold the fresh page simply replaced the stale one; with it, the reader's
+   * own note would have been held behind a count for ever. (e2e/crm.spec.ts
+   * walks exactly that and caught exactly this.)
+   *
+   * isStale RATHER THAN isFetching, and the difference is a real one that cost
+   * an afternoon. `isFetching` says whether a request is in flight, which on a
+   * remount depends on WHEN React Query dispatches the mount refetch relative
+   * to this effect -- an ordering that differed between this component and the
+   * Meetings tab beside it, so the same code was correct in one and wrong in
+   * the other. `isStale` is a property of the DATA (invalidated, or older than
+   * the 10s staleTime), decided before any of that, and it is the question
+   * actually being asked: is this page fit to keep?
    *
    * WAITING COSTS ONE ROUND TRIP AND ONLY WHERE THE DATA IS ALREADY WRONG. A
-   * cold mount has no `data` to take anyway; a warm mount inside the 10s
-   * staleTime is not fetching, so it paints from cache with no delay; only a
-   * mount over data something has invalidated waits -- and the alternative
-   * there is painting rows that are known to be stale and then keeping them.
-   * The loading line below is gated on the same flag so that wait does not
-   * render as "No activity yet".
+   * cold mount has no `data` to take anyway; a warm mount inside the staleTime
+   * is not stale, so it paints from cache with no delay; only a mount over
+   * data something has invalidated waits -- and the alternative there is
+   * painting rows that are known to be stale and then keeping them. The
+   * loading line below is gated on isFetching so that wait does not render as
+   * "No activity yet".
    *
-   * `pages` is a dependency, which it has to be: a re-snapshot replaces the
-   * accumulator without changing the data, the key OR the cursor (page one's
-   * cursor is undefined either way), and an effect that did not watch the
-   * accumulator would leave the list showing the old rows until something
-   * else happened to move. Safe because takeCursorPage settles -- its second
-   * call for the same cursor returns the same object, so React bails out.
+   * `pages` IS NOT A DEPENDENCY, and the inbox's copy of this effect needs it
+   * to be. There it re-snapshots by emptying the accumulator and letting this
+   * effect refill it, so the accumulator has to be watched or the list stays
+   * empty; here the re-snapshot writes the fetched page itself, in one call,
+   * and there is nothing left for this effect to recover. Every other way the
+   * accumulator moves ("load more", a record change) moves `cursor` or `key`
+   * with it, both of which are watched.
    */
   useEffect(() => {
-    if (!data || isFetching) return;
+    if (!data || isStale) return;
     setPages((current) => takeCursorPage(current, key, cursor, data.items, data.nextCursor));
-  }, [data, isFetching, cursor, key, pages]);
+  }, [data, isStale, cursor, key]);
 
   // pages.key can lag `key` by one render (the take above runs in an effect),
   // and rendering the previous record's rows for that render is exactly the
