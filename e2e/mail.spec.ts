@@ -2858,6 +2858,25 @@ test.describe.serial("Mail journey", () => {
     // the check because a reload resets the accumulation with it.
     await pollWithReload(async () => {
       await loadAllThreadsOn(page);
+      // THE LAST ONE APPENDED, AND IT IS THE SENTINEL FOR THE WHOLE SET.
+      //
+      // This wait used to name backlogSubject(0) alone, which is the FIRST of
+      // the thirty appended and therefore the first ingested -- the pass walks
+      // by ascending UID (mail-sync.ts) and these went up in a loop, so item 00
+      // appearing says one of thirty has landed and nothing at all about the
+      // other twenty-nine. The index assertion below needs all of them: it
+      // counts the rows above the target, and rows that have not been ingested
+      // yet cannot be among them.
+      //
+      // Measured, not reasoned about after the fact: CI run 33953041155 read
+      // `indexOf` as 17 where it wanted >= 25. Thirteen fixture threads plus
+      // backlog 03, 04 and 05 above a target of 02 is exactly 16 -- i.e. six
+      // of the thirty had arrived, item 00 among them, and the poll let the
+      // test through. Item 29 is the one whose arrival means the set is whole.
+      await expect(threadRow(backlogSubject(BACKLOG_COUNT - 1)))
+        .toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+      // And the oldest, which is the half about PAGING rather than ingest: it
+      // sorts to the very bottom, so seeing it means every page is on screen.
       await expect(threadRow(backlogSubject(0))).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
     });
 
