@@ -187,14 +187,26 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
    * Take a new snapshot: fetch page one, THEN start the accumulation over from
    * what came back.
    *
-   * IN THAT ORDER, AND THE ORDER IS THE WHOLE FUNCTION. Emptying first would
-   * adopt whatever the cache is holding for page one, which after an
-   * invalidation is the answer from BEFORE whatever caused it -- so the entry
-   * the reader just asked to see would be missing, and the fresh page landing
-   * a moment later would find page one held again and take nothing from it.
-   * Waiting for the fetch costs one round trip and is never wrong. `refetch`
-   * on an in-flight query returns that fetch's own promise (React Query
-   * dedupes), so the common case issues no second request.
+   * IN THAT ORDER, AND THE ORDER IS NOT LOAD-BEARING HERE -- WHICH IS WRITTEN
+   * DOWN RATHER THAN LEFT TO BE REDISCOVERED. The only thing that asks for a
+   * snapshot is the control below, and by the time that control exists the
+   * head query has already refetched, because that is where its count came
+   * from; so emptying first would adopt a page one that is fresh anyway. A
+   * mutation reversing these two lines survived the whole suite, and that is
+   * the honest state of it.
+   *
+   * IT IS STILL WRITTEN THIS WAY, for two reasons. It is the order the same
+   * function has on the other two surfaces -- mail/thread-list.tsx's
+   * resnapshot and meetings.tsx's reset -- where the snapshot DOES follow the
+   * reader's own write, the cache is holding the answer from before it, and
+   * the reverse order silently loses the thing they just did. Three copies of
+   * one idea should not differ in a way that looks deliberate and is not. And
+   * it is the order that stays correct if this component ever gains such a
+   * trigger, which is exactly the change the header's rejected refreshToken
+   * note describes.
+   *
+   * `refetch` on an in-flight query returns that fetch's own promise (React
+   * Query dedupes), so the common case issues no second request.
    *
    * IT GOES BACK TO PAGE ONE, and the accumulated pages are re-fetched by
    * pressing "Load more" again rather than re-paged here: their cursors are
