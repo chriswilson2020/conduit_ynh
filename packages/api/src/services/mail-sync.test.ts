@@ -2184,6 +2184,33 @@ describe("SyncManager", () => {
 
   beforeEach(() => { clients.length = 0; });
 
+  /**
+   * WHAT ACTUALLY REACHES THE SERVER, which nothing here asserted until a
+   * mutation said so: replacing ensureConnected's password with `""` passed
+   * all 67 cases in this file. Every one of them drives a FakeImapClient that
+   * never looks at its own settings, so the whole credential path -- decrypt
+   * the row, narrow the union, put the imap half (not the smtp half, not an
+   * empty string) into the connection -- was covered by nothing.
+   *
+   * It matters more after Phase 8, not less: a blank or wrong password does
+   * not fail loudly here, it fails at the PROVIDER, and arrives as an account
+   * whose mail quietly stopped -- the failure mode the spec's Risk 3 names.
+   */
+  it("connects with the account's own stored IMAP password, not a blank or the smtp half", async () => {
+    const id = await makeAccount({
+      email: "creds@example.com", password: "imap-half", smtpPassword: "smtp-half",
+    });
+    const manager = makeManager();
+    await manager.start();
+    await waitFor(() => (manager.get(id)?.stats.passes ?? 0) >= 1, "the account's first pass");
+
+    expect(clients[0]?.settings).toMatchObject({
+      accountId: id,
+      host: "mail.example.com", port: 993, security: "tls",
+      username: "chris", password: "imap-half",
+    });
+  });
+
   it("starts one AccountSync per non-archived account", async () => {
     const first = await makeAccount({ email: "one@example.com", label: "One" });
     const second = await makeAccount({ email: "two@example.com", label: "Two" });

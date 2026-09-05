@@ -1,8 +1,12 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import nodemailer from "nodemailer";
+import type { MailAccount } from "@conduit/shared";
+import { MailCredentialKindError } from "./errors.js";
 import type { ImapConnectionSettings } from "./mail-imap.js";
 import {
   ImapIdleUnsupportedError, ImapflowClient,
   buildImapOptions, buildSmtpOptions, continueWalk, createImapClientFactory,
+  createSmtpTransportFactory,
   defaultTestConnectionDeps, imapVerify, nextWalk, normalizeMailError, readFetchedSource,
   readFolderListing, requireSearchUids, smtpVerify, SOCKET_TIMEOUT_MS,
   type ImapflowListEntry,
@@ -476,6 +480,50 @@ describe("createImapClientFactory", () => {
     expect(first).not.toBe(second);
     await first.disconnect();
     await second.disconnect();
+  });
+});
+
+describe("createSmtpTransportFactory", () => {
+  const account = {
+    id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    smtpHost: "mail.example.com", smtpPort: 587, smtpSecurity: "starttls" as const,
+    username: "chris",
+  } as unknown as MailAccount;
+
+  /**
+   * A SPY THAT CALLS THROUGH, not a mock, which is why this does not breach
+   * the boundary stated at the top of this file. nodemailer really builds its
+   * transport (it opens nothing until sendMail), and the spy exists only to
+   * read back the argument it was built from. Nothing here stands in for the
+   * library's behaviour.
+   *
+   * A mutation is why this test exists at all. Swapping `.smtpPassword` for
+   * `.imapPassword` in the factory survived BOTH this file and mail-send's --
+   * mail-send drives a fake transport factory and never reaches the real one --
+   * so an account using the "SMTP differs" toggle would have logged in to its
+   * SMTP server with the IMAP password, and the only symptom would have been
+   * sends failing on exactly the accounts configured that way.
+   */
+  it("authenticates SMTP with the smtp password, never the imap one", () => {
+    const spy = vi.spyOn(nodemailer, "createTransport");
+    try {
+      createSmtpTransportFactory({ rejectUnauthorized: false })(account, {
+        kind: "password", imapPassword: "imap-half", smtpPassword: "smtp-half",
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0]?.[0]).toMatchObject({ auth: { user: "chris", pass: "smtp-half" } });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // Phase 8's union reaching the one place that cannot use its other half.
+  // Unreachable today (nothing creates an OAuth account) and it must stay a
+  // throw rather than a fallback: a transport built with a blank password
+  // would present as the SMTP server rejecting the login.
+  it("refuses to build a transport for an OAuth account rather than sending with a blank password", () => {
+    expect(() => createSmtpTransportFactory()(account, { kind: "oauth", refreshToken: "r" }))
+      .toThrow(MailCredentialKindError);
   });
 });
 
