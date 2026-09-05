@@ -243,6 +243,10 @@ async function ensureAccessToken(
   provider: MailOAuthProvider,
   credentials: MailOAuthCredentials,
 ): Promise<string> {
+  // The cast is sound by isUsable's first line, which returns false unless both
+  // the token and its expiry are present; TypeScript cannot narrow across the
+  // call, and inlining the check to avoid the cast would put the skew
+  // comparison in two places.
   if (isUsable(credentials, deps.now())) return credentials.accessToken as string;
 
   const grant = await deps.refresh(provider, credentials.refreshToken);
