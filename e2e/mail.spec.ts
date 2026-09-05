@@ -384,6 +384,28 @@ test.describe.serial("Mail journey", () => {
   /** The target row's testid, captured in one test and asserted in the next:
    * after the reveal it takes the position the server has had it in all along. */
   let targetRowId = "";
+  /**
+   * WHEN the backlog reply was dated, carried into the next test so the
+   * conversation that arrives there can be dated STRICTLY LATER.
+   *
+   * A COIN FLIP LIVED HERE, and it is what turned CI run 33947079397 red on
+   * its first trial -- a docs-only commit, on a mailbox holding nothing but
+   * its own fixtures. Both arrivals were dated `new Date()` and the two tests
+   * run about 0.8 s apart, but an RFC 2822 `Date:` header carries WHOLE
+   * SECONDS; mail-ingest takes `last_message_at` from that header verbatim,
+   * and the list orders `desc(last_message_at), desc(id)` over an `id` that is
+   * a RANDOM UUID (services/mail-threads.ts, db/schema.ts). Two arrivals
+   * inside one clock second therefore TIE on the sort key, and the order of
+   * the two rows the reveal test names by index is then decided by a toss.
+   * About one run in five put both appends in the same second; the run above
+   * is one that lost.
+   *
+   * Dating the second arrival one clear second after the first makes that
+   * order a fact about the data instead. Derived from this value rather than
+   * waited out, so there is no window in which the two can tie however CI's
+   * clock behaves and no second spent not tying.
+   */
+  let backlogReplyAt = new Date(0);
   const backlogSubject = (index: number) => `${backlogPrefix} ${String(index).padStart(2, "0")}`;
   const backlogId = (index: number) => `<backlog-${attemptTag}-${index}@example.com>`;
 
@@ -2834,6 +2856,11 @@ test.describe.serial("Mail journey", () => {
     const before = await rowIds();
     await expect(page.getByTestId("thread-list-new-show")).toHaveCount(0);
 
+    // Captured, because the arrival in the NEXT test has to be dated strictly
+    // after this one or the two rows tie and the reveal order is a toss (the
+    // whole story is on backlogReplyAt). Used for both the header and the
+    // INTERNALDATE, so the two cannot drift apart.
+    backlogReplyAt = new Date();
     await withImap(async (client) => {
       await client.append(
         INBOX_FOLDER,
@@ -2844,11 +2871,11 @@ test.describe.serial("Mail journey", () => {
           `Message-ID: <backlog-reply-${attemptTag}@example.com>`,
           `In-Reply-To: ${backlogId(BACKLOG_TARGET)}`,
           `References: ${backlogId(BACKLOG_TARGET)}`,
-          `Date: ${new Date().toUTCString()}`,
+          `Date: ${backlogReplyAt.toUTCString()}`,
           "Content-Type: text/plain; charset=utf-8",
         ], `Replying about the backlog ${backlogReplyMarker}.`),
         [],
-        new Date(),
+        backlogReplyAt,
       );
     });
 
@@ -2878,6 +2905,21 @@ test.describe.serial("Mail journey", () => {
   test("counts a new conversation instead of showing it, until the reader asks", async () => {
     const before = await rowIds();
 
+    // ONE CLEAR SECOND AFTER THE REPLY IN THE TEST ABOVE, which is what makes
+    // the two index assertions at the foot of this test claims about the
+    // server's order rather than about a coin (see backlogReplyAt). `max` so
+    // this is never dated further ahead than it has to be: about 0.8 s of test
+    // usually passes between the two appends, and then this IS the wall clock.
+    const liveAt = new Date(Math.max(Date.now(), backlogReplyAt.getTime() + 1_000));
+    // Stated rather than trusted. An edit that dates this `new Date()` again
+    // fails here, on the header it changed, instead of one run in five on a
+    // row order two assertions further down with two UUIDs to compare.
+    expect(
+      Math.floor(liveAt.getTime() / 1_000),
+      "the two live arrivals must not share a clock second: a Date: header is whole seconds, "
+      + "and threads that tie on last_message_at are ordered by a random UUID",
+    ).toBeGreaterThan(Math.floor(backlogReplyAt.getTime() / 1_000));
+
     await withImap(async (client) => {
       await client.append(
         INBOX_FOLDER,
@@ -2886,11 +2928,11 @@ test.describe.serial("Mail journey", () => {
           `To: Conduit <${USERNAME}>`,
           `Subject: ${liveSubject}`,
           `Message-ID: <late-${attemptTag}@example.com>`,
-          `Date: ${new Date().toUTCString()}`,
+          `Date: ${liveAt.toUTCString()}`,
           "Content-Type: text/plain; charset=utf-8",
         ], "Something has just come up."),
         [],
-        new Date(),
+        liveAt,
       );
     });
 
@@ -2915,6 +2957,12 @@ test.describe.serial("Mail journey", () => {
     // reply landed, and the list was holding it in place. Asking is what
     // takes the server's order -- the reader's place is lost when they choose
     // to lose it, and not before.
+    //
+    // BOTH INDICES ARE CLAIMS ABOUT THE SERVER'S ORDER, and are worth making
+    // only while that order is determined. What determines it is the clear
+    // second between the two `Date:` headers at the top of this test; without
+    // it these two threads tie on `last_message_at` and this pair of lines is
+    // a coin toss (see backlogReplyAt).
     expect(after[1]).toBe(targetRowId);
     await expect(show).toHaveCount(0);
   });
