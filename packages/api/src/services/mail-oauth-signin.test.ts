@@ -16,8 +16,8 @@ import { decryptCredentialsAt, encryptCredentialsAt } from "./mail-crypto.js";
 import type { MailOAuthClient, MailTokenGrant } from "./mail-oauth.js";
 import {
   MailOAuthNotConfiguredError, MailOAuthStates, MissingRefreshTokenError, SIGNIN_STATE_TTL_MS,
-  buildAuthorizeUrl, completeSignin, configuredProviders, connectionFor, createHttpCodeExchanger,
-  providerDisplayName, startSignin,
+  appendsSentCopy, buildAuthorizeUrl, completeSignin, configuredProviders, connectionFor,
+  createHttpCodeExchanger, providerDisplayName, startSignin,
   type MailOAuthCodeExchanger, type SigninDeps, type SigninTarget,
 } from "./mail-oauth-signin.js";
 
@@ -800,6 +800,69 @@ describe("providerDisplayName and connectionFor", () => {
     // form does not have.
     expect(connectionFor("microsoft", "a@b.example").username).toBe("a@b.example");
     expect(connectionFor("google", "a@b.example").username).toBe("a@b.example");
+  });
+
+  /**
+   * THE PROVIDER TABLE, PINNED AGAINST WHAT EACH PROVIDER PUBLISHES (Task 4).
+   *
+   * Every value here was read out of the provider's own documentation on 5 Sep
+   * -- Microsoft's "Authenticate an IMAP, POP or SMTP connection using OAuth"
+   * and its POP/IMAP settings page, Google's "OAuth 2.0 for Web Server
+   * Applications" and its IMAP settings page -- rather than checked against the
+   * other provider, which is the mistake that makes one table read as if two
+   * services were the same service.
+   *
+   * IT IS A CHANGE-DETECTOR AND THAT IS WHAT IT IS FOR. Every one of these
+   * strings fails at a mail server or a consent screen if it is wrong, in an
+   * environment no test in this repository can reach: the failure is somebody
+   * else's 535 or an "invalid scope" page. A wrong port here is not a bug this
+   * suite can catch by exercising it, so the suite catches it by refusing to
+   * let it change quietly.
+   */
+  it("pins each provider's hosts and ports to what that provider documents", () => {
+    expect(connectionFor("microsoft", "a@b.example")).toMatchObject({
+      imapHost: "outlook.office365.com", imapPort: 993, imapSecurity: "tls",
+      smtpHost: "smtp.office365.com", smtpPort: 587, smtpSecurity: "starttls",
+      sentFolder: "Sent Items",
+    });
+    expect(connectionFor("google", "a@b.example")).toMatchObject({
+      imapHost: "imap.gmail.com", imapPort: 993, imapSecurity: "tls",
+      smtpHost: "smtp.gmail.com", smtpPort: 587, smtpSecurity: "starttls",
+      // The ENGLISH name. Gmail localises the whole special namespace with the
+      // mailbox's language, so this is a starting value the operator can edit
+      // and not a constant -- see ProviderFacts.sentFolder.
+      sentFolder: "[Gmail]/Sent Mail",
+    });
+  });
+});
+
+/**
+ * WHO FILES THE SENT COPY (Task 4's second finding).
+ *
+ * The phase brief said Gmail duplicates sent mail and Exchange does not. The
+ * first half is right; the second is not -- Exchange Online's
+ * MessageCopyForSMTPClientSubmissionEnabled defaults to $true and it saves SMTP
+ * client submissions too. What actually differs is whether the operator can
+ * turn it off, and the reasoning from there is in ProviderFacts.appendsSentCopy.
+ */
+describe("appendsSentCopy", () => {
+  it("is false for Google, whose auto-save cannot be turned off", () => {
+    expect(appendsSentCopy("oauth_google")).toBe(false);
+  });
+
+  it("is true for Microsoft, whose auto-save is a switch this process cannot read", () => {
+    // Deliberately NOT symmetric with Google, and the asymmetry is the whole
+    // decision: appending over Exchange's own copy is a visible duplicate the
+    // operator can fix with one cmdlet; not appending when the switch is off
+    // leaves no copy in the mailbox and says nothing.
+    expect(appendsSentCopy("oauth_microsoft")).toBe(true);
+  });
+
+  it("is true for a password account, which is the behaviour that must not change", () => {
+    // A self-hosted Dovecot -- this install's common case -- files nothing on
+    // submission, so the APPEND is the only thing that puts a sent message in
+    // the mailbox. Phase 8 must not have touched this arm.
+    expect(appendsSentCopy("password")).toBe(true);
   });
 });
 

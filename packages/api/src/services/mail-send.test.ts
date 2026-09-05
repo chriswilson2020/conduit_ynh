@@ -372,6 +372,73 @@ describe("sendMail", () => {
       .rejects.toThrow(SmtpSendError);
   });
 
+  /**
+   * GOOGLE ALREADY PUT IT THERE (Phase 8 Task 4).
+   *
+   * Gmail files every SMTP submission in Sent Mail itself and offers no setting
+   * to stop it, so Conduit's APPEND is a second upload of the same bytes -- and
+   * Gmail's IMAP server intermittently refuses the concurrent one, which
+   * reaches the journal as "could not be appended" on a send that was fine.
+   * See mail-oauth-signin.ts's appendsSentCopy.
+   *
+   * THE FOUR ASSERTIONS ARE THE POINT TOGETHER. That nothing was appended is
+   * only half the claim; the other half is that the message was still SENT and
+   * still STORED against the account's own Sent folder, and that no warning was
+   * produced -- a skipped APPEND is not a degraded send, and an operator who
+   * saw a warning would go looking for a failure that did not happen.
+   */
+  it("does not APPEND to Sent Mail for a Google account, because Google already did", async () => {
+    const sync = new FakeAccountSync();
+    syncs.set(accountId, sync);
+    await handle.db.update(mailAccounts).set({
+      authMethod: "oauth_google",
+      credentialsCiphertext: encryptCredentialsAt(keyPath, { kind: "oauth", refreshToken: "r" }),
+    }).where(eq(mailAccounts.id, accountId));
+
+    const message = await sendMail(handle.db, dataDir, actorId, input(), deps({
+      tokenRefresher: () => Promise.resolve({ accessToken: "at", expiresInSeconds: 3600 }),
+    }));
+
+    expect(transport.sent).toHaveLength(1);
+    expect(sync.appended).toHaveLength(0);
+    expect(warnings).toHaveLength(0);
+    const [stored] = await storedMessages();
+    expect(stored?.id).toBe(message.id);
+    // The row still names the account's Sent folder, so the sync's later
+    // sighting of Google's own copy dedupes onto this row rather than arriving
+    // as a second message.
+    expect(stored?.folder).toBe("Sent");
+  });
+
+  /**
+   * AND MICROSOFT STILL DOES, which is the half of this that is a decision
+   * rather than an observation. Exchange Online also auto-saves SMTP client
+   * submissions -- MessageCopyForSMTPClientSubmissionEnabled defaults to $true
+   * -- but it is a per-mailbox switch this process cannot read, and the two
+   * wrong answers are not equally wrong: a duplicate in Sent Items is visible
+   * and the operator can turn the switch off, while a missing one is silent.
+   *
+   * This test is what stops "skip the APPEND for OAuth accounts" being the
+   * tidier-looking edit somebody makes later.
+   */
+  it("still APPENDs for a Microsoft account, whose auto-save is a switch we cannot read", async () => {
+    const sync = new FakeAccountSync();
+    syncs.set(accountId, sync);
+    await handle.db.update(mailAccounts).set({
+      authMethod: "oauth_microsoft",
+      credentialsCiphertext: encryptCredentialsAt(keyPath, { kind: "oauth", refreshToken: "r" }),
+    }).where(eq(mailAccounts.id, accountId));
+
+    await sendMail(handle.db, dataDir, actorId, input(), deps({
+      tokenRefresher: () => Promise.resolve({ accessToken: "at", expiresInSeconds: 3600 }),
+    }));
+
+    expect(sync.appended).toHaveLength(1);
+    // The SAME BYTES that were submitted, not a recomposition -- this module's
+    // one-composition rule, which the provider fork must not have broken.
+    expect(sync.appended[0]?.toString("utf8")).toBe(transport.rawText());
+  });
+
   it("stores the message and warns when the Sent-folder APPEND fails", async () => {
     const sync = new FakeAccountSync();
     sync.failure = new Error("connection: Socket is already closed");

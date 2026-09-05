@@ -1,5 +1,8 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import type { MailOAuthProvider, MailSecurity } from "@conduit/shared";
+import {
+  mailOAuthProviderOf,
+  type MailAuthMethod, type MailOAuthProvider, type MailSecurity,
+} from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { ArchivedError, ConflictError, NotFoundError } from "./errors.js";
 import { encryptCredentialsChecked, loadMailKey } from "./mail-crypto.js";
@@ -111,8 +114,62 @@ interface ProviderFacts {
    * is not APPENDed where the mailbox keeps sent mail, which is recoverable
    * from Settings (mail_accounts.sent_folder is an ordinary editable column)
    * and is why this is a starting value rather than a constant the code trusts.
+   *
+   * GMAIL'S IS LOCALISED AND THIS IS THE ENGLISH ONE, which Task 4 checked
+   * rather than assumed: Gmail translates the whole special namespace with the
+   * mailbox's own language setting, so a Dutch mailbox answers LIST with
+   * "[Gmail]/Verzonden berichten" and some older accounts use "[Google Mail]"
+   * for the prefix itself. Google's answer is the SPECIAL-USE `\Sent`
+   * attribute, which the adapter does not read -- resolving the folder that way
+   * would be a change to mail-imap.ts's contract, which Task 2's instruction
+   * says to stop at. So this stays a starting value, the operator's remedy is
+   * the editable column, and docs/mail-oauth-setup.md says so before they meet
+   * it. It matters even where nothing is APPENDed (see appendsSentCopy): the
+   * send path stores its own row with `folder` set to this column and the sync
+   * has to walk the same mailbox to find the copy Google filed.
    */
   sentFolder: string;
+  /**
+   * Whether Conduit APPENDs its own copy of a sent message to that folder.
+   *
+   * THE PHASE'S BRIEF SAID "GMAIL DUPLICATES SENT MAIL, EXCHANGE DOES NOT" AND
+   * THE SECOND HALF IS NO LONGER TRUE. Checked 5 Sep against Microsoft's own
+   * reference rather than against Gmail: `Set-Mailbox`'s
+   * `MessageCopyForSMTPClientSubmissionEnabled` is Exchange-Online-only and its
+   * documented default is `$true` -- "a copy of the message is sent to the
+   * user's mailbox. This value is the default." Exchange Online files SMTP
+   * client submissions in Sent Items by itself, exactly as Gmail does. So the
+   * two providers do NOT differ in whether they auto-save. They differ in
+   * something else, and that is what this flag is actually about:
+   *
+   * AT GOOGLE THE AUTO-SAVE IS UNCONDITIONAL AND CANNOT BE TURNED OFF. There is
+   * no Gmail setting for it. So Conduit's APPEND there is always a second
+   * upload of the same bytes. Whether the operator SEES two copies is the part
+   * that is not documented anywhere authoritative -- Gmail is widely reported
+   * to collapse them by Message-ID, and that is a community claim rather than
+   * something Google publishes, so it is not what this decision rests on. What
+   * is certain is the cost: every message uploaded twice, and an IMAP server
+   * that intermittently refuses the concurrent APPEND -- arriving as
+   * mail-send.ts's "could not be appended" warning on a send that was fine.
+   * Skipping it costs nothing and cannot lose anything, whichever way the
+   * dedupe question goes.
+   *
+   * AT MICROSOFT IT IS A PER-MAILBOX SWITCH THIS PROCESS CANNOT READ. Answering
+   * it needs Exchange PowerShell, not IMAP. So the choice is between two wrong
+   * answers on a mailbox whose switch has been flipped, and they are not
+   * equally wrong: appending when Exchange also saved leaves TWO VISIBLE COPIES
+   * in Sent Items -- ugly, obvious within a minute, and fixed by the operator
+   * with the one cmdlet docs/mail-oauth-setup.md names. Not appending when
+   * Exchange did not save leaves NO copy in the mailbox at all -- invisible,
+   * indistinguishable from working, and discovered weeks later by somebody
+   * looking for a message in Outlook. This codebase has been bitten twice by
+   * the silent one, so Microsoft keeps the APPEND.
+   *
+   * A PASSWORD ACCOUNT ALWAYS APPENDS, unchanged and not covered by this table:
+   * a self-hosted Dovecot files nothing on submission and the APPEND is the
+   * only thing that puts a sent message in the mailbox.
+   */
+  appendsSentCopy: boolean;
   /**
    * The scopes asked for at the consent screen.
    *
@@ -151,6 +208,15 @@ interface ProviderFacts {
    * MICROSOFT HAS NONE, and that is also a decision. `offline_access` already
    * guarantees the refresh token on every authorisation, so forcing a consent
    * screen on every sign-in would cost the operator a click and buy nothing.
+   *
+   * WHAT `prompt=consent` COSTS, checked rather than waved past: every
+   * re-authorisation mints a NEW refresh token instead of reusing the grant,
+   * and Google caps a user at 100 live refresh tokens per client id, revoking
+   * the oldest past that. Reaching it needs a hundred sign-ins at one mailbox,
+   * and the tokens it would revoke are ones Conduit has already replaced -- so
+   * the cap is reachable in principle and harmless in fact. The alternative
+   * (omitting the parameter) is not: it is a "Sign in again" that completes and
+   * stores nothing usable, which is a strictly worse trade at any frequency.
    */
   extraAuthorizeParams: Readonly<Record<string, string>>;
 }
@@ -158,9 +224,25 @@ interface ProviderFacts {
 const PROVIDERS: Readonly<Record<MailOAuthProvider, ProviderFacts>> = {
   microsoft: {
     displayName: "Microsoft",
+    // THESE ARE EXCHANGE ONLINE'S, WHICH IS WHAT THE SPEC TARGETS ("an M365
+    // account added by signing in"), AND THE SMTP ONE IS NOT UNIVERSAL. Checked
+    // 5 Sep against Microsoft's own settings pages rather than assumed from the
+    // IMAP host: a CONSUMER outlook.com / hotmail.com / live.com mailbox shares
+    // the IMAP host but submits through smtp-mail.outlook.com, and
+    // smtp.office365.com refuses it. The symptom is the one this phase already
+    // has a worse cause for -- IMAP syncs perfectly and every send fails -- so
+    // it is written down here and in docs/mail-oauth-setup.md rather than left
+    // to be diagnosed twice.
+    //
+    // NOT FIXED BY MAKING THE HOST A CHOICE. The OAuth form asks for no host on
+    // purpose, and adding one back for a mailbox class outside this phase's
+    // definition of done would trade the feature's whole shape for it. A
+    // consumer Microsoft account is an unsupported case that is NAMED, which is
+    // the honest version of not supporting something.
     imapHost: "outlook.office365.com", imapPort: 993, imapSecurity: "tls",
     smtpHost: "smtp.office365.com", smtpPort: 587, smtpSecurity: "starttls",
     sentFolder: "Sent Items",
+    appendsSentCopy: true,
     scopes: [
       "offline_access",
       "https://outlook.office.com/IMAP.AccessAsUser.All",
@@ -173,6 +255,7 @@ const PROVIDERS: Readonly<Record<MailOAuthProvider, ProviderFacts>> = {
     imapHost: "imap.gmail.com", imapPort: 993, imapSecurity: "tls",
     smtpHost: "smtp.gmail.com", smtpPort: 587, smtpSecurity: "starttls",
     sentFolder: "[Gmail]/Sent Mail",
+    appendsSentCopy: false,
     scopes: ["https://mail.google.com/"],
     extraAuthorizeParams: { access_type: "offline", prompt: "consent" },
   },
@@ -183,6 +266,30 @@ const PROVIDERS: Readonly<Record<MailOAuthProvider, ProviderFacts>> = {
  * page says it too and a second spelling of "Microsoft" is a second answer. */
 export function providerDisplayName(provider: MailOAuthProvider): string {
   return PROVIDERS[provider].displayName;
+}
+
+/**
+ * Whether the send path should APPEND its own copy of a sent message to this
+ * account's Sent folder. See ProviderFacts.appendsSentCopy for the measurement
+ * and for why the two providers are answered differently despite both
+ * auto-saving.
+ *
+ * TAKES THE AUTH METHOD RATHER THAN THE ACCOUNT, so the caller is
+ * mail-send.ts's one line and this module still learns nothing about mail rows.
+ * A password account answers true through the `provider === null` arm: that is
+ * the pre-Phase-8 behaviour, and it is the arm that must not change.
+ *
+ * NOT KEYED ON THE SMTP HOSTNAME, which was the other candidate and is worse.
+ * Sniffing "smtp.gmail.com" would also catch a password account at Gmail, which
+ * is true and tempting -- and it would silently start skipping the APPEND for
+ * relay hostnames that behave differently (smtp-relay.gmail.com does not file
+ * anything in a mailbox), on a column the operator can type anything into. The
+ * auth method is a fact this server wrote itself, at the moment it knew which
+ * provider the mailbox came from.
+ */
+export function appendsSentCopy(authMethod: MailAuthMethod): boolean {
+  const provider = mailOAuthProviderOf(authMethod);
+  return provider === null || PROVIDERS[provider].appendsSentCopy;
 }
 
 /** The connection an account with this provider gets. Separated from the table

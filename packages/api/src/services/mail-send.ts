@@ -17,6 +17,7 @@ import {
 import {
   resolveConnectionAuth, unconfiguredTokenRefresher, type MailTokenRefresher,
 } from "./mail-oauth.js";
+import { appendsSentCopy } from "./mail-oauth-signin.js";
 import { ingestMessage, type IngestedMessage } from "./mail-ingest.js";
 
 /**
@@ -557,8 +558,21 @@ export async function sendMail(
   // the outgoing References chain resolves a reply onto the same thread the
   // explicit threadId would have chosen, so only a compose-seeded link on a
   // brand-new thread can actually be lost, and only in that window.
+  //
+  // AND AT ONE PROVIDER IT DOES NOT HAPPEN AT ALL. Google files every SMTP
+  // submission in Sent Mail itself and offers no way to stop it, so an APPEND
+  // there is a second upload of bytes the mailbox already has -- see
+  // mail-oauth-signin.ts's appendsSentCopy for the measurement, for why
+  // Microsoft is answered the other way despite doing the same thing, and for
+  // why a password account is untouched. NOTHING BELOW CHANGES: ingest still
+  // stores this message against the account's sent_folder, and the sync's later
+  // sighting of Google's own copy still dedupes onto that row through UNIQUE
+  // (account_id, message_id), because the Message-ID is the one nodemailer put
+  // in the bytes Google accepted.
   try {
-    const append = deps.syncManager?.get(account.id)?.appendSent(raw);
+    const append = appendsSentCopy(account.authMethod)
+      ? deps.syncManager?.get(account.id)?.appendSent(raw)
+      : undefined;
     if (append !== undefined) {
       await withTimeout(
         append,
