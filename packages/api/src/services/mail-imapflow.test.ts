@@ -422,6 +422,45 @@ describe("readFolderListing", () => {
     expect(listed.map((item) => item.folder)).toEqual(["INBOX", "All Mail", "Starred", "Projects"]);
   });
 
+  /**
+   * THE THREE MAILBOXES THAT MAKE A GMAIL ACCOUNT SYNC ITSELF SEVERAL TIMES
+   * (Phase 8 Task 4). `\All`, `\Flagged` and Gmail's `\Important` are views
+   * over messages that live in other folders, so a walk of one re-sights the
+   * whole mailbox under a second name and ingest's duplicate path then rewrites
+   * `mail_messages.folder` on every pass.
+   *
+   * READ FROM `flags`, NOT FROM `specialUse`, which is why this is a separate
+   * test from the one above rather than an assertion inside it: the mapper
+   * deliberately carries no ROLE for these, and it must still notice them.
+   */
+  it("marks \\All, \\Flagged and \\Important as virtual views", () => {
+    const listed = readFolderListing([
+      entry("INBOX", { flags: ["\\HasNoChildren"] }),
+      entry("[Gmail]/All Mail", { flags: ["\\All", "\\HasNoChildren"], specialUse: "\\All" }),
+      entry("[Gmail]/Starred", { flags: ["\\Flagged"], specialUse: "\\Flagged" }),
+      entry("[Gmail]/Important", { flags: ["\\Important"] }),
+      // Case-insensitive, like the unselectable check beside it: RFC 3501
+      // mailbox attributes are, and `flags` holds the server's own spelling.
+      entry("Shouty", { flags: ["\\ALL"] }),
+      entry("Projects", { flags: ["\\HasNoChildren"] }),
+    ]);
+    expect(listed.map((item) => item.virtual))
+      .toEqual([undefined, true, true, true, true, undefined]);
+    // Still listed, and still selectable: the claim is that walking one is
+    // duplicated work, not that it cannot be opened. Discovery records them and
+    // the picker shows them.
+    expect(listed).toHaveLength(6);
+    expect(listed.every((item) => item.selectable)).toBe(true);
+  });
+
+  /** Omitted rather than false, so a listing from a server that offers no such
+   * attribute -- Dovecot, this install's ordinary case -- is byte-identical to
+   * what this mapper produced before the field existed. */
+  it("leaves the field off entirely for an ordinary mailbox", () => {
+    const [listed] = readFolderListing([entry("Projects", { flags: ["\\HasNoChildren"] })]);
+    expect(listed).not.toHaveProperty("virtual");
+  });
+
   it("reports \\Noselect (and \\NonExistent) folders as unselectable without dropping them", () => {
     const listed = readFolderListing([
       entry("Lists", { flags: ["\\Noselect", "\\HasChildren"] }),

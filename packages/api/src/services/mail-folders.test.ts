@@ -41,12 +41,18 @@ function accountHints(): SseHint[] {
  * cases where the separator is the point say so explicitly. */
 function listing(
   folder: string,
-  options: { specialUse?: ImapFolderListing["specialUse"]; selectable?: boolean; delimiter?: string | null } = {},
+  options: {
+    specialUse?: ImapFolderListing["specialUse"]; selectable?: boolean;
+    delimiter?: string | null; virtual?: boolean;
+  } = {},
 ): ImapFolderListing {
   return {
     folder,
     ...(options.specialUse === undefined ? {} : { specialUse: options.specialUse }),
     selectable: options.selectable ?? true,
+    // Omitted unless asked for, matching the adapter: an ordinary mailbox
+    // carries no such key at all.
+    ...(options.virtual === true ? { virtual: true } : {}),
     delimiter: options.delimiter === undefined ? "/" : options.delimiter,
   };
 }
@@ -254,6 +260,70 @@ describe("discoverFolders", () => {
       ["INBOX", true], ["Junk", false], ["Projects", true], ["Sent", true], ["Trash", false],
     ]);
     expect(rows.every((row) => row.lastDiscoveredAt.getTime() === PASS_ONE.getTime())).toBe(true);
+  });
+
+  /**
+   * A GMAIL MAILBOX SYNCING ITSELF FOUR TIMES, which is what this default
+   * prevents (Phase 8 Task 4).
+   *
+   * `[Gmail]/All Mail` holds every message the INBOX holds, `Starred` and
+   * `Important` hold subsets. With all three walked, every message is re-sighted
+   * under a second folder name each pass; ingest's duplicate path then updates
+   * `mail_messages.folder` to wherever it was last seen, so rows flip folders
+   * for ever and Phase 4.4's filing is undone as fast as it is done.
+   *
+   * NOT A BAN. The row exists, the picker shows it, and an operator who turns
+   * All Mail on keeps it on -- the no-clobber rule below covers this exactly as
+   * it covers an opted-in Junk folder.
+   */
+  it("defaults a virtual mailbox off, so a Gmail account does not sync itself twice", async () => {
+    const accountId = await makeAccount();
+    await discoverFolders(handle.db, accountId, [
+      listing("INBOX"),
+      listing("[Gmail]/All Mail", { virtual: true }),
+      listing("[Gmail]/Starred", { virtual: true }),
+      listing("[Gmail]/Important", { virtual: true }),
+      listing("[Gmail]/Sent Mail", { specialUse: "sent" }),
+    ], PASS_ONE);
+
+    // Keyed rather than ordered: the row order is the database's collation's
+    // business and "[Gmail]" against "INBOX" is exactly where a collation has
+    // an opinion. What this test is about is which of the five is on.
+    expect(Object.fromEntries(
+      (await rowsOf(accountId)).map((row) => [row.folder, row.syncEnabled]),
+    )).toEqual({
+      "INBOX": true,
+      "[Gmail]/All Mail": false,
+      "[Gmail]/Important": false,
+      "[Gmail]/Sent Mail": true,
+      "[Gmail]/Starred": false,
+    });
+  });
+
+  it("still records a virtual mailbox, and as selectable", async () => {
+    // The claim is that walking one is duplicated work, not that it cannot be
+    // opened. A picker that hid them would leave an operator who wants All Mail
+    // with no way to ask for it.
+    const accountId = await makeAccount();
+    await discoverFolders(handle.db, accountId, [listing("[Gmail]/All Mail", { virtual: true })], PASS_ONE);
+    expect(await rowOf(accountId, "[Gmail]/All Mail"))
+      .toMatchObject({ selectable: true, syncEnabled: false });
+  });
+
+  it("keeps a virtual mailbox the operator turned ON", async () => {
+    // The no-clobber rule, in the direction that is easy to miss. Someone who
+    // deliberately wants All Mail synced must not be overruled every pass.
+    const accountId = await makeAccount();
+    await discoverFolders(handle.db, accountId, [listing("[Gmail]/All Mail", { virtual: true })], PASS_ONE);
+    await handle.db.update(mailAccountFolders).set({ syncEnabled: true })
+      .where(and(
+        eq(mailAccountFolders.accountId, accountId),
+        eq(mailAccountFolders.folder, "[Gmail]/All Mail"),
+      ));
+
+    await discoverFolders(handle.db, accountId, [listing("[Gmail]/All Mail", { virtual: true })], PASS_TWO);
+
+    expect(await rowOf(accountId, "[Gmail]/All Mail")).toMatchObject({ syncEnabled: true });
   });
 
   it("records an unselectable folder rather than dropping it", async () => {

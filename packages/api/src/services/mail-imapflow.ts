@@ -512,6 +512,27 @@ const SPECIAL_USE_BY_LISTING_FLAG = new Map<string, SpecialUse>([
 const UNSELECTABLE_FLAGS = new Set(["\\noselect", "\\nonexistent"]);
 
 /**
+ * Mailbox attributes that mean "the messages in here also live elsewhere".
+ *
+ * THE THREE THAT MAKE A GMAIL MAILBOX SYNC ITSELF SEVERAL TIMES. `\All` is RFC
+ * 6154's "all messages" and is `[Gmail]/All Mail`; `\Flagged` is its "virtual
+ * mailbox" of flagged messages and is `[Gmail]/Starred`; `\Important` is
+ * Gmail's own and is not in RFC 6154 at all. Read from `flags` rather than from
+ * `specialUse` because SPECIAL_USE_BY_LISTING_FLAG deliberately maps none of
+ * them to one of the CRM's five roles -- and it should not start to, for the
+ * reason its own comment gives.
+ *
+ * Case-insensitive, matching UNSELECTABLE_FLAGS above and for the same reason:
+ * RFC 3501 mailbox attributes are case-insensitive and `flags` holds the
+ * server's spelling verbatim.
+ *
+ * NOTHING IS FILTERED OUT ON ACCOUNT OF THIS. The listing still reports these
+ * mailboxes; what changes is only the sync_enabled a folder gets on its FIRST
+ * sighting (mail-imap.ts's `virtual`, mail-folders.ts's defaultSyncEnabled).
+ */
+const VIRTUAL_FLAGS = new Set(["\\all", "\\flagged", "\\important"]);
+
+/**
  * imapflow's LIST result as the contract's listings, or a readable error for
  * either falsy shape (see mail-imap.ts's `list`).
  *
@@ -530,13 +551,21 @@ export function readFolderListing(
       ? undefined
       : SPECIAL_USE_BY_LISTING_FLAG.get(entry.specialUse);
     let selectable = true;
+    let virtual = false;
     for (const flag of entry.flags) {
-      if (UNSELECTABLE_FLAGS.has(flag.toLowerCase())) { selectable = false; break; }
+      const lower = flag.toLowerCase();
+      if (UNSELECTABLE_FLAGS.has(lower)) selectable = false;
+      if (VIRTUAL_FLAGS.has(lower)) virtual = true;
     }
     return {
       folder: entry.path,
       ...(role === undefined ? {} : { specialUse: role }),
       selectable,
+      // Omitted rather than `virtual: false`, so a listing from a server with
+      // no such attribute is byte-identical to the one this function used to
+      // produce -- which is what keeps every existing assertion on a whole
+      // listing object meaningful instead of quietly needing a new key.
+      ...(virtual ? { virtual: true } : {}),
       // One shape for "the server reports no hierarchy", so mail-folders.ts
       // does not have to know about two.
       delimiter: entry.delimiter === undefined || entry.delimiter === "" ? null : entry.delimiter,
