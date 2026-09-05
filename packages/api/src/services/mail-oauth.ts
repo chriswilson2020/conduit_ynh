@@ -404,9 +404,16 @@ export function createHttpTokenRefresher(
       // either. An operator-fixable deployment gap, in the shape
       // MailKeyMissingError has -- named plainly, in mail_accounts.last_error,
       // where the operator will read it.
+      // The tenant is named for Microsoft because config.ts treats a
+      // registration missing it as no registration at all (its /common fallback
+      // would authenticate against the wrong directory), so an operator who set
+      // the id and the secret and got THIS sentence needs to be told which of
+      // the three is still missing rather than sent to check two that are fine.
+      const settings = provider === "microsoft"
+        ? "MAIL_OAUTH_MICROSOFT_CLIENT_ID, _CLIENT_SECRET and _TENANT"
+        : "MAIL_OAUTH_GOOGLE_CLIENT_ID and MAIL_OAUTH_GOOGLE_CLIENT_SECRET";
       throw new Error(
-        `mail OAuth is not configured for ${provider} on this install:`
-        + ` set MAIL_OAUTH_${provider.toUpperCase()}_CLIENT_ID and _CLIENT_SECRET`,
+        `mail OAuth is not configured for ${provider} on this install: set ${settings}`,
       );
     }
 

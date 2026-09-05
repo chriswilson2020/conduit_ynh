@@ -579,6 +579,24 @@ describe("createHttpTokenRefresher", () => {
 
     expect(error).not.toBeInstanceOf(MailReauthRequiredError);
     expect((error as Error).message).toContain("MAIL_OAUTH_GOOGLE_CLIENT_ID");
+    expect((error as Error).message).toContain("MAIL_OAUTH_GOOGLE_CLIENT_SECRET");
+  });
+
+  /**
+   * MICROSOFT'S THIRD SETTING, NAMED. config.ts treats a Microsoft registration
+   * with no tenant as no registration at all -- deliberately, because /common is
+   * the MULTI-tenant endpoint and falling back to it would authenticate against
+   * the wrong directory. So an operator who has set the id and the secret and
+   * lands here needs to be told which of the three is still missing; a sentence
+   * naming only the two they already set would send them to check something
+   * that is fine, which is the shape of misdirection this whole task is about.
+   */
+  it("names the tenant too for Microsoft, since that is what makes a registration incomplete", async () => {
+    const { fetch } = fakeFetch(jsonResponse(200, { access_token: "x", expires_in: 60 }));
+    const error = await createHttpTokenRefresher({}, { fetch })("microsoft", "refresh-1")
+      .then(() => null, (err: unknown) => err);
+
+    expect((error as Error).message).toContain("_TENANT");
   });
 
   /**
