@@ -132,4 +132,37 @@ test.describe("a lapsed OAuth grant, on the Settings row", () => {
     await expect(card(page)).not.toContainText("Sign in again");
     await expect(card(page).getByRole("alert")).toContainText("Server unreachable");
   });
+
+  /**
+   * THE OTHER HALF OF THE CASE ABOVE, added by Task 3 because that case caught
+   * Task 3 getting this wrong.
+   *
+   * The re-authorise control was labelled "Sign in again" at first -- the
+   * badge's own words for status='auth_required' -- and putting them on a
+   * button that renders for EVERY provider row put them on the error card the
+   * case above forbids them on. It failed, which is the case doing its job.
+   *
+   * So the control names the PROVIDER, and this is what stops the fix from
+   * being a rename that quietly removed the control instead: a card that lost
+   * the button altogether would satisfy the negative assertion above perfectly.
+   * Two claims, and neither is satisfiable by the other's failure.
+   */
+  test("offers a re-authorise control that names the provider, in both failure states", async ({ page }) => {
+    for (const status of ["auth_required", "error"] as const) {
+      await stubAccount(page, { status, authMethod: "oauth_microsoft", lastError: "whatever" });
+      await page.goto("/settings/mail");
+      await expect(
+        card(page).getByRole("button", { name: "Sign in with Microsoft" }),
+      ).toBeVisible();
+    }
+  });
+
+  /** And it is absent from a PASSWORD account, which has no grant to renew --
+   * offering one would be a control whose only outcome is a refusal. */
+  test("offers no re-authorise control on a password account", async ({ page }) => {
+    await stubAccount(page, { status: "error", authMethod: "password", lastError: "connection: nope" });
+    await page.goto("/settings/mail");
+    await expect(card(page)).toContainText("Error");
+    await expect(card(page).getByRole("button", { name: /^Sign in with/ })).toHaveCount(0);
+  });
 });

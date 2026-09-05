@@ -363,14 +363,26 @@ function AccountCard({
 }
 
 /**
- * "Sign in again" -- send the operator back to the provider for a fresh grant
- * (Phase 8 Task 3).
+ * Send the operator back to the provider for a fresh grant (Phase 8 Task 3).
  *
  * ON EVERY OAUTH ACCOUNT, not only on one whose grant has lapsed. A grant can
  * be revoked at the provider without this install hearing about it until the
  * next pass, and the operator who has just fixed something at Azure should not
  * have to wait for a badge before they can act. The lapsed case is the one that
  * NEEDS it; the rest is a control that is where it will be looked for.
+ *
+ * IT IS NOT LABELLED "Sign in again", AND THAT IS TASK 2'S GUARD CATCHING THIS
+ * BUTTON. It was, at first. Those three words are the badge's own text for
+ * status='auth_required' (accountStatusLabel), and e2e/mail-reauth.spec.ts has
+ * a case whose whole purpose is that they must NOT appear on a row whose
+ * failure is an ordinary one -- because an operator told to re-authorise over a
+ * mail server that is rebooting has been sent away from Test connection, which
+ * is the control that would actually help. A button carrying the badge's phrase
+ * on every provider row put those words on exactly the card that test forbids
+ * them on, and it failed. Naming the PROVIDER instead says what the button does
+ * without borrowing a sentence that means something else, and it matches the
+ * add-account form's "Continue with Microsoft". That test now guards the label:
+ * renaming it back turns the suite red again.
  *
  * THE NAVIGATION IS A FULL PAGE LOAD, deliberately: the consent screen is a
  * third party's page and the callback comes back as a top-level request
@@ -392,7 +404,7 @@ function ReauthorizeButton({ accountId, provider }: { accountId: string; provide
           });
         }}
       >
-        {signin.isPending ? "Opening..." : "Sign in again"}
+        {signin.isPending ? "Opening..." : `Sign in with ${providerLabel(provider)}`}
       </Button>
       {signin.isError && (
         <p role="alert" className="w-full text-sm text-red-600">{signin.error.message}</p>
@@ -1075,7 +1087,7 @@ function AccountForm({
  * browser to the consent screen and the account appears when the callback
  * brings it back -- so there is no create mutation here at all. On an edit, the
  * three fields that are still this install's business are PATCHed like any
- * other setting, and "Sign in again" is a separate control because renewing a
+ * other setting, and ReauthorizeButton is a separate control because renewing a
  * grant is a different act from renaming a mailbox.
  */
 function OAuthAccountForm({
