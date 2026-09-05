@@ -389,6 +389,57 @@ describe("doc/ADMIN.md", () => {
   it("says plainly that none of it was tested against a real provider", () => {
     expect(doc).toContain("has not been tested against a real Microsoft or Google");
   });
+
+  /**
+   * THE EXPERIMENTAL LABEL, AND THE THING THAT MAKES IT A LABEL RATHER THAN A
+   * FOOTNOTE, WHICH IS WHERE IT SITS.
+   *
+   * The sentence above already existed, at the bottom, under a heading called
+   * "The long version, and what has not been verified" -- which is read by
+   * somebody who has finished, and skipped by somebody who came here to be told
+   * what to register. So it was true and it was arriving late. The slice below
+   * is the whole point of this test: the label has to be ABOVE the first step,
+   * because the decision it informs is whether to start.
+   *
+   * BOTH HALVES, BECAUSE ONE OF THEM WAS NOWHERE ON THIS PAGE. That no sign-in
+   * met a real tenant was said. That NONE OF THE PACKAGING has ever run -- the
+   * `.env.oauth` file section 4 tells them to edit, its survival across an
+   * upgrade, the unit line that reads it, the rendering of this page -- was
+   * said nowhere, and it is the half a reader cannot infer, because every one
+   * of those reads on the page as an arrangement that exists.
+   *
+   * AND THE COUNTERWEIGHT, PINNED TOO. "Experimental" with nothing after it is
+   * a disclaimer, and a page that let it be read as "this may not work" would
+   * be false about tested code -- which costs the true half its credibility.
+   */
+  it("carries the experimental label above the first step, not under the last heading", () => {
+    const firstStep = doc.indexOf("### It needs a one-time app registration");
+    expect(firstStep, "the page's first step moved; this slice is now meaningless")
+      .toBeGreaterThan(0);
+    const label = doc.slice(0, firstStep);
+
+    expect(label, "the word, where the reader decides whether to read on")
+      .toContain("This is experimental");
+    expect(label, "the provider half").toContain("has ever completed against a real Microsoft or Google account");
+    expect(label, "the packaging half, which was on no surface before").toContain("has ever run on a YunoHost server");
+    expect(label, "and what IS proven, so the label is information and not a hedge")
+      .toContain("What *is* tested");
+  });
+
+  /**
+   * THE PACKAGING HALF AGAIN, WHERE IT IS ACTED ON RATHER THAN WHERE IT IS
+   * ANNOUNCED. Section 4 is the one place this page asks the operator to do
+   * something to the file system, and the arrangement it describes -- created
+   * once by the install script, preserved by a `--keep` on the upgrade script
+   * -- is exactly the part nothing here has executed. The consequence is
+   * specific enough to act on and is pinned with it: Microsoft shows a client
+   * secret once, so an operator who keeps no copy of this file is issuing a new
+   * secret rather than restoring an old one.
+   */
+  it("says the .env.oauth arrangement is itself unrun, where it tells them to use it", () => {
+    expect(doc).toContain("part of what has never been run");
+    expect(doc).toContain("client secret exactly once");
+  });
 });
 
 /**
@@ -471,13 +522,24 @@ describe("doc/POST_INSTALL.md", () => {
    * sharper half and is pinned exactly: anything appended fails here rather
    * than in somebody's modal. The character bound is what catches a paragraph
    * swelling in place instead, and it is an editorial line drawn on purpose --
-   * 700 against the 555 written, so a short clarification fits and another
+   * 700 against the 615 written, so a short clarification fits and another
    * explanation does not.
    *
    * BOTH EARLIER DRAFTS OF THAT NUMBER WERE MUTATION-TESTED AND BOTH FAILED THE
    * TEST: at 1200 and then at 800, a paragraph with one more explaining
    * sentence bolted on -- the exact way this file will be asked to grow --
    * passed unnoticed. A bound nothing can exceed is not a bound.
+   *
+   * 615, NOT 555, AND THE BOUND DID NOT MOVE WITH IT. The experimental label
+   * went in by REWRITING the middle paragraph rather than by adding to it:
+   * "Conduit cannot ship one for you" became "only an administrator of your own
+   * tenant can make", which says the same thing in the possessive and paid for
+   * the new sentence. Headroom is therefore 85 rather than 145, and the
+   * mutation was re-run at that width to check the bound still bites -- one
+   * more explaining sentence on any paragraph here is 90 characters at its
+   * shortest and every real one in the file is longer, so it still fails.
+   * Raising 700 was the alternative and was not taken: the number is only worth
+   * anything while it is smaller than the thing it is meant to stop.
    */
   it("stays short enough to be read at the one moment somebody is looking", () => {
     expect(notification.trim().split(/\n{2,}/)).toHaveLength(3);
@@ -546,6 +608,36 @@ describe("doc/POST_INSTALL.md", () => {
     expect(doc).toContain("It needs a one-time app registration");
     expect(doc).toContain(MAIL_OAUTH_CALLBACK_PATH);
     expect(doc).toContain("__DOMAIN__");
+    // The third thing it now promises is there. This file has room for the
+    // word and one sentence of what it means; the rest of the gap -- the
+    // packaging, and what IS proven -- is on the page, so the promise is part
+    // of the label rather than a flourish.
+    expect(notification).toContain("what has not been tested");
+    expect(doc, "the page has to carry the half this notification cannot")
+      .toContain("has ever run on a YunoHost server");
+  });
+
+  /**
+   * THE EXPERIMENTAL LABEL, ON THE ONE SURFACE THAT IS SHOWN WITHOUT BEING
+   * ASKED FOR.
+   *
+   * Everything else carrying this label is read by somebody who went looking:
+   * the admin page, the long guide, the add-account form. This is pushed at an
+   * operator in a modal they cannot cancel, at the only moment the whole
+   * install has their attention -- so it is the one place the label reaches
+   * somebody who would otherwise meet the word for the first time three
+   * afternoons into a registration.
+   *
+   * THE WORD AND ITS MEANING, NOT THE WORD. Budget is why the meaning here is
+   * one clause rather than two, and the clause chosen is the one this reader
+   * can act on: they have not started, so "nobody has completed one of these"
+   * is what decides whether they do. The packaging half is on the page above,
+   * which the last paragraph now promises and the test above checks.
+   */
+  it("carries the experimental label, with the one fact that decides whether to start", () => {
+    expect(notification).toContain("experimental");
+    expect(notification)
+      .toContain("no sign-in here has ever completed against a real Microsoft or Google account");
   });
 
   /**
@@ -600,5 +692,29 @@ describe("doc/DESCRIPTION.md", () => {
   it("says a provider sign-in needs a registration, and points at the admin page", () => {
     expect(description).toContain("app registration");
     expect(description).toContain("admin documentation");
+  });
+
+  /**
+   * THE LABEL AT THE EARLIEST POSSIBLE MOMENT, WHICH IS BEFORE THE APP EXISTS.
+   *
+   * This page is what the webadmin shows in the install form, so it is the only
+   * surface a reader can act on by not installing -- or, more usefully, by
+   * installing without counting on this feature. It used to call the provider
+   * path "supported", which is a word that means finished, and was the single
+   * most misleading claim on any of these three pages.
+   *
+   * THE COUNTERWEIGHT IS PINNED HERE TOO, in the shortest form it takes
+   * anywhere: this is a catalogue entry, and "experimental" alone in a
+   * catalogue reads as "half-built". It is not half-built. It is finished and
+   * unproven, and those are different products to choose between.
+   */
+  it("calls the provider path experimental rather than supported", () => {
+    expect(description).toContain("**experimental**");
+    expect(description, "'supported' means finished, and it is not")
+      .not.toContain("at the provider instead is supported");
+    expect(description)
+      .toContain("no sign-in has ever completed against a real Microsoft or Google account");
+    expect(description, "and what it does pass, so the word is not read as half-built")
+      .toContain("passes every test Conduit can run");
   });
 });

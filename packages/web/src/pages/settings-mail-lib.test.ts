@@ -19,6 +19,7 @@ import {
   initialFormState,
   initialOAuthFormState,
   isPort,
+  oauthExperimentalNotice,
   oauthSetupHint,
   providerLabel,
   providerSigninCaveat,
@@ -542,6 +543,126 @@ describe("oauthSetupHint", () => {
   it("says nothing when the server did not answer", () => {
     expect(oauthSetupHint(undefined, "https://crm.example")).toBeNull();
     expect(oauthSetupHint("", "https://crm.example")).toBeNull();
+  });
+
+  /**
+   * THE EXPERIMENTAL LABEL WHERE THE COST IS COMMITTED RATHER THAN WHERE IT IS
+   * PAID.
+   *
+   * This sentence is the only one in the product that asks somebody to go and
+   * do a thing: register an app at a provider, in a console they may not own,
+   * needing an administrator who may not be them. That is the expensive step,
+   * and everybody who reaches oauthExperimentalNotice has already taken it. So
+   * a label that appeared only on the add-account form would be told to every
+   * reader except the one who could still decide not to.
+   *
+   * BOTH HALVES HERE, unlike the notification, because there is no budget
+   * pressure on a paragraph in a dialog and both are things this reader is
+   * about to rely on: they are about to create the registration, and they are
+   * about to put its values in a file whose survival nothing has watched.
+   */
+  it("says the provider path is experimental, before it asks for an afternoon", () => {
+    const hint = oauthSetupHint("/api/mail/oauth/callback", "https://crm.example") ?? "";
+    expect(hint).toContain("experimental");
+    expect(hint).toContain("no sign-in here has ever completed against a real one");
+    expect(hint, "the packaging half, which this reader is about to depend on")
+      .toContain("the packaging that carries its settings has never been run");
+    // The label leads, because the instruction is what costs the afternoon and
+    // a caveat after it is a caveat after the decision.
+    expect(hint.indexOf("experimental")).toBeLessThan(hint.indexOf("MAIL_OAUTH_REDIRECT_URI"));
+  });
+});
+
+/**
+ * -----------------------------------------------------------------------
+ * WHAT "EXPERIMENTAL" MEANS, PINNED SO THAT IT CANNOT SHRINK TO THE WORD
+ * -----------------------------------------------------------------------
+ *
+ * Chris asked for the label on 5 Sep. The reason it needs tests rather than
+ * only prose is the way a label like this decays: the sentences explaining it
+ * read as verbose beside the word that summarises them, so the first tidy-up
+ * keeps "experimental" and drops the two facts -- at which point the box says
+ * nothing anybody can act on and looks like it still does.
+ *
+ * EACH ASSERTION BELOW IS ONE FACT THAT CANNOT BE DROPPED SILENTLY. The
+ * provider half, the packaging half, and the counterweight, which is the one
+ * most likely to go because it reads as defensive. It is not: the code under
+ * this label is tested and mutation-tested, and a notice that let itself be
+ * read as "this may not work" would be false in a way anybody could check --
+ * and would take the credibility of the true half with it.
+ */
+describe("oauthExperimentalNotice", () => {
+  it("names the word and then says what it means", () => {
+    const notice = oauthExperimentalNotice();
+    expect(notice.heading).toContain("experimental");
+    // The heading names both providers, because the box sits above a radio
+    // group where one of the three options is a password and the label is
+    // false about that one.
+    expect(notice.heading).toContain("Microsoft");
+    expect(notice.heading).toContain("Google");
+    expect(notice.paragraphs.length).toBeGreaterThan(0);
+  });
+
+  it("says the provider round trip has never been run", () => {
+    const text = oauthExperimentalNotice().paragraphs.join(" ");
+    expect(text).toContain("never been run against a real Microsoft or Google account");
+    // WHY it cannot be, which is what stops the sentence reading as an excuse
+    // that a future release will delete. The consent screen is somebody else's
+    // and no test in this repository will ever reach one.
+    expect(text).toContain("consent screen belongs to whoever owns the directory");
+  });
+
+  it("says the packaging that carries its settings has never been run either", () => {
+    const text = oauthExperimentalNotice().paragraphs.join(" ");
+    expect(text).toContain("packaging that carries the server-side settings has never been run");
+    // The consequence, so it is a fact this reader can act on rather than a
+    // disclosure aimed at nobody: a YunoHost upgrade is where an untested
+    // --keep would take the registration away.
+    expect(text).toContain("upgrade");
+  });
+
+  /**
+   * THE COUNTERWEIGHT, AND IT IS LOAD-BEARING. Everything Conduit does on its
+   * own is covered -- the authorise request, the boot-time refusal of a
+   * redirect URI that cannot work, the exchange, the refresh, what reaches IMAP
+   * and SMTP. Saying only "experimental" invites the reader to discount the
+   * whole feature, which is the wrong decision on the evidence and the one this
+   * paragraph exists to prevent.
+   */
+  it("says what IS covered, so the word is information rather than a hedge", () => {
+    const text = oauthExperimentalNotice().paragraphs.join(" ");
+    expect(text).toContain("the request Conduit builds");
+    expect(text).toContain("the values it refuses");
+    expect(text).toContain("not the round trip itself");
+  });
+
+  /**
+   * IT IS RENDERED, WHICH IS A DIFFERENT CLAIM FROM IT EXISTING.
+   *
+   * The sibling test on providerSigninCaveat learned this the expensive way:
+   * a caveat that lives in a module and is never rendered is the same as no
+   * caveat, and this repository has no testing-library, so a source guard is
+   * the only unit-level check on a rule that lives in JSX.
+   *
+   * IN THE CHOOSER, WHICH IS THE ASSERTION WITH CONTENT. The Gmail box sits
+   * inside OAuthAccountForm because it is about which Google account; this one
+   * has to sit above the radios, because the alternative it is weighed against
+   * -- signing in with a password -- exists nowhere else on the screen. Moving
+   * it into either provider's form would leave it correct, rendered, and
+   * arriving after the choice it informs. The `<fieldset` in the second
+   * assertion is what pins the order: the notice's markup has to come before
+   * the radio group and not merely somewhere in the file.
+   */
+  it("is rendered in the chooser, above the radios", () => {
+    const source = withoutComments(
+      readFileSync(new URL("./settings-mail.tsx", import.meta.url), "utf8"),
+    );
+    expect(source).toContain("const experimental = oauthExperimentalNotice();");
+    const notice = source.indexOf('data-testid="oauth-experimental-notice"');
+    const radios = source.indexOf("<fieldset");
+    expect(notice, "the notice is not rendered at all").toBeGreaterThan(0);
+    expect(radios, "the chooser's fieldset moved").toBeGreaterThan(0);
+    expect(notice, "the notice has to precede the choice it informs").toBeLessThan(radios);
   });
 });
 

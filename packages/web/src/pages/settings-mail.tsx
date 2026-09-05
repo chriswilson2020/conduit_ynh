@@ -43,6 +43,7 @@ import {
   folderRenameBlocked,
   initialFormState,
   initialOAuthFormState,
+  oauthExperimentalNotice,
   oauthSetupHint,
   providerLabel,
   providerSigninCaveat,
@@ -1070,9 +1071,32 @@ function AccountForm({
       </div>
     );
   }
+  const experimental = oauthExperimentalNotice();
   return (
     <div className="flex flex-col gap-4">
       <DialogTitle>Add mail account</DialogTitle>
+      {/* WHAT "EXPERIMENTAL" MEANS, ABOVE THE CHOICE IT BEARS ON.
+          HERE RATHER THAN INSIDE EITHER PROVIDER FORM, which is where the
+          Gmail fork sits: that one is about which Google account, this one is
+          about whether to use a provider at all, and the alternative it is
+          weighed against -- the password radio below -- exists only on this
+          screen. It therefore renders whichever radio is selected, including
+          password, because "why you might stay on a password" is the same
+          information read from the other side.
+          A BORDERED BOX AND NOT role="alert", unlike the amber caveat below.
+          That one appears when the radio changes and needs announcing; this is
+          in the dialog's first paint, above the radios in document order, so a
+          screen reader reaches it on the way to them and an alert role would
+          announce text that never changed. Slate rather than amber for the
+          same reason: two amber boxes on one Google form would cost the seven
+          days its emphasis, and this is not a warning about a mailbox. */}
+      <div
+        data-testid="oauth-experimental-notice"
+        className="flex flex-col gap-2 rounded-md border border-slate-300 bg-slate-50 p-3 text-xs text-slate-700"
+      >
+        <p className="font-semibold">{experimental.heading}</p>
+        {experimental.paragraphs.map((text) => <p key={text}>{text}</p>)}
+      </div>
       <fieldset className="flex flex-col gap-2">
         <legend className="text-xs font-semibold uppercase text-slate-500">How does it sign in?</legend>
         {/* Radios, not tabs: this is one question with one answer, and a radio

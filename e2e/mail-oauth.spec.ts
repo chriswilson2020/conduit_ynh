@@ -194,6 +194,54 @@ test.describe("signing a mailbox in at a provider", () => {
     await expect(page.getByTestId("oauth-provider-caveat")).toHaveCount(0);
   });
 
+  /**
+   * THE EXPERIMENTAL LABEL, ON SCREEN, WHATEVER IS SELECTED.
+   *
+   * Chris, 5 Sep: "label the Microsoft and Google connectivity as experimental
+   * for now. I don't have time to check it." What this file is exists to make
+   * that concrete rather than decorative, and it is the same argument the Gmail
+   * caveat's test makes one block up: a label that lives in a module and never
+   * reaches a screen is the same as no label, and only a browser can tell the
+   * two apart.
+   *
+   * ASSERTED IN ALL THREE STATES, WHICH IS THE PART A UNIT TEST CANNOT REACH.
+   * The box is rendered by the chooser rather than by either provider form, so
+   * it must survive the radio changing -- including to Password, where it is
+   * still the reason somebody might stay there. A version that had drifted into
+   * OAuthAccountForm would pass on Microsoft and Google and fail here, which is
+   * exactly the failure worth catching: it would mean the label had stopped
+   * being visible at the moment the choice is made.
+   *
+   * NOT A LIVE REGION, and asserted as such rather than left to chance. The
+   * amber box above IS one because it appears when the radio changes; this one
+   * is in the dialog's first paint, so an alert role would announce unchanged
+   * text over the top of the box that does need announcing.
+   */
+  test("says the provider path is experimental, whichever option is selected", async ({ page }) => {
+    await page.goto(SETTINGS);
+    await page.getByRole("button", { name: "Add account" }).click();
+
+    const notice = page.getByTestId("oauth-experimental-notice");
+    await expect(notice).toBeVisible();
+    await expect(notice, "an alert role here would announce text that never changed")
+      .not.toHaveAttribute("role", /.*/);
+    await expect(notice).toContainText("experimental");
+    // The two halves of what the word means, and the counterweight. Each is a
+    // sentence a tidy-up would delete first, and each is the reason the label
+    // lets somebody decide instead of merely worry.
+    await expect(notice).toContainText("never been run against a real Microsoft or Google account");
+    await expect(notice).toContainText("packaging that carries the server-side settings has never been run");
+    await expect(notice).toContainText("the request Conduit builds");
+
+    // Present before any choice is made, and still present after either. The
+    // password radio is checked on arrival, so the first assertion above
+    // already covered that state.
+    for (const provider of ["Microsoft", "Google"]) {
+      await page.getByRole("radio", { name: provider }).check();
+      await expect(page.getByTestId("oauth-experimental-notice")).toBeVisible();
+    }
+  });
+
   test("REFUSES A FORGED CALLBACK, and says so on the settings page", async ({ page }) => {
     // Nothing minted this state, so nothing can redeem it. The whole journey
     // is real: the server route, the 303, the SPA route's search parsing, and
