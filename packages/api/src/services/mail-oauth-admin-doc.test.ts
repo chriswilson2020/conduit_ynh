@@ -56,6 +56,7 @@ const REPO = path.join(
 );
 const doc = await readFile(path.join(REPO, "doc", "ADMIN.md"), "utf8");
 const description = await readFile(path.join(REPO, "doc", "DESCRIPTION.md"), "utf8");
+const notification = await readFile(path.join(REPO, "doc", "POST_INSTALL.md"), "utf8");
 const common = await readFile(path.join(REPO, "scripts", "_common.sh"), "utf8");
 const upgrade = await readFile(path.join(REPO, "scripts", "upgrade"), "utf8");
 
@@ -387,6 +388,186 @@ describe("doc/ADMIN.md", () => {
    * sentence. */
   it("says plainly that none of it was tested against a real provider", () => {
     expect(doc).toContain("has not been tested against a real Microsoft or Google");
+  });
+});
+
+/**
+ * doc/POST_INSTALL.md, WHICH IS A NOTIFICATION RATHER THAN A DOC PAGE, and
+ * YunoHost does not treat the two alike. Verified in yunohost's own source at
+ * tag debian/12.1.17 -- the minimum this package's manifest declares:
+ *
+ *   app_utils.py _parse_app_doc_and_notifications: one function, two loops.
+ *     The doc-page loop matches `([A-Z]*)(_[a-z]{2,3})?.md`, whose first group
+ *     CANNOT CONTAIN AN UNDERSCORE, so "POST_INSTALL.md" does not match it at
+ *     all and is dropped by `if not m: continue` -- not, as it first looks, by
+ *     the `if pagename in notification_names: continue` two lines below, which
+ *     no underscored name can ever reach. The notification loop then picks the
+ *     file up on its own terms, `re.match("POST_INSTALL" + "(_[a-z]{2,3})?.md")`
+ *     over `glob("POST_INSTALL*.md")`. So this file can never appear as an Admin
+ *     doc tab, and its name has to be exactly that: `post_install.md` matches
+ *     NEITHER loop and is dropped in silence, leaving an install that shows
+ *     nothing and says nothing about why.
+ *   app.py app_install (the block after `installation_complete`): `settings =
+ *     _get_app_settings(app_instance_name)`, then
+ *     `_filter_and_hydrate_notifications(manifest["notifications"]
+ *     ["POST_INSTALL"], data=settings)` -- which calls the SAME
+ *     _hydrate_app_template that doc pages go through, with settings from the
+ *     same function (the one injecting `settings["app"] = app`). Jinja and
+ *     __VAR__ substitution therefore behave here exactly as they do in
+ *     ADMIN.md, and `hydrate` above is as faithful for this file as for that
+ *     one. An empty render is dropped rather than shown blank.
+ *
+ * WHERE IT IS SHOWN, which is what its shape has to answer to. Three surfaces,
+ * not one:
+ *   - the webadmin, immediately after the install, as a modal that cannot be
+ *     cancelled -- yunohost-admin AppInstall.vue passes the hydrated text to
+ *     modalConfirm with `{ markdown: true, cancelable: false }`, under a title
+ *     of its own ("Post-install notifications for '<app>'");
+ *   - that app's info page for the following seven days, as a dismissible alert
+ *     under an h2 of its own (AppInfo.vue), until somebody presses Understood
+ *     or _notification_is_dismissed retires it on install_time + 7 days;
+ *   - and `yunohost app install` at a terminal, where _display_notifications
+ *     PRINTS THE MARKDOWN RAW between two rules and blocks on a confirmation.
+ *
+ * That last surface is the difference from ADMIN.md that shapes this file.
+ * ADMIN.md is only ever rendered; this one is also read as characters, so
+ * anything that means nothing until it is rendered is noise to whoever installs
+ * from a terminal -- and both rendered surfaces supply a heading already, so
+ * one here would sit under a title as a second title.
+ *
+ * SHOWDOWN AT GITHUB FLAVOUR, which is a property of the renderer and not of
+ * taste: yunohost-admin's main.ts registers VueShowdownPlugin with
+ * `flavor: "github"`, so simpleLineBreaks turns every hard wrap into a <br> and
+ * ghMentions turns a bare @something into a link to github.com/something. Hence
+ * the shape test below, which is the same reason ADMIN.md is written unwrapped.
+ *
+ * WHAT IT DELIBERATELY DOES NOT CARRY IS THE REDIRECT URI, and that is the
+ * choice most worth defending. The URI is compared byte for byte at the
+ * provider, it already has a home on the page this file points at, and a second
+ * copy would be a second thing to keep right -- including the doubled slash a
+ * root install produces, which the tests above exist to catch in one place. A
+ * notification is read once; the page it points at is read with a provider
+ * console open. So this one is a signpost, and the test below is what stops it
+ * growing into a second copy of the page.
+ */
+describe("doc/POST_INSTALL.md", () => {
+  // THE INSTRUMENT, shown failing before the assertions below are trusted.
+  it("was actually read", () => {
+    expect(notification.length).toBeGreaterThan(300);
+    expect(notification).not.toContain("A STRING THAT IS NOT IN THE DOCUMENT");
+  });
+
+  /**
+   * BREVITY IS THE FEATURE, so it is the thing under test.
+   *
+   * This is shown at the one moment an operator is certainly looking, in a
+   * modal they must dismiss to continue. A notification nobody finishes is
+   * worse than a short one, because it spends that moment and returns nothing.
+   * ADMIN.md is where length belongs; it is sixteen times this file.
+   *
+   * TWO CLAUSES BECAUSE THERE ARE TWO WAYS TO GROW. The paragraph count is the
+   * sharper half and is pinned exactly: anything appended fails here rather
+   * than in somebody's modal. The character bound is what catches a paragraph
+   * swelling in place instead, and it is an editorial line drawn on purpose --
+   * 700 against the 555 written, so a short clarification fits and another
+   * explanation does not.
+   *
+   * BOTH EARLIER DRAFTS OF THAT NUMBER WERE MUTATION-TESTED AND BOTH FAILED THE
+   * TEST: at 1200 and then at 800, a paragraph with one more explaining
+   * sentence bolted on -- the exact way this file will be asked to grow --
+   * passed unnoticed. A bound nothing can exceed is not a bound.
+   */
+  it("stays short enough to be read at the one moment somebody is looking", () => {
+    expect(notification.trim().split(/\n{2,}/)).toHaveLength(3);
+    expect(notification.length).toBeLessThan(700);
+  });
+
+  /**
+   * THE TWO WAYS GITHUB-FLAVOURED SHOWDOWN REWRITES ORDINARY PROSE.
+   * simpleLineBreaks makes a <br> of every hard wrap, so a wrapped paragraph
+   * renders as a ragged column; ghMentions makes `github.com/gmail.com` of a
+   * bare `@gmail.com`, which is a link to a stranger's account printed in an
+   * administrator's console. Neither shows up in the source.
+   */
+  it("survives github-flavoured showdown: unwrapped paragraphs, no bare mention", () => {
+    const lines = notification.trim().split("\n");
+    for (const [index, line] of lines.entries()) {
+      if (line.trim() === "") continue;
+      expect(lines[index + 1] ?? "", `line ${index + 1} is hard-wrapped into the next`)
+        .toBe("");
+    }
+    // Inline code spans removed first, because a backticked address is exactly
+    // how ADMIN.md defuses this and is allowed here too.
+    expect(notification.replace(/`[^`]*`/g, ""), "a bare @ becomes a github.com link")
+      .not.toContain("@");
+  });
+
+  /**
+   * NO HEADING OF ITS OWN. Both webadmin surfaces put this text under a heading
+   * they supply, and shift any heading in it down to h3 or h4 to sit beneath
+   * theirs; the CLI prints the `#` characters. A title here is redundant twice
+   * and noise once.
+   */
+  it("carries no heading, because every surface that shows it supplies one", () => {
+    expect(notification.match(/^#{1,6} .*/m)).toBeNull();
+  });
+
+  /**
+   * THE TWO CLAIMS IT EXISTS TO MAKE, in the words the other two surfaces use.
+   * The operator meeting this notification, the one reading DESCRIPTION.md
+   * before installing and the one reading ADMIN.md afterwards are the same
+   * person on three different days, and "app registration" is the phrase they
+   * have to recognise as the same thing each time.
+   */
+  it("says the password case needs nothing, and names the two providers that do", () => {
+    expect(notification).toContain("password");
+    expect(notification).toContain("Microsoft 365");
+    expect(notification).toContain("Google Workspace");
+    for (const surface of [notification, doc, description]) {
+      expect(surface, "all three surfaces name the same thing").toContain("app registration");
+    }
+    // Who has to make it, which is the half that decides whether the reader can
+    // act at all: on most installs it is somebody else, in somebody else's
+    // console, and finding that out later is the wasted afternoon.
+    expect(notification).toContain("administrator");
+  });
+
+  /**
+   * THE SIGNPOST, CHECKED AGAINST WHAT IT PROMISES IS THERE. This file's whole
+   * job is to send the reader somewhere else, so the test is not that it says
+   * so -- it is that the page it names still carries both things it promises:
+   * the steps, and this install's own redirect URI.
+   */
+  it("points at the admin page, and that page still has the steps and the URI", () => {
+    expect(notification).toContain("webadmin");
+    expect(notification).toContain("redirect URI");
+    expect(doc).toContain("It needs a one-time app registration");
+    expect(doc).toContain(MAIL_OAUTH_CALLBACK_PATH);
+    expect(doc).toContain("__DOMAIN__");
+  });
+
+  /**
+   * NO URL OF ITS OWN, IN ANY INSTALL SHAPE. The doubled-slash trap the tests
+   * above exist for is a trap only for a file that prints a URL; the cheapest
+   * way not to fall in it twice is to have one place that prints one. This
+   * fails the moment somebody helpfully pastes the URI in here.
+   */
+  it("prints no URL of its own, in any install shape this package produces", () => {
+    for (const [name, settings] of Object.entries(INSTALLS)) {
+      expect(hydrate(notification, settings).match(/https?:\/\/\S+/g), name).toBeNull();
+    }
+  });
+
+  /** The same two guards the page above carries, for the same reasons: a
+   * construct `hydrate` cannot reproduce would make every assertion here a
+   * check on a rendering YunoHost does not produce, and a placeholder whose
+   * setting does not exist is left on screen verbatim rather than emptied. */
+  it("uses only reproducible constructs, and leaves no placeholder behind", () => {
+    expect(notification).not.toContain("{{");
+    expect(notification).not.toContain("{#");
+    for (const [name, settings] of Object.entries(INSTALLS)) {
+      expect(hydrate(notification, settings).match(/__[A-Z0-9_]+__/g), name).toBeNull();
+    }
   });
 });
 
