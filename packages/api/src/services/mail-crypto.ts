@@ -107,10 +107,15 @@ const oauthCredentialsSchema = z.object({
 
 /**
  * The JSON payload encrypted into mail_accounts.credentials_ciphertext: a
- * password pair, or an OAuth refresh token. The two members are mutually
- * exclusive by construction -- the password member rejects `kind: "oauth"`
- * and the OAuth member has no imapPassword -- so union member order carries
- * no meaning and nothing depends on which is tried first.
+ * password pair, or an OAuth refresh token.
+ *
+ * THE TWO MEMBERS ARE MUTUALLY EXCLUSIVE BY CONSTRUCTION, so union member
+ * order carries no meaning and nothing depends on which zod tries first. The
+ * password member requires both passwords and refuses any tag but "password";
+ * the OAuth member requires the tag "oauth" and a refresh token, and has no
+ * password fields to satisfy. No payload can pass both, and
+ * mail-crypto.test.ts pins each of those four halves rather than trusting the
+ * reading.
  */
 const mailCredentialsSchema = z.union([passwordCredentialsSchema, oauthCredentialsSchema]);
 
