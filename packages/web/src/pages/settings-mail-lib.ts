@@ -158,3 +158,122 @@ export function buildTestInput(state: AccountFormState, accountId?: string): Mai
   } satisfies MailAccountTestInput;
   return accountId === undefined ? overrides : { accountId, ...overrides };
 }
+
+// --- Folder management (Phase 4.4 Task 4) ------------------------------------
+
+/**
+ * Why this folder cannot be renamed, or null when it can.
+ *
+ * PURE, AND SEPARATE FROM THE COMPONENT, following restoreConfirmBlocked's
+ * precedent (settings-data-lib): the interesting part of a destructive control
+ * is which cases it refuses, and that is worth unit tests rather than a render
+ * test per case.
+ *
+ * THE CLIENT'S COPY OF RULES THE SERVER ALSO ENFORCES, deliberately, and the
+ * server is the authority: every one of these comes back as a 409 with a
+ * sentence of its own if a request is made anyway. What the client copy buys is
+ * that the sentence arrives BEFORE the gesture rather than after it -- which is
+ * the whole difference between a control that explains itself and one that
+ * punishes a click.
+ *
+ * Note which folders are NOT here. The account's Sent, Trash and Archive
+ * folders can all be renamed: the rename rewrites the account columns that name
+ * them, in the same transaction (api: renameFolder), so the account follows its
+ * folder rather than breaking.
+ */
+export function folderRenameBlocked(
+  folder: { folder: string; locked: boolean; selectable: boolean },
+  options: { stale: boolean },
+): string | null {
+  // Refused by every mail server worth the name: IMAP reserves the name, and
+  // the servers that do implement RENAME INBOX give it different semantics
+  // (the messages move out and INBOX stays).
+  if (folder.folder.toUpperCase() === "INBOX") return "INBOX cannot be renamed.";
+  if (!folder.selectable) return NOT_A_FOLDER;
+  if (options.stale) return GONE_FROM_SERVER;
+  return null;
+}
+
+/**
+ * The two reasons that block BOTH commands, spelled identically in both so the
+ * row can render its reasons deduped and show one line rather than two
+ * near-identical ones. Neither sentence names an action, precisely because the
+ * two actions share it.
+ */
+const NOT_A_FOLDER =
+  "This is a hierarchy node rather than a folder — it holds no messages of its own.";
+const GONE_FROM_SERVER =
+  "The last sync did not find this folder on the server. Conduit keeps the row because it"
+  + " still holds the mail it stored from it.";
+
+/** Why this folder cannot be deleted, or null when it can. See
+ * folderRenameBlocked for why this is pure and why it duplicates the server. */
+export function folderDeleteBlocked(
+  folder: { folder: string; selectable: boolean },
+  account: { sentFolder: string; trashFolder: string | null; archiveFolder: string | null },
+  options: { stale: boolean },
+): string | null {
+  if (folder.folder.toUpperCase() === "INBOX") return "INBOX cannot be deleted.";
+  // By NAME rather than by special_use, exactly as the server refuses it: it is
+  // the account COLUMN that would break, and a folder can be the Archive target
+  // without carrying the \Archive attribute.
+  const role = folder.folder === account.sentFolder.trim() ? "Sent"
+    : folder.folder === account.trashFolder?.trim() ? "Trash"
+      : folder.folder === account.archiveFolder?.trim() ? "Archive" : null;
+  if (role !== null) {
+    return `This is the account's ${role} folder. Point ${role} at another folder below first.`;
+  }
+  if (!folder.selectable) return NOT_A_FOLDER;
+  if (options.stale) return GONE_FROM_SERVER;
+  return null;
+}
+
+/**
+ * Every reason this row's commands are unavailable, deduped, in the order a
+ * reader meets them.
+ *
+ * SHOWN AS TEXT, always, rather than left as the absence of a button. That
+ * absence is a blocked reason like any other, and this codebase's rule for one
+ * is that it is visible text -- never a `title`, which is invisible to touch
+ * and silent to a screen reader (bulk-bar.tsx). "Why is there no Delete on my
+ * Archive folder" is a question the row should answer where it is asked.
+ *
+ * Deduped because the two commands share two of their four refusals word for
+ * word (see NOT_A_FOLDER and GONE_FROM_SERVER): a hierarchy node would
+ * otherwise print two near-identical sentences, which reads as a bug.
+ */
+export function folderCommandReasons(
+  folder: { folder: string; locked: boolean; selectable: boolean },
+  account: { sentFolder: string; trashFolder: string | null; archiveFolder: string | null },
+  options: { stale: boolean },
+): string[] {
+  return [...new Set([
+    folderRenameBlocked(folder, options),
+    folderDeleteBlocked(folder, account, options),
+  ].filter((reason): reason is string => reason !== null))];
+}
+
+/**
+ * What deleting this folder does, said BEFORE it happens (the spec's
+ * requirement, in as many words).
+ *
+ * Three sentences and each one is load-bearing: what leaves, what stays, and
+ * the one refusal a user cannot see coming. The middle one is the promise this
+ * product makes everywhere -- it archives rather than expunges -- and the last
+ * one is why a user with a full folder is about to be told no rather than asked
+ * "are you sure".
+ *
+ * A count is deliberately NOT in it. Conduit only knows what it has synced, and
+ * quoting that number here would understate a folder whose sync is off by
+ * however much it has never seen. The server's real count arrives in the
+ * refusal, which is the only place it is true.
+ */
+export function folderDeleteWarning(folder: string): string[] {
+  return [
+    `"${folder}" is removed from the mail server.`,
+    "Every message Conduit has already stored from it is KEPT — still searchable, still on"
+      + " the records its conversations are linked to, and still shown under this folder's name.",
+    "If the folder still holds mail on the server, or has folders inside it, this is refused"
+      + " rather than done: Conduit does not delete mail.",
+  ];
+}

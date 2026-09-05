@@ -12,7 +12,9 @@ import {
   mergeCursorPage,
   overridableClass,
   parseDecimal,
+  refreshCursorRows,
   relativeTime,
+  takeCursorPage,
   todayLocalIso,
   userLabel,
 } from "./lib";
@@ -192,6 +194,144 @@ describe("cursor page accumulation", () => {
     let pages = mergeCursorPage(emptyCursorPages<Row>("k"), "k", undefined, [row("a")], "cursor-1");
     pages = mergeCursorPage(pages, "k", "cursor-1", [row("b"), row("a")], null);
     expect(flattenCursorPages(pages).map((item) => item.id)).toEqual(["a", "b"]);
+  });
+});
+
+/**
+ * The list stays still under the reader (Phase 4.4 Task 3), in two halves that
+ * are deliberately two functions: what may be TAKEN from a fetch, and what may
+ * be REFRESHED from one. A row already on screen is subject to the second and
+ * out of reach of the first.
+ */
+describe("cursor page holding", () => {
+  // A row with something to change, so "refreshed in place" is distinguishable
+  // from "left alone" -- id alone could only ever prove membership.
+  interface Titled { id: string; title: string }
+  const row = (id: string, title = id): Titled => ({ id, title });
+
+  it("takes a page the record is not holding yet", () => {
+    const pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a"), row("b")], "c1");
+    expect(flattenCursorPages(pages).map((item) => item.id)).toEqual(["a", "b"]);
+    expect(pages.nextCursor).toBe("c1");
+  });
+
+  it("takes the next page, which is a page the reader asked for", () => {
+    let pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a")], "c1");
+    pages = advanceCursorPages(pages, "k");
+    pages = takeCursorPage(pages, "k", "c1", [row("b")], null);
+    expect(flattenCursorPages(pages).map((item) => item.id)).toEqual(["a", "b"]);
+  });
+
+  it("starts over when the filter key changes", () => {
+    let pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a")], null);
+    pages = takeCursorPage(pages, "unread", undefined, [row("z")], null);
+    expect(pages.key).toBe("unread");
+    expect(flattenCursorPages(pages).map((item) => item.id)).toEqual(["z"]);
+  });
+
+  /**
+   * THE WHOLE POINT. New mail re-orders the server's list (the keyset is
+   * `last_message_at`), so the same page fetched again is a DIFFERENT page --
+   * a conversation at the top that was in the middle, and one pushed off the
+   * bottom. Taking that is what moves a row out from under a reader's cursor.
+   */
+  it("takes nothing at all from a refetch of a page it holds", () => {
+    let pages = takeCursorPage(
+      emptyCursorPages<Titled>("k"), "k", undefined, [row("a"), row("b"), row("c")], "c1",
+    );
+    const before = pages;
+    pages = takeCursorPage(pages, "k", undefined, [row("new"), row("a"), row("b")], "c2");
+    expect(pages).toBe(before);
+    expect(flattenCursorPages(pages).map((item) => item.id)).toEqual(["a", "b", "c"]);
+  });
+
+  // "Load more" continues from the bottom of what is SHOWN. The refetch's own
+  // nextCursor describes a list three rows further along that nobody is
+  // looking at, and taking it would skip those three.
+  it("keeps the boundary of what is on screen, not the refetch's", () => {
+    let pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a"), row("b")], "c1");
+    pages = takeCursorPage(pages, "k", undefined, [row("new"), row("a")], "c2");
+    expect(pages.nextCursor).toBe("c1");
+  });
+
+  /**
+   * An empty list has no reader's place to protect, and holding there would
+   * put "No conversations" on screen beside an offer to show the ones that
+   * have just arrived. The first mail into an empty inbox simply appears.
+   */
+  it("takes a page into a held page that is empty", () => {
+    let pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [], null);
+    expect(flattenCursorPages(pages)).toEqual([]);
+    pages = takeCursorPage(pages, "k", undefined, [row("first")], null);
+    expect(flattenCursorPages(pages).map((item) => item.id)).toEqual(["first"]);
+  });
+
+  it("refreshes a row that is on screen, in place", () => {
+    let pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a"), row("b")], null);
+    pages = refreshCursorRows(pages, "k", [row("b", "read"), row("a")]);
+    expect(flattenCursorPages(pages)).toEqual([{ id: "a", title: "a" }, { id: "b", title: "read" }]);
+  });
+
+  it("adds nothing while refreshing, however new the row it was handed", () => {
+    let pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a")], null);
+    pages = refreshCursorRows(pages, "k", [row("new"), row("a", "read")]);
+    expect(flattenCursorPages(pages)).toEqual([{ id: "a", title: "read" }]);
+  });
+
+  // The row a fetch has nothing to say about keeps the copy it had. A row
+  // missing from a refetched page has usually been pushed past the page's end
+  // by new arrivals, not deleted, and dropping it would be the re-order this
+  // pair exists to prevent.
+  it("keeps a row the fetched page no longer contains", () => {
+    let pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a"), row("b")], null);
+    pages = refreshCursorRows(pages, "k", [row("a")]);
+    expect(flattenCursorPages(pages).map((item) => item.id)).toEqual(["a", "b"]);
+  });
+
+  /**
+   * A conversation with new mail is by definition among the NEWEST, so its
+   * fresh copy arrives in page one whatever page the reader is showing it on.
+   * This is the only way a row below page one is ever refreshed.
+   */
+  it("refreshes a held row on any page, not only the first", () => {
+    let pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a")], "c1");
+    pages = advanceCursorPages(pages, "k");
+    pages = takeCursorPage(pages, "k", "c1", [row("b")], null);
+    pages = refreshCursorRows(pages, "k", [row("b", "replied"), row("a")]);
+    expect(flattenCursorPages(pages)).toEqual([{ id: "a", title: "a" }, { id: "b", title: "replied" }]);
+  });
+
+  // A record holding another filter's pages is not this fetch's to touch --
+  // the same rule mergeCursorPage's key check states, in the one direction
+  // this function has (it never resets).
+  it("refreshes nothing for a key the record is not holding", () => {
+    const pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a")], null);
+    expect(refreshCursorRows(pages, "unread", [row("a", "changed")])).toBe(pages);
+  });
+
+  /**
+   * This runs from a render effect, so a fresh object for an unchanged refetch
+   * would set state on every render forever. React Query's structural sharing
+   * is what makes the reference comparison exact rather than approximate: a
+   * row whose data did not change comes back as the SAME object.
+   */
+  it("returns the same record when the refetch changed no row", () => {
+    const a = row("a");
+    const b = row("b");
+    const pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [a, b], null);
+    expect(refreshCursorRows(pages, "k", [b, a])).toBe(pages);
+  });
+
+  // ...and the pages it did not touch keep their arrays, so a memoised row on
+  // an untouched page is not re-rendered by another page's refetch.
+  it("keeps the untouched pages' own arrays when one page changes", () => {
+    let pages = takeCursorPage(emptyCursorPages<Titled>("k"), "k", undefined, [row("a")], "c1");
+    pages = advanceCursorPages(pages, "k");
+    pages = takeCursorPage(pages, "k", "c1", [row("b")], null);
+    const second = pages.byCursor["c1"];
+    const after = refreshCursorRows(pages, "k", [row("a", "read")]);
+    expect(after).not.toBe(pages);
+    expect(after.byCursor["c1"]).toBe(second);
   });
 });
 

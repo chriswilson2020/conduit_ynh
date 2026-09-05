@@ -1,22 +1,34 @@
 import { describe, it, expect } from "vitest";
 import type { BulkThreadFailureReason, BulkThreadSkipReason } from "@conduit/shared";
-import { MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX } from "@conduit/shared";
+import {
+  BULK_MESSAGE_ACTION_CAP, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
+} from "@conduit/shared";
 import { ApiError, ResponseShapeError } from "../../api";
 import {
   buildFolderRows,
   bulkActionBlocked,
   bulkErrorMessage,
   bulkOwnershipBlocked,
+  fileTargetsBlocked,
+  fileTargetNames,
   bulkPendingLabel,
   BULK_TIMEOUT_MESSAGE,
   isThreadGone,
   NOT_OWNER_EXPLANATION,
   THREAD_GONE_MESSAGE,
+  emptyMessageSelection,
   emptySelection,
   extendThreadSelection,
+  messageActionBlocked,
   messageIsInTrash,
+  selectedMessageIds,
+  singleOwnAccount,
+  toggleMessageSelected,
   moveTargetPatch,
   newestDiscovery,
+  newMailLabel,
+  pendingArrivals,
+  type ArrivalRow,
   selectedThreadIds,
   selectionForKey,
   selectionLabel,
@@ -952,13 +964,72 @@ describe("bulkActionBlocked", () => {
   it("permits a selection inside each action's own cap", () => {
     expect(bulkActionBlocked("archive", 50)).toBeNull();
     expect(bulkActionBlocked("trash", 1)).toBeNull();
+    expect(bulkActionBlocked("file", 50)).toBeNull();
     expect(bulkActionBlocked("hide", 200)).toBeNull();
+    // `unhide` is a local row DELETE and takes hide's outer bound, not the
+    // mail server's 50 -- the case a `!== "hide"` test would have got wrong.
+    expect(bulkActionBlocked("unhide", 200)).toBeNull();
   });
 
   it("refuses more threads than the server would accept, per action", () => {
     expect(bulkActionBlocked("archive", 51)).toContain("50");
     expect(bulkActionBlocked("trash", 51)).toContain("50");
+    expect(bulkActionBlocked("file", 51)).toContain("50");
     expect(bulkActionBlocked("hide", 201)).toContain("200");
+    expect(bulkActionBlocked("unhide", 201)).toContain("200");
+  });
+});
+
+// The destination picker's own disabled state (Phase 4.4). Two causes, two
+// remedies, two sentences -- and neither is a tooltip, for the same reason as
+// every other note on this bar.
+describe("fileTargetsBlocked", () => {
+  it("offers the picker only when the list is scoped to one account with folders", () => {
+    expect(fileTargetsBlocked("list", true, 3)).toBeNull();
+  });
+
+  // Phase 4.4 Task 2. Three surfaces ask the same question and each has its
+  // own remedy, so each gets its own sentence -- pointing a reader at the
+  // list's account filter would be pointing at a control that is not on
+  // their screen.
+  it("names the remedy that belongs to each surface", () => {
+    // The list: pick one account in the filter above.
+    expect(fileTargetsBlocked("list", false, 0)).toContain("single account");
+    // The conversation header: there is no filter -- the thread simply reaches
+    // two of your mailboxes, and the way out is to file its messages instead.
+    const conversation = fileTargetsBlocked("conversation", false, 0);
+    expect(conversation).toContain("more than one of your mailboxes");
+    expect(conversation).toContain("file those");
+    expect(conversation).not.toContain("above");
+    // The message bar: untick until the selection is one mailbox's.
+    const messages = fileTargetsBlocked("messages", false, 0);
+    expect(messages).toContain("single mailbox");
+    expect(messages).not.toContain("above");
+    // Three distinct sentences, not one reused three times.
+    expect(new Set([fileTargetsBlocked("list", false, 0), conversation, messages]).size).toBe(3);
+  });
+
+  // The empty-folders half is the SAME sentence on every surface, and
+  // deliberately so: the cause and the remedy are identical wherever it is
+  // met -- this mailbox has nothing listed yet, and a sync pass is what fixes
+  // it.
+  it("words an account with no folders the same way on every surface", () => {
+    const wording = fileTargetsBlocked("list", true, 0);
+    expect(wording).toContain("sync pass");
+    expect(fileTargetsBlocked("conversation", true, 0)).toBe(wording);
+    expect(fileTargetsBlocked("messages", true, 0)).toBe(wording);
+  });
+
+  // A folder name is per mailbox: "Clients" on one account and "Clients" on
+  // another are different folders that may not both exist, so a picker built
+  // while every account is in view would be offering one account's names as
+  // everyone's.
+  it("explains that filing needs one account in view", () => {
+    expect(fileTargetsBlocked("list", false, 12)).toContain("single account");
+  });
+
+  it("explains an account that has no folders listed yet", () => {
+    expect(fileTargetsBlocked("list", true, 0)).toContain("sync pass");
   });
 });
 
@@ -985,15 +1056,114 @@ describe("bulkOwnershipBlocked", () => {
   // Settings: the mailbox can be another user's.
   it("phrases the rule as the spec words it, with no Settings pointer", () => {
     expect(NOT_OWNER_EXPLANATION)
-      .toBe("only the mailbox owner can archive or trash \u2014 Hide in CRM is available to everyone");
+      .toBe("only the mailbox owner can file, archive or trash \u2014 Hide in CRM is available to everyone");
     expect(NOT_OWNER_EXPLANATION).not.toContain("your account");
     expect(NOT_OWNER_EXPLANATION).not.toContain("Settings");
   });
 
   // Hide in CRM is exactly what every viewer keeps -- an unowned selection
-  // must never grey it out.
-  it("never blocks hide", () => {
+  // must never grey it out. Nor its inverse: unhiding is the same per-viewer
+  // filing act run backwards.
+  it("never blocks the CRM-side pair", () => {
     expect(bulkOwnershipBlocked("hide", 50)).toBeNull();
+    expect(bulkOwnershipBlocked("unhide", 50)).toBeNull();
+  });
+
+  // `file` is a server MOVE, so it takes the owner-only rule exactly as
+  // Archive and Trash do -- a colleague must never reorganise your mailbox,
+  // whichever folder they were reorganising it into.
+  it("blocks filing on an unowned selection", () => {
+    expect(bulkOwnershipBlocked("file", 1))
+      .toBe(`1 selected conversation is in a mailbox you don't own: ${NOT_OWNER_EXPLANATION}.`);
+  });
+});
+
+// --- Per-message selection, in the conversation (Phase 4.4 Task 2) ----------
+
+describe("messageActionBlocked", () => {
+  it("permits a selection up to the server's own cap", () => {
+    expect(messageActionBlocked(1)).toBeNull();
+    expect(messageActionBlocked(BULK_MESSAGE_ACTION_CAP)).toBeNull();
+  });
+
+  // ONE cap rather than a per-action Record, unlike the thread bar's: every
+  // kind this path offers waits on a mail server, so there is no CRM-side
+  // action to give a looser bound to.
+  it("refuses more messages than the route would accept, naming the number", () => {
+    expect(messageActionBlocked(BULK_MESSAGE_ACTION_CAP + 1))
+      .toContain(String(BULK_MESSAGE_ACTION_CAP));
+    expect(messageActionBlocked(BULK_MESSAGE_ACTION_CAP + 1)).toContain("messages");
+  });
+});
+
+describe("toggleMessageSelected and selectedMessageIds", () => {
+  it("ticks and unticks one message at a time", () => {
+    const empty = emptyMessageSelection();
+    const one = toggleMessageSelected(empty, "a");
+    expect([...one.ids]).toEqual(["a"]);
+    const two = toggleMessageSelected(one, "b");
+    expect([...two.ids].sort()).toEqual(["a", "b"]);
+    expect([...toggleMessageSelected(two, "a").ids]).toEqual(["b"]);
+  });
+
+  // A tick past the cap is REFUSED rather than swapping some other message
+  // out: the cap is a property of the request, and silently dropping one the
+  // user ticked earlier is worse than not adding this one. Reported through
+  // `capped` so the bar can explain a checkbox that did not tick.
+  it("refuses a tick past the cap and reports what was asked for", () => {
+    let state = emptyMessageSelection();
+    for (let i = 0; i < BULK_MESSAGE_ACTION_CAP; i += 1) {
+      state = toggleMessageSelected(state, `m${i}`);
+    }
+    expect(state.capped).toBeNull();
+    const overflowed = toggleMessageSelected(state, "one-too-many");
+    expect(overflowed.ids.size).toBe(BULK_MESSAGE_ACTION_CAP);
+    expect(overflowed.ids.has("one-too-many")).toBe(false);
+    expect(overflowed.capped).toBe(BULK_MESSAGE_ACTION_CAP + 1);
+    // Unticking always works, and clears the refusal: the selection is
+    // sendable again, so the bar must stop saying it is not.
+    expect(toggleMessageSelected(overflowed, "m0").capped).toBeNull();
+  });
+
+  // The filter is not tidiness. A refetch can drop a message out of the
+  // conversation -- filed elsewhere, or its account's visibility flipped --
+  // while its id sits in the selection, and sending an id for a row nobody can
+  // see any more would act on mail the user is not looking at.
+  it("returns the still-rendered ids only, in rendered order", () => {
+    const state = { ids: new Set(["c", "a", "gone"]), capped: null };
+    expect(selectedMessageIds(state, ["a", "b", "c"])).toEqual(["a", "c"]);
+  });
+});
+
+describe("singleOwnAccount", () => {
+  const own = new Set(["mine", "also-mine"]);
+
+  it("names the account when every owned message shares one", () => {
+    expect(singleOwnAccount(
+      [{ accountId: "mine" }, { accountId: "mine" }], own,
+    )).toBe("mine");
+  });
+
+  // A folder name is PER MAILBOX, so a picker built from two accounts would be
+  // offering one mailbox's names as both. "" is the no-single-account answer
+  // fileTargetsBlocked words for each surface.
+  it("answers nothing when the messages span two of the viewer's mailboxes", () => {
+    expect(singleOwnAccount(
+      [{ accountId: "mine" }, { accountId: "also-mine" }], own,
+    )).toBe("");
+  });
+
+  // Filing is a server MOVE and those are owner-only, so another user's shared
+  // mailbox is never a destination this viewer can file into -- and its
+  // messages must not COUNT either. Counting them would blank the picker for a
+  // conversation the viewer can file perfectly well.
+  it("ignores messages on accounts the viewer does not own", () => {
+    expect(singleOwnAccount(
+      [{ accountId: "mine" }, { accountId: "someone-elses" }], own,
+    )).toBe("mine");
+    // And a conversation with nothing of the viewer's own has no answer.
+    expect(singleOwnAccount([{ accountId: "someone-elses" }], own)).toBe("");
+    expect(singleOwnAccount([], own)).toBe("");
   });
 });
 
@@ -1172,6 +1342,73 @@ describe("summarizeBulkResult", () => {
   it("uses the action's own verb", () => {
     expect(summarizeBulkResult("trash", [ok("1")]).headline).toBe("1 moved to Trash.");
     expect(summarizeBulkResult("hide", [ok("1"), ok("2")]).headline).toBe("2 hidden.");
+    // Phase 4.4's pair. The verbs come off a Record over the kind enum now:
+    // the if-chain this replaced ended in "archived", so a bulk unhide would
+    // have been summarised as "2 archived" with nothing to say otherwise.
+    expect(summarizeBulkResult("unhide", [ok("1"), ok("2")]).headline).toBe("2 unhidden.");
+    // Filing names the folder, because it is the only part of the action the
+    // user chose.
+    expect(summarizeBulkResult("file", [ok("1")], { targetFolder: "Clients" }).headline)
+      .toBe("1 filed into \u201cClients\u201d.");
+  });
+
+  // The quiet notification the filing rule owes the operator. Filing into an
+  // unsynced folder turns that folder's sync ON without asking (api:
+  // mail-move.ts) -- a warning beforehand was rejected as a choice between two
+  // bad outcomes dressed as consent -- so what is left is to SAY it
+  // afterwards, and to say it first among the notes because it is the one
+  // sentence describing a lasting change rather than one about these threads.
+  it("leads with the sync note when filing switched a folder's sync on", () => {
+    const summary = summarizeBulkResult("file", [ok("1"), skip("2", "awaiting_reconciliation")], {
+      targetFolder: "Clients", syncEnabled: "Clients",
+    });
+    expect(summary.headline).toBe("1 filed into \u201cClients\u201d, 1 skipped.");
+    expect(summary.notes[0]).toBe("Conduit is now syncing \u201cClients\u201d.");
+    expect(summary.notes).toHaveLength(2);
+  });
+
+  it("says nothing about syncing when the response reports none switched", () => {
+    const summary = summarizeBulkResult("file", [ok("1")], { targetFolder: "Clients" });
+    // The note follows the SERVER'S answer, never an assumption from the
+    // action: most filings go into folders that were already syncing, and a
+    // sentence attached to all of them would be noise.
+    expect(summary.notes).toEqual([]);
+  });
+
+  // unknown_target is `file`'s own failure and deliberately NOT no_target: the
+  // remedy is a different folder, not a Settings page, so the summary must not
+  // offer the link that no_target does.
+  it("explains a destination the account does not have, with no Settings pointer", () => {
+    const summary = summarizeBulkResult("file", [fail("1", "unknown_target"), fail("2", "unknown_target")], {
+      targetFolder: "Clients",
+    });
+    expect(summary.notes).toEqual([
+      "2 could not be filed: \u201cClients\u201d is not a folder on every selected"
+      + " conversation's mail account.",
+    ]);
+    expect(summary.settingsLink).toBe(false);
+  });
+
+  // Phase 4.4 Task 2. The counting and the copy serve both units, so the two
+  // notes whose sentences NAME the unit have to follow it -- and not_found's
+  // has to name the right SURFACE too, since the message path refreshes the
+  // open conversation while the thread path refreshes the list. Telling
+  // someone whose message vanished that "the list" was refreshed points them
+  // at a pane they were not looking at.
+  it("names messages, and the conversation, when the unit is a message", () => {
+    const summary = summarizeBulkResult(
+      "file", [fail("1", "unknown_target"), fail("2", "not_found")],
+      { targetFolder: "Clients", unit: "message" },
+    );
+    expect(summary.notes).toEqual([
+      "1 could not be found \u2014 the conversation has been refreshed.",
+      "1 could not be filed: \u201cClients\u201d is not a folder on every selected"
+      + " message's mail account.",
+    ]);
+    // And the default is still the thread surfaces, which are every caller
+    // but the conversation's message bar.
+    expect(summarizeBulkResult("trash", [fail("1", "not_found")]).notes)
+      .toEqual(["1 could not be found \u2014 the list has been refreshed."]);
   });
 
   // Every branch keys off the `reason` CODE. Nothing here may ever match on
@@ -1223,7 +1460,7 @@ describe("summarizeBulkResult", () => {
       "1 will complete after the next sync pass.",
       "1 belongs to an archived mail account"
       + " \u2014 its mail can be moved again once its owner unarchives it.",
-      "1 skipped: only the mailbox owner can archive or trash"
+      "1 skipped: only the mailbox owner can file, archive or trash"
       + " \u2014 Hide in CRM is available to everyone.",
     ]);
   });
@@ -1236,7 +1473,7 @@ describe("summarizeBulkResult", () => {
     const summary = summarizeBulkResult("archive", [skip("1", "not_owner"), skip("2", "not_owner")]);
     expect(summary.headline).toBe("Nothing archived, 2 skipped.");
     expect(summary.notes).toEqual([
-      "2 skipped: only the mailbox owner can archive or trash"
+      "2 skipped: only the mailbox owner can file, archive or trash"
       + " \u2014 Hide in CRM is available to everyone.",
     ]);
     // Another user's sharing is not fixable in the viewer's Settings.
@@ -1311,6 +1548,111 @@ describe("summarizeBulkResult", () => {
   });
 });
 
+/**
+ * Phase 4.4 Task 3. The list holds still under the reader, so something has to
+ * say what is waiting -- and it has to be TRUE, because a count that announces
+ * new mail where there is none is the reader's place lost for nothing.
+ */
+describe("pendingArrivals", () => {
+  const row = (id: string, at: string): ArrivalRow => ({ id, lastMessageAt: at });
+  // One page of what the reader is looking at, newest first, as the list holds
+  // it. Times an hour apart so a "newer than the floor" case is unambiguous.
+  const shown = [
+    row("a", "2026-09-04T12:00:00.000Z"),
+    row("b", "2026-09-04T11:00:00.000Z"),
+    row("c", "2026-09-04T10:00:00.000Z"),
+  ];
+
+  it("counts a conversation that has arrived and is not on screen", () => {
+    const head = [row("new", "2026-09-04T13:00:00.000Z"), ...shown.slice(0, 2)];
+    expect(pendingArrivals(shown, head, false)).toEqual({ count: 1, atLeast: false });
+  });
+
+  // A reply to a conversation the reader can see is not something to reveal:
+  // its row is refreshed where it stands. What is withheld is the jump to the
+  // top, which nobody asked for.
+  it("does not count a conversation the list already shows, however new", () => {
+    const head = [row("c", "2026-09-04T13:00:00.000Z"), row("a", "2026-09-04T12:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false).count).toBe(0);
+  });
+
+  /**
+   * THE ONE THAT WOULD LIE. File or trash a row out of the list and the server
+   * pulls up whatever sat just past the bottom of the page. It is in the fetch
+   * and not on screen -- and it is not new mail, it is an old conversation
+   * that has moved into view. Being older than every row listed is what gives
+   * it away.
+   */
+  it("does not count an old conversation that has slid up from below the list", () => {
+    const head = [...shown, row("older", "2026-09-04T09:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false).count).toBe(0);
+  });
+
+  // The boundary itself is not new either. A row sharing the oldest listed
+  // row's timestamp is one the page break happened to fall beside, not mail
+  // that has arrived since -- which is always LATER than everything listed.
+  it("does not count a conversation exactly as old as the oldest on screen", () => {
+    expect(pendingArrivals(shown, [row("tie", "2026-09-04T10:00:00.000Z")], false).count).toBe(0);
+  });
+
+  // The floor is the OLDEST row on screen, not the last one: the list holds
+  // its fetched order, and a row refreshed in place can carry a timestamp
+  // newer than the rows above it.
+  it("takes the floor from the oldest row, not from the last one", () => {
+    const bumped = [
+      row("a", "2026-09-04T12:00:00.000Z"),
+      row("b", "2026-09-04T10:30:00.000Z"),
+      row("c", "2026-09-04T14:00:00.000Z"),
+    ];
+    // Older than `c`, which is last, and newer than `b`, which is the floor.
+    const head = [row("mid", "2026-09-04T11:00:00.000Z")];
+    expect(pendingArrivals(bumped, head, false).count).toBe(1);
+  });
+
+  // An empty list has no place to protect: adoptCursorPage shows those rows
+  // rather than holding them, so an offer here would point at what is already
+  // on screen.
+  it("counts nothing against an empty list", () => {
+    expect(pendingArrivals([], [row("new", "2026-09-04T13:00:00.000Z")], true))
+      .toEqual({ count: 0, atLeast: false });
+  });
+
+  it("reports a floor when every fetched row is unseen and there is a page behind it", () => {
+    const head = [row("n1", "2026-09-04T15:00:00.000Z"), row("n2", "2026-09-04T14:00:00.000Z")];
+    expect(pendingArrivals(shown, head, true)).toEqual({ count: 2, atLeast: true });
+  });
+
+  // ...and not when the page IS the whole list, because then there is nothing
+  // behind it for the count to be short of.
+  it("reports an exact count when the fetched page is the last one", () => {
+    const head = [row("n1", "2026-09-04T15:00:00.000Z"), row("n2", "2026-09-04T14:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false)).toEqual({ count: 2, atLeast: false });
+  });
+
+  // "Nothing is waiting" is never a floor: `count === head.length` is trivially
+  // true at zero, and an atLeast there would put a "+" on a control that is not
+  // even rendered -- or, worse, invite one to be.
+  it("reports no floor when nothing is waiting at all", () => {
+    expect(pendingArrivals(shown, [], true)).toEqual({ count: 0, atLeast: false });
+  });
+
+  it("reports an exact count when the fetched page still holds a row the list has", () => {
+    const head = [row("n1", "2026-09-04T15:00:00.000Z"), row("a", "2026-09-04T12:00:00.000Z")];
+    expect(pendingArrivals(shown, head, true)).toEqual({ count: 1, atLeast: false });
+  });
+});
+
+describe("newMailLabel", () => {
+  it("says how many, in the singular when there is one", () => {
+    expect(newMailLabel({ count: 1, atLeast: false })).toBe("Show 1 new conversation");
+    expect(newMailLabel({ count: 3, atLeast: false })).toBe("Show 3 new conversations");
+  });
+
+  it("marks a count that is only a floor", () => {
+    expect(newMailLabel({ count: 25, atLeast: true })).toBe("Show 25+ new conversations");
+  });
+});
+
 describe("selectionLabel", () => {
   it("counts what is selected, and names the limit when a gesture was cut short", () => {
     expect(selectionLabel(3, null)).toBe("3 selected");
@@ -1323,6 +1665,28 @@ describe("bulkPendingLabel", () => {
     expect(bulkPendingLabel("archive", 3)).toBe("Archiving 3 conversations\u2026");
     expect(bulkPendingLabel("trash", 2)).toBe("Moving 2 conversations to Trash\u2026");
     expect(bulkPendingLabel("hide", 1)).toBe("Hiding 1 conversation\u2026");
+    expect(bulkPendingLabel("unhide", 4)).toBe("Unhiding 4 conversations\u2026");
+  });
+
+  // Filing is the one whose pending line is incomplete without the folder --
+  // and this request is the one that can hold the connection open longest, so
+  // the line has the most work to do.
+  it("names the destination while a filing is in flight", () => {
+    expect(bulkPendingLabel("file", 2, "Clients"))
+      .toBe("Filing 2 conversations into \u201cClients\u201d\u2026");
+    expect(bulkPendingLabel("file", 1)).toBe("Filing 1 conversation\u2026");
+  });
+
+  // Phase 4.4 Task 2: the conversation's message bar waits on the same server
+  // for the same kinds, so only the NOUN differs. A parameter rather than a
+  // second table, because two tables saying the same thing about
+  // conversations and messages is two chances for them to drift.
+  it("counts messages when that is the unit, and defaults to conversations", () => {
+    expect(bulkPendingLabel("archive", 3, null, "message")).toBe("Archiving 3 messages\u2026");
+    expect(bulkPendingLabel("trash", 1, null, "message")).toBe("Moving 1 message to Trash\u2026");
+    expect(bulkPendingLabel("file", 2, "Clients", "message"))
+      .toBe("Filing 2 messages into \u201cClients\u201d\u2026");
+    expect(bulkPendingLabel("archive", 3, null)).toBe("Archiving 3 conversations\u2026");
   });
 });
 
@@ -1514,5 +1878,47 @@ describe("composerInitialFocus", () => {
     expect(composerInitialFocus({ to, subject: replySubject("") })).toBe("body");
     expect(composerInitialFocus({ to, subject: "   " })).toBe("subject");
     expect(composerInitialFocus({ to, subject: "" })).toBe("subject");
+  });
+});
+
+describe("fileTargetNames", () => {
+  const OLD = "2026-09-04T09:00:00.000Z";
+  const NEW = "2026-09-04T10:00:00.000Z";
+
+  function row(folder: string, over: { selectable?: boolean; lastDiscoveredAt?: string } = {}) {
+    return {
+      folder,
+      selectable: over.selectable ?? true,
+      lastDiscoveredAt: over.lastDiscoveredAt ?? NEW,
+    };
+  }
+
+  it("drops the folders the last discovery pass did not re-sight", () => {
+    // The second of the two things Tasks 1-3 left behind: rows here are never
+    // deleted, so a folder renamed or removed on the server keeps its row for
+    // ever and the picker went on offering it. Filing into it fails at IMAP,
+    // late, in the server's words rather than the app's.
+    expect(fileTargetNames([
+      row("INBOX"), row("Clients"), row("Gone", { lastDiscoveredAt: OLD }),
+    ])).toEqual(["INBOX", "Clients"]);
+  });
+
+  it("drops \\Noselect hierarchy nodes, which the API refuses as a destination", () => {
+    expect(fileTargetNames([row("Lists", { selectable: false }), row("Lists/Dev")]))
+      .toEqual(["Lists/Dev"]);
+  });
+
+  it("KEEPS a folder whose sync is off, which is what the feature is for", () => {
+    // Filing into one turns its sync on (api: enableTargetSync). Dropping these
+    // would remove the case Task 1 exists to serve, so nothing here reads
+    // syncEnabled at all -- and the type says so.
+    expect(fileTargetNames([row("INBOX"), row("Archive")])).toEqual(["INBOX", "Archive"]);
+  });
+
+  it("offers everything when no folder is newer than any other", () => {
+    // One pass, every row stamped alike: nothing is stale relative to a set
+    // whose newest value it shares, so a fresh account offers all of it.
+    expect(fileTargetNames([row("A"), row("B"), row("C")])).toEqual(["A", "B", "C"]);
+    expect(fileTargetNames([])).toEqual([]);
   });
 });

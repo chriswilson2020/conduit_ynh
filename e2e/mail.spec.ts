@@ -107,6 +107,38 @@ const JUNK_FOLDER = "Junk";
 const TRASH_FOLDER = "Trash";
 const ARCHIVE_FOLDER = "Archive";
 
+/**
+ * Phase 4.4's filing destination, and the ONE fixture folder this spec makes
+ * for itself (seedMailbox creates it over IMAP rather than start-dovecot.sh
+ * declaring it, because it is this journey's alone and nothing else asserts
+ * against it).
+ *
+ * IT HAS TO BE A FOLDER CONDUIT IS NOT SYNCING, which is the whole point:
+ * filing into one turns its sync on, and a destination that was already
+ * syncing could not tell that rule working from that rule missing. Junk and
+ * trash are the only two roles the CRM leaves switched OFF on first sight, and
+ * the fixture Junk mailbox is already spoken for by the Settings-picker test
+ * earlier in this journey -- so this one is named to be classified junk by
+ * mail-folders.ts's NAME heuristic (no SPECIAL-USE attribute is set on it, and
+ * imapflow resolves competing \Junk claims to a single winner, which must stay
+ * the fixture Junk).
+ */
+const SPAM_FOLDER = "Spam";
+
+/**
+ * Phase 4.4 Task 2's destination, and the second fixture folder this spec
+ * makes for itself.
+ *
+ * A PLAIN, ORDINARY FOLDER, deliberately unlike SPAM_FOLDER above: nothing
+ * classifies "Clients", so the CRM syncs it from first sight and filing into
+ * it switches nothing on. That is what these two tests want -- they are about
+ * the two NEW ENTRANCES to filing (from inside a conversation, and per
+ * message), and the sync rule they both inherit is already proved by the test
+ * above through the same server call. A shared destination would also have let
+ * that test's assertions and these interfere.
+ */
+const CLIENTS_FOLDER = "Clients";
+
 test.describe.serial("Mail journey", () => {
   // Playwright's default test timeout is 30s, which is LESS than the sync
   // budget below -- so without this the deadline in pollWithReload could
@@ -186,6 +218,34 @@ test.describe.serial("Mail journey", () => {
    * describe the same conversations afterwards as before. */
   let archiveSubjects: [string, string] = ["", ""];
   let trashSubject = "";
+  /** Phase 4.4: the one filed into an arbitrary folder, which is also what
+   * turns that folder's sync on. */
+  let fileSubject = "";
+  /**
+   * Phase 4.4 Task 2's two conversations, each a real two-message References
+   * chain because both tests turn on what happens to a thread's OTHER
+   * messages: one is filed WHOLE from inside itself, and one has a single
+   * message filed out of it while the rest stays put.
+   *
+   * Two threads rather than one reused, because these tests share a mailbox
+   * and run in order: filing the first one whole empties its INBOX copies,
+   * which is exactly the state the second test needs NOT to be in.
+   */
+  let convFileSubject = "";
+  let splitSubject = "";
+  /**
+   * Phase 4.4 Task 4's folder, before and after its rename.
+   *
+   * PER ATTEMPT, unlike every other folder constant in this file, and that is
+   * forced rather than tidy: these two are the only mailboxes this spec CREATES
+   * through the app, and a CREATE of a name that already exists is refused. A
+   * fixed name would pass once and then fail every retry and every later run
+   * against the same Dovecot, because the mailbox the first attempt made is
+   * still sitting there. The delete leg removes the second name; the first is
+   * gone by then because the rename moved it.
+   */
+  let madeFolder = "";
+  let renamedFolder = "";
 
   /**
    * The Phase 4.3 fixtures, per-attempt for the same unrecoverability
@@ -211,6 +271,49 @@ test.describe.serial("Mail journey", () => {
   let hideSubject = "";
   let sentinelSubject = "";
   let hideMarker = "";
+
+  /**
+   * Phase 4.4 Task 3's fixtures: enough conversations to push the reader PAST
+   * PAGE ONE, plus the two arrivals the live list has to treat differently.
+   *
+   * WHY A BACKLOG AT ALL. The whole task is that the list is live beyond page
+   * one -- before it, the observed query after "load more" was page TWO, so
+   * page one, where new mail lands, had no observer and never refetched. A
+   * journey that never pages proves the paging query alone, which is the case
+   * that already worked. Thirty is simply more than the list's 25.
+   *
+   * THEY ARE DAYS OLD AND ALREADY \Seen, which is what keeps them out of every
+   * earlier test's way on a retry: dated below every other fixture they cannot
+   * disturb page-one geography (the same trick the 4.3 fixtures use for the
+   * same reason, one order of magnitude further back), and flagged \Seen they
+   * cannot move the unread badge those tests count.
+   *
+   * EACH ATTEMPT'S SET IS NEWER THAN THE LAST'S (see backlogBaseMs), so this
+   * attempt's backlog always sits directly under the live fixtures rather than
+   * under a previous attempt's leftovers -- which is what keeps the target
+   * row's depth predictable however many attempts have run.
+   */
+  const BACKLOG_COUNT = 30;
+  /**
+   * Which backlog conversation the reply lands in, counted from the OLDEST.
+   * Low on purpose: the backlog is the bottom of the list, so a low index is
+   * deep, and the test asserts its actual depth rather than trusting this.
+   */
+  const BACKLOG_TARGET = 2;
+  let backlogPrefix = "";
+  let backlogBaseMs = 0;
+  /** A body marker, one alphanumeric token: it is read off the list ROW, whose
+   * snippet is the newest message's body -- so this appearing in place is the
+   * refresh happening without the row moving. */
+  let backlogReplyMarker = "";
+  /** The conversation that arrives while the reader is looking at the list and
+   * must NOT appear until they ask for it. */
+  let liveSubject = "";
+  /** The target row's testid, captured in one test and asserted in the next:
+   * after the reveal it takes the position the server has had it in all along. */
+  let targetRowId = "";
+  const backlogSubject = (index: number) => `${backlogPrefix} ${String(index).padStart(2, "0")}`;
+  const backlogId = (index: number) => `<backlog-${attemptTag}-${index}@example.com>`;
 
   /**
    * The Phase 5 timeline fixture: one inbound message from a contact who
@@ -465,10 +568,72 @@ test.describe.serial("Mail journey", () => {
 
     return [
       message(junkSubject, JUNK_FOLDER, new Date(now - 5 * MINUTE_MS)),
+      // OLDER THAN THE ARCHIVE PAIR, deliberately: the shift-range above takes
+      // every row BETWEEN the two it is given, so a fourth INBOX fixture must
+      // not be able to sort between them. now - 4s is outside the three-second
+      // window the comment above reserves for exactly that.
+      message(fileSubject, INBOX_FOLDER, new Date(now - 4_000)),
       message(archiveSubjects[0], INBOX_FOLDER, new Date(now - 3_000)),
       message(archiveSubjects[1], INBOX_FOLDER, new Date(now - 2_000)),
       message(trashSubject, INBOX_FOLDER, new Date(now - 1_000)),
+      ...task2Fixtures(now),
     ];
+  }
+
+  /**
+   * Phase 4.4 Task 2: two INBOX conversations of TWO messages each, threaded
+   * on a real References chain (what mail-ingest actually consults -- a shared
+   * subject is not a thread).
+   *
+   * Two messages is the minimum that can prove either half. Filing a whole
+   * conversation from inside it has to move BOTH; filing one message out of it
+   * has to move exactly one and leave the other where it was, which a
+   * one-message thread cannot distinguish from moving the thread.
+   *
+   * MINUTES OLD, not seconds, and outside the three-second window the archive
+   * pair reserves for its shift-range (see folderFixtures): these four must not
+   * be able to sort between those two.
+   */
+  function task2Fixtures(now: number): { raw: Buffer; date: Date; folder: string }[] {
+    const pair = (subject: string, at: number) => {
+      const slug = subject.replace(/[^a-z0-9]+/gi, "-");
+      const rootId = `<${slug}-1@example.com>`;
+      const message = (extra: string[], id: string, date: Date, body: string) => rfc822([
+        `From: Dana Renewals <dana-${runId}@example.com>`,
+        `To: Conduit <${USERNAME}>`,
+        ...extra,
+        `Message-ID: ${id}`,
+        `Date: ${date.toUTCString()}`,
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=utf-8",
+      ], body);
+      const firstAt = new Date(now - at);
+      const secondAt = new Date(now - at + 30_000);
+      return [
+        {
+          folder: INBOX_FOLDER, date: firstAt,
+          raw: message([`Subject: ${subject}`], rootId, firstAt, `Opening ${subject}.`),
+        },
+        {
+          folder: INBOX_FOLDER, date: secondAt,
+          // "Re:" is stripped by normalizeSubject, so the THREAD is titled
+          // `subject` -- which is what threadRow matches on. The reply keeps
+          // the prefix on the SERVER, which is how subjectsIn tells the two
+          // messages apart after one of them has moved.
+          //
+          // ITS BODY DIFFERS FROM THE ROOT'S, which is not decoration: the
+          // list row's snippet is the NEWEST message's body, so two messages
+          // sharing one body would leave nothing on screen to say whether the
+          // reply had been ingested yet -- the very thing the sync test waits
+          // on before the badge-delta test runs.
+          raw: message(
+            [`Subject: Re: ${subject}`, `In-Reply-To: ${rootId}`, `References: ${rootId}`],
+            `<${slug}-2@example.com>`, secondAt, `Replying about ${subject}.`,
+          ),
+        },
+      ];
+    };
+    return [...pair(convFileSubject, 9 * MINUTE_MS), ...pair(splitSubject, 7 * MINUTE_MS)];
   }
 
   /**
@@ -483,6 +648,15 @@ test.describe.serial("Mail journey", () => {
    */
   async function seedMailbox(): Promise<void> {
     await withImap(async (client) => {
+      // Phase 4.4's filing destination, made before the account exists so the
+      // very first pass discovers it -- unsynced, because its name classifies
+      // junk (see SPAM_FOLDER). A retry finds it already there, which is not
+      // an error: the folder is per-run, while the mail_account_folders rows
+      // that decide its sync state belong to the account this attempt creates.
+      await client.mailboxCreate(SPAM_FOLDER).catch(() => undefined);
+      // Task 2's destination, for the same reason and with the same
+      // already-there-is-not-an-error tolerance.
+      await client.mailboxCreate(CLIENTS_FOLDER).catch(() => undefined);
       for (const fixture of fixtures()) {
         await client.append(fixture.folder, fixture.raw, [], fixture.date);
       }
@@ -514,6 +688,27 @@ test.describe.serial("Mail journey", () => {
     } finally {
       await client.logout();
     }
+  }
+
+  /**
+   * Move every message out of `folder` and into `target`, over raw IMAP.
+   *
+   * The harness's way to reach an empty mailbox, not the app's -- see the
+   * delete case for why it must not be the app's there.
+   */
+  async function emptyOnServer(folder: string, target: string): Promise<void> {
+    await withImap(async (client) => {
+      const mailbox = await client.mailboxOpen(folder);
+      if (mailbox.exists > 0) await client.messageMove("1:*", target);
+      await client.mailboxClose();
+    });
+  }
+
+  /** Every mailbox the server LISTs. The only way to ask "is this folder gone"
+   * of the server rather than of the CRM, which is exactly the question the
+   * delete leg has to answer -- Conduit deliberately keeps its own row. */
+  async function listFolders(): Promise<string[]> {
+    return await withImap(async (client) => (await client.list()).map((entry) => entry.path));
   }
 
   /** Every subject currently in `folder`, straight off the server. Read-only,
@@ -573,6 +768,19 @@ test.describe.serial("Mail journey", () => {
 
   function threadRowOn(target: Page, subject: string): Locator {
     return target.locator('[data-testid^="thread-row-"]').filter({ hasText: subject });
+  }
+
+  /**
+   * Every visible thread row's testid, in the order they are painted.
+   *
+   * The Task 3 tests compare this array before and after new mail lands, which
+   * is the only assertion shape that says "nothing moved" rather than "the
+   * thing I thought about did not move": an inserted row, a removed one and a
+   * re-ordered one all change it, and a row REFRESHED in place does not.
+   */
+  async function rowIds(): Promise<string[]> {
+    return page.locator('[data-testid^="thread-row-"]')
+      .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-testid") ?? ""));
   }
 
   async function idOf(locator: Locator, prefix: string): Promise<string> {
@@ -665,6 +873,20 @@ test.describe.serial("Mail journey", () => {
     junkSubject = `Newsletter ${attemptId}`;
     archiveSubjects = [`Invoice ${attemptId}`, `Shipping ${attemptId}`];
     trashSubject = `Offer ${attemptId}`;
+    fileSubject = `Contract ${attemptId}`;
+    // No subject here is a substring of another, NOR OF ANY PER-RUN ONE, which
+    // is the half that is easy to miss: threadRow matches by hasText, and
+    // `attemptId` is `runId` plus a suffix, so a `Word ${attemptId}` fixture
+    // silently CONTAINS the `Word ${runId}` one declared at the top of this
+    // file. The first draft of this line was `Renewal ${attemptId}` against
+    // aliceSubject's `Renewal ${runId}`, which made Alice's thread match two
+    // rows and failed the sync test three retries deep.
+    convFileSubject = `Statement ${attemptId}`;
+    splitSubject = `Proposal ${attemptId}`;
+    // No space in either: these two are folder NAMES rather than subjects, and
+    // a name is what the picker's data-testid is built from.
+    madeFolder = `Retainers-${attemptId}`;
+    renamedFolder = `Clients-Retainers-${attemptId}`;
 
     // The Phase 4.3 set (see the declarations above). No subject here is a
     // substring of another, because threadRow matches by hasText.
@@ -677,6 +899,19 @@ test.describe.serial("Mail journey", () => {
     // One alphanumeric token, same reason as textMarker above: it travels
     // through websearch_to_tsquery as a single lexeme.
     hideMarker = `hidemarker${attemptId}`;
+
+    // The Phase 4.4 Task 3 set (see the declarations above). Two-digit indices
+    // so that no backlog subject is a substring of another -- `Backlog X 1`
+    // would match the row for `Backlog X 10` under threadRow's hasText, which
+    // is the bug the per-attempt naming rules above were written after.
+    backlogPrefix = `Backlog ${attemptId}`;
+    backlogReplyMarker = `backlogreply${attemptId}`;
+    liveSubject = `Latebreaking ${attemptId}`;
+    // Five days back on the first attempt, four on the second, three on the
+    // third: every attempt's backlog is NEWER than the previous attempt's and
+    // older than every other fixture in this file, which are minutes or hours
+    // old. Still well inside the account form's default 90-day backfill.
+    backlogBaseMs = Date.now() - (5 - testInfo.retry) * 24 * 60 * MINUTE_MS;
 
     // The Phase 5 set (see the declarations above for why the ADDRESS is
     // per-attempt and not merely per-run).
@@ -878,6 +1113,17 @@ test.describe.serial("Mail journey", () => {
       // other fixture, so one still trickling in after this test would move
       // the badge between the next test's before-read and its delta.
       await expect(threadRow(timelineSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+      // Phase 4.4 Task 2's two conversations, waited for here for the badge
+      // reason above -- they arrive unread like every other fixture. Both are
+      // two-message chains, and the SECOND message is what these assert on
+      // (the row's snippet is the newest body): a thread whose reply had not
+      // landed yet would file or split only half of itself later, and the
+      // tests that do would fail describing the wrong thing.
+      for (const subject of [convFileSubject, splitSubject]) {
+        await expect(threadRow(subject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+        await expect(threadRow(subject))
+          .toContainText(`Replying about ${subject}`, { timeout: ATTEMPT_TIMEOUT_MS });
+      }
     });
 
     aliceThreadId = await idOf(threadRow(aliceSubject), "thread-row-");
@@ -1436,6 +1682,331 @@ test.describe.serial("Mail journey", () => {
     await expect(page.getByTestId("trash-chip")).toBeVisible();
   });
 
+  /**
+   * Phase 4.4, and the rule this whole task turns on: FILING INTO A FOLDER
+   * CONDUIT IS NOT SYNCING TURNS THAT SYNC ON. No warning, no confirm, no
+   * second request -- filing a thread into a folder IS the statement that the
+   * folder matters, and the app's job is to act on it and then say what it
+   * did.
+   *
+   * The destination is chosen so the rule has something to prove: SPAM_FOLDER
+   * classifies junk by name, so the CRM leaves it switched off on first sight
+   * (see that constant), and the picker offers it anyway -- offering only
+   * folders Conduit already syncs would make this feature useless for exactly
+   * the folders people file into.
+   */
+  test("files a conversation into an unsynced folder, which starts syncing because of it", async () => {
+    await page.goto("/mail");
+    const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
+    await inboxRow.click();
+    // Same reason the trash test asserts this: a click that did not land
+    // leaves the list in "All mail", which is a different (whole-thread)
+    // request -- and, for filing, a view with no single account, where the
+    // picker is deliberately disabled.
+    await expect(inboxRow).toHaveAttribute("aria-current", "true");
+    await expect(threadRow(fileSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    // The folder is NOT in the rail yet -- an unsynced folder with nothing
+    // unread in it has no row -- which is what makes its arrival below mean
+    // something.
+    await expect(page.getByTestId(`folder-${SPAM_FOLDER}`)).toHaveCount(0);
+
+    await tickThread(fileSubject);
+    await expect(page.getByTestId("bulk-count")).toHaveText("1 selected");
+
+    // PICKING THE FOLDER IS THE GESTURE. There is no second button to press:
+    // the choice is the instruction, the same single click the other three
+    // actions take.
+    await page.getByTestId("bulk-file").click();
+    await page.getByRole("option", { name: SPAM_FOLDER, exact: true }).click();
+
+    await expect(page.getByTestId("bulk-result"))
+      .toContainText(`1 filed into \u201c${SPAM_FOLDER}\u201d`, { timeout: BULK_TIMEOUT_MS });
+    // The consequence, said AFTER the fact and quietly -- a notification, not
+    // a gate. Enabling a sync is real (a folder Conduit now walks every pass),
+    // and nobody should have to discover it from a bandwidth graph.
+    await expect(page.getByTestId("bulk-result"))
+      .toContainText(`Conduit is now syncing \u201c${SPAM_FOLDER}\u201d`);
+
+    // Out of the folder it was filed from...
+    await expect(threadRow(fileSubject)).toHaveCount(0, { timeout: REFETCH_TIMEOUT_MS });
+    // ...really on the server, asked of Dovecot rather than of the app that
+    // says it put it there...
+    await expect.poll(() => subjectsIn(SPAM_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(fileSubject);
+    // ...and the conversation is still reachable rather than having quietly
+    // left the CRM's view, which is the outcome the rule exists to prevent.
+    await expect(page.getByTestId(`folder-${SPAM_FOLDER}`))
+      .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    await page.getByTestId(`folder-${SPAM_FOLDER}`).click();
+    await expect(threadRow(fileSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    // THE SWITCH ITSELF, read where a user would read it. The rail row above
+    // is suggestive rather than conclusive -- a folder holding unread mail
+    // gets a row whether or not it syncs -- so the claim is settled against
+    // the Settings picker, which renders sync_enabled directly. The picker
+    // and the filing rule write the same column through the same call
+    // (setFolderSyncEnabled), and this is where that shows.
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await expect(page.getByTestId(`folder-picker-${SPAM_FOLDER}`))
+      .toBeChecked({ timeout: REFETCH_TIMEOUT_MS });
+  });
+
+  /**
+   * Phase 4.4 Task 2, first half: FILING FROM INSIDE THE CONVERSATION.
+   *
+   * Task 1 built filing on the list only, so reading a thread and wanting to
+   * file it meant going back, finding it again and selecting it -- three steps
+   * to undo one navigation. This is a second ENTRANCE to that action, not a
+   * second implementation, and what the test proves is the wiring: the same
+   * endpoint, in the same whole-thread mode the Archive and Trash buttons
+   * beside it already use.
+   *
+   * WHOLE-THREAD IS THE ASSERTION THAT MATTERS. Both of this conversation's
+   * messages move, from one gesture, without either ever being selected --
+   * which is exactly what the list's folder-scoped selection could not do.
+   */
+  test("files a whole conversation from inside it, both messages at once", async () => {
+    await page.goto("/mail");
+    const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
+    await inboxRow.click();
+    await expect(inboxRow).toHaveAttribute("aria-current", "true");
+    // These fixtures are MINUTES old, not seconds like the archive/trash trio
+    // above, so on a retry -- where the mailbox also holds every earlier
+    // attempt's threads -- they can sit past the list's first page. Same
+    // reason the sync test loads all before reading the 4.3 rows.
+    await loadAllThreadsOn(page);
+    await expect(threadRow(convFileSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    await threadRow(convFileSubject).click();
+    const conversation = page.getByTestId("conversation");
+    await expect(conversation).toBeVisible();
+    // The fixture really did thread: two messages, one conversation. Every
+    // claim below about "both" rests on this.
+    await expect(conversation.locator('[data-testid^="message-"]')).toHaveCount(2);
+
+    // PICKING THE FOLDER IS THE GESTURE, here as on the list's bar: no second
+    // button to press, because the choice is the instruction.
+    await page.getByTestId("conversation-file").click();
+    await page.getByRole("option", { name: CLIENTS_FOLDER, exact: true }).click();
+
+    await expect(page.getByTestId("conversation-move-result"))
+      .toContainText(`1 filed into \u201c${CLIENTS_FOLDER}\u201d`, { timeout: BULK_TIMEOUT_MS });
+
+    // ONE conversation filed, but BOTH its messages moved -- asked of Dovecot
+    // rather than of the app that says it moved them. The reply keeps its
+    // "Re:" on the server, which is what makes the pair nameable apart.
+    await expect.poll(() => subjectsIn(CLIENTS_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toEqual(expect.arrayContaining([convFileSubject, `Re: ${convFileSubject}`]));
+    // Plain, not polled: the poll above has already waited for the move to
+    // land, and a polled NEGATIVE would pass on its first attempt for a move
+    // that had not happened yet.
+    const inboxAfter = await subjectsIn(INBOX_FOLDER);
+    expect(inboxAfter).not.toContain(convFileSubject);
+    expect(inboxAfter).not.toContain(`Re: ${convFileSubject}`);
+  });
+
+  /**
+   * Phase 4.4 Task 2, second half: ONE MESSAGE FILED OUT OF A THREAD.
+   *
+   * Selection has been per THREAD since 4.3, and this is the gesture that is
+   * not expressible that way at all: file the first message of a conversation
+   * and leave the rest where it is. It goes to its own endpoint
+   * (/api/mail/messages/bulk) with its own results, keyed per message.
+   *
+   * WHAT THE APP SHOWS AFTERWARDS IS THE POINT OF THE LAST HALF OF THIS TEST,
+   * and it is a decision rather than a consequence: the thread is INTACT. Its
+   * row is untouched, the conversation still renders both messages (the
+   * conversation is not folder-scoped), and the thread is now listed in BOTH
+   * folder views at once -- because a thread is "in" a folder when any of its
+   * messages is, which is 4.1's existing rule and not a new one. The
+   * alternative would have been splitting the conversation, which destroys the
+   * reply chain threading exists for.
+   */
+  test("files ONE message out of a conversation, leaving the thread intact", async () => {
+    await page.goto("/mail");
+    const inboxRow = page.getByTestId(`folder-${INBOX_FOLDER}`);
+    await inboxRow.click();
+    await expect(inboxRow).toHaveAttribute("aria-current", "true");
+    await loadAllThreadsOn(page);
+    await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+
+    await threadRow(splitSubject).click();
+    const conversation = page.getByTestId("conversation");
+    await expect(conversation.locator('[data-testid^="message-"]')).toHaveCount(2);
+
+    // The conversation renders oldest-first, so the first checkbox is the
+    // thread's root -- the one whose subject carries no "Re:", which is how
+    // the server-side assertions below tell which message moved.
+    await conversation.locator('[data-testid^="select-message-"]').first().check();
+    await expect(page.getByTestId("selection-count")).toHaveText("1 selected");
+
+    await page.getByTestId("selection-file").click();
+    await page.getByRole("option", { name: CLIENTS_FOLDER, exact: true }).click();
+
+    // "1 filed" counts a MESSAGE here, not a conversation -- the response is
+    // keyed per message, which is the whole reason this path is its own.
+    await expect(page.getByTestId("conversation-move-result"))
+      .toContainText(`1 filed into \u201c${CLIENTS_FOLDER}\u201d`, { timeout: BULK_TIMEOUT_MS });
+    // The bar goes with the selection it described: nothing may invite a blind
+    // retry of a move that has already landed.
+    await expect(page.getByTestId("selection-bar")).toHaveCount(0);
+
+    // EXACTLY ONE of the two moved, asked of the server. The root is in
+    // Clients; its reply is still in INBOX.
+    await expect.poll(() => subjectsIn(CLIENTS_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(splitSubject);
+    await expect.poll(() => subjectsIn(INBOX_FOLDER), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(`Re: ${splitSubject}`);
+    expect(await subjectsIn(INBOX_FOLDER)).not.toContain(splitSubject);
+
+    // THE THREAD IS INTACT. The conversation still holds both messages --
+    // filing one out of it moves mail between mailboxes, it does not split a
+    // conversation -- and the CRM has not expunged anything.
+    await expect(conversation.locator('[data-testid^="message-"]'))
+      .toHaveCount(2, { timeout: REFETCH_TIMEOUT_MS });
+
+    // AND IT IS NOW LISTED IN BOTH FOLDER VIEWS, which is the decision this
+    // test exists to pin. It stays in INBOX because its reply is still there,
+    // and it appears in Clients because its root now is. Neither is a special
+    // case: both fall out of the folder rule 4.1 already had.
+    await page.getByTestId(`folder-${INBOX_FOLDER}`).click();
+    await loadAllThreadsOn(page);
+    await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+    await page.getByTestId(`folder-${CLIENTS_FOLDER}`).click();
+    await loadAllThreadsOn(page);
+    await expect(threadRow(splitSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+  });
+
+  // -- Phase 4.4 Task 4: folder management, against the real server ---------
+
+  test("makes a folder from Settings, and it is on the server and filable into", async () => {
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await page.getByTestId(`folder-create-input-${accountId}`).fill(madeFolder);
+    await page.getByTestId(`folder-create-${accountId}`).click();
+
+    // BORN SYNCING, unlike a folder Conduit merely discovers: making one here
+    // is the statement that it matters, so its box is ticked from the start.
+    const box = page.getByTestId(`folder-picker-${madeFolder}`);
+    await expect(box).toBeChecked({ timeout: REFETCH_TIMEOUT_MS });
+    // And it really is a mailbox: asked of Dovecot, not of the CRM.
+    await expect.poll(() => subjectsIn(madeFolder), { timeout: REFETCH_TIMEOUT_MS }).toEqual([]);
+
+    // It is offered as a filing destination straight away -- the create
+    // invalidates the folders query the picker reads.
+    //
+    // `junkSubject` and not one of the already-filed fixtures, and the reason
+    // is worth keeping because it cost a CI run to find: a move NULLS the
+    // stored `imap_uid` and the next pass of the TARGET folder restores it, so
+    // a message that has just been filed is ineligible for a second move until
+    // that pass lands ("1 will complete after the next sync pass"). junkSubject
+    // was INGESTED by the pass that walked Junk and has never been moved, so
+    // its UID is real. It is also a single message, which is what makes the
+    // rename's "1 stored message moved with it" exact rather than approximate.
+    await page.goto("/mail");
+    await page.getByTestId(`folder-${JUNK_FOLDER}`).click();
+    await loadAllThreadsOn(page);
+    await tickThread(junkSubject);
+    await page.getByTestId("bulk-file").click();
+    await page.getByRole("option", { name: madeFolder, exact: true }).click();
+    await expect(page.getByTestId("bulk-result"))
+      .toContainText("1 filed", { timeout: BULK_TIMEOUT_MS });
+    await expect.poll(() => subjectsIn(madeFolder), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(junkSubject);
+  });
+
+  test("renames it, and the stored mail moves with it on BOTH sides", async () => {
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await expect(page.getByTestId(`folder-picker-${madeFolder}`))
+      .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+
+    await page.getByTestId(`folder-rename-${madeFolder}`).click();
+    await page.getByTestId(`folder-rename-input-${madeFolder}`).fill(renamedFolder);
+    await page.getByTestId(`folder-rename-save-${madeFolder}`).click();
+
+    // The row is RE-KEYED IN PLACE: the new name appears and the old one is
+    // gone entirely, rather than a second row arriving beside a stale first.
+    // That is the whole difference between renaming through Conduit and
+    // renaming in another client, and it is what stops the filing picker
+    // going on offering a folder that is not there.
+    await expect(page.getByTestId(`folder-picker-${renamedFolder}`))
+      .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+    await expect(page.getByTestId(`folder-picker-${madeFolder}`)).toHaveCount(0);
+    // Said afterwards, because a rename silently re-keys stored mail and an
+    // operator who is not told finds out from a search that stops matching.
+    await expect(page.getByText(/1 stored message moved with it/)).toBeVisible();
+
+    // THE SERVER MOVED TOO, and the message went with the mailbox.
+    await expect.poll(() => subjectsIn(renamedFolder), { timeout: REFETCH_TIMEOUT_MS })
+      .toContain(junkSubject);
+
+    // AND THE DATABASE AGREES: the conversation is listed under the NEW folder
+    // and under no other. A re-key that had missed mail_messages would leave
+    // this view empty while the server held the mail.
+    await page.goto("/mail");
+    await page.getByTestId(`folder-${renamedFolder}`).click();
+    await loadAllThreadsOn(page);
+    await expect(threadRow(junkSubject)).toHaveCount(1, { timeout: REFETCH_TIMEOUT_MS });
+  });
+
+  test("REFUSES to delete it while it still holds mail, then deletes it once empty", async () => {
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await expect(page.getByTestId(`folder-picker-${renamedFolder}`))
+      .toBeVisible({ timeout: REFETCH_TIMEOUT_MS });
+
+    await page.getByTestId(`folder-delete-${renamedFolder}`).click();
+    // WHAT HAPPENS IS SAID BEFORE IT HAPPENS -- the spec's requirement, and the
+    // sentence that keeps this from being the product's first expunge.
+    await expect(page.getByText(/Every message Conduit has already stored from it is KEPT/))
+      .toBeVisible();
+    await page.getByTestId("folder-delete-confirm").click();
+
+    // Refused BY THE SERVER'S OWN COUNT, and the folder is still there. No mail
+    // server refuses this for us: Dovecot deletes a full mailbox without
+    // complaint, so this refusal is the only thing between a click and
+    // destroyed mail.
+    // Scoped to the dialog: the settings page can carry other alerts, and the
+    // refusal has to be where the question was asked.
+    await expect(page.getByRole("dialog").getByRole("alert"))
+      .toContainText(/still holds 1 message on the mail server/, { timeout: BULK_TIMEOUT_MS });
+    expect(await subjectsIn(renamedFolder)).toContain(junkSubject);
+
+    // THE APP'S way out is the filing action the refusal names, and this leg
+    // has already shown filing INTO this folder work. Emptying it again is done
+    // over RAW IMAP instead, deliberately: filing the message OUT would need
+    // its `imap_uid` back, and a move nulls that until the target folder's next
+    // pass re-sights it -- so routing the tidy-up through the app would make
+    // this delete case wait on a sync pass to test something that has nothing
+    // to do with one. Conduit is NOT told, which is better still: it goes on
+    // holding the stored message, so the count it reports below is the promise
+    // being kept rather than a coincidence.
+    await emptyOnServer(renamedFolder, ARCHIVE_FOLDER);
+    await expect.poll(() => subjectsIn(renamedFolder), { timeout: REFETCH_TIMEOUT_MS }).toEqual([]);
+
+    await page.goto("/settings/mail");
+    await page.getByTestId(`folders-toggle-${accountId}`).click();
+    await page.getByTestId(`folder-delete-${renamedFolder}`).click();
+    await page.getByTestId("folder-delete-confirm").click();
+
+    // Gone from the server, and the count says what was KEPT rather than what
+    // was removed -- the promise the confirmation made, restated as a fact.
+    await expect(page.getByText(/Deleted from the mail server\. Conduit kept 1 stored message/))
+      .toBeVisible({ timeout: BULK_TIMEOUT_MS });
+    await expect.poll(async () => (await listFolders()).includes(renamedFolder), {
+      timeout: REFETCH_TIMEOUT_MS,
+    }).toBe(false);
+    // ...and the ROW SURVIVES, switched off, because rows in that table are
+    // never deleted and the mail Conduit stored from this folder still has to
+    // have a folder to be listed under. The mail is still there, too.
+    const box = page.getByTestId(`folder-picker-${renamedFolder}`);
+    await expect(box).toBeVisible();
+    await expect(box).not.toBeChecked();
+  });
+
   // -- Phase 4.2: private by default, the deal link as the sharing act, the
   //    Settings toggle, owner-only moves -- all from user B's own context ----
 
@@ -1522,9 +2093,16 @@ test.describe.serial("Mail journey", () => {
     await expect(bPage.getByTestId("bulk-count")).toHaveText("1 selected");
     await expect(bPage.getByTestId("bulk-archive")).toBeDisabled();
     await expect(bPage.getByTestId("bulk-trash")).toBeDisabled();
+    // Filing is a server move too, so the owner-only rule takes it as well
+    // (Phase 4.4) -- a colleague must never reorganise your mailbox, whichever
+    // folder they were reorganising it into. B is over-determined here (they
+    // own no mail account of their own either, which alone would empty the
+    // picker); the unit suite is where the two reasons are told apart, and
+    // what matters on this screen is that the control is not offered.
+    await expect(bPage.getByTestId("bulk-file")).toBeDisabled();
     await expect(bPage.getByTestId("bulk-hide")).toBeEnabled();
     await expect(bPage.getByTestId("bulk-owner-blocked"))
-      .toContainText("only the mailbox owner can archive or trash");
+      .toContainText("only the mailbox owner can file, archive or trash");
     await bPage.getByTestId("bulk-clear").click();
 
     // The conversation view agrees with the bar, and stays open for the next
@@ -1778,6 +2356,18 @@ test.describe.serial("Mail journey", () => {
     await expect(threadRow(hideSubject).getByTestId("hidden-chip")).toBeVisible();
     await expect(threadRow(hideSubject).getByTestId("hidden-chip")).toContainText("Hidden");
     await expect(threadRow(aliceSubject)).toHaveCount(0);
+
+    // Phase 4.4: in the Hidden view the bulk bar's CRM-side button is the
+    // INVERSE, swapped rather than added -- the same choice the conversation
+    // makes from a thread's own hiddenAt. Exactly one of the pair is the
+    // useful gesture for a selection here, and rendering both would put a
+    // permanent no-op beside the one the user wants. Asserted without running
+    // it: the next test needs this thread still hidden, and unhide's behaviour
+    // is pinned in the unit and route suites.
+    await tickThread(hideSubject);
+    await expect(page.getByTestId("bulk-unhide")).toBeEnabled();
+    await expect(page.getByTestId("bulk-hide")).toHaveCount(0);
+    await page.getByTestId("bulk-clear").click();
   });
 
   test("unhides from the conversation, restoring A's inbox, and re-privatizes the mailbox", async () => {
@@ -1963,5 +2553,158 @@ test.describe.serial("Mail journey", () => {
     // would prove nothing while moving state the earlier assertions describe.
     await panel.getByRole("button", { name: "Cancel" }).click();
     await expect(panel.getByTestId("link-search-contact")).toHaveCount(0);
+  });
+
+  // -- Phase 4.4 Task 3: the list is live, and it does not move ------------
+  //
+  // THESE THREE RUN LAST AND SHARE ONE PAGE, deliberately and in this order.
+  // Nothing between them navigates or reloads, because "without a reload" is
+  // the property: the reader loads a deep list once and everything after that
+  // has to reach them over SSE. A goto in the middle would reset the
+  // accumulation and prove the first page instead.
+
+  test("pages past the first page of a backlog deep enough to have one", async () => {
+    // Appended AFTER the account exists, unlike seedMailbox's fixtures: the
+    // incremental pass fetches by UID and only applies the backfill window
+    // while the cursor is still at zero (api: mail-sync.ts), so a message with
+    // an old INTERNALDATE arriving now is ingested on its UID and lands at the
+    // BOTTOM of the list -- which is exactly where a backlog belongs.
+    await withImap(async (client) => {
+      for (let index = 0; index < BACKLOG_COUNT; index += 1) {
+        await client.append(
+          INBOX_FOLDER,
+          rfc822([
+            `From: Backlog Sender <backlog-${attemptTag}@example.com>`,
+            `To: Conduit <${USERNAME}>`,
+            `Subject: ${backlogSubject(index)}`,
+            `Message-ID: ${backlogId(index)}`,
+            `Date: ${new Date(backlogBaseMs + index * MINUTE_MS).toUTCString()}`,
+            "Content-Type: text/plain; charset=utf-8",
+          ], `Backlog item ${index}.`),
+          // \Seen on purpose: the unread badge is counted exactly by earlier
+          // tests in this file, and on a retry these messages exist while
+          // those run.
+          ["\\Seen"],
+          new Date(backlogBaseMs + index * MINUTE_MS),
+        );
+      }
+    });
+
+    await page.goto("/mail");
+    // The RELOAD IS ALLOWED HERE and nowhere below: this is setup waiting on a
+    // background sync pass, not the property under test. Load-more runs inside
+    // the check because a reload resets the accumulation with it.
+    await pollWithReload(async () => {
+      await loadAllThreadsOn(page);
+      await expect(threadRow(backlogSubject(0))).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });
+    });
+
+    // The row the next test replies into, and PROOF THAT IT IS BEYOND PAGE ONE
+    // rather than a hope about how the fixtures stacked up. Page one is 25
+    // rows (thread-list.tsx's DEFAULT_LIMIT), so an index of 25 or more is a
+    // row only the accumulated pages are showing -- the rows that had no live
+    // query at all before this task.
+    targetRowId = (await threadRow(backlogSubject(BACKLOG_TARGET))
+      .getAttribute("data-testid")) as string;
+    expect((await rowIds()).indexOf(targetRowId)).toBeGreaterThanOrEqual(25);
+  });
+
+  /**
+   * The half that stops "does not move" from meaning "goes stale". New mail in
+   * a conversation the reader can SEE arrives where that conversation already
+   * is -- new snippet, unread again -- and the list does not re-order itself
+   * around it, even though the server now sorts that thread first.
+   *
+   * It also proves the cross-page refresh: the row being refreshed is beyond
+   * page one, and the only fetch carrying its new copy is page one's, because
+   * a conversation with new mail is by definition among the newest.
+   */
+  test("brings new mail to a listed conversation without moving its row", async () => {
+    const before = await rowIds();
+    await expect(page.getByTestId("thread-list-new-show")).toHaveCount(0);
+
+    await withImap(async (client) => {
+      await client.append(
+        INBOX_FOLDER,
+        rfc822([
+          `From: Backlog Sender <backlog-${attemptTag}@example.com>`,
+          `To: Conduit <${USERNAME}>`,
+          `Subject: Re: ${backlogSubject(BACKLOG_TARGET)}`,
+          `Message-ID: <backlog-reply-${attemptTag}@example.com>`,
+          `In-Reply-To: ${backlogId(BACKLOG_TARGET)}`,
+          `References: ${backlogId(BACKLOG_TARGET)}`,
+          `Date: ${new Date().toUTCString()}`,
+          "Content-Type: text/plain; charset=utf-8",
+        ], `Replying about the backlog ${backlogReplyMarker}.`),
+        [],
+        new Date(),
+      );
+    });
+
+    // NO RELOAD. The snippet is the newest message's body, so the marker
+    // appearing in this row IS the SSE hint arriving, the page-one refetch
+    // landing and the row being refreshed where it stands.
+    const target = threadRow(backlogSubject(BACKLOG_TARGET));
+    await expect(target).toContainText(backlogReplyMarker, { timeout: SYNC_TIMEOUT_MS });
+    // ...and the row is unread again, which is the other half of the copy
+    // being replaced rather than merely re-rendered.
+    await expect(target.getByRole("img", { name: "Unread" })).toBeVisible();
+
+    // NOTHING MOVED. Not the replied-to row, which the server now sorts first;
+    // not the rows it would have passed on its way there; and nothing was
+    // added or dropped anywhere in the list.
+    expect(await rowIds()).toEqual(before);
+    // And no offer to reveal it, because there is nothing to reveal: the mail
+    // is already on screen. A count here would point at a row the reader can
+    // see.
+    await expect(page.getByTestId("thread-list-new-show")).toHaveCount(0);
+  });
+
+  /**
+   * The other half: a conversation the reader CANNOT see is counted rather
+   * than inserted, and the reader decides when to lose their place.
+   */
+  test("counts a new conversation instead of showing it, until the reader asks", async () => {
+    const before = await rowIds();
+
+    await withImap(async (client) => {
+      await client.append(
+        INBOX_FOLDER,
+        rfc822([
+          `From: Helen Late <helen-${attemptTag}@example.com>`,
+          `To: Conduit <${USERNAME}>`,
+          `Subject: ${liveSubject}`,
+          `Message-ID: <late-${attemptTag}@example.com>`,
+          `Date: ${new Date().toUTCString()}`,
+          "Content-Type: text/plain; charset=utf-8",
+        ], "Something has just come up."),
+        [],
+        new Date(),
+      );
+    });
+
+    // NO RELOAD, again: this arriving is the liveness, and the exact wording
+    // is the count being right. Not "1+": that suffix is for a page one that
+    // is unseen all the way down with more behind it (mail-lib's
+    // pendingArrivals), and one arrival among twenty-five listed rows is not.
+    const show = page.getByTestId("thread-list-new-show");
+    await expect(show).toHaveText("Show 1 new conversation", { timeout: SYNC_TIMEOUT_MS });
+
+    // The reader's list is untouched while that offer stands -- same rows,
+    // same order -- and the new conversation is nowhere in it.
+    expect(await rowIds()).toEqual(before);
+    await expect(threadRow(liveSubject)).toHaveCount(0);
+
+    await show.click();
+    await expect(threadRow(liveSubject)).toHaveCount(1);
+    const after = await rowIds();
+    expect(after[0]).toBe(await threadRow(liveSubject).getAttribute("data-testid"));
+    // AND THE ROW FROM THE TEST ABOVE IS NOW SECOND, which is the whole point
+    // said backwards: the server has sorted that conversation first since its
+    // reply landed, and the list was holding it in place. Asking is what
+    // takes the server's order -- the reader's place is lost when they choose
+    // to lose it, and not before.
+    expect(after[1]).toBe(targetRowId);
+    await expect(show).toHaveCount(0);
   });
 });

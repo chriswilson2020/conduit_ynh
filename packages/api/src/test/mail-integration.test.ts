@@ -33,20 +33,25 @@ import { UID_CHUNK } from "../services/mail-sync.js";
  * EVERYTHING HERE DRIVES THE ADAPTER, never imapflow or nodemailer directly:
  * createImapClientFactory, createSmtpTransportFactory, imapVerify and
  * smtpVerify are the entry points, because a test that talked to the library
- * would prove the container works and nothing about the code that ships. It
- * is also why the folder fixtures are declared in the Dovecot config rather
- * than created from here -- the ImapClient contract has no create-mailbox
- * call, so a test that needed one would have to reach past the adapter.
+ * would prove the container works and nothing about the code that ships. The
+ * folder fixtures are declared in the Dovecot config for the same reason: they
+ * predate Phase 4.4's createMailbox, and moving them onto it now would make
+ * every other block's setup depend on the newest call in the contract.
+ * (4.4's own "folder commands" block does make its mailboxes through the
+ * adapter, because making them IS what it is testing.)
  *
  * The one exception is `doveadm` below, which ADMINISTERS the fixture from
  * outside (docker exec) for the single case that needs a folder to appear and
  * then vanish mid-run. It speaks no IMAP: see its own note.
  *
- * ISOLATION WITHOUT DELETES. The contract has no expunge either, so nothing
- * here empties a folder. Instead every case records the folder's highest UID
- * first and asserts only about what it appended above that, and every subject
+ * ISOLATION WITHOUT DELETES. The contract has no expunge, so nothing here
+ * empties a folder. Instead every case records the folder's highest UID first
+ * and asserts only about what it appended above that, and every subject
  * carries a per-run id. Dovecot's storage persists for the whole job, and
- * these tests are correct anyway. That isolation is SEQUENTIAL, though: two
+ * these tests are correct anyway. (The 4.4 block is the exception and has to
+ * be: its mailboxes are named with the run id and removed in its own afterAll,
+ * because a mailbox left behind by one run is a name the next run's CREATE
+ * would be refused for.) That isolation is SEQUENTIAL, though: two
  * cases sharing a folder concurrently would each read a highestUid the other
  * is about to invalidate, so `it.concurrent` must not be used in this file.
  */
@@ -971,5 +976,158 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
       expect(await uidsAbove(client, "MoveBulk", base)).toEqual([]);
       expect(await uidsAbove(client, "MoveBulkTarget", targetBase)).toHaveLength(UID_CHUNK);
     }, 180_000);
+  });
+
+  /**
+   * What a real Dovecot does with CREATE, RENAME and DELETE (Phase 4.4 Task 4).
+   *
+   * EVERY CLAIM IN mail-folders.ts's THREE COMMANDS RESTS ON ONE OF THESE, and
+   * they are the claims most easily got wrong by reading the RFC instead of the
+   * server: the RFC PERMITS a server to refuse a delete of a non-empty mailbox,
+   * and this one does not; the RFC REQUIRES a subtree rename, and it is worth
+   * knowing that rather than assuming it; and the placeholder a deleted parent
+   * leaves behind is described by the RFC in terms this server does not use.
+   *
+   * Run against Dovecot 2.3.21 in CI. The same set was first run against 2.3.19
+   * while the task was designed, and the two agreed on every point; a
+   * disagreement here on some later version is exactly the thing that should
+   * fail loudly rather than be discovered by a user.
+   *
+   * Every folder name carries `runId`, like every subject in this file, so a
+   * retried run never meets its own leftovers -- and each test tidies up after
+   * itself because these are the only tests here that CREATE mailboxes.
+   */
+  describe("folder commands", () => {
+    let client: ImapflowClient;
+    const made: string[] = [];
+
+    beforeAll(async () => { client = await connectClient(); });
+
+    /** A unique mailbox name, remembered so afterAll can remove it. */
+    function box(name: string): string {
+      const folder = `T4-${runId}-${name}`;
+      made.push(folder);
+      return folder;
+    }
+
+    afterAll(async () => {
+      // Deepest first, so a parent is never deleted while a child still holds
+      // it in place -- which is the very behaviour this block is about.
+      for (const folder of [...made].sort((a, b) => b.length - a.length)) {
+        await client.deleteMailbox(folder).catch(() => undefined);
+      }
+    });
+
+    it("refuses a CREATE of a name that already exists, rather than reporting success", async () => {
+      // imapflow does NOT reject here: it resolves with `created: false`, the
+      // same falsy-return trap as messageMove. Without the adapter's guard,
+      // Conduit would stamp a fresh folder row -- its own sync_enabled, its own
+      // first-sight defaults -- over a mailbox that was already there.
+      const folder = box("exists");
+      await client.createMailbox(folder);
+      await expect(client.createMailbox(folder)).rejects.toThrow(/already exists on the server/);
+    }, 30_000);
+
+    it("RENAMES THE WHOLE SUBTREE, and carries UIDVALIDITY and the UIDs across", async () => {
+      const parent = box("sub");
+      const child = `${parent}/Kid`;
+      const renamed = box("sub-renamed");
+      made.push(`${renamed}/Kid`);
+      await client.createMailbox(parent);
+      await client.createMailbox(child);
+      await client.append(child, rfc822({ subject: `${runId} kid` }), ["\\Seen"]);
+      const before = await client.status(parent);
+
+      await client.renameMailbox(parent, renamed);
+
+      // RFC 3501 6.3.5 requires this, and it is what makes mail-folders.ts's
+      // re-key a PREFIX rewrite rather than an exact-name one: a re-key of the
+      // exact name alone would leave the child's stored mail pointing at a
+      // mailbox that no longer exists.
+      const listed = (await client.list()).map((entry) => entry.folder);
+      expect(listed).toContain(renamed);
+      expect(listed).toContain(`${renamed}/Kid`);
+      expect(listed).not.toContain(parent);
+      expect(listed).not.toContain(child);
+
+      // And this is why the re-key does NOT null imap_uid: the message keeps
+      // both its mailbox identity and its number, so the stored UIDs stay true
+      // and no folder has to be re-walked.
+      const after = await client.status(renamed);
+      expect(after.uidvalidity).toBe(before.uidvalidity);
+      expect(await client.messageCount(`${renamed}/Kid`)).toBe(1);
+    }, 60_000);
+
+    it("refuses a RENAME onto an existing name, and a rename of INBOX", async () => {
+      const source = box("collide-src");
+      const taken = box("collide-dst");
+      await client.createMailbox(source);
+      await client.createMailbox(taken);
+      await expect(client.renameMailbox(source, taken)).rejects.toThrow();
+      // The service refuses INBOX earlier, with a better sentence and for a
+      // better reason (the RFC gives RENAME INBOX semantics no re-key could
+      // describe) -- but the server agreeing is worth knowing.
+      await expect(client.renameMailbox("INBOX", box("inbox-moved"))).rejects.toThrow();
+    }, 30_000);
+
+    it("DESTROYS THE MAIL IN A NON-EMPTY MAILBOX WITHOUT COMPLAINT", async () => {
+      // The finding the whole delete design rests on. There is no server-side
+      // refusal to lean on: if Conduit does not check, Conduit's folder tool
+      // becomes this product's first expunge.
+      const folder = box("full");
+      await client.createMailbox(folder);
+      await client.append(folder, rfc822({ subject: `${runId} doomed` }), ["\\Seen"]);
+      expect(await client.messageCount(folder)).toBe(1);
+
+      await client.deleteMailbox(folder);
+
+      expect((await client.list()).map((entry) => entry.folder)).not.toContain(folder);
+      // Gone, not moved. A mailbox that is not there AT ALL makes imapflow
+      // reject with the server's own words, so this is the plain-rejection
+      // half of the pair; the falsy-return half -- the one the adapter's guard
+      // exists for -- is the placeholder case below, and the two really are
+      // different code paths on the same server.
+      await expect(client.messageCount(folder)).rejects.toThrow(/Mailbox doesn't exist/);
+    }, 30_000);
+
+    it("leaves a DELETED PARENT listed, unselectable, and NOT marked \\Noselect", async () => {
+      // The second finding, and the reason a folder with children is refused
+      // rather than attempted. The parent's own mail is destroyed, the name
+      // stays in LIST, and on this server it carries neither \Noselect nor
+      // \NonExistent -- so discovery would go on recording it as a live
+      // selectable folder, the walk would open it, and the pass would fail.
+      // Every pass. That is a permanently backed-off account.
+      const parent = box("placeholder");
+      const child = `${parent}/Kid`;
+      made.push(child);
+      await client.createMailbox(parent);
+      await client.createMailbox(child);
+      await client.append(parent, rfc822({ subject: `${runId} parent mail` }), ["\\Seen"]);
+
+      await client.deleteMailbox(parent);
+
+      const entry = (await client.list()).find((row) => row.folder === parent);
+      expect(entry).toBeDefined();
+      // The trap, stated as an assertion: LIST says selectable...
+      expect(entry?.selectable).toBe(true);
+      // ...and every attempt to use it fails. THIS is the case the adapter's
+      // falsy guard on messageCount exists for, and the sentence proves which
+      // path ran: imapflow RESOLVES WITH `false` for this placeholder (rather
+      // than rejecting, as it does for a mailbox that is not listed at all --
+      // see the case above), so without the guard a deleted parent would count
+      // as empty and be reported as a folder holding no mail.
+      await expect(client.messageCount(parent)).rejects.toThrow(/could not read the status/);
+      expect((await client.list()).map((row) => row.folder)).toContain(child);
+    }, 60_000);
+
+    it("reports the hierarchy delimiter per entry, which is what a rename re-keys with", async () => {
+      // Nothing stores this, so a rename LISTs for it. Dovecot reports "." for
+      // a Maildir++ layout and "/" for an fs one and both are ordinary, which
+      // is why guessing it is not a near miss: on a "." server, splitting a
+      // name on "/" finds no separator at all.
+      const entry = (await client.list()).find((row) => row.folder === "INBOX");
+      expect(entry?.delimiter).toBeTruthy();
+      expect(typeof entry?.delimiter).toBe("string");
+    }, 30_000);
   });
 });

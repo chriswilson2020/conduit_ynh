@@ -1,7 +1,8 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   backupPreflightSchema,
   bulkThreadResultSchema,
+  bulkMessageResultSchema,
   companySchema,
   contactSchema,
   csvInspectionSchema,
@@ -45,6 +46,7 @@ import {
   taskSchema,
   usersResponseSchema,
   type BulkThreadActionInput,
+  type BulkMessageActionInput,
   type Company,
   type Contact,
   type CreateCompanyInput,
@@ -63,6 +65,13 @@ import {
   type DocumentType,
   type IssueQuoteInput,
   type FolderPatchInput,
+  folderRenameResultSchema,
+  folderDeleteResultSchema,
+  type FolderCreateInput,
+  type FolderRenameInput,
+  type FolderRenameResult,
+  type FolderDeleteInput,
+  type FolderDeleteResult,
   type GanttPayload,
   type MailAccountCreateInput,
   type MailAccountFolder,
@@ -1495,6 +1504,73 @@ export function useSetFolderSync() {
   });
 }
 
+/**
+ * The three folder COMMANDS (Phase 4.4 Task 4): create, rename and delete a
+ * mailbox on the server.
+ *
+ * ONE INVALIDATION SET FOR ALL THREE, written once here rather than three
+ * times, because all three change the same three things: which folders this
+ * account has, which folder every stored message says it is in (a rename
+ * re-keys them), and therefore the per-folder unread badges. `mail-accounts` is
+ * in it too, and only these hooks need it: a rename can rewrite the account's
+ * own sent/trash/archive columns, which the settings form renders.
+ *
+ * All three are POST, including delete: an IMAP mailbox name is arbitrary user
+ * text and belongs in a body rather than in a URL and every access log along
+ * the way (see the shared folderRenameInputSchema).
+ */
+function invalidateFolderCommand(queryClient: QueryClient, accountId: string): void {
+  void queryClient.invalidateQueries({ queryKey: ["mail-folders", accountId] });
+  void queryClient.invalidateQueries({ queryKey: ["mail-accounts"] });
+  void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
+  void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
+}
+
+export function useCreateFolder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ accountId, input }: { accountId: string; input: FolderCreateInput }) =>
+      parseWith(
+        mailAccountFolderSchema,
+        await postJson<unknown>(`/mail/accounts/${accountId}/folders`, input),
+        "mail folder",
+      ),
+    onSuccess: (_folder: MailAccountFolder, { accountId }) => {
+      invalidateFolderCommand(queryClient, accountId);
+    },
+  });
+}
+
+export function useRenameFolder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ accountId, input }: { accountId: string; input: FolderRenameInput }) =>
+      parseWith(
+        folderRenameResultSchema,
+        await postJson<unknown>(`/mail/accounts/${accountId}/folders/rename`, input),
+        "folder rename",
+      ),
+    onSuccess: (_result: FolderRenameResult, { accountId }) => {
+      invalidateFolderCommand(queryClient, accountId);
+    },
+  });
+}
+
+export function useDeleteFolder() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ accountId, input }: { accountId: string; input: FolderDeleteInput }) =>
+      parseWith(
+        folderDeleteResultSchema,
+        await postJson<unknown>(`/mail/accounts/${accountId}/folders/delete`, input),
+        "folder delete",
+      ),
+    onSuccess: (_result: FolderDeleteResult, { accountId }) => {
+      invalidateFolderCommand(queryClient, accountId);
+    },
+  });
+}
+
 export interface MailThreadListParams {
   accountId?: string;
   unread?: boolean;
@@ -1699,14 +1775,16 @@ export function useUnreadMailCountsByFolder() {
 }
 
 /**
- * The bulk thread actions (Phase 4.1): Trash and Archive MOVE messages on the
- * IMAP server, "Hide in CRM" sets the CRM-side thread archive.
+ * The bulk thread actions: Trash, Archive and File (Phase 4.4) MOVE messages
+ * on the IMAP server, "Hide in CRM" and its inverse set and clear the
+ * CRM-side, per-viewer hide row.
  *
  * `folder` carries the move service's two modes and the caller decides which:
  * PRESENT means folder-scoped (a multi-select made in a folder view acts only
  * on the messages in THAT folder), ABSENT means whole-thread (the conversation
  * view's single-thread buttons). See bulk-bar.tsx for the ruling on the
- * unfiltered list.
+ * unfiltered list. `targetFolder` is a DIFFERENT field and a different
+ * question -- where the mail is going, for `file` alone.
  *
  * ALWAYS 200 when the request was valid: per-thread failures ride inside the
  * body, so a caller must read `results` rather than trusting the absence of a
@@ -1729,10 +1807,67 @@ export function useBulkThreadAction() {
       void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
       void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
       void queryClient.invalidateQueries({ queryKey: ["search"] });
+      // Filing can have switched a folder's sync ON (api: mail-move.ts), which
+      // changes what the sidebar shows and what the picker says about it. The
+      // server publishes its own folders hint from that write, so this is the
+      // belt to that braces: a client whose SSE stream is down still sees the
+      // switch it just caused. Every accountId's, because the response says
+      // WHICH folder was enabled but not on which accounts, and a bulk
+      // selection can span several.
+      if (input.action === "file") {
+        void queryClient.invalidateQueries({ queryKey: ["mail-folders"] });
+      }
       // Each touched thread's own detail entry: the conversation on screen may
       // be one of them, and its messages' folders have just changed.
       for (const threadId of input.threadIds) {
         void queryClient.invalidateQueries({ queryKey: ["mail-thread", threadId] });
+      }
+    },
+  });
+}
+
+/**
+ * The per-message actions (Phase 4.4 Task 2): Trash, Archive and File applied
+ * to individual messages of a conversation rather than to whole threads.
+ *
+ * ITS OWN HOOK AND ITS OWN ENDPOINT, matching the API's ruling: a message id is
+ * a different unit from a thread id, the response is keyed on `messageId`, and
+ * there is no `folder` because the ids ARE the scope. The two hooks share no
+ * body shape, which is the point -- one that took either would be the
+ * overloading the whole task exists to avoid.
+ *
+ * WHAT IT INVALIDATES IS DELIBERATELY THE SAME SET, minus the one key it cannot
+ * name. Filing a message changes which folder views its THREAD appears in (a
+ * thread is "in" a folder when any of its messages is), so the thread list and
+ * the unread counts move exactly as they do for a thread action -- filing one
+ * message out of an INBOX-only conversation removes that conversation from the
+ * INBOX view. The key it cannot name is the thread's own detail entry: the
+ * response carries message ids, not the threads they belong to. ["mail-thread"]
+ * as a PREFIX covers every open conversation instead, which is at most the one
+ * on screen and its capped/uncapped pair -- the coarser invalidation is the
+ * honest one here, since guessing the thread id client-side would mean trusting
+ * a cache to still hold rows the server has just moved.
+ */
+export function useBulkMessageAction() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: BulkMessageActionInput) =>
+      parseWith(
+        bulkMessageResultSchema,
+        await postJson<unknown>("/mail/messages/bulk", input),
+        "bulk message action result",
+      ),
+    onSettled: (_result, _error, input) => {
+      void queryClient.invalidateQueries({ queryKey: ["mail-threads"] });
+      void queryClient.invalidateQueries({ queryKey: ["mail-unread"] });
+      void queryClient.invalidateQueries({ queryKey: ["search"] });
+      void queryClient.invalidateQueries({ queryKey: ["mail-thread"] });
+      // Filing can have switched a folder's sync ON (api: mail-move.ts), which
+      // changes what the sidebar shows and what the picker offers. The server
+      // publishes its own folders hint from that write; this is the belt to
+      // that braces, for a client whose SSE stream is down.
+      if (input.action === "file") {
+        void queryClient.invalidateQueries({ queryKey: ["mail-folders"] });
       }
     },
   });

@@ -252,6 +252,112 @@ export function mergeCursorPage<T extends { id: string }>(
 }
 
 /**
+ * Take a page the reader ASKED FOR, and leave a page they are already looking
+ * at exactly as it is.
+ *
+ * mergeCursorPage above REPLACES the page it is given, which is right for a
+ * page somebody asked for and wrong for the same page arriving again behind
+ * their back. The two cases are told apart by one question -- do we already
+ * hold this cursor? -- and nothing else:
+ *
+ *   NOT HELD: the reader asked for it (the first load, a filter change, "load
+ *   more", a deliberate re-snapshot). Straight to mergeCursorPage; there is
+ *   nothing on screen for it to disturb, because a page that is not held
+ *   appends below everything that is.
+ *
+ *   HELD: this is a REFETCH nobody asked for -- an SSE hint, a window
+ *   refocus, a mutation's own invalidation. The list is ordered by recency, so
+ *   the same page fetched again is a DIFFERENT page: a conversation that got a
+ *   reply has MOVED to the top from wherever it was, and every row it passed
+ *   has shifted down one. Taking that is how a row moves out from under a
+ *   reader's cursor between two clicks, so this takes nothing at all.
+ *   refreshCursorRows below is how a held page is kept current instead.
+ *
+ * WHY "HELD" IS A REFETCH AND NOT A JUDGEMENT CALL: every page this record
+ * holds got here by being asked for, and a cursor is never re-requested except
+ * by the query layer refetching a key it is already observing.
+ *
+ * AN EMPTY HELD PAGE IS NOT HELD. A list showing nothing has no reader's place
+ * to protect, and holding there would put "No conversations" on screen beside
+ * an offer to show the conversations that have just arrived -- a screen that
+ * contradicts itself. Page one is the only page a reader can reach with no
+ * rows, so this is the only case where "held" and "on screen" disagree.
+ */
+export function takeCursorPage<T extends { id: string }>(
+  state: CursorPages<T>,
+  key: string,
+  cursor: string | undefined,
+  items: readonly T[],
+  nextCursor: string | null,
+): CursorPages<T> {
+  const held = state.key === key ? state.byCursor[cursor ?? FIRST_PAGE] : undefined;
+  if (held !== undefined && held.length > 0) return state;
+  return mergeCursorPage(state, key, cursor, items, nextCursor);
+}
+
+/**
+ * Keep the rows that are on screen CURRENT, without moving one of them.
+ *
+ * Every row this record holds that appears in `items` takes the fetched copy,
+ * in the position it already occupies. Nothing is added, nothing is removed,
+ * nothing is re-ordered, and neither the page boundaries nor the accumulated
+ * nextCursor move -- so "load more" still continues from the bottom of what is
+ * actually shown rather than from the bottom of a list the reader is not being
+ * shown.
+ *
+ * THIS IS THE HALF THAT MAKES THE HOLD SURVIVABLE. Freezing a list outright is
+ * one function shorter and wrong within a click: opening a mail conversation
+ * marks it read, which invalidates the list, and a list that took nothing from
+ * a refetch would keep the bold unread row for the conversation the reader is
+ * looking at. New mail in a conversation that is already listed lands the same
+ * way -- new snippet, new time, the dot back on, where the row already is.
+ * What is withheld is only the jump to the top, which nobody asked for.
+ *
+ * IT RUNS OVER EVERY HELD PAGE, not just the one the fetch came from. A row
+ * that has slid onto a later page since it was fetched is still that row, and
+ * this is the ONLY way a row below page one is ever refreshed: a conversation
+ * with new mail is by definition among the newest, so page one is where its
+ * fresh copy arrives, whatever page the reader is showing it on.
+ *
+ * ONE WRITER, AND THAT IS A REQUIREMENT RATHER THAN A TIDINESS. Two fetches
+ * that both refreshed rows would hand out DIFFERENT objects for the same row
+ * (structural sharing is per query, not across queries), so any row they both
+ * covered would be rewritten by each in turn, for ever, from an effect. Call
+ * this from exactly one place -- the query that watches page one -- and let
+ * every other page reach the record through takeCursorPage above, which writes
+ * a page once and never again.
+ *
+ * REFERENCE COMPARISON IS WHAT DECIDES "changed", and with one writer it is
+ * exact rather than approximate: React Query's structural sharing (on by
+ * default in v5 -- router.tsx overrides only staleTime and retry) hands back
+ * the PREVIOUS object for a row whose data did not change, so an unchanged row
+ * compares identical and neither this record nor the memoised component
+ * rendering it is disturbed. A changed row is a new object, and exactly that
+ * row is replaced.
+ */
+export function refreshCursorRows<T extends { id: string }>(
+  state: CursorPages<T>, key: string, items: readonly T[],
+): CursorPages<T> {
+  if (state.key !== key) return state;
+  const fresh = new Map(items.map((item) => [item.id, item] as const));
+  let changed = false;
+  const byCursor: Record<string, readonly T[]> = {};
+  for (const page of state.order) {
+    const rows = state.byCursor[page] ?? [];
+    let pageChanged = false;
+    const next = rows.map((row) => {
+      const replacement = fresh.get(row.id);
+      if (replacement === undefined || replacement === row) return row;
+      pageChanged = true;
+      return replacement;
+    });
+    byCursor[page] = pageChanged ? next : rows;
+    changed ||= pageChanged;
+  }
+  return changed ? { ...state, byCursor } : state;
+}
+
+/**
  * The accumulated rows, in page order, de-duplicated by id with the FIRST
  * sighting winning. The dedupe is not paranoia: a thread that gets a new
  * message while a later page is on screen is re-ordered to the top of page one

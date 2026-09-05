@@ -19,6 +19,34 @@ export default defineConfig({
   test: {
     include: ["packages/*/src/**/*.test.ts"],
     environment: "node",
+    // TWENTY SECONDS, BECAUSE 5000 WAS VITEST'S DEFAULT AND NOBODY EVER CHOSE IT.
+    //
+    // THE EXPOSURE IS THE PARALLELISATION'S, AND IT SHOWED UP ONE TASK LATER.
+    // A CI run of Phase 4.4 Task 2 failed four cases in services/restore.test.ts
+    // -- all `Test timed out in 5000ms`, no assertion failures, in code that task
+    // never touched -- and a re-run of the same commit was green. The file took
+    // 206s in that run against roughly 60s in a quiet one.
+    //
+    // WHY CONTENTION AND NOT A HANG. Per-worker databases removed the shared
+    // DATABASE, not the shared PostgreSQL SERVER: four workers still compete for
+    // one instance's CPU, I/O and buffers, and the two restore files are the
+    // heaviest in the suite precisely because they drop and reload real schemas
+    // (26.8% of all test time between them, measured 4 Sep). At the ~3.4x
+    // slowdown that run saw, the file's ordinary 1.5s cases land past 5s. The
+    // tests are not wrong and the code is not slow; the budget was set for unit
+    // tests by somebody who had never seen this suite.
+    //
+    // RAISED RATHER THAN THE FILE PINNED TO ONE WORKER, which was the other
+    // option: pinning buys back the contention but also the serialisation, on
+    // exactly the two files that gained most from running alongside something
+    // else. And raised globally rather than per-file, because there is nothing
+    // special about restore -- it is merely first to the cliff.
+    //
+    // WHAT IT COSTS: a genuinely hung test now takes 20s to report instead of 5.
+    // That is paid only on failures, and a hang that a 5s budget catches and a
+    // 20s one does not is not a shape anything here produces -- the failure mode
+    // this suite actually has is a query waiting on a lock, which waits for ever.
+    testTimeout: 20_000,
     // TEST FILES RUN CONCURRENTLY AGAIN, AND THE REASON THEY COULD NOT IS GONE.
     //
     // What used to stand here: "Test files run one at a time. The database-backed

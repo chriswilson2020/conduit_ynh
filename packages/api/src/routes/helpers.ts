@@ -5,6 +5,7 @@ import {
   NotFoundError, ArchivedError, ConflictError, DuplicateAttendeeError,
   MailKeyMissingError, MailCredentialDecryptError,
   AttachmentTooLargeError, SmtpSendError,
+  MailFolderCommandError, MailFolderRenameFailedError,
 } from "../services/errors.js";
 import { decodeCursor } from "../services/pagination.js";
 
@@ -131,6 +132,29 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
     // composer can branch on `auth:` vs `connection:` without parsing an
     // English sentence out of `message`.
     void reply.code(502).send({ error: "smtp_failed", message: error.message, reason: error.reason });
+    return;
+  }
+  // 502 for the same reason, one protocol over: a folder command the IMAP
+  // server (or the account's sync loop) refused. `reason` rides alongside for
+  // the same reason it does above -- it carries the adapter's `auth:` /
+  // `connection:` classification, and a client branching on English prose is a
+  // client that breaks when the prose is reworded.
+  if (error instanceof MailFolderCommandError) {
+    void reply.code(502).send({ error: "imap_failed", message: error.message, reason: error.reason });
+    return;
+  }
+  // 500, and TWO CODES off one class, because the client's situation is
+  // genuinely different in the two cases (see the class): `compensated` means
+  // nothing changed and retrying is safe, and the other means the mail server
+  // and Conduit now disagree and a person has to put them back in step. A
+  // client that showed one sentence for both would be telling half its users
+  // something false. The message is echoed for both: it names two folders the
+  // account's owner chose and nothing else.
+  if (error instanceof MailFolderRenameFailedError) {
+    void reply.code(500).send({
+      error: error.compensated ? "folder_rename_failed" : "folder_rename_diverged",
+      message: error.message,
+    });
     return;
   }
   throw error;

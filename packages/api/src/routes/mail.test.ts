@@ -11,6 +11,8 @@ import {
   mailThreadListItemSchema, mailThreadDetailSchema, markThreadReadResponseSchema,
   mailMessageSchema, mailUnreadCountSchema,
   mailUnreadFolderCountsSchema, mailAccountFolderSchema, bulkThreadResultSchema,
+  folderRenameResultSchema, folderDeleteResultSchema,
+  bulkMessageResultSchema, BULK_MESSAGE_ACTION_CAP,
   searchResultsSchema,
   type MailAccountCreateInput, type MailAccountSyncStats, type SendMailInput,
 } from "@conduit/shared";
@@ -24,6 +26,7 @@ import {
 import { saveBlob } from "../services/blobs.js";
 import { subscribe } from "../services/sse.js";
 import type { SendMailMessage, SendMailTransport } from "../services/mail-send.js";
+import type { ImapFolderListing } from "../services/mail-sync.js";
 import type { MailRouteSyncManager } from "./mail.js";
 
 const handle = openTestDatabase();
@@ -123,6 +126,58 @@ class FakeAccountSync {
   moveMessages(folder: string, uids: readonly number[], targetFolder: string): Promise<void> {
     this.moveCalls.push({ folder, uids: [...uids], targetFolder });
     return this.moveFailure === null ? Promise.resolve() : Promise.reject(this.moveFailure);
+  }
+
+  // --- Folder commands (Phase 4.4 Task 4) ---------------------------------
+  //
+  // A tiny mailbox model rather than call recorders, because the routes
+  // exercise the REAL service and the service's decisions are all made from
+  // what the server answers: whether a folder is listed, what its delimiter is,
+  // how many messages it holds. A fake that only recorded calls could not
+  // produce a refusal, which is most of what there is to assert here.
+
+  /** name -> message count. The listing IS the key set, so a folder can exist
+   * holding nothing, which is the case delete cares about most. */
+  readonly mailboxes = new Map<string, number>([["INBOX", 0], ["Sent", 0]]);
+  delimiter: string | null = "/";
+  listFoldersFailure: Error | null = null;
+  createFailure: Error | null = null;
+  renameFailure: Error | null = null;
+  deleteFailure: Error | null = null;
+
+  listFolders(): Promise<ImapFolderListing[]> {
+    if (this.listFoldersFailure !== null) return Promise.reject(this.listFoldersFailure);
+    return Promise.resolve([...this.mailboxes.keys()].map((folder) => ({
+      folder, selectable: true, delimiter: this.delimiter,
+    })));
+  }
+
+  createMailbox(folder: string): Promise<void> {
+    if (this.createFailure !== null) return Promise.reject(this.createFailure);
+    if (this.mailboxes.has(folder)) {
+      return Promise.reject(new Error(`mailbox ${folder} already exists on the server`));
+    }
+    this.mailboxes.set(folder, 0);
+    return Promise.resolve();
+  }
+
+  /** Subtree-wide, like the server (RFC 3501 6.3.5, and Dovecot). */
+  renameMailbox(folder: string, newFolder: string): Promise<void> {
+    if (this.renameFailure !== null) return Promise.reject(this.renameFailure);
+    const prefix = `${folder}${this.delimiter ?? ""}`;
+    for (const [name, count] of [...this.mailboxes]) {
+      if (name !== folder && !(this.delimiter !== null && name.startsWith(prefix))) continue;
+      this.mailboxes.delete(name);
+      this.mailboxes.set(newFolder + name.slice(folder.length), count);
+    }
+    return Promise.resolve();
+  }
+
+  deleteMailboxIfEmpty(folder: string): Promise<number> {
+    if (this.deleteFailure !== null) return Promise.reject(this.deleteFailure);
+    const count = this.mailboxes.get(folder) ?? 0;
+    if (count === 0) this.mailboxes.delete(folder);
+    return Promise.resolve(count);
   }
 }
 
@@ -725,6 +780,204 @@ describe("mail folder routes", () => {
     });
     expect(survived.statusCode).toBe(200);
     await throwing.close();
+  });
+
+  // --- create / rename / delete (Phase 4.4 Task 4) --------------------------
+
+  /** An account whose folders Conduit knows about and whose fake server holds
+   * the same set, so the two agree the way they do after a discovery pass. */
+  async function folderAccount(
+    a: Awaited<ReturnType<typeof app>>,
+    folders: Record<string, number> = { INBOX: 0, Sent: 0, Projects: 0 },
+    overrides: Record<string, unknown> = {},
+  ) {
+    const account = await makeAccount(a, { sentFolder: "Sent", ...overrides });
+    const sync = new FakeAccountSync();
+    sync.mailboxes.clear();
+    for (const [folder, count] of Object.entries(folders)) {
+      sync.mailboxes.set(folder, count);
+      await seedFolder(account.id, folder);
+    }
+    syncs.set(account.id, sync);
+    return { account, sync };
+  }
+
+  it("creates a folder on the server, records it born syncing, and answers 201", async () => {
+    const a = await app();
+    const { account, sync } = await folderAccount(a);
+
+    const response = await a.inject({
+      method: "POST", url: `/api/mail/accounts/${account.id}/folders`, headers: authHeaders,
+      // Trimmed by the shared schema before the service ever sees it.
+      payload: { folder: "  Clients  " },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(mailAccountFolderSchema.parse(response.json()))
+      .toMatchObject({ folder: "Clients", syncEnabled: true, selectable: true });
+    expect(sync.mailboxes.has("Clients")).toBe(true);
+    // Creating a folder asks for no pass: the row is already recorded, and an
+    // empty new folder has nothing for a pass to fetch.
+    expect(syncNowCalls).toEqual([]);
+    await a.close();
+  });
+
+  it("502s `imap_failed` when the mail server refuses a folder command, and writes nothing", async () => {
+    const a = await app();
+    const { account, sync } = await folderAccount(a);
+    sync.createFailure = new Error("connection: socket closed");
+
+    const response = await a.inject({
+      method: "POST", url: `/api/mail/accounts/${account.id}/folders`, headers: authHeaders,
+      payload: { folder: "Clients" },
+    });
+
+    // Not a 500: the request was well-formed and this server did its part.
+    expect(response.statusCode).toBe(502);
+    expect(errorResponseSchema.parse(response.json())).toMatchObject({ error: "imap_failed" });
+    // The reason rides alongside so a client can branch on `connection:` /
+    // `auth:` rather than on English prose.
+    expect(response.json().reason).toContain("connection: socket closed");
+    const rows = await handle.db.select().from(mailAccountFolders)
+      .where(and(eq(mailAccountFolders.accountId, account.id), eq(mailAccountFolders.folder, "Clients")));
+    expect(rows).toEqual([]);
+    await a.close();
+  });
+
+  it("renames a folder, re-keys the stored mail, and asks for a pass", async () => {
+    const a = await app();
+    const { account, sync } = await folderAccount(a);
+
+    const response = await a.inject({
+      method: "POST", url: `/api/mail/accounts/${account.id}/folders/rename`, headers: authHeaders,
+      payload: { folder: "Projects", newFolder: "Clients" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(folderRenameResultSchema.parse(response.json()))
+      .toMatchObject({ folder: { folder: "Clients" }, messages: 0, folders: 1 });
+    expect(sync.mailboxes.has("Clients")).toBe(true);
+    // The pass is what gives the new name its SPECIAL-USE classification, which
+    // the rename deliberately does not guess.
+    expect(syncNowCalls).toEqual([account.id]);
+    await a.close();
+  });
+
+  it("400s a rename to the same name, in the schema rather than as a conflict", async () => {
+    const a = await app();
+    const { account } = await folderAccount(a);
+    for (const payload of [
+      { folder: "Projects", newFolder: "Projects" },
+      // Both fields trim first, so this is the same request spelled differently.
+      { folder: "Projects", newFolder: "  Projects  " },
+    ]) {
+      const response = await a.inject({
+        method: "POST", url: `/api/mail/accounts/${account.id}/folders/rename`,
+        headers: authHeaders, payload,
+      });
+      expect(response.statusCode).toBe(400);
+    }
+    expect(syncNowCalls).toEqual([]);
+    await a.close();
+  });
+
+  it("500s `folder_rename_diverged` when the compensating rename also fails", async () => {
+    const a = await app();
+    const { account, sync } = await folderAccount(a);
+    // The destination row appears between the server's RENAME and the re-key --
+    // a real UNIQUE (account_id, folder) violation in the real statement.
+    const original = sync.renameMailbox.bind(sync);
+    let renames = 0;
+    sync.renameMailbox = async (folder: string, newFolder: string): Promise<void> => {
+      renames += 1;
+      if (renames === 2) throw new Error("connection: socket closed");
+      await original(folder, newFolder);
+      await seedFolder(account.id, "Clients");
+    };
+
+    const response = await a.inject({
+      method: "POST", url: `/api/mail/accounts/${account.id}/folders/rename`, headers: authHeaders,
+      payload: { folder: "Projects", newFolder: "Clients" },
+    });
+
+    expect(response.statusCode).toBe(500);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("folder_rename_diverged");
+    // Echoed, unlike the mail-key branch: it names two folders the account's
+    // owner chose, and it is the only place the fix is stated.
+    expect(body.message).toMatch(/Rename "Clients" back to "Projects" in any mail client/);
+    await a.close();
+  });
+
+  it("deletes an empty folder, keeps its row and its stored mail, and asks for a pass", async () => {
+    const a = await app();
+    const { account, sync } = await folderAccount(a);
+
+    const response = await a.inject({
+      method: "POST", url: `/api/mail/accounts/${account.id}/folders/delete`, headers: authHeaders,
+      payload: { folder: "Projects" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(folderDeleteResultSchema.parse(response.json()))
+      .toMatchObject({ folder: { folder: "Projects", syncEnabled: false }, messages: 0 });
+    expect(sync.mailboxes.has("Projects")).toBe(false);
+    // The row survives -- rows in this table are never deleted -- and the pass
+    // is what makes it go stale, which is what stops the pickers offering it.
+    const [row] = await handle.db.select().from(mailAccountFolders)
+      .where(and(eq(mailAccountFolders.accountId, account.id), eq(mailAccountFolders.folder, "Projects")));
+    expect(row).toMatchObject({ folder: "Projects", syncEnabled: false });
+    expect(syncNowCalls).toEqual([account.id]);
+    await a.close();
+  });
+
+  it("409s a delete of a folder the server says still holds mail, and deletes nothing", async () => {
+    const a = await app();
+    const { account, sync } = await folderAccount(a, { INBOX: 0, Sent: 0, Projects: 7 });
+
+    const response = await a.inject({
+      method: "POST", url: `/api/mail/accounts/${account.id}/folders/delete`, headers: authHeaders,
+      payload: { folder: "Projects" },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(response.json()).message)
+      .toMatch(/still holds 7 messages on the mail server, and Conduit does not delete mail/);
+    expect(sync.mailboxes.has("Projects")).toBe(true);
+    expect(syncNowCalls).toEqual([]);
+    await a.close();
+  });
+
+  it("rejects a body carrying a field the folder-command shapes do not have", async () => {
+    const a = await app();
+    const { account, sync } = await folderAccount(a);
+    // `.strict()`: a caller who sends syncEnabled here has confused this
+    // endpoint with the PATCH, and being told beats being silently stripped.
+    const response = await a.inject({
+      method: "POST", url: `/api/mail/accounts/${account.id}/folders`, headers: authHeaders,
+      payload: { folder: "Clients", syncEnabled: true },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(sync.mailboxes.has("Clients")).toBe(false);
+    await a.close();
+  });
+
+  it("keeps the three folder commands owner-only", async () => {
+    const a = await app();
+    const { account } = await folderAccount(a);
+    // otherHeaders is a different CRM user; a foreign account id 404s exactly
+    // as a nonexistent one does, so the two cannot be told apart.
+    for (const [url, payload] of [
+      [`/api/mail/accounts/${account.id}/folders`, { folder: "Clients" }],
+      [`/api/mail/accounts/${account.id}/folders/rename`, { folder: "Projects", newFolder: "Clients" }],
+      [`/api/mail/accounts/${account.id}/folders/delete`, { folder: "Projects" }],
+    ] as const) {
+      const response = await a.inject({ method: "POST", url, headers: otherHeaders, payload });
+      expect(response.statusCode).toBe(404);
+      // And unauthenticated is a 401 on every one of them.
+      expect((await a.inject({ method: "POST", url, payload })).statusCode).toBe(401);
+    }
+    await a.close();
   });
 
   it("requires authentication on both folder routes", async () => {
@@ -1934,7 +2187,7 @@ describe("mail bulk thread action route", () => {
     await a.close();
   });
 
-  it("caps trash and archive at 50 threads while hide keeps the shared schema's 200", async () => {
+  it("caps the three server moves at 50 threads while hide and unhide keep the shared schema's 200", async () => {
     const a = await app();
     const ids = Array.from({ length: 51 }, () => randomUUID());
 
@@ -1946,12 +2199,27 @@ describe("mail bulk thread action route", () => {
         message: `${action} accepts at most 50 threads per request (received 51)`,
       });
     }
+    // `file` (Phase 4.4) waits on the same serial loop as the other two, so it
+    // takes the same cap for the same reason.
+    const overFileCap = await bulk(a, {
+      threadIds: ids, folder: "INBOX", targetFolder: "Clients", action: "file",
+    });
+    expect(overFileCap.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(overFileCap.json())).toEqual({
+      error: "validation",
+      message: "file accepts at most 50 threads per request (received 51)",
+    });
 
-    // hide waits on nothing but the database, so it keeps the outer bound.
-    // (Every id here is unknown, which is a per-thread failure, not a 400.)
-    const hide = await bulk(a, { threadIds: ids, action: "hide" });
-    expect(hide.statusCode).toBe(200);
-    expect(bulkThreadResultSchema.parse(hide.json()).results).toHaveLength(51);
+    // hide and unhide wait on nothing but the database, so they keep the outer
+    // bound. (Every id here is unknown, which is a per-thread failure, not a
+    // 400.) UNHIDE IS THE ONE THAT USED TO BE GUESSED: the check was once
+    // `action !== "hide"`, which would have handed a local row DELETE the mail
+    // server's cap purely because it was not spelled "hide".
+    for (const action of ["hide", "unhide"] as const) {
+      const response = await bulk(a, { threadIds: ids, action });
+      expect(response.statusCode).toBe(200);
+      expect(bulkThreadResultSchema.parse(response.json()).results).toHaveLength(51);
+    }
 
     // Both caps bracketed on the passing side too, so neither is off by one:
     // exactly 50 moves, and exactly 200 hides.
@@ -1960,17 +2228,92 @@ describe("mail bulk thread action route", () => {
     });
     expect(atMoveCap.statusCode).toBe(200);
     expect(bulkThreadResultSchema.parse(atMoveCap.json()).results).toHaveLength(50);
-    const atSharedCap = await bulk(a, {
-      threadIds: Array.from({ length: 200 }, () => randomUUID()), action: "hide",
-    });
-    expect(atSharedCap.statusCode).toBe(200);
-    expect(bulkThreadResultSchema.parse(atSharedCap.json()).results).toHaveLength(200);
+    for (const action of ["hide", "unhide"] as const) {
+      const atSharedCap = await bulk(a, {
+        threadIds: Array.from({ length: 200 }, () => randomUUID()), action,
+      });
+      expect(atSharedCap.statusCode).toBe(200);
+      expect(bulkThreadResultSchema.parse(atSharedCap.json()).results).toHaveLength(200);
+    }
 
     // The shared cap still holds above it, for every action.
     const tooMany = await bulk(a, {
       threadIds: Array.from({ length: 201 }, () => randomUUID()), action: "hide",
     });
     expect(tooMany.statusCode).toBe(400);
+    await a.close();
+  });
+
+  // The destination is a SECOND field, and the schema's correlation with the
+  // action is enforced at the door rather than half-honoured downstream --
+  // both directions, because a silently ignored targetFolder is how a caller
+  // comes to believe it filed something.
+  it("400s a file with no destination, and a destination on any other action", async () => {
+    const a = await app();
+    const ids = [randomUUID()];
+
+    const noTarget = await bulk(a, { threadIds: ids, folder: "INBOX", action: "file" });
+    expect(noTarget.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(noTarget.json()).message).toContain("targetFolder is required");
+
+    for (const action of ["trash", "archive", "hide", "unhide"] as const) {
+      const response = await bulk(a, { threadIds: ids, targetFolder: "Clients", action });
+      expect(response.statusCode).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).message)
+        .toContain("targetFolder is only valid when action is file");
+    }
+    await a.close();
+  });
+
+  it("files into a folder the request names, turning that folder's sync on and saying so", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    // The case the whole rule is about: a folder Conduit knows and is NOT
+    // syncing. The picker offers it precisely so it can be filed into.
+    await seedFolder(account.id, "Clients", { syncEnabled: false });
+    const threadId = await seedThread({ subject: "File me", lastMessageAt: new Date("2026-08-04T10:00:00Z") });
+    const messageId = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-04T10:00:00Z"), imapUid: 71,
+    });
+
+    const response = await bulk(a, {
+      threadIds: [threadId], folder: "INBOX", targetFolder: "Clients", action: "file",
+    });
+
+    expect(response.statusCode).toBe(200);
+    // No warning, no gate, no second request: filing into the folder IS the
+    // instruction, and the response reports the consequence after the fact.
+    expect(bulkThreadResultSchema.parse(response.json())).toEqual({
+      results: [{ threadId, ok: true }], syncEnabled: "Clients",
+    });
+    expect(await messageRow(messageId)).toMatchObject({ folder: "Clients", imapUid: null });
+    expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [71], targetFolder: "Clients" }]);
+    const [folderRow] = await handle.db.select().from(mailAccountFolders).where(and(
+      eq(mailAccountFolders.accountId, account.id), eq(mailAccountFolders.folder, "Clients"),
+    ));
+    expect(folderRow?.syncEnabled).toBe(true);
+    await a.close();
+  });
+
+  it("unhides in bulk, removing the requesting user's own hide rows", async () => {
+    const a = await app();
+    const { account } = await readyAccount(a);
+    const first = await seedThread({ subject: "One", lastMessageAt: new Date("2026-08-04T10:00:00Z") });
+    await seedMessage(first, account.id, { sentAt: new Date("2026-08-04T10:00:00Z"), imapUid: 81 });
+    const second = await seedThread({ subject: "Two", lastMessageAt: new Date("2026-08-03T10:00:00Z") });
+    await seedMessage(second, account.id, { sentAt: new Date("2026-08-03T10:00:00Z"), imapUid: 82 });
+
+    expect((await bulk(a, { threadIds: [first, second], action: "hide" })).statusCode).toBe(200);
+    expect(await handle.db.select().from(mailThreadHides)).toHaveLength(2);
+
+    // The inverse, in one gesture rather than in two: fifty threads hide in
+    // one click and used to need fifty to come back.
+    const response = await bulk(a, { threadIds: [first, second], action: "unhide" });
+    expect(response.statusCode).toBe(200);
+    expect(bulkThreadResultSchema.parse(response.json())).toEqual({
+      results: [{ threadId: first, ok: true }, { threadId: second, ok: true }],
+    });
+    expect(await handle.db.select().from(mailThreadHides)).toHaveLength(0);
     await a.close();
   });
 
@@ -2180,6 +2523,160 @@ describe("mail bulk thread action route", () => {
     const response = await a.inject({
       method: "POST", url: "/api/mail/threads/bulk",
       payload: { threadIds: [UNKNOWN_ID], action: "hide" },
+    });
+    expect(response.statusCode).toBe(401);
+    await a.close();
+  });
+});
+
+// --- Per-message selection (Phase 4.4 Task 2) -------------------------------
+
+describe("mail bulk MESSAGE action route", () => {
+  async function readyAccount(a: App, overrides: Partial<MailAccountCreateInput> = {}) {
+    const account = await makeAccount(a, overrides);
+    await setMoveTargets(account.id, { trashFolder: "Trash", archiveFolder: "Archive" });
+    const sync = new FakeAccountSync();
+    syncs.set(account.id, sync);
+    return { account, sync };
+  }
+
+  async function bulkMessages(a: App, payload: Record<string, unknown>) {
+    return a.inject({ method: "POST", url: "/api/mail/messages/bulk", headers: authHeaders, payload });
+  }
+
+  async function messageRow(id: string) {
+    const [row] = await handle.db.select().from(mailMessages).where(eq(mailMessages.id, id));
+    return row;
+  }
+
+  it("files ONE message of a conversation and leaves its siblings alone", async () => {
+    const a = await app();
+    const { account, sync } = await readyAccount(a);
+    await seedFolder(account.id, "Clients", { syncEnabled: true });
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const filed = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 71,
+    });
+    const kept = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T09:00:00Z"), imapUid: 72,
+    });
+
+    const response = await bulkMessages(a, {
+      messageIds: [filed], targetFolder: "Clients", action: "file",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(bulkMessageResultSchema.parse(response.json()))
+      .toEqual({ results: [{ messageId: filed, ok: true }] });
+    expect(await messageRow(filed)).toMatchObject({ folder: "Clients", imapUid: null });
+    expect(await messageRow(kept)).toMatchObject({ folder: "INBOX", imapUid: 72 });
+    expect(sync.moveCalls).toEqual([{ folder: "INBOX", uids: [71], targetFolder: "Clients" }]);
+  });
+
+  it("answers per MESSAGE, so two messages of one thread can differ", async () => {
+    const a = await app();
+    const { account } = await readyAccount(a);
+    await seedFolder(account.id, "Clients", { syncEnabled: true });
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const moving = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 81,
+    });
+    const settled = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T09:00:00Z"), folder: "Clients", imapUid: 82,
+    });
+
+    const response = await bulkMessages(a, {
+      messageIds: [moving, settled], targetFolder: "Clients", action: "file",
+    });
+
+    expect(bulkMessageResultSchema.parse(response.json()).results).toEqual([
+      { messageId: moving, ok: true },
+      { messageId: settled, ok: true, skipped: true, reason: "already_in_target" },
+    ]);
+  });
+
+  it("turns the destination folder's sync on and says which folder, over the wire", async () => {
+    const a = await app();
+    const { account } = await readyAccount(a);
+    await seedFolder(account.id, "Clients", { syncEnabled: false });
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const messageId = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 91,
+    });
+
+    const response = await bulkMessages(a, {
+      messageIds: [messageId], targetFolder: "Clients", action: "file",
+    });
+
+    expect(bulkMessageResultSchema.parse(response.json()).syncEnabled).toBe("Clients");
+    const [row] = await handle.db.select().from(mailAccountFolders).where(and(
+      eq(mailAccountFolders.accountId, account.id), eq(mailAccountFolders.folder, "Clients"),
+    ));
+    expect(row?.syncEnabled).toBe(true);
+  });
+
+  // The narrowing this endpoint exists to keep. Each of these is a body whose
+  // sender misunderstands what it is asking for, and each gets a 400 at the
+  // door rather than a field quietly dropped -- a silently ignored `folder` is
+  // how a caller comes to believe it scoped something, and a silently ignored
+  // `hide` is how one comes to believe a message was filed out of its views.
+  it("rejects hide/unhide, a source folder, an over-cap list and a missing destination", async () => {
+    const a = await app();
+    const { account } = await readyAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const messageId = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 101,
+    });
+    for (const payload of [
+      { messageIds: [messageId], action: "hide" },
+      { messageIds: [messageId], action: "unhide" },
+      { messageIds: [messageId], folder: "INBOX", action: "archive" },
+      { messageIds: [messageId], action: "file" },
+      { messageIds: [messageId], targetFolder: "Clients", action: "archive" },
+      { messageIds: [], action: "archive" },
+      { messageIds: [messageId], threadIds: [threadId], action: "archive" },
+      {
+        messageIds: Array.from({ length: BULK_MESSAGE_ACTION_CAP + 1 }, () => randomUUID()),
+        action: "archive",
+      },
+    ]) {
+      const response = await bulkMessages(a, payload);
+      expect(response.statusCode).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    }
+    // And nothing moved on the way through all of that.
+    expect(await messageRow(messageId)).toMatchObject({ folder: "INBOX", imapUid: 101 });
+    await a.close();
+  });
+
+  it("accepts exactly the cap, since the schema's max IS this endpoint's only limit", async () => {
+    // The thread endpoint needs a route-level cap because its schema's 200 is
+    // an outer bound only hide/unhide may reach. Every kind here waits on a
+    // mail server, so one number covers them all and it lives in the schema.
+    const a = await app();
+    const { account } = await readyAccount(a);
+    const threadId = await seedThread({ lastMessageAt: new Date("2026-08-02T10:00:00Z") });
+    const first = await seedMessage(threadId, account.id, {
+      sentAt: new Date("2026-08-02T10:00:00Z"), imapUid: 111,
+    });
+    const messageIds = [
+      first,
+      ...Array.from({ length: BULK_MESSAGE_ACTION_CAP - 1 }, () => randomUUID()),
+    ];
+
+    const response = await bulkMessages(a, { messageIds, action: "archive" });
+
+    expect(response.statusCode).toBe(200);
+    expect(bulkMessageResultSchema.parse(response.json()).results)
+      .toHaveLength(BULK_MESSAGE_ACTION_CAP);
+    await a.close();
+  });
+
+  it("requires authentication", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/messages/bulk",
+      payload: { messageIds: [UNKNOWN_ID], action: "archive" },
     });
     expect(response.statusCode).toBe(401);
     await a.close();

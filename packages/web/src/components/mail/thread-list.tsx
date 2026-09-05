@@ -8,8 +8,9 @@ import {
   emptyCursorPages,
   flattenCursorPages,
   identityKey,
-  mergeCursorPage,
+  refreshCursorRows,
   relativeTime,
+  takeCursorPage,
   type CursorPages,
 } from "../../lib";
 import {
@@ -22,7 +23,9 @@ import {
   type MailThreadListParams,
 } from "../../queries";
 import { useLatest } from "../../hooks";
-import { addressLabel, hiddenChipLabel, subjectLabel } from "./mail-lib";
+import {
+  addressLabel, hiddenChipLabel, newMailLabel, pendingArrivals, subjectLabel,
+} from "./mail-lib";
 import { Button } from "../ui/button";
 
 /**
@@ -89,6 +92,24 @@ export interface ThreadListProps {
    * its selection into a request (and gate its move buttons on each row's
    * ownership) without duplicating the accumulator. */
   onRowsChange?: (rows: ThreadRowInfo[]) => void;
+  /**
+   * Bump this to make the list take a NEW SNAPSHOT: fetch page one afresh and
+   * start the accumulation over from it.
+   *
+   * The caller's own writes are what this is for (Phase 4.4 Task 3). The list
+   * holds still under mail arriving from elsewhere -- see the header comment --
+   * and a write the reader themselves made is the opposite case: they trashed
+   * ten conversations and those rows must go. The number is a nonce; only the
+   * fact that it CHANGED is read, so a caller may increment it from wherever
+   * its mutation settles without thinking about what the value means.
+   *
+   * NOT for a write that only changes what a row SAYS. Marking a conversation
+   * read is the one every reader does constantly, and re-snapshotting on it
+   * would move the list under them on every click -- exactly what this task
+   * exists to stop. The refresh in place handles that case with no gesture at
+   * all: the dot goes out where the row stands.
+   */
+  refreshToken?: number;
 }
 
 const DEFAULT_LIMIT = 25;
@@ -116,16 +137,85 @@ const DEFAULT_LIMIT = 25;
  * toggled on and off again used to resurrect a page-two cursor and lose page
  * one).
  *
- * One consequence, accepted: only the CURRENT page is a live query, so after
- * "load more" an SSE invalidation refreshes the page that is mounted and the
- * earlier pages keep the rows they were fetched with until the list resets
- * (a filter change, or a remount). New mail still bumps its thread to the top
- * of page one -- it is just not re-fetched underneath an accumulated list.
+ * =====================================================================
+ * LIVE, AND THE LIST DOES NOT MOVE UNDER THE READER (Phase 4.4 Task 3)
+ * =====================================================================
+ *
+ * WHAT THIS REPLACED, because the starting point was not "not live". The
+ * transport was already here: api/services/mail-ingest.ts publishes
+ * ["mail-threads"] after every ingest and components/sse.tsx invalidates it,
+ * so page one refetched on new mail and mergeCursorPage swapped the whole page
+ * for the server's newest 25. THAT is the thing the spec's third risk names.
+ * The list is ordered by `last_message_at`, so a reply to a three-week-old
+ * conversation does not add a row at the top -- it MOVES one there, from
+ * wherever it was, and every row in between shifts down by one. A reader
+ * halfway down, ticking rows or aiming at one, got a different row under the
+ * cursor between two clicks. What was genuinely missing was liveness BEYOND
+ * page one: after "load more" the observed query is page two, so page one --
+ * where new mail lands -- had no observer and never refetched at all.
+ *
+ * THE RULE, and it is one sentence: A ROW NEVER MOVES, APPEARS OR VANISHES
+ * WITHOUT THE READER ASKING; A ROW THAT IS ALREADY ON SCREEN IS KEPT CURRENT
+ * WHERE IT STANDS.
+ *
+ * So there are three behaviours, and the second is the one worth being sure
+ * about:
+ *
+ *   1. A conversation the reader cannot see gets new mail -> counted, and a
+ *      control at the top of the list offers to show it. Nothing moves until
+ *      it is pressed. (mail-lib's pendingArrivals, and the control below.)
+ *
+ *   2. A conversation the reader CAN see gets new mail -> its row is refreshed
+ *      in place: new snippet, new time, the unread dot back on, at the
+ *      position it already occupies. The mail is on screen immediately; what
+ *      is withheld is only the jump to the top. (lib.ts's refreshCursorRows.)
+ *
+ *   3. The reader's own write -> a new snapshot, because those rows really
+ *      have gone (see the refreshToken prop).
+ *
+ * THE ALTERNATIVES, and why each is worse:
+ *
+ *   INSERT THE ROWS AND LET THE LIST RE-ORDER. This is what the code did
+ *   before, and (1) is the whole of the case against it.
+ *
+ *   FREEZE THE LIST COMPLETELY UNTIL ASKED. One function shorter, and wrong
+ *   within a click: opening a conversation marks it read, which publishes
+ *   ["mail-threads"], and a list that adopted nothing would keep the bold
+ *   unread row for the conversation the reader is looking at. Behaviour (2)
+ *   is not a nicety, it is what makes the rule survive its own side effects.
+ *
+ *   REFETCH EVERY ACCUMULATED PAGE ON EACH HINT. The cursors are keyset
+ *   positions in an ordering that has moved. Page two's cursor was issued by
+ *   the page one that existed BEFORE three messages arrived; refetch page one
+ *   and it now ends three rows earlier, so the three rows between its new end
+ *   and that cursor are returned by neither fetch and are shown nowhere. The
+ *   dedupe in flattenCursorPages cannot help -- these are rows that arrive
+ *   from no page at all.
+ *
+ *   RE-SNAPSHOT ON EVERY HINT. That is "reorders under the reader" with extra
+ *   steps: it throws away their paging as well as their place, on somebody
+ *   else's schedule.
+ *
+ * SCROLL POSITION IS UNTOUCHED, AND THAT IS THE POINT. inbox.tsx rules that
+ * this surface keeps no state parallel to the URL, which is why it does not
+ * restore a scroll offset across its levels. THIS TASK DOES NOT OVERTURN THAT
+ * RULING AND DOES NOT NEED TO: the answer here is not to restore the reader's
+ * place after moving it, it is never to move it. Nothing below remembers an
+ * offset, and nothing calls scrollTo.
+ *
+ * TWO OBSERVERS, ONE OF THEM FREE. `head` below is page one, always -- which
+ * is what makes the list live past page one at all, since after "load more"
+ * the paging query is watching page two. While the reader is ON page one the
+ * two calls hash to the SAME query key (React Query's key hash drops
+ * undefined values, so `{cursor: undefined}` and no cursor are one entry), so
+ * they share one cache entry and one fetch and the second observer costs
+ * nothing. Only a reader who has paged pays for a second entry, and that is
+ * exactly the reader it exists for.
  */
 export function ThreadList({
   filters, onSelect, selectedId = null, limit = DEFAULT_LIMIT, emptyLabel = "No conversations",
   selectable = false, selectedIds, onToggleThread, onToggleAll, allSelected = false,
-  someSelected = false, selectionDisabled = false, onRowsChange,
+  someSelected = false, selectionDisabled = false, onRowsChange, refreshToken = 0,
 }: ThreadListProps) {
   const key = identityKey({ ...filters });
   const [pages, setPages] = useState<CursorPages<MailThreadListItem>>(
@@ -134,13 +224,100 @@ export function ThreadList({
   const cursor = cursorForKey(pages, key);
 
   const { data, isLoading, isFetching, error } = useMailThreads({ ...filters, cursor, limit });
+  // Page one, whatever page the reader is on. See the header: on page one this
+  // IS the query above, sharing its entry and its fetch.
+  const head = useMailThreads({ ...filters, limit });
+  const headData = head.data;
 
+  /**
+   * THE PAGING QUERY ONLY EVER ADDS A PAGE. takeCursorPage returns the record
+   * UNCHANGED for a cursor already held, so a refetch of a page on screen
+   * cannot move, insert or drop a row; refreshing what is already here is the
+   * other effect's job, and only the other effect's.
+   *
+   * `pages` is a dependency, which it has to be: a re-snapshot empties the
+   * accumulator without changing the data, the key OR the cursor (page one's
+   * cursor is undefined either way), and an effect that did not watch the
+   * accumulator would leave the list empty until something else happened to
+   * move. Safe because takeCursorPage settles -- its second call for the same
+   * cursor returns the same object, so React bails out.
+   */
   useEffect(() => {
     if (data === undefined) return;
-    // mergeCursorPage returns the SAME object when this page's items are the
-    // array already stored, so this settles after one pass instead of looping.
-    setPages((current) => mergeCursorPage(current, key, cursor, data.items, data.nextCursor));
-  }, [data, key, cursor]);
+    setPages((current) => takeCursorPage(current, key, cursor, data.items, data.nextCursor));
+  }, [data, key, cursor, pages]);
+
+  /**
+   * ...AND PAGE ONE IS THE ONLY THING THAT REFRESHES WHAT IS ON SCREEN.
+   *
+   * ONE WRITER, and lib.ts's refreshCursorRows says why it must be exactly
+   * one: two fetches writing row objects would hand out different objects for
+   * any row they both covered, and each would rewrite the other's, from an
+   * effect, for ever. The overlap is rare (page one and a later page's window
+   * are disjoint while nothing above the cursor is deleted) and an infinite
+   * render loop is not a thing to leave resting on "rare".
+   *
+   * PAGE ONE IS ALSO THE RIGHT ONE to be the writer: new mail is what makes a
+   * row's copy stale, and a conversation with new mail is by definition among
+   * the newest, so page one is where every fresh copy arrives -- whatever page
+   * the reader happens to be showing that row on.
+   *
+   * WHAT THAT COSTS, stated rather than discovered: a row below page one that
+   * changes WITHOUT becoming recent -- the unread dot on a conversation the
+   * reader opened at row 60 -- keeps its old copy until the next snapshot.
+   * Before this task the last-loaded page refetched into view and the earlier
+   * ones did not, so the same staleness was already here with a different
+   * boundary; what is new is that it is now a rule with a reason instead of a
+   * consequence of which query happened to be observed.
+   */
+  useEffect(() => {
+    if (headData === undefined) return;
+    setPages((current) => refreshCursorRows(current, key, headData.items));
+  }, [headData, key, pages]);
+
+  /**
+   * Take a new snapshot: fetch page one, THEN start the accumulation over from
+   * what came back.
+   *
+   * IN THAT ORDER, AND THE ORDER IS THE WHOLE FUNCTION. The caller's most
+   * important reason to ask is a write it has just made (refreshToken), and by
+   * then its mutation hook has already invalidated ["mail-threads"] -- so a
+   * fetch is in flight and the cache still holds the answer from BEFORE the
+   * write. Emptying the accumulator first would adopt that stale page, putting
+   * the ten conversations the reader just trashed straight back on screen; and
+   * the fresh page landing a moment later would find its cursor held again and
+   * refresh those rows in place rather than remove them, so they would stay
+   * there. Waiting for the fetch costs one round trip and is never wrong.
+   *
+   * `refetch` on an in-flight query returns that fetch's own promise (React
+   * Query dedupes), so the common case does not issue a second request.
+   *
+   * IT GOES BACK TO PAGE ONE, and the accumulated pages are re-fetched by
+   * pressing "Load more" again rather than re-paged here. Their cursors are
+   * keyset positions in the ordering that has just moved, so re-fetching each
+   * one with the cursor it was issued would leave the rows between page one's
+   * new end and page two's old cursor returned by no fetch at all. Page one is
+   * the only boundary that is certainly still true.
+   */
+  const headRefetch = head.refetch;
+  // The key AS OF THE RESET, not as of the ask: a filter changed while the
+  // fetch was in flight would otherwise re-key the accumulator backwards, and
+  // the list would blink empty for a render. Through a ref, so this callback
+  // keeps one identity (the effect below has it as a dependency).
+  const keyRef = useLatest(key);
+  const resnapshot = useCallback(() => {
+    void headRefetch().then(() => setPages(emptyCursorPages<MailThreadListItem>(keyRef.current)));
+  }, [headRefetch, keyRef]);
+
+  // Only a CHANGE means anything -- the value is a nonce -- so the mount pass,
+  // where there is nothing to refresh, is skipped rather than costing a fetch
+  // and a render on every list that ever mounts.
+  const seenToken = useRef(refreshToken);
+  useEffect(() => {
+    if (seenToken.current === refreshToken) return;
+    seenToken.current = refreshToken;
+    resnapshot();
+  }, [refreshToken, resnapshot]);
 
   const threads = useMemo(
     () => (pages.key === key ? flattenCursorPages(pages) : []),
@@ -162,6 +339,24 @@ export function ThreadList({
   // switches to a cache entry with no data yet, and a button that unmounted
   // for the duration of its own fetch could never show that it was fetching.
   const showLoadMore = pages.key === key && pages.nextCursor !== null;
+
+  /**
+   * What has arrived that the list is not showing -- the difference between
+   * the freshest page one and the rows on screen. mail-lib's pendingArrivals
+   * owns the two exclusions that keep the number honest.
+   *
+   * Both sides are this filter set's by construction, with no guard needed for
+   * it: `threads` is empty for any key the accumulator is not holding, and a
+   * changed key gives `head` a different query rather than the old one's data
+   * (nothing here sets placeholderData). An empty list counts nothing, so the
+   * render between a filter change and its first page offers nothing.
+   */
+  const pending = useMemo(
+    () => (headData === undefined
+      ? { count: 0, atLeast: false }
+      : pendingArrivals(threads, headData.items, headData.nextCursor !== null)),
+    [headData, threads],
+  );
 
   /**
    * The visible row order, for shift-ranges and select-all.
@@ -203,6 +398,30 @@ export function ThreadList({
           Could not load conversations: {error.message}
         </p>
       )}
+      {/* NOT STICKY, AND NOT A TOAST. A reader deep in a list is precisely the
+          reader this whole design is protecting from interruption, and a badge
+          that follows them down the page is the interruption in a smaller
+          font. It sits at the top of the list, where a reader who has come
+          back up to look for it will find it -- and the nav's unread badge
+          (live, and untouched by any of this) is the signal that says "there
+          is new mail" wherever they are.
+
+          MOUNTED ALWAYS, so its live region is announced when it fills:
+          exactly BulkResult's shape below the filter bar, and for the same
+          reason -- a region that appears with its text already in it is a
+          region a screen reader has nothing to compare against. */}
+      <div data-testid="thread-list-new" role="status" aria-live="polite" className="empty:hidden">
+        {pending.count > 0 && (
+          <Button
+            variant="outline"
+            className="mb-2 w-full"
+            data-testid="thread-list-new-show"
+            onClick={resnapshot}
+          >
+            {newMailLabel(pending)}
+          </Button>
+        )}
+      </div>
       {selectable && threads.length > 0 && (
         // 24px at a desk, measured. The TARGET is the label, not the 16px box
         // inside it -- a native checkbox cannot be resized without replacing

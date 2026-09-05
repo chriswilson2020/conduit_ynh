@@ -1,7 +1,8 @@
 import {
   ImapFlow,
   type AppendResponseObject, type CopyResponseObject, type FetchMessageObject,
-  type ImapFlowOptions, type StatusObject,
+  type ImapFlowOptions, type MailboxCreateResponse, type MailboxDeleteResponse,
+  type MailboxRenameResponse, type StatusObject,
 } from "imapflow";
 import nodemailer from "nodemailer";
 import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
@@ -780,6 +781,61 @@ export class ImapflowClient implements ImapClient {
       // messages and ingest's duplicate guard restores their UIDs.
       if (!moved) throw new Error(`MOVE from ${folder} to ${targetFolder} was refused`);
     });
+  }
+
+  /**
+   * CREATE, with the contract's falsy-return rule applied to a field rather
+   * than to the result: imapflow reports "the server said ALREADYEXISTS" as
+   * `created: false` on an otherwise successful resolve, so the check is
+   * `!created`, not `!response`.
+   *
+   * Every folder name is passed as a STRING, here and in the two below, never
+   * as imapflow's `string[]` path-segment form. The segment form asks imapflow
+   * to JOIN the parts with the server's delimiter, which is only correct for a
+   * caller that has the parts; this adapter's callers have a full path exactly
+   * as `list()` reported it, and splitting it to have imapflow rejoin it could
+   * only introduce a place to get the delimiter wrong.
+   */
+  async createMailbox(folder: string): Promise<void> {
+    const created = await this.run<MailboxCreateResponse | false | undefined>(
+      () => this.client.mailboxCreate(folder),
+    );
+    if (!created) throw new Error(`CREATE of ${folder} was refused`);
+    if (!created.created) throw new Error(`mailbox ${folder} already exists on the server`);
+  }
+
+  /** RENAME. Subtree-wide on the server -- see the contract. */
+  async renameMailbox(folder: string, newFolder: string): Promise<void> {
+    const renamed = await this.run<MailboxRenameResponse | false | undefined>(
+      () => this.client.mailboxRename(folder, newFolder),
+    );
+    if (!renamed) throw new Error(`RENAME of ${folder} to ${newFolder} was refused`);
+  }
+
+  /** DELETE. Destroys the mailbox's messages -- see the contract, and see
+   * mail-folders.ts for the checks that must have happened first. */
+  async deleteMailbox(folder: string): Promise<void> {
+    const deleted = await this.run<MailboxDeleteResponse | false | undefined>(
+      () => this.client.mailboxDelete(folder),
+    );
+    if (!deleted) throw new Error(`DELETE of ${folder} was refused`);
+  }
+
+  /**
+   * STATUS MESSAGES. `status()`'s falsy guard for the same reason it has one,
+   * plus a second on the field: imapflow's StatusObject types every counter as
+   * optional, and an absent MESSAGES read as 0 would be a server that declined
+   * to answer read as an empty mailbox -- on the one call whose answer decides
+   * whether mail is destroyed.
+   */
+  async messageCount(folder: string): Promise<number> {
+    const status = await this.run<StatusObject | false>(
+      () => this.client.status(folder, { messages: true }),
+    );
+    if (status === false) throw new Error(`could not read the status of ${folder}`);
+    const { messages } = status;
+    if (messages === undefined) throw new Error(`${folder} reported no message count`);
+    return messages;
   }
 
   /**

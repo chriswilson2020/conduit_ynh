@@ -4,10 +4,12 @@ import {
   bulkActionBlocked,
   bulkOwnershipBlocked,
   bulkPendingLabel,
+  fileTargetsBlocked,
   selectionLabel,
   type BulkActionSummary,
 } from "./mail-lib";
 import { Button } from "../ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 
 /**
  * What one completed bulk action left behind: the server's per-thread verdicts,
@@ -42,26 +44,58 @@ export interface BulkBarProps {
    * component that called `mutate` is still mounted, and this component is
    * unmounted by its own success. */
   pendingAction: BulkThreadActionKind | null;
-  onRun: (action: BulkThreadActionKind) => void;
+  /** The folder a pending `file` is filing into, for the pending line. */
+  pendingTarget: string | null;
+  /**
+   * The destination folders this selection may be filed into (Phase 4.4) --
+   * the CURRENT ACCOUNT'S own folder names, byte-exact as the server listed
+   * them, unsyncable ones already dropped by the caller. Empty when the list
+   * is not scoped to one account, which `accountScoped` tells apart from an
+   * account that simply has none yet (fileTargetsBlocked words both).
+   */
+  folders: readonly string[];
+  accountScoped: boolean;
+  /**
+   * The list is showing the viewer's HIDDEN threads, so the CRM-side button is
+   * Unhide rather than Hide in CRM.
+   *
+   * SWAPPED, NOT ADDED, which is the same choice conversation.tsx makes from a
+   * thread's own `hiddenAt`: the pair are inverses, exactly one of them is the
+   * useful gesture for a given selection, and rendering both would put a
+   * permanent no-op next to the action the user wants. In the Hidden view
+   * every row is hidden by definition, so the swap needs no per-row state.
+   */
+  hiddenView: boolean;
+  onRun: (action: BulkThreadActionKind, targetFolder?: string) => void;
   onClear: () => void;
 }
 
 /**
- * The bar that appears while rows are selected: Archive, Trash, Hide in CRM.
+ * The bar that appears while rows are selected: Archive, Trash, File into…,
+ * and Hide in CRM (or Unhide, in the Hidden view).
  *
- * All three go through POST /api/mail/threads/bulk (see the inbox page, which
- * owns the mutation). The first two MOVE mail on the IMAP server (to the
- * account's Archive/Trash folder); the third is the CRM-only, PER-ACTOR
- * filing act (Phase 4.3: hide rows for the clicking user alone -- nobody
- * else's view moves), labelled "Hide in CRM" everywhere so the two can
- * never be confused.
+ * All of them go through POST /api/mail/threads/bulk (see the inbox page,
+ * which owns the mutation). The first three MOVE mail on the IMAP server --
+ * Archive and Trash to the folders the ACCOUNT names, File to the one the
+ * USER picks (Phase 4.4) -- while the last is the CRM-only, PER-ACTOR filing
+ * act (Phase 4.3: hide rows for the clicking user alone -- nobody else's view
+ * moves), labelled "Hide in CRM" everywhere so the two can never be confused.
+ *
+ * FILING INTO A FOLDER CONDUIT IS NOT SYNCING TURNS THAT SYNC ON, and nothing
+ * here asks about it first: filing a thread into a folder IS the statement
+ * that the folder matters (api: mail-move.ts's header, where the rejected
+ * warn-instead design is recorded). What the user gets afterwards is a
+ * sentence in the result below, not a dialog before the click.
  *
  * `role="group"`, not `role="toolbar"`: a toolbar is a single tab stop with
  * arrow-key navigation between its controls, and implementing none of that
  * while claiming the role leaves a keyboard user pressing arrows at buttons
  * that do not respond. A labelled group is what this actually is.
  */
-export function BulkBar({ count, unowned, capped, pendingAction, onRun, onClear }: BulkBarProps) {
+export function BulkBar({
+  count, unowned, capped, pendingAction, pendingTarget, folders, accountScoped, hiddenView,
+  onRun, onClear,
+}: BulkBarProps) {
   const pending = pendingAction !== null;
   return (
     <div
@@ -83,10 +117,21 @@ export function BulkBar({ count, unowned, capped, pendingAction, onRun, onClear 
           testId="bulk-trash" label="Trash" action="trash"
           count={count} unowned={unowned} pending={pending} onRun={onRun}
         />
-        <BulkButton
-          testId="bulk-hide" label="Hide in CRM" action="hide"
-          count={count} unowned={unowned} pending={pending} onRun={onRun}
+        <FilePicker
+          count={count} unowned={unowned} pending={pending}
+          folders={folders} accountScoped={accountScoped} onRun={onRun}
         />
+        {hiddenView ? (
+          <BulkButton
+            testId="bulk-unhide" label="Unhide" action="unhide"
+            count={count} unowned={unowned} pending={pending} onRun={onRun}
+          />
+        ) : (
+          <BulkButton
+            testId="bulk-hide" label="Hide in CRM" action="hide"
+            count={count} unowned={unowned} pending={pending} onRun={onRun}
+          />
+        )}
         <Button variant="ghost" data-testid="bulk-clear" onClick={onClear} disabled={pending}>
           Clear
         </Button>
@@ -99,10 +144,14 @@ export function BulkBar({ count, unowned, capped, pendingAction, onRun, onClear 
           minutes, and a bar that only greyed out would read as a dead app. */}
       {pendingAction !== null && (
         <p data-testid="bulk-pending" role="status" className="text-xs text-slate-500">
-          {bulkPendingLabel(pendingAction, count)}
+          {bulkPendingLabel(pendingAction, count, pendingTarget)}
         </p>
       )}
-      {!pending && <BulkBlockedNote count={count} unowned={unowned} />}
+      {!pending && (
+        <BulkBlockedNote
+          count={count} unowned={unowned} folders={folders} accountScoped={accountScoped}
+        />
+      )}
     </div>
   );
 }
@@ -129,11 +178,27 @@ export function BulkBar({ count, unowned, capped, pendingAction, onRun, onClear 
  * shared or deal-linked mailbox the viewer does not own and the two moves
  * grey out with this explanation, while Hide stays live.
  */
-function BulkBlockedNote({ count, unowned }: { count: number; unowned: number }) {
+function BulkBlockedNote({
+  count, unowned, folders, accountScoped,
+}: {
+  count: number;
+  unowned: number;
+  folders: readonly string[];
+  accountScoped: boolean;
+}) {
   const moves = bulkActionBlocked("archive", count);
   const hide = bulkActionBlocked("hide", count);
   const capNote = hide ?? moves;
   const ownerNote = bulkOwnershipBlocked("archive", unowned);
+  // The picker's own reason, and it is REACHABLE in the ordinary course of
+  // using the app: a user with two mail accounts opens the inbox on "All
+  // accounts", where a list of folder names would be one mailbox's names
+  // pretending to be everyone's. (With ONE account the page treats "all" as
+  // that account and the picker stays live -- see the inbox's fileAccountId,
+  // where that case is settled.) Suppressed while the ownership note is up:
+  // filing is owner-only too, so both would be showing and the ownership one
+  // is the more specific answer.
+  const fileNote = ownerNote === null ? fileTargetsBlocked("list", accountScoped, folders.length) : null;
   return (
     <>
       {capNote !== null && (
@@ -146,7 +211,64 @@ function BulkBlockedNote({ count, unowned }: { count: number; unowned: number })
           {ownerNote}
         </p>
       )}
+      {fileNote !== null && (
+        <p data-testid="bulk-file-blocked" className="text-xs text-amber-700">
+          {fileNote}
+        </p>
+      )}
     </>
+  );
+}
+
+/**
+ * "File into…": the destination picker, and the fourth bulk action.
+ *
+ * PICKING THE FOLDER IS THE GESTURE. There is no second "File" button to press
+ * after choosing, because the choice IS the instruction -- the same one click
+ * the other three buttons take, and the "one gesture" the spec asks for.
+ * Nothing here is destructive in the way that would argue for a confirm step:
+ * a misfiled conversation is filed back with the same control, and the mail
+ * itself is never expunged.
+ *
+ * The value is never held. This is a trigger, not a setting: a Select that
+ * remembered "Clients" would read as a filter on the bar, and the bar is gone
+ * by the time the action lands anyway (the page drops the selection on
+ * success). So the trigger always shows its placeholder.
+ *
+ * Disabled with the same three reasons as the buttons -- the cap, the
+ * owner-only move rule, and the picker's own (no single account, or no folders
+ * yet) -- and every one of them rendered as text by BulkBlockedNote above,
+ * because a `title` on a disabled control is invisible to a touch screen and
+ * silent to a screen reader.
+ */
+function FilePicker({
+  count, unowned, pending, folders, accountScoped, onRun,
+}: {
+  count: number;
+  unowned: number;
+  pending: boolean;
+  folders: readonly string[];
+  accountScoped: boolean;
+  onRun: (action: BulkThreadActionKind, targetFolder?: string) => void;
+}) {
+  const blocked = bulkActionBlocked("file", count)
+    ?? bulkOwnershipBlocked("file", unowned)
+    ?? fileTargetsBlocked("list", accountScoped, folders.length);
+  return (
+    <Select value="" onValueChange={(folder) => onRun("file", folder)} disabled={pending || blocked !== null}>
+      <SelectTrigger
+        testId="bulk-file"
+        ariaLabel="File into folder"
+        className="w-auto min-w-44 disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <SelectValue placeholder={"File into\u2026"} />
+      </SelectTrigger>
+      <SelectContent position="popper">
+        {folders.map((folder) => (
+          <SelectItem key={folder} value={folder}>{folder}</SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   );
 }
 

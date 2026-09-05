@@ -1,9 +1,11 @@
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
   mailAccountCreateInputSchema, mailAccountUpdateInputSchema, mailAccountUpdatePasswordFieldsSchema,
   mailAccountTestInputSchema, mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
-  bulkThreadActionInputSchema, folderPatchInputSchema, MOVE_ACTION_THREAD_CAP,
+  bulkThreadActionInputSchema, bulkMessageActionInputSchema, folderPatchInputSchema,
+  folderCreateInputSchema, folderRenameInputSchema, folderDeleteInputSchema,
+  BULK_ACTION_THREAD_CAPS,
   type MailAccountSyncStats,
 } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
@@ -13,7 +15,7 @@ import {
 import { openBlob } from "../services/blobs.js";
 import { decodeLastMessageAtCursor } from "../services/pagination.js";
 import type { SendMailSyncManager } from "../services/mail-send.js";
-import type { SyncStopOptions, SyncStopResult } from "../services/mail-sync.js";
+import type { ImapFolderListing, SyncStopOptions, SyncStopResult } from "../services/mail-sync.js";
 import { sendMail } from "../services/mail-send.js";
 import { defaultTestConnectionDeps } from "../services/mail-imapflow.js";
 import {
@@ -24,8 +26,10 @@ import {
   hideThread, unhideThread, unreadThreadCount, unreadCountsByFolder,
   getAttachmentBlob, toMessage,
 } from "../services/mail-threads.js";
-import { listAccountFolders, setFolderSyncEnabled } from "../services/mail-folders.js";
-import { moveThreads } from "../services/mail-move.js";
+import {
+  createFolder, deleteFolder, listAccountFolders, renameFolder, setFolderSyncEnabled,
+} from "../services/mail-folders.js";
+import { moveMessages, moveThreads } from "../services/mail-move.js";
 
 /**
  * The slice of mail-sync.ts's SyncManager the ROUTES use, declared here for
@@ -53,6 +57,22 @@ export interface MailRouteSyncManager extends SendMailSyncManager {
      * claiming a move that never happened (see accountStateOf).
      */
     moveMessages(folder: string, uids: readonly number[], targetFolder: string): Promise<void>;
+    /**
+     * The four folder commands (Phase 4.4 Task 4), widened onto this slice for
+     * exactly the reason `moveMessages` was: one getter then also satisfies
+     * mail-folders.ts's FolderSyncManager, so the three folder routes hand this
+     * value straight to that service rather than the router carrying a third
+     * manager beside the other two.
+     *
+     * Not best-effort either, and for a sharper version of the move service's
+     * reason: a missing sync means Conduit cannot reach the mail server at all,
+     * and the local half of a folder command is a change to records describing
+     * a mailbox nobody changed (see folderSyncOf).
+     */
+    listFolders(): Promise<ImapFolderListing[]>;
+    createMailbox(folder: string): Promise<void>;
+    renameMailbox(folder: string, newFolder: string): Promise<void>;
+    deleteMailboxIfEmpty(folder: string): Promise<number>;
     readonly stats: MailAccountSyncStats;
   } | undefined;
   /**
@@ -260,6 +280,34 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   // --- Folders -------------------------------------------------------------
 
   /**
+   * Ask for a sync pass after a folder command, and do not wait for it.
+   *
+   * The PATCH handler's enable branch does this inline and this is the same
+   * thing three call sites deep, so it is one function: syncNow resolves when
+   * the pass is REQUESTED (the loop may be mid-backfill), the client learns
+   * what came of it from the SSE hints the pass publishes, and a rejection is
+   * logged and swallowed because the write this route came to make has already
+   * landed. The `try` around the `void` is the same belt and braces the two
+   * inline copies carry: syncNow is documented to reject rather than throw, and
+   * a fake that throws must not take the request with it.
+   */
+  function requestPassAfterFolderCommand(
+    request: FastifyRequest, accountId: string, folder: string,
+  ): void {
+    const onFailure = (error: unknown): void => {
+      request.log.warn(
+        { err: error, accountId, folder },
+        "mail: could not request a sync pass after a folder command",
+      );
+    };
+    try {
+      void syncManager()?.syncNow(accountId).catch(onFailure);
+    } catch (error) {
+      onFailure(error);
+    }
+  }
+
+  /**
    * The account's discovered folders, for the Settings picker and the inbox
    * sidebar (Phase 4.1).
    *
@@ -342,6 +390,110 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
       }
     }
     return result.folder;
+  });
+
+  /**
+   * Create, rename and delete a MAILBOX ON THE SERVER (Phase 4.4 Task 4).
+   *
+   * Owner-only like every other folder route above, through the same
+   * mustGetOwnedAccount check inside the service -- and more obviously so:
+   * these change another person's mail server, and only its owner may.
+   *
+   * ALL THREE ARE POST, and rename and delete deliberately do not name the
+   * folder in the path. An IMAP mailbox name is arbitrary user text -- it can
+   * carry the hierarchy separator, spaces and any non-ASCII the server's
+   * namespace allows -- and a name in a URL is a name in every access log and
+   * proxy trace between here and the browser. Same reasoning as the
+   * test-connection route below being POST despite reading nothing. It is also
+   * why DELETE-the-verb is not used: the name has to travel in a body, and a
+   * body on DELETE is a thing HTTP declines to define.
+   *
+   * NO REQUEST CAP HERE, unlike the bulk routes. Each of these is ONE mailbox
+   * command, so there is no size to bound -- but they do wait on the account's
+   * serial sync loop exactly as a bulk move does, so a folder command issued
+   * against an account mid-backfill waits for that backfill, and a proxy 504
+   * means the ANSWER was lost rather than that the command failed.
+   */
+  app.post("/api/mail/accounts/:id/folders", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(folderCreateInputSchema, request.body, reply);
+    if (input === undefined) return;
+    try {
+      const folder = await createFolder(db, user.id, params.id, input, {
+        syncManager: syncManager(), logger: request.log,
+      });
+      void reply.code(201);
+      return folder;
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
+  });
+
+  /**
+   * Rename, with the two-system write mail-folders.ts's renameFolder argues.
+   *
+   * A SYNC PASS IS ASKED FOR AFTERWARDS, and not waited on, exactly as the
+   * PATCH above does when it enables a folder. The re-key has already made
+   * Conduit's own records right; what a pass adds is the server's opinion of
+   * the new name -- its SPECIAL-USE classification, which the rename
+   * deliberately does not guess (see renameFolder) -- and it costs nothing to
+   * ask for it now rather than in five minutes. A rejection is logged and
+   * swallowed for that route's reason: a sync engine having a bad day must not
+   * turn a completed rename into a 500.
+   */
+  app.post("/api/mail/accounts/:id/folders/rename", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(folderRenameInputSchema, request.body, reply);
+    if (input === undefined) return;
+    let result;
+    try {
+      result = await renameFolder(db, user.id, params.id, input, {
+        syncManager: syncManager(), logger: request.log,
+      });
+    } catch (error) {
+      mapDomainError(reply, error);
+      return;
+    }
+    requestPassAfterFolderCommand(request, params.id, input.folder);
+    return result;
+  });
+
+  /**
+   * Delete, which deletes no mail: mail-folders.ts's deleteFolder refuses a
+   * folder the server says still holds any, and keeps every message Conduit
+   * had already stored from it.
+   *
+   * THE PASS MATTERS MORE HERE THAN ANYWHERE ELSE ON THIS ROUTER. The deleted
+   * folder's row survives (rows in that table are never deleted), and what
+   * makes the clients stop offering it is going STALE -- its
+   * last_discovered_at standing still while every re-sighted folder's moves on.
+   * Only a pass moves the others. Without this call the row would go on looking
+   * live, and filable-into, until the poll interval came round.
+   */
+  app.post("/api/mail/accounts/:id/folders/delete", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(folderDeleteInputSchema, request.body, reply);
+    if (input === undefined) return;
+    let result;
+    try {
+      result = await deleteFolder(db, user.id, params.id, input, {
+        syncManager: syncManager(), logger: request.log,
+      });
+    } catch (error) {
+      mapDomainError(reply, error);
+      return;
+    }
+    requestPassAfterFolderCommand(request, params.id, input.folder);
+    return result;
   });
 
   // POST, not GET, despite reading nothing: the body carries credentials for
@@ -528,10 +680,20 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   });
 
   /**
-   * The bulk thread actions: Trash and Archive MOVE messages on the IMAP
-   * server, "Hide in CRM" writes the ACTOR'S own per-user hide rows
+   * The bulk thread actions: Trash, Archive and File MOVE messages on the IMAP
+   * server -- the first two to a folder the OWNING ACCOUNT names, File (Phase
+   * 4.4) to one the REQUEST names in `targetFolder` -- while "Hide in CRM" and
+   * its inverse write and delete the ACTOR'S own per-user hide rows
    * (mail_thread_hides, Phase 4.3 -- nobody else's views change;
-   * services/mail-move.ts owns all three).
+   * services/mail-move.ts owns all five).
+   *
+   * FILING INTO A FOLDER CONDUIT IS NOT SYNCING TURNS THAT SYNC ON, without
+   * warning and without refusing (the Phase 4.4 rule -- see mail-move.ts's
+   * header for why a warning there would be an admission that the design is
+   * wrong). It is the one side effect of this route that outlives the request,
+   * so the response says which folder it was (`syncEnabled`) for the client to
+   * show after the fact, and the service's summary log line records it for
+   * whoever asks later.
    *
    * AUTH-ONLY at the route, BY DESIGN -- the real gates live in the service,
    * in a fixed order. Thread ids of other users' private threads ARE
@@ -576,10 +738,10 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     if (user === null) return;
     const input = parseOrReject(bulkThreadActionInputSchema, request.body, reply);
     if (input === undefined) return;
-    // The shared schema's 200 is the outer bound and only `hide` may reach it:
-    // hiding is one CRM-side hide-row insert per thread (the actor's own
-    // mail_thread_hides row), while trash/archive each
-    // wait on a real mail server. Capping the two MOVE actions lower is the
+    // The shared schema's 200 is the outer bound and only the CRM-side pair
+    // may reach it: hiding and unhiding are one hide-row insert or delete per
+    // thread (the actor's own mail_thread_hides row), while trash/archive/file
+    // each wait on a real mail server. Capping the MOVE actions lower is the
     // ruling's answer to that wait -- bound the SIZE of the request rather than
     // its duration, since a timeout would produce exactly the "claimed a move
     // the server refused" state the move service's compensation exists to
@@ -589,14 +751,23 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     // account's serial loop is already doing -- and a user who has pressed "load
     // more" once can still select everything on screen and act on it in one
     // gesture. Enforced HERE rather than in the schema because it is a
-    // property of the ACTION, not of the body shape; the NUMBER lives in
-    // @conduit/shared beside that schema, because the web client mirrors it (its
-    // select-all cap) and a client-side copy that drifted would build requests
-    // this line answers with a 400.
-    if (input.action !== "hide" && input.threadIds.length > MOVE_ACTION_THREAD_CAP) {
+    // property of the ACTION, not of the body shape; the NUMBERS live in
+    // @conduit/shared beside that schema, because the web client mirrors them
+    // (its select-all cap) and a client-side copy that drifted would build
+    // requests this line answers with a 400.
+    //
+    // READ OFF A TABLE, not off an `action !== "hide"` test, which is what
+    // this line used to be. That negation was right while `hide` was the only
+    // action waiting on nothing, and would have silently handed Phase 4.4's
+    // `unhide` -- a local row DELETE -- the mail server's cap, with no test to
+    // notice. BULK_ACTION_THREAD_CAPS is a Record over the kind enum, so the
+    // next kind cannot be added without someone deciding which side of the
+    // wait it is on.
+    const cap = BULK_ACTION_THREAD_CAPS[input.action];
+    if (input.threadIds.length > cap) {
       return reply.code(400).send({
         error: "validation",
-        message: `${input.action} accepts at most ${MOVE_ACTION_THREAD_CAP} threads per request`
+        message: `${input.action} accepts at most ${cap} threads per request`
           + ` (received ${input.threadIds.length})`,
       });
     }
@@ -606,6 +777,59 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
         // when routes are registered (see CrmRouteDeps.syncManager). null is
         // an ordinary answer here and the service knows what to do with it --
         // every account refuses, and each refusal is reported per thread.
+        syncManager: syncManager(),
+        logger: request.log,
+      });
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
+  });
+
+  /**
+   * POST /api/mail/messages/bulk -- the per-message selection (Phase 4.4).
+   *
+   * A SEPARATE ROUTE FROM /threads/bulk, not a widened one, and this is the
+   * whole surface the ruling produces. Selection in this app has been per
+   * THREAD since 4.3, whose folder-scoped rule exists precisely because a
+   * thread id cannot say which of its spread-out messages a gesture meant.
+   * A message id says it exactly. Overloading `threadIds` to sometimes mean
+   * messages -- or teaching this body two units -- is how that scoping rule
+   * became necessary in the first place.
+   *
+   * It is deliberately NARROWER than the thread endpoint on three axes, each
+   * checked by the shared schema rather than here (see
+   * bulkMessageActionInputSchema): the three MOVE kinds only, since a hide is
+   * one mail_thread_hides row per THREAD and there is no per-message one; no
+   * source `folder`, since the ids are already the exact scope, and a body
+   * carrying one is REJECTED rather than quietly ignored; and results keyed on
+   * `messageId`, because two messages of one conversation can genuinely land
+   * differently and a thread-keyed answer would have to lie about one of them.
+   *
+   * NO CAP CHECK OF ITS OWN, unlike the thread endpoint above, and the absence
+   * is the point rather than an omission. That one needs a route-level check
+   * because its schema's 200 is an outer bound only the CRM-side pair may
+   * reach, so the real limit depends on the ACTION. Here every kind waits on a
+   * mail server, so there is one limit for all of them and it lives in the
+   * schema's own `.max()` (BULK_MESSAGE_ACTION_CAP) -- a second copy here
+   * would be two numbers to keep in step for no gain.
+   *
+   * Everything else is the thread endpoint's contract unchanged: always 200
+   * when the request itself was valid, per-message verdicts inside the body in
+   * request order, and A 504 FROM A PROXY DOES NOT MEAN THE ACTION FAILED --
+   * the queued MOVEs run on their accounts' serial sync loops and carry on
+   * after the client disconnects, so the answer is lost while the work lands.
+   * Refetch rather than retry.
+   */
+  app.post("/api/mail/messages/bulk", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const input = parseOrReject(bulkMessageActionInputSchema, request.body, reply);
+    if (input === undefined) return;
+    try {
+      return await moveMessages(db, user.id, input, {
+        // Resolved per request, never captured -- the manager does not exist
+        // when routes are registered (see CrmRouteDeps.syncManager), and null
+        // is an ordinary answer the service knows what to do with.
         syncManager: syncManager(),
         logger: request.log,
       });

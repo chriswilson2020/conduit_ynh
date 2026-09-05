@@ -3,8 +3,8 @@ import type {
   MailUnreadFolderCount, SpecialUse,
 } from "@conduit/shared";
 import {
-  BULK_THREAD_ACTION_CAP, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
-  MOVE_ACTION_THREAD_CAP,
+  BULK_ACTION_THREAD_CAPS, MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
+  MOVE_ACTION_THREAD_CAP, BULK_MESSAGE_ACTION_CAP,
 } from "@conduit/shared";
 import { ApiError, ResponseShapeError } from "../../api";
 import { relativeTime } from "../../lib";
@@ -844,15 +844,6 @@ export interface ThreadSelection {
  */
 export const SELECT_ALL_CAP = MOVE_ACTION_THREAD_CAP;
 
-/** Per-action request caps, mirroring the API: the shared schema's outer bound,
- * which only `hide` may reach, and the route's tighter one for the two actions
- * that wait on a real mail server. Both numbers come from @conduit/shared. */
-const BULK_ACTION_CAPS: Record<BulkThreadActionKind, number> = {
-  trash: MOVE_ACTION_THREAD_CAP,
-  archive: MOVE_ACTION_THREAD_CAP,
-  hide: BULK_THREAD_ACTION_CAP,
-};
-
 export function emptySelection(key: string): ThreadSelection {
   return { key, ids: new Set(), anchor: null, capped: null };
 }
@@ -1005,9 +996,58 @@ export function selectedThreadIds(
  * beats a red error after the click.
  */
 export function bulkActionBlocked(action: BulkThreadActionKind, count: number): string | null {
-  const cap = BULK_ACTION_CAPS[action];
+  // The API's own table, imported rather than mirrored: it used to be a copy
+  // of the same Record in this file, which is one more place for the numbers
+  // to drift and one more place a new action kind has to be remembered.
+  const cap = BULK_ACTION_THREAD_CAPS[action];
   if (count <= cap) return null;
   return `Select ${cap} conversations or fewer for this action (${count} selected).`;
+}
+
+/**
+ * Why the destination picker cannot be offered, or null when it can.
+ *
+ * TWO CAUSES, TWO SENTENCES, because they have two different remedies and a
+ * greyed control with no explanation is the thing this bar has been at pains
+ * not to be (see BulkBlockedNote).
+ *
+ * The account one is the interesting decision. A folder name is PER MAILBOX:
+ * "Clients" on one account and "Clients" on another are different folders that
+ * may not both exist, so a picker built while the list is showing every
+ * account would be offering one account's folders as if they were everyone's.
+ * The API handles the mixed case honestly either way -- it resolves the
+ * destination per account and refuses only the accounts that lack it
+ * (unknown_target) -- so this is a UI decision about what a list of folder
+ * names can truthfully mean, not a server limitation.
+ *
+ * WHERE THE ONE ACCOUNT COMES FROM is the scope, and each has its own first
+ * sentence because each has its own remedy. In the LIST it is the account
+ * filter, so the answer is to pick one. In the CONVERSATION header there is no
+ * filter to pick from -- the account is whichever of the viewer's own mailboxes
+ * the thread's messages sit on, and a conversation that reaches two of them
+ * cannot be filed as a unit, so the remedy is to file the messages instead. In
+ * the message BAR the remedy is narrower still: untick until the selection is
+ * one mailbox's. A Record over the scope rather than an if-chain, for the same
+ * compile-nudge reason as every other table in this file.
+ */
+export type FileTargetScope = "list" | "conversation" | "messages";
+
+const NO_SINGLE_ACCOUNT: Record<FileTargetScope, string> = {
+  list: "Pick a single account above to file into one of its folders.",
+  conversation: "This conversation reaches more than one of your mailboxes, whose folders are"
+    + " different \u2014 select the messages you want and file those.",
+  messages: "Select messages from a single mailbox to file them into one of its folders.",
+};
+
+export function fileTargetsBlocked(
+  scope: FileTargetScope, accountScoped: boolean, folderCount: number,
+): string | null {
+  if (!accountScoped) return NO_SINGLE_ACCOUNT[scope];
+  if (folderCount === 0) {
+    return "This account has no folders to file into yet \u2014 they appear once a sync pass has"
+      + " listed them.";
+  }
+  return null;
 }
 
 /**
@@ -1020,7 +1060,20 @@ export function bulkActionBlocked(action: BulkThreadActionKind, count: number): 
  * can be ANOTHER user's, whose sharing is not the viewer's to change.
  */
 export const NOT_OWNER_EXPLANATION =
-  "only the mailbox owner can archive or trash \u2014 Hide in CRM is available to everyone";
+  "only the mailbox owner can file, archive or trash \u2014 Hide in CRM is available to everyone";
+
+/**
+ * Which actions the owner-only move rule applies to -- a Record over the kind
+ * enum rather than an `action === "hide"` test, so a new kind is a compile
+ * error here until someone decides whether it touches a mailbox.
+ *
+ * `file` (Phase 4.4) is a server MOVE and takes the rule; `unhide` is the CRM
+ * side and does not, symmetric with `hide` -- both are exactly the actions
+ * every viewer keeps.
+ */
+const NEEDS_OWNERSHIP: Record<BulkThreadActionKind, boolean> = {
+  trash: true, archive: true, file: true, hide: false, unhide: false,
+};
 
 /**
  * Why the two MOVE actions cannot be sent for this selection, or null when
@@ -1046,9 +1099,130 @@ export const NOT_OWNER_EXPLANATION =
 export function bulkOwnershipBlocked(
   action: BulkThreadActionKind, unowned: number,
 ): string | null {
-  if (action === "hide" || unowned <= 0) return null;
+  if (!NEEDS_OWNERSHIP[action] || unowned <= 0) return null;
   const what = unowned === 1 ? "1 selected conversation is" : `${unowned} selected conversations are`;
   return `${what} in a mailbox you don't own: ${NOT_OWNER_EXPLANATION}.`;
+}
+
+// ---------------------------------------------------------------------------
+// Per-message selection, in the conversation (Phase 4.4 Task 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the conversation holds while messages are ticked.
+ *
+ * NO ANCHOR AND NO RANGE, unlike ThreadSelection, and that is a decision about
+ * this surface rather than an unfinished copy of that one. A shift-range exists
+ * in the list because a folder view ACCUMULATES pages and can hold hundreds of
+ * rows the user would otherwise tick one at a time. A conversation renders one
+ * thread, capped at the newest 50 unless Show-earlier is pressed, all of it on
+ * one screen -- there is no long haul for a range to shorten.
+ *
+ * THERE IS NO SELECT-ALL HERE EITHER, for a stronger reason: filing the whole
+ * conversation is a DIFFERENT and better action that already exists one row
+ * above (the header picker, Task 2's first half). It sends whole-thread mode,
+ * which takes every message including any below the detail cap and carves out
+ * Sent; a select-all would send capped, message-scoped ids instead. Offering
+ * both would be offering a worse way to do the same thing, next to the better
+ * one.
+ */
+export interface MessageSelection {
+  ids: ReadonlySet<string>;
+  /** What the last gesture asked for when the cap refused it (cap + 1), else
+   * null -- the same reporting ThreadSelection.capped does. */
+  capped: number | null;
+}
+
+export function emptyMessageSelection(): MessageSelection {
+  return { ids: new Set(), capped: null };
+}
+
+/**
+ * Tick or untick one message. A tick past the cap is REFUSED rather than
+ * swapping some other message out, exactly as toggleThreadSelected refuses:
+ * the cap is a property of the request, and silently dropping a message the
+ * user ticked earlier is worse than not adding this one. Unticking always
+ * works, and clears the refusal because the selection is now sendable.
+ */
+export function toggleMessageSelected(
+  state: MessageSelection, messageId: string,
+): MessageSelection {
+  const ids = new Set(state.ids);
+  if (ids.has(messageId)) {
+    ids.delete(messageId);
+    return { ids, capped: null };
+  }
+  if (ids.size >= BULK_MESSAGE_ACTION_CAP) return { ids, capped: ids.size + 1 };
+  ids.add(messageId);
+  return { ids, capped: null };
+}
+
+/**
+ * The selected ids in rendered order, and ONLY the ones still rendered.
+ *
+ * The filter is selectedThreadIds' rule for selectedThreadIds' reason: a
+ * refetch can drop a message out of the conversation -- it was filed
+ * elsewhere, or its account's visibility flipped -- while its id sits in the
+ * selection, and sending an id for a row nobody can see any more would act on
+ * mail the user is not looking at.
+ */
+export function selectedMessageIds(
+  state: MessageSelection, order: readonly string[],
+): string[] {
+  return order.filter((id) => state.ids.has(id));
+}
+
+/**
+ * Why a per-message action cannot be sent as selected, or null when it can.
+ *
+ * The server's own number (BULK_MESSAGE_ACTION_CAP), imported rather than
+ * copied, for the reason SELECT_ALL_CAP imports its own: a local 50 that
+ * outlived a server-side change would build requests the route answers with a
+ * 400. ONE cap rather than a Record, because unlike the thread endpoint every
+ * kind this path offers waits on a mail server and takes the same bound.
+ */
+export function messageActionBlocked(count: number): string | null {
+  if (count <= BULK_MESSAGE_ACTION_CAP) return null;
+  return `Select ${BULK_MESSAGE_ACTION_CAP} messages or fewer for this action (${count} selected).`;
+}
+
+/**
+ * The ONE mailbox of the viewer's own that these messages sit on, or "" when it
+ * is not exactly one.
+ *
+ * Both halves of Task 2 need this and both need it for the same reason a
+ * folder picker always does: a folder name is PER MAILBOX, so "Clients" on one
+ * account and "Clients" on another are different folders that may not both
+ * exist, and a list of names built from two accounts would be one mailbox's
+ * names pretending to be both. The header picker asks it of the whole
+ * conversation's messages; the message bar asks it of the ticked ones, which is
+ * why unticking is a real remedy there and not in the header.
+ *
+ * OWN ACCOUNTS ONLY, because filing is a server MOVE and those are owner-only
+ * (Phase 4.2): another user's shared mailbox is never a destination this viewer
+ * can file into, so its messages must not count towards the answer either --
+ * counting them would blank the picker for a conversation the viewer can file
+ * perfectly well.
+ *
+ * KNOWN LIMIT, and it is the pre-existing one rather than a new one: the
+ * conversation renders at most the newest 50 messages, so a thread whose only
+ * message on a SECOND own account is older than that page will look
+ * single-account here. The header picker then files whole-thread anyway, the
+ * second account has no folder by that name, and the API answers
+ * unknown_target for it -- an honest partial failure the result summary
+ * reports. The list's picker has exactly this shape of gap (its account filter
+ * does not bound which accounts a selected thread's messages are on), and
+ * inventing a second, stricter answer here would make the two surfaces
+ * disagree about the same question.
+ */
+export function singleOwnAccount(
+  messages: readonly { accountId: string }[], ownAccountIds: ReadonlySet<string>,
+): string {
+  const owned = new Set<string>();
+  for (const message of messages) {
+    if (ownAccountIds.has(message.accountId)) owned.add(message.accountId);
+  }
+  return owned.size === 1 ? [...owned][0] ?? "" : "";
 }
 
 /**
@@ -1071,14 +1245,136 @@ export function selectionLabel(count: number, capped: number | null): string {
     : `${count} of ${capped} selected (per-request limit)`;
 }
 
+/** How each action reads while it is still running -- present participle, from
+ * a Record over the kind enum for the same compile-nudge reason as every other
+ * table in this file. */
+const PENDING_VERBS: Record<BulkThreadActionKind, string> = {
+  trash: "Moving", archive: "Archiving", file: "Filing", hide: "Hiding", unhide: "Unhiding",
+};
+
+/**
+ * What a selection is made OF, for the copy that has to name it.
+ *
+ * Phase 4.4 Task 2 introduced the second value, and the reason it is a
+ * parameter rather than a second set of copy is that only the NOUN differs:
+ * every sentence about a refusal, a cap, a pending wait or a sync switch is
+ * true of both units, and two tables saying the same thing about
+ * conversations and messages is two chances for them to drift apart.
+ */
+export type BulkUnit = "conversation" | "message";
+
+function unitNoun(unit: BulkUnit, count: number): string {
+  return count === 1 ? unit : `${unit}s`;
+}
+
 /** How each action reads while it is still running. Present tense and the
  * count, so a bar that is waiting on a mail server says what it is waiting
- * for rather than only greying out. */
-export function bulkPendingLabel(action: BulkThreadActionKind, count: number): string {
-  const noun = count === 1 ? "conversation" : "conversations";
-  const verb = action === "hide" ? "Hiding" : action === "trash" ? "Moving" : "Archiving";
-  const tail = action === "trash" ? " to Trash" : "";
-  return `${verb} ${count} ${noun}${tail}\u2026`;
+ * for rather than only greying out. `targetFolder` names the destination for
+ * `file`, which is the one action whose sentence is incomplete without it --
+ * "Filing 3 conversations..." leaves out the only part the user chose. */
+export function bulkPendingLabel(
+  action: BulkThreadActionKind, count: number, targetFolder?: string | null,
+  unit: BulkUnit = "conversation",
+): string {
+  const noun = unitNoun(unit, count);
+  const tail = action === "trash" ? " to Trash"
+    : action === "file" && targetFolder != null ? ` into ${quoted(targetFolder)}` : "";
+  return `${PENDING_VERBS[action]} ${count} ${noun}${tail}\u2026`;
+}
+
+/** A folder name in the copy, always quoted: mailbox names are arbitrary
+ * strings ("Clients 2026", "re: urgent") and an unquoted one runs into the
+ * sentence around it. */
+function quoted(folder: string): string {
+  return `\u201c${folder}\u201d`;
+}
+
+// ---------------------------------------------------------------------------
+// Mail that has arrived behind the reader (Phase 4.4 Task 3)
+// ---------------------------------------------------------------------------
+
+/** All either side of the comparison needs: which conversation, and when its
+ * newest message landed. Structural rather than MailThreadListItem so a case
+ * can be stated in two fields (the same reason ReplySource is structural). */
+export interface ArrivalRow {
+  id: string;
+  lastMessageAt: string;
+}
+
+export interface PendingArrivals {
+  /** How many conversations the fetched page has that the list is not
+   * showing. Zero means there is nothing to offer the reader. */
+  count: number;
+  /**
+   * True when `count` is a FLOOR rather than a total -- every row of the
+   * fetched page is unseen AND the server said there is a page after it, so
+   * the arrivals may run past the only page that was looked at. Exact, not
+   * cautious: when the page is the whole list there can be nothing behind it,
+   * and the count is then the answer.
+   */
+  atLeast: boolean;
+}
+
+/**
+ * How much new mail is waiting behind a list that is deliberately holding
+ * still (see lib.ts's takeCursorPage and refreshCursorRows).
+ *
+ * `shown` is what the reader is looking at, in whatever order they are looking
+ * at it. `head` is the freshest page one, which the query layer keeps warm and
+ * which the list is NOT displaying; `headHasMore` is that fetch's own
+ * nextCursor, which is what tells an exact count from a floor.
+ *
+ * TWO EXCLUSIONS, AND THE SECOND ONE IS THE SUBTLE HALF.
+ *
+ * A conversation the list ALREADY SHOWS is never counted, however new its
+ * message is. Its row is refreshed where it stands -- new snippet, new time,
+ * unread dot back on -- so the mail is already on screen and an offer to
+ * "show" it would point at a row the reader can see. What is being withheld
+ * from them is the JUMP TO THE TOP, and nobody ever asked for that.
+ *
+ * A conversation OLDER THAN EVERY ROW ON SCREEN is never counted either, and
+ * this is what stops the count lying after a removal. Delete or file a row out
+ * of the list and the server closes the gap by pulling up the conversation
+ * that sat just past the bottom of the page -- an old thread, arriving in
+ * page one for the first time, which a plain "in the fetch and not on screen"
+ * test would announce as new mail. Mail that is genuinely new is newer than
+ * everything already listed; a row sliding up from below the floor is, by
+ * construction, older than the row that used to be the last one.
+ *
+ * The floor is the MINIMUM rather than the last row's, because the list's
+ * order is the order it was fetched in and a row refreshed in place can carry
+ * a timestamp newer than the rows above it.
+ *
+ * ISO strings compare as strings: every one of these comes from a Postgres
+ * timestamptz through toISOString(), so they are fixed-width, UTC and
+ * millisecond-precise, and lexical order is chronological order.
+ *
+ * AN EMPTY LIST HAS NOTHING TO PROTECT and counts nothing -- takeCursorPage
+ * shows those rows instead of holding them, and a count here would be an
+ * offer to reveal what is already on screen.
+ */
+export function pendingArrivals(
+  shown: readonly ArrivalRow[], head: readonly ArrivalRow[], headHasMore: boolean,
+): PendingArrivals {
+  if (shown.length === 0) return { count: 0, atLeast: false };
+  const listed = new Set(shown.map((row) => row.id));
+  let floor = shown[0]?.lastMessageAt ?? "";
+  for (const row of shown) if (row.lastMessageAt < floor) floor = row.lastMessageAt;
+  const count = head.filter(
+    (row) => !listed.has(row.id) && row.lastMessageAt > floor,
+  ).length;
+  return { count, atLeast: headHasMore && count > 0 && count === head.length };
+}
+
+/**
+ * The control's label. It says the number because "new mail" alone cannot tell
+ * a reader whether it is worth losing their place for, and it is phrased as an
+ * instruction because the thing is a button: a bare "3 new conversations"
+ * reads as a status line, and a status line that silently swallows clicks is
+ * worse than no affordance at all.
+ */
+export function newMailLabel({ count, atLeast }: PendingArrivals): string {
+  return `Show ${count}${atLeast ? "+" : ""} new ${unitNoun("conversation", count)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1436,42 @@ const INBOX_NAME = "INBOX";
  * folder deleted or renamed on the server. With one row, or with a set that has
  * never been re-discovered, nothing is behind and nothing is stale.
  */
+/**
+ * The folder names a thread or a message may be FILED into (Phase 4.4).
+ *
+ * TWO EXCLUSIONS, AND THEY ARE THERE FOR DIFFERENT REASONS:
+ *
+ * - `\Noselect` -- a hierarchy node holding no messages. The API refuses it
+ *   (`unknown_target`), so offering it would be offering a failure.
+ * - STALE -- a folder the LAST DISCOVERY PASS DID NOT RE-SIGHT. This one was
+ *   missing until Task 4 and it is the second of the two things the earlier
+ *   tasks left: rows in mail_account_folders are never deleted, so a folder
+ *   renamed or removed on the server keeps its row for ever, and the picker
+ *   went on offering it. Filing into it fails at IMAP -- late, after an
+ *   optimistic write, a round trip and a compensating revert, and reported in
+ *   the mail server's words rather than the app's. The sidebar and the settings
+ *   picker have greyed these on exactly this basis since 4.1; this is that rule
+ *   reaching the third surface that needed it.
+ *
+ * WHAT IS DELIBERATELY KEPT: a folder whose SYNC IS OFF. That is not a mistake
+ * to filter out, it is what the feature is for -- filing into such a folder
+ * turns its sync on (api: mail-move.ts's enableTargetSync).
+ *
+ * Staleness is `lastDiscoveredAt < newestDiscovery(...)` -- the same comparison
+ * buildFolderRows makes, against the same newest value -- because the newest
+ * discovery among an account's folders IS the moment of its last successful
+ * LIST. It needs no account row and no clock, and it says exactly "the last
+ * pass looked and did not find this one".
+ */
+export function fileTargetNames(
+  folders: readonly { folder: string; selectable: boolean; lastDiscoveredAt: string }[],
+): string[] {
+  const newest = newestDiscovery(folders);
+  return folders
+    .filter((row) => row.selectable && !(row.lastDiscoveredAt < newest))
+    .map((row) => row.folder);
+}
+
 export function newestDiscovery(folders: readonly { lastDiscoveredAt: string }[]): string {
   return folders.reduce<string>(
     (max, row) => (row.lastDiscoveredAt > max ? row.lastDiscoveredAt : max), "",
@@ -1221,7 +1553,14 @@ export function buildFolderRows(
 // Bulk action results
 // ---------------------------------------------------------------------------
 
-type BulkResultItem = BulkThreadResult["results"][number];
+/**
+ * One result row, MINUS its id: `threadId` and `messageId` are the only
+ * difference between the two response shapes, and everything this summary
+ * reads -- ok, skipped, error, reason -- is common to both. Written as an Omit
+ * so a message result satisfies it structurally and the whole counting-and-copy
+ * layer serves both paths without a second copy (Phase 4.4 Task 2).
+ */
+type BulkResultItem = Omit<BulkThreadResult["results"][number], "threadId">;
 
 export interface BulkActionSummary {
   /** Threads the action actually applied to. */
@@ -1247,15 +1586,41 @@ export interface BulkActionSummary {
   settingsLink: boolean;
 }
 
-/** How each action reads in a past-tense summary. */
-function actionVerb(action: BulkThreadActionKind): string {
-  if (action === "hide") return "hidden";
-  return action === "trash" ? "moved to Trash" : "archived";
+/**
+ * How each action reads in a past-tense summary, as a Record over the kind
+ * enum -- the same reason REASON_NOTES below is one. The if-chain this
+ * replaced ended `: "archived"`, so Phase 4.4's two new kinds would have
+ * summarised a bulk unhide as "3 archived" with nothing failing to say so.
+ *
+ * `file` is a function rather than a string because its sentence names the
+ * folder the user picked, which is the only part of it they chose.
+ */
+const PAST_VERBS: Record<BulkThreadActionKind, string | ((folder: string | null) => string)> = {
+  trash: "moved to Trash",
+  archive: "archived",
+  hide: "hidden",
+  unhide: "unhidden",
+  file: (folder) => (folder === null ? "filed" : `filed into ${quoted(folder)}`),
+};
+
+function actionVerb(action: BulkThreadActionKind, targetFolder: string | null): string {
+  const verb = PAST_VERBS[action];
+  return typeof verb === "string" ? verb : verb(targetFolder);
 }
 
-/** The folder an action targets, for the no_target note. */
+/**
+ * The folder an action targets, for the no_target note.
+ *
+ * ONLY EVER ASKED ABOUT trash/archive: no_target is the "this account's
+ * Trash/Archive column is NULL" refusal, and the API cannot produce it for
+ * `file` (which names its own destination -- an unusable one is
+ * unknown_target) or for the CRM-side pair (which has no folder at all). The
+ * fallback is therefore unreachable rather than a default, and says so.
+ */
 function actionTarget(action: BulkThreadActionKind): string {
-  return action === "trash" ? "Trash" : "Archive";
+  if (action === "trash") return "Trash";
+  if (action === "archive") return "Archive";
+  return "target";
 }
 
 /** At most this many distinct server refusal strings are shown, each trimmed to
@@ -1274,6 +1639,11 @@ function truncate(text: string): string {
 interface BulkNoteContext {
   action: BulkThreadActionKind;
   refusals: readonly string[];
+  /** `file`'s destination, for the notes that have to name it. */
+  targetFolder: string | null;
+  /** Which unit these results are about, for the two notes below whose
+   * sentences name it (Phase 4.4 Task 2). */
+  unit: BulkUnit;
 }
 
 /**
@@ -1327,7 +1697,13 @@ const REASON_NOTES: Record<BulkThreadResultReason, ((count: number, context: Bul
     + " \u2014 it may be reconnecting or paused.",
   no_target: (count, { action }) => `${count} could not be moved: no ${actionTarget(action)} folder is set`
     + " for that account yet.",
-  not_found: (count) => `${count} could not be found \u2014 the list has been refreshed.`,
+  // Names WHAT was refreshed, because the two surfaces refresh different
+  // things: the thread list for a conversation, the open conversation for a
+  // message (queries.ts invalidates each path's own keys). Telling someone
+  // whose message vanished that "the list" was refreshed points them at a
+  // pane they were not looking at.
+  not_found: (count, { unit }) => `${count} could not be found \u2014 the`
+    + `${unit === "message" ? " conversation" : " list"} has been refreshed.`,
   server_refused: (count, { refusals }) => {
     const shown = refusals.slice(0, MAX_REFUSALS_SHOWN).map(truncate).join("; ");
     return `${count} ${count === 1 ? "was" : "were"} refused by the mail server: ${shown}.`;
@@ -1338,15 +1714,40 @@ const REASON_NOTES: Record<BulkThreadResultReason, ((count: number, context: Bul
   not_owner: (count) => `${count} skipped: ${NOT_OWNER_EXPLANATION}.`,
   already_in_target: null,
   out_of_scope: null,
+  // Phase 4.4. Deliberately NOT a Settings pointer, unlike no_target above:
+  // the account simply has no folder by that name, and the remedies are to
+  // pick a different one or to make it in the mail client -- neither of which
+  // is in Conduit's Settings. It names the folder rather than the account
+  // because a mixed selection can produce several, and the folder is the one
+  // thing all of them have in common.
+  unknown_target: (count, { targetFolder, unit }) => `${count} could not be filed: `
+    + `${targetFolder === null ? "that folder" : quoted(targetFolder)}`
+    + ` is not a folder on every selected ${unit}'s mail account.`,
 };
+
+/** What the summary needs from the REQUEST and the response envelope, as
+ * opposed to from the per-thread results: the destination the user picked, and
+ * the folder the server says it started syncing because of it. Both absent for
+ * every action but `file`. */
+export interface BulkSummaryOptions {
+  targetFolder?: string | null;
+  /** The response's own `syncEnabled` (shared: bulkThreadResultSchema). */
+  syncEnabled?: string | null;
+  /** What these results are about. Defaults to the thread surfaces, which are
+   * every caller but the conversation's message bar. */
+  unit?: BulkUnit;
+}
 
 /**
  * What to tell the user about one bulk response. Counting and copy both run
  * off REASON_NOTES above, which is where every per-reason decision lives.
  */
 export function summarizeBulkResult(
-  action: BulkThreadActionKind, results: readonly BulkResultItem[],
+  action: BulkThreadActionKind,
+  results: readonly BulkResultItem[],
+  options: BulkSummaryOptions = {},
 ): BulkActionSummary {
+  const targetFolder = options.targetFolder ?? null;
   let moved = 0;
   let skipped = 0;
   let failed = 0;
@@ -1362,13 +1763,25 @@ export function summarizeBulkResult(
       && !refusals.includes(result.error)) refusals.push(result.error);
   }
 
-  const verb = actionVerb(action);
+  const verb = actionVerb(action, targetFolder);
   const parts = [moved > 0 ? `${moved} ${verb}` : `Nothing ${verb}`];
   if (skipped > 0) parts.push(`${skipped} skipped`);
   if (failed > 0) parts.push(`${failed} failed`);
 
-  const context: BulkNoteContext = { action, refusals };
+  const context: BulkNoteContext = {
+    action, refusals, targetFolder, unit: options.unit ?? "conversation",
+  };
   const notes: string[] = [];
+  // THE SYNC NOTE COMES FIRST, before every per-reason note. It is the one
+  // sentence here that describes a change to the app's ongoing behaviour
+  // rather than to the threads just acted on: filing into a folder Conduit
+  // was not syncing turns that sync ON (api: mail-move.ts), and the whole
+  // reason the response carries the folder name is so this can be said
+  // afterwards instead of being discovered from a bandwidth graph. Said, not
+  // asked: a confirmation here would be the warning that ruling rejected.
+  if (options.syncEnabled != null) {
+    notes.push(`Conduit is now syncing ${quoted(options.syncEnabled)}.`);
+  }
   // Insertion order of the table IS the display order.
   for (const [reason, note] of Object.entries(REASON_NOTES) as
     [BulkThreadResultReason, (typeof REASON_NOTES)[BulkThreadResultReason]][]) {

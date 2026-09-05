@@ -55,6 +55,11 @@ import {
   specialUseSchema,
   mailAccountFolderSchema,
   folderPatchInputSchema,
+  folderCreateInputSchema,
+  folderRenameInputSchema,
+  folderDeleteInputSchema,
+  folderRenameResultSchema,
+  folderDeleteResultSchema,
   bulkThreadActionKindSchema,
   bulkThreadActionInputSchema,
   bulkThreadResultSchema,
@@ -62,6 +67,10 @@ import {
   bulkThreadSkipReasonSchema,
   BULK_THREAD_ACTION_CAP,
   MOVE_ACTION_THREAD_CAP,
+  BULK_ACTION_THREAD_CAPS,
+  bulkMessageActionInputSchema,
+  bulkMessageResultSchema,
+  BULK_MESSAGE_ACTION_CAP,
   meetingSchema,
   meetingDetailSchema,
   meetingAttendeeSchema,
@@ -1077,6 +1086,50 @@ describe("folderPatchInputSchema", () => {
   });
 });
 
+describe("the folder command schemas (Phase 4.4 Task 4)", () => {
+  it("trims both names and rejects blanks, like every other folder field", () => {
+    expect(folderCreateInputSchema.parse({ folder: "  Clients  " })).toEqual({ folder: "Clients" });
+    expect(folderRenameInputSchema.parse({ folder: " A ", newFolder: " B " }))
+      .toEqual({ folder: "A", newFolder: "B" });
+    expect(folderDeleteInputSchema.parse({ folder: " Clients " })).toEqual({ folder: "Clients" });
+    expect(() => folderCreateInputSchema.parse({ folder: "  " })).toThrow();
+    expect(() => folderDeleteInputSchema.parse({ folder: "" })).toThrow();
+  });
+
+  it("rejects a rename to the same name, comparing AFTER the trim", () => {
+    expect(() => folderRenameInputSchema.parse({ folder: "Sent", newFolder: "Sent" })).toThrow();
+    // The trim is what makes this the same request rather than a collision the
+    // mail server would have to refuse.
+    expect(() => folderRenameInputSchema.parse({ folder: "Sent", newFolder: " Sent " })).toThrow();
+    // Case is NOT sameness: RFC 3501 leaves every name but INBOX
+    // case-sensitive, so these are two different mailboxes.
+    expect(folderRenameInputSchema.parse({ folder: "Sent", newFolder: "sent" }).newFolder).toBe("sent");
+  });
+
+  it("REJECTS an unknown field rather than stripping it", () => {
+    // `.strict()`: a body carrying syncEnabled here is a caller who has
+    // confused this endpoint with the PATCH, and being told beats coming to
+    // believe it toggled something.
+    expect(() => folderCreateInputSchema.parse({ folder: "Clients", syncEnabled: true })).toThrow();
+    expect(() => folderRenameInputSchema.parse({ folder: "A", newFolder: "B", folderId: "x" })).toThrow();
+    expect(() => folderDeleteInputSchema.parse({ folder: "Clients", force: true })).toThrow();
+  });
+
+  it("carries the counts a rename and a delete answer with", () => {
+    const folder = {
+      id: uuid1, accountId: uuid2, folder: "Clients", specialUse: null,
+      syncEnabled: true, selectable: true, locked: false,
+      lastDiscoveredAt: now, createdAt: now, updatedAt: now,
+    };
+    // Both counts cover the subtree, because an IMAP RENAME is a subtree
+    // rename -- see the schema's own comment.
+    expect(folderRenameResultSchema.parse({ folder, messages: 412, folders: 3 }).messages).toBe(412);
+    expect(folderDeleteResultSchema.parse({ folder, messages: 0 }).messages).toBe(0);
+    expect(() => folderRenameResultSchema.parse({ folder, messages: -1, folders: 1 })).toThrow();
+    expect(() => folderDeleteResultSchema.parse({ folder })).toThrow();
+  });
+});
+
 describe("mailThreadSchema", () => {
   it("accepts a fully-linked thread", () => {
     const thread = {
@@ -1355,12 +1408,48 @@ describe("threadListFiltersSchema", () => {
 });
 
 describe("bulkThreadActionKindSchema and bulkThreadActionInputSchema", () => {
-  it("accepts each of the three action kinds, folder-scoped (folder present)", () => {
-    for (const action of ["trash", "archive", "hide"] as const) {
+  it("accepts each destination-free action kind, folder-scoped (folder present)", () => {
+    for (const action of ["trash", "archive", "hide", "unhide"] as const) {
       expect(bulkThreadActionKindSchema.parse(action)).toBe(action);
       const input = { threadIds: [uuid1], folder: "INBOX", action };
       expect(bulkThreadActionInputSchema.parse(input)).toEqual(input);
     }
+  });
+
+  // Phase 4.4. `folder` is the SOURCE (the view the selection was made in)
+  // and `targetFolder` the DESTINATION, and this case is the one that needs
+  // both at once: filing out of the INBOX view into Clients.
+  it("accepts file with both a source folder and a destination", () => {
+    const input = { threadIds: [uuid1], folder: "INBOX", targetFolder: "Clients", action: "file" as const };
+    expect(bulkThreadActionInputSchema.parse(input)).toEqual(input);
+  });
+
+  it("rejects file with no destination -- there is no defensible default", () =>
+    expect(() =>
+      bulkThreadActionInputSchema.parse({ threadIds: [uuid1], folder: "INBOX", action: "file" }),
+    ).toThrow(/targetFolder is required/));
+
+  // A targetFolder on any other kind is a request whose sender misunderstands
+  // it: trash/archive read their destination off the ACCOUNT, hide/unhide have
+  // none at all. Rejected rather than ignored -- a silently dropped field is
+  // how a caller comes to believe it filed something.
+  it("rejects a destination on every kind that does not take one", () => {
+    for (const action of ["trash", "archive", "hide", "unhide"] as const) {
+      expect(() =>
+        bulkThreadActionInputSchema.parse({ threadIds: [uuid1], targetFolder: "Clients", action }),
+      ).toThrow(/targetFolder is only valid when action is file/);
+    }
+  });
+
+  it("trims a present destination and rejects a blank one", () => {
+    expect(
+      bulkThreadActionInputSchema.parse(
+        { threadIds: [uuid1], targetFolder: "  Clients  ", action: "file" },
+      ).targetFolder,
+    ).toBe("Clients");
+    expect(() =>
+      bulkThreadActionInputSchema.parse({ threadIds: [uuid1], targetFolder: "   ", action: "file" }),
+    ).toThrow();
   });
 
   // The whole-thread mode (single-thread conversation/record-tab buttons):
@@ -1408,6 +1497,19 @@ describe("bulkThreadActionKindSchema and bulkThreadActionInputSchema", () => {
   it("exports the caps the route and the web client both key on", () => {
     expect(BULK_THREAD_ACTION_CAP).toBe(200);
     expect(MOVE_ACTION_THREAD_CAP).toBe(50);
+  });
+
+  // The table, not the "everything except hide" test the route used to make.
+  // `unhide` is the case that negation would have got wrong: it is CRM-side,
+  // waits on nothing, and belongs on hide's side of the line -- which the
+  // Record states and a `!== "hide"` silently denied.
+  it("caps every action kind, with the two CRM-side ones on the outer bound", () => {
+    expect(BULK_ACTION_THREAD_CAPS).toEqual({
+      trash: 50, archive: 50, file: 50, hide: 200, unhide: 200,
+    });
+    // Every kind the enum has, so a new one cannot join without a cap.
+    expect(Object.keys(BULK_ACTION_THREAD_CAPS).sort())
+      .toEqual([...bulkThreadActionKindSchema.options].sort());
   });
 });
 
@@ -1471,7 +1573,7 @@ describe("bulkThreadResultSchema", () => {
     // Pinned so a rename cannot quietly land without the client that
     // branches on these being updated with it.
     expect(bulkThreadFailureReasonSchema.options)
-      .toEqual(["no_sync", "no_target", "not_found", "server_refused"]);
+      .toEqual(["no_sync", "no_target", "not_found", "server_refused", "unknown_target"]);
     // archived_account, not_owner, awaiting_reconciliation, already_in_target
     // are in SKIP_REASON_RANK's precedence order (api: mail-move.ts) -- see
     // that table's own comment for why not_owner sits second; out_of_scope
@@ -1480,6 +1582,31 @@ describe("bulkThreadResultSchema", () => {
     // noteSkip/skip).
     expect(bulkThreadSkipReasonSchema.options)
       .toEqual(["archived_account", "not_owner", "awaiting_reconciliation", "already_in_target", "out_of_scope"]);
+  });
+
+  // Phase 4.4's unknown_target is a FAILURE (the account has no such folder,
+  // so nothing was filed), never a skip -- the same either/or every other
+  // reason is held to.
+  it("accepts unknown_target as a failure reason, and refuses it as a skip", () => {
+    const failure = {
+      threadId: uuid1, ok: false,
+      error: 'account "Work" has no folder named "Clients"', reason: "unknown_target" as const,
+    };
+    expect(bulkThreadResultSchema.parse({ results: [failure] })).toEqual({ results: [failure] });
+    expect(() => bulkThreadResultSchema.parse({
+      results: [{ threadId: uuid1, ok: true, skipped: true, reason: "unknown_target" }],
+    })).toThrow();
+  });
+
+  // The quiet notification the filing rule owes the operator: enabling a
+  // folder's sync is a real consequence, so the response says which folder it
+  // was, and says nothing at all when it enabled none.
+  it("carries the folder whose sync the request switched on, and omits it otherwise", () => {
+    expect(bulkThreadResultSchema.parse({
+      results: [{ threadId: uuid1, ok: true }], syncEnabled: "Clients",
+    }).syncEnabled).toBe("Clients");
+    expect("syncEnabled" in bulkThreadResultSchema.parse({ results: [{ threadId: uuid1, ok: true }] }))
+      .toBe(false);
   });
 
   it("rejects error present alongside ok: true", () =>
@@ -1498,6 +1625,133 @@ describe("bulkThreadResultSchema", () => {
         results: [{ threadId: uuid1, ok: false, skipped: true, error: "x", reason: "no_sync" }],
       }),
     ).toThrow());
+});
+
+describe("bulkMessageActionInputSchema (Phase 4.4 per-message selection)", () => {
+  // The three MOVE kinds and ONLY those. hide/unhide are absent by design and
+  // this is where that is pinned: a hide is one mail_thread_hides row per
+  // THREAD, so there is no per-message hide to ask for -- offering one would
+  // mean inventing a second visibility concept, not widening this one.
+  it("accepts the three move kinds and rejects both CRM-side ones", () => {
+    for (const action of ["trash", "archive"] as const) {
+      const input = { messageIds: [uuid1], action };
+      expect(bulkMessageActionInputSchema.parse(input)).toEqual(input);
+    }
+    const filed = { messageIds: [uuid1], targetFolder: "Clients", action: "file" as const };
+    expect(bulkMessageActionInputSchema.parse(filed)).toEqual(filed);
+    for (const action of ["hide", "unhide"]) {
+      expect(() => bulkMessageActionInputSchema.parse({ messageIds: [uuid1], action })).toThrow();
+    }
+  });
+
+  // THE SOURCE FOLDER HAS NO MEANING HERE, and rejecting it is how that gets
+  // said out loud. `folder` on the thread schema names the VIEW a selection was
+  // made in, because a thread's messages spread across folders and a thread id
+  // alone cannot say which of them was meant. A message id says it exactly.
+  // Accepting and ignoring the field is how a caller comes to believe it
+  // scoped something.
+  it("rejects a source folder -- a message id is already the exact scope", () => {
+    expect(() => bulkMessageActionInputSchema.parse(
+      { messageIds: [uuid1], folder: "INBOX", action: "archive" },
+    )).toThrow();
+  });
+
+  it("rejects file with no destination, and a destination on the other two", () => {
+    expect(() => bulkMessageActionInputSchema.parse({ messageIds: [uuid1], action: "file" }))
+      .toThrow(/targetFolder is required/);
+    for (const action of ["trash", "archive"] as const) {
+      expect(() => bulkMessageActionInputSchema.parse(
+        { messageIds: [uuid1], targetFolder: "Clients", action },
+      )).toThrow(/targetFolder is only valid when action is file/);
+    }
+  });
+
+  it("trims a present destination and rejects a blank one", () => {
+    expect(bulkMessageActionInputSchema.parse(
+      { messageIds: [uuid1], targetFolder: "  Clients  ", action: "file" },
+    ).targetFolder).toBe("Clients");
+    expect(() => bulkMessageActionInputSchema.parse(
+      { messageIds: [uuid1], targetFolder: "   ", action: "file" },
+    )).toThrow();
+  });
+
+  it("rejects an empty messageIds array and one over the cap, and accepts the cap itself", () => {
+    expect(() => bulkMessageActionInputSchema.parse({ messageIds: [], action: "archive" })).toThrow();
+    const over = Array.from({ length: BULK_MESSAGE_ACTION_CAP + 1 }, () => randomUUID());
+    expect(() => bulkMessageActionInputSchema.parse({ messageIds: over, action: "archive" })).toThrow();
+    const at = Array.from({ length: BULK_MESSAGE_ACTION_CAP }, () => randomUUID());
+    expect(bulkMessageActionInputSchema.parse({ messageIds: at, action: "archive" }).messageIds)
+      .toHaveLength(BULK_MESSAGE_ACTION_CAP);
+  });
+
+  // Pinned to its number, like the thread caps, because the web client mirrors
+  // it (the conversation's select-all) and a client-side copy that drifted
+  // would build requests the route answers with a 400.
+  it("exports the cap the route and the conversation view both key on", () =>
+    expect(BULK_MESSAGE_ACTION_CAP).toBe(50));
+});
+
+describe("bulkMessageResultSchema (Phase 4.4 per-message selection)", () => {
+  it("keys each result on messageId and carries the same ok/skipped/failed mix", () => {
+    const results = [
+      { messageId: uuid1, ok: true },
+      { messageId: uuid2, ok: true, skipped: true, reason: "already_in_target" as const },
+      { messageId: randomUUID(), ok: false, error: "the server said no", reason: "server_refused" as const },
+    ];
+    expect(bulkMessageResultSchema.parse({ results })).toEqual({ results });
+  });
+
+  // out_of_scope is the one skip reason this path CANNOT produce, and the enum
+  // says so rather than a comment: it means "the action never applied to this
+  // thread" -- every message sat in some other folder, or the conversation was
+  // nothing but Sent mail -- and a request that named a message by id leaves it
+  // no scope to fall outside of. Every skip here is one the service NOTED
+  // against the row it was looking at.
+  it("rejects out_of_scope, which no per-message request can reach", () => {
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true, skipped: true, reason: "out_of_scope" }],
+    })).toThrow();
+    for (const reason of
+      ["archived_account", "not_owner", "awaiting_reconciliation", "already_in_target"] as const) {
+      expect(bulkMessageResultSchema.parse({
+        results: [{ messageId: uuid1, ok: true, skipped: true, reason }],
+      }).results[0]?.reason).toBe(reason);
+    }
+  });
+
+  // The same correlations the thread result enforces, because they are
+  // properties of ONE answer rather than of the unit it is about -- and
+  // because a second, quieter copy of them is exactly how the two shapes would
+  // drift.
+  it("enforces the same flag correlations as the thread result", () => {
+    expect(() => bulkMessageResultSchema.parse({ results: [{ messageId: uuid1, ok: false }] })).toThrow();
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true, error: "should not be here" }],
+    })).toThrow();
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: false, skipped: true, error: "x", reason: "no_sync" }],
+    })).toThrow();
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true, skipped: true }],
+    })).toThrow(/reason is required/);
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true, reason: "already_in_target" }],
+    })).toThrow(/reason must be absent/);
+    expect(() => bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: false, error: "x", reason: "already_in_target" }],
+    })).toThrow(/failure must carry a failure reason/);
+  });
+
+  // Filing a single message out of a thread into an unsynced folder turns that
+  // folder's sync on for exactly the reason filing a whole thread does, so the
+  // notification rides this envelope too.
+  it("carries the folder whose sync the request switched on, and omits it otherwise", () => {
+    expect(bulkMessageResultSchema.parse({
+      results: [{ messageId: uuid1, ok: true }], syncEnabled: "Clients",
+    }).syncEnabled).toBe("Clients");
+    expect("syncEnabled" in bulkMessageResultSchema.parse({ results: [{ messageId: uuid1, ok: true }] }))
+      .toBe(false);
+  });
 });
 
 describe("threadLinksInputSchema", () => {

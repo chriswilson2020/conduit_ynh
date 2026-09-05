@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { clsx } from "clsx";
 import type { BulkThreadActionKind } from "@conduit/shared";
-import { useBulkThreadAction, useMailAccounts } from "../queries";
+import { useBulkThreadAction, useMailAccounts, useMailFolders } from "../queries";
 import { useLatest } from "../hooks";
 import { useIsMobile } from "../use-is-mobile";
 import { inboxStackView } from "./inbox-lib";
@@ -22,6 +22,7 @@ import {
   extendThreadSelection,
   selectedThreadIds,
   selectionForKey,
+  fileTargetNames,
   summarizeBulkResult,
   toggleAllOnPage,
   toggleThreadSelected,
@@ -236,7 +237,107 @@ export function InboxPage() {
    */
   const bulk = useBulkThreadAction();
   const pendingAction = bulk.isPending ? bulk.variables?.action ?? null : null;
+  const pendingTarget = bulk.isPending ? bulk.variables?.targetFolder ?? null : null;
   const busy = pendingAction !== null;
+
+  /**
+   * WHEN THE LIST TAKES A NEW SNAPSHOT (Phase 4.4 Task 3).
+   *
+   * The list holds still under mail arriving from elsewhere -- rows are
+   * refreshed where they stand and arrivals wait behind a count, which is
+   * thread-list.tsx's whole header comment. THE READER'S OWN WRITES ARE THE
+   * EXCEPTION, and they have to be: trash ten conversations and those rows are
+   * genuinely gone, and a list that held them would be showing mail that is no
+   * longer there. A nonce rather than a flag, so every write site can say "the
+   * list is now wrong" without agreeing on what the value means.
+   *
+   * EVERY WRITE ON THIS PAGE BUMPS IT, INCLUDING THE ONES INSIDE THE
+   * CONVERSATION, because "the reader's own gesture" is a fact about the
+   * reader and not about which pane they made it in. Archiving from the
+   * conversation header removes the thread from the folder view beside it, and
+   * a list that only noticed its own bulk bar would leave that row on screen.
+   *
+   * WHAT DELIBERATELY DOES NOT BUMP IT: marking a conversation read, which
+   * every click on a row does. It changes what a row SAYS, not whether it
+   * belongs, and the refresh in place already carries that -- the dot goes out
+   * where the row stands. Re-snapshotting there would re-order the list on
+   * every single click, which is the exact behaviour this task removed. The
+   * one case that costs is the Unread filter, where a read conversation no
+   * longer matches: its row stays, un-bolded, until something else refreshes.
+   * That is the better outcome anyway -- a reader working down an unread list
+   * has rows vanishing from under them on every click otherwise.
+   *
+   * ON FAILURE AS WELL AS SUCCESS. useBulkThreadAction's own comment says why:
+   * after this call the client's view of the mail is unknown either way (a
+   * proxy 504 means the answer was lost while the moves carry on), and the fix
+   * is to refetch.
+   */
+  const [refreshToken, setRefreshToken] = useState(0);
+  const refreshList = useCallback(() => setRefreshToken((n) => n + 1), []);
+
+  /**
+   * A WRITE FROM THE CONVERSATION DOES NOT RE-SNAPSHOT WHILE THE BULK BAR'S
+   * OWN REQUEST IS IN FLIGHT, and this is the hazard Task 2 found wearing
+   * different clothes.
+   *
+   * Task 2's was two move paths gated only on their own mutation, overlapping
+   * on the same rows; the answer there was one `busy` for both. This is the
+   * same shape at one remove: the two panes' moves are still gated separately
+   * -- `busy` here disables the filters and the rail, and the conversation's
+   * own buttons are gated on ITS mutations -- so a reader CAN archive from the
+   * conversation while a bulk request is queued behind an account's serial
+   * sync loop. (Whether the two panes should share one gate is a wider
+   * question than this task; what is closed here is the LIST moving.) And a
+   * re-snapshot at that moment would change which rows are listed underneath a
+   * request that named the old ones, shrinking the bar's count (or unmounting
+   * the bar) mid-flight and leaving the outcome to be read against a view that
+   * had already moved.
+   *
+   * Deferring costs nothing, because the bulk's OWN settle re-snapshots
+   * unconditionally a moment later and that snapshot carries both writes. The
+   * rule in one line: a write in flight owns the next snapshot.
+   *
+   * The liveness itself needs no such guard, and that is by construction
+   * rather than by luck: mail arriving from elsewhere can only refresh rows
+   * the list is already showing, never add, remove or re-order one
+   * (lib.ts's takeCursorPage), so `rows`, `selectedThreads` and
+   * `unownedSelected` below cannot move under a request that named them.
+   */
+  const busyRef = useLatest(busy);
+  const refreshFromConversation = useCallback(() => {
+    if (busyRef.current) return;
+    refreshList();
+  }, [busyRef, refreshList]);
+
+  /**
+   * WHOSE folders the bulk bar's "File into…" picker offers.
+   *
+   * A folder name is per mailbox -- "Clients" on one account and "Clients" on
+   * another are different folders that may not both exist -- so the picker
+   * needs exactly one account to name folders from, and says so instead of
+   * offering a list when it has none (mail-lib's fileTargetsBlocked).
+   *
+   * A SINGLE OWN ACCOUNT COUNTS AS PICKED, even though the filter reads "All
+   * accounts", and that case is not a nicety: with one account the filter
+   * select is not RENDERED AT ALL (see filterAccounts below), so "pick a
+   * single account above" would point at a control that does not exist, and
+   * the only way to reach the picker would be to click a folder in the rail
+   * first. For that user the two readings of "all accounts" are the same set.
+   * From `ownActive` rather than filterAccounts because filing is a server
+   * move and those are owner-only (Phase 4.2): another user's shared mailbox
+   * is never a destination this viewer can file into.
+   */
+  const fileAccountId = accountId !== ALL_ACCOUNTS ? accountId
+    : ownActive.length === 1 ? ownActive[0]?.id ?? "" : "";
+
+  /**
+   * What that picker offers. UNSELECTABLE AND STALE FOLDERS ARE DROPPED,
+   * sync-off ones deliberately KEPT -- the rule and its reasons live in
+   * fileTargetNames, which the conversation's picker calls too so the two
+   * cannot drift.
+   */
+  const folderList = useMailFolders(fileAccountId);
+  const fileTargets = useMemo(() => fileTargetNames(folderList.data ?? []), [folderList.data]);
 
   // Reference-guarded so a re-render that produced the same rows cannot loop
   // through this back into a new state object. Both fields compare: a refetch
@@ -269,33 +370,49 @@ export function InboxPage() {
    * retry -- for `trash` a blind second attempt would move whatever is now in
    * the source folder -- so the hook refetches from onSettled instead.
    */
-  const runBulk = useCallback((action: BulkThreadActionKind) => {
+  const runBulk = useCallback((action: BulkThreadActionKind, targetFolder?: string) => {
     if (selectedThreads.length === 0) return;
     handleOutcome(null);
+    const crmSide = action === "hide" || action === "unhide";
     bulk.mutate(
       {
         threadIds: [...selectedThreads],
-        // `hide` ignores folder server-side either way; sending it only for the
-        // two move actions keeps the request saying exactly what it means. With
-        // no folder filter there is no folder view, so the request carries the
-        // whole-thread mode instead (see BulkBarProps.folder).
-        ...(folder !== null && action !== "hide" ? { folder } : {}),
+        // `hide`/`unhide` ignore folder server-side either way; sending it only
+        // for the move actions keeps the request saying exactly what it means.
+        // With no folder filter there is no folder view, so the request carries
+        // the whole-thread mode instead (see BulkBarProps.folder).
+        ...(folder !== null && !crmSide ? { folder } : {}),
+        // The DESTINATION, which is a different field from the source above and
+        // valid only for `file` -- the shared schema rejects it on anything
+        // else rather than ignoring it.
+        ...(action === "file" && targetFolder !== undefined ? { targetFolder } : {}),
         action,
       },
       {
         onSuccess: (result) => {
-          handleOutcome({ kind: "summary", summary: summarizeBulkResult(action, result.results) });
+          handleOutcome({
+            kind: "summary",
+            summary: summarizeBulkResult(action, result.results, {
+              targetFolder: targetFolder ?? null,
+              // The server's answer, not an assumption: it is present only
+              // when a folder's sync was actually switched on by this request
+              // (api: mail-move.ts's enableTargetSync).
+              syncEnabled: result.syncEnabled ?? null,
+            }),
+          });
           clearSelection();
+          refreshList();
         },
         // A throw is not necessarily a failed action: a proxy 504 means the
         // ANSWER was lost while the queued moves carry on (routes/mail.ts).
         onError: (error) => {
           handleOutcome({ kind: "failure", message: bulkErrorMessage(error) });
           clearSelection();
+          refreshList();
         },
       },
     );
-  }, [bulk, clearSelection, folder, handleOutcome, selectedThreads]);
+  }, [bulk, clearSelection, folder, handleOutcome, refreshList, selectedThreads]);
 
   // Stable, so the memoised rows in thread-list can bail out: a new closure
   // here every render would defeat their shallow comparison one prop before it
@@ -671,6 +788,10 @@ export function InboxPage() {
               unowned={unownedSelected}
               capped={selection.capped}
               pendingAction={pendingAction}
+              pendingTarget={pendingTarget}
+              folders={fileTargets}
+              accountScoped={fileAccountId !== ""}
+              hiddenView={hidden}
               onRun={runBulk}
               onClear={clearSelection}
             />
@@ -696,6 +817,10 @@ export function InboxPage() {
             // claiming one of the two.
             someSelected={selectedThreads.length > 0}
             onRowsChange={handleRows}
+            // See refreshToken's declaration above for what does and does not
+            // move this, and why the reader's own writes are the exception to
+            // a list that otherwise holds still.
+            refreshToken={refreshToken}
             // An inbox with no mail account is not an empty inbox, it is an
             // unconfigured one (spec: "Empty state points at Settings ->
             // Mail"), and that reading beats the hidden/unfiltered wording:
@@ -737,7 +862,16 @@ export function InboxPage() {
             // Keyed on the thread: the conversation's local state (expanded
             // messages, remote images, an open composer) belongs to one
             // thread, and a remount is the cleanest way to leave it behind.
-            <Conversation key={selectedId} threadId={selectedId} />
+            //
+            // The pane reports its own writes so the list beside it can take a
+            // new snapshot -- archiving, filing or hiding from in here changes
+            // which folder views the thread belongs to, and the list is
+            // holding still against everything it did not cause.
+            <Conversation
+              key={selectedId}
+              threadId={selectedId}
+              onThreadsChanged={refreshFromConversation}
+            />
           )}
         </div>
       </div>

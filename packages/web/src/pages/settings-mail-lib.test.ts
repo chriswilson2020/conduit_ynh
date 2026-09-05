@@ -5,6 +5,10 @@ import {
   buildTestInput,
   buildUpdatePatch,
   dovecotPreset,
+  folderCommandReasons,
+  folderDeleteBlocked,
+  folderDeleteWarning,
+  folderRenameBlocked,
   initialFormState,
   isPort,
   settingsFields,
@@ -239,5 +243,110 @@ describe("buildTestInput", () => {
     expect("accountId" in input).toBe(false);
     expect(input.password).toBe("hunter2");
     expect(input.username).toBe("chris");
+  });
+});
+
+describe("folder command gating", () => {
+  const fresh = { stale: false };
+  const account = { sentFolder: "Sent", trashFolder: "Bin", archiveFolder: "Filed" };
+  const folder = (name: string, selectable = true) =>
+    ({ folder: name, locked: false, selectable });
+
+  describe("folderRenameBlocked", () => {
+    it("allows an ordinary folder, and the account's own move targets", () => {
+      expect(folderRenameBlocked(folder("Projects"), fresh)).toBeNull();
+      // Sent, Trash and Archive are renameable: the server-side rename rewrites
+      // the account columns that name them, in the same transaction, so the
+      // account follows its folder rather than breaking.
+      expect(folderRenameBlocked({ ...folder("Sent"), locked: true }, fresh)).toBeNull();
+      expect(folderRenameBlocked(folder("Bin"), fresh)).toBeNull();
+      expect(folderRenameBlocked(folder("Filed"), fresh)).toBeNull();
+    });
+
+    it("refuses INBOX whatever case it is spelled in", () => {
+      expect(folderRenameBlocked(folder("INBOX"), fresh)).toMatch(/cannot be renamed/);
+      // RFC 3501 makes INBOX the one case-insensitive mailbox name, so a server
+      // that listed it lower-case is still the same mailbox.
+      expect(folderRenameBlocked(folder("inbox"), fresh)).toMatch(/cannot be renamed/);
+    });
+
+    it("refuses a hierarchy node and a folder the last sync did not find", () => {
+      expect(folderRenameBlocked(folder("Lists", false), fresh)).toMatch(/hierarchy node/);
+      expect(folderRenameBlocked(folder("Gone"), { stale: true }))
+        .toMatch(/did not find this folder on the server/);
+    });
+  });
+
+  describe("folderCommandReasons", () => {
+    it("says nothing at all for a folder both commands accept", () => {
+      expect(folderCommandReasons(folder("Projects"), account, fresh)).toEqual([]);
+    });
+
+    it("DEDUPES the two refusals the commands share word for word", () => {
+      // A hierarchy node and a vanished folder block both commands for one
+      // reason each, and printing the same sentence twice reads as a bug.
+      expect(folderCommandReasons(folder("Lists", false), account, fresh)).toHaveLength(1);
+      expect(folderCommandReasons(folder("Gone"), account, { stale: true })).toHaveLength(1);
+    });
+
+    it("keeps two genuinely different reasons apart", () => {
+      // INBOX refuses each command for its own reason, and both are true.
+      const inbox = folderCommandReasons(folder("INBOX"), account, fresh);
+      expect(inbox).toHaveLength(2);
+      expect(inbox[0]).toMatch(/renamed/);
+      expect(inbox[1]).toMatch(/deleted/);
+    });
+
+    it("gives a move target the one reason that applies to it", () => {
+      // Sent can be RENAMED -- the server-side rename rewrites sent_folder with
+      // it -- so the only sentence is delete's, and it names the fix.
+      expect(folderCommandReasons({ ...folder("Sent"), locked: true }, account, fresh))
+        .toEqual(["This is the account's Sent folder. Point Sent at another folder below first."]);
+    });
+  });
+
+  describe("folderDeleteBlocked", () => {
+    it("allows an ordinary folder", () => {
+      expect(folderDeleteBlocked(folder("Projects"), account, fresh)).toBeNull();
+    });
+
+    it("refuses INBOX and each of the account's three move targets by NAME", () => {
+      expect(folderDeleteBlocked(folder("INBOX"), account, fresh)).toMatch(/cannot be deleted/);
+      // By name rather than by special_use, exactly as the server refuses it: a
+      // folder can be the Archive target without carrying \Archive, and it is
+      // the account COLUMN that would break.
+      expect(folderDeleteBlocked(folder("Sent"), account, fresh)).toMatch(/account's Sent folder/);
+      expect(folderDeleteBlocked(folder("Bin"), account, fresh)).toMatch(/account's Trash folder/);
+      expect(folderDeleteBlocked(folder("Filed"), account, fresh)).toMatch(/account's Archive folder/);
+    });
+
+    it("tolerates the stored whitespace the server side trims around", () => {
+      const padded = { sentFolder: " Sent ", trashFolder: " Bin ", archiveFolder: null };
+      expect(folderDeleteBlocked(folder("Sent"), padded, fresh)).toMatch(/Sent folder/);
+      expect(folderDeleteBlocked(folder("Bin"), padded, fresh)).toMatch(/Trash folder/);
+      // A null target names no folder, so nothing is refused for being it.
+      expect(folderDeleteBlocked(folder("Filed"), padded, fresh)).toBeNull();
+    });
+
+    it("refuses a hierarchy node and a folder the last sync did not find", () => {
+      expect(folderDeleteBlocked(folder("Lists", false), account, fresh)).toMatch(/hierarchy node/);
+      expect(folderDeleteBlocked(folder("Gone"), account, { stale: true }))
+        .toMatch(/did not find this folder on the server/);
+    });
+  });
+
+  describe("folderDeleteWarning", () => {
+    it("says what leaves, what stays, and what is refused -- before it happens", () => {
+      const lines = folderDeleteWarning("Projects");
+      expect(lines[0]).toContain('"Projects" is removed from the mail server');
+      // The promise this product makes everywhere, said where it matters most.
+      expect(lines[1]).toMatch(/KEPT/);
+      expect(lines[1]).toMatch(/still on the records/);
+      expect(lines[2]).toMatch(/Conduit does not delete mail/);
+      // No count: Conduit knows only what it has synced, and quoting that here
+      // would understate a folder whose sync is off by however much it has
+      // never seen. The server's real count arrives in the refusal.
+      expect(lines.join(" ")).not.toMatch(/\d/);
+    });
   });
 });

@@ -921,6 +921,96 @@ export const folderPatchInputSchema = z.object({
 });
 export type FolderPatchInput = z.infer<typeof folderPatchInputSchema>;
 
+// --- Folder management (Phase 4.4 Task 4) -----------------------------------
+//
+// Create, rename and delete a mailbox ON THE SERVER, which is what makes these
+// three different in kind from the toggle above: that one writes a Conduit
+// preference about a folder the server already has, and these three change
+// what the server has. Every one of them is therefore a TWO-SYSTEM write, and
+// the api service (mail-folders.ts) is where the ordering that makes each of
+// them safe is argued.
+//
+// THREE BODIES, THREE ENDPOINTS, rather than more fields on
+// folderPatchInputSchema. Phase 4.4 learned this twice already -- `folder`
+// meaning source-or-destination depending on the action (Task 1's correction)
+// and `threadIds` meaning threads-or-messages (Task 2's ruling) -- and both
+// times the answer was a separate, narrower shape. A `newFolder` bolted onto
+// the patch schema would make `syncEnabled` meaningless for half the requests
+// that carry it, which is the same mistake one field wide.
+//
+// `.strict()` on all three, matching bulkMessageActionInputSchema's reasoning:
+// a body carrying a field this shape does not have is a caller who has
+// misunderstood which endpoint they are talking to, and rejecting says so
+// where silently stripping would let them believe it scoped something.
+
+// POST /api/mail/accounts/:id/folders -- CREATE one mailbox.
+export const folderCreateInputSchema = z.object({
+  folder: folderNameSchema,
+}).strict();
+export type FolderCreateInput = z.infer<typeof folderCreateInputSchema>;
+
+// POST /api/mail/accounts/:id/folders/rename.
+//
+// POST rather than PATCH-with-a-name-in-the-path, and the same for delete
+// below, for the reason the test-connection route is already POST: an IMAP
+// mailbox name is arbitrary user text -- it can contain the path separator,
+// spaces, and any non-ASCII the server's namespace allows -- and a name in a
+// URL is a name in every access log and proxy trace between here and the
+// browser. It is also the reason neither takes a `:folder` path parameter:
+// the name is data, and data belongs in the body.
+export const folderRenameInputSchema = z.object({
+  folder: folderNameSchema, newFolder: folderNameSchema,
+}).strict().refine((input) => input.folder !== input.newFolder, {
+  // Rejected in the SCHEMA rather than as a service conflict, because it is a
+  // malformed request and not a state clash: there is no folder arrangement
+  // that would make renaming a folder to its own name meaningful. Compared
+  // AFTER folderNameSchema's trim (both fields parse through it), so " Sent "
+  // and "Sent" are caught as the same name rather than sent to a mail server
+  // that would refuse them as a collision.
+  path: ["newFolder"],
+  message: "the new name is the same as the current one",
+});
+export type FolderRenameInput = z.infer<typeof folderRenameInputSchema>;
+
+// POST /api/mail/accounts/:id/folders/delete.
+export const folderDeleteInputSchema = z.object({
+  folder: folderNameSchema,
+}).strict();
+export type FolderDeleteInput = z.infer<typeof folderDeleteInputSchema>;
+
+// What a rename actually moved. Both counts cover the folder AND every
+// descendant of it, because an IMAP RENAME is a SUBTREE rename -- verified
+// against Dovecot 2.3, which renames "Parent" and "Parent/Child" together
+// (api: renameFolder, and the integration test that pins it) -- so a rename
+// that re-keyed only the exact name would leave every child's stored mail
+// pointing at a name the server no longer has.
+//
+// The counts are on the wire because the UI says them afterwards. Renaming a
+// folder silently moves potentially thousands of stored messages, and "Renamed
+// to Clients; 412 stored messages moved with it" is the difference between an
+// operator who knows what happened and one who finds out from a search that
+// stops matching.
+export const folderRenameResultSchema = z.object({
+  folder: mailAccountFolderSchema,
+  /** mail_messages rows re-keyed. */
+  messages: z.number().int().nonnegative(),
+  /** Folder rows re-keyed: the folder itself plus each descendant. */
+  folders: z.number().int().nonnegative(),
+});
+export type FolderRenameResult = z.infer<typeof folderRenameResultSchema>;
+
+// What a delete left behind. `folder` is the row, WHICH STILL EXISTS: this
+// table's rows are never deleted (api: db/schema.ts, "a folder that vanishes
+// from a later LIST keeps its row"), and a Conduit-driven delete is not the
+// exception that proves it. `messages` is the count of stored messages Conduit
+// KEPT -- the promise the confirmation made beforehand, restated as a fact
+// afterwards.
+export const folderDeleteResultSchema = z.object({
+  folder: mailAccountFolderSchema,
+  messages: z.number().int().nonnegative(),
+});
+export type FolderDeleteResult = z.infer<typeof folderDeleteResultSchema>;
+
 export const mailThreadSchema = z.object({
   id: z.uuid(),
   // No .min(1): a thread's subject derives from its first message's
@@ -1189,12 +1279,25 @@ export const threadListFiltersSchema = z.object({
 });
 export type ThreadListFilters = z.infer<typeof threadListFiltersSchema>;
 
-// The three bulk/single-thread mail actions (Phase 4.1). trash/archive MOVE
-// the underlying messages server-side (api: services/mail-move.ts); hide is
-// the CRM-side, PER-ACTOR filing act (one mail_thread_hides row per thread
-// for the requesting user, Phase 4.3) applied in bulk, named "Hide in CRM"
-// in the UI so it is never confused with the other two (spec).
-export const bulkThreadActionKindSchema = z.enum(["trash", "archive", "hide"]);
+// The bulk/single-thread mail actions. Three MOVE the underlying messages
+// server-side (api: services/mail-move.ts) and two are the CRM-side,
+// PER-ACTOR filing act (one mail_thread_hides row per thread for the
+// requesting user, Phase 4.3):
+//
+// - trash/archive (Phase 4.1): move to the OWNING ACCOUNT'S configured
+//   trash_folder/archive_folder -- a destination the request never names.
+// - file (Phase 4.4): move to a destination the request DOES name
+//   (`targetFolder` below). The fourth kind exists because filing mail is
+//   mostly not trash or archive, it is "put this in Clients", and the first
+//   two have no way to say so.
+// - hide/unhide: the CRM-side pair, named "Hide in CRM" in the UI so it is
+//   never confused with the IMAP moves. `unhide` (Phase 4.4) is `hide`'s
+//   inverse -- a hide-row DELETE where hide is an INSERT -- and exists in
+//   bulk because without it fifty threads hide in one gesture and unhide in
+//   fifty.
+export const bulkThreadActionKindSchema = z.enum([
+  "trash", "archive", "hide", "unhide", "file",
+]);
 export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
 
 // POST /api/mail/threads/bulk body (Task 4). folder is OPTIONAL and carries
@@ -1208,32 +1311,88 @@ export type BulkThreadActionKind = z.infer<typeof bulkThreadActionKindSchema>;
 // folder and those in the account's sent folder (archiving a conversation
 // must never empty Sent). Either way, trash/archive target the owning
 // account's trash_folder/archive_folder (spec: "only Trash/Archive targets
-// in v0.6.0"); `hide` ignores folder entirely in both modes -- it is the
-// per-actor CRM-side filing act (mail_thread_hides, Phase 4.3), which has
-// no concept of an IMAP folder at all.
+// in v0.6.0"); `hide`/`unhide` ignore folder entirely in both modes -- they
+// are the per-actor CRM-side filing act (mail_thread_hides, Phase 4.3),
+// which has no concept of an IMAP folder at all.
+//
+// `folder` IS THE SOURCE, NEVER THE DESTINATION, and Phase 4.4's `file`
+// action is where that stopped being an academic distinction. Both the 4.4
+// spec and its plan describe this field as the destination the new action
+// already had ("bulkThreadActionInputSchema already carries an optional
+// folder") -- it does not, and reusing it that way would have destroyed
+// 4.3's folder-scoped selection ruling, since filing out of the INBOX view
+// into Clients has to say BOTH which folder the selection was made in and
+// which folder the mail is going to. Hence `targetFolder`, a second field
+// rather than a second meaning on the first. It is REQUIRED for `file` and
+// REJECTED for every other kind (the superRefine below): trash/archive read
+// their destination off the account, and hide/unhide have none, so a
+// targetFolder on any of them is a request whose sender misunderstands what
+// it is asking for -- better a 400 than a silently ignored field.
+
 // threadIds capped at 200: large enough for a full page of multi-select,
 // small enough that one request's per-account IMAP MOVE queueing stays
 // bounded; `.min(1)` because a bulk action against zero threads is not a
 // request, it's a bug in whatever sent it.
 //
-// 200 is the OUTER bound, and only `hide` reaches it. trash/archive wait on
-// a real mail server -- each queued MOVE runs on its account's serial sync
-// loop -- so the route applies a tighter per-action cap of 50 to those two
-// and rejects a larger request with the uniform 400 (api: routes/mail.ts's
-// bulk endpoint, Task 4 ruling). The CHECK lives there rather than in this
-// schema because it is a property of the ACTION, not of the body shape, and
-// this schema is also what the whole-thread single-id callers parse through
-// -- but the NUMBER lives here, next to the outer bound it tightens, because
-// the web client mirrors it too (web: mail-lib's select-all cap and its
-// per-action disable), and three copies of 50 in three packages is three
-// chances for the client to build a request the server answers with a 400.
+// 200 is the OUTER bound, and only the CRM-side pair reaches it. The three
+// MOVE kinds wait on a real mail server -- each queued MOVE runs on its
+// account's serial sync loop -- so the route applies a tighter per-action cap
+// of 50 to those and rejects a larger request with the uniform 400 (api:
+// routes/mail.ts's bulk endpoint, Task 4 ruling). The CHECK lives there
+// rather than in this schema because it is a property of the ACTION, not of
+// the body shape, and this schema is also what the whole-thread single-id
+// callers parse through -- but the NUMBERS live here, next to the outer bound
+// they tighten, because the web client mirrors them too (web: mail-lib's
+// select-all cap and its per-action disable), and three copies of 50 in three
+// packages is three chances for the client to build a request the server
+// answers with a 400.
 export const BULK_THREAD_ACTION_CAP = 200;
 export const MOVE_ACTION_THREAD_CAP = 50;
+
+// The cap per action, as a Record over the kind enum rather than as the
+// "everything except hide" test the route used to make. That negation was
+// correct while `hide` was the only CRM-side kind and became a latent bug the
+// moment 4.4 added a second one: `unhide` would have inherited the 50 by
+// falling on the wrong side of a `!== "hide"`, silently, with nothing to fail.
+// A Record is what makes a new kind a COMPILE error until someone decides
+// which side of the wait it is on -- the same reasoning as web mail-lib's
+// REASON_NOTES table, and the reason this replaces the client's own copy of
+// it rather than joining it.
+export const BULK_ACTION_THREAD_CAPS: Record<BulkThreadActionKind, number> = {
+  trash: MOVE_ACTION_THREAD_CAP,
+  archive: MOVE_ACTION_THREAD_CAP,
+  // Files into an arbitrary folder, so it waits on the server exactly as the
+  // other two moves do and takes their cap for exactly their reason.
+  file: MOVE_ACTION_THREAD_CAP,
+  hide: BULK_THREAD_ACTION_CAP,
+  // A hide-row DELETE. Local, no mailbox, nothing to wait on -- so it takes
+  // the outer bound, symmetric with the INSERT it undoes.
+  unhide: BULK_THREAD_ACTION_CAP,
+};
 
 export const bulkThreadActionInputSchema = z.object({
   threadIds: z.array(z.uuid()).min(1).max(BULK_THREAD_ACTION_CAP),
   folder: folderNameSchema.optional(),
+  targetFolder: folderNameSchema.optional(),
   action: bulkThreadActionKindSchema,
+}).superRefine((v, ctx) => {
+  // Enforced structurally rather than left to the service, for the same
+  // reason bulkThreadResultItemSchema correlates its own flags: a `file` with
+  // no destination has no defensible default (the account's Archive is a
+  // different action the caller could have asked for), and the honest answer
+  // to a request that does not say where is a 400 at the door.
+  if (v.action === "file" && v.targetFolder === undefined) {
+    ctx.addIssue({
+      code: "custom", path: ["targetFolder"],
+      message: "targetFolder is required when action is file",
+    });
+  }
+  if (v.action !== "file" && v.targetFolder !== undefined) {
+    ctx.addIssue({
+      code: "custom", path: ["targetFolder"],
+      message: "targetFolder is only valid when action is file",
+    });
+  }
 });
 export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
 
@@ -1266,12 +1425,25 @@ export type BulkThreadActionInput = z.infer<typeof bulkThreadActionInputSchema>;
 //   MOVE out would leave the CRM claiming a move that never happened.
 // - no_target: trash_folder/archive_folder is NULL for that account, the
 //   spec's "detect this for me" state. Fixable in Settings, or by waiting for
-//   a discovery pass.
+//   a discovery pass. NEVER produced by `file`, which names its own
+//   destination -- see unknown_target.
 // - not_found: no such thread id.
 // - server_refused: the queued IMAP MOVE was rejected; the optimistic rows
 //   have been put back. `error` carries the server's text.
+// - unknown_target (Phase 4.4, `file` only): the named destination is not a
+//   folder this message's account has -- either the account never had it, or
+//   the picker's list is stale against a folder renamed on the server. Its
+//   own code rather than a second meaning on no_target, because the two have
+//   different remedies and the client BRANCHES on that: no_target offers
+//   "Open Settings -> Mail", which is the wrong place to send someone whose
+//   only problem is that the second account in a mixed selection has no
+//   folder called Clients (web: summarizeBulkResult's settingsLink). It also
+//   covers a \Noselect destination -- a hierarchy node holding no messages,
+//   which cannot receive mail and is refused BEFORE the optimistic write
+//   rather than being left to the server (see api: mail-move.ts's
+//   fileTargetsOf).
 export const bulkThreadFailureReasonSchema = z.enum([
-  "no_sync", "no_target", "not_found", "server_refused",
+  "no_sync", "no_target", "not_found", "server_refused", "unknown_target",
 ]);
 export type BulkThreadFailureReason = z.infer<typeof bulkThreadFailureReasonSchema>;
 
@@ -1325,13 +1497,25 @@ export type BulkThreadResultReason = z.infer<typeof bulkThreadResultReasonSchema
 const FAILURE_REASONS = new Set<string>(bulkThreadFailureReasonSchema.options);
 const SKIP_REASONS = new Set<string>(bulkThreadSkipReasonSchema.options);
 
-const bulkThreadResultItemSchema = z.object({
-  threadId: z.uuid(),
-  ok: z.boolean(),
-  skipped: z.boolean().optional(),
-  error: z.string().optional(),
-  reason: bulkThreadResultReasonSchema.optional(),
-}).superRefine((v, ctx) => {
+/**
+ * The flag correlations every bulk result item obeys, whatever unit it is
+ * about -- factored out when Phase 4.4's per-message path arrived rather than
+ * copied into it. They are properties of ONE ANSWER (a failure carries text, a
+ * skip is a success, an explained outcome names its reason), and none of them
+ * mentions threads; a second, quieter copy beside the first is precisely how
+ * the two shapes would come to disagree about what `skipped` means.
+ *
+ * IT TAKES NO PER-PATH SKIP SET, which the first draft of it did: the
+ * per-message path cannot produce `out_of_scope`, and the place that enforces
+ * that is its `reason` ENUM, which rejects the value before this function ever
+ * sees it. A narrower set passed in here would have been a parameter no test
+ * could distinguish from SKIP_REASONS -- caught by trying to mutate it and
+ * finding nothing failed.
+ */
+function refineBulkResultItem(
+  v: { ok: boolean; skipped?: boolean | undefined; error?: string | undefined; reason?: string | undefined },
+  ctx: z.RefinementCtx,
+): void {
   if (v.ok && v.error !== undefined) {
     ctx.addIssue({ code: "custom", path: ["error"], message: "error must be absent when ok is true" });
   }
@@ -1361,11 +1545,172 @@ const bulkThreadResultItemSchema = z.object({
       ctx.addIssue({ code: "custom", path: ["reason"], message: "a skip must carry a skip reason" });
     }
   }
-});
+}
+
+const bulkThreadResultItemSchema = z.object({
+  threadId: z.uuid(),
+  ok: z.boolean(),
+  skipped: z.boolean().optional(),
+  error: z.string().optional(),
+  reason: bulkThreadResultReasonSchema.optional(),
+}).superRefine(refineBulkResultItem);
 export const bulkThreadResultSchema = z.object({
   results: z.array(bulkThreadResultItemSchema),
+  // Phase 4.4, `file` only: the destination folder whose sync THIS REQUEST
+  // switched on, absent when it switched none on.
+  //
+  // FILING INTO A FOLDER IS THE STATEMENT THAT THE FOLDER MATTERS, so filing
+  // into one whose sync is off turns that sync on (api: mail-move.ts). It
+  // does not warn and it does not refuse: the rejected alternative was to
+  // allow the move and warn that the thread would then vanish from Conduit's
+  // view, which is not informed consent -- it is a choice between losing the
+  // thread and not filing it where it belongs, dressed as one.
+  //
+  // This field exists so the consequence is still SAID, after the fact:
+  // enabling a sync is real (bandwidth, storage, a folder Conduit now walks
+  // every pass) and nobody should discover it from a graph. A notification,
+  // not a gate -- the client renders "Filed into Clients, and Conduit is now
+  // syncing that folder" beside the per-thread summary.
+  //
+  // ONE NAME, not one per account: the destination is a single string for the
+  // whole request, so every account this turned on turned on THAT folder, and
+  // the sentence is true of each. Present when at least one was switched;
+  // absent when the folder was already synced everywhere it mattered, when it
+  // is INBOX or a Sent folder (always synced, never toggleable), or when
+  // nothing was filed at all.
+  syncEnabled: z.string().min(1).optional(),
 });
 export type BulkThreadResult = z.infer<typeof bulkThreadResultSchema>;
+
+// ---------------------------------------------------------------------------
+// Per-message selection (Phase 4.4 Task 2) -- POST /api/mail/messages/bulk
+// ---------------------------------------------------------------------------
+//
+// A SECOND SURFACE, NOT A WIDENING OF THE FIRST. Selection in this app has
+// been per THREAD since 4.3, and 4.3's folder-scoped rule (the `folder` field
+// above) exists precisely because one conversation's messages spread across
+// folders: a thread id cannot say WHICH of its messages a gesture meant, so
+// the view it was made in had to say it instead. Filing a single message out
+// of a thread is a different unit of work, and the spec's ruling is that it
+// gets its own path -- overloading `threadIds` to sometimes mean messages is
+// how the folder-scoped rule became necessary in the first place.
+//
+// WHAT THE SECOND SURFACE DELIBERATELY DOES NOT COPY, each a decision:
+//
+// - NO hide/unhide. A hide is one mail_thread_hides row per THREAD, for the
+//   acting user. There is no per-message hide to ask for, and inventing one
+//   would be a new visibility concept rather than a wider version of this one.
+//   That is what keeps this enum at three kinds -- exactly the MOVE actions
+//   (api: mail-move.ts's MoveAction), which is also why the two files' sets
+//   are the same size.
+// - NO `folder`. It is the SOURCE on the thread schema -- the view a selection
+//   was made in -- and a message id IS that scope, exactly, with nothing left
+//   to approximate. Rejected rather than ignored, for the reason targetFolder
+//   is rejected on the kinds that have no destination: a silently dropped
+//   field is how a caller comes to believe it scoped something.
+// - NO `out_of_scope` (see bulkMessageResultSchema below).
+//
+// What it DOES share is the destination rule, byte for byte: `targetFolder` is
+// required for `file` and rejected on the other two, and filing into a folder
+// whose sync is off turns that sync ON rather than warning about it -- the
+// same service call, not a second decision (api: mail-move.ts's
+// enableTargetSync).
+export const bulkMessageActionKindSchema = z.enum(["trash", "archive", "file"]);
+export type BulkMessageActionKind = z.infer<typeof bulkMessageActionKindSchema>;
+
+// 50, and it is the MOVE cap's number for the MOVE cap's reason: every kind
+// here waits on a real mail server, each queued MOVE runs on its account's
+// serial sync loop, and bounding the SIZE of that wait rather than its
+// duration is what stops a timeout producing the "claimed a move the server
+// refused" state (api: routes/mail.ts's bulk endpoints).
+//
+// A SEPARATE CONSTANT FROM MOVE_ACTION_THREAD_CAP despite sharing its value,
+// because the two count different things: 50 threads can carry hundreds of
+// messages, so this is the tighter bound of the two and tying them together
+// would make one of them move when the other was reasoned about. Its own
+// second justification is that it matches what the surface can offer -- the
+// conversation view renders the newest 50 messages of a thread (api:
+// mail-threads.ts's THREAD_DETAIL_MESSAGE_CAP), so one full page of a
+// conversation selects and files in one gesture, and only a thread expanded
+// past that page can build a selection this refuses.
+export const BULK_MESSAGE_ACTION_CAP = 50;
+
+export const bulkMessageActionInputSchema = z.object({
+  messageIds: z.array(z.uuid()).min(1).max(BULK_MESSAGE_ACTION_CAP),
+  targetFolder: folderNameSchema.optional(),
+  action: bulkMessageActionKindSchema,
+// STRICT, unlike the thread input above, and that is what enforces the "no
+// `folder`" ruling: a plain z.object strips unknown keys silently, which would
+// accept `{ messageIds, folder: "INBOX" }` and file the mail while telling the
+// caller nothing about the scope it thought it had asked for.
+}).strict().superRefine((v, ctx) => {
+  if (v.action === "file" && v.targetFolder === undefined) {
+    ctx.addIssue({
+      code: "custom", path: ["targetFolder"],
+      message: "targetFolder is required when action is file",
+    });
+  }
+  if (v.action !== "file" && v.targetFolder !== undefined) {
+    ctx.addIssue({
+      code: "custom", path: ["targetFolder"],
+      message: "targetFolder is only valid when action is file",
+    });
+  }
+});
+export type BulkMessageActionInput = z.infer<typeof bulkMessageActionInputSchema>;
+
+// The skip reasons a per-message request can actually reach: the four the move
+// service NOTES against an individual row, and no fifth.
+//
+// `out_of_scope` is the one left out, and leaving it out is the contract
+// saying something true rather than a comment claiming it. That reason means
+// "this action never applied to this thread at all" -- in the folder-scoped
+// mode every message sat in some other folder, in the whole-thread mode the
+// conversation was nothing but Sent mail -- and it is the FALLBACK the thread
+// path reaches for when a thread finishes with no reason recorded against any
+// of its messages. A request that named a message by id leaves that message no
+// scope to fall outside of: it is looked at, and whatever happens to it is
+// noted against it. So every skip here is a noted one, which is exactly the
+// set api: mail-move.ts already types as NotedSkipReason.
+export const bulkMessageSkipReasonSchema = z.enum([
+  "archived_account", "not_owner", "awaiting_reconciliation", "already_in_target",
+]);
+export type BulkMessageSkipReason = z.infer<typeof bulkMessageSkipReasonSchema>;
+
+export const bulkMessageResultReasonSchema = z.enum([
+  ...bulkThreadFailureReasonSchema.options, ...bulkMessageSkipReasonSchema.options,
+]);
+export type BulkMessageResultReason = z.infer<typeof bulkMessageResultReasonSchema>;
+
+// KEYED ON messageId, in request order, and that key is the whole reason this
+// is a separate response shape rather than the thread one reused. Two messages
+// of ONE conversation can come out differently -- one filed, one refused by
+// the server, one already in the destination -- and a threadId-keyed result
+// has no way to say so: it would have to collapse them into a single verdict
+// per thread, which is either a lie about the ones that worked or a lie about
+// the ones that did not.
+//
+// The FAILURE reasons are shared with the thread path unchanged, because each
+// of them is a fact about a message and its account (no running loop, no
+// classified target, the server said no, that account has no such folder)
+// rather than about the unit a request selected in.
+const bulkMessageResultItemSchema = z.object({
+  messageId: z.uuid(),
+  ok: z.boolean(),
+  skipped: z.boolean().optional(),
+  error: z.string().optional(),
+  reason: bulkMessageResultReasonSchema.optional(),
+}).superRefine(refineBulkResultItem);
+
+export const bulkMessageResultSchema = z.object({
+  results: z.array(bulkMessageResultItemSchema),
+  // The same after-the-fact notification the thread result carries, for the
+  // same rule applied by the same call: filing into a folder IS the statement
+  // that the folder matters, so a destination whose sync is off is switched on
+  // and then SAID -- never asked about first.
+  syncEnabled: z.string().min(1).optional(),
+});
+export type BulkMessageResult = z.infer<typeof bulkMessageResultSchema>;
 
 export const mailLinkKindSchema = z.enum(["company", "contact", "deal", "project"]);
 export type MailLinkKind = z.infer<typeof mailLinkKindSchema>;
