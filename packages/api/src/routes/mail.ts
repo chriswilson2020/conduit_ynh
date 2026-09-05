@@ -184,7 +184,9 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
   // syncManager is the GETTER, captured here and called inside each handler:
   // the manager itself does not exist until after the server is listening
   // (see CrmRouteDeps), so nothing may read it at registration time.
-  const { db, dataDir, mailKeyPath, basePath, transportFactory, syncManager } = deps;
+  const {
+    db, dataDir, mailKeyPath, basePath, transportFactory, mailTokenRefresher, syncManager,
+  } = deps;
 
   // --- Accounts ------------------------------------------------------------
 
@@ -851,7 +853,8 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     if (input === undefined) return;
     try {
       const message = await sendMail(db, dataDir, user.id, input, {
-        mailKeyPath, transportFactory, syncManager: syncManager(),
+        mailKeyPath, transportFactory, tokenRefresher: mailTokenRefresher,
+        syncManager: syncManager(),
       });
       // Placeholders resolved on the way out, like every other body-serving
       // path -- the stored form never leaves the API.

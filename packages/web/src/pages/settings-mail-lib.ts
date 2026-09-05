@@ -1,6 +1,8 @@
-import type {
-  MailAccount, MailAccountCreateInput, MailAccountTestInput, MailAccountUpdateInput,
-  MailAccountUpdatePasswordFields, MailSecurity,
+import {
+  mailOAuthProviderOf,
+  type MailAccount, type MailAccountCreateInput, type MailAccountStatus,
+  type MailAccountTestInput, type MailAccountUpdateInput,
+  type MailAccountUpdatePasswordFields, type MailAuthMethod, type MailSecurity,
 } from "@conduit/shared";
 
 /**
@@ -276,4 +278,66 @@ export function folderDeleteWarning(folder: string): string[] {
     "If the folder still holds mail on the server, or has folders inside it, this is refused"
       + " rather than done: Conduit does not delete mail.",
   ];
+}
+
+// --- The account's state, as a row shows it (Phase 8 Task 2) -----------------
+
+/**
+ * What the status badge says.
+ *
+ * PURE AND SEPARATE FROM THE COMPONENT, following folderRenameBlocked's
+ * precedent above: the interesting part of a state is which words it produces,
+ * and that is worth a test per case rather than a render test per case.
+ *
+ * 'auth_required' READS AS AN INSTRUCTION, NOT A DIAGNOSIS. "Error" describes
+ * the server's mood; "Sign in again" describes what the person looking at the
+ * row has to do, which is the entire reason this state exists apart from
+ * 'error' (see mailAccountStatusSchema in @conduit/shared). An operator who
+ * reads "Error" waits for it to clear, and this one never clears on its own.
+ */
+export function accountStatusLabel(status: MailAccountStatus, archived: boolean): string {
+  if (archived) return "Archived";
+  switch (status) {
+    case "auth_required": return "Sign in again";
+    case "error": return "Error";
+    case "active": return "Active";
+    // Exhaustive by construction: a fourth status nobody adds here is a
+    // compile error at the `never`, not a badge that silently reads "Active"
+    // for a state the server considers broken.
+    default: {
+      const exhaustive: never = status;
+      return exhaustive;
+    }
+  }
+}
+
+/**
+ * The sentence beneath the badge when an account's grant has lapsed, or null
+ * when the row has nothing of this kind to say.
+ *
+ * NAMES THE PROVIDER, because "sign in again" is a different gesture at
+ * Microsoft than at Google and the operator is about to go and do one of them.
+ * The name comes from mail_accounts.auth_method, which is in the clear and is
+ * the whole reason that column exists -- rendering this costs no trip to
+ * mail.key.
+ *
+ * DELIBERATELY NOT last_error. That column still holds the provider's own words
+ * (an AADSTS code, say) for whoever is diagnosing this, and those words are of
+ * no use to the person who simply has to sign in again -- an operator reading a
+ * technical string and concluding that waiting is the remedy is the exact
+ * failure this state exists to prevent.
+ *
+ * The password branch is unreachable -- a password account has no grant to
+ * lapse -- and returns a sentence rather than throwing: a row that somehow
+ * reached this state should still say something true and actionable.
+ */
+export function accountReauthMessage(
+  status: MailAccountStatus, authMethod: MailAuthMethod,
+): string | null {
+  if (status !== "auth_required") return null;
+  const provider = mailOAuthProviderOf(authMethod);
+  if (provider === null) return "This mailbox needs to be signed in to again before it can sync.";
+  const name = provider === "microsoft" ? "Microsoft" : "Google";
+  return `${name} has stopped accepting this mailbox's saved sign-in.`
+    + " Sign in again to resume syncing and sending.";
 }

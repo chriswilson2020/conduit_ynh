@@ -23,6 +23,8 @@ import {
   friendlyMailError, htmlIsBlank, moveTargetPatch, newestDiscovery,
 } from "../components/mail/mail-lib";
 import {
+  accountReauthMessage,
+  accountStatusLabel,
   buildCreateInput,
   buildTestInput,
   buildUpdatePatch,
@@ -187,6 +189,7 @@ function AccountCard({
   const [showSignature, setShowSignature] = useState(false);
   const [showFolders, setShowFolders] = useState(false);
   const isArchived = account.archivedAt !== null;
+  const reauthMessage = accountReauthMessage(account.status, account.authMethod);
 
   return (
     <section
@@ -271,6 +274,13 @@ function AccountCard({
         </div>
       </div>
 
+      {/* The two are mutually exclusive by construction (one status column), and
+          they are two elements rather than one because they say different KINDS
+          of thing: an error is the server's report, and this is an instruction
+          to the person reading it. */}
+      {reauthMessage !== null && (
+        <p role="alert" className="mt-2 text-sm text-amber-700">{reauthMessage}</p>
+      )}
       {account.status === "error" && account.lastError !== null && (
         <p role="alert" className="mt-2 text-sm text-red-600">{friendlyMailError(account.lastError)}</p>
       )}
@@ -353,14 +363,26 @@ function VisibilitySection({ account }: { account: MailAccountWithSyncStats }) {
   );
 }
 
+/**
+ * AMBER FOR 'auth_required', NOT RED, and the colour is doing work rather than
+ * decorating. Red is this page's "something broke" and sits next to a Test
+ * connection button; amber is "you have something to do", which is the true
+ * shape of a lapsed sign-in. The WORDS carry the meaning either way
+ * (accountStatusLabel), because colour alone is never a state here -- the same
+ * rule the folder rows follow for their blocked reasons.
+ */
 function StatusBadge({ status, archived }: { status: MailAccountWithSyncStats["status"]; archived: boolean }) {
+  const label = accountStatusLabel(status, archived);
   if (archived) {
-    return <span className="rounded bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">Archived</span>;
+    return <span className="rounded bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">{label}</span>;
+  }
+  if (status === "auth_required") {
+    return <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">{label}</span>;
   }
   if (status === "error") {
-    return <span className="rounded bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700">Error</span>;
+    return <span className="rounded bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700">{label}</span>;
   }
-  return <span className="rounded bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">Active</span>;
+  return <span className="rounded bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">{label}</span>;
 }
 
 function TestResult({ result }: { result: MailAccountTestResult }) {

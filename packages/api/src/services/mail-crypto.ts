@@ -132,19 +132,26 @@ export type MailOAuthCredentials = Extract<MailCredentials, { kind: "oauth" }>;
  * Narrow to the password shape, or throw.
  *
  * EXISTS BECAUSE THE UNION LANDED BEFORE THE CODE THAT USES ITS OTHER HALF.
- * Four call sites can only do something with a password -- the IMAP connect,
- * the SMTP transport, updateAccount's carry-the-imap-half-forward branch, and
- * testConnection's stored-password fallback -- and Phase 8 Task 2 is what
- * teaches the first two to hand an access token to imapflow/nodemailer
- * instead. Until then the compiler must not let them read `.imapPassword` off
- * a value that might not have one, and a silent fallback would be worse than
- * a throw: a sync that quietly used an empty password would present as an
- * auth failure against the provider, which is precisely the "mail just
- * stopped" symptom the spec's Risk 3 is about.
+ * Four call sites could only do something with a password. Task 2 removed the
+ * two that mattered -- the IMAP connect and the SMTP transport now take an
+ * already-resolved credential from mail-oauth.ts's resolveConnectionAuth, which
+ * hands imapflow and nodemailer an access token where there is one. The two
+ * that remain are both in mail-accounts.ts and both belong to Task 3:
+ * updateAccount's carry-the-imap-half-forward branch (an OAuth account has no
+ * password half to carry, and acquiring one is signing in, not editing) and
+ * testConnection's stored-password fallback (which has no second form to test
+ * an OAuth account from until Task 3 builds one).
  *
- * NOT REACHABLE IN TASK 1. Nothing in this release can create an OAuth
- * account -- there is no route, no form and no writer for the OAuth shape --
- * so this is a compile-time completeness guard that only tests exercise.
+ * A THROW RATHER THAN A FALLBACK, unchanged and still the point: a path that
+ * quietly used an empty password would present as an auth failure against the
+ * provider, which is precisely the "mail just stopped" symptom the spec's
+ * Risk 3 is about.
+ *
+ * STILL NOT REACHABLE. Nothing in this release can create an OAuth account --
+ * there is no route, no form and no writer for the OAuth shape -- so this
+ * remains a compile-time completeness guard that only tests exercise, and
+ * MailCredentialKindError still needs no mapDomainError entry until the moment
+ * one can exist.
  */
 export function mustBePasswordCredentials(
   credentials: MailCredentials, accountId: string,
@@ -243,6 +250,49 @@ export function encryptCredentials(key: Buffer, credentials: MailCredentialsInpu
   const data = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
   return [VERSION, iv.toString("base64"), tag.toString("base64"), data.toString("base64")].join(":");
+}
+
+/**
+ * encryptCredentials, refusing anything decryptCredentials would then refuse.
+ *
+ * EXISTS BECAUSE SEALING IS IRREVERSIBLE IN THE WAY THAT MATTERS. Its sibling
+ * above serialises whatever it is handed; a caller that gets past the type
+ * parameter -- a cast, or a value assembled from a provider's JSON response --
+ * can therefore write a blob that authenticates perfectly under GCM and yet
+ * fails mailCredentialsSchema on every read from that moment on. The row then
+ * reads "credentials unreadable" for ever, which points an operator at
+ * mail.key, which is not the problem, and no backup helps because the bad bytes
+ * were written on purpose. One safeParse before the cipher turns that into a
+ * throw at the moment of the mistake.
+ *
+ * THE PAYLOAD ENCRYPTED IS THE CALLER'S OWN VALUE, NOT THE PARSED OUTPUT, and
+ * that is deliberate rather than lazy. The password member's transform ADDS
+ * `kind: "password"`, so sealing the parsed output would change the bytes a
+ * v1.7.0 install writes for a password account -- the exact thing Task 1 went
+ * out of its way to keep identical to v1.6.0's (see passwordCredentialsSchema's
+ * "NOTHING WRITES kind: password"). The parse is a gate here, never a
+ * normaliser.
+ *
+ * USED BY THE PATHS THAT SEAL SOMETHING THEY DID NOT CONSTRUCT THEMSELVES --
+ * today mail-oauth.ts, writing a token an HTTP response supplied. The password
+ * call sites in mail-accounts.ts stay on the plain encryptCredentials: each
+ * builds `{imapPassword, smtpPassword}` inline from two strings it already has,
+ * so there is nothing for a check to catch. mail-crypto.test.ts's
+ * wrong-shape-ciphertext fixture depends on the plain one staying unchecked,
+ * which is the other reason this is a second function and not a new behaviour
+ * of the first.
+ */
+export function encryptCredentialsChecked(key: Buffer, credentials: MailCredentialsInput): string {
+  const result = mailCredentialsSchema.safeParse(credentials);
+  if (!result.success) {
+    // No field values in the message: the payload being refused may be an
+    // OAuth one, and its refresh token is the last thing that should reach an
+    // error string. The zod issue PATHS are safe (they are key names) and are
+    // what a caller needs to fix the payload.
+    const paths = result.error.issues.map((issue) => issue.path.join(".") || "(root)").join(", ");
+    throw new Error(`refusing to encrypt a credential payload that would not decrypt: ${paths}`);
+  }
+  return encryptCredentials(key, credentials);
 }
 
 /**

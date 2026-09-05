@@ -15,10 +15,12 @@ import { createCompany } from "./companies.js";
 import { createContact } from "./contacts.js";
 import { createProject } from "./projects.js";
 import {
-  ArchivedError, AttachmentTooLargeError, ConflictError, NotFoundError, SmtpSendError,
+  ArchivedError, AttachmentTooLargeError, ConflictError, MailReauthRequiredError, NotFoundError,
+  SmtpSendError,
 } from "./errors.js";
 import { archiveAccount, createAccount } from "./mail-accounts.js";
-import type { MailCredentials } from "./mail-crypto.js";
+import { encryptCredentialsAt } from "./mail-crypto.js";
+import type { MailConnectionAuth } from "./mail-imap.js";
 import { ingestMessage } from "./mail-ingest.js";
 import { SyncUnavailableError } from "./mail-sync.js";
 import {
@@ -75,13 +77,15 @@ async function makeAccount(overrides: Partial<MailAccountCreateInput> = {}): Pro
  * way a real transport does, after the message was fully composed. */
 class FakeTransport implements SendMailTransport {
   readonly sent: SendMailMessage[] = [];
-  readonly seenCredentials: MailCredentials[] = [];
+  /** What actually reached nodemailer, per send: a password half or a token,
+   * already resolved by mail-oauth.ts before the factory was called. */
+  readonly seenAuth: MailConnectionAuth[] = [];
   readonly seenAccounts: MailAccount[] = [];
   failure: Error | null = null;
 
-  factory = (account: MailAccount, credentials: MailCredentials): SendMailTransport => {
+  factory = (account: MailAccount, auth: MailConnectionAuth): SendMailTransport => {
     this.seenAccounts.push(account);
-    this.seenCredentials.push(credentials);
+    this.seenAuth.push(auth);
     return this;
   };
 
@@ -252,7 +256,7 @@ describe("sendMail", () => {
     expect(transport.sent).toHaveLength(1);
     expect(transport.sent[0]?.envelope).toEqual({ from: "chris@example.com", to: ["alice@example.com"] });
     // The SMTP password, not the IMAP one (the account was created with both).
-    expect(transport.seenCredentials[0]).toMatchObject({ kind: "password", smtpPassword: "smtp-secret" });
+    expect(transport.seenAuth[0]).toEqual({ kind: "password", password: "smtp-secret" });
     expect(transport.seenAccounts[0]?.id).toBe(accountId);
 
     // Stored by ingest, with everything ingest is responsible for.
@@ -313,6 +317,59 @@ describe("sendMail", () => {
     transport.failure = new Error("Message failed: 550 5.7.1 relay denied");
     await expect(sendMail(handle.db, dataDir, actorId, input(), deps()))
       .rejects.toThrow(/550 5.7.1 relay denied/);
+  });
+
+  /**
+   * A DEAD GRANT AT SEND TIME, which is the one moment a person is looking.
+   *
+   * The composer's dialog shows this sentence, so it has to be the instruction
+   * ("sign in again") and not the diagnosis ("auth: invalid login") -- neither
+   * of the two classified prefixes is true of it: "check the username/password"
+   * points at a field this account does not have, and "server unreachable"
+   * invites a retry that cannot work. Nothing is stored, as with every other
+   * SMTP refusal.
+   *
+   * IT DOES NOT WRITE THE ACCOUNT'S STATE, deliberately. The sync loop is the
+   * single writer of mail_accounts.status (mail-sync.ts) and reaches the same
+   * conclusion within a poll interval; a second writer here is how a state gets
+   * overwritten by whichever ran last.
+   */
+  it("tells a composing user to sign in again when the OAuth grant has lapsed", async () => {
+    // The suite's own account, signed in with Microsoft: this file already has
+    // exactly one mailbox for this address and a second would be refused.
+    await handle.db.update(mailAccounts).set({
+      authMethod: "oauth_microsoft",
+      credentialsCiphertext: encryptCredentialsAt(keyPath, { kind: "oauth", refreshToken: "dead" }),
+    }).where(eq(mailAccounts.id, accountId));
+
+    const error = await sendMail(handle.db, dataDir, actorId, input(), deps({
+      tokenRefresher: () => Promise.reject(new MailReauthRequiredError("microsoft", "invalid_grant")),
+    })).then(() => null, (err: unknown) => err);
+
+    expect(error).toBeInstanceOf(SmtpSendError);
+    expect((error as SmtpSendError).message).toContain("Sign in again");
+    expect((error as SmtpSendError).message).toContain("microsoft");
+    // Neither classified prefix: the composer must not translate this into
+    // "check the username/password".
+    expect((error as SmtpSendError).reason).not.toContain("auth:");
+    expect((error as SmtpSendError).reason).not.toContain("connection:");
+    expect(await storedMessages()).toHaveLength(0);
+    // The state is the sync loop's to write; the send path leaves it alone.
+    const [row] = await handle.db.select().from(mailAccounts).where(eq(mailAccounts.id, accountId));
+    expect(row?.status).toBe("active");
+  });
+
+  /** With no refresher wired up at all -- an install with no app registration
+   * -- the refusal still has to be a sentence rather than a TypeError from
+   * calling undefined, and still a 502 rather than a 500. */
+  it("refuses in a sentence when the server has no token refresher at all", async () => {
+    await handle.db.update(mailAccounts).set({
+      authMethod: "oauth_google",
+      credentialsCiphertext: encryptCredentialsAt(keyPath, { kind: "oauth", refreshToken: "r" }),
+    }).where(eq(mailAccounts.id, accountId));
+
+    await expect(sendMail(handle.db, dataDir, actorId, input(), deps()))
+      .rejects.toThrow(SmtpSendError);
   });
 
   it("stores the message and warns when the Sent-folder APPEND fails", async () => {
@@ -644,8 +701,32 @@ describe("sendMail", () => {
 
     // A 409 with the stored error beats a 502 arriving a connect-timeout
     // later with nothing useful in it.
-    await expect(sendMail(handle.db, dataDir, actorId, input(), deps()))
-      .rejects.toBeInstanceOf(ConflictError);
+    const error = await sendMail(handle.db, dataDir, actorId, input(), deps())
+      .then(() => null, (err: unknown) => err);
+    expect(error).toBeInstanceOf(ConflictError);
+    expect((error as Error).message).toContain("test its connection");
+    expect(transport.sent).toHaveLength(0);
+  });
+
+  /**
+   * THE SAME GATE, THE OTHER SENTENCE. An account whose OAuth grant has lapsed
+   * is refused for the same reason -- its SMTP submission is about to fail the
+   * same way -- but "test its connection in settings" is the WRONG instruction
+   * for it: there is nothing to test, and the button would answer "credentials
+   * unreadable". Sending someone to the wrong control is the v1.4.1 mistake the
+   * Phase 8 plan names by hand, where an error message blamed the wrong thing
+   * and the operator concluded Conduit was broken.
+   */
+  it("tells a composer to sign in again, not to test the connection, when the grant has lapsed", async () => {
+    await handle.db.update(mailAccounts)
+      .set({ status: "auth_required", lastError: "microsoft would not renew this account's sign-in" })
+      .where(eq(mailAccounts.id, accountId));
+
+    const error = await sendMail(handle.db, dataDir, actorId, input(), deps())
+      .then(() => null, (err: unknown) => err);
+    expect(error).toBeInstanceOf(ConflictError);
+    expect((error as Error).message).toContain("sign in again");
+    expect((error as Error).message).not.toContain("test its connection");
     expect(transport.sent).toHaveLength(0);
   });
 

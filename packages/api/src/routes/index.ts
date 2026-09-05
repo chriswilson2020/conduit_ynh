@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import multipart from "@fastify/multipart";
 import type { Database } from "../db/client.js";
 import type { SendMailTransportFactory } from "../services/mail-send.js";
+import type { MailTokenRefresher } from "../services/mail-oauth.js";
 import type { MailRouteSyncManager } from "./mail.js";
 import { registerCompanyRoutes } from "./companies.js";
 import { registerContactRoutes } from "./contacts.js";
@@ -96,6 +97,14 @@ export interface CrmRouteDeps {
    * mail-imapflow.ts's createSmtpTransportFactory.
    */
   transportFactory: SendMailTransportFactory;
+  /**
+   * How an OAuth mail account's refresh token becomes an access token, from
+   * the composition root exactly as transportFactory is (services/mail-oauth.ts).
+   * The send path needs it because a send is one of the two things that opens a
+   * connection on an account's behalf; the other is the sync loop, which is
+   * given its own by server.ts.
+   */
+  mailTokenRefresher: MailTokenRefresher;
   /**
    * How a password is checked, supplied by the composition root the same way
    * transportFactory is -- production binds against YunoHost's portal API,

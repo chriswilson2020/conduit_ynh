@@ -450,6 +450,22 @@ export const mailAccounts = pgTable("mail_accounts", {
   // (schema.test.ts's withPreMigrationDatabase("0006") drill asserts a
   // pre-0006 row comes back private, not just that the column exists).
   visibility: text("visibility").notNull().default("private"),
+  // What the sync loop last had to say, and its ONLY writer is that loop
+  // (mail-sync.ts's writeAccountState) plus updateAccount's clear-a-stale-error
+  // branch. See @conduit/shared's mailAccountStatusSchema for what the three
+  // values mean.
+  //
+  // 'auth_required' IS PHASE 8 TASK 2's, and it is the account state the spec's
+  // Risk 3 asks for: an OAuth grant the provider has stopped honouring. It is
+  // separate from 'error' because it is the one failure retrying cannot clear
+  // -- the engine will get the identical refusal every 32 minutes until a human
+  // signs in again -- so the Settings row has to say "sign in again" rather
+  // than showing an error that reads like a server having a bad day.
+  //
+  // NOT RESET BY AN ORDINARY EDIT, unlike 'error': updateAccount's
+  // shouldResetStatus is gated on `status === 'error'`, so relabelling an
+  // account cannot clear a re-authorisation it still needs. Whether the grant
+  // came back is the sync loop's question and it answers it on the next pass.
   status: text("status").notNull().default("active"),
   lastError: text("last_error"),
   lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
@@ -459,7 +475,7 @@ export const mailAccounts = pgTable("mail_accounts", {
 }, (t) => [
   check("mail_accounts_imap_security_valid", sql`imap_security IN ('tls','starttls')`),
   check("mail_accounts_smtp_security_valid", sql`smtp_security IN ('tls','starttls')`),
-  check("mail_accounts_status_valid", sql`status IN ('active','error')`),
+  check("mail_accounts_status_valid", sql`status IN ('active','error','auth_required')`),
   check("mail_accounts_visibility_valid", sql`visibility IN ('private','shared')`),
   check("mail_accounts_auth_method_valid", sql`auth_method IN ('password','oauth_microsoft','oauth_google')`),
 ]);

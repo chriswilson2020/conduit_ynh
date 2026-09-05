@@ -48,6 +48,8 @@ const config: Config = {
   // gate to open hands buildApp its own. Nothing passes the gate by forgetting.
   ldapUrl: "ldap://127.0.0.1:389",
   reauthPassword: null,
+  // No app registration: these tests build an app, never an OAuth account.
+  mailOAuth: { microsoft: null, google: null },
 };
 
 const authHeaders = {

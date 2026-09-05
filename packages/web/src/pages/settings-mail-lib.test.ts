@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import type { MailAccount } from "@conduit/shared";
 import {
+  accountReauthMessage,
+  accountStatusLabel,
   buildCreateInput,
   buildTestInput,
   buildUpdatePatch,
@@ -349,5 +351,59 @@ describe("folder command gating", () => {
       // never seen. The server's real count arrives in the refusal.
       expect(lines.join(" ")).not.toMatch(/\d/);
     });
+  });
+});
+
+// --- The account's state, as a row shows it (Phase 8 Task 2) -----------------
+
+describe("accountStatusLabel", () => {
+  /**
+   * THE WHOLE POINT OF THE THIRD STATE IS THESE THREE WORDS. "Error" is a
+   * description of the server's mood and invites waiting; a lapsed OAuth grant
+   * never clears on its own, so the badge has to name the action instead. An
+   * implementation that folded this into "Error" would pass every other test in
+   * this repo and still produce the failure the spec's Risk 3 describes.
+   */
+  it("tells an operator what to DO when a grant has lapsed", () => {
+    expect(accountStatusLabel("auth_required", false)).toBe("Sign in again");
+  });
+
+  it("leaves the two pre-existing states alone", () => {
+    expect(accountStatusLabel("active", false)).toBe("Active");
+    expect(accountStatusLabel("error", false)).toBe("Error");
+  });
+
+  /** Archiving stops syncing, so whatever the loop last thought is history --
+   * and an archived row must not nag about a sign-in it no longer needs. */
+  it("says Archived regardless of the status underneath", () => {
+    expect(accountStatusLabel("auth_required", true)).toBe("Archived");
+    expect(accountStatusLabel("error", true)).toBe("Archived");
+  });
+});
+
+describe("accountReauthMessage", () => {
+  it("names the provider, because signing in again is a different errand at each", () => {
+    expect(accountReauthMessage("auth_required", "oauth_microsoft")).toContain("Microsoft");
+    expect(accountReauthMessage("auth_required", "oauth_google")).toContain("Google");
+  });
+
+  it("says what to do and what it fixes", () => {
+    const message = accountReauthMessage("auth_required", "oauth_microsoft") ?? "";
+    expect(message).toContain("Sign in again");
+    expect(message).toContain("syncing");
+  });
+
+  /** Silent for every other state: an account in ordinary error already shows
+   * last_error, and two alerts on one row read as two problems. */
+  it("says nothing for an account that is not in that state", () => {
+    expect(accountReauthMessage("active", "oauth_microsoft")).toBeNull();
+    expect(accountReauthMessage("error", "oauth_microsoft")).toBeNull();
+  });
+
+  /** Unreachable -- a password account has no grant to lapse -- but a row that
+   * somehow got there must still say something true and actionable rather than
+   * throwing on the settings page. */
+  it("still says something useful for a password account", () => {
+    expect(accountReauthMessage("auth_required", "password")).toContain("signed in");
   });
 });

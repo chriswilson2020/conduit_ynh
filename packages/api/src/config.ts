@@ -45,7 +45,65 @@ const envSchema = z.object({
   // deploy target is a gate nobody ever proves -- including the half that
   // matters most, that bypassing it fails.
   CONDUIT_REAUTH_PASSWORD: z.string().min(1).optional(),
+  // --- Phase 8: the OAuth app registrations ---------------------------------
+  //
+  // THE MINIMUM A TOKEN REFRESH NEEDS, AND NOTHING MORE. Task 2 exchanges a
+  // stored refresh token for an access token, which is an RFC 6749 4c
+  // client-authenticated POST -- so a client id and secret are the whole of
+  // what has to be configurable here. The redirect URI and the scope list
+  // belong to the AUTHORISE half (Task 3) and are deliberately absent: adding
+  // env vars nothing reads is how a deployment ends up carrying settings whose
+  // truth nobody checks.
+  //
+  // ABSENT IS THE NORMAL STATE, hence optional with no defaults. This install's
+  // accounts are password accounts against a self-hosted Dovecot, and the spec
+  // is explicit that they stay the common case. An install with no registration
+  // configured simply has no way to make an OAuth account; the refresher says
+  // so in a sentence rather than failing at a provider with an empty client id.
+  //
+  // THE SECRET IS A SECRET AND HAS NO PRODUCTION GUARD, unlike CONDUIT_DEV_USER
+  // and CONDUIT_REAUTH_PASSWORD above -- those two DISABLE a security control
+  // when set, which is why production refuses them. This one is an ordinary
+  // credential that production is exactly where you want it; it lives in the
+  // install's .env beside DATABASE_URL, is never logged, and never reaches a
+  // response.
+  MAIL_OAUTH_MICROSOFT_CLIENT_ID: z.string().min(1).optional(),
+  MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: z.string().min(1).optional(),
+  // Single-tenant, per the spec's "a single-tenant app registration in the
+  // operator's own Azure AD". "common" is the multi-tenant endpoint and is a
+  // deliberate non-default: an operator who sets an id and secret but no tenant
+  // has not finished, and a silent fallback to /common would authenticate
+  // against the wrong directory rather than refusing.
+  MAIL_OAUTH_MICROSOFT_TENANT: z.string().min(1).optional(),
+  MAIL_OAUTH_GOOGLE_CLIENT_ID: z.string().min(1).optional(),
+  MAIL_OAUTH_GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
 });
+
+/**
+ * One provider's app registration, or null when this install has none.
+ * `tokenEndpoint` is resolved here rather than at the point of use so that the
+ * "which URL does Microsoft's tenant give" question is answered once, in the
+ * composition root's own input, and a test can point it at a local server
+ * without knowing anything about Azure's URL shape.
+ */
+export interface MailOAuthClientConfig {
+  clientId: string;
+  clientSecret: string;
+  tokenEndpoint: string;
+}
+
+export interface MailOAuthConfig {
+  microsoft: MailOAuthClientConfig | null;
+  google: MailOAuthClientConfig | null;
+}
+
+/** Google's token endpoint. One fixed URL, no tenant equivalent. */
+export const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+
+/** Microsoft identity platform v2.0 token endpoint for one tenant. */
+export function microsoftTokenEndpoint(tenant: string): string {
+  return `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`;
+}
 
 export interface Config {
   nodeEnv: z.infer<typeof envSchema>["NODE_ENV"];
@@ -69,6 +127,27 @@ export interface Config {
   /** A fixed re-authentication password. Never set in production; see the
    * schema entry and the guard in parseConfig. */
   reauthPassword: string | null;
+  /** Phase 8's OAuth app registrations, per provider. Both null on an install
+   * that only has password accounts, which is the ordinary case. */
+  mailOAuth: MailOAuthConfig;
+}
+
+/**
+ * One provider's registration, or null when it is not fully configured.
+ *
+ * ALL-OR-NOTHING, never a half. A client id without a secret (or, for
+ * Microsoft, without a tenant) cannot complete a single request, and carrying
+ * it as a partly-populated object would push the "is this usable?" question
+ * down to the token exchange, where the answer arrives as a provider's 401 with
+ * an operator-hostile message. A half-set registration reads here as no
+ * registration, and the refresher's own sentence says which install-side thing
+ * is missing.
+ */
+function oauthClient(
+  clientId: string | undefined, clientSecret: string | undefined, tokenEndpoint: string | null,
+): MailOAuthClientConfig | null {
+  if (clientId === undefined || clientSecret === undefined || tokenEndpoint === null) return null;
+  return { clientId, clientSecret, tokenEndpoint };
 }
 
 export function parseConfig(env: Record<string, string | undefined>): Config {
@@ -120,5 +199,19 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     mailTlsRejectUnauthorized: value.MAIL_TLS_REJECT_UNAUTHORIZED !== "0",
     ldapUrl: value.CONDUIT_LDAP_URL,
     reauthPassword: value.CONDUIT_REAUTH_PASSWORD ?? null,
+    mailOAuth: {
+      microsoft: oauthClient(
+        value.MAIL_OAUTH_MICROSOFT_CLIENT_ID,
+        value.MAIL_OAUTH_MICROSOFT_CLIENT_SECRET,
+        value.MAIL_OAUTH_MICROSOFT_TENANT === undefined
+          ? null
+          : microsoftTokenEndpoint(value.MAIL_OAUTH_MICROSOFT_TENANT),
+      ),
+      google: oauthClient(
+        value.MAIL_OAUTH_GOOGLE_CLIENT_ID,
+        value.MAIL_OAUTH_GOOGLE_CLIENT_SECRET,
+        GOOGLE_TOKEN_ENDPOINT,
+      ),
+    },
   };
 }

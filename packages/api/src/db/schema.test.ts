@@ -317,7 +317,11 @@ describe("mail schema (0004)", () => {
   // insert, and a value outside the enum must be rejected by the CHECK.
   it("keeps mailSecuritySchema/mailAccountStatusSchema/mailDirectionSchema in sync with their DB CHECKs", async () => {
     expect(mailSecuritySchema.options).toEqual(["tls", "starttls"]);
-    expect(mailAccountStatusSchema.options).toEqual(["active", "error"]);
+    // 'auth_required' is Phase 8 Task 2's third state: the failure a retry can
+    // never clear. Listed here so widening the zod enum without widening 0015's
+    // CHECK (or the reverse) is a red test rather than a runtime 23514 the
+    // first time an OAuth grant lapses on a real install.
+    expect(mailAccountStatusSchema.options).toEqual(["active", "error", "auth_required"]);
     expect(mailDirectionSchema.options).toEqual(["inbound", "outbound"]);
 
     // Distinct emails per row: mail_accounts_user_email_active_unique (this
@@ -2173,6 +2177,57 @@ describe("the duplicate probe's indexes (0013)", () => {
         WHERE conduit_lower_emails(emails) && ARRAY['ada@example.com']
       `);
       expect(folded[0]?.hit).toBe(1);
+    });
+  }, 30000);
+});
+
+describe("mail re-authentication state (0015)", () => {
+  /**
+   * 0015 REPLACES A CONSTRAINT RATHER THAN ADDING A COLUMN, and that is a
+   * different kind of risk from 0014's. `DROP CONSTRAINT` without IF EXISTS
+   * fails hard against a table whose constraint is not named exactly
+   * `mail_accounts_status_valid` -- and a failed migration is a server that
+   * does not boot, on an install that was working a minute earlier. The only
+   * honest way to know the name matches what earlier migrations really created
+   * is to run the whole chain against a real pre-0015 database, which is what
+   * this does.
+   *
+   * IT ALSO PINS THAT NOTHING MOVES. The new predicate is a strict superset of
+   * the old one, so a row that was 'error' before must still be 'error'
+   * afterwards -- the migration widens what is legal, it does not reclassify
+   * anything.
+   */
+  it("applies migration 0015 to a real pre-0015 database, keeping existing statuses and admitting the new one", async () => {
+    await withPreMigrationDatabase("0015", async (scratch) => {
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const [account] = await scratch.db.insert(mailAccounts).values({
+        userId: user!.id, label: "Work", email: "chris@example.com",
+        imapHost: "localhost", imapPort: 993, imapSecurity: "tls",
+        smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls",
+        username: "chris", credentialsCiphertext: "v1:x:y:z", status: "error",
+        lastError: "connection: ECONNREFUSED",
+      }).returning();
+
+      // The drill's own premise: before the upgrade the new value really is
+      // refused, so the assertion after it is about the migration rather than
+      // about a CHECK that never constrained anything.
+      await expect(scratch.db.update(mailAccounts)
+        .set({ status: "auth_required" }).where(eq(mailAccounts.id, account!.id)))
+        .rejects.toMatchObject({
+          cause: { message: expect.stringMatching(/mail_accounts_status_valid|check/i) },
+        });
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const [reread] = await scratch.db.select().from(mailAccounts)
+        .where(eq(mailAccounts.id, account!.id));
+      expect(reread).toMatchObject({ status: "error", lastError: "connection: ECONNREFUSED" });
+
+      await scratch.db.update(mailAccounts)
+        .set({ status: "auth_required" }).where(eq(mailAccounts.id, account!.id));
+      const [after] = await scratch.db.select().from(mailAccounts)
+        .where(eq(mailAccounts.id, account!.id));
+      expect(after?.status).toBe("auth_required");
     });
   }, 30000);
 });

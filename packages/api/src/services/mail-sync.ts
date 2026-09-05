@@ -1,20 +1,24 @@
 import { and, eq, inArray, isNull, ne } from "drizzle-orm";
-import type { MailSecurity } from "@conduit/shared";
+import type { MailAccountStatus, MailSecurity } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
   mailAccounts, mailFolderState, mailMessages,
   type MailAccountFolderRow, type MailAccountRow,
 } from "../db/schema.js";
-import { ArchivedError, MailIngestError, NotFoundError } from "./errors.js";
+import {
+  ArchivedError, MailIngestError, MailReauthRequiredError, NotFoundError,
+} from "./errors.js";
 import {
   consoleSyncLogger, systemClock as systemSyncClock,
   type ImapClient, type ImapClientFactory, type ImapFolderListing,
   type ImapMessageDescriptor, type IngestMessageFn, type SyncClock, type SyncLogger,
 } from "./mail-imap.js";
 import { getAccountCredentialsAsSystem, setAccountChangedHook } from "./mail-accounts.js";
-import { mustBePasswordCredentials } from "./mail-crypto.js";
 import { INBOX, discoverFolders, folderKey, publishFoldersHint } from "./mail-folders.js";
 import { ingestMessage } from "./mail-ingest.js";
+import {
+  resolveConnectionAuth, unconfiguredTokenRefresher, type MailTokenRefresher,
+} from "./mail-oauth.js";
 import { publish } from "./sse.js";
 
 /**
@@ -252,6 +256,14 @@ export interface AccountSyncOptions {
   dataDir: string;
   mailKeyPath: string;
   clientFactory: ImapClientFactory;
+  /**
+   * How an OAuth account's stored refresh token becomes an access token
+   * (mail-oauth.ts). Optional: a password account never reaches it, and this
+   * deployment's accounts are all password accounts, so an install with no app
+   * registration configured wires nothing here. The default REFUSES with a
+   * sentence rather than doing nothing -- see unconfiguredTokenRefresher.
+   */
+  tokenRefresher?: MailTokenRefresher;
   clock?: SyncClock;
   logger?: SyncLogger;
   pollIntervalMs?: number;
@@ -281,6 +293,7 @@ export class AccountSync {
   private readonly dataDir: string;
   private readonly mailKeyPath: string;
   private readonly clientFactory: ImapClientFactory;
+  private readonly tokenRefresher: MailTokenRefresher;
   private readonly clock: SyncClock;
   private readonly logger: SyncLogger;
   private readonly pollIntervalMs: number;
@@ -354,6 +367,7 @@ export class AccountSync {
     this.dataDir = options.dataDir;
     this.mailKeyPath = options.mailKeyPath;
     this.clientFactory = options.clientFactory;
+    this.tokenRefresher = options.tokenRefresher ?? unconfiguredTokenRefresher;
     this.clock = options.clock ?? systemSyncClock;
     this.logger = options.logger ?? consoleSyncLogger;
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -755,9 +769,26 @@ export class AccountSync {
       // Kept in memory too, so queued work refused during the backoff can
       // tell its caller WHY without a database read (see whyUnavailable).
       this.lastErrorText = failureText;
+      // THE ONE FAILURE THAT IS NOT AN ERROR BUT A STATE (Phase 8 Task 2, and
+      // the spec's Risk 3). A provider that has stopped honouring this
+      // account's refresh token will answer identically on every retry from
+      // here to eternity; the only thing that changes it is a person signing in
+      // again. Writing that as `status='error'` would put it beside the server
+      // that was briefly down and the socket that dropped -- failures whose
+      // whole remedy is the backoff below -- and an operator reading the
+      // Settings row would wait for it to clear. It never clears.
+      //
+      // THE BACKOFF STILL RUNS, deliberately, and the loop is NOT stopped. A
+      // stopped loop would need something to restart it the moment Task 3's
+      // callback stores a new grant, which is a second mechanism that can be
+      // forgotten; carrying on means the first pass after a successful
+      // re-authorisation simply succeeds and clears the state, with nothing to
+      // wire up. The cost is one token request per account per capped backoff
+      // interval -- 32 minutes, so under 50 a day for a grant nobody has fixed.
+      const status = error instanceof MailReauthRequiredError ? "auth_required" : "error";
       try {
         await this.writeAccountState({
-          status: "error",
+          status,
           lastError: failureText,
           touchSynced: false,
         });
@@ -895,19 +926,28 @@ export class AccountSync {
     // ArchivedError for an archived account, which isTeardownError treats as
     // "stop syncing this account" exactly like the loadAccount check above.
     const credentials = await getAccountCredentialsAsSystem(this.db, account.id, this.mailKeyPath);
-    // Phase 8 Task 1 made the stored credential a union; this is one of the two
-    // sites Task 2 replaces, by exchanging the refresh token for an access
-    // token and handing imapflow `auth.accessToken` instead of a password.
-    // Until then an OAuth account cannot reach here at all (nothing creates
-    // one) and the throw is the compiler's, not a runtime path.
-    const password = mustBePasswordCredentials(credentials, account.id).imapPassword;
+    // Phase 8 Task 2: the stored credential becomes the one this connection
+    // actually authenticates with -- the IMAP password half, or an access token
+    // exchanged for the refresh token (and refreshed here rather than by
+    // imapflow, which takes a token and never fetches one).
+    //
+    // BEFORE connect(), NOT LAZILY, which is what the plan asks for in as many
+    // words. A token fetched during AUTHENTICATE would put a third-party HTTP
+    // request inside a path with no cancellation and no timeout of its own
+    // (mail-imap.ts's CANCELLATION AND SHUTDOWN); doing it here means the token
+    // request is bounded by mail-oauth.ts's own timeout and a dead grant is
+    // known before a socket is opened.
+    const auth = await resolveConnectionAuth(
+      { db: this.db, mailKeyPath: this.mailKeyPath, refresh: this.tokenRefresher, now: () => this.clock.now() },
+      account, credentials, "imap",
+    );
     const client = this.clientFactory({
       accountId: account.id,
       host: account.imapHost,
       port: account.imapPort,
       security: account.imapSecurity as MailSecurity,
       username: account.username,
-      password,
+      auth,
     });
     try {
       await client.connect();
@@ -1206,7 +1246,7 @@ export class AccountSync {
    * concurrent settings edit cannot make the comparison read a stale row.
    */
   private async writeAccountState(
-    next: { status: "active" | "error"; lastError: string | null; touchSynced: boolean },
+    next: { status: MailAccountStatus; lastError: string | null; touchSynced: boolean },
   ): Promise<void> {
     const now = this.clock.now();
     const changed = await this.db.transaction(async (tx) => {
@@ -1434,6 +1474,9 @@ export interface SyncManagerOptions {
   dataDir: string;
   mailKeyPath: string;
   clientFactory: ImapClientFactory;
+  /** Handed to every AccountSync this manager creates (it spreads its whole
+   * options object into each one); see AccountSyncOptions.tokenRefresher. */
+  tokenRefresher?: MailTokenRefresher;
   clock?: SyncClock;
   logger?: SyncLogger;
   pollIntervalMs?: number;

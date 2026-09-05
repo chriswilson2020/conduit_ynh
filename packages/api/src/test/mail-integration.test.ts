@@ -100,7 +100,7 @@ function settings(overrides: Partial<ImapConnectionSettings> = {}): ImapConnecti
   return {
     accountId: "00000000-0000-4000-8000-000000000001",
     host: IMAP_HOST, port: IMAP_PORT, security: "tls",
-    username: USERNAME, password: PASSWORD,
+    username: USERNAME, auth: { kind: "password", password: PASSWORD },
     ...overrides,
   };
 }
@@ -759,7 +759,9 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
 
     it("sends through the transport factory and Mailpit shows the message", async () => {
       const subject = `${runId} smtp send`;
-      const transport = createSmtpTransportFactory({ rejectUnauthorized: false })(account(), credentials);
+      const transport = createSmtpTransportFactory({ rejectUnauthorized: false })(
+        account(), { kind: "password", password: PASSWORD },
+      );
       await transport.sendMail({
         raw: rfc822({ subject }),
         envelope: { from: USERNAME, to: ["recipient@example.com"] },

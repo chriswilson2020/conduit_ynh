@@ -9,10 +9,10 @@ import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
 import type { MailSecurity, SpecialUse } from "@conduit/shared";
 import type { TestConnectionDeps, VerifySettings } from "./mail-accounts.js";
 import type { SendMailTransportFactory } from "./mail-send.js";
-import { mustBePasswordCredentials } from "./mail-crypto.js";
 import {
   MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
   type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
+  type MailConnectionAuth,
   type ImapFolderListing, type ImapFolderStatus, type ImapMessageDescriptor,
 } from "./mail-imap.js";
 
@@ -254,7 +254,59 @@ interface ConnectionSettings {
   port: number;
   security: MailSecurity;
   username: string;
-  password: string;
+  auth: MailConnectionAuth;
+}
+
+/**
+ * The auth block for imapflow.
+ *
+ * `accessToken` WINS OVER `pass` IN imapflow AND WE NEVER SEND BOTH. Verified
+ * in the installed 1.7.1: `ImAPFlow.authenticate` tests `options.auth.accessToken`
+ * FIRST and only falls through to `options.auth.pass` when it is absent
+ * (lib/imap-flow.js), then issues AUTHENTICATE OAUTHBEARER or XOAUTH2 depending
+ * on which the server advertised (lib/commands/authenticate.js). Sending both
+ * would work by luck of that ordering; sending exactly one means a bug that
+ * dropped the token cannot silently fall back to a password.
+ *
+ * ONE CAVEAT MEASURED IN 1.7.1 AND NOT FIXABLE FROM HERE: `authOauth` builds
+ * its SASL payload only if the server advertises AUTH=OAUTHBEARER, AUTH=XOAUTH
+ * or AUTH=XOAUTH2. Against a server advertising none of them it reaches
+ * `Buffer.from(undefined)` and the resulting TypeError is caught by its own
+ * handler and stamped `authenticationFailed: true` -- so this adapter would
+ * classify it `auth:` and the settings UI would tell the operator to check a
+ * password the account does not have. Not reachable for the two providers this
+ * phase targets (both advertise XOAUTH2), and worth knowing before anyone
+ * points an OAuth account at a self-hosted server.
+ */
+function imapAuthOptions(username: string, auth: MailConnectionAuth) {
+  return auth.kind === "oauth"
+    ? { user: username, accessToken: auth.accessToken }
+    : { user: username, pass: auth.password };
+}
+
+/**
+ * The auth block for nodemailer, and the shape is the decision recorded in
+ * mail-oauth.ts's header: `{ type: "OAuth2", user, accessToken }` and
+ * DELIBERATELY NOTHING ELSE.
+ *
+ * WHAT THE OMISSIONS DO, measured against nodemailer 9.0.5 rather than assumed.
+ * `SMTPTransport.getAuth` turns a `type: "OAuth2"` block into an `XOAuth2`
+ * instance (lib/smtp-transport/index.js), and `XOAuth2.getToken` renews only
+ * when it holds a refreshToken, a provisionCallback or a serviceClient
+ * (lib/xoauth2/index.js) -- with none of them it reuses the token it was given
+ * and never contacts a token endpoint. So leaving clientId/clientSecret/
+ * refreshToken/accessUrl out is what makes Conduit the only refresher, and
+ * `expires` is left out for the same reason: with no renewal available it could
+ * only turn a fresh token into a "no refresh capability" log line.
+ *
+ * `user` is required, not decoration: getAuth returns FALSE for an OAuth2 block
+ * with neither `user` nor `service`, and a false auth makes nodemailer send the
+ * message with no authentication at all.
+ */
+function smtpAuthOptions(username: string, auth: MailConnectionAuth): SMTPTransport.Options["auth"] {
+  return auth.kind === "oauth"
+    ? { type: "OAuth2", user: username, accessToken: auth.accessToken }
+    : { user: username, pass: auth.password };
 }
 
 /**
@@ -279,7 +331,7 @@ export function buildImapOptions(
     port: settings.port,
     secure: settings.security === "tls",
     ...(settings.security === "starttls" ? { doSTARTTLS: true } : {}),
-    auth: { user: settings.username, pass: settings.password },
+    auth: imapAuthOptions(settings.username, settings.auth),
     connectionTimeout: CONNECT_TIMEOUT_MS,
     greetingTimeout: GREETING_TIMEOUT_MS,
     socketTimeout: SOCKET_TIMEOUT_MS,
@@ -307,7 +359,7 @@ export function buildSmtpOptions(
     port: settings.port,
     secure: settings.security === "tls",
     ...(settings.security === "starttls" ? { requireTLS: true } : {}),
-    auth: { user: settings.username, pass: settings.password },
+    auth: smtpAuthOptions(settings.username, settings.auth),
     connectionTimeout: CONNECT_TIMEOUT_MS,
     greetingTimeout: GREETING_TIMEOUT_MS,
     socketTimeout: SOCKET_TIMEOUT_MS,
@@ -979,12 +1031,26 @@ export function createImapClientFactory(
 // --- Verification (the test-connection endpoint's real deps) ---------------
 
 /**
+ * VerifySettings still carries a bare `password`, and that is Task 3's to
+ * change rather than an oversight. The test-connection endpoint can only reach
+ * an OAuth account through mail-accounts.ts's stored-credential branch, which
+ * refuses one today with "credentials unreadable" (see testConnection's own
+ * comment) -- and it will keep refusing it until there is a way to CREATE an
+ * OAuth account, which is the same task that gives this endpoint a second form
+ * to test from. Widening the shape now would be a seam with nothing on the
+ * other side of it.
+ */
+function verifyAuth(settings: VerifySettings): ConnectionSettings {
+  return { ...settings, auth: { kind: "password", password: settings.password } };
+}
+
+/**
  * Log in and hang up. imapflow's `verifyOnly` does exactly that -- it logs
  * out as soon as authentication succeeds -- so this never selects a mailbox
  * or touches a message.
  */
 export async function imapVerify(settings: VerifySettings): Promise<void> {
-  const client = new ImapFlow({ ...buildImapOptions(settings), verifyOnly: true });
+  const client = new ImapFlow({ ...buildImapOptions(verifyAuth(settings)), verifyOnly: true });
   client.on("error", () => { /* see ImapflowClient's constructor */ });
   try {
     await client.connect();
@@ -1002,7 +1068,7 @@ export async function imapVerify(settings: VerifySettings): Promise<void> {
 /** nodemailer's own connection+login check (EHLO, STARTTLS if required,
  * AUTH), with no message sent. */
 export async function smtpVerify(settings: VerifySettings): Promise<void> {
-  const transport = nodemailer.createTransport(buildSmtpOptions(settings));
+  const transport = nodemailer.createTransport(buildSmtpOptions(verifyAuth(settings)));
   try {
     await transport.verify();
   } catch (error) {
@@ -1040,19 +1106,20 @@ export const defaultTestConnectionDeps: TestConnectionDeps = { imapVerify, smtpV
  * and mail-imap.ts's ERROR CLASSIFICATION.
  */
 export function createSmtpTransportFactory(options: MailAdapterOptions = {}): SendMailTransportFactory {
-  return (account, credentials) => {
-    // Phase 8 Task 1 made the stored credential a union; this is the SMTP half
-    // of the pair Task 2 replaces. nodemailer has OAuth2 built in, refresh
-    // included (smtp-connection/index.js:1965), so this becomes an auth block
-    // rather than a password there. Not reachable with an OAuth account today
-    // -- nothing creates one.
-    const password = mustBePasswordCredentials(credentials, account.id).smtpPassword;
+  // TAKES AN ALREADY-RESOLVED CREDENTIAL, not the stored union, as of Phase 8
+  // Task 2. mail-send.ts resolves it (mail-oauth.ts's resolveConnectionAuth)
+  // before calling this, which is what keeps the database, the token endpoint
+  // and mail.key out of the one module whose job is to map settings onto
+  // imapflow and nodemailer. It also means the SMTP half no longer narrows the
+  // union at all: which of the two passwords, or a token, is somebody else's
+  // decided question by the time it arrives.
+  return (account, auth) => {
     const transport = nodemailer.createTransport(buildSmtpOptions({
       host: account.smtpHost,
       port: account.smtpPort,
       security: account.smtpSecurity,
       username: account.username,
-      password,
+      auth,
     }, options));
     return {
       async sendMail(message): Promise<unknown> {

@@ -9,6 +9,7 @@ import {
   decryptCredentials,
   encryptCredentialsAt,
   decryptCredentialsAt,
+  encryptCredentialsChecked,
   mustBePasswordCredentials,
   type MailCredentials,
   type MailCredentialsInput,
@@ -379,6 +380,63 @@ describe("what the password path actually writes", () => {
       kind: "certificate", imapPassword: "a", smtpPassword: "b",
     } as unknown as MailCredentialsInput);
     expect(() => decryptCredentials(key, ciphertext)).toThrow(MailCredentialDecryptError);
+  });
+});
+
+describe("encryptCredentialsChecked", () => {
+  /**
+   * SEALING IS THE IRREVERSIBLE STEP, and this is the function that exists to
+   * make it survivable. encryptCredentials serialises whatever it is handed --
+   * a payload assembled from an HTTP response can pass the type parameter and
+   * still fail the schema on the way back out, and from then on the row reads
+   * "credentials unreadable" for ever, pointing an operator at mail.key over a
+   * problem mail.key has nothing to do with. No backup helps: the bad bytes
+   * were written deliberately.
+   */
+  it("refuses a payload that decryptCredentials would then reject", () => {
+    const key = randomBytes(32);
+    // The OAuth shape's own invariant: an access token with no expiry would be
+    // used until a provider rejected it. See mail-crypto.ts.
+    expect(() => encryptCredentialsChecked(key, {
+      kind: "oauth", refreshToken: "r", accessToken: "a",
+    } as unknown as MailCredentialsInput)).toThrow(/would not decrypt/);
+  });
+
+  it("names the offending field and never the payload's values", () => {
+    const key = randomBytes(32);
+    const secret = "0.AXoA-a-refresh-token";
+    try {
+      encryptCredentialsChecked(key, { kind: "oauth", refreshToken: secret, accessToken: "" } as unknown as MailCredentialsInput);
+      throw new Error("expected encryptCredentialsChecked to throw");
+    } catch (err) {
+      expect((err as Error).message).not.toContain(secret);
+    }
+  });
+
+  /**
+   * THE BYTES A VALID PAYLOAD PRODUCES ARE THE PLAIN ENCODER'S. The check is a
+   * gate, never a normaliser: encrypting the PARSED output would add
+   * `kind: "password"` to every password blob and break the byte-identity with
+   * v1.6.0 that Task 1 went out of its way to keep (a restore or a rollback
+   * would then meet blobs it had never written).
+   */
+  it("seals the caller's own payload, not the schema's normalised output", () => {
+    const key = randomBytes(32);
+    const payload = { imapPassword: "a", smtpPassword: "b" };
+    const checked = decryptCredentials(key, encryptCredentialsChecked(key, payload));
+    expect(checked).toEqual({ kind: "password", imapPassword: "a", smtpPassword: "b" });
+    // Same plaintext both ways: only the random IV differs, so decrypting each
+    // is how the two are compared.
+    expect(decryptCredentials(key, encryptCredentials(key, payload))).toEqual(checked);
+  });
+
+  it("round-trips a full OAuth credential", () => {
+    const key = randomBytes(32);
+    const payload = {
+      kind: "oauth" as const, refreshToken: "r", accessToken: "a",
+      accessTokenExpiresAt: "2026-09-05T13:00:00.000Z",
+    };
+    expect(decryptCredentials(key, encryptCredentialsChecked(key, payload))).toEqual(payload);
   });
 });
 

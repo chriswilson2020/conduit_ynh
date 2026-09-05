@@ -451,13 +451,55 @@ export interface ImapClient {
   idle(signal: AbortSignal): Promise<IdleOutcome>;
 }
 
+/**
+ * What actually authenticates ONE connection, already resolved: a password, or
+ * a short-lived OAuth access token. Produced by mail-oauth.ts's
+ * resolveConnectionAuth and consumed by both protocols -- it is
+ * ImapConnectionSettings' `auth` field and mail-send.ts's
+ * SendMailTransportFactory's second argument, so IMAP and SMTP cannot end up
+ * disagreeing about what "the credential" is.
+ *
+ * NOT MailCredentials, AND THE DIFFERENCE IS THE POINT. What is STORED is a
+ * password pair or a refresh token (mail-crypto.ts's union); what a connection
+ * needs is one secret for one protocol, right now. Between the two sits a
+ * choice (which password half?) and possibly a network round trip (exchange the
+ * refresh token for an access token). Handing the stored shape to the adapter
+ * would put that round trip inside the one module that is supposed to be a thin
+ * mapping onto imapflow and nodemailer, and would give it a reason to reach for
+ * the database. This type is the resolved value, so the adapter stays a
+ * mapping.
+ *
+ * A DISCRIMINATED UNION, NOT TWO OPTIONAL FIELDS. `password?: string;
+ * accessToken?: string` was the smaller diff and makes "neither" and "both"
+ * both representable and both meaningless -- the same argument
+ * mail_accounts.auth_method's comment (db/schema.ts) makes for being one column
+ * rather than a kind/provider pair. "Neither" is the dangerous one: it would
+ * hand imapflow a blank password, and a blank password does not fail loudly, it
+ * fails at the SERVER and arrives as an account whose mail quietly stopped.
+ */
+export type MailConnectionAuth =
+  | { kind: "password"; password: string }
+  | { kind: "oauth"; accessToken: string };
+
+/**
+ * THIS INTERFACE CHANGED IN PHASE 8, AND THE REST OF THE CONTRACT DID NOT.
+ * `password: string` became `auth: MailConnectionAuth`. Everything the phase's
+ * spec calls IMAP-typed-on-purpose -- ImapFolderStatus.uidvalidity,
+ * ImapMessageDescriptor.uid, and every method on ImapClient that Phase 4.4's
+ * filing, per-message selection, live list and folder management are built on
+ * -- is untouched by it. This is the factory's INPUT, not the sync engine's
+ * view of a mailbox: it is where the secret comes from, which is the one thing
+ * the spec says this phase changes ("nothing in the mail engine changes ... what
+ * changes is where the secret comes from and what shape it is"). An adapter
+ * against a different server still implements the same commands.
+ */
 export interface ImapConnectionSettings {
   accountId: string;
   host: string;
   port: number;
   security: MailSecurity;
   username: string;
-  password: string;
+  auth: MailConnectionAuth;
 }
 
 /** MUST return a fresh instance per call -- see the lifecycle notes above. */

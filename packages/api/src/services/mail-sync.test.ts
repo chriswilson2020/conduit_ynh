@@ -9,10 +9,12 @@ import type { SseHint } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { mailAccountFolders, mailAccounts, mailFolderState, mailMessages, mailThreads } from "../db/schema.js";
-import { MailIngestError, NotFoundError } from "./errors.js";
+import { MailIngestError, MailReauthRequiredError, NotFoundError } from "./errors.js";
 import { archiveAccount, createAccount, updateAccount } from "./mail-accounts.js";
 import { ingestMessage } from "./mail-ingest.js";
+import { encryptCredentialsAt } from "./mail-crypto.js";
 import { moveThreads } from "./mail-move.js";
+import type { MailTokenRefresher } from "./mail-oauth.js";
 import {
   AccountSync, SyncManager, SyncStoppedError, SyncUnavailableError, startSyncManager,
   RESTORE_STOP_TIMEOUT_MS, STOP_TIMEOUT_MS,
@@ -606,11 +608,13 @@ function makeSync(
   accountId: string,
   options: {
     clock?: ManualClock; ingest?: IngestMessageFn; pollIntervalMs?: number; logger?: SyncLogger;
+    tokenRefresher?: MailTokenRefresher;
   } = {},
 ): Harness {
   const clock = options.clock ?? new ManualClock();
   const client = new FakeImapClient({
-    accountId, host: "mail.example.com", port: 993, security: "tls", username: "chris", password: "hunter2",
+    accountId, host: "mail.example.com", port: 993, security: "tls", username: "chris",
+    auth: { kind: "password", password: "hunter2" },
   });
   const sync = new AccountSync({
     db: handle.db,
@@ -620,6 +624,7 @@ function makeSync(
     // The same fake across reconnects, so connectCalls/disconnectCalls count
     // the loop's real connection churn.
     clientFactory: () => client,
+    ...(options.tokenRefresher === undefined ? {} : { tokenRefresher: options.tokenRefresher }),
     clock,
     logger: options.logger ?? silentLogger,
     pollIntervalMs: options.pollIntervalMs ?? 300_000,
@@ -1638,6 +1643,142 @@ describe("AccountSync: pass failures", () => {
 
 // --- Poison messages --------------------------------------------------------
 
+// --- A lapsed OAuth grant (Phase 8 Task 2) ----------------------------------
+
+/**
+ * THE ITEM THE PHASE 8 PLAN CALLS THE ONE THAT MATTERS MOST, and it is here
+ * rather than in mail-oauth.test.ts because "the operator sees it" is a fact
+ * about the SYNC LOOP: mail-oauth throws a typed error, and the loop is the
+ * single writer that turns it into something on the Settings row.
+ *
+ * The failure being guarded against is not an exception going missing. It is
+ * mail stopping in a way that looks temporary: an account that says "Error",
+ * backs off, retries, says "Error" again, for ever -- while the only thing that
+ * could fix it is a person opening a browser. Spec Risk 3, and a shape this
+ * codebase has been bitten by before.
+ */
+describe("AccountSync: a lapsed OAuth grant", () => {
+  /** Task 3's callback, stood in for: the column and the blob, written
+   * together, because writing one without the other is a state of its own. */
+  async function signIn(accountId: string, refreshToken = "refresh-1"): Promise<void> {
+    await handle.db.update(mailAccounts).set({
+      authMethod: "oauth_microsoft",
+      credentialsCiphertext: encryptCredentialsAt(keyPath, { kind: "oauth", refreshToken }),
+    }).where(eq(mailAccounts.id, accountId));
+  }
+
+  const grantRevoked: MailTokenRefresher = () => Promise.reject(
+    new MailReauthRequiredError("microsoft", "invalid_grant: the grant was revoked"),
+  );
+
+  it("puts the account in auth_required, not error, and says to sign in again", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    await signIn(accountId);
+    const { sync } = makeSync(accountId, { tokenRefresher: grantRevoked });
+    hints = [];
+
+    sync.start();
+    await waitFor(() => sync.stats.failures >= 1, "the first failed pass");
+
+    const row = await accountRow(accountId);
+    expect(row.status).toBe("auth_required");
+    // The stored text is what a support question reads: it has to name the
+    // provider and the remedy, not just a code.
+    expect(row.lastError).toContain("microsoft");
+    expect(row.lastError).toContain("Sign in again");
+    // And the change is PUSHED, so a settings page already open moves without
+    // waiting for its poll.
+    expect(accountHints()).toHaveLength(1);
+  });
+
+  /**
+   * THE DISCRIMINATING CASE, and without it the test above is satisfied by an
+   * implementation that marks EVERY failure auth_required -- which would tell
+   * an operator to re-authorise over a mail server that was rebooting. The two
+   * are one behaviour: this state is reserved for the failure a retry cannot
+   * clear.
+   */
+  it("leaves an ordinary connection failure as an error, on the same OAuth account", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    await signIn(accountId);
+    const transient: MailTokenRefresher = () => Promise.reject(
+      new Error("connection: could not reach microsoft's token endpoint"),
+    );
+    const { sync } = makeSync(accountId, { tokenRefresher: transient });
+
+    sync.start();
+    await waitFor(() => sync.stats.failures >= 1, "the first failed pass");
+
+    expect((await accountRow(accountId)).status).toBe("error");
+  });
+
+  /**
+   * THE LOOP IS NOT STOPPED, AND THAT IS WHAT MAKES THE RECOVERY FREE. Nothing
+   * has to notice a re-authorisation and restart anything: the next pass simply
+   * succeeds and clears the state. A design that tore the sync down here would
+   * need Task 3's callback to remember to rebuild it -- a second mechanism, and
+   * one whose absence would present as "I signed in again and nothing
+   * happened".
+   */
+  it("recovers on the next pass once the grant is replaced, with nothing restarted", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    await signIn(accountId, "dead-refresh");
+    let alive = false;
+    const refresher: MailTokenRefresher = (_provider, refreshToken) => (
+      alive && refreshToken === "live-refresh"
+        ? Promise.resolve({ accessToken: "fresh", expiresInSeconds: 3600 })
+        : Promise.reject(new MailReauthRequiredError("microsoft", "invalid_grant"))
+    );
+    const { sync, clock } = makeSync(accountId, { tokenRefresher: refresher });
+
+    sync.start();
+    await waitFor(() => sync.stats.failures >= 1, "the failed pass");
+    expect((await accountRow(accountId)).status).toBe("auth_required");
+
+    // The operator signs in again: same account, new grant. Done while the loop
+    // is parked in its backoff, for the reason the backoff case above spells
+    // out at length -- repairing after the fire races the pass the fire starts.
+    await waitFor(() => clock.pendingCount() > 0, "the backoff wait");
+    await signIn(accountId, "live-refresh");
+    alive = true;
+    clock.fire();
+    await waitFor(() => sync.stats.passes >= 1 || sync.stats.failures > 1, "the recovery pass");
+
+    const row = await accountRow(accountId);
+    expect(row.status).toBe("active");
+    expect(row.lastError).toBeNull();
+  });
+
+  /**
+   * WHAT ACTUALLY REACHES imapflow. The sibling of SyncManager's "connects with
+   * the account's own stored IMAP password" below, and it exists for the same
+   * reason: the FakeImapClient never looks at its own settings, so without this
+   * the whole OAuth connect path -- decrypt, refresh, hand over a token -- is
+   * exercised by nothing that would notice it handing over a blank.
+   */
+  it("connects with the exchanged access token, never a password", async () => {
+    const accountId = await makeAccount({ backfillDays: null });
+    await signIn(accountId);
+    const seen: ImapConnectionSettings[] = [];
+    const clock = new ManualClock();
+    const sync = new AccountSync({
+      db: handle.db, accountId, dataDir, mailKeyPath: keyPath,
+      clientFactory: (given) => {
+        seen.push(given);
+        return new FakeImapClient(given);
+      },
+      tokenRefresher: () => Promise.resolve({ accessToken: "ya29.fresh", expiresInSeconds: 3600 }),
+      clock, logger: silentLogger, pollIntervalMs: 300_000,
+    });
+    running.push(sync);
+
+    sync.start();
+    await waitFor(() => sync.stats.passes >= 1, "the first pass");
+
+    expect(seen[0]?.auth).toEqual({ kind: "oauth", accessToken: "ya29.fresh" });
+  });
+});
+
 describe("AccountSync: poison-message contract", () => {
   it("retries a failed ingest once inside the same pass", async () => {
     const accountId = await makeAccount({ backfillDays: null });
@@ -1755,7 +1896,8 @@ describe("AccountSync: teardown", () => {
     const stoppedIds: string[] = [];
     const clock = new ManualClock();
     const client = new FakeImapClient({
-      accountId, host: "mail.example.com", port: 993, security: "tls", username: "chris", password: "hunter2",
+      accountId, host: "mail.example.com", port: 993, security: "tls", username: "chris",
+    auth: { kind: "password", password: "hunter2" },
     });
     const sync = new AccountSync({
       db: handle.db, accountId, dataDir, mailKeyPath: keyPath,
@@ -2207,7 +2349,7 @@ describe("SyncManager", () => {
     expect(clients[0]?.settings).toMatchObject({
       accountId: id,
       host: "mail.example.com", port: 993, security: "tls",
-      username: "chris", password: "imap-half",
+      username: "chris", auth: { kind: "password", password: "imap-half" },
     });
   });
 

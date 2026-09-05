@@ -247,6 +247,8 @@ async function appFor(install: Install, options: AppOptions = {}): Promise<Fasti
     mailTlsRejectUnauthorized: true,
     ldapUrl: "ldap://127.0.0.1:389",
     reauthPassword: null,
+    // No app registration: these tests build an app, never an OAuth account.
+    mailOAuth: { microsoft: null, google: null },
   };
   const app = await buildApp({
     config,
@@ -1111,6 +1113,8 @@ describe("POST /api/restore/apply -- the guards in front of the destruction", ()
         defaultCurrency: "EUR", mailKeyPath: path.join(elsewhere, "mail.key"),
         mailTlsRejectUnauthorized: true, ldapUrl: "ldap://127.0.0.1:389",
         reauthPassword: null,
+        // No app registration: these tests build an app, never an OAuth account.
+        mailOAuth: { microsoft: null, google: null },
       },
       db: target.handle.db, dataDir: elsewhere, reauthVerifier: testReauthVerifier(),
     });

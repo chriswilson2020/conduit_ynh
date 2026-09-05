@@ -57,6 +57,11 @@ function okDeps(): TestConnectionDeps {
 async function forceError(id: string): Promise<void> {
   await handle.db.update(mailAccounts).set({ status: "error", lastError: "boom" }).where(eq(mailAccounts.id, id));
 }
+async function forceReauthRequired(id: string): Promise<void> {
+  await handle.db.update(mailAccounts)
+    .set({ status: "auth_required", lastError: "microsoft would not renew this account's sign-in" })
+    .where(eq(mailAccounts.id, id));
+}
 // A structurally-valid v1 ciphertext (right segment count, right IV/tag
 // lengths) but encrypted under a DIFFERENT key than the one at keyPath, so
 // decrypting it fails GCM authentication -- MailCredentialDecryptError, the
@@ -368,6 +373,28 @@ describe("updateAccount", () => {
     const updated = await updateAccount(handle.db, actorId, account.id, { password: "new-password" }, keyPath);
     expect(updated.status).toBe("active");
     expect(updated.lastError).toBeNull();
+  });
+
+  /**
+   * A NEEDED SIGN-IN IS NOT A STALE ERROR, and the reset must not clear it.
+   *
+   * shouldResetStatus is gated on `status === 'error'` and the gate is doing
+   * real work here rather than being incidentally correct: an OAuth account has
+   * a host, a port and a security mode like any other, so an edit to any of
+   * them counts as a "connection field change" and would otherwise flip a
+   * lapsed grant back to Active. The row would then say the mailbox is fine
+   * until the next sync pass, which is the whole failure this state exists to
+   * prevent, reintroduced by a relabelling.
+   *
+   * Whether the grant came back is the sync loop's question, and it answers it
+   * on the next pass -- see mail-sync.test.ts's recovery case.
+   */
+  it("does NOT clear a needed re-authorisation, even when a connection field changes", async () => {
+    const account = await make();
+    await forceReauthRequired(account.id);
+    const updated = await updateAccount(handle.db, actorId, account.id, { imapHost: "imap.example.com" }, keyPath);
+    expect(updated.status).toBe("auth_required");
+    expect(updated.lastError).toContain("sign-in");
   });
 
   it("does NOT reset an errored account when only an unrelated field (label) changes", async () => {

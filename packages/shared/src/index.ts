@@ -650,7 +650,40 @@ export const MAIL_CONNECTION_ERROR_PREFIX = "connection:";
 export const mailSecuritySchema = z.enum(["tls", "starttls"]);
 export type MailSecurity = z.infer<typeof mailSecuritySchema>;
 
-export const mailAccountStatusSchema = z.enum(["active", "error"]);
+/**
+ * What the sync engine last had to say about an account (mail_accounts.status
+ * -- api: db/schema.ts). Written by the sync loop and by nothing else, so that
+ * the three values can never disagree with each other.
+ *
+ * 'auth_required' IS PHASE 8's, AND IT IS A THIRD STATE RATHER THAN A FLAVOUR
+ * OF 'error' FOR ONE REASON: it is the only one a retry can never clear. An
+ * 'error' account is one the next pass might get past -- a server that was
+ * down, a socket that dropped -- and the engine's whole answer to it is to
+ * back off and try again. A provider that has stopped honouring the stored
+ * refresh token will answer identically for ever, and the ONLY thing that
+ * changes it is a person signing in again. Rendering that as an error would
+ * tell an operator to wait for something that is never going to happen, which
+ * is exactly the "mail quietly stopped" failure the Phase 8 spec's Risk 3
+ * names.
+ *
+ * A THIRD ENUM MEMBER, NOT A PARSED PREFIX ON last_error. The `auth:` /
+ * `connection:` prefixes below are a real machine-readable contract and a
+ * `reauth:` sibling was the cheaper option, considered and rejected: those
+ * classify a CONNECTION FAILURE for a message that is displayed, while this is
+ * a LIFECYCLE STATE that a badge, a send gate and (Task 3) a re-authorise
+ * control all branch on. A client deciding a lifecycle state by matching prose
+ * is the thing DuplicateAttendeeError's comment (api: services/errors.ts)
+ * exists to warn about.
+ *
+ * ONE ROLLBACK NOTE, because it is the only cost. A v1.7.0 install that writes
+ * 'auth_required' and is then rolled back to v1.6.0 has rows carrying a value
+ * that release's enum does not know. Nothing crashes -- no route validates its
+ * own response against this schema and the client does not parse one -- but
+ * v1.6.0's StatusBadge falls through to "Active" for such a row, i.e. the
+ * rollback loses the warning rather than corrupting anything. Stated here
+ * rather than discovered: 0015's header carries the same note beside the CHECK.
+ */
+export const mailAccountStatusSchema = z.enum(["active", "error", "auth_required"]);
 export type MailAccountStatus = z.infer<typeof mailAccountStatusSchema>;
 
 // Phase 4.2: private by default, per account (spec's Decisions table: "the

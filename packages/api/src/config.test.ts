@@ -144,4 +144,79 @@ describe("parseConfig", () => {
   it("rejects a DEFAULT_CURRENCY that is not 3 letters", () => {
     expect(() => parseConfig({ ...valid, DEFAULT_CURRENCY: "EURO" })).toThrow(/DEFAULT_CURRENCY/);
   });
+  // --- Phase 8's OAuth app registrations -------------------------------------
+
+  it("has no OAuth registration by default -- a password-only install", () => {
+    expect(parseConfig(valid).mailOAuth).toEqual({ microsoft: null, google: null });
+  });
+
+  it("builds Microsoft's tenant-scoped v2.0 token endpoint", () => {
+    const config = parseConfig({
+      ...valid,
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
+      MAIL_OAUTH_MICROSOFT_TENANT: "contoso.onmicrosoft.com",
+    });
+    expect(config.mailOAuth.microsoft).toEqual({
+      clientId: "app-id",
+      clientSecret: "app-secret",
+      tokenEndpoint:
+        "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token",
+    });
+  });
+
+  it("escapes a tenant rather than splicing it into the URL", () => {
+    const config = parseConfig({
+      ...valid,
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
+      MAIL_OAUTH_MICROSOFT_TENANT: "a/b?c",
+    });
+    expect(config.mailOAuth.microsoft?.tokenEndpoint)
+      .toBe("https://login.microsoftonline.com/a%2Fb%3Fc/oauth2/v2.0/token");
+  });
+
+  it("uses Google's single token endpoint, which has no tenant", () => {
+    const config = parseConfig({
+      ...valid,
+      MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id",
+      MAIL_OAUTH_GOOGLE_CLIENT_SECRET: "g-secret",
+    });
+    expect(config.mailOAuth.google?.tokenEndpoint).toBe("https://oauth2.googleapis.com/token");
+  });
+
+  /**
+   * A HALF-SET REGISTRATION IS NO REGISTRATION, in every direction. Carrying a
+   * client id with no secret would push "is this usable?" down to the token
+   * exchange, where the answer comes back as a provider's 401 with an
+   * operator-hostile message instead of "this install has not configured it".
+   * The Microsoft tenant is part of that: /common is the MULTI-tenant endpoint,
+   * so falling back to it would authenticate against the wrong directory rather
+   * than refusing.
+   */
+  it("treats a half-configured registration as none at all", () => {
+    const half = [
+      { MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id" },
+      { MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret" },
+      { MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id", MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret" },
+      { MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id", MAIL_OAUTH_MICROSOFT_TENANT: "t" },
+    ];
+    for (const partial of half) {
+      expect(parseConfig({ ...valid, ...partial }).mailOAuth.microsoft).toBeNull();
+    }
+    expect(parseConfig({ ...valid, MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id" }).mailOAuth.google).toBeNull();
+  });
+
+  /**
+   * NOT REFUSED IN PRODUCTION, unlike CONDUIT_DEV_USER and
+   * CONDUIT_REAUTH_PASSWORD. Those two DISABLE a security control when set;
+   * this is an ordinary credential, and production is exactly where it belongs.
+   */
+  it("accepts an OAuth registration under NODE_ENV=production", () => {
+    expect(() => parseConfig({
+      ...valid,
+      MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id",
+      MAIL_OAUTH_GOOGLE_CLIENT_SECRET: "g-secret",
+    })).not.toThrow();
+  });
 });

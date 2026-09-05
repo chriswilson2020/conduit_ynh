@@ -189,6 +189,8 @@ function config(basePath = "/"): Config {
     version: "0.1.0-test", devUser: null, dataDir, defaultCurrency: "EUR",
     mailKeyPath: keyPath, mailTlsRejectUnauthorized: true,
     ldapUrl: "ldap://127.0.0.1:389", reauthPassword: null,
+    // No app registration: this file's accounts are password accounts.
+    mailOAuth: { microsoft: null, google: null },
   };
 }
 

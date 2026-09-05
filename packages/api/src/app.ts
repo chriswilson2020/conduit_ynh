@@ -9,6 +9,9 @@ import { registerSpa } from "./spa.js";
 import { registerCrmRoutes } from "./routes/index.js";
 import { createSmtpTransportFactory } from "./services/mail-imapflow.js";
 import type { SendMailTransportFactory } from "./services/mail-send.js";
+import {
+  createHttpTokenRefresher, oauthClientsFrom, type MailTokenRefresher,
+} from "./services/mail-oauth.js";
 import type { MailRouteSyncManager } from "./routes/mail.js";
 import {
   ReauthTickets, ReauthThrottle,
@@ -49,6 +52,10 @@ export interface BuildAppOptions {
   mail?: {
     syncManager: () => MailRouteSyncManager | null;
     transportFactory: SendMailTransportFactory;
+    /** Optional even inside `mail`, because most callers that supply a
+     * transport still never send from an OAuth account; the fallback below is
+     * built from this app's own config, like transportFactory's. */
+    tokenRefresher?: MailTokenRefresher;
   };
   /**
    * Test-only sink for the request log, so a test can read what was written
@@ -287,6 +294,8 @@ export async function buildApp(
     syncManager: mail?.syncManager ?? (() => null),
     transportFactory: mail?.transportFactory
       ?? createSmtpTransportFactory({ rejectUnauthorized: config.mailTlsRejectUnauthorized }),
+    mailTokenRefresher: mail?.tokenRefresher
+      ?? createHttpTokenRefresher(oauthClientsFrom(config.mailOAuth)),
     reauthVerifier: reauthVerifier ?? (
       config.reauthPassword === null
         ? createLdapVerifier(config.ldapUrl)

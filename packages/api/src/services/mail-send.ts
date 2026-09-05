@@ -10,10 +10,13 @@ import {
 import { getAccountCredentialsAsSystem, getOwnAccount } from "./mail-accounts.js";
 import { htmlToText, sanitizeMailHtml } from "./mail-content.js";
 import { getAttachmentBlob, mustGetThread, visibleMessageTerm } from "./mail-threads.js";
-import type { MailCredentials } from "./mail-crypto.js";
 import {
-  MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX, consoleSyncLogger, type SyncLogger,
+  MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX, consoleSyncLogger,
+  type MailConnectionAuth, type SyncLogger,
 } from "./mail-imap.js";
+import {
+  resolveConnectionAuth, unconfiguredTokenRefresher, type MailTokenRefresher,
+} from "./mail-oauth.js";
 import { ingestMessage, type IngestedMessage } from "./mail-ingest.js";
 
 /**
@@ -113,10 +116,19 @@ export interface SendMailTransport {
   sendMail(message: SendMailMessage): Promise<unknown>;
 }
 
-/** Built per send, from the account row and its decrypted credentials.
- * mail-imapflow.ts's createSmtpTransportFactory builds the production one. */
+/**
+ * Built per send, from the account row and an ALREADY-RESOLVED credential.
+ * mail-imapflow.ts's createSmtpTransportFactory builds the production one.
+ *
+ * MailConnectionAuth, not MailCredentials, since Phase 8 Task 2. Choosing
+ * between the two stored passwords -- and, for an OAuth account, exchanging the
+ * refresh token for an access token, which is a network round trip and a
+ * database write -- happens in sendMail below, before the factory is called.
+ * That keeps the adapter a mapping onto nodemailer rather than something that
+ * needs mail.key, a token endpoint and a Database of its own.
+ */
 export type SendMailTransportFactory =
-  (account: MailAccount, credentials: MailCredentials) => SendMailTransport;
+  (account: MailAccount, auth: MailConnectionAuth) => SendMailTransport;
 
 /**
  * The slice of mail-sync.ts's SyncManager this service uses. Structural
@@ -132,9 +144,18 @@ export interface SendMailSyncManager {
 }
 
 export interface SendMailDeps {
-  /** Where mail.key lives; the account's SMTP password is decrypted with it
+  /** Where mail.key lives; the account's SMTP credential is decrypted with it
    * (mail-crypto.ts), after the owner check has passed. */
   mailKeyPath: string;
+  /**
+   * How an OAuth account's refresh token becomes an access token
+   * (mail-oauth.ts). Optional because most sends never reach it: a password
+   * account resolves without one, and an install with no app registration has
+   * no OAuth account to send from. When it is absent and an OAuth account does
+   * try to send, the default refuser says so in a sentence rather than
+   * pretending a token was obtained.
+   */
+  tokenRefresher?: MailTokenRefresher;
   transportFactory: SendMailTransportFactory;
   syncManager: SendMailSyncManager | null;
   /** Defaults to the console logger, like the sync engine's own. */
@@ -425,9 +446,18 @@ export async function sendMail(
   // connection timeout dressed up as a 502.
   if (account.archivedAt !== null) throw new ArchivedError("mail account", account.id);
   if (account.status !== "active") {
+    // TWO SENTENCES, BECAUSE THE TWO REMEDIES ARE DIFFERENT. "Test its
+    // connection" is right for a server that refused, and wrong for a grant the
+    // provider has stopped honouring -- there is nothing to test, and the
+    // button would answer "credentials unreadable". Sending an operator to the
+    // wrong control is the v1.4.1 mistake the Phase 8 plan names: the error
+    // message blamed the wrong thing and the operator concluded Conduit was
+    // broken.
     throw new ConflictError(
       "mail account", account.id,
-      "this mail account is in an error state; test its connection in settings before sending",
+      account.status === "auth_required"
+        ? "this mail account's sign-in has lapsed; sign in again in settings before sending"
+        : "this mail account is in an error state; test its connection in settings before sending",
     );
   }
 
@@ -481,10 +511,28 @@ export async function sendMail(
   const raw = await composer.compile().build();
 
   try {
-    // The factory call is inside the try as well: building a transport is
-    // just "open an SMTP connection with these settings", so a failure there
-    // is the same 502-shaped answer as a rejected login, not a 500.
-    const transport = deps.transportFactory(account, credentials);
+    // BOTH THE TOKEN RESOLUTION AND THE FACTORY CALL ARE INSIDE THE TRY, and
+    // for the same reason the factory call always was: building a transport is
+    // just "open an SMTP connection with these settings", so a failure there is
+    // the same 502-shaped answer as a rejected login, not a 500.
+    //
+    // A DEAD OAUTH GRANT ARRIVES HERE AS A MailReauthRequiredError, and this is
+    // the one place where "sign in again" reaches a person immediately: the
+    // composer shows smtpFailureReason's text on the dialog they are looking
+    // at. It does NOT write the account's state -- the sync loop is the single
+    // writer of mail_accounts.status and it will reach the same conclusion on
+    // its next pass, within the poll interval. Two writers to that column is
+    // how a state gets silently overwritten by whichever ran last.
+    const auth = await resolveConnectionAuth(
+      {
+        db,
+        mailKeyPath: deps.mailKeyPath,
+        refresh: deps.tokenRefresher ?? unconfiguredTokenRefresher,
+        now: () => new Date(),
+      },
+      account, credentials, "smtp",
+    );
+    const transport = deps.transportFactory(account, auth);
     await transport.sendMail({ raw, envelope: buildEnvelope(account.email, input) });
   } catch (error) {
     // Nothing is stored on this path -- deliberately, and asserted by a test:
@@ -558,6 +606,20 @@ export async function sendMail(
  * anything else through untouched rather than guessing.
  */
 function smtpFailureReason(error: unknown): string {
+  // A LAPSED OAUTH GRANT FALLS THROUGH TO THE PASS-THROUGH ARM, deliberately
+  // and by an invariant rather than by luck. MailReauthRequiredError's message
+  // carries NEITHER classified prefix -- neither is true of it: "check the
+  // username/password" points at a field an OAuth account does not have, and
+  // "unreachable" invites a retry that cannot work -- so it reaches the
+  // composer as the sentence errors.ts wrote, which is already addressed to the
+  // person reading the dialog.
+  //
+  // AN `instanceof` BRANCH HERE WAS TRIED AND REMOVED: it returned exactly what
+  // the pass-through returns, so deleting it changed no behaviour and no test
+  // noticed (mutation M28). The invariant it was quietly relying on is pinned
+  // where it belongs instead -- mail-oauth.test.ts asserts that the error's
+  // message starts with neither prefix, so an edit that gave it one fails a
+  // test rather than silently rewriting this sentence into the wrong advice.
   const text = errorText(error);
   if (text.startsWith(MAIL_AUTH_ERROR_PREFIX)) {
     return `the mail server rejected this account's credentials (${text})`;
