@@ -186,14 +186,20 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
    * own note would have been held behind a count for ever. (e2e/crm.spec.ts
    * walks exactly that and caught exactly this.)
    *
-   * isStale RATHER THAN isFetching, and the difference is a real one that cost
-   * an afternoon. `isFetching` says whether a request is in flight, which on a
+   * isStale RATHER THAN isFetching, AND THE SUITE NO LONGER TELLS THEM APART
+   * -- which is said out loud because the choice therefore rests on this
+   * paragraph. `isFetching` says whether a request is in flight, which on a
    * remount depends on WHEN React Query dispatches the mount refetch relative
-   * to this effect -- an ordering that differed between this component and the
-   * Meetings tab beside it, so the same code was correct in one and wrong in
-   * the other. `isStale` is a property of the DATA (invalidated, or older than
-   * the 10s staleTime), decided before any of that, and it is the question
-   * actually being asked: is this page fit to keep?
+   * to this effect. That was not theoretical: with isFetching, and with the
+   * accumulator still in this effect's dependencies, coming back to the
+   * Meetings tab adopted the cache entry it had left and held it, offering
+   * "Show 1 new meeting" for a meeting nothing would ever show -- while this
+   * component, the same code one file away, was fine. Removing the redundant
+   * dependency (below) moved that race, and substituting isFetching back now
+   * passes; the mutation survives. `isStale` is kept because it is a property
+   * of the DATA -- invalidated, or older than the 10s staleTime -- settled
+   * before any dispatch ordering, and because it is the question actually
+   * being asked: is this page fit to keep?
    *
    * WAITING COSTS ONE ROUND TRIP AND ONLY WHERE THE DATA IS ALREADY WRONG. A
    * cold mount has no `data` to take anyway; a warm mount inside the staleTime
