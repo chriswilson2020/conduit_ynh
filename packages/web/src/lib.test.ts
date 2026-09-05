@@ -457,6 +457,51 @@ describe("pendingArrivals", () => {
   });
 });
 
+/**
+ * THE RULE, STATED ONCE FOR EVERY SURFACE THERE IS AND EVERY SURFACE THERE
+ * WILL BE (v1.7.1).
+ *
+ * mergeCursorPage REPLACES the page it is given, which is right for a page a
+ * reader asked for and wrong for the same page arriving again behind their
+ * back -- and no component can tell those apart, because the difference is
+ * whether the cursor is already held and only the accumulator knows that.
+ * takeCursorPage is the function that asks; mergeCursorPage is its private
+ * half, exported for the tests above and for nothing else.
+ *
+ * A WALK RATHER THAN THREE NAMED FILES. The two rails shipped this defect for
+ * a year because the inbox's fix was applied to the inbox, and the next
+ * time-ordered list somebody adds will reach for the same import for the same
+ * reason. Naming the files would have to be remembered; walking them cannot
+ * be forgotten.
+ *
+ * This is also the cross-check on everything below: put mergeCursorPage back
+ * into either rail and this turns red on the spot.
+ */
+describe("no component merges a page it is already holding", () => {
+  function componentsIn(dir: URL): URL[] {
+    const out: URL[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === "node_modules" || entry.name === "dist") continue;
+      if (entry.isDirectory()) out.push(...componentsIn(new URL(`${entry.name}/`, dir)));
+      else if (entry.name.endsWith(".tsx")) out.push(new URL(entry.name, dir));
+    }
+    return out;
+  }
+
+  it("finds the components to walk at all", () => {
+    // A guard whose corpus is empty passes for the wrong reason, silently and
+    // for ever. This is the one assertion that would notice.
+    expect(componentsIn(new URL("./", import.meta.url)).length).toBeGreaterThan(20);
+  });
+
+  it("names mergeCursorPage in no component's code", () => {
+    const offenders = componentsIn(new URL("./", import.meta.url))
+      .filter((file) => withoutComments(readFileSync(file, "utf8")).includes("mergeCursorPage"))
+      .map((file) => file.pathname.split("/packages/web/")[1] ?? file.pathname);
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe("cursor page cursors", () => {
   const row = (id: string): Row => ({ id });
 

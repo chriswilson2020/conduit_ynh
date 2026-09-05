@@ -20,6 +20,7 @@ import {
   localInputToIso,
   meetingErrorMessage,
   meetingWhenLabel,
+  newMeetingsLabel,
   nowLocalInput,
   summarizeAttendees,
   taskCountLabel,
@@ -302,5 +303,21 @@ describe("error messages", () => {
   it("falls through to the server's own message for anything else", () => {
     expect(meetingErrorMessage(new ApiError("title: too small", 400, "validation"))).toBe("title: too small");
     expect(followUpErrorMessage(new Error("offline"))).toBe("offline");
+  });
+});
+
+/**
+ * v1.7.1. The Meetings tab holds still under the reader too, and its control
+ * counts meetings rather than timeline entries -- which is the whole reason
+ * the wording did not move to lib.ts along with the count itself.
+ */
+describe("newMeetingsLabel", () => {
+  it("says how many, in the singular when there is one", () => {
+    expect(newMeetingsLabel({ count: 1, atLeast: false })).toBe("Show 1 new meeting");
+    expect(newMeetingsLabel({ count: 2, atLeast: false })).toBe("Show 2 new meetings");
+  });
+
+  it("marks a count that is only a floor", () => {
+    expect(newMeetingsLabel({ count: 20, atLeast: true })).toBe("Show 20+ new meetings");
   });
 });

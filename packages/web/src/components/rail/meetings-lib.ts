@@ -3,6 +3,7 @@ import type {
 } from "@conduit/shared";
 import { meetingAtLeastOneLink } from "@conduit/shared";
 import { ApiError } from "../../api";
+import type { PendingArrivals } from "../../lib";
 import { htmlIsBlank } from "../mail/mail-lib";
 
 /**
@@ -104,6 +105,19 @@ export function meetingWhenLabel(occurredAt: string, durationMinutes: number | n
 export function taskCountLabel(count: number): string {
   if (count === 0) return "No follow-up tasks";
   return count === 1 ? "1 follow-up task" : `${count} follow-up tasks`;
+}
+
+/**
+ * The label on the control that reveals what the list is holding back (v1.7.1
+ * -- meetings.tsx's header carries the ruling).
+ *
+ * The number, and the "+" that says the number is a floor, for the reasons
+ * mail-lib's newMailLabel gives. The COUNT is lib.ts's pendingArrivals for all
+ * three lists that hold still; only the noun is per-surface, which is why this
+ * one line lives here and the arithmetic does not.
+ */
+export function newMeetingsLabel({ count, atLeast }: PendingArrivals): string {
+  return `Show ${count}${atLeast ? "+" : ""} new ${count === 1 ? "meeting" : "meetings"}`;
 }
 
 /** How many attendees a list row names before it stops naming them. Each
