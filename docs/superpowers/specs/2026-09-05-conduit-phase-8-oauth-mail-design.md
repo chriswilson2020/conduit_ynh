@@ -88,6 +88,12 @@ is untouched, because a self-hosted IMAP server with a password is still the com
 **Microsoft: straightforward.** A single-tenant app registration in the operator's own Azure AD.
 No verification, refresh tokens do not expire.
 
+> **Task 4: "do not expire" is right in practice and wrong as written.** Entra's refresh tokens
+> carry a 90-day *inactivity* limit and rotate on every use, so a mailbox on a poll interval
+> renews indefinitely and the limit is unreachable. It is reachable by an account that has been
+> stopped, or by a server that was off for three months -- which then reads as "sign in again",
+> correctly, and is the one case the sentence above would have made look like a bug.
+
 **Google: the code is identical and the ADMINISTRATIVE story is not**, and it forks on something
 outside this repository:
 
@@ -102,6 +108,29 @@ outside this repository:
 **This is documentation, not code.** Both providers are built; the docs state the Gmail fork
 plainly so nobody discovers it on day eight. **Shipping a weekly-expiring integration without
 saying so would be the worst outcome available.**
+
+> **Task 4's correction: "documentation, not code" was wrong, and this section contradicts the
+> Definition of Done six lines below it.** The DoD requires "the Workspace/consumer distinction
+> stated in the UI at the point of choosing", which is code by definition -- a rendered component,
+> a pure function and a test that the form actually shows it. Both statements are in this
+> document and they cannot both be right; Task 4 followed the DoD.
+>
+> **And the sentence understated the rest of the gap.** Finishing Google needed three more code
+> changes that nothing here anticipated: the Sent-folder APPEND had to fork per provider (below),
+> `MAIL_OAUTH_REDIRECT_URI` needed a boot-time check because `z.url()` accepts three values that
+> cannot work, and the providers route had to start answering with the callback path because an
+> operator creating a registration has no other way to learn it. The two providers really are one
+> code path -- and "one code path" turned out to mean one code path *with a table of differences
+> in it*, which is a different claim.
+>
+> **A SIXTH THING THAT WILL GO WRONG, belonging beside Risk 2's list: the SMTP host is not the
+> same for every Microsoft mailbox.** A consumer `@outlook.com` / `@hotmail.com` / `@live.com`
+> account shares Microsoft's IMAP host and submits through `smtp-mail.outlook.com`;
+> Exchange Online's `smtp.office365.com`, which is what this phase configures, refuses it. The
+> symptom is Risk 2's own worst one -- IMAP syncs perfectly and every send fails -- so it now has
+> two causes that present identically. Named in `docs/mail-oauth-setup.md` and in the provider
+> table; not fixed, because the OAuth form asks for no host on purpose and a consumer Microsoft
+> account is outside this phase's definition of done.
 
 ---
 

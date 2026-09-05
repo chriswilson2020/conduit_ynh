@@ -104,6 +104,69 @@ secret and a tenant but no redirect URI reads as having no registration at all.
       as v1.4.1's error message that blamed the wrong thing: the operator concludes Conduit is
       broken.
 
+### Five corrections, written after Task 4 built it
+
+1. **"GMAIL DUPLICATES SENT MAIL, EXCHANGE DOES NOT" IS HALF FALSE, and it was the task's own
+   framing.** Checked 5 Sep against Microsoft's `Set-Mailbox` reference rather than against
+   Gmail: `MessageCopyForSMTPClientSubmissionEnabled` is Exchange-Online-only and its documented
+   default is `$true` -- "a copy of the message is sent to the user's mailbox. This value is the
+   default." Exchange Online files SMTP client submissions in Sent Items exactly as Gmail does,
+   so both providers auto-save and the phrase "it is Gmail-only" describes nothing.
+
+   What actually differs is **whether the operator can turn it off**, and that is what the fix
+   forked on. At Google it is unconditional with no setting anywhere, so Conduit's APPEND is
+   always a second upload of bytes the mailbox already has -- skipped. At Microsoft it is a
+   per-mailbox switch this process cannot read (it needs Exchange PowerShell, not IMAP), so the
+   choice is between two wrong answers on a flipped switch, and they are not equally wrong:
+   a duplicate in Sent Items is visible within a minute and fixed by one cmdlet, while a missing
+   Sent copy is invisible and found weeks later by somebody hunting for a message. Microsoft
+   keeps the APPEND, and the cmdlet is in `docs/mail-oauth-setup.md`.
+
+2. **"THE GMAIL FORK IS DOCUMENTATION" CONTRADICTS THIS PLAN'S OWN DEFINITION OF DONE**, which
+   requires the distinction "on screen at the choice". The spec says the same two things in the
+   same section. Code won, because a sentence in a README is not read by the person choosing a
+   provider six months later.
+
+3. **"THE REDIRECT URI HAS TO BE CONFIGURED, NOT ONLY REGISTERED" WAS RIGHT AND STOPPED ONE STEP
+   SHORT: THERE WAS NOWHERE TO CONFIGURE IT.** `conf/.env` is a template, and both
+   `scripts/install` and `scripts/upgrade` end with `ynh_config_add --template=".env"`, which
+   RE-RENDERS it. `ynh_setup_source --keep=".env"` preserves an operator's file through the
+   source swap and the render then overwrites it two steps later -- so "add the OAuth settings to
+   `.env`" is an instruction that works until the next upgrade and then silently un-works: the
+   app boots, the registration is gone, and the provider quietly stops being offered. Putting
+   them IN the template is worse, because an unsubstituted `__MAIL_OAUTH_..._ID__` renders as a
+   literal, which is not empty, which `config.ts` reads as a complete registration. Hence
+   `.env.oauth`, loaded by systemd with `EnvironmentFile=-` and never rewritten.
+
+4. **THE PROVIDER TABLE WAS RIGHT AND UNPROVABLE.** Every endpoint, scope, host and port in it
+   fails only at a mail server or a consent screen -- environments no test here can reach -- so
+   nothing in the suite would have noticed one being edited. They are pinned now, against the
+   values each provider publishes, and the e2e config carries a second fake registration so the
+   three parameters that make Google's authorise request different from Microsoft's
+   (`access_type`, `prompt`, its single restricted scope) are walked in a browser rather than
+   assumed to work because Microsoft's do.
+
+5. **A GMAIL ACCOUNT WOULD HAVE SYNCED ITSELF FOUR TIMES, AND NOTHING IN THIS PHASE WOULD HAVE
+   CAUSED IT.** Discovery enables every folder but Junk and Trash on first sight (Phase 4.1), and
+   Gmail lists `[Gmail]/All Mail`, `[Gmail]/Starred` and `[Gmail]/Important` as ordinary
+   mailboxes. All three are VIEWS of messages that also live in the Inbox -- so the walk would
+   meet every message again under a second folder name, ingest would take its duplicate path, and
+   that path updates `mail_messages.folder` to wherever a message was last seen. Every row in the
+   account would flip folders on every pass, undoing Phase 4.4's filing as fast as it was done.
+
+   It sits under the spec's "nothing in the mail engine changes... not the folder walk", which is
+   true of the authentication swap and was never true of *adding a provider that lists mailboxes
+   like this*. Fixed at the one place it can be fixed cheaply: `ImapFolderListing` gains an
+   OPTIONAL `virtual`, set from the `\All` / `\Flagged` / `\Important` LIST attributes, and
+   `defaultSyncEnabled` starts those folders off. A default, not a ban -- the picker still shows
+   them and the no-clobber rule keeps an operator's "on" for ever. No existing install changes,
+   because discovery has never rewritten an existing row's `sync_enabled`.
+
+Also: **`z.url()` is not a redirect-URI check.** It accepts a fragment, plain `http`, and a path
+this server does not serve -- three values that boot cleanly and then fail at somebody else's
+consent screen or at a 404 holding an authorisation code. All three are decidable at boot, and
+are now refused there with the setting named.
+
 ---
 
 ## Definition of done
