@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import type { Event } from "@conduit/shared";
 import { useEvents, useUsers } from "../../queries";
@@ -6,7 +6,7 @@ import {
   advanceCursorPages, cursorForKey, emptyCursorPages, flattenCursorPages, identityKey,
   pendingArrivals, takeCursorPage, type CursorPages,
 } from "../../lib";
-import { useLatest } from "../../hooks";
+import { useLatest, useOwnWriteNonce } from "../../hooks";
 import { Button } from "../ui/button";
 import { VERB_BADGE, eventLink, newActivityLabel, summarize } from "./timeline-lib";
 
@@ -79,13 +79,21 @@ export interface TimelineProps {
  * it, because a meeting row's task count, title and attendees all change under
  * a reader -- see meetings.tsx.)
  *
- * SO THERE ARE TWO BEHAVIOURS RATHER THAN THE INBOX'S THREE:
+ * SO THERE ARE THE INBOX'S THREE BEHAVIOURS, WITH ITS SECOND ONE EMPTY:
  *
- *   1. Activity the reader cannot see -> counted, and a control at the top of
- *      the list offers to show it. Nothing moves until it is pressed.
- *      (lib.ts's pendingArrivals, and the control below.)
+ *   1. Activity from ANYWHERE ELSE -- a colleague's write, mail landing on a
+ *      linked thread -- is counted, and a control at the top of the list
+ *      offers to show it. Nothing moves until it is pressed. (lib.ts's
+ *      pendingArrivals, and the control below.)
  *
- *   2. Asking is what takes the server's order, all of it, from page one.
+ *   2. Nothing, because nothing can change in place. See above.
+ *
+ *   3. The reader's OWN write -> a new snapshot, at once and with no gesture.
+ *      They edited a field beside this rail, or a task above this drawer, and
+ *      an activity feed that answered "Show 1 new entry" to the thing they
+ *      just did would be hiding their own work behind a button. hooks.ts's
+ *      useOwnWriteNonce is how that write is told from an arrival, and its
+ *      doc comment carries the reasoning.
  *
  * THE ALTERNATIVES, and why each is worse:
  *
@@ -109,29 +117,31 @@ export interface TimelineProps {
  *   it throws away their paging as well as their place, on somebody else's
  *   schedule.
  *
- *   NEVER HOLD BACK THE READER'S OWN ACTIVITY, by comparing an entry's
- *   actorUserId against the signed-in user -- so that editing a task in the
- *   drawer showed its own entry at once instead of behind a button. Rejected
- *   because the signal is WRONG FOR EXACTLY THE CASE THIS EXISTS FOR: a
- *   `mail_received` entry is written with the MAILBOX OWNER as its actor (api:
- *   mail-ingest.ts's emitMailEvent takes `account.userId`), so mail arriving
- *   in the reader's own account is "the reader's own activity" by this test
- *   and would re-snapshot the list under them. The one signal that looks like
- *   it separates a write from an arrival is the one that cannot.
+ *   HOLD THE READER'S OWN WRITE TOO, AND LET THEM CLICK FOR IT. This was the
+ *   first shape, and it is the one alternative that was tried rather than
+ *   argued about: it turns "edit the industry field and watch it land on the
+ *   timeline" into "edit the field, then press a button", on the app's busiest
+ *   surface, for every note, file, stage change and task edit. Two existing
+ *   journeys assert against it (e2e/crm.spec.ts's inline edit, and
+ *   e2e/meetings.spec.ts's archive, where the reader's own archive has to take
+ *   the row away), and they were right to. Behaviour 3 is not a nicety; it is
+ *   what stops the hold from being a regression.
+ *
+ *   TELLING THE READER'S OWN WRITE BY ITS actorUserId, which is the obvious
+ *   way to do behaviour 3 and is wrong for exactly the case the hold exists
+ *   for: a `mail_received` entry is written with the MAILBOX OWNER as its
+ *   actor (api: mail-ingest.ts's emitMailEvent takes `account.userId`), so
+ *   mail arriving in the reader's own account reads as their own activity and
+ *   would move the list under them. The signal used instead is the mutation
+ *   cache, which sees this browser's writes and nothing else -- hooks.ts's
+ *   useOwnWriteNonce.
  *
  *   A refreshToken PROP, the way the inbox lets its caller say "that was me"
  *   (thread-list.tsx). The inbox has ONE caller making ONE kind of write; this
  *   component is rendered by the record rail and by the task drawer, and the
  *   writes that reach it come from some twenty mutation hooks across
- *   queries.ts, none of which know a timeline is on screen. Threading a nonce
- *   through all of them to save one click is a great deal of surface for a
- *   small gain -- and the rail's tabs unmount (Radix Tabs renders only the
- *   active one), so leaving the Timeline tab and coming back is already a
- *   fresh snapshot.
- *
- * WHAT THE READER'S OWN WRITE THEREFORE DOES: it is counted like anything
- * else, and one click shows it. Stated here because it is the one place this
- * is visibly less immediate than what shipped before.
+ *   queries.ts, none of which know a timeline is on screen. That prop is the
+ *   right idea with the wrong supplier, which is what useOwnWriteNonce is.
  *
  * TWO OBSERVERS, ONE OF THEM FREE, exactly as the inbox has it: `head` below
  * is page one whatever page the reader is on, which is also what makes this
@@ -145,7 +155,7 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
   const key = identityKey({ companyId, contactId, dealId, projectId, taskId });
   const [pages, setPages] = useState<CursorPages<Event>>(() => emptyCursorPages<Event>(key));
   const cursor = cursorForKey(pages, key);
-  const { data, isLoading, isError, refetch } = useEvents({
+  const { data, isLoading, isError, isFetching, refetch } = useEvents({
     companyId, contactId, dealId, projectId, taskId, cursor,
   });
   // Page one, whatever page the reader is on. See the header.
@@ -165,17 +175,36 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
    * is already held (see the header), a held page is simply final until the
    * reader asks for a new snapshot.
    *
-   * `pages` is a dependency, which it has to be: a re-snapshot empties the
+   * ...AND ONLY FROM A FETCH THAT HAS SETTLED. `data` while `isFetching` is a
+   * CACHE ENTRY, not an answer: React Query hands back what it has while it
+   * revalidates. Taking that and then holding it locks in a page that was
+   * already known to be out of date, and it is not a corner case -- this rail
+   * lives in Radix tabs, which unmount the inactive one, so the ordinary
+   * "write a note on the Notes tab, then look at the Timeline" gesture
+   * remounts this component over a cache entry the write has just
+   * invalidated. Before the hold, the fresh page simply replaced the stale
+   * one; with it, the reader's own note would have been held behind a count
+   * for ever. (e2e/crm.spec.ts walks exactly that, and caught exactly this.)
+   *
+   * WAITING COSTS ONE ROUND TRIP AND ONLY WHERE THE DATA IS ALREADY WRONG. A
+   * cold mount has no `data` to take anyway; a warm mount inside the 10s
+   * staleTime is not fetching, so it paints from cache with no delay; only a
+   * mount over data something has invalidated waits -- and the alternative
+   * there is painting rows that are known to be stale and then keeping them.
+   * The loading line below is gated on the same flag so that wait does not
+   * render as "No activity yet".
+   *
+   * `pages` is a dependency, which it has to be: a re-snapshot replaces the
    * accumulator without changing the data, the key OR the cursor (page one's
    * cursor is undefined either way), and an effect that did not watch the
-   * accumulator would leave the list empty until something else happened to
-   * move. Safe because takeCursorPage settles -- its second call for the same
-   * cursor returns the same object, so React bails out.
+   * accumulator would leave the list showing the old rows until something
+   * else happened to move. Safe because takeCursorPage settles -- its second
+   * call for the same cursor returns the same object, so React bails out.
    */
   useEffect(() => {
-    if (!data) return;
+    if (!data || isFetching) return;
     setPages((current) => takeCursorPage(current, key, cursor, data.items, data.nextCursor));
-  }, [data, cursor, key, pages]);
+  }, [data, isFetching, cursor, key, pages]);
 
   // pages.key can lag `key` by one render (the take above runs in an effect),
   // and rendering the previous record's rows for that render is exactly the
@@ -184,43 +213,66 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
   const hasMore = pages.key === key && pages.nextCursor !== null;
 
   /**
-   * Take a new snapshot: fetch page one, THEN start the accumulation over from
-   * what came back.
+   * Take a new snapshot: fetch page one, and start the accumulation over from
+   * WHAT CAME BACK.
    *
-   * IN THAT ORDER, AND THE ORDER IS NOT LOAD-BEARING HERE -- WHICH IS WRITTEN
-   * DOWN RATHER THAN LEFT TO BE REDISCOVERED. The only thing that asks for a
-   * snapshot is the control below, and by the time that control exists the
-   * head query has already refetched, because that is where its count came
-   * from; so emptying first would adopt a page one that is fresh anyway. A
-   * mutation reversing these two lines survived the whole suite, and that is
-   * the honest state of it.
+   * IN THAT ORDER, AND THE ORDER IS THE WHOLE FUNCTION. Emptying first would
+   * adopt whatever the cache is holding, which after a write is the answer
+   * from BEFORE it -- so the entry the reader just made would be missing, and
+   * the fresh page landing a moment later would find page one held again and
+   * take nothing from it. `refetch` on an in-flight query returns that fetch's
+   * own promise (React Query dedupes), so following a mutation's own
+   * invalidation costs no second request.
    *
-   * IT IS STILL WRITTEN THIS WAY, for two reasons. It is the order the same
-   * function has on the other two surfaces -- mail/thread-list.tsx's
-   * resnapshot and meetings.tsx's reset -- where the snapshot DOES follow the
-   * reader's own write, the cache is holding the answer from before it, and
-   * the reverse order silently loses the thing they just did. Three copies of
-   * one idea should not differ in a way that looks deliberate and is not. And
-   * it is the order that stays correct if this component ever gains such a
-   * trigger, which is exactly the change the header's rejected refreshToken
-   * note describes.
-   *
-   * `refetch` on an in-flight query returns that fetch's own promise (React
-   * Query dedupes), so the common case issues no second request.
+   * IN ONE setPages RATHER THAN TWO, which the inbox does not need and this
+   * does. Emptying and then letting the effect above re-take page one leaves
+   * one committed render with no rows in it, and useEffect is passive -- it
+   * flushes after paint, so that render can be seen. The inbox re-snapshots
+   * on a deliberate gesture a handful of times a session; this one also runs
+   * on every write the reader makes, where a frame of empty list would be a
+   * flicker under their hands.
    *
    * IT GOES BACK TO PAGE ONE, and the accumulated pages are re-fetched by
    * pressing "Load more" again rather than re-paged here: their cursors are
    * keyset positions in an ordering that has just moved, and page one is the
    * only boundary that is certainly still true.
+   *
+   * A FAILED REFETCH CHANGES NOTHING. `data` is undefined only when the fetch
+   * itself failed, and keeping the rows already on screen is better than
+   * clearing them to prove a request went wrong -- the error line below is
+   * what says that.
    */
   const headRefetch = head.refetch;
-  // The key AS OF THE RESET, not as of the ask: a record changing under this
-  // component while the fetch is in flight would otherwise re-key the
+  // The key AS OF THE SNAPSHOT, not as of the ask: a record changing under
+  // this component while the fetch is in flight would otherwise re-key the
   // accumulator backwards and blink the list empty for a render.
   const keyRef = useLatest(key);
   const resnapshot = useCallback(() => {
-    void headRefetch().then(() => setPages(emptyCursorPages<Event>(keyRef.current)));
+    void headRefetch().then(({ data: fresh }) => {
+      if (fresh === undefined) return;
+      const snapshotKey = keyRef.current;
+      setPages(takeCursorPage(
+        emptyCursorPages<Event>(snapshotKey), snapshotKey, undefined, fresh.items, fresh.nextCursor,
+      ));
+    });
   }, [headRefetch, keyRef]);
+
+  /**
+   * THE READER'S OWN WRITE IS NEVER HELD BACK (behaviour 3 in the header).
+   *
+   * Only a CHANGE means anything -- the value is a nonce -- so the mount pass,
+   * where there is nothing to refresh, is skipped rather than costing a fetch
+   * and a render on every timeline that ever mounts. Exactly the shape
+   * thread-list.tsx gives its refreshToken prop; the difference is only where
+   * the signal comes from, which hooks.ts explains.
+   */
+  const ownWrite = useOwnWriteNonce();
+  const seenOwnWrite = useRef(ownWrite);
+  useEffect(() => {
+    if (seenOwnWrite.current === ownWrite) return;
+    seenOwnWrite.current = ownWrite;
+    resnapshot();
+  }, [ownWrite, resnapshot]);
 
   /**
    * What has arrived that the list is not showing. Both sides are this
@@ -255,14 +307,20 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
           </Button>
         )}
       </div>
-      {isLoading && rows.length === 0 && <p className="text-sm text-slate-400">Loading...</p>}
+      {/* isFetching as well as isLoading, because of the effect above: a mount
+          over data something has invalidated has `data` in hand and is still
+          waiting for the answer it will actually take, and with rows still
+          empty the line below would otherwise claim there is no activity. */}
+      {(isLoading || isFetching) && rows.length === 0 && (
+        <p className="text-sm text-slate-400">Loading...</p>
+      )}
       {/* A record with no activity and a timeline that FAILED to load are
           different facts. Rendering the first for the second is the worse
           mistake -- "No activity yet" on a busy record reads as data loss --
           and it is newly easy to hit: an old browser tab against a v0.9.0 API
           throws on the three verbs it has never heard of, so the whole page
           fails to parse. */}
-      {!isLoading && !isError && rows.length === 0 && (
+      {!isLoading && !isFetching && !isError && rows.length === 0 && (
         <p data-testid="timeline-empty" className="text-sm text-slate-400">No activity yet</p>
       )}
       <ul className="flex flex-col gap-3">

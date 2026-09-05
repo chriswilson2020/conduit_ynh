@@ -110,6 +110,9 @@ function arrival(label: string): Seed {
   return { id: rowId(90), at: new Date().toISOString(), label, taskCount: 0 };
 }
 
+/** What the timeline entry a reader's own edit produces says, in this file. */
+const OWN_WRITE_LABEL = "Written by the reader";
+
 /** The wire shape of one timeline row (@conduit/shared's eventSchema), which
  * the client parses with zod -- so a missing field is a hard error in the app,
  * not a soft one in this file. */
@@ -211,6 +214,27 @@ async function stubRail(browserPage: Page, companyId: string, stub: RailStub): P
     await route.fulfill({ json: { items: items.map((seed) => wireMeeting(seed, companyId)), nextCursor } });
   });
 
+  /**
+   * The reader's OWN write, made through the real API and noticed here.
+   *
+   * The PATCH is performed for real (`route.fetch`) and its real answer is
+   * returned, so the app's own mutation runs exactly as it does in the field;
+   * all this adds is the timeline entry the real service would have written,
+   * which /api/events is stubbed and therefore would not otherwise have.
+   */
+  await browserPage.route(
+    (url) => /^\/api\/companies\/[0-9a-f-]{36}$/.test(url.pathname),
+    async (route: Route) => {
+      if (route.request().method() !== "PATCH") {
+        await route.continue();
+        return;
+      }
+      const response = await route.fetch();
+      if (response.ok()) stub.events = [arrival(OWN_WRITE_LABEL), ...stub.events];
+      await route.fulfill({ response });
+    },
+  );
+
   // One frame per connection, then EOF; the browser reconnects after `retry`.
   await browserPage.route((url) => url.pathname === "/api/stream", async (route: Route) => {
     const frame = stub.live.length === 0
@@ -290,6 +314,40 @@ test("holds an arriving timeline entry behind a count, and moves nothing to do i
   expect(after).toHaveLength(7);
   expect(after[0]).toContain("Arriving now");
   expect(after.slice(1)).toEqual(before);
+});
+
+/**
+ * BEHAVIOUR 3, AND THE HALF THAT COSTS SOMETHING IF IT IS MISSING. The hold
+ * protects a reader from other people's writes; it must not hold back their
+ * own. The record page's inline field edits are the commonest write in this
+ * app and they land on the rail beside them -- an activity feed that answered
+ * "Show 1 new entry" to the thing the reader had just typed would be hiding
+ * their own work behind a button.
+ *
+ * The edit here is REAL (the PATCH goes to the API and its answer comes back);
+ * only the entry it produces is served from this file's list, because
+ * /api/events is stubbed. e2e/crm.spec.ts walks the same journey against the
+ * real timeline route.
+ */
+test("shows the reader's own edit at once, with nothing to click", async ({ page }, info) => {
+  const companyId = await makeCompany(page, uniqueName("own edit", info.retry));
+  const stub: RailStub = { events: seedRows(3, (n) => `Note ${n}`), meetings: [], live: [] };
+  await stubRail(page, companyId, stub);
+  await page.goto(`/companies/${companyId}`);
+  await expect(page.locator('[data-testid="timeline-entry"]')).toHaveCount(3);
+
+  const industry = page.getByTestId("field-industry");
+  await industry.click();
+  await industry.locator("input").fill("biotech");
+  await industry.locator("input").press("Enter");
+  await expect(industry).toContainText("biotech");
+
+  // NO HINT IS SENT (stub.live is still empty) and no timer exists, so the
+  // only thing that can put this entry on screen is the write itself being
+  // recognised as the reader's own.
+  await expect(page.getByTestId("timeline").getByText(OWN_WRITE_LABEL)).toBeVisible();
+  await expect(page.getByTestId("timeline-new-show")).toHaveCount(0);
+  expect(await entryTexts(page)).toHaveLength(4);
 });
 
 test("keeps the timeline live past page one, where nothing was watching before", async ({ page }, info) => {
