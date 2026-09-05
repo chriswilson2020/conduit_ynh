@@ -29,8 +29,11 @@ archive being restored, which has no recovery path.
 | ~~**7.6 → v1.3.0**~~ | Export (plain ZIP, readable, not restorable) and backup (AES-256 `.7z`, exact, not readable), told apart on a Settings page, **both behind a password re-prompt**. No schema change | **SHIPPED 31 Aug** |
 | ~~**7.7 → v1.4.0**~~ | Restore (preview, safety backup, apply) and two importers -- the exact one reading Conduit's own export, the forgiving one reading a foreign CSV. **Seven nginx location blocks, one of which did not parse until the release checked it.** No schema change | **SHIPPED 2 Sep** |
 | ~~**v1.4.1**~~ | Opened by a live defect (the re-auth gate refusing the correct password), then the seven hygiene items 7.7 surfaced: ticket scoping, the sync-stop asymmetry, two dev-loop script defects, a third intermittent, unheld guards, the `lower()`/`toLowerCase()` fold gap, and Chris's four decisions. **Ships `0013`, two functional indexes and one IMMUTABLE function** -- "no schema change" stopped being true when he took decision 3 | **SHIPPED 4 Sep**, upgraded on the deploy target, `NRestarts=0` |
+| ~~**v1.5.0**~~ | Focus after navigation, generalised from the two pages that had each solved it by hand -- and the test suite taken off one core (a database per worker), which cut CI's test step from 371s to 151s and made the 20-minute job cap unreachable | **SHIPPED 4 Sep.** No schema change |
+| ~~**4.4 → v1.6.0**~~ | Mail filing power tools, all four items: file into any folder (from the list AND from a conversation), per-message selection, bulk unhide, live inbox beyond page one, and folder create/rename/delete with the rename atomic across IMAP and the database | **SHIPPED 5 Sep.** No schema change |
 | **Phase 8** | M365 mail via Graph, Gmail XOAUTH2 behind it | **Trigger-based** — jumps the queue the day the Listerdale tenant needs syncing |
-| **Phase 4.4** | Mail filing power tools: per-message selection, arbitrary folder moves, folder management, bulk unhide, live inbox beyond page one | Unspecced. Overlaps "emailing a quote" below |
+| **Phase 9** | Four more document types: meeting summary, project status report, NDA and mutual NDA, plain letter on the letterhead | Agreed 30 Aug, **unspecced** |
+| **Phase 10** | Time tracking and timesheets. `meetings.duration_minutes` already exists, so Conduit ALREADY holds tracked time | Agreed 30 Aug, **unspecced** |
 
 ---
 
