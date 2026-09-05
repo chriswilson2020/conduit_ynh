@@ -1,6 +1,7 @@
 import type { Event } from "@conduit/shared";
 import { formatMoneyCents } from "@conduit/shared";
 import type { PendingArrivals } from "../../lib";
+import { newArrivalsLabel } from "../../lib";
 import { subjectLabel } from "../mail/mail-lib";
 
 /**
@@ -70,8 +71,8 @@ export const VERB_BADGE: Record<Event["verb"], string> = {
  * 328px wide. The tab is called Activity; a row in it is an entry, which is
  * also what this component's own testids have called one since v0.9.0.
  */
-export function newActivityLabel({ count, atLeast }: PendingArrivals): string {
-  return `Show ${count}${atLeast ? "+" : ""} new ${count === 1 ? "entry" : "entries"}`;
+export function newActivityLabel(pending: PendingArrivals): string {
+  return newArrivalsLabel(pending, "entry", "entries");
 }
 
 /**

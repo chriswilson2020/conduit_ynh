@@ -4,6 +4,7 @@ import type {
 import { meetingAtLeastOneLink } from "@conduit/shared";
 import { ApiError } from "../../api";
 import type { PendingArrivals } from "../../lib";
+import { newArrivalsLabel } from "../../lib";
 import { htmlIsBlank } from "../mail/mail-lib";
 
 /**
@@ -116,8 +117,8 @@ export function taskCountLabel(count: number): string {
  * three lists that hold still; only the noun is per-surface, which is why this
  * one line lives here and the arithmetic does not.
  */
-export function newMeetingsLabel({ count, atLeast }: PendingArrivals): string {
-  return `Show ${count}${atLeast ? "+" : ""} new ${count === 1 ? "meeting" : "meetings"}`;
+export function newMeetingsLabel(pending: PendingArrivals): string {
+  return newArrivalsLabel(pending, "meeting", "meetings");
 }
 
 /** How many attendees a list row names before it stops naming them. Each
