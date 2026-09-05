@@ -12,6 +12,7 @@ import {
   type ImapMessageDescriptor, type IngestMessageFn, type SyncClock, type SyncLogger,
 } from "./mail-imap.js";
 import { getAccountCredentialsAsSystem, setAccountChangedHook } from "./mail-accounts.js";
+import { mustBePasswordCredentials } from "./mail-crypto.js";
 import { INBOX, discoverFolders, folderKey, publishFoldersHint } from "./mail-folders.js";
 import { ingestMessage } from "./mail-ingest.js";
 import { publish } from "./sse.js";
@@ -894,13 +895,19 @@ export class AccountSync {
     // ArchivedError for an archived account, which isTeardownError treats as
     // "stop syncing this account" exactly like the loadAccount check above.
     const credentials = await getAccountCredentialsAsSystem(this.db, account.id, this.mailKeyPath);
+    // Phase 8 Task 1 made the stored credential a union; this is one of the two
+    // sites Task 2 replaces, by exchanging the refresh token for an access
+    // token and handing imapflow `auth.accessToken` instead of a password.
+    // Until then an OAuth account cannot reach here at all (nothing creates
+    // one) and the throw is the compiler's, not a runtime path.
+    const password = mustBePasswordCredentials(credentials, account.id).imapPassword;
     const client = this.clientFactory({
       accountId: account.id,
       host: account.imapHost,
       port: account.imapPort,
       security: account.imapSecurity as MailSecurity,
       username: account.username,
-      password: credentials.imapPassword,
+      password,
     });
     try {
       await client.connect();

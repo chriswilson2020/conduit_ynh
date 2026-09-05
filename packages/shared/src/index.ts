@@ -662,6 +662,42 @@ export type MailAccountStatus = z.infer<typeof mailAccountStatusSchema>;
 export const mailVisibilitySchema = z.enum(["private", "shared"]);
 export type MailVisibility = z.infer<typeof mailVisibilitySchema>;
 
+// Phase 8: how an account authenticates, and with whom when that is OAuth
+// (mail_accounts.auth_method -- api: db/schema.ts, which carries the reasoning
+// for it being ONE column rather than a kind/provider pair). Lives in shared
+// because the settings UI branches on it to render "signed in with Microsoft"
+// in place of a password field, and packages/web cannot import from
+// packages/api.
+//
+// This is the ONE fact about an OAuth account that crosses the wire. The
+// refresh token behind it never does -- same rule credentials_ciphertext has
+// always had.
+export const mailAuthMethodSchema = z.enum(["password", "oauth_microsoft", "oauth_google"]);
+export type MailAuthMethod = z.infer<typeof mailAuthMethodSchema>;
+
+export const mailOAuthProviderSchema = z.enum(["microsoft", "google"]);
+export type MailOAuthProvider = z.infer<typeof mailOAuthProviderSchema>;
+
+// The provider half of an auth method, or null for a password account.
+//
+// A FUNCTION RATHER THAN A SECOND COLUMN, and rather than each call site
+// slicing the string itself: "does this start with oauth_" is exactly the
+// prefix test that gets written slightly differently in three places and then
+// disagrees. Exhaustive by construction -- a new member of
+// mailAuthMethodSchema that nobody adds here is a compile error at the
+// `never`, not a silent null.
+export function mailOAuthProviderOf(method: MailAuthMethod): MailOAuthProvider | null {
+  switch (method) {
+    case "password": return null;
+    case "oauth_microsoft": return "microsoft";
+    case "oauth_google": return "google";
+    default: {
+      const exhaustive: never = method;
+      return exhaustive;
+    }
+  }
+}
+
 // mail_account_folders.special_use's five classified values (Phase 4.1) --
 // the SPECIAL-USE attribute (RFC 6154) where the server offers it, else a
 // case-insensitive name-heuristic fallback (api: services/mail-folders.ts).
@@ -689,6 +725,11 @@ export const mailAccountSchema = z.object({
   signatureHtml: nullableString,
   backfillDays: z.number().int().positive().nullable(),
   visibility: mailVisibilitySchema,
+  // Phase 8. Safe to serialize where credentialsCiphertext is not, and the
+  // distinction is the point: this says an account signs in with Microsoft,
+  // never what it signs in WITH. The settings row is rendered from this alone,
+  // so nothing on the read path has to reach for mail.key.
+  authMethod: mailAuthMethodSchema,
   status: mailAccountStatusSchema,
   lastError: nullableString,
   lastSyncedAt: z.iso.datetime().nullable(),

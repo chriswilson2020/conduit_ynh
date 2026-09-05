@@ -386,6 +386,42 @@ export const mailAccounts = pgTable("mail_accounts", {
   // AES-256-GCM, format v1:<iv>:<tag>:<data>; see the Phase 4 spec's Key
   // handling section. Never selected into any API response.
   credentialsCiphertext: text("credentials_ciphertext").notNull(),
+  // Phase 8: HOW this account authenticates, and -- when that is OAuth -- with
+  // WHOM. 'password' is an IMAP/SMTP login with the password sealed in
+  // credentials_ciphertext (still the common case on a self-hosted install);
+  // 'oauth_microsoft'/'oauth_google' mean the ciphertext holds a refresh token
+  // instead (services/mail-crypto.ts's credential union).
+  //
+  // THIS COLUMN EXISTS SO SETTINGS NEVER HAS TO TOUCH mail.key. Rendering
+  // "signed in with Microsoft" rather than a password field is a question
+  // about every account in the list, and answering it by decrypting would
+  // make the settings page depend on a key that can be missing (503) or
+  // rotated -- for a fact that is not a secret in the first place. It is also
+  // the only fact about an OAuth account that a route may return.
+  //
+  // ONE COLUMN, NOT A kind/provider PAIR. The provider is only meaningful when
+  // the kind is OAuth, and a nullable second column would make "oauth with no
+  // provider" and "password with a provider" both representable and both
+  // meaningless -- states a CHECK would then have to forbid. Folding them
+  // makes those states unspellable. The cost is that adding a third provider
+  // is a CHECK migration rather than a row update, which is the right way
+  // round: a provider Conduit has no code for should not be storable.
+  //
+  // DEFAULT 'password' IS THE MIGRATION, exactly as visibility's DEFAULT
+  // 'private' was for 0006: the ALTER's default is what makes every
+  // pre-existing account a password account on upgrade, with no separate
+  // UPDATE statement (schema.test.ts's withPreMigrationDatabase("0014") drill
+  // asserts a pre-0014 row comes back 'password', not merely that the column
+  // exists). Every account that exists when this ships IS a password account
+  // -- there has never been another way to make one -- so the default is not
+  // an assumption, it is the only true value.
+  //
+  // NOT IN CONNECTION_FIELDS (services/mail-accounts.ts) and deliberately not
+  // patchable: an account does not change how it authenticates through the
+  // ordinary update path. Switching a password account to OAuth means signing
+  // in, which is Task 3's authorise/callback pair writing both this column and
+  // the ciphertext together.
+  authMethod: text("auth_method").notNull().default("password"),
   sentFolder: text("sent_folder").notNull().default("Sent"),
   // Resolved automatically from a discovered folder's special_use
   // classification when NULL (services/mail-folders.ts, Phase 4.1 Task 2);
@@ -425,6 +461,7 @@ export const mailAccounts = pgTable("mail_accounts", {
   check("mail_accounts_smtp_security_valid", sql`smtp_security IN ('tls','starttls')`),
   check("mail_accounts_status_valid", sql`status IN ('active','error')`),
   check("mail_accounts_visibility_valid", sql`visibility IN ('private','shared')`),
+  check("mail_accounts_auth_method_valid", sql`auth_method IN ('password','oauth_microsoft','oauth_google')`),
 ]);
 export type MailAccountRow = typeof mailAccounts.$inferSelect;
 

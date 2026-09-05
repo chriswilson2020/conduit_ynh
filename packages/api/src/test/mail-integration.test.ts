@@ -85,7 +85,7 @@ const STORM_MESSAGES = 20;
 /** Tags every subject this run writes, so a re-run reads its own mail. */
 const runId = randomUUID().slice(0, 8);
 
-const credentials: MailCredentials = { imapPassword: PASSWORD, smtpPassword: PASSWORD };
+const credentials: MailCredentials = { kind: "password", imapPassword: PASSWORD, smtpPassword: PASSWORD };
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -279,7 +279,7 @@ function account(): MailAccount {
     imapHost: IMAP_HOST, imapPort: IMAP_PORT, imapSecurity: "tls",
     smtpHost: SMTP_HOST, smtpPort: SMTP_PORT, smtpSecurity: "starttls",
     username: USERNAME, sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null,
-    backfillDays: null, visibility: "private", status: "active", lastError: null,
+    backfillDays: null, visibility: "private", authMethod: "password", status: "active", lastError: null,
     lastSyncedAt: null, archivedAt: null, createdAt: now, updatedAt: now,
   };
 }

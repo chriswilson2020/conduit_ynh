@@ -70,6 +70,32 @@ export class MailCredentialDecryptError extends Error {
   }
 }
 
+// Raised by mail-crypto's mustBePasswordCredentials when a code path that can
+// only use a password meets an account whose stored credential is an OAuth
+// refresh token (Phase 8 Task 1's union).
+//
+// NOT A DECRYPT FAILURE, which is why it is not a MailCredentialDecryptError
+// subclass: mail.key worked, the ciphertext authenticated, and the payload
+// was a perfectly valid credential -- just not one this caller can use. Rolling
+// the two together would tell an operator to check their key over a problem
+// their key has nothing to do with.
+//
+// NOT MAPPED BY mapDomainError, and not reachable in v1.7.0 Task 1: nothing
+// in this release writes an OAuth blob (no route, no form, no writer), so the
+// only thing that constructs this is a unit test. Task 2 removes two of its
+// four call sites by teaching IMAP and SMTP to use a token; whatever remains
+// after that needs a route mapping, and it will need it at the same moment an
+// OAuth account can first exist.
+//
+// The message names the account id and the kind. Neither is a secret -- the id
+// is in every mail URL and "oauth" is exactly what auth_method says in the
+// clear -- and no token, key or password reaches it.
+export class MailCredentialKindError extends Error {
+  constructor(accountId: string, kind: string) {
+    super(`mail account ${accountId} authenticates with '${kind}', but this path requires a stored password`);
+  }
+}
+
 // Raised by mail-accounts.ts's testConnection when accountId is absent and
 // the submitted fields do not fully determine a connection to test. Not a
 // reachable route error in practice: mailAccountTestInputSchema's

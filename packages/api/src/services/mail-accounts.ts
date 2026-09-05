@@ -2,12 +2,14 @@ import { and, desc, eq, isNull, isNotNull, ne } from "drizzle-orm";
 import type {
   MailAccount, MailAccountCreateInput, MailAccountUpdateInput, MailAccountTestInput,
   MailAccountUpdatePasswordFields, MailAccountSummary, MailAccountList, MailAccountTestResult,
-  MailSecurity, MailAccountStatus, MailVisibility,
+  MailSecurity, MailAccountStatus, MailVisibility, MailAuthMethod,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { mailAccounts, type MailAccountRow } from "../db/schema.js";
 import { NotFoundError, ArchivedError, ConflictError, IncompleteTestConnectionSettingsError } from "./errors.js";
-import { encryptCredentialsAt, decryptCredentialsAt, type MailCredentials } from "./mail-crypto.js";
+import {
+  encryptCredentialsAt, decryptCredentialsAt, mustBePasswordCredentials, type MailCredentials,
+} from "./mail-crypto.js";
 import { sanitizeMailHtml } from "./mail-content.js";
 import { publish } from "./sse.js";
 
@@ -155,6 +157,7 @@ function toMailAccount(row: MailAccountRow) {
     trashFolder: row.trashFolder, archiveFolder: row.archiveFolder,
     signatureHtml: row.signatureHtml, backfillDays: row.backfillDays,
     visibility: row.visibility as MailVisibility,
+    authMethod: row.authMethod as MailAuthMethod,
     status: row.status as MailAccountStatus, lastError: row.lastError,
     lastSyncedAt: row.lastSyncedAt?.toISOString() ?? null,
     archivedAt: row.archivedAt?.toISOString() ?? null,
@@ -386,7 +389,14 @@ export async function updateAccount(
       // unchanged -- decrypting the row THIS transaction holds a lock on,
       // not a pre-transaction read, is what makes this race-safe (see the
       // doc comment above).
-      const current = decryptCredentialsAt(mailKeyPath, locked.credentialsCiphertext);
+      // mustBePasswordCredentials, not a cast: an OAuth account has no imap
+      // password to carry forward, and inventing one ("" or the smtp value)
+      // would seal a blob that logs in as nobody. Unreachable in v1.7.0 --
+      // nothing yet creates an OAuth account -- and the update path is not how
+      // one would ever acquire a password anyway; signing in is (Task 3).
+      const current = mustBePasswordCredentials(
+        decryptCredentialsAt(mailKeyPath, locked.credentialsCiphertext), id,
+      );
       credentialsCiphertext = encryptCredentialsAt(mailKeyPath, {
         imapPassword: current.imapPassword,
         smtpPassword: smtpPassword as string,
@@ -678,7 +688,9 @@ export async function testConnection(
 
     if (input.password === undefined) {
       try {
-        const creds = decryptCredentialsAt(mailKeyPath, account.credentialsCiphertext);
+        const creds = mustBePasswordCredentials(
+          decryptCredentialsAt(mailKeyPath, account.credentialsCiphertext), account.id,
+        );
         storedImapPassword = creds.imapPassword;
         storedSmtpPassword = creds.smtpPassword;
       } catch {
@@ -689,6 +701,15 @@ export async function testConnection(
         // the stored credentials." This is a test endpoint: someone pressing
         // "Test connection" on a broken account needs an answer, never an
         // unhandled 500.
+        //
+        // Phase 8 adds MailCredentialKindError to that list, and it is the one
+        // case where "credentials unreadable" is the wrong WORD for a right
+        // answer: an OAuth account's stored credential reads perfectly, there
+        // is simply no password for imapVerify/smtpVerify to try. The result
+        // ("this will not connect this way") is still correct, and Task 2 is
+        // what gives this branch a token to test with -- so the phrasing is
+        // left for the task that can actually fix it rather than guessed at
+        // here. Unreachable until an OAuth account can exist at all.
         return {
           imap: { ok: false, error: CREDENTIALS_UNREADABLE },
           smtp: { ok: false, error: CREDENTIALS_UNREADABLE },

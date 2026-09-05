@@ -30,6 +30,7 @@ const storedAccount: MailAccount = {
   signatureHtml: null,
   backfillDays: 90,
   visibility: "private",
+  authMethod: "password",
   status: "active",
   lastError: null,
   lastSyncedAt: null,

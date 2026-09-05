@@ -252,7 +252,7 @@ describe("sendMail", () => {
     expect(transport.sent).toHaveLength(1);
     expect(transport.sent[0]?.envelope).toEqual({ from: "chris@example.com", to: ["alice@example.com"] });
     // The SMTP password, not the IMAP one (the account was created with both).
-    expect(transport.seenCredentials[0]?.smtpPassword).toBe("smtp-secret");
+    expect(transport.seenCredentials[0]).toMatchObject({ kind: "password", smtpPassword: "smtp-secret" });
     expect(transport.seenAccounts[0]?.id).toBe(accountId);
 
     // Stored by ingest, with everything ingest is responsible for.

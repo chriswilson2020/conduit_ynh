@@ -99,13 +99,13 @@ describe("createAccount", () => {
   it("defaults smtpPassword to password when no override is given", async () => {
     const account = await make({ password: "shared-secret" });
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
-    expect(creds).toEqual({ imapPassword: "shared-secret", smtpPassword: "shared-secret" });
+    expect(creds).toEqual({ kind: "password", imapPassword: "shared-secret", smtpPassword: "shared-secret" });
   });
 
   it("keeps a distinct smtpPassword when the 'SMTP differs' override is given", async () => {
     const account = await make({ password: "imap-secret", smtpPassword: "smtp-secret" });
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
-    expect(creds).toEqual({ imapPassword: "imap-secret", smtpPassword: "smtp-secret" });
+    expect(creds).toEqual({ kind: "password", imapPassword: "imap-secret", smtpPassword: "smtp-secret" });
   });
 
   it("applies DB defaults for omitted sentFolder/backfillDays and preserves an explicit null backfillDays", async () => {
@@ -166,7 +166,10 @@ describe("updateAccount", () => {
     const updated = await updateAccount(handle.db, actorId, account.id, { label: "Renamed" }, keyPath);
     expect(updated.label).toBe("Renamed");
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
-    expect(creds.imapPassword).toBe("original");
+    // toMatchObject on the whole value rather than one field: the credential is a
+    // union as of Phase 8, and asserting `kind` here is what keeps this test
+    // honest about WHICH member survived an unrelated field edit.
+    expect(creds).toMatchObject({ kind: "password", imapPassword: "original" });
   });
 
   it("trims sent_folder on update, and treats a resubmitted padded value as no change", async () => {
@@ -251,7 +254,7 @@ describe("updateAccount", () => {
     const account = await make({ password: "keep-me", smtpPassword: "keep-me-too" });
     await updateAccount(handle.db, actorId, account.id, { label: "Renamed", password: "", smtpPassword: undefined }, keyPath);
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
-    expect(creds).toEqual({ imapPassword: "keep-me", smtpPassword: "keep-me-too" });
+    expect(creds).toEqual({ kind: "password", imapPassword: "keep-me", smtpPassword: "keep-me-too" });
   });
 
   // RULING: a lone `password` means BOTH protocols (matches createAccount's
@@ -261,21 +264,21 @@ describe("updateAccount", () => {
     const account = await make({ password: "imap-old", smtpPassword: "smtp-old" });
     await updateAccount(handle.db, actorId, account.id, { password: "both-new" }, keyPath);
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
-    expect(creds).toEqual({ imapPassword: "both-new", smtpPassword: "both-new" });
+    expect(creds).toEqual({ kind: "password", imapPassword: "both-new", smtpPassword: "both-new" });
   });
 
   it("password + smtpPassword together: smtpPassword wins for smtp, password sets imap", async () => {
     const account = await make({ password: "imap-old", smtpPassword: "smtp-old" });
     await updateAccount(handle.db, actorId, account.id, { password: "imap-new", smtpPassword: "smtp-new" }, keyPath);
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
-    expect(creds).toEqual({ imapPassword: "imap-new", smtpPassword: "smtp-new" });
+    expect(creds).toEqual({ kind: "password", imapPassword: "imap-new", smtpPassword: "smtp-new" });
   });
 
   it("a lone smtpPassword changes only smtp, carrying the stored imap password forward", async () => {
     const account = await make({ password: "imap-unchanged", smtpPassword: "smtp-old" });
     await updateAccount(handle.db, actorId, account.id, { smtpPassword: "smtp-new" }, keyPath);
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
-    expect(creds).toEqual({ imapPassword: "imap-unchanged", smtpPassword: "smtp-new" });
+    expect(creds).toEqual({ kind: "password", imapPassword: "imap-unchanged", smtpPassword: "smtp-new" });
   });
 
   it("a full password submission succeeds even against an undecryptable stored ciphertext (key-rotation recovery)", async () => {
@@ -288,7 +291,7 @@ describe("updateAccount", () => {
     // password instead of a permanent dead end.
     await updateAccount(handle.db, actorId, account.id, { password: "recovered" }, keyPath);
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
-    expect(creds).toEqual({ imapPassword: "recovered", smtpPassword: "recovered" });
+    expect(creds).toEqual({ kind: "password", imapPassword: "recovered", smtpPassword: "recovered" });
   });
 
   // Item 14 coverage: pins that smtpPassword-ALONE is explicitly NOT a
@@ -567,8 +570,10 @@ describe("updateAccount: concurrency", () => {
     // to "imap-original", or smtp remaining at "smtp-original": either
     // would mean a call read a stale pre-transaction snapshot instead of
     // the other's committed write.
-    expect(creds.imapPassword).toBe("password-call-value");
-    expect(["smtp-call-value", "password-call-value"]).toContain(creds.smtpPassword);
+    expect(creds).toMatchObject({ kind: "password", imapPassword: "password-call-value" });
+    expect(["smtp-call-value", "password-call-value"]).toContain(
+      creds.kind === "password" ? creds.smtpPassword : null,
+    );
   });
 });
 
@@ -743,7 +748,7 @@ describe("getAccountCredentialsAsSystem", () => {
   it("decrypts stored credentials regardless of who calls it (no owner check -- system callers only)", async () => {
     const account = await make({ password: "sync-secret" }, otherActorId);
     const creds = await getAccountCredentialsAsSystem(handle.db, account.id, keyPath);
-    expect(creds.imapPassword).toBe("sync-secret");
+    expect(creds).toMatchObject({ kind: "password", imapPassword: "sync-secret" });
   });
 
   it("throws NotFoundError for a nonexistent account", async () => {

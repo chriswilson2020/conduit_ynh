@@ -9,6 +9,7 @@ import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
 import type { MailSecurity, SpecialUse } from "@conduit/shared";
 import type { TestConnectionDeps, VerifySettings } from "./mail-accounts.js";
 import type { SendMailTransportFactory } from "./mail-send.js";
+import { mustBePasswordCredentials } from "./mail-crypto.js";
 import {
   MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
   type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
@@ -1040,12 +1041,18 @@ export const defaultTestConnectionDeps: TestConnectionDeps = { imapVerify, smtpV
  */
 export function createSmtpTransportFactory(options: MailAdapterOptions = {}): SendMailTransportFactory {
   return (account, credentials) => {
+    // Phase 8 Task 1 made the stored credential a union; this is the SMTP half
+    // of the pair Task 2 replaces. nodemailer has OAuth2 built in, refresh
+    // included (smtp-connection/index.js:1965), so this becomes an auth block
+    // rather than a password there. Not reachable with an OAuth account today
+    // -- nothing creates one.
+    const password = mustBePasswordCredentials(credentials, account.id).smtpPassword;
     const transport = nodemailer.createTransport(buildSmtpOptions({
       host: account.smtpHost,
       port: account.smtpPort,
       security: account.smtpSecurity,
       username: account.username,
-      password: credentials.smtpPassword,
+      password,
     }, options));
     return {
       async sendMail(message): Promise<unknown> {

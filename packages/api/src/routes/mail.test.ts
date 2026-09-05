@@ -442,9 +442,20 @@ async function makeDeal(a: App, extra: Record<string, unknown> = {}) {
 /** Every account-returning response must be free of anything credential
  * shaped -- the whole point of mailAccountSchema (see its own note in
  * packages/shared). Asserted on the raw JSON, not the parsed value, because
- * zod strips unknown keys and would hide exactly the leak this is looking for. */
+ * zod strips unknown keys and would hide exactly the leak this is looking for.
+ *
+ * authMethod's VALUE is neutralised first, and only its value. Phase 8 made
+ * "password" a legitimate thing for an account body to SAY -- it is how the
+ * account authenticates, not what it authenticates with -- and this scan is a
+ * substring match over the whole serialised body, so it went red on the word
+ * itself. Two ways not to fix that were rejected: loosening the pattern (it
+ * would stop catching a leaked `imapPassword` key, which is the entire job)
+ * and dropping the field before serialising (the KEY would then go unchecked
+ * too). Replacing the value keeps `"authMethod"` in the scanned string, and
+ * the value it hides is constrained by mailAuthMethodSchema to three enum
+ * members -- there is no shape of leak it could be concealing. */
 function expectNoCredentials(payload: unknown): void {
-  const json = JSON.stringify(payload);
+  const json = JSON.stringify(payload, (key, value) => (key === "authMethod" ? "<enum>" : value));
   expect(json).not.toMatch(/password|credential|ciphertext|secret/i);
 }
 

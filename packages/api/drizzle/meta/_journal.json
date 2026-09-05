@@ -99,6 +99,13 @@
       "when": 1788600000000,
       "tag": "0013_wide_wolverine",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1788700000000,
+      "tag": "0014_soft_shotgun",
+      "breakpoints": true
     }
   ]
 }
