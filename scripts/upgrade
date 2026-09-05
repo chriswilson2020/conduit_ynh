@@ -12,8 +12,13 @@ ynh_systemctl --service="$app" --action="stop" --log_path="systemd"
 
 ynh_script_progression "Upgrading source files..."
 
-# Replace code wholesale but keep .env, which carries generated DB credentials.
-ynh_setup_source --dest_dir="$install_dir" --keep=".env"
+# Replace code wholesale but keep .env, which carries generated DB credentials,
+# and .env.oauth, which carries whatever OAuth registration the operator entered
+# by hand. The second one is kept here AND never re-rendered below, which is the
+# pair of properties .env does not have: ynh_config_add rewrites .env from the
+# template two steps down, so anything hand-added to it does not survive an
+# upgrade. See scripts/_common.sh's conduit_ensure_oauth_env.
+ynh_setup_source --dest_dir="$install_dir" --keep=".env .env.oauth"
 
 chown -R "$app:www-data" "$install_dir"
 
@@ -55,6 +60,13 @@ ynh_script_progression "Updating $app's configuration..."
 ynh_config_add --template=".env" --destination="$install_dir/.env"
 chmod 400 "$install_dir/.env"
 chown "$app:$app" "$install_dir/.env"
+
+# The OAuth file arrived in 1.7.0, so anything upgraded from 1.6.x reaches this
+# line without one. Creating it is how the operator discovers the feature
+# exists; the [ -f ] guard inside is what stops this line undoing their edits on
+# the NEXT upgrade, which is the failure this whole arrangement exists to
+# prevent.
+conduit_ensure_oauth_env
 
 ynh_script_progression "Upgrading system configurations related to $app..."
 
