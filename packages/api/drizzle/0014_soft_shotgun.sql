@@ -1,0 +1,48 @@
+-- THIS RELEASE'S ONLY MIGRATION, and the DEFAULT is the whole of it.
+--
+-- Phase 8 lets a mail account authenticate with OAuth instead of a password.
+-- Which one it uses is a question the Settings list has to answer for every
+-- row it renders, and answering it by decrypting credentials_ciphertext would
+-- make a read path depend on mail.key -- a file that can be absent (503) or
+-- restored from a backup that no longer matches -- for a fact that is not a
+-- secret. Hence a column, in the clear, beside the ciphertext rather than
+-- inside it.
+--
+-- WHY THERE IS NO BACKFILL STATEMENT, and why none is needed: every account
+-- that exists at the moment this runs is a password account, because there has
+-- never been another way to create one. The ALTER's DEFAULT therefore fills
+-- every pre-existing row with the only value that was ever true of it, in the
+-- same statement, and 'password' is not an assumption to be revisited later.
+-- Same arrangement as 0006's visibility DEFAULT 'private'; schema.test.ts's
+-- withPreMigrationDatabase("0014") drill seeds a row while the column does not
+-- yet exist and asserts it comes back 'password' afterwards, which is what
+-- distinguishes "the default fired at UPGRADE" from "the default fired at
+-- INSERT" -- the hole that drill exists to close.
+--
+-- ONE COLUMN, NOT TWO. 'oauth_microsoft'/'oauth_google' fold the kind and the
+-- provider together rather than pairing auth_kind with a nullable
+-- oauth_provider. A pair makes "oauth with no provider" and "password with a
+-- provider" both representable and both meaningless, and the CHECK forbidding
+-- them would be longer than this one; folding makes them unspellable. The
+-- price is that a third provider needs a CHECK migration -- which is the right
+-- price, because a provider Conduit has no code for should not be storable.
+--
+-- COSTS NOTHING TO APPLY, and this is a claim about the statement rather than
+-- about this install's data. A non-volatile DEFAULT on ADD COLUMN has been
+-- metadata-only since PostgreSQL 11: no table rewrite, no per-row update, and
+-- the ACCESS EXCLUSIVE lock is held for the catalogue write alone. The CHECK
+-- is the half that does read rows -- ADD CONSTRAINT ... CHECK validates
+-- existing data -- but it validates a column every row of which the same
+-- transaction just defaulted to a value the CHECK admits, so it cannot fail
+-- and there is nothing to repair. 0013's header has the general argument about
+-- migrations running before the server listens; it applies unchanged here and
+-- is not repeated.
+--
+-- THE ROW SHAPE THIS DOES NOT CHANGE: credentials_ciphertext still holds the
+-- v1:<iv>:<tag>:<data> blob it always did, and a password account's blob is
+-- still the same bytes the pre-Phase-8 encoder wrote -- see
+-- services/mail-crypto.ts's note that nothing writes `kind: "password"`. This
+-- column is additive in the strictest sense: an upgraded install reads and
+-- writes every existing account exactly as it did before.
+ALTER TABLE "mail_accounts" ADD COLUMN "auth_method" text DEFAULT 'password' NOT NULL;--> statement-breakpoint
+ALTER TABLE "mail_accounts" ADD CONSTRAINT "mail_accounts_auth_method_valid" CHECK (auth_method IN ('password','oauth_microsoft','oauth_google'));

@@ -2,6 +2,8 @@ import type { FastifyInstance } from "fastify";
 import multipart from "@fastify/multipart";
 import type { Database } from "../db/client.js";
 import type { SendMailTransportFactory } from "../services/mail-send.js";
+import type { MailOAuthClients, MailTokenRefresher } from "../services/mail-oauth.js";
+import type { MailOAuthCodeExchanger, MailOAuthStates } from "../services/mail-oauth-signin.js";
 import type { MailRouteSyncManager } from "./mail.js";
 import { registerCompanyRoutes } from "./companies.js";
 import { registerContactRoutes } from "./contacts.js";
@@ -96,6 +98,38 @@ export interface CrmRouteDeps {
    * mail-imapflow.ts's createSmtpTransportFactory.
    */
   transportFactory: SendMailTransportFactory;
+  /**
+   * How an OAuth mail account's refresh token becomes an access token, from
+   * the composition root exactly as transportFactory is (services/mail-oauth.ts).
+   * The send path needs it because a send is one of the two things that opens a
+   * connection on an account's behalf; the other is the sync loop, which is
+   * given its own by server.ts.
+   */
+  mailTokenRefresher: MailTokenRefresher;
+  /**
+   * The OAuth app registrations this install has, per provider -- config.ts's
+   * mailOAuth, paired by mail-oauth.ts's oauthClientsFrom. The routes read it
+   * for two questions the token layer never asks: which providers can be
+   * offered at all, and what the authorise URL for one looks like.
+   */
+  mailOAuthClients: MailOAuthClients;
+  /**
+   * The sign-ins currently away at a provider. ONE INSTANCE PER APP, for
+   * exactly the reason reauthTickets is: the `state` the authorise route mints
+   * has to be the `state` the callback route redeems, and a store built inside
+   * a register call would be a different map on every registration -- which
+   * would make every callback fail the check that is the whole security of the
+   * flow, and fail it in a way that looks like a provider problem.
+   */
+  mailOAuthStates: MailOAuthStates;
+  /**
+   * How an authorisation code becomes a refresh token, from the composition
+   * root exactly as mailTokenRefresher is. A separate seam from the refresher
+   * because it is a separate grant type with one extra requirement (a refresh
+   * token must actually come back), and because a test drives the two through
+   * different paths.
+   */
+  mailOAuthExchange: MailOAuthCodeExchanger;
   /**
    * How a password is checked, supplied by the composition root the same way
    * transportFactory is -- production binds against YunoHost's portal API,

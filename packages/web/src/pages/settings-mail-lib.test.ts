@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import type { MailAccount } from "@conduit/shared";
+import { withoutComments } from "../test/source";
 import {
+  accountReauthMessage,
+  accountStatusLabel,
   buildCreateInput,
   buildTestInput,
   buildUpdatePatch,
@@ -9,10 +13,20 @@ import {
   folderDeleteBlocked,
   folderDeleteWarning,
   folderRenameBlocked,
+  buildOAuthSigninInput,
+  buildOAuthUpdatePatch,
+  buildReauthorizeInput,
   initialFormState,
+  initialOAuthFormState,
   isPort,
+  oauthSetupHint,
+  providerLabel,
+  providerSigninCaveat,
   settingsFields,
+  signedInWith,
+  signinBanner,
   validateForm,
+  validateOAuthForm,
   type AccountFormState,
 } from "./settings-mail-lib";
 
@@ -30,6 +44,7 @@ const storedAccount: MailAccount = {
   signatureHtml: null,
   backfillDays: 90,
   visibility: "private",
+  authMethod: "password",
   status: "active",
   lastError: null,
   lastSyncedAt: null,
@@ -348,5 +363,423 @@ describe("folder command gating", () => {
       // never seen. The server's real count arrives in the refusal.
       expect(lines.join(" ")).not.toMatch(/\d/);
     });
+  });
+});
+
+// --- The account's state, as a row shows it (Phase 8 Task 2) -----------------
+
+describe("accountStatusLabel", () => {
+  /**
+   * THE WHOLE POINT OF THE THIRD STATE IS THESE THREE WORDS. "Error" is a
+   * description of the server's mood and invites waiting; a lapsed OAuth grant
+   * never clears on its own, so the badge has to name the action instead. An
+   * implementation that folded this into "Error" would pass every other test in
+   * this repo and still produce the failure the spec's Risk 3 describes.
+   */
+  it("tells an operator what to DO when a grant has lapsed", () => {
+    expect(accountStatusLabel("auth_required", false)).toBe("Sign in again");
+  });
+
+  it("leaves the two pre-existing states alone", () => {
+    expect(accountStatusLabel("active", false)).toBe("Active");
+    expect(accountStatusLabel("error", false)).toBe("Error");
+  });
+
+  /** Archiving stops syncing, so whatever the loop last thought is history --
+   * and an archived row must not nag about a sign-in it no longer needs. */
+  it("says Archived regardless of the status underneath", () => {
+    expect(accountStatusLabel("auth_required", true)).toBe("Archived");
+    expect(accountStatusLabel("error", true)).toBe("Archived");
+  });
+});
+
+describe("accountReauthMessage", () => {
+  it("names the provider, because signing in again is a different errand at each", () => {
+    expect(accountReauthMessage("auth_required", "oauth_microsoft")).toContain("Microsoft");
+    expect(accountReauthMessage("auth_required", "oauth_google")).toContain("Google");
+  });
+
+  it("says what to do and what it fixes", () => {
+    const message = accountReauthMessage("auth_required", "oauth_microsoft") ?? "";
+    expect(message).toContain("Sign in again");
+    expect(message).toContain("syncing");
+  });
+
+  /** Silent for every other state: an account in ordinary error already shows
+   * last_error, and two alerts on one row read as two problems. */
+  it("says nothing for an account that is not in that state", () => {
+    expect(accountReauthMessage("active", "oauth_microsoft")).toBeNull();
+    expect(accountReauthMessage("error", "oauth_microsoft")).toBeNull();
+  });
+
+  /** Unreachable -- a password account has no grant to lapse -- but a row that
+   * somehow got there must still say something true and actionable rather than
+   * throwing on the settings page. */
+  it("still says something useful for a password account", () => {
+    expect(accountReauthMessage("auth_required", "password")).toContain("signed in");
+  });
+
+  /**
+   * THE GMAIL FORK'S SECOND HOME (Task 4). A consumer @gmail.com on an app in
+   * Testing lands on this row every seven days, and the row without this
+   * sentence reads exactly like a mailbox whose password changed -- so the
+   * operator's conclusion is that Conduit keeps breaking.
+   */
+  it("tells a lapsed Google account that seven days may be all this is", () => {
+    const message = accountReauthMessage("auth_required", "oauth_google") ?? "";
+    expect(message).toContain("7 days");
+    expect(message).toContain("Testing");
+    // Conditional, not a claim: nothing on this row knows whether the mailbox
+    // is Workspace or consumer, and Conduit deliberately never asked for the id
+    // token that would say (api: mail-oauth-signin.ts's scope note).
+    expect(message).toContain("If this is");
+  });
+
+  /** Microsoft's refresh token has no expiry a syncing mailbox can reach --
+   * Entra's 90 days is an inactivity limit and the token rotates on every use.
+   * Telling a Microsoft operator about a weekly revocation would be a wrong
+   * instruction, and a wrong instruction is worse than none. */
+  it("does not say it about Microsoft, whose tokens survive an active mailbox", () => {
+    const message = accountReauthMessage("auth_required", "oauth_microsoft") ?? "";
+    expect(message).not.toContain("7 days");
+  });
+});
+
+/**
+ * THE GMAIL FORK, AT THE POINT OF CHOOSING.
+ *
+ * The phase plan calls shipping this silently "the worst outcome available":
+ * a consumer Gmail account stops weekly and the operator concludes Conduit is
+ * broken. These tests are what make the sentence load-bearing rather than
+ * decorative -- every figure in them is Google's own, and a rewrite that
+ * softened the seven days or dropped the assessment would have to delete an
+ * assertion to do it.
+ */
+describe("providerSigninCaveat", () => {
+  it("warns about a consumer Gmail account before the sign-in starts", () => {
+    const caveat = providerSigninCaveat("google");
+    expect(caveat).not.toBeNull();
+    const text = caveat!.paragraphs.join(" ");
+    expect(text).toContain("7 days");
+    expect(text).toContain("@gmail.com");
+  });
+
+  it("says the Workspace path is fine, and names what makes it fine", () => {
+    // Half a warning is worse than none: an operator told only that Google is
+    // trouble abandons a Workspace mailbox that would have worked perfectly.
+    const text = providerSigninCaveat("google")!.paragraphs.join(" ");
+    expect(text).toContain("Workspace");
+    expect(text).toContain("Internal");
+  });
+
+  it("says leaving Testing costs verification and a paid assessment", () => {
+    const text = providerSigninCaveat("google")!.paragraphs.join(" ");
+    expect(text).toContain("https://mail.google.com/");
+    expect(text).toContain("verification");
+    expect(text).toContain("paid");
+  });
+
+  it("has nothing to say about Microsoft", () => {
+    // Not symmetry for its own sake: a single-tenant registration in the
+    // operator's own directory needs no verification and its refresh tokens do
+    // not expire on a timer. Microsoft's real traps are tenant-side switches
+    // that cannot be met or fixed at this screen.
+    expect(providerSigninCaveat("microsoft")).toBeNull();
+  });
+
+  /**
+   * The create form shows it and the edit form does not -- by the time the
+   * account exists the decision is made, and a box repeated on every visit is
+   * a box that gets skipped. Read out of the page rather than rendered, the
+   * same way this file already checks the password form's controls.
+   *
+   * THE WHOLE GUARDED EXPRESSION, NOT ITS TWO HALVES. A mutation deleting the
+   * `!isEdit &&` survived an earlier version of this test that asserted
+   * `"!isEdit && "` on its own: the Backfill field below the caveat opens with
+   * the same three tokens, so the string was still there and nothing failed.
+   * Asserting the exact expression is what makes this test about the caveat's
+   * guard rather than about the file containing the word `isEdit`.
+   */
+  it("is rendered on the add form only", () => {
+    const source = withoutComments(
+      readFileSync(new URL("./settings-mail.tsx", import.meta.url), "utf8"),
+    );
+    expect(source).toContain("const caveat = providerSigninCaveat(provider);");
+    expect(source).toContain("{!isEdit && (() => {");
+  });
+});
+
+describe("oauthSetupHint", () => {
+  /** An install with no registration used to show the password form and no
+   * explanation, and "nothing here" reads identically to "this needs setting up
+   * first". */
+  it("names the exact redirect URI to register and the setting to put it in", () => {
+    const hint = oauthSetupHint("/api/mail/oauth/callback", "https://crm.example");
+    expect(hint).toContain("https://crm.example/api/mail/oauth/callback");
+    expect(hint).toContain("MAIL_OAUTH_REDIRECT_URI");
+    expect(hint).toContain("docs/mail-oauth-setup.md");
+  });
+
+  /** An install mounted under a prefix serves its callback there, and a hint
+   * that dropped the prefix would be the byte-for-byte mismatch it exists to
+   * prevent. The path comes from the server for exactly this reason. */
+  it("carries a base path through untouched", () => {
+    expect(oauthSetupHint("/conduit/api/mail/oauth/callback", "https://box.example"))
+      .toContain("https://box.example/conduit/api/mail/oauth/callback");
+  });
+
+  /**
+   * SAYS NOTHING WHEN IT DOES NOT KNOW. The same branch of the page renders for
+   * "this install has no registration" and for "the providers query failed",
+   * and only the first of those has anything true to say. A hint built from an
+   * absent path would name the site root -- a plausible string that is wrong,
+   * which is worse than silence.
+   *
+   * The nullability lives in this function rather than in the JSX because that
+   * is the difference between a case a test can state and a `!== undefined` in
+   * a component nothing in this repository renders.
+   */
+  it("says nothing when the server did not answer", () => {
+    expect(oauthSetupHint(undefined, "https://crm.example")).toBeNull();
+    expect(oauthSetupHint("", "https://crm.example")).toBeNull();
+  });
+});
+
+// --- Phase 8 Task 3: the form's second path ---------------------------------
+
+describe("the OAuth form", () => {
+  const empty = initialOAuthFormState();
+
+  it("starts empty for a new account, with the ordinary backfill default", () => {
+    expect(empty).toEqual({ label: "", email: "", sentFolder: "", backfill: "90" });
+  });
+
+  it("starts an edit from the stored account, including the folder the server chose", () => {
+    const account = {
+      ...storedAccount, label: "Work", email: "chris@contoso.example",
+      sentFolder: "Sent Items", backfillDays: 30,
+    };
+    expect(initialOAuthFormState(account))
+      .toEqual({ label: "Work", email: "chris@contoso.example", sentFolder: "Sent Items", backfill: "30" });
+  });
+
+  it("reads a null backfill as Everything, like the password form does", () => {
+    expect(initialOAuthFormState({ ...storedAccount, backfillDays: null }).backfill).toBe("all");
+  });
+
+  it("requires a label and an address to create", () => {
+    expect(validateOAuthForm(empty, false)).toContain("label");
+    // AN EMPTY FIELD AND A MALFORMED ONE GET DIFFERENT SENTENCES, and the
+    // distinction is asserted rather than assumed. A mutation deleting the
+    // empty-string check survived at first: "" contains no "@" either, so the
+    // second branch caught it and the suite could not tell the two apart --
+    // which would have quietly replaced "you have not filled this in" with
+    // "what you typed is wrong" for the commonest mistake on the form.
+    expect(validateOAuthForm({ ...empty, label: "Work" }, false))
+      .toBe("The mailbox address is required.");
+    expect(validateOAuthForm({ ...empty, label: "Work", email: "not-an-address" }, false))
+      .toBe("Enter the full mailbox address.");
+    expect(validateOAuthForm({ ...empty, label: "Work", email: "a@b.example" }, false)).toBeNull();
+  });
+
+  it("does not ask an EDIT for an address, because the address cannot be changed", () => {
+    // The address is the mailbox the grant was issued for and the username
+    // XOAUTH2 authenticates as; the control is disabled and the patch omits it.
+    expect(validateOAuthForm({ ...empty, label: "Work" }, true)).toBeNull();
+  });
+
+  it("sends the provider, the label, the address and the backfill -- and nothing else", () => {
+    // THE ABSENCES ARE THE ASSERTION, and they are the spec's second path in as
+    // many words: no host, no port, no security, no username, no password.
+    const input = buildOAuthSigninInput(
+      { label: " Work ", email: " chris@contoso.example ", sentFolder: "", backfill: "30" },
+      "microsoft",
+    );
+    expect(input).toEqual({
+      provider: "microsoft", label: "Work", email: "chris@contoso.example", backfillDays: 30,
+    });
+    expect(Object.keys(input).sort()).toEqual(["backfillDays", "email", "label", "provider"]);
+  });
+
+  it("sends Everything as a null backfill, not as the string", () => {
+    expect(buildOAuthSigninInput({ ...empty, label: "W", email: "a@b.example", backfill: "all" }, "google"))
+      .toMatchObject({ backfillDays: null, provider: "google" });
+  });
+
+  it("re-authorising sends the account and the provider, and no mailbox address", () => {
+    // The address comes from the stored row server-side; taking the client's
+    // word for it would let one request's login hint be pointed at somebody
+    // else's mailbox.
+    expect(buildReauthorizeInput("acc-1", "microsoft"))
+      .toEqual({ accountId: "acc-1", provider: "microsoft" });
+  });
+
+  it("patches the three fields that are still this install's business", () => {
+    const patch = buildOAuthUpdatePatch({
+      label: " Work ", email: "chris@contoso.example", sentFolder: " Sent Items ", backfill: "all",
+    });
+    expect(patch).toEqual({ label: "Work", sentFolder: "Sent Items", backfillDays: null });
+    // No password half (the server answers 409 to one), no host/port/security
+    // (they are the provider's), no email (see above).
+    for (const forbidden of ["password", "smtpPassword", "imapHost", "imapPort", "username", "email"]) {
+      expect(patch).not.toHaveProperty(forbidden);
+    }
+  });
+});
+
+describe("signedInWith and providerLabel", () => {
+  it("names the provider for an OAuth account and says nothing for a password one", () => {
+    expect(signedInWith("oauth_microsoft")).toBe("Signed in with Microsoft");
+    expect(signedInWith("oauth_google")).toBe("Signed in with Google");
+    // Rendering nothing rather than "Signed in with a password": the password
+    // row already shows a username and a host, which is the same fact.
+    expect(signedInWith("password")).toBeNull();
+  });
+
+  it("spells each provider once", () => {
+    expect(providerLabel("microsoft")).toBe("Microsoft");
+    expect(providerLabel("google")).toBe("Google");
+  });
+});
+
+describe("signinBanner", () => {
+  it("says nothing when the page was not reached from a callback", () => {
+    expect(signinBanner({})).toBeNull();
+    expect(signinBanner({ reason: "state" })).toBeNull();
+  });
+
+  it("congratulates a connection and says the sync starts by itself", () => {
+    const banner = signinBanner({ oauth: "connected" });
+    expect(banner?.tone).toBe("ok");
+    expect(banner?.text).toContain("connected");
+  });
+
+  it("gives each failure its own sentence", () => {
+    const texts = new Set<string>();
+    for (const reason of ["state", "denied", "provider", "no_refresh_token", "duplicate", "account", "failed"]) {
+      const banner = signinBanner({ oauth: "failed", reason });
+      expect(banner?.tone, reason).toBe("error");
+      texts.add(banner!.text);
+    }
+    // Seven reasons, seven sentences: an operator who is told the same thing
+    // for a declined consent and a broken app registration has been told
+    // nothing.
+    expect(texts.size).toBe(7);
+  });
+
+  it("does not accuse anybody of an attack over an expired state", () => {
+    // The overwhelming majority of these are a timeout or a second tab, and an
+    // alarming sentence for a routine one teaches an operator to ignore it.
+    const text = signinBanner({ oauth: "failed", reason: "state" })!.text;
+    // It still has to say what to do, or it is a dead end dressed as calm.
+    expect(text).toContain("Start it again");
+    expect(text.toLowerCase()).not.toContain("attack");
+  });
+
+  /**
+   * THE REDIRECT URI, WHERE THE OPERATOR CAN ACT ON IT (Task 4).
+   *
+   * "This is usually the app registration" is true and is advice with nowhere
+   * to go; the value it has to be compared against is a string this install
+   * decided and nothing on screen used to show. It is compared byte for byte at
+   * the provider, so a trailing slash decides the whole sign-in.
+   */
+  it("shows the redirect URI on the failure that is usually a registration", () => {
+    const text = signinBanner(
+      { oauth: "failed", reason: "provider" }, "https://crm.example/api/mail/oauth/callback",
+    )!.text;
+    expect(text).toContain("https://crm.example/api/mail/oauth/callback");
+    expect(text).toContain("character for character");
+  });
+
+  it("keeps its old sentence when there is no redirect URI to show", () => {
+    // Null is an install with no registration and undefined is the query still
+    // in flight. Neither may produce "the redirect URI is: null", which is a
+    // worse banner than the one that says nothing about it.
+    for (const value of [null, undefined]) {
+      const text = signinBanner({ oauth: "failed", reason: "provider" }, value)!.text;
+      expect(text).not.toContain("redirect URI");
+      expect(text).toContain("app registration");
+    }
+  });
+
+  it("does not append it to failures a redirect URI cannot explain", () => {
+    // A declined consent, an expired state and a duplicate mailbox are not
+    // registration problems, and a URI bolted onto them sends the operator to
+    // check something that was never wrong.
+    for (const reason of ["state", "denied", "no_refresh_token", "duplicate", "account", "failed"]) {
+      const text = signinBanner({ oauth: "failed", reason }, "https://crm.example/cb")!.text;
+      expect(text, reason).not.toContain("https://crm.example/cb");
+    }
+  });
+
+  it("still says something true for a reason it does not recognise", () => {
+    // A client and a server that disagree about the code set is a thing that
+    // happens across an upgrade.
+    const banner = signinBanner({ oauth: "failed", reason: "something-new" });
+    expect(banner?.tone).toBe("error");
+    expect(banner?.text).toContain("did not complete");
+  });
+
+  it("carries no provider prose, because the redirect it reads never carries any", () => {
+    // The server sends a CODE; a provider's error_description would otherwise
+    // ride a URL into a history entry and nginx's access log.
+    const banner = signinBanner({ oauth: "failed", reason: "AADSTS50011: the reply URL does not match" });
+    expect(banner?.text).not.toContain("AADSTS");
+  });
+});
+
+describe("the OAuth form's source", () => {
+  /**
+   * A SOURCE GUARD, because the rule lives in JSX and this package has no
+   * testing-library. The spec's requirement is that an OAuth account asks for
+   * no host, port, security or password -- an absence, which no behavioural
+   * assertion in this file can see, and which a well-meaning edit adding "just
+   * the port, for a proxy" would break silently.
+   */
+  it("asks for no host, port, security, username or password", () => {
+    const source = withoutComments(
+      readFileSync(new URL("./settings-mail.tsx", import.meta.url), "utf8"),
+    );
+    const form = source.slice(
+      source.indexOf("function OAuthAccountForm("),
+      source.indexOf("function BackfillSelect("),
+    );
+    // The slice really found the function: an indexOf that missed would make
+    // every assertion below vacuously true against an empty string.
+    expect(form.length).toBeGreaterThan(500);
+    // FIELD SPELLINGS, NOT THE WORD "password". The form's own copy says
+    // "Conduit never sees the password", which is the sentence that makes the
+    // absence legible to the operator -- banning the word would ban the
+    // explanation. What must not be here is a CONTROL.
+    for (const control of [
+      "imapHost", "imapPort", "smtpHost", "smtpPort", "SecuritySelect", "smtpDiffers",
+      'type="password"',
+    ]) {
+      expect(form, control).not.toContain(control);
+    }
+  });
+
+  /** The other half, and the one the spec is most insistent about: the
+   * password path is UNTOUCHED. A self-hosted IMAP server with a password is
+   * still the common case on this install. */
+  it("leaves the password form asking for all of them", () => {
+    const source = withoutComments(
+      readFileSync(new URL("./settings-mail.tsx", import.meta.url), "utf8"),
+    );
+    // Bounded at the next component, not at the end of the file: `Field` and
+    // `SecuritySelect` are DEFINED below it, so an unbounded slice would pass
+    // this on the definitions rather than on the password form using them.
+    const form = source.slice(
+      source.indexOf("function PasswordAccountForm("),
+      source.indexOf("function Field("),
+    );
+    expect(form.length).toBeGreaterThan(500);
+    for (const control of [
+      "imapHost", "imapPort", "smtpHost", "smtpPort", "SecuritySelect", "smtpDiffers",
+      'type="password"',
+    ]) {
+      expect(form, control).toContain(control);
+    }
   });
 });

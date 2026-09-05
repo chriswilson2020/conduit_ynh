@@ -166,6 +166,35 @@ export interface ImapFolderListing {
    */
   selectable: boolean;
   /**
+   * true for a mailbox the server presents as a VIEW over messages that also
+   * live somewhere else: RFC 6154's `\All` ("all messages") and `\Flagged`
+   * ("a virtual mailbox"), plus Gmail's non-standard `\Important`.
+   *
+   * ADDED IN PHASE 8 TASK 4, FOR A GMAIL PROBLEM THAT IS NOT AN AUTHENTICATION
+   * PROBLEM. Discovery enables every folder but Junk and Trash on first sight,
+   * and Gmail lists `[Gmail]/All Mail`, `[Gmail]/Starred` and
+   * `[Gmail]/Important` as ordinary mailboxes -- so the sync walk would open
+   * all three, meet every INBOX message again under a different folder name,
+   * and take ingest's duplicate path, which updates `mail_messages.folder` to
+   * wherever the message was last seen. The row would then flip folders on
+   * every pass, for the whole mailbox, undoing Phase 4.4's filing as it went.
+   * Nothing about that is caused by OAuth; it is simply what a Gmail account
+   * would have done the first time one existed.
+   *
+   * OPTIONAL, so it is an addition to this contract rather than a change to it:
+   * every existing construction of a listing stays valid and reads as `false`.
+   * A server that offers no such attribute -- Dovecot, which is this install's
+   * ordinary case -- is unaffected in every direction.
+   *
+   * IT IS NOT A SECOND `selectable`. These mailboxes CAN be selected and are
+   * perfectly ordinary to open; the claim is only that walking one duplicates
+   * work the walk has already done. So it decides a DEFAULT (mail-folders.ts's
+   * defaultSyncEnabled) and nothing else -- an operator who wants All Mail
+   * synced turns it on in Settings like any other folder, and the no-clobber
+   * rule then keeps it on.
+   */
+  virtual?: boolean;
+  /**
    * The server's hierarchy delimiter for this mailbox, or null when it
    * reports none (a flat namespace: RFC 3501 permits NIL here).
    *
@@ -451,13 +480,55 @@ export interface ImapClient {
   idle(signal: AbortSignal): Promise<IdleOutcome>;
 }
 
+/**
+ * What actually authenticates ONE connection, already resolved: a password, or
+ * a short-lived OAuth access token. Produced by mail-oauth.ts's
+ * resolveConnectionAuth and consumed by both protocols -- it is
+ * ImapConnectionSettings' `auth` field and mail-send.ts's
+ * SendMailTransportFactory's second argument, so IMAP and SMTP cannot end up
+ * disagreeing about what "the credential" is.
+ *
+ * NOT MailCredentials, AND THE DIFFERENCE IS THE POINT. What is STORED is a
+ * password pair or a refresh token (mail-crypto.ts's union); what a connection
+ * needs is one secret for one protocol, right now. Between the two sits a
+ * choice (which password half?) and possibly a network round trip (exchange the
+ * refresh token for an access token). Handing the stored shape to the adapter
+ * would put that round trip inside the one module that is supposed to be a thin
+ * mapping onto imapflow and nodemailer, and would give it a reason to reach for
+ * the database. This type is the resolved value, so the adapter stays a
+ * mapping.
+ *
+ * A DISCRIMINATED UNION, NOT TWO OPTIONAL FIELDS. `password?: string;
+ * accessToken?: string` was the smaller diff and makes "neither" and "both"
+ * both representable and both meaningless -- the same argument
+ * mail_accounts.auth_method's comment (db/schema.ts) makes for being one column
+ * rather than a kind/provider pair. "Neither" is the dangerous one: it would
+ * hand imapflow a blank password, and a blank password does not fail loudly, it
+ * fails at the SERVER and arrives as an account whose mail quietly stopped.
+ */
+export type MailConnectionAuth =
+  | { kind: "password"; password: string }
+  | { kind: "oauth"; accessToken: string };
+
+/**
+ * THIS INTERFACE CHANGED IN PHASE 8, AND THE REST OF THE CONTRACT DID NOT.
+ * `password: string` became `auth: MailConnectionAuth`. Everything the phase's
+ * spec calls IMAP-typed-on-purpose -- ImapFolderStatus.uidvalidity,
+ * ImapMessageDescriptor.uid, and every method on ImapClient that Phase 4.4's
+ * filing, per-message selection, live list and folder management are built on
+ * -- is untouched by it. This is the factory's INPUT, not the sync engine's
+ * view of a mailbox: it is where the secret comes from, which is the one thing
+ * the spec says this phase changes ("nothing in the mail engine changes ... what
+ * changes is where the secret comes from and what shape it is"). An adapter
+ * against a different server still implements the same commands.
+ */
 export interface ImapConnectionSettings {
   accountId: string;
   host: string;
   port: number;
   security: MailSecurity;
   username: string;
-  password: string;
+  auth: MailConnectionAuth;
 }
 
 /** MUST return a fresh instance per call -- see the lifecycle notes above. */

@@ -2,10 +2,11 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
   mailAccountCreateInputSchema, mailAccountUpdateInputSchema, mailAccountUpdatePasswordFieldsSchema,
-  mailAccountTestInputSchema, mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
+  mailAccountTestInputSchema, mailOAuthSigninInputSchema,
+  mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
   bulkThreadActionInputSchema, bulkMessageActionInputSchema, folderPatchInputSchema,
   folderCreateInputSchema, folderRenameInputSchema, folderDeleteInputSchema,
-  BULK_ACTION_THREAD_CAPS,
+  BULK_ACTION_THREAD_CAPS, MAIL_OAUTH_CALLBACK_PATH,
   type MailAccountSyncStats,
 } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
@@ -20,7 +21,12 @@ import { sendMail } from "../services/mail-send.js";
 import { defaultTestConnectionDeps } from "../services/mail-imapflow.js";
 import {
   createAccount, updateAccount, archiveAccount, unarchiveAccount, listAccounts, testConnection,
+  getOwnAccount,
 } from "../services/mail-accounts.js";
+import {
+  completeSignin, configuredProviders, startSignin, MailOAuthNotConfiguredError,
+  type SigninDeps,
+} from "../services/mail-oauth-signin.js";
 import {
   listThreads, getThreadDetail, markThreadRead, setThreadLink, clearThreadLink,
   hideThread, unhideThread, unreadThreadCount, unreadCountsByFolder,
@@ -180,11 +186,53 @@ const linkKindParamSchema = z.object({ id: z.uuid(), kind: mailLinkKindSchema })
  */
 const INLINE_RENDERABLE_MIME = /^image\/(png|jpeg|jpg|gif|webp|bmp|avif|x-icon|vnd\.microsoft\.icon)$/i;
 
+/**
+ * The OAuth callback's query string (RFC 6749 4.1.2 and 4.1.2.1).
+ *
+ * EVERY FIELD IS OPTIONAL AND NOTHING IS BOUNDED BY FORMAT, deliberately. This
+ * is the one route on the app whose caller is a third party's redirect rather
+ * than this app's own client, so a schema that REJECTED a shape would only
+ * change which refusal the operator sees -- completeSignin refuses an
+ * unredeemable state and a missing code just as firmly, and does it after the
+ * state check rather than before it. The parse is here to narrow `unknown` into
+ * strings, not to gate.
+ *
+ * `error_description` IS NOT IN IT, and its absence is the point: the provider
+ * sends one, this server has no use for it that is worth the risk of carrying
+ * it, and a field nobody reads is a field that ends up in a log the day
+ * somebody adds a debug line. What is diagnosed from is `error`, the code.
+ */
+const oauthCallbackQuerySchema = z.object({
+  state: z.string().optional(),
+  code: z.string().optional(),
+  error: z.string().optional(),
+});
+
+/** Where the callback sends the browser afterwards. Built from config.basePath
+ * and a literal path -- never from anything on the request -- so an install at
+ * `/conduit` lands on its own settings page and nothing a provider echoes can
+ * choose the destination. */
+function settingsMailPath(basePath: string): string {
+  return basePath === "/" ? "/settings/mail" : `${basePath}/settings/mail`;
+}
+
+/** The callback's public path on this install. Same construction as
+ * settingsMailPath and for the same reason: an install mounted at /conduit
+ * serves both under that prefix. MAIL_OAUTH_CALLBACK_PATH is the literal this
+ * router registers below, shared so config.ts can check a redirect URI against
+ * it without importing a route module. */
+function oauthCallbackPath(basePath: string): string {
+  return basePath === "/" ? MAIL_OAUTH_CALLBACK_PATH : `${basePath}${MAIL_OAUTH_CALLBACK_PATH}`;
+}
+
 export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): void {
   // syncManager is the GETTER, captured here and called inside each handler:
   // the manager itself does not exist until after the server is listening
   // (see CrmRouteDeps), so nothing may read it at registration time.
-  const { db, dataDir, mailKeyPath, basePath, transportFactory, syncManager } = deps;
+  const {
+    db, dataDir, mailKeyPath, basePath, transportFactory, mailTokenRefresher, syncManager,
+    mailOAuthClients, mailOAuthStates, mailOAuthExchange,
+  } = deps;
 
   // --- Accounts ------------------------------------------------------------
 
@@ -505,10 +553,186 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     const input = parseOrReject(mailAccountTestInputSchema, request.body, reply);
     if (input === undefined) return;
     try {
-      return await testConnection(db, user.id, input, mailKeyPath, defaultTestConnectionDeps);
+      return await testConnection(db, user.id, input, mailKeyPath, {
+        ...defaultTestConnectionDeps,
+        // An OAuth account is tested with a real access token, which means a
+        // real refresh against a real provider. Same refresher the send path
+        // gets, from the same composition root, so "Test connection" cannot
+        // report on a mechanism the sync loop does not use.
+        refresh: mailTokenRefresher,
+      });
     } catch (error) {
       mapDomainError(reply, error);
     }
+  });
+
+  // --- Signing in at a provider (Phase 8 Task 3) ---------------------------
+
+  /** Everything the sign-in service needs that this router already holds.
+   * Built per request rather than captured, for the reason `syncManager` is a
+   * getter: nothing here may read a value that did not exist at registration. */
+  function signinDeps(): SigninDeps {
+    return {
+      db, mailKeyPath,
+      clients: mailOAuthClients,
+      states: mailOAuthStates,
+      exchange: mailOAuthExchange,
+      now: () => new Date(),
+    };
+  }
+
+  /**
+   * Which providers this install can sign in to.
+   *
+   * Its own route rather than a field on the accounts list, because it answers
+   * a question about the DEPLOYMENT and not about any account -- and because
+   * the add-account form needs it before there is an account to ask about. See
+   * mailOAuthProvidersSchema (@conduit/shared) for why the client ids are not
+   * in the response even though they are not secret.
+   *
+   * IT ANSWERS AN EMPTY LIST USEFULLY (Task 4), which is the case this install
+   * is in today. `providers: []` alone says "no", and the page could only
+   * render silence; the two fields beside it say what would have to be true
+   * instead -- the exact path to register, and whichever half of the pair is
+   * already configured -- so an operator holding the Azure or Google console
+   * open can finish the job from this screen rather than from routes/mail.ts.
+   */
+  app.get("/api/mail/oauth/providers", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    return {
+      providers: configuredProviders(mailOAuthClients),
+      // basePath, not the bare literal: an install mounted at /conduit serves
+      // its callback under that prefix, and a path that omitted it is exactly
+      // the byte-for-byte mismatch this field exists to prevent.
+      callbackPath: oauthCallbackPath(basePath),
+      // THE PAIR IS ONE VALUE, so either registration answers it and neither
+      // is preferred; config.ts builds both registrations from the same
+      // MAIL_OAUTH_REDIRECT_URI and refuses a half one. Null means unset,
+      // which is a different thing from "wrong" -- a wrong one does not reach
+      // here, because parseConfig refuses to boot with it.
+      redirectUri: (mailOAuthClients.microsoft ?? mailOAuthClients.google)?.redirectUri ?? null,
+    };
+  });
+
+  /**
+   * Start a sign-in: mint a state and answer with where to send the browser.
+   *
+   * POST, AND IT WRITES NOTHING TO THE DATABASE. The POST is not about
+   * persistence -- it is that the body carries the mailbox address and the
+   * label for an account that does not exist yet, and that the response is a
+   * URL the client navigates to rather than a redirect this server performs.
+   * A 302 here would be followed by the fetch, not by the window.
+   *
+   * THE STATE IS MINTED AGAINST user.id, and that is the binding the callback
+   * checks (services/mail-oauth-signin.ts's header, item 3).
+   */
+  app.post("/api/mail/accounts/oauth/authorize", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const input = parseOrReject(mailOAuthSigninInputSchema, request.body, reply);
+    if (input === undefined) return;
+    try {
+      // A re-authorisation names an account, and the ACCOUNT supplies the
+      // address -- never the request. Taking the client's word for it would let
+      // one request's login_hint be pointed at somebody else's mailbox, and
+      // mustGetOwned here is also what makes a foreign account id 404 rather
+      // than mint a state for a row the caller cannot see.
+      //
+      // The two casts are sound by mailOAuthSigninInputSchema's superRefine,
+      // which requires both fields whenever `accountId` is absent -- the same
+      // XOR mailAccountTestInputSchema uses, and typed the same way, so
+      // TypeScript cannot narrow across it. What makes that a fact rather than
+      // a reading: index.test.ts pins the superRefine (it names the missing
+      // FIELDS, not just that something is missing) and the route test pins the
+      // 400 it produces, so a schema edit that dropped it fails on both sides
+      // rather than writing `undefined` into a NOT NULL column as a 500.
+      const target = input.accountId === undefined
+        ? {
+            kind: "create" as const,
+            label: input.label as string,
+            email: input.email as string,
+            ...(input.backfillDays !== undefined ? { backfillDays: input.backfillDays } : {}),
+          }
+        : {
+            kind: "reauthorize" as const,
+            accountId: input.accountId,
+            email: (await getOwnAccount(db, user.id, input.accountId)).email,
+          };
+      return await startSignin(signinDeps(), user.id, { ...target, provider: input.provider });
+    } catch (error) {
+      if (error instanceof MailOAuthNotConfiguredError) {
+        // 409 rather than 500 or 503: nothing is broken and nothing will fix
+        // itself, this install simply has no registration for that provider.
+        // The message names the settings, which is the whole of the remedy.
+        return reply.code(409).send({ error: "mail_oauth_not_configured", message: error.message });
+      }
+      mapDomainError(reply, error);
+    }
+  });
+
+  /**
+   * The redirect URI. The provider sends the operator's browser back here.
+   *
+   * A TOP-LEVEL NAVIGATION, WHICH DECIDES EVERYTHING ABOUT THIS HANDLER. It is
+   * a window, not a fetch, so the answer has to be something a window can
+   * render: a redirect to the settings page carrying a one-word outcome. A JSON
+   * body -- including the JSON 500 an uncaught throw would produce -- would
+   * leave the operator staring at a serialised error where a page should be.
+   * completeSignin is documented never to throw for exactly this reason.
+   *
+   * IT CARRIES THE SSO IDENTITY LIKE ANY OTHER REQUEST, because it is one:
+   * nginx injects Ynh-User on the way through (auth.ts), so requireUser here is
+   * the session half of the state binding rather than a formality.
+   *
+   * WHICH LEAVES ONE UGLY CASE, named rather than papered over: an SSOwat
+   * session that expires while the operator is at the consent screen gets the
+   * ordinary 401 JSON body in a browser window. Rendering a page for it would
+   * mean this route answering an unauthenticated request with HTML, which is a
+   * bigger change to the app's one auth shape than the case is worth -- it
+   * needs a session to lapse inside a ten-minute window, and pressing back and
+   * signing in again costs nothing, because the state was never spent.
+   *
+   * WHAT GOES IN THE REDIRECT IS A CODE, NEVER PROVIDER TEXT. See
+   * SigninOutcome. The provider's own words go to the journal, at warn, where
+   * a person diagnosing this can read them and a URL bar cannot.
+   *
+   * 303, AND ANSWERING WITH A REDIRECT RATHER THAN A PAGE IS WORTH MORE THAN IT
+   * LOOKS. The URL this route is reached at carries the authorisation code. A
+   * handler that RENDERED here would leave that URL as the document's own
+   * address: in the history, in the address bar, and in the `Referer` of every
+   * subresource the page then fetched. A server redirect leaves no history
+   * entry for the redirecting URL, so the document that ends up loaded is
+   * /settings/mail and the code is gone from everything a browser keeps. What
+   * that does NOT reach is nginx's access log, which has its own copy this
+   * process cannot do anything about -- which is the exposure PKCE is here to
+   * make survivable (services/mail-oauth-signin.ts's header).
+   */
+  // THE CONSTANT, NOT A SECOND COPY OF THE STRING. config.ts checks a
+  // configured MAIL_OAUTH_REDIRECT_URI against it and the providers route tells
+  // the operator to register it; a literal here would let this route move and
+  // leave both of those quietly describing a path that no longer exists.
+  app.get(MAIL_OAUTH_CALLBACK_PATH, async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = oauthCallbackQuerySchema.safeParse(request.query);
+    // A callback whose query is not even the right SHAPE is treated as a
+    // failed state check rather than a 400: it is not a request a client made,
+    // it is something that arrived at a URL, and the operator's answer is the
+    // same either way. parseOrReject's 400 JSON would be the wrong medium.
+    const result = await completeSignin(
+      signinDeps(), user.id, params.success ? params.data : {},
+    );
+    if (result.outcome !== "connected") {
+      request.log.warn(
+        { outcome: result.outcome, detail: result.logDetail },
+        "mail oauth: sign-in did not complete",
+      );
+    }
+    const query = result.outcome === "connected"
+      ? "oauth=connected"
+      : `oauth=failed&reason=${result.outcome}`;
+    return reply.redirect(`${settingsMailPath(basePath)}?${query}`, 303);
   });
 
   // --- Threads -------------------------------------------------------------
@@ -851,7 +1075,8 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
     if (input === undefined) return;
     try {
       const message = await sendMail(db, dataDir, user.id, input, {
-        mailKeyPath, transportFactory, syncManager: syncManager(),
+        mailKeyPath, transportFactory, tokenRefresher: mailTokenRefresher,
+        syncManager: syncManager(),
       });
       // Placeholders resolved on the way out, like every other body-serving
       // path -- the stored form never leaves the API.

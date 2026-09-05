@@ -85,7 +85,7 @@ const STORM_MESSAGES = 20;
 /** Tags every subject this run writes, so a re-run reads its own mail. */
 const runId = randomUUID().slice(0, 8);
 
-const credentials: MailCredentials = { imapPassword: PASSWORD, smtpPassword: PASSWORD };
+const credentials: MailCredentials = { kind: "password", imapPassword: PASSWORD, smtpPassword: PASSWORD };
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -100,7 +100,7 @@ function settings(overrides: Partial<ImapConnectionSettings> = {}): ImapConnecti
   return {
     accountId: "00000000-0000-4000-8000-000000000001",
     host: IMAP_HOST, port: IMAP_PORT, security: "tls",
-    username: USERNAME, password: PASSWORD,
+    username: USERNAME, auth: { kind: "password", password: PASSWORD },
     ...overrides,
   };
 }
@@ -279,7 +279,7 @@ function account(): MailAccount {
     imapHost: IMAP_HOST, imapPort: IMAP_PORT, imapSecurity: "tls",
     smtpHost: SMTP_HOST, smtpPort: SMTP_PORT, smtpSecurity: "starttls",
     username: USERNAME, sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null,
-    backfillDays: null, visibility: "private", status: "active", lastError: null,
+    backfillDays: null, visibility: "private", authMethod: "password", status: "active", lastError: null,
     lastSyncedAt: null, archivedAt: null, createdAt: now, updatedAt: now,
   };
 }
@@ -311,21 +311,21 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
       // environment rather than through a passed flag.
       await expect(imapVerify({
         host: IMAP_HOST, port: IMAP_PORT, security: "tls",
-        username: USERNAME, password: PASSWORD,
+        username: USERNAME, auth: { kind: "password", password: PASSWORD },
       })).resolves.toBeUndefined();
     });
 
     it("classifies a rejected password as auth:", async () => {
       await expect(imapVerify({
         host: IMAP_HOST, port: IMAP_PORT, security: "tls",
-        username: USERNAME, password: "not-the-password",
+        username: USERNAME, auth: { kind: "password", password: "not-the-password" },
       })).rejects.toThrow(/^auth:/);
     });
 
     it("classifies a port nothing listens on as connection:", async () => {
       await expect(imapVerify({
         host: IMAP_HOST, port: DEAD_PORT, security: "tls",
-        username: USERNAME, password: PASSWORD,
+        username: USERNAME, auth: { kind: "password", password: PASSWORD },
       })).rejects.toThrow(/^connection:/);
     });
 
@@ -746,20 +746,22 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
     it("verifies against Mailpit through a required STARTTLS upgrade", async () => {
       await expect(smtpVerify({
         host: SMTP_HOST, port: SMTP_PORT, security: "starttls",
-        username: USERNAME, password: PASSWORD,
+        username: USERNAME, auth: { kind: "password", password: PASSWORD },
       })).resolves.toBeUndefined();
     });
 
     it("classifies an SMTP port nothing listens on as connection:", async () => {
       await expect(smtpVerify({
         host: SMTP_HOST, port: DEAD_PORT, security: "starttls",
-        username: USERNAME, password: PASSWORD,
+        username: USERNAME, auth: { kind: "password", password: PASSWORD },
       })).rejects.toThrow(/^connection:/);
     });
 
     it("sends through the transport factory and Mailpit shows the message", async () => {
       const subject = `${runId} smtp send`;
-      const transport = createSmtpTransportFactory({ rejectUnauthorized: false })(account(), credentials);
+      const transport = createSmtpTransportFactory({ rejectUnauthorized: false })(
+        account(), { kind: "password", password: PASSWORD },
+      );
       await transport.sendMail({
         raw: rfc822({ subject }),
         envelope: { from: USERNAME, to: ["recipient@example.com"] },

@@ -5,6 +5,7 @@ import { parseConfig } from "./config.js";
 import { createDatabase, runMigrations } from "./db/client.js";
 import { buildApp } from "./app.js";
 import { createImapClientFactory, createSmtpTransportFactory } from "./services/mail-imapflow.js";
+import { createHttpTokenRefresher, oauthClientsFrom } from "./services/mail-oauth.js";
 import { startSyncManager, type SyncManager } from "./services/mail-sync.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -48,6 +49,12 @@ async function main(): Promise<void> {
   const transportFactory = createSmtpTransportFactory({
     rejectUnauthorized: config.mailTlsRejectUnauthorized,
   });
+  // ONE refresher for the whole process, handed to BOTH things that open a
+  // connection on an account's behalf: the send path (through the routes) and
+  // the sync loop. One instance rather than two because the app registrations
+  // are a deployment fact and there should be exactly one reading of them --
+  // two would be two answers to "is OAuth configured here?".
+  const mailTokenRefresher = createHttpTokenRefresher(oauthClientsFrom(config.mailOAuth));
 
   const app = await buildApp({
     config,
@@ -58,7 +65,7 @@ async function main(): Promise<void> {
     // <root>, then into web. (Compare db/client.ts's migrationsFolder(), which needs
     // two: server/db/client.js is nested one level deeper than server/server.js.)
     webRoot: process.env.WEB_ROOT ?? path.join(here, "..", "web"),
-    mail: { syncManager: () => syncManager, transportFactory },
+    mail: { syncManager: () => syncManager, transportFactory, tokenRefresher: mailTokenRefresher },
   });
 
   // Loopback only. nginx is the sole ingress, and that is what makes the
@@ -86,6 +93,7 @@ async function main(): Promise<void> {
     clientFactory: createImapClientFactory({
       rejectUnauthorized: config.mailTlsRejectUnauthorized,
     }),
+    tokenRefresher: mailTokenRefresher,
     logger: {
       info: (details, message) => { app.log.info(details, message); },
       warn: (details, message) => { app.log.warn(details, message); },

@@ -650,7 +650,40 @@ export const MAIL_CONNECTION_ERROR_PREFIX = "connection:";
 export const mailSecuritySchema = z.enum(["tls", "starttls"]);
 export type MailSecurity = z.infer<typeof mailSecuritySchema>;
 
-export const mailAccountStatusSchema = z.enum(["active", "error"]);
+/**
+ * What the sync engine last had to say about an account (mail_accounts.status
+ * -- api: db/schema.ts). Written by the sync loop and by nothing else, so that
+ * the three values can never disagree with each other.
+ *
+ * 'auth_required' IS PHASE 8's, AND IT IS A THIRD STATE RATHER THAN A FLAVOUR
+ * OF 'error' FOR ONE REASON: it is the only one a retry can never clear. An
+ * 'error' account is one the next pass might get past -- a server that was
+ * down, a socket that dropped -- and the engine's whole answer to it is to
+ * back off and try again. A provider that has stopped honouring the stored
+ * refresh token will answer identically for ever, and the ONLY thing that
+ * changes it is a person signing in again. Rendering that as an error would
+ * tell an operator to wait for something that is never going to happen, which
+ * is exactly the "mail quietly stopped" failure the Phase 8 spec's Risk 3
+ * names.
+ *
+ * A THIRD ENUM MEMBER, NOT A PARSED PREFIX ON last_error. The `auth:` /
+ * `connection:` prefixes below are a real machine-readable contract and a
+ * `reauth:` sibling was the cheaper option, considered and rejected: those
+ * classify a CONNECTION FAILURE for a message that is displayed, while this is
+ * a LIFECYCLE STATE that a badge, a send gate and (Task 3) a re-authorise
+ * control all branch on. A client deciding a lifecycle state by matching prose
+ * is the thing DuplicateAttendeeError's comment (api: services/errors.ts)
+ * exists to warn about.
+ *
+ * ONE ROLLBACK NOTE, because it is the only cost. A v1.7.0 install that writes
+ * 'auth_required' and is then rolled back to v1.6.0 has rows carrying a value
+ * that release's enum does not know. Nothing crashes -- no route validates its
+ * own response against this schema and the client does not parse one -- but
+ * v1.6.0's StatusBadge falls through to "Active" for such a row, i.e. the
+ * rollback loses the warning rather than corrupting anything. Stated here
+ * rather than discovered: 0015's header carries the same note beside the CHECK.
+ */
+export const mailAccountStatusSchema = z.enum(["active", "error", "auth_required"]);
 export type MailAccountStatus = z.infer<typeof mailAccountStatusSchema>;
 
 // Phase 4.2: private by default, per account (spec's Decisions table: "the
@@ -661,6 +694,42 @@ export type MailAccountStatus = z.infer<typeof mailAccountStatusSchema>;
 // migration.
 export const mailVisibilitySchema = z.enum(["private", "shared"]);
 export type MailVisibility = z.infer<typeof mailVisibilitySchema>;
+
+// Phase 8: how an account authenticates, and with whom when that is OAuth
+// (mail_accounts.auth_method -- api: db/schema.ts, which carries the reasoning
+// for it being ONE column rather than a kind/provider pair). Lives in shared
+// because the settings UI branches on it to render "signed in with Microsoft"
+// in place of a password field, and packages/web cannot import from
+// packages/api.
+//
+// This is the ONE fact about an OAuth account that crosses the wire. The
+// refresh token behind it never does -- same rule credentials_ciphertext has
+// always had.
+export const mailAuthMethodSchema = z.enum(["password", "oauth_microsoft", "oauth_google"]);
+export type MailAuthMethod = z.infer<typeof mailAuthMethodSchema>;
+
+export const mailOAuthProviderSchema = z.enum(["microsoft", "google"]);
+export type MailOAuthProvider = z.infer<typeof mailOAuthProviderSchema>;
+
+// The provider half of an auth method, or null for a password account.
+//
+// A FUNCTION RATHER THAN A SECOND COLUMN, and rather than each call site
+// slicing the string itself: "does this start with oauth_" is exactly the
+// prefix test that gets written slightly differently in three places and then
+// disagrees. Exhaustive by construction -- a new member of
+// mailAuthMethodSchema that nobody adds here is a compile error at the
+// `never`, not a silent null.
+export function mailOAuthProviderOf(method: MailAuthMethod): MailOAuthProvider | null {
+  switch (method) {
+    case "password": return null;
+    case "oauth_microsoft": return "microsoft";
+    case "oauth_google": return "google";
+    default: {
+      const exhaustive: never = method;
+      return exhaustive;
+    }
+  }
+}
 
 // mail_account_folders.special_use's five classified values (Phase 4.1) --
 // the SPECIAL-USE attribute (RFC 6154) where the server offers it, else a
@@ -689,6 +758,11 @@ export const mailAccountSchema = z.object({
   signatureHtml: nullableString,
   backfillDays: z.number().int().positive().nullable(),
   visibility: mailVisibilitySchema,
+  // Phase 8. Safe to serialize where credentialsCiphertext is not, and the
+  // distinction is the point: this says an account signs in with Microsoft,
+  // never what it signs in WITH. The settings row is rendered from this alone,
+  // so nothing on the read path has to reach for mail.key.
+  authMethod: mailAuthMethodSchema,
   status: mailAccountStatusSchema,
   lastError: nullableString,
   lastSyncedAt: z.iso.datetime().nullable(),
@@ -832,6 +906,122 @@ export const mailAccountTestResultSchema = z.object({
   imap: mailTestProtocolResultSchema, smtp: mailTestProtocolResultSchema,
 });
 export type MailAccountTestResult = z.infer<typeof mailAccountTestResultSchema>;
+
+// --- Phase 8 Task 3: signing in at a provider -------------------------------
+
+// POST /api/mail/accounts/oauth/authorize's body: the operator is about to be
+// sent to Microsoft or Google, and this is everything the server needs to
+// remember while they are away.
+//
+// TWO SHAPES, XOR, exactly as mailAccountTestInputSchema has two: with
+// `accountId` this is a RE-AUTHORISATION of an account that already exists
+// (the "Sign in again" control on a lapsed row), and every other field is
+// meaningless -- the stored row supplies them. Without it, this is a NEW
+// account and the two facts a provider cannot supply are required.
+//
+// NO HOST, PORT, SECURITY, USERNAME OR PASSWORD, and their absence is the
+// point rather than an omission (the spec's "an OAuth account asks for none of
+// them -- the endpoints are the provider's and known"). The IMAP and SMTP
+// endpoints come from the provider table in api: services/mail-oauth-signin.ts,
+// the username IS the mailbox address, and there is no password to ask for.
+//
+// `sentFolder` is absent for a subtler reason than the others: it is not a
+// provider CONSTANT the way the hosts are -- Microsoft's is "Sent Items" and
+// Gmail's is "[Gmail]/Sent Mail" -- but it is still a fact about the provider
+// rather than a choice, so the server fills it and Settings can correct it
+// afterwards like any other account field. Asking a person to type it at the
+// moment they are trying to press one button would be asking them to know
+// something Conduit already knows.
+export const mailOAuthSigninInputSchema = z.object({
+  provider: mailOAuthProviderSchema,
+  accountId: z.uuid().optional(),
+  label: z.string().min(1).optional(),
+  email: z.email().optional(),
+  backfillDays: z.number().int().positive().nullable().optional(),
+}).superRefine((v, ctx) => {
+  if (v.accountId !== undefined) return;
+  // Field-level issues rather than one coarse message, mirroring
+  // mailAccountTestInputSchema's superRefine, so the form can point at the
+  // control that is empty.
+  for (const field of ["label", "email"] as const) {
+    if (v[field] === undefined) {
+      ctx.addIssue({ code: "custom", path: [field], message: `${field} is required when accountId is not given` });
+    }
+  }
+});
+export type MailOAuthSigninInput = z.infer<typeof mailOAuthSigninInputSchema>;
+
+// What that POST answers with: where to send the browser.
+//
+// A URL FOR THE CLIENT TO NAVIGATE TO, NOT A 302, and the difference matters
+// for one reason: the body above is a JSON POST from the SPA, and a redirect
+// answering a fetch() is followed by the fetch rather than by the window. The
+// page assigns this to window.location itself.
+//
+// IT CARRIES NO SECRET. client_id, redirect_uri, scope and the PKCE challenge
+// are all public by design (RFC 7636 4.2: the challenge is a hash, and only the
+// verifier -- which stays on this server -- can redeem it), and `state` is a
+// one-time value minted FOR this browser. The client secret and the refresh
+// token never appear in it.
+export const mailOAuthSigninStartSchema = z.object({ authorizeUrl: z.url() });
+export type MailOAuthSigninStart = z.infer<typeof mailOAuthSigninStartSchema>;
+
+// GET /api/mail/oauth/providers: which providers this install can actually
+// sign in to.
+//
+// A ROUTE RATHER THAN A GUESS IN THE UI. An app registration is deployment
+// configuration (api: config.ts's MAIL_OAUTH_* block) and an install with none
+// -- which is this deployment today, and the ordinary case per the spec -- must
+// not offer a button whose only possible outcome is a failure. Offering the
+// choice and then refusing it is v1.4.1's error-that-blamed-the-wrong-thing in
+// a new place.
+//
+// NOTHING SECRET IS IN IT. A client id is public (it travels in every
+// authorize URL) and is still not returned here: the client has no use for one,
+// and a field nobody reads is a field that leaks the day somebody logs the
+// response. The two fields Task 4 added pass that same test rather than the
+// secrecy one -- both are read on screen, by an operator holding a provider
+// console open in the other tab.
+export const mailOAuthProvidersSchema = z.object({
+  providers: z.array(mailOAuthProviderSchema),
+  /**
+   * Where this server's callback actually is, relative to the site root
+   * (BASE_PATH included). The FIRST HALF OF THE ONE THING AN OPERATOR HAS TO
+   * GET EXACTLY RIGHT: the redirect URI is compared byte for byte at the
+   * provider (RFC 6749 3.1.2.3), and until this was on screen the only way to
+   * learn it was to read routes/mail.ts. Always present, including -- and
+   * especially -- on an install with no registration at all, which is the
+   * moment the operator is trying to create one.
+   */
+  callbackPath: z.string(),
+  /**
+   * MAIL_OAUTH_REDIRECT_URI as this server actually parsed it, or null when it
+   * is unset. The SECOND HALF: the operator compares this against what the
+   * provider console shows, and a mismatch invisible to the eye (a trailing
+   * slash, http for https) is a mismatch they can now see.
+   *
+   * NOT A SECRET AND NOT A CAPABILITY. It travels in every authorize URL this
+   * server builds and in every consent screen the operator has already seen;
+   * what makes it safe is that the server DECIDED it from configuration rather
+   * than from a request (api: config.ts's MAIL_OAUTH_REDIRECT_URI), and nothing
+   * about echoing it back changes that.
+   */
+  redirectUri: z.url().nullable(),
+});
+export type MailOAuthProviders = z.infer<typeof mailOAuthProvidersSchema>;
+
+/**
+ * The path the OAuth callback route is served at, under BASE_PATH.
+ *
+ * ONE SPELLING FOR THREE READERS: the route that registers it
+ * (api: routes/mail.ts), the boot-time check that MAIL_OAUTH_REDIRECT_URI
+ * actually points at it (api: config.ts), and the settings page that tells the
+ * operator what to register. It lives in shared because config.ts must not
+ * import a route module, and because the failure it prevents -- a redirect URI
+ * registered at a path this server does not serve -- shows up as a 404 with an
+ * authorisation code in the URL bar, which reads like a Conduit bug and is not.
+ */
+export const MAIL_OAUTH_CALLBACK_PATH = "/api/mail/oauth/callback";
 
 // Live counters from the in-process sync engine (api:
 // services/mail-sync.ts's AccountSyncStats), mirrored here by hand because

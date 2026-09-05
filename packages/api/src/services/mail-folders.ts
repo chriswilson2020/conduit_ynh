@@ -215,8 +215,21 @@ export function classifyFolder(listing: ImapFolderListing): FolderClassification
  * This is why the column has no SQL DEFAULT -- the value depends on the row's
  * own classification, so it can only be decided here (db/schema.ts's
  * syncEnabled comment).
+ *
+ * AND EXCEPT A VIRTUAL MAILBOX, which Phase 8 Task 4 added for Gmail. `\All`,
+ * `\Flagged` and `\Important` are views over messages that live in other
+ * folders, so walking one re-sights the whole mailbox under a second name:
+ * ingest takes its duplicate path, which updates `mail_messages.folder` to
+ * wherever a message was last seen, and the row then flips folders on every
+ * pass -- undoing Phase 4.4's filing across the account. A Gmail mailbox lists
+ * three of them. See mail-imap.ts's ImapFolderListing.virtual.
+ *
+ * A DEFAULT, NOT A BAN, and the distinction is the same one junk and trash
+ * already rely on: the no-clobber rule below means this decides the value once,
+ * and an operator who turns All Mail on in Settings keeps it on for ever.
  */
-function defaultSyncEnabled(specialUse: SpecialUse | null): boolean {
+function defaultSyncEnabled(specialUse: SpecialUse | null, virtual: boolean): boolean {
+  if (virtual) return false;
   return specialUse !== "junk" && specialUse !== "trash";
 }
 
@@ -405,7 +418,7 @@ export async function discoverFolders(
       accountId,
       folder: listing.folder,
       specialUse: classification.specialUse,
-      syncEnabled: defaultSyncEnabled(classification.specialUse),
+      syncEnabled: defaultSyncEnabled(classification.specialUse, listing.virtual === true),
       selectable: listing.selectable,
       lastDiscoveredAt: now,
     })))

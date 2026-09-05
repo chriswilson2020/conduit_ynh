@@ -34,6 +34,10 @@ import {
   shiftResultSchema,
   ganttPayloadSchema,
   mailAccountSchema,
+  mailAuthMethodSchema,
+  mailOAuthProviderSchema,
+  mailOAuthProviderOf,
+  mailOAuthSigninInputSchema,
   mailAccountSummarySchema,
   mailAccountCreateInputSchema,
   mailAccountUpdateInputSchema,
@@ -804,7 +808,7 @@ describe("mailAccountSchema", () => {
     smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
     username: "chris",
     sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null, backfillDays: 90,
-    visibility: "private" as const,
+    visibility: "private" as const, authMethod: "password" as const,
     status: "active" as const, lastError: null, lastSyncedAt: null,
     archivedAt: null, createdAt: now, updatedAt: now,
   };
@@ -840,6 +844,23 @@ describe("mailAccountSchema", () => {
   it("rejects a visibility value outside private/shared", () =>
     expect(() => mailAccountSchema.parse({ ...account, visibility: "public" })).toThrow());
 
+  // Phase 8. The fixture above is a password account, which is what every
+  // account on an upgraded install is; these cover the other two.
+  it("accepts an account signed in with a provider", () => {
+    expect(mailAccountSchema.parse({ ...account, authMethod: "oauth_microsoft" }).authMethod)
+      .toBe("oauth_microsoft");
+    expect(mailAccountSchema.parse({ ...account, authMethod: "oauth_google" }).authMethod)
+      .toBe("oauth_google");
+  });
+
+  it("rejects an auth method Conduit has no code for", () =>
+    expect(() => mailAccountSchema.parse({ ...account, authMethod: "oauth_yahoo" })).toThrow());
+
+  it("requires an auth method rather than inferring one", () => {
+    const { authMethod: _omitted, ...without } = account;
+    expect(() => mailAccountSchema.parse(without)).toThrow();
+  });
+
   // The whole point of this schema: no key on it may look like a credential.
   // schema.ts's mail_accounts.credentials_ciphertext (and imap/smtp passwords)
   // must never reach this shape -- see the Phase 4 spec's Key handling section.
@@ -848,6 +869,68 @@ describe("mailAccountSchema", () => {
     expect(keys).not.toContain("credentialsCiphertext");
     for (const key of keys) {
       expect(key.toLowerCase()).not.toMatch(/password|credential|secret/);
+    }
+  });
+});
+
+describe("mailOAuthProviderOf", () => {
+  it("names the provider for each OAuth method and nothing for a password", () => {
+    expect(mailOAuthProviderOf("password")).toBeNull();
+    expect(mailOAuthProviderOf("oauth_microsoft")).toBe("microsoft");
+    expect(mailOAuthProviderOf("oauth_google")).toBe("google");
+  });
+
+  // The provider lives in the auth method rather than in a column of its own,
+  // so "every method has an answer" is the invariant that replaces a NOT NULL.
+  // Exhaustive over the enum rather than over a list written out again here: a
+  // new member added to mailAuthMethodSchema alone fails this instead of
+  // silently returning null and rendering as a password account in Settings.
+  it("answers for every member of mailAuthMethodSchema", () => {
+    for (const method of mailAuthMethodSchema.options) {
+      const provider = mailOAuthProviderOf(method);
+      expect(provider === null || mailOAuthProviderSchema.options.includes(provider)).toBe(true);
+      expect(provider === null).toBe(method === "password");
+    }
+  });
+});
+
+describe("mailOAuthSigninInputSchema", () => {
+  it("takes a label and an address to add a mailbox", () => {
+    expect(mailOAuthSigninInputSchema.parse({
+      provider: "microsoft", label: "Work", email: "chris@contoso.example",
+    })).toEqual({ provider: "microsoft", label: "Work", email: "chris@contoso.example" });
+  });
+
+  it("takes an accountId ALONE to re-authorise one", () => {
+    // The stored row supplies the address; anything else here would be a
+    // client choosing the login hint for an account it names.
+    expect(mailOAuthSigninInputSchema.parse({ provider: "google", accountId: uuid1 }))
+      .toEqual({ provider: "google", accountId: uuid1 });
+  });
+
+  it("names the FIELD that is missing on a create, not just that something is", () => {
+    const result = mailOAuthSigninInputSchema.safeParse({ provider: "microsoft" });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join("."))).toEqual(["label", "email"]);
+  });
+
+  it("refuses a provider Conduit has no code for", () => {
+    expect(mailOAuthSigninInputSchema.safeParse({
+      provider: "yahoo", label: "Work", email: "a@b.example",
+    }).success).toBe(false);
+  });
+
+  it("has no host, port, security, username or password field at all", () => {
+    // THE SPEC'S SECOND PATH IS AN ABSENCE, and a schema that merely ignored
+    // these would let a client believe it had set them. Unknown keys are
+    // stripped rather than rejected here (zod's default), which is why this
+    // asserts on the OUTPUT rather than on whether the parse succeeded.
+    const parsed = mailOAuthSigninInputSchema.parse({
+      provider: "microsoft", label: "Work", email: "a@b.example",
+      imapHost: "evil.example", imapPort: 993, username: "someone", password: "hunter2",
+    });
+    for (const key of ["imapHost", "imapPort", "username", "password"]) {
+      expect(parsed, key).not.toHaveProperty(key);
     }
   });
 });
@@ -1026,7 +1109,7 @@ describe("mailAccountListSchema", () => {
       smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
       username: "chris",
       sentFolder: "Sent", trashFolder: null, archiveFolder: null, signatureHtml: null, backfillDays: 90,
-      visibility: "private" as const,
+      visibility: "private" as const, authMethod: "password" as const,
       status: "active" as const, lastError: null, lastSyncedAt: null,
       archivedAt: null, createdAt: now, updatedAt: now,
     };
@@ -1235,7 +1318,7 @@ describe("mailAccountWithSyncStatsSchema", () => {
     smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls" as const,
     username: "chris", sentFolder: "Sent", trashFolder: null, archiveFolder: null,
     signatureHtml: null, backfillDays: 90,
-    visibility: "private" as const,
+    visibility: "private" as const, authMethod: "password" as const,
     status: "active" as const, lastError: null, lastSyncedAt: null,
     archivedAt: null, createdAt: now, updatedAt: now,
   };

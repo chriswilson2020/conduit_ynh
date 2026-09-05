@@ -144,4 +144,208 @@ describe("parseConfig", () => {
   it("rejects a DEFAULT_CURRENCY that is not 3 letters", () => {
     expect(() => parseConfig({ ...valid, DEFAULT_CURRENCY: "EURO" })).toThrow(/DEFAULT_CURRENCY/);
   });
+  // --- Phase 8's OAuth app registrations -------------------------------------
+
+  /** The one Phase 8 value this server cannot work out for itself, and the one
+   * a provider compares byte for byte (RFC 6749 3.1.2.3). */
+  const REDIRECT_URI = "https://conduit.example/api/mail/oauth/callback";
+
+  it("has no OAuth registration by default -- a password-only install", () => {
+    expect(parseConfig(valid).mailOAuth).toEqual({ microsoft: null, google: null });
+  });
+
+  it("builds Microsoft's tenant-scoped v2.0 endpoints, both of them", () => {
+    const config = parseConfig({
+      ...valid,
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
+      MAIL_OAUTH_MICROSOFT_TENANT: "contoso.onmicrosoft.com",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
+    });
+    expect(config.mailOAuth.microsoft).toEqual({
+      clientId: "app-id",
+      clientSecret: "app-secret",
+      // The pair travels together because it moves together: a tenant that
+      // changes changes both, and a pair built in two places is a pair that can
+      // end up naming two directories.
+      tokenEndpoint:
+        "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token",
+      authorizeEndpoint:
+        "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/authorize",
+      redirectUri: REDIRECT_URI,
+    });
+  });
+
+  it("escapes a tenant rather than splicing it into the URL", () => {
+    const config = parseConfig({
+      ...valid,
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
+      MAIL_OAUTH_MICROSOFT_TENANT: "a/b?c",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
+    });
+    expect(config.mailOAuth.microsoft?.tokenEndpoint)
+      .toBe("https://login.microsoftonline.com/a%2Fb%3Fc/oauth2/v2.0/token");
+    // Both endpoints, because escaping one and splicing the other would be a
+    // tenant that reaches the right token URL and the wrong consent screen.
+    expect(config.mailOAuth.microsoft?.authorizeEndpoint)
+      .toBe("https://login.microsoftonline.com/a%2Fb%3Fc/oauth2/v2.0/authorize");
+  });
+
+  it("uses Google's single token endpoint, which has no tenant", () => {
+    const config = parseConfig({
+      ...valid,
+      MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id",
+      MAIL_OAUTH_GOOGLE_CLIENT_SECRET: "g-secret",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
+    });
+    expect(config.mailOAuth.google?.tokenEndpoint).toBe("https://oauth2.googleapis.com/token");
+    // The v2 authorisation endpoint, which is the one that accepts
+    // access_type and prompt -- both load-bearing for getting a refresh token
+    // back at all (api: services/mail-oauth-signin.ts).
+    expect(config.mailOAuth.google?.authorizeEndpoint)
+      .toBe("https://accounts.google.com/o/oauth2/v2/auth");
+  });
+
+  /**
+   * A HALF-SET REGISTRATION IS NO REGISTRATION, in every direction. Carrying a
+   * client id with no secret would push "is this usable?" down to the token
+   * exchange, where the answer comes back as a provider's 401 with an
+   * operator-hostile message instead of "this install has not configured it".
+   * The Microsoft tenant is part of that: /common is the MULTI-tenant endpoint,
+   * so falling back to it would authenticate against the wrong directory rather
+   * than refusing.
+   */
+  it("treats a half-configured registration as none at all", () => {
+    const complete = {
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
+      MAIL_OAUTH_MICROSOFT_TENANT: "t",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
+    };
+    // Every single-field omission, derived from the complete set rather than
+    // listed: a FIFTH field added to a registration is then covered by this
+    // without anyone remembering to extend a literal.
+    for (const missing of Object.keys(complete)) {
+      const partial = { ...valid, ...complete } as Record<string, string | undefined>;
+      delete partial[missing];
+      expect(parseConfig(partial).mailOAuth.microsoft, missing).toBeNull();
+    }
+    expect(parseConfig({ ...valid, ...complete }).mailOAuth.microsoft).not.toBeNull();
+    expect(parseConfig({ ...valid, MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id" }).mailOAuth.google).toBeNull();
+  });
+
+  /**
+   * THE REDIRECT URI IS SHARED, not per provider: there is one callback route,
+   * and `state` -- not the path -- is what says which sign-in came back. Two
+   * registrations pointing at one URI is what both consoles expect.
+   */
+  it("gives both registrations the same redirect URI", () => {
+    const config = parseConfig({
+      ...valid,
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
+      MAIL_OAUTH_MICROSOFT_TENANT: "t",
+      MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id",
+      MAIL_OAUTH_GOOGLE_CLIENT_SECRET: "g-secret",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
+    });
+    expect(config.mailOAuth.microsoft?.redirectUri).toBe(REDIRECT_URI);
+    expect(config.mailOAuth.google?.redirectUri).toBe(REDIRECT_URI);
+  });
+
+  /** A value that is not a URL cannot be a redirect URI, and finding that out
+   * at boot is better than finding it out at a consent screen. */
+  it("refuses a redirect URI that is not a URL", () => {
+    expect(() => parseConfig({ ...valid, MAIL_OAUTH_REDIRECT_URI: "conduit.example/callback" }))
+      .toThrow(/MAIL_OAUTH_REDIRECT_URI/);
+  });
+
+  /**
+   * WHAT z.url() LETS THROUGH, AND WHY BOOT IS THE PLACE TO STOP IT (Task 4).
+   *
+   * Every value below parses as a URL and every one of them fails somewhere
+   * else: at Google's console, which refuses the registration; at a consent
+   * screen, showing a provider's own message about a URI this server never
+   * sees; or at a 404 with an authorisation code sitting in the address bar,
+   * which looks exactly like Conduit being broken and is not. Each rule comes
+   * from a published one -- RFC 6749 3.1.2 on the fragment, Google's "Redirect
+   * URIs must use the HTTPS scheme" on the scheme -- rather than from taste.
+   */
+  it("refuses a redirect URI a provider or this server will refuse later", () => {
+    const bad: Record<string, RegExp> = {
+      // RFC 6749 3.1.2: "MUST NOT include a fragment component". A fragment
+      // never reaches a server at all, so this one is not provider-specific.
+      "https://conduit.example/api/mail/oauth/callback#x": /fragment/,
+      // Google: "Redirect URIs must use the HTTPS scheme, not plain HTTP."
+      "http://conduit.example/api/mail/oauth/callback": /https/,
+      // Registered perfectly and pointing at a path this server does not
+      // serve: the sign-in appears to work and lands on a 404 holding the code.
+      "https://conduit.example/": /api\/mail\/oauth\/callback/,
+      "https://conduit.example/api/mail/oauth/callback/": /api\/mail\/oauth\/callback/,
+    };
+    for (const [uri, expected] of Object.entries(bad)) {
+      expect(() => parseConfig({ ...valid, MAIL_OAUTH_REDIRECT_URI: uri }), uri)
+        .toThrow(expected);
+      // Whatever else it says, it has to name the setting: this message is the
+      // operator's only pointer from a server that will not start back to the
+      // line they typed.
+      expect(() => parseConfig({ ...valid, MAIL_OAUTH_REDIRECT_URI: uri }), uri)
+        .toThrow(/MAIL_OAUTH_REDIRECT_URI/);
+    }
+  });
+
+  /** The loopback exemption is not a courtesy to developers: both providers
+   * grant it, and it is what lets the e2e suite register a real redirect URI
+   * and exercise this path rather than mock around it. */
+  it("allows http on the loopback, which is what both providers exempt", () => {
+    for (const host of ["localhost", "127.0.0.1"]) {
+      expect(() => parseConfig({
+        ...valid,
+        MAIL_OAUTH_REDIRECT_URI: `http://${host}:3100/api/mail/oauth/callback`,
+      }), host).not.toThrow();
+    }
+  });
+
+  /** An install mounted at /conduit serves its callback under that prefix, and
+   * the check is a SUFFIX for exactly this reason -- where a deployment is
+   * publicly mounted is BASE_PATH's business, and a stricter comparison would
+   * refuse a reverse proxy this file has no opinion about. */
+  it("accepts the callback under a base path", () => {
+    expect(() => parseConfig({
+      ...valid,
+      BASE_PATH: "/conduit",
+      MAIL_OAUTH_REDIRECT_URI: "https://box.example/conduit/api/mail/oauth/callback",
+    })).not.toThrow();
+  });
+
+  /** The refusal quotes the path back, because a server that will not start is
+   * only useful if the message contains the fix. */
+  it("names the path to use in the refusal", () => {
+    expect(() => parseConfig({
+      ...valid, BASE_PATH: "/conduit", MAIL_OAUTH_REDIRECT_URI: "https://box.example/wrong",
+    })).toThrow(/\/conduit\/api\/mail\/oauth\/callback/);
+  });
+
+  /** An install that never set it still boots with no registration, exactly as
+   * before. Only a value that IS set and cannot work stops the server -- the
+   * alternative, treating an unusable URI as an absent one, would read as "this
+   * install has no OAuth" and hide the typo the operator is hunting. */
+  it("still boots with no redirect URI at all", () => {
+    expect(() => parseConfig(valid)).not.toThrow();
+    expect(parseConfig(valid).mailOAuth.microsoft).toBeNull();
+  });
+
+  /**
+   * NOT REFUSED IN PRODUCTION, unlike CONDUIT_DEV_USER and
+   * CONDUIT_REAUTH_PASSWORD. Those two DISABLE a security control when set;
+   * this is an ordinary credential, and production is exactly where it belongs.
+   */
+  it("accepts an OAuth registration under NODE_ENV=production", () => {
+    expect(() => parseConfig({
+      ...valid,
+      MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id",
+      MAIL_OAUTH_GOOGLE_CLIENT_SECRET: "g-secret",
+    })).not.toThrow();
+  });
 });

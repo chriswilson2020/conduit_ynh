@@ -1,0 +1,56 @@
+-- THE SECOND MIGRATION OF v1.7.0, AND THE SPEC SAID THERE WOULD BE ONE.
+--
+-- The Phase 8 spec's section 2 says "This release therefore has a migration,
+-- and it is a small one" about 0014's auth_method column. This is a second one,
+-- and it is here because the spec's own Definition of Done asks for something
+-- 0014 cannot express: "a refresh failure surfaced as 'sign in again' rather
+-- than as a mail error". mail_accounts.status had exactly two values and both
+-- of them are wrong for it -- 'active' is a lie and 'error' is the thing the
+-- spec says not to do.
+--
+-- WHY A RETRY CANNOT CLEAR IT, which is the whole argument for a third value.
+-- Every other failure the sync engine records in `status='error'` is one the
+-- next pass might get past: the server was down, the socket dropped, the
+-- greeting timed out. The engine's entire answer to those is to back off (60s
+-- doubling to a 32-minute cap) and try again, and often that works. A provider
+-- that has stopped honouring the stored refresh token -- Google revoking a
+-- consumer grant after 7 days, a tenant admin withdrawing consent, a password
+-- change -- answers `invalid_grant` and will answer `invalid_grant` for ever.
+-- Retrying is not part of the remedy; a person signing in again is the whole of
+-- it. Two failure classes with two different remedies need two different
+-- states, or the operator is told to wait for something that is never coming.
+--
+-- REJECTED: A `reauth:` PREFIX ON last_error. The `auth:`/`connection:` message
+-- prefixes (packages/shared) are a genuine machine-readable contract and a
+-- third sibling would have cost no migration at all. It was not taken because
+-- those prefixes classify a CONNECTION FAILURE for a message that gets
+-- displayed, whereas this is a lifecycle state that a badge, the send gate
+-- (mail-send.ts refuses a non-active account) and Task 3's re-authorise control
+-- all have to branch on -- and deciding a lifecycle state by matching prose is
+-- precisely what services/errors.ts's DuplicateAttendeeError comment warns
+-- against. status is the account's state column; this is a state.
+--
+-- COSTS ONE FULL-TABLE VALIDATION, and that is honest rather than free. Unlike
+-- 0014's metadata-only ADD COLUMN, DROP CONSTRAINT + ADD CONSTRAINT ... CHECK
+-- re-validates every existing row under ACCESS EXCLUSIVE. It cannot fail: the
+-- new predicate is a strict superset of the old one, so any row the old CHECK
+-- admitted the new one admits too. And the table is mail_accounts -- one row
+-- per mailbox an operator has configured, which on the deployment target is a
+-- handful and on any plausible install is dozens. 0013's header has the general
+-- argument about migrations running before the server listens; it applies here
+-- unchanged.
+--
+-- THE ONE ROLLBACK COST, stated so it is not discovered. Rolling v1.7.0 back to
+-- v1.6.0 leaves any row that reached 'auth_required' carrying a value the older
+-- release's mailAccountStatusSchema does not list. Nothing crashes: no route
+-- validates its own response against that schema and the web client does not
+-- parse one, so v1.6.0's StatusBadge simply falls through to its "Active"
+-- branch. The rollback therefore LOSES THE WARNING for those accounts rather
+-- than breaking the page -- their mail is stopped and the badge says it is
+-- fine. Re-running this migration restores the truth on the next pass. This is
+-- the one place where Phase 8 costs a rollback something, and it was weighed
+-- against Task 1's deliberate byte-identical password blobs: the credential
+-- data survives a rollback untouched, which is the half that could not be
+-- risked.
+ALTER TABLE "mail_accounts" DROP CONSTRAINT "mail_accounts_status_valid";--> statement-breakpoint
+ALTER TABLE "mail_accounts" ADD CONSTRAINT "mail_accounts_status_valid" CHECK (status IN ('active','error','auth_required'));

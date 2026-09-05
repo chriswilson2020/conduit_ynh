@@ -1,8 +1,11 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import nodemailer from "nodemailer";
+import type { MailAccount } from "@conduit/shared";
 import type { ImapConnectionSettings } from "./mail-imap.js";
 import {
   ImapIdleUnsupportedError, ImapflowClient,
   buildImapOptions, buildSmtpOptions, continueWalk, createImapClientFactory,
+  createSmtpTransportFactory,
   defaultTestConnectionDeps, imapVerify, nextWalk, normalizeMailError, readFetchedSource,
   readFolderListing, requireSearchUids, smtpVerify, SOCKET_TIMEOUT_MS,
   type ImapflowListEntry,
@@ -20,9 +23,13 @@ import { RESTORE_STOP_TIMEOUT_MS } from "./mail-sync.js";
 
 const tlsSettings = {
   host: "mail.example.com", port: 993, security: "tls" as const,
-  username: "chris", password: "hunter2",
+  username: "chris", auth: { kind: "password" as const, password: "hunter2" },
 };
 const starttlsSettings = { ...tlsSettings, port: 143, security: "starttls" as const };
+/** The same connection, authenticated the Phase 8 way. */
+const oauthSettings = {
+  ...tlsSettings, auth: { kind: "oauth" as const, accessToken: "ya29.an-access-token" },
+};
 
 const previousEnv = process.env.MAIL_TLS_REJECT_UNAUTHORIZED;
 afterEach(() => {
@@ -115,8 +122,72 @@ describe("buildSmtpOptions", () => {
   });
 
   it("passes the SMTP credentials, not the IMAP ones", () => {
-    expect(buildSmtpOptions({ ...tlsSettings, password: "smtp-secret" }).auth)
-      .toEqual({ user: "chris", pass: "smtp-secret" });
+    expect(buildSmtpOptions({
+      ...tlsSettings, auth: { kind: "password", password: "smtp-secret" },
+    }).auth).toEqual({ user: "chris", pass: "smtp-secret" });
+  });
+});
+
+// --- XOAUTH2 (Phase 8 Task 2) ------------------------------------------------
+
+/**
+ * WHAT THE TWO LIBRARIES ARE ACTUALLY HANDED, which is the only part of the
+ * OAuth path that can be checked without a provider. Both option shapes were
+ * read out of the installed sources rather than the documentation, and both are
+ * pinned here because both have a silent failure mode: imapflow prefers
+ * `accessToken` over `pass` and would fall back to a password if the token were
+ * dropped, and nodemailer's XOAuth2 quietly REUSES a token it cannot renew, so
+ * a stray refreshToken here would make it a second refresher nobody knew about.
+ */
+describe("the XOAUTH2 auth blocks", () => {
+  it("gives imapflow an accessToken and NO password", () => {
+    // Verified in imapflow 1.7.1: authenticate() tests auth.accessToken first
+    // and only falls through to auth.pass when it is absent.
+    expect(buildImapOptions(oauthSettings).auth)
+      .toEqual({ user: "chris", accessToken: "ya29.an-access-token" });
+  });
+
+  it("gives nodemailer an OAuth2 block and NO password", () => {
+    expect(buildSmtpOptions(oauthSettings).auth)
+      .toEqual({ type: "OAuth2", user: "chris", accessToken: "ya29.an-access-token" });
+  });
+
+  /**
+   * THE DECISION THIS FILE HAS TO DEFEND: Conduit refreshes for both protocols,
+   * so nodemailer must be given nothing it could refresh WITH. Measured in
+   * nodemailer 9.0.5: XOAuth2.getToken renews only when the block carries a
+   * refreshToken, provisionCallback or serviceClient, and otherwise reuses what
+   * it was given. Any of these four appearing here would silently make
+   * nodemailer a second refresher -- with its own idea of when the grant is
+   * dead, reported to nobody, on a transport that is closed after one message.
+   */
+  it("hands nodemailer nothing it could refresh with", () => {
+    const auth = buildSmtpOptions(oauthSettings).auth as Record<string, unknown>;
+    expect(auth.refreshToken).toBeUndefined();
+    expect(auth.clientId).toBeUndefined();
+    expect(auth.clientSecret).toBeUndefined();
+    expect(auth.accessUrl).toBeUndefined();
+  });
+
+  it("still says type OAuth2 -- getAuth returns false for a block with no user", () => {
+    // nodemailer's SMTPTransport.getAuth returns FALSE for an OAuth2 block with
+    // neither `user` nor `service`, and a false auth sends the message with no
+    // authentication at all rather than failing.
+    const auth = buildSmtpOptions(oauthSettings).auth as Record<string, unknown>;
+    expect(auth.type).toBe("OAuth2");
+    expect(auth.user).toBe("chris");
+  });
+
+  it("leaves TLS and the timeouts exactly where the password path has them", () => {
+    // The auth mechanism is the ONLY thing Phase 8 changes about a connection
+    // (spec: "nothing in the mail engine changes"). A token account on a
+    // STARTTLS port must still require the upgrade.
+    const token = buildImapOptions({ ...oauthSettings, port: 143, security: "starttls" });
+    const password = buildImapOptions(starttlsSettings);
+    expect(token.doSTARTTLS).toBe(password.doSTARTTLS);
+    expect(token.secure).toBe(password.secure);
+    expect(token.socketTimeout).toBe(password.socketTimeout);
+    expect(token.connectionTimeout).toBe(password.connectionTimeout);
   });
 });
 
@@ -351,6 +422,45 @@ describe("readFolderListing", () => {
     expect(listed.map((item) => item.folder)).toEqual(["INBOX", "All Mail", "Starred", "Projects"]);
   });
 
+  /**
+   * THE THREE MAILBOXES THAT MAKE A GMAIL ACCOUNT SYNC ITSELF SEVERAL TIMES
+   * (Phase 8 Task 4). `\All`, `\Flagged` and Gmail's `\Important` are views
+   * over messages that live in other folders, so a walk of one re-sights the
+   * whole mailbox under a second name and ingest's duplicate path then rewrites
+   * `mail_messages.folder` on every pass.
+   *
+   * READ FROM `flags`, NOT FROM `specialUse`, which is why this is a separate
+   * test from the one above rather than an assertion inside it: the mapper
+   * deliberately carries no ROLE for these, and it must still notice them.
+   */
+  it("marks \\All, \\Flagged and \\Important as virtual views", () => {
+    const listed = readFolderListing([
+      entry("INBOX", { flags: ["\\HasNoChildren"] }),
+      entry("[Gmail]/All Mail", { flags: ["\\All", "\\HasNoChildren"], specialUse: "\\All" }),
+      entry("[Gmail]/Starred", { flags: ["\\Flagged"], specialUse: "\\Flagged" }),
+      entry("[Gmail]/Important", { flags: ["\\Important"] }),
+      // Case-insensitive, like the unselectable check beside it: RFC 3501
+      // mailbox attributes are, and `flags` holds the server's own spelling.
+      entry("Shouty", { flags: ["\\ALL"] }),
+      entry("Projects", { flags: ["\\HasNoChildren"] }),
+    ]);
+    expect(listed.map((item) => item.virtual))
+      .toEqual([undefined, true, true, true, true, undefined]);
+    // Still listed, and still selectable: the claim is that walking one is
+    // duplicated work, not that it cannot be opened. Discovery records them and
+    // the picker shows them.
+    expect(listed).toHaveLength(6);
+    expect(listed.every((item) => item.selectable)).toBe(true);
+  });
+
+  /** Omitted rather than false, so a listing from a server that offers no such
+   * attribute -- Dovecot, this install's ordinary case -- is byte-identical to
+   * what this mapper produced before the field existed. */
+  it("leaves the field off entirely for an ordinary mailbox", () => {
+    const [listed] = readFolderListing([entry("Projects", { flags: ["\\HasNoChildren"] })]);
+    expect(listed).not.toHaveProperty("virtual");
+  });
+
   it("reports \\Noselect (and \\NonExistent) folders as unselectable without dropping them", () => {
     const listed = readFolderListing([
       entry("Lists", { flags: ["\\Noselect", "\\HasChildren"] }),
@@ -476,6 +586,62 @@ describe("createImapClientFactory", () => {
     expect(first).not.toBe(second);
     await first.disconnect();
     await second.disconnect();
+  });
+});
+
+describe("createSmtpTransportFactory", () => {
+  const account = {
+    id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    smtpHost: "mail.example.com", smtpPort: 587, smtpSecurity: "starttls" as const,
+    username: "chris",
+  } as unknown as MailAccount;
+
+  /**
+   * A SPY THAT CALLS THROUGH, not a mock, which is why this does not breach
+   * the boundary stated at the top of this file. nodemailer really builds its
+   * transport (it opens nothing until sendMail), and the spy exists only to
+   * read back the argument it was built from. Nothing here stands in for the
+   * library's behaviour.
+   *
+   * A mutation is why this test exists at all. Swapping `.smtpPassword` for
+   * `.imapPassword` in the factory survived BOTH this file and mail-send's --
+   * mail-send drives a fake transport factory and never reaches the real one --
+   * so an account using the "SMTP differs" toggle would have logged in to its
+   * SMTP server with the IMAP password, and the only symptom would have been
+   * sends failing on exactly the accounts configured that way.
+   */
+  it("authenticates SMTP with the credential it is handed", () => {
+    const spy = vi.spyOn(nodemailer, "createTransport");
+    try {
+      createSmtpTransportFactory({ rejectUnauthorized: false })(account, {
+        kind: "password", password: "smtp-half",
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0]?.[0]).toMatchObject({ auth: { user: "chris", pass: "smtp-half" } });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  /**
+   * Task 2 moved the "which half?" decision to mail-oauth.ts, so THAT is where
+   * the imap/smtp mix-up the mutation above found is now pinned
+   * (mail-oauth.test.ts, "hands IMAP the imap half and SMTP the smtp half").
+   * What is left here is the other half of the same journey: a token handed in
+   * reaches nodemailer as a token, not as a password and not as nothing.
+   */
+  it("authenticates SMTP with an access token when it is given one", () => {
+    const spy = vi.spyOn(nodemailer, "createTransport");
+    try {
+      createSmtpTransportFactory({ rejectUnauthorized: false })(account, {
+        kind: "oauth", accessToken: "ya29.an-access-token",
+      });
+      expect(spy.mock.calls[0]?.[0]).toMatchObject({
+        auth: { type: "OAuth2", user: "chris", accessToken: "ya29.an-access-token" },
+      });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

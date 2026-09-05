@@ -1,6 +1,9 @@
-import type {
-  MailAccount, MailAccountCreateInput, MailAccountTestInput, MailAccountUpdateInput,
-  MailAccountUpdatePasswordFields, MailSecurity,
+import {
+  mailOAuthProviderOf,
+  type MailAccount, type MailAccountCreateInput, type MailAccountStatus,
+  type MailAccountTestInput, type MailAccountUpdateInput,
+  type MailAccountUpdatePasswordFields, type MailAuthMethod, type MailSecurity,
+  type MailOAuthProvider, type MailOAuthSigninInput,
 } from "@conduit/shared";
 
 /**
@@ -159,6 +162,302 @@ export function buildTestInput(state: AccountFormState, accountId?: string): Mai
   return accountId === undefined ? overrides : { accountId, ...overrides };
 }
 
+// --- Signing in at a provider (Phase 8 Task 3) -------------------------------
+
+/**
+ * How the account being added signs in. "password" is the default and stays
+ * the common case on this install (a self-hosted Dovecot); the other two exist
+ * only when the deployment has an app registration for them.
+ */
+export type MailSigninMethod = "password" | MailOAuthProvider;
+
+/**
+ * The OAuth form's state, and what is NOT in it is the point.
+ *
+ * No host, no port, no security, no username, no password. Those are the
+ * provider's and known (api: services/mail-oauth-signin.ts's provider table) --
+ * the spec's second path, in as many words. What is left is what only the
+ * operator knows: which mailbox, and what to call it.
+ *
+ * `sentFolder` is on the EDIT form only. The server fills it per provider
+ * ("Sent Items", "[Gmail]/Sent Mail") because it is a fact about the provider
+ * rather than a choice, and it is editable afterwards because a mailbox with a
+ * non-default namespace can prove that fact wrong.
+ */
+export interface OAuthFormState {
+  label: string;
+  email: string;
+  sentFolder: string;
+  /** "30" | "90" | "all", or an existing account's own stored value. Shares
+   * AccountFormState's convention so the two forms' Backfill controls behave
+   * identically. */
+  backfill: string;
+}
+
+export function initialOAuthFormState(account?: MailAccount): OAuthFormState {
+  if (account === undefined) {
+    return { label: "", email: "", sentFolder: "", backfill: "90" };
+  }
+  return {
+    label: account.label,
+    email: account.email,
+    sentFolder: account.sentFolder,
+    backfill: account.backfillDays === null ? "all" : String(account.backfillDays),
+  };
+}
+
+/**
+ * The one field-level gate, and it has two fields to check because that is all
+ * the form has.
+ *
+ * THE ADDRESS IS NOT VERIFIED AGAINST THE MAILBOX SIGNED INTO, and cannot be
+ * from here -- see the note at the foot of api: services/mail-oauth-signin.ts.
+ * What this catches is an empty one, which would produce an authorise request
+ * with no login hint and an account row naming nobody.
+ */
+export function validateOAuthForm(state: OAuthFormState, isEdit: boolean): string | null {
+  if (state.label.trim() === "") return "A label is required.";
+  if (isEdit) return null;
+  if (state.email.trim() === "") return "The mailbox address is required.";
+  // Deliberately not a full address grammar: the shared schema's z.email() is
+  // the authority and answers a 400 with its own message. This is the cheap
+  // check that stops the round trip for the ordinary mistake.
+  if (!state.email.includes("@")) return "Enter the full mailbox address.";
+  return null;
+}
+
+/** The body POST /api/mail/accounts/oauth/authorize takes to add a NEW
+ * mailbox. */
+export function buildOAuthSigninInput(
+  state: OAuthFormState, provider: MailOAuthProvider,
+): MailOAuthSigninInput {
+  return {
+    provider,
+    label: state.label.trim(),
+    email: state.email.trim(),
+    backfillDays: state.backfill === "all" ? null : Number(state.backfill),
+  };
+}
+
+/** The same body for RE-authorising an account that already exists. The
+ * account supplies its own address server-side, so nothing else is sent -- a
+ * label typed into the edit form is saved by the PATCH, not by this. */
+export function buildReauthorizeInput(
+  accountId: string, provider: MailOAuthProvider,
+): MailOAuthSigninInput {
+  return { provider, accountId };
+}
+
+/**
+ * The PATCH an OAuth account's edit form sends.
+ *
+ * THREE FIELDS, AND THE OMISSIONS ARE ENFORCED SERVER-SIDE TOO. There is no
+ * password half (the server answers 409 `mail_password_not_applicable` to one),
+ * and the host/port/security/username are the provider's -- submitting them
+ * would be this form claiming to own settings it does not. The address is not
+ * here either: it is the mailbox the grant was issued for, and changing it
+ * would leave a token that authenticates somebody else.
+ */
+export function buildOAuthUpdatePatch(state: OAuthFormState): AccountPatchBody {
+  return {
+    label: state.label.trim(),
+    sentFolder: state.sentFolder.trim(),
+    backfillDays: state.backfill === "all" ? null : Number(state.backfill),
+  };
+}
+
+/** What the settings row says an OAuth account signs in with. Named here
+ * rather than at the two call sites so "Microsoft" has one spelling. */
+export function providerLabel(provider: MailOAuthProvider): string {
+  return provider === "microsoft" ? "Microsoft" : "Google";
+}
+
+/** A warning shown BEFORE a sign-in is started, when the provider has one. */
+export interface SigninCaveat {
+  heading: string;
+  paragraphs: string[];
+}
+
+/**
+ * What the operator has to know about this provider before they press the
+ * button, or null when there is nothing.
+ *
+ * -------------------------------------------------------------------------
+ * THIS IS THE GMAIL FORK, AND IT IS HERE BECAUSE HERE IS WHERE THE CHOICE IS
+ * -------------------------------------------------------------------------
+ *
+ * The plan says it "must appear at the point of CHOOSING, not in a README", and
+ * the reason is not tidiness. What Google does to a consumer account is revoke
+ * the refresh token every seven days while the app's publishing status is
+ * Testing -- so a Conduit that shipped this quietly would sync for a week,
+ * stop, and be indistinguishable from broken. The operator would look for the
+ * bug here. That is v1.4.1's error-that-blamed-the-wrong-thing exactly, and the
+ * sentence that prevents it costs nothing as long as it is read BEFORE the
+ * mailbox is connected rather than after it stops.
+ *
+ * IT DOES NOT REFUSE, AND THAT IS DELIBERATE. A consumer Gmail account signed
+ * in weekly by an operator who KNOWS is a legitimate way to use this -- annoying
+ * and honest. What is not legitimate is finding out on day eight. So this
+ * informs and the button still works.
+ *
+ * THE FIGURES ARE GOOGLE'S OWN, checked 5 Sep against its OAuth 2.0
+ * documentation and not paraphrased from memory: "A Google Cloud Platform
+ * project with an OAuth consent screen configured for an external user type and
+ * a publishing status of 'Testing' is issued a refresh token expiring in 7
+ * days"; IMAP needs `https://mail.google.com/`, which is a RESTRICTED scope, and
+ * restricted scopes require verification plus an annual security assessment by
+ * a Google-approved third party. The assessment is the paid part, and its price
+ * is not Google's to publish, so this says "paid" and does not invent a number.
+ *
+ * MICROSOFT HAS NO CAVEAT OF THIS KIND, which is why the return type is
+ * nullable rather than a two-branch table pretending at symmetry. A
+ * single-tenant registration in the operator's own directory needs no
+ * verification, and its refresh token has no expiry a syncing mailbox can
+ * reach: Entra's 90 days is an INACTIVITY limit and the token rotates on every
+ * use, so a poll interval measured in minutes renews it indefinitely. (The spec
+ * says "do not expire", which is that in shorter words and is wrong only for a
+ * mailbox nothing has touched for three months -- a stopped account, or a
+ * server that was off.) Microsoft's real traps are tenant-side switches
+ * (SMTP AUTH, the Web-vs-SPA platform) that
+ * cannot be met at this screen and cannot be fixed from it -- they belong in
+ * docs/mail-oauth-setup.md, which is where the operator is when they can act on
+ * them.
+ */
+export function providerSigninCaveat(provider: MailOAuthProvider): SigninCaveat | null {
+  if (provider === "microsoft") return null;
+  return {
+    heading: "Which kind of Google account is this?",
+    paragraphs: [
+      "A Google Workspace mailbox on a domain you administer is fine. Publish your"
+      + " own OAuth app as Internal in that organisation and the sign-in lasts"
+      + " indefinitely, the same as Microsoft.",
+      "A personal @gmail.com address is not. While your app's publishing status is"
+      + " Testing, Google revokes the sign-in every 7 days — mail stops until you"
+      + " come back to this page and sign in again, every week.",
+      "Leaving Testing is not a setting. IMAP needs Google's restricted"
+      + " https://mail.google.com/ scope, so the app has to pass Google's"
+      + " verification and a paid annual security assessment by a third party"
+      + " Google approves.",
+    ],
+  };
+}
+
+/**
+ * What an operator sees where a provider button would have been, when this
+ * install has no app registration at all.
+ *
+ * SILENCE WAS THE PREVIOUS ANSWER AND IT IS THE WRONG ONE. Task 3 was right
+ * that an install with no registration must not be offered a button whose only
+ * outcome is a 409 -- but the form then simply showed the password fields, and
+ * an operator who came to Settings specifically to connect their Microsoft
+ * mailbox got no explanation of where the option went. "Nothing here" and "this
+ * needs setting up first" look identical and are not.
+ *
+ * IT NAMES THE CALLBACK PATH, WHICH IS THE HALF NOBODY CAN GUESS. Registering
+ * an app at either provider asks for a redirect URI first, it is compared byte
+ * for byte afterwards, and until this line existed the only place that string
+ * was written down was a route file. The origin comes from the browser that is
+ * displaying it -- correct by construction for the person reading it, and never
+ * used by the server to build a redirect (api: config.ts refuses to derive one
+ * from a request, and that is unchanged).
+ *
+ * NULL WHEN THE PATH IS NOT KNOWN, and that branch is here rather than in the
+ * component on purpose. The no-provider case is also where a FAILED providers
+ * query lands, and a hint assembled from an absent callbackPath would tell the
+ * operator to register the site root -- a plausible-looking string that is
+ * wrong, which is worse than the silence "we could not ask" deserves. Deciding
+ * it here makes it a case a test can state; deciding it in the JSX made it a
+ * `!== undefined` that no test in this repository could reach.
+ */
+export function oauthSetupHint(callbackPath: string | undefined, origin: string): string | null {
+  if (callbackPath === undefined || callbackPath === "") return null;
+  return `No mail provider is set up on this install, so a mailbox here signs in with a`
+    + ` password. To add Microsoft or Google, register ${origin}${callbackPath} as the`
+    + ` redirect URI at the provider and set MAIL_OAUTH_REDIRECT_URI to that exact string.`
+    + ` docs/mail-oauth-setup.md has the rest.`;
+}
+
+/** "Signed in with Microsoft", or null for a password account. */
+export function signedInWith(authMethod: MailAuthMethod): string | null {
+  const provider = mailOAuthProviderOf(authMethod);
+  return provider === null ? null : `Signed in with ${providerLabel(provider)}`;
+}
+
+export interface SigninBanner {
+  tone: "ok" | "error";
+  text: string;
+}
+
+/**
+ * What the `?oauth=` the callback redirects with means, as a sentence.
+ *
+ * THE SERVER SENDS A CODE AND THE CLIENT OWNS THE PROSE, which is a security
+ * decision rather than a layering preference (api:
+ * services/mail-oauth-signin.ts's SigninOutcome). A redirect's query string
+ * lands in a URL bar, a history entry and nginx's access log, so a provider's
+ * own error_description must never ride one -- it goes to the journal instead,
+ * and this table is what an operator reads.
+ *
+ * AN UNKNOWN REASON STILL SAYS SOMETHING TRUE. A client and a server that
+ * disagree about the code set is a thing that happens across an upgrade, and
+ * "the sign-in did not complete" is correct for every member of it.
+ */
+export function signinBanner(
+  search: { oauth?: string; reason?: string },
+  /**
+   * MAIL_OAUTH_REDIRECT_URI as the server parsed it, when the page knows it.
+   *
+   * ONLY THE `provider` FAILURE USES IT, and only that one should. That outcome
+   * already says "this is usually the app registration", which is true and is
+   * advice with nowhere to go: the operator now has to find out what this
+   * install actually sends and compare it, by eye, against a provider console.
+   * The value IS the comparison, and it is compared BYTE FOR BYTE at the
+   * provider (RFC 6749 3.1.2.3) -- a trailing slash or an http decides it -- so
+   * showing it next to the failure is the difference between the spec's "one
+   * round of real-world fixing" and four.
+   *
+   * Absent (or unset) leaves the sentence exactly as it was, because a banner
+   * that said "the redirect URI is: null" would be worse than one that did not
+   * mention it.
+   */
+  redirectUri?: string | null,
+): SigninBanner | null {
+  if (search.oauth === "connected") {
+    return { tone: "ok", text: "That mailbox is connected. The first sync starts on its own." };
+  }
+  if (search.oauth !== "failed") return null;
+  const text = SIGNIN_FAILURES[search.reason ?? ""] ?? SIGNIN_FAILED_GENERIC;
+  if (search.reason === "provider" && redirectUri !== undefined && redirectUri !== null) {
+    return {
+      tone: "error",
+      text: `${text} This install sends ${redirectUri} as the redirect URI; the provider`
+        + " compares it character for character against the one registered there.",
+    };
+  }
+  return { tone: "error", text };
+}
+
+const SIGNIN_FAILED_GENERIC =
+  "The sign-in did not complete, and nothing was changed. Try again.";
+
+const SIGNIN_FAILURES: Record<string, string> = {
+  // Deliberately does NOT say "somebody may be attacking you". The overwhelming
+  // majority of these are an expired state or a second tab, and an alarming
+  // sentence for a routine timeout teaches an operator to ignore it.
+  state: "That sign-in could not be verified — it may have taken too long, or been"
+    + " started in another window. Start it again from this page.",
+  denied: "The sign-in was declined at the provider, so nothing was changed.",
+  provider: "The provider would not complete the sign-in. This is usually the app"
+    + " registration rather than the mailbox; the server log has what it said.",
+  no_refresh_token: "The provider signed in but did not grant offline access, so the"
+    + " mailbox could not be saved. Try again and allow offline access when asked.",
+  duplicate: "You already have an active mail account for that address. Archive the old"
+    + " one first if you are replacing it.",
+  account: "That mailbox could not accept this sign-in. It may be archived, or signed in"
+    + " with a different provider.",
+  failed: "The mailbox could not be saved. The server log has the details.",
+};
+
 // --- Folder management (Phase 4.4 Task 4) ------------------------------------
 
 /**
@@ -276,4 +575,82 @@ export function folderDeleteWarning(folder: string): string[] {
     "If the folder still holds mail on the server, or has folders inside it, this is refused"
       + " rather than done: Conduit does not delete mail.",
   ];
+}
+
+// --- The account's state, as a row shows it (Phase 8 Task 2) -----------------
+
+/**
+ * What the status badge says.
+ *
+ * PURE AND SEPARATE FROM THE COMPONENT, following folderRenameBlocked's
+ * precedent above: the interesting part of a state is which words it produces,
+ * and that is worth a test per case rather than a render test per case.
+ *
+ * 'auth_required' READS AS AN INSTRUCTION, NOT A DIAGNOSIS. "Error" describes
+ * the server's mood; "Sign in again" describes what the person looking at the
+ * row has to do, which is the entire reason this state exists apart from
+ * 'error' (see mailAccountStatusSchema in @conduit/shared). An operator who
+ * reads "Error" waits for it to clear, and this one never clears on its own.
+ */
+export function accountStatusLabel(status: MailAccountStatus, archived: boolean): string {
+  if (archived) return "Archived";
+  switch (status) {
+    case "auth_required": return "Sign in again";
+    case "error": return "Error";
+    case "active": return "Active";
+    // Exhaustive by construction: a fourth status nobody adds here is a
+    // compile error at the `never`, not a badge that silently reads "Active"
+    // for a state the server considers broken.
+    default: {
+      const exhaustive: never = status;
+      return exhaustive;
+    }
+  }
+}
+
+/**
+ * The sentence beneath the badge when an account's grant has lapsed, or null
+ * when the row has nothing of this kind to say.
+ *
+ * NAMES THE PROVIDER, because "sign in again" is a different gesture at
+ * Microsoft than at Google and the operator is about to go and do one of them.
+ * The name comes from mail_accounts.auth_method, which is in the clear and is
+ * the whole reason that column exists -- rendering this costs no trip to
+ * mail.key.
+ *
+ * DELIBERATELY NOT last_error. That column still holds the provider's own words
+ * (an AADSTS code, say) for whoever is diagnosing this, and those words are of
+ * no use to the person who simply has to sign in again -- an operator reading a
+ * technical string and concluding that waiting is the remedy is the exact
+ * failure this state exists to prevent.
+ *
+ * The password branch is unreachable -- a password account has no grant to
+ * lapse -- and returns a sentence rather than throwing: a row that somehow
+ * reached this state should still say something true and actionable.
+ *
+ * GOOGLE GETS ONE MORE SENTENCE, AND THIS IS THE SECOND PLACE THE GMAIL FORK
+ * HAS TO APPEAR (Task 4). providerSigninCaveat says it before the sign-in; this
+ * says it at the only other moment it matters, which is the one where the
+ * operator has forgotten. A consumer @gmail.com account on an app still in
+ * Testing arrives here every seven days, on the dot, and the row otherwise
+ * reads exactly like a mailbox whose password changed -- so the operator's
+ * conclusion is "this keeps breaking" and the thing they suspect is Conduit.
+ * Naming the seven days turns a recurring mystery into a known cost of the
+ * account they chose. It is CONDITIONAL prose ("if this is") rather than a
+ * claim, because nothing on this row knows whether the mailbox is Workspace or
+ * consumer: mail_accounts.auth_method records the provider and Conduit
+ * deliberately never asked for an id token that would say more (api:
+ * services/mail-oauth-signin.ts's scope note).
+ */
+export function accountReauthMessage(
+  status: MailAccountStatus, authMethod: MailAuthMethod,
+): string | null {
+  if (status !== "auth_required") return null;
+  const provider = mailOAuthProviderOf(authMethod);
+  if (provider === null) return "This mailbox needs to be signed in to again before it can sync.";
+  const base = `${providerLabel(provider)} has stopped accepting this mailbox's saved sign-in.`
+    + " Sign in again to resume syncing and sending.";
+  if (provider === "microsoft") return base;
+  return `${base} If this is a personal @gmail.com address, Google does this every 7 days`
+    + " until the OAuth app leaves Testing.";
 }

@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { User } from "@conduit/shared";
 import {
   NotFoundError, ArchivedError, ConflictError, DuplicateAttendeeError,
-  MailKeyMissingError, MailCredentialDecryptError,
+  MailKeyMissingError, MailCredentialDecryptError, MailCredentialKindError,
   AttachmentTooLargeError, SmtpSendError,
   MailFolderCommandError, MailFolderRenameFailedError,
 } from "../services/errors.js";
@@ -104,6 +104,31 @@ export function mapDomainError(reply: FastifyReply, error: unknown): void {
     void reply.code(409).send({
       error: "mail_credentials_unreadable",
       message: "stored mail credentials could not be decrypted; submit a new password to re-establish them",
+    });
+    return;
+  }
+  // 409, and the code is `mail_password_not_applicable` rather than a second
+  // `mail_credentials_unreadable`: the row above is about mail.key failing, and
+  // this one is about a request asking a provider mailbox to do something only
+  // a password mailbox can. Telling them apart is the whole reason this class
+  // is not a MailCredentialDecryptError subclass (services/errors.ts).
+  //
+  // WHY IT NEEDED A MAPPING AT ALL, since Tasks 1 and 2 correctly left it
+  // without one: nothing could create an OAuth account, so nothing could raise
+  // it outside a test. Task 3's authorise/callback pair changes that, and the
+  // very first PATCH that carries a password to one of those accounts would
+  // otherwise have been a 500 -- an unhandled error for a submission the
+  // operator can correct.
+  //
+  // STATIC MESSAGE, NOT error.message, which is this file's habit for a reason
+  // even when the underlying text is safe. The class's own message is written
+  // for a server log ("this path requires a stored password") and names an
+  // internal expectation rather than an action; what a settings form needs is
+  // the gesture that WOULD work.
+  if (error instanceof MailCredentialKindError) {
+    void reply.code(409).send({
+      error: "mail_password_not_applicable",
+      message: "this mailbox signs in with a provider, so it has no password to set; sign in again to renew it",
     });
     return;
   }

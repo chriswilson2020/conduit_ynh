@@ -70,6 +70,41 @@ export class MailCredentialDecryptError extends Error {
   }
 }
 
+// Raised by mail-crypto's mustBePasswordCredentials when a code path that can
+// only use a password meets an account whose stored credential is an OAuth
+// refresh token (Phase 8 Task 1's union).
+//
+// NOT A DECRYPT FAILURE, which is why it is not a MailCredentialDecryptError
+// subclass: mail.key worked, the ciphertext authenticated, and the payload
+// was a perfectly valid credential -- just not one this caller can use. Rolling
+// the two together would tell an operator to check their key over a problem
+// their key has nothing to do with.
+//
+// MAPPED SINCE TASK 3, WHICH IS THE MOMENT IT BECAME REACHABLE. Tasks 1 and 2
+// left it unmapped on the honest grounds that nothing in the release could
+// write an OAuth blob, so the only thing constructing it was a unit test. Task
+// 3 adds the authorise/callback pair, and with it the first PATCH that can
+// carry a password to a mailbox that has none -- which without a mapping is a
+// 500 on a request the operator can fix. routes/helpers.ts answers 409
+// `mail_password_not_applicable`: the submission conflicts with the account's
+// stored state, and the remedy is a different gesture (sign in again), not a
+// retry.
+//
+// ITS PRIMARY RAISER IS NOW A COLUMN CHECK, not a decrypt. mail-accounts.ts's
+// updateAccount refuses a password submission by reading auth_method, so the
+// refusal works on an install whose mail.key is missing or restored from the
+// wrong backup -- the states in which decrypting first would blame the key for
+// a request whose real problem is elsewhere.
+//
+// The message names the account id and the kind. Neither is a secret -- the id
+// is in every mail URL and "oauth" is exactly what auth_method says in the
+// clear -- and no token, key or password reaches it.
+export class MailCredentialKindError extends Error {
+  constructor(accountId: string, kind: string) {
+    super(`mail account ${accountId} authenticates with '${kind}', but this path requires a stored password`);
+  }
+}
+
 // Raised by mail-accounts.ts's testConnection when accountId is absent and
 // the submitted fields do not fully determine a connection to test. Not a
 // reachable route error in practice: mailAccountTestInputSchema's
@@ -235,5 +270,87 @@ export class MailIngestError extends Error {
     this.folder = context.folder;
     this.uid = context.uid;
     this.reason = truncated;
+  }
+}
+
+// Raised by mail-oauth.ts when a provider REFUSED to exchange this account's
+// stored refresh token for an access token, permanently: RFC 6749 5.2's
+// `invalid_grant`, which is what a revoked, expired or superseded grant answers
+// with. Google's consumer-Gmail 7-day revocation, a Microsoft tenant admin
+// revoking consent, and a password change that invalidates the grant all arrive
+// here as the same code.
+//
+// THE ONE MAIL FAILURE THAT NO AMOUNT OF RETRYING FIXES, and that is the whole
+// reason it has a type. Every other connection failure in this file is
+// something the next pass might get past -- a server that was down, a socket
+// that dropped, a message that would not parse. This one cannot be: the sync
+// engine can retry it every 32 minutes for a year and the answer will be
+// identical until a HUMAN signs in again. So the sync engine turns it into an
+// account STATE (mail_accounts.status = 'auth_required') rather than another
+// line of last_error, which is the spec's Risk 3 in as many words -- a refresh
+// failure looks exactly like mail quietly stopping.
+//
+// EVERY OTHER TOKEN-ENDPOINT FAILURE IS DELIBERATELY NOT THIS. A 5xx, a DNS
+// failure or a timeout is transient and gets the ordinary `connection:`
+// treatment and the ordinary backoff. `invalid_client`/`unauthorized_client`/
+// `invalid_scope` are the APP REGISTRATION being wrong, not the operator's
+// sign-in -- signing in again would fail identically, so telling them to do it
+// would be a wrong instruction, and those stay ordinary errors too.
+//
+// NO TOKEN REACHES THE MESSAGE. `reason` is the provider's own error code plus
+// a truncated error_description; neither ever contains the refresh token (the
+// endpoint does not echo it back), and nothing here adds it. mail-oauth.test.ts
+// pins that against a hostile endpoint that tries to echo one.
+export class MailReauthRequiredError extends Error {
+  readonly provider: string;
+  readonly reason: string;
+
+  static readonly MAX_REASON_LENGTH = 200;
+
+  constructor(provider: string, reason: string, options?: { cause?: unknown }) {
+    const truncated = reason.length > MailReauthRequiredError.MAX_REASON_LENGTH
+      ? `${reason.slice(0, MailReauthRequiredError.MAX_REASON_LENGTH)}...`
+      : reason;
+    super(
+      `${provider} would not renew this account's sign-in (${truncated}).`
+      + " Sign in again to resume syncing.",
+      options,
+    );
+    this.provider = provider;
+    this.reason = truncated;
+  }
+}
+
+// Raised by mail-oauth.ts when mail_accounts.auth_method and the decrypted
+// credential blob disagree about how an account authenticates -- an
+// auth_method of 'password' over an OAuth blob, or an 'oauth_*' one over a
+// password pair.
+//
+// UNREACHABLE BY CONSTRUCTION, and kept precisely because the construction is
+// what has to hold. The two facts live in two places on purpose (the column so
+// Settings can render a row without touching mail.key; the blob because the
+// secret has to be encrypted), and mail-accounts.ts's createOAuthAccount is the
+// only writer that sets both -- in one statement.
+//
+// TASK 3 FOUND THE ONE WAY THIS COULD HAVE HAPPENED AND SHUT IT, which is worth
+// recording because "unreachable by construction" was already written here
+// before the construction was complete. updateAccount computed a password
+// ciphertext from the submission alone and wrote it over whatever the row held,
+// with no reference to auth_method -- so a single PATCH carrying `password` to
+// an OAuth account produced exactly this disagreement, and destroyed the
+// refresh token doing it. It needed an OAuth account to exist, which is why it
+// had never been reachable; it is now refused on the column, before the write.
+//
+// This stays as the guard that turns a FUTURE writer setting one and not the
+// other into a named failure on the account rather than a connection attempted
+// with the wrong mechanism, which would present as an authentication failure
+// against the provider and send the operator to check a password that is not
+// the problem.
+export class MailAuthMethodMismatchError extends Error {
+  constructor(accountId: string, authMethod: string, credentialKind: string) {
+    super(
+      `mail account ${accountId} records auth_method '${authMethod}' but its stored credential`
+      + ` is a '${credentialKind}' one; the two are written together and must agree`,
+    );
   }
 }

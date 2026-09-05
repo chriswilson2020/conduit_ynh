@@ -1229,22 +1229,51 @@ describe("restoring onto a different install", () => {
     expect((failure as PlanApplyError).outcome.dispatched).toBeGreaterThan(0);
   });
 
+  /**
+   * How many trailing rows of drizzle's bookkeeping the fixture below has to
+   * remove for the REPLAY TO THROW -- everything from REPLAY_ANCHOR_TAG on.
+   *
+   * FORGETTING JUST THE LAST ONE USED TO BE ENOUGH, AND IT WAS LUCK. drizzle
+   * re-applies every migration after the last one the bookkeeping records, so
+   * the case only produces a failure if one of those cannot be applied twice --
+   * and 0015 (a DROP CONSTRAINT + ADD CONSTRAINT pair) replays perfectly
+   * cleanly, which turned this case red the day it shipped with nothing about
+   * restore having changed. The hidden coupling was "whatever migration happens
+   * to be newest must be non-idempotent", which is not a property anybody
+   * writing a migration knows they owe this file.
+   *
+   * ANCHORED ON 0014 INSTEAD, because its `ALTER TABLE ... ADD COLUMN` cannot
+   * be applied to a table that already has the column -- and because it is
+   * replayed FIRST, so it throws no matter how many idempotent migrations are
+   * added after it. That makes this stable for every future migration rather
+   * than for the current one.
+   */
+  const REPLAY_ANCHOR_TAG = "0014_";
+  async function forgottenMigrationCount(): Promise<number> {
+    const journalPath = path.join(migrationsFolder(), "meta", "_journal.json");
+    const journal = JSON.parse(await readFile(journalPath, "utf8")) as { entries: { tag: string }[] };
+    const index = journal.entries.findIndex((entry) => entry.tag.startsWith(REPLAY_ANCHOR_TAG));
+    if (index < 0) throw new Error(`no ${REPLAY_ANCHOR_TAG} migration in the journal`);
+    return journal.entries.length - index;
+  }
+
   // A migration that THROWS after the load has committed is an ordinary way to
   // fail -- a constraint a years-old install violates is exactly what the
   // older-backup path exists for -- and it left the same silence.
   itRestore("says the database is restored when the migrations themselves fail", async () => {
     const journal = await readMigrationJournal();
-    // FULLY migrated, so every object the last migration creates is already in
+    const forget = await forgottenMigrationCount();
+    // FULLY migrated, so every object those migrations create is already in
     // the dump...
     const source = await makeInstall("srcmigfail");
     await seed(source, ["Ancient Holdings"]);
     const target = await makeInstall("dstmigfail");
 
-    // ...but the dump's own drizzle bookkeeping is made to forget the last one.
-    // The restored database then has the schema and claims not to, so drizzle
-    // applies a migration over objects that already exist and throws. No seam:
-    // this is what migrating real data forward looks like when it goes wrong,
-    // and it happens AFTER the load has committed.
+    // ...but the dump's own drizzle bookkeeping is made to forget the tail of
+    // them. The restored database then has the schema and claims not to, so
+    // drizzle applies a migration over objects that already exist and throws.
+    // No seam: this is what migrating real data forward looks like when it goes
+    // wrong, and it happens AFTER the load has committed.
     const archive = await alteredBackup(source, async (dir, manifest) => {
       const dumpPath = path.join(dir, "database.sql");
       const dump = await readFile(dumpPath, "utf8");
@@ -1256,14 +1285,14 @@ describe("restoring onto a different install", () => {
       const block = dump.slice(copyAt, endAt);
       const tail = dump.slice(endAt);
       const rows = block.split("\n");
-      expect(rows.length).toBeGreaterThan(2);
-      const edited = `${head}${rows.slice(0, -1).join("\n")}${tail}`;
+      expect(rows.length).toBeGreaterThan(forget + 1);
+      const edited = `${head}${rows.slice(0, rows.length - forget).join("\n")}${tail}`;
       await writeFile(dumpPath, edited);
       const inventory = manifest.inventory;
       if (inventory === undefined) throw new Error("the real backup carried no inventory");
       return {
         ...manifest,
-        migrationPosition: journal.position - 1,
+        migrationPosition: journal.position - forget,
         schemaVersion: "an-older-tag",
         members: manifest.members.map((member) => member.path === "database.sql"
           ? { ...member, bytes: Buffer.byteLength(edited), sha256: digestOf(edited) }
@@ -1279,7 +1308,7 @@ describe("restoring onto a different install", () => {
           ...inventory,
           tables: inventory.tables.map((one) =>
             one.table === "drizzle.__drizzle_migrations"
-              ? { ...one, rows: one.rows - 1 } : one),
+              ? { ...one, rows: one.rows - forget } : one),
         },
       };
     });

@@ -8,6 +8,7 @@ import { and, eq } from "drizzle-orm";
 import {
   contactSchema, dealSchema, errorResponseSchema, listResponseSchema, pipelineSchema, stageSchema,
   mailAccountSchema, mailAccountListSchema, mailAccountTestResultSchema, mailThreadSchema,
+  mailOAuthProvidersSchema, mailOAuthSigninStartSchema,
   mailThreadListItemSchema, mailThreadDetailSchema, markThreadReadResponseSchema,
   mailMessageSchema, mailUnreadCountSchema,
   mailUnreadFolderCountsSchema, mailAccountFolderSchema, bulkThreadResultSchema,
@@ -28,6 +29,7 @@ import { subscribe } from "../services/sse.js";
 import type { SendMailMessage, SendMailTransport } from "../services/mail-send.js";
 import type { ImapFolderListing } from "../services/mail-sync.js";
 import type { MailRouteSyncManager } from "./mail.js";
+import type { MailOAuthCodeExchanger } from "../services/mail-oauth-signin.js";
 
 const handle = openTestDatabase();
 
@@ -183,12 +185,25 @@ class FakeAccountSync {
 
 // --- App -------------------------------------------------------------------
 
-function config(basePath = "/"): Config {
+/** Phase 8: one provider's registration, as config.ts resolves one. Used only
+ * by the sign-in cases -- every other test in this file leaves both null,
+ * because every other account here is a password account. */
+const MICROSOFT_REGISTRATION = {
+  clientId: "client-id", clientSecret: "client-secret",
+  tokenEndpoint: "https://login.microsoftonline.example/tenant/oauth2/v2.0/token",
+  authorizeEndpoint: "https://login.microsoftonline.example/tenant/oauth2/v2.0/authorize",
+  redirectUri: "https://conduit.example/api/mail/oauth/callback",
+};
+
+function config(basePath = "/", oauth = false): Config {
   return {
     nodeEnv: "test", port: 0, databaseUrl: "unused-in-tests", basePath,
     version: "0.1.0-test", devUser: null, dataDir, defaultCurrency: "EUR",
     mailKeyPath: keyPath, mailTlsRejectUnauthorized: true,
     ldapUrl: "ldap://127.0.0.1:389", reauthPassword: null,
+    // No app registration by default: this file's accounts are password
+    // accounts, which is the deployment target's ordinary case.
+    mailOAuth: { microsoft: oauth ? MICROSOFT_REGISTRATION : null, google: null },
   };
 }
 
@@ -196,16 +211,21 @@ interface AppOptions {
   basePath?: string;
   /** Defaults to the fake manager; pass `() => null` for the no-engine case. */
   syncManager?: () => MailRouteSyncManager | null;
+  /** Phase 8: give this app a Microsoft registration. */
+  oauth?: boolean;
+  /** Phase 8: what an authorisation code exchanges for. */
+  codeExchanger?: MailOAuthCodeExchanger;
 }
 
 async function app(options: AppOptions = {}) {
   return buildApp({
-    config: config(options.basePath),
+    config: config(options.basePath, options.oauth),
     db: handle.db,
     dataDir,
     mail: {
       syncManager: options.syncManager ?? (() => manager),
       transportFactory: transport.factory,
+      ...(options.codeExchanger === undefined ? {} : { codeExchanger: options.codeExchanger }),
     },
   });
 }
@@ -442,9 +462,20 @@ async function makeDeal(a: App, extra: Record<string, unknown> = {}) {
 /** Every account-returning response must be free of anything credential
  * shaped -- the whole point of mailAccountSchema (see its own note in
  * packages/shared). Asserted on the raw JSON, not the parsed value, because
- * zod strips unknown keys and would hide exactly the leak this is looking for. */
+ * zod strips unknown keys and would hide exactly the leak this is looking for.
+ *
+ * authMethod's VALUE is neutralised first, and only its value. Phase 8 made
+ * "password" a legitimate thing for an account body to SAY -- it is how the
+ * account authenticates, not what it authenticates with -- and this scan is a
+ * substring match over the whole serialised body, so it went red on the word
+ * itself. Two ways not to fix that were rejected: loosening the pattern (it
+ * would stop catching a leaked `imapPassword` key, which is the entire job)
+ * and dropping the field before serialising (the KEY would then go unchecked
+ * too). Replacing the value keeps `"authMethod"` in the scanned string, and
+ * the value it hides is constrained by mailAuthMethodSchema to three enum
+ * members -- there is no shape of leak it could be concealing. */
 function expectNoCredentials(payload: unknown): void {
-  const json = JSON.stringify(payload);
+  const json = JSON.stringify(payload, (key, value) => (key === "authMethod" ? "<enum>" : value));
   expect(json).not.toMatch(/password|credential|ciphertext|secret/i);
 }
 
@@ -3980,5 +4011,407 @@ describe("per-user hide", () => {
     expect(hide.statusCode).toBe(200);
     expect(await danasWorld()).toEqual(before);
     await a.close();
+  });
+});
+
+/**
+ * Phase 8 Task 3: the authorise/callback pair, at the HTTP boundary.
+ *
+ * What is tested here rather than in mail-oauth-signin.test.ts is what only a
+ * route can get wrong: which identity the state is minted against and checked
+ * against, what a browser is handed back (a redirect, never JSON), and whether
+ * the authorisation code reaches the request log.
+ */
+describe("mail OAuth sign-in routes", () => {
+  const REFRESH_TOKEN = "refresh-token-that-must-never-escape";
+
+  /** An exchanger that answers a usable grant and records the code. */
+  function exchanger(): { exchange: MailOAuthCodeExchanger; codes: string[] } {
+    const codes: string[] = [];
+    return {
+      codes,
+      exchange: (_provider, code) => {
+        codes.push(code);
+        return Promise.resolve({
+          accessToken: "access-token", expiresInSeconds: 3600, refreshToken: REFRESH_TOKEN,
+        });
+      },
+    };
+  }
+
+  /** Start a sign-in and return the `state` the provider would echo back. */
+  async function startState(a: App, payload: Record<string, unknown>, headers = authHeaders): Promise<string> {
+    const response = await a.inject({
+      method: "POST", url: "/api/mail/accounts/oauth/authorize", headers, payload,
+    });
+    expect(response.statusCode).toBe(200);
+    const { authorizeUrl } = mailOAuthSigninStartSchema.parse(response.json());
+    return new URL(authorizeUrl).searchParams.get("state") ?? "";
+  }
+
+  /** The account list as one identity sees it. */
+  async function ownAccounts(a: App, headers = authHeaders) {
+    const response = await a.inject({ method: "GET", url: "/api/mail/accounts", headers });
+    return mailAccountListSchema.parse(response.json()).own;
+  }
+
+  describe("GET /api/mail/oauth/providers", () => {
+    it("lists nothing on an install with no registration, which is this deployment", async () => {
+      const a = await app();
+      const response = await a.inject({ method: "GET", url: "/api/mail/oauth/providers", headers: authHeaders });
+      expect(response.statusCode).toBe(200);
+      // AN EMPTY LIST STILL ANSWERS USEFULLY (Task 4). This is the install
+      // Chris is on, and it is the one where an operator is trying to CREATE a
+      // registration -- so the response has to carry the path they must
+      // register even though it can offer them no provider at all.
+      expect(mailOAuthProvidersSchema.parse(response.json())).toEqual({
+        providers: [],
+        callbackPath: "/api/mail/oauth/callback",
+        redirectUri: null,
+      });
+      await a.close();
+    });
+
+    it("lists the providers this install registered", async () => {
+      const a = await app({ oauth: true });
+      const response = await a.inject({ method: "GET", url: "/api/mail/oauth/providers", headers: authHeaders });
+      expect(response.json()).toEqual({
+        providers: ["microsoft"],
+        callbackPath: "/api/mail/oauth/callback",
+        // Echoed back so the operator can compare it, character for character,
+        // against what the provider console shows -- which is the comparison
+        // the provider itself makes (RFC 6749 3.1.2.3).
+        redirectUri: MICROSOFT_REGISTRATION.redirectUri,
+      });
+      await a.close();
+    });
+
+    /** An install mounted at /conduit serves its callback under that prefix,
+     * and a path that omitted it is precisely the byte-for-byte mismatch this
+     * field exists to prevent. Same construction as the settings redirect the
+     * callback itself performs. */
+    it("carries the base path, because that is what has to be registered", async () => {
+      const a = await app({ basePath: "/conduit" });
+      const response = await a.inject({ method: "GET", url: "/api/mail/oauth/providers", headers: authHeaders });
+      expect(mailOAuthProvidersSchema.parse(response.json()).callbackPath)
+        .toBe("/conduit/api/mail/oauth/callback");
+      await a.close();
+    });
+
+    /**
+     * The advertised path has to be the one the route is really served at, or
+     * the operator registers a URI that 404s while holding an authorisation
+     * code. They are one constant now (@conduit/shared's
+     * MAIL_OAUTH_CALLBACK_PATH, used at the app.get and at this response), and
+     * this is what proves the constant is the live one rather than a copy that
+     * happens to agree today.
+     *
+     * IT ADVERTISES THE PUBLIC PATH AND FASTIFY ANSWERS THE SUFFIX, which is
+     * not a discrepancy: conf/nginx.conf proxies `__PATH__/` to `:PORT/` with a
+     * trailing slash, so nginx strips the prefix and the app never sees it.
+     * What the provider must be given is the public one; what must exist is the
+     * suffix. Both halves are asserted because getting either wrong produces
+     * the same 404.
+     */
+    it("advertises the public path, whose served half this app really answers", async () => {
+      const a = await app({ basePath: "/conduit" });
+      const { callbackPath } = mailOAuthProvidersSchema.parse(
+        (await a.inject({ method: "GET", url: "/api/mail/oauth/providers", headers: authHeaders })).json(),
+      );
+      expect(callbackPath).toBe("/conduit/api/mail/oauth/callback");
+      const callback = await a.inject({
+        method: "GET", url: callbackPath.slice("/conduit".length), headers: authHeaders,
+      });
+      // A 303 back to settings: the callback refuses a state it never minted,
+      // which is the right answer and, crucially, is not a 404.
+      expect(callback.statusCode).toBe(303);
+      await a.close();
+    });
+
+    it("returns no client id, even though a client id is not a secret", async () => {
+      // A field nobody reads is a field that leaks the day somebody logs the
+      // response; the client has no use for one.
+      const a = await app({ oauth: true });
+      const response = await a.inject({ method: "GET", url: "/api/mail/oauth/providers", headers: authHeaders });
+      expect(response.body).not.toContain("client-id");
+      await a.close();
+    });
+
+    it("401s without an identity", async () => {
+      const a = await app({ oauth: true });
+      expect((await a.inject({ method: "GET", url: "/api/mail/oauth/providers" })).statusCode).toBe(401);
+      await a.close();
+    });
+  });
+
+  describe("POST /api/mail/accounts/oauth/authorize", () => {
+    it("answers a URL the client navigates to, not a redirect", async () => {
+      // A 302 answering a fetch() is followed by the fetch, not by the window,
+      // and the operator ends up looking at a consent page rendered into a
+      // JSON parse error.
+      const a = await app({ oauth: true });
+      const response = await a.inject({
+        method: "POST", url: "/api/mail/accounts/oauth/authorize", headers: authHeaders,
+        payload: { provider: "microsoft", label: "Work", email: "chris@contoso.example" },
+      });
+      expect(response.statusCode).toBe(200);
+      const url = new URL(mailOAuthSigninStartSchema.parse(response.json()).authorizeUrl);
+      expect(url.origin + url.pathname).toBe(MICROSOFT_REGISTRATION.authorizeEndpoint);
+      expect(url.searchParams.get("login_hint")).toBe("chris@contoso.example");
+      await a.close();
+    });
+
+    it("409s for a provider this install has not registered", async () => {
+      const a = await app({ oauth: true });
+      const response = await a.inject({
+        method: "POST", url: "/api/mail/accounts/oauth/authorize", headers: authHeaders,
+        payload: { provider: "google", label: "Work", email: "chris@gmail.example" },
+      });
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toMatchObject({ error: "mail_oauth_not_configured" });
+      // The sentence has to name what an operator must set, or it is a dead end.
+      expect(errorResponseSchema.parse(response.json()).message).toContain("MAIL_OAUTH_GOOGLE_CLIENT_ID");
+      await a.close();
+    });
+
+    it("400s a create request with no label or address", async () => {
+      const a = await app({ oauth: true });
+      const response = await a.inject({
+        method: "POST", url: "/api/mail/accounts/oauth/authorize", headers: authHeaders,
+        payload: { provider: "microsoft" },
+      });
+      expect(response.statusCode).toBe(400);
+      await a.close();
+    });
+
+    it("404s a re-authorisation naming ANOTHER user's account", async () => {
+      // A foreign account 404s exactly as it does everywhere else -- and, more
+      // to the point, never gets as far as minting a state for a row the
+      // caller cannot see.
+      const a = await app({ oauth: true });
+      const account = await makeAccount(a, {}, otherHeaders);
+      const response = await a.inject({
+        method: "POST", url: "/api/mail/accounts/oauth/authorize", headers: authHeaders,
+        payload: { provider: "microsoft", accountId: account.id },
+      });
+      expect(response.statusCode).toBe(404);
+      await a.close();
+    });
+
+    it("takes the login hint from the ACCOUNT, never from the request", async () => {
+      const a = await app({ oauth: true });
+      const account = await makeAccount(a, { email: "stored@contoso.example" });
+      const response = await a.inject({
+        method: "POST", url: "/api/mail/accounts/oauth/authorize", headers: authHeaders,
+        payload: { provider: "microsoft", accountId: account.id, email: "attacker@evil.example" },
+      });
+      const url = new URL(mailOAuthSigninStartSchema.parse(response.json()).authorizeUrl);
+      expect(url.searchParams.get("login_hint")).toBe("stored@contoso.example");
+      await a.close();
+    });
+  });
+
+  describe("GET /api/mail/oauth/callback", () => {
+    it("redirects to the settings page and creates the account", async () => {
+      const { exchange, codes } = exchanger();
+      const a = await app({ oauth: true, codeExchanger: exchange });
+      const state = await startState(a, {
+        provider: "microsoft", label: "Work", email: "chris@contoso.example",
+      });
+
+      const response = await a.inject({
+        method: "GET", url: `/api/mail/oauth/callback?code=the-code&state=${state}`, headers: authHeaders,
+      });
+      expect(response.statusCode).toBe(303);
+      expect(response.headers.location).toBe("/settings/mail?oauth=connected");
+      expect(codes).toEqual(["the-code"]);
+
+      const own = await ownAccounts(a);
+      expect(own).toHaveLength(1);
+      expect(own[0]).toMatchObject({
+        authMethod: "oauth_microsoft", email: "chris@contoso.example",
+        imapHost: "outlook.office365.com", status: "active",
+      });
+      await a.close();
+    });
+
+    it("REFUSES A FORGED STATE: no exchange, no account, and a readable reason", async () => {
+      // The hole this whole flow is built around. An attacker who can make the
+      // operator's browser load a callback with THEIR code attaches THEIR
+      // mailbox to this account.
+      const a = await app({
+        oauth: true,
+        codeExchanger: () => Promise.reject(new Error("the token endpoint was contacted")),
+      });
+      await startState(a, { provider: "microsoft", label: "Work", email: "chris@contoso.example" });
+
+      const response = await a.inject({
+        method: "GET", url: `/api/mail/oauth/callback?code=stolen&state=${"f".repeat(64)}`,
+        headers: authHeaders,
+      });
+      expect(response.statusCode).toBe(303);
+      expect(response.headers.location).toBe("/settings/mail?oauth=failed&reason=state");
+      expect(await ownAccounts(a)).toEqual([]);
+      await a.close();
+    });
+
+    it("REFUSES A STATE MINTED FOR ANOTHER IDENTITY", async () => {
+      // Dana starts a sign-in; the callback arrives carrying Chris's identity.
+      // This is the binding, and it is the reason the state is remembered
+      // against a user id rather than merely being random.
+      const a = await app({ oauth: true, codeExchanger: exchanger().exchange });
+      const state = await startState(
+        a, { provider: "microsoft", label: "Work", email: "dana@contoso.example" }, otherHeaders,
+      );
+      const response = await a.inject({
+        method: "GET", url: `/api/mail/oauth/callback?code=c&state=${state}`, headers: authHeaders,
+      });
+      expect(response.headers.location).toBe("/settings/mail?oauth=failed&reason=state");
+      expect(await ownAccounts(a, authHeaders)).toEqual([]);
+      expect(await ownAccounts(a, otherHeaders)).toEqual([]);
+      await a.close();
+    });
+
+    it("refuses a REPLAYED callback, so a history entry cannot make a second mailbox", async () => {
+      const a = await app({ oauth: true, codeExchanger: exchanger().exchange });
+      const state = await startState(a, {
+        provider: "microsoft", label: "Work", email: "chris@contoso.example",
+      });
+      const url = `/api/mail/oauth/callback?code=c&state=${state}`;
+      expect((await a.inject({ method: "GET", url, headers: authHeaders })).headers.location)
+        .toBe("/settings/mail?oauth=connected");
+      expect((await a.inject({ method: "GET", url, headers: authHeaders })).headers.location)
+        .toBe("/settings/mail?oauth=failed&reason=state");
+      expect(await ownAccounts(a)).toHaveLength(1);
+      await a.close();
+    });
+
+    it("refuses a callback carrying no identity at all", async () => {
+      // THE SESSION HALF OF THE STATE BINDING. There is no app-level session on
+      // this install -- SSOwat's per-request Ynh-User IS the session (auth.ts)
+      // -- so a callback that arrives without one has nothing to bind against,
+      // and this route must not be the one place in the app that answers
+      // anyway. Asserted rather than assumed, because requireUser is one line
+      // and its absence would look exactly like the rest of the file.
+      const a = await app({ oauth: true, codeExchanger: exchanger().exchange });
+      const state = await startState(a, {
+        provider: "microsoft", label: "Work", email: "chris@contoso.example",
+      });
+      const response = await a.inject({
+        method: "GET", url: `/api/mail/oauth/callback?code=c&state=${state}`,
+      });
+      expect(response.statusCode).toBe(401);
+      expect(await ownAccounts(a)).toEqual([]);
+      await a.close();
+    });
+
+    it("answers a redirect rather than JSON even when the query is nonsense", async () => {
+      // This is the one route whose caller is a third party's redirect. A 400
+      // JSON body here is an error page where a settings page should be.
+      const a = await app({ oauth: true, codeExchanger: exchanger().exchange });
+      const response = await a.inject({
+        method: "GET", url: "/api/mail/oauth/callback?state[]=1&state[]=2", headers: authHeaders,
+      });
+      expect(response.statusCode).toBe(303);
+      expect(response.headers.location).toBe("/settings/mail?oauth=failed&reason=state");
+      await a.close();
+    });
+
+    it("carries a declined consent back as its own reason, without the provider's prose", async () => {
+      const a = await app({ oauth: true, codeExchanger: exchanger().exchange });
+      const state = await startState(a, {
+        provider: "microsoft", label: "Work", email: "chris@contoso.example",
+      });
+      const response = await a.inject({
+        method: "GET",
+        url: `/api/mail/oauth/callback?error=access_denied&error_description=user+said+no&state=${state}`,
+        headers: authHeaders,
+      });
+      expect(response.headers.location).toBe("/settings/mail?oauth=failed&reason=denied");
+      // The provider's PROSE goes to the journal, never into a URL bar, a
+      // history entry or nginx's access log.
+      expect(response.headers.location).not.toContain("said");
+      await a.close();
+    });
+
+    it("lands on the install's own settings page under a base path", async () => {
+      const a = await app({ oauth: true, basePath: "/conduit", codeExchanger: exchanger().exchange });
+      const state = await startState(a, {
+        provider: "microsoft", label: "Work", email: "chris@contoso.example",
+      });
+      const response = await a.inject({
+        method: "GET", url: `/api/mail/oauth/callback?code=c&state=${state}`, headers: authHeaders,
+      });
+      expect(response.headers.location).toBe("/conduit/settings/mail?oauth=connected");
+      await a.close();
+    });
+
+    it("never puts a token in the response", async () => {
+      const a = await app({ oauth: true, codeExchanger: exchanger().exchange });
+      const state = await startState(a, {
+        provider: "microsoft", label: "Work", email: "chris@contoso.example",
+      });
+      const response = await a.inject({
+        method: "GET", url: `/api/mail/oauth/callback?code=c&state=${state}`, headers: authHeaders,
+      });
+      expect(JSON.stringify(response.headers) + response.body).not.toContain(REFRESH_TOKEN);
+      await a.close();
+    });
+  });
+
+  describe("what a signed-in account is not allowed to do", () => {
+    async function connected(a: App): Promise<string> {
+      const state = await startState(a, {
+        provider: "microsoft", label: "Work", email: "chris@contoso.example",
+      });
+      await a.inject({
+        method: "GET", url: `/api/mail/oauth/callback?code=c&state=${state}`, headers: authHeaders,
+      });
+      return (await ownAccounts(a))[0]!.id;
+    }
+
+    it("409s a PATCH that carries a password, rather than 500ing on it", async () => {
+      // MailCredentialKindError had no mapDomainError entry until this task,
+      // on the honest grounds that nothing could create an account to raise it.
+      // This route is what changed that.
+      const a = await app({ oauth: true, codeExchanger: exchanger().exchange });
+      const id = await connected(a);
+      const response = await a.inject({
+        method: "PATCH", url: `/api/mail/accounts/${id}`, headers: authHeaders,
+        payload: { password: "hunter2" },
+      });
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toMatchObject({ error: "mail_password_not_applicable" });
+      // The message names the gesture that WOULD work; the class's own wording
+      // ("this path requires a stored password") is written for a log.
+      expect(errorResponseSchema.parse(response.json()).message).toContain("sign in again");
+      await a.close();
+    });
+
+    it("still accepts an ordinary setting on the same account", async () => {
+      const a = await app({ oauth: true, codeExchanger: exchanger().exchange });
+      const id = await connected(a);
+      const response = await a.inject({
+        method: "PATCH", url: `/api/mail/accounts/${id}`, headers: authHeaders,
+        payload: { label: "Renamed" },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(mailAccountSchema.parse(response.json())).toMatchObject({
+        label: "Renamed", authMethod: "oauth_microsoft",
+      });
+      await a.close();
+    });
+
+    it("never returns the ciphertext or the token on the accounts list", async () => {
+      const a = await app({ oauth: true, codeExchanger: exchanger().exchange });
+      await connected(a);
+      const response = await a.inject({ method: "GET", url: "/api/mail/accounts", headers: authHeaders });
+      expect(response.body).not.toContain(REFRESH_TOKEN);
+      expect(response.body).not.toContain("credentials");
+      // auth_method IS returned, and that is the one fact about an OAuth
+      // account a route may give out (mail_accounts.auth_method's comment).
+      expect(response.body).toContain("oauth_microsoft");
+      await a.close();
+    });
   });
 });

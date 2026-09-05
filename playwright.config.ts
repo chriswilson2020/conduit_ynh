@@ -30,7 +30,28 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? [["html", { open: "never" }], ["list"]] : "list",
-  use: { baseURL: "http://127.0.0.1:3100" },
+  use: {
+    baseURL: "http://127.0.0.1:3100",
+    // THE FIRST TRIAL IS THE ATTEMPT WHOSE EVIDENCE IS THINNEST, and that is
+    // what this buys. The `if: always()` report upload settled the mail e2e
+    // cascade in an afternoon (see docs/superpowers/reports/), but the same
+    // exercise had to record one failure as an honest "unknown" because the
+    // report carries no trace and no screenshot for the attempt that failed
+    // FIRST -- "the helper returned early", "the button was disabled" and "the
+    // ingest had not finished" are not separated by anything an HTML report
+    // can show.
+    //
+    // `retain-on-first-failure`, NOT `on-first-retry`, and the difference is
+    // the whole point rather than a preference. `on-first-retry` records the
+    // RETRY -- the attempt that usually passes -- and keeps nothing at all
+    // from the trial that failed. It is the cheaper setting and it answers a
+    // different question. This one traces every test's first run and keeps the
+    // trace only where that run failed, which is exactly the artifact the
+    // diagnosis wanted and did not have. The price is tracing overhead on
+    // first runs; against a spec whose first-trial failures have gone
+    // unexplained across three releases, it is worth paying.
+    trace: "retain-on-first-failure",
+  },
   webServer: {
     command: "node packages/api/dist/server.js",
     url: "http://127.0.0.1:3100/api/health",
@@ -64,6 +85,39 @@ export default defineConfig({
       // the journey could only ever prove that the prompt appears, which is not
       // the property (see e2e/data.spec.ts).
       CONDUIT_REAUTH_PASSWORD: "e2e-reauth-password",
+      // Phase 8: an app registration, so the add-account form's second path
+      // exists to be walked (e2e/mail-oauth.spec.ts).
+      //
+      // A FAKE ONE, AND THE SPEC NEVER LEAVES THIS MACHINE. The tenant is a
+      // made-up string, so the authorise URL points at a login.microsoftonline
+      // .com path nothing here can reach -- the journey asserts on the URL the
+      // app builds and aborts the navigation before it is issued. The half that
+      // does run end to end is the CALLBACK, which is this server's own route
+      // and is where the security lives: a forged `state` has to be refused,
+      // and the refusal has to reach the page as a sentence.
+      //
+      // The secret is a literal because there is nothing behind it. It is not a
+      // credential for anything, at any provider, ever.
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "e2e-client-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "e2e-client-secret-not-a-real-one",
+      MAIL_OAUTH_MICROSOFT_TENANT: "e2e-tenant.example",
+      // BOTH PROVIDERS, from Task 4, and the second one is not decoration. The
+      // phase's claim is that Microsoft and Google are one code path with two
+      // configurations; with only one registered, every journey walked the same
+      // configuration and the claim was untested. Google's authorise request
+      // differs in three ways that each fail silently at a consent screen --
+      // access_type, prompt and the single restricted scope -- and having it
+      // here is what lets a browser assert them.
+      //
+      // Equally fake, for the same reason and with the same guarantee: these
+      // are credentials for nothing, at any provider, ever.
+      MAIL_OAUTH_GOOGLE_CLIENT_ID: "e2e-google-client-id",
+      MAIL_OAUTH_GOOGLE_CLIENT_SECRET: "e2e-google-secret-not-a-real-one",
+      // Loopback http, which both providers exempt from their https rule and
+      // config.ts's own check exempts for exactly that reason -- so this is a
+      // redirect URI the real validation accepts rather than a value the suite
+      // is excused from.
+      MAIL_OAUTH_REDIRECT_URI: "http://127.0.0.1:3100/api/mail/oauth/callback",
       BASE_PATH: "/",
       WEB_ROOT: "packages/web/dist",
     },

@@ -12,6 +12,7 @@ import type { SendMailTransportFactory } from "./mail-send.js";
 import {
   MAIL_AUTH_ERROR_PREFIX, MAIL_CONNECTION_ERROR_PREFIX,
   type FetchNewerOptions, type IdleOutcome, type ImapClient, type ImapConnectionSettings,
+  type MailConnectionAuth,
   type ImapFolderListing, type ImapFolderStatus, type ImapMessageDescriptor,
 } from "./mail-imap.js";
 
@@ -253,7 +254,59 @@ interface ConnectionSettings {
   port: number;
   security: MailSecurity;
   username: string;
-  password: string;
+  auth: MailConnectionAuth;
+}
+
+/**
+ * The auth block for imapflow.
+ *
+ * `accessToken` WINS OVER `pass` IN imapflow AND WE NEVER SEND BOTH. Verified
+ * in the installed 1.7.1: `ImAPFlow.authenticate` tests `options.auth.accessToken`
+ * FIRST and only falls through to `options.auth.pass` when it is absent
+ * (lib/imap-flow.js), then issues AUTHENTICATE OAUTHBEARER or XOAUTH2 depending
+ * on which the server advertised (lib/commands/authenticate.js). Sending both
+ * would work by luck of that ordering; sending exactly one means a bug that
+ * dropped the token cannot silently fall back to a password.
+ *
+ * ONE CAVEAT MEASURED IN 1.7.1 AND NOT FIXABLE FROM HERE: `authOauth` builds
+ * its SASL payload only if the server advertises AUTH=OAUTHBEARER, AUTH=XOAUTH
+ * or AUTH=XOAUTH2. Against a server advertising none of them it reaches
+ * `Buffer.from(undefined)` and the resulting TypeError is caught by its own
+ * handler and stamped `authenticationFailed: true` -- so this adapter would
+ * classify it `auth:` and the settings UI would tell the operator to check a
+ * password the account does not have. Not reachable for the two providers this
+ * phase targets (both advertise XOAUTH2), and worth knowing before anyone
+ * points an OAuth account at a self-hosted server.
+ */
+function imapAuthOptions(username: string, auth: MailConnectionAuth) {
+  return auth.kind === "oauth"
+    ? { user: username, accessToken: auth.accessToken }
+    : { user: username, pass: auth.password };
+}
+
+/**
+ * The auth block for nodemailer, and the shape is the decision recorded in
+ * mail-oauth.ts's header: `{ type: "OAuth2", user, accessToken }` and
+ * DELIBERATELY NOTHING ELSE.
+ *
+ * WHAT THE OMISSIONS DO, measured against nodemailer 9.0.5 rather than assumed.
+ * `SMTPTransport.getAuth` turns a `type: "OAuth2"` block into an `XOAuth2`
+ * instance (lib/smtp-transport/index.js), and `XOAuth2.getToken` renews only
+ * when it holds a refreshToken, a provisionCallback or a serviceClient
+ * (lib/xoauth2/index.js) -- with none of them it reuses the token it was given
+ * and never contacts a token endpoint. So leaving clientId/clientSecret/
+ * refreshToken/accessUrl out is what makes Conduit the only refresher, and
+ * `expires` is left out for the same reason: with no renewal available it could
+ * only turn a fresh token into a "no refresh capability" log line.
+ *
+ * `user` is required, not decoration: getAuth returns FALSE for an OAuth2 block
+ * with neither `user` nor `service`, and a false auth makes nodemailer send the
+ * message with no authentication at all.
+ */
+function smtpAuthOptions(username: string, auth: MailConnectionAuth): SMTPTransport.Options["auth"] {
+  return auth.kind === "oauth"
+    ? { type: "OAuth2", user: username, accessToken: auth.accessToken }
+    : { user: username, pass: auth.password };
 }
 
 /**
@@ -278,7 +331,7 @@ export function buildImapOptions(
     port: settings.port,
     secure: settings.security === "tls",
     ...(settings.security === "starttls" ? { doSTARTTLS: true } : {}),
-    auth: { user: settings.username, pass: settings.password },
+    auth: imapAuthOptions(settings.username, settings.auth),
     connectionTimeout: CONNECT_TIMEOUT_MS,
     greetingTimeout: GREETING_TIMEOUT_MS,
     socketTimeout: SOCKET_TIMEOUT_MS,
@@ -306,7 +359,7 @@ export function buildSmtpOptions(
     port: settings.port,
     secure: settings.security === "tls",
     ...(settings.security === "starttls" ? { requireTLS: true } : {}),
-    auth: { user: settings.username, pass: settings.password },
+    auth: smtpAuthOptions(settings.username, settings.auth),
     connectionTimeout: CONNECT_TIMEOUT_MS,
     greetingTimeout: GREETING_TIMEOUT_MS,
     socketTimeout: SOCKET_TIMEOUT_MS,
@@ -459,6 +512,27 @@ const SPECIAL_USE_BY_LISTING_FLAG = new Map<string, SpecialUse>([
 const UNSELECTABLE_FLAGS = new Set(["\\noselect", "\\nonexistent"]);
 
 /**
+ * Mailbox attributes that mean "the messages in here also live elsewhere".
+ *
+ * THE THREE THAT MAKE A GMAIL MAILBOX SYNC ITSELF SEVERAL TIMES. `\All` is RFC
+ * 6154's "all messages" and is `[Gmail]/All Mail`; `\Flagged` is its "virtual
+ * mailbox" of flagged messages and is `[Gmail]/Starred`; `\Important` is
+ * Gmail's own and is not in RFC 6154 at all. Read from `flags` rather than from
+ * `specialUse` because SPECIAL_USE_BY_LISTING_FLAG deliberately maps none of
+ * them to one of the CRM's five roles -- and it should not start to, for the
+ * reason its own comment gives.
+ *
+ * Case-insensitive, matching UNSELECTABLE_FLAGS above and for the same reason:
+ * RFC 3501 mailbox attributes are case-insensitive and `flags` holds the
+ * server's spelling verbatim.
+ *
+ * NOTHING IS FILTERED OUT ON ACCOUNT OF THIS. The listing still reports these
+ * mailboxes; what changes is only the sync_enabled a folder gets on its FIRST
+ * sighting (mail-imap.ts's `virtual`, mail-folders.ts's defaultSyncEnabled).
+ */
+const VIRTUAL_FLAGS = new Set(["\\all", "\\flagged", "\\important"]);
+
+/**
  * imapflow's LIST result as the contract's listings, or a readable error for
  * either falsy shape (see mail-imap.ts's `list`).
  *
@@ -477,13 +551,21 @@ export function readFolderListing(
       ? undefined
       : SPECIAL_USE_BY_LISTING_FLAG.get(entry.specialUse);
     let selectable = true;
+    let virtual = false;
     for (const flag of entry.flags) {
-      if (UNSELECTABLE_FLAGS.has(flag.toLowerCase())) { selectable = false; break; }
+      const lower = flag.toLowerCase();
+      if (UNSELECTABLE_FLAGS.has(lower)) selectable = false;
+      if (VIRTUAL_FLAGS.has(lower)) virtual = true;
     }
     return {
       folder: entry.path,
       ...(role === undefined ? {} : { specialUse: role }),
       selectable,
+      // Omitted rather than `virtual: false`, so a listing from a server with
+      // no such attribute is byte-identical to the one this function used to
+      // produce -- which is what keeps every existing assertion on a whole
+      // listing object meaningful instead of quietly needing a new key.
+      ...(virtual ? { virtual: true } : {}),
       // One shape for "the server reports no hierarchy", so mail-folders.ts
       // does not have to know about two.
       delimiter: entry.delimiter === undefined || entry.delimiter === "" ? null : entry.delimiter,
@@ -978,12 +1060,34 @@ export function createImapClientFactory(
 // --- Verification (the test-connection endpoint's real deps) ---------------
 
 /**
+ * VerifySettings AND ConnectionSettings are now the same shape, which is what
+ * Task 3 said this seam would become.
+ *
+ * Until an OAuth account could exist, VerifySettings carried a bare `password`
+ * and this function wrapped it -- a deliberate hold, because widening the shape
+ * while the test-connection endpoint could only ever reach a password would
+ * have been a seam with nothing on the other side of it. It can now reach a
+ * token (mail-accounts.ts's resolveStoredAuth), so the two types met and the
+ * wrapper became the identity.
+ *
+ * KEPT AS A FUNCTION RATHER THAN DELETED, and only just: it is the one place
+ * that asserts the two interfaces still agree. If mail-accounts.ts's
+ * VerifySettings and this file's ConnectionSettings ever drift, this line stops
+ * compiling -- which is worth more than the line costs, because the alternative
+ * is two structurally-identical interfaces silently growing apart across a
+ * module boundary that exists to keep this adapter out of the accounts service.
+ */
+function verifyAuth(settings: VerifySettings): ConnectionSettings {
+  return settings;
+}
+
+/**
  * Log in and hang up. imapflow's `verifyOnly` does exactly that -- it logs
  * out as soon as authentication succeeds -- so this never selects a mailbox
  * or touches a message.
  */
 export async function imapVerify(settings: VerifySettings): Promise<void> {
-  const client = new ImapFlow({ ...buildImapOptions(settings), verifyOnly: true });
+  const client = new ImapFlow({ ...buildImapOptions(verifyAuth(settings)), verifyOnly: true });
   client.on("error", () => { /* see ImapflowClient's constructor */ });
   try {
     await client.connect();
@@ -1001,7 +1105,7 @@ export async function imapVerify(settings: VerifySettings): Promise<void> {
 /** nodemailer's own connection+login check (EHLO, STARTTLS if required,
  * AUTH), with no message sent. */
 export async function smtpVerify(settings: VerifySettings): Promise<void> {
-  const transport = nodemailer.createTransport(buildSmtpOptions(settings));
+  const transport = nodemailer.createTransport(buildSmtpOptions(verifyAuth(settings)));
   try {
     await transport.verify();
   } catch (error) {
@@ -1039,13 +1143,20 @@ export const defaultTestConnectionDeps: TestConnectionDeps = { imapVerify, smtpV
  * and mail-imap.ts's ERROR CLASSIFICATION.
  */
 export function createSmtpTransportFactory(options: MailAdapterOptions = {}): SendMailTransportFactory {
-  return (account, credentials) => {
+  // TAKES AN ALREADY-RESOLVED CREDENTIAL, not the stored union, as of Phase 8
+  // Task 2. mail-send.ts resolves it (mail-oauth.ts's resolveConnectionAuth)
+  // before calling this, which is what keeps the database, the token endpoint
+  // and mail.key out of the one module whose job is to map settings onto
+  // imapflow and nodemailer. It also means the SMTP half no longer narrows the
+  // union at all: which of the two passwords, or a token, is somebody else's
+  // decided question by the time it arrives.
+  return (account, auth) => {
     const transport = nodemailer.createTransport(buildSmtpOptions({
       host: account.smtpHost,
       port: account.smtpPort,
       security: account.smtpSecurity,
       username: account.username,
-      password: credentials.smtpPassword,
+      auth,
     }, options));
     return {
       async sendMail(message): Promise<unknown> {

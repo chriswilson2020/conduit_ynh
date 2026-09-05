@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema, mailVisibilitySchema,
+  mailAuthMethodSchema, mailOAuthProviderOf,
   CONTACT_FIELD_CAPS, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -21,6 +22,8 @@ import { createPipeline, createStage } from "../services/pipelines.js";
 import { createDeal } from "../services/deals.js";
 import { createProject } from "../services/projects.js";
 import { listThreads } from "../services/mail-threads.js";
+import { decryptCredentials } from "../services/mail-crypto.js";
+import { LEGACY_MAIL_KEY_BASE64, LEGACY_PASSWORD_BLOBS } from "../test/legacy-mail-credentials.js";
 import { createDatabase, migrationsFolder, type DatabaseHandle } from "./client.js";
 import {
   users, companies, contacts, pipelines, stages, deals, projects, events, files,
@@ -314,7 +317,11 @@ describe("mail schema (0004)", () => {
   // insert, and a value outside the enum must be rejected by the CHECK.
   it("keeps mailSecuritySchema/mailAccountStatusSchema/mailDirectionSchema in sync with their DB CHECKs", async () => {
     expect(mailSecuritySchema.options).toEqual(["tls", "starttls"]);
-    expect(mailAccountStatusSchema.options).toEqual(["active", "error"]);
+    // 'auth_required' is Phase 8 Task 2's third state: the failure a retry can
+    // never clear. Listed here so widening the zod enum without widening 0015's
+    // CHECK (or the reverse) is a red test rather than a runtime 23514 the
+    // first time an OAuth grant lapses on a real install.
+    expect(mailAccountStatusSchema.options).toEqual(["active", "error", "auth_required"]);
     expect(mailDirectionSchema.options).toEqual(["inbound", "outbound"]);
 
     // Distinct emails per row: mail_accounts_user_email_active_unique (this
@@ -806,16 +813,26 @@ describe("mail thread hides schema (0007)", () => {
       // both threads post-upgrade (the 4.2 visibility predicate hides a
       // message-less thread from every inbox) -- what turns the final
       // assertions into a real proof that it is the HIDE rows, not
-      // visibility, deciding each list. mail_accounts/mail_messages are
-      // byte-identical between 0006 and 0007, so drizzle inserts describe
-      // this old shape exactly.
-      const [account] = await scratch.db.insert(mailAccounts).values({
-        userId: chris!.id, label: "Team", email: "team@example.com",
-        imapHost: "localhost", imapPort: 993, imapSecurity: "tls",
-        smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls",
-        username: "chris", credentialsCiphertext: "v1:iv:tag:data",
-        visibility: "shared",
-      }).returning();
+      // visibility, deciding each list.
+      //
+      // RAW SQL, naming only the columns mail_accounts had at 0006. This used
+      // to be a drizzle insert, on the stated grounds that the table was
+      // "byte-identical between 0006 and 0007" -- true when it was written and
+      // false the moment 0014 added auth_method, because a drizzle insert names
+      // every column schema.ts knows about and this database is nine migrations
+      // short of that one. It failed exactly that way, which is the reason this
+      // is now the same old-shape technique the 0005/0006/0014 drills use: a
+      // drill seeding the OLD shape cannot describe it with the NEW schema
+      // object, however alike the two look on the day it is written.
+      const [account] = await scratch.db.execute<{ id: string }>(sql`
+        INSERT INTO mail_accounts
+          (user_id, label, email, imap_host, imap_port, imap_security,
+           smtp_host, smtp_port, smtp_security, username, credentials_ciphertext, visibility)
+        VALUES
+          (${chris!.id}, 'Team', 'team@example.com', 'localhost', 993, 'tls',
+           'localhost', 587, 'starttls', 'chris', 'v1:iv:tag:data', 'shared')
+        RETURNING id
+      `);
       for (const thread of [archived!, live!]) {
         await scratch.db.insert(mailMessages).values({
           accountId: account!.id, threadId: thread.id,
@@ -2162,4 +2179,156 @@ describe("the duplicate probe's indexes (0013)", () => {
       expect(folded[0]?.hit).toBe(1);
     });
   }, 30000);
+});
+
+describe("mail re-authentication state (0015)", () => {
+  /**
+   * 0015 REPLACES A CONSTRAINT RATHER THAN ADDING A COLUMN, and that is a
+   * different kind of risk from 0014's. `DROP CONSTRAINT` without IF EXISTS
+   * fails hard against a table whose constraint is not named exactly
+   * `mail_accounts_status_valid` -- and a failed migration is a server that
+   * does not boot, on an install that was working a minute earlier. The only
+   * honest way to know the name matches what earlier migrations really created
+   * is to run the whole chain against a real pre-0015 database, which is what
+   * this does.
+   *
+   * IT ALSO PINS THAT NOTHING MOVES. The new predicate is a strict superset of
+   * the old one, so a row that was 'error' before must still be 'error'
+   * afterwards -- the migration widens what is legal, it does not reclassify
+   * anything.
+   */
+  it("applies migration 0015 to a real pre-0015 database, keeping existing statuses and admitting the new one", async () => {
+    await withPreMigrationDatabase("0015", async (scratch) => {
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const [account] = await scratch.db.insert(mailAccounts).values({
+        userId: user!.id, label: "Work", email: "chris@example.com",
+        imapHost: "localhost", imapPort: 993, imapSecurity: "tls",
+        smtpHost: "localhost", smtpPort: 587, smtpSecurity: "starttls",
+        username: "chris", credentialsCiphertext: "v1:x:y:z", status: "error",
+        lastError: "connection: ECONNREFUSED",
+      }).returning();
+
+      // The drill's own premise: before the upgrade the new value really is
+      // refused, so the assertion after it is about the migration rather than
+      // about a CHECK that never constrained anything.
+      await expect(scratch.db.update(mailAccounts)
+        .set({ status: "auth_required" }).where(eq(mailAccounts.id, account!.id)))
+        .rejects.toMatchObject({
+          cause: { message: expect.stringMatching(/mail_accounts_status_valid|check/i) },
+        });
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const [reread] = await scratch.db.select().from(mailAccounts)
+        .where(eq(mailAccounts.id, account!.id));
+      expect(reread).toMatchObject({ status: "error", lastError: "connection: ECONNREFUSED" });
+
+      await scratch.db.update(mailAccounts)
+        .set({ status: "auth_required" }).where(eq(mailAccounts.id, account!.id));
+      const [after] = await scratch.db.select().from(mailAccounts)
+        .where(eq(mailAccounts.id, account!.id));
+      expect(after?.status).toBe("auth_required");
+    });
+  }, 30000);
+});
+
+describe("mail auth method (0014)", () => {
+  /**
+   * THE WHOLE OF PHASE 8'S MIGRATION IS A DEFAULT, and this is the drill that
+   * makes that claim mean something. Mirrors 0006's visibility drill exactly,
+   * because it is the same mechanism: a row is inserted while the column does
+   * not yet exist, and what fills it is the ALTER's DEFAULT rather than any
+   * UPDATE anybody wrote.
+   *
+   * AND IT CARRIES A REAL CREDENTIAL BLOB THROUGH THE UPGRADE. The account
+   * seeded below stores a ciphertext written by the PRE-UNION encoder
+   * (test/legacy-mail-credentials.ts), and after the migration it is decrypted
+   * by the post-union decrypter. That is the end-to-end statement of the thing
+   * this task exists to protect: an account that existed on v1.6.0 still hands
+   * back its password on v1.7.0 -- the migration did not touch the ciphertext,
+   * and the union still reads it.
+   */
+  it("applies migration 0014 to a real pre-0014 database -- a pre-existing account comes back auth_method 'password' and its old credential blob still decrypts", async () => {
+    await withPreMigrationDatabase("0014", async (scratch) => {
+      const legacy = LEGACY_PASSWORD_BLOBS[0]!;
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      // Raw SQL naming only the pre-0014 columns (the 0005/0006 old-shape
+      // technique): a drizzle insert would now name auth_method, and a row
+      // that supplied the value itself could not show the DEFAULT doing
+      // anything.
+      const [account] = await scratch.db.execute<{ id: string }>(sql`
+        INSERT INTO mail_accounts
+          (user_id, label, email, imap_host, imap_port, imap_security,
+           smtp_host, smtp_port, smtp_security, username, credentials_ciphertext)
+        VALUES
+          (${user!.id}, 'Work', 'chris@example.com', 'localhost', 993, 'tls',
+           'localhost', 587, 'starttls', 'chris', ${legacy.ciphertext})
+        RETURNING id
+      `);
+
+      // Pin the drill's own premise, exactly as the 0006 drill does: the raw
+      // insert above would ALSO succeed against a fully-migrated table (it
+      // simply names no auth_method, so the DEFAULT would fire at INSERT
+      // time), and 'password' below would then pass without the ALTER proving
+      // anything at all.
+      const [preState] = await scratch.db.execute<{ present: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'mail_accounts' AND column_name = 'auth_method'
+        ) AS present
+      `);
+      expect(preState?.present).toBe(false);
+
+      // Upgrade: the real, full migrations folder. 0014 is the only pending one.
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const [reread] = await scratch.db.select().from(mailAccounts)
+        .where(eq(mailAccounts.id, account!.id));
+      expect(reread).toMatchObject({
+        id: account!.id, email: "chris@example.com", authMethod: "password",
+      });
+      // Byte-for-byte: the migration is additive and must not have rewritten
+      // the one column whose contents nothing but mail.key can reconstruct.
+      expect(reread?.credentialsCiphertext).toBe(legacy.ciphertext);
+      // And it still decrypts, through the union, to what the old encoder sealed.
+      expect(decryptCredentials(Buffer.from(LEGACY_MAIL_KEY_BASE64, "base64"), reread!.credentialsCiphertext))
+        .toMatchObject({
+          kind: "password",
+          imapPassword: legacy.imapPassword,
+          smtpPassword: legacy.smtpPassword,
+        });
+    });
+  }, 30000);
+
+  it("defaults a fresh account's auth_method to password", async () => {
+    const [account] = await handle.db.insert(mailAccounts)
+      .values(accountValues({ email: "fresh-auth@example.com" })).returning();
+    expect(account?.authMethod).toBe("password");
+  });
+
+  // Mirrors the 0006 block's visibility equivalent: the shared enum and the
+  // column's CHECK are two spellings of one list, and a member added to either
+  // alone is a value that either cannot be stored or cannot be described.
+  it("keeps mailAuthMethodSchema in sync with mail_accounts' auth_method CHECK", async () => {
+    expect(mailAuthMethodSchema.options).toEqual(["password", "oauth_microsoft", "oauth_google"]);
+
+    for (const authMethod of mailAuthMethodSchema.options) {
+      await handle.db.insert(mailAccounts)
+        .values(accountValues({ authMethod, label: authMethod, email: `${authMethod}@example.com` }));
+    }
+    await expect(
+      handle.db.insert(mailAccounts)
+        .values(accountValues({ authMethod: "oauth_yahoo", email: "bogus-auth@example.com" })),
+    ).rejects.toMatchObject({
+      cause: { message: expect.stringMatching(/mail_accounts_auth_method_valid|check/i) },
+    });
+  });
+
+  // The provider is derived from this one column rather than stored beside it,
+  // so the derivation is part of the schema's contract, not a UI detail.
+  it("derives the provider from the auth method, and null for a password account", () => {
+    expect(mailOAuthProviderOf("password")).toBeNull();
+    expect(mailOAuthProviderOf("oauth_microsoft")).toBe("microsoft");
+    expect(mailOAuthProviderOf("oauth_google")).toBe("google");
+  });
 });

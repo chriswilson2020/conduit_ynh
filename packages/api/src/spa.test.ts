@@ -38,6 +38,8 @@ const baseConfig: Config = {
   // gate to open hands buildApp its own. Nothing passes the gate by forgetting.
   ldapUrl: "ldap://127.0.0.1:389",
   reauthPassword: null,
+  // No app registration: these tests build an app, never an OAuth account.
+  mailOAuth: { microsoft: null, google: null },
 };
 
 // A Database pointed at an address nothing listens on, with a short connect

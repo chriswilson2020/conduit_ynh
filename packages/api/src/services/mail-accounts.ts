@@ -2,12 +2,19 @@ import { and, desc, eq, isNull, isNotNull, ne } from "drizzle-orm";
 import type {
   MailAccount, MailAccountCreateInput, MailAccountUpdateInput, MailAccountTestInput,
   MailAccountUpdatePasswordFields, MailAccountSummary, MailAccountList, MailAccountTestResult,
-  MailSecurity, MailAccountStatus, MailVisibility,
+  MailSecurity, MailAccountStatus, MailVisibility, MailAuthMethod,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { mailAccounts, type MailAccountRow } from "../db/schema.js";
-import { NotFoundError, ArchivedError, ConflictError, IncompleteTestConnectionSettingsError } from "./errors.js";
-import { encryptCredentialsAt, decryptCredentialsAt, type MailCredentials } from "./mail-crypto.js";
+import {
+  NotFoundError, ArchivedError, ConflictError, IncompleteTestConnectionSettingsError,
+  MailCredentialKindError,
+} from "./errors.js";
+import {
+  encryptCredentialsAt, decryptCredentialsAt, mustBePasswordCredentials, type MailCredentials,
+} from "./mail-crypto.js";
+import type { MailConnectionAuth } from "./mail-imap.js";
+import { resolveConnectionAuth, unconfiguredTokenRefresher, type MailTokenRefresher } from "./mail-oauth.js";
 import { sanitizeMailHtml } from "./mail-content.js";
 import { publish } from "./sse.js";
 
@@ -155,6 +162,7 @@ function toMailAccount(row: MailAccountRow) {
     trashFolder: row.trashFolder, archiveFolder: row.archiveFolder,
     signatureHtml: row.signatureHtml, backfillDays: row.backfillDays,
     visibility: row.visibility as MailVisibility,
+    authMethod: row.authMethod as MailAuthMethod,
     status: row.status as MailAccountStatus, lastError: row.lastError,
     lastSyncedAt: row.lastSyncedAt?.toISOString() ?? null,
     archivedAt: row.archivedAt?.toISOString() ?? null,
@@ -238,6 +246,170 @@ export async function createAccount(
   // A brand-new account has no sync at all yet, so this is always the full
   // create path.
   notifyAccountChanged(row.id, { connectionChanged: true });
+  publishAccountsHint();
+  return toMailAccount(row);
+}
+
+/** The connection an OAuth account is created with -- the provider's own
+ * endpoints, resolved by services/mail-oauth-signin.ts's provider table.
+ *
+ * TAKEN AS PLAIN FIELDS RATHER THAN A PROVIDER NAME, so this module stays the
+ * writer of mail_accounts and never becomes a directory of mailbox hosts. It is
+ * the same division mail-imapflow.ts has with `rejectUnauthorized`: the caller
+ * that knows resolves, and the one that writes takes values. */
+export interface OAuthAccountConnection {
+  imapHost: string; imapPort: number; imapSecurity: MailSecurity;
+  smtpHost: string; smtpPort: number; smtpSecurity: MailSecurity;
+  username: string; sentFolder: string;
+}
+
+export interface OAuthAccountInput extends OAuthAccountConnection {
+  label: string;
+  email: string;
+  /** 'oauth_microsoft' or 'oauth_google'. Typed as the whole enum because the
+   * column is, and narrowed by the caller that built it from a provider. */
+  authMethod: MailAuthMethod;
+  backfillDays?: number | null;
+}
+
+/**
+ * Create an account that authenticates with a provider (Phase 8 Task 3).
+ *
+ * A SECOND CREATE FUNCTION RATHER THAN A BRANCH IN THE FIRST, and the reason is
+ * what each is handed. createAccount takes a MailAccountCreateInput -- a form
+ * submission, with a password in it -- and seals that password itself. This
+ * takes a CIPHERTEXT that mail-oauth-signin.ts already sealed with
+ * encryptCredentialsChecked, because the payload came from an HTTP response and
+ * had to be validated before the cipher rather than after (mail-crypto.ts's
+ * encryptCredentials: "serialises, does not validate"). Folding the two into
+ * one function would mean one signature carrying both a plaintext password and
+ * a sealed blob, with a comment explaining that exactly one of them is ever set.
+ *
+ * THE COLUMN AND THE BLOB ARE WRITTEN IN ONE STATEMENT, which is the invariant
+ * MailAuthMethodMismatchError exists to guard: auth_method and
+ * credentials_ciphertext are two halves of one fact, and this is the only place
+ * that creates them.
+ *
+ * NO status ARGUMENT. A new account is 'active' like any other; whether the
+ * grant works is the first sync pass's question.
+ */
+export async function createOAuthAccount(
+  db: Database, actorId: string, input: OAuthAccountInput, credentialsCiphertext: string,
+): Promise<MailAccount> {
+  let row: MailAccountRow | undefined;
+  try {
+    [row] = await db.insert(mailAccounts).values({
+      userId: actorId, label: input.label, email: input.email,
+      imapHost: input.imapHost, imapPort: input.imapPort, imapSecurity: input.imapSecurity,
+      smtpHost: input.smtpHost, smtpPort: input.smtpPort, smtpSecurity: input.smtpSecurity,
+      username: input.username,
+      credentialsCiphertext,
+      authMethod: input.authMethod,
+      sentFolder: input.sentFolder,
+      // Conditional spread for the same reason createAccount uses one: an
+      // omitted backfill takes the column default (90 days), while an explicit
+      // null means "sync everything" and must survive.
+      ...(input.backfillDays !== undefined ? { backfillDays: input.backfillDays } : {}),
+      // No signature: there is no field for one on the OAuth form and the
+      // column is nullable. Settings adds one afterwards like any other.
+      status: "active",
+    }).returning();
+  } catch (err) {
+    // The same unique index createAccount meets, for the same reason: re-adding
+    // a mailbox that is already here would sync every message a second time
+    // under a new account id. Reachable from a DIFFERENT gesture, though --
+    // signing in to a mailbox that is already configured with a password -- so
+    // the message is the one an operator needs either way.
+    if (isUniqueViolation(err)) throw new ConflictError("mail account", input.email, DUPLICATE_MAILBOX_MESSAGE);
+    throw err;
+  }
+  if (row === undefined) throw new Error("insert returned no row");
+  notifyAccountChanged(row.id, { connectionChanged: true });
+  publishAccountsHint();
+  return toMailAccount(row);
+}
+
+/**
+ * Replace an OAuth account's stored grant with a freshly authorised one -- the
+ * "Sign in again" path (Phase 8 Task 3).
+ *
+ * IT RESETS status, WHICH MAKES THIS A THIRD WRITER OF THAT COLUMN, and the
+ * entitlement is worth stating because two writers to a state column is how a
+ * state gets silently overwritten (mail-oauth.ts's header says so about the
+ * refresh path, which deliberately does NOT write it). The difference is
+ * causal: 'auth_required' is a verdict about a SPECIFIC refresh token, and this
+ * statement replaces that token in the same transaction. The verdict is stale
+ * by construction the moment the bytes change, so leaving it would leave the
+ * row telling the operator to do the thing they have just done. It is the same
+ * argument updateAccount's shouldResetStatus makes for a password change, one
+ * credential type over.
+ *
+ * IT DOES NOT CLEAR 'active', obviously, and it does not need to distinguish
+ * 'error' from 'auth_required': a new grant plausibly fixes either, the sync
+ * loop re-decides on its very next pass, and notifyAccountChanged below makes
+ * that pass happen in seconds rather than at the end of a 32-minute backoff.
+ *
+ * THE RACE IS REAL AND IT SELF-HEALS, which is why it is named rather than
+ * locked against. A pass that started BEFORE this transaction can finish after
+ * it and write 'auth_required' back, from a verdict about the token this
+ * statement has already replaced -- so the badge can flicker back for one
+ * interval. It does not stick: notifyAccountChanged restarts the AccountSync,
+ * whose first pass then succeeds and writes 'active'. Holding a lock across
+ * that would mean holding one across a provider round trip, which is the thing
+ * persistRefreshedToken's own comment is careful not to do.
+ *
+ * THREE REFUSALS, ALL ConflictError, all under the row lock:
+ *
+ * - AN ARCHIVED ACCOUNT. Archiving stops sync and hides the mailbox; signing
+ *   in to one would store a live credential for something deliberately put
+ *   away. Unarchive first, exactly as updateAccount requires.
+ * - A DIFFERENT PROVIDER. Re-authorising a Microsoft account against Google is
+ *   not a re-authorisation, it is a different mailbox wearing this row's label
+ *   -- and it would leave every stored message filed under an account that no
+ *   longer points at the server they came from.
+ * - A PASSWORD ACCOUNT. Converting one to OAuth is a real thing an operator
+ *   might want and is NOT this gesture: the addresses need not match, the
+ *   stored password would be destroyed, and there is no screen that asks for
+ *   any of that. Refused rather than half-supported; the way to move a mailbox
+ *   to OAuth today is to add it as an OAuth account and archive the old row.
+ */
+export async function replaceOAuthCredentials(
+  db: Database, actorId: string, id: string, authMethod: MailAuthMethod,
+  credentialsCiphertext: string, now: Date,
+): Promise<MailAccount> {
+  await mustGetOwned(db, actorId, id);
+
+  const row = await db.transaction(async (tx) => {
+    const [locked] = await tx.select().from(mailAccounts).where(eq(mailAccounts.id, id)).for("update");
+    if (locked === undefined) throw new NotFoundError("mail account", id);
+    if (locked.archivedAt !== null) throw new ArchivedError("mail account", id);
+    if (locked.authMethod !== authMethod) {
+      throw new ConflictError(
+        "mail account", id,
+        locked.authMethod === "password"
+          ? "this mailbox signs in with a password; add it again as a provider mailbox instead of"
+            + " signing in to this one"
+          : `this mailbox is signed in with '${locked.authMethod}', not '${authMethod}'`,
+      );
+    }
+    const [updated] = await tx.update(mailAccounts).set({
+      credentialsCiphertext,
+      status: "active" as const,
+      lastError: null,
+      updatedAt: now,
+      // isNull(archivedAt) is the same defence in depth updateAccount carries:
+      // the FOR UPDATE above already makes a concurrent archive impossible, and
+      // this keeps a future writer that forgets the lock failing closed.
+    }).where(and(eq(mailAccounts.id, id), isNull(mailAccounts.archivedAt))).returning();
+    if (updated === undefined) throw new ArchivedError("mail account", id);
+    return updated;
+  });
+
+  // connectionChanged, so the AccountSync RESTARTS rather than merely waking:
+  // an account that reached 'auth_required' is sitting in a capped 32-minute
+  // backoff, and a wake would leave the operator watching a row that says
+  // nothing for half an hour after a sign-in that worked.
+  notifyAccountChanged(id, { connectionChanged: true });
   publishAccountsHint();
   return toMailAccount(row);
 }
@@ -378,6 +550,33 @@ export async function updateAccount(
       return { row: locked, wrote: false, connectionChanged: false, visibilityChanged: false };
     }
 
+    // A PASSWORD SUBMITTED FOR AN OAUTH ACCOUNT IS REFUSED, AND UNTIL TASK 3 IT
+    // WAS NOT. This is the seam Tasks 1 and 2 left here, and reading it again
+    // once an OAuth account could actually EXIST turned up more than the
+    // carry-forward branch below.
+    //
+    // Without this line, a PATCH carrying `password` on an OAuth account
+    // reached freshCredentialsCiphertext -- computed above, outside the
+    // transaction, from the submission alone -- and that password blob was
+    // written straight over the row's refresh token. auth_method stayed
+    // 'oauth_microsoft'. The result is the exact state
+    // MailAuthMethodMismatchError calls "unreachable by construction": the
+    // column and the blob disagreeing, the grant destroyed with no backup that
+    // helps, and every subsequent connection failing with a mismatch nobody
+    // asked for. It was genuinely unreachable while nothing could create an
+    // OAuth account; this task is what makes it reachable, so this task is
+    // where it is closed.
+    //
+    // ON THE COLUMN, NOT ON THE BLOB, which is the other half of the fix. This
+    // needs no mail.key and no decrypt, so it refuses correctly even on an
+    // install whose key is missing or has been restored from the wrong backup
+    // -- the two states in which the decrypt-and-narrow below would throw
+    // something about credentials being unreadable over a request whose real
+    // problem is that this mailbox has no password to set.
+    if (wantsPasswordChange && locked.authMethod !== "password") {
+      throw new MailCredentialKindError(id, "oauth");
+    }
+
     let credentialsCiphertext = freshCredentialsCiphertext;
     if (credentialsCiphertext === undefined && wantsSmtpPasswordAloneChange) {
       // The ciphertext holds BOTH imap+smtp passwords as one JSON blob (GCM
@@ -386,7 +585,18 @@ export async function updateAccount(
       // unchanged -- decrypting the row THIS transaction holds a lock on,
       // not a pre-transaction read, is what makes this race-safe (see the
       // doc comment above).
-      const current = decryptCredentialsAt(mailKeyPath, locked.credentialsCiphertext);
+      // mustBePasswordCredentials, not a cast, and it is no longer the guard --
+      // the auth_method check above is, and it fires before this line for every
+      // OAuth account without touching mail.key. What remains here is the
+      // NARROWING the type system needs (decryptCredentialsAt returns the
+      // union; this branch wants `.imapPassword`) plus a fail-closed backstop
+      // for the one state the column check cannot see: a row whose auth_method
+      // says 'password' over a blob that is not one. That is exactly what
+      // MailCredentialKindError was written for, and a cast here would turn it
+      // into an undefined password sealed into a new blob.
+      const current = mustBePasswordCredentials(
+        decryptCredentialsAt(mailKeyPath, locked.credentialsCiphertext), id,
+      );
       credentialsCiphertext = encryptCredentialsAt(mailKeyPath, {
         imapPassword: current.imapPassword,
         smtpPassword: smtpPassword as string,
@@ -611,15 +821,39 @@ export async function listAccounts(db: Database, actorId: string): Promise<MailA
 /** One protocol's connection settings, as testConnection resolves them (and
  * as mail-imapflow.ts's real imapVerify/smtpVerify consume them). Exported so
  * the adapter can name the type rather than redeclare it and hope the two
- * stay identical. */
+ * stay identical.
+ *
+ * `password: string` BECAME `auth: MailConnectionAuth` IN TASK 3, which is the
+ * change mail-imapflow.ts's verifyAuth said would be Task 3's and not an
+ * oversight. Until now the only credential this endpoint could reach was a
+ * stored password, because an OAuth account could not exist; now one can, and
+ * "test this connection" has to mean the same thing for both. It is the same
+ * type the sync engine and the send path already resolve to
+ * (mail-imap.ts's MailConnectionAuth), so there is one answer to "what
+ * authenticates a connection" rather than one per entry point. */
 export interface VerifySettings {
-  host: string; port: number; security: MailSecurity; username: string; password: string;
+  host: string; port: number; security: MailSecurity; username: string;
+  auth: MailConnectionAuth;
 }
 export interface TestConnectionDeps {
   // Resolve on a successful login, reject with an Error otherwise -- mirrors
   // nodemailer's transporter.verify() (the real Task 6 implementation).
   imapVerify: (settings: VerifySettings) => Promise<void>;
   smtpVerify: (settings: VerifySettings) => Promise<void>;
+  /**
+   * How an OAuth account's refresh token becomes an access token to test with.
+   *
+   * OPTIONAL, AND THE DEFAULT IS A REFUSAL RATHER THAN A NO-OP -- the same
+   * arrangement, and the same reasoning, as mail-sync.ts's and mail-send.ts's
+   * (mail-oauth.ts's unconfiguredTokenRefresher). Every password account tests
+   * without touching it, which is every account on this deployment, so a caller
+   * that never signs in at a provider passes nothing; a caller that does and
+   * forgot gets a readable sentence in the result rather than a TypeError.
+   */
+  refresh?: MailTokenRefresher;
+  /** The clock the token's expiry is compared against. Defaults to the real
+   * one; a test moves it rather than waiting an hour. */
+  now?: () => Date;
 }
 type ProtocolTestResult = MailAccountTestResult["imap"];
 
@@ -636,6 +870,82 @@ async function runVerify(verify: () => Promise<void>): Promise<ProtocolTestResul
     // here constructs a message containing one either, so this never leaks a
     // credential into the result the client sees.
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** A submitted password as a connection credential, or undefined when there is
+ * no submission. One function so the two protocol halves cannot spell the same
+ * wrapping two different ways. */
+function passwordAuth(password: string | undefined): MailConnectionAuth | undefined {
+  return password === undefined ? undefined : { kind: "password", password };
+}
+
+/**
+ * What the stored credential authenticates each protocol with -- or, when it
+ * cannot, the ONE SENTENCE both protocols report.
+ *
+ * A RESULT RATHER THAN A THROW, for the reason the old broad catch here existed:
+ * somebody pressing "Test connection" on a broken account needs the answer, not
+ * an error page. What changed in Task 3 is that there are now two genuinely
+ * different answers behind that, and collapsing them was the wrong-words problem
+ * Task 2 named:
+ *
+ * - "credentials unreadable" is about mail.key. It covers a missing key file, a
+ *   key that no longer decrypts this row (a restore, a rotation), and a
+ *   ciphertext that is not structurally v1 -- three causes with one remedy, and
+ *   the remedy is to submit a fresh password, which is why the wording steers
+ *   there. Deliberately broad, unchanged.
+ * - A DEAD OR UNRENEWABLE GRANT is not that. The row decrypted perfectly and the
+ *   provider refused, or could not be reached, or this install has no
+ *   registration to ask with. Reporting mail.key for any of those would send an
+ *   operator to a file that is fine. So the token layer's own message is
+ *   carried through, and it is already written for an operator to read
+ *   (MailReauthRequiredError's ends "Sign in again to resume syncing").
+ *
+ * NO TOKEN CAN REACH THE STRING. Everything returned here is either the fixed
+ * CREDENTIALS_UNREADABLE constant or an error message from mail-oauth.ts, which
+ * redacts this request's own secrets out of provider text and never adds one
+ * itself (that module's `redact`, and MailReauthRequiredError's own note).
+ */
+async function resolveStoredAuth(
+  db: Database, account: MailAccountRow, mailKeyPath: string, deps: TestConnectionDeps,
+): Promise<{ imap: MailConnectionAuth; smtp: MailConnectionAuth } | { failure: string }> {
+  let credentials: MailCredentials;
+  try {
+    credentials = decryptCredentialsAt(mailKeyPath, account.credentialsCiphertext);
+  } catch {
+    // MailKeyMissingError, MailCredentialDecryptError, and the plain Error a
+    // non-v1 ciphertext throws. See above for why they share one answer.
+    return { failure: CREDENTIALS_UNREADABLE };
+  }
+  const authDeps = {
+    db, mailKeyPath,
+    refresh: deps.refresh ?? unconfiguredTokenRefresher,
+    now: deps.now ?? (() => new Date()),
+  };
+  try {
+    const imap = await resolveConnectionAuth(authDeps, account, credentials, "imap");
+    // ONE RESOLUTION FOR AN OAUTH ACCOUNT, TWO FOR A PASSWORD ONE, and the
+    // asymmetry is the contract rather than an optimisation. An OAuth account
+    // has a single access token that authenticates both protocols (see
+    // resolveConnectionAuth: "there is nothing to pick"), while a password
+    // account has two halves and getting them the wrong way round is a failure
+    // that only shows up at the server.
+    //
+    // ASKING TWICE WOULD BE WORSE THAN WASTEFUL. `credentials` is one in-memory
+    // value, so a second call sees the SAME expired token and refreshes again --
+    // two grants against one refresh token, of which persistRefreshedToken's
+    // compare-and-set then keeps exactly one. At a provider that rotates
+    // (Microsoft always does) the discarded one may be the grant that retired
+    // the stored one, which is the unrecoverable case that write exists to
+    // avoid. Pressing "Test connection" must not be the thing that strands an
+    // account.
+    const smtp = imap.kind === "oauth"
+      ? imap
+      : await resolveConnectionAuth(authDeps, account, credentials, "smtp");
+    return { imap, smtp };
+  } catch (err) {
+    return { failure: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -664,36 +974,47 @@ async function runVerify(verify: () => Promise<void>): Promise<ProtocolTestResul
  *   the IncompleteTestConnectionSettingsError branch below -- it is a
  *   defensive guard for a direct service caller that bypasses the schema
  *   (e.g. a test), not a reachable route outcome.
+ *
+ * AN OAUTH ACCOUNT IS TESTED WITH A TOKEN (Phase 8 Task 3), which is the item
+ * Task 2 left here in as many words: this endpoint used to answer "credentials
+ * unreadable" for one, and that was the right OUTCOME under the wrong words --
+ * the credential read perfectly, there was simply no password to try and, until
+ * Task 2, nothing to try instead. There is now. The token resolution is the
+ * same resolveConnectionAuth the sync loop and the send path use, so what this
+ * endpoint proves is what a real connection would do rather than an
+ * approximation of it -- including a dead grant, which arrives here as the same
+ * "sign in again" sentence the Settings row carries.
  */
 export async function testConnection(
   db: Database, actorId: string, input: MailAccountTestInput, mailKeyPath: string, deps: TestConnectionDeps,
 ): Promise<MailAccountTestResult> {
   let account: MailAccountRow | undefined;
-  let storedImapPassword: string | undefined;
-  let storedSmtpPassword: string | undefined;
+  let storedImapAuth: MailConnectionAuth | undefined;
+  let storedSmtpAuth: MailConnectionAuth | undefined;
+  let isOAuth = false;
 
   if (input.accountId !== undefined) {
     account = await mustGetOwned(db, actorId, input.accountId);
     if (account.archivedAt !== null) throw new ArchivedError("mail account", input.accountId);
+    // On the COLUMN, not on the decrypted blob: this decides whether to read
+    // mail.key at all, so it cannot depend on having read it.
+    isOAuth = account.authMethod !== "password";
 
-    if (input.password === undefined) {
-      try {
-        const creds = decryptCredentialsAt(mailKeyPath, account.credentialsCiphertext);
-        storedImapPassword = creds.imapPassword;
-        storedSmtpPassword = creds.smtpPassword;
-      } catch {
-        // Deliberately broad: catches MailKeyMissingError, MailCredentialDecryptError,
-        // AND the plain Error decryptCredentials throws for a ciphertext that
-        // is not even structurally v1 (see mail-crypto.ts) -- every failure
-        // mode ends up meaning the same thing to a caller here, "cannot read
-        // the stored credentials." This is a test endpoint: someone pressing
-        // "Test connection" on a broken account needs an answer, never an
-        // unhandled 500.
-        return {
-          imap: { ok: false, error: CREDENTIALS_UNREADABLE },
-          smtp: { ok: false, error: CREDENTIALS_UNREADABLE },
-        };
+    // A SUBMITTED PASSWORD IS IGNORED FOR AN OAUTH ACCOUNT, rather than
+    // short-circuiting the stored credential as it does for a password one.
+    // The override exists so a REPLACEMENT password can be tested after
+    // mail.key was lost -- a repair that has no meaning here, because this
+    // account will never authenticate with a password whatever the test says.
+    // Honouring one would report success for a login the account cannot make,
+    // which is worse than any refusal.
+    const needsStored = input.password === undefined || isOAuth;
+    if (needsStored) {
+      const resolved = await resolveStoredAuth(db, account, mailKeyPath, deps);
+      if ("failure" in resolved) {
+        return { imap: { ok: false, error: resolved.failure }, smtp: { ok: false, error: resolved.failure } };
       }
+      storedImapAuth = resolved.imap;
+      storedSmtpAuth = resolved.smtp;
     }
   }
 
@@ -704,28 +1025,39 @@ export async function testConnection(
   const smtpPort = input.smtpPort ?? account?.smtpPort;
   const smtpSecurity = (input.smtpSecurity ?? account?.smtpSecurity) as MailSecurity | undefined;
   const username = input.username ?? account?.username;
-  // Same "SMTP differs" default as create/update: an explicit smtpPassword
-  // wins, else the single password field covers both protocols, else fall
-  // back to whatever was decrypted from storage above.
-  const imapPassword = input.password ?? storedImapPassword;
-  const smtpPassword = input.smtpPassword ?? input.password ?? storedSmtpPassword;
+  // TWO PRECEDENCES, AND WHICH ONE APPLIES IS THE ACCOUNT'S AUTH METHOD.
+  //
+  // For a password account, a submission WINS over storage, unchanged from
+  // before Phase 8: an explicit smtpPassword covers SMTP, else the single
+  // password field covers both protocols, else the stored pair. That ordering
+  // is what makes "test a replacement password against an account whose stored
+  // ciphertext no longer decrypts" work, and what makes the smtpPassword-alone
+  // case test the override against the stored IMAP half.
+  //
+  // For an OAuth account, STORAGE WINS and there is nothing to fall back to:
+  // see `needsStored` above for why honouring a submitted password there would
+  // report on a login the account cannot make.
+  const imapAuth = isOAuth ? storedImapAuth : (passwordAuth(input.password) ?? storedImapAuth);
+  const smtpAuth = isOAuth
+    ? storedSmtpAuth
+    : (passwordAuth(input.smtpPassword ?? input.password) ?? storedSmtpAuth);
 
   if (imapHost === undefined || imapPort === undefined || imapSecurity === undefined
-    || username === undefined || imapPassword === undefined) {
+    || username === undefined || imapAuth === undefined) {
     throw new IncompleteTestConnectionSettingsError(
       "testConnection: incomplete IMAP settings (missing accountId or required fields)",
     );
   }
   if (smtpHost === undefined || smtpPort === undefined || smtpSecurity === undefined
-    || smtpPassword === undefined) {
+    || smtpAuth === undefined) {
     throw new IncompleteTestConnectionSettingsError(
       "testConnection: incomplete SMTP settings (missing accountId or required fields)",
     );
   }
 
   const [imap, smtp] = await Promise.all([
-    runVerify(() => deps.imapVerify({ host: imapHost, port: imapPort, security: imapSecurity, username, password: imapPassword })),
-    runVerify(() => deps.smtpVerify({ host: smtpHost, port: smtpPort, security: smtpSecurity, username, password: smtpPassword })),
+    runVerify(() => deps.imapVerify({ host: imapHost, port: imapPort, security: imapSecurity, username, auth: imapAuth })),
+    runVerify(() => deps.smtpVerify({ host: smtpHost, port: smtpPort, security: smtpSecurity, username, auth: smtpAuth })),
   ]);
   return { imap, smtp } satisfies MailAccountTestResult;
 }

@@ -11,6 +11,13 @@ WorkingDirectory=__INSTALL_DIR__/
 Environment="PATH=__PATH_WITH_NODEJS__"
 Environment="NODE_ENV=production"
 EnvironmentFile=__INSTALL_DIR__/.env
+# Phase 8's OAuth app registration, if this install has one. The leading dash
+# means "carry on if it is absent", which is the ordinary case: mail accounts
+# here sign in with a password. It is a SECOND file rather than more lines in
+# .env because .env is re-rendered from conf/.env on every upgrade and would
+# silently discard whatever the operator put there -- see
+# scripts/_common.sh's conduit_ensure_oauth_env.
+EnvironmentFile=-__INSTALL_DIR__/.env.oauth
 ExecStart=__NODEJS_DIR__/node __INSTALL_DIR__/server/server.js
 Restart=always
 RestartSec=2s
