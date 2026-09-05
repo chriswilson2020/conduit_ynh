@@ -39,10 +39,18 @@ export default defineConfig({
     // report carries no trace and no screenshot for the attempt that failed
     // FIRST -- "the helper returned early", "the button was disabled" and "the
     // ingest had not finished" are not separated by anything an HTML report
-    // can show. `on-first-retry` keeps the trace of trial 0 for any test that
-    // goes on to be retried, which is every intermittent by definition, and
-    // costs nothing on a run where nothing is retried.
-    trace: "on-first-retry",
+    // can show.
+    //
+    // `retain-on-first-failure`, NOT `on-first-retry`, and the difference is
+    // the whole point rather than a preference. `on-first-retry` records the
+    // RETRY -- the attempt that usually passes -- and keeps nothing at all
+    // from the trial that failed. It is the cheaper setting and it answers a
+    // different question. This one traces every test's first run and keeps the
+    // trace only where that run failed, which is exactly the artifact the
+    // diagnosis wanted and did not have. The price is tracing overhead on
+    // first runs; against a spec whose first-trial failures have gone
+    // unexplained across three releases, it is worth paying.
+    trace: "retain-on-first-failure",
   },
   webServer: {
     command: "node packages/api/dist/server.js",
