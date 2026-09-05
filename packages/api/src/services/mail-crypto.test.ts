@@ -282,6 +282,21 @@ describe("the OAuth member of the credential union", () => {
     expect(() => decryptCredentials(key, ciphertext)).toThrow(MailCredentialDecryptError);
   });
 
+  // THE ASYMMETRY IS THE POINT, and a mutation is what put this test here: making
+  // the OAuth member's `kind` optional -- the way the password member's is --
+  // survived the whole suite. The password member cannot require its tag,
+  // because no blob written before Phase 8 has one. The OAuth member CAN, and
+  // must: there is no historical OAuth blob to accommodate, so an untagged
+  // `{refreshToken}` is a payload no writer of Conduit's ever produced, and
+  // accepting it would widen what a ciphertext that authenticates under
+  // mail.key is allowed to unwrap to for nothing in return. That widening is
+  // exactly what this schema's strictness exists to prevent.
+  it("refuses an untagged payload that merely looks like a refresh token", async () => {
+    const key = loadMailKey(await writeKey(randomBytes(32)));
+    const ciphertext = encryptCredentials(key, { refreshToken: "r" } as unknown as MailCredentialsInput);
+    expect(() => decryptCredentials(key, ciphertext)).toThrow(MailCredentialDecryptError);
+  });
+
   it("refuses an expiry that is not an ISO instant", async () => {
     const key = loadMailKey(await writeKey(randomBytes(32)));
     const ciphertext = encryptCredentials(key, {
