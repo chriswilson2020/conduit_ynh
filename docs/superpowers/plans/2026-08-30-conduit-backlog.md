@@ -1695,6 +1695,31 @@ v1.1.0; the rest are enumerated at that fix.
 
 ## If it becomes a product
 
+**M365 AND GMAIL REQUIRE A TENANT ADMINISTRATOR, ONCE PER INSTALL, AND CONDUIT CANNOT DESIGN
+THAT AWAY.** Raised by Chris on 5 Sep while Phase 8 was being built, and recorded because it
+reads as an oversight later if nobody writes down that it was considered.
+
+OAuth is "an app asks a provider for delegated access on a user's behalf", so the provider has to
+know who the app is -- that is what a client id and secret are. Registering one needs rights an
+ordinary user does not have: Azure app registration is usually restricted to admins or a
+delegated role, and Google's **Internal** publishing (the one that avoids verification and the
+7-day refresh-token revocation) requires the project to sit inside a Workspace organisation the
+operator administers. **So every install wanting M365 or Gmail needs somebody with tenant admin
+for a one-time job.**
+
+**The alternative was considered and rejected on a stronger ground than cost.** Conduit could
+ship its own client id and secret -- a multi-tenant Azure app, and for Google a published
+External app with restricted scopes (verification plus a paid annual security assessment). The
+cost is real, but the disqualifying objection is not the cost: **a shared registration means the
+project's maintainer holds a credential that participates in every install's mailbox access.**
+That is precisely the property somebody self-hosts to avoid. The data stays yours; so should the
+registration.
+
+**What it means for the software being generally usable:** "you cannot use M365 mail unless you
+can register an app in your tenant" is a real barrier for a user who is not their own
+administrator, and it sits beside the read-scoping and multi-user items below rather than being
+fixable on its own. For the deploy target it is a one-time job Chris can do himself.
+
 ~~**FOCUS AFTER NAVIGATION BELONGS HERE**~~ **-- MOVED OUT AGAIN THE SAME DAY. It is NEXT, and
 this paragraph is kept only so the reasoning that was wrong is visible.**
 
