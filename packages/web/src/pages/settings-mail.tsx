@@ -1,8 +1,11 @@
 import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
+import { useSearch } from "@tanstack/react-router";
 import { clsx } from "clsx";
+import { mailOAuthProviderOf } from "@conduit/shared";
 import type {
-  MailAccountFolder, MailAccountTestResult, MailAccountWithSyncStats, MailSecurity,
+  MailAccountFolder, MailAccountTestResult, MailAccountWithSyncStats, MailOAuthProvider,
+  MailSecurity,
 } from "@conduit/shared";
 import { relativeTime } from "../lib";
 import {
@@ -12,9 +15,11 @@ import {
   useDeleteFolder,
   useMailAccounts,
   useMailFolders,
+  useMailOAuthProviders,
   useMe,
   useRenameFolder,
   useSetFolderSync,
+  useStartMailOAuthSignin,
   useTestMailAccount,
   useUnarchiveMailAccount,
   useUpdateMailAccount,
@@ -26,6 +31,9 @@ import {
   accountReauthMessage,
   accountStatusLabel,
   buildCreateInput,
+  buildOAuthSigninInput,
+  buildOAuthUpdatePatch,
+  buildReauthorizeInput,
   buildTestInput,
   buildUpdatePatch,
   dovecotPreset,
@@ -34,8 +42,15 @@ import {
   folderDeleteWarning,
   folderRenameBlocked,
   initialFormState,
+  initialOAuthFormState,
+  providerLabel,
+  signedInWith,
+  signinBanner,
   validateForm,
+  validateOAuthForm,
   type AccountFormState,
+  type MailSigninMethod,
+  type OAuthFormState,
 } from "./settings-mail-lib";
 import { RichTextEditor } from "../components/mail/rich-text";
 import { SettingsLayout } from "../components/settings-layout";
@@ -72,6 +87,18 @@ export function SettingsMailPage() {
   // open rather than held here. See components/ui/dialog-focus.ts.
   const returnFocus = useDialogReturnFocus();
 
+  // Phase 8: what the OAuth callback redirected back with. Read from the URL
+  // rather than held in state because the callback is a full page navigation --
+  // this component is mounting for the first time when it arrives, so there is
+  // no state for it to have survived in.
+  const search = useSearch({ from: "/settings/mail" });
+  const banner = signinBanner(search);
+  // Fetched HERE as well as in the dialog, so the answer is already cached when
+  // the dialog opens and the add-account form never has to render a spinner
+  // before it can ask its first question. One query key, so this is one request
+  // per session (staleTime: Infinity -- it is deployment configuration).
+  useMailOAuthProviders();
+
   const own = data?.own ?? [];
   const active = own.filter((account) => account.archivedAt === null);
   const archived = own.filter((account) => account.archivedAt !== null);
@@ -80,6 +107,24 @@ export function SettingsMailPage() {
   return (
     <SettingsLayout title="Mail accounts">
       <div data-testid="mail-settings" className="flex flex-col gap-4">
+        {banner !== null && (
+          <p
+            data-testid="oauth-banner"
+            // role="status" for the success and role="alert" for the failure:
+            // one is an outcome the operator asked for and the other interrupts
+            // what they were about to do next.
+            role={banner.tone === "ok" ? "status" : "alert"}
+            className={clsx(
+              "rounded-md border px-3 py-2 text-sm",
+              banner.tone === "ok"
+                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                : "border-amber-200 bg-amber-50 text-amber-800",
+            )}
+          >
+            {banner.text}
+          </p>
+        )}
+
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-slate-900">Your mail accounts</h2>
           <Button
@@ -190,6 +235,7 @@ function AccountCard({
   const [showFolders, setShowFolders] = useState(false);
   const isArchived = account.archivedAt !== null;
   const reauthMessage = accountReauthMessage(account.status, account.authMethod);
+  const provider = mailOAuthProviderOf(account.authMethod);
 
   return (
     <section
@@ -203,6 +249,14 @@ function AccountCard({
             <StatusBadge status={account.status} archived={isArchived} />
           </div>
           <p className="text-sm text-slate-600">{account.email}</p>
+          {/* Phase 8: rendered from auth_method, which is in the clear -- the
+              whole reason that column exists is that a settings row must not
+              have to touch mail.key to say this (api: db/schema.ts). */}
+          {signedInWith(account.authMethod) !== null && (
+            <p data-testid={`signed-in-with-${account.id}`} className="mt-1 text-xs text-slate-500">
+              {signedInWith(account.authMethod)}
+            </p>
+          )}
           <p className="mt-1 text-xs text-slate-400">
             IMAP {account.imapHost}:{account.imapPort} ({account.imapSecurity})
             {" \u00B7 "}
@@ -233,6 +287,7 @@ function AccountCard({
           {!isArchived && (
             <>
               <Button variant="outline" onClick={(event) => onEdit(event.currentTarget)}>Edit</Button>
+              {provider !== null && <ReauthorizeButton accountId={account.id} provider={provider} />}
               <Button
                 variant="outline"
                 disabled={test.isPending}
@@ -304,6 +359,45 @@ function AccountCard({
           finds no sync loop to ask for a pass. */}
       {showFolders && <FolderPicker account={account} />}
     </section>
+  );
+}
+
+/**
+ * "Sign in again" -- send the operator back to the provider for a fresh grant
+ * (Phase 8 Task 3).
+ *
+ * ON EVERY OAUTH ACCOUNT, not only on one whose grant has lapsed. A grant can
+ * be revoked at the provider without this install hearing about it until the
+ * next pass, and the operator who has just fixed something at Azure should not
+ * have to wait for a badge before they can act. The lapsed case is the one that
+ * NEEDS it; the rest is a control that is where it will be looked for.
+ *
+ * THE NAVIGATION IS A FULL PAGE LOAD, deliberately: the consent screen is a
+ * third party's page and the callback comes back as a top-level request
+ * carrying SSOwat's identity, which is what the server's state check compares
+ * against. An iframe or a popup would work at both providers and would make
+ * that identity's presence a property of the browser's cookie policy.
+ */
+function ReauthorizeButton({ accountId, provider }: { accountId: string; provider: MailOAuthProvider }) {
+  const signin = useStartMailOAuthSignin();
+  return (
+    <>
+      <Button
+        variant="outline"
+        data-testid={`reauthorize-${accountId}`}
+        disabled={signin.isPending}
+        onClick={() => {
+          signin.mutate(buildReauthorizeInput(accountId, provider), {
+            onSuccess: ({ authorizeUrl }) => { window.location.assign(authorizeUrl); },
+          });
+        }}
+      >
+        {signin.isPending ? "Opening..." : "Sign in again"}
+      </Button>
+      {signin.isError && (
+        <p role="alert" className="w-full text-sm text-red-600">{signin.error.message}</p>
+      )}
+    </>
   );
 }
 
@@ -889,12 +983,239 @@ function MoveTargets({
   );
 }
 
+/**
+ * The dialog's one job before either form renders: which of the two paths this
+ * account is on.
+ *
+ * THE EXISTING PASSWORD PATH IS UNTOUCHED, which is the spec's requirement in
+ * as many words -- a self-hosted IMAP server with a password is still the
+ * common case on this install, and it is what an install with no app
+ * registration gets with no choice to make at all. The chooser appears only
+ * when there is something to choose between.
+ *
+ * AN EDIT NEVER OFFERS THE CHOICE. How an account authenticates is not a
+ * setting (mail_accounts.auth_method is deliberately not patchable): a password
+ * mailbox becomes an OAuth one by being added again and the old row archived,
+ * because the addresses need not match and the stored password would be
+ * destroyed on the way. The server refuses the conversion too
+ * (replaceOAuthCredentials); this is the same rule where the operator meets it.
+ */
 function AccountForm({
   account,
   onClose,
 }: {
   account?: MailAccountWithSyncStats;
   onClose: () => void;
+}) {
+  const oauth = useMailOAuthProviders();
+  const editingProvider = account === undefined ? null : mailOAuthProviderOf(account.authMethod);
+  const [method, setMethod] = useState<MailSigninMethod>(editingProvider ?? "password");
+  const providers = oauth.data?.providers ?? [];
+
+  if (editingProvider !== null) {
+    return <OAuthAccountForm account={account} provider={editingProvider} onClose={onClose} />;
+  }
+  if (account !== undefined) return <PasswordAccountForm account={account} onClose={onClose} />;
+  // WAIT RATHER THAN GUESS, and the page above has usually made this instant:
+  // it calls the same hook on mount, so by the time the dialog opens the answer
+  // is in the cache. Defaulting to the password form while the answer is in
+  // flight would render it and then swap it out from under a reader who had
+  // already started typing -- and the swap only happens on the installs that
+  // have a registration, which is the population least able to spare the
+  // confusion. A failed fetch falls through to the password path below, which
+  // is the honest answer: this install cannot offer a provider it cannot name.
+  if (oauth.isPending) {
+    return (
+      <div className="flex flex-col gap-4">
+        <DialogTitle>Add mail account</DialogTitle>
+        <p className="text-sm text-slate-400">Loading...</p>
+      </div>
+    );
+  }
+  if (providers.length === 0) return <PasswordAccountForm onClose={onClose} />;
+  return (
+    <div className="flex flex-col gap-4">
+      <DialogTitle>Add mail account</DialogTitle>
+      <fieldset className="flex flex-col gap-2">
+        <legend className="text-xs font-semibold uppercase text-slate-500">How does it sign in?</legend>
+        {/* Radios, not tabs: this is one question with one answer, and a radio
+            group is the control a screen reader announces that way. Password is
+            first and pre-selected because it is the common case here. */}
+        {(["password", ...providers] as MailSigninMethod[]).map((option) => (
+          <label key={option} className={CHECKBOX_LABEL}>
+            <input
+              type="radio"
+              name="signin-method"
+              value={option}
+              checked={method === option}
+              onChange={() => setMethod(option)}
+            />
+            {option === "password" ? "Password (IMAP and SMTP)" : providerLabel(option)}
+          </label>
+        ))}
+      </fieldset>
+      {method === "password"
+        ? <PasswordAccountForm onClose={onClose} embedded />
+        : <OAuthAccountForm provider={method} onClose={onClose} embedded />}
+    </div>
+  );
+}
+
+/**
+ * The OAuth path: a label, an address, and a button that leaves for the
+ * provider.
+ *
+ * NO HOST, PORT, SECURITY, USERNAME OR PASSWORD, and their absence is the
+ * feature. Those are the provider's and known (api:
+ * services/mail-oauth-signin.ts's provider table), the mailbox address IS the
+ * username, and there is no password to ask for. Everything this form has is
+ * something only the operator knows.
+ *
+ * CREATING LEAVES THE PAGE; EDITING DOES NOT. On a create, the submit hands the
+ * browser to the consent screen and the account appears when the callback
+ * brings it back -- so there is no create mutation here at all. On an edit, the
+ * three fields that are still this install's business are PATCHed like any
+ * other setting, and "Sign in again" is a separate control because renewing a
+ * grant is a different act from renaming a mailbox.
+ */
+function OAuthAccountForm({
+  account,
+  provider,
+  onClose,
+  embedded = false,
+}: {
+  account?: MailAccountWithSyncStats;
+  provider: MailOAuthProvider;
+  onClose: () => void;
+  /** Rendered inside the chooser above, which already carries the title. */
+  embedded?: boolean;
+}) {
+  const isEdit = account !== undefined;
+  const [state, setState] = useState<OAuthFormState>(() => initialOAuthFormState(account));
+  const [localError, setLocalError] = useState<string | null>(null);
+  const update = useUpdateMailAccount();
+  const signin = useStartMailOAuthSignin();
+
+  function set<K extends keyof OAuthFormState>(key: K, value: OAuthFormState[K]) {
+    setState((current) => ({ ...current, [key]: value }));
+  }
+
+  function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    const problem = validateOAuthForm(state, isEdit);
+    if (problem !== null) {
+      setLocalError(problem);
+      return;
+    }
+    setLocalError(null);
+    if (account === undefined) {
+      signin.mutate(buildOAuthSigninInput(state, provider), {
+        onSuccess: ({ authorizeUrl }) => { window.location.assign(authorizeUrl); },
+      });
+      return;
+    }
+    update.mutate({ id: account.id, patch: buildOAuthUpdatePatch(state) }, { onSuccess: onClose });
+  }
+
+  const pending = signin.isPending || update.isPending;
+  const submitError = signin.error ?? update.error;
+
+  return (
+    <form data-testid="oauth-account-form" onSubmit={handleSubmit} className="flex flex-col gap-4">
+      {!embedded && <DialogTitle>Edit mail account</DialogTitle>}
+
+      <p className="text-xs text-slate-500">
+        {isEdit
+          ? `${signedInWith(account.authMethod) ?? ""}. The server settings come from ${providerLabel(provider)}, so there is nothing to configure here.`
+          : `You will be sent to ${providerLabel(provider)} to sign in. Conduit never sees the password — it stores the sign-in ${providerLabel(provider)} gives back, encrypted.`}
+      </p>
+
+      <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
+        <Field label="Label" testId="oauth-label">
+          <Input value={state.label} onChange={(e) => set("label", e.target.value)} placeholder="Work" autoFocus />
+        </Field>
+        <Field label="Mailbox address" testId="oauth-email">
+          <Input
+            type="email"
+            value={state.email}
+            onChange={(e) => set("email", e.target.value)}
+            placeholder="you@example.com"
+            // The address is the mailbox the grant was issued for, and the
+            // username XOAUTH2 authenticates as. Changing it would leave a
+            // token that authenticates somebody else, so it is fixed once the
+            // account exists -- signing in to a different mailbox means adding
+            // one.
+            disabled={isEdit}
+            autoComplete="username"
+          />
+        </Field>
+      </div>
+
+      {isEdit && (
+        <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
+          <Field label="Sent folder" testId="oauth-sent-folder">
+            {/* Filled in per provider when the account was created ("Sent
+                Items", "[Gmail]/Sent Mail") and editable because a mailbox with
+                a non-default namespace can prove that starting value wrong. */}
+            <Input value={state.sentFolder} onChange={(e) => set("sentFolder", e.target.value)} />
+          </Field>
+          <Field label="Backfill" testId="oauth-backfill">
+            <BackfillSelect value={state.backfill} onChange={(value) => set("backfill", value)} account={account} />
+          </Field>
+        </div>
+      )}
+      {!isEdit && (
+        <Field label="Backfill" testId="oauth-backfill">
+          <BackfillSelect value={state.backfill} onChange={(value) => set("backfill", value)} />
+        </Field>
+      )}
+
+      {localError !== null && <p role="alert" className="text-sm text-red-600">{localError}</p>}
+      {submitError && <p role="alert" className="text-sm text-red-600">{submitError.message}</p>}
+
+      <div className="flex justify-end gap-2">
+        <Button variant="outline" onClick={onClose}>Cancel</Button>
+        <Button type="submit" disabled={pending}>
+          {pending ? "Opening..." : isEdit ? "Save changes" : `Continue with ${providerLabel(provider)}`}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+/** The 30/90/Everything control, shared by both forms so a backfill window an
+ * account already has cannot be silently rewritten by whichever form happens to
+ * open. */
+function BackfillSelect({
+  value, onChange, account,
+}: {
+  value: string; onChange: (value: string) => void; account?: MailAccountWithSyncStats;
+}) {
+  const options = [...new Set([
+    "30", "90", ...(account?.backfillDays != null ? [String(account.backfillDays)] : []),
+  ])];
+  return (
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger ariaLabel="Backfill">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {options.map((days) => <SelectItem key={days} value={days}>Last {days} days</SelectItem>)}
+        <SelectItem value="all">Everything</SelectItem>
+      </SelectContent>
+    </Select>
+  );
+}
+
+function PasswordAccountForm({
+  account,
+  onClose,
+  embedded = false,
+}: {
+  account?: MailAccountWithSyncStats;
+  onClose: () => void;
+  /** Rendered inside the chooser above, which already carries the title. */
+  embedded?: boolean;
 }) {
   const isEdit = account !== undefined;
   const { data: me } = useMe();
@@ -946,7 +1267,9 @@ function AccountForm({
 
   return (
     <form data-testid="account-form" onSubmit={handleSubmit} className="flex flex-col gap-4">
-      <DialogTitle>{isEdit ? "Edit mail account" : "Add mail account"}</DialogTitle>
+      {/* The chooser above already carries the title when this form is one of
+          its two branches; a second DialogTitle would announce twice. */}
+      {!embedded && <DialogTitle>{isEdit ? "Edit mail account" : "Add mail account"}</DialogTitle>}
 
       {/*
         Every field grid in this file collapses to one column below the

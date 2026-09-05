@@ -173,6 +173,16 @@ const mailRoute = createRoute({
 const settingsMailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/mail",
+  // Phase 8: where the OAuth callback lands. `?oauth=connected`, or
+  // `?oauth=failed&reason=<code>` -- a CODE, never the provider's own words,
+  // because a redirect's query string reaches a URL bar, a history entry and
+  // nginx's access log (api: services/mail-oauth-signin.ts's SigninOutcome).
+  // Loosely typed like every other search here: an unrecognised value degrades
+  // to a generic sentence rather than to a route that will not render.
+  validateSearch: (search: Record<string, unknown>): { oauth?: string; reason?: string } => ({
+    oauth: typeof search.oauth === "string" ? search.oauth : undefined,
+    reason: typeof search.reason === "string" ? search.reason : undefined,
+  }),
   component: SettingsMailPage,
 });
 

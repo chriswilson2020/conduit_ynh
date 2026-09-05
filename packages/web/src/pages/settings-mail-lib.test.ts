@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import type { MailAccount } from "@conduit/shared";
+import { withoutComments } from "../test/source";
 import {
   accountReauthMessage,
   accountStatusLabel,
@@ -11,10 +13,18 @@ import {
   folderDeleteBlocked,
   folderDeleteWarning,
   folderRenameBlocked,
+  buildOAuthSigninInput,
+  buildOAuthUpdatePatch,
+  buildReauthorizeInput,
   initialFormState,
+  initialOAuthFormState,
   isPort,
+  providerLabel,
   settingsFields,
+  signedInWith,
+  signinBanner,
   validateForm,
+  validateOAuthForm,
   type AccountFormState,
 } from "./settings-mail-lib";
 
@@ -405,5 +415,207 @@ describe("accountReauthMessage", () => {
    * throwing on the settings page. */
   it("still says something useful for a password account", () => {
     expect(accountReauthMessage("auth_required", "password")).toContain("signed in");
+  });
+});
+
+// --- Phase 8 Task 3: the form's second path ---------------------------------
+
+describe("the OAuth form", () => {
+  const empty = initialOAuthFormState();
+
+  it("starts empty for a new account, with the ordinary backfill default", () => {
+    expect(empty).toEqual({ label: "", email: "", sentFolder: "", backfill: "90" });
+  });
+
+  it("starts an edit from the stored account, including the folder the server chose", () => {
+    const account = {
+      ...storedAccount, label: "Work", email: "chris@contoso.example",
+      sentFolder: "Sent Items", backfillDays: 30,
+    };
+    expect(initialOAuthFormState(account))
+      .toEqual({ label: "Work", email: "chris@contoso.example", sentFolder: "Sent Items", backfill: "30" });
+  });
+
+  it("reads a null backfill as Everything, like the password form does", () => {
+    expect(initialOAuthFormState({ ...storedAccount, backfillDays: null }).backfill).toBe("all");
+  });
+
+  it("requires a label and an address to create", () => {
+    expect(validateOAuthForm(empty, false)).toContain("label");
+    // AN EMPTY FIELD AND A MALFORMED ONE GET DIFFERENT SENTENCES, and the
+    // distinction is asserted rather than assumed. A mutation deleting the
+    // empty-string check survived at first: "" contains no "@" either, so the
+    // second branch caught it and the suite could not tell the two apart --
+    // which would have quietly replaced "you have not filled this in" with
+    // "what you typed is wrong" for the commonest mistake on the form.
+    expect(validateOAuthForm({ ...empty, label: "Work" }, false))
+      .toBe("The mailbox address is required.");
+    expect(validateOAuthForm({ ...empty, label: "Work", email: "not-an-address" }, false))
+      .toBe("Enter the full mailbox address.");
+    expect(validateOAuthForm({ ...empty, label: "Work", email: "a@b.example" }, false)).toBeNull();
+  });
+
+  it("does not ask an EDIT for an address, because the address cannot be changed", () => {
+    // The address is the mailbox the grant was issued for and the username
+    // XOAUTH2 authenticates as; the control is disabled and the patch omits it.
+    expect(validateOAuthForm({ ...empty, label: "Work" }, true)).toBeNull();
+  });
+
+  it("sends the provider, the label, the address and the backfill -- and nothing else", () => {
+    // THE ABSENCES ARE THE ASSERTION, and they are the spec's second path in as
+    // many words: no host, no port, no security, no username, no password.
+    const input = buildOAuthSigninInput(
+      { label: " Work ", email: " chris@contoso.example ", sentFolder: "", backfill: "30" },
+      "microsoft",
+    );
+    expect(input).toEqual({
+      provider: "microsoft", label: "Work", email: "chris@contoso.example", backfillDays: 30,
+    });
+    expect(Object.keys(input).sort()).toEqual(["backfillDays", "email", "label", "provider"]);
+  });
+
+  it("sends Everything as a null backfill, not as the string", () => {
+    expect(buildOAuthSigninInput({ ...empty, label: "W", email: "a@b.example", backfill: "all" }, "google"))
+      .toMatchObject({ backfillDays: null, provider: "google" });
+  });
+
+  it("re-authorising sends the account and the provider, and no mailbox address", () => {
+    // The address comes from the stored row server-side; taking the client's
+    // word for it would let one request's login hint be pointed at somebody
+    // else's mailbox.
+    expect(buildReauthorizeInput("acc-1", "microsoft"))
+      .toEqual({ accountId: "acc-1", provider: "microsoft" });
+  });
+
+  it("patches the three fields that are still this install's business", () => {
+    const patch = buildOAuthUpdatePatch({
+      label: " Work ", email: "chris@contoso.example", sentFolder: " Sent Items ", backfill: "all",
+    });
+    expect(patch).toEqual({ label: "Work", sentFolder: "Sent Items", backfillDays: null });
+    // No password half (the server answers 409 to one), no host/port/security
+    // (they are the provider's), no email (see above).
+    for (const forbidden of ["password", "smtpPassword", "imapHost", "imapPort", "username", "email"]) {
+      expect(patch).not.toHaveProperty(forbidden);
+    }
+  });
+});
+
+describe("signedInWith and providerLabel", () => {
+  it("names the provider for an OAuth account and says nothing for a password one", () => {
+    expect(signedInWith("oauth_microsoft")).toBe("Signed in with Microsoft");
+    expect(signedInWith("oauth_google")).toBe("Signed in with Google");
+    // Rendering nothing rather than "Signed in with a password": the password
+    // row already shows a username and a host, which is the same fact.
+    expect(signedInWith("password")).toBeNull();
+  });
+
+  it("spells each provider once", () => {
+    expect(providerLabel("microsoft")).toBe("Microsoft");
+    expect(providerLabel("google")).toBe("Google");
+  });
+});
+
+describe("signinBanner", () => {
+  it("says nothing when the page was not reached from a callback", () => {
+    expect(signinBanner({})).toBeNull();
+    expect(signinBanner({ reason: "state" })).toBeNull();
+  });
+
+  it("congratulates a connection and says the sync starts by itself", () => {
+    const banner = signinBanner({ oauth: "connected" });
+    expect(banner?.tone).toBe("ok");
+    expect(banner?.text).toContain("connected");
+  });
+
+  it("gives each failure its own sentence", () => {
+    const texts = new Set<string>();
+    for (const reason of ["state", "denied", "provider", "no_refresh_token", "duplicate", "account", "failed"]) {
+      const banner = signinBanner({ oauth: "failed", reason });
+      expect(banner?.tone, reason).toBe("error");
+      texts.add(banner!.text);
+    }
+    // Seven reasons, seven sentences: an operator who is told the same thing
+    // for a declined consent and a broken app registration has been told
+    // nothing.
+    expect(texts.size).toBe(7);
+  });
+
+  it("does not accuse anybody of an attack over an expired state", () => {
+    // The overwhelming majority of these are a timeout or a second tab, and an
+    // alarming sentence for a routine one teaches an operator to ignore it.
+    const text = signinBanner({ oauth: "failed", reason: "state" })!.text;
+    // It still has to say what to do, or it is a dead end dressed as calm.
+    expect(text).toContain("Start it again");
+    expect(text.toLowerCase()).not.toContain("attack");
+  });
+
+  it("still says something true for a reason it does not recognise", () => {
+    // A client and a server that disagree about the code set is a thing that
+    // happens across an upgrade.
+    const banner = signinBanner({ oauth: "failed", reason: "something-new" });
+    expect(banner?.tone).toBe("error");
+    expect(banner?.text).toContain("did not complete");
+  });
+
+  it("carries no provider prose, because the redirect it reads never carries any", () => {
+    // The server sends a CODE; a provider's error_description would otherwise
+    // ride a URL into a history entry and nginx's access log.
+    const banner = signinBanner({ oauth: "failed", reason: "AADSTS50011: the reply URL does not match" });
+    expect(banner?.text).not.toContain("AADSTS");
+  });
+});
+
+describe("the OAuth form's source", () => {
+  /**
+   * A SOURCE GUARD, because the rule lives in JSX and this package has no
+   * testing-library. The spec's requirement is that an OAuth account asks for
+   * no host, port, security or password -- an absence, which no behavioural
+   * assertion in this file can see, and which a well-meaning edit adding "just
+   * the port, for a proxy" would break silently.
+   */
+  it("asks for no host, port, security, username or password", () => {
+    const source = withoutComments(
+      readFileSync(new URL("./settings-mail.tsx", import.meta.url), "utf8"),
+    );
+    const form = source.slice(
+      source.indexOf("function OAuthAccountForm("),
+      source.indexOf("function BackfillSelect("),
+    );
+    // The slice really found the function: an indexOf that missed would make
+    // every assertion below vacuously true against an empty string.
+    expect(form.length).toBeGreaterThan(500);
+    // FIELD SPELLINGS, NOT THE WORD "password". The form's own copy says
+    // "Conduit never sees the password", which is the sentence that makes the
+    // absence legible to the operator -- banning the word would ban the
+    // explanation. What must not be here is a CONTROL.
+    for (const control of [
+      "imapHost", "imapPort", "smtpHost", "smtpPort", "SecuritySelect", "smtpDiffers",
+      'type="password"',
+    ]) {
+      expect(form, control).not.toContain(control);
+    }
+  });
+
+  /** The other half, and the one the spec is most insistent about: the
+   * password path is UNTOUCHED. A self-hosted IMAP server with a password is
+   * still the common case on this install. */
+  it("leaves the password form asking for all of them", () => {
+    const source = withoutComments(
+      readFileSync(new URL("./settings-mail.tsx", import.meta.url), "utf8"),
+    );
+    // Bounded at the next component, not at the end of the file: `Field` and
+    // `SecuritySelect` are DEFINED below it, so an unbounded slice would pass
+    // this on the definitions rather than on the password form using them.
+    const form = source.slice(
+      source.indexOf("function PasswordAccountForm("),
+      source.indexOf("function Field("),
+    );
+    expect(form.length).toBeGreaterThan(500);
+    for (const control of [
+      "imapHost", "imapPort", "smtpHost", "smtpPort", "SecuritySelect", "smtpDiffers",
+      'type="password"',
+    ]) {
+      expect(form, control).toContain(control);
+    }
   });
 });

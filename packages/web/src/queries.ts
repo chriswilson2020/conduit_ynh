@@ -20,6 +20,8 @@ import {
   mailAccountListSchema,
   mailAccountSchema,
   mailAccountTestResultSchema,
+  mailOAuthProvidersSchema,
+  mailOAuthSigninStartSchema,
   mailMessageSchema,
   mailThreadDetailSchema,
   mailThreadListItemSchema,
@@ -76,6 +78,7 @@ import {
   type MailAccountCreateInput,
   type MailAccountFolder,
   type MailAccountTestInput,
+  type MailOAuthSigninInput,
   type MailAccountUpdateInput,
   type MailAccountUpdatePasswordFields,
   type MailLinkKind,
@@ -1450,6 +1453,59 @@ export function useTestMailAccount() {
         mailAccountTestResultSchema,
         await postJson<unknown>("/mail/accounts/test", input),
         "mail account test result",
+      ),
+  });
+}
+
+/**
+ * Which providers this install can sign in to (Phase 8 Task 3).
+ *
+ * A DEPLOYMENT FACT, WHICH IS WHY IT IS ITS OWN QUERY AND NOT PART OF THE
+ * ACCOUNT LIST. It changes when somebody edits the install's .env and restarts
+ * the process, i.e. never during a session, so it is fetched once and left
+ * alone -- no SSE key publishes it, and there is nothing for one to invalidate.
+ *
+ * The settings form needs it BEFORE there is an account to ask about: an empty
+ * list is what keeps the add-account dialog from offering a button whose only
+ * possible outcome is a 409 naming environment variables.
+ */
+export function useMailOAuthProviders() {
+  return useQuery({
+    queryKey: ["mail-oauth-providers"],
+    queryFn: async () =>
+      parseWith(
+        mailOAuthProvidersSchema,
+        await getJson<unknown>("/mail/oauth/providers"),
+        "mail OAuth providers",
+      ),
+    // Deployment configuration. Refetching it on every window focus would be
+    // one request per focus for an answer that cannot have moved.
+    staleTime: Infinity,
+  });
+}
+
+/**
+ * Start a sign-in: ask the server for the provider's authorise URL.
+ *
+ * INVALIDATES NOTHING, and that is not an oversight -- this mutation writes no
+ * row. What it mints is a `state`, which lives in the server's memory until the
+ * callback redeems it (api: services/mail-oauth-signin.ts). The account appears
+ * after the CALLBACK, and the callback is a full page navigation back to
+ * Settings, so the list is refetched by the page loading rather than by a cache
+ * hint that would fire while the operator is still at a consent screen.
+ *
+ * THE NAVIGATION IS THE CALLER'S. This hook hands back a URL; the component
+ * assigns it to window.location. Doing it here would make a data hook perform a
+ * side effect a test cannot observe, and would fire while React is still
+ * rendering the success path.
+ */
+export function useStartMailOAuthSignin() {
+  return useMutation({
+    mutationFn: async (input: MailOAuthSigninInput) =>
+      parseWith(
+        mailOAuthSigninStartSchema,
+        await postJson<unknown>("/mail/accounts/oauth/authorize", input),
+        "mail OAuth sign-in",
       ),
   });
 }
