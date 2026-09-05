@@ -907,6 +907,84 @@ export const mailAccountTestResultSchema = z.object({
 });
 export type MailAccountTestResult = z.infer<typeof mailAccountTestResultSchema>;
 
+// --- Phase 8 Task 3: signing in at a provider -------------------------------
+
+// POST /api/mail/accounts/oauth/authorize's body: the operator is about to be
+// sent to Microsoft or Google, and this is everything the server needs to
+// remember while they are away.
+//
+// TWO SHAPES, XOR, exactly as mailAccountTestInputSchema has two: with
+// `accountId` this is a RE-AUTHORISATION of an account that already exists
+// (the "Sign in again" control on a lapsed row), and every other field is
+// meaningless -- the stored row supplies them. Without it, this is a NEW
+// account and the two facts a provider cannot supply are required.
+//
+// NO HOST, PORT, SECURITY, USERNAME OR PASSWORD, and their absence is the
+// point rather than an omission (the spec's "an OAuth account asks for none of
+// them -- the endpoints are the provider's and known"). The IMAP and SMTP
+// endpoints come from the provider table in api: services/mail-oauth-signin.ts,
+// the username IS the mailbox address, and there is no password to ask for.
+//
+// `sentFolder` is absent for a subtler reason than the others: it is not a
+// provider CONSTANT the way the hosts are -- Microsoft's is "Sent Items" and
+// Gmail's is "[Gmail]/Sent Mail" -- but it is still a fact about the provider
+// rather than a choice, so the server fills it and Settings can correct it
+// afterwards like any other account field. Asking a person to type it at the
+// moment they are trying to press one button would be asking them to know
+// something Conduit already knows.
+export const mailOAuthSigninInputSchema = z.object({
+  provider: mailOAuthProviderSchema,
+  accountId: z.uuid().optional(),
+  label: z.string().min(1).optional(),
+  email: z.email().optional(),
+  backfillDays: z.number().int().positive().nullable().optional(),
+}).superRefine((v, ctx) => {
+  if (v.accountId !== undefined) return;
+  // Field-level issues rather than one coarse message, mirroring
+  // mailAccountTestInputSchema's superRefine, so the form can point at the
+  // control that is empty.
+  for (const field of ["label", "email"] as const) {
+    if (v[field] === undefined) {
+      ctx.addIssue({ code: "custom", path: [field], message: `${field} is required when accountId is not given` });
+    }
+  }
+});
+export type MailOAuthSigninInput = z.infer<typeof mailOAuthSigninInputSchema>;
+
+// What that POST answers with: where to send the browser.
+//
+// A URL FOR THE CLIENT TO NAVIGATE TO, NOT A 302, and the difference matters
+// for one reason: the body above is a JSON POST from the SPA, and a redirect
+// answering a fetch() is followed by the fetch rather than by the window. The
+// page assigns this to window.location itself.
+//
+// IT CARRIES NO SECRET. client_id, redirect_uri, scope and the PKCE challenge
+// are all public by design (RFC 7636 4.2: the challenge is a hash, and only the
+// verifier -- which stays on this server -- can redeem it), and `state` is a
+// one-time value minted FOR this browser. The client secret and the refresh
+// token never appear in it.
+export const mailOAuthSigninStartSchema = z.object({ authorizeUrl: z.url() });
+export type MailOAuthSigninStart = z.infer<typeof mailOAuthSigninStartSchema>;
+
+// GET /api/mail/oauth/providers: which providers this install can actually
+// sign in to.
+//
+// A ROUTE RATHER THAN A GUESS IN THE UI. An app registration is deployment
+// configuration (api: config.ts's MAIL_OAUTH_* block) and an install with none
+// -- which is this deployment today, and the ordinary case per the spec -- must
+// not offer a button whose only possible outcome is a failure. Offering the
+// choice and then refusing it is v1.4.1's error-that-blamed-the-wrong-thing in
+// a new place.
+//
+// NOTHING SECRET IS IN IT. A client id is public (it travels in every
+// authorize URL) and is still not returned here: the client has no use for one,
+// and a field nobody reads is a field that leaks the day somebody logs the
+// response.
+export const mailOAuthProvidersSchema = z.object({
+  providers: z.array(mailOAuthProviderSchema),
+});
+export type MailOAuthProviders = z.infer<typeof mailOAuthProvidersSchema>;
+
 // Live counters from the in-process sync engine (api:
 // services/mail-sync.ts's AccountSyncStats), mirrored here by hand because
 // packages/web cannot import from packages/api. Purely observational -- the

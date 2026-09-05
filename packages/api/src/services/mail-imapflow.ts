@@ -1031,17 +1031,25 @@ export function createImapClientFactory(
 // --- Verification (the test-connection endpoint's real deps) ---------------
 
 /**
- * VerifySettings still carries a bare `password`, and that is Task 3's to
- * change rather than an oversight. The test-connection endpoint can only reach
- * an OAuth account through mail-accounts.ts's stored-credential branch, which
- * refuses one today with "credentials unreadable" (see testConnection's own
- * comment) -- and it will keep refusing it until there is a way to CREATE an
- * OAuth account, which is the same task that gives this endpoint a second form
- * to test from. Widening the shape now would be a seam with nothing on the
- * other side of it.
+ * VerifySettings AND ConnectionSettings are now the same shape, which is what
+ * Task 3 said this seam would become.
+ *
+ * Until an OAuth account could exist, VerifySettings carried a bare `password`
+ * and this function wrapped it -- a deliberate hold, because widening the shape
+ * while the test-connection endpoint could only ever reach a password would
+ * have been a seam with nothing on the other side of it. It can now reach a
+ * token (mail-accounts.ts's resolveStoredAuth), so the two types met and the
+ * wrapper became the identity.
+ *
+ * KEPT AS A FUNCTION RATHER THAN DELETED, and only just: it is the one place
+ * that asserts the two interfaces still agree. If mail-accounts.ts's
+ * VerifySettings and this file's ConnectionSettings ever drift, this line stops
+ * compiling -- which is worth more than the line costs, because the alternative
+ * is two structurally-identical interfaces silently growing apart across a
+ * module boundary that exists to keep this adapter out of the accounts service.
  */
 function verifyAuth(settings: VerifySettings): ConnectionSettings {
-  return { ...settings, auth: { kind: "password", password: settings.password } };
+  return settings;
 }
 
 /**

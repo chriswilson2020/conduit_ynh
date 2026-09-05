@@ -12,6 +12,9 @@ import type { SendMailTransportFactory } from "./services/mail-send.js";
 import {
   createHttpTokenRefresher, oauthClientsFrom, type MailTokenRefresher,
 } from "./services/mail-oauth.js";
+import {
+  createHttpCodeExchanger, MailOAuthStates, type MailOAuthCodeExchanger,
+} from "./services/mail-oauth-signin.js";
 import type { MailRouteSyncManager } from "./routes/mail.js";
 import {
   ReauthTickets, ReauthThrottle,
@@ -25,6 +28,94 @@ declare module "fastify" {
   interface FastifyRequest {
     user: User | null;
   }
+}
+
+/**
+ * Query parameters whose VALUE is a credential, and which therefore must not
+ * reach the journal on the request line.
+ *
+ * FOUND BY ASKING WHERE A TOKEN COULD STILL GO, not by a failure. Phase 8's
+ * OAuth callback is the first route on this app whose URL carries a secret:
+ * RFC 6749's authorization code arrives in the query string of a GET (`code`),
+ * beside the single-use CSRF value the callback is verified with (`state`).
+ * Fastify's default request serializer logs `req.url` verbatim at info, so
+ * without this every completed sign-in would write both into
+ * /var/log/journal -- where they outlive the request, the exchange and any
+ * reason to have them.
+ *
+ * THE CODE IS SINGLE-USE AND THAT IS NOT THE ARGUMENT. It is spent seconds
+ * later and PKCE makes a stolen one inert (services/mail-oauth-signin.ts's
+ * header), which is exactly why this is defence in depth rather than the only
+ * line. The reason to write it anyway: a log is a place secrets go and are
+ * never taken out again, nginx's own access log already has a copy this
+ * process cannot do anything about, and adding a second one deliberately is a
+ * choice rather than an inheritance.
+ *
+ * A NAMED LIST RATHER THAN "STRIP EVERY QUERY STRING". The rest of this app's
+ * query parameters are the opposite of secret and are the first thing anyone
+ * reads when diagnosing a request -- a cursor, a folder, a thread id, a search
+ * term. Blanking them all would trade a real class of leak for a real loss of
+ * evidence. Neither name is used by any other route on this app, so the list
+ * costs nothing elsewhere.
+ */
+const SENSITIVE_QUERY_PARAMS = ["code", "state"] as const;
+
+/**
+ * A URL with SENSITIVE_QUERY_PARAMS' values replaced, and everything else
+ * untouched.
+ *
+ * Exported for its own test: the interesting cases are a URL with no query at
+ * all, one with a parameter that merely LOOKS like a match, and a value that is
+ * already empty -- and the way to be sure about those is to assert on them
+ * rather than to read a regex.
+ *
+ * PARSED, NOT PATTERN-MATCHED. A regex over `[?&]code=[^&]*` is the shorter
+ * version and gets `?authcode=x` wrong in one direction and `?code` (no `=`)
+ * wrong in the other. URLSearchParams answers both correctly, and re-encodes
+ * what it round-trips, which is what a log line wants anyway.
+ *
+ * `req.url` IS PATH-AND-QUERY, never absolute, so a base is needed for parsing
+ * and is discarded again. It is a URL that goes nowhere for exactly that
+ * reason.
+ */
+export function redactSensitiveQuery(url: string): string {
+  const marked = url.indexOf("?");
+  if (marked < 0) return url;
+  const parsed = new URL(url, "http://redact.invalid");
+  let touched = false;
+  for (const name of SENSITIVE_QUERY_PARAMS) {
+    if (!parsed.searchParams.has(name)) continue;
+    parsed.searchParams.set(name, "[redacted]");
+    touched = true;
+  }
+  // Returned unchanged when nothing matched, so an ordinary request's line is
+  // byte-for-byte what it always was rather than a re-encoding of it.
+  if (!touched) return url;
+  return `${parsed.pathname}${parsed.search}`;
+}
+
+/**
+ * Fastify 5's own request serializer with the URL passed through
+ * redactSensitiveQuery.
+ *
+ * COPIED FIELD FOR FIELD from fastify/lib/logger-pino.js's `asReqValue` rather
+ * than wrapping it, because it is not exported. That means this can drift on a
+ * Fastify upgrade -- and the failure mode of drift is a missing field in a log
+ * line, not a leak, since the one field that matters here is the one this file
+ * is replacing.
+ */
+function redactingRequestSerializer(req: {
+  method: string; url: string; host?: string; ip?: string;
+  headers?: Record<string, unknown>; socket?: { remotePort?: number };
+}): Record<string, unknown> {
+  return {
+    method: req.method,
+    url: redactSensitiveQuery(req.url),
+    version: req.headers?.["accept-version"],
+    host: req.host,
+    remoteAddress: req.ip,
+    remotePort: req.socket?.remotePort,
+  };
 }
 
 export interface BuildAppOptions {
@@ -56,6 +147,11 @@ export interface BuildAppOptions {
      * transport still never send from an OAuth account; the fallback below is
      * built from this app's own config, like transportFactory's. */
     tokenRefresher?: MailTokenRefresher;
+    /** Optional for the same reason, one grant type over: almost nothing that
+     * builds an app signs in at a provider. The fallback is built from this
+     * app's own config and answers "not configured for that provider" on an
+     * install with no registration, which is every install today. */
+    codeExchanger?: MailOAuthCodeExchanger;
   };
   /**
    * Test-only sink for the request log, so a test can read what was written
@@ -102,10 +198,26 @@ export async function buildApp(
     reauthVerifier, restoreMaxUploadBytes, importMaxUploadBytes, restoreDrainTimeoutMs,
   }: BuildAppOptions,
 ): Promise<FastifyInstance> {
+  // ONE READING OF config.mailOAuth FOR THIS FILE'S THREE CONSUMERS: the
+  // refresher's fallback, the authorise route's registration lookup, and the
+  // code exchanger's fallback. Three separate calls here would be three objects
+  // to keep in step for no reason.
+  //
+  // server.ts DERIVES ITS OWN as well, and that is not a second answer:
+  // oauthClientsFrom is a pure function of config.mailOAuth, which is parsed
+  // once at boot, so the two cannot disagree about whether a provider is
+  // registered. What server.ts's exists for is the SYNC ENGINE, which is
+  // started after listen and never passes through this function.
+  const oauthClients = oauthClientsFrom(config.mailOAuth);
+
   const app = Fastify({
     logger: config.nodeEnv === "test"
       ? false
-      : { level: "info", ...(loggerStream === undefined ? {} : { stream: loggerStream }) },
+      : {
+          level: "info",
+          serializers: { req: redactingRequestSerializer },
+          ...(loggerStream === undefined ? {} : { stream: loggerStream }),
+        },
     // 1, not true: the app binds to loopback and is reachable through exactly one
     // hop, YunoHost's nginx. trustProxy: 1 trusts only that single nearest hop's
     // X-Forwarded-* headers. trustProxy: true would trust an unbounded chain,
@@ -295,7 +407,13 @@ export async function buildApp(
     transportFactory: mail?.transportFactory
       ?? createSmtpTransportFactory({ rejectUnauthorized: config.mailTlsRejectUnauthorized }),
     mailTokenRefresher: mail?.tokenRefresher
-      ?? createHttpTokenRefresher(oauthClientsFrom(config.mailOAuth)),
+      ?? createHttpTokenRefresher(oauthClients),
+    mailOAuthClients: oauthClients,
+    // ONE INSTANCE PER APP, exactly like reauthTickets and intakeSessions above
+    // -- the `state` POST /api/mail/accounts/oauth/authorize mints has to be
+    // the one GET /api/mail/oauth/callback redeems. See CrmRouteDeps.
+    mailOAuthStates: new MailOAuthStates(),
+    mailOAuthExchange: mail?.codeExchanger ?? createHttpCodeExchanger(oauthClients),
     reauthVerifier: reauthVerifier ?? (
       config.reauthPassword === null
         ? createLdapVerifier(config.ldapUrl)

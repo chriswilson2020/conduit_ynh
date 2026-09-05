@@ -9,12 +9,15 @@ import { mailAccountSchema, mailAccountSummarySchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { mailAccounts } from "../db/schema.js";
-import { encryptCredentials } from "./mail-crypto.js";
+import { encryptCredentials, encryptCredentialsAt } from "./mail-crypto.js";
 import {
   createAccount, updateAccount, archiveAccount, unarchiveAccount, getOwnAccount, getAccountCredentialsAsSystem,
-  listAccounts, testConnection, setAccountChangedHook, type TestConnectionDeps,
+  listAccounts, testConnection, setAccountChangedHook,
+  type TestConnectionDeps, type VerifySettings,
 } from "./mail-accounts.js";
-import { NotFoundError, ArchivedError, ConflictError, MailCredentialDecryptError } from "./errors.js";
+import {
+  NotFoundError, ArchivedError, ConflictError, MailCredentialDecryptError, MailReauthRequiredError,
+} from "./errors.js";
 import { subscribe } from "./sse.js";
 
 const handle = openTestDatabase();
@@ -49,6 +52,14 @@ function make(overrides: Partial<MailAccountCreateInput> = {}, actor = actorId) 
 
 function okDeps(): TestConnectionDeps {
   return { imapVerify: async () => {}, smtpVerify: async () => {} };
+}
+
+/** The password a verify() was handed, or a marker naming what it got instead.
+ * A marker rather than a throw or an empty string: an assertion comparing
+ * passwords must FAIL loudly, and readably, when a token turns up where a
+ * password was expected. */
+function passwordOf(settings: VerifySettings): string {
+  return settings.auth.kind === "password" ? settings.auth.password : `<oauth:${settings.auth.accessToken}>`;
 }
 
 // Test-only backdoors for states the service's own API cannot produce:
@@ -849,8 +860,8 @@ describe("testConnection", () => {
     }, keyPath, deps);
     expect(result).toEqual({ imap: { ok: true }, smtp: { ok: true } });
     expect(calls).toEqual([
-      ["imap", { host: "imap.example.com", port: 993, security: "tls", username: "chris", password: "fresh-secret" }],
-      ["smtp", { host: "smtp.example.com", port: 587, security: "starttls", username: "chris", password: "fresh-secret" }],
+      ["imap", { host: "imap.example.com", port: 993, security: "tls", username: "chris", auth: { kind: "password", password: "fresh-secret" } }],
+      ["smtp", { host: "smtp.example.com", port: 587, security: "starttls", username: "chris", auth: { kind: "password", password: "fresh-secret" } }],
     ]);
   });
 
@@ -862,8 +873,8 @@ describe("testConnection", () => {
     // comparison could never catch.
     const calls: [string, string][] = [];
     const deps: TestConnectionDeps = {
-      imapVerify: async (s) => { calls.push(["imap", s.password]); },
-      smtpVerify: async (s) => { calls.push(["smtp", s.password]); },
+      imapVerify: async (s) => { calls.push(["imap", passwordOf(s)]); },
+      smtpVerify: async (s) => { calls.push(["smtp", passwordOf(s)]); },
     };
     const result = await testConnection(handle.db, actorId, { accountId: account.id }, keyPath, deps);
     expect(result).toEqual({ imap: { ok: true }, smtp: { ok: true } });
@@ -880,8 +891,8 @@ describe("testConnection", () => {
     const account = await make({ password: "stored-imap", smtpPassword: "stored-smtp" });
     const calls: [string, string][] = [];
     const deps: TestConnectionDeps = {
-      imapVerify: async (s) => { calls.push(["imap", s.password]); },
-      smtpVerify: async (s) => { calls.push(["smtp", s.password]); },
+      imapVerify: async (s) => { calls.push(["imap", passwordOf(s)]); },
+      smtpVerify: async (s) => { calls.push(["smtp", passwordOf(s)]); },
     };
     const result = await testConnection(
       handle.db, actorId, { accountId: account.id, smtpPassword: "override-smtp" }, keyPath, deps,
@@ -965,6 +976,134 @@ describe("testConnection", () => {
     await archiveAccount(handle.db, actorId, account.id);
     await expect(testConnection(handle.db, actorId, { accountId: account.id }, keyPath, okDeps()))
       .rejects.toBeInstanceOf(ArchivedError);
+  });
+});
+
+/**
+ * Phase 8 Task 3: the item Task 2 left here in as many words.
+ *
+ * This endpoint used to answer "credentials unreadable" for an OAuth account --
+ * the right OUTCOME under the wrong words, because the credential read
+ * perfectly and there was simply no password to try and, before Task 2, nothing
+ * to try instead. There is now, and what it must do is test the SAME mechanism
+ * a real connection would use rather than an approximation of it.
+ */
+describe("testConnection: an OAuth account", () => {
+  /** An account that signs in with a provider: the column and the blob written
+   * together, which is the invariant MailAuthMethodMismatchError guards. */
+  async function makeOAuth(credentials: {
+    refreshToken: string; accessToken?: string; accessTokenExpiresAt?: string;
+  }): Promise<string> {
+    const account = await make();
+    await handle.db.update(mailAccounts).set({
+      authMethod: "oauth_microsoft",
+      credentialsCiphertext: encryptCredentialsAt(keyPath, { kind: "oauth", ...credentials }),
+    }).where(eq(mailAccounts.id, account.id));
+    return account.id;
+  }
+
+  const FAR_FUTURE = new Date(Date.now() + 3600_000).toISOString();
+
+  it("tests BOTH protocols with the access token, never a password", async () => {
+    const id = await makeOAuth({
+      refreshToken: "r", accessToken: "cached-token", accessTokenExpiresAt: FAR_FUTURE,
+    });
+    const seen: [string, unknown][] = [];
+    const result = await testConnection(handle.db, actorId, { accountId: id }, keyPath, {
+      imapVerify: async (s) => { seen.push(["imap", s.auth]); },
+      smtpVerify: async (s) => { seen.push(["smtp", s.auth]); },
+    });
+
+    expect(result).toEqual({ imap: { ok: true }, smtp: { ok: true } });
+    // One token authenticates both protocols -- a mail grant's scopes cover
+    // IMAP and SMTP together, so there is no half to pick and no way to pick
+    // one wrong.
+    const sorted = [...seen].sort((a, b) => a[0].localeCompare(b[0]));
+    expect(sorted).toEqual([
+      ["imap", { kind: "oauth", accessToken: "cached-token" }],
+      ["smtp", { kind: "oauth", accessToken: "cached-token" }],
+    ]);
+  });
+
+  it("REFRESHES ONCE for the two protocols, not twice", async () => {
+    // Two refreshes against one stored refresh token produce two grants, of
+    // which persistRefreshedToken's compare-and-set keeps exactly one -- and at
+    // a provider that rotates (Microsoft always does) the discarded one may be
+    // the grant that retired the stored one. Pressing "Test connection" must
+    // not be the thing that strands an account.
+    const id = await makeOAuth({ refreshToken: "r" });
+    let refreshes = 0;
+    await testConnection(handle.db, actorId, { accountId: id }, keyPath, {
+      ...okDeps(),
+      refresh: () => {
+        refreshes += 1;
+        return Promise.resolve({ accessToken: "fresh", expiresInSeconds: 3600 });
+      },
+    });
+    expect(refreshes).toBe(1);
+  });
+
+  it("says 'sign in again' rather than 'credentials unreadable' for a dead grant", async () => {
+    const id = await makeOAuth({ refreshToken: "revoked" });
+    const result = await testConnection(handle.db, actorId, { accountId: id }, keyPath, {
+      ...okDeps(),
+      refresh: () => Promise.reject(new MailReauthRequiredError("microsoft", "invalid_grant")),
+    });
+    // THE WHOLE POINT OF THE ITEM. "credentials unreadable" points an operator
+    // at mail.key, which is fine; the answer they need names the remedy.
+    for (const protocol of [result.imap, result.smtp]) {
+      expect(protocol.ok).toBe(false);
+      expect(protocol.error).toContain("Sign in again");
+      expect(protocol.error).not.toContain("credentials unreadable");
+    }
+  });
+
+  it("still says 'credentials unreadable' when mail.key really is the problem", async () => {
+    // The other half: an OAuth account whose row will not decrypt is a key
+    // problem, and must not be reported as a lapsed grant.
+    const id = await makeOAuth({ refreshToken: "r" });
+    await corruptCiphertext(id);
+    const result = await testConnection(handle.db, actorId, { accountId: id }, keyPath, okDeps());
+    expect(result.imap.error).toBe("credentials unreadable");
+    expect(result.smtp.error).toBe("credentials unreadable");
+  });
+
+  it("names the missing settings when this install has no registration", async () => {
+    // The default refresher is a refusal, not a no-op: a caller that forgot to
+    // wire one gets a readable sentence rather than a TypeError.
+    const id = await makeOAuth({ refreshToken: "r" });
+    const result = await testConnection(handle.db, actorId, { accountId: id }, keyPath, okDeps());
+    expect(result.imap.ok).toBe(false);
+    expect(result.imap.error).toContain("no OAuth token refresher");
+  });
+
+  it("IGNORES a submitted password rather than reporting on a login it cannot make", async () => {
+    const id = await makeOAuth({
+      refreshToken: "r", accessToken: "cached-token", accessTokenExpiresAt: FAR_FUTURE,
+    });
+    const seen: unknown[] = [];
+    await testConnection(
+      handle.db, actorId, { accountId: id, password: "typed-by-hand" }, keyPath,
+      { imapVerify: async (s) => { seen.push(s.auth); }, smtpVerify: async (s) => { seen.push(s.auth); } },
+    );
+    // Honouring it would report success for a password this account will never
+    // authenticate with -- worse than any refusal, because it reads as proof.
+    expect(seen).toEqual([
+      { kind: "oauth", accessToken: "cached-token" },
+      { kind: "oauth", accessToken: "cached-token" },
+    ]);
+  });
+
+  it("never puts the token in the result", async () => {
+    const id = await makeOAuth({
+      refreshToken: "refresh-secret", accessToken: "access-secret", accessTokenExpiresAt: FAR_FUTURE,
+    });
+    const result = await testConnection(handle.db, actorId, { accountId: id }, keyPath, {
+      imapVerify: () => Promise.reject(new Error("auth: rejected")),
+      smtpVerify: () => Promise.reject(new Error("auth: rejected")),
+    });
+    expect(JSON.stringify(result)).not.toContain("access-secret");
+    expect(JSON.stringify(result)).not.toContain("refresh-secret");
   });
 });
 

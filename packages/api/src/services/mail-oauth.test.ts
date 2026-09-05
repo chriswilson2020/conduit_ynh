@@ -15,8 +15,8 @@ import { createAccount } from "./mail-accounts.js";
 import { decryptCredentialsAt, encryptCredentialsAt, type MailCredentials } from "./mail-crypto.js";
 import {
   TOKEN_EXPIRY_SKEW_MS, createHttpTokenRefresher, oauthClientsFrom, resolveConnectionAuth,
-  unconfiguredTokenRefresher, type MailConnectionAuthDeps, type MailTokenGrant,
-  type MailTokenRefresher,
+  unconfiguredTokenRefresher, type MailConnectionAuthDeps, type MailOAuthClient,
+  type MailTokenGrant, type MailTokenRefresher,
 } from "./mail-oauth.js";
 
 /**
@@ -433,11 +433,18 @@ describe("unconfiguredTokenRefresher", () => {
 
 // --- The real token endpoint -------------------------------------------------
 
+// A whole registration, including the two fields Task 3 added and this file
+// never reads: the refresher uses three of the five, and typing the fixture as
+// the real MailOAuthClient is what keeps that "never reads" honest rather than
+// a claim -- a refresh that started sending redirect_uri would still compile
+// against a narrower literal.
 const CLIENTS = {
   microsoft: {
     clientId: "client-id", clientSecret: "client-secret",
     tokenEndpoint: "https://login.microsoftonline.example/tenant/oauth2/v2.0/token",
-  },
+    authorizeEndpoint: "https://login.microsoftonline.example/tenant/oauth2/v2.0/authorize",
+    redirectUri: "https://conduit.example/api/mail/oauth/callback",
+  } satisfies MailOAuthClient,
 };
 
 function jsonResponse(status: number, body: unknown): Response {

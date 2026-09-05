@@ -75,11 +75,20 @@ import { MAIL_CONNECTION_ERROR_PREFIX, type MailConnectionAuth } from "./mail-im
 // --- The provider seam -----------------------------------------------------
 
 /** One provider's app registration, as the composition root resolved it from
- * config (config.ts's MailOAuthClientConfig). */
+ * config (config.ts's MailOAuthClientConfig).
+ *
+ * THE WHOLE REGISTRATION, not the refresh's half of it. This module reads three
+ * of the five fields; mail-oauth-signin.ts reads all five. One interface rather
+ * than two because there is one registration -- config.ts's oauthClient builds
+ * it complete or not at all -- and a second, narrower type would let a caller
+ * hold "the parts I happen to need", which is how the token endpoint and the
+ * authorise endpoint end up naming two different tenants. */
 export interface MailOAuthClient {
   clientId: string;
   clientSecret: string;
   tokenEndpoint: string;
+  authorizeEndpoint: string;
+  redirectUri: string;
 }
 
 /** Registrations this install has. A provider absent from the record is one no
@@ -376,6 +385,113 @@ export interface HttpTokenRefresherOptions {
 }
 
 /**
+ * The sentence an install with no registration for `provider` needs to read.
+ *
+ * ONE PLACE, because two callers now say it -- the refresher below and Task 3's
+ * authorise route -- and a deployment gap described two different ways is a
+ * deployment gap an operator fixes twice. Exported for that second caller.
+ *
+ * IT NAMES EVERY SETTING THE REGISTRATION NEEDS, not the one this code path
+ * happens to be missing, and that is deliberate: config.ts's oauthClient is
+ * all-or-nothing, so what reaches here is "no registration" with no record of
+ * which field was absent. An operator who set the id and the secret and got
+ * this sentence needs the whole list to find the one they have not set. The
+ * tenant is Microsoft-only for the reason config.ts gives (a /common fallback
+ * would authenticate against the wrong directory); the redirect URI is on both
+ * because it is one setting shared by both registrations.
+ */
+export function missingSettingsFor(provider: MailOAuthProvider): string {
+  const own = provider === "microsoft"
+    ? "MAIL_OAUTH_MICROSOFT_CLIENT_ID, _CLIENT_SECRET and _TENANT"
+    : "MAIL_OAUTH_GOOGLE_CLIENT_ID and MAIL_OAUTH_GOOGLE_CLIENT_SECRET";
+  return `${own}, and MAIL_OAUTH_REDIRECT_URI`;
+}
+
+/**
+ * Raised when this install has no registration for a provider something just
+ * asked to use.
+ *
+ * NOT A REAUTH ERROR AND NOT A CONNECTION FAILURE. Signing in again cannot fix
+ * an install with no app registration, and neither can waiting -- so it must
+ * not be classified as either, or the operator is told to do something that
+ * will not work. An operator-fixable deployment gap, in the shape
+ * MailKeyMissingError has: named plainly, with the settings in it, wherever it
+ * is going to be read (mail_accounts.last_error for the refresh, a 409 body for
+ * the authorise route).
+ *
+ * ONE CLASS FOR THREE RAISERS -- the refresher below, the code exchanger and
+ * the authorise route (services/mail-oauth-signin.ts) -- because it was three
+ * copies of one sentence before, and a deployment gap described three ways is a
+ * deployment gap an operator fixes three times. It lives HERE rather than in
+ * errors.ts only because missingSettingsFor does: errors.ts importing this
+ * module would close a cycle.
+ */
+export class MailOAuthNotConfiguredError extends Error {
+  constructor(readonly provider: MailOAuthProvider) {
+    super(
+      `mail OAuth is not configured for ${provider} on this install:`
+      + ` set ${missingSettingsFor(provider)}`,
+    );
+  }
+}
+
+/**
+ * POST a form body to a provider's token endpoint and return the parsed JSON,
+ * or throw the classified error a non-2xx deserves.
+ *
+ * SHARED BY BOTH GRANT TYPES, and that is the whole reason it exists as a
+ * function. RFC 6749's authorization_code exchange (4.1.3) and its
+ * refresh_token grant (6) are the same request to the same URL with a different
+ * body, and everything AROUND that body is the part with the security
+ * properties: the timeout, the connection-failure classification, the
+ * `invalid_grant` reading, and -- most of all -- the redaction of this
+ * request's own secrets out of whatever the provider writes back. Task 3's code
+ * exchange carries an authorisation code and a client secret where the refresh
+ * carries a refresh token and a client secret; if it had grown its own copy of
+ * this, the copy would have been the one without the redaction.
+ *
+ * `secrets` IS THIS REQUEST'S OWN, supplied by the caller because only the
+ * caller knows what it just put in the body. See redact.
+ *
+ * NOTHING IS LOGGED FROM HERE, at all. The body holds a credential and the
+ * response holds an access token; there is no level at which any of it is worth
+ * a log line, and the errors this throws are built from the provider's error
+ * CODE and description only.
+ */
+export async function postToTokenEndpoint(
+  provider: MailOAuthProvider, client: MailOAuthClient, body: URLSearchParams,
+  secrets: readonly string[],
+  options: { fetch: typeof globalThis.fetch; timeoutMs: number },
+): Promise<Record<string, unknown>> {
+  let response: Response;
+  try {
+    response = await options.fetch(client.tokenEndpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        accept: "application/json",
+      },
+      body,
+      signal: AbortSignal.timeout(options.timeoutMs),
+    });
+  } catch (error) {
+    // DNS, TLS, a refused connection, the timeout above. Classified
+    // `connection:` so it lands in the settings UI as "server unreachable"
+    // and, more importantly, so it is NOT mistaken for a dead grant: the
+    // whole difference between the two is whether backing off will help.
+    throw new Error(
+      `${MAIL_CONNECTION_ERROR_PREFIX} could not reach ${provider}'s token endpoint`
+      + ` (${errorText(error)})`,
+      { cause: error },
+    );
+  }
+
+  const payload = await readJson(response);
+  if (!response.ok) throw tokenErrorFor(provider, response.status, payload, secrets);
+  return payload;
+}
+
+/**
  * The real refresher: an RFC 6749 section 6 refresh_token grant, client
  * credentials in the body.
  *
@@ -398,24 +514,9 @@ export function createHttpTokenRefresher(
 
   return async (provider, refreshToken) => {
     const client = clients[provider];
-    if (client === undefined) {
-      // NOT a reauth error: signing in again cannot fix an install that has no
-      // app registration for this provider, and it is not a connection failure
-      // either. An operator-fixable deployment gap, in the shape
-      // MailKeyMissingError has -- named plainly, in mail_accounts.last_error,
-      // where the operator will read it.
-      // The tenant is named for Microsoft because config.ts treats a
-      // registration missing it as no registration at all (its /common fallback
-      // would authenticate against the wrong directory), so an operator who set
-      // the id and the secret and got THIS sentence needs to be told which of
-      // the three is still missing rather than sent to check two that are fine.
-      const settings = provider === "microsoft"
-        ? "MAIL_OAUTH_MICROSOFT_CLIENT_ID, _CLIENT_SECRET and _TENANT"
-        : "MAIL_OAUTH_GOOGLE_CLIENT_ID and MAIL_OAUTH_GOOGLE_CLIENT_SECRET";
-      throw new Error(
-        `mail OAuth is not configured for ${provider} on this install: set ${settings}`,
-      );
-    }
+    // Lands in mail_accounts.last_error, where the operator will read it. See
+    // the class for why it is neither a reauth error nor a connection one.
+    if (client === undefined) throw new MailOAuthNotConfiguredError(provider);
 
     // NO `scope` PARAMETER, AND IT IS THE MOST LIKELY THING TO NEED A SECOND
     // LOOK AT THE FIRST REAL SIGN-IN (the spec's Risk 2 in the concrete). RFC
@@ -437,54 +538,44 @@ export function createHttpTokenRefresher(
       client_secret: client.clientSecret,
     });
 
-    let response: Response;
-    try {
-      response = await doFetch(client.tokenEndpoint, {
-        method: "POST",
-        headers: {
-          "content-type": "application/x-www-form-urlencoded",
-          accept: "application/json",
-        },
-        body,
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch (error) {
-      // DNS, TLS, a refused connection, the timeout above. Classified
-      // `connection:` so it lands in the settings UI as "server unreachable"
-      // and, more importantly, so it is NOT mistaken for a dead grant: the
-      // whole difference between the two is whether backing off will help.
-      throw new Error(
-        `${MAIL_CONNECTION_ERROR_PREFIX} could not reach ${provider}'s token endpoint`
-        + ` (${errorText(error)})`,
-        { cause: error },
-      );
-    }
-
-    const payload = await readJson(response);
-    // The two secrets this request carried, handed to the error builder so it
+    // The two secrets this request carried, handed down so the error builder
     // can scrub them out of whatever the endpoint says back. See redact.
-    if (!response.ok) {
-      throw tokenErrorFor(provider, response.status, payload, [refreshToken, client.clientSecret]);
-    }
+    const payload = await postToTokenEndpoint(
+      provider, client, body, [refreshToken, client.clientSecret],
+      { fetch: doFetch, timeoutMs },
+    );
+    return grantFrom(provider, payload);
+  };
+}
 
-    const accessToken = typeof payload.access_token === "string" ? payload.access_token : "";
-    const expiresIn = typeof payload.expires_in === "number" ? payload.expires_in : 0;
-    if (accessToken === "" || expiresIn <= 0) {
-      // A 200 whose body is not a token response. Not a dead grant and not a
-      // network failure -- something is answering at that URL that is not the
-      // provider's token endpoint (a captive portal, a proxy, a typo'd tenant),
-      // and saying so is more use than "authentication failed".
-      throw new Error(
-        `${provider}'s token endpoint answered ${response.status} without a usable access token`,
-      );
-    }
-    return {
-      accessToken,
-      expiresInSeconds: expiresIn,
-      ...(typeof payload.refresh_token === "string" && payload.refresh_token !== ""
-        ? { refreshToken: payload.refresh_token }
-        : {}),
-    };
+/**
+ * A token endpoint's 2xx body as a MailTokenGrant, or a throw.
+ *
+ * SHARED WITH THE CODE EXCHANGE for the same reason postToTokenEndpoint is: the
+ * response shape of RFC 6749 4.1.4 and 5.1 is one shape, and the "a 200 that is
+ * not a token response" reading below is the part worth having once. Task 3's
+ * exchange then adds ONE requirement of its own on top -- that
+ * `refreshToken` is actually present -- because that is the only place the
+ * difference between the two grants matters.
+ */
+export function grantFrom(
+  provider: MailOAuthProvider, payload: Record<string, unknown>,
+): MailTokenGrant {
+  const accessToken = typeof payload.access_token === "string" ? payload.access_token : "";
+  const expiresIn = typeof payload.expires_in === "number" ? payload.expires_in : 0;
+  if (accessToken === "" || expiresIn <= 0) {
+    // A 200 whose body is not a token response. Not a dead grant and not a
+    // network failure -- something is answering at that URL that is not the
+    // provider's token endpoint (a captive portal, a proxy, a typo'd tenant),
+    // and saying so is more use than "authentication failed".
+    throw new Error(`${provider}'s token endpoint answered without a usable access token`);
+  }
+  return {
+    accessToken,
+    expiresInSeconds: expiresIn,
+    ...(typeof payload.refresh_token === "string" && payload.refresh_token !== ""
+      ? { refreshToken: payload.refresh_token }
+      : {}),
   };
 }
 

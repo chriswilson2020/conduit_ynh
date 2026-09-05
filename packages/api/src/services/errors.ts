@@ -80,12 +80,21 @@ export class MailCredentialDecryptError extends Error {
 // the two together would tell an operator to check their key over a problem
 // their key has nothing to do with.
 //
-// NOT MAPPED BY mapDomainError, and not reachable in v1.7.0 Task 1: nothing
-// in this release writes an OAuth blob (no route, no form, no writer), so the
-// only thing that constructs this is a unit test. Task 2 removes two of its
-// four call sites by teaching IMAP and SMTP to use a token; whatever remains
-// after that needs a route mapping, and it will need it at the same moment an
-// OAuth account can first exist.
+// MAPPED SINCE TASK 3, WHICH IS THE MOMENT IT BECAME REACHABLE. Tasks 1 and 2
+// left it unmapped on the honest grounds that nothing in the release could
+// write an OAuth blob, so the only thing constructing it was a unit test. Task
+// 3 adds the authorise/callback pair, and with it the first PATCH that can
+// carry a password to a mailbox that has none -- which without a mapping is a
+// 500 on a request the operator can fix. routes/helpers.ts answers 409
+// `mail_password_not_applicable`: the submission conflicts with the account's
+// stored state, and the remedy is a different gesture (sign in again), not a
+// retry.
+//
+// ITS PRIMARY RAISER IS NOW A COLUMN CHECK, not a decrypt. mail-accounts.ts's
+// updateAccount refuses a password submission by reading auth_method, so the
+// refusal works on an install whose mail.key is missing or restored from the
+// wrong backup -- the states in which decrypting first would blame the key for
+// a request whose real problem is elsewhere.
 //
 // The message names the account id and the kind. Neither is a secret -- the id
 // is in every mail URL and "oauth" is exactly what auth_method says in the
@@ -320,12 +329,23 @@ export class MailReauthRequiredError extends Error {
 // UNREACHABLE BY CONSTRUCTION, and kept precisely because the construction is
 // what has to hold. The two facts live in two places on purpose (the column so
 // Settings can render a row without touching mail.key; the blob because the
-// secret has to be encrypted), and Task 3's authorise callback is the only
-// writer that sets both -- in one transaction. This is the guard that turns a
-// future writer setting one and not the other into a named failure on the
-// account rather than a connection attempted with the wrong mechanism, which
-// would present as an authentication failure against the provider and send the
-// operator to check a password that is not the problem.
+// secret has to be encrypted), and mail-accounts.ts's createOAuthAccount is the
+// only writer that sets both -- in one statement.
+//
+// TASK 3 FOUND THE ONE WAY THIS COULD HAVE HAPPENED AND SHUT IT, which is worth
+// recording because "unreachable by construction" was already written here
+// before the construction was complete. updateAccount computed a password
+// ciphertext from the submission alone and wrote it over whatever the row held,
+// with no reference to auth_method -- so a single PATCH carrying `password` to
+// an OAuth account produced exactly this disagreement, and destroyed the
+// refresh token doing it. It needed an OAuth account to exist, which is why it
+// had never been reachable; it is now refused on the column, before the write.
+//
+// This stays as the guard that turns a FUTURE writer setting one and not the
+// other into a named failure on the account rather than a connection attempted
+// with the wrong mechanism, which would present as an authentication failure
+// against the provider and send the operator to check a password that is not
+// the problem.
 export class MailAuthMethodMismatchError extends Error {
   constructor(accountId: string, authMethod: string, credentialKind: string) {
     super(

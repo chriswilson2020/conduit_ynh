@@ -37,6 +37,7 @@ import {
   mailAuthMethodSchema,
   mailOAuthProviderSchema,
   mailOAuthProviderOf,
+  mailOAuthSigninInputSchema,
   mailAccountSummarySchema,
   mailAccountCreateInputSchema,
   mailAccountUpdateInputSchema,
@@ -889,6 +890,47 @@ describe("mailOAuthProviderOf", () => {
       const provider = mailOAuthProviderOf(method);
       expect(provider === null || mailOAuthProviderSchema.options.includes(provider)).toBe(true);
       expect(provider === null).toBe(method === "password");
+    }
+  });
+});
+
+describe("mailOAuthSigninInputSchema", () => {
+  it("takes a label and an address to add a mailbox", () => {
+    expect(mailOAuthSigninInputSchema.parse({
+      provider: "microsoft", label: "Work", email: "chris@contoso.example",
+    })).toEqual({ provider: "microsoft", label: "Work", email: "chris@contoso.example" });
+  });
+
+  it("takes an accountId ALONE to re-authorise one", () => {
+    // The stored row supplies the address; anything else here would be a
+    // client choosing the login hint for an account it names.
+    expect(mailOAuthSigninInputSchema.parse({ provider: "google", accountId: uuid1 }))
+      .toEqual({ provider: "google", accountId: uuid1 });
+  });
+
+  it("names the FIELD that is missing on a create, not just that something is", () => {
+    const result = mailOAuthSigninInputSchema.safeParse({ provider: "microsoft" });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join("."))).toEqual(["label", "email"]);
+  });
+
+  it("refuses a provider Conduit has no code for", () => {
+    expect(mailOAuthSigninInputSchema.safeParse({
+      provider: "yahoo", label: "Work", email: "a@b.example",
+    }).success).toBe(false);
+  });
+
+  it("has no host, port, security, username or password field at all", () => {
+    // THE SPEC'S SECOND PATH IS AN ABSENCE, and a schema that merely ignored
+    // these would let a client believe it had set them. Unknown keys are
+    // stripped rather than rejected here (zod's default), which is why this
+    // asserts on the OUTPUT rather than on whether the parse succeeded.
+    const parsed = mailOAuthSigninInputSchema.parse({
+      provider: "microsoft", label: "Work", email: "a@b.example",
+      imapHost: "evil.example", imapPort: 993, username: "someone", password: "hunter2",
+    });
+    for (const key of ["imapHost", "imapPort", "username", "password"]) {
+      expect(parsed, key).not.toHaveProperty(key);
     }
   });
 });

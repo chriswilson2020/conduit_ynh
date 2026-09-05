@@ -47,13 +47,15 @@ const envSchema = z.object({
   CONDUIT_REAUTH_PASSWORD: z.string().min(1).optional(),
   // --- Phase 8: the OAuth app registrations ---------------------------------
   //
-  // THE MINIMUM A TOKEN REFRESH NEEDS, AND NOTHING MORE. Task 2 exchanges a
-  // stored refresh token for an access token, which is an RFC 6749 4c
-  // client-authenticated POST -- so a client id and secret are the whole of
-  // what has to be configurable here. The redirect URI and the scope list
-  // belong to the AUTHORISE half (Task 3) and are deliberately absent: adding
-  // env vars nothing reads is how a deployment ends up carrying settings whose
-  // truth nobody checks.
+  // WHAT A WHOLE REGISTRATION IS, and Task 3 finished the list. Task 2 needed
+  // only a client id and secret, because a refresh is an RFC 6749 6
+  // client-authenticated POST; Task 3 added the AUTHORISE half, and with it the
+  // one value that cannot be derived from anything -- the redirect URI. The
+  // scope list is still deliberately absent, and that is not the same decision:
+  // a scope is a fact about which PROVIDER this is (see
+  // services/mail-oauth-signin.ts's PROVIDERS), not about this install, and an
+  // env var nothing but a typo can change is a setting whose truth nobody
+  // checks.
   //
   // ABSENT IS THE NORMAL STATE, hence optional with no defaults. This install's
   // accounts are password accounts against a self-hosted Dovecot, and the spec
@@ -77,19 +79,56 @@ const envSchema = z.object({
   MAIL_OAUTH_MICROSOFT_TENANT: z.string().min(1).optional(),
   MAIL_OAUTH_GOOGLE_CLIENT_ID: z.string().min(1).optional(),
   MAIL_OAUTH_GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
+  // WHERE THE PROVIDER SENDS THE OPERATOR BACK, and the one Phase 8 value that
+  // this server cannot work out for itself.
+  //
+  // IT IS COMPARED BYTE FOR BYTE AT THE PROVIDER (RFC 6749 3.1.2.3, and both
+  // Microsoft's and Google's consoles enforce it literally), so it has to be
+  // the exact string registered there -- scheme, host, port and path, no
+  // trailing slash it does not have. A mismatch fails at the consent screen
+  // with the provider's own message and never reaches this code at all.
+  //
+  // NOT DERIVED FROM THE REQUEST, and that is a security decision rather than a
+  // convenience one. `Host`/`X-Forwarded-Host` are client-supplied, and
+  // building a redirect_uri out of them would let a request choose where the
+  // authorisation code is delivered -- the classic redirect-URI-injection hole.
+  // The provider's own exact-match check is the backstop, but a value this
+  // server has decided on its own is what stops the question being asked.
+  //
+  // ONE URI FOR BOTH PROVIDERS, not one each, because there is one callback
+  // route and it is the same route whichever provider answered -- `state`, not
+  // the path, is what says which sign-in came back. Two registrations pointing
+  // at one URI is ordinary and is what both consoles expect.
+  //
+  // z.url() rather than z.string(): a value that is not a URL cannot be a
+  // redirect URI, and finding that out at boot is better than finding it out at
+  // the consent screen.
+  MAIL_OAUTH_REDIRECT_URI: z.url().optional(),
 });
 
 /**
  * One provider's app registration, or null when this install has none.
- * `tokenEndpoint` is resolved here rather than at the point of use so that the
- * "which URL does Microsoft's tenant give" question is answered once, in the
- * composition root's own input, and a test can point it at a local server
- * without knowing anything about Azure's URL shape.
+ *
+ * BOTH ENDPOINTS ARE RESOLVED HERE rather than at the point of use, so that the
+ * "which URLs does Microsoft's tenant give" question is answered once, in the
+ * composition root's own input, and a test can point both at a local server
+ * without knowing anything about Azure's URL shape. They travel together
+ * because they move together: a tenant that changes changes both, and a pair
+ * built in two places is a pair that can end up naming two directories.
  */
 export interface MailOAuthClientConfig {
   clientId: string;
   clientSecret: string;
+  /** RFC 6749 4.1.3 (code exchange) and 6 (refresh) both POST here. */
   tokenEndpoint: string;
+  /** Where the operator's browser is sent (RFC 6749 4.1.1). */
+  authorizeEndpoint: string;
+  /** MAIL_OAUTH_REDIRECT_URI, copied onto every registration -- see there for
+   * why it is one value for both providers and why it is never derived from a
+   * request. Carried per-provider rather than beside the pair so that a
+   * registration is one object that is either complete or absent, which is what
+   * oauthClient below enforces. */
+  redirectUri: string;
 }
 
 export interface MailOAuthConfig {
@@ -100,9 +139,20 @@ export interface MailOAuthConfig {
 /** Google's token endpoint. One fixed URL, no tenant equivalent. */
 export const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 
+/** Google's authorisation endpoint. The v2 OAuth 2.0 one, which is what
+ * accepts `access_type` and `prompt` -- see mail-oauth-signin.ts, where both
+ * are load-bearing for getting a refresh token back at all. */
+export const GOOGLE_AUTHORIZE_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
+
 /** Microsoft identity platform v2.0 token endpoint for one tenant. */
 export function microsoftTokenEndpoint(tenant: string): string {
   return `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`;
+}
+
+/** Microsoft identity platform v2.0 authorisation endpoint for one tenant.
+ * Same tenant, same encoding, same reasoning as microsoftTokenEndpoint. */
+export function microsoftAuthorizeEndpoint(tenant: string): string {
+  return `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/authorize`;
 }
 
 export interface Config {
@@ -142,12 +192,28 @@ export interface Config {
  * an operator-hostile message. A half-set registration reads here as no
  * registration, and the refresher's own sentence says which install-side thing
  * is missing.
+ *
+ * THE REDIRECT URI JOINED THAT LIST IN TASK 3, and it is a real widening rather
+ * than a tidy-up: an install that set an id, a secret and a tenant but no
+ * MAIL_OAUTH_REDIRECT_URI now reads as having no registration where before it
+ * read as having one. Nothing is stranded by that, and the reason is worth
+ * stating rather than assuming -- the only thing a registration without a
+ * redirect URI could ever have done is REFRESH a grant, and a grant can only
+ * exist if a sign-in completed, which needs the redirect URI. So the state this
+ * widening reclassifies is one no install can be in.
  */
 function oauthClient(
-  clientId: string | undefined, clientSecret: string | undefined, tokenEndpoint: string | null,
+  clientId: string | undefined, clientSecret: string | undefined,
+  endpoints: { token: string; authorize: string } | null,
+  redirectUri: string | undefined,
 ): MailOAuthClientConfig | null {
-  if (clientId === undefined || clientSecret === undefined || tokenEndpoint === null) return null;
-  return { clientId, clientSecret, tokenEndpoint };
+  if (clientId === undefined || clientSecret === undefined) return null;
+  if (endpoints === null || redirectUri === undefined) return null;
+  return {
+    clientId, clientSecret,
+    tokenEndpoint: endpoints.token, authorizeEndpoint: endpoints.authorize,
+    redirectUri,
+  };
 }
 
 export function parseConfig(env: Record<string, string | undefined>): Config {
@@ -205,12 +271,17 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
         value.MAIL_OAUTH_MICROSOFT_CLIENT_SECRET,
         value.MAIL_OAUTH_MICROSOFT_TENANT === undefined
           ? null
-          : microsoftTokenEndpoint(value.MAIL_OAUTH_MICROSOFT_TENANT),
+          : {
+              token: microsoftTokenEndpoint(value.MAIL_OAUTH_MICROSOFT_TENANT),
+              authorize: microsoftAuthorizeEndpoint(value.MAIL_OAUTH_MICROSOFT_TENANT),
+            },
+        value.MAIL_OAUTH_REDIRECT_URI,
       ),
       google: oauthClient(
         value.MAIL_OAUTH_GOOGLE_CLIENT_ID,
         value.MAIL_OAUTH_GOOGLE_CLIENT_SECRET,
-        GOOGLE_TOKEN_ENDPOINT,
+        { token: GOOGLE_TOKEN_ENDPOINT, authorize: GOOGLE_AUTHORIZE_ENDPOINT },
+        value.MAIL_OAUTH_REDIRECT_URI,
       ),
     },
   };

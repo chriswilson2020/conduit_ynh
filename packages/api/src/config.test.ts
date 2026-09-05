@@ -146,22 +146,33 @@ describe("parseConfig", () => {
   });
   // --- Phase 8's OAuth app registrations -------------------------------------
 
+  /** The one Phase 8 value this server cannot work out for itself, and the one
+   * a provider compares byte for byte (RFC 6749 3.1.2.3). */
+  const REDIRECT_URI = "https://conduit.example/api/mail/oauth/callback";
+
   it("has no OAuth registration by default -- a password-only install", () => {
     expect(parseConfig(valid).mailOAuth).toEqual({ microsoft: null, google: null });
   });
 
-  it("builds Microsoft's tenant-scoped v2.0 token endpoint", () => {
+  it("builds Microsoft's tenant-scoped v2.0 endpoints, both of them", () => {
     const config = parseConfig({
       ...valid,
       MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
       MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
       MAIL_OAUTH_MICROSOFT_TENANT: "contoso.onmicrosoft.com",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
     });
     expect(config.mailOAuth.microsoft).toEqual({
       clientId: "app-id",
       clientSecret: "app-secret",
+      // The pair travels together because it moves together: a tenant that
+      // changes changes both, and a pair built in two places is a pair that can
+      // end up naming two directories.
       tokenEndpoint:
         "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token",
+      authorizeEndpoint:
+        "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/authorize",
+      redirectUri: REDIRECT_URI,
     });
   });
 
@@ -171,9 +182,14 @@ describe("parseConfig", () => {
       MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
       MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
       MAIL_OAUTH_MICROSOFT_TENANT: "a/b?c",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
     });
     expect(config.mailOAuth.microsoft?.tokenEndpoint)
       .toBe("https://login.microsoftonline.com/a%2Fb%3Fc/oauth2/v2.0/token");
+    // Both endpoints, because escaping one and splicing the other would be a
+    // tenant that reaches the right token URL and the wrong consent screen.
+    expect(config.mailOAuth.microsoft?.authorizeEndpoint)
+      .toBe("https://login.microsoftonline.com/a%2Fb%3Fc/oauth2/v2.0/authorize");
   });
 
   it("uses Google's single token endpoint, which has no tenant", () => {
@@ -181,8 +197,14 @@ describe("parseConfig", () => {
       ...valid,
       MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id",
       MAIL_OAUTH_GOOGLE_CLIENT_SECRET: "g-secret",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
     });
     expect(config.mailOAuth.google?.tokenEndpoint).toBe("https://oauth2.googleapis.com/token");
+    // The v2 authorisation endpoint, which is the one that accepts
+    // access_type and prompt -- both load-bearing for getting a refresh token
+    // back at all (api: services/mail-oauth-signin.ts).
+    expect(config.mailOAuth.google?.authorizeEndpoint)
+      .toBe("https://accounts.google.com/o/oauth2/v2/auth");
   });
 
   /**
@@ -195,16 +217,48 @@ describe("parseConfig", () => {
    * than refusing.
    */
   it("treats a half-configured registration as none at all", () => {
-    const half = [
-      { MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id" },
-      { MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret" },
-      { MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id", MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret" },
-      { MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id", MAIL_OAUTH_MICROSOFT_TENANT: "t" },
-    ];
-    for (const partial of half) {
-      expect(parseConfig({ ...valid, ...partial }).mailOAuth.microsoft).toBeNull();
+    const complete = {
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
+      MAIL_OAUTH_MICROSOFT_TENANT: "t",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
+    };
+    // Every single-field omission, derived from the complete set rather than
+    // listed: a FIFTH field added to a registration is then covered by this
+    // without anyone remembering to extend a literal.
+    for (const missing of Object.keys(complete)) {
+      const partial = { ...valid, ...complete } as Record<string, string | undefined>;
+      delete partial[missing];
+      expect(parseConfig(partial).mailOAuth.microsoft, missing).toBeNull();
     }
+    expect(parseConfig({ ...valid, ...complete }).mailOAuth.microsoft).not.toBeNull();
     expect(parseConfig({ ...valid, MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id" }).mailOAuth.google).toBeNull();
+  });
+
+  /**
+   * THE REDIRECT URI IS SHARED, not per provider: there is one callback route,
+   * and `state` -- not the path -- is what says which sign-in came back. Two
+   * registrations pointing at one URI is what both consoles expect.
+   */
+  it("gives both registrations the same redirect URI", () => {
+    const config = parseConfig({
+      ...valid,
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "app-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "app-secret",
+      MAIL_OAUTH_MICROSOFT_TENANT: "t",
+      MAIL_OAUTH_GOOGLE_CLIENT_ID: "g-id",
+      MAIL_OAUTH_GOOGLE_CLIENT_SECRET: "g-secret",
+      MAIL_OAUTH_REDIRECT_URI: REDIRECT_URI,
+    });
+    expect(config.mailOAuth.microsoft?.redirectUri).toBe(REDIRECT_URI);
+    expect(config.mailOAuth.google?.redirectUri).toBe(REDIRECT_URI);
+  });
+
+  /** A value that is not a URL cannot be a redirect URI, and finding that out
+   * at boot is better than finding it out at a consent screen. */
+  it("refuses a redirect URI that is not a URL", () => {
+    expect(() => parseConfig({ ...valid, MAIL_OAUTH_REDIRECT_URI: "conduit.example/callback" }))
+      .toThrow(/MAIL_OAUTH_REDIRECT_URI/);
   });
 
   /**

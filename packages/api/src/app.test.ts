@@ -6,7 +6,7 @@ import path from "node:path";
 import { healthResponseSchema, meResponseSchema, errorResponseSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "./test/db.js";
 import { users } from "./db/schema.js";
-import { buildApp } from "./app.js";
+import { buildApp, redactSensitiveQuery } from "./app.js";
 import type { Config } from "./config.js";
 import type { Database } from "./db/client.js";
 
@@ -296,6 +296,76 @@ describe("error handler installation order", () => {
     expect(body.error).toBe("internal_error");
     expect(response.body).not.toContain(secretDriverMessage);
     expect(response.body).not.toContain("connection refused");
+    await app.close();
+  });
+});
+
+/**
+ * Phase 8 Task 3. The OAuth callback is the first route on this app whose URL
+ * carries a credential -- RFC 6749's authorisation code arrives in the query
+ * string of a GET, beside the single-use state the callback is verified with --
+ * and Fastify's default serializer logs `req.url` verbatim at info.
+ */
+describe("redactSensitiveQuery", () => {
+  it("blanks an OAuth code and state, and nothing else", () => {
+    expect(redactSensitiveQuery("/api/mail/oauth/callback?code=abc&state=def"))
+      .toBe("/api/mail/oauth/callback?code=%5Bredacted%5D&state=%5Bredacted%5D");
+  });
+
+  it("leaves every other parameter alone -- they are the evidence, not the risk", () => {
+    // Blanking whole query strings would trade a real class of leak for a real
+    // loss of the first thing anyone reads when diagnosing a request.
+    const url = "/api/mail/threads?cursor=abc&folder=INBOX&unread=1";
+    expect(redactSensitiveQuery(url)).toBe(url);
+  });
+
+  it("returns a URL with no query byte for byte", () => {
+    expect(redactSensitiveQuery("/api/mail/accounts")).toBe("/api/mail/accounts");
+  });
+
+  it("does not match a parameter that merely LOOKS like one", () => {
+    // The regex version of this gets `authcode` wrong in one direction and a
+    // bare `?code` wrong in the other; parsing gets both right.
+    const url = "/api/x?authcode=keep-me&stateful=keep-me-too";
+    expect(redactSensitiveQuery(url)).toBe(url);
+  });
+
+  it("blanks a code that is present but empty, rather than deciding it is harmless", () => {
+    expect(redactSensitiveQuery("/api/x?code=")).toContain("code=%5Bredacted%5D");
+  });
+});
+
+describe("the request log", () => {
+  it("never writes an OAuth authorisation code or state, and shows the log really was watching", async () => {
+    const lines: string[] = [];
+    const marker = "AUTHORISATION-CODE-THAT-MUST-NOT-BE-LOGGED";
+    const stateMarker = "STATE-THAT-MUST-NOT-BE-LOGGED";
+    // Logging is off entirely under NODE_ENV=test, so "the transcript is
+    // empty" would prove nothing -- reauth.test.ts's own log assertion makes
+    // the same move for the same reason.
+    const app = await buildApp({
+      config: { ...config, nodeEnv: "development" },
+      db: handle.db,
+      loggerStream: { write: (line: string) => { lines.push(line); } },
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/mail/oauth/callback?code=${marker}&state=${stateMarker}`,
+      headers: authHeaders,
+    });
+    // The state cannot redeem -- nothing minted it -- so this is also the path
+    // that logs a warn line of its own, which is the one place the callback
+    // deliberately writes to the journal.
+    expect(response.statusCode).toBe(303);
+
+    const transcript = lines.join("");
+    // The instrument, shown working: the request WAS logged, and the warn line
+    // this route writes for a failed sign-in was written too.
+    expect(transcript).toContain("/api/mail/oauth/callback");
+    expect(transcript).toContain("mail oauth: sign-in did not complete");
+    expect(transcript).not.toContain(marker);
+    expect(transcript).not.toContain(stateMarker);
     await app.close();
   });
 });

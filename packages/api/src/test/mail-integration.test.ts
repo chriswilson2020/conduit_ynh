@@ -311,21 +311,21 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
       // environment rather than through a passed flag.
       await expect(imapVerify({
         host: IMAP_HOST, port: IMAP_PORT, security: "tls",
-        username: USERNAME, password: PASSWORD,
+        username: USERNAME, auth: { kind: "password", password: PASSWORD },
       })).resolves.toBeUndefined();
     });
 
     it("classifies a rejected password as auth:", async () => {
       await expect(imapVerify({
         host: IMAP_HOST, port: IMAP_PORT, security: "tls",
-        username: USERNAME, password: "not-the-password",
+        username: USERNAME, auth: { kind: "password", password: "not-the-password" },
       })).rejects.toThrow(/^auth:/);
     });
 
     it("classifies a port nothing listens on as connection:", async () => {
       await expect(imapVerify({
         host: IMAP_HOST, port: DEAD_PORT, security: "tls",
-        username: USERNAME, password: PASSWORD,
+        username: USERNAME, auth: { kind: "password", password: PASSWORD },
       })).rejects.toThrow(/^connection:/);
     });
 
@@ -746,14 +746,14 @@ describe.skipIf(!RUN)("mail integration (Dovecot + Mailpit)", () => {
     it("verifies against Mailpit through a required STARTTLS upgrade", async () => {
       await expect(smtpVerify({
         host: SMTP_HOST, port: SMTP_PORT, security: "starttls",
-        username: USERNAME, password: PASSWORD,
+        username: USERNAME, auth: { kind: "password", password: PASSWORD },
       })).resolves.toBeUndefined();
     });
 
     it("classifies an SMTP port nothing listens on as connection:", async () => {
       await expect(smtpVerify({
         host: SMTP_HOST, port: DEAD_PORT, security: "starttls",
-        username: USERNAME, password: PASSWORD,
+        username: USERNAME, auth: { kind: "password", password: PASSWORD },
       })).rejects.toThrow(/^connection:/);
     });
 

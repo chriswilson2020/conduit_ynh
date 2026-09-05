@@ -131,27 +131,32 @@ export type MailOAuthCredentials = Extract<MailCredentials, { kind: "oauth" }>;
 /**
  * Narrow to the password shape, or throw.
  *
- * EXISTS BECAUSE THE UNION LANDED BEFORE THE CODE THAT USES ITS OTHER HALF.
- * Four call sites could only do something with a password. Task 2 removed the
- * two that mattered -- the IMAP connect and the SMTP transport now take an
- * already-resolved credential from mail-oauth.ts's resolveConnectionAuth, which
- * hands imapflow and nodemailer an access token where there is one. The two
- * that remain are both in mail-accounts.ts and both belong to Task 3:
- * updateAccount's carry-the-imap-half-forward branch (an OAuth account has no
- * password half to carry, and acquiring one is signing in, not editing) and
- * testConnection's stored-password fallback (which has no second form to test
- * an OAuth account from until Task 3 builds one).
+ * EXISTS BECAUSE THE UNION LANDED BEFORE THE CODE THAT USES ITS OTHER HALF, AND
+ * IT IS DOWN TO ONE CALL SITE. Four sites could only do something with a
+ * password. Task 2 removed the two that mattered -- the IMAP connect and the
+ * SMTP transport now take an already-resolved credential from mail-oauth.ts's
+ * resolveConnectionAuth, which hands imapflow and nodemailer an access token
+ * where there is one. Task 3 removed the third: testConnection resolves an
+ * OAuth account's token and tests with it rather than demanding a password it
+ * was never going to have.
+ *
+ * THE ONE THAT REMAINS IS NO LONGER A GAP. updateAccount's
+ * carry-the-imap-half-forward branch still calls this, but the REFUSAL now
+ * happens a few lines earlier and on mail_accounts.auth_method -- a column, in
+ * the clear, needing no mail.key. This call is what narrows the union for the
+ * type system, plus a fail-closed backstop for the one state the column cannot
+ * see: a row claiming 'password' over a blob that is not one.
  *
  * A THROW RATHER THAN A FALLBACK, unchanged and still the point: a path that
  * quietly used an empty password would present as an auth failure against the
  * provider, which is precisely the "mail just stopped" symptom the spec's
  * Risk 3 is about.
  *
- * STILL NOT REACHABLE. Nothing in this release can create an OAuth account --
- * there is no route, no form and no writer for the OAuth shape -- so this
- * remains a compile-time completeness guard that only tests exercise, and
- * MailCredentialKindError still needs no mapDomainError entry until the moment
- * one can exist.
+ * IT IS REACHABLE NOW, AND MAPPED. Task 3 makes an OAuth account creatable, so
+ * MailCredentialKindError stopped being a class only tests construct --
+ * routes/helpers.ts's mapDomainError answers it 409 rather than letting it
+ * become a 500, which is what it would have been the first time somebody
+ * PATCHed a password onto a provider mailbox.
  */
 export function mustBePasswordCredentials(
   credentials: MailCredentials, accountId: string,
