@@ -128,6 +128,28 @@ saying so would be the worst outcome available.**
 2. **The registration is not code and cannot be tested here.** Azure and Google consent screens
    are the operator's, and a wrong redirect URI or scope fails at a provider nobody can mock
    honestly. Expect one round of real-world fixing after the first sign-in attempt.
+
+   **The four things that will actually go wrong, written down by Task 3 so that round is one
+   round rather than four.** None of them is a Conduit bug and each presents as one:
+
+   - **The Azure app must be registered as a WEB platform, not a SPA.** Conduit authenticates the
+     token request with a client secret (RFC 6749 4.1.3, confidential client); a SPA registration
+     refuses one outright, and the failure arrives at the token endpoint rather than at the
+     consent screen, so the operator sees a sign-in that appeared to work and then did not.
+   - **SMTP AUTH IS A SEPARATE SWITCH AND OAUTH DOES NOT BYPASS IT.** Exchange Online disables
+     SMTP AUTH per tenant and per mailbox, and a valid OAuth token against a mailbox with
+     `SmtpClientAuthenticationDisabled = $true` is still refused. The symptom is the one that
+     wastes the most time here -- IMAP syncs perfectly and every send fails -- and the fix is
+     `Set-CASMailbox -SmtpClientAuthenticationDisabled $false`, in the tenant, not in this
+     repository.
+   - **The delegated permissions are Office 365 Exchange Online's, not Graph's.**
+     `IMAP.AccessAsUser.All` and `SMTP.Send` under Office 365 Exchange Online. Graph's `Mail.*`
+     are the wrong permissions AND actively harmful: a grant covering more than one resource is
+     what can hand the refresh a token IMAP refuses, presenting as a nameless authentication
+     failure weeks later (the caveat Task 2 recorded at the refresh call site, and why Task 3's
+     scope list carries no `openid` either).
+   - **The redirect URI is compared byte for byte** (RFC 6749 3.1.2.3) against
+     `MAIL_OAUTH_REDIRECT_URI`. Scheme, host, port, path; no trailing slash it does not have.
 3. **A refresh failure is silent by nature** -- it looks like mail simply stopping. It must be
    surfaced as an account state, not as a sync log line.
 4. **Gmail consumer accounts.** Named above; the risk is shipping without saying so.

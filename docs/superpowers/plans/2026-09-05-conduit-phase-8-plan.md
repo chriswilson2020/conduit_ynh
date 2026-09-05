@@ -55,6 +55,44 @@ item that cannot be finished without Chris at a browser.
       an API response.** The rule `credentials_ciphertext` already has; `routes/mail.ts` never
       selects it.
 
+### Four corrections, written after Task 3 built it
+
+1. **THIS TASK SAYS NOTHING ABOUT `state`, AND IT IS THE ONLY SECURITY PROPERTY THE FLOW HAS.**
+   The largest error in this document. A callback that accepts any `state` lets an attacker who
+   completes an authorisation against THEIR mailbox, and gets the operator's browser to load the
+   callback, attach that mailbox to this install's account -- and every message the operator
+   files, links or replies to then goes somewhere else. The bullets above describe the happy
+   path of an OAuth flow and none of its adversarial one. Task 3's `state` is unguessable
+   (32 CSPRNG bytes), single-use, bound to the user id (SSOwat's per-request identity is the
+   only session this install has), and redeemed BEFORE the code or the error is looked at. PKCE
+   (S256) sits on top because the code arrives in a query string and therefore in nginx's access
+   log. None of that is in this plan; all of it is in `services/mail-oauth-signin.ts`.
+
+2. **THREE ROUTES, NOT TWO.** `GET /api/mail/oauth/providers` is the third and is not optional:
+   an install with no app registration -- which is this deployment, and the plan says so
+   elsewhere -- must not be offered a button whose only possible outcome is a 409 naming
+   environment variables. Offering a choice and then refusing it is v1.4.1's error-that-blamed-
+   the-wrong-thing wearing a different hat.
+
+3. **THE SENT FOLDER IS A PROVIDER FACT TOO, and leaving it off the list would have shipped a
+   feature that half-works.** The third bullet lists host, port, security and password. Exchange
+   Online exposes `Sent Items` and Gmail exposes `[Gmail]/Sent Mail`; `mail_accounts.sent_folder`
+   defaults to `Sent`, which is neither. An account created literally to this bullet would sync
+   fine and then fail the APPEND on every message it sent, against a folder that is not there.
+   Filled per provider at create, editable in Settings afterwards.
+
+4. **"`routes/mail.ts` never selects it" NAMES THE WRONG GUARD.** True, and never the whole rule.
+   Task 2 found a live path from a provider's `error_description` into `mail_accounts.last_error`
+   into the accounts response. Task 3 found Fastify's own request serializer, which logs
+   `req.url` verbatim at info -- so every completed sign-in would have written the authorisation
+   code and the `state` into the journal. Two leaks, neither of them a `select`. The rule needs
+   stating as a property to be hunted for, not as one call site that satisfies it.
+
+Also: **the redirect URI has to be CONFIGURED, not only registered.** The second bullet says it
+is registered by hand at the provider, which is true and half the story -- `MAIL_OAUTH_REDIRECT_URI`
+is now part of what makes a registration complete in `config.ts`, and an install with an id, a
+secret and a tenant but no redirect URI reads as having no registration at all.
+
 ## Task 4: Both providers, and Gmail's fork stated where it is chosen
 
 - [ ] Microsoft and Google are one code path with two configurations.
