@@ -85,6 +85,23 @@ export default defineConfig({
       // the journey could only ever prove that the prompt appears, which is not
       // the property (see e2e/data.spec.ts).
       CONDUIT_REAUTH_PASSWORD: "e2e-reauth-password",
+      // Phase 8: an app registration, so the add-account form's second path
+      // exists to be walked (e2e/mail-oauth.spec.ts).
+      //
+      // A FAKE ONE, AND THE SPEC NEVER LEAVES THIS MACHINE. The tenant is a
+      // made-up string, so the authorise URL points at a login.microsoftonline
+      // .com path nothing here can reach -- the journey asserts on the URL the
+      // app builds and aborts the navigation before it is issued. The half that
+      // does run end to end is the CALLBACK, which is this server's own route
+      // and is where the security lives: a forged `state` has to be refused,
+      // and the refusal has to reach the page as a sentence.
+      //
+      // The secret is a literal because there is nothing behind it. It is not a
+      // credential for anything, at any provider, ever.
+      MAIL_OAUTH_MICROSOFT_CLIENT_ID: "e2e-client-id",
+      MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "e2e-client-secret-not-a-real-one",
+      MAIL_OAUTH_MICROSOFT_TENANT: "e2e-tenant.example",
+      MAIL_OAUTH_REDIRECT_URI: "http://127.0.0.1:3100/api/mail/oauth/callback",
       BASE_PATH: "/",
       WEB_ROOT: "packages/web/dist",
     },
