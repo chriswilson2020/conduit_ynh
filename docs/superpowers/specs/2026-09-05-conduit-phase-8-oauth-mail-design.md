@@ -1,6 +1,7 @@
 # Conduit Phase 8 — OAuth mail (XOAUTH2)
 
-**Status:** spec, awaiting Chris's approval.
+**Status:** approved by Chris 5 Sep and built; shipped in v1.7.0 and **labelled experimental**,
+because two of its Definition-of-done items were never met. See the note under that heading.
 **Target release:** v1.7.0.
 **Predecessor:** v1.6.0 (Phase 4.4), shipped 5 Sep.
 
@@ -146,6 +147,18 @@ saying so would be the worst outcome available.**
 - The refresh token never leaves the server, never reaches a log, and never appears in an API
   response -- the rule `credentials_ciphertext` already has.
 - Full unit and e2e green.
+
+> **THE FIRST TWO WERE NEVER DONE, AND v1.7.0 SHIPPED WITHOUT THEM.** No sign-in in this phase
+> has ever completed against a real Microsoft or Google account: the whole of it was exercised
+> against fakes, which is the most any test here can do and is exactly what Risk 2 below
+> predicted. The fourth item holds only against a stub token endpoint. And the packaging that
+> carries these settings to a server -- `.env.oauth`, the `--keep` on upgrade, the unit's
+> `EnvironmentFile`, the `doc/` pages YunoHost renders -- has never run at all, which this list
+> does not mention because nobody thought to put it here.
+>
+> **So the feature is labelled experimental** wherever an operator meets it, and the label says
+> which half is proven rather than only carrying the word. The plan's Definition of done has the
+> item-by-item account. What closes this phase is one real sign-in and one real install.
 
 ---
 

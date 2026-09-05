@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Meeting, MeetingAttendee, MeetingDetail, Task } from "@conduit/shared";
 import {
   useArchiveMeeting,
@@ -14,8 +14,10 @@ import {
 import { EntityPicker } from "../entity-picker";
 import {
   advanceCursorPages, cursorForKey, emptyCursorPages, flattenCursorPages, identityKey,
-  mergeCursorPage, userLabel, type CursorPages,
+  pendingArrivals, refreshCursorRows, takeCursorPage, userLabel,
+  type CursorPages, type PendingArrivals,
 } from "../../lib";
+import { useLatest, useOwnWriteNonce } from "../../hooks";
 import { RichTextEditor, RichTextView } from "../mail/rich-text";
 import { OwnerSelect } from "../owner-select";
 import { UserPicker } from "../user-picker";
@@ -35,6 +37,7 @@ import {
   followUpErrorMessage,
   meetingErrorMessage,
   meetingWhenLabel,
+  newMeetingsLabel,
   summarizeAttendees,
   taskCountLabel,
   type AttendeeDraft,
@@ -92,13 +95,26 @@ interface MeetingListState {
   setArchived: (next: boolean) => void;
   rows: Meeting[];
   isLoading: boolean;
+  /** A fetch is in flight. Read beside isLoading wherever the list would
+   * otherwise claim to be empty -- see the accumulating effect. */
+  isFetching: boolean;
   isError: boolean;
   hasMore: boolean;
   loadMore: () => void;
-  /** Back to page one, discarding every accumulated page. */
+  /** Back to page one: fetch it, THEN discard every accumulated page. Used by
+   * the reader's own "Log a meeting" and by the control that reveals what the
+   * list is holding -- see the hook. */
   reset: () => void;
   retry: () => void;
+  /** What has arrived that the list is not showing. */
+  pending: PendingArrivals;
 }
+
+/** The column this list is ORDERED BY (api: services/meetings.ts's
+ * `(occurred_at, id)` keyset), which is the only one the arrivals count may
+ * read -- NOT createdAt, which is when the meeting was logged and is not what
+ * decides where its row sits. At module scope so it keeps one identity. */
+const occurredAtOf = (meeting: Meeting): string => meeting.occurredAt;
 
 /**
  * The Meetings tab's list state, as one hook so it can be owned by the
@@ -107,49 +123,161 @@ interface MeetingListState {
  *
  * Pages accumulate through the same cursor-page record the timeline and the
  * inbox use, keyed on the filter set -- so toggling "Archived" starts at page
- * one rather than applying the live list's cursor to the archived list, and a
- * background ["meetings"] invalidation (another user logging a meeting here,
- * or a follow-up task changing a task count) REPLACES the page it refetched
- * instead of appending it again.
+ * one rather than applying the live list's cursor to the archived list.
+ *
+ * =====================================================================
+ * THE LIST DOES NOT MOVE UNDER THE READER (v1.7.1)
+ * =====================================================================
+ *
+ * WHAT THIS REPLACED. The accumulator took every page a fetch handed it,
+ * including one it was already showing, and ["meetings"] is published by every
+ * meeting write anyone makes (api: services/meetings.ts). The list is keyed
+ * `(occurred_at, id)` descending and occurredAt is USER-SUPPLIED -- a colleague
+ * logging a meeting, backdating one, correcting a time, or archiving one all
+ * re-order the page a reader is looking at, and the row under their pointer
+ * changes between two clicks. Same defect as the inbox's before v1.6.0, same
+ * shape; thread-list.tsx carries the long version of the reasoning and this
+ * records only what differs here.
+ *
+ * THE RULE: A ROW NEVER MOVES, APPEARS OR VANISHES WITHOUT THE READER ASKING;
+ * A ROW THAT IS ALREADY ON SCREEN IS KEPT CURRENT WHERE IT STANDS.
+ *
+ * BOTH HALVES EARN THEIR KEEP HERE, which is what separates this list from the
+ * timeline beside it. A timeline entry is immutable, so timeline.tsx holds and
+ * refreshes nothing; a MEETING row changes constantly and in place -- its
+ * follow-up task count when anyone adds a task from the meeting view, its
+ * title, duration, attendees and notes when anyone edits it. Freezing outright
+ * would leave "No follow-up tasks" under a meeting whose task the reader had
+ * just added. So refreshCursorRows runs, from page one and only from page one
+ * (its doc comment gives the one-writer argument).
+ *
+ * WHAT THAT COSTS, stated rather than discovered:
+ *
+ *   A meeting ARCHIVED by someone else keeps its row until the next snapshot.
+ *   refreshCursorRows adds and removes nothing, and the archived meeting is
+ *   simply absent from the live list's page one rather than present-and-
+ *   changed. The row still opens, and the meeting view it opens says "This
+ *   meeting is archived" with an Unarchive beside it -- stale, but never a
+ *   lie, which is the trade the rule already makes for every held row.
+ *
+ *   A meeting BACKDATED BELOW EVERYTHING ON SCREEN is not counted either.
+ *   lib.ts's pendingArrivals excludes a row older than the oldest listed,
+ *   because that is how it tells an arrival from a row the server pulled up to
+ *   close a gap, and it cannot tell those two apart. Such a meeting would sort
+ *   below every row on screen, so nothing the reader is looking at is wrong --
+ *   it is only late.
+ *
+ * THE READER'S OWN WRITES ARE NEVER HELD BACK, and on this tab they are the
+ * ones that must not be. Logging a meeting, archiving one from its view,
+ * unarchiving it: all three change which rows belong here, and two of them
+ * REMOVE a row -- which refreshCursorRows cannot do and the count cannot
+ * offer. hooks.ts's useOwnWriteNonce is the signal, the same one the timeline
+ * uses, and it replaced an explicit reset() call in MeetingForm's onDone: the
+ * form's create is not a special case, it is one of three, and one mechanism
+ * that covers all three is better than one that covers the one somebody
+ * happened to think of.
+ *
+ * THE SNAPSHOT'S ORDER IS LOAD-BEARING HERE, unlike on the timeline. The write
+ * has already invalidated ["meetings"], so the cache is holding the answer
+ * from BEFORE it; emptying the accumulator first would adopt that stale page,
+ * and the fresh one landing a moment later would find page one held again and
+ * take nothing from it -- so the meeting just logged would never appear, on
+ * any hint, ever.
  */
 function useMeetingList(links: RecordLinks): MeetingListState {
   const [archived, setArchived] = useState(false);
   const key = identityKey({ ...links, archived });
   const [pages, setPages] = useState<CursorPages<Meeting>>(() => emptyCursorPages<Meeting>(key));
   const cursor = cursorForKey(pages, key);
-  const { data, isLoading, isError, refetch } = useMeetings({ ...links, archived, cursor });
+  const {
+    data, isLoading, isError, isFetching, isStale, refetch,
+  } = useMeetings({ ...links, archived, cursor });
+  // Page one, whatever page the reader is on: the only writer of refreshed
+  // rows, the source of the arrivals count, and what makes this list live past
+  // page one at all. On page one it hashes to the query above and shares its
+  // cache entry and its fetch.
+  const head = useMeetings({ ...links, archived });
+  const headData = head.data;
 
+  // ONLY EVER ADDS A PAGE, AND ONLY ONE THE QUERY STILL CALLS CURRENT --
+  // timeline.tsx's copy of this effect carries the reasoning for every part of
+  // that, including why the accumulator is not a dependency here and is one in
+  // the inbox, and why isStale rather than isFetching (this tab is the reason).
   useEffect(() => {
-    if (!data) return;
-    setPages((current) => mergeCursorPage(current, key, cursor, data.items, data.nextCursor));
-  }, [data, cursor, key]);
+    if (!data || isStale) return;
+    setPages((current) => takeCursorPage(current, key, cursor, data.items, data.nextCursor));
+  }, [data, isStale, cursor, key]);
+
+  // ...AND PAGE ONE IS THE ONLY THING THAT REFRESHES WHAT IS ON SCREEN. Two
+  // fetches writing row objects would hand out different objects for any row
+  // they both covered and rewrite each other's, from an effect, for ever.
+  //
+  // `pages` IS a dependency here, unlike in the take above: this one is about
+  // the rows the accumulator holds, so a page arriving from "load more" is a
+  // new set of rows to bring up to date against a head that has not itself
+  // changed. Safe because refreshCursorRows returns the same record when it
+  // replaces nothing.
+  useEffect(() => {
+    if (!headData) return;
+    setPages((current) => refreshCursorRows(current, key, headData.items));
+  }, [headData, key, pages]);
 
   const rows = useMemo(() => (pages.key === key ? flattenCursorPages(pages) : []), [pages, key]);
+
+  const headRefetch = head.refetch;
+  // The key AS OF THE SNAPSHOT, not as of the ask: "Archived" toggled while
+  // the fetch is in flight would otherwise re-key the accumulator backwards.
+  const keyRef = useLatest(key);
+  // Fetch, then take what came back, in ONE setPages -- timeline.tsx's
+  // resnapshot carries the reasoning for both halves of that sentence.
+  const reset = useCallback(() => {
+    void headRefetch().then(({ data: fresh }) => {
+      if (fresh === undefined) return;
+      const snapshotKey = keyRef.current;
+      setPages(takeCursorPage(
+        emptyCursorPages<Meeting>(snapshotKey), snapshotKey, undefined, fresh.items, fresh.nextCursor,
+      ));
+    });
+  }, [headRefetch, keyRef]);
+
+  // The reader's own write, which is never held back: logging a meeting from
+  // the form below, archiving one from its view, adding a follow-up task to
+  // it. Only a CHANGE means anything, so the mount pass is skipped.
+  const ownWrite = useOwnWriteNonce();
+  const seenOwnWrite = useRef(ownWrite);
+  useEffect(() => {
+    if (seenOwnWrite.current === ownWrite) return;
+    seenOwnWrite.current = ownWrite;
+    reset();
+  }, [ownWrite, reset]);
+
+  const pending = useMemo(
+    () => (headData === undefined
+      ? { count: 0, atLeast: false }
+      : pendingArrivals(rows, headData.items, headData.nextCursor !== null, occurredAtOf)),
+    [headData, rows],
+  );
 
   return {
     archived,
     setArchived,
     rows,
     isLoading,
+    isFetching,
     isError,
-    // pages.key can lag `key` by one render (the merge runs in an effect), and
+    // pages.key can lag `key` by one render (the take runs in an effect), and
     // offering the previous filter's "Load more" for that render would page
     // the wrong list.
     hasMore: pages.key === key && pages.nextCursor !== null,
     loadMore: () => setPages((current) => advanceCursorPages(current, key)),
-    // A NEW MEETING LANDS ON PAGE ONE, and page one is a frozen snapshot once
-    // any later page has been loaded: the accumulator holds it under its own
-    // cursor while only the CURRENT page's query is mounted, so no
-    // invalidation refetches it. Without this, a meeting logged after any
-    // "Load more" click would simply never appear. Starting over is both
-    // correct and cheap.
-    reset: () => setPages(emptyCursorPages<Meeting>(key)),
+    reset,
     // The only escape from a failed page fetch. `loadMore` cannot serve: the
     // cursor is ALREADY at nextCursor, so advancing again produces the same
     // query key, which TanStack answers from its error state without going
     // near the network. Clicking would look like doing something and do
     // nothing, forever.
     retry: () => { void refetch(); },
+    pending,
   };
 }
 
@@ -157,7 +285,7 @@ function MeetingList({
   list, links, onSelect,
 }: { list: MeetingListState; links: RecordLinks; onSelect: (id: string) => void }) {
   const [formOpen, setFormOpen] = useState(false);
-  const { archived, rows, isLoading, isError } = list;
+  const { archived, rows, isLoading, isFetching, isError } = list;
 
   return (
     <>
@@ -177,16 +305,36 @@ function MeetingList({
       </div>
 
       {formOpen && (
-        <MeetingForm
-          links={links}
-          onDone={() => {
-            setFormOpen(false);
-            list.reset();
-          }}
-        />
+        // Closing the form is ALL this does now. Getting the new meeting onto
+        // the list was a `list.reset()` here until v1.7.1; it is the hook's
+        // own-write signal instead, which also covers the archive and the
+        // unarchive that this callback never knew about. See useMeetingList.
+        <MeetingForm links={links} onDone={() => setFormOpen(false)} />
       )}
 
-      {isLoading && rows.length === 0 && <p className="text-sm text-slate-400">Loading...</p>}
+      {/* MOUNTED ALWAYS, so its live region is announced when it fills, and
+          NOT sticky -- the reasoning is thread-list.tsx's, which renders the
+          same control for the same rule. */}
+      <div data-testid="meetings-new" role="status" aria-live="polite" className="empty:hidden">
+        {list.pending.count > 0 && (
+          <Button
+            variant="outline"
+            className="w-full"
+            data-testid="meetings-new-show"
+            onClick={list.reset}
+          >
+            {newMeetingsLabel(list.pending)}
+          </Button>
+        )}
+      </div>
+
+      {/* isFetching as well, for the reason timeline.tsx's copy of this line
+          gives: a mount over invalidated data holds `data` and is still
+          waiting for the answer it will take, and the empty label below would
+          otherwise claim the record has no meetings. */}
+      {(isLoading || isFetching) && rows.length === 0 && (
+        <p className="text-sm text-slate-400">Loading...</p>
+      )}
       <ul className="flex flex-col gap-2">
         {rows.map((meeting) => (
           <MeetingRow key={meeting.id} meeting={meeting} onSelect={onSelect} />
@@ -194,7 +342,7 @@ function MeetingList({
         {/* An empty list and a FAILED list are different facts, and rendering
             the first for the second is the worse of the two mistakes: "No
             meetings yet" on a record that has plenty reads as data loss. */}
-        {!isLoading && !isError && rows.length === 0 && (
+        {!isLoading && !isFetching && !isError && rows.length === 0 && (
           <li data-testid="meetings-empty" className="text-sm text-slate-400">
             {archived ? "No archived meetings" : "No meetings yet"}
           </li>

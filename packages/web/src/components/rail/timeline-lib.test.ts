@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { Event } from "@conduit/shared";
 import { eventVerbSchema } from "@conduit/shared";
 import { NO_SUBJECT_LABEL } from "../mail/mail-lib";
-import { VERB_BADGE, eventLink, summarize } from "./timeline-lib";
+import { VERB_BADGE, eventLink, newActivityLabel, summarize } from "./timeline-lib";
 
 /** A timeline row with every pointer null, so each case below sets only what
  * it is actually about. */
@@ -112,5 +112,23 @@ describe("eventLink", () => {
 
   it("leads nowhere for an entry carrying neither pointer", () => {
     expect(eventLink(event({ verb: "note_added", companyId: "c1" }))).toBeNull();
+  });
+});
+
+/**
+ * v1.7.1. The timeline holds still under the reader, so the control that
+ * offers what it is holding has to say how much -- "new activity" alone cannot
+ * tell a reader whether it is worth losing their place for.
+ */
+describe("newActivityLabel", () => {
+  it("says how many, in the singular when there is one", () => {
+    expect(newActivityLabel({ count: 1, atLeast: false })).toBe("Show 1 new entry");
+    expect(newActivityLabel({ count: 4, atLeast: false })).toBe("Show 4 new entries");
+  });
+
+  // The "+" is the difference between a count and a floor, and dropping it
+  // would state a number the fetch never established.
+  it("marks a count that is only a floor", () => {
+    expect(newActivityLabel({ count: 20, atLeast: true })).toBe("Show 20+ new entries");
   });
 });

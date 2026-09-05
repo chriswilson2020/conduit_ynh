@@ -8,6 +8,7 @@ import {
   emptyCursorPages,
   flattenCursorPages,
   identityKey,
+  pendingArrivals,
   refreshCursorRows,
   relativeTime,
   takeCursorPage,
@@ -24,7 +25,7 @@ import {
 } from "../../queries";
 import { useLatest } from "../../hooks";
 import {
-  addressLabel, hiddenChipLabel, newMailLabel, pendingArrivals, subjectLabel,
+  addressLabel, hiddenChipLabel, newMailLabel, subjectLabel,
 } from "./mail-lib";
 import { Button } from "../ui/button";
 
@@ -114,6 +115,12 @@ export interface ThreadListProps {
 
 const DEFAULT_LIMIT = 25;
 
+/** The column this list is ORDERED BY, which is the only one the arrivals
+ * count may read. At module scope so it keeps one identity: the memo below has
+ * it in its closure, and an inline arrow would be a new function on every
+ * render. */
+const lastMessageAtOf = (thread: MailThreadListItem): string => thread.lastMessageAt;
+
 /**
  * The thread list, shared by the inbox's left pane and every record page's
  * Mail tab -- which is why it takes a filter set and a selection callback
@@ -163,7 +170,7 @@ const DEFAULT_LIMIT = 25;
  *
  *   1. A conversation the reader cannot see gets new mail -> counted, and a
  *      control at the top of the list offers to show it. Nothing moves until
- *      it is pressed. (mail-lib's pendingArrivals, and the control below.)
+ *      it is pressed. (lib.ts's pendingArrivals, and the control below.)
  *
  *   2. A conversation the reader CAN see gets new mail -> its row is refreshed
  *      in place: new snippet, new time, the unread dot back on, at the
@@ -342,7 +349,7 @@ export function ThreadList({
 
   /**
    * What has arrived that the list is not showing -- the difference between
-   * the freshest page one and the rows on screen. mail-lib's pendingArrivals
+   * the freshest page one and the rows on screen. lib.ts's pendingArrivals
    * owns the two exclusions that keep the number honest.
    *
    * Both sides are this filter set's by construction, with no guard needed for
@@ -354,7 +361,7 @@ export function ThreadList({
   const pending = useMemo(
     () => (headData === undefined
       ? { count: 0, atLeast: false }
-      : pendingArrivals(threads, headData.items, headData.nextCursor !== null)),
+      : pendingArrivals(threads, headData.items, headData.nextCursor !== null, lastMessageAtOf)),
     [headData, threads],
   );
 

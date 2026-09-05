@@ -2,6 +2,8 @@
 
 Conduit's mail accounts sign in with a **password**, and that needs nothing on this page: an account on your own IMAP server is the ordinary case here and always will be. Read on only if you want people to connect a Microsoft 365 or Google mailbox by signing in at the provider instead.
 
+**This is experimental, and here is exactly what that means.** No sign-in described below has ever completed against a real Microsoft or Google account, and none of the packaging that carries these settings -- the `.env.oauth` file, its survival across an upgrade, the unit line that reads it -- has ever run on a YunoHost server. What *is* tested, and heavily, is everything Conduit does on its own: the request it builds, the values it refuses at boot, the tokens it stores and renews, and that this page still agrees with the code. What is untested is the round trip through somebody else's console and the install path that carries these values to the server, neither of which anything in Conduit can reach. Read the rest as carefully written and never once run.
+
 The values below are this install's own. YunoHost fills them in from its settings before showing you this page.
 
 ### It needs a one-time app registration, made by a tenant administrator
@@ -72,6 +74,8 @@ Then `systemctl restart __APP__`.
 
 **Not `.env`.** That file is re-rendered from a packaging template on every upgrade, so anything added to it is lost the next time this app is upgraded, and lost quietly: Conduit starts, the provider option stops appearing in Settings > Mail, and nothing anywhere says why. `.env.oauth` exists precisely because the packaging creates it once and never rewrites it.
 
+**That arrangement is part of what has never been run.** `.env.oauth` is created by this package's install script and carried across an upgrade by a `--keep` on its upgrade script, and neither line has executed on a YunoHost server. So keep your own copy of whatever you put in this file: Microsoft shows a client secret exactly once, and if an upgrade did lose the file you would be issuing a new secret rather than finding the old one.
+
 Microsoft's tenant is required, and there is deliberately no fallback to `common`, which is the *multi*-tenant endpoint and would authenticate against the wrong directory rather than refuse. Google has no tenant equivalent. A registration is all or nothing: a client id with no secret, or Microsoft without a tenant, or either provider without the redirect URI, reads as no registration at all, because none of those can complete a single request.
 
 ### When it does not work
@@ -89,3 +93,5 @@ journalctl -u __APP__ -n 200 | grep 'mail oauth'
 `docs/mail-oauth-setup.md` in the Conduit source is the full guide: the same registrations at more length, plus the sent-mail behaviour of each provider, Gmail's localised folder names, and the three Gmail views Conduit leaves switched off.
 
 Everything here about Microsoft's and Google's own consoles was written from their published documentation. It **has not been tested against a real Microsoft or Google** tenant: those consent screens belong to whoever owns the directory, and no test in Conduit can honestly stand in for one. What is tested is the request Conduit builds, the values it refuses, and that this page still agrees with the code. Expect one round of correction on the first real sign-in; this page exists so that it is one round.
+
+The packaging is the second untested half, and it is the less obvious one. Nothing in this repository can install itself on a YunoHost, so the creation of `.env.oauth`, the `--keep` that carries it across an upgrade, the `EnvironmentFile` line that makes the service read it, and the rendering of this very page are all first run on your server rather than on somebody's before it. A test here reproduces YunoHost's substitution from its published source, which is why the values above are this install's own and not a template; it cannot watch YunoHost do it.

@@ -279,6 +279,69 @@ export interface SigninCaveat {
 }
 
 /**
+ * ---------------------------------------------------------------------------
+ * WHAT "EXPERIMENTAL" MEANS HERE, WHERE PASSWORD AND PROVIDER ARE THE CHOICE
+ * ---------------------------------------------------------------------------
+ *
+ * Chris, 5 Sep: "label the Microsoft and Google connectivity as experimental
+ * for now. I don't have time to check it." The reason is in this phase's own
+ * four task reports rather than in a mood. Nothing in it was ever exercised
+ * against a real Microsoft or Google tenant -- the consent screens belong to
+ * whoever owns the directory and cannot be honestly mocked -- and not one line
+ * of the YunoHost packaging that carries its settings has been run either,
+ * because nothing in this repository can reach a YunoHost. Every other feature
+ * in this product has been used on the machine it runs on. This one has not,
+ * and that difference is invisible from outside: the suites are green, and
+ * green against a fake looks exactly like green against Microsoft.
+ *
+ * THE WORD ON ITS OWN WOULD BE A DISCLAIMER RATHER THAN INFORMATION, which is
+ * the failure mode this codebase already named once, in oauthSetupHint: an
+ * absence and a deployment step nobody has taken look identical. "Experimental"
+ * unqualified reads as a hedge, gets skipped, and lets nobody decide anything.
+ * What a reader needs is the SHAPE of the gap -- which half is proven and which
+ * half nobody has run -- so that "try it on a mailbox that can afford a bad
+ * afternoon" is a conclusion they reach rather than advice they are given.
+ *
+ * AND NOT OVERSTATED, which is the other way to be useless and the easier one
+ * to fall into. What sits under this is tested and mutation-tested: the
+ * authorise request and its PKCE, the redirect URI refused at boot, the token
+ * exchange, the refresh, what actually reaches IMAP and SMTP, and the pages
+ * describing all of it. "This might not work" would be false, and false in a
+ * way anyone who looked would catch, which would cost the true half its
+ * credibility too.
+ *
+ * WHY THE CHOOSER AND NOT THE PROVIDER FORM, where providerSigninCaveat below
+ * lives. That one appears once a provider is picked because it is about WHICH
+ * Google account. This one is about whether to use a provider at all, and its
+ * alternative -- a password account -- is on screen only in the chooser. Put it
+ * inside either provider's form and it arrives after the question it answers
+ * has been answered.
+ *
+ * NOT A LIVE REGION, and that is the one substantive difference from the amber
+ * box below. That box APPEARS when the Google radio is chosen, so without
+ * role="alert" a screen reader user meets the seven days and never the warning.
+ * This one is in the dialog's first paint, in document order above the radios,
+ * so it is read on the way to them; an alert role here would announce text that
+ * did not change, which is noise aimed at the same person.
+ */
+export function oauthExperimentalNotice(): SigninCaveat {
+  return {
+    heading: "Signing in at Microsoft or Google is experimental",
+    paragraphs: [
+      "This has never been run against a real Microsoft or Google account. The"
+      + " consent screen belongs to whoever owns the directory and no test here"
+      + " can honestly stand in for one, so what is covered is the request"
+      + " Conduit builds, the values it refuses and what it does with what comes"
+      + " back — not the round trip itself.",
+      "The packaging that carries the server-side settings has never been run"
+      + " either, so an upgrade is a second place this can go wrong. Expect one"
+      + " round of correction on the first sign-in, and leave a mailbox that has"
+      + " to work today on a password.",
+    ],
+  };
+}
+
+/**
  * What the operator has to know about this provider before they press the
  * button, or null when there is nothing.
  *
@@ -368,12 +431,22 @@ export function providerSigninCaveat(provider: MailOAuthProvider): SigninCaveat 
  * wrong, which is worse than the silence "we could not ask" deserves. Deciding
  * it here makes it a case a test can state; deciding it in the JSX made it a
  * `!== undefined` that no test in this repository could reach.
+ *
+ * IT CARRIES THE EXPERIMENTAL LABEL TOO, and this is the surface where the
+ * label is worth most rather than the one where it is most obvious. The reader
+ * of oauthExperimentalNotice above has a registration already; somebody has
+ * spent the afternoon. The reader of THIS sentence has not, and what it asks of
+ * them is a trip into a console they may not own, for an app registration only
+ * a tenant administrator can make. Telling them afterwards that nothing here
+ * has met a real provider would be telling them once the cost was sunk.
  */
 export function oauthSetupHint(callbackPath: string | undefined, origin: string): string | null {
   if (callbackPath === undefined || callbackPath === "") return null;
   return `No mail provider is set up on this install, so a mailbox here signs in with a`
-    + ` password. To add Microsoft or Google, register ${origin}${callbackPath} as the`
-    + ` redirect URI at the provider and set MAIL_OAUTH_REDIRECT_URI to that exact string.`
+    + ` password. Adding Microsoft or Google is experimental: no sign-in here has ever`
+    + ` completed against a real one, and the packaging that carries its settings has`
+    + ` never been run. To set one up, register ${origin}${callbackPath} as the redirect`
+    + ` URI at the provider and set MAIL_OAUTH_REDIRECT_URI to that exact string.`
     + ` docs/mail-oauth-setup.md has the rest.`;
 }
 

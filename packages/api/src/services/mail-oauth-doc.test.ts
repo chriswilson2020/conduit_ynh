@@ -222,4 +222,55 @@ describe("docs/mail-oauth-setup.md", () => {
   it("says plainly that none of it was tested against a real provider", () => {
     expect(doc).toContain("Conduit's tests cannot reach either\nprovider");
   });
+
+  /**
+   * THE SAME HONESTY, MOVED TO WHERE IT CHANGES A DECISION.
+   *
+   * The section above is the last one on a 13,000-character page. Everything it
+   * says is true and a reader who gets there has already spent the afternoon
+   * this page is asking for -- so as a warning it is correctly worded and
+   * arrives after the money is spent. The label goes at the top, in the same
+   * position as "You do not need any of this", because those two sentences
+   * answer the same question and a reader deciding whether to start needs both.
+   *
+   * THE SLICE IS THE ASSERTION. `toContain` on its own would be satisfied by
+   * the bottom section, which already contained most of these words; taking the
+   * text above the first instruction heading is what makes this test about
+   * placement rather than about vocabulary.
+   */
+  it("carries the experimental label above the first instruction, not only below the last", () => {
+    const firstSection = doc.indexOf("## What you are creating");
+    expect(firstSection, "the first instruction heading moved; this slice means nothing now")
+      .toBeGreaterThan(0);
+    const top = doc.slice(0, firstSection);
+
+    expect(top).toContain("This is experimental, and the word is meant literally");
+    expect(top).toContain("has ever completed against a real Microsoft or Google account");
+    expect(top, "the half that is not about a provider at all").toContain("has never been run either");
+    // Not overstated. The request, the refusals and the token handling are all
+    // covered, and a page that read as "this may not work" would be false in a
+    // way its own test suite contradicts.
+    expect(top).toContain("What\nis tested is everything Conduit does on its own");
+  });
+
+  /**
+   * THE PACKAGING, WHICH IS THE HALF NOBODY WROTE DOWN ANYWHERE UNTIL NOW.
+   *
+   * Every unverified claim this page listed was a claim about Microsoft or
+   * Google. But `.env.oauth` being created at install, surviving an upgrade and
+   * being read by the service unit are three claims about THIS repository's own
+   * packaging, and no test here has run any of them -- there is no YunoHost in
+   * the repo or in CI. They read on the page as arrangements that exist, which
+   * is exactly why they needed saying out loud.
+   *
+   * The consequence is pinned with the fact, because a caveat an operator
+   * cannot act on is decoration: Microsoft shows a client secret once, so
+   * "keep your own copy" is the difference between an upgrade that costs five
+   * minutes and one that costs a new registration.
+   */
+  it("says the packaging has never been run either, and what to do about it", () => {
+    expect(doc).toContain("**The packaging has not been run either**");
+    expect(doc).toContain("`.env.oauth` being");
+    expect(doc).toContain("secret exactly once");
+  });
 });

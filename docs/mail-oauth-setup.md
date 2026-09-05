@@ -9,6 +9,14 @@ up, and what you need to know before you decide to.
 a password and always will; that is the ordinary case here and nothing on this
 page changes it.
 
+**This is experimental, and the word is meant literally.** No sign-in described
+here has ever completed against a real Microsoft or Google account, and the
+packaging that carries the settings to a server has never been run either. What
+is tested is everything Conduit does on its own -- the request it builds, the
+values it refuses, the tokens it stores and renews -- and the last section of
+this page says exactly where that stops. Nothing here is a guess; none of it has
+been through a provider.
+
 > This file is checked by a test. `packages/api/src/services/mail-oauth-doc.test.ts`
 > reads the claims below out of this markdown and checks them against the code
 > that implements them -- the callback path, the scopes actually requested, the
@@ -291,7 +299,7 @@ Check the switch first.
 
 ---
 
-## What has not been tested against a real provider
+## What has not been tested, which is why this is experimental
 
 Everything on this page about Microsoft's and Google's own consoles was written
 from their published documentation. **Conduit's tests cannot reach either
@@ -299,6 +307,14 @@ provider** -- the consent screens belong to whoever owns the directory, and a
 wrong scope or redirect URI fails at a service no test here can honestly stand
 in for. What the tests do cover is the request Conduit builds, the values it
 refuses, and what it does with what comes back.
+
+**The packaging has not been run either**, and that half is the easier one to
+overlook because it is not about Microsoft or Google at all. Nothing in this
+repository can install itself on a YunoHost server, so `.env.oauth` being
+created at install, surviving an upgrade, and being read by the service unit
+are three claims made here on the strength of the scripts rather than of a run.
+Keep your own copy of whatever you put in that file: Microsoft shows a client
+secret exactly once, so losing it means issuing a new one.
 
 Expect one round of correction on the first real sign-in. This page exists so
 that it is one round.

@@ -177,6 +177,40 @@ are now refused there with the setting named.
 - Tokens refreshed without operator action; a refresh failure reads as "sign in again".
 - Full unit and e2e green, counts accounted for.
 
+### Which of those were actually met, written after v1.7.0 shipped
+
+**Three were not, and the release went out anyway.** Recorded here rather than quietly ticked:
+a definition of done that a later reader takes as met is worse than one nobody wrote, and this
+list is the only place the difference is visible. Every task in this phase said the same thing
+in its own report; nothing gathered it into one statement until Chris asked for the label.
+
+1. **The first two items need a real tenant and never had one.** No M365 or Google account has
+   been added by signing in, and none has synced or sent. What exists and is proven is the same
+   journey against fakes -- a fake registration in the e2e config, a fake IMAP and SMTP server,
+   and unit tests over the request Conduit builds and what it does with what comes back. The
+   Workspace/consumer distinction IS on screen at the choice, which is the half of item two that
+   never needed a provider.
+
+2. **Item four is met only as far as a test can reach.** A refresh runs against a stub token
+   endpoint and a dead grant does read as "sign in again" on the row. Nothing has watched
+   Microsoft or Google rotate a real token, which is precisely where Task 2's multi-resource
+   caveat would appear if it were going to appear at all.
+
+3. **A sixth item was missing from this list and is also unrun: the packaging.** `.env.oauth`
+   created at install, carried across an upgrade by `--keep`, read by the unit's
+   `EnvironmentFile`, and these `doc/` pages hydrated and rendered by YunoHost -- none of it has
+   executed on a YunoHost server, because there is not one in this repository or in CI. The
+   tests reproduce YunoHost's substitution from its published source at the tag the manifest
+   requires; they cannot watch it happen. A definition of done for a phase whose settings arrive
+   through packaging should have said so, and did not.
+
+**Hence the experimental label**, on the add-account form and its no-registration hint, in
+`doc/ADMIN.md`, `doc/POST_INSTALL.md`, `doc/DESCRIPTION.md` and `docs/mail-oauth-setup.md`, each
+one pinned by a test so it cannot be dropped in a tidy-up. Chris, 5 Sep: "label the Microsoft and
+Google connectivity as experimental for now. I don't have time to check it." What closes this
+phase is one sign-in against a real tenant and one install on a real YunoHost. Everything else
+on the list above is done.
+
 ---
 
 ## Explicitly NOT in this phase
