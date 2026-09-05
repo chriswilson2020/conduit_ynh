@@ -30,7 +30,20 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? [["html", { open: "never" }], ["list"]] : "list",
-  use: { baseURL: "http://127.0.0.1:3100" },
+  use: {
+    baseURL: "http://127.0.0.1:3100",
+    // THE FIRST TRIAL IS THE ATTEMPT WHOSE EVIDENCE IS THINNEST, and that is
+    // what this buys. The `if: always()` report upload settled the mail e2e
+    // cascade in an afternoon (see docs/superpowers/reports/), but the same
+    // exercise had to record one failure as an honest "unknown" because the
+    // report carries no trace and no screenshot for the attempt that failed
+    // FIRST -- "the helper returned early", "the button was disabled" and "the
+    // ingest had not finished" are not separated by anything an HTML report
+    // can show. `on-first-retry` keeps the trace of trial 0 for any test that
+    // goes on to be retried, which is every intermittent by definition, and
+    // costs nothing on a run where nothing is retried.
+    trace: "on-first-retry",
+  },
   webServer: {
     command: "node packages/api/dist/server.js",
     url: "http://127.0.0.1:3100/api/health",
