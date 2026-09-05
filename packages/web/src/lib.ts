@@ -380,6 +380,79 @@ export function flattenCursorPages<T extends { id: string }>(state: CursorPages<
   return out;
 }
 
+export interface PendingArrivals {
+  /** How many rows the fetched page has that the list is not showing. Zero
+   * means there is nothing to offer the reader. */
+  count: number;
+  /**
+   * True when `count` is a FLOOR rather than a total -- every row of the
+   * fetched page is unseen AND the server said there is a page after it, so
+   * the arrivals may run past the only page that was looked at. Exact, not
+   * cautious: when the page is the whole list there can be nothing behind it,
+   * and the count is then the answer.
+   */
+  atLeast: boolean;
+}
+
+/**
+ * How much has arrived behind a list that is deliberately holding still (see
+ * takeCursorPage and refreshCursorRows above).
+ *
+ * `shown` is what the reader is looking at, in whatever order they are looking
+ * at it. `head` is the freshest page one, which the query layer keeps warm and
+ * which the list is NOT displaying; `headHasMore` is that fetch's own
+ * nextCursor, which is what tells an exact count from a floor. `at` reads the
+ * timestamp the list is ORDERED BY -- see the note on the accessor below.
+ *
+ * TWO EXCLUSIONS, AND THE SECOND ONE IS THE SUBTLE HALF.
+ *
+ * A row the list ALREADY SHOWS is never counted, however new. Where rows can
+ * change it is refreshed where it stands (refreshCursorRows), and where they
+ * cannot it is already correct -- either way the content is on screen and an
+ * offer to "show" it would point at a row the reader can see. What is being
+ * withheld from them is the JUMP TO THE TOP, and nobody ever asked for that.
+ *
+ * A row OLDER THAN EVERY ROW ON SCREEN is never counted either, and this is
+ * what stops the count lying after a removal. File a conversation, archive a
+ * meeting, and the server closes the gap by pulling up whatever sat just past
+ * the bottom of the page -- an old row, arriving in page one for the first
+ * time, which a plain "in the fetch and not on screen" test would announce as
+ * an arrival. Something that genuinely just happened is newer than everything
+ * already listed; a row sliding up from below the floor is, by construction,
+ * older than the row that used to be the last one.
+ *
+ * The floor is the MINIMUM rather than the last row's, because the list's
+ * order is the order it was fetched in and a row refreshed in place can carry
+ * a timestamp newer than the rows above it.
+ *
+ * THE TIMESTAMP COMES IN AS AN ACCESSOR because the three lists that hold
+ * still are ordered by three different columns -- a thread by `lastMessageAt`,
+ * a timeline entry by `createdAt`, a meeting by `occurredAt`. A structural
+ * `{ id, at }` row type would read better and would make every caller build a
+ * throwaway array of pairs, on every render, for a value this reads twice.
+ * (This function was mail-lib's until v1.7.1, when the record rails needed the
+ * same rule; one implementation rather than three is the same argument
+ * identityKey above makes.)
+ *
+ * ISO strings compare as strings: every one of these comes from a Postgres
+ * timestamptz through toISOString(), so they are fixed-width, UTC and
+ * millisecond-precise, and lexical order is chronological order.
+ *
+ * AN EMPTY LIST HAS NOTHING TO PROTECT and counts nothing -- takeCursorPage
+ * shows those rows instead of holding them, and a count here would be an
+ * offer to reveal what is already on screen.
+ */
+export function pendingArrivals<T extends { id: string }>(
+  shown: readonly T[], head: readonly T[], headHasMore: boolean, at: (row: T) => string,
+): PendingArrivals {
+  if (shown.length === 0) return { count: 0, atLeast: false };
+  const listed = new Set(shown.map((row) => row.id));
+  let floor = shown[0] === undefined ? "" : at(shown[0]);
+  for (const row of shown) if (at(row) < floor) floor = at(row);
+  const count = head.filter((row) => !listed.has(row.id) && at(row) > floor).length;
+  return { count, atLeast: headHasMore && count > 0 && count === head.length };
+}
+
 /**
  * The ONE width at which this app switches between its two interaction
  * models, as a CSS length. Everything that needs to know what "mobile" means

@@ -12,6 +12,7 @@ import {
   mergeCursorPage,
   overridableClass,
   parseDecimal,
+  pendingArrivals,
   refreshCursorRows,
   relativeTime,
   takeCursorPage,
@@ -332,6 +333,127 @@ describe("cursor page holding", () => {
     const after = refreshCursorRows(pages, "k", [row("a", "read")]);
     expect(after).not.toBe(pages);
     expect(after.byCursor["c1"]).toBe(second);
+  });
+});
+
+/**
+ * Phase 4.4 Task 3, generalised in v1.7.1. The list holds still under the
+ * reader, so something has to say what is waiting -- and it has to be TRUE,
+ * because a count that announces arrivals where there are none is the reader's
+ * place lost for nothing.
+ *
+ * THE TIMESTAMP ARRIVES AS AN ACCESSOR because the three surfaces that hold
+ * still order themselves by three different columns -- a thread by
+ * `lastMessageAt`, a timeline entry by `createdAt`, a meeting by `occurredAt`
+ * -- and the rule reads exactly one of them. A structural `{ id, at }` row
+ * type would make every caller build a throwaway array of pairs on every
+ * render, which is a copy of the whole list per hint for a value the function
+ * reads twice.
+ */
+describe("pendingArrivals", () => {
+  const row = (id: string, at: string): Row & { at: string } => ({ id, at });
+  const at = (r: { at: string }): string => r.at;
+  // One page of what the reader is looking at, newest first, as the list holds
+  // it. Times an hour apart so a "newer than the floor" case is unambiguous.
+  const shown = [
+    row("a", "2026-09-04T12:00:00.000Z"),
+    row("b", "2026-09-04T11:00:00.000Z"),
+    row("c", "2026-09-04T10:00:00.000Z"),
+  ];
+
+  it("counts a row that has arrived and is not on screen", () => {
+    const head = [row("new", "2026-09-04T13:00:00.000Z"), ...shown.slice(0, 2)];
+    expect(pendingArrivals(shown, head, false, at)).toEqual({ count: 1, atLeast: false });
+  });
+
+  // A change to a row the reader can see is not something to reveal: its row
+  // is refreshed where it stands (or, where rows never change at all, is
+  // already correct). What is withheld is the jump to the top, which nobody
+  // asked for.
+  it("does not count a row the list already shows, however new", () => {
+    const head = [row("c", "2026-09-04T13:00:00.000Z"), row("a", "2026-09-04T12:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false, at).count).toBe(0);
+  });
+
+  /**
+   * THE ONE THAT WOULD LIE. Take a row out of the list -- file a conversation,
+   * archive a meeting -- and the server pulls up whatever sat just past the
+   * bottom of the page. It is in the fetch and not on screen, and it is not an
+   * arrival: it is an old row that has moved into view. Being older than every
+   * row listed is what gives it away.
+   */
+  it("does not count an old row that has slid up from below the list", () => {
+    const head = [...shown, row("older", "2026-09-04T09:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false, at).count).toBe(0);
+  });
+
+  // The boundary itself is not an arrival either. A row sharing the oldest
+  // listed row's timestamp is one the page break happened to fall beside.
+  it("does not count a row exactly as old as the oldest on screen", () => {
+    expect(pendingArrivals(shown, [row("tie", "2026-09-04T10:00:00.000Z")], false, at).count).toBe(0);
+  });
+
+  // The floor is the OLDEST row on screen, not the last one: the list holds
+  // its fetched order, and a row refreshed in place can carry a timestamp
+  // newer than the rows above it.
+  it("takes the floor from the oldest row, not from the last one", () => {
+    const bumped = [
+      row("a", "2026-09-04T12:00:00.000Z"),
+      row("b", "2026-09-04T10:30:00.000Z"),
+      row("c", "2026-09-04T14:00:00.000Z"),
+    ];
+    // Older than `c`, which is last, and newer than `b`, which is the floor.
+    const head = [row("mid", "2026-09-04T11:00:00.000Z")];
+    expect(pendingArrivals(bumped, head, false, at).count).toBe(1);
+  });
+
+  // An empty list has no place to protect: takeCursorPage shows those rows
+  // rather than holding them, so an offer here would point at what is already
+  // on screen.
+  it("counts nothing against an empty list", () => {
+    expect(pendingArrivals([], [row("new", "2026-09-04T13:00:00.000Z")], true, at))
+      .toEqual({ count: 0, atLeast: false });
+  });
+
+  it("reports a floor when every fetched row is unseen and there is a page behind it", () => {
+    const head = [row("n1", "2026-09-04T15:00:00.000Z"), row("n2", "2026-09-04T14:00:00.000Z")];
+    expect(pendingArrivals(shown, head, true, at)).toEqual({ count: 2, atLeast: true });
+  });
+
+  // ...and not when the page IS the whole list, because then there is nothing
+  // behind it for the count to be short of.
+  it("reports an exact count when the fetched page is the last one", () => {
+    const head = [row("n1", "2026-09-04T15:00:00.000Z"), row("n2", "2026-09-04T14:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false, at)).toEqual({ count: 2, atLeast: false });
+  });
+
+  // "Nothing is waiting" is never a floor: `count === head.length` is trivially
+  // true at zero, and an atLeast there would put a "+" on a control that is not
+  // even rendered -- or, worse, invite one to be.
+  it("reports no floor when nothing is waiting at all", () => {
+    expect(pendingArrivals(shown, [], true, at)).toEqual({ count: 0, atLeast: false });
+  });
+
+  it("reports an exact count when the fetched page still holds a row the list has", () => {
+    const head = [row("n1", "2026-09-04T15:00:00.000Z"), row("a", "2026-09-04T12:00:00.000Z")];
+    expect(pendingArrivals(shown, head, true, at)).toEqual({ count: 1, atLeast: false });
+  });
+
+  /**
+   * THE ACCESSOR IS READ, AND THE ROW'S OWN FIELDS ARE NOT. Every caller here
+   * spells its timestamp differently, and a function that reached for one
+   * hard-coded name would compare `undefined` against `undefined` for the other
+   * two -- which is not a crash, it is a count of zero that never rises. Two
+   * fields on one row, ordered against each other, is what tells "read the
+   * accessor" from "read whatever looks like a time".
+   */
+  it("reads the timestamp the caller names, not another field on the same row", () => {
+    const dual = (id: string, sortAt: string, other: string) => ({ id, sortAt, other });
+    const listed = [dual("a", "2026-09-04T12:00:00.000Z", "2026-09-04T01:00:00.000Z")];
+    // Newer than the floor by `sortAt`; older than it by `other`.
+    const head = [dual("new", "2026-09-04T13:00:00.000Z", "2026-09-04T00:30:00.000Z")];
+    expect(pendingArrivals(listed, head, false, (r) => r.sortAt).count).toBe(1);
+    expect(pendingArrivals(listed, head, false, (r) => r.other).count).toBe(0);
   });
 });
 

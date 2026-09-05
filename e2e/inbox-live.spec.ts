@@ -76,6 +76,19 @@ function isoAgo(minutes: number): string {
   return new Date(Date.now() - minutes * 60_000).toISOString();
 }
 
+/**
+ * When a thread was STARTED, which is deliberately not when its newest message
+ * landed.
+ *
+ * The list is ordered by `last_message_at`, and v1.7.1 made the column the
+ * arrivals count reads an argument rather than a hard-coded field name
+ * (lib.ts's pendingArrivals, now shared with the record rails). A fixture that
+ * set every timestamp from one clock could not tell the right column from a
+ * wrong one; with created_at pinned in the past, a build that counted on it
+ * would find nothing newer than the floor and would offer nothing at all.
+ */
+const THREAD_STARTED_AT = "2020-01-01T00:00:00.000Z";
+
 /** The wire shape of one list row (@conduit/shared's mailThreadListItemSchema),
  * which the client parses with zod -- so a missing field is a hard error in the
  * app, not a soft one in this file. */
@@ -88,7 +101,8 @@ function wireThread(seed: Seed) {
     messageCount: 1,
     companyId: null, contactId: null, dealId: null, projectId: null,
     hiddenAt: null,
-    createdAt: at, updatedAt: at,
+    // NOT `at` -- see THREAD_STARTED_AT.
+    createdAt: THREAD_STARTED_AT, updatedAt: THREAD_STARTED_AT,
     unread: false,
     snippet: seed.snippet,
     senders: [{ name: "Sender", address: "sender@example.com" }],
