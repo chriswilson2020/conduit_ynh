@@ -41,7 +41,8 @@ The brief's reading of the log is wrong in three ways, and each changes the diag
 | **`2566`** (first trial of the release run) | `Backlog … 00` absent with a "Load more" still on screen and only 25 rows. | **NO — see §6. I will not name a mechanism I cannot support.** |
 
 **Rate: 6 red in 26 attempts since Phase 4.4 opened, 23.1% (Wilson 95%: 11.0–42.1%).**
-Before Phase 4.4: **0 red in 245 attempts (0–1.5%)**. The intervals do not overlap.
+Before Phase 4.4: **1 red in 308 attempts, 0.3% (0.1–1.8%)** — and that one was a
+deterministic feature-branch bug, not an intermittent (§7). The intervals do not overlap.
 
 **And the number that matters most: since Phase 4.4, the retry recovery rate on this spec is
 0 of 6.** Every first-trial failure turned its run red. For scale, the prior harvest's figure
@@ -236,7 +237,7 @@ produced a first-trial failure within 19 attempts.
 
 | window | attempts | red from `mail.spec.ts` | rate | Wilson 95% |
 |---|---|---|---|---|
-| before Phase 4.4 (< 4 Sep 13:42Z) | **245** | **0** | 0% | 0–1.5% |
+| before Phase 4.4 (< 4 Sep 13:42Z) | **308** | **1** | 0.3% | 0.1–1.8% |
 | Phase 4.4 era (≥ 4 Sep 13:42Z, `a57ef2c`) | **26** | **6** | **23.1%** | 11.0–42.1% |
 | since Task 4.4.3 (≥ 4 Sep 21:05Z, `3434467`) | **19** | **4** | **21.1%** | 8.5–43.3% |
 | since v1.6.0 merged (≥ 5 Sep 05:01Z) | **12** | **2** | 16.7% | 4.7–44.8% |
@@ -246,10 +247,24 @@ the 2 Sep harvest followed; they contributed six more `mail.spec.ts` failure lin
 named in the method note. Including them changes nothing about the comparison, because all six
 predate Phase 4.4.
 
-**In 245 pre-Phase-4.4 attempts there is exactly one `mail.spec.ts` failure line** — run
-`33337452620`, 30 Aug, the `route.continue: Route is already handled!` leak that the 2 Sep
-harvest already recorded as a closed one-off. **That run went green.** It is the only
-`mail.spec.ts` failure in repository history that a retry ever recovered.
+**In 308 pre-Phase-4.4 attempts — the complete population back to the first run in the
+repository — `mail.spec.ts` failed in exactly two, and neither is this phenomenon:**
+
+- `33337452620`, 30 Aug, `worktree-v1.2.1-fixes`: the `route.continue: Route is already
+  handled!` leak the 2 Sep harvest already recorded as a closed one-off. **That run went
+  green.** It remains the only `mail.spec.ts` failure in repository history that a retry ever
+  recovered.
+- `32414822541`, 20 Aug, `worktree-phase-4.1-folders`: red, and **deterministic**. The same
+  test failed on all three attempts with the same error in 217 / 199 / 231 ms —
+  `locator.check: Clicking the checkbox did not change its state`, on the controlled folder
+  checkbox. It is the bug `mail.spec.ts`'s own "click(), NOT check()" comment was written
+  after, on the branch where that feature was being built.
+
+**That second run is worth the space because it is the control.** It is the only pre-Phase-4.4
+attempt where `mail.spec.ts` exhausted its retries, and it has the **opposite** signature to
+§2: the same test failing at the same point three times, in a fifth of a second each. The
+cascade — each attempt dying *earlier* than the last, at a *different* test — appears nowhere
+in this repository before 4 September.
 
 The six red runs, all within 16 hours:
 
@@ -339,11 +354,10 @@ prescribes, because `gh run list` shows only a re-run's latest attempt:
    earlier attempt visible at all.
 3. For each job: `gh api ".../actions/jobs/<job_id>/logs"`, ANSI stripped.
 
-**Log-verified sub-population: 284 attempts, back to 2026-08-28T04:56Z**, of which 279 show
-`e2e/mail.spec.ts` running. That covers every attempt in every window compared in §7 — the
-Phase 4.4 windows are complete (26 of 26, 19 of 19). For 18–28 Aug this report relies on the
-2 Sep harvest, which swept 401 attempts and 801 job logs independently and found no
-`mail.spec.ts` failure in that period other than the 30 Aug route leak.
+**All 483 attempt logs were fetched and read — the complete population, 2026-08-18T15:21Z to
+2026-09-05T06:21Z**, of which 334 non-excluded attempts show `e2e/mail.spec.ts` running (141
+predate the spec or its e2e job). No window in §7 relies on extrapolation, and none relies on
+the 2 Sep harvest: that report is used here only to corroborate, and it agrees.
 
 **Numerator: an attempt whose log carries at least one `✘ … e2e/mail.spec.ts:N` line.** "Red"
 additionally requires the run's own conclusion to be `failure`. First-trial failures are
