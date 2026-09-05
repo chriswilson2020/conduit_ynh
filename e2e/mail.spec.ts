@@ -110,6 +110,10 @@ const MAILPIT_URL = process.env.E2E_MAILPIT_URL ?? "http://127.0.0.1:8025";
  */
 const DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgres:///conduit_test";
 
+/** One `postgres` client, named so the two wipe helpers can take it rather
+ * than each opening a connection of their own. */
+type DatabaseHandle = ReturnType<typeof postgres>;
+
 /**
  * Every mail table, CHILD FIRST: this list is a delete order, not a set. The
  * FKs are plain no-action ones (schema.ts), so a parent deleted before its
@@ -881,39 +885,37 @@ test.describe.serial("Mail journey", () => {
    * TRUNCATE refuses a table an FK references unless the referencing table
    * goes with it, which for `events` would mean everybody's timeline.)
    */
-  async function wipeMailTables(): Promise<void> {
-    // Mirrors packages/api/src/test/global-setup.ts: a bare "postgres:///db"
-    // URL with no ambient PGHOST connects over TCP to localhost, which needs a
-    // password this role does not have. In CI the URL is a full TCP one and
-    // this never comes into play.
-    process.env.PGHOST ??= "/run/postgresql";
-    const sql = postgres(DATABASE_URL, { max: 1, onnotice: () => undefined });
-    try {
-      // starts_with rather than LIKE 'mail\_%': the underscore would have to be
-      // escaped to mean itself, and a backslash inside a tagged template is
-      // eaten by JavaScript before postgres ever sees it.
-      const present = await sql<{ table_name: string }[]>`
-        SELECT table_name FROM information_schema.tables
-        WHERE table_schema = 'public' AND starts_with(table_name, 'mail_')
-      `;
-      const unknown = present
-        .map((row) => row.table_name)
-        .filter((name) => !(MAIL_TABLES as readonly string[]).includes(name));
-      // Loud, and on the retry rather than fifteen tests into it: a mail table
-      // this list has never heard of is a table this reset leaves full, which
-      // is the exact defect the reset exists to close.
-      expect(
-        unknown,
-        "MAIL_TABLES in e2e/mail.spec.ts no longer covers every mail_* table; "
-        + "add these to it, child-first, or a retry will start dirty",
-      ).toEqual([]);
-      await sql.begin(async (tx) => {
-        await tx`DELETE FROM events WHERE mail_thread_id IS NOT NULL`;
-        for (const table of MAIL_TABLES) await tx`DELETE FROM ${tx(table)}`;
-      });
-    } finally {
-      await sql.end();
-    }
+  async function wipeMailTables(sql: DatabaseHandle): Promise<void> {
+    await sql.begin(async (tx) => {
+      await tx`DELETE FROM events WHERE mail_thread_id IS NOT NULL`;
+      for (const table of MAIL_TABLES) await tx`DELETE FROM ${tx(table)}`;
+    });
+  }
+
+  /**
+   * MAIL_TABLES against the database's own catalogue, once per reset.
+   *
+   * A mail table this file has never heard of is a table the wipe leaves full,
+   * which is the exact defect the reset exists to close -- so it stops the
+   * attempt here, naming itself, rather than surfacing fifteen tests later as
+   * a list with somebody else's conversations in it.
+   */
+  async function assertMailTablesKnown(sql: DatabaseHandle): Promise<void> {
+    // starts_with rather than LIKE 'mail\_%': the underscore would have to be
+    // escaped to mean itself, and a backslash inside a tagged template is
+    // eaten by JavaScript before postgres ever sees it.
+    const present = await sql<{ table_name: string }[]>`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND starts_with(table_name, 'mail_')
+    `;
+    const unknown = present
+      .map((row) => row.table_name)
+      .filter((name) => !(MAIL_TABLES as readonly string[]).includes(name));
+    expect(
+      unknown,
+      "MAIL_TABLES in e2e/mail.spec.ts no longer covers every mail_* table; "
+      + "add these to it, child-first, or a retry will start dirty",
+    ).toEqual([]);
   }
 
   /**
@@ -949,20 +951,47 @@ test.describe.serial("Mail journey", () => {
    * deadline rather than a hope.
    */
   async function resetForRetry(): Promise<void> {
+    // Mirrors packages/api/src/test/global-setup.ts: a bare "postgres:///db"
+    // URL with no ambient PGHOST connects over TCP to localhost, which needs a
+    // password this role does not have. In CI the URL is a full TCP one and
+    // this never comes into play.
+    process.env.PGHOST ??= "/run/postgresql";
+    const sql = postgres(DATABASE_URL, { max: 1, onnotice: () => undefined });
     let left: Record<string, number> = {};
     let threads = -1;
-    for (let round = 0; round < 5; round += 1) {
-      await emptyMailboxForRetry();
-      await wipeMailTables();
+    try {
+      await assertMailTablesKnown(sql);
+      for (let round = 0; round < 5; round += 1) {
+        const last = round === 4;
+        await emptyMailboxForRetry();
+        try {
+          await wipeMailTables(sql);
+        } catch (error) {
+          // The straggling pass again, and this is the shape it takes when it
+          // wins the race outright: an INSERT of a message referencing the
+          // account this transaction is deleting makes the parent DELETE fail
+          // on the foreign key rather than merely leave a row behind. By the
+          // next round that pass has reached its own loadAccount and stopped
+          // itself, so the same wipe goes through. Re-thrown as ITSELF on the
+          // last round -- a genuinely broken statement has to read as the
+          // statement it is, not as "the reset did not take".
+          if (last) throw error;
+          await page.waitForTimeout(1_000);
+          continue;
+        }
 
-      left = await remainingOnServer();
-      const listed = await page.request.get("/api/mail/threads");
-      expect(listed.ok()).toBe(true);
-      threads = ((await listed.json()) as { items: unknown[] }).items.length;
-      if (Object.keys(left).length === 0 && threads === 0) return;
-      // A pass that was in flight when the archive landed. Give it a beat to
-      // unwind and take the leftovers it wrote with the next round.
-      await page.waitForTimeout(1_000);
+        left = await remainingOnServer();
+        const listed = await page.request.get("/api/mail/threads");
+        expect(listed.ok()).toBe(true);
+        threads = ((await listed.json()) as { items: unknown[] }).items.length;
+        if (Object.keys(left).length === 0 && threads === 0) return;
+        // A pass that was in flight when the archive landed and got its rows
+        // in before the wipe. Give it a beat to unwind, and take what it wrote
+        // with the next round.
+        if (!last) await page.waitForTimeout(1_000);
+      }
+    } finally {
+      await sql.end();
     }
     throw new Error(
       "the retry reset did not take: the mail tables and the Dovecot mailbox have to be empty "
