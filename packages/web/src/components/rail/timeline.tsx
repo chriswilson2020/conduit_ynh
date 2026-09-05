@@ -177,7 +177,7 @@ export function Timeline({ companyId, contactId, dealId, projectId, taskId, onOp
     setPages((current) => takeCursorPage(current, key, cursor, data.items, data.nextCursor));
   }, [data, cursor, key, pages]);
 
-  // pages.key can lag `key` by one render (the merge above runs in an effect),
+  // pages.key can lag `key` by one render (the take above runs in an effect),
   // and rendering the previous record's rows for that render is exactly the
   // leak the accumulator exists to prevent.
   const rows = useMemo(() => (pages.key === key ? flattenCursorPages(pages) : []), [pages, key]);
