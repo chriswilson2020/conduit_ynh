@@ -725,8 +725,71 @@ test("shows a note the reader writes themselves, at once", async ({ page }, info
   // thing that can put this note on screen is the write being recognised as
   // the reader's own.
   await expect(page.getByTestId("notes").getByText("Written by the reader")).toBeVisible();
+
+  // POLLED, AND THE ONE-SHOT READ THIS REPLACES WAS A REAL DEFECT -- but NOT
+  // the one 48cf351 closed in pipeline.spec.ts, and the difference is the
+  // whole reason this was measured rather than pattern-matched. There the gate
+  // was one React commit EARLY: dnd-kit announces the drop in the same batch
+  // as the drop, and the optimistic reorder is a commit later. Here the gate
+  // is not early. It is satisfied by the wrong element.
+  //
+  // THE LINE ABOVE IS SATISFIED BY THE COMPOSER. `[data-testid="notes"]` is
+  // the whole tab, and the <Textarea> the reader has just typed into is inside
+  // it. React writes a controlled textarea's value into `node.defaultValue`,
+  // and a textarea's defaultValue IS its child text node -- so "Written by the
+  // reader" is inside the container the instant it is typed, and getByText
+  // finds it there. Measured on the dev server on 5 Sep: that locator resolved
+  // to ONE element before the write had even been sent, 15 times out of 15,
+  // with no note row on screen at all. (It resolves to one rather than two
+  // because `createNote`'s mutate-level onSuccess clears the draft before the
+  // own-write nonce fires the re-snapshot that puts the row there; the two are
+  // never on screen together, which is why this has never thrown a strict-mode
+  // violation instead.)
+  //
+  // So the gate returns while the list is still the three seeded notes, and
+  // what the one-shot read got was `Note body 00` at the head -- the untouched
+  // fixture, which is the same signature every read of a list that has not
+  // settled produces. REPRODUCED, NOT REASONED ABOUT: 2 times in 10 with the
+  // stub answering at once, and 15 times out of 15 with POST /api/notes held
+  // for 400 ms. Holding the WRITE is what moves the failure, which is what
+  // makes the gate causally the draft rather than the note -- and the same
+  // journey gated on the note row instead of on the text was 0 out of 15 under
+  // that identical 400 ms hold.
+  //
+  // THE OTHER NINE one-shot result reads in this file were measured the same
+  // way and are sound, so they are deliberately left as they are -- 48cf351's
+  // rule, that a fix names what it did not close. Each of them waits on the
+  // row's own testid, on the row COUNT, or on the "Show" control clearing, and
+  // every one of those is produced by the SAME single setState that puts the
+  // list in order: both rails replace their whole visible list in one go (see
+  // lib.ts's takeWholeList and takeCursorPage, and each component's
+  // `resnapshot`/`reset`), so there is no second commit for a read to fall
+  // into. Read at the instant their own gate came true: 0 wrong in 30 for each
+  // of the seven "Show"-click, paging and own-edit reads, and 0 in 10 for the
+  // meeting and file own-write reads -- which stayed 0 in 15 with their own
+  // write held for the same 400 ms that makes the note read fail every time.
+  //
+  // AND THE "NOTHING MOVED" READS MUST NOT BE POLLED, which is the trap this
+  // change looks like it invites. `expect.poll` retries until it PASSES, and
+  // an invariance claim passes on its first read -- the list has not moved YET
+  // -- so polling one would not harden it, it would make it unfalsifiable.
+  // They stay one-shot, after the wait that gives them their meaning.
+  //
+  // The expected value is untouched, so this keeps its teeth -- proved with
+  // the mutation that breaks what THIS line guards, which is the ORDER rather
+  // than the arrival. Change notes.tsx's `resnapshot` to the "keep every seen
+  // row where it is and append arrivals at the bottom" design its own header
+  // rejects: the note is then on screen, so the gate above still passes, and
+  // this poll fails for its whole 5 s timeout on
+  // `Received string: "...Note body 00"` -- the same head the too-early read
+  // produced, which is exactly why an intermittent here would have been
+  // indistinguishable from a real regression. Taking the own-write effect out
+  // instead is NOT that proof: the note never appears at all, so the gate
+  // above fails first and this line is never reached.
+  await expect
+    .poll(async () => (await noteTexts(page))[0] ?? "")
+    .toContain("Written by the reader");
   await expect(page.getByTestId("notes-new-show")).toHaveCount(0);
-  expect((await noteTexts(page))[0]).toContain("Written by the reader");
 });
 
 test("shows the first note on a record rather than offering to", async ({ page }, info) => {
