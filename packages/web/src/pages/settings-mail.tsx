@@ -43,7 +43,9 @@ import {
   folderRenameBlocked,
   initialFormState,
   initialOAuthFormState,
+  oauthSetupHint,
   providerLabel,
+  providerSigninCaveat,
   signedInWith,
   signinBanner,
   validateForm,
@@ -92,12 +94,16 @@ export function SettingsMailPage() {
   // this component is mounting for the first time when it arrives, so there is
   // no state for it to have survived in.
   const search = useSearch({ from: "/settings/mail" });
-  const banner = signinBanner(search);
   // Fetched HERE as well as in the dialog, so the answer is already cached when
   // the dialog opens and the add-account form never has to render a spinner
   // before it can ask its first question. One query key, so this is one request
   // per session (staleTime: Infinity -- it is deployment configuration).
-  useMailOAuthProviders();
+  const oauthConfig = useMailOAuthProviders();
+  // The redirect URI reaches the banner for the one failure it can explain --
+  // see signinBanner. Undefined while the query is in flight, which is the
+  // right value to pass: the banner then says what it always said, and the
+  // extra sentence appears on the re-render rather than never.
+  const banner = signinBanner(search, oauthConfig.data?.redirectUri);
 
   const own = data?.own ?? [];
   const active = own.filter((account) => account.archivedAt === null);
@@ -1044,7 +1050,26 @@ function AccountForm({
       </div>
     );
   }
-  if (providers.length === 0) return <PasswordAccountForm onClose={onClose} />;
+  // NO REGISTRATION: the password form, and a sentence saying why that is the
+  // only option. Task 3 was right not to offer a button that can only 409; what
+  // it left was an absence, and an absence reads as a missing feature rather
+  // than as a deployment step nobody has taken yet. See oauthSetupHint.
+  if (providers.length === 0) {
+    // `oauth.data` rather than the defaulted `providers`: this branch is also
+    // where a FAILED fetch lands, and a hint built from a callbackPath nobody
+    // answered would tell the operator to register the site root. Which of
+    // those two it is, is oauthSetupHint's decision -- it returns null and this
+    // renders nothing, rather than the guard living here where no test reaches.
+    const hint = oauthSetupHint(oauth.data?.callbackPath, window.location.origin);
+    return (
+      <div className="flex flex-col gap-4">
+        {hint !== null && (
+          <p data-testid="oauth-setup-hint" className="text-xs text-slate-500">{hint}</p>
+        )}
+        <PasswordAccountForm onClose={onClose} />
+      </div>
+    );
+  }
   return (
     <div className="flex flex-col gap-4">
       <DialogTitle>Add mail account</DialogTitle>
@@ -1141,6 +1166,39 @@ function OAuthAccountForm({
           ? `${signedInWith(account.authMethod) ?? ""}. The server settings come from ${providerLabel(provider)}, so there is nothing to configure here.`
           : `You will be sent to ${providerLabel(provider)} to sign in. Conduit never sees the password — it stores the sign-in ${providerLabel(provider)} gives back, encrypted.`}
       </p>
+
+      {/* THE GMAIL FORK, AT THE POINT OF CHOOSING (Phase 8 Task 4).
+          ON THE CREATE FORM ONLY, and the omission on an edit is the same
+          judgement the caveat itself is: this is information for a decision,
+          and by the time the account exists the decision is made. Repeating it
+          on every visit to a working account's settings would train the reader
+          to skip the box -- and the moment it becomes relevant again (the grant
+          lapsing on the seventh day) is covered where that actually shows up,
+          in accountReauthMessage on the account's own row.
+          A styled callout rather than the small grey paragraph above it,
+          because it is the one thing on this form that can make the mailbox not
+          work, and prose that looks like the surrounding hint text gets read
+          like the surrounding hint text. */}
+      {!isEdit && (() => {
+        const caveat = providerSigninCaveat(provider);
+        if (caveat === null) return null;
+        return (
+          <div
+            data-testid="oauth-provider-caveat"
+            // role="alert", matching this codebase's other amber warning boxes
+            // (board.tsx, and the callback banner on this page). It APPEARS
+            // when the operator picks Google, so without a live region a screen
+            // reader user meets the consequences and never the warning -- which
+            // is the exact failure the box exists to prevent, aimed at the
+            // person least able to recover from it.
+            role="alert"
+            className="flex flex-col gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900"
+          >
+            <p className="font-semibold">{caveat.heading}</p>
+            {caveat.paragraphs.map((text) => <p key={text}>{text}</p>)}
+          </div>
+        );
+      })()}
 
       <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
         <Field label="Label" testId="oauth-label">

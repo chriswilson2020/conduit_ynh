@@ -101,6 +101,22 @@ export default defineConfig({
       MAIL_OAUTH_MICROSOFT_CLIENT_ID: "e2e-client-id",
       MAIL_OAUTH_MICROSOFT_CLIENT_SECRET: "e2e-client-secret-not-a-real-one",
       MAIL_OAUTH_MICROSOFT_TENANT: "e2e-tenant.example",
+      // BOTH PROVIDERS, from Task 4, and the second one is not decoration. The
+      // phase's claim is that Microsoft and Google are one code path with two
+      // configurations; with only one registered, every journey walked the same
+      // configuration and the claim was untested. Google's authorise request
+      // differs in three ways that each fail silently at a consent screen --
+      // access_type, prompt and the single restricted scope -- and having it
+      // here is what lets a browser assert them.
+      //
+      // Equally fake, for the same reason and with the same guarantee: these
+      // are credentials for nothing, at any provider, ever.
+      MAIL_OAUTH_GOOGLE_CLIENT_ID: "e2e-google-client-id",
+      MAIL_OAUTH_GOOGLE_CLIENT_SECRET: "e2e-google-secret-not-a-real-one",
+      // Loopback http, which both providers exempt from their https rule and
+      // config.ts's own check exempts for exactly that reason -- so this is a
+      // redirect URI the real validation accepts rather than a value the suite
+      // is excused from.
       MAIL_OAUTH_REDIRECT_URI: "http://127.0.0.1:3100/api/mail/oauth/callback",
       BASE_PATH: "/",
       WEB_ROOT: "packages/web/dist",

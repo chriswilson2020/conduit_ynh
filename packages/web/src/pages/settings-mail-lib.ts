@@ -272,6 +272,111 @@ export function providerLabel(provider: MailOAuthProvider): string {
   return provider === "microsoft" ? "Microsoft" : "Google";
 }
 
+/** A warning shown BEFORE a sign-in is started, when the provider has one. */
+export interface SigninCaveat {
+  heading: string;
+  paragraphs: string[];
+}
+
+/**
+ * What the operator has to know about this provider before they press the
+ * button, or null when there is nothing.
+ *
+ * -------------------------------------------------------------------------
+ * THIS IS THE GMAIL FORK, AND IT IS HERE BECAUSE HERE IS WHERE THE CHOICE IS
+ * -------------------------------------------------------------------------
+ *
+ * The plan says it "must appear at the point of CHOOSING, not in a README", and
+ * the reason is not tidiness. What Google does to a consumer account is revoke
+ * the refresh token every seven days while the app's publishing status is
+ * Testing -- so a Conduit that shipped this quietly would sync for a week,
+ * stop, and be indistinguishable from broken. The operator would look for the
+ * bug here. That is v1.4.1's error-that-blamed-the-wrong-thing exactly, and the
+ * sentence that prevents it costs nothing as long as it is read BEFORE the
+ * mailbox is connected rather than after it stops.
+ *
+ * IT DOES NOT REFUSE, AND THAT IS DELIBERATE. A consumer Gmail account signed
+ * in weekly by an operator who KNOWS is a legitimate way to use this -- annoying
+ * and honest. What is not legitimate is finding out on day eight. So this
+ * informs and the button still works.
+ *
+ * THE FIGURES ARE GOOGLE'S OWN, checked 5 Sep against its OAuth 2.0
+ * documentation and not paraphrased from memory: "A Google Cloud Platform
+ * project with an OAuth consent screen configured for an external user type and
+ * a publishing status of 'Testing' is issued a refresh token expiring in 7
+ * days"; IMAP needs `https://mail.google.com/`, which is a RESTRICTED scope, and
+ * restricted scopes require verification plus an annual security assessment by
+ * a Google-approved third party. The assessment is the paid part, and its price
+ * is not Google's to publish, so this says "paid" and does not invent a number.
+ *
+ * MICROSOFT HAS NO CAVEAT OF THIS KIND, which is why the return type is
+ * nullable rather than a two-branch table pretending at symmetry. A
+ * single-tenant registration in the operator's own directory needs no
+ * verification, and its refresh token has no expiry a syncing mailbox can
+ * reach: Entra's 90 days is an INACTIVITY limit and the token rotates on every
+ * use, so a poll interval measured in minutes renews it indefinitely. (The spec
+ * says "do not expire", which is that in shorter words and is wrong only for a
+ * mailbox nothing has touched for three months -- a stopped account, or a
+ * server that was off.) Microsoft's real traps are tenant-side switches
+ * (SMTP AUTH, the Web-vs-SPA platform) that
+ * cannot be met at this screen and cannot be fixed from it -- they belong in
+ * docs/mail-oauth-setup.md, which is where the operator is when they can act on
+ * them.
+ */
+export function providerSigninCaveat(provider: MailOAuthProvider): SigninCaveat | null {
+  if (provider === "microsoft") return null;
+  return {
+    heading: "Which kind of Google account is this?",
+    paragraphs: [
+      "A Google Workspace mailbox on a domain you administer is fine. Publish your"
+      + " own OAuth app as Internal in that organisation and the sign-in lasts"
+      + " indefinitely, the same as Microsoft.",
+      "A personal @gmail.com address is not. While your app's publishing status is"
+      + " Testing, Google revokes the sign-in every 7 days — mail stops until you"
+      + " come back to this page and sign in again, every week.",
+      "Leaving Testing is not a setting. IMAP needs Google's restricted"
+      + " https://mail.google.com/ scope, so the app has to pass Google's"
+      + " verification and a paid annual security assessment by a third party"
+      + " Google approves.",
+    ],
+  };
+}
+
+/**
+ * What an operator sees where a provider button would have been, when this
+ * install has no app registration at all.
+ *
+ * SILENCE WAS THE PREVIOUS ANSWER AND IT IS THE WRONG ONE. Task 3 was right
+ * that an install with no registration must not be offered a button whose only
+ * outcome is a 409 -- but the form then simply showed the password fields, and
+ * an operator who came to Settings specifically to connect their Microsoft
+ * mailbox got no explanation of where the option went. "Nothing here" and "this
+ * needs setting up first" look identical and are not.
+ *
+ * IT NAMES THE CALLBACK PATH, WHICH IS THE HALF NOBODY CAN GUESS. Registering
+ * an app at either provider asks for a redirect URI first, it is compared byte
+ * for byte afterwards, and until this line existed the only place that string
+ * was written down was a route file. The origin comes from the browser that is
+ * displaying it -- correct by construction for the person reading it, and never
+ * used by the server to build a redirect (api: config.ts refuses to derive one
+ * from a request, and that is unchanged).
+ *
+ * NULL WHEN THE PATH IS NOT KNOWN, and that branch is here rather than in the
+ * component on purpose. The no-provider case is also where a FAILED providers
+ * query lands, and a hint assembled from an absent callbackPath would tell the
+ * operator to register the site root -- a plausible-looking string that is
+ * wrong, which is worse than the silence "we could not ask" deserves. Deciding
+ * it here makes it a case a test can state; deciding it in the JSX made it a
+ * `!== undefined` that no test in this repository could reach.
+ */
+export function oauthSetupHint(callbackPath: string | undefined, origin: string): string | null {
+  if (callbackPath === undefined || callbackPath === "") return null;
+  return `No mail provider is set up on this install, so a mailbox here signs in with a`
+    + ` password. To add Microsoft or Google, register ${origin}${callbackPath} as the`
+    + ` redirect URI at the provider and set MAIL_OAUTH_REDIRECT_URI to that exact string.`
+    + ` docs/mail-oauth-setup.md has the rest.`;
+}
+
 /** "Signed in with Microsoft", or null for a password account. */
 export function signedInWith(authMethod: MailAuthMethod): string | null {
   const provider = mailOAuthProviderOf(authMethod);
@@ -297,12 +402,39 @@ export interface SigninBanner {
  * disagree about the code set is a thing that happens across an upgrade, and
  * "the sign-in did not complete" is correct for every member of it.
  */
-export function signinBanner(search: { oauth?: string; reason?: string }): SigninBanner | null {
+export function signinBanner(
+  search: { oauth?: string; reason?: string },
+  /**
+   * MAIL_OAUTH_REDIRECT_URI as the server parsed it, when the page knows it.
+   *
+   * ONLY THE `provider` FAILURE USES IT, and only that one should. That outcome
+   * already says "this is usually the app registration", which is true and is
+   * advice with nowhere to go: the operator now has to find out what this
+   * install actually sends and compare it, by eye, against a provider console.
+   * The value IS the comparison, and it is compared BYTE FOR BYTE at the
+   * provider (RFC 6749 3.1.2.3) -- a trailing slash or an http decides it -- so
+   * showing it next to the failure is the difference between the spec's "one
+   * round of real-world fixing" and four.
+   *
+   * Absent (or unset) leaves the sentence exactly as it was, because a banner
+   * that said "the redirect URI is: null" would be worse than one that did not
+   * mention it.
+   */
+  redirectUri?: string | null,
+): SigninBanner | null {
   if (search.oauth === "connected") {
     return { tone: "ok", text: "That mailbox is connected. The first sync starts on its own." };
   }
   if (search.oauth !== "failed") return null;
-  return { tone: "error", text: SIGNIN_FAILURES[search.reason ?? ""] ?? SIGNIN_FAILED_GENERIC };
+  const text = SIGNIN_FAILURES[search.reason ?? ""] ?? SIGNIN_FAILED_GENERIC;
+  if (search.reason === "provider" && redirectUri !== undefined && redirectUri !== null) {
+    return {
+      tone: "error",
+      text: `${text} This install sends ${redirectUri} as the redirect URI; the provider`
+        + " compares it character for character against the one registered there.",
+    };
+  }
+  return { tone: "error", text };
 }
 
 const SIGNIN_FAILED_GENERIC =
@@ -495,6 +627,20 @@ export function accountStatusLabel(status: MailAccountStatus, archived: boolean)
  * The password branch is unreachable -- a password account has no grant to
  * lapse -- and returns a sentence rather than throwing: a row that somehow
  * reached this state should still say something true and actionable.
+ *
+ * GOOGLE GETS ONE MORE SENTENCE, AND THIS IS THE SECOND PLACE THE GMAIL FORK
+ * HAS TO APPEAR (Task 4). providerSigninCaveat says it before the sign-in; this
+ * says it at the only other moment it matters, which is the one where the
+ * operator has forgotten. A consumer @gmail.com account on an app still in
+ * Testing arrives here every seven days, on the dot, and the row otherwise
+ * reads exactly like a mailbox whose password changed -- so the operator's
+ * conclusion is "this keeps breaking" and the thing they suspect is Conduit.
+ * Naming the seven days turns a recurring mystery into a known cost of the
+ * account they chose. It is CONDITIONAL prose ("if this is") rather than a
+ * claim, because nothing on this row knows whether the mailbox is Workspace or
+ * consumer: mail_accounts.auth_method records the provider and Conduit
+ * deliberately never asked for an id token that would say more (api:
+ * services/mail-oauth-signin.ts's scope note).
  */
 export function accountReauthMessage(
   status: MailAccountStatus, authMethod: MailAuthMethod,
@@ -502,7 +648,9 @@ export function accountReauthMessage(
   if (status !== "auth_required") return null;
   const provider = mailOAuthProviderOf(authMethod);
   if (provider === null) return "This mailbox needs to be signed in to again before it can sync.";
-  const name = provider === "microsoft" ? "Microsoft" : "Google";
-  return `${name} has stopped accepting this mailbox's saved sign-in.`
+  const base = `${providerLabel(provider)} has stopped accepting this mailbox's saved sign-in.`
     + " Sign in again to resume syncing and sending.";
+  if (provider === "microsoft") return base;
+  return `${base} If this is a personal @gmail.com address, Google does this every 7 days`
+    + " until the OAuth app leaves Testing.";
 }

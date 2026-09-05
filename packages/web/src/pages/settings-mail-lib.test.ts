@@ -19,7 +19,9 @@ import {
   initialFormState,
   initialOAuthFormState,
   isPort,
+  oauthSetupHint,
   providerLabel,
+  providerSigninCaveat,
   settingsFields,
   signedInWith,
   signinBanner,
@@ -416,6 +418,131 @@ describe("accountReauthMessage", () => {
   it("still says something useful for a password account", () => {
     expect(accountReauthMessage("auth_required", "password")).toContain("signed in");
   });
+
+  /**
+   * THE GMAIL FORK'S SECOND HOME (Task 4). A consumer @gmail.com on an app in
+   * Testing lands on this row every seven days, and the row without this
+   * sentence reads exactly like a mailbox whose password changed -- so the
+   * operator's conclusion is that Conduit keeps breaking.
+   */
+  it("tells a lapsed Google account that seven days may be all this is", () => {
+    const message = accountReauthMessage("auth_required", "oauth_google") ?? "";
+    expect(message).toContain("7 days");
+    expect(message).toContain("Testing");
+    // Conditional, not a claim: nothing on this row knows whether the mailbox
+    // is Workspace or consumer, and Conduit deliberately never asked for the id
+    // token that would say (api: mail-oauth-signin.ts's scope note).
+    expect(message).toContain("If this is");
+  });
+
+  /** Microsoft's refresh token has no expiry a syncing mailbox can reach --
+   * Entra's 90 days is an inactivity limit and the token rotates on every use.
+   * Telling a Microsoft operator about a weekly revocation would be a wrong
+   * instruction, and a wrong instruction is worse than none. */
+  it("does not say it about Microsoft, whose tokens survive an active mailbox", () => {
+    const message = accountReauthMessage("auth_required", "oauth_microsoft") ?? "";
+    expect(message).not.toContain("7 days");
+  });
+});
+
+/**
+ * THE GMAIL FORK, AT THE POINT OF CHOOSING.
+ *
+ * The phase plan calls shipping this silently "the worst outcome available":
+ * a consumer Gmail account stops weekly and the operator concludes Conduit is
+ * broken. These tests are what make the sentence load-bearing rather than
+ * decorative -- every figure in them is Google's own, and a rewrite that
+ * softened the seven days or dropped the assessment would have to delete an
+ * assertion to do it.
+ */
+describe("providerSigninCaveat", () => {
+  it("warns about a consumer Gmail account before the sign-in starts", () => {
+    const caveat = providerSigninCaveat("google");
+    expect(caveat).not.toBeNull();
+    const text = caveat!.paragraphs.join(" ");
+    expect(text).toContain("7 days");
+    expect(text).toContain("@gmail.com");
+  });
+
+  it("says the Workspace path is fine, and names what makes it fine", () => {
+    // Half a warning is worse than none: an operator told only that Google is
+    // trouble abandons a Workspace mailbox that would have worked perfectly.
+    const text = providerSigninCaveat("google")!.paragraphs.join(" ");
+    expect(text).toContain("Workspace");
+    expect(text).toContain("Internal");
+  });
+
+  it("says leaving Testing costs verification and a paid assessment", () => {
+    const text = providerSigninCaveat("google")!.paragraphs.join(" ");
+    expect(text).toContain("https://mail.google.com/");
+    expect(text).toContain("verification");
+    expect(text).toContain("paid");
+  });
+
+  it("has nothing to say about Microsoft", () => {
+    // Not symmetry for its own sake: a single-tenant registration in the
+    // operator's own directory needs no verification and its refresh tokens do
+    // not expire on a timer. Microsoft's real traps are tenant-side switches
+    // that cannot be met or fixed at this screen.
+    expect(providerSigninCaveat("microsoft")).toBeNull();
+  });
+
+  /**
+   * The create form shows it and the edit form does not -- by the time the
+   * account exists the decision is made, and a box repeated on every visit is
+   * a box that gets skipped. Read out of the page rather than rendered, the
+   * same way this file already checks the password form's controls.
+   *
+   * THE WHOLE GUARDED EXPRESSION, NOT ITS TWO HALVES. A mutation deleting the
+   * `!isEdit &&` survived an earlier version of this test that asserted
+   * `"!isEdit && "` on its own: the Backfill field below the caveat opens with
+   * the same three tokens, so the string was still there and nothing failed.
+   * Asserting the exact expression is what makes this test about the caveat's
+   * guard rather than about the file containing the word `isEdit`.
+   */
+  it("is rendered on the add form only", () => {
+    const source = withoutComments(
+      readFileSync(new URL("./settings-mail.tsx", import.meta.url), "utf8"),
+    );
+    expect(source).toContain("const caveat = providerSigninCaveat(provider);");
+    expect(source).toContain("{!isEdit && (() => {");
+  });
+});
+
+describe("oauthSetupHint", () => {
+  /** An install with no registration used to show the password form and no
+   * explanation, and "nothing here" reads identically to "this needs setting up
+   * first". */
+  it("names the exact redirect URI to register and the setting to put it in", () => {
+    const hint = oauthSetupHint("/api/mail/oauth/callback", "https://crm.example");
+    expect(hint).toContain("https://crm.example/api/mail/oauth/callback");
+    expect(hint).toContain("MAIL_OAUTH_REDIRECT_URI");
+    expect(hint).toContain("docs/mail-oauth-setup.md");
+  });
+
+  /** An install mounted under a prefix serves its callback there, and a hint
+   * that dropped the prefix would be the byte-for-byte mismatch it exists to
+   * prevent. The path comes from the server for exactly this reason. */
+  it("carries a base path through untouched", () => {
+    expect(oauthSetupHint("/conduit/api/mail/oauth/callback", "https://box.example"))
+      .toContain("https://box.example/conduit/api/mail/oauth/callback");
+  });
+
+  /**
+   * SAYS NOTHING WHEN IT DOES NOT KNOW. The same branch of the page renders for
+   * "this install has no registration" and for "the providers query failed",
+   * and only the first of those has anything true to say. A hint built from an
+   * absent path would name the site root -- a plausible string that is wrong,
+   * which is worse than silence.
+   *
+   * The nullability lives in this function rather than in the JSX because that
+   * is the difference between a case a test can state and a `!== undefined` in
+   * a component nothing in this repository renders.
+   */
+  it("says nothing when the server did not answer", () => {
+    expect(oauthSetupHint(undefined, "https://crm.example")).toBeNull();
+    expect(oauthSetupHint("", "https://crm.example")).toBeNull();
+  });
 });
 
 // --- Phase 8 Task 3: the form's second path ---------------------------------
@@ -547,6 +674,43 @@ describe("signinBanner", () => {
     // It still has to say what to do, or it is a dead end dressed as calm.
     expect(text).toContain("Start it again");
     expect(text.toLowerCase()).not.toContain("attack");
+  });
+
+  /**
+   * THE REDIRECT URI, WHERE THE OPERATOR CAN ACT ON IT (Task 4).
+   *
+   * "This is usually the app registration" is true and is advice with nowhere
+   * to go; the value it has to be compared against is a string this install
+   * decided and nothing on screen used to show. It is compared byte for byte at
+   * the provider, so a trailing slash decides the whole sign-in.
+   */
+  it("shows the redirect URI on the failure that is usually a registration", () => {
+    const text = signinBanner(
+      { oauth: "failed", reason: "provider" }, "https://crm.example/api/mail/oauth/callback",
+    )!.text;
+    expect(text).toContain("https://crm.example/api/mail/oauth/callback");
+    expect(text).toContain("character for character");
+  });
+
+  it("keeps its old sentence when there is no redirect URI to show", () => {
+    // Null is an install with no registration and undefined is the query still
+    // in flight. Neither may produce "the redirect URI is: null", which is a
+    // worse banner than the one that says nothing about it.
+    for (const value of [null, undefined]) {
+      const text = signinBanner({ oauth: "failed", reason: "provider" }, value)!.text;
+      expect(text).not.toContain("redirect URI");
+      expect(text).toContain("app registration");
+    }
+  });
+
+  it("does not append it to failures a redirect URI cannot explain", () => {
+    // A declined consent, an expired state and a duplicate mailbox are not
+    // registration problems, and a URI bolted onto them sends the operator to
+    // check something that was never wrong.
+    for (const reason of ["state", "denied", "no_refresh_token", "duplicate", "account", "failed"]) {
+      const text = signinBanner({ oauth: "failed", reason }, "https://crm.example/cb")!.text;
+      expect(text, reason).not.toContain("https://crm.example/cb");
+    }
   });
 
   it("still says something true for a reason it does not recognise", () => {
