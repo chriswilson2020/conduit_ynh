@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 import type { BrowserContext, Locator, Page, Route } from "@playwright/test";
 import { ImapFlow } from "imapflow";
+import postgres from "postgres";
 import { typeIntoEditor } from "./helpers.js";
 
 /**
@@ -45,19 +46,37 @@ import { typeIntoEditor } from "./helpers.js";
  * project, so a "skip when the fixture is absent" would only ever hide a
  * fixture that had gone missing in the one place it must not.
  *
- * RETRY SAFETY IS RUN-ID SCOPING, and it is load-bearing here in a way it is
- * not in the other specs. Nothing empties the Dovecot mailbox and nothing
- * resets the database between Playwright retries, so a second attempt starts
- * with the previous attempt's mail already in INBOX and its threads already
- * in the database. Every fixture subject, address and body marker therefore
- * carries a run id, every assertion matches a run-id-scoped SET rather than a
- * bare count, and the one genuinely global number in the app -- the nav's
- * unread badge -- is asserted as a DELTA against what it read before the
- * step, never as an absolute. The one thing scoping cannot fix is a second
- * live mail account pointed at the same mailbox (each account ingests the
- * same message into the same thread, so the conversation would show every
- * message twice), which is why beforeAll archives whatever accounts a
- * previous attempt left behind.
+ * RETRY SAFETY IS A RESET (see resetForRetry below), and this file is the
+ * only spec in the suite that needs one. It is one `describe.serial` block, so
+ * a failure anywhere skips the rest and Playwright re-runs the WHOLE block --
+ * and the two stores this journey writes to, the Dovecot mailbox and the
+ * database, live outside Playwright and outlive the worker it discards.
+ * Until 2026-09-05 nothing emptied either of them, and the consequence was
+ * measured rather than guessed: each attempt re-seeded a full fixture set on
+ * top of the last one's leftovers and died EARLIER than the attempt before it,
+ * so the retry budget was spent on failures the retries themselves created and
+ * the first-trial failure was never re-run at all. Six red runs in twenty-six
+ * attempts, and a retry recovery rate of 0 of 6 where every other e2e
+ * intermittent in this repository's history is 36 of 36
+ * (docs/superpowers/reports/2026-09-05-mail-e2e-intermittent.md).
+ *
+ * So `beforeAll` empties both stores whenever `testInfo.retry > 0`, and a
+ * retry now means what Playwright intends by it: the same attempt again, not a
+ * compounding one.
+ *
+ * THE RUN-ID SCOPING BELOW STAYS, and not out of sentiment. The reset asserts
+ * its own postconditions and fails the attempt loudly if either store is still
+ * dirty, but scoping is what makes the assertions in this file describe THIS
+ * attempt's fixtures rather than a count of everything present -- which is the
+ * right shape for a spec sharing a mailbox with e2e/mobile.spec.ts whatever
+ * the reset does. Every fixture subject, address and body marker carries a run
+ * id, every assertion matches a scoped SET rather than a bare count, and the
+ * one genuinely global number in the app -- the nav's unread badge -- is
+ * asserted as a DELTA against what it read before the step, never as an
+ * absolute. What scoping never could fix is a second live mail account pointed
+ * at the same mailbox (each account ingests the same message into the same
+ * thread, so the conversation would show every message twice), which is why
+ * beforeAll archives whatever accounts it finds before it resets anything.
  *
  * Tests run in file order and share a single page; state (the contact, thread
  * and deal ids) accumulates across them, and a failure stops the rest rather
@@ -71,6 +90,59 @@ const SMTP_PORT = Number(process.env.E2E_MAIL_SMTP_PORT ?? 1025);
 const USERNAME = process.env.E2E_MAIL_USERNAME ?? "conduit@test.local";
 const PASSWORD = process.env.E2E_MAIL_PASSWORD ?? "testpass";
 const MAILPIT_URL = process.env.E2E_MAILPIT_URL ?? "http://127.0.0.1:8025";
+
+/**
+ * The database under test, for the ONE thing no app surface can do: put the
+ * mail tables back to empty between Playwright attempts (see resetForRetry).
+ *
+ * Conduit is archive-not-delete all the way down -- an account archives, a
+ * thread hides, and neither leaves the list. That is the right product
+ * behaviour and this file asserts it in several places; it is also why the
+ * harness cannot ask the app to undo an attempt. The same reasoning
+ * `emptyOnServer` already follows for Dovecot, one store along: a reset is
+ * the harness's business, and asking the app to clean up after itself would
+ * be asking it to mark its own homework.
+ *
+ * Spelled exactly like playwright.config.ts's webServer DATABASE_URL, because
+ * it has to be the same database the app under test is using -- a full TCP
+ * connection string in CI, with a local socket fallback for a machine running
+ * this against its own PostgreSQL.
+ */
+const DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgres:///conduit_test";
+
+/**
+ * Every mail table, CHILD FIRST: this list is a delete order, not a set. The
+ * FKs are plain no-action ones (schema.ts), so a parent deleted before its
+ * children fails outright rather than cascading.
+ *
+ * `resetForRetry` checks this list against the database's own catalogue before
+ * it deletes anything, so a mail table added in a later phase stops a retry
+ * with a message naming itself rather than silently leaving its rows behind --
+ * which is precisely the failure mode this whole reset exists to end.
+ */
+const MAIL_TABLES = [
+  "mail_attachments",
+  "mail_messages",
+  "mail_thread_hides",
+  "mail_threads",
+  "mail_account_folders",
+  "mail_folder_state",
+  "mail_accounts",
+] as const;
+
+/**
+ * The mailboxes this spec CREATES, by prefix, so a reset can take them away
+ * again. Kept beside the names they are built from in beforeAll
+ * (`Retainers-${attemptId}` and its renamed form) -- matching on the run id
+ * instead would not do, because a retry runs in a fresh worker and may well
+ * re-evaluate this module, giving the leftovers a run id this attempt has
+ * never heard of.
+ *
+ * Nothing else in the mailbox is deleted as a MAILBOX: the fixture folders
+ * belong to .github/scripts/start-dovecot.sh and to seedMailbox, which both
+ * tolerate finding them already there.
+ */
+const SPEC_MADE_FOLDER_PREFIXES = ["Retainers-", "Clients-Retainers-"];
 
 /** How long a sync pass, an SSE hint and a refetch get to produce something.
  * Generous: the first pass includes an IMAP connect and LOGIN, and CI's CPU
@@ -725,6 +797,158 @@ test.describe.serial("Mail journey", () => {
     });
   }
 
+  // -- the retry reset --------------------------------------------------
+
+  /**
+   * Empty the Dovecot mailbox: every message out of every selectable folder,
+   * and the folders this spec made for itself removed with them.
+   *
+   * EXPUNGED, not moved. `emptyOnServer` above moves, because the tests that
+   * use it are asserting where mail ENDED UP and a harness that deleted the
+   * evidence would be no harness at all. Here the point is the opposite:
+   * nothing from a previous attempt may survive anywhere the CRM can see it,
+   * and Trash and Archive are two of the places it looks.
+   *
+   * `\Noselect` mailboxes are skipped because they cannot be opened at all --
+   * they are path components (a parent of `a/b` that holds no mail), not
+   * mailboxes.
+   */
+  async function emptyMailboxForRetry(): Promise<void> {
+    await withImap(async (client) => {
+      const mailboxes = await client.list();
+      for (const mailbox of mailboxes) {
+        if (mailbox.flags.has("\\Noselect")) continue;
+        const opened = await client.mailboxOpen(mailbox.path);
+        if (opened.exists > 0) await client.messageDelete("1:*");
+        await client.mailboxClose();
+      }
+      // After the emptying, not before: Dovecot refuses to delete a mailbox
+      // that is open, and an empty one is also the only kind whose deletion
+      // can be read as "the reset worked" rather than as data loss.
+      for (const mailbox of mailboxes) {
+        if (!SPEC_MADE_FOLDER_PREFIXES.some((prefix) => mailbox.path.startsWith(prefix))) continue;
+        await client.mailboxDelete(mailbox.path);
+      }
+    });
+  }
+
+  /** What the server still holds, per mailbox, so the postcondition below can
+   * say WHICH folder is dirty rather than merely that one is. */
+  async function remainingOnServer(): Promise<Record<string, number>> {
+    return await withImap(async (client) => {
+      const left: Record<string, number> = {};
+      for (const mailbox of await client.list()) {
+        if (mailbox.flags.has("\\Noselect")) continue;
+        const opened = await client.mailboxOpen(mailbox.path, { readOnly: true });
+        if (opened.exists > 0) left[mailbox.path] = opened.exists;
+        await client.mailboxClose();
+      }
+      return left;
+    });
+  }
+
+  /**
+   * Empty the mail tables, in one transaction.
+   *
+   * `events` FIRST and by predicate, not by truncation: Phase 5 puts a
+   * `mail_thread_id` pointer on the timeline, so those rows reference threads
+   * this deletes -- but the same table carries every other record's timeline
+   * too, and the specs that ran before this one in the same database own
+   * those. `WHERE mail_thread_id IS NOT NULL` takes exactly the mail entries.
+   * (This is also why the tables below are DELETEd rather than TRUNCATEd:
+   * TRUNCATE refuses a table an FK references unless the referencing table
+   * goes with it, which for `events` would mean everybody's timeline.)
+   */
+  async function wipeMailTables(): Promise<void> {
+    // Mirrors packages/api/src/test/global-setup.ts: a bare "postgres:///db"
+    // URL with no ambient PGHOST connects over TCP to localhost, which needs a
+    // password this role does not have. In CI the URL is a full TCP one and
+    // this never comes into play.
+    process.env.PGHOST ??= "/run/postgresql";
+    const sql = postgres(DATABASE_URL, { max: 1, onnotice: () => undefined });
+    try {
+      // starts_with rather than LIKE 'mail\_%': the underscore would have to be
+      // escaped to mean itself, and a backslash inside a tagged template is
+      // eaten by JavaScript before postgres ever sees it.
+      const present = await sql<{ table_name: string }[]>`
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public' AND starts_with(table_name, 'mail_')
+      `;
+      const unknown = present
+        .map((row) => row.table_name)
+        .filter((name) => !(MAIL_TABLES as readonly string[]).includes(name));
+      // Loud, and on the retry rather than fifteen tests into it: a mail table
+      // this list has never heard of is a table this reset leaves full, which
+      // is the exact defect the reset exists to close.
+      expect(
+        unknown,
+        "MAIL_TABLES in e2e/mail.spec.ts no longer covers every mail_* table; "
+        + "add these to it, child-first, or a retry will start dirty",
+      ).toEqual([]);
+      await sql.begin(async (tx) => {
+        await tx`DELETE FROM events WHERE mail_thread_id IS NOT NULL`;
+        for (const table of MAIL_TABLES) await tx`DELETE FROM ${tx(table)}`;
+      });
+    } finally {
+      await sql.end();
+    }
+  }
+
+  /**
+   * Put both stores back to what a first attempt sees.
+   *
+   * WHY THIS EXISTS AT ALL is the file header's subject and is not repeated
+   * here. What belongs here is the ORDER, because each step depends on the one
+   * before it:
+   *
+   *   1. The live accounts are archived by the caller, BEFORE this runs. That
+   *      is what stops the previous attempt's sync loop: mail-sync.ts's
+   *      `loadAccount` re-reads the row every pass and treats an archived (or
+   *      absent) one as teardown. Wiping the rows under a running loop would
+   *      work too -- NotFoundError is a teardown error as well -- but only
+   *      after that loop had finished whatever pass it was in the middle of,
+   *      and a pass finishing after the wipe would ingest straight back into
+   *      the tables just emptied.
+   *   2. Dovecot is emptied next, so a straggling pass has nothing left to
+   *      find even if it does come round again.
+   *   3. The tables go last.
+   *
+   * AND THEN IT CHECKS, which is the half that keeps this honest. This code
+   * runs only on a retry, so on a green run it is never exercised at all --
+   * a reset that had quietly stopped working would show up as the retry
+   * cascade coming back, months later, looking exactly like a new
+   * intermittent. The postconditions are asked of the SERVER and of the API
+   * rather than of the statements just executed, and they are what fails when
+   * one of them is not true.
+   *
+   * The loop is for the race in (1): archiving is noticed at a pass boundary,
+   * so a pass already in flight can still insert after the wipe. One more
+   * round of the same wipe is what clears that, and the attempt count is a
+   * deadline rather than a hope.
+   */
+  async function resetForRetry(): Promise<void> {
+    let left: Record<string, number> = {};
+    let threads = -1;
+    for (let round = 0; round < 5; round += 1) {
+      await emptyMailboxForRetry();
+      await wipeMailTables();
+
+      left = await remainingOnServer();
+      const listed = await page.request.get("/api/mail/threads");
+      expect(listed.ok()).toBe(true);
+      threads = ((await listed.json()) as { items: unknown[] }).items.length;
+      if (Object.keys(left).length === 0 && threads === 0) return;
+      // A pass that was in flight when the archive landed. Give it a beat to
+      // unwind and take the leftovers it wrote with the next round.
+      await page.waitForTimeout(1_000);
+    }
+    throw new Error(
+      "the retry reset did not take: the mail tables and the Dovecot mailbox have to be empty "
+      + "before this attempt seeds, or it will fail somewhere it has no business failing "
+      + `(threads still listed: ${threads}; messages still on the server: ${JSON.stringify(left)})`,
+    );
+  }
+
   // -- helpers ---------------------------------------------------------
 
   /**
@@ -791,15 +1015,18 @@ test.describe.serial("Mail journey", () => {
   /**
    * Click "Load more" until every page of the thread list is on screen.
    *
-   * The Phase 4.3 fixtures are dated HOURS old, deliberately, so they can
-   * never disturb the earlier journeys' page-one geography -- the flip side
-   * is that on a retry, with previous attempts' leftover threads piled
-   * newest-first above them, they can sit below the first page of 25. A row
-   * assertion made after this helper is about the WHOLE list, which is also
-   * the only honest shape for the hide journey's absence claims. Bounded
-   * rather than clever: even three attempts' pile-up is two pages, and if
-   * the list never finishes materializing it is the caller's own row
-   * assertion that should fail, with the better message.
+   * A row assertion made after this helper is about the WHOLE list rather
+   * than about page one, which is the only honest shape for the hide
+   * journey's absence claims and for the Task 3 backlog's thirty rows.
+   *
+   * IT USED TO BE ABOUT RETRIES TOO -- the Phase 4.3 fixtures are dated hours
+   * old so they cannot disturb the earlier journeys' page-one geography, and
+   * previous attempts' leftovers piled newest-first above them used to push
+   * them past the first page of 25. resetForRetry has ended that; what is
+   * left is the ordinary reason, that this file's own fixture set has grown
+   * twice and page one is 25 rows. Bounded rather than clever: if the list
+   * never finishes materializing it is the caller's own row assertion that
+   * should fail, with the better message.
    */
   async function loadAllThreadsOn(target: Page): Promise<void> {
     for (let round = 0; round < 20; round += 1) {
@@ -907,11 +1134,18 @@ test.describe.serial("Mail journey", () => {
     backlogPrefix = `Backlog ${attemptId}`;
     backlogReplyMarker = `backlogreply${attemptId}`;
     liveSubject = `Latebreaking ${attemptId}`;
-    // Five days back on the first attempt, four on the second, three on the
-    // third: every attempt's backlog is NEWER than the previous attempt's and
-    // older than every other fixture in this file, which are minutes or hours
-    // old. Still well inside the account form's default 90-day backfill.
-    backlogBaseMs = Date.now() - (5 - testInfo.retry) * 24 * 60 * MINUTE_MS;
+    // Five days back, on every attempt alike: older than every other fixture
+    // in this file, which are minutes or hours old, and still well inside the
+    // account form's default 90-day backfill.
+    //
+    // IT USED TO BE `5 - testInfo.retry`, so that each attempt's backlog was
+    // newer than the last one's and the target row's depth stayed predictable
+    // however many attempts had run. That was a workaround for leftovers, and
+    // resetForRetry has taken the leftovers away: a retry now sees the same
+    // mailbox a first attempt sees, so it should compute the same fixture
+    // dates from it. An attempt that is not identical to the first one is
+    // exactly what this file spent six red runs learning to distrust.
+    backlogBaseMs = Date.now() - 5 * 24 * 60 * MINUTE_MS;
 
     // The Phase 5 set (see the declarations above for why the ADDRESS is
     // per-attempt and not merely per-run).
@@ -920,76 +1154,46 @@ test.describe.serial("Mail journey", () => {
     timelineSubject = `Pilot quote ${attemptId}`;
     timelineReplyBody = `Thanks Cora ${attemptId}`;
 
-    // A previous attempt's account would sync this same mailbox alongside the
-    // one added below, ingesting every message twice (once per account, into
-    // the same thread) and doubling the conversation. Archiving stops its
-    // sync and leaves its messages alone, which run-id scoping already
-    // handles. A no-op on the first attempt, where there are no accounts.
+    // A live account not this attempt's own would sync this same mailbox
+    // alongside the one added below, ingesting every message twice (once per
+    // account, into the same thread) and doubling the conversation. There are
+    // two ways one can be here: a previous attempt of this block left it, or
+    // some other spec did (e2e/mobile.spec.ts adds one to this same mailbox,
+    // and refuses to run at more than one worker for exactly this reason).
+    //
+    // UNCONDITIONAL, unlike the reset below, because the second case has
+    // nothing to do with retries. On a retry it is also step one of the reset:
+    // archiving is what stops the previous attempt's sync loop before
+    // resetForRetry empties the tables under it (see that function's ORDER).
     const response = await page.request.get("/api/mail/accounts");
     expect(response.ok()).toBe(true);
     const { own } = await response.json() as {
-      own: { id: string; archivedAt: string | null; visibility: "private" | "shared" }[];
+      own: { id: string; archivedAt: string | null }[];
     };
-    // Only LIVE accounts need (or admit) the visibility reset -- a
-    // shared+archived leftover would be uncleanable from here (the PATCH
-    // refuses archived rows) and would poison B's empty-inbox assertions
-    // permanently, but that state cannot arise in this suite, by
-    // construction: CI's postgres is fresh per run, and within a run the
-    // ONLY archiver of accounts is this very block, which always flips a
-    // shared account private FIRST -- the journey's own tests flip
-    // visibility but never archive, so every account this loop archives is
-    // private at that moment, and nothing can re-share it afterwards (the
-    // toggle does not render on archived cards and the PATCH refuses them).
-    // If this spec is ever pointed at a PERSISTENT database where that
-    // invariant does not hold, widen the flip to unarchive -> flip ->
-    // re-archive (the documented recovery road) rather than deleting this
-    // comment.
     for (const account of own) {
-      if (account.archivedAt === null) {
-        // Phase 4.2 retry hygiene, and it must run BEFORE the archive below:
-        // an attempt that failed between the shared flip and the flip back
-        // would leave a SHARED account behind, archiving does not clear
-        // visibility, and the account PATCH refuses archived rows -- so this
-        // is the one moment the leftover can be made private again. Without
-        // it, every previous attempt's threads would sit in user B's inbox
-        // and the 4.2 "empty" assertions would fail every retry for a reason
-        // no retry could clear (the same unrecoverability class the
-        // per-attempt subjects above exist for).
-        if (account.visibility === "shared") {
-          const flipped = await page.request.patch(`/api/mail/accounts/${account.id}`, {
-            data: { visibility: "private" },
-          });
-          expect(flipped.ok()).toBe(true);
-        }
-        // Checked, not fired and forgotten: this POST is the whole of what
-        // stands between a retry and a double-ingested conversation, and it
-        // is a line that only ever runs ON a retry -- so a 4xx here has to
-        // fail with "the archive was refused" rather than surface two steps
-        // later as a conversation with twice the messages it should have.
-        const archived = await page.request.post(`/api/mail/accounts/${account.id}/archive`);
-        expect(archived.ok()).toBe(true);
-      }
+      if (account.archivedAt !== null) continue;
+      // Checked, not fired and forgotten: a 4xx here has to fail with "the
+      // archive was refused" rather than surface two steps later as a
+      // conversation with twice the messages it should have.
+      const archived = await page.request.post(`/api/mail/accounts/${account.id}/archive`);
+      expect(archived.ok()).toBe(true);
     }
 
-    // Phase 4.3 retry hygiene, the same class as the visibility flip above:
-    // the hide journey ends with A's Hidden view EMPTY (its post-unhide
-    // negative asserts the "No hidden conversations" label as the
-    // loaded-list sentinel), and an attempt that failed between its hide
-    // and its unhide would leave a hidden thread behind that per-attempt
-    // SUBJECT scoping cannot clear -- hide state is keyed on the thread,
-    // not on this attempt's fixtures, and archiving the account above does
-    // not unlist its threads. Unhiding whatever a previous attempt left
-    // makes the empty-Hidden-view claim true by construction. Bounded loop
-    // only because the list pages; a first attempt breaks out immediately.
-    for (let round = 0; round < 5; round += 1) {
-      const hiddenList = await page.request.get("/api/mail/threads?hidden=true");
-      expect(hiddenList.ok()).toBe(true);
-      const { items } = await hiddenList.json() as { items: { id: string }[] };
-      if (items.length === 0) break;
-      for (const item of items) {
-        const unhidden = await page.request.post(`/api/mail/threads/${item.id}/unarchive`);
-        expect(unhidden.ok()).toBe(true);
-      }
+    // THE RESET, and the file header says why it is the whole answer to a
+    // retry. Only on a retry: on a first attempt both stores are already what
+    // this makes them, and emptying a mailbox is the one destructive thing
+    // this file does -- it should happen when there is a reason for it and
+    // not as a matter of course.
+    if (testInfo.retry > 0) {
+      // A hook gets the test timeout, and seedMailbox's ~65 APPENDs already
+      // spend a good part of it. The reset walks every mailbox on the server
+      // twice and empties seven tables, so a retry is asked to do noticeably
+      // more work in the same budget than a first attempt -- and a reset that
+      // ran out of time would present as a hook timeout with nothing said
+      // about the mailbox, which is the least useful failure this file could
+      // produce.
+      testInfo.setTimeout(testInfo.timeout + 60_000);
+      await resetForRetry();
     }
 
     await seedMailbox();
@@ -1100,9 +1304,16 @@ test.describe.serial("Mail journey", () => {
       // themselves, because the unread-badge test below reads the badge as a
       // delta of its own making -- a fixture still trickling in AFTER this
       // test would move the badge between that test's before-read and its
-      // assertion, a race no per-test poll further down could close. Dated
-      // hours old, these rows can sit past page one on a retry, hence the
-      // load-all first (see loadAllThreadsOn).
+      // assertion, a race no per-test poll further down could close.
+      //
+      // The load-all is what makes the four assertions below about the whole
+      // list; it is a no-op today, because this attempt's own fixtures are
+      // thirteen threads and page one is 25. Alice's and Bob's rows above are
+      // deliberately NOT behind it: those two are minutes old, they are the
+      // newest things in the mailbox at this point in the journey, and a load
+      // -all that had to run before them would be saying that this attempt
+      // could be looking at somebody else's mail. Since resetForRetry it
+      // cannot be.
       await loadAllThreadsOn(page);
       await expect(threadRow(longSubject)).toContainText("Message 51", { timeout: ATTEMPT_TIMEOUT_MS });
       await expect(threadRow(attachSubject)).toHaveCount(1, { timeout: ATTEMPT_TIMEOUT_MS });

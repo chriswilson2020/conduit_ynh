@@ -17,6 +17,7 @@
     "@playwright/test": "^1.62.1",
     "@types/node": "^24.0.0",
     "imapflow": "^1.0.191",
+    "postgres": "^3.4.9",
     "typescript": "^5.9.0",
     "vitest": "^4.1.10"
   },
