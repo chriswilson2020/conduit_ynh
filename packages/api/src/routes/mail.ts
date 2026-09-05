@@ -6,7 +6,7 @@ import {
   mailLinkKindSchema, threadLinksInputSchema, sendMailInputSchema,
   bulkThreadActionInputSchema, bulkMessageActionInputSchema, folderPatchInputSchema,
   folderCreateInputSchema, folderRenameInputSchema, folderDeleteInputSchema,
-  BULK_ACTION_THREAD_CAPS,
+  BULK_ACTION_THREAD_CAPS, MAIL_OAUTH_CALLBACK_PATH,
   type MailAccountSyncStats,
 } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
@@ -214,6 +214,15 @@ const oauthCallbackQuerySchema = z.object({
  * choose the destination. */
 function settingsMailPath(basePath: string): string {
   return basePath === "/" ? "/settings/mail" : `${basePath}/settings/mail`;
+}
+
+/** The callback's public path on this install. Same construction as
+ * settingsMailPath and for the same reason: an install mounted at /conduit
+ * serves both under that prefix. MAIL_OAUTH_CALLBACK_PATH is the literal this
+ * router registers below, shared so config.ts can check a redirect URI against
+ * it without importing a route module. */
+function oauthCallbackPath(basePath: string): string {
+  return basePath === "/" ? MAIL_OAUTH_CALLBACK_PATH : `${basePath}${MAIL_OAUTH_CALLBACK_PATH}`;
 }
 
 export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): void {
@@ -580,11 +589,30 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * the add-account form needs it before there is an account to ask about. See
    * mailOAuthProvidersSchema (@conduit/shared) for why the client ids are not
    * in the response even though they are not secret.
+   *
+   * IT ANSWERS AN EMPTY LIST USEFULLY (Task 4), which is the case this install
+   * is in today. `providers: []` alone says "no", and the page could only
+   * render silence; the two fields beside it say what would have to be true
+   * instead -- the exact path to register, and whichever half of the pair is
+   * already configured -- so an operator holding the Azure or Google console
+   * open can finish the job from this screen rather than from routes/mail.ts.
    */
   app.get("/api/mail/oauth/providers", async (request, reply) => {
     const user = requireUser(request, reply);
     if (user === null) return;
-    return { providers: configuredProviders(mailOAuthClients) };
+    return {
+      providers: configuredProviders(mailOAuthClients),
+      // basePath, not the bare literal: an install mounted at /conduit serves
+      // its callback under that prefix, and a path that omitted it is exactly
+      // the byte-for-byte mismatch this field exists to prevent.
+      callbackPath: oauthCallbackPath(basePath),
+      // THE PAIR IS ONE VALUE, so either registration answers it and neither
+      // is preferred; config.ts builds both registrations from the same
+      // MAIL_OAUTH_REDIRECT_URI and refuses a half one. Null means unset,
+      // which is a different thing from "wrong" -- a wrong one does not reach
+      // here, because parseConfig refuses to boot with it.
+      redirectUri: (mailOAuthClients.microsoft ?? mailOAuthClients.google)?.redirectUri ?? null,
+    };
   });
 
   /**
@@ -680,7 +708,11 @@ export function registerMailRoutes(app: FastifyInstance, deps: CrmRouteDeps): vo
    * process cannot do anything about -- which is the exposure PKCE is here to
    * make survivable (services/mail-oauth-signin.ts's header).
    */
-  app.get("/api/mail/oauth/callback", async (request, reply) => {
+  // THE CONSTANT, NOT A SECOND COPY OF THE STRING. config.ts checks a
+  // configured MAIL_OAUTH_REDIRECT_URI against it and the providers route tells
+  // the operator to register it; a literal here would let this route move and
+  // leave both of those quietly describing a path that no longer exists.
+  app.get(MAIL_OAUTH_CALLBACK_PATH, async (request, reply) => {
     const user = requireUser(request, reply);
     if (user === null) return;
     const params = oauthCallbackQuerySchema.safeParse(request.query);

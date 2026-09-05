@@ -4060,14 +4060,71 @@ describe("mail OAuth sign-in routes", () => {
       const a = await app();
       const response = await a.inject({ method: "GET", url: "/api/mail/oauth/providers", headers: authHeaders });
       expect(response.statusCode).toBe(200);
-      expect(mailOAuthProvidersSchema.parse(response.json())).toEqual({ providers: [] });
+      // AN EMPTY LIST STILL ANSWERS USEFULLY (Task 4). This is the install
+      // Chris is on, and it is the one where an operator is trying to CREATE a
+      // registration -- so the response has to carry the path they must
+      // register even though it can offer them no provider at all.
+      expect(mailOAuthProvidersSchema.parse(response.json())).toEqual({
+        providers: [],
+        callbackPath: "/api/mail/oauth/callback",
+        redirectUri: null,
+      });
       await a.close();
     });
 
     it("lists the providers this install registered", async () => {
       const a = await app({ oauth: true });
       const response = await a.inject({ method: "GET", url: "/api/mail/oauth/providers", headers: authHeaders });
-      expect(response.json()).toEqual({ providers: ["microsoft"] });
+      expect(response.json()).toEqual({
+        providers: ["microsoft"],
+        callbackPath: "/api/mail/oauth/callback",
+        // Echoed back so the operator can compare it, character for character,
+        // against what the provider console shows -- which is the comparison
+        // the provider itself makes (RFC 6749 3.1.2.3).
+        redirectUri: MICROSOFT_REGISTRATION.redirectUri,
+      });
+      await a.close();
+    });
+
+    /** An install mounted at /conduit serves its callback under that prefix,
+     * and a path that omitted it is precisely the byte-for-byte mismatch this
+     * field exists to prevent. Same construction as the settings redirect the
+     * callback itself performs. */
+    it("carries the base path, because that is what has to be registered", async () => {
+      const a = await app({ basePath: "/conduit" });
+      const response = await a.inject({ method: "GET", url: "/api/mail/oauth/providers", headers: authHeaders });
+      expect(mailOAuthProvidersSchema.parse(response.json()).callbackPath)
+        .toBe("/conduit/api/mail/oauth/callback");
+      await a.close();
+    });
+
+    /**
+     * The advertised path has to be the one the route is really served at, or
+     * the operator registers a URI that 404s while holding an authorisation
+     * code. They are one constant now (@conduit/shared's
+     * MAIL_OAUTH_CALLBACK_PATH, used at the app.get and at this response), and
+     * this is what proves the constant is the live one rather than a copy that
+     * happens to agree today.
+     *
+     * IT ADVERTISES THE PUBLIC PATH AND FASTIFY ANSWERS THE SUFFIX, which is
+     * not a discrepancy: conf/nginx.conf proxies `__PATH__/` to `:PORT/` with a
+     * trailing slash, so nginx strips the prefix and the app never sees it.
+     * What the provider must be given is the public one; what must exist is the
+     * suffix. Both halves are asserted because getting either wrong produces
+     * the same 404.
+     */
+    it("advertises the public path, whose served half this app really answers", async () => {
+      const a = await app({ basePath: "/conduit" });
+      const { callbackPath } = mailOAuthProvidersSchema.parse(
+        (await a.inject({ method: "GET", url: "/api/mail/oauth/providers", headers: authHeaders })).json(),
+      );
+      expect(callbackPath).toBe("/conduit/api/mail/oauth/callback");
+      const callback = await a.inject({
+        method: "GET", url: callbackPath.slice("/conduit".length), headers: authHeaders,
+      });
+      // A 303 back to settings: the callback refuses a state it never minted,
+      // which is the right answer and, crucially, is not a 404.
+      expect(callback.statusCode).toBe(303);
       await a.close();
     });
 

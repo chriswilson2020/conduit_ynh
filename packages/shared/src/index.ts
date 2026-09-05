@@ -979,11 +979,49 @@ export type MailOAuthSigninStart = z.infer<typeof mailOAuthSigninStartSchema>;
 // NOTHING SECRET IS IN IT. A client id is public (it travels in every
 // authorize URL) and is still not returned here: the client has no use for one,
 // and a field nobody reads is a field that leaks the day somebody logs the
-// response.
+// response. The two fields Task 4 added pass that same test rather than the
+// secrecy one -- both are read on screen, by an operator holding a provider
+// console open in the other tab.
 export const mailOAuthProvidersSchema = z.object({
   providers: z.array(mailOAuthProviderSchema),
+  /**
+   * Where this server's callback actually is, relative to the site root
+   * (BASE_PATH included). The FIRST HALF OF THE ONE THING AN OPERATOR HAS TO
+   * GET EXACTLY RIGHT: the redirect URI is compared byte for byte at the
+   * provider (RFC 6749 3.1.2.3), and until this was on screen the only way to
+   * learn it was to read routes/mail.ts. Always present, including -- and
+   * especially -- on an install with no registration at all, which is the
+   * moment the operator is trying to create one.
+   */
+  callbackPath: z.string(),
+  /**
+   * MAIL_OAUTH_REDIRECT_URI as this server actually parsed it, or null when it
+   * is unset. The SECOND HALF: the operator compares this against what the
+   * provider console shows, and a mismatch invisible to the eye (a trailing
+   * slash, http for https) is a mismatch they can now see.
+   *
+   * NOT A SECRET AND NOT A CAPABILITY. It travels in every authorize URL this
+   * server builds and in every consent screen the operator has already seen;
+   * what makes it safe is that the server DECIDED it from configuration rather
+   * than from a request (api: config.ts's MAIL_OAUTH_REDIRECT_URI), and nothing
+   * about echoing it back changes that.
+   */
+  redirectUri: z.url().nullable(),
 });
 export type MailOAuthProviders = z.infer<typeof mailOAuthProvidersSchema>;
+
+/**
+ * The path the OAuth callback route is served at, under BASE_PATH.
+ *
+ * ONE SPELLING FOR THREE READERS: the route that registers it
+ * (api: routes/mail.ts), the boot-time check that MAIL_OAUTH_REDIRECT_URI
+ * actually points at it (api: config.ts), and the settings page that tells the
+ * operator what to register. It lives in shared because config.ts must not
+ * import a route module, and because the failure it prevents -- a redirect URI
+ * registered at a path this server does not serve -- shows up as a 404 with an
+ * authorisation code in the URL bar, which reads like a Conduit bug and is not.
+ */
+export const MAIL_OAUTH_CALLBACK_PATH = "/api/mail/oauth/callback";
 
 // Live counters from the in-process sync engine (api:
 // services/mail-sync.ts's AccountSyncStats), mirrored here by hand because

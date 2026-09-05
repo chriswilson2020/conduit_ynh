@@ -1,5 +1,6 @@
 import path from "node:path";
 import { z } from "zod";
+import { MAIL_OAUTH_CALLBACK_PATH } from "@conduit/shared";
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -103,8 +104,74 @@ const envSchema = z.object({
   // z.url() rather than z.string(): a value that is not a URL cannot be a
   // redirect URI, and finding that out at boot is better than finding it out at
   // the consent screen.
+  //
+  // AND THAT SENTENCE IS WHY TASK 4 WENT FURTHER (see redirectUriProblem).
+  // z.url() accepts `http://conduit.example/` and `https://conduit.example/x#y`
+  // and a path that is not this server's callback -- three values that parse,
+  // boot cleanly, and then fail at a provider or at a 404 with an authorisation
+  // code in the URL bar. Every one of them is decidable here.
   MAIL_OAUTH_REDIRECT_URI: z.url().optional(),
 });
+
+/**
+ * Why this value cannot work as a redirect URI, or null when it can.
+ *
+ * BOOT IS THE ONLY PLACE THIS IS CHEAP. Each of these fails somewhere else
+ * otherwise: at Google's console, which refuses the registration; at the
+ * consent screen, which shows the provider's own message about a URI this
+ * server never sees; or at a 404 that has an authorisation code in its URL and
+ * looks exactly like Conduit being broken. None of those name the setting.
+ *
+ * THREE CHECKS, EACH FROM A PUBLISHED RULE rather than from taste:
+ *
+ * 1. NO FRAGMENT. RFC 6749 3.1.2 says the redirection endpoint URI "MUST NOT
+ *    include a fragment component", and Google's console says the same in as
+ *    many words. A fragment never reaches a server anyway, so this one is not
+ *    even provider-specific.
+ * 2. HTTPS, EXCEPT ON THE LOOPBACK. Google: "Redirect URIs must use the HTTPS
+ *    scheme, not plain HTTP. Localhost URIs ... are exempt from this rule."
+ *    Microsoft's is the same shape. The loopback exemption is not a courtesy to
+ *    developers here -- it is what lets the e2e suite register
+ *    http://127.0.0.1:3100/... and exercise this path for real.
+ * 3. IT HAS TO BE THIS SERVER'S CALLBACK. A registration that is byte-perfect
+ *    at the provider and points at a path Conduit does not serve produces the
+ *    worst-looking failure in the phase: the sign-in appears to work, the
+ *    browser lands on a 404, and the authorisation code is sitting in the
+ *    address bar. Checked as a SUFFIX rather than against basePath exactly,
+ *    because the public path an operator is reverse-proxied at is BASE_PATH's
+ *    business and a stricter check would refuse a deployment this file has no
+ *    business having an opinion about.
+ *
+ * WHAT IT DELIBERATELY DOES NOT CHECK: the host. This server does not know its
+ * own public domain -- BASE_PATH is a path, and deriving an origin from a
+ * request header is the redirect-URI-injection hole the entry above refuses to
+ * open. A wrong host is caught at the provider, by the byte-for-byte compare,
+ * with the operator looking at both values (the settings page now shows this
+ * one back to them).
+ */
+export function redirectUriProblem(value: string, expectedPath: string): string | null {
+  let url: URL;
+  try {
+    // UNREACHABLE THROUGH parseConfig, and kept rather than asserted away: the
+    // schema's z.url() has already refused a non-URL, so no mutation can make
+    // this branch run and no test can kill it. It stays because this function
+    // is exported and takes a bare string -- a second caller that had not been
+    // through zod would otherwise get a TypeError where a sentence belongs.
+    url = new URL(value);
+  } catch {
+    return "is not a URL";
+  }
+  if (url.hash !== "") return "must not contain a #fragment (RFC 6749 3.1.2)";
+  const loopback = url.hostname === "localhost"
+    || url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1";
+  if (url.protocol !== "https:" && !loopback) {
+    return "must use https (both providers refuse plain http except on localhost)";
+  }
+  if (!url.pathname.endsWith(expectedPath)) {
+    return `must end with ${expectedPath}, which is where this server serves the callback`;
+  }
+  return null;
+}
 
 /**
  * One provider's app registration, or null when this install has none.
@@ -252,11 +319,35 @@ export function parseConfig(env: Record<string, string | undefined>): Config {
     );
   }
 
+  // Computed before the return because the redirect-URI check below quotes it
+  // back at the operator; it was inline in the object literal until then.
+  const basePath = value.BASE_PATH === "/"
+    ? "/"
+    : value.BASE_PATH.replace(/\/+$/, "") || "/";
+
+  // REFUSED AT BOOT, LOUDLY, rather than carried as a registration that cannot
+  // complete. The alternative considered and rejected was to treat an
+  // unusable URI as an absent one -- which reads as "this install has no OAuth"
+  // and hides the typo the operator is looking for. An install that has not set
+  // it at all still boots with no registration, exactly as before; only a value
+  // that IS set and cannot work stops the server, and the message names the
+  // setting, the reason and the path to use.
+  if (value.MAIL_OAUTH_REDIRECT_URI !== undefined) {
+    const problem = redirectUriProblem(value.MAIL_OAUTH_REDIRECT_URI, MAIL_OAUTH_CALLBACK_PATH);
+    if (problem !== null) {
+      throw new Error(
+        `MAIL_OAUTH_REDIRECT_URI ${problem}. It must be the exact string registered at the`
+        + ` provider: https://<this install's domain>${basePath === "/" ? "" : basePath}`
+        + `${MAIL_OAUTH_CALLBACK_PATH}`,
+      );
+    }
+  }
+
   return {
     nodeEnv: value.NODE_ENV,
     port: value.PORT,
     databaseUrl: value.DATABASE_URL,
-    basePath: value.BASE_PATH === "/" ? "/" : value.BASE_PATH.replace(/\/+$/, "") || "/",
+    basePath,
     version: value.APP_VERSION,
     devUser: value.CONDUIT_DEV_USER ?? null,
     dataDir: value.DATA_DIR,
