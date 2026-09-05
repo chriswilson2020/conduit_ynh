@@ -410,6 +410,19 @@ export function createHttpTokenRefresher(
       );
     }
 
+    // NO `scope` PARAMETER, AND IT IS THE MOST LIKELY THING TO NEED A SECOND
+    // LOOK AT THE FIRST REAL SIGN-IN (the spec's Risk 2 in the concrete). RFC
+    // 6749 6 makes scope optional on a refresh and says the issued token carries
+    // the originally granted scopes, which is what both providers document. The
+    // caveat is Microsoft's: its refresh tokens are multi-resource, and the
+    // scope is what picks the AUDIENCE when a grant covers more than one. An app
+    // registration whose only permissions are the mail ones -- which is what
+    // this phase asks the operator to create -- has one audience and needs no
+    // parameter. One that also carried, say, a Graph permission might get a
+    // token the IMAP server will not accept, and the symptom would be an
+    // authentication failure rather than anything naming scopes. Left out
+    // because Task 3 owns the scope list and duplicating it here would create
+    // two answers; named here so the first failure is recognised.
     const body = new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: refreshToken,
