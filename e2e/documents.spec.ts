@@ -459,6 +459,17 @@ test.describe.serial("Raising a quote from a deal", () => {
     await page.getByTestId("org-website").fill("https://example.test");
     await page.getByTestId("org-bank").fill("IBAN GB00 EXMP 0000 0000 0000 00");
 
+    // THE TIMEZONE, WHICH IS A SELECT AND NOT A TEXT BOX, and what is asserted
+    // here is the half only a real browser can answer: that the option list was
+    // built from the BROWSER's own `Intl.supportedValuesOf` rather than from
+    // anything shipped in this repository. `selectOption` fails outright when the
+    // option is absent, so choosing Europe/Amsterdam IS that assertion.
+    await page.getByTestId("org-timezone").selectOption("Europe/Amsterdam");
+    // CEST in summer and CET in winter, off the same stored zone -- which is the
+    // whole reason the label is computed at the instant rather than stored.
+    await expect(page.getByTestId("org-timezone-preview")).toContainText(/ CES?T/);
+    await expect(page.getByTestId("org-timezone-problem")).toHaveCount(0);
+
     // THE ONE BRANCH IN THIS FILE, AND THE SINGLETON IS WHY. Every other fixture
     // here carries a run id and is therefore new; the issuer profile is one row
     // per install, so a previous run -- or a previous ATTEMPT, since a serial
@@ -501,6 +512,10 @@ test.describe.serial("Raising a quote from a deal", () => {
     await page.reload();
     await expect(page.getByTestId("org-name")).toHaveValue(orgName);
     await expect(page.getByTestId("org-logo-preview")).toBeVisible();
+    // The zone came back off the row, which is the half a `<select>` can fail
+    // silently: an option list that did not contain the stored value would render
+    // with nothing selected and submit its first entry on the next save.
+    await expect(page.getByTestId("org-timezone")).toHaveValue("Europe/Amsterdam");
   });
 
   test("refuses a quote by naming the box that is empty", async () => {
