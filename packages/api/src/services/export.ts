@@ -9,7 +9,7 @@ import { decimalFromCents } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { readMigrationJournal } from "./migration-journal.js";
 import {
-  companies, contacts, deals, documents, files, meetingAttendees, meetings,
+  companies, contacts, deals, documentQuotes, documents, files, meetingAttendees, meetings,
   notes, pipelines, projects, stages, tasks, users,
 } from "../db/schema.js";
 import { csvDocument } from "./csv.js";
@@ -648,8 +648,19 @@ async function meetingsSheet(db: Database): Promise<Sheet> {
  */
 async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<string, string>): Promise<Sheet> {
   const rows = await db
-    .select({ doc: documents, dealTitle: deals.title, issuedByUsername: users.username })
+    .select({
+      doc: documents, quote: documentQuotes,
+      dealTitle: deals.title, issuedByUsername: users.username,
+    })
     .from(documents)
+    // INNER, where the other two joins are LEFT, and the asymmetry is the point:
+    // a deal or an issuer can be missing and every other cell in the row is
+    // still true, but a document with no document_quotes row is not a quote and
+    // this sheet has a currency and three money columns it could not fill. The
+    // header below is a quote's header; when a second type has rows, this file
+    // needs a decision about what its sheet looks like rather than a join that
+    // quietly emits blanks in the money columns.
+    .innerJoin(documentQuotes, eq(documentQuotes.documentId, documents.id))
     .leftJoin(deals, eq(documents.dealId, deals.id))
     .leftJoin(users, eq(documents.issuedByUserId, users.id))
     .orderBy(documents.number);
@@ -663,11 +674,11 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
       "issued_by_user_id", "issued_by_username", "file_id", "file_archive_path", "created_at",
     ],
     rows: rows.map((r) => [
-      r.doc.id, r.doc.number, r.doc.type, r.doc.dealId, text(r.dealTitle), r.doc.currency,
-      r.doc.issueDate, text(r.doc.validUntilDate),
-      r.doc.recipientName, r.doc.recipientContactName, r.doc.recipientSalutation, r.doc.recipientAddress,
-      money(r.doc.subtotalCents), money(r.doc.taxCents), money(r.doc.totalCents),
-      r.doc.notes, r.doc.terms,
+      r.doc.id, r.doc.number, r.doc.type, text(r.doc.dealId), text(r.dealTitle), r.quote.currency,
+      r.doc.issueDate, text(r.quote.validUntilDate),
+      r.quote.recipientName, r.quote.recipientContactName, r.quote.recipientSalutation, r.quote.recipientAddress,
+      money(r.quote.subtotalCents), money(r.quote.taxCents), money(r.quote.totalCents),
+      r.quote.notes, r.quote.terms,
       r.doc.issuedByUserId, text(r.issuedByUsername), r.doc.fileId,
       // The issued PDF's member path, so a reader can get from a quote number
       // to the page that was sent without opening every file in files/.

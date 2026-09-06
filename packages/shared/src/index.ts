@@ -2331,6 +2331,39 @@ export const documentTypeSchema = z.enum(["quote"]);
 export type DocumentType = z.infer<typeof documentTypeSchema>;
 
 /**
+ * WHETHER A DOCUMENT OF THIS TYPE MAY STILL CHANGE ONCE IT HAS BEEN ISSUED.
+ *
+ * Chris's decision, 6 Sep: **freezing is per type, not universal.** Phase 7 made
+ * an issued document immutable, and that is right for a quote -- you sent
+ * somebody a price and must be able to prove what you sent -- but treating it as
+ * a property of documents in general makes three of the four new types annoying
+ * to use. A quote and an NDA are handed to someone else, and an agreement you
+ * can silently edit after sending is a different kind of document from one you
+ * cannot. A meeting summary, a status report and a letter are not: a stale
+ * status report is worse than an edited one, and a letter wants redrafting
+ * before it goes.
+ *
+ * A `switch` OVER THE UNION RATHER THAN A `Set` OR A LOOKUP OBJECT, and the
+ * difference is the only compile-time help available here. TypeScript's
+ * exhaustiveness check makes a type added to `documentTypeSchema` without an
+ * answer a build error; a `Set<string>.has()` would silently answer `false` --
+ * "editable" -- for a type nobody had considered, which is the wrong way round
+ * for a rule whose failure mode is an editable quote.
+ *
+ * THE DATABASE SAYS THE SAME THING, in `documents_frozen_matches_type`, and
+ * db/schema.test.ts asserts the two spellings agree for every member of the
+ * enum. Two places state this rule because they answer different questions: this
+ * one tells a writer what to store, and the CHECK stops a writer that got it
+ * wrong -- including a writer that is a psql session.
+ */
+export function documentTypeFreezes(type: DocumentType): boolean {
+  switch (type) {
+    case "quote":
+      return true;
+  }
+}
+
+/**
  * The UTF-8 cost of a value once it has been merged into a document, escaping
  * included.
  *

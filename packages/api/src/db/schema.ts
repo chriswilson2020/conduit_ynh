@@ -872,15 +872,40 @@ export const orgProfile = pgTable("org_profile", {
 ]);
 export type OrgProfileRow = typeof orgProfile.$inferSelect;
 
-// An ISSUED document. There is no draft state and no update path: a row here
-// means a PDF exists, and nothing ever rewrites either (Phase 7 spec's
-// immutability decision). Hence no updated_at -- the column would only ever
-// record a bug.
+// A DOCUMENT -- the part that is common to every type, and nothing else.
 //
-// The recipient is SNAPSHOT, not joined. A company that is renamed or moves
-// office does not rewrite a quote somebody already has in their inbox, and
-// companies/contacts carry no history that could reconstruct what was
-// printed.
+// UNTIL PHASE 9 THIS WAS A QUOTE TABLE WEARING A GENERIC NAME, and the columns
+// that are no longer here are the evidence: currency, subtotal_cents, tax_cents,
+// total_cents and recipient_name were all NOT NULL, plus valid_until_date and a
+// NOT NULL deal_id. A meeting summary has no currency; a letter has no total.
+// Five shapes could not keep those promises, so the quote's own columns moved to
+// document_quotes below (migration 0016) and this table kept the identity, the
+// type, the rendered file, the issue date, the issuer, what the document is
+// attached to, and whether it is frozen. That list is the whole design.
+//
+// REJECTED, BECAUSE THE CHEAP OPTION IS GENUINELY TEMPTING: make the money
+// columns nullable and add each new type's columns beside them. One table, no
+// join, a far smaller migration -- and it deletes every guarantee at once.
+// `currency NOT NULL` becomes "currency, sometimes", and nothing then prevents a
+// meeting summary carrying a tax total: the wrong shape stops being unspellable
+// and becomes merely unusual. Also rejected: a JSON payload per type, which
+// moves validation out of the database into whichever reader remembers, and
+// which a documents list showing totals would have to unpack per row.
+//
+// THE RECIPIENT WENT WITH THE MONEY, and that is the one column group where the
+// split is a judgement rather than a deduction. An NDA and a letter are also
+// addressed to somebody, so "recipient" looks common at three types out of five
+// -- but the four columns as they exist are shaped by the QUOTE: a salutation
+// column exists because a quote prints a greeting, and recipient_contact_name
+// because a quote prints "Acme Ltd, FAO Jane Smith". Generalising a party model
+// from the one type that has been built is exactly how this table became a quote
+// table in the first place. Tasks 3 and 4 have the two further types that would
+// have to agree with it; if they do, a common `document_parties` is a migration
+// they can make with three examples in front of them instead of one.
+//
+// STILL NO updated_at. Phase 7's "a row here means a PDF exists, and nothing
+// ever rewrites either" holds for the quote exactly as it did; `frozen` below is
+// where that stopped being a property of documents in general.
 export const documents = pgTable("documents", {
   id: uuid("id").primaryKey().defaultRandom(),
   // Formatted per (type, year) as QUO-2026-0001, so the type prefix and the
@@ -892,30 +917,138 @@ export const documents = pgTable("documents", {
   // "QUO-2026-0001" back at you never says which column it came from -- and
   // if a future type were ever given a colliding prefix, this rejects the
   // second document loudly at issue instead of minting a duplicate.
+  //
+  // NOT EVERY TYPE WILL WANT ONE. QUO-2026-0001 suits a quote and suits a
+  // meeting summary not at all, and the spec makes numbering a per-type
+  // decision. The column stays NOT NULL for now because the one type that
+  // exists is numbered; the type that does not want a number is the migration
+  // that relaxes it, with a reason.
   number: text("number").notNull(),
   type: text("type").notNull(),
-  dealId: uuid("deal_id").notNull().references(() => deals.id),
-  // The rendered PDF, stored as an ordinary files row against the same deal,
+  // EXACTLY ONE OF FIVE, and the CHECK below is `notes`'/`files`' `exactlyOne`
+  // with meeting_id added -- the same rule, already enforced in two places,
+  // copied rather than invented. It is not literally that constant because that
+  // one names four columns: notes and files deliberately exclude meetings (a
+  // note about a meeting goes on the meeting's own record), while a document
+  // ABOUT a meeting is the whole point of the meeting summary.
+  //
+  // A DOCUMENT BELONGS TO EXACTLY ONE THING, which is Chris's decision of 6 Sep
+  // and is the strict reading rather than `meetings_has_link`'s at-least-one. An
+  // NDA naming a contact at a company attaches to the COMPANY and names the
+  // contact in its content; that was the trade, and reopening it is his call
+  // rather than a CHECK to widen quietly.
+  companyId: uuid("company_id").references(() => companies.id),
+  contactId: uuid("contact_id").references(() => contacts.id),
+  // NO LONGER NOT NULL, which is the smaller half of what Phase 9 did to this
+  // table and the only half the backlog had noticed. Every row that existed
+  // before 0016 is a quote and still carries it.
+  dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
+  meetingId: uuid("meeting_id").references(() => meetings.id),
+  // The rendered PDF, stored as an ordinary files row against the same record,
   // so it appears on the Files tab and downloads through the existing
-  // GET /api/files/:id with no second storage or download path.
+  // GET /api/files/:id/download with no second storage or download path.
+  //
+  // CONTENT-ADDRESSED, WHICH IS WHY 0016 DOES NOT TOUCH IT. blobPath() is
+  // derived from files.sha256 alone, so a migration that leaves this column and
+  // that row alone leaves the PDF reachable and unchanged -- an existing quote
+  // opens afterwards without anything having re-rendered it.
   fileId: uuid("file_id").notNull().references(() => files.id),
-  currency: char("currency", { length: 3 }).notNull(),
   issueDate: date("issue_date").notNull(),
+  // WHETHER THIS DOCUMENT MAY STILL CHANGE, AND IT IS PER TYPE (Chris, 6 Sep).
+  // A quote and an NDA freeze on issue: both are handed to somebody else, and an
+  // agreement you can silently edit after sending is a different kind of
+  // document from one you cannot. A meeting summary, a status report and a
+  // letter do not: a stale status report is worse than an edited one, and a
+  // letter wants redrafting before it goes.
+  //
+  // A COLUMN RATHER THAN A LOOKUP AT EVERY CALL SITE. Phase 7 made "an issued
+  // document never changes" unconditional -- there is no update path at all --
+  // and Task 3 is where that guard becomes conditional, which the spec names as
+  // the place a mistake would let a quote be edited. A guard that re-derives
+  // policy from the type at each call site is a guard that can be written wrong
+  // once per call site; one that reads a fact off the row cannot.
+  //
+  // NO DEFAULT, AND THAT IS DELIBERATE. 0016 adds the column WITH `DEFAULT true`
+  // -- a metadata-only ADD COLUMN that fills every pre-existing row with the
+  // only value that was ever true of it, the same arrangement 0014's
+  // auth_method used -- and then drops the default in the same migration. Unlike
+  // auth_method there WILL be a type whose answer is false, so a writer that
+  // forgets to say must fail loudly rather than inherit "frozen". It also keeps
+  // documents_frozen_matches_type from being satisfiable by accident.
+  frozen: boolean("frozen").notNull(),
+  issuedByUserId: uuid("issued_by_user_id").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  unique("documents_number_unique").on(t.number),
+  check("documents_type_valid", sql`type IN ('quote')`),
+  // Spelled exactly like notes'/files' `exactlyOne` above, one column wider.
+  check(
+    "documents_exactly_one_entity",
+    sql`num_nonnulls(company_id, contact_id, deal_id, project_id, meeting_id) = 1`,
+  ),
+  // THE PER-TYPE FREEZING RULE, IN THE DATABASE, so the column and
+  // @conduit/shared's documentTypeFreezes() cannot drift apart -- the same
+  // arrangement mailAuthMethodSchema has with mail_accounts_auth_method_valid,
+  // and schema.test.ts asserts the two spellings agree for every type.
+  //
+  // AN EQUALITY, NOT AN IMPLICATION, so neither direction can be wrong: a quote
+  // that is not frozen is the failure that matters, and a letter that is frozen
+  // for no reason is a stored fact disagreeing with the declared rule. With one
+  // type this reads as `frozen`, which is not vacuous -- it is precisely the
+  // clause that forbids an editable quote. Each later type widens the list here,
+  // exactly as every phase has widened events_verb_valid, and widening it is
+  // also the moment somebody has to decide what happens to rows already stored
+  // under the old rule rather than have it change under them.
+  check("documents_frozen_matches_type", sql`frozen = (type IN ('quote'))`),
+]);
+export type DocumentRow = typeof documents.$inferSelect;
+
+// THE QUOTE'S OWN COLUMNS -- which is to say, `documents`' columns until 0016
+// moved them here. Nothing about a quote changed; what changed is that a
+// meeting summary is no longer obliged to have a currency.
+//
+// KEYED BY document_id, WHICH IS ALSO THE PRIMARY KEY. One detail row per
+// document, said by the database rather than by convention: a second row for
+// the same document is not something any reader would know what to do with, and
+// a surrogate id would have made it representable for nothing. The key is also
+// the only index this table needs -- every read of it is "the quote detail for
+// these documents".
+//
+// CONSIDERED AND LEFT OUT: a composite (document_id, type) foreign key back to
+// documents(id, type), which is the standard trick for making "a meeting summary
+// with a tax total" unspellable rather than merely unusual. The spec's argument
+// against nullable columns is that they make the wrong shape the DEFAULT
+// representation, and a separate table already answers that -- a summary simply
+// has no row here. Buying the rest costs a redundant `type` column on every
+// quote, added by the one migration in this phase that moves live rows, in
+// exchange for a constraint that cannot be exercised at all until a second type
+// exists. Task 2 is both the first moment it would catch anything and the first
+// moment it could be tested as more than structure; it is a cheap ALTER then.
+//
+// NO ON DELETE CASCADE, matching every other foreign key in this file. A
+// document is never deleted, so a cascade would be configuration that can only
+// fire by accident.
+export const documentQuotes = pgTable("document_quotes", {
+  documentId: uuid("document_id").primaryKey().references(() => documents.id),
+  currency: char("currency", { length: 3 }).notNull(),
   // Nullable: a quote with no expiry is a legitimate quote.
   validUntilDate: date("valid_until_date"),
+  // The recipient is SNAPSHOT, not joined. A company that is renamed or moves
+  // office does not rewrite a quote somebody already has in their inbox, and
+  // companies/contacts carry no history that could reconstruct what was printed.
   recipientName: text("recipient_name").notNull(),
   // The PERSON the quote is addressed to, snapshot beside the company's name.
-  // Not in the spec's column list, which says "name and address as text" --
-  // but the same spec has the form default its recipient from "the deal's
-  // company AND contact", and a quote prints both ("Acme Ltd, FAO Jane
-  // Smith"). With only the two columns the contact would have to be smuggled
-  // into one of them, and the row would stop recording what was on the page,
-  // which is the job the spec gives it. Defaulted to '' rather than nullable,
-  // matching recipient_address: a quote to a company with no named contact is
-  // ordinary, not missing data.
+  // Not in the Phase 7 spec's column list, which says "name and address as text"
+  // -- but the same spec has the form default its recipient from "the deal's
+  // company AND contact", and a quote prints both ("Acme Ltd, FAO Jane Smith").
+  // With only the two columns the contact would have to be smuggled into one of
+  // them, and the row would stop recording what was on the page. Defaulted to ''
+  // rather than nullable, matching recipient_address: a quote to a company with
+  // no named contact is ordinary, not missing data.
   recipientContactName: text("recipient_contact_name").notNull().default(""),
   // HOW THAT PERSON WAS ADDRESSED, SNAPSHOT AT ISSUE (v1.1.0), and this column
-  // is the whole reason the release has a data model rather than a template
+  // is the whole reason that release had a data model rather than a template
   // change. contacts.salutation is editable; a quote is not. Read live, a title
   // corrected next year would silently rewrite the greeting on a quote sent last
   // year -- the same failure recipient_name and recipient_address are copied to
@@ -924,38 +1057,33 @@ export const documents = pgTable("documents", {
   //
   // PRONOUNS ARE DELIBERATELY NOT HERE. A quote's greeting takes the salutation
   // and has no use for them, and freezing a personal detail into an immutable
-  // artifact that gets downloaded and emailed should need a reason. contacts.pronouns
-  // is read live off the record wherever it is shown, which is the right lifetime
-  // for it: a person who corrects their pronouns has corrected them everywhere at
-  // once, and no stored copy disagrees.
+  // artifact that gets downloaded and emailed should need a reason.
+  // contacts.pronouns is read live off the record wherever it is shown, which is
+  // the right lifetime for it: a person who corrects their pronouns has
+  // corrected them everywhere at once, and no stored copy disagrees.
   recipientSalutation: text("recipient_salutation").notNull().default(""),
   recipientAddress: text("recipient_address").notNull().default(""),
-  // Integer cents, as deals.value_cents already is, computed by
-  // @conduit/shared's documentTotals -- the same function the form's running
-  // total uses. NOT recomputed on read: a later change to the arithmetic can
-  // never restate an issued document.
+  // Integer cents, as deals.value_cents already is, computed by @conduit/shared's
+  // documentTotals -- the same function the form's running total uses. NOT
+  // recomputed on read: a later change to the arithmetic can never restate an
+  // issued document.
   subtotalCents: bigint("subtotal_cents", { mode: "number" }).notNull(),
   taxCents: bigint("tax_cents", { mode: "number" }).notNull(),
   totalCents: bigint("total_cents", { mode: "number" }).notNull(),
   notes: text("notes").notNull().default(""),
   terms: text("terms").notNull().default(""),
-  issuedByUserId: uuid("issued_by_user_id").notNull().references(() => users.id),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [
-  unique("documents_number_unique").on(t.number),
-  check("documents_type_valid", sql`type IN ('quote')`),
-  // deals_currency_format's twin. A document's currency is copied from its
-  // deal and printed on the page; the same three-letter rule has to hold or
-  // the two records disagree about what the money is.
-  check("documents_currency_format", sql`currency ~ '^[A-Z]{3}$'`),
+}, () => [
+  // deals_currency_format's twin. A quote's currency is copied from its deal and
+  // printed on the page; the same three-letter rule has to hold or the two
+  // records disagree about what the money is.
+  check("document_quotes_currency_format", sql`currency ~ '^[A-Z]{3}$'`),
   // The stored totals are the only totals anyone ever reads back, so the one
   // relation between them is worth asserting where no write path can skip it.
   // documentTotals() guarantees it by construction; this is the backstop for
   // every other write path, the same split as contacts.emails and
-  // projects.color. A future discount or rounding column would alter this
-  // CHECK in its own migration, exactly as each phase has widened
-  // events_verb_valid.
-  check("documents_totals_consistent", sql`total_cents = subtotal_cents + tax_cents`),
+  // projects.color. A future discount or rounding column would alter this CHECK
+  // in its own migration, exactly as each phase has widened events_verb_valid.
+  check("document_quotes_totals_consistent", sql`total_cents = subtotal_cents + tax_cents`),
   // THE OTHER HALF OF A GUARD money.ts ONLY HAS ONE SIDE OF. documentTotals()
   // refuses to PRODUCE a total past Number.MAX_SAFE_INTEGER, because these are
   // bigint columns read through drizzle's `mode: "number"` and a larger value
@@ -964,13 +1092,13 @@ export const documents = pgTable("documents", {
   // shared arithmetic -- and being silently misread on the way out. Postgres
   // reaches 2^63; this pins the columns to the range the reader can represent.
   check(
-    "documents_totals_representable",
+    "document_quotes_totals_representable",
     sql`subtotal_cents BETWEEN -9007199254740991 AND 9007199254740991
         AND tax_cents BETWEEN -9007199254740991 AND 9007199254740991
         AND total_cents BETWEEN -9007199254740991 AND 9007199254740991`,
   ),
 ]);
-export type DocumentRow = typeof documents.$inferSelect;
+export type DocumentQuoteRow = typeof documentQuotes.$inferSelect;
 
 // Frozen at issue, in the units packages/shared/src/money.ts defines: quantity
 // in THOUSANDTHS, price in CENTS, tax in BASIS POINTS. The stored

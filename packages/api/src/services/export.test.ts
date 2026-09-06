@@ -26,6 +26,7 @@ import { createNote } from "./notes.js";
 import { createMeeting, archiveMeeting } from "./meetings.js";
 import {
   companies as companiesTable, deals as dealsTable, documents as documentsTable,
+  documentQuotes as documentQuotesTable,
   mailAccounts, mailAttachments, mailMessages, mailThreads,
 } from "../db/schema.js";
 import {
@@ -963,13 +964,16 @@ describe("export documents", () => {
     // Inserted directly rather than issued: issueQuote spawns WeasyPrint, and
     // what is under test here is the export's reading of the row, not the
     // renderer that wrote it.
-    await handle.db.insert(documentsTable).values({
-      number: "QUO-2026-0007", type: "quote", dealId: deal.id, fileId: pdf.id, currency: "EUR",
-      issueDate: "2026-08-20", validUntilDate: "2026-09-20",
+    const [document] = await handle.db.insert(documentsTable).values({
+      number: "QUO-2026-0007", type: "quote", dealId: deal.id, fileId: pdf.id,
+      issueDate: "2026-08-20", frozen: true, issuedByUserId: actorId,
+    }).returning();
+    await handle.db.insert(documentQuotesTable).values({
+      documentId: document!.id, currency: "EUR", validUntilDate: "2026-09-20",
       recipientName: "M\u00FCller GmbH", recipientContactName: "Jana M\u00FCller",
       recipientSalutation: "Frau", recipientAddress: "Hauptstra\u00DFe 4\n50667 K\u00F6ln",
       subtotalCents: 1_000_000, taxCents: 190_000, totalCents: 1_190_000,
-      notes: "", terms: "", issuedByUserId: actorId,
+      notes: "", terms: "",
     });
 
     const root = await extract(await writeArchive());

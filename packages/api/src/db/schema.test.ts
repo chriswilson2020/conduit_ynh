@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
-import { eq, sql } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync } from "node:fs";
@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema, mailVisibilitySchema,
-  mailAuthMethodSchema, mailOAuthProviderOf,
+  mailAuthMethodSchema, mailOAuthProviderOf, documentTypeSchema, documentTypeFreezes,
   CONTACT_FIELD_CAPS, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -24,12 +24,18 @@ import { createProject } from "../services/projects.js";
 import { listThreads } from "../services/mail-threads.js";
 import { decryptCredentials } from "../services/mail-crypto.js";
 import { LEGACY_MAIL_KEY_BASE64, LEGACY_PASSWORD_BLOBS } from "../test/legacy-mail-credentials.js";
+import {
+  LEGACY_DOCUMENT_COLUMNS, LEGACY_QUOTE_DEAL_ID, LEGACY_QUOTE_LIST, LEGACY_QUOTE_PDFS,
+  replayLegacyQuoteRows,
+} from "../test/legacy-quote-rows.js";
+import { listDocuments } from "../services/documents.js";
 import { createDatabase, migrationsFolder, type DatabaseHandle } from "./client.js";
 import {
   users, companies, contacts, pipelines, stages, deals, projects, events, files,
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
   mailThreadHides, meetings, meetingAttendees,
-  orgProfile, documents, documentLineItems, documentNumberSequences, documentTemplates,
+  orgProfile, documents, documentQuotes, documentLineItems, documentNumberSequences,
+  documentTemplates,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -1355,10 +1361,37 @@ describe("documents schema (0009)", () => {
   ) {
     return {
       number: "QUO-2026-0001", type: "quote", dealId: parents.dealId, fileId: parents.fileId,
-      currency: "EUR", issueDate: "2026-08-28", recipientName: "Acme",
-      subtotalCents: 11_000, taxCents: 2100, totalCents: 13_100,
+      issueDate: "2026-08-28",
+      // Spelled `true`, NOT documentTypeFreezes("quote"). This is a fixture, and
+      // one that asked the code under test what to expect could never disagree
+      // with it -- which is the whole job of the sync test further down.
+      frozen: true,
       issuedByUserId: userId, ...overrides,
     } satisfies typeof documents.$inferInsert;
+  }
+
+  /** The quote half of the same document, which 0016 moved into its own table. */
+  function quoteValues(
+    documentId: string,
+    overrides: Partial<typeof documentQuotes.$inferInsert> = {},
+  ) {
+    return {
+      documentId, currency: "EUR", recipientName: "Acme",
+      subtotalCents: 11_000, taxCents: 2100, totalCents: 13_100,
+      ...overrides,
+    } satisfies typeof documentQuotes.$inferInsert;
+  }
+
+  /** Both rows, in the order issueQuote writes them -- the pair IS the quote. */
+  async function insertQuote(
+    parents: { dealId: string; fileId: string },
+    document: Partial<typeof documents.$inferInsert> = {},
+    quote: Partial<typeof documentQuotes.$inferInsert> = {},
+  ): Promise<typeof documents.$inferSelect> {
+    const [row] = await handle.db.insert(documents)
+      .values(documentValues(parents, document)).returning();
+    await handle.db.insert(documentQuotes).values(quoteValues(row!.id, quote));
+    return row!;
   }
 
   // The 0004-0008 drill, one migration on. Also the ONLY place the seeded
@@ -1451,13 +1484,21 @@ describe("documents schema (0009)", () => {
         originalName: "QUO-2026-0001.pdf", mime: "application/pdf", sizeBytes: 16_003,
         sha256: "b".repeat(64), uploaderUserId: user!.id, dealId: deal.id,
       }).returning();
+      // TWO ROWS SINCE 0016, and this drill migrates all the way to HEAD rather
+      // than stopping at 0009 -- so the quote it writes here is a quote in the
+      // shape the CURRENT schema keeps, not the one 0009 created. What it still
+      // proves is 0009's claim: a deal that existed before v1.0.0 can be quoted.
       const [document] = await scratch.db.insert(documents).values({
         number: "QUO-2026-0001", type: "quote", dealId: deal.id, fileId: file!.id,
-        currency: "EUR", issueDate: "2026-08-28",
-        recipientName: "Acme", recipientContactName: "Jane Smith", recipientAddress: "2 Low St",
-        subtotalCents: 11_000, taxCents: 2100, totalCents: 13_100, issuedByUserId: user!.id,
+        issueDate: "2026-08-28", frozen: true, issuedByUserId: user!.id,
       }).returning();
-      expect(document).toMatchObject({ dealId: deal.id, fileId: file!.id, validUntilDate: null });
+      const [quote] = await scratch.db.insert(documentQuotes).values({
+        documentId: document!.id, currency: "EUR",
+        recipientName: "Acme", recipientContactName: "Jane Smith", recipientAddress: "2 Low St",
+        subtotalCents: 11_000, taxCents: 2100, totalCents: 13_100,
+      }).returning();
+      expect(document).toMatchObject({ dealId: deal.id, fileId: file!.id, frozen: true });
+      expect(quote).toMatchObject({ documentId: document!.id, validUntilDate: null });
 
       const [line] = await scratch.db.insert(documentLineItems).values({
         documentId: document!.id, position: 1, description: "Widget",
@@ -1538,17 +1579,134 @@ describe("documents schema (0009)", () => {
     expect(second).toMatchObject({ number: "QUO-2026-0002", dealId: parents.dealId });
   });
 
-  it("enforces documents_type_valid, documents_currency_format and documents_totals_consistent", async () => {
+  it("enforces documents_type_valid, and the currency and totals CHECKs that moved to document_quotes", async () => {
     const parents = await seedDocumentParents();
-    await expect(handle.db.insert(documents).values(documentValues(parents, { type: "invoice" })))
-      .rejects.toMatchObject({ cause: { code: "23514" } });
-    await expect(handle.db.insert(documents).values(documentValues(parents, { currency: "eur" })))
-      .rejects.toMatchObject({ cause: { code: "23514" } });
+    // A type outside the enum still fails on `documents`, where the type lives
+    // -- and it is asserted BY NAME, because a bare 23514 cannot tell this
+    // constraint from documents_frozen_matches_type. `frozen: false` is what
+    // makes the rejection attributable rather than merely likely: with the
+    // fixture's `frozen: true` an 'invoice' row breaks BOTH constraints (true
+    // does not equal `'invoice' IN ('quote')`) and Postgres reports whichever it
+    // reaches first, which was measured to be the frozen one. With `frozen:
+    // false` the frozen CHECK is satisfied -- false = false -- so only
+    // documents_type_valid can have refused this row.
+    await expect(handle.db.insert(documents)
+      .values(documentValues(parents, { type: "invoice", frozen: false })))
+      .rejects.toMatchObject({
+        cause: { code: "23514", message: expect.stringContaining("documents_type_valid") },
+      });
+
+    const document = await insertQuote(parents);
+    // ...and the money CHECKs fail on document_quotes, which is where the money
+    // is. Same rules, same rejection, one table further down.
+    await expect(handle.db.insert(documentQuotes)
+      .values(quoteValues(document.id, { currency: "eur" })))
+      .rejects.toMatchObject({
+        cause: {
+          code: "23514", message: expect.stringContaining("document_quotes_currency_format"),
+        },
+      });
     // The totals identity: a total that is not subtotal + tax is the defect
     // this backstop exists for, and it is one an off-by-one-cent arithmetic
     // bug would produce.
-    await expect(handle.db.insert(documents).values(documentValues(parents, { totalCents: 13_101 })))
-      .rejects.toMatchObject({ cause: { code: "23514" } });
+    await expect(handle.db.insert(documentQuotes)
+      .values(quoteValues(document.id, { totalCents: 13_101 })))
+      .rejects.toMatchObject({
+        cause: {
+          code: "23514", message: expect.stringContaining("document_quotes_totals_consistent"),
+        },
+      });
+  });
+
+  // THE RULE THE WHOLE FK WIDENING RESTS ON, and it is `notes`'/`files`'
+  // rule with a fifth column rather than a new one. Both directions are
+  // driven, because either alone leaves half the constraint unexercised: zero
+  // owners is the state `deal_id NOT NULL` used to forbid, and two owners is
+  // the state nothing forbade before 0016 because nothing could.
+  it("accepts a document attached to exactly one of the five, and refuses none or two", async () => {
+    const parents = await seedDocumentParents();
+    const company = await createCompany(handle.db, userId, { name: "Owner Ltd" });
+    const contact = await createContact(handle.db, userId, { firstName: "Owner" });
+    const project = await createProject(handle.db, userId, { name: "Owner Project" });
+    const [meeting] = await handle.db.insert(meetings).values({
+      title: "Kickoff", occurredAt: new Date(), ownerUserId: userId, companyId: company.id,
+    }).returning();
+
+    const owners: Partial<typeof documents.$inferInsert>[] = [
+      { dealId: parents.dealId },
+      { dealId: null, companyId: company.id },
+      { dealId: null, contactId: contact.id },
+      { dealId: null, projectId: project.id },
+      { dealId: null, meetingId: meeting!.id },
+    ];
+    for (const [index, owner] of owners.entries()) {
+      const [row] = await handle.db.insert(documents)
+        .values(documentValues(parents, { number: `QUO-2026-30${index}`, ...owner }))
+        .returning();
+      expect(row).toMatchObject(owner);
+    }
+
+    // None.
+    await expect(handle.db.insert(documents)
+      .values(documentValues(parents, { number: "QUO-2026-3900", dealId: null })))
+      .rejects.toMatchObject({
+        cause: { code: "23514", message: expect.stringContaining("documents_exactly_one_entity") },
+      });
+    // Two, in every pairing a fifth column makes possible -- a CHECK that
+    // named only four columns passes the first of these and fails the rest.
+    const pairs: Partial<typeof documents.$inferInsert>[] = [
+      { companyId: company.id }, { contactId: contact.id },
+      { projectId: project.id }, { meetingId: meeting!.id },
+    ];
+    for (const [index, second] of pairs.entries()) {
+      await expect(handle.db.insert(documents)
+        .values(documentValues(parents, { number: `QUO-2026-39${index}`, ...second })))
+        .rejects.toMatchObject({
+          cause: {
+            code: "23514", message: expect.stringContaining("documents_exactly_one_entity"),
+          },
+        });
+    }
+  });
+
+  // THE PER-TYPE FREEZING RULE, IN ITS TWO SPELLINGS. @conduit/shared's
+  // documentTypeFreezes() tells a writer what to store and the CHECK stops a
+  // writer that got it wrong, so a member added to one and not the other is a
+  // document that either cannot be stored or is stored under the wrong rule.
+  // Mirrors the mailAuthMethodSchema/mail_accounts_auth_method_valid pair.
+  //
+  // DRIVEN OFF THE ENUM rather than over a hardcoded list, so a type added in
+  // Task 2 arrives here without anybody remembering to add it.
+  it("keeps documentTypeFreezes in step with documents_frozen_matches_type, for every type", async () => {
+    const parents = await seedDocumentParents();
+    for (const [index, type] of documentTypeSchema.options.entries()) {
+      const declared = documentTypeFreezes(type);
+      const [row] = await handle.db.insert(documents)
+        .values(documentValues(parents, { number: `QUO-2026-40${index}`, type, frozen: declared }))
+        .returning();
+      expect(row).toMatchObject({ type, frozen: declared });
+
+      await expect(handle.db.insert(documents).values(
+        documentValues(parents, { number: `QUO-2026-49${index}`, type, frozen: !declared }),
+      )).rejects.toMatchObject({
+        cause: {
+          code: "23514", message: expect.stringContaining("documents_frozen_matches_type"),
+        },
+      });
+    }
+  });
+
+  // The column has no DEFAULT, and that is what makes the value above a
+  // decision rather than something a forgetful writer inherits. 0016 adds it
+  // WITH `DEFAULT true` -- that is how every pre-existing quote gets filled --
+  // and drops the default in the same migration, because the next three types
+  // to arrive are all `false`.
+  it("gives frozen no default, so a writer that says nothing is refused", async () => {
+    const [column] = await handle.db.execute<{ column_default: string | null }>(sql`
+      SELECT column_default FROM information_schema.columns
+      WHERE table_name = 'documents' AND column_name = 'frozen'
+    `);
+    expect(column?.column_default).toBeNull();
   });
 
   it("enforces one line per position per document, and the three line-item CHECKs", async () => {
@@ -1683,16 +1841,17 @@ describe("documents schema (0009)", () => {
     // The ceiling row is exactly what
     // documentTotals([{ qtyMilli: 1000, unitPriceCents: SAFE }]) emits, which is
     // why this edge has to be ACCEPTED rather than merely nearly rejected.
-    const rows: Partial<typeof documents.$inferInsert>[] = [
+    const rows: Partial<typeof documentQuotes.$inferInsert>[] = [
       { subtotalCents: SAFE, taxCents: 0, totalCents: SAFE },
       { subtotalCents: 0, taxCents: SAFE, totalCents: SAFE },
       { subtotalCents: -SAFE, taxCents: 0, totalCents: -SAFE },
       { subtotalCents: 0, taxCents: -SAFE, totalCents: -SAFE },
     ];
     for (const [index, overrides] of rows.entries()) {
-      const [row] = await handle.db.insert(documents)
-        .values(documentValues(parents, { number: `QUO-2026-100${index}`, ...overrides }))
-        .returning();
+      const [owner] = await handle.db.insert(documents)
+        .values(documentValues(parents, { number: `QUO-2026-100${index}` })).returning();
+      const [row] = await handle.db.insert(documentQuotes)
+        .values(quoteValues(owner!.id, overrides)).returning();
       expect(row).toMatchObject(overrides);
     }
 
@@ -1719,15 +1878,20 @@ describe("documents schema (0009)", () => {
     // only have come from the clause under test -- asserted BY NAME, since a
     // bare 23514 cannot tell the two constraints apart and the consistency one
     // would fire on a naively-built row.
-    const rows: Partial<typeof documents.$inferInsert>[] = [
+    const rows: Partial<typeof documentQuotes.$inferInsert>[] = [
       { subtotalCents: 2 * SAFE, taxCents: -SAFE, totalCents: SAFE },
       { subtotalCents: -SAFE, taxCents: 2 * SAFE, totalCents: SAFE },
       { subtotalCents: SAFE, taxCents: SAFE, totalCents: 2 * SAFE },
     ];
-    for (const overrides of rows) {
-      await expect(handle.db.insert(documents).values(documentValues(parents, overrides)))
+    for (const [index, overrides] of rows.entries()) {
+      const [owner] = await handle.db.insert(documents)
+        .values(documentValues(parents, { number: `QUO-2026-200${index}` })).returning();
+      await expect(handle.db.insert(documentQuotes).values(quoteValues(owner!.id, overrides)))
         .rejects.toMatchObject({
-          cause: { code: "23514", message: expect.stringContaining("documents_totals_representable") },
+          cause: {
+            code: "23514",
+            message: expect.stringContaining("document_quotes_totals_representable"),
+          },
         });
     }
 
@@ -1750,12 +1914,33 @@ describe("documents schema (0009)", () => {
     }
   });
 
-  it("enforces every foreign key on documents and document_line_items", async () => {
+  it("enforces every foreign key on documents, document_quotes and document_line_items", async () => {
     const parents = await seedDocumentParents();
-    for (const bad of [{ dealId: randomUUID() }, { fileId: randomUUID() }, { issuedByUserId: randomUUID() }]) {
-      await expect(handle.db.insert(documents).values(documentValues(parents, bad)))
+    // The four record FKs 0016 added are driven with `dealId: null` beside them,
+    // so each row has exactly one owner and reaches the foreign key: with
+    // deal_id still set, documents_exactly_one_entity fires first and every one
+    // of these would report 23514 without the FK being consulted at all.
+    const bad: Partial<typeof documents.$inferInsert>[] = [
+      { dealId: randomUUID() },
+      { dealId: null, companyId: randomUUID() },
+      { dealId: null, contactId: randomUUID() },
+      { dealId: null, projectId: randomUUID() },
+      { dealId: null, meetingId: randomUUID() },
+      { fileId: randomUUID() },
+      { issuedByUserId: randomUUID() },
+    ];
+    for (const overrides of bad) {
+      await expect(handle.db.insert(documents).values(documentValues(parents, overrides)))
         .rejects.toMatchObject({ cause: { code: "23503" } });
     }
+    await expect(handle.db.insert(documentQuotes).values(quoteValues(randomUUID())))
+      .rejects.toMatchObject({ cause: { code: "23503" } });
+    // One detail row per document, said by the primary key rather than by
+    // convention -- a second quote body for the same document is not something
+    // any reader would know what to do with.
+    const document = await insertQuote(parents);
+    await expect(handle.db.insert(documentQuotes).values(quoteValues(document.id)))
+      .rejects.toMatchObject({ cause: { code: "23505" } });
     await expect(handle.db.insert(documentLineItems).values({
       documentId: randomUUID(), position: 1, description: "Widget",
       qtyMilli: 1000, unitPriceCents: 1, lineTotalCents: 1,
@@ -1896,8 +2081,13 @@ describe("salutation and pronouns (0011)", () => {
         .select({ salutation: contacts.salutation, pronouns: contacts.pronouns })
         .from(contacts);
       expect(contact).toEqual({ salutation: null, pronouns: null });
+      // READ OUT OF document_quotes, NOT documents, and that is 0016 showing
+      // through a drill about 0011: this migrates all the way to HEAD, so by the
+      // time the assertion runs the column 0011 added has been moved to the
+      // quote's own table -- carrying the '' that 0011 backfilled, which is the
+      // thing being asserted and is exactly what 0016 must not have disturbed.
       const [document] = await scratch.db
-        .select({ recipientSalutation: documents.recipientSalutation }).from(documents);
+        .select({ recipientSalutation: documentQuotes.recipientSalutation }).from(documentQuotes);
       expect(document?.recipientSalutation).toBe("");
 
       // THE SEED, AMENDED IN PLACE. An install that never touched the template gets
@@ -2330,5 +2520,143 @@ describe("mail auth method (0014)", () => {
     expect(mailOAuthProviderOf("password")).toBeNull();
     expect(mailOAuthProviderOf("oauth_microsoft")).toBe("microsoft");
     expect(mailOAuthProviderOf("oauth_google")).toBe("google");
+  });
+});
+
+describe("documents stops being a quote table (0016)", () => {
+  /**
+   * THE ONE MIGRATION IN THIS PROJECT THAT MOVES ROWS, AND THE ONLY DRILL THAT
+   * READS A FIXTURE THE CODE UNDER TEST DID NOT WRITE.
+   *
+   * 0013 built indexes, 0014 added a defaulted column, 0015 swapped a CHECK.
+   * This one lifts eleven columns out of `documents` into `document_quotes` on
+   * an install whose rows are quotes already sent to customers, so the question
+   * is not "does the schema end up right" -- a fresh migrate() answers that on
+   * every run -- but "does an EXISTING quote come out the other side".
+   *
+   * WHICH IS WHY THE ROWS COME FROM test/legacy-quote-rows.ts. They were written
+   * by `issueQuote` as it stood before any Phase 9 edit, against a pre-0016
+   * database, and dumped column by column; that file carries the commit and blob
+   * hashes. Issuing a quote here with the new writer and reading it back with
+   * the new reader would prove only that the new code agrees with itself, which
+   * is v1.7.0's credential-union lesson and the whole reason the fixture exists.
+   */
+  it("moves two real pre-migration quotes into document_quotes, and the new reader returns exactly what the old one returned", async () => {
+    await withPreMigrationDatabase("0016", async (scratch) => {
+      await replayLegacyQuoteRows(scratch.db);
+
+      // PIN THE PREMISE, AND CHECK THE FIXTURE'S OWN CLAIM IN THE SAME BREATH.
+      // The fixture says these are the columns a pre-0016 `documents` had; this
+      // is a real pre-0016 catalogue saying so too. Without it every assertion
+      // below would also pass against a database that had been fully migrated
+      // all along -- and the fixture could have been quietly reshaped to suit
+      // whatever the new code wanted to read.
+      const preColumns = await scratch.db.execute<{ column_name: string }>(sql`
+        SELECT column_name FROM information_schema.columns WHERE table_name = 'documents'
+      `);
+      expect(preColumns.map((row) => row.column_name).sort()).toEqual(LEGACY_DOCUMENT_COLUMNS);
+      const [preTable] = await scratch.db.execute<{ present: number }>(sql`
+        SELECT count(*)::int AS present FROM information_schema.tables
+        WHERE table_name = 'document_quotes'
+      `);
+      expect(preTable?.present).toBe(0);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // THE ASSERTION THE WHOLE FIXTURE EXISTS FOR: the new listDocuments, over
+      // the new two-table schema, hands back byte for byte what the old
+      // listDocuments handed back over the old one-table schema, for rows the
+      // old writer wrote. Every moved column, both line orders, the '' that is
+      // not a null and the null that is not a '', and a recipient carrying an
+      // ampersand, a '<' and two Latin-1 letters.
+      expect(await listDocuments(scratch.db, LEGACY_QUOTE_DEAL_ID)).toEqual(LEGACY_QUOTE_LIST);
+
+      // The `documents` half: the deal it was always attached to, kept; the four
+      // columns 0016 added, empty -- which is what makes num_nonnulls = 1 true
+      // of a pre-existing row -- and `frozen` filled by the ALTER's DEFAULT
+      // rather than by any UPDATE, since these rows were inserted while the
+      // column did not exist. That is the same hole the 0014 drill closes: it
+      // distinguishes "the default fired at UPGRADE" from "the default fired at
+      // INSERT".
+      const documentRows = await scratch.db.select().from(documents)
+        .orderBy(asc(documents.number));
+      expect(documentRows).toHaveLength(2);
+      for (const row of documentRows) {
+        expect(row).toMatchObject({
+          type: "quote", dealId: LEGACY_QUOTE_DEAL_ID, frozen: true,
+          companyId: null, contactId: null, projectId: null, meetingId: null,
+        });
+      }
+      // ...and nothing of the quote is left behind on it. Spelled as the whole
+      // column set rather than as eleven absences, so a column that failed to
+      // drop is as visible as one that failed to arrive.
+      const postColumns = await scratch.db.execute<{ column_name: string }>(sql`
+        SELECT column_name FROM information_schema.columns WHERE table_name = 'documents'
+      `);
+      expect(postColumns.map((row) => row.column_name).sort()).toEqual([
+        "company_id", "contact_id", "created_at", "deal_id", "file_id", "frozen",
+        "id", "issue_date", "issued_by_user_id", "meeting_id", "number", "project_id", "type",
+      ]);
+
+      // THE PDFs. Content-addressed, so an unchanged sha256 IS the statement
+      // that the stored bytes are the same bytes and that nothing re-rendered
+      // them -- test/legacy-quote-rows.ts has the argument for why the bytes
+      // themselves are not committed. Asserted against the `files` rows AND
+      // against documents.file_id, because a migration could in principle leave
+      // the files table alone and repoint the document at a different row.
+      const fileRows = await scratch.db.select().from(files).orderBy(asc(files.originalName));
+      expect(fileRows.map((row) => ({
+        fileId: row.id, originalName: row.originalName,
+        sha256: row.sha256, sizeBytes: row.sizeBytes,
+      }))).toEqual(LEGACY_QUOTE_PDFS.map(({ pages: _pages, ...rest }) => rest));
+      expect(documentRows.map((row) => row.fileId).sort())
+        .toEqual(LEGACY_QUOTE_PDFS.map((pdf) => pdf.fileId).sort());
+
+      // The lines were never touched -- document_line_items points at
+      // documents(id), which did not move -- and the number sequence still says
+      // the next quote of 2026 is the third, so an operator's numbering does not
+      // restart under them.
+      expect(await scratch.db.select().from(documentLineItems)).toHaveLength(4);
+      expect(await scratch.db.select().from(documentNumberSequences))
+        .toEqual([{ type: "quote", year: 2026, lastValue: 2 }]);
+    });
+  }, 30000);
+
+  /**
+   * THE CHECK THAT WOULD HAVE SHIPPED A MIGRATION THAT NEVER RUNS.
+   *
+   * drizzle applies a migration only when `lastDbMigration.created_at <
+   * migration.folderMillis` (drizzle-orm/pg-core/dialect.js), reading the ONE
+   * newest applied row -- so the journal's `when` values are not decoration,
+   * they ARE the ordering, and an entry whose `when` is lower than the newest
+   * applied one is silently skipped on every database that already has its
+   * predecessor. Not an error, not a warning: the table simply is not there.
+   *
+   * `drizzle-kit generate` stamps `when` from the wall clock, while entries 0013
+   * onwards were given round numbers by hand -- 1788600000000, 1788700000000,
+   * 1788800000000 -- all of which are in the FUTURE relative to that clock. 0016
+   * generated as 1788663974827, between 0013's and 0014's, and would have been
+   * skipped on every install in existence. It was caught by reading the
+   * migrator, and nothing in this suite would have caught it: global-setup
+   * migrates a fresh database in one pass, where the same skip leaves the same
+   * absent table and every resulting failure blames the schema.
+   */
+  it("keeps the migration journal's `when` values strictly increasing, which is what makes drizzle apply them", () => {
+    const journal = JSON.parse(
+      readFileSync(path.join(migrationsFolder(), "meta", "_journal.json"), "utf8"),
+    ) as { entries: { idx: number; when: number; tag: string }[] };
+    expect(journal.entries.length).toBeGreaterThan(0);
+
+    // NEIGHBOUR BY NEIGHBOUR rather than by sorting, and reported by NAME: a
+    // sorted comparison says only that something is wrong, and this has to say
+    // which migration, because the answer is to edit that one entry.
+    const outOfOrder = journal.entries
+      .filter((entry, i) => i > 0 && entry.when <= journal.entries[i - 1]!.when)
+      .map((entry) => `${entry.tag} (when ${String(entry.when)})`);
+    expect(outOfOrder).toEqual([]);
+    // ...and the array order really is the idx order, or the neighbour test
+    // above would be comparing each entry against the wrong predecessor.
+    expect(journal.entries.map((entry) => entry.idx))
+      .toEqual(journal.entries.map((_entry, i) => i));
   });
 });

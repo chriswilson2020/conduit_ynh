@@ -233,6 +233,63 @@ describe("issueQuote", () => {
     expect(doc.currency).toBe("GBP");
   });
 
+  /**
+   * EVERY OPTIONAL COLUMN, ON THE WRITER'S PATH, READ BACK THROUGH listDocuments.
+   *
+   * FOUND BY MUTATION, AND THE HOLE PREDATES THE 0016 SPLIT. Replacing the
+   * writer's `terms: quote.terms ?? ""` with `terms: ""` passed this file and
+   * routes.test.ts and export.test.ts -- every one of them green over a quote
+   * that had silently lost its payment terms. `notes`, `terms`,
+   * `recipientAddress` and `validUntilDate` were written by issueQuote and
+   * asserted by nobody: buildContext's suite covers what the TEMPLATE does with
+   * them, the 0016 drill covers what the MIGRATION does with them, and between
+   * those two nothing had ever looked at what the INSERT did.
+   *
+   * A DISTINCT VALUE PER FIELD, because identical ones would still pass if the
+   * writer put notes in the terms column -- which is the exact shape of mistake
+   * an eleven-column move to another table invites.
+   */
+  it("stores every optional field it was given, and hands each one back", async () => {
+    await issueWithStub(varyingPdf(), quoteInput({
+      validUntilDate: "2026-12-24",
+      recipientName: "Recipient Name",
+      recipientContactName: "Contact Name",
+      recipientSalutation: "Prof",
+      recipientAddress: "Address line one\nAddress line two",
+      notes: "The notes, which are not the terms.",
+      terms: "The terms, which are not the notes.",
+    }));
+    const [stored] = await listDocuments(handle.db, dealId);
+    expect(stored).toMatchObject({
+      validUntilDate: "2026-12-24",
+      recipientName: "Recipient Name",
+      recipientContactName: "Contact Name",
+      recipientSalutation: "Prof",
+      recipientAddress: "Address line one\nAddress line two",
+      notes: "The notes, which are not the terms.",
+      terms: "The terms, which are not the notes.",
+    });
+  });
+
+  // The other side of every `??` in that INSERT: an omitted optional is stored as
+  // the column's '' and an omitted expiry as null, which is what makes
+  // recipient_contact_name and its three neighbours NOT NULL columns rather than
+  // nullable ones. The pre-migration fixture's second quote has exactly this
+  // shape, so this and the 0016 drill agree on what the least a quote can be
+  // looks like -- one from the writer's side, one from a row the writer wrote a
+  // release ago.
+  it("stores an omitted optional as the empty string, and an omitted expiry as null", async () => {
+    await issueWithStub(varyingPdf(), {
+      issueDate: "2026-08-28", recipientName: "Acme",
+      lines: [{ description: "Widget", qtyMilli: 1000, unitPriceCents: 1, taxRateBp: 0 }],
+    });
+    const [stored] = await listDocuments(handle.db, dealId);
+    expect(stored).toMatchObject({
+      validUntilDate: null, recipientContactName: "", recipientSalutation: "",
+      recipientAddress: "", notes: "", terms: "",
+    });
+  });
+
   it("gives the second quote of the year the next number", async () => {
     const first = await issueWithStub();
     const second = await issueWithStub();
@@ -401,10 +458,13 @@ describe("issueQuote rollback", () => {
       originalName: "QUO-2026-0001.pdf", mime: "application/pdf", sizeBytes: 1,
       sha256: "a".repeat(64), uploaderUserId: actorId, dealId,
     }).returning();
+    // Only the `documents` half is needed: what has to exist for the collision
+    // is the NUMBER, and documents_number_unique lives on this table. No
+    // document_quotes row is written, so nothing here quietly depends on the
+    // detail insert having run.
     await handle.db.insert(documents).values({
       number: "QUO-2026-0001", type: "quote", dealId, fileId: placeholder!.id,
-      currency: "EUR", issueDate: "2026-08-28", recipientName: "Someone Else",
-      subtotalCents: 100, taxCents: 0, totalCents: 100, issuedByUserId: actorId,
+      issueDate: "2026-08-28", frozen: true, issuedByUserId: actorId,
     });
 
     const before = blobCount();

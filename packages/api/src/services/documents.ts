@@ -1,7 +1,8 @@
 import { Readable } from "node:stream";
 import { asc, desc, eq, inArray, sql } from "drizzle-orm";
 import {
-  documentTemplateInputSchema, documentTotals, formatMoneyCents, formatQtyMilli,
+  documentTemplateInputSchema, documentTotals, documentTypeFreezes, formatMoneyCents,
+  formatQtyMilli,
   documentContentBytes, formatTaxRateBp, issueQuoteInputSchema, lineTotalCents,
   MAX_TEMPLATE_BYTES, renderInputCost, RENDER_IMAGE_CAP_BYTES, RENDER_IMAGE_PIXEL_CAP,
   RENDER_MARKUP_CAP_BYTES,
@@ -10,8 +11,8 @@ import {
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
-  deals, documentLineItems, documents, documentTemplates,
-  type DocumentLineItemRow, type DocumentRow,
+  deals, documentLineItems, documentQuotes, documents, documentTemplates,
+  type DocumentLineItemRow, type DocumentQuoteRow, type DocumentRow,
 } from "../db/schema.js";
 import { allocateNumber } from "./documents-number.js";
 import { renderPdf } from "./documents-render.js";
@@ -91,27 +92,49 @@ export interface IssueQuoteDeps {
   dataDir: string;
 }
 
-function toDocumentRecord(row: DocumentRow, lines: DocumentLineItemRow[]): DocumentRecord {
+/**
+ * Two rows and their lines, as one DTO -- the shape this API has always returned.
+ *
+ * THE WIRE SHAPE DID NOT MOVE WHEN THE STORAGE DID, and that is the point of
+ * doing the split in its own task. `documents` and `document_quotes` are where a
+ * quote lives; `DocumentRecord` is what a quote IS, and nothing about a quote
+ * changed in Phase 9. So the client, the CSV header and the e2e specs are
+ * untouched, and "an existing quote still opens" is literally true at the HTTP
+ * layer rather than approximately true. It becomes a discriminated union when
+ * the second type arrives and there is something to discriminate.
+ *
+ * THE DEAL COMES FROM THE CALLER, NOT FROM `row`, and that is not a convenience.
+ * `documents.deal_id` is nullable since 0016 -- a meeting summary will carry
+ * meeting_id instead -- while `DocumentRecord.dealId` is not, because a quote is
+ * always of a deal and the client renders it. Writing `row.dealId!` or
+ * `row.dealId ?? ""` would put a branch here that no caller can reach and no
+ * test could exercise: one call site queried BY the deal id and the other is
+ * issuing against it, so both have it in hand and passing it makes the narrowing
+ * a fact instead of an assertion.
+ */
+function toDocumentRecord(
+  row: DocumentRow, quote: DocumentQuoteRow, lines: DocumentLineItemRow[], dealId: string,
+): DocumentRecord {
   return {
     id: row.id,
     number: row.number,
     // The column is `text` with a CHECK rather than an enum, so the cast is where
     // the CHECK's promise is cashed into the shared union.
     type: row.type as DocumentRecord["type"],
-    dealId: row.dealId,
+    dealId,
     fileId: row.fileId,
-    currency: row.currency,
+    currency: quote.currency,
     issueDate: row.issueDate,
-    validUntilDate: row.validUntilDate,
-    recipientName: row.recipientName,
-    recipientContactName: row.recipientContactName,
-    recipientSalutation: row.recipientSalutation,
-    recipientAddress: row.recipientAddress,
-    subtotalCents: row.subtotalCents,
-    taxCents: row.taxCents,
-    totalCents: row.totalCents,
-    notes: row.notes,
-    terms: row.terms,
+    validUntilDate: quote.validUntilDate,
+    recipientName: quote.recipientName,
+    recipientContactName: quote.recipientContactName,
+    recipientSalutation: quote.recipientSalutation,
+    recipientAddress: quote.recipientAddress,
+    subtotalCents: quote.subtotalCents,
+    taxCents: quote.taxCents,
+    totalCents: quote.totalCents,
+    notes: quote.notes,
+    terms: quote.terms,
     issuedByUserId: row.issuedByUserId,
     createdAt: row.createdAt.toISOString(),
     lines: lines.map((line) => ({
@@ -345,9 +368,24 @@ export async function issueQuote(
       originalName: `${number}.pdf`, mime: "application/pdf", sizeBytes, sha256, dealId,
     });
 
+    // TWO INSERTS SINCE 0016, in the same transaction as everything else here.
+    // The common row first, because document_quotes.document_id references it.
     const [row] = await tx.insert(documents).values({
-      number, type: "quote", dealId, fileId: file.id, currency: deal.currency,
+      number, type: "quote", dealId, fileId: file.id,
       issueDate: quote.issueDate,
+      // WRITTEN, NOT DEFAULTED. The column has no DEFAULT (0016 drops the one it
+      // used to backfill existing rows), so this value is the only thing that
+      // can fill it, and documents_frozen_matches_type refuses the row if it
+      // disagrees with the type. That is what keeps the rule in @conduit/shared
+      // and the rule in the database from drifting: getting this wrong is a
+      // failed INSERT, not a quote somebody can edit.
+      frozen: documentTypeFreezes("quote"),
+      issuedByUserId: actorId,
+    }).returning();
+    if (row === undefined) throw new Error("document insert returned no row");
+
+    const [quoteRow] = await tx.insert(documentQuotes).values({
+      documentId: row.id, currency: deal.currency,
       validUntilDate: quote.validUntilDate ?? null,
       recipientName: quote.recipientName,
       recipientContactName: quote.recipientContactName ?? "",
@@ -361,9 +399,8 @@ export async function issueQuote(
       totalCents: totals.totalCents,
       notes: quote.notes ?? "",
       terms: quote.terms ?? "",
-      issuedByUserId: actorId,
     }).returning();
-    if (row === undefined) throw new Error("document insert returned no row");
+    if (quoteRow === undefined) throw new Error("document_quotes insert returned no row");
 
     const lineRows = await tx.insert(documentLineItems).values(lines.map((line, index) => ({
       documentId: row.id, position: index + 1,
@@ -375,7 +412,9 @@ export async function issueQuote(
     // Sorted rather than trusted: `returning()` promises no particular order, and
     // this DTO is compared field for field against the one listDocuments builds (in
     // position order) by the immutability test.
-    return toDocumentRecord(row, [...lineRows].sort((a, b) => a.position - b.position));
+    return toDocumentRecord(
+      row, quoteRow, [...lineRows].sort((a, b) => a.position - b.position), dealId,
+    );
   });
 
   publish({ keys: [["documents", dealId], ["files"], ["events"]] });
@@ -473,16 +512,35 @@ export async function saveDocumentTemplate(
  * NOT RECOMPUTED FROM THE LINES: the stored totals are what was printed, and a later
  * change to the arithmetic must never restate an issued document. The rows are read
  * back exactly as they were written.
+ *
+ * AN INNER JOIN, WHICH IS THE ONLY ONE THAT TYPECHECKS AND ALSO THE RIGHT ONE.
+ * `document_quotes.document_id` is both the primary key and the foreign key and
+ * the pair is written in one transaction, so a document on a deal without its
+ * detail row does not occur. A LEFT JOIN would make `row.quote` nullable and
+ * every field below `string | null`, against a DTO whose currency and totals are
+ * not -- so the lenient version cannot be written without also inventing what a
+ * quote with no money looks like, which is the question this split exists to
+ * stop anybody answering. What the join says is "the documents on this deal THAT
+ * ARE QUOTES", and that is what this function returns.
+ *
+ * The Phase 9 spec attaches none of the four new types to a deal -- a summary is
+ * of a meeting, a report of a project, an NDA of a company -- so this is not
+ * expected to start filtering anything. If a later type does attach to a deal,
+ * this becomes a union of per-type reads rather than a widened one.
  */
 export async function listDocuments(db: Database, dealId: string): Promise<DocumentRecord[]> {
-  const rows = await db.select().from(documents)
+  const rows = await db.select({ document: documents, quote: documentQuotes })
+    .from(documents)
+    .innerJoin(documentQuotes, eq(documentQuotes.documentId, documents.id))
     .where(eq(documents.dealId, dealId))
     .orderBy(desc(documents.createdAt), desc(documents.id));
   if (rows.length === 0) return [];
   const lineRows = await db.select().from(documentLineItems)
-    .where(inArray(documentLineItems.documentId, rows.map((row) => row.id)))
+    .where(inArray(documentLineItems.documentId, rows.map((row) => row.document.id)))
     .orderBy(asc(documentLineItems.position));
   return rows.map((row) => toDocumentRecord(
-    row, lineRows.filter((line) => line.documentId === row.id),
+    row.document, row.quote,
+    lineRows.filter((line) => line.documentId === row.document.id),
+    dealId,
   ));
 }
