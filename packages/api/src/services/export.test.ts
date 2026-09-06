@@ -675,11 +675,41 @@ describe("export contents", () => {
     expect(cell(notes, 0, "company_name")).toBe("Acme Ltd");
     expect(cell(notes, 0, "author_username")).toBe("chris");
 
+    // v1.9.0's new column, present and EMPTY on an unestimated task -- not "0",
+    // which would be an estimate of no work rather than the absence of one.
+    expect(cell(tasks, 0, "estimate_minutes")).toBe("");
+
     const meetings = await readSheet(root, "meetings.csv");
     expect(cell(meetings, 0, "title")).toBe("Kickoff");
     expect(cell(meetings, 0, "occurred_at")).toBe("2026-08-20T10:00:00.000Z");
     expect(cell(meetings, 0, "attendees")).toBe("Their lawyer");
     expect(cell(meetings, 0, "company_name")).toBe("Acme Ltd");
+  });
+
+  /**
+   * **THE ESTIMATE LEAVES IN THE READABLE HALF TOO (v1.9.0, 0022).** The backup
+   * is a `pg_dump` and gets a new column for free; this half gets it never, and
+   * "booked versus estimated" is only answerable outside Conduit if BOTH halves
+   * of the comparison are in the archive -- `time_entries.csv` carries the booked
+   * minutes and this carries the estimate. MINUTES IN BOTH, so a reader with a
+   * spreadsheet can subtract one column from a SUM of the other without knowing
+   * this product's unit conventions.
+   */
+  itZip("carries a task's estimate in the same unit time_entries.csv carries its minutes", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    const task = await createTask(handle.db, actorId, {
+      title: "Draft the plan", projectId: project.id, estimateMinutes: 240,
+    });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 90, billable: true, taskId: task.id,
+    });
+
+    const root = await extract(await writeArchive());
+    const tasks = await readSheet(root, "tasks.csv");
+    expect(cell(tasks, 0, "estimate_minutes")).toBe("240");
+    const entries = await readSheet(root, "time_entries.csv");
+    expect(cell(entries, 0, "minutes")).toBe("90");
+    expect(cell(entries, 0, "task_id")).toBe(task.id);
   });
 });
 
@@ -1537,6 +1567,137 @@ describe("export coverage", () => {
     expect(phantom).toEqual([]);
     // And no table is in both, which would make the whole check vacuous for it.
     expect(Object.keys(EXPORTED).filter((t) => t in NOT_EXPORTED)).toEqual([]);
+  });
+
+  /**
+   * **AND EVERY COLUMN OF EVERY EXPORTED TABLE IS EITHER IN ITS SHEET OR
+   * DECLARED ABSENT WITH A REASON.** One level below the test above, which asks
+   * only whether a TABLE has a sheet.
+   *
+   * **THIS GENERALISES A GUARD THAT COVERED EXACTLY ONE TABLE.** Task 1 wrote
+   * the `information_schema` column check for `time_entries` and wrote down why:
+   * "Phase 9 lost a letter's body and a report's project because a table gained
+   * columns and a hand-written `*Sheet` did not -- silently, with the row still
+   * coming out looking perfect." That reasoning was never specific to
+   * `time_entries`, and the very next task to add a column added it to `tasks`,
+   * where NOTHING WOULD HAVE NOTICED: `tasks.csv` has no such check, and the
+   * Phase 10 plan's own convention note claims it has. It has one now, and so
+   * does every other exported table.
+   *
+   * READ OUT OF `information_schema`, NEVER OUT OF A LIST WRITTEN HERE -- a list
+   * would have to be updated by the same person who forgot the sheet. And the
+   * headers are read out of a REAL ARCHIVE rather than out of `export.ts`, so a
+   * column named in a header but never written into a row would still be caught
+   * downstream by that sheet's own tests.
+   *
+   * **IT MATCHES ON NAMES, WHICH IS WHY A RENAME NEEDS A LINE TOO.** Seventeen
+   * columns are carried under a different header -- `deals.value_cents` as
+   * `value` in major units, the letter's and the agreement's fields under their
+   * own prefixes, and so on -- and every one of them is a decision somebody made
+   * for a stated reason. A guard that guessed at the mapping (strip `_cents`,
+   * allow a prefix) would excuse a genuine miss the day a new column happened to
+   * look like one of those shapes, so it does not guess: it asks for a sentence.
+   */
+  const COLUMNS_NOT_NAMED_IN_A_HEADER: Record<string, Record<string, string>> = {
+    tasks: {
+      position: "GENUINELY ABSENT: the fractional index that orders a board column, an "
+        + "opaque collation-sensitive string with no meaning outside this database. "
+        + "services/import-export.ts already names its absence as the first reason "
+        + "tasks.csv cannot be imported back",
+    },
+    deals: {
+      position: "GENUINELY ABSENT, for tasks.position' reason exactly",
+      value_cents: "carried as `value`, in major units -- see money(), which is how every "
+        + "amount in this archive is written, so a reader is never asked which unit a "
+        + "column is in",
+    },
+    meetings: {
+      notes: "carried as `notes_html`, named for what it holds: sanitised rich text, "
+        + "exported verbatim rather than flattened, which would make it the one lossy "
+        + "column in the file",
+    },
+    document_quotes: {
+      document_id: "the join key -- it IS documents.csv's `id`, and a second column "
+        + "holding the same uuid would invite a reader to check they matched",
+      subtotal_cents: "carried as `subtotal`, in major units (see deals.value_cents)",
+      tax_cents: "carried as `tax`, in major units",
+      total_cents: "carried as `total`, in major units",
+    },
+    document_letters: {
+      document_id: "the join key, as document_quotes.document_id",
+      subject: "carried as `letter_subject`. The prefix is deliberate and documentsSheet "
+        + "argues it: the letter's fields are NOT folded into the quote's, because two "
+        + "tables mean two things and a coalesce would stop being true the day they diverge",
+      body_html: "carried as `letter_body_html` -- the column Phase 9 shipped EMPTY, which "
+        + "is the miss this whole guard exists for",
+    },
+    document_agreements: {
+      document_id: "the join key, as document_quotes.document_id",
+      effective_date: "carried as `agreement_effective_date` (the prefix, for "
+        + "document_letters.subject' reason)",
+      term_months: "carried as `agreement_term_months`",
+      jurisdiction: "carried as `agreement_jurisdiction`",
+      party_name: "carried as `agreement_party_name`",
+      party_contact_name: "carried as `agreement_party_contact_name`",
+      party_address: "carried as `agreement_party_address`",
+    },
+  };
+
+  itZip("names every column of every exported table, or declares why it does not", async () => {
+    const root = await extract(await writeArchive());
+    const headerOf = new Map<string, string[]>();
+    for (const member of new Set(MEMBER_BY_TABLE.values())) {
+      headerOf.set(member, (await readSheet(root, member)).header);
+    }
+
+    const rows = await handle.db.execute<{ table_name: string; column_name: string }>(sql`
+      SELECT table_name, column_name FROM information_schema.columns
+      WHERE table_schema = 'public'
+      ORDER BY table_name, column_name
+    `);
+    // The premise: the catalogue was really read. A typo in the filter returns
+    // nothing, and every assertion below would then pass over an empty set.
+    expect(rows.length).toBeGreaterThan(100);
+    expect(rows.some((r) => r.table_name === "tasks" && r.column_name === "estimate_minutes")).toBe(true);
+
+    const missing: string[] = [];
+    for (const [table, member] of MEMBER_BY_TABLE) {
+      const header = headerOf.get(member) ?? [];
+      const declared = COLUMNS_NOT_NAMED_IN_A_HEADER[table] ?? {};
+      for (const { column_name: column } of rows.filter((r) => r.table_name === table)) {
+        if (!header.includes(column) && !(column in declared)) missing.push(`${table}.${column}`);
+      }
+    }
+    expect(
+      missing,
+      "these columns exist in the database and no sheet names them. Add the column to "
+      + "its *Sheet in services/export.ts, or -- if it is carried under a different header "
+      + "-- a one-line reason to COLUMNS_NOT_NAMED_IN_A_HEADER above saying where it went. "
+      + "But decide, because a hand-written sheet is the half of this product that never "
+      + "picks up a new column for free, and a row missing one still looks perfect.",
+    ).toEqual([]);
+
+    // A STALE EXCEPTION IS AS BAD AS A MISSING COLUMN, because it stands ready
+    // to excuse a NEW column that happens to reuse the name.
+    const phantom: string[] = [];
+    for (const [table, columns] of Object.entries(COLUMNS_NOT_NAMED_IN_A_HEADER)) {
+      for (const column of Object.keys(columns)) {
+        const exists = rows.some((r) => r.table_name === table && r.column_name === column);
+        const exported = headerOf.get(MEMBER_BY_TABLE.get(table) ?? "")?.includes(column) === true;
+        if (!exists || exported) phantom.push(`${table}.${column}`);
+      }
+    }
+    expect(phantom, "declared absent, but the column is gone or is in the sheet after all")
+      .toEqual([]);
+
+    // THE INSTRUMENT, WATCHED FAILING RATHER THAN TRUSTED. The identical
+    // comparison against a tasks header with one column taken out of it names
+    // exactly that column -- so the empty result above is a comparison that ran,
+    // not one that could not fail.
+    const mutilated = (headerOf.get("tasks.csv") ?? []).filter((n) => n !== "estimate_minutes");
+    expect(rows.filter((r) => r.table_name === "tasks" && !mutilated.includes(r.column_name)
+      && !(r.column_name in (COLUMNS_NOT_NAMED_IN_A_HEADER.tasks ?? {}))).map((r) => r.column_name))
+      .toEqual(["estimate_minutes"]);
   });
 
   itZip("actually writes every member the EXPORTED map claims", async () => {

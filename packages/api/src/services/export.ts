@@ -565,6 +565,11 @@ async function tasksSheet(db: Database): Promise<Sheet> {
     header: [
       "id", "title", "description", "type", "status",
       "assignee_user_id", "assignee_username", "start_date", "due_date", "completed_at", "progress_pct",
+      // v1.9.0's new column (0022). MINUTES, spelled as the column is: an
+      // `estimate_hours` here would be a second representation of one number,
+      // which is why time_entries.csv has no `hours` column either -- and the
+      // two sheets are read side by side precisely to compare them.
+      "estimate_minutes",
       "parent_task_id", "company_id", "company_name", "contact_id", "contact_name",
       "deal_id", "deal_title", "project_id", "project_name",
       "archived_at", "created_at", "updated_at",
@@ -574,6 +579,7 @@ async function tasksSheet(db: Database): Promise<Sheet> {
       text(r.t.assigneeUserId), text(r.assigneeUsername),
       text(r.t.startDate), text(r.t.dueDate), timestamp(r.t.completedAt),
       r.t.progressPct === null ? "" : String(r.t.progressPct),
+      r.t.estimateMinutes === null ? "" : String(r.t.estimateMinutes),
       text(r.t.parentTaskId), text(r.t.companyId), text(r.companyName),
       text(r.t.contactId), contactName(r.contactFirstName, r.contactLastName),
       text(r.t.dealId), text(r.dealTitle), text(r.t.projectId), text(r.projectName),
