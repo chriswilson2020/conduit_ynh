@@ -1330,6 +1330,13 @@ DEAL's, and the two 320px sweeps do not cover the project page either way (findi
 An e2e spec written here would be written blind — the whole suite runs in CI — so the
 push is what proves it rather than a local guess.
 
+CI green on the first push: **4142 passed / 3 skipped in 102 files** for the unit job
+(the runner has WeasyPrint and 7-Zip, so 45 of the dev server's 48 skips run there) and
+**257 passed** for the e2e job. **No e2e regression, and the e2e count is unchanged from
+Task 3's** — which is the measurement behind the paragraph above: the new section, the
+sixth Settings tab and the rollup checkbox are all additions to pages the existing specs
+already walk, and none of them moved anything those specs assert.
+
 ---
 
 ## Definition of done
