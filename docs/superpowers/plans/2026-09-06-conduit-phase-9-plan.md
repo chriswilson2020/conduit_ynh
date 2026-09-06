@@ -845,14 +845,490 @@ on two existing pages, and the specs that measure those pages at 320px
 
 ## Task 4: Project status report — the broadest source, and the schedule risk
 
-- [ ] Content is a `projects` row plus its tasks, dates and Gantt state. **This is the one most
+- [x] Content is a `projects` row plus its tasks, dates and Gantt state. **This is the one most
       likely to be larger than it looks**, and the spec says so.
-- [ ] **Possibly a date range**, which no other type needs. Establish whether it is required
+- [x] **Possibly a date range**, which no other type needs. Establish whether it is required
       before building a form for it.
-- [ ] **Not frozen** — you regenerate it next month, and a stale report is worse than an edited
+- [x] **Not frozen** — you regenerate it next month, and a stale report is worse than an edited
       one.
-- [ ] **If this turns out to be a phase of its own, say so and stop.** Three types shipped and one
+- [x] **If this turns out to be a phase of its own, say so and stop.** Three types shipped and one
       reported is a better outcome than four types half-built.
+
+### Task 4 as built — v1.8.0, migration 0020
+
+`project_status_report` is a real type: `documentTypeSchema`, two widened CHECKs, a
+template seeded by 0020, `documents_project_idx`, `issueStatusReport`,
+`listProjectDocuments`, `GET`/`POST /api/projects/:id/documents`, a Documents section
+on the project page, and a sixth tab in the Settings template editor. It attaches to
+its project and to nothing else, takes **no number**, is **not frozen**, and has **no
+detail table**.
+
+Two things arrive that are not the type: **`documents_entity_matches_type`**, the CHECK
+Task 3 wrote out in the plan and left for whoever had all the types; and the
+**company Documents rollup** Task 3 recommended, as an opt-in read.
+
+#### WAS IT THE PHASE-SIZED ITEM THE PLAN FEARED? NO — AND THE REASON IS THE DATE RANGE
+
+**It is the SECOND TYPE WITH NO FORM**, which nobody expected. The spec's table gives
+it "possibly a date range" as its extra input and the plan asked for that to be settled
+before a form was built; settled NO, it has no input at all. (That also settles the
+phase's counts, which nobody has got right yet — see finding 5: five templates, two
+forms.)
+
+The breadth the spec worried about is real and it is **entirely on the read**: which
+tasks, in what order, with whose dependencies, summarised by seven counts and an
+overdue rule. None of that is submitted by anybody, so none of it needed a form, a
+validation schema, a detail table or a DTO field. The whole type is one service
+function, one reader, two routes and a template.
+
+#### THE DATE RANGE: NOT REQUIRED, AND HERE IS WHAT SETTLED IT
+
+A range could only be one of two things.
+
+1. **A FILTER over which tasks appear.** `tasks_dates_paired` admits a task with NO
+   dates — both null, which is what every task looks like before anybody schedules it
+   — so a range has to decide what to do with one, and both answers are wrong. Drop
+   them and the report silently omits exactly the tasks that most need attention,
+   which is the same class of failure as the export's INNER JOIN dropping every
+   meeting summary. Keep them and the range is not a filter.
+
+   **THE DECIDING EVIDENCE IS A PRECEDENT IN THIS CODEBASE AND IT POINTS THE OTHER
+   WAY.** `ganttPayload` DOES drop undated tasks (`isNotNull(startDate),
+   isNotNull(dueDate)`) — because a chart has nowhere to draw a bar with no ends. A
+   report is a table: it has a row. So the one place Conduit already applies a date
+   filter to tasks applies it for a reason that does not transfer.
+
+   And over dated tasks a range only subtracts: narrower than the project hides work,
+   wider contains the same tasks. The one genuinely interesting window — "what changed
+   since the last report" — is not answerable from a range at all. It needs the
+   previous report and a diff; `tasks` keeps no history, and reconstructing one from
+   `events` is a different feature with a different name.
+
+2. **A LABEL saying what period the report covers.** The project already has
+   `start_date` and `due_date` and both are printed at the top of the page. A second,
+   per-document range that can disagree with them is a second answer to "what period
+   is this project", inside the document whose job is to be the answer.
+
+**AND THE ISSUE DATE IS THE SERVER'S, NOT THE OPERATOR'S**, which is the same argument
+one step on. A quote's issue date is client-supplied because the operator chose the
+content too. A report's content is read LIVE at the moment it is produced, so a report
+dated last Friday prints Friday's date over today's tasks — and the same value is what
+the overdue count is measured against, so a back-dated report is arithmetically wrong
+as well. `todayInZone(org.timeZone)`, which is v1.8.0's timezone field's third call
+site.
+
+#### NOT NUMBERED — AND THE LETTER'S REASON HAD TO BE TURNED INSIDE OUT
+
+The three reasons are at `documentTypeNumbered`. The first two carry over (the handle
+is the project and the date, both printed; the `(type, year)` row lock would serialise
+"run this month's reports", which is a sentence about every active project at once).
+
+**THE THIRD DOES NOT CARRY OVER AND SAYING SO IS THE POINT.** The letter's argument is
+that a REDRAFT rewrites the page under a fixed number, so `LET-2026-0001` names
+different content on Tuesday from Monday. A report is not redrafted — regenerating one
+appends a SECOND document, exactly as a summary does — so that failure cannot arise
+here. What arises instead is the summary's other one: the sequence fills with
+near-duplicates. Twelve monthly reports on one project are twelve numbers, and "which
+did we issue in 2026, and are there gaps" answers nothing, because two adjacent numbers
+are the same report of the same project a month apart. **A gapless sequence is worth
+having when its members are distinct commitments; successive answers to one standing
+question are not.**
+
+#### NO DETAIL TABLE, AND IT IS THE SECOND TYPE WITH NONE FOR A DIFFERENT REASON
+
+A meeting summary needs none because its content is the `meetings` row it points at.
+This one needs none because its content is a `projects` row, its `tasks` and their
+`task_dependencies` — and unlike a letter's body, **not one byte of it was typed into
+this document**. What a detail table would have bought is a snapshot of the counts, so
+a Documents list could say "12 of 20 done" without re-reading the project; rejected as
+a cache of a page that is already stored, in a table that would then have to be kept
+truthful against a PDF nothing can regenerate, to spare one query on a list of
+single-digit length.
+
+#### THE THREE THINGS TASKS 1–3 DEFERRED HERE
+
+**1. `documents_entity_matches_type` — BUILT, AND NOT AS THE PLAN SKETCHED IT.**
+
+Task 3's five-line CHECK is in 0020, with one clause changed:
+
+```sql
+  OR (type IN ('letter','nda','mutual_nda')
+      AND (company_id IS NOT NULL OR contact_id IS NOT NULL))   -- not num_nonnulls(...) = 1
+```
+
+`num_nonnulls(company_id, contact_id) = 1` admits exactly the same rows once
+`documents_exactly_one_entity` stands beside it, and it costs the property this schema
+keeps paying to protect: a letter naming BOTH a company and a contact would violate two
+constraints at once, so PostgreSQL names whichever it reaches first and
+`documents_exactly_one_entity` — Chris's decision of 6 Sep — could no longer be probed
+by name **for the case it is most about**, the NDA-at-a-contact-of-a-company shape the
+spec's third risk is entirely concerned with. Every arm now states which column and
+none of them states how many.
+
+**WHAT IT COST IN TESTS IS THE INTERESTING PART, BECAUSE EVERY PROBE IT BROKE WAS
+MEASURING A GAP RATHER THAN A GUARANTEE.** Ten tests went red on first application,
+and every one of them was writing a row the database now forbids:
+
+| what went red | what it was really doing |
+|---|---|
+| `documents-summary.test.ts`'s "ignores a document on the meeting that is not a summary" | putting a QUOTE on a meeting to exercise `listMeetingSummaries`' type filter |
+| `documents-letter.test.ts`'s "throws on a letter attached to a deal" | Task 3's own hand-written row, added to kill a surviving mutant |
+| four enum-driven loops in `schema.test.ts` | hanging every type off the fixture's DEAL, which nothing had checked |
+
+The first two are rewritten to assert the REFUSAL, which is the better test. **And both
+leave a guard behind that is now unexercisable and is recorded as such rather than
+quietly deleted**: `listMeetingSummaries`' `eq(type, 'meeting_summary')` and
+`redraftLetter`'s "attached to neither a company nor a contact" branch are both green
+under mutation from here on, because the state they handle is unreachable. Both stay —
+a guard at a dereference costs a line, and what makes it unreachable is a constraint a
+later migration could widen.
+
+**THE ONE OVERLAP THAT CANNOT BE REMOVED**: an UNKNOWN type satisfies no arm here AND
+breaks `documents_type_valid`, so from 0020 that constraint **cannot be probed by name
+through an INSERT at all**. Its assertion moved to `pg_get_constraintdef`, compared
+against `documentTypeSchema` — which is a stronger test than the INSERT ever was.
+(Same shape as Task 3's finding 3 about the frozen trigger shadowing a detail-table
+CHECK.)
+
+**2. THE "Documents TAB" — STILL A SECTION, AND NOW WITH THE COST MEASURED.**
+
+Both halves of the deal section's original reason have expired: after this task all
+four records carry documents. It is still four sections, and here is what a sixth rail
+tab would actually cost:
+
+- **It would break a MEASURED phone claim.** `e2e/mobile.spec.ts`'s "reads the record
+  rail, reaching its last tab by keyboard" arrows right FOUR times from Timeline and
+  asserts Meetings is focused, is last, and is in the viewport. Its comment records the
+  measurement: at 390px in Chrome on macOS the five labels are 349px of content in a
+  342px box, and the test exists because below 360px that spill used to scroll the
+  whole PAGE. A sixth label moves the number that was measured, and the guard would be
+  rewritten by the same change that invalidates it.
+- **It would move four shipped surfaces at once**, each with test ids and e2e specs:
+  `deal-documents` (with the quote form), `record-documents` (two forms, three
+  buttons and the redraft dialog) on two pages, and `project-documents`.
+- **And the four are not one component.** A deal's raises quotes, a company's raises
+  letters and agreements, a project's raises reports with no form at all. A shared tab
+  is a switch over the record type wrapping three bodies — the consolidation people
+  picture, one list of mixed types on one record, is not available, because
+  `documents_exactly_one_entity` means a record carries only the types its own writers
+  produce.
+
+**Reported, not absorbed.** It is a UI task with an e2e measurement in it, not a
+paragraph at the end of a data-model phase. **The spec's and the plan's "a record's
+Documents TAB" is still wrong and has been wrong for four tasks.**
+
+**3. THE LETTER ROLLUP — BUILT, OPT-IN, AND NO SECOND OWNER COLUMN.**
+
+`listRecordDocuments(db, target, { includeContacts })`, exactly Task 3's SQL, behind
+`GET /api/companies/:id/documents?includeContacts=true` and a checkbox on the company's
+Documents section. Nothing about the data model moved: no widened CHECK, no second
+owner, and a rolled-up row still comes back with `contactId` set and `companyId` null.
+
+**DEFAULT OFF, WHICH IS WHY THE DECISION IS STILL VISIBLE.** Task 3's "keeps a
+contact's documents separate from their company's" asserts a deliberate emptiness; a
+rollup that turned itself on would have required deleting that test, which is how a
+decision gets reversed by a task that was only asked to consider reversing it. Both
+behaviours are asserted side by side now. Reversing the default later is one line.
+
+**The query parameter is tested for the literal string `"true"`, not coerced.**
+`z.coerce.boolean()` answers TRUE for the string `"false"`, which is the one value a
+client is most likely to send when it means the opposite; `"false"`, `"1"`, `"yes"` and
+`""` are all asserted to leave it off, and none of them is ever refused.
+
+### What the spec and the plan did not say, and needed to
+
+1. **THE MIGRATION TRAP FIRED A FIFTH TIME OUT OF FIVE — AND THIS TIME IT IS EXPLAINED
+   RATHER THAN COUNTED.** `drizzle-kit generate` stamped 0020's journal `when` as
+   **1788697198962** (measured twice), between 0013's 1788600000000 and 0014's
+   1788700000000, so 0020 would have been skipped silently on every install already
+   carrying 0014. Hand-set to 1789300000000.
+
+   **THE DATES SAY WHY IT KEEPS HAPPENING AND WHY IT CANNOT BE FIXED FROM HERE.** `when`
+   is `Date.now()`. 0013's is 2026-09-05T09:20Z, 0019's is 2026-09-12T08:00Z, 0020's is
+   2026-09-13T11:46Z — each spaced by adding 1e11 ms rather than by re-reading the
+   clock, so the entries have drifted steadily AHEAD of the wall clock, which today is
+   2026-09-06. What matters is not which gap a generated value lands in but that it
+   lands **below the newest entry**: drizzle reads the one newest applied row. So every
+   migration generated before **2026-09-13T11:46Z** is skipped. And it cannot be fixed
+   by choosing a smaller number for 0020, because a `when` must exceed 0019's and
+   0019's is already six days ahead. **The trap is locked in for 0021 as well**, and
+   the only things between it and a silent skip are the file header and
+   `schema.test.ts`'s journal test.
+
+2. **THE EXPORT WAS MISSED FOR THE THIRD TASK RUNNING, AND THIS FAILURE WOULD HAVE BEEN
+   THE QUIETEST OF THE THREE.** Task 2 found an INNER JOIN dropping every meeting
+   summary. Task 3 found no `company_id`/`contact_id`, so a letter named no record. A
+   status report would not have been dropped and would not have looked wrong: its
+   `documents` row would have come out perfectly, with `project_id` in a column that
+   did not exist — so the ONE fact saying which project a report is about would have
+   been absent from the archive entirely. `project_id` and `project_name` are in the
+   sheet now. **Neither the spec nor the plan mentions the export, for the third task
+   running.**
+
+3. **TASK 3's COUNTEREXAMPLE AGAINST MERGING `documentTypeFreezes` AND
+   `documentTypeNumbered` WAS NOT A COUNTEREXAMPLE.** It wrote: "The two rules are
+   still independent and the counterexamples are ordinary: Task 4's status report is
+   neither, and a credit note would be frozen and numbered..." **"Neither" is
+   AGREEMENT** — both functions answer false — so the report, now built and indeed
+   neither, made the coincidence **six for six** rather than breaking it. A prediction
+   that a type would disagree was written down, the type was built, and it agreed. The
+   two sets stay separate and the argument now stands on the rules answering different
+   questions rather than on a promised counterexample; the remaining ones are all
+   hypothetical.
+
+4. **`recordDocumentSchema`'s COMMENT WAS WRONG ABOUT THIS TASK, IN ITS OWN LAST
+   SENTENCE.** "If Task 4's status report attaches to a project, it joins this union."
+   It attaches to a project and it does NOT join, because that union is the
+   COMPANY-AND-CONTACT reader and a project is neither — the same reasoning the rest of
+   the paragraph applies to the quote and the summary. Corrected; the rule the
+   paragraph meant (a record that carries more than one type grows a union for its own
+   reader) is untouched and correct.
+
+5. **THE PHASE IS FIVE TEMPLATES AND TWO FORMS, AND BOTH PUBLISHED COUNTS ARE WRONG IN
+   BOTH HALVES.** The spec says "four templates, four forms". Task 2 corrected that to
+   "four templates and THREE forms, because this one has none" — which fixed one number
+   with another wrong one and left the first alone. Counted off the shipped tree:
+
+   - **Templates the phase seeds: five.** 0017 one (`meeting_summary`), 0019 three
+     (`letter`, `nda`, `mutual_nda`), 0020 one (`project_status_report`). The spec's
+     "four" comes from its own table, which collapses the NDA pair into one row — but
+     they are two types with two `document_templates` rows and two different bodies,
+     because 0019's whole reason for one detail table is that what separates them is
+     wording.
+   - **Forms the phase adds: two.** `LetterForm` and `AgreementForm` in
+     `components/record-documents.tsx`, and nothing else — `AgreementForm` serves both
+     NDAs (same fields, different `type`), the summary has none, and the status report
+     has none. Three BUTTONS, two forms.
+
+   So: five templates, two forms, six types in total once the quote is counted.
+
+6. **`documents_type_valid` IS NOW LOGICALLY IMPLIED BY
+   `documents_entity_matches_type`.** Every arm of the new CHECK names a known type, so
+   any unknown type satisfies none of them and is refused there too. The two constraints
+   are both violated by the same row and PostgreSQL names whichever it reaches first, so
+   **`documents_type_valid` can no longer be probed by name through an INSERT**. It is
+   emphatically not redundant — it states the rule directly, `document_templates` mirrors
+   it, and a future type could legitimately relax the entity rule without relaxing the
+   type list — but its test is now a `pg_get_constraintdef` read compared against
+   `documentTypeSchema`, which is a better assertion than the INSERT it replaces.
+
+7. **A DOCUMENT'S PDF MAY BE FILED AGAINST A DIFFERENT RECORD FROM THE DOCUMENT, AND
+   0020 DOES NOT CLOSE THAT.** `documents.file_id` is a plain foreign key: nothing ties
+   the `files` row's record to the `documents` row's, so a status report on project X
+   pointing at a `files` row on deal Y is storable. Every writer gets it right (they
+   pass the same `target` to `attachFile` and to the INSERT) and no test could tell the
+   difference today. **A CHECK cannot express it** — it is a rule about two rows in two
+   tables — so closing it means a second trigger, alongside
+   `conduit_document_frozen_guard`. **Reported, not built:** it is the neighbouring hole
+   to the one this task was asked to close, and it is a different mechanism.
+
+8. **AN UNHANDLED `EPIPE` IN `services/restore.ts`, SURFACED BY THIS TASK'S EXTRA
+   LOAD.** The full suite reported `Errors 1 error` while exiting **0** — the failure
+   mode this project keeps finding. `proveArchiveOpens` writes the passphrase to 7z's
+   stdin with no `error` listener on the stream (`child.on("error")` does not catch
+   it), so when 7z exits before reading — which it does on the truncated archive the
+   "refuses a truncated one" test builds — the write lands on a closed pipe. It did NOT
+   reproduce in three consecutive isolated runs of `restore.test.ts`, so it is
+   timing-dependent and this task's extra test file is what shifted the timing.
+   **Reported, not fixed**: it is a one-line change in the most safety-critical path in
+   the product and it wants a test that forces the race.
+
+9. **`e2e/mobile.spec.ts`'s 320px OVERFLOW SWEEP COVERS TWO OF THE FOUR DETAIL PAGES,
+   AND NONE OF SETTINGS.** "does not cut a long name or email off the screen" sweeps
+   the CONTACT and the DEAL pages. The company page has carried a Documents section
+   since Task 3, the project page has one now, and Settings → Templates has had a
+   tab strip since Task 2 — none of the three is in the sweep. Two layouts were fixed
+   here by REASONING where the swept pages have a measurement, and both are marked as
+   such in the code: the project section's header takes `max-md:flex-wrap` (the same
+   fix the project page's own header carries, for a longer button label), and the
+   template tab strip takes `flex-wrap` because six labels are wider than a phone and
+   that strip — unlike the record rail's — has no `overflow-x-auto` to scroll inside.
+   **It was already the wrong shape at five tabs**, so the fix is the wrap rather than
+   one fewer word.
+
+10. **`listTasks`' ORDERING COMMENT DESCRIBES THE OPPOSITE OF WHAT ITS QUERY DOES, AND
+    THIS TASK'S OWN REASONING DEPENDED ON WHICH WAY ROUND IT IS.** `services/tasks.ts`
+    said `ORDER BY parent_task_id, position` "groups every top-level task
+    (parent_task_id NULL) together, then each parent's children together" — roots
+    first. **Measured on the dev server**: `SELECT x FROM (VALUES (2),(NULL),(1)) t(x)
+    ORDER BY x ASC` gives `1, 2, NULL`, so NULLS LAST puts the ROOTS last and the
+    children first. Nothing depends on it (the board and the drawer regroup, and
+    `tasks.test.ts`'s ordering test carefully asserts only contiguity) — but the status
+    report rejected that ordering for its printed table on exactly the property the
+    comment got wrong, so a reader checking the rejection would have found the
+    comment contradicting it. Corrected, with the measurement in it.
+
+11. **`doc/DESCRIPTION.md` STILL SAYS "quotes rendered to PDF from your own
+    templates".** That is the YunoHost catalogue's description of the product, and
+    after this phase it names one of six document types. Tasks 2 and 3 both left it and
+    so does this one, deliberately: it is release copy, v1.8.0 is not released, and the
+    sentence becomes wrong at the release rather than now — so it belongs in whatever
+    change cuts the release, worded by whoever is presenting the product, rather than
+    half-updated by a task. **Flagged so it is not missed a fourth time.**
+
+12. **THE STATUS LABELS LIVED IN `packages/web`, UNDER A COMMENT SAYING THEY MUST LIVE
+    IN ONE PLACE.** `task-board.tsx`: "so a status/type's wording only ever lives in one
+    place" — and `project-detail.tsx` had a private copy of the project's. The status
+    report prints both into a PDF from the server, which is the first reader outside a
+    browser, so `TASK_STATUS_LABEL` and `PROJECT_STATUS_LABEL` moved to
+    `@conduit/shared`. `task-board.tsx` re-exports its one under the old name, so
+    nothing that imported `STATUS_LABEL` changed.
+
+### Mutation evidence
+
+**65 distinct mutations, 77 runs over three passes. 58 killed by tests, 3 by typecheck,
+2 green by design (the two calibrations), 2 green with reasons.** Run on an isolated
+remote directory and database against `schema.test.ts`, `documents-report.test.ts`,
+`documents-letter.test.ts`, `documents-summary.test.ts`, `documents.test.ts`,
+`documents-seed.test.ts`, `export.test.ts`, `routes.test.ts`, `scheduling.test.ts`
+(added for the second pass) and `shared/index.test.ts` — 711 tests at the first pass,
+753 at the third.
+
+**FIVE SURVIVED THE FIRST PASS AND ALL FIVE ARE NOW CLOSED**; two more first-pass
+survivors turned out to be artefacts of the harness rather than gaps, and one first-pass
+KILL turned out to be a flake.
+
+**THE HARNESS WAS CALIBRATED IN BOTH DIRECTIONS BEFORE ANY OF IT COUNTED, AND ITS
+VERDICT IS AN EXIT STATUS RATHER THAN A GREP.** M00 changes only a comment and must
+report GREEN; it did (710 passed, 0 failed). M01 makes `buildStatusReportContext` report
+a task count of zero and must report RED; it did.
+
+**Task 3's `| tail` BUG IS WHY THE VERDICT IS AN EXIT STATUS.** Its harness ended the
+remote command with `| tail -6`, so the status was TAIL's — always 0 — and a mutation
+that stopped the suite from STARTING printed no "Tests … failed" line and scored
+SURVIVED. `set -o pipefail` runs inside the remote command here and the harness reads
+`returncode != 0`; nothing greps the output for a verdict.
+
+#### AND THE HARNESS STILL HAD THREE DEFECTS OF ITS OWN, ALL FOUND BY ITS OWN OUTPUT
+
+Recorded first, because every count below depends on them and each was invisible in a
+green-looking result.
+
+1. **A FALSE KILL, FROM AN INTERMITTENT — AND IT WAS CAUGHT ONLY BECAUSE THE PREDICTION
+   WAS WRITTEN DOWN FIRST.** M41 removes `listProjectDocuments`' `eq(type,
+   'project_status_report')`, which the code comment and this plan both say is
+   unexercisable after 0020. The first pass scored it **KILLED (1 failed)**. Re-run
+   twice with the same mutation applied: **710 passed, 0 failed, both times.** The kill
+   was an unrelated flake in the 711-test set. A survivor that had been predicted to
+   die would have been investigated; a KILL that agrees with nothing was only
+   investigated because it contradicted a claim already in the source. **Verdicts here
+   are one run each, so any of them could be a false kill; the ones that matter are the
+   ones somebody predicted.**
+2. **THE FIRST PASS MUTATED A FILE WHOSE OWN SUITE IT DID NOT RUN.** `taskOutlineOrder`
+   lives in `services/scheduling.ts` and is shared with `ganttPayload`; the test set had
+   no `scheduling.test.ts` in it, so M55 and M56 scored SURVIVED against a set that
+   could not see the function's other caller. That is an artefact of the instrument,
+   not a gap in the tests, and the second pass adds the file.
+3. **A TYPECHECK-VERDICT MUTATION POISONS THE INCREMENTAL BUILD, AND THE POISONING
+   OUTLIVES THE RESTORE.** `npm run typecheck` runs `tsc -b`, which emits `.d.ts` into
+   `packages/*/dist` and stamps a `.tsbuildinfo` claiming it current. M22 (removing
+   `statusReportSchema.projectId`) therefore left a stale declaration behind, and the
+   next typecheck — on fully restored source — reported an error against a line that
+   was demonstrably correct. **The consequence for the scoring is worse than the
+   nuisance:** M57 ran after M22 and would have failed typecheck whatever it did to its
+   own file, so its KILLED-BY-TYPECHECK verdict was not about M57. All three typecheck
+   mutations are re-run in the second pass with the build state cleared first, and all
+   three are genuinely red.
+
+#### FIVE SURVIVORS FROM THE FIRST PASS, AND WHAT CLOSED EACH
+
+| survivor | why it survived | what closed it |
+|---|---|---|
+| the report uses `listTasks`' ordering instead of the Gantt's outline order | **the assertion could not fail.** It searched the merged page for `>Design` and `>Design sketches` — and the first is a PREFIX of the second, so both `indexOf` calls returned whichever row came first. Under the mutation the four positions collapsed to two ascending pairs and the test passed | titles that are not prefixes of each other, a match CLOSED on the cell (`>Framing<`), and an explicit assertion that a ROOT precedes another root's child — which is exactly what `listTasks`' NULLS-LAST ordering reverses |
+| the assignee prefers the username to the full name | the only name reaching a printed page was the project OWNER, who was the same user, and `issueStatusReport` builds that from a different expression the mutation did not touch. "Chris Wilson" appeared either way | a second user assigned to a task, whose username (`jsmith`) is not a substring of their full name, and an assertion that the username appears NOWHERE on the page |
+| `PROJECT_STATUS_LABEL` loses its capitals | the assertion was `toBe(PROJECT_STATUS_LABEL.active)` — the value under test compared with itself. `db/schema.test.ts`'s `documentValues` had written this rule down already ("a fixture that asked the code under test what to expect could never disagree with it") and this was the same mistake one file over | the words spelled as literals, both of them, plus one assertion pinning the constant so the two really are one string |
+| the filename stops truncating a long project name | every test used a short project name, so the `slice` was unreachable from the suite | a 280-character project name, asserted as a prefix AND as a length AND as under the export's 180-byte member limit — three, because an expectation built from the same `slice` would agree with an off-by-one |
+| `taskOutlineOrder` stops ordering siblings by position (found in the second pass, as a failed RED calibration) | **every ordering test in the codebase gave each parent exactly ONE child** — this file's and `scheduling.test.ts`'s alike. The clause has been in `ganttPayload` since Phase 3 and nothing could tell if it stopped | two children of one parent, asserted in position order. **The gap was not this task's code**; the report is what put a second reader on a shared function and made it visible |
+
+#### TWO ARE GREEN AND STAY GREEN, WITH REASONS
+
+1. **`undatedCount` counting `startDate === null` instead of `dueDate === null` is an
+   EQUIVALENT MUTANT, and it is equivalent because of a CHECK rather than by accident.**
+   `tasks_dates_paired` admits both dates null or both set, never one, so the two
+   spellings ask the same question of every storable row. `dueDate` stays because it is
+   the half the OVERDUE rule turns on: "undated" then means exactly "not a task the
+   Overdue count could ever have included", which is the sentence the two counts are
+   printed side by side to make.
+2. **`listProjectDocuments` dropping its `eq(type, 'project_status_report')` is green,
+   and that is `documents_entity_matches_type` working.** After 0020 a project can carry
+   no other type, from any writer including a psql session, so no test can build a row
+   the predicate would filter. The predicate stays: it is what makes
+   `toStatusReportRecord`'s literal `type` a fact rather than an assumption, and the day
+   a second project-attached type exists — which means widening that CHECK — this
+   function keeps meaning what its name says. **`redraftLetter`'s "attached to neither a
+   company nor a contact" branch and `listMeetingSummaries`' type filter are green for
+   the same reason and stay for the same reason**; both were reachable before 0020 and
+   are not now, and both are recorded as such in their own files rather than left as
+   silent survivors.
+
+#### EVERYTHING ELSE, IN GROUPS
+
+**The entity CHECK, which is what this task was asked to close (7, all killed):** the
+constraint admitting everything; each of the four arms widened to admit any record; the
+letter family narrowed to companies only; **and the letter arm spelled as the plan
+sketched it** — `num_nonnulls(company_id, contact_id) = 1` — which is caught by
+`documents_exactly_one_entity` no longer being nameable for the both-set case.
+
+**The migration (8):** either type CHECK not widened; the index not built; the template
+seeded under a misspelt type; the template misspelling a count, losing its
+empty-project row, or losing the per-task dependency line; **the journal `when` put back
+to what drizzle-kit generated**.
+
+**@conduit/shared's per-type rules (7):** `documentTypeFreezes` and
+`documentTypeNumbered` each flipped for the report; both status label maps altered, one
+of them with its two words swapped; the enum losing the member and
+`statusReportSchema` losing its `projectId` (both **typecheck**).
+
+**The counts and the overdue rule (6):** overdue counting a task due TODAY, a DONE task,
+or an UNDATED one; `doneCount` counting the wrong status; a null progress printing `0%`;
+`undatedCount`'s equivalent spelling (green, above).
+
+**The read (7):** archived tasks listed; `ganttPayload`'s date filter adopted, dropping
+undated tasks; `listTasks`' ordering; the dependency read following the edge backwards;
+the assignee's precedence; predecessor names run together with no separator; an
+unassigned task printing a placeholder.
+
+**The writer (10):** `frozen` hardcoded true; the issue date read in UTC rather than the
+organisation's zone; the archived refusal removed; the filename losing its date, losing
+its truncation, or truncating one character short; the size refusal losing the task
+count or calling the document a quote; the PDF filed against nothing, and against the
+wrong kind of record.
+
+**The reader and the routes (5):** `listProjectDocuments` ordered oldest-first, ignoring
+which project it was asked about, or losing its type predicate (green, above); the
+project's GET and POST routes never registered.
+
+**The rollup (4):** the flag ignored; the flag always on (which is what protects Task 3's
+asserted separation); the subquery pulling in every contact rather than this company's;
+the route coercing the query parameter so `?includeContacts=false` turns it ON.
+
+**The export (2):** `documents.csv` blanking the project name, and losing the project
+pair entirely.
+
+**The shared ordering (4):** `taskOutlineOrder` losing its COALESCE, losing its
+root-before-children clause, losing its sibling order, and reversing it.
+
+**The merge context and the template reader (2):** `MergeContext` losing its `tasks`
+collection (**typecheck**); the report's template migration misrecorded in
+`test/seed-template.ts`.
+
+### Counts
+
+Unit suite **4097 passed / 48 skipped in 102 files**, against **4065 / 48 in 101** at
+Task 3's tip: **+32 tests, +1 file**
+(`packages/api/src/services/documents-report.test.ts`, 22 tests). `npm run typecheck`
+clean. Run on an isolated remote directory and database, both removed afterwards —
+`/home/chris/conduit` is shared and the suite's advisory lock is cluster-wide.
+
+**ONE RUN REPORTED `Errors 1 error` WHILE EXITING 0, AND IT WAS NOT THIS TASK'S CODE**
+— see finding 8. It has not recurred since; the run recorded here is clean.
+
+**NO NEW e2e SPEC**, which is Task 3's decision repeated and is worth naming rather
+than leaving as an absence: this type's surfaces are one section on one page with one
+button and no form, the four e2e specs that touch document surfaces all measure the
+DEAL's, and the two 320px sweeps do not cover the project page either way (finding 9).
+An e2e spec written here would be written blind — the whole suite runs in CI — so the
+push is what proves it rather than a local guess.
 
 ---
 
