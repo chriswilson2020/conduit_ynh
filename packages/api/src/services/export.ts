@@ -655,6 +655,17 @@ async function meetingsSheet(db: Database): Promise<Sheet> {
  * `archivePathByFileId` maps every exported file's id to its member path, not
  * only the quote PDFs -- documents.csv is just the only sheet that needs the
  * reverse lookup, to get a reader from a quote number to the page that was sent.
+ *
+ * **A STATUS REPORT AND A MEETING SUMMARY EXPORT WITH EVERY CONTENT COLUMN
+ * BLANK, AND THAT IS COMPLETE RATHER THAN LOSSY.** Both types have no detail
+ * table, because neither holds a byte that was typed into the document: a
+ * summary's content is the `meetings` row (meetings.csv), and a report's is a
+ * `projects` row plus its `tasks` (projects.csv, tasks.csv). What is NOT
+ * derivable from those is what the page SAID on the day it was produced -- a
+ * report is a snapshot of state that has since moved -- and that is in the
+ * archive too, as the PDF at `file_archive_path`. The one type whose content
+ * would genuinely have been lost is the letter, whose body exists nowhere else,
+ * and Task 3 added the six columns that carry it.
  */
 async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<string, string>): Promise<Sheet> {
   const rows = await db
@@ -663,7 +674,9 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
       agreement: documentAgreements,
       companyName: companies.name,
       contactFirstName: contacts.firstName, contactLastName: contacts.lastName,
-      dealTitle: deals.title, meetingTitle: meetings.title, issuedByUsername: users.username,
+      dealTitle: deals.title, meetingTitle: meetings.title,
+      documentProjectName: projects.name,
+      issuedByUsername: users.username,
     })
     .from(documents)
     // **LEFT SINCE PHASE 9, AND THIS IS THE DECISION THE OLD COMMENT ASKED FOR.**
@@ -708,6 +721,17 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
     .leftJoin(contacts, eq(documents.contactId, contacts.id))
     .leftJoin(deals, eq(documents.dealId, deals.id))
     .leftJoin(meetings, eq(documents.meetingId, meetings.id))
+    // **THE PROJECT, WHICH IS THE FIFTH AND LAST OF THE RECORD JOINS, AND THE
+    // THIRD TASK RUNNING TO FIND THIS SHEET A TYPE BEHIND THE DATA MODEL.** Task
+    // 2 found an INNER JOIN silently dropping every meeting summary; Task 3
+    // found no `company_id`/`contact_id` at all, so a letter would have exported
+    // naming no record; a status report would have been the same failure a third
+    // time, and quieter than either -- its `documents` row would have come out
+    // looking perfect, with `project_id` in a column that did not exist and
+    // therefore nothing anywhere in the archive saying WHICH PROJECT the report
+    // was about. Neither the spec nor the plan mentions the export, for the third
+    // task running.
+    .leftJoin(projects, eq(documents.projectId, projects.id))
     .leftJoin(users, eq(documents.issuedByUserId, users.id))
     // `number` still leads, because for a numbered type it is the order a reader
     // expects. It is NULL for every summary and PostgreSQL sorts those last, so
@@ -719,7 +743,8 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
     header: [
       "id", "number", "type",
       "company_id", "company_name", "contact_id", "contact_name",
-      "deal_id", "deal_title", "meeting_id", "meeting_title", "currency",
+      "deal_id", "deal_title", "meeting_id", "meeting_title",
+      "project_id", "project_name", "currency",
       "issue_date", "valid_until_date",
       "recipient_name", "recipient_contact_name", "recipient_salutation", "recipient_address",
       "subtotal", "tax", "total", "notes", "terms",
@@ -742,6 +767,7 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
       text(r.doc.companyId), text(r.companyName),
       text(r.doc.contactId), contactName(r.contactFirstName, r.contactLastName),
       text(r.doc.dealId), text(r.dealTitle), text(r.doc.meetingId), text(r.meetingTitle),
+      text(r.doc.projectId), text(r.documentProjectName),
       text(r.quote?.currency),
       r.doc.issueDate, text(r.quote?.validUntilDate),
       text(r.quote?.recipientName), text(r.quote?.recipientContactName),
