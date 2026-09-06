@@ -503,10 +503,231 @@ implementation.
 
 ## Task 3: `tasks` gets an estimate, and booked-versus-estimated exists
 
-- [ ] `tasks` carries **no effort or estimate column** — only `start_date`, `due_date`,
+- [x] `tasks` carries **no effort or estimate column** — only `start_date`, `due_date`,
       `completed_at`, `status`, `progress_pct`. Dates and a percentage, never a quantity of work.
-- [ ] **This changes a shipped surface.** The board, the Gantt and the task drawer all render
+- [x] **This changes a shipped surface.** The board, the Gantt and the task drawer all render
       tasks today. **If adding an estimate ripples further than expected, report it.**
+
+### Task 3 as built — migration 0022, `tasks.estimate_minutes`
+
+**ONE NULLABLE COLUMN AND ONE CHECK.** `estimate_minutes integer`, and
+`tasks_estimate_range`: `estimate_minutes IS NULL OR (estimate_minutes > 0 AND
+estimate_minutes <= 525600)`. The migration alters one table, moves no rows and adds
+no default, so a populated install upgrades in one statement pair.
+
+**MINUTES, BECAUSE THE OTHER HALF OF THE COMPARISON IS MINUTES.** `time_entries.minutes`
+and `meetings.duration_minutes` are both integer minutes, so an estimate in hours would
+put a conversion and a rounding between a number and the number it exists to be read
+against. Hours-as-numeric was rejected for the reason `time_entries.csv` has no `hours`
+column: `formatMinutes` already renders 90 as "1h 30m", so a second representation buys
+nothing at the display end and costs correctness at the comparison end.
+
+**THE BOUND, ARGUED AT BOTH ENDS.**
+
+- **`> 0`.** NULL already spells "nobody has estimated this". A zero would be a second
+  spelling of one absence, and the one that reads as a *claim* — an estimate of no work,
+  against which the first minute booked is infinitely over. `normaliseDescription`'s rule
+  (`""` stored as null) and `time_entries.minutes > 0`'s.
+- **`<= 525600`, one year of wall clock, and deliberately NOT 1440.** `MAX_TIME_ENTRY_MINUTES`
+  is definitional because `work_date` is one day; a task's dates are a **span**
+  (`tasks_dates_paired`, and the Gantt draws a bar across it), so the same bound here would
+  refuse true rows in bulk. What a year draws instead is the line between two entities this
+  schema already has: **a work item estimated at more than a person-year is a project**, and
+  `tasks.project_id` is the column that says so. Wall clock rather than an eight-hour working
+  day for `MAX_TIME_ENTRY_MINUTES`' reason — Conduit does not know the operator's working day,
+  and the one place the schema would have had to guess (`time_entries.billable`) it refused to.
+- **AND A BOUND EXISTS AT ALL BECAUSE THE COLUMN IS EMPTY TODAY.** This is Task 2's finding
+  used rather than repeated: `meetingSchema.durationMinutes` takes 999,999,999 and now
+  dominates a week's total, and it **cannot** be tightened, because a `.max()` would make the
+  client refuse to parse rows that already exist. **A bound is free exactly once, on the day
+  the column is created**, and this is that day. In the database *and* on the wire, unlike
+  that column.
+- **REJECTED, so it is not revisited: bounding the estimate by the task's own
+  `start_date..due_date` span.** It is the tempting cross-column CHECK and it is wrong twice.
+  A span is elapsed time and an estimate is effort — eight hours of work inside a two-week
+  window is the normal case, not an error — and it would make an ordinary reschedule that
+  narrows the dates fail against an estimate already stored, leaving a row that cannot be
+  patched out of its state one field at a time.
+
+### `taskEffort`, and where it deliberately does not live
+
+`taskEffort(db, taskId)` joins `timesheetTotals` in `services/timesheet.ts` — one table
+further along that module's founding reason: it reads `tasks` and `time_entries` and belongs
+to neither. `GET /api/tasks/:id/effort` serves it.
+
+**NOT A FIELD ON `taskSchema`, WHICH IS THE RIPPLE THAT WAS MEASURED AND REFUSED.** A board
+of forty cards would become forty aggregates over `time_entries` to draw something nobody put
+on a card, and the Gantt, My Tasks, search and a meeting's follow-up list would each pay the
+same. It is a second endpoint under the same `:id`, exactly as the drawer's dependency list
+already is.
+
+**THE BOOKED HALF IS `time_entries` ALONE, AND THAT IS THE SCHEMA'S DOING.** `meetings` has
+four record links and `task_id` is not one of them, so no meeting minute can reach a task's
+total; `db/schema.test.ts` pins that against the catalogue rather than arguing it. The one
+link between the two halves is a meeting's follow-up TASK, and Task 2 settled it — an hour
+booked there is different work. Tested as a reading.
+
+### An estimate on a task nobody has started — the question Task 2's third bucket raises
+
+**IT COUNTS, IN FULL, FROM THE MOMENT IT IS TYPED, AND THERE IS NO BUCKET FOR IT.** Nothing
+in `taskEffort` or `taskEffortSummary` asks about `status`, `progress_pct`, `start_date` or
+`completed_at`. Task 2 excluded meetings that have not happened because the timesheet sums
+time that **happened** and an arranged meeting is a plan; **an estimate never claims anything
+happened**, so "has it started" is not a question it has to answer. Dropping unstarted tasks
+would also make the estimated side *shrink as work went undone*, which is backwards — and a
+task estimated at four hours with nothing booked is the most informative row this comparison
+produces.
+
+**AND NO ESTIMATE EVER REACHES `countedMinutes`.** `timesheetTotals` does not read `tasks` at
+all and must not start: adding estimates into the week's total would answer "where did the
+week go" with work nobody has done. A test fails the day somebody does.
+
+**AN ARCHIVED ENTRY IS NOT BOOKED; AN ARCHIVED TASK STILL ANSWERS.** The asymmetry is
+deliberate. Archiving is the only way an hour leaves a total anywhere in this phase, so an
+archived entry that still counted would break the correction for a mis-booked afternoon on
+this reading alone. An archived task, by contrast, is one somebody has opened the drawer to
+ask about.
+
+### How far the ripple actually went
+
+| surface | what changed |
+|---|---|
+| the **board** | **nothing.** The card renders title, type badge, due date and owner; `Task` gained a field it does not read |
+| the **Gantt** | **one line**, and the compiler found it: `services/scheduling.ts` has a SECOND hand-written `toTask`, and `ganttPayload`'s `GanttTask[]` annotation makes a missing field `TS2322` rather than a silently thinner payload |
+| the **task drawer** | the real surface: an Estimate field and the derived sentence |
+| **`services/documents.ts`** | **deliberately not changed.** `StatusReportTask` is a projection for a frozen PDF template; adding a column would change the shape of every future status report without anybody asking |
+| **`services/time-entries.ts`** | **the ripple nobody would have predicted** — see below |
+
+**THE SSE HINT IS THE PART THAT WOULD HAVE GONE WRONG QUIETLY.** The booked figure's only
+source is a write in `services/time-entries.ts`, and **nothing on a task surface listened to
+`["time-entries"]`.** So `publishTimeEntryHint` now also publishes `["task", id]` when the
+entry names one — the exact key `publishTaskHint` uses, so TanStack's prefix match reaches
+`["task", id, "effort"]` with no key of its own. An UPDATE publishes **both** the pre- and
+post-patch task: re-linking an hour changes two totals, and a drawer open on the task it left
+is as stale as one open on the task it arrived at. That is `publishTaskHint`'s
+`extraAssigneeIds` shape, one table over.
+
+**ONE SENTENCE, NEVER TWO FIGURES SIDE BY SIDE.** `taskEffortSummary` composes the booked
+total, the estimate and the gap, because "5h booked" on a task estimated at two hours is a
+number that is wrong without looking wrong — `timesheetSummary`'s arrangement and
+`EXPORT_ARCHIVE_SUMMARY`'s. `task-effort-render.test.ts` reads the drawer off disk and fails
+if it starts spelling any part of the comparison itself, which is
+`settings-data-lib.test.ts`'s guard at a smaller card.
+
+### THE PLAN'S OWN CONVENTION NOTE IS WRONG, AND IT WOULD HAVE COST THIS TASK
+
+**"`tasks.csv`'s columns are checked against `information_schema`, so a missing one may fail
+by itself" IS FALSE.** Task 1 wrote that guard for **`time_entries` alone**, and the very next
+task to add a column added it to `tasks` — where nothing would have noticed. The estimate
+could have shipped unexported in silence, which is Phase 9's miss for the fourth time.
+
+Task 1's reasoning was never specific to one table, so the check now covers **every table any
+member carries**, read out of `information_schema` and compared against the headers of a real
+archive. **What it found on its first run:** seventeen columns are carried under a *different*
+header — `deals.value_cents` as `value` in major units, `meetings.notes` as `notes_html`, the
+letter's and the agreement's fields under their own prefixes (because `documentsSheet`
+refuses to coalesce two tables into one set of columns), and three detail tables'
+`document_id`, which *is* `documents.csv`'s own `id`. Two are genuinely absent:
+`tasks.position` and `deals.position`. Each is now a stated line. **It matches on names and
+asks for a sentence rather than guessing at the mapping**: a guard that stripped `_cents` or
+allowed a prefix would excuse a real miss the day a new column looked like one of those shapes.
+
+`tasks.csv` gains `estimate_minutes`, in minutes, so a reader with a spreadsheet can subtract
+it from a `SUM` over `time_entries.csv`'s `minutes`. `EXPORT_FORMAT_VERSION` stays at 1.
+
+### The index the plan assigns to Task 4 is wanted a task early, and is still not built
+
+**"Task 4 is the first task with readers for [the five record foreign keys]" IS NO LONGER
+TRUE.** `taskEffort` is a reader for `task_id`, it arrives a task early, and it runs on every
+drawer open rather than a few times a day. Measured on the dev server against a database built
+by the real migrations, entries spread over 200 tasks with a tenth archived, warm, without and
+then with a partial index on `(task_id) WHERE archived_at IS NULL`:
+
+```
+    5,000 entries,  22 live on the task:   0.42ms /    73 buffers  ->  0.04ms /  24, index  56kB / 584kB heap
+  200,000 entries, 907 live on the task:  18.80ms / 2,881 buffers  ->  0.78ms / 910, index 1.2MB /  23MB heap
+```
+
+Five thousand entries is a decade of a single operator logging two entries a working day, and
+the difference there is four tenths of a millisecond on a request that already costs a network
+round trip. **Not built** — 0017/0019/0020's rule, and Task 2's decision on
+`meetings(occurred_at)` against the same evidence at the same scale. Note that even at 200k the
+index saves only two thirds of the buffers: a task's hours are scattered across years of insert
+order, so the bitmap heap scan still visits 907 pages.
+
+**THE MEASUREMENT'S FIRST DRAFT WAS A BAD INSTRUMENT AND SAID SO.** It spread entries over
+tasks with `g % 200` and archived them with `g % 10`, and 10 divides 200 — so every entry on
+the target task had one fixed `g mod 10` and **all of them were archived**. It reported nought
+rows on the task, which is the only reason it was caught rather than written down as a fast
+query.
+
+### The journal trap: seventh time, and it cost nothing again
+
+`drizzle-kit generate` stamped 0022's `when` as the wall clock again. `npm run db:generate`
+restamped to `1789300000002` and said so on stdout. A mutation putting the raw value back is
+killed by `schema.test.ts`'s strictly-increasing check **and** by the 0022 drill, which finds
+the column simply absent.
+
+### Mutation evidence
+
+**Forty-four mutations, all forty-four killed, plus a control watched GREEN first.** The
+harness reads vitest's exit status from `spawnSync`'s `status` **before any output is piped
+anywhere**, and refuses to edit unless its search string occurs **exactly once** in the target
+file.
+
+**FIVE BAD INSTRUMENTS WERE CAUGHT, AND FOUR OF THEM SHARED ONE CAUSE WORTH WRITING DOWN.**
+
+- **Four DDL mutations were aimed at `db/schema.ts` and changed nothing the tests can see.**
+  Every database in this suite is built by `migrate(migrationsFolder)` — out of
+  `drizzle/*.sql`. `db/schema.ts` is what drizzle-kit reads to *generate* those files and what
+  the query builder types itself from; **a CHECK deleted there is still enforced by the
+  database.** Re-aimed at `0022_task_estimate.sql`, all four are killed, along with a
+  fifth (the column arriving as `text`) and a sixth (the journal trap). **The standing gap
+  this exposes is real and general: nothing in the suite compares `db/schema.ts` to the
+  migrations**, so the two could drift and the only symptom would be a spurious `DROP
+  CONSTRAINT` in whatever migration is generated next. It predates this task and is left
+  recorded rather than fixed in passing.
+- **One "survivor" inserted `AND true` beside a predicate instead of deleting it** — a no-op
+  dressed as a mutation. Deleting `isNull(timeEntries.archivedAt)` properly is killed.
+
+**FOUR WERE REFUSED BY THE HARNESS BEFORE THEY COULD LIE.** Twice because
+`estimateMinutes: z.number().int().min(1).max(MAX_TASK_ESTIMATE_MINUTES).nullable(),` occurs in
+**both** `taskSchema` and `taskEffortSchema` — a mutation applied to the wrong one and then
+surviving would have been recorded as a gap in these tests. Twice because a search string had a
+typo and matched nothing.
+
+**AND ONE EQUIVALENT MUTANT WAS RECOGNISED RATHER THAN RECORDED AS A SURVIVOR.** `gap < 0 ? … :
+…` rewritten as `gap > 0 ? … : …` with the branches exchanged is the *same function*, because
+`gap === 0` has already returned above it. Replaced by two that genuinely differ — the words
+"over" and "left" exchanged, and the subtraction reversed — and both are killed by six tests.
+
+| mutation | answered by |
+|---|---|
+| `tasks_estimate_range` never added / admits a zero / ceiling ±1 | the exact-edges test and the 0022 drill |
+| the column arrives with `DEFAULT 0` | 5 tests, including the drill's "existing tasks read back unestimated" |
+| the column arrives as `text` | the catalogue test, which also compares it against `time_entries.minutes` |
+| **0022's journal `when` put back to what drizzle-kit generated** | the strictly-increasing journal test, and the drill finding no column |
+| `MAX_TASK_ESTIMATE_MINUTES` becomes the entry bound | the shared test, the schema test's pinned literal |
+| the wire floor drops to 0; either ceiling removed; `taskEffortSchema` unbounded | the shared tests and the route's 400s |
+| `taskEffortSchema`'s same-population refine removed | "refuses minutes with no entries" |
+| the summary drops its estimate clause / its "no time booked yet" branch / "exactly on" / the sign / the plural | 1–9 tests each, in shared and in the service |
+| **the words "over" and "left" swapped; the gap subtracted the wrong way round** | 6 tests each |
+| the archived-entry filter deleted; the task filter dropped; the sum not COALESCEd | the `taskEffort` tests |
+| **the `::int` casts dropped, so the driver returns bigint strings** | the runtime-type test and the route's schema parse |
+| the 404 removed; the estimate not carried back; minutes and count swapped; an archived task refused | the `taskEffort` tests |
+| `toTask` drops the estimate; it is not patchable; create ignores it; the UPDATE never writes it | 3–4 tests each, in the service and over HTTP |
+| **the task key never published; only the arriving task published; archive silent; create silent; the Set removed** | the four hint tests — the ripple's own guard |
+| `estimate_minutes` dropped from the sheet's header | **the new column-coverage guard**, by name |
+| the estimate cell blanked, or exported as `0` for an unestimated task | the export tests |
+| the effort route never registered | the route test |
+| **the drawer composes the comparison itself; it clamps against a typed-out 525600** | `task-effort-render.test.ts`, reading the page off disk |
+| **the Gantt's own `toTask` forgets the field** | `tsc` (exit 2): `TS2322`. Nothing had to run |
+| a comment-only change (**the control**) | green, watched first |
+
+**WHAT IS NOT COVERED, AND IS SAID RATHER THAN GLOSSED.** `handleEstimateBlur`'s clamp has no
+unit-level behavioural test — this repo has no DOM testing, so its unit guard reads the source.
+The e2e now types a `0` and asserts the field reads back `1`, which is the only place that
+branch runs end to end.
 
 ## Task 4: The timesheet
 

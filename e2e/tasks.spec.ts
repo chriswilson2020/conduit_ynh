@@ -246,6 +246,19 @@ test.describe.serial("Tasks/Gantt journey", () => {
 
     // Commits on blur, like the progress field beside it.
     const estimate = page.getByTestId("field-estimateMinutes").getByLabel("Estimate in minutes");
+
+    // A ZERO IS NOT "NO ESTIMATE", AND THE CONTROL SAYS SO IN FRONT OF THE
+    // OPERATOR. `null` is the one spelling of unestimated, so the field clamps a
+    // typed 0 up to the smallest real estimate rather than sending a value the
+    // CHECK would refuse -- and puts the clamped number back in the box, or it
+    // would go on showing one the task has not got. This is the only place that
+    // branch is exercised end to end: there is no DOM testing in the unit suite,
+    // so its unit-level guard reads the source rather than the rendering.
+    await estimate.fill("0");
+    await estimate.blur();
+    await expect(estimate).toHaveValue("1");
+    await expect(effort).toHaveText("No time booked yet, against an estimate of 1m: 1m left.");
+
     await estimate.fill("240");
     await estimate.blur();
     await expect(effort).toHaveText("No time booked yet, against an estimate of 4h: 4h left.");
