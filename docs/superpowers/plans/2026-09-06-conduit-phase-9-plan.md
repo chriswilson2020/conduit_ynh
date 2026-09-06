@@ -715,10 +715,14 @@ is a free migration whenever it is taken.
 
 ### Mutation evidence
 
-**69 mutations. 67 killed, one green by design, one proved equivalent and argued.**
-Run against `schema.test.ts`, `documents-letter.test.ts`, `documents-number.test.ts`,
-`routes.test.ts`, `documents-errors.test.ts` and `export.test.ts`, on an isolated
-remote directory and database.
+**67 mutations over two passes. 63 killed, one green by design, three green with
+reasons.** Run against `schema.test.ts`, `documents-letter.test.ts`,
+`documents-number.test.ts`, `routes.test.ts`, `documents-errors.test.ts` and
+`export.test.ts`, on an isolated remote directory and database. (The first pass
+attempted 58 and could not apply three of them — the letter's `values` object is
+written identically by the issue path and the redraft path, so the anchor was
+ambiguous. The second pass runs those three against EACH path separately, which is
+six mutations and the right number: a mutation of one path is invisible in the other.)
 
 **The harness was calibrated in both directions before any of it counted.** M00
 changes only a comment and must report GREEN; it did (131 passed, 0 failed). M01
@@ -795,8 +799,19 @@ The export (2): the letter join broken; a missing term exported as `0` rather th
 | `assertRecordIssuable`'s archived check deleted | `attachFile` refuses an archived record too, with the SAME `ArchivedError` — so the error type and an empty `documents` table were identical either way. But `attachFile` runs AFTER the merge, the caps, the render and the blob write | a renderer stub that fails if it is called at all, so the refusal has to arrive before anything spawns. Three assertions now, one per branch and one on the agreement path (where a spent number would be the visible trace) |
 | `redraftLetter`'s "attached to neither a company nor a contact" branch | no writer can produce the row, so nothing reached it | a test that writes the row the way a psql session would — `UPDATE documents SET company_id = NULL, deal_id = ...` — which is also the concrete demonstration of the "which entity, per type" gap above |
 
-#### TWO ARE GREEN AND STAY GREEN, WITH REASONS
+#### THREE ARE GREEN AND STAY GREEN, WITH REASONS
 
+0. **Altering the letter template's opening literal in the migration is green, and
+   it is an EQUIVALENT MUTANT BY CONSTRUCTION rather than a gap in the assertions.**
+   `test/seed-template.ts` derives the expected template from the same file the
+   migration is read out of, so both sides of the drill's comparison move together
+   — which that file's own header already warns about ("a migration that amends the
+   body in some OTHER shape would be missed here silently"). What is NOT equivalent
+   is a change that alters what the template NAMES or whether it lands at all, and
+   both were run instead: dropping `{{document.body}}` from the letter template
+   fails the token-set equality (5 tests), and inserting it under a misspelt type
+   fails the "every type has a seeded template" assertion (which now comes off the
+   enum).
 1. **Removing the UPDATE's `AND frozen = false` ALONE is green, and it is an
    equivalent mutant that was measured rather than assumed.** Nothing can change
    `frozen` under a live row — `documents_frozen_matches_type` ties it to `type`, and
@@ -820,6 +835,13 @@ on an isolated remote directory and database, both removed afterwards —
 
 `drizzle-kit generate` answers "No schema changes, nothing to migrate" against this
 branch, which is the measurement behind finding 7 above.
+
+CI green on the first push: **4110 passed / 3 skipped in 101 files** for the unit
+job (the runner has WeasyPrint and 7-Zip, so 45 of the dev server's 48 skips run
+there) and **257 passed** for the e2e job. No e2e regression, which is worth naming
+because Task 2's push found one: the letter and the agreement forms are new dialogs
+on two existing pages, and the specs that measure those pages at 320px
+(`mobile.spec.ts`'s overflow guard) pass with the section's header wrapping.
 
 ## Task 4: Project status report — the broadest source, and the schedule risk
 
