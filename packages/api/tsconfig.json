@@ -2,6 +2,14 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": { "outDir": "./dist", "rootDir": "./src" },
   "include": ["src/**/*"],
-  "exclude": ["src/**/*.test.ts", "src/test/**"],
+  "//exclude": [
+    "journal-stamp.ts is DEV TOOLING, not server code: `npm run db:generate` runs it as",
+    "TypeScript through plain node, and nothing in src imports it. Excluded from the BUILD",
+    "only, so scripts/make-release.sh's `cp -R packages/api/dist/.` cannot put a script that",
+    "rewrites the migration journal into an operator's install, where nothing would ever run",
+    "it and it could only be a surprise. tsconfig.test.json sets `exclude: []`, so typecheck",
+    "still covers it -- and so does vitest, which resolves the source."
+  ],
+  "exclude": ["src/**/*.test.ts", "src/test/**", "src/db/journal-stamp.ts"],
   "references": [{ "path": "../shared" }]
 }
