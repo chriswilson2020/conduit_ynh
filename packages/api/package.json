@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc -b",
     "dev": "node --watch --experimental-strip-types src/server.ts",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate && node src/db/journal-stamp.ts"
   },
   "dependencies": {
     "@conduit/shared": "*",
