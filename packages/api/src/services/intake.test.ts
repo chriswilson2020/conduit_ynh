@@ -9,7 +9,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import {
   archiveMemberProblem, archivePathProblem, attributeFlags, attributeMode,
-  parseArchiveIndex, receiveIntake, safeFilename,
+  parseArchiveIndex, receiveIntake, runSevenZip, safeFilename,
   sevenZipExtractArgs, sevenZipListArgs, stageArchive, stagedPathProblem, stageVerbatim,
   sweepAbandonedIntakes, StagedMemberRef,
   DEFAULT_MAX_TEXT_BYTES, INTAKE_WORK_PREFIX,
@@ -354,6 +354,62 @@ describe("the 7z argument lists", () => {
   // directory as an archive to extract.
   it("joins the extraction directory to -o, which 7z requires", () => {
     expect(sevenZipExtractArgs("/a/b.7z", "/a/staged")).toContain("-o/a/staged");
+  });
+
+  /**
+   * AND THE WRITE TO 7z's stdin LEAVES NOTHING UNCAUGHT BEHIND IT.
+   *
+   * This is the site where the child provably exits WITHOUT READING A BYTE:
+   * `7z l` on a file that is not an archive answers "Is not archive" and exit 2,
+   * measured 10/10 on the deploy target, and that is an ordinary wrong upload
+   * rather than a rare corruption. A stream 'error' with no listener is an
+   * uncaught exception, and packages/api/src installs no process-level handler,
+   * so it would end the API server instead of the upload.
+   *
+   * WHAT MAKES IT SURVIVABLE TODAY IS SIZE, NOT LUCK, and that is also why this
+   * test writes 256 KiB rather than a passphrase. libuv gives a child's stdin a
+   * socketpair whose send buffer took 128 KiB whole on that box; 256 KiB EPIPEs
+   * 10/10 and 28 bytes 0/10. stageArchive applies passphraseProblem (256
+   * CHARACTERS) before it ever reaches here, which is exactly why the test has
+   * to call runSevenZip directly -- driven through stageArchive it would pass
+   * with the guard deleted.
+   */
+  it7z("survives a 7z that exits without reading stdin", async () => {
+    const notAnArchive = path.join(scratch, "not-an-archive.7z");
+    await writeFile(notAnArchive, Buffer.alloc(4096, 0x41));
+    const oversized = "x".repeat(256 * 1024);
+
+    // THE CONTROL FIRST. The assertion below is that nothing escaped, which
+    // passes for free the day this stops provoking an EPIPE at all -- a larger
+    // socket buffer, a 7z that drains stdin, a different libuv. So the same
+    // spawn is made here with a listener of its own and asserted to SEE one.
+    const observed = await new Promise<string[]>((resolve) => {
+      const child = spawn("7z", sevenZipListArgs(notAnArchive), {
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      const codes: string[] = [];
+      child.stdin.on("error", (error: NodeJS.ErrnoException) => { codes.push(error.code ?? "?"); });
+      child.on("error", () => { resolve(["spawn failed"]); });
+      child.on("close", () => { setTimeout(() => { resolve(codes); }, 250); });
+      child.stdin.write(oversized);
+      child.stdin.end();
+    });
+    expect(observed).toEqual(["EPIPE"]);
+
+    // `process.on`, not removeAllListeners: vitest's own listener stays, so a
+    // regression is a failed assertion here AND a red run rather than either
+    // one alone.
+    const escaped: unknown[] = [];
+    const capture = (error: unknown): void => { escaped.push(error); };
+    process.on("uncaughtException", capture);
+    try {
+      expect((await runSevenZip(sevenZipListArgs(notAnArchive), oversized)).code).not.toBe(0);
+      // The 'error' arrives on its own turn, and `close` does not order it.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      process.off("uncaughtException", capture);
+    }
+    expect(escaped).toEqual([]);
   });
 });
 
