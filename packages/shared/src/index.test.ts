@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   CSV_IMPORT_FIELDS,
   csvImportFieldSchema,
+  formatDocumentInstant,
   userSchema,
   meResponseSchema,
   healthResponseSchema,
@@ -2575,6 +2576,48 @@ describe("csvImportFieldSchema", () => {
     }
     for (const bad of ["company.vat", "contact.email ", "COMPANY.NAME", "", "email"]) {
       expect(csvImportFieldSchema.safeParse(bad).success, bad).toBe(false);
+    }
+  });
+});
+
+/**
+ * THE ZONE IS NAMED BECAUSE CONDUIT DOES NOT KNOW THE RIGHT ONE. `meetings.occurred_at`
+ * is built in the browser from what the operator typed in their own zone, and nothing
+ * stores that zone -- so a document rendered on the server cannot reproduce their wall
+ * clock, and the honest thing is to say which clock it is using.
+ */
+describe("formatDocumentInstant", () => {
+  it("prints a long-form date, a 24-hour time, and the zone", () => {
+    expect(formatDocumentInstant("2026-09-01T13:30:00.000Z")).toBe("1 September 2026 at 13:30 UTC");
+  });
+
+  it("converts an offset rather than printing its local wall clock", () => {
+    // The same instant, written three ways. All three must print one time, or the
+    // function is reading the string instead of the moment.
+    for (const iso of [
+      "2026-09-01T13:30:00.000Z", "2026-09-01T15:30:00.000+02:00", "2026-09-01T08:30:00.000-05:00",
+    ]) {
+      expect(formatDocumentInstant(iso), iso).toBe("1 September 2026 at 13:30 UTC");
+    }
+  });
+
+  it("is not the running process's timezone", () => {
+    // The day boundary is where a local-zone formatter would give itself away: this
+    // instant is the 2nd in UTC and the 1st in New York.
+    expect(formatDocumentInstant("2026-09-02T02:30:00.000Z")).toContain("2 September 2026");
+  });
+
+  it("spells the month as a word, because 08/09 means two different days", () => {
+    expect(formatDocumentInstant("2026-09-08T00:00:00.000Z")).toContain("September");
+  });
+
+  /**
+   * NEVER THROWS, matching every formatter in money-format.ts and for the same
+   * reason: these are display functions with no error boundary above them.
+   */
+  it("returns an empty string for something that is not an instant", () => {
+    for (const bad of ["", "not a date", "2026-13-45T99:99:99Z"]) {
+      expect(formatDocumentInstant(bad), bad).toBe("");
     }
   });
 });

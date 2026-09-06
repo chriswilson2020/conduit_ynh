@@ -17,6 +17,11 @@ export type { LineInput, DocumentTotals } from "./money.js";
 export {
   decimalFromCents, formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE,
 } from "./money-format.js";
+// ...and imported as well as re-exported, because `formatDocumentInstant` below
+// formats a date in the same locale the money figures beside it use. A re-export
+// does not put the name in this module's scope, which is why the line above is
+// not enough on its own.
+import { MONEY_LOCALE } from "./money-format.js";
 // 7.6's backup passphrase rule, reaching web the same way and for the same
 // reason the money helpers do: the Settings page refuses a passphrase before it
 // is sent and services/backup.ts refuses one that arrives anyway, and those two
@@ -228,6 +233,16 @@ export const fileMetaSchema = z.object({
   uploaderUserId: z.uuid(),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
   projectId: z.uuid().nullable(),
+  // A FIFTH PARENT ON THE READ SHAPE AND NOT ON `createNoteInputSchema`'s
+  // `exactlyOneEntity` ABOVE, and the asymmetry is deliberate (Phase 9 Task 2).
+  // `files_exactly_one_entity` gained meeting_id so that a RENDERED DOCUMENT can
+  // live on the record it is a document OF -- documents.meeting_id and
+  // files.meeting_id have to agree about what the artifact belongs to, or the
+  // download route hands you a PDF filed under a deal that the document says is a
+  // meeting's. Nothing UPLOADS a file to a meeting: POST /api/files still takes
+  // the four, because "attach this PDF to a meeting" is a feature nobody has asked
+  // for and the Files rail has no meeting scope to show it in.
+  meetingId: z.uuid().nullable(),
   createdAt: z.iso.datetime(),
 });
 export type FileMeta = z.infer<typeof fileMetaSchema>;
@@ -2326,8 +2341,18 @@ function documentText(max: number, min = 0) {
   });
 }
 
-/** The one document type v1.0.0 ships. `documents_type_valid` CHECKs the same set. */
-export const documentTypeSchema = z.enum(["quote"]);
+/**
+ * The document types Conduit can produce. `documents_type_valid` CHECKs the same
+ * set, and `document_templates_type_valid` with it -- every type here has an
+ * editable template and a row seeded by the migration that added the type.
+ *
+ * `meeting_summary` is Phase 9 Task 2's, and it is the type that has no form: its
+ * whole content is a `meetings` row, so nothing about it is submitted. The other
+ * three the spec names (letter, nda, mutual_nda, project_status_report) are Tasks
+ * 3 and 4's and are deliberately absent -- a member here with no template row and
+ * no writer is a type an operator can select and nothing can produce.
+ */
+export const documentTypeSchema = z.enum(["quote", "meeting_summary"]);
 export type DocumentType = z.infer<typeof documentTypeSchema>;
 
 /**
@@ -2360,7 +2385,102 @@ export function documentTypeFreezes(type: DocumentType): boolean {
   switch (type) {
     case "quote":
       return true;
+    // Chris's decision, 6 Sep, and the first `false` this function has ever
+    // returned. It is also why 0016 dropped `frozen`'s DEFAULT rather than
+    // leaving `true` standing: with a type whose answer is false, "the writer
+    // forgot" and "the writer meant frozen" had to stop being the same row.
+    case "meeting_summary":
+      return false;
   }
+}
+
+/**
+ * WHETHER A DOCUMENT OF THIS TYPE IS GIVEN A NUMBER AT ALL.
+ *
+ * **A MEETING SUMMARY IS NOT, AND THAT IS PHASE 9 TASK 2'S DECISION.** The spec
+ * left it open ("whether an NDA or a letter wants a sequence at all is a per-type
+ * decision... a meeting summary almost certainly does not"); this is the answer
+ * and the reasons it was given for, because "QUO-2026-0001 suits this not at all"
+ * is an aesthetic judgement and three of these are not.
+ *
+ * 1. **A NUMBER IS AN EXTERNAL HANDLE.** `documents.number` exists so that the
+ *    person you sent the document to can quote it back at you, and so that a
+ *    commercial document belongs to a gapless sequence somebody can audit. A
+ *    meeting summary is identified by the meeting it is of -- its title and its
+ *    date, both printed on it -- and there is nobody on the other end holding a
+ *    reference.
+ * 2. **NUMBERING SERIALISES ISSUING, MEASURABLY.** `allocateNumber` takes a row
+ *    lock on (type, year) held to commit, and the render happens inside it
+ *    (~600-700ms for a one-page document on the server's WeasyPrint). For a quote
+ *    that is the behaviour you want -- consecutive numbers are consecutive. For a
+ *    summary it would make every summary of a given year queue behind every other
+ *    one, to buy a string nobody reads.
+ * 3. **A SUMMARY IS NOT FROZEN, SO IT CAN BE PRODUCED AGAIN**, and a numbered
+ *    thing that can be produced again has to choose between spending a second
+ *    number (a sequence full of near-duplicates) and reusing the first (a number
+ *    that is no longer unique). Neither is better than having none.
+ *
+ * THE SAME `switch`-OVER-THE-UNION SHAPE AS documentTypeFreezes ABOVE, for the
+ * same reason: a type added without an answer is a build error rather than a
+ * silent `false`. It is a separate function and not a second field on one lookup
+ * table because the two rules are independent -- an NDA is frozen AND numbered, a
+ * letter is neither -- and a shared table would invite the belief that they move
+ * together.
+ *
+ * THE DATABASE SAYS THE SAME THING, in `documents_number_matches_type` (migration
+ * 0017), which is an equality in both directions: a quote with no number is
+ * refused, and a summary that somehow acquired one is refused too. db/schema.test.ts
+ * asserts the two spellings agree for every member of the enum. A third place
+ * agrees by omission: `document_number_sequences_type_valid` still names only
+ * 'quote', so a writer that called `allocateNumber` for a summary fails on the
+ * INSERT instead of minting `DOC-2026-0001`.
+ */
+export function documentTypeNumbered(type: DocumentType): boolean {
+  switch (type) {
+    case "quote":
+      return true;
+    case "meeting_summary":
+      return false;
+  }
+}
+
+/**
+ * An instant, as a document prints it: `8 September 2026 at 14:00 UTC`.
+ *
+ * **THE ZONE IS NAMED BECAUSE CONDUIT DOES NOT KNOW THE RIGHT ONE, AND THIS IS A
+ * FINDING RATHER THAN A PREFERENCE.** `meetings.occurred_at` is a `timestamptz`
+ * built in the browser from what the operator typed in their own zone
+ * (`localInputToIso` in web's meetings-lib.ts), and nothing anywhere stores that
+ * zone: `org_profile` has no timezone column, `users` has none, and no request
+ * carries one. So a document rendered on the server cannot reproduce the wall
+ * clock the operator saw. The rail shows `toLocaleString()` -- the VIEWER's zone,
+ * which is right for a screen -- and this prints UTC and says so, which is right
+ * for a page that gets downloaded and sent: a reader can convert an instant that
+ * names its zone and cannot even detect one that does not. Two hours' difference
+ * between the rail and the PDF, admitted, beats the same two hours concealed.
+ *
+ * If that is not the trade Chris wants, the fix is an org-profile timezone and
+ * this function taking it -- a Settings field and one argument, not a redesign.
+ *
+ * MONEY_LOCALE's locale, deliberately, and for MONEY_LOCALE's own reason: the
+ * package owns the formatting rather than the viewer, or the same meeting reads
+ * `8 September 2026` in one place and `9/8/2026` in another. `dateStyle: "long"`
+ * so the month is a word -- `08/09/2026` is the one format that means two
+ * different days on two sides of the Atlantic, which is exactly the ambiguity a
+ * document must not carry.
+ *
+ * IT NEVER THROWS, matching every formatter in money-format.ts and for the same
+ * reason. An unparseable instant would make `Intl.DateTimeFormat.format` throw a
+ * RangeError; nothing storable in a `timestamptz` can produce one, and the guard
+ * is what keeps that true for a caller this function does not know about.
+ */
+export function formatDocumentInstant(iso: string): string {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return "";
+  const formatted = new Intl.DateTimeFormat(MONEY_LOCALE, {
+    dateStyle: "long", timeStyle: "short", timeZone: "UTC",
+  }).format(at);
+  return `${formatted} UTC`;
 }
 
 /**
@@ -3046,11 +3166,28 @@ export type DocumentLineItem = z.infer<typeof documentLineItemSchema>;
  *
  * There is no update shape anywhere below, and that is the phase's central claim
  * rather than an omission: an issued quote never changes.
+ *
+ * **THIS IS THE QUOTE'S RECORD, AND SINCE PHASE 9 THE `type` SAYS SO.** It was
+ * `documentTypeSchema` when that enum had one member; now that it has two, leaving
+ * it would let a payload claim `meeting_summary` beside a currency and three money
+ * fields -- exactly the shape the table split exists to make unspellable. The
+ * literal is what makes `DocumentRecord["type"]` mean something at the cast in
+ * services/documents.ts.
+ *
+ * **AND IT IS STILL NOT A DISCRIMINATED UNION**, which Task 1 predicted would
+ * arrive with the second type. It has not, because nothing yet RECEIVES both
+ * shapes: a deal's Documents section reads quotes (`GET /api/deals/:id/documents`)
+ * and a meeting's reads summaries (`GET /api/meetings/:id/documents`), so a union
+ * here would be a type every one of its consumers narrows on the first line and
+ * nobody ever holds. The reader that genuinely mixes types is the phase's
+ * record-level Documents tab, which needs three types to be designed against
+ * rather than two; the union is that reader's, and building it early is how the
+ * common table became a quote table in the first place.
  */
 export const documentSchema = z.object({
   id: z.uuid(),
   number: z.string().min(1),
-  type: documentTypeSchema,
+  type: z.literal("quote"),
   dealId: z.uuid(),
   fileId: z.uuid(),
   currency: currencyCodeSchema,
@@ -3072,6 +3209,48 @@ export const documentSchema = z.object({
   lines: z.array(documentLineItemSchema),
 });
 export type DocumentRecord = z.infer<typeof documentSchema>;
+
+/**
+ * A generated meeting summary, as `GET`/`POST /api/meetings/:id/documents` return it.
+ *
+ * **NO `number` FIELD, AND ITS ABSENCE IS THE DESIGN** -- see `documentTypeNumbered`
+ * for the three reasons. Spelled as an absent field rather than `number: null`
+ * because a summary does not have a number that happens to be unset: nothing
+ * allocates one, `document_number_sequences` has no row for this type and could not
+ * accept one, and a nullable field here would put a "no number yet" state into a
+ * client that would then have to render it.
+ *
+ * **NO CONTENT FIELDS EITHER, AND THAT IS THE TYPE WITH NO FORM SHOWING THROUGH.**
+ * The title, the date, the attendees and the notes are all on the `meetings` row
+ * this points at, so copying them here would be a second, staler copy of a record
+ * the client already has open -- and unlike a quote's recipient they were never
+ * snapshot at issue: a summary is not frozen, so there is nothing to preserve
+ * against a later edit. What is snapshot is the PDF, and `fileId` is how you read
+ * it.
+ *
+ * `frozen` is on the wire because the client has to know whether the thing it is
+ * looking at can be produced again, and deriving it from `type` in the client
+ * would be a fourth copy of a rule that already lives in two places.
+ *
+ * `z.boolean()` AND NOT `z.literal(false)`, which was the first spelling and is
+ * the wrong one. A summary is never frozen -- but the thing that guarantees it is
+ * `documents_frozen_matches_type`, in the database, where a violation is a refused
+ * INSERT. A literal here would move the noticing to the CLIENT's `parseWith`,
+ * which throws, i.e. a row the database accepted would blank a page in the browser
+ * instead of being caught where it was written. The column is reported, not
+ * asserted.
+ */
+export const meetingSummarySchema = z.object({
+  id: z.uuid(),
+  type: z.literal("meeting_summary"),
+  meetingId: z.uuid(),
+  fileId: z.uuid(),
+  issueDate: z.iso.date(),
+  frozen: z.boolean(),
+  issuedByUserId: z.uuid(),
+  createdAt: z.iso.datetime(),
+});
+export type MeetingSummaryRecord = z.infer<typeof meetingSummarySchema>;
 
 /**
  * THE RENDER BUDGET. Every number below was MEASURED against the shipped template,
