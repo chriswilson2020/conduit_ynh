@@ -67,6 +67,12 @@ import {
   type DocumentTemplateInput,
   type DocumentType,
   type IssueQuoteInput,
+  letterSchema,
+  type LetterRecord,
+  recordDocumentSchema,
+  type RecordDocument,
+  type RecordDocumentInput,
+  type RedraftLetterInput,
   type FolderPatchInput,
   folderRenameResultSchema,
   folderDeleteResultSchema,
@@ -2157,6 +2163,105 @@ export function useIssueMeetingSummary() {
     ),
     onSuccess: (_document: MeetingSummaryRecord, meetingId) => {
       void queryClient.invalidateQueries({ queryKey: ["meeting-documents", meetingId] });
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+    },
+  });
+}
+
+const recordDocumentListSchema = recordDocumentSchema.array();
+
+/**
+ * Which record a documents list belongs to. Exactly one, as a union rather than
+ * two optional keys, so "neither" is unspellable -- the service's `RecordTarget`
+ * for the same reason.
+ */
+export type DocumentRecordTarget = { companyId: string } | { contactId: string };
+
+function targetPath(target: DocumentRecordTarget): string {
+  return "companyId" in target
+    ? `/companies/${target.companyId}/documents`
+    : `/contacts/${target.contactId}/documents`;
+}
+
+function targetKey(target: DocumentRecordTarget): string {
+  return "companyId" in target ? target.companyId : target.contactId;
+}
+
+/**
+ * A company's or a contact's documents -- its letters and its agreements
+ * together, newest first.
+ *
+ * **ONE KEY AND ONE HOOK FOR BOTH RECORDS AND BOTH SHAPES**, which is the
+ * opposite of the split between `useDealDocuments` and `useMeetingSummaries` and
+ * is not an inconsistency. Those two are separate because they return DIFFERENT
+ * shapes from different routes -- a quote with money and lines, a summary with
+ * neither -- so pooling them would put two shapes under one cache entry and a
+ * parse that had to guess. This one returns a DISCRIMINATED UNION from a route
+ * that already mixes them, so the guessing is `type`'s job and the parser does
+ * it.
+ */
+export function useRecordDocuments(target: DocumentRecordTarget) {
+  const id = targetKey(target);
+  return useQuery({
+    queryKey: ["record-documents", id],
+    queryFn: async () => parseWith(
+      recordDocumentListSchema, await getJson<unknown>(targetPath(target)), "documents list",
+    ),
+    enabled: id !== "",
+  });
+}
+
+/**
+ * Write a letter or raise an agreement against a company or a contact.
+ *
+ * INVALIDATES FILES AND EVENTS FOR useIssueQuote's REASON: the PDF is an
+ * ordinary `files` row on the same record and it stamps a `file_attached` entry,
+ * so the rail's Files and Timeline tabs are stale the instant this returns.
+ */
+export function useIssueRecordDocument() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ target, input }: {
+      target: DocumentRecordTarget; input: RecordDocumentInput;
+    }) => parseWith(
+      recordDocumentSchema, await postJson<unknown>(targetPath(target), input), "document",
+    ),
+    onSuccess: (_document: RecordDocument, { target }) => {
+      void queryClient.invalidateQueries({ queryKey: ["record-documents", targetKey(target)] });
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+    },
+  });
+}
+
+/**
+ * **REDRAFT A LETTER. THE ONLY MUTATION IN THIS FILE THAT CHANGES AN ISSUED
+ * DOCUMENT**, and the reason `useIssueQuote`'s "there is deliberately no update
+ * or delete hook beside this one" is now a statement about the QUOTE rather than
+ * about documents.
+ *
+ * IT EXISTS FOR EXACTLY ONE TYPE AND THE SERVER IS WHAT SAYS SO. There is no
+ * client-side check that the document is a letter or that it is unfrozen: the
+ * service refuses a frozen document with a 409 and a sentence, and
+ * `conduit_document_frozen_guard` refuses it again in the database. A guard here
+ * as well would be a third copy of a rule, in the one place it can be bypassed
+ * with a developer console.
+ *
+ * THE WHOLE FORM, NOT A PATCH -- `RedraftLetterInput` is the issue schema minus
+ * its `type`, so a redraft cannot validate differently from the letter it
+ * replaces.
+ */
+export function useRedraftLetter() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ documentId, input }: {
+      documentId: string; target: DocumentRecordTarget; input: RedraftLetterInput;
+    }) => parseWith(
+      letterSchema, await putJson<unknown>(`/documents/${documentId}`, input), "letter",
+    ),
+    onSuccess: (_letter: LetterRecord, { target }) => {
+      void queryClient.invalidateQueries({ queryKey: ["record-documents", targetKey(target)] });
       void queryClient.invalidateQueries({ queryKey: ["files"] });
       void queryClient.invalidateQueries({ queryKey: ["events"] });
     },

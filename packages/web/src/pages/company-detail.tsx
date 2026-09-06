@@ -16,6 +16,7 @@ import {
 import { FieldCard, type FieldCardField } from "../components/field-card";
 import { OwnerSelect } from "../components/owner-select";
 import { Rail } from "../components/rail/rail";
+import { RecordDocumentsSection } from "../components/record-documents";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
@@ -335,6 +336,29 @@ export function CompanyDetailPage() {
             )}
           </ul>
         </section>
+
+        {/*
+          THE COMPANY'S LETTERS AND AGREEMENTS -- Phase 9 Task 3. A section on
+          the page rather than a sixth rail tab, which record-documents.tsx
+          argues at length (and flags for Task 4 to reconsider with four records
+          in front of it).
+
+          THE ADDRESSEE DEFAULTS COME OFF THE COMPANY ROW ALREADY IN HAND, which
+          is why there is no `defaultsInFlight` here and there is one on the
+          deal's form: a deal has to fetch its company and its contact to fill
+          the recipient, and this page IS the company. The named contact and the
+          salutation are deliberately left empty -- a company may have twenty
+          contacts and picking one for the operator would be a guess printed on
+          a letter.
+        */}
+        <RecordDocumentsSection
+          target={{ companyId }}
+          archived={company.archivedAt !== null}
+          defaultRecipientName={company.name}
+          defaultRecipientContactName=""
+          defaultRecipientSalutation=""
+          defaultRecipientAddress={company.address ?? ""}
+        />
       </div>
       <aside className="min-w-0 lg:w-1/3">
         <Rail companyId={companyId} />

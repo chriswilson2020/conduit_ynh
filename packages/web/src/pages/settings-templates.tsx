@@ -87,6 +87,38 @@ const ORG_FIELDS: readonly [string, string][] = [
   ["org.logoDataUri", "Your logo, as an image source"],
 ];
 
+/**
+ * **THE WARNING BELONGS HERE AND NOT ON THE PAGE.** The two agreements ship with
+ * a working default so that an NDA renders before anybody has opened Settings --
+ * that is the same reason every type has a seeded template -- but the wording of
+ * an agreement is a legal question and this product is not qualified to answer
+ * it. A note printed INSIDE the PDF saying so would be worse than useless: the
+ * PDF goes to the counterparty. So the caveat is shown to the one person who can
+ * act on it, standing in the editor that lets them.
+ */
+const AGREEMENT_CAVEAT = " The wording is a plain-language starting point and not"
+  + " legal advice; have it reviewed by your own advisers before you send one, and"
+  + " edit it here.";
+
+/**
+ * The two agreements name the same fields, because they take the same form and
+ * differ only in what their templates SAY about it. One list, for the reason
+ * ORG_FIELDS is one list: two copies would be two contracts, and the failure of
+ * the second to gain a field somebody added to the first is a blank on a signed
+ * page.
+ */
+const AGREEMENT_FIELDS: readonly [string, string][] = [
+  ...ORG_FIELDS,
+  ["document.number", "The allocated number, e.g. NDA-2026-0001"],
+  ["document.issueDate", "The day the agreement was produced"],
+  ["document.effectiveDate", "The date the obligations start"],
+  ["document.term", "How long they last, e.g. 36 months"],
+  ["document.jurisdiction", "The governing law"],
+  ["document.partyName", "The other party"],
+  ["document.partyContactName", "The individual they act through, or empty"],
+  ["document.partyAddress", "Their address, line breaks kept"],
+];
+
 const TEMPLATE_HELP: Record<DocumentType, TemplateHelp> = {
   quote: {
     label: "Quote",
@@ -138,6 +170,40 @@ const TEMPLATE_HELP: Record<DocumentType, TemplateHelp> = {
       note: "Wrap a row in {{#attendees}} ... {{/attendees}} and it repeats once per attendee.",
       fields: [["name", "The attendee's name"]],
     },
+  },
+  letter: {
+    label: "Letter",
+    blurb: "The HTML a letter is rendered from. The body is typed per letter; everything"
+      + " around it -- the letterhead, the greeting and the sign-off -- is here.",
+    fields: [
+      ...ORG_FIELDS,
+      ["document.issueDate", "The date on the letter"],
+      ["document.subject", "The subject line, or empty"],
+      ["document.recipientName", "Who the letter is addressed to"],
+      ["document.recipientContactName", "The named contact, or empty"],
+      ["document.recipientSalutation", "How that contact is addressed, or empty"],
+      ["document.recipientAddress", "Their address, line breaks kept"],
+      // THE SECOND EXCEPTION ON THIS PAGE, named for the summary's notes' reason:
+      // it is one of the two fields in the whole system whose value is markup
+      // rather than text, and somebody editing this template needs to know it
+      // brings its own paragraphs with it. There is no `{{document.bodyHtml}}` --
+      // the merge path is `body`, because a template is not the place to spell an
+      // implementation detail.
+      ["document.body", "The letter itself. Rich text: it arrives as formatted HTML, not plain text"],
+    ],
+  },
+  nda: {
+    label: "NDA",
+    blurb: "The HTML a one-way non-disclosure agreement is rendered from."
+      + AGREEMENT_CAVEAT,
+    fields: AGREEMENT_FIELDS,
+  },
+  mutual_nda: {
+    label: "Mutual NDA",
+    blurb: "The HTML a mutual non-disclosure agreement is rendered from. It differs from"
+      + " the one-way version only in wording: the obligations bind each party in respect"
+      + " of the other." + AGREEMENT_CAVEAT,
+    fields: AGREEMENT_FIELDS,
   },
 };
 
