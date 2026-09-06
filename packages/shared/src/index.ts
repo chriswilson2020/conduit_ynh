@@ -67,6 +67,20 @@ export type {
 // ticket, and routes/restore.ts refuses one that arrives anyway. One function,
 // two callers -- not two comparisons that agree today.
 export { installNameMatches } from "./install-name.js";
+// v1.9.0's ONE LIST OF WHAT THE EXPORT CONTAINS, reaching api and web the same
+// way the rules above do -- and for a sharper version of their reason. Those
+// are two judgements that must agree; this is FIVE hand-written lists that
+// agreed only by somebody remembering, and Phase 9 proved three times running
+// that somebody does not. The export writes these members, the importer explains
+// the ones it cannot read, and Settings tells the operator what is in the file:
+// three surfaces, one declaration. See the module for the full table of readers.
+export {
+  EXPORT_MEMBERS, EXPORT_MEMBER_NAMES, MEMBER_BY_TABLE, NOT_IMPORTED_MEMBERS,
+  exportMemberNouns, importedMembers,
+} from "./export-members.js";
+export type {
+  ExportMember, ExportMemberImport, ExportMemberName, ImportedMemberName,
+} from "./export-members.js";
 // IN SCOPE, not merely re-exported: the zod schema at the foot of this file is
 // held against this type by the compiler, and a `export type ... from` does not
 // bring the name into this module.
