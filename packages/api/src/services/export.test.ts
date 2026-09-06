@@ -991,6 +991,102 @@ describe("export documents", () => {
     const archivePath = cell(sheet, 0, "file_archive_path");
     expect(archivePath).toBe("files/Angebot QUO-2026-0007.pdf");
     expect(await readFile(path.join(root, archivePath), "utf8")).toBe("%PDF-1.7 quote");
+    // The two columns Phase 9 added, on a row that has neither. `frozen` stopped
+    // being derivable from `type` by a reader of the archive when freezing became
+    // per type, so it is a column rather than an inference.
+    expect(cell(sheet, 0, "meeting_id")).toBe("");
+    expect(cell(sheet, 0, "meeting_title")).toBe("");
+    expect(cell(sheet, 0, "frozen")).toBe("true");
+  });
+
+  /**
+   * **THE SHEET USED TO DROP THIS ROW ENTIRELY, SILENTLY.** documentsSheet joined
+   * `document_quotes` with an INNER JOIN, which was right while every document was
+   * a quote and became data loss the moment one was not: a meeting summary has no
+   * detail row, so it matched nothing and vanished from the one artefact whose
+   * justification is that an operator can read all of their data out of it. The
+   * join is a LEFT JOIN now and this is the test that says so.
+   */
+  itZip("exports a meeting summary, with its meeting named and its money columns blank", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme Ltd" });
+    const meeting = await createMeeting(handle.db, actorId, {
+      title: "Kickoff with Acme", occurredAt: "2026-09-01T13:30:00.000Z",
+      companyId: company.id, attendees: [],
+    });
+    const { sha256, sizeBytes } = await saveBlob(dataDir, Readable.from([Buffer.from("%PDF-1.7 summary")]));
+    const pdf = await attachFile(handle.db, actorId, {
+      originalName: "Meeting summary.pdf", mime: "application/pdf", sizeBytes, sha256,
+      meetingId: meeting.id,
+    });
+    await handle.db.insert(documentsTable).values({
+      number: null, type: "meeting_summary", meetingId: meeting.id, fileId: pdf.id,
+      issueDate: "2026-09-06", frozen: false, issuedByUserId: actorId,
+    });
+
+    const root = await extract(await writeArchive());
+    const sheet = await readSheet(root, "documents.csv");
+    expect(sheet.records).toHaveLength(1);
+    expect(cell(sheet, 0, "type")).toBe("meeting_summary");
+    expect(cell(sheet, 0, "meeting_id")).toBe(meeting.id);
+    expect(cell(sheet, 0, "meeting_title")).toBe("Kickoff with Acme");
+    expect(cell(sheet, 0, "frozen")).toBe("false");
+    // BLANK, NOT "0.00". A spreadsheet parses `0.00` as a number and would sum it
+    // into a column total -- a figure about documents that have no figures.
+    for (const column of ["number", "deal_id", "currency", "subtotal", "tax", "total"]) {
+      expect(cell(sheet, 0, column), column).toBe("");
+    }
+    // ...and its page is still reachable from the row, which is the whole point of
+    // the sheet carrying a file_archive_path at all.
+    const archivePath = cell(sheet, 0, "file_archive_path");
+    expect(await readFile(path.join(root, archivePath), "utf8")).toBe("%PDF-1.7 summary");
+
+    // files.csv names the meeting too, or a meeting summary's PDF would be the one
+    // member of files/ whose every record column is blank.
+    const filesSheet = await readSheet(root, "files.csv");
+    expect(cell(filesSheet, 0, "meeting_id")).toBe(meeting.id);
+    expect(cell(filesSheet, 0, "meeting_title")).toBe("Kickoff with Acme");
+    expect(cell(filesSheet, 0, "company_id")).toBe("");
+  });
+
+  /**
+   * The order the sheet is written in, now that some rows have no number to order
+   * by. PostgreSQL sorts NULLs last in ASC, so the numbered documents keep the
+   * order a reader expects and created_at/id make the unnumbered tail
+   * deterministic rather than whatever the plan produced.
+   */
+  itZip("orders numbered documents first and the rest deterministically", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme Ltd" });
+    const { deal } = await makeDeal(handle.db, "Big Deal", company.id);
+    const meeting = await createMeeting(handle.db, actorId, {
+      title: "Kickoff", occurredAt: "2026-09-01T13:30:00.000Z",
+      companyId: company.id, attendees: [],
+    });
+    async function pdfFor(name: string, target: { dealId?: string; meetingId?: string }) {
+      const { sha256, sizeBytes } = await saveBlob(dataDir, Readable.from([Buffer.from(name)]));
+      return await attachFile(handle.db, actorId, {
+        originalName: name, mime: "application/pdf", sizeBytes, sha256, ...target,
+      });
+    }
+    const summaryPdf = await pdfFor("s1.pdf", { meetingId: meeting.id });
+    const quotePdf = await pdfFor("q1.pdf", { dealId: deal.id });
+    // The summary is written FIRST, so an ordering that fell back to insertion
+    // order would put it before the quote.
+    await handle.db.insert(documentsTable).values({
+      number: null, type: "meeting_summary", meetingId: meeting.id, fileId: summaryPdf.id,
+      issueDate: "2026-09-06", frozen: false, issuedByUserId: actorId,
+    });
+    const [quote] = await handle.db.insert(documentsTable).values({
+      number: "QUO-2026-0001", type: "quote", dealId: deal.id, fileId: quotePdf.id,
+      issueDate: "2026-09-05", frozen: true, issuedByUserId: actorId,
+    }).returning();
+    await handle.db.insert(documentQuotesTable).values({
+      documentId: quote!.id, currency: "EUR", recipientName: "Acme Ltd",
+      subtotalCents: 100, taxCents: 21, totalCents: 121,
+    });
+
+    const sheet = await readSheet(await extract(await writeArchive()), "documents.csv");
+    expect(sheet.records.map((_r, i) => cell(sheet, i, "type")))
+      .toEqual(["quote", "meeting_summary"]);
   });
 });
 

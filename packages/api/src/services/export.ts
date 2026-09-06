@@ -83,9 +83,10 @@ import { csvDocument } from "./csv.js";
 // mail_attachments.blob_path addresses blobs in the same content-addressed
 // directory that files.sha256 does. Reading the DIRECTORY would sweep up every
 // attachment of every message; reading the TABLE gets uploaded files and issued
-// quote PDFs and nothing else. (An issued quote's PDF is an ordinary `files`
-// row against its deal -- see documents.file_id -- so "the stored files and
-// issued quote PDFs" of the spec is one query, not two.)
+// document PDFs and nothing else. (An issued document's PDF is an ordinary
+// `files` row against the record the document belongs to -- its deal for a
+// quote, its meeting for a summary since Phase 9 -- see documents.file_id, so
+// "the stored files and issued quote PDFs" of the spec is one query, not two.)
 
 /**
  * The layout version of the archive itself, bumped when a member is renamed,
@@ -332,8 +333,16 @@ function createNamer(): (originalName: string) => string {
 // count in a comment above a list is a number that drifts the first time the
 // list grows.
 
-/** A nullable text column. NULL and the empty string both become empty. */
-function text(value: string | null): string {
+/**
+ * A nullable text column. NULL and the empty string both become empty.
+ *
+ * `undefined` too, since Phase 9: documents.csv LEFT JOINs `document_quotes`, so
+ * its quote cells arrive through an optional chain and are `string | undefined`
+ * rather than `string | null`. Widening the parameter keeps every such cell going
+ * through the one formatter instead of sprouting `?? null` at the call sites,
+ * which is the arrangement this block exists to hold.
+ */
+function text(value: string | null | undefined): string {
   return value ?? "";
 }
 
@@ -650,35 +659,67 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
   const rows = await db
     .select({
       doc: documents, quote: documentQuotes,
-      dealTitle: deals.title, issuedByUsername: users.username,
+      dealTitle: deals.title, meetingTitle: meetings.title, issuedByUsername: users.username,
     })
     .from(documents)
-    // INNER, where the other two joins are LEFT, and the asymmetry is the point:
-    // a deal or an issuer can be missing and every other cell in the row is
-    // still true, but a document with no document_quotes row is not a quote and
-    // this sheet has a currency and three money columns it could not fill. The
-    // header below is a quote's header; when a second type has rows, this file
-    // needs a decision about what its sheet looks like rather than a join that
-    // quietly emits blanks in the money columns.
-    .innerJoin(documentQuotes, eq(documentQuotes.documentId, documents.id))
+    // **LEFT SINCE PHASE 9, AND THIS IS THE DECISION THE OLD COMMENT ASKED FOR.**
+    // It was an INNER JOIN, with a note saying "the header below is a quote's
+    // header; when a second type has rows, this file needs a decision about what
+    // its sheet looks like rather than a join that quietly emits blanks in the
+    // money columns". The second type has rows. An INNER JOIN now DROPS every
+    // meeting summary from the export -- silently, from the one artefact whose
+    // whole justification is that an operator can read all of their data out of
+    // it -- and that is a worse outcome than a blank cell.
+    //
+    // WHAT MAKES THE BLANKS HONEST RATHER THAN QUIET is the `type` column, which
+    // was always here: a row saying `meeting_summary` with no currency and no
+    // totals is describing a document that has none, and the reader can see which
+    // it is. The objection the old comment raised -- a quote whose money silently
+    // went missing -- is not reachable through this join: `document_quotes.document_id`
+    // is the primary key AND the foreign key, written in the same transaction as
+    // its `documents` row, so a quote without a detail row does not occur.
+    //
+    // ONE ROW PER DOCUMENT, and the alternative was two sheets (a common
+    // documents.csv plus a document_quotes.csv, mirroring the tables). Rejected:
+    // it moves eleven columns an operator already knows out of the file they are
+    // in, to spare some blanks in a file that has `type` in the third column.
+    .leftJoin(documentQuotes, eq(documentQuotes.documentId, documents.id))
     .leftJoin(deals, eq(documents.dealId, deals.id))
+    .leftJoin(meetings, eq(documents.meetingId, meetings.id))
     .leftJoin(users, eq(documents.issuedByUserId, users.id))
-    .orderBy(documents.number);
+    // `number` still leads, because for a numbered type it is the order a reader
+    // expects. It is NULL for every summary and PostgreSQL sorts those last, so
+    // created_at and id are what make the unnumbered tail deterministic rather
+    // than whatever the plan produced.
+    .orderBy(documents.number, documents.createdAt, documents.id);
   return {
     name: "documents.csv",
     header: [
-      "id", "number", "type", "deal_id", "deal_title", "currency",
+      "id", "number", "type", "deal_id", "deal_title", "meeting_id", "meeting_title", "currency",
       "issue_date", "valid_until_date",
       "recipient_name", "recipient_contact_name", "recipient_salutation", "recipient_address",
       "subtotal", "tax", "total", "notes", "terms",
-      "issued_by_user_id", "issued_by_username", "file_id", "file_archive_path", "created_at",
+      "frozen", "issued_by_user_id", "issued_by_username", "file_id", "file_archive_path", "created_at",
     ],
     rows: rows.map((r) => [
-      r.doc.id, r.doc.number, r.doc.type, text(r.doc.dealId), text(r.dealTitle), r.quote.currency,
-      r.doc.issueDate, text(r.quote.validUntilDate),
-      r.quote.recipientName, r.quote.recipientContactName, r.quote.recipientSalutation, r.quote.recipientAddress,
-      money(r.quote.subtotalCents), money(r.quote.taxCents), money(r.quote.totalCents),
-      r.quote.notes, r.quote.terms,
+      r.doc.id, text(r.doc.number), r.doc.type,
+      text(r.doc.dealId), text(r.dealTitle), text(r.doc.meetingId), text(r.meetingTitle),
+      text(r.quote?.currency),
+      r.doc.issueDate, text(r.quote?.validUntilDate),
+      text(r.quote?.recipientName), text(r.quote?.recipientContactName),
+      text(r.quote?.recipientSalutation), text(r.quote?.recipientAddress),
+      // The three money cells are BLANK rather than 0.00 for a type that has no
+      // money -- which is what `money(null)` already does, and the reason is
+      // arithmetic rather than tidiness: a spreadsheet parses `0.00` as a number
+      // and would sum it into a column total, producing a figure about documents
+      // that have no figures.
+      money(r.quote?.subtotalCents ?? null),
+      money(r.quote?.taxCents ?? null),
+      money(r.quote?.totalCents ?? null),
+      text(r.quote?.notes), text(r.quote?.terms),
+      // Phase 9 made this per type, so it stopped being derivable from `type` by
+      // anyone reading the archive without the source in front of them.
+      r.doc.frozen ? "true" : "false",
       r.doc.issuedByUserId, text(r.issuedByUsername), r.doc.fileId,
       // The issued PDF's member path, so a reader can get from a quote number
       // to the page that was sent without opening every file in files/.
@@ -717,6 +758,12 @@ interface ExportFile {
   dealTitle: string | null;
   projectId: string | null;
   projectName: string | null;
+  // Phase 9's fifth parent. Without these two columns a meeting summary's PDF is
+  // the one member of files/ whose four record cells are all blank -- which is
+  // exactly the "a folder of documents with nothing saying which company each
+  // belongs to" that filesSheet exists to prevent.
+  meetingId: string | null;
+  meetingTitle: string | null;
   createdAt: Date;
 }
 
@@ -741,7 +788,7 @@ async function collectFiles(db: Database, dataDir: string): Promise<ExportFile[]
     .select({
       f: files, uploaderUsername: users.username, companyName: companies.name,
       contactFirstName: contacts.firstName, contactLastName: contacts.lastName,
-      dealTitle: deals.title, projectName: projects.name,
+      dealTitle: deals.title, projectName: projects.name, meetingTitle: meetings.title,
     })
     .from(files)
     .leftJoin(users, eq(files.uploaderUserId, users.id))
@@ -749,6 +796,7 @@ async function collectFiles(db: Database, dataDir: string): Promise<ExportFile[]
     .leftJoin(contacts, eq(files.contactId, contacts.id))
     .leftJoin(deals, eq(files.dealId, deals.id))
     .leftJoin(projects, eq(files.projectId, projects.id))
+    .leftJoin(meetings, eq(files.meetingId, meetings.id))
     .orderBy(files.createdAt, files.id);
 
   const nameFor = createNamer();
@@ -794,6 +842,8 @@ async function collectFiles(db: Database, dataDir: string): Promise<ExportFile[]
       dealTitle: r.dealTitle,
       projectId: r.f.projectId,
       projectName: r.projectName,
+      meetingId: r.f.meetingId,
+      meetingTitle: r.meetingTitle,
       createdAt: r.f.createdAt,
     });
   }
@@ -819,13 +869,15 @@ function filesSheet(exportFiles: readonly ExportFile[]): Sheet {
       "id", "original_name", "archive_path", "mime", "size_bytes", "sha256",
       "uploader_user_id", "uploader_username",
       "company_id", "company_name", "contact_id", "contact_name",
-      "deal_id", "deal_title", "project_id", "project_name", "created_at",
+      "deal_id", "deal_title", "project_id", "project_name",
+      "meeting_id", "meeting_title", "created_at",
     ],
     rows: exportFiles.map((f) => [
       f.id, f.originalName, f.archivePath, f.mime, String(f.sizeBytes), f.sha256,
       f.uploaderUserId, text(f.uploaderUsername),
       text(f.companyId), text(f.companyName), text(f.contactId), f.contactName,
       text(f.dealId), text(f.dealTitle), text(f.projectId), text(f.projectName),
+      text(f.meetingId), text(f.meetingTitle),
       timestamp(f.createdAt),
     ]),
   };
