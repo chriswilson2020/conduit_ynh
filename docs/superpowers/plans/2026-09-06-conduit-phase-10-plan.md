@@ -192,6 +192,121 @@ because the seven that already had one still clear the bar. Tightened to an exac
 **The fix is one shared list of members that all four read**, and it is a real change to a
 shipped format rather than a tidy-up, so it is written down here rather than done in passing.
 
+### The fix, as built — `@conduit/shared`'s `EXPORT_MEMBERS`
+
+**IT WAS TEN PLACES, NOT FOUR.** The note above counts four hand-written lists plus one weak
+assertion, which is what Task 1 found from the product side. Counted properly while building
+the fix, the same ten member names were typed out in **ten** places — three in the product
+(`services/export.ts`, `services/import-export.ts`, `settings-data.tsx`) and seven in the
+tests (`e2e/data.spec.ts`, `routes/import.test.ts`'s count, `routes/export.test.ts`'s readdir
+list, `services/import-export.test.ts`'s ordered skip list, and **three in
+`services/export.test.ts`** — the member list, the manifest member count, and the thirteen-entry
+`EXPORTED` map that Task 1 had just added as the guard). The guard was itself a copy. All
+seven test copies fail loudly when they go stale — the one that did not,
+`toBeGreaterThanOrEqual(7)`, Task 1 had already tightened — so they were nuisances rather than
+hazards. The silent one was the product's third: the Settings sentence.
+
+**One list; ten entries; four fields each** — the member's path in the archive, the schema
+tables it carries (`documents.csv` carries four), the noun the operator reads, and whether the
+exact importer reads it back. The last is a **union**, not a flag beside an optional reason:
+`{ imported: true } | { imported: false, notImported: string }`, so an unimported member
+cannot exist without the sentence the preview shows, and an imported one cannot carry prose
+nobody will ever see.
+
+**What now derives, and what each one is compared against.** The point is that not one of
+them is compared against another copy of the list:
+
+| place | before | now |
+|---|---|---|
+| `services/export.ts` | an array of ten thunks | `Record<ExportMemberName, builder>` — **a member with no builder does not compile** |
+| `services/import-export.ts` | `NOT_IMPORTED`, eight hand-written entries | `NOT_IMPORTED_MEMBERS`, derived |
+| `settings-data.tsx` | a typed sentence, **untested** | renders `EXPORT_ARCHIVE_SUMMARY`, composed from the nouns |
+| `e2e/data.spec.ts` | eight member names typed out | the declaration, walked against the real preview |
+| `routes/import.test.ts` | `toBe(8)` | `toBe(NOT_IMPORTED_MEMBERS.length)` |
+| `services/export.test.ts` | a members list, a count, and a 13-entry `EXPORTED` map | all three derived; the map is `MEMBER_BY_TABLE` |
+| `routes/export.test.ts` | a sorted readdir list | the declaration plus `files/` and the manifest |
+
+**THE COMPILER HOLDS THE FIRST ONE, WHICH IS A DIFFERENT KIND OF GUARANTEE FROM A TEST.**
+`EXPORT_MEMBERS` is `as const satisfies`, so the member names survive as literal types; adding
+an entry with no builder in `services/export.ts` is `TS2741: Property '"invoices.csv"' is
+missing`. Nothing has to run, and nobody has to remember.
+
+**AND DELETION IS HELD FROM THE OTHER END.** Deriving everything from one list creates an
+obvious new failure: remove a member and every reader stops expecting it, in unison. What does
+not stop is `describe("export coverage")`, because what IT compares the list against is the
+database's own catalogue — the orphaned table is then carried by no member and declared
+unexported by nobody, and it fails by name. Adding a table and deleting a member are both
+caught, at opposite ends of the same list.
+
+**THE OPERATOR'S SENTENCE, WHICH IS THE ONE THAT MATTERED.** It is now
+`EXPORT_ARCHIVE_SUMMARY` in `settings-data-lib.ts` — the whole paragraph, not a list
+interpolated into prose that could still describe the archive wrongly. `settings-data.tsx`
+renders it and nothing else, and two tests hold that: one checks the sentence names every
+member in archive order, and one **reads `settings-data.tsx` off disk** and fails if the card
+contains `EXPORT_MEMBERS`' nouns as literal text. That second test is unusual and is the only
+thing that can catch the mutation Task 1 recorded as surviving the entire suite; it was
+watched failing against the page's own pre-v1.9.0 paragraph before the page was changed. e2e
+asserts the rendered card names every member, so a page that stopped rendering the derived
+sentence is red in CI as well.
+
+**`files.csv` GAINED A NOUN, WHICH CHANGES THE SENTENCE AN OPERATOR READS.** The old copy
+listed nine record types and then said "plus every file you have uploaded" — so the archive's
+TENTH sheet, the index that says which company each stored file belongs to, was not mentioned
+at all. Every member now contributes a noun, because a member that contributes none is
+invisible again by construction.
+
+**NO EXPORT BYTES CHANGED.** `EXPORT_FORMAT_VERSION` stays at 1; no member was added, removed
+or renamed; the order is the old build list's order. `Sheet` lost its `name` field — the
+member it is written as is now the key it was fetched under, so a sheet cannot disagree with
+its own filename — and no `*Sheet` body changed otherwise (the diff is ten deleted
+`name: "….csv",` lines and nothing else inside those functions).
+
+**MEASURED RATHER THAN ARGUED.** A scratch probe built an export over an empty database with a
+fixed `now` and appVersion, at this commit and with `services/export.ts` swapped back to its
+pre-change version, and printed the manifest and every sheet's header row. The two are
+identical: same ten members, same order, same byte counts, same SHA-256s, `formatVersion` 1.
+
+```
+companies.csv 120 3a045de174836489   notes.csv        145 42fe6d83beec5530
+contacts.csv  166 32c8e49ba48d85c7   meetings.csv     217 ff1260ea43793f7c
+deals.csv     234 97ebf2b2499e7448   time_entries.csv 219 da52526bc6732fab
+projects.csv  151 15556aee35f3d206   documents.csv    642 1ff2537be7a0321c
+tasks.csv     258 7c84fea6fc0fe4c0   files.csv        219 68f0693ccf2c9d70
+```
+
+An empty database is what makes the comparison exact — every row this export writes carries a
+generated uuid and a wall-clock timestamp, so a seeded one could only ever be compared
+loosely. What it holds is the members, their order, and every header; what it cannot see is
+row rendering, which no line of this change touches.
+
+### Mutation evidence
+
+**Twelve mutations, run one at a time against the isolated remote, with the vitest exit status
+captured BEFORE anything was piped anywhere** — Phase 9's harness lost one to a `| tail` and
+recorded a survivor as a kill. The mutator refuses to edit unless its search string occurs
+exactly once in the target file, so a mutation that applied to nothing is an error here rather
+than a green result. Watched failing AND watched passing: the control below was run first.
+
+| mutation | answered by |
+|---|---|
+| **the operator's sentence typed out again in the page, derivation dropped** | `settings-data-lib.test.ts` — "expected … to contain `{EXPORT_ARCHIVE_SUMMARY}`". **This is the mutation Task 1 recorded as surviving the entire suite.** |
+| the sentence typed out again BESIDE the derived one | the same test's noun scan, by name: `"companies" is typed into the export card` |
+| `exportMemberNouns` drops the last noun | the shared test and the summary test, both naming `documents.csv` |
+| **a member added to the list with no builder** | `tsc` (exit 2): `TS2741: Property '"invoices.csv"' is missing … but required in type 'Record<…>'`. Nothing had to run. |
+| **a member deleted from the list, builder and all** | `describe("export coverage")`: `expected [ 'time_entries' ] to deeply equal []`. `tsc` is silent here, which is exactly why the catalogue guard is load-bearing. |
+| a member claiming a table the database has not got | the same guard, naming `files` |
+| the archive written in the wrong order | "contains every entity sheet and a manifest" — the manifest's member order |
+| the importer drops one of its "not imported" notes | `routes/import.test.ts` (`expected 7 to be 8`) and `services/import-export.test.ts` (the ordered list) |
+| **a member declared `imported: true` that the importer never opens** | `applyImport`'s `opened`, compared against `importedMembers()` |
+| **a member the importer DOES read, declared `imported: false`** | `tsc` (exit 2): `Type '"contacts.csv"' is not assignable to type '"companies.csv"'` |
+| a comment-only change (**the control**) | green, watched first, so a red result afterwards means something |
+
+**WHAT CANNOT FAIL, AND SHOULD NOT.** Adding a member to the list and writing its builder
+makes no test go red — the import preview's note, the Settings sentence, the archive's member
+list, the coverage map and the e2e journey all follow it. That is the deliverable, not a gap:
+the guards fire on *inconsistency*, and after this change there is nothing left to be
+inconsistent with.
+
 ### The journal trap: sixth time, and it cost nothing
 
 `drizzle-kit generate` stamped 0021's `when` as **1788718705895** (2026-09-06T18:18Z, the
