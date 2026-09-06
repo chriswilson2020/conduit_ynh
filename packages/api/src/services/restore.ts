@@ -980,10 +980,10 @@ async function runPsqlLoad(options: {
     };
 
     child.on("close", (code) => { closed = { code: code ?? -1 }; finish(); });
-    // NO `stdin.on("error")` HERE, AND THE ABSENCE IS DELIBERATE -- the other
-    // 7z sites in this package have one, so the next person auditing for the
-    // missing handler needs the answer at the line rather than a fourth copy of
-    // it. `pipeline` below attaches its own 'error' listener to `child.stdin`,
+    // NO `stdin.on("error")` HERE, AND THE ABSENCE IS DELIBERATE -- the four
+    // other spawn sites in this package have one, so the next person auditing
+    // for a missing handler needs the answer at the line rather than a fifth
+    // copy of it. `pipeline` below attaches its own 'error' listener to stdin,
     // synchronously on this same tick, and a socket reports a failed write
     // asynchronously -- so it is registered before anything this write can emit.
     // MEASURED with this exact shape against a child that exits without reading
@@ -1076,9 +1076,9 @@ export async function proveArchiveOpens(
     // caller to say what was actually wrong with it.
     //
     // WHEN THE WRITE CAN FAIL, MEASURED ON THE DEPLOY TARGET (7-Zip 26.02 via
-    // p7zip 16.02, node 24.19), 10 runs per cell. 7z reads NOTHING from stdin in
-    // any of these three before exiting -- `t` on a truncated .7z, `l` on a file
-    // that is not an archive, `l` on an unencrypted one:
+    // p7zip 16.02, node 24.19). 7z reads NOTHING from stdin in any of these
+    // three before exiting -- `t` on a truncated .7z, `l` on a file that is not
+    // an archive, `l` on an unencrypted one:
     //
     //     28 bytes .. EPIPE  0/70    256 KiB .. EPIPE 30/30
     //     128 KiB ... EPIPE  0/40    1 MiB .... EPIPE 30/30
