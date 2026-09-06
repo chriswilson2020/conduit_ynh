@@ -508,13 +508,31 @@ describe("mergeTemplate emits a MergeHtml value unescaped, and only that", () =>
   });
 
   it("treats a wrapped value as a scalar in a block, not as a scope", () => {
-    // The summary template's own shape. If the wrapper were pushed as a scope,
-    // the inner field would resolve against it and print nothing -- a heading
-    // over a blank, which is the failure this module is written against.
+    // The summary template's own shape.
     expect(mergeTemplate(
       "{{#document.notes}}<h2>Notes</h2>{{document.notes}}{{/document.notes}}",
       withDocument({ notes: new MergeHtml("<p>hi</p>") }),
     )).toBe("<h2>Notes</h2><p>hi</p>");
+  });
+
+  /**
+   * **THE ASSERTION THAT MAKES THE SCALAR ARM LOAD-BEARING, AND IT WAS FOUND BY
+   * MUTATION RATHER THAN BY READING.** Replacing that arm with the scope-pushing
+   * one beside it was GREEN across this whole file: `lookup` walks the scope
+   * stack outward and the wrapper has no `document` key, so the case above
+   * resolves correctly either way and the arm looked like redundancy.
+   *
+   * What it really prevents is this: with the wrapper pushed as a scope, `{{html}}`
+   * inside the block resolves to the wrapper's own property and prints the raw
+   * markup, escaped, into the middle of the page. The block's scope is the
+   * DOCUMENT's, and a template naming an internal field of the merge machinery
+   * must get a blank like any other unknown path.
+   */
+  it("does not put the wrapper's own property in scope inside its block", () => {
+    expect(mergeTemplate(
+      "{{#document.notes}}[{{html}}]{{/document.notes}}",
+      withDocument({ notes: new MergeHtml("<b>x</b>") }),
+    )).toBe("[]");
   });
 
   it("counts an empty rich-text value as empty, tags and all", () => {

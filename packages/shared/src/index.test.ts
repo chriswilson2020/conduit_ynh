@@ -2601,10 +2601,30 @@ describe("formatDocumentInstant", () => {
     }
   });
 
-  it("is not the running process's timezone", () => {
-    // The day boundary is where a local-zone formatter would give itself away: this
-    // instant is the 2nd in UTC and the 1st in New York.
-    expect(formatDocumentInstant("2026-09-02T02:30:00.000Z")).toContain("2 September 2026");
+  /**
+   * **THIS TEST EXISTS BECAUSE THE OBVIOUS ONE CANNOT WORK, AND A MUTATION PROVED
+   * IT.** Deleting `timeZone: "UTC"` from the formatter was GREEN against an
+   * assertion that merely read the output, for the reason that ought to have been
+   * obvious: CI, the dev server and every developer machine here run at Etc/UTC,
+   * where "formatted in UTC" and "formatted in the process's zone" are the same
+   * string. The zone has to be moved for the two to be distinguishable.
+   *
+   * `process.env.TZ` IS RE-READ BY A FORMATTER CONSTRUCTED AFTERWARDS on Node 24,
+   * which is what CI and the server both run -- so the instant below, which is the
+   * 2nd in UTC and the 1st in New York, is where a local-zone formatter gives
+   * itself away. Restored in a `finally`, because leaving it set would silently
+   * change how every later test in this file reads a date.
+   */
+  it("is not the running process's timezone, even when that is not UTC", () => {
+    const original = process.env.TZ;
+    try {
+      process.env.TZ = "America/New_York";
+      expect(formatDocumentInstant("2026-09-02T02:30:00.000Z"))
+        .toBe("2 September 2026 at 02:30 UTC");
+    } finally {
+      if (original === undefined) delete process.env.TZ;
+      else process.env.TZ = original;
+    }
   });
 
   it("spells the month as a word, because 08/09 means two different days", () => {

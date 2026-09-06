@@ -325,6 +325,30 @@ describe("the summary's content is the meeting, and the notes are markup", () =>
     expect(html).not.toContain("etc/passwd");
   });
 
+  /**
+   * **THE ASSERTION THAT MAKES THE FIRST SANITISER PASS OBSERVABLE, AND IT WAS
+   * FOUND BY MUTATION.** Removing `sanitizeDocumentHtml` from the service and
+   * letting the stored notes into the context raw was GREEN across this file: the
+   * merged PAGE is sanitised too, so the script came out either way and the test
+   * above could not tell the two arrangements apart.
+   *
+   * What the earlier pass really decides is EMPTINESS. `isEmpty` asks a rich-text
+   * value for its text, and a note that is nothing but markup this profile removes
+   * has no text at all -- so sanitising first makes the template take its
+   * `{{^document.notes}}` branch and SAY there were no notes. Sanitising only at
+   * the end leaves a non-empty value at merge time, the `{{#document.notes}}`
+   * branch renders, and the page gets an empty box under a heading with no
+   * sentence explaining it.
+   */
+  it("treats notes that sanitise away to nothing as no notes at all", async () => {
+    await handle.db.update(meetings).set({ notes: "<script>alert(1)</script>" })
+      .where(eq(meetings.id, meetingId));
+
+    const html = await mergedHtml();
+    expect(html).toContain("No notes were recorded.");
+    expect(html).not.toContain("alert(1)");
+  });
+
   it("escapes the title, which is plain text in a text input", async () => {
     await handle.db.update(meetings).set({ title: "Q3 <b>review</b> & plan" })
       .where(eq(meetings.id, meetingId));
@@ -423,7 +447,11 @@ describe("the summary's content is the meeting, and the notes are markup", () =>
   });
 
   it("omits the duration row when the meeting has none, and prints it when it has", async () => {
-    expect(await mergedHtml()).toContain("45 minutes");
+    // THE CELL, NOT THE SUBSTRING. `toContain("1 minute")` is satisfied by
+    // "1 minutes" -- which is exactly what a mutation removing the singular
+    // produced, and it was GREEN until this assertion was closed round the cell
+    // the template actually prints.
+    expect(await mergedHtml()).toContain("<td>45 minutes</td>");
 
     await handle.db.update(meetings).set({ durationMinutes: null })
       .where(eq(meetings.id, meetingId));
@@ -431,7 +459,7 @@ describe("the summary's content is the meeting, and the notes are markup", () =>
 
     await handle.db.update(meetings).set({ durationMinutes: 1 })
       .where(eq(meetings.id, meetingId));
-    expect(await mergedHtml()).toContain("1 minute");
+    expect(await mergedHtml()).toContain("<td>1 minute</td>");
   });
 
   /**
