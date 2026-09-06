@@ -523,10 +523,73 @@ export interface MergeLine {
   lineTotal: string;
 }
 
+/** One person who was at the meeting, as the summary prints them. */
+export interface MergeAttendee {
+  name: string;
+}
+
+/**
+ * A value that is ALREADY HTML and must not be escaped again.
+ *
+ * **THE ONE CASE THAT NEEDS IT IS THE MEETING SUMMARY'S NOTES**, which are TipTap
+ * rich text stored as HTML on `meetings.notes`. Escaped like every other merge
+ * value they would print as the literal characters `<p>Agreed to...`, so the
+ * summary needs the markup to survive the merge -- and the Phase 9 spec says so:
+ * the notes "go through the existing sanitiser rather than a new path".
+ *
+ * **WHICH VALUES ARE RAW IS DECIDED BY THE CONTEXT, NOT BY THE TEMPLATE, AND THAT
+ * IS THE WHOLE DESIGN.** The obvious alternative is Mustache's triple brace --
+ * `{{{document.notes}}}` -- and it is the wrong one here for a reason that is
+ * specific to this codebase: templates are edited in Settings by any
+ * authenticated user, and this module's own header records that "authenticated"
+ * is not "trusted" (a reviewer read a mode-600 key off the server through a
+ * template during Phase 7's spec review). A template-side escape hatch would let
+ * that editor write `{{{document.recipientName}}}` and turn a CRM text field into
+ * a markup injection into a document rendered by a subprocess. With the decision
+ * on this side, the set of raw values is whatever `buildContext` constructs, in
+ * code, reviewable in one place -- and a template that names a raw field gets raw
+ * HTML whichever brace count it uses, because there is only one.
+ *
+ * IT IS STILL SANITISED, TWICE. The value is passed through
+ * `sanitizeDocumentHtml` before it is put in the context (see
+ * services/documents.ts), because the fragment arrives from a DIFFERENT profile
+ * -- meetings.notes is sanitised on write with the MAIL profile, which allows and
+ * forbids a different set -- and then `prepareDocumentHtml` sanitises the merged
+ * page, which is what re-balances any tag the fragment left open and is the
+ * control that would hold even if the first pass were removed.
+ *
+ * A CLASS RATHER THAN `{ html: string }`, so nothing can arrive here by
+ * structural accident: `instanceof` is a fact about who constructed the value,
+ * where a shape test would make any bag with an `html` string key emit raw
+ * markup. `lookup` can still reach `.html` (a template writing
+ * `{{document.notes.html}}` gets the string) and that is harmless -- it takes the
+ * ordinary escaping path, which is the safe one.
+ */
+export class MergeHtml {
+  constructor(readonly html: string) {}
+}
+
+/** Everything a merge field may resolve to. */
+export type MergeValue = string | MergeHtml;
+
 export interface MergeContext {
   org: Record<string, string>;
-  document: Record<string, string>;
+  /**
+   * `MergeValue`, not `string`, and only here: the letterhead above is the
+   * issuer's own profile fields and none of them is markup, so widening `org`
+   * would be permission granted to nobody.
+   */
+  document: Record<string, MergeValue>;
   lines: MergeLine[];
+  /**
+   * The meeting summary's attendees. OPTIONAL, where `lines` is not, because
+   * `lines` predates this and every existing context supplies it; a context
+   * without this key makes `{{#attendees}}` render nothing and
+   * `{{^attendees}}` render its body, which is exactly what an absent
+   * collection should do. A second collection beside `lines` is also the
+   * cheapest available proof that the block machinery was never quote-specific.
+   */
+  attendees?: MergeAttendee[];
 }
 
 /** A template that cannot produce a document at all, as opposed to one with a typo. */
@@ -847,10 +910,32 @@ function lookup(scopes: unknown[], segments: string[]): unknown {
 function isEmpty(value: unknown): boolean {
   if (value === undefined || value === null) return true;
   if (typeof value === "string") return value.trim() === "";
+  // BEFORE isBag, which would otherwise call it non-empty for having one own
+  // property. The trim is what makes `{{#document.notes}}Notes{{/document.notes}}`
+  // behave the same for rich text as for plain: an emptied TipTap editor stores
+  // `<p></p>`, which is markup and is nothing, so the heading must not print over
+  // it -- and a sanitiser that removed everything leaves "" here.
+  if (value instanceof MergeHtml) return stripTags(value.html).trim() === "";
   if (typeof value === "boolean") return !value;
   if (Array.isArray(value)) return value.length === 0;
   if (isBag(value)) return Object.keys(value).length === 0;
   return false;
+}
+
+/**
+ * The text inside a fragment, for the emptiness test above and nothing else.
+ *
+ * NOT A SANITISER AND NEVER USED AS ONE. It is deliberately crude -- everything
+ * between `<` and `>` goes -- because the only question asked of its output is
+ * whether any non-space character survives. `<p></p>`, `<p><br></p>` and
+ * `<div>\n</div>` are the three shapes an emptied rich-text editor actually
+ * stores and all three answer "empty"; an `<img>` with no text answers "empty"
+ * too, which is the one wrong answer available and costs a heading over a
+ * picture. Getting that right would mean knowing which elements are void
+ * content, which is a parser, for a heading.
+ */
+function stripTags(html: string): string {
+  return html.replace(/<[^>]*>/g, "");
 }
 
 /** HTML-escape a substituted value. Includes `'`, since a template may use it. */
@@ -919,7 +1004,16 @@ function render(nodes: Node[], scopes: unknown[], sink: Sink, depth: number): vo
     }
     if (node.kind === "field") {
       const value = lookup(scopes, node.segments);
-      emit(sink, typeof value === "string" ? escapeHtml(value) : "");
+      if (typeof value === "string") {
+        emit(sink, escapeHtml(value));
+        continue;
+      }
+      // THE ONE PLACE MARKUP LEAVES THIS MODULE UNESCAPED, and it is reachable
+      // only for a value `buildContext` wrapped -- see MergeHtml for why the
+      // decision is the context's and not the template's. What follows it is
+      // `prepareDocumentHtml`'s sanitiser pass over the whole merged page, which
+      // is what closes the tags this fragment may have left open.
+      emit(sink, value instanceof MergeHtml ? value.html : "");
       continue;
     }
 
@@ -947,6 +1041,15 @@ function render(nodes: Node[], scopes: unknown[], sink: Sink, depth: number): vo
         spend(sink);
         render(node.body, [...scopes, item], sink, depth + 1);
       }
+    } else if (value instanceof MergeHtml) {
+      // A SCALAR, NOT A SCOPE, and the arm has to come before isBag or it would
+      // be one. `{{#document.notes}}<h2>Notes</h2>{{document.notes}}{{/...}}` is
+      // the shape the summary template uses, and pushing the wrapper as a scope
+      // would make the inner `{{document.notes}}` resolve against it and print
+      // nothing -- a heading over a blank, silently, which is the failure mode
+      // this whole module is written against.
+      spend(sink);
+      render(node.body, scopes, sink, depth + 1);
     } else if (isBag(value)) {
       spend(sink);
       render(node.body, [...scopes, value], sink, depth + 1);
@@ -975,6 +1078,11 @@ function render(nodes: Node[], scopes: unknown[], sink: Sink, depth: number): vo
  * AN UNKNOWN PATH RENDERS AS EMPTY AND NEVER THROWS. A template is edited by hand and
  * a typo must be a blank on a page, not a failed render an hour before a quote is
  * due. The single exception is MERGE_MAX_OUTPUT_CHARS -- see its comment.
+ *
+ * THERE IS NO FOURTH FORM FOR RAW HTML, and there deliberately never will be: a
+ * value is escaped or not according to what the CONTEXT wrapped it in (see
+ * MergeHtml), so `{{document.notes}}` prints markup while `{{document.title}}`
+ * beside it prints text, with the same braces. A template cannot ask for either.
  */
 export function mergeTemplate(template: string, context: MergeContext): string {
   const parsed = parse(template);
