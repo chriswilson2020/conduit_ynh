@@ -9,13 +9,13 @@ import {
   errorResponseSchema, listResponseSchema, searchResultsSchema,
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
-  meetingSchema, meetingDetailSchema, documentSchema, orgProfileSchema,
+  meetingSchema, meetingDetailSchema, meetingSummarySchema, documentSchema, orgProfileSchema,
   documentTemplateSchema, CONTACT_FIELD_CAPS, DOCUMENT_MAX_DESCRIPTION_CHARS,
   DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
-import { seededQuoteTemplate } from "../test/seed-template.js";
+import { seededMeetingSummaryTemplate, seededQuoteTemplate } from "../test/seed-template.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
 import { listFiles } from "../services/files.js";
 import { listEvents } from "../services/timeline.js";
@@ -2427,15 +2427,109 @@ describe("documents routes", () => {
     await a.close();
   });
 
+  /**
+   * THE MEETING SUMMARY'S PAIR: the type with no form, at the HTTP layer.
+   *
+   * The POST carries NO BODY, which is the whole point -- everything printed is on
+   * the meeting and the URL says which one. So there is no input schema to reject
+   * and no 400 to test; what is worth testing is that the empty request really is
+   * accepted, that the PDF comes back through the route that already existed, and
+   * that the type's own rules survive the round trip.
+   */
+  async function makeMeeting(a: Awaited<ReturnType<typeof app>>): Promise<{ id: string }> {
+    const company = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    const created = await a.inject({
+      method: "POST", url: "/api/meetings", headers: authHeaders,
+      payload: {
+        title: "Kickoff with Acme", occurredAt: "2026-09-01T13:30:00.000Z",
+        notes: "<p>Agreed to ship on the 3rd.</p>",
+        companyId: (company.json() as { id: string }).id,
+        attendees: [{ guestName: "Their lawyer" }],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    return created.json() as { id: string };
+  }
+
+  it("generates a meeting summary with no body at all, lists it, and serves its PDF", async () => {
+    await handle.db.insert(documentTemplates)
+      .values({ type: "meeting_summary", bodyHtml: seededMeetingSummaryTemplate() });
+    const a = await app();
+    const meeting = await makeMeeting(a);
+
+    const created = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/meetings/${meeting.id}/documents`, headers: authHeaders,
+      }));
+    expect(created.statusCode).toBe(201);
+    const summary = meetingSummarySchema.parse(created.json());
+    expect(summary).toMatchObject({ type: "meeting_summary", meetingId: meeting.id, frozen: false });
+    // The wire shape has no `number`, which is the type's decision made visible at
+    // the boundary rather than only in the row.
+    expect(created.json()).not.toHaveProperty("number");
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/meetings/${meeting.id}/documents`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(meetingSummarySchema).parse(listed.json())).toEqual([summary]);
+
+    // NO SECOND DOWNLOAD PATH, exactly as for a quote: the PDF is an ordinary
+    // files row -- on the MEETING, since Phase 9 -- and comes back through the
+    // route that already existed.
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${summary.fileId}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.headers["content-type"]).toContain("application/pdf");
+    expect(download.rawPayload.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(download.headers["content-disposition"]).toContain("Meeting summary");
+    await a.close();
+  });
+
+  it("answers 404 for a meeting that does not exist and 409 with no template", async () => {
+    const a = await app();
+
+    // 409 BEFORE 404 IN THIS TEST'S ORDER, deliberately: with no template row at
+    // all, a real meeting is the only way to reach the template read, and an
+    // install whose seeded row was deleted must get a message an operator can act
+    // on rather than a 500.
+    const meeting = await makeMeeting(a);
+    const noTemplate = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/meetings/${meeting.id}/documents`, headers: authHeaders,
+      }));
+    expect(noTemplate.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(noTemplate.json()).error).toBe("template_missing");
+
+    const missing = await a.inject({
+      method: "POST", url: `/api/meetings/${unknownId}/documents`, headers: authHeaders,
+    });
+    expect(missing.statusCode).toBe(404);
+
+    // An unparseable id is the uniform 400 rather than a 500 out of the driver.
+    const bad = await a.inject({
+      method: "GET", url: "/api/meetings/not-a-uuid/documents", headers: authHeaders,
+    });
+    expect(bad.statusCode).toBe(400);
+    await a.close();
+  });
+
   it("returns 401 without an identity header on every documents route", async () => {
     const a = await app();
     const calls = [
       { method: "GET" as const, url: `/api/deals/${unknownId}/documents` },
       { method: "POST" as const, url: `/api/deals/${unknownId}/documents` },
+      { method: "GET" as const, url: `/api/meetings/${unknownId}/documents` },
+      { method: "POST" as const, url: `/api/meetings/${unknownId}/documents` },
       { method: "GET" as const, url: "/api/org-profile" },
       { method: "PUT" as const, url: "/api/org-profile" },
       { method: "GET" as const, url: "/api/document-templates/quote" },
       { method: "PUT" as const, url: "/api/document-templates/quote" },
+      { method: "GET" as const, url: "/api/document-templates/meeting_summary" },
+      { method: "PUT" as const, url: "/api/document-templates/meeting_summary" },
     ];
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });

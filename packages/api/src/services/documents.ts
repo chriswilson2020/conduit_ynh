@@ -1,28 +1,30 @@
 import { Readable } from "node:stream";
-import { asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import {
-  documentTemplateInputSchema, documentTotals, documentTypeFreezes, formatMoneyCents,
-  formatQtyMilli,
+  documentTemplateInputSchema, documentTotals, documentTypeFreezes, formatDocumentInstant,
+  formatMoneyCents, formatQtyMilli,
   documentContentBytes, formatTaxRateBp, issueQuoteInputSchema, lineTotalCents,
   MAX_TEMPLATE_BYTES, renderInputCost, RENDER_IMAGE_CAP_BYTES, RENDER_IMAGE_PIXEL_CAP,
   RENDER_MARKUP_CAP_BYTES,
   type DocumentRecord, type DocumentTemplate, type DocumentTemplateInput,
-  type IssueQuoteInput, type OrgProfile,
+  type IssueQuoteInput, type MeetingSummaryRecord, type OrgProfile,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
-  deals, documentLineItems, documentQuotes, documents, documentTemplates,
+  contacts, deals, documentLineItems, documentQuotes, documents, documentTemplates,
+  meetingAttendees, meetings, users,
   type DocumentLineItemRow, type DocumentQuoteRow, type DocumentRow,
 } from "../db/schema.js";
 import { allocateNumber } from "./documents-number.js";
 import { renderPdf } from "./documents-render.js";
 import {
-  documentTemplateErrors, documentTemplateWarnings, prepareDocumentHtml,
+  documentTemplateErrors, documentTemplateWarnings, MergeHtml, prepareDocumentHtml,
   sanitizeDocumentHtml, type MergeContext,
 } from "./documents-template.js";
 import { getOrgProfile } from "./org-profile.js";
 import { saveBlob } from "./blobs.js";
 import { attachFile } from "./files.js";
+import { todayDateOnly } from "./scheduling.js";
 import { ArchivedError, NotFoundError } from "./errors.js";
 import { publish } from "./sse.js";
 
@@ -115,6 +117,16 @@ export interface IssueQuoteDeps {
 function toDocumentRecord(
   row: DocumentRow, quote: DocumentQuoteRow, lines: DocumentLineItemRow[], dealId: string,
 ): DocumentRecord {
+  // `documents.number` is nullable since 0017 and `DocumentRecord.number` is not,
+  // and this is where the two are reconciled. It cannot fire: this function is
+  // reached only for a row that HAS a `document_quotes` row (both call sites --
+  // issueQuote, which just wrote the pair, and listDocuments' INNER JOIN), and
+  // `documents_number_matches_type` says a quote has a number. Throwing rather
+  // than `?? ""` because a quote whose number vanished is a broken record and an
+  // empty string on a document list is a broken record nobody notices.
+  if (row.number === null) {
+    throw new Error(`document ${row.id} is a quote with no number, which two CHECKs forbid`);
+  }
   return {
     id: row.id,
     number: row.number,
@@ -192,20 +204,33 @@ export interface QuoteContextInput {
  * has no expressions, and it uses @conduit/shared's formatters rather than local ones
  * so the quote form's running total and this page cannot disagree about a locale.
  */
+/**
+ * The letterhead, which is the same nine fields on every type's page.
+ *
+ * Extracted when the second type arrived rather than copied: the `org` bag is a
+ * KEY SET, and the key set is the contract this file's suite checks against the
+ * tokens read out of each seeded template. Two copies would be two contracts, and
+ * the failure of the second to gain a field somebody added to the first is a
+ * blank on a printed page and nothing else.
+ */
+function orgContext(org: OrgProfile): Record<string, string> {
+  return {
+    name: org.name,
+    addressLines: org.addressLines,
+    email: org.email,
+    phone: org.phone,
+    website: org.website,
+    bankDetails: org.bankDetails,
+    vatNumber: org.vatNumber,
+    registrationNumber: org.registrationNumber,
+    logoDataUri: org.logoDataUri,
+  };
+}
+
 export function buildContext(input: QuoteContextInput): MergeContext {
   const money = (cents: number): string => formatMoneyCents(cents, input.currency);
   return {
-    org: {
-      name: input.org.name,
-      addressLines: input.org.addressLines,
-      email: input.org.email,
-      phone: input.org.phone,
-      website: input.org.website,
-      bankDetails: input.org.bankDetails,
-      vatNumber: input.org.vatNumber,
-      registrationNumber: input.org.registrationNumber,
-      logoDataUri: input.org.logoDataUri,
-    },
+    org: orgContext(input.org),
     document: {
       number: input.number,
       issueDate: input.issueDate,
@@ -231,6 +256,100 @@ export function buildContext(input: QuoteContextInput): MergeContext {
       lineTotal: money(line.lineTotalCents),
     })),
   };
+}
+
+/**
+ * A type's editable template body, or the 409 that says somebody deleted it.
+ *
+ * Read inside the caller's transaction, and read BEFORE anything is allocated or
+ * spawned: an install whose template row is gone must fail with a message an
+ * operator can act on, having spent nothing.
+ */
+async function loadTemplateBody(tx: Database, type: string): Promise<string> {
+  const [template] = await tx.select({ bodyHtml: documentTemplates.bodyHtml })
+    .from(documentTemplates).where(eq(documentTemplates.type, type));
+  if (template === undefined) throw new DocumentTemplateMissingError(type);
+  return template.bodyHtml;
+}
+
+/** What `renderAndStore` needs that differs between one document type and the next. */
+interface RenderAndStoreInput {
+  /** How the size refusals name this document: "quote", "meeting summary". */
+  noun: string;
+  templateHtml: string;
+  context: MergeContext;
+  /** Where the bytes came from, appended to every size refusal. */
+  provenance: string;
+  /** `files.original_name`, which is what a download is called. */
+  originalName: string;
+  /** Exactly one, matching the `documents` row this file is about to belong to. */
+  target: { dealId?: string; meetingId?: string };
+}
+
+/**
+ * Merge, check the three render caps, render, store the blob, and make the `files`
+ * row -- the part of issuing a document that is the same whatever the type is.
+ *
+ * EXTRACTED WHEN THE SECOND TYPE ARRIVED, and the three cap checks are the reason
+ * rather than the line count. They are the authoritative size gate (see
+ * DocumentTooLargeError), they are the only place a size failure can still be
+ * attributed to a field, and a second type that reimplemented them would sooner or
+ * later implement two of the three -- which is exactly the failure v1.0.1 added the
+ * third for: 12,227 bytes of PNG can be 100 megapixels, so a copy that counted only
+ * bytes would pass a document costing 535MB to render.
+ *
+ * THE NOUN IS A PARAMETER AND THE MESSAGES ARE NOT OTHERWISE TOUCHED. A quote's
+ * three refusals read exactly as they did in v1.7.2, which is what keeps the route
+ * suite's assertions about them meaningful.
+ */
+async function renderAndStore(
+  tx: Database, deps: IssueQuoteDeps, actorId: string, input: RenderAndStoreInput,
+) {
+  const html = prepareDocumentHtml(input.templateHtml, input.context);
+  // THE SAME THREE CAPS renderPdf ENFORCES, one layer up, where the failure can
+  // still be attributed to a field. Split the way they are because the answer to
+  // "what is too big" is different for each: shorten the text, use a smaller logo
+  // FILE, or use a logo with fewer PIXELS -- and the last of those is invisible in
+  // a byte count, which is why v1.0.0 could not have said it.
+  const cost = renderInputCost(html);
+  if (cost.markupBytes > RENDER_MARKUP_CAP_BYTES) {
+    throw new DocumentTooLargeError(
+      `this ${input.noun} merges to ${String(cost.markupBytes)} bytes of markup, over the `
+      + `${String(RENDER_MARKUP_CAP_BYTES)} a document may render. ${input.provenance}; `
+      + "shorten whichever of those you can",
+    );
+  }
+  if (cost.imageBytes > RENDER_IMAGE_CAP_BYTES) {
+    throw new DocumentTooLargeError(
+      `this ${input.noun} carries ${String(cost.imageBytes)} bytes of inline image, over the `
+      + `${String(RENDER_IMAGE_CAP_BYTES)} a document may render. ${input.provenance}; `
+      + "use a smaller logo, or fewer images in the template",
+    );
+  }
+  if (cost.imagePixels > RENDER_IMAGE_PIXEL_CAP) {
+    throw new DocumentTooLargeError(
+      `this ${input.noun}'s ${String(cost.images)} inline image(s) decode to `
+      + `${String(cost.imagePixels)} pixels, over the `
+      + `${String(RENDER_IMAGE_PIXEL_CAP)} a document may render. A file's size does `
+      + "not say how large the picture inside it is; use one with fewer pixels"
+      + (cost.unreadableImages === 0 ? ""
+        : `. ${String(cost.unreadableImages)} of them are not a PNG, JPEG, GIF or `
+          + "WEBP at all, and something the renderer cannot be asked to identify is "
+          + "charged the most its bytes could decode to"),
+    );
+  }
+  const pdf = await renderPdf(html);
+
+  const { sha256, sizeBytes } = await saveBlob(deps.dataDir, Readable.from([pdf]));
+  // Reused rather than reimplemented: this is the one place a `files` row is
+  // created, and it also stamps the `file_attached` timeline entry and re-checks
+  // the record the file is going on. Called with `tx`, so its own transaction is a
+  // savepoint inside this one and the row disappears with a rollback like
+  // everything else here.
+  return await attachFile(tx, actorId, {
+    originalName: input.originalName, mime: "application/pdf", sizeBytes, sha256,
+    ...input.target,
+  });
 }
 
 /**
@@ -299,73 +418,35 @@ export async function issueQuote(
     if (deal === undefined) throw new NotFoundError("deal", dealId);
     if (deal.archivedAt !== null) throw new ArchivedError("deal", dealId);
 
-    const [template] = await tx.select({ bodyHtml: documentTemplates.bodyHtml })
-      .from(documentTemplates).where(eq(documentTemplates.type, "quote"));
-    if (template === undefined) throw new DocumentTemplateMissingError("quote");
+    const templateHtml = await loadTemplateBody(tx, "quote");
 
     // The logo arrives with the row: it is a data: URI column, not a file this
     // transaction has to open (see org-profile.ts).
     const org = await getOrgProfile(tx);
 
     const number = await allocateNumber(tx, "quote", year);
-    const html = prepareDocumentHtml(template.bodyHtml, buildContext({
-      org, currency: deal.currency, number,
-      issueDate: quote.issueDate,
-      validUntilDate: quote.validUntilDate ?? null,
-      recipientName: quote.recipientName,
-      recipientContactName: quote.recipientContactName ?? "",
-      recipientSalutation: quote.recipientSalutation ?? "",
-      recipientAddress: quote.recipientAddress ?? "",
-      notes: quote.notes ?? "",
-      terms: quote.terms ?? "",
-      ...totals,
-      lines,
-    }));
-    // THE SAME THREE CAPS renderPdf ENFORCES, one layer up, where the failure can
-    // still be attributed to a field. Split the way they are because the answer to
-    // "what is too big" is different for each: shorten the text, use a smaller logo
-    // FILE, or use a logo with fewer PIXELS -- and the last of those is invisible in
-    // a byte count, which is why v1.0.0 could not have said it.
-    const cost = renderInputCost(html);
-    const provenance = "Its template is "
-      + `${String(Buffer.byteLength(template.bodyHtml, "utf8"))} bytes, its logo `
-      + `${String(org.logoDataUri.length)}, and its own content `
-      + `${String(documentContentBytes(quote))}`;
-    if (cost.markupBytes > RENDER_MARKUP_CAP_BYTES) {
-      throw new DocumentTooLargeError(
-        `this quote merges to ${String(cost.markupBytes)} bytes of markup, over the `
-        + `${String(RENDER_MARKUP_CAP_BYTES)} a document may render. ${provenance}; `
-        + "shorten whichever of those you can",
-      );
-    }
-    if (cost.imageBytes > RENDER_IMAGE_CAP_BYTES) {
-      throw new DocumentTooLargeError(
-        `this quote carries ${String(cost.imageBytes)} bytes of inline image, over the `
-        + `${String(RENDER_IMAGE_CAP_BYTES)} a document may render. ${provenance}; `
-        + "use a smaller logo, or fewer images in the template",
-      );
-    }
-    if (cost.imagePixels > RENDER_IMAGE_PIXEL_CAP) {
-      throw new DocumentTooLargeError(
-        `this quote's ${String(cost.images)} inline image(s) decode to `
-        + `${String(cost.imagePixels)} pixels, over the `
-        + `${String(RENDER_IMAGE_PIXEL_CAP)} a document may render. A file's size does `
-        + "not say how large the picture inside it is; use one with fewer pixels"
-        + (cost.unreadableImages === 0 ? ""
-          : `. ${String(cost.unreadableImages)} of them are not a PNG, JPEG, GIF or `
-            + "WEBP at all, and something the renderer cannot be asked to identify is "
-            + "charged the most its bytes could decode to"),
-      );
-    }
-    const pdf = await renderPdf(html);
-
-    const { sha256, sizeBytes } = await saveBlob(deps.dataDir, Readable.from([pdf]));
-    // Reused rather than reimplemented: this is the one place a `files` row is
-    // created, and it also stamps the `file_attached` timeline entry and re-checks
-    // the deal. Called with `tx`, so its own transaction is a savepoint inside this
-    // one and the row disappears with a rollback like everything else here.
-    const file = await attachFile(tx, actorId, {
-      originalName: `${number}.pdf`, mime: "application/pdf", sizeBytes, sha256, dealId,
+    const file = await renderAndStore(tx, deps, actorId, {
+      noun: "quote",
+      templateHtml,
+      context: buildContext({
+        org, currency: deal.currency, number,
+        issueDate: quote.issueDate,
+        validUntilDate: quote.validUntilDate ?? null,
+        recipientName: quote.recipientName,
+        recipientContactName: quote.recipientContactName ?? "",
+        recipientSalutation: quote.recipientSalutation ?? "",
+        recipientAddress: quote.recipientAddress ?? "",
+        notes: quote.notes ?? "",
+        terms: quote.terms ?? "",
+        ...totals,
+        lines,
+      }),
+      provenance: "Its template is "
+        + `${String(Buffer.byteLength(templateHtml, "utf8"))} bytes, its logo `
+        + `${String(org.logoDataUri.length)}, and its own content `
+        + `${String(documentContentBytes(quote))}`,
+      originalName: `${number}.pdf`,
+      target: { dealId },
     });
 
     // TWO INSERTS SINCE 0016, in the same transaction as everything else here.
@@ -419,6 +500,289 @@ export async function issueQuote(
 
   publish({ keys: [["documents", dealId], ["files"], ["events"]] });
   return record;
+}
+
+/* ========================================================================== *
+ *  THE MEETING SUMMARY -- THE TYPE WITH NO FORM
+ * ========================================================================== */
+
+/** Everything the meeting summary template is allowed to print. */
+export interface MeetingSummaryContextInput {
+  org: OrgProfile;
+  /** The day the summary was produced, which is not the day of the meeting. */
+  issueDate: string;
+  title: string;
+  /** The meeting's own moment, as an ISO instant. */
+  occurredAt: string;
+  durationMinutes: number | null;
+  /**
+   * The meeting's notes, ALREADY SANITISED WITH THE DOCUMENT PROFILE. It arrives
+   * here as markup and leaves as markup -- see `buildMeetingSummaryContext`.
+   */
+  notesHtml: string;
+  /** One display name per attendee, in the order the summary prints them. */
+  attendees: string[];
+}
+
+/**
+ * How long a meeting took, as a page says it.
+ *
+ * PLAIN MINUTES, and "90 minutes" rather than "1 hour 30 minutes" is a decision
+ * and not laziness: an hours-and-minutes rendering needs a pluralisation rule, a
+ * separator convention and a choice about "1 hour 0 minutes", all of which are
+ * invented formatting for a field the operator typed as a number of minutes in
+ * the first place. The label beside it says Duration.
+ */
+function formatDurationMinutes(minutes: number): string {
+  return `${String(minutes)} ${minutes === 1 ? "minute" : "minutes"}`;
+}
+
+/**
+ * The merge context for one meeting summary.
+ *
+ * **`notes` IS THE ONLY `MergeHtml` IN THIS FILE, AND IT IS WHY THAT TYPE EXISTS.**
+ * `meetings.notes` is TipTap rich text -- markup, written by the operator, stored
+ * as HTML -- so escaping it like every other merge value would print `<p>Agreed
+ * to</p>` as those characters on a page. The Phase 9 spec says the notes "go
+ * through the existing sanitiser rather than a new path", and this is that: the
+ * caller passes the fragment through `sanitizeDocumentHtml` before it gets here,
+ * and `prepareDocumentHtml` sanitises the whole merged page afterwards. Two
+ * passes, because they answer different questions -- the first because the
+ * fragment was stored under the MAIL profile, which allows and forbids a
+ * different set; the second because a fragment can leave a tag open and only a
+ * pass over the finished document can close it.
+ *
+ * THE TITLE IS NOT RAW and neither is anything else here. A meeting title is
+ * plain text in a text input; escaped, a title of `<b>Q3</b>` prints as itself
+ * rather than restructuring the page.
+ *
+ * NO `number` KEY, so a template that names `{{document.number}}` prints a blank
+ * -- which is the correct outcome for a type that has none, and is what the
+ * merge language's unknown-path rule gives for free.
+ */
+export function buildMeetingSummaryContext(input: MeetingSummaryContextInput): MergeContext {
+  return {
+    org: orgContext(input.org),
+    document: {
+      title: input.title,
+      meetingWhen: formatDocumentInstant(input.occurredAt),
+      duration: input.durationMinutes === null ? "" : formatDurationMinutes(input.durationMinutes),
+      issueDate: input.issueDate,
+      notes: new MergeHtml(input.notesHtml),
+    },
+    // A summary has no priced lines, and `{{#lines}}` in a summary template
+    // therefore renders nothing. Empty rather than absent because MergeContext
+    // requires it, and requiring it is what keeps every existing quote context
+    // honest.
+    lines: [],
+    attendees: input.attendees.map((name) => ({ name })),
+  };
+}
+
+/**
+ * Every attendee of one meeting, as a name a page can print, in a stable order.
+ *
+ * THE THREE FORMS, AND THE PRECEDENCE IS export.ts's: a guest name is the name
+ * (nothing else is stored), then a Conduit user, then a linked contact. It cannot
+ * be ambiguous -- `meeting_attendees_exactly_one` admits exactly one of the three
+ * per row -- so the precedence only decides which read wins for a row that could
+ * not exist.
+ *
+ * `full_name` BEFORE `username`, WHICH IS WHERE THIS DIFFERS FROM THE EXPORT. A
+ * CSV column wants the identifier an operator can join on; a printed summary
+ * wants "Chris Wilson" rather than "chris". `full_name` is nullable (it comes
+ * from the auth header) and the username is the fallback.
+ *
+ * ORDERED BY id, and by nothing else, for services/meetings.ts's own reason:
+ * `meeting_attendees` deliberately carries no created_at and no ordinal, and the
+ * set is rewritten wholesale on every update, so id is the only order a read can
+ * reproduce. Without it the printed order would be stable only by accident of the
+ * plan -- and this page gets sent to people who were in the room.
+ */
+async function loadAttendeeNames(tx: Database, meetingId: string): Promise<string[]> {
+  const rows = await tx.select({
+    guestName: meetingAttendees.guestName,
+    fullName: users.fullName,
+    username: users.username,
+    firstName: contacts.firstName,
+    lastName: contacts.lastName,
+  })
+    .from(meetingAttendees)
+    .leftJoin(users, eq(meetingAttendees.userId, users.id))
+    .leftJoin(contacts, eq(meetingAttendees.contactId, contacts.id))
+    .where(eq(meetingAttendees.meetingId, meetingId))
+    .orderBy(asc(meetingAttendees.id));
+  return rows.map((row) => row.guestName
+    ?? row.fullName
+    ?? row.username
+    ?? [row.firstName, row.lastName].filter((part) => part !== null && part !== "").join(" "));
+}
+
+/** `documents` row -> the wire shape, for the type whose content is not in the row. */
+function toMeetingSummaryRecord(row: DocumentRow, meetingId: string): MeetingSummaryRecord {
+  return {
+    id: row.id,
+    type: "meeting_summary",
+    // THE MEETING COMES FROM THE CALLER, NOT FROM `row`, for the reason
+    // toDocumentRecord takes its dealId that way: `documents.meeting_id` is
+    // nullable (a quote's is null) while this DTO's is not, so reading it off the
+    // row would put a `!` or a `?? ""` here that no caller can reach and no test
+    // could exercise. Both call sites have the id in hand.
+    meetingId,
+    fileId: row.fileId,
+    issueDate: row.issueDate,
+    frozen: row.frozen,
+    issuedByUserId: row.issuedByUserId,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+/**
+ * Produce the summary of a meeting. ONE TRANSACTION, and NO INPUT AT ALL.
+ *
+ * **THIS IS THE TYPE THAT PROVES THE DATA MODEL WITHOUT A FORM CONFUSING THE
+ * PICTURE**, which is why the plan put it second. Everything printed is on the
+ * `meetings` row and its attendees; the only thing the caller supplies is which
+ * meeting, and the only thing this function decides is what day it is.
+ *
+ * WHAT IT DOES **NOT** DO, EACH FOR A REASON:
+ *
+ * - **NO NUMBER.** @conduit/shared's `documentTypeNumbered` has the three
+ *   arguments. The consequence here is the one worth naming: there is no
+ *   `allocateNumber` call, so there is no row lock, so there is no `SET LOCAL
+ *   lock_timeout` either -- two summaries render side by side, bounded by
+ *   renderPdf's own concurrency cap and nothing else. `documents_number_matches_type`
+ *   refuses this row if a future edit puts a number on it.
+ * - **NO FREEZE.** `frozen` is `documentTypeFreezes("meeting_summary")`, which is
+ *   `false`, written rather than defaulted for the reason the quote's is (0016
+ *   dropped the DEFAULT precisely so a writer that forgets cannot inherit one).
+ * - **NO UPDATE PATH.** Producing a summary again appends a SECOND document with
+ *   its own PDF; it does not rewrite the first. That is deliberate scope, not an
+ *   oversight: Task 1's note says nothing reads `frozen` yet and Task 3 is where
+ *   the guard that reads it arrives, so an edit-in-place path here would be the
+ *   one place in the codebase that mutated an issued document with no guard
+ *   anywhere. Appending is also what makes "no number" free -- a numbered type
+ *   would have to choose between spending a second number and reusing the first.
+ *
+ * THE ORDER IS issueQuote's, minus the allocation: read the meeting, read the
+ * template, read the issuer profile, merge, check the caps, render, write the
+ * blob, insert the file, insert the document. Everything attributable to the
+ * caller fails before anything spawns. The blob write is the one part that cannot
+ * roll back, for issueQuote's reason exactly.
+ */
+export async function issueMeetingSummary(
+  db: Database,
+  deps: IssueQuoteDeps,
+  actorId: string,
+  meetingId: string,
+): Promise<MeetingSummaryRecord> {
+  const record = await db.transaction(async (tx) => {
+    const [meeting] = await tx.select({
+      title: meetings.title, occurredAt: meetings.occurredAt,
+      durationMinutes: meetings.durationMinutes, notes: meetings.notes,
+      archivedAt: meetings.archivedAt,
+    }).from(meetings).where(eq(meetings.id, meetingId));
+    if (meeting === undefined) throw new NotFoundError("meeting", meetingId);
+    // issueQuote's refusal of an archived deal, on the record this document is of.
+    // attachFile re-checks it a moment later from inside the same transaction; this
+    // one is what makes the refusal arrive before a subprocess has run.
+    if (meeting.archivedAt !== null) throw new ArchivedError("meeting", meetingId);
+
+    const templateHtml = await loadTemplateBody(tx, "meeting_summary");
+    const org = await getOrgProfile(tx);
+    const attendees = await loadAttendeeNames(tx, meetingId);
+
+    // SERVER-AUTHORITATIVE, AND UTC, which is scheduling.ts's `todayDateOnly` and
+    // its documented +/-2h caveat. There is no input to take an issue date from --
+    // that is what "the type with no form" means -- and a client-supplied one would
+    // be a field on a form that does not exist.
+    const issueDate = todayDateOnly();
+    // SANITISED WITH THE DOCUMENT PROFILE BEFORE IT IS RAW. The stored value went
+    // through the MAIL profile on write (services/meetings.ts's sanitizeNotes), and
+    // the two profiles differ in both directions -- mail strips the page-layout CSS
+    // a document is made of, and a document allows `<style>`, which mail does not.
+    // So what is about to be emitted unescaped is measured against the profile of
+    // the document it is going into, not the one it was stored under.
+    const notesHtml = meeting.notes === null ? "" : sanitizeDocumentHtml(meeting.notes);
+
+    const file = await renderAndStore(tx, deps, actorId, {
+      noun: "meeting summary",
+      templateHtml,
+      context: buildMeetingSummaryContext({
+        org, issueDate,
+        title: meeting.title,
+        occurredAt: meeting.occurredAt.toISOString(),
+        durationMinutes: meeting.durationMinutes,
+        notesHtml,
+        attendees,
+      }),
+      // NAMES THE NOTES FIRST, because they are the only part of this document an
+      // operator can shorten. A quote's provenance offers three levers and so does
+      // this one, but the middle term is different: there is no submission to trim,
+      // there is a meeting whose notes are as long as they are.
+      provenance: "Its template is "
+        + `${String(Buffer.byteLength(templateHtml, "utf8"))} bytes, its logo `
+        + `${String(org.logoDataUri.length)}, and the meeting's notes `
+        + `${String(Buffer.byteLength(notesHtml, "utf8"))}`,
+      originalName: summaryFileName(meeting.title, issueDate),
+      target: { meetingId },
+    });
+
+    const [row] = await tx.insert(documents).values({
+      // SPELLED OUT RATHER THAN OMITTED. `number` is nullable now, so leaving it
+      // off would insert the same NULL -- but this is the one type in the codebase
+      // that has no number, and the line is where a reader finds out.
+      number: null,
+      type: "meeting_summary", meetingId, fileId: file.id,
+      issueDate,
+      frozen: documentTypeFreezes("meeting_summary"),
+      issuedByUserId: actorId,
+    }).returning();
+    if (row === undefined) throw new Error("document insert returned no row");
+
+    // NO SECOND INSERT, and its absence is the data model working. A quote needs
+    // `document_quotes` because a quote has a currency and three totals; a meeting
+    // summary's whole content is the `meetings` row it points at, so there is
+    // nothing left to store. The composite (document_id, type) foreign key added in
+    // 0017 is what makes the other direction impossible: no `document_quotes` row
+    // can name this document.
+    return toMeetingSummaryRecord(row, meetingId);
+  });
+
+  publish({ keys: [["meeting-documents", meetingId], ["files"], ["events"]] });
+  return record;
+}
+
+/**
+ * The longest a meeting's title may be inside a downloaded filename.
+ *
+ * `meetings.title` has no upper bound in the schema or in `meetingCreateInputSchema`,
+ * and `files.original_name` has none either, so without this a paragraph pasted
+ * into the title field becomes a filename no filesystem will accept. 80 characters
+ * leaves the rest of the name well inside the export's own 180-BYTE member limit
+ * even when every character costs three bytes.
+ */
+const SUMMARY_TITLE_CHARS = 80;
+
+/**
+ * What a downloaded meeting summary is called.
+ *
+ * THE TITLE IS IN IT, AND IT IS NOT SANITISED HERE. `files.original_name` already
+ * holds whatever a browser sent for an uploaded file, and the two places that turn
+ * a stored name into a real filename both defend themselves: the export's
+ * `archiveFileName` strips path separators, control characters and the bytes
+ * Windows refuses, and the download route sets its own Content-Disposition. A
+ * second, different sanitiser here would be a third opinion about what a filename
+ * is.
+ *
+ * THE DATE IS IN IT BECAUSE THIS TYPE CAN BE PRODUCED AGAIN. Two summaries of one
+ * meeting are ordinary (nothing freezes, nothing stops you), and two downloads
+ * called `Meeting summary - Kickoff.pdf` land in the same folder as
+ * `... (1).pdf`, which says nothing about which is which.
+ */
+function summaryFileName(title: string, issueDate: string): string {
+  const trimmed = title.trim().slice(0, SUMMARY_TITLE_CHARS);
+  return `Meeting summary - ${trimmed === "" ? "untitled" : trimmed} - ${issueDate}.pdf`;
 }
 
 /**
@@ -543,4 +907,31 @@ export async function listDocuments(db: Database, dealId: string): Promise<Docum
     lineRows.filter((line) => line.documentId === row.document.id),
     dealId,
   ));
+}
+
+/**
+ * Every summary produced for a meeting, newest first.
+ *
+ * NO JOIN, AND THAT IS THE SHAPE OF THIS TYPE RATHER THAN AN OPTIMISATION.
+ * `listDocuments` joins `document_quotes` because a quote's content is in a second
+ * table; a summary's content is in the `meetings` row the client already has open,
+ * so there is nothing to fetch and nothing to snapshot. What comes back is the
+ * identity, the PDF and when it was made.
+ *
+ * FILTERED BY TYPE AS WELL AS BY MEETING, though nothing else attaches to a
+ * meeting today. It is what makes `toMeetingSummaryRecord`'s literal `type` true
+ * rather than assumed, and the moment a second meeting-attached type exists this
+ * function keeps meaning what its name says instead of quietly widening.
+ *
+ * SERVED BY documents_meeting_idx (0017). 0016 deliberately created no index on
+ * the four FKs it added, on the grounds that nothing read documents by any of them
+ * -- this function is the read that changed that, so its migration built the index.
+ */
+export async function listMeetingSummaries(
+  db: Database, meetingId: string,
+): Promise<MeetingSummaryRecord[]> {
+  const rows = await db.select().from(documents)
+    .where(and(eq(documents.meetingId, meetingId), eq(documents.type, "meeting_summary")))
+    .orderBy(desc(documents.createdAt), desc(documents.id));
+  return rows.map((row) => toMeetingSummaryRecord(row, meetingId));
 }

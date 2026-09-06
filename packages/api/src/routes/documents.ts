@@ -9,7 +9,8 @@ import { RenderBusyError, RenderError } from "../services/documents-render.js";
 import { TemplateError } from "../services/documents-template.js";
 import {
   DocumentInputError, DocumentTemplateMissingError, DocumentTooLargeError,
-  getDocumentTemplate, issueQuote, listDocuments, saveDocumentTemplate,
+  getDocumentTemplate, issueMeetingSummary, issueQuote, listDocuments,
+  listMeetingSummaries, saveDocumentTemplate,
 } from "../services/documents.js";
 import { getOrgProfile, OrgProfileInputError, saveOrgProfile } from "../services/org-profile.js";
 
@@ -142,6 +143,37 @@ export function registerDocumentRoutes(app: FastifyInstance, { db, dataDir }: Cr
       // 201 with the document. The PDF is not in the body: it is a stored file, and
       // the client fetches it by fileId through the download route above.
       const document = await issueQuote(db, { dataDir }, user.id, params.id, input);
+      return await reply.code(201).send(document);
+    } catch (error) {
+      mapDocumentError(reply, error);
+    }
+  });
+
+  // THE MEETING SUMMARY'S PAIR, registered here rather than in routes/meetings.ts
+  // because this file owns the document surfaces -- mapDocumentError's seven arms
+  // are what a caller of either POST needs, and duplicating that mapping next to
+  // the meeting CRUD is how the two would drift. `:id` matches routes/meetings.ts's
+  // own parameter name, which find-my-way requires in the same path position.
+  app.get("/api/meetings/:id/documents", async (request, reply) => {
+    if (requireUser(request, reply) === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    // Unbounded, like the deal's documents: a meeting's summaries stay countable.
+    return await listMeetingSummaries(db, params.id);
+  });
+
+  // NO BODY, AND THAT IS THE WHOLE POINT OF THIS TYPE. Everything printed is on
+  // the meeting; the URL says which one. There is nothing to parse, so there is no
+  // `parseOrReject` for a body and no input schema in @conduit/shared -- an empty
+  // input schema would be a form with no fields, which is what "the type with no
+  // form" means. Fastify accepts a POST with no body.
+  app.post("/api/meetings/:id/documents", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    try {
+      const document = await issueMeetingSummary(db, { dataDir }, user.id, params.id);
       return await reply.code(201).send(document);
     } catch (error) {
       mapDocumentError(reply, error);
