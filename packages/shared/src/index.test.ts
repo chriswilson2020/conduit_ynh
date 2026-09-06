@@ -4,6 +4,9 @@ import {
   CSV_IMPORT_FIELDS,
   DEFAULT_TIME_ZONE,
   MAX_TIME_ENTRY_MINUTES,
+  formatMinutes,
+  timesheetSummary,
+  timesheetTotalsSchema,
   timeEntryAtLeastOneLink,
   timeEntryCreateInputSchema,
   timeEntryUpdateInputSchema,
@@ -2813,5 +2816,159 @@ describe("time entries (Phase 10)", () => {
     // whitespace-only one; the schema is what refuses the empty string outright.
     expect(timeEntryCreateInputSchema.safeParse({ ...base, description: null }).success).toBe(true);
     expect(timeEntryCreateInputSchema.safeParse({ ...base, description: "" }).success).toBe(false);
+  });
+});
+
+describe("formatMinutes", () => {
+  it("writes a quantity of work the way the meetings rail already writes one", () => {
+    expect(formatMinutes(45)).toBe("45m");
+    expect(formatMinutes(60)).toBe("1h");
+    expect(formatMinutes(90)).toBe("1h 30m");
+    expect(formatMinutes(1440)).toBe("24h");
+  });
+
+  /**
+   * **ZERO IS "0m", AND IT IS NOT NOTHING.** `durationLabel` in the meetings rail
+   * answers null here, because a meeting nobody timed renders as no duration at
+   * all rather than as a zero-length meeting. A TIMESHEET's zero is the opposite:
+   * an empty week is a real answer and has to print as one, or the page that
+   * cannot decide between "no hours" and "no data" is the failure this phase is
+   * about. The two contracts differ, which is exactly why the rail's function
+   * keeps its own null branch and delegates only the formatting.
+   */
+  it("prints an empty total rather than nothing at all", () => {
+    expect(formatMinutes(0)).toBe("0m");
+  });
+});
+
+/**
+ * **THE READING LAYER'S ANSWER, AND THE SENTENCE THAT CANNOT LEAVE THE CAVEAT
+ * OUT.** Phase 10 Task 2. The spec's rule is that a meeting with no recorded
+ * length contributes nothing and that this must be VISIBLE -- "a report that
+ * silently treats unknown length as zero is the same failure in a smaller
+ * costume".
+ */
+describe("timesheetTotalsSchema", () => {
+  const totals = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    entryMinutes: 300, entryCount: 4,
+    meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 2, meetingsNotYetOccurred: 1,
+    meetingsInRange: 6,
+    countedMinutes: 450,
+  };
+
+  it("parses a consistent answer", () => {
+    expect(timesheetTotalsSchema.parse(totals)).toEqual(totals);
+  });
+
+  /**
+   * **THE TOTAL IS REFUSED IF IT IS NOT THE SUM OF ITS HALVES.** A client that
+   * parses this shape cannot be handed a headline figure that disagrees with the
+   * two numbers printed underneath it -- the disagreement is a shape error rather
+   * than a page. This is the one number the whole phase exists to produce, so a
+   * wrong one arriving quietly is worse than no answer.
+   */
+  it("refuses a total that is not the entries plus the meetings", () => {
+    expect(timesheetTotalsSchema.safeParse({ ...totals, countedMinutes: 451 }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, entryMinutes: 299 }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, meetingMinutes: 0 }).success).toBe(false);
+  });
+
+  /**
+   * EVERY MEETING IN THE RANGE IS IN EXACTLY ONE BUCKET. Counted, unmeasured, or
+   * not yet happened -- and the three add up to the meetings the range contains.
+   * A meeting that fell out of all three would be an hour that vanished with
+   * nothing saying so, and one in two would be the double count this task exists
+   * to make impossible, arriving inside a single query.
+   */
+  it("refuses meeting buckets that do not account for every meeting in the range", () => {
+    expect(timesheetTotalsSchema.safeParse({ ...totals, meetingsInRange: 7 }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, meetingsUnmeasured: 1 }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, meetingsNotYetOccurred: 0 }).success).toBe(false);
+  });
+
+  it("refuses a range that runs backwards, and negative counts", () => {
+    expect(timesheetTotalsSchema.safeParse({ ...totals, from: "2026-09-20" }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, entryCount: -1 }).success).toBe(false);
+  });
+
+  it("accepts an empty week, which is zero hours rather than no answer", () => {
+    const empty = {
+      from: "2026-09-07", to: "2026-09-13", timeZone: "UTC",
+      entryMinutes: 0, entryCount: 0,
+      meetingMinutes: 0, meetingsCounted: 0, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+      meetingsInRange: 0, countedMinutes: 0,
+    };
+    expect(timesheetTotalsSchema.parse(empty)).toEqual(empty);
+  });
+});
+
+describe("timesheetSummary", () => {
+  const base = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    entryMinutes: 300, entryCount: 4,
+    meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+    meetingsInRange: 3,
+    countedMinutes: 450,
+  };
+
+  it("says what was counted and where it came from", () => {
+    expect(timesheetSummary(base)).toBe(
+      "7h 30m counted from 2026-09-07 to 2026-09-13: 5h across 4 entries, "
+      + "and 2h 30m across 3 meetings.",
+    );
+  });
+
+  /**
+   * **THIS IS THE WHOLE POINT OF THE FUNCTION.** The uncounted meetings are part
+   * of the same string as the total, so there is no way to render the figure
+   * without them: a page cannot drop a clause it never had. Task 4 renders this
+   * sentence -- a page that prints `countedMinutes` on its own is the failure the
+   * spec names, and the field is called `countedMinutes` rather than
+   * `totalMinutes` so that such a page reads as a lie in its own source.
+   */
+  it("names the meetings it could not count, in the same sentence as the total", () => {
+    expect(timesheetSummary({
+      ...base, meetingsUnmeasured: 2, meetingsNotYetOccurred: 1, meetingsInRange: 6,
+    })).toBe(
+      "7h 30m counted from 2026-09-07 to 2026-09-13: 5h across 4 entries, "
+      + "and 2h 30m across 3 meetings. Not counted: 2 meetings with no recorded length, "
+      + "and 1 meeting that has not happened yet.",
+    );
+  });
+
+  it("names only the kind of uncounted meeting it actually has", () => {
+    expect(timesheetSummary({ ...base, meetingsUnmeasured: 1, meetingsInRange: 4 }))
+      .toMatch(/Not counted: 1 meeting with no recorded length\.$/);
+    expect(timesheetSummary({ ...base, meetingsNotYetOccurred: 2, meetingsInRange: 5 }))
+      .toMatch(/Not counted: 2 meetings that have not happened yet\.$/);
+  });
+
+  it("reads as a real sentence when a week is empty", () => {
+    expect(timesheetSummary({
+      from: "2026-09-07", to: "2026-09-13", timeZone: "UTC",
+      entryMinutes: 0, entryCount: 0,
+      meetingMinutes: 0, meetingsCounted: 0, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+      meetingsInRange: 0, countedMinutes: 0,
+    })).toBe(
+      "0m counted from 2026-09-07 to 2026-09-13: 0m across 0 entries, and 0m across 0 meetings.",
+    );
+  });
+
+  /**
+   * DERIVED FROM THE VALUE, NOT FROM A SECOND COPY OF IT: every figure in the
+   * sentence has to move when the totals move, or the prose becomes the stale
+   * half of a pair. Walked rather than asserted case by case, on the export
+   * summary's precedent.
+   */
+  it("carries every figure it was given", () => {
+    const totals = {
+      ...base, entryMinutes: 65, entryCount: 1, meetingMinutes: 25, meetingsCounted: 1,
+      meetingsUnmeasured: 3, meetingsNotYetOccurred: 4, meetingsInRange: 8, countedMinutes: 90,
+    };
+    const sentence = timesheetSummary(totals);
+    for (const fragment of ["1h 30m", "1h 5m", "1 entry", "25m", "1 meeting", "3 meetings", "4 meetings"]) {
+      expect(sentence, fragment).toContain(fragment);
+    }
   });
 });

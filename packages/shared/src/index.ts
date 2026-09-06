@@ -27,10 +27,14 @@ import { MONEY_LOCALE } from "./money-format.js";
 // is sent, saveOrgProfile refuses one that arrives anyway, and the renderer has
 // to make the same judgement about a stored one. Three readings of "is this a
 // zone" that agree today would not stay agreed.
+// zonedDayRange joins them in v1.9.0: the timesheet sums a `date` column and a
+// `timestamptz` one, so it has to decide which calendar day a meeting's instant
+// fell on, and that is this same field's question at a second surface.
 export {
   DEFAULT_TIME_ZONE, MAX_TIME_ZONE_LENGTH, timeZoneLabel, timeZoneProblem, todayInZone,
-  usableTimeZone,
+  usableTimeZone, zonedDayRange,
 } from "./time-zone.js";
+export type { ZonedDayRange } from "./time-zone.js";
 // ...and imported as well as re-exported, for the reason MONEY_LOCALE is:
 // `formatDocumentInstant` below needs the names in scope, and a re-export does
 // not put them there.
@@ -4850,12 +4854,13 @@ export type ImportOutcome = z.infer<typeof importOutcomeSchema>;
  *
  * SPELLED HERE AND AS A DB CHECK, and schema.test.ts probes the exact edges so
  * the two cannot drift -- the belt-and-braces arrangement projects.color and
- * tasks.progress_pct use, NOT meetings.duration_minutes' zod-only one. The
- * difference between those two columns is what this one IS: a meeting's
- * duration sits beside the meeting and nothing sums it, while these minutes ARE
- * the week's total, so a value the database would accept and no report could
- * explain is exactly the failure the spec calls "quietly wrong in the direction
- * nobody checks".
+ * tasks.progress_pct use, NOT meetings.duration_minutes' zod-only one.
+ *
+ * **THE DIFFERENCE IS NOT "NOTHING SUMS A MEETING'S DURATION" ANY MORE.** That
+ * was the reason when this was written and v1.9.0's timesheet made it false:
+ * both numbers are now summed into one week (api: services/timesheet.ts). What
+ * still differs is that this bound is DEFINITIONAL and that column has none
+ * available to it -- see below, and db/schema.ts on both columns.
  *
  * ONE DAY, because `work_date` is one day. An entry is a quantity of work
  * attributed to a calendar date, and no date holds more than 24 hours -- so
@@ -5039,3 +5044,155 @@ export const timeEntryListFiltersSchema = z.object({
   limit: z.number().int().positive().max(100).optional(),
 });
 export type TimeEntryListFilters = z.infer<typeof timeEntryListFiltersSchema>;
+
+/* -------------------------------------------------------------------------- *
+ *  The timesheet's totals (Phase 10 Task 2)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * A quantity of work, written the way this product already writes one: "45m",
+ * "1h", "1h 30m".
+ *
+ * **THE RAIL'S `durationLabel` NOW DELEGATES TO THIS AND KEEPS ITS OWN NULL
+ * BRANCH**, because the two have genuinely different contracts at the bottom of
+ * the range. A meeting nobody timed renders as nothing at all -- there is no such
+ * thing as a zero-length meeting, so `durationLabel` answers null. An empty week
+ * is a real answer and must print as "0m", or a page cannot distinguish "no
+ * hours" from "no data", which is this phase's failure mode in miniature. What
+ * they must NOT differ about is how 90 minutes is spelled, hence one function
+ * for that and two callers for the edge each of them owns.
+ */
+export function formatMinutes(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours === 0) return `${String(rest)}m`;
+  return rest === 0 ? `${String(hours)}h` : `${String(hours)}h ${String(rest)}m`;
+}
+
+/** "1 entry" / "4 entries", so the sentence below never says "1 meetings". */
+function countOf(n: number, singular: string, plural: string): string {
+  return `${String(n)} ${n === 1 ? singular : plural}`;
+}
+
+/**
+ * **WHERE THE WEEK WENT: THE ANSWER, AND WHAT IT COULD NOT ANSWER FOR.**
+ *
+ * Phase 10's spec decides that the timesheet reads meetings and time entries
+ * TOGETHER -- `meetings.duration_minutes` has held tracked time since Phase 5 and
+ * has never been aggregated -- and that a manual entry cannot name a meeting, so
+ * one hour has exactly one source. api: services/timesheet.ts produces this;
+ * Task 4's page renders it.
+ *
+ * **THREE BUCKETS FOR MEETINGS, NOT ONE, AND THE TWO EXTRA ONES ARE THE POINT.**
+ * The spec: "a meeting with no duration contributes nothing, which is correct and
+ * must be visible: a report that silently treats unknown length as zero is the
+ * same failure in a smaller costume." So an uncounted meeting is a number in the
+ * answer rather than an absence from it:
+ *
+ *   `meetingsUnmeasured` -- in the range, has happened, and nobody recorded how
+ *   long it ran. `meetings.duration_minutes` is nullable precisely because that
+ *   is honest (Phase 5), and treating the null as a zero would turn an unknown
+ *   into a claim.
+ *
+ *   `meetingsNotYetOccurred` -- in the range and still in the future. **THIS ONE
+ *   IS NOT IN THE SPEC AND IS A CONSEQUENCE OF PHASE 5 THE SPEC DID NOT NOTICE.**
+ *   `occurred_at` is deliberately free in both directions, because "logging a
+ *   meeting you have just had and one you have just arranged are the same act",
+ *   and NO COLUMN DISTINGUISHES THE TWO. So the current week contains Friday's
+ *   arranged meetings on Wednesday morning, and counting them would answer "where
+ *   did the week go" with work nobody has done yet. The spec's own premise is
+ *   that "a logged meeting with a duration IS a recorded hour"; an arranged one
+ *   is a plan, so it is reported and not counted.
+ *
+ * `meetingsInRange` is the three of them added up, and the refine below is what
+ * makes that a guarantee rather than a hope: a meeting in two buckets is a double
+ * count inside a single query, and one in none is an hour that vanished.
+ *
+ * **`countedMinutes`, NEVER `totalMinutes`.** The name is doing work: a page that
+ * prints this figure and calls it the total, with the uncounted meetings left
+ * off, is the exact failure the spec describes -- and with this name it reads as
+ * a lie in its own source. {@link timesheetSummary} is the sentence that cannot
+ * leave them off at all.
+ */
+export const timesheetTotalsSchema = z.object({
+  /** Inclusive first day of the range, in `timeZone`'s calendar. */
+  from: z.iso.date(),
+  /** Inclusive last day. */
+  to: z.iso.date(),
+  /**
+   * THE CLOCK THE MEETING DAYS WERE DECIDED IN, named because it was used --
+   * `formatDocumentInstant`'s rule. This is `org_profile.time_zone` after
+   * `usableTimeZone`, so it can differ from the stored string when that has
+   * stopped resolving; a report that quietly fell back to UTC and did not say so
+   * is the failure that rule exists for.
+   */
+  timeZone: z.string().min(1),
+  entryMinutes: z.number().int().nonnegative(),
+  entryCount: z.number().int().nonnegative(),
+  meetingMinutes: z.number().int().nonnegative(),
+  meetingsCounted: z.number().int().nonnegative(),
+  meetingsUnmeasured: z.number().int().nonnegative(),
+  meetingsNotYetOccurred: z.number().int().nonnegative(),
+  meetingsInRange: z.number().int().nonnegative(),
+  countedMinutes: z.number().int().nonnegative(),
+}).superRefine((v, ctx) => {
+  if (v.from > v.to) {
+    ctx.addIssue({ code: "custom", message: `from ${v.from} is after to ${v.to}` });
+  }
+  // THE HEADLINE FIGURE IS REFUSED IF IT DISAGREES WITH ITS OWN HALVES. This is
+  // the one number the phase exists to produce, so a wrong one arriving quietly
+  // is worse than no answer at all.
+  if (v.countedMinutes !== v.entryMinutes + v.meetingMinutes) {
+    ctx.addIssue({
+      code: "custom",
+      message: `countedMinutes ${String(v.countedMinutes)} is not entryMinutes `
+        + `${String(v.entryMinutes)} plus meetingMinutes ${String(v.meetingMinutes)}`,
+    });
+  }
+  const bucketed = v.meetingsCounted + v.meetingsUnmeasured + v.meetingsNotYetOccurred;
+  if (bucketed !== v.meetingsInRange) {
+    ctx.addIssue({
+      code: "custom",
+      message: `${String(bucketed)} meetings are accounted for but ${String(v.meetingsInRange)} `
+        + "are in the range: every meeting must be counted, unmeasured or not yet happened",
+    });
+  }
+});
+export type TimesheetTotals = z.infer<typeof timesheetTotalsSchema>;
+
+/**
+ * The operator's sentence: the week's figure and, in the same string, every
+ * meeting that is not in it.
+ *
+ * **ONE SENTENCE BECAUSE A PAGE CANNOT DROP A CLAUSE IT NEVER HAD.** The spec
+ * requires the uncounted meetings to be visible, and a `count` sitting beside a
+ * `total` in a payload is visible only to a UI that chooses to render it -- which
+ * is the same silence in a different place. This is `EXPORT_ARCHIVE_SUMMARY`'s
+ * arrangement (web: settings-data-lib.ts) and its reason: the whole paragraph is
+ * derived, so the page renders it or renders nothing.
+ *
+ * NO CLAUSE WHEN THERE IS NOTHING TO SAY, deliberately: "every meeting has a
+ * recorded length" on a quiet week is noise, and the absence of the caveat is
+ * only readable as an assurance if the caveat is guaranteed to appear when it is
+ * warranted -- which is what deriving it from the value guarantees.
+ */
+export function timesheetSummary(totals: TimesheetTotals): string {
+  const head = `${formatMinutes(totals.countedMinutes)} counted from ${totals.from} to `
+    + `${totals.to}: ${formatMinutes(totals.entryMinutes)} across `
+    + `${countOf(totals.entryCount, "entry", "entries")}, and `
+    + `${formatMinutes(totals.meetingMinutes)} across `
+    + `${countOf(totals.meetingsCounted, "meeting", "meetings")}.`;
+  const uncounted: string[] = [];
+  if (totals.meetingsUnmeasured > 0) {
+    uncounted.push(
+      `${countOf(totals.meetingsUnmeasured, "meeting", "meetings")} with no recorded length`,
+    );
+  }
+  if (totals.meetingsNotYetOccurred > 0) {
+    uncounted.push(
+      `${countOf(totals.meetingsNotYetOccurred, "meeting", "meetings")} that `
+      + `${totals.meetingsNotYetOccurred === 1 ? "has" : "have"} not happened yet`,
+    );
+  }
+  return uncounted.length === 0 ? head : `${head} Not counted: ${uncounted.join(", and ")}.`;
+}
