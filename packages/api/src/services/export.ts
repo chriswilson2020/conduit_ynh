@@ -9,7 +9,8 @@ import { decimalFromCents } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { readMigrationJournal } from "./migration-journal.js";
 import {
-  companies, contacts, deals, documentQuotes, documents, files, meetingAttendees, meetings,
+  companies, contacts, deals, documentAgreements, documentLetters, documentQuotes, documents,
+  files, meetingAttendees, meetings,
   notes, pipelines, projects, stages, tasks, users,
 } from "../db/schema.js";
 import { csvDocument } from "./csv.js";
@@ -658,7 +659,10 @@ async function meetingsSheet(db: Database): Promise<Sheet> {
 async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<string, string>): Promise<Sheet> {
   const rows = await db
     .select({
-      doc: documents, quote: documentQuotes,
+      doc: documents, quote: documentQuotes, letter: documentLetters,
+      agreement: documentAgreements,
+      companyName: companies.name,
+      contactFirstName: contacts.firstName, contactLastName: contacts.lastName,
       dealTitle: deals.title, meetingTitle: meetings.title, issuedByUsername: users.username,
     })
     .from(documents)
@@ -684,6 +688,24 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
     // it moves eleven columns an operator already knows out of the file they are
     // in, to spare some blanks in a file that has `type` in the third column.
     .leftJoin(documentQuotes, eq(documentQuotes.documentId, documents.id))
+    // **THE SAME LESSON, ONE TASK ON, AND IT WOULD HAVE BEEN THE SAME BUG.** Task
+    // 2 found this sheet's INNER JOIN silently dropping every meeting summary and
+    // made it a LEFT one; these two tables arrive with Task 3 and are LEFT for the
+    // same reason, but the failure they avoid is a different and quieter one. A
+    // missing join here would not have dropped a row -- a letter's `documents`
+    // row would still come out -- it would have exported the letter with its
+    // subject, its addressee and its BODY absent, which is the one thing about a
+    // letter that exists nowhere else in the archive. The row would look fine.
+    .leftJoin(documentLetters, eq(documentLetters.documentId, documents.id))
+    .leftJoin(documentAgreements, eq(documentAgreements.documentId, documents.id))
+    // THE COMPANY AND THE CONTACT, WHICH THIS SHEET HAS NEVER HAD, and their
+    // absence stopped being harmless with Task 3. Until now every document was of
+    // a deal or of a meeting, so `deal_id` and `meeting_id` covered the file; a
+    // letter is of a company or a contact, so without these a letter's row names
+    // no record at all -- an operator reading the archive could not tell who it
+    // was addressed to from the sheet that is supposed to say.
+    .leftJoin(companies, eq(documents.companyId, companies.id))
+    .leftJoin(contacts, eq(documents.contactId, contacts.id))
     .leftJoin(deals, eq(documents.dealId, deals.id))
     .leftJoin(meetings, eq(documents.meetingId, meetings.id))
     .leftJoin(users, eq(documents.issuedByUserId, users.id))
@@ -695,14 +717,30 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
   return {
     name: "documents.csv",
     header: [
-      "id", "number", "type", "deal_id", "deal_title", "meeting_id", "meeting_title", "currency",
+      "id", "number", "type",
+      "company_id", "company_name", "contact_id", "contact_name",
+      "deal_id", "deal_title", "meeting_id", "meeting_title", "currency",
       "issue_date", "valid_until_date",
       "recipient_name", "recipient_contact_name", "recipient_salutation", "recipient_address",
       "subtotal", "tax", "total", "notes", "terms",
+      // THE LETTER'S THREE. `letter_recipient_*` are deliberately NOT folded into
+      // the quote's `recipient_*` columns above, even though a spreadsheet would
+      // read them the same way and `type` says which is which. Two tables, two
+      // meanings: a coalesce here would be the common `document_parties` this
+      // task argued against, built in the one place nothing enforces it, and the
+      // day the letter's model diverges the CSV would silently stop being true.
+      "letter_subject", "letter_recipient_name", "letter_recipient_contact_name",
+      "letter_recipient_salutation", "letter_recipient_address", "letter_body_html",
+      // THE AGREEMENT'S SIX. `body_html` above and these are what make the
+      // archive able to reconstruct a document rather than merely list it.
+      "agreement_effective_date", "agreement_term_months", "agreement_jurisdiction",
+      "agreement_party_name", "agreement_party_contact_name", "agreement_party_address",
       "frozen", "issued_by_user_id", "issued_by_username", "file_id", "file_archive_path", "created_at",
     ],
     rows: rows.map((r) => [
       r.doc.id, text(r.doc.number), r.doc.type,
+      text(r.doc.companyId), text(r.companyName),
+      text(r.doc.contactId), contactName(r.contactFirstName, r.contactLastName),
       text(r.doc.dealId), text(r.dealTitle), text(r.doc.meetingId), text(r.meetingTitle),
       text(r.quote?.currency),
       r.doc.issueDate, text(r.quote?.validUntilDate),
@@ -717,6 +755,20 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
       money(r.quote?.taxCents ?? null),
       money(r.quote?.totalCents ?? null),
       text(r.quote?.notes), text(r.quote?.terms),
+      text(r.letter?.subject), text(r.letter?.recipientName),
+      text(r.letter?.recipientContactName), text(r.letter?.recipientSalutation),
+      text(r.letter?.recipientAddress),
+      // Named `_html` for meetings.csv's `notes_html` reason: it holds sanitised
+      // rich text, exported verbatim, and flattening it to plain text here would
+      // make it the one lossy column in the file.
+      text(r.letter?.bodyHtml),
+      text(r.agreement?.effectiveDate),
+      // BLANK RATHER THAN 0 for a document with no term, which is the three money
+      // cells' argument repeated: a spreadsheet parses 0 as a number and would
+      // average it into a column about documents that have no term.
+      r.agreement === null ? "" : String(r.agreement.termMonths),
+      text(r.agreement?.jurisdiction), text(r.agreement?.partyName),
+      text(r.agreement?.partyContactName), text(r.agreement?.partyAddress),
       // Phase 9 made this per type, so it stopped being derivable from `type` by
       // anyone reading the archive without the source in front of them.
       r.doc.frozen ? "true" : "false",
