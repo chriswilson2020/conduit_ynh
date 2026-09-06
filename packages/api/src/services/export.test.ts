@@ -26,7 +26,7 @@ import { createNote } from "./notes.js";
 import { createMeeting, archiveMeeting } from "./meetings.js";
 import {
   companies as companiesTable, deals as dealsTable, documents as documentsTable,
-  documentQuotes as documentQuotesTable,
+  documentAgreements, documentLetters, documentQuotes as documentQuotesTable,
   mailAccounts, mailAttachments, mailMessages, mailThreads,
 } from "../db/schema.js";
 import {
@@ -1046,6 +1046,102 @@ describe("export documents", () => {
     expect(cell(filesSheet, 0, "meeting_id")).toBe(meeting.id);
     expect(cell(filesSheet, 0, "meeting_title")).toBe("Kickoff with Acme");
     expect(cell(filesSheet, 0, "company_id")).toBe("");
+  });
+
+  /**
+   * **THE SAME LESSON ONE TASK ON, AND IT WOULD HAVE BEEN A QUIETER FAILURE.**
+   * The summary above was DROPPED by an INNER JOIN. A letter would not have been
+   * dropped -- its `documents` row would have come out perfectly -- it would have
+   * come out with its subject, its addressee and its BODY absent, which is the one
+   * thing about a letter that exists nowhere else in the archive. The row would
+   * have looked fine.
+   *
+   * AND `company_id` IS NEW TO THIS SHEET. Until Task 3 every document was of a
+   * deal or of a meeting, so `deal_id` and `meeting_id` covered the file; a letter
+   * is of a company or a contact, so without those columns a letter's row named no
+   * record at all.
+   */
+  itZip("exports a letter with its body, and an agreement with its terms", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme Ltd" });
+    const blob = async (bytes: string) =>
+      await saveBlob(dataDir, Readable.from([Buffer.from(bytes)]));
+
+    const letterBlob = await blob("%PDF-1.7 letter");
+    const letterPdf = await attachFile(handle.db, actorId, {
+      originalName: "Letter - Renewal - 2026-09-06.pdf", mime: "application/pdf",
+      sizeBytes: letterBlob.sizeBytes, sha256: letterBlob.sha256, companyId: company.id,
+    });
+    const [letter] = await handle.db.insert(documentsTable).values({
+      number: null, type: "letter", companyId: company.id, fileId: letterPdf.id,
+      issueDate: "2026-09-06", frozen: false, issuedByUserId: actorId,
+    }).returning();
+    await handle.db.insert(documentLetters).values({
+      documentId: letter!.id, subject: "Renewal", recipientName: "Acme Ltd",
+      recipientContactName: "Jana Müller", recipientSalutation: "Frau Müller",
+      recipientAddress: "Hauptstraße 4\n50667 Köln",
+      bodyHtml: "<p>Thank you.</p>",
+    });
+
+    const ndaBlob = await blob("%PDF-1.7 nda");
+    const ndaPdf = await attachFile(handle.db, actorId, {
+      originalName: "NDA-2026-0001.pdf", mime: "application/pdf",
+      sizeBytes: ndaBlob.sizeBytes, sha256: ndaBlob.sha256, companyId: company.id,
+    });
+    const [nda] = await handle.db.insert(documentsTable).values({
+      number: "NDA-2026-0001", type: "nda", companyId: company.id, fileId: ndaPdf.id,
+      issueDate: "2026-09-06", frozen: true, issuedByUserId: actorId,
+    }).returning();
+    await handle.db.insert(documentAgreements).values({
+      documentId: nda!.id, type: "nda", effectiveDate: "2026-09-01", termMonths: 36,
+      jurisdiction: "the Netherlands", partyName: "Acme Ltd", partyContactName: "Jana Müller",
+      partyAddress: "Hauptstraße 4",
+    });
+
+    const root = await extract(await writeArchive());
+    const sheet = await readSheet(root, "documents.csv");
+    expect(sheet.records).toHaveLength(2);
+    // `number` leads the ORDER BY and PostgreSQL sorts NULLs last, so the NDA is
+    // row 0 and the letter is row 1.
+    expect(cell(sheet, 0, "type")).toBe("nda");
+    expect(cell(sheet, 1, "type")).toBe("letter");
+
+    expect(cell(sheet, 1, "company_id")).toBe(company.id);
+    expect(cell(sheet, 1, "company_name")).toBe("Acme Ltd");
+    expect(cell(sheet, 1, "letter_subject")).toBe("Renewal");
+    expect(cell(sheet, 1, "letter_recipient_contact_name")).toBe("Jana Müller");
+    expect(cell(sheet, 1, "letter_recipient_salutation")).toBe("Frau Müller");
+    expect(cell(sheet, 1, "letter_recipient_address")).toBe("Hauptstraße 4\n50667 Köln");
+    // THE BODY, VERBATIM. Named `_html` for meetings.csv's `notes_html` reason:
+    // flattening it to plain text would make it the one lossy column in the file.
+    expect(cell(sheet, 1, "letter_body_html")).toBe("<p>Thank you.</p>");
+    expect(cell(sheet, 1, "frozen")).toBe("false");
+
+    expect(cell(sheet, 0, "number")).toBe("NDA-2026-0001");
+    expect(cell(sheet, 0, "agreement_effective_date")).toBe("2026-09-01");
+    expect(cell(sheet, 0, "agreement_term_months")).toBe("36");
+    expect(cell(sheet, 0, "agreement_jurisdiction")).toBe("the Netherlands");
+    expect(cell(sheet, 0, "agreement_party_name")).toBe("Acme Ltd");
+    expect(cell(sheet, 0, "frozen")).toBe("true");
+
+    // THE COLUMNS THAT BELONG TO THE OTHER TYPES ARE BLANK RATHER THAN 0 OR "0.00",
+    // and `agreement_term_months` is in the list for the money columns' reason: a
+    // spreadsheet parses 0 as a number and would average it into a column about
+    // documents that have no term.
+    for (const column of [
+      "currency", "subtotal", "tax", "total", "recipient_name",
+      "agreement_term_months", "agreement_jurisdiction",
+    ]) {
+      expect(cell(sheet, 1, column), column).toBe("");
+    }
+    for (const column of ["letter_subject", "letter_body_html", "subtotal"]) {
+      expect(cell(sheet, 0, column), column).toBe("");
+    }
+
+    // Both pages are still reachable from their rows.
+    expect(await readFile(path.join(root, cell(sheet, 1, "file_archive_path")), "utf8"))
+      .toBe("%PDF-1.7 letter");
+    expect(await readFile(path.join(root, cell(sheet, 0, "file_archive_path")), "utf8"))
+      .toBe("%PDF-1.7 nda");
   });
 
   /**

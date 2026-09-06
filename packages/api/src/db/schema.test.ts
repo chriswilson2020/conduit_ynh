@@ -15,7 +15,9 @@ import { openTestDatabase, truncateAll } from "../test/db.js";
 import {
   SCRATCH_DATABASE_PREFIXES, TEST_DATABASE_URL, withDatabaseName,
 } from "../test/databases.js";
-import { seededMeetingSummaryTemplate, seededQuoteTemplate } from "../test/seed-template.js";
+import {
+  seededAgreementTemplate, seededLetterTemplate, seededMeetingSummaryTemplate, seededQuoteTemplate,
+} from "../test/seed-template.js";
 import { resolveUser } from "../users.js";
 import { createCompany } from "../services/companies.js";
 import { createContact } from "../services/contacts.js";
@@ -35,8 +37,8 @@ import {
   users, companies, contacts, pipelines, stages, deals, projects, events, files,
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
   mailThreadHides, meetings, meetingAttendees,
-  orgProfile, documents, documentQuotes, documentLineItems, documentNumberSequences,
-  documentTemplates,
+  orgProfile, documents, documentAgreements, documentLetters, documentQuotes, documentLineItems,
+  documentNumberSequences, documentTemplates,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -1447,13 +1449,23 @@ describe("documents schema (0009)", () => {
       // trusted: exactly one row, of the right type, whose merge fields are
       // exactly the set above and whose page-layout CSS survived the SQL
       // literal intact.
-      // TWO ROWS SINCE 0017, and this drill migrates to HEAD: 0009 seeds the
-      // quote's template and 0017 seeds the meeting summary's. The assertion is
-      // still about 0009's -- what changed is that it has to name the row it
-      // means rather than take the only one there is.
+      // TWO ROWS SINCE 0017 AND FIVE SINCE 0019, and this drill migrates to
+      // HEAD: 0009 seeds the quote's template, 0017 the meeting summary's, 0019
+      // the letter's and the two agreements'. The assertion is still about
+      // 0009's -- what changed is that it has to name the row it means rather
+      // than take the only one there is.
+      //
+      // **DRIVEN OFF THE ENUM RATHER THAN LISTED**, which it was not until Task
+      // 3 and should have been from 0017. A hardcoded pair is a line every later
+      // task has to remember to edit, in a drill about a migration that predates
+      // its type -- and what it is really asserting is the invariant
+      // `document_templates_type_valid`'s comment states: EVERY type Conduit can
+      // produce has a template row seeded before anyone opens Settings. Written
+      // this way, a type added with no seed fails here rather than at issue time
+      // with a 409 on somebody's install.
       const templates = await scratch.db.select().from(documentTemplates)
         .orderBy(asc(documentTemplates.type));
-      expect(templates.map((row) => row.type)).toEqual(["meeting_summary", "quote"]);
+      expect(templates.map((row) => row.type)).toEqual([...documentTypeSchema.options].sort());
       const quoteTemplate = templates.find((row) => row.type === "quote");
       const body = quoteTemplate!.bodyHtml;
       expect([...new Set(body.match(/\{\{[^}]*\}\}/g) ?? [])].sort()).toEqual(SEEDED_FIELDS);
@@ -2878,10 +2890,21 @@ describe("the meeting summary (0017)", () => {
       expect(meetingIndex?.indexdef).toMatch(/\(meeting_id\)/i);
       expect(meetingIndex?.indexdef).not.toMatch(/UNIQUE/i);
       expect(meetingIndex?.indexdef).not.toMatch(/WHERE/i);
-      // ...and the other three FKs 0016 added are still unindexed, which is the
-      // decision 0016 recorded and this migration deliberately did not widen.
+      // ...and of the other three FKs 0016 added, exactly the two whose READS
+      // arrived in Task 3 are indexed.
+      //
+      // **THIS ASSERTION USED TO BE `toEqual([])` AND TASK 3 BROKE IT, WHICH IS
+      // THE DRILL WORKING.** The drill migrates to HEAD, so it sees every later
+      // migration's indexes; 0016's rule was never "these three stay unindexed"
+      // but "an index arrives with the read that needs it", and 0017's own
+      // comment named the schedule -- "company and contact with the NDA, project
+      // with the status report". The letter and the agreements are those reads,
+      // so `documents_company_idx` and `documents_contact_idx` are here and
+      // `documents_project_idx` is not. Rewritten as the rule rather than as a
+      // count, so Task 4 changes one line and the sentence stays true.
       expect(indexes.map((row) => row.indexname)
-        .filter((name) => /company|contact|project/.test(name))).toEqual([]);
+        .filter((name) => /company|contact|project/.test(name)).sort())
+        .toEqual(["documents_company_idx", "documents_contact_idx"]);
 
       // A PRE-EXISTING MEETING CAN BE SUMMARISED, which is the point of the
       // whole upgrade rather than a property of a fresh install.
@@ -3024,10 +3047,37 @@ describe("the meeting summary (0017)", () => {
 
     // ...and it cannot be anything else, so the key can only ever mean "this
     // detail row describes a document whose type is quote".
+    //
+    // **PROBED ON THE INSERT SINCE 0019, AND THE REASON IS A REAL INTERACTION
+    // WORTH RECORDING.** This used to be an UPDATE, and the UPDATE now fails for
+    // a DIFFERENT reason: `conduit_document_frozen_guard` fires BEFORE the row
+    // is checked, so on a quote -- which is frozen -- the trigger refuses first
+    // and `document_quotes_type_is_quote` is never consulted. Both are 23514, so
+    // the old assertion went red on the constraint NAME rather than on the
+    // refusal, which is exactly the distinction that had to be noticed.
+    //
+    // The CHECK is not dead, and this is where that is proved: nothing guards an
+    // INSERT (the trigger is BEFORE UPDATE OR DELETE), so the insert path is
+    // both the one a writer can reach and the one that exercises the CHECK.
+    // The UPDATE is asserted below as well, because "a quote's detail row cannot
+    // be retyped" is the claim, and which of the two guards refuses it is an
+    // implementation detail the claim should survive.
+    const [other] = await handle.db.insert(documents)
+      .values(documentValues(parents, { number: "QUO-2026-7001" })).returning();
+    await expect(handle.db.execute(sql`
+      INSERT INTO document_quotes (document_id, type, currency, recipient_name,
+                                   subtotal_cents, tax_cents, total_cents)
+      VALUES (${other!.id}, 'meeting_summary', 'EUR', 'Acme', 100, 21, 121)
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", message: expect.stringContaining("document_quotes_type_is_quote") },
+    });
+
     await expect(handle.db.execute(sql`
       UPDATE document_quotes SET type = 'meeting_summary' WHERE document_id = ${document!.id}
     `)).rejects.toMatchObject({
-      cause: { code: "23514", message: expect.stringContaining("document_quotes_type_is_quote") },
+      cause: {
+        code: "23514", message: expect.stringContaining("documents_frozen_is_immutable"),
+      },
     });
   });
 
@@ -3186,5 +3236,531 @@ describe("the organisation's timezone (0018)", () => {
       WHERE z ~ '^[A-Za-z][A-Za-z0-9_+/-]*$' AND char_length(z) <= 64
     `);
     expect(ok?.n).toBe(all.length);
+  });
+});
+
+/* ========================================================================== *
+ *  THE LETTER AND THE AGREEMENTS (0019)
+ * ========================================================================== */
+
+describe("the letter and the agreements (0019)", () => {
+  /** A company, and the file a document attached to it needs. */
+  async function seedCompanyParents(): Promise<{ companyId: string; fileId: string }> {
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const [file] = await handle.db.insert(files).values({
+      originalName: "Letter - Acme - 2026-09-06.pdf", mime: "application/pdf",
+      sizeBytes: 9001, sha256: "b".repeat(64), uploaderUserId: userId, companyId: company.id,
+    }).returning();
+    return { companyId: company.id, fileId: file!.id };
+  }
+
+  function letterValues(
+    parents: { companyId: string; fileId: string },
+    overrides: Partial<typeof documents.$inferInsert> = {},
+  ) {
+    return {
+      // Spelled `null` and `false`, not asked of documentTypeNumbered /
+      // documentTypeFreezes -- documentValues' reason: a fixture that asked the
+      // code under test what to expect could never disagree with it.
+      number: null, frozen: false,
+      type: "letter", companyId: parents.companyId, fileId: parents.fileId,
+      issueDate: "2026-09-06", issuedByUserId: userId, ...overrides,
+    } satisfies typeof documents.$inferInsert;
+  }
+
+  function agreementValues(
+    parents: { companyId: string; fileId: string },
+    overrides: Partial<typeof documents.$inferInsert> = {},
+  ) {
+    return {
+      number: "NDA-2026-0001", frozen: true,
+      type: "nda", companyId: parents.companyId, fileId: parents.fileId,
+      issueDate: "2026-09-06", issuedByUserId: userId, ...overrides,
+    } satisfies typeof documents.$inferInsert;
+  }
+
+  /**
+   * EVERY merge token the seeded letter template contains, as an EQUALITY in
+   * both directions -- 0009's SEEDED_FIELDS and 0017's SUMMARY_FIELDS, one task
+   * on. A token the resolver does not supply renders as a silent blank on a
+   * printed page; a context key the template stopped naming is built for nothing.
+   *
+   * THE GREETING IS THE ONE THAT OWES BOTH BLOCK FORMS. A letter to a company
+   * with no named contact is ordinary, and "Dear ," is what you get if the
+   * conditional is left out -- 0009's logo lesson for the third time.
+   */
+  const LETTER_OPTIONAL = [
+    "org.logoDataUri", "org.addressLines", "org.email", "org.phone", "org.website",
+    "document.subject", "document.recipientContactName", "document.recipientAddress",
+  ];
+  const LETTER_FIELDS = [
+    "{{org.name}}", "{{document.issueDate}}", "{{document.recipientName}}",
+    // The raw-HTML field. NAMED `body` AND NOT `bodyHtml`: the merge path is what
+    // an operator types into a template, and the column name is not their problem.
+    "{{document.body}}",
+    // The salutation, in BOTH forms, plus its own value.
+    "{{#document.recipientSalutation}}", "{{^document.recipientSalutation}}",
+    "{{document.recipientSalutation}}", "{{/document.recipientSalutation}}",
+    ...LETTER_OPTIONAL.flatMap((path) => [`{{#${path}}}`, `{{${path}}}`, `{{/${path}}}`]),
+  ].sort();
+
+  const AGREEMENT_FIELD_TOKENS_OPTIONAL = [
+    "org.logoDataUri", "org.addressLines",
+    "document.partyContactName", "document.partyAddress",
+  ];
+  const AGREEMENT_FIELD_TOKENS = [
+    "{{org.name}}", "{{document.number}}", "{{document.issueDate}}",
+    "{{document.effectiveDate}}", "{{document.term}}", "{{document.jurisdiction}}",
+    "{{document.partyName}}",
+    ...AGREEMENT_FIELD_TOKENS_OPTIONAL.flatMap((p) => [`{{#${p}}}`, `{{${p}}}`, `{{/${p}}}`]),
+  ].sort();
+
+  /**
+   * **THE UPGRADE DRILL.** 0019 moves no rows -- every statement is a catalogue
+   * change, a CREATE or an INSERT -- so the questions are the ones a catalogue
+   * change raises: does the quote that was already there still satisfy three
+   * widened CHECKs, do the three templates arrive, do the two indexes get built,
+   * and does the guard exist and refuse the row it is for.
+   *
+   * THE LAST ONE IS WHY THIS DRILL MATTERS MORE THAN 0017'S. The trigger is the
+   * only object in this migration whose absence would be SILENT: every CHECK
+   * widening is visible the moment somebody inserts a letter, and a missing
+   * template is a 409 at issue. A trigger that was never created looks exactly
+   * like one that never fires -- which is also what a correctly behaving guard
+   * looks like, every day, on every install.
+   */
+  it("applies migration 0019 to a real pre-0019 database -- the existing quote is untouched, three templates arrive, both indexes are built, and the frozen guard refuses to change it", async () => {
+    await withPreMigrationDatabase("0019", async (scratch) => {
+      const [user] = await scratch.db.insert(users).values({ username: "chris" }).returning();
+      const company = await createCompany(scratch.db, user!.id, { name: "Acme" });
+      const pipeline = await createPipeline(scratch.db, user!.id, { name: "Sales", scope: "global" });
+      const stage = await createStage(scratch.db, user!.id, pipeline.id, { name: "New" });
+      const deal = await createDeal(
+        scratch.db, user!.id, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+      );
+      const [file] = await scratch.db.insert(files).values({
+        originalName: "QUO-2026-0001.pdf", mime: "application/pdf", sizeBytes: 16_003,
+        sha256: "d".repeat(64), uploaderUserId: user!.id, dealId: deal.id,
+      }).returning();
+      const [document] = await scratch.db.insert(documents).values({
+        number: "QUO-2026-0001", type: "quote", dealId: deal.id, fileId: file!.id,
+        issueDate: "2026-08-28", frozen: true, issuedByUserId: user!.id,
+      }).returning();
+      await scratch.db.insert(documentQuotes).values({
+        documentId: document!.id, currency: "EUR", recipientName: "Acme",
+        subtotalCents: 11_000, taxCents: 2100, totalCents: 13_100,
+      });
+
+      // PIN THE PREMISE, or every assertion below would also pass against a
+      // database that had been fully migrated all along.
+      const beforeTables = await scratch.db.execute<{ table_name: string }>(sql`
+        SELECT table_name FROM information_schema.tables
+        WHERE table_name IN ('document_letters', 'document_agreements')
+      `);
+      expect(beforeTables).toEqual([]);
+      const beforeTriggers = await scratch.db.execute<{ tgname: string }>(sql`
+        SELECT tgname FROM pg_trigger WHERE NOT tgisinternal
+      `);
+      expect(beforeTriggers).toEqual([]);
+      // **AND THE PRE-0019 QUOTE REALLY IS UPDATABLE**, which is exactly what
+      // stops being true a few lines down. Without this the guard's assertions
+      // would be satisfied by a database in which nothing was ever updatable --
+      // and the whole claim of this task is that ONE migration changed that.
+      await scratch.db.execute(sql`
+        UPDATE documents SET issue_date = '2026-08-29' WHERE id = ${document!.id}
+      `);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // 1. The quote is untouched, and still satisfies all three widened CHECKs.
+      const [after] = await scratch.db.select().from(documents);
+      expect(after).toMatchObject({
+        number: "QUO-2026-0001", type: "quote", frozen: true, issueDate: "2026-08-29",
+        fileId: file!.id,
+      });
+      const [quoteAfter] = await scratch.db.select().from(documentQuotes);
+      expect(quoteAfter).toMatchObject({ type: "quote", currency: "EUR", totalCents: 13_100 });
+
+      // 2. **THE GUARD.** The same UPDATE that succeeded above is now refused, and
+      // so is the DELETE, and so is a change to the money.
+      const refused = {
+        code: "23514", message: expect.stringContaining("documents_frozen_is_immutable"),
+      };
+      await expect(scratch.db.execute(sql`
+        UPDATE documents SET issue_date = '2026-08-30' WHERE id = ${document!.id}
+      `)).rejects.toMatchObject({ cause: refused });
+      await expect(scratch.db.execute(sql`
+        UPDATE document_quotes SET total_cents = 1 WHERE document_id = ${document!.id}
+      `)).rejects.toMatchObject({ cause: refused });
+      await expect(scratch.db.execute(sql`DELETE FROM documents WHERE id = ${document!.id}`))
+        .rejects.toMatchObject({ cause: refused });
+      // ...and the row really is still what it was, which is the difference
+      // between a refusal and an error raised after the damage.
+      const [stillThere] = await scratch.db.select().from(documents);
+      expect(stillThere).toMatchObject({ number: "QUO-2026-0001", issueDate: "2026-08-29" });
+
+      // 3. Three more templates, byte for byte what test/seed-template.ts derives
+      // from the migration file -- which is what keeps every suite that seeds its
+      // own copy honest about what a fresh install really holds.
+      const templates = await scratch.db.select().from(documentTemplates)
+        .orderBy(asc(documentTemplates.type));
+      expect(templates.map((row) => row.type)).toEqual([...documentTypeSchema.options].sort());
+      const bodyOf = (type: string) => templates.find((row) => row.type === type)?.bodyHtml ?? "";
+      expect(bodyOf("letter")).toBe(seededLetterTemplate());
+      expect(bodyOf("nda")).toBe(seededAgreementTemplate("nda"));
+      expect(bodyOf("mutual_nda")).toBe(seededAgreementTemplate("mutual_nda"));
+      // The earlier types' rows are untouched: widening the type CHECK must not
+      // have disturbed what 0009, 0011 and 0017 seeded.
+      expect(bodyOf("quote")).toBe(seededQuoteTemplate());
+      expect(bodyOf("meeting_summary")).toBe(seededMeetingSummaryTemplate());
+      // The two agreements are the same document in different words, so their
+      // token sets are identical and their BODIES are not.
+      expect(bodyOf("nda")).not.toBe(bodyOf("mutual_nda"));
+
+      for (const [type, expected] of [
+        ["letter", LETTER_FIELDS],
+        ["nda", AGREEMENT_FIELD_TOKENS],
+        ["mutual_nda", AGREEMENT_FIELD_TOKENS],
+      ] as const) {
+        const body = bodyOf(type);
+        expect([...new Set(body.match(/\{\{[^}]*\}\}/g) ?? [])].sort()).toEqual(expected);
+        // Every `{{` in the body is one of those tokens -- a CSS rule that
+        // accidentally put two braces together would be eaten as a merge field.
+        expect(body.match(/\{\{/g) ?? [])
+          .toHaveLength((body.match(/\{\{[^}]*\}\}/g) ?? []).length);
+        // The two properties the document sanitiser profile exists to allow, and
+        // the one that keeps a newline-separated address printing as lines.
+        expect(body).toContain("@page");
+        expect(body).toContain("white-space: pre-line");
+      }
+
+      // 4. The two indexes 0017 said would arrive "with the NDA", and the third
+      // still absent because its read is Task 4's.
+      const indexes = await scratch.db.execute<{ indexname: string; indexdef: string }>(
+        sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'documents'`,
+      );
+      const named = (name: string) => indexes.find((row) => row.indexname === name);
+      expect(named("documents_company_idx")?.indexdef).toMatch(/\(company_id\)/i);
+      expect(named("documents_contact_idx")?.indexdef).toMatch(/\(contact_id\)/i);
+      for (const name of ["documents_company_idx", "documents_contact_idx"]) {
+        expect(named(name)?.indexdef).not.toMatch(/UNIQUE/i);
+        expect(named(name)?.indexdef).not.toMatch(/WHERE/i);
+      }
+      expect(named("documents_project_idx")).toBeUndefined();
+
+      // 5. A PRE-EXISTING COMPANY CAN BE WRITTEN TO, which is the point of the
+      // upgrade rather than a property of a fresh install -- and the letter it
+      // gets is EDITABLE while the quote above is not. One migration, two
+      // opposite answers, off one column.
+      const [letterFile] = await scratch.db.insert(files).values({
+        originalName: "Letter - Acme - 2026-09-06.pdf", mime: "application/pdf",
+        sizeBytes: 5000, sha256: "e".repeat(64), uploaderUserId: user!.id, companyId: company.id,
+      }).returning();
+      const [letter] = await scratch.db.insert(documents).values({
+        number: null, type: "letter", companyId: company.id, fileId: letterFile!.id,
+        issueDate: "2026-09-06", frozen: false, issuedByUserId: user!.id,
+      }).returning();
+      await scratch.db.insert(documentLetters)
+        .values({ documentId: letter!.id, recipientName: "Acme", bodyHtml: "<p>Hello</p>" });
+      await scratch.db.execute(sql`
+        UPDATE document_letters SET body_html = '<p>Redrafted</p>' WHERE document_id = ${letter!.id}
+      `);
+      const [redrafted] = await scratch.db.select().from(documentLetters);
+      expect(redrafted?.bodyHtml).toBe("<p>Redrafted</p>");
+    });
+  });
+
+  /**
+   * **THE GUARD, ACROSS EVERY TABLE IT COVERS AND IN BOTH VERBS.**
+   *
+   * The spec's fourth risk in one test: "making it conditional is where a
+   * mistake would let a quote be edited". A quote's three rows are frozen, a
+   * letter's two are not, and the difference is one column.
+   *
+   * `document_line_items` IS IN THE LIST AND IT IS THE ONE THAT MATTERS MOST.
+   * The parent row is where `frozen` lives, but the PRICE somebody was sent is in
+   * `document_quotes` and the lines are here -- a guard that covered only the
+   * parent would leave both editable, and the `documents` row would sit there
+   * untouched while the page it points at became a lie.
+   */
+  it("refuses every UPDATE and DELETE against a frozen document, on all four tables", async () => {
+    const parents = await seedDocumentParents();
+    const quote = await insertQuote(parents);
+    const [line] = await handle.db.insert(documentLineItems).values({
+      documentId: quote.id, position: 1, description: "Widget",
+      qtyMilli: 2000, unitPriceCents: 5000, taxRateBp: 2100, lineTotalCents: 10_000,
+    }).returning();
+
+    const refused = {
+      code: "23514", message: expect.stringContaining("documents_frozen_is_immutable"),
+    };
+    for (const statement of [
+      sql`UPDATE documents SET issue_date = '2026-01-01' WHERE id = ${quote.id}`,
+      sql`UPDATE documents SET frozen = false WHERE id = ${quote.id}`,
+      sql`DELETE FROM documents WHERE id = ${quote.id}`,
+      sql`UPDATE document_quotes SET total_cents = 1 WHERE document_id = ${quote.id}`,
+      sql`UPDATE document_quotes SET recipient_name = 'Someone else' WHERE document_id = ${quote.id}`,
+      sql`DELETE FROM document_quotes WHERE document_id = ${quote.id}`,
+      sql`UPDATE document_line_items SET line_total_cents = 1 WHERE id = ${line!.id}`,
+      sql`DELETE FROM document_line_items WHERE id = ${line!.id}`,
+    ]) {
+      await expect(handle.db.execute(statement)).rejects.toMatchObject({ cause: refused });
+    }
+
+    // NOT ONE OF THEM LANDED. Eight refusals prove eight errors were raised; this
+    // proves the rows are what they were, which is the claim being made.
+    const [documentAfter] = await handle.db.select().from(documents)
+      .where(eq(documents.id, quote.id));
+    expect(documentAfter).toMatchObject({ issueDate: "2026-08-28", frozen: true });
+    const [quoteAfter] = await handle.db.select().from(documentQuotes);
+    expect(quoteAfter).toMatchObject({ totalCents: 13_100, recipientName: "Acme" });
+    const [lineAfter] = await handle.db.select().from(documentLineItems);
+    expect(lineAfter).toMatchObject({ lineTotalCents: 10_000 });
+  });
+
+  it("lets an unfrozen document and its detail row be changed, and deleted", async () => {
+    const parents = await seedCompanyParents();
+    const [letter] = await handle.db.insert(documents).values(letterValues(parents)).returning();
+    await handle.db.insert(documentLetters)
+      .values({ documentId: letter!.id, recipientName: "Acme", bodyHtml: "<p>Draft</p>" });
+
+    await handle.db.update(documentLetters)
+      .set({ bodyHtml: "<p>Redrafted</p>", subject: "Renewal" })
+      .where(eq(documentLetters.documentId, letter!.id));
+    await handle.db.update(documents)
+      .set({ issueDate: "2026-09-07" }).where(eq(documents.id, letter!.id));
+
+    const [afterLetter] = await handle.db.select().from(documentLetters);
+    expect(afterLetter).toMatchObject({ bodyHtml: "<p>Redrafted</p>", subject: "Renewal" });
+    const [afterDocument] = await handle.db.select().from(documents);
+    expect(afterDocument).toMatchObject({ issueDate: "2026-09-07" });
+
+    // DELETE TOO, asserted rather than left out because the trigger covers BEFORE
+    // UPDATE OR DELETE and a guard that refused every delete would pass every
+    // assertion above. Nothing in the product deletes a document; what is pinned
+    // here is that the guard is about `frozen` and not about the verb.
+    await handle.db.delete(documentLetters).where(eq(documentLetters.documentId, letter!.id));
+    await handle.db.delete(documents).where(eq(documents.id, letter!.id));
+    expect(await handle.db.select().from(documents)).toHaveLength(0);
+  });
+
+  /**
+   * FREEZING IS PER DOCUMENT AND NOT PER TABLE, which is the distinction a guard
+   * keyed on the table name would lose. A `document_agreements` row is frozen
+   * because its DOCUMENT is; if a future type shared that table and answered
+   * `false`, its rows would be editable and these would not.
+   */
+  it("refuses an agreement's terms off the same trigger that admits a letter's body", async () => {
+    const parents = await seedCompanyParents();
+    const [nda] = await handle.db.insert(documents).values(agreementValues(parents)).returning();
+    await handle.db.insert(documentAgreements).values({
+      documentId: nda!.id, type: "nda", effectiveDate: "2026-09-01", termMonths: 36,
+      jurisdiction: "the Netherlands", partyName: "Acme",
+    });
+
+    await expect(handle.db.execute(sql`
+      UPDATE document_agreements SET term_months = 1 WHERE document_id = ${nda!.id}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", message: expect.stringContaining("documents_frozen_is_immutable") },
+    });
+    const [unchanged] = await handle.db.select().from(documentAgreements);
+    expect(unchanged).toMatchObject({ termMonths: 36, jurisdiction: "the Netherlands" });
+  });
+
+  /**
+   * The per-type answers as LITERALS. The enum-driven sync tests in the 0009
+   * block already assert `documentTypeFreezes` and `documentTypeNumbered` against
+   * their CHECKs for every member -- what those cannot say is that the answers
+   * are the ones Chris decided, because they ask the functions.
+   */
+  it("freezes and numbers exactly the types the spec says, spelled rather than derived", () => {
+    expect(documentTypeSchema.options.filter(documentTypeFreezes))
+      .toEqual(["quote", "nda", "mutual_nda"]);
+    expect(documentTypeSchema.options.filter(documentTypeNumbered))
+      .toEqual(["quote", "nda", "mutual_nda"]);
+    expect(documentTypeSchema.options.filter((t) => !documentTypeFreezes(t)))
+      .toEqual(["meeting_summary", "letter"]);
+    // **THE TWO SETS COINCIDE AT FIVE TYPES AND THAT IS TODAY'S ARITHMETIC, NOT AN
+    // INVARIANT.** Written as two independent literals above rather than as
+    // `expect(frozen).toEqual(numbered)`, because that spelling would read as a
+    // rule -- and the rule it would state is exactly the one documentTypeNumbered
+    // argues against, which a later type (a status report is neither; a delivery
+    // note would be numbered and reprintable) is going to break.
+  });
+
+  it("refuses a numbered letter and an unnumbered agreement", async () => {
+    const parents = await seedCompanyParents();
+    const violates = {
+      code: "23514", message: expect.stringContaining("documents_number_matches_type"),
+    };
+    await expect(handle.db.insert(documents)
+      .values(letterValues(parents, { number: "LET-2026-0001" })))
+      .rejects.toMatchObject({ cause: violates });
+    await expect(handle.db.insert(documents).values(agreementValues(parents, { number: null })))
+      .rejects.toMatchObject({ cause: violates });
+  });
+
+  /**
+   * THE THIRD ENFORCEMENT, WHICH IS THE ONE THAT IS AN ABSENCE.
+   * `document_number_sequences_type_valid` is deliberately NARROWER than
+   * `documents_type_valid`: it names the NUMBERED types, so a writer that called
+   * allocateNumber for a letter fails on that INSERT rather than minting
+   * `DOC-2026-0001` out of formatDocumentNumber's fallback.
+   */
+  it("admits a sequence row for every numbered type and refuses one for every other", async () => {
+    for (const type of documentTypeSchema.options) {
+      const insert = handle.db.insert(documentNumberSequences).values({ type, year: 2026 });
+      if (documentTypeNumbered(type)) {
+        await expect(insert).resolves.toBeDefined();
+      } else {
+        await expect(insert).rejects.toMatchObject({
+          cause: {
+            code: "23514",
+            message: expect.stringContaining("document_number_sequences_type_valid"),
+          },
+        });
+      }
+    }
+  });
+
+  /**
+   * The composite key on both new tables -- 0017's trick applied to two types
+   * that did not exist when it was invented. What it catches is reachable:
+   * `listRecordDocuments` LEFT JOINs both detail tables on `document_id` alone,
+   * so without the key a `document_agreements` row naming a LETTER would come
+   * back as an NDA, with a term and a jurisdiction, from code that never asked.
+   */
+  it("refuses a detail row that names a document of the wrong type, on both new tables", async () => {
+    const parents = await seedCompanyParents();
+    const [letter] = await handle.db.insert(documents).values(letterValues(parents)).returning();
+    const [nda] = await handle.db.insert(documents).values(agreementValues(parents)).returning();
+
+    await expect(handle.db.insert(documentAgreements).values({
+      documentId: letter!.id, type: "nda", effectiveDate: "2026-09-01", termMonths: 12,
+      jurisdiction: "the Netherlands", partyName: "Acme",
+    })).rejects.toMatchObject({
+      cause: {
+        code: "23503",
+        message: expect.stringContaining("document_agreements_document_id_type_fk"),
+      },
+    });
+
+    // A letter row pointing at the NDA. Its `type` is a CONSTANT filled by the
+    // DEFAULT, so a writer cannot even spell the disagreement -- which is exactly
+    // what makes this the same failure arriving through the key.
+    await expect(handle.db.insert(documentLetters)
+      .values({ documentId: nda!.id, recipientName: "Acme", bodyHtml: "<p>x</p>" }))
+      .rejects.toMatchObject({
+        cause: {
+          code: "23503",
+          message: expect.stringContaining("document_letters_document_id_type_fk"),
+        },
+      });
+
+    // And the pairs that DO agree are accepted, or a key that refused everything
+    // would pass both assertions above and break every letter.
+    const [letterRow] = await handle.db.insert(documentLetters)
+      .values({ documentId: letter!.id, recipientName: "Acme", bodyHtml: "<p>x</p>" }).returning();
+    expect(letterRow?.type).toBe("letter");
+    const [ndaRow] = await handle.db.insert(documentAgreements).values({
+      documentId: nda!.id, type: "nda", effectiveDate: "2026-09-01", termMonths: 12,
+      jurisdiction: "the Netherlands", partyName: "Acme",
+    }).returning();
+    expect(ndaRow?.type).toBe("nda");
+  });
+
+  it("pins document_letters.type to 'letter' and document_agreements.type to the two agreements", async () => {
+    const parents = await seedCompanyParents();
+    const [letter] = await handle.db.insert(documents).values(letterValues(parents)).returning();
+    await expect(handle.db.execute(sql`
+      INSERT INTO document_letters (document_id, type, recipient_name, body_html)
+      VALUES (${letter!.id}, 'quote', 'Acme', '<p>x</p>')
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", message: expect.stringContaining("document_letters_type_is_letter") },
+    });
+
+    // The agreements' CHECK is the first of the three that pins a SET rather than
+    // a constant, because the writer is the only thing that knows which of the two
+    // an agreement is.
+    const [mutual] = await handle.db.insert(documents)
+      .values(agreementValues(parents, { type: "mutual_nda", number: "MNDA-2026-0001" }))
+      .returning();
+    const [mutualRow] = await handle.db.insert(documentAgreements).values({
+      documentId: mutual!.id, type: "mutual_nda", effectiveDate: "2026-09-01", termMonths: 24,
+      jurisdiction: "England and Wales", partyName: "Acme",
+    }).returning();
+    expect(mutualRow?.type).toBe("mutual_nda");
+
+    const [third] = await handle.db.insert(documents)
+      .values(agreementValues(parents, { number: "NDA-2026-0009" })).returning();
+    await expect(handle.db.execute(sql`
+      INSERT INTO document_agreements (document_id, type, effective_date, term_months,
+                                       jurisdiction, party_name)
+      VALUES (${third!.id}, 'letter', '2026-09-01', 12, 'the Netherlands', 'Acme')
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", message: expect.stringContaining("document_agreements_type_valid") },
+    });
+  });
+
+  it("bounds the term and refuses an agreement with no party or no governing law", async () => {
+    const parents = await seedCompanyParents();
+    const [nda] = await handle.db.insert(documents).values(agreementValues(parents)).returning();
+    const base = {
+      documentId: nda!.id, type: "nda", effectiveDate: "2026-09-01",
+      termMonths: 36, jurisdiction: "the Netherlands", partyName: "Acme",
+    };
+    for (const [bad, constraint] of [
+      [{ termMonths: 0 }, "document_agreements_term_range"],
+      [{ termMonths: 1201 }, "document_agreements_term_range"],
+      [{ partyName: "" }, "document_agreements_stated"],
+      [{ jurisdiction: "" }, "document_agreements_stated"],
+    ] as const) {
+      await expect(handle.db.insert(documentAgreements).values({ ...base, ...bad }))
+        .rejects.toMatchObject({
+          cause: { code: "23514", message: expect.stringContaining(constraint) },
+        });
+    }
+    // THE EXACT EDGES ARE ACCEPTED, which is what stops the bound being narrowed
+    // by one and nobody noticing: 1 and 1200 are both real terms.
+    for (const months of [1, 1200]) {
+      const [row] = await handle.db.insert(documents)
+        .values(agreementValues(parents, { number: `NDA-2026-1${String(months)}` })).returning();
+      await handle.db.insert(documentAgreements)
+        .values({ ...base, documentId: row!.id, termMonths: months });
+    }
+    expect(await handle.db.select().from(documentAgreements)).toHaveLength(2);
+  });
+
+  /**
+   * A letter attaches to exactly one of the five, and it is the first type to use
+   * `company_id` or `contact_id` -- the columns 0016 added and nothing read.
+   */
+  it("attaches a letter to a company or a contact and to nothing else", async () => {
+    const parents = await seedCompanyParents();
+    const contact = await createContact(handle.db, userId, { firstName: "Jane", lastName: "Smith" });
+    const [file] = await handle.db.insert(files).values({
+      originalName: "l.pdf", mime: "application/pdf", sizeBytes: 10, sha256: "c".repeat(64),
+      uploaderUserId: userId, contactId: contact.id,
+    }).returning();
+
+    const [onCompany] = await handle.db.insert(documents).values(letterValues(parents)).returning();
+    expect(onCompany).toMatchObject({
+      companyId: parents.companyId, contactId: null, dealId: null, projectId: null, meetingId: null,
+    });
+    const [onContact] = await handle.db.insert(documents).values(letterValues(parents, {
+      companyId: null, contactId: contact.id, fileId: file!.id,
+    })).returning();
+    expect(onContact).toMatchObject({ companyId: null, contactId: contact.id });
+
+    // **BOTH AT ONCE IS THE SHAPE CHRIS'S DECISION FORBIDS**, and an NDA naming a
+    // contact at a company is precisely the document somebody would reach for it
+    // with. It attaches to the company and names the contact in its CONTENT --
+    // `document_agreements.party_contact_name` -- which is a column and not a
+    // second owner.
+    await expect(handle.db.insert(documents)
+      .values(letterValues(parents, { contactId: contact.id })))
+      .rejects.toMatchObject({
+        cause: { code: "23514", message: expect.stringContaining("documents_exactly_one_entity") },
+      });
   });
 });

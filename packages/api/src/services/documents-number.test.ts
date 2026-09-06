@@ -1,5 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
+import { documentTypeNumbered, documentTypeSchema } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { documentNumberSequences } from "../db/schema.js";
 import { allocateNumber, formatDocumentNumber } from "./documents-number.js";
@@ -24,6 +25,46 @@ describe("formatDocumentNumber", () => {
   // than left to be discovered by a quote numbered `undefined-2026-0001`.
   it("falls back to DOC for a type with no prefix of its own", () => {
     expect(formatDocumentNumber("invoice", 2026, 7)).toBe("DOC-2026-0007");
+  });
+
+  it("gives each agreement its own prefix", () => {
+    expect(formatDocumentNumber("nda", 2026, 1)).toBe("NDA-2026-0001");
+    expect(formatDocumentNumber("mutual_nda", 2026, 1)).toBe("MNDA-2026-0001");
+  });
+
+  /**
+   * **EVERY NUMBERED TYPE HAS A PREFIX OF ITS OWN, AND NO TWO SHARE ONE.**
+   *
+   * `documents_number_unique` is GLOBAL while numbering is per (type, year), and
+   * the only thing that makes those two consistent is that no two types format to
+   * the same string. Two types sharing a prefix would mint QUO-2026-0001 twice --
+   * the second one failing at issue, on somebody's install, at the moment they
+   * needed the document.
+   *
+   * IT ALSO CATCHES THE FALLBACK, which is the likelier mistake by far: a type
+   * added to `documentTypeNumbered` and to
+   * `document_number_sequences_type_valid` but NOT to PREFIX gets `DOC-`, quietly,
+   * and would collide with the next such type rather than with anything visible.
+   * Driven off the enum so a sixth type arrives here without anybody remembering.
+   */
+  it("gives every numbered type a distinct prefix, and none of them the fallback", () => {
+    const numbered = documentTypeSchema.options.filter(documentTypeNumbered);
+    const prefixes = numbered.map((type) => formatDocumentNumber(type, 2026, 1).split("-")[0]);
+    expect(new Set(prefixes).size).toBe(numbered.length);
+    expect(prefixes).not.toContain("DOC");
+  });
+
+  /**
+   * `NDA` AND `MNDA` RATHER THAN `NDA` AND `NDA-M`, and the distinctness test
+   * above would pass either way. The formatted numbers are what a person reads:
+   * `NDA-M-2026-0001` reads as a malformed `NDA-2026-...` and sorts among them.
+   */
+  it("keeps the two agreement numbers unmistakable, not merely unequal", () => {
+    const nda = formatDocumentNumber("nda", 2026, 1);
+    const mutual = formatDocumentNumber("mutual_nda", 2026, 1);
+    expect(mutual.startsWith("NDA-")).toBe(false);
+    expect(nda.split("-")).toHaveLength(3);
+    expect(mutual.split("-")).toHaveLength(3);
   });
 });
 

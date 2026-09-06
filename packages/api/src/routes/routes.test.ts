@@ -10,12 +10,15 @@ import {
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, meetingSummarySchema, documentSchema, orgProfileSchema,
+  agreementSchema, letterSchema, recordDocumentSchema,
   documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
   DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
-import { seededMeetingSummaryTemplate, seededQuoteTemplate } from "../test/seed-template.js";
+import {
+  seededAgreementTemplate, seededLetterTemplate, seededMeetingSummaryTemplate, seededQuoteTemplate,
+} from "../test/seed-template.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
 import { listFiles } from "../services/files.js";
 import { listEvents } from "../services/timeline.js";
@@ -2542,6 +2545,230 @@ describe("documents routes", () => {
     await a.close();
   });
 
+  /* ---------------------------------------------------------------------- *
+   *  PHASE 9 TASK 3: the letter, the agreements, and the redraft
+   * ---------------------------------------------------------------------- */
+
+  /** Its own rather than the meetings block's, which is scoped to that describe. */
+  async function makeCompany(a: Awaited<ReturnType<typeof app>>) {
+    const response = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    return companySchema.parse(response.json());
+  }
+
+  /** truncateAll empties document_templates, so the three new types seed their own. */
+  async function seedTask3Templates(): Promise<void> {
+    await handle.db.insert(documentTemplates).values([
+      { type: "letter", bodyHtml: seededLetterTemplate() },
+      { type: "nda", bodyHtml: seededAgreementTemplate("nda") },
+      { type: "mutual_nda", bodyHtml: seededAgreementTemplate("mutual_nda") },
+    ]);
+  }
+
+  const letterPayload = (overrides: Record<string, unknown> = {}) => ({
+    type: "letter",
+    issueDate: "2026-09-06",
+    subject: "Renewal",
+    recipientName: "Acme Manufacturing BV",
+    recipientContactName: "Jane Smith",
+    recipientSalutation: "Ms Smith",
+    recipientAddress: "1 Industrieweg",
+    bodyHtml: "<p>Thank you for your time.</p>",
+    ...overrides,
+  });
+
+  const ndaPayload = (overrides: Record<string, unknown> = {}) => ({
+    type: "nda",
+    issueDate: "2026-09-06", effectiveDate: "2026-09-01", termMonths: 36,
+    jurisdiction: "the Netherlands", partyName: "Acme Manufacturing BV",
+    partyContactName: "Jane Smith", partyAddress: "1 Industrieweg",
+    ...overrides,
+  });
+
+  it("writes a letter on a company, lists it beside an NDA, and serves both PDFs", async () => {
+    await seedTask3Templates();
+    const a = await app();
+    const company = await makeCompany(a);
+
+    const withStub = async (payload: Record<string, unknown>) =>
+      await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+        await a.inject({
+          method: "POST", url: `/api/companies/${company.id}/documents`,
+          headers: authHeaders, payload,
+        }));
+
+    const letterResponse = await withStub(letterPayload());
+    expect(letterResponse.statusCode).toBe(201);
+    const letter = letterSchema.parse(letterResponse.json());
+    expect(letter).toMatchObject({ type: "letter", companyId: company.id, frozen: false });
+
+    const ndaResponse = await withStub(ndaPayload());
+    expect(ndaResponse.statusCode).toBe(201);
+    const nda = agreementSchema.parse(ndaResponse.json());
+    expect(nda).toMatchObject({ type: "nda", number: "NDA-2026-0001", frozen: true });
+
+    // **THE MIXED LIST**, parsed with the discriminated union rather than with one
+    // member -- which is the whole point of it being a union.
+    const listed = await a.inject({
+      method: "GET", url: `/api/companies/${company.id}/documents`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(recordDocumentSchema).parse(listed.json())).toEqual([nda, letter]);
+
+    // NO SECOND DOWNLOAD PATH, as for every other type.
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${nda.fileId}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.headers["content-disposition"]).toContain("NDA-2026-0001.pdf");
+    await a.close();
+  });
+
+  it("writes a letter on a contact, which the company's list does not show", async () => {
+    await seedTask3Templates();
+    const a = await app();
+    const company = await makeCompany(a);
+    const created = await a.inject({
+      method: "POST", url: "/api/contacts", headers: authHeaders,
+      payload: { firstName: "Jane", lastName: "Smith", companyId: company.id },
+    });
+    const contactId = (created.json() as { id: string }).id;
+
+    const response = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/contacts/${contactId}/documents`,
+        headers: authHeaders, payload: letterPayload(),
+      }));
+    expect(response.statusCode).toBe(201);
+    expect(letterSchema.parse(response.json())).toMatchObject({ companyId: null, contactId });
+
+    // **CHRIS'S "EXACTLY ONE" DECISION, VISIBLE AT THE HTTP SURFACE.** A letter to
+    // Jane at Acme is on JANE, so Acme's own list is empty -- which is the
+    // consequence of the decision and the thing to look at before deciding whether
+    // it was the right one.
+    const onCompany = await a.inject({
+      method: "GET", url: `/api/companies/${company.id}/documents`, headers: authHeaders,
+    });
+    expect(onCompany.json()).toEqual([]);
+    await a.close();
+  });
+
+  it("redrafts a letter in place and refuses to redraft a quote or an NDA", async () => {
+    await seedTemplate();
+    await seedTask3Templates();
+    const a = await app();
+    const company = await makeCompany(a);
+    const stub = async (fn: () => Promise<unknown>) =>
+      await withPythonStub(writePythonStub(dataDir, VARYING_PDF), fn);
+
+    const letter = letterSchema.parse((await stub(async () => await a.inject({
+      method: "POST", url: `/api/companies/${company.id}/documents`,
+      headers: authHeaders, payload: letterPayload(),
+    })) as { json: () => unknown }).json());
+
+    const redrafted = await stub(async () => await a.inject({
+      method: "PUT", url: `/api/documents/${letter.id}`, headers: authHeaders,
+      // NO `type` IN THE BODY: the redraft schema is the issue schema minus its
+      // discriminator, because the document already knows what it is.
+      payload: {
+        issueDate: "2026-09-07", subject: "Second thoughts",
+        recipientName: "Acme Manufacturing BV", recipientContactName: "",
+        recipientSalutation: "", recipientAddress: "",
+        bodyHtml: "<p>Rewritten.</p>",
+      },
+    })) as { statusCode: number; json: () => unknown };
+    expect(redrafted.statusCode).toBe(200);
+    expect(letterSchema.parse(redrafted.json()))
+      .toMatchObject({ id: letter.id, subject: "Second thoughts", bodyHtml: "<p>Rewritten.</p>" });
+
+    // ONE DOCUMENT, EDITED. Not two.
+    const listed = await a.inject({
+      method: "GET", url: `/api/companies/${company.id}/documents`, headers: authHeaders,
+    });
+    expect(z.array(recordDocumentSchema).parse(listed.json())).toHaveLength(1);
+
+    // **AND THE TWO REFUSALS THAT MATTER.** A quote and an NDA are frozen, so a
+    // PUT at either is a 409 with a sentence rather than a silent edit.
+    const nda = agreementSchema.parse((await stub(async () => await a.inject({
+      method: "POST", url: `/api/companies/${company.id}/documents`,
+      headers: authHeaders, payload: ndaPayload(),
+    })) as { json: () => unknown }).json());
+
+    const deal = await makeQuotableDeal(a);
+    const quote = documentSchema.parse((await stub(async () => await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/documents`,
+      headers: authHeaders, payload: quotePayload(),
+    })) as { json: () => unknown }).json());
+
+    for (const [id, noun] of [[quote.id, "quote"], [nda.id, "nda"]] as const) {
+      const refused = await stub(async () => await a.inject({
+        method: "PUT", url: `/api/documents/${id}`, headers: authHeaders,
+        payload: {
+          issueDate: "2026-09-07", recipientName: "Acme", bodyHtml: "<p>x</p>",
+          subject: "", recipientContactName: "", recipientSalutation: "", recipientAddress: "",
+        },
+      })) as { statusCode: number; json: () => unknown };
+      expect(refused.statusCode).toBe(409);
+      const body = errorResponseSchema.parse(refused.json());
+      expect(body.error).toBe("frozen");
+      expect(body.message).toBe(`an issued ${noun.replace("_", " ")} cannot be changed`);
+    }
+
+    // ...and the quote is exactly what it was, which is the claim rather than the
+    // status code.
+    const quoteAfter = await a.inject({
+      method: "GET", url: `/api/deals/${deal.id}/documents`, headers: authHeaders,
+    });
+    expect(z.array(documentSchema).parse(quoteAfter.json())).toEqual([quote]);
+    await a.close();
+  });
+
+  it("answers 404 for an unknown record and 409 for an archived one", async () => {
+    await seedTask3Templates();
+    const a = await app();
+    const company = await makeCompany(a);
+
+    const unknown = await a.inject({
+      method: "POST", url: `/api/companies/${unknownId}/documents`,
+      headers: authHeaders, payload: letterPayload(),
+    });
+    expect(unknown.statusCode).toBe(404);
+
+    await a.inject({
+      method: "POST", url: `/api/companies/${company.id}/archive`, headers: authHeaders,
+    });
+    const archived = await a.inject({
+      method: "POST", url: `/api/companies/${company.id}/documents`,
+      headers: authHeaders, payload: letterPayload(),
+    });
+    expect(archived.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(archived.json()).error).toBe("archived");
+    await a.close();
+  });
+
+  it("refuses a body whose type is not one of the two this route can produce", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    for (const payload of [
+      // A type that exists but does not attach to a company.
+      letterPayload({ type: "meeting_summary" }),
+      // A type that does not exist at all.
+      letterPayload({ type: "invoice" }),
+      // The right type with a missing required field.
+      letterPayload({ recipientName: "" }),
+      // An agreement with a term outside the bound.
+      ndaPayload({ termMonths: 0 }),
+    ]) {
+      const response = await a.inject({
+        method: "POST", url: `/api/companies/${company.id}/documents`,
+        headers: authHeaders, payload,
+      });
+      expect(response.statusCode).toBe(400);
+    }
+    await a.close();
+  });
+
   it("returns 401 without an identity header on every documents route", async () => {
     const a = await app();
     const calls = [
@@ -2549,12 +2776,20 @@ describe("documents routes", () => {
       { method: "POST" as const, url: `/api/deals/${unknownId}/documents` },
       { method: "GET" as const, url: `/api/meetings/${unknownId}/documents` },
       { method: "POST" as const, url: `/api/meetings/${unknownId}/documents` },
+      { method: "GET" as const, url: `/api/companies/${unknownId}/documents` },
+      { method: "POST" as const, url: `/api/companies/${unknownId}/documents` },
+      { method: "GET" as const, url: `/api/contacts/${unknownId}/documents` },
+      { method: "POST" as const, url: `/api/contacts/${unknownId}/documents` },
+      { method: "PUT" as const, url: `/api/documents/${unknownId}` },
       { method: "GET" as const, url: "/api/org-profile" },
       { method: "PUT" as const, url: "/api/org-profile" },
       { method: "GET" as const, url: "/api/document-templates/quote" },
       { method: "PUT" as const, url: "/api/document-templates/quote" },
       { method: "GET" as const, url: "/api/document-templates/meeting_summary" },
       { method: "PUT" as const, url: "/api/document-templates/meeting_summary" },
+      { method: "GET" as const, url: "/api/document-templates/letter" },
+      { method: "PUT" as const, url: "/api/document-templates/nda" },
+      { method: "GET" as const, url: "/api/document-templates/mutual_nda" },
     ];
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });
