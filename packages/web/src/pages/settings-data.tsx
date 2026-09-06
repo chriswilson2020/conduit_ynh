@@ -681,11 +681,18 @@ function ExportCard(
 ) {
   return (
     <Card title="Export -- the readable half" testId="export-card">
+      {/* THE THIRD HAND-WRITTEN LIST OF SHEETS, found by Phase 10 Task 1 while
+          adding a tenth. services/export.ts has one `*Sheet` function per entity,
+          services/import-export.ts has one NOT_IMPORTED entry per sheet, and this
+          sentence is the only one a USER ever reads -- so a sheet missing here is
+          an operator who does not know their timesheet is in the file. Nothing
+          derives any of the three from the others; adding a sheet means editing
+          all three, and this is the one with no test behind it. */}
       <p className="text-sm text-slate-600">
         A ZIP holding one CSV per record type -- companies, contacts, deals, projects,
-        tasks, notes, meetings and documents -- plus every file you have uploaded and
-        every quote PDF you have issued. The CSVs open in Excel, Numbers or LibreOffice,
-        accented names intact.
+        tasks, notes, meetings, time entries and documents -- plus every file you have
+        uploaded and every quote PDF you have issued. The CSVs open in Excel, Numbers
+        or LibreOffice, accented names intact.
       </p>
       <Limitation testId="export-limitation" headline="It cannot be restored into Conduit.">
         There is no database dump in it, no mail, and no passwords, so nothing can rebuild

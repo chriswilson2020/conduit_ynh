@@ -1058,9 +1058,13 @@ describe("findings", () => {
     const { plan } = await planFor(archive);
 
     const skipped = plan.findings.filter((f) => f.code === IMPORT_FINDINGS.sheetNotImported);
+    // AN EXACT LIST, WHICH IS WHY THIS TEST DID ITS JOB: Phase 10 added a tenth
+    // sheet and this went red at the moment `time_entries.csv` reached the
+    // archive with no NOT_IMPORTED entry behind it -- the "a new sheet nobody
+    // told the other half about" failure, caught rather than shipped.
     expect(skipped.map((f) => f.message.split(" ")[0])).toEqual([
       "deals.csv", "projects.csv", "tasks.csv", "notes.csv",
-      "meetings.csv", "documents.csv", "files.csv",
+      "meetings.csv", "documents.csv", "files.csv", "time_entries.csv",
     ]);
     // THE REASONS ARE SPECIFIC, because they are the specification for the
     // formatVersion 2 that would close them.
@@ -1068,6 +1072,8 @@ describe("findings", () => {
       .toMatch(/no pipelines or stages/);
     expect(skipped.find((f) => f.message.startsWith("documents.csv"))?.message)
       .toMatch(/no line items/);
+    expect(skipped.find((f) => f.message.startsWith("time_entries.csv"))?.message)
+      .toMatch(/at least one record/);
     expect(findingCodes(plan)).toContain(IMPORT_FINDINGS.partialImport);
   });
 });

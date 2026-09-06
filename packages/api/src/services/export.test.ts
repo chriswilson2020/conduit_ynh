@@ -24,6 +24,7 @@ import { createProject, archiveProject } from "./projects.js";
 import { createTask, archiveTask } from "./tasks.js";
 import { createNote } from "./notes.js";
 import { createMeeting, archiveMeeting } from "./meetings.js";
+import { createTimeEntry, archiveTimeEntry } from "./time-entries.js";
 import {
   companies as companiesTable, deals as dealsTable, documents as documentsTable,
   documentAgreements, documentLetters, documentQuotes as documentQuotesTable,
@@ -426,6 +427,7 @@ describe("export archive shape", () => {
     expect(await memberPaths(root)).toEqual([
       "companies.csv", "contacts.csv", "deals.csv", "documents.csv", "files.csv",
       "manifest.json", "meetings.csv", "notes.csv", "projects.csv", "tasks.csv",
+      "time_entries.csv",
     ]);
   });
 
@@ -455,7 +457,7 @@ describe("export archive shape", () => {
 
     const root = await extract(await writeArchive());
     const manifest = await readManifest(root);
-    expect(manifest.members.length).toBe(10);
+    expect(manifest.members.length).toBe(11);
     for (const member of manifest.members) {
       const bytes = await readFile(path.join(root, member.path));
       expect(createHash("sha256").update(bytes).digest("hex"), member.path).toBe(member.sha256);
@@ -1258,6 +1260,277 @@ describe("export documents", () => {
 // test: ftruncate reserves no blocks, reads return zeros, and yazl streams the
 // same bytes it would stream from a real PDF. Stored rather than deflated, like
 // every files/ member.
+describe("export time entries", () => {
+  /** A company, contact, deal, project and task, so an entry can name all five. */
+  async function everyRecord() {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const contact = await createContact(handle.db, actorId, { firstName: "Jane", lastName: "Smith" });
+    const { deal } = await makeDeal(handle.db, "Big one", company.id, contact.id);
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    const task = await createTask(handle.db, actorId, { title: "Migrate the data", projectId: project.id });
+    return { company, contact, deal, project, task };
+  }
+
+  // THE SHEET'S WHOLE JOB, AND PHASE 9'S THIRD MISS IN ADVANCE. A status report
+  // exported with `project_id` in a column that did not exist named no project
+  // anywhere in the archive; an hour whose task title is missing is the same
+  // failure on the one table whose entire content is what the time went on.
+  itZip("names all five records an entry can belong to, id and readable name for each", async () => {
+    const { company, contact, deal, project, task } = await everyRecord();
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-01", minutes: 90, billable: true,
+      description: "Data migration dry run",
+      companyId: company.id, contactId: contact.id, dealId: deal.id,
+      projectId: project.id, taskId: task.id,
+    });
+
+    const sheet = await readSheet(await extract(await writeArchive()), "time_entries.csv");
+    expect(cell(sheet, 0, "company_id")).toBe(company.id);
+    expect(cell(sheet, 0, "company_name")).toBe("Acme");
+    expect(cell(sheet, 0, "contact_id")).toBe(contact.id);
+    expect(cell(sheet, 0, "contact_name")).toBe("Jane Smith");
+    expect(cell(sheet, 0, "deal_id")).toBe(deal.id);
+    expect(cell(sheet, 0, "deal_title")).toBe("Big one");
+    expect(cell(sheet, 0, "project_id")).toBe(project.id);
+    expect(cell(sheet, 0, "project_name")).toBe("Rollout");
+    expect(cell(sheet, 0, "task_id")).toBe(task.id);
+    expect(cell(sheet, 0, "task_title")).toBe("Migrate the data");
+    expect(cell(sheet, 0, "owner_user_id")).toBe(actorId);
+    expect(cell(sheet, 0, "owner_username")).toBe("chris");
+    expect(cell(sheet, 0, "description")).toBe("Data migration dry run");
+  });
+
+  // THE OTHER HALF OF THAT, AND PHASE 9'S FIRST MISS IN ADVANCE: an INNER JOIN
+  // anywhere among those five would drop this row entirely, because
+  // at-least-one means the ordinary entry has four NULL links.
+  itZip("exports an entry that names ONE record, with the other four blank", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-02", minutes: 30, billable: false, projectId: project.id,
+    });
+
+    const sheet = await readSheet(await extract(await writeArchive()), "time_entries.csv");
+    expect(sheet.records).toHaveLength(1);
+    expect(cell(sheet, 0, "project_id")).toBe(project.id);
+    for (const blank of ["company_id", "company_name", "contact_id", "contact_name",
+      "deal_id", "deal_title", "task_id", "task_title", "description"]) {
+      expect(cell(sheet, 0, blank), blank).toBe("");
+    }
+  });
+
+  itZip("writes minutes as a plain integer and billable the way documents.csv writes frozen", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-01", minutes: 90, billable: true, projectId: project.id,
+    });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-01", minutes: 15, billable: false, projectId: project.id,
+    });
+
+    const sheet = await readSheet(await extract(await writeArchive()), "time_entries.csv");
+    const minutes = sheet.records.map((r) => r[sheet.header.indexOf("minutes")]).sort();
+    expect(minutes).toEqual(["15", "90"]);
+    // Both spellings present, so a mutation that hardcodes either one is caught.
+    // "true"/"false" is documents.csv's `frozen`, so the archive has one boolean
+    // dialect rather than a second one in its tenth file.
+    expect(sheet.records.map((r) => r[sheet.header.indexOf("billable")]).sort())
+      .toEqual(["false", "true"]);
+    // No hours column: minutes are readable, and a second representation of one
+    // number is how a CSV starts disagreeing with itself.
+    expect(sheet.header).not.toContain("hours");
+  });
+
+  // A BARE DATE STAYS A BARE DATE, which is the whole reason the column is one.
+  // Turning it into an instant here would put the day an hour belongs to at the
+  // mercy of whoever opens the file, in exactly the direction (a day earlier)
+  // that moves an hour into the previous week.
+  itZip("keeps work_date the day it was, with no time and no offset", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-01-01", minutes: 60, billable: true, projectId: project.id,
+    });
+
+    const sheet = await readSheet(await extract(await writeArchive()), "time_entries.csv");
+    expect(cell(sheet, 0, "work_date")).toBe("2026-01-01");
+    // created_at, on the same row, IS an instant -- so the two kinds of column
+    // stay visibly different in the file, which is what services/export.ts's
+    // `timestamp` comment claims and nothing asserted for this sheet.
+    expect(cell(sheet, 0, "created_at")).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
+  });
+
+  // Conduit never expunges, and archiving is the ONLY way an hour leaves a
+  // total -- so an export that dropped archived entries would disagree with the
+  // database about how much time exists. Same rule, and same test, as every
+  // other sheet with an archived_at.
+  itZip("includes an archived entry, with archived_at populated", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    const entry = await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-03", minutes: 45, billable: false, projectId: project.id,
+    });
+    await archiveTimeEntry(handle.db, actorId, entry.id);
+
+    const sheet = await readSheet(await extract(await writeArchive()), "time_entries.csv");
+    expect(sheet.records).toHaveLength(1);
+    expect(cell(sheet, 0, "archived_at")).not.toBe("");
+  });
+
+  itZip("orders by the day the work was done, not by the order the rows were typed", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    // Typed newest-first, deliberately: with created_at ordering these come out
+    // backwards, so this fails against the wrong ORDER BY rather than passing by
+    // coincidence of insertion order.
+    for (const workDate of ["2026-09-05", "2026-09-03", "2026-09-04"]) {
+      await createTimeEntry(handle.db, actorId, {
+        workDate, minutes: 60, billable: true, projectId: project.id,
+      });
+    }
+
+    const sheet = await readSheet(await extract(await writeArchive()), "time_entries.csv");
+    expect(sheet.records.map((r) => r[sheet.header.indexOf("work_date")]))
+      .toEqual(["2026-09-03", "2026-09-04", "2026-09-05"]);
+  });
+
+  /**
+   * **THE GUARD THE PLAN'S OPENING OBLIGATION ASKS FOR, ONE LEVEL DOWN.**
+   *
+   * The sheet exists; this is what stops it going stale. Phase 9 lost a letter's
+   * body and a report's project because a table gained columns and a
+   * hand-written `*Sheet` did not -- silently, with the row still coming out
+   * looking perfect. Task 5 adds timer columns to this very table, so the next
+   * chance to repeat that failure is one task away.
+   *
+   * READ OUT OF `information_schema`, NEVER OUT OF A LIST WRITTEN HERE. A list
+   * would have to be updated by the same person who forgot the sheet.
+   */
+  itZip("names every time_entries column, so a column added later cannot ship unexported", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-01", minutes: 90, billable: true, projectId: project.id,
+    });
+    const sheet = await readSheet(await extract(await writeArchive()), "time_entries.csv");
+
+    const rows = await handle.db.execute<{ column_name: string }>(sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'time_entries'
+      ORDER BY column_name
+    `);
+    const catalogue = rows.map((row) => row.column_name);
+    // The premise: the catalogue was really read. A typo in the table name
+    // returns nothing and every assertion below would pass over an empty set.
+    expect(catalogue).toContain("work_date");
+    expect(catalogue.length).toBeGreaterThanOrEqual(14);
+
+    expect(catalogue.filter((name) => !sheet.header.includes(name))).toEqual([]);
+
+    // THE INSTRUMENT, WATCHED FAILING RATHER THAN TRUSTED. The identical
+    // comparison against a header with one column taken out of it names exactly
+    // that column -- so the empty result above is a comparison that ran, not one
+    // that could not fail.
+    const mutilated = sheet.header.filter((name) => name !== "billable");
+    expect(catalogue.filter((name) => !mutilated.includes(name))).toEqual(["billable"]);
+  });
+});
+
+/**
+ * **EVERY TABLE IS EITHER EXPORTED OR DECLARED UNEXPORTED, WITH A REASON.**
+ *
+ * This is the guard for the failure the Phase 10 plan opens with: "one
+ * hand-written `*Sheet` per entity, and it does not walk the schema", so a table
+ * added later appears only if somebody writes the function. The backup gets a
+ * new table for free because it is a `pg_dump`; this half gets it never.
+ *
+ * WHAT IT COSTS THE NEXT AUTHOR is one line saying which it is -- which is
+ * exactly the decision that was skipped three times running in Phase 9, and
+ * making it explicit is the whole point. A table in NEITHER map fails this test
+ * by name.
+ *
+ * IT IS NOT A CLAIM THAT THE UNEXPORTED ONES ARE RIGHT to be unexported. Several
+ * are known gaps in formatVersion 1 (there is no pipelines.csv, and
+ * services/import-export.ts's header is a list of what that costs). It is a
+ * claim that each absence was decided rather than forgotten.
+ */
+describe("export coverage", () => {
+  /** Which member carries each table. Several tables share documents.csv, which
+   * is one row per document with its detail tables joined on -- see
+   * documentsSheet for why that is one sheet and not four. */
+  const EXPORTED: Record<string, string> = {
+    companies: "companies.csv", contacts: "contacts.csv", deals: "deals.csv",
+    projects: "projects.csv", tasks: "tasks.csv", notes: "notes.csv",
+    meetings: "meetings.csv", time_entries: "time_entries.csv", files: "files.csv",
+    documents: "documents.csv", document_quotes: "documents.csv",
+    document_letters: "documents.csv", document_agreements: "documents.csv",
+  };
+
+  /** Why each remaining table is absent. One sentence each, and each one is a
+   * decision somebody made rather than a table nobody thought about. */
+  const NOT_EXPORTED: Record<string, string> = {
+    users: "the export names people by id and username inline; a users sheet would be a "
+      + "directory of accounts in an archive whose whole selling point is that it is safe to "
+      + "hand to anyone",
+    pipelines: "a known gap in formatVersion 1 -- deals.csv carries pipeline_name, but the "
+      + "pipeline rows themselves are absent, which is why the importer cannot create a deal",
+    stages: "the same gap as pipelines, and the same consequence",
+    task_dependencies: "join rows with no identity of their own; a file of (predecessor, "
+      + "successor) uuid pairs is the one shape a person with a spreadsheet cannot read",
+    meeting_attendees: "folded into meetings.csv's `attendees` cell as display names -- see "
+      + "meetingsSheet, which explains why this is a fold rather than a tenth sheet",
+    events: "the timeline is derived history over rows that are all exported already, and it "
+      + "is by far the largest table on a live install",
+    org_profile: "the issuer's own letterhead and logo, which is configuration rather than "
+      + "data -- and its logo column is a base64 image that would be one enormous cell",
+    document_line_items: "a known gap in formatVersion 1, named in "
+      + "services/import-export.ts: an imported quote would print an empty table under a "
+      + "frozen total",
+    document_number_sequences: "the per-year allocator's counters; they describe numbers "
+      + "already printed on the documents that were exported",
+    document_templates: "editable HTML templates, which are configuration and are restored "
+      + "from a backup, not read out of a spreadsheet",
+    mail_accounts: "NO CREDENTIALS LEAVE IN THE EXPORT -- see services/export.ts's header. "
+      + "This absence is a security property, not a gap",
+    mail_account_folders: "mailbox structure belongs to the mail server and is rediscovered",
+    mail_folder_state: "sync cursors; they describe a connection, not the operator's data",
+    mail_threads: "mail bodies are enormous, already exist on the mail server, and nobody "
+      + "wants them in a spreadsheet; they are in the backup instead",
+    mail_thread_hides: "per-user visibility state over threads that are not exported",
+    mail_messages: "the same as mail_threads, and the bulk of it",
+    mail_attachments: "deliberately absent, and the export reads the `files` TABLE rather "
+      + "than the blob DIRECTORY precisely so these are never swept up",
+  };
+
+  itZip("gives every table in the schema either a sheet or a declared reason it has none", async () => {
+    const rows = await handle.db.execute<{ tablename: string }>(sql`
+      SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename
+    `);
+    const tables = rows.map((row) => row.tablename);
+    // The premise: this really read the catalogue of a migrated database.
+    expect(tables.length).toBeGreaterThan(20);
+    expect(tables).toContain("time_entries");
+
+    const undeclared = tables.filter((t) => !(t in EXPORTED) && !(t in NOT_EXPORTED));
+    expect(
+      undeclared,
+      "these tables are neither exported nor declared unexported. Add a *Sheet to "
+      + "services/export.ts, or a one-line reason to NOT_EXPORTED above -- but decide, because "
+      + "the readable export is the half that never picks a new table up for free.",
+    ).toEqual([]);
+
+    // Neither map may name a table that is not there: a stale entry would let a
+    // DROPPED table go on standing in for a NEW one of a similar name.
+    const phantom = [...Object.keys(EXPORTED), ...Object.keys(NOT_EXPORTED)]
+      .filter((t) => !tables.includes(t));
+    expect(phantom).toEqual([]);
+    // And no table is in both, which would make the whole check vacuous for it.
+    expect(Object.keys(EXPORTED).filter((t) => t in NOT_EXPORTED)).toEqual([]);
+  });
+
+  itZip("actually writes every member the EXPORTED map claims", async () => {
+    const members = await memberPaths(await extract(await writeArchive()));
+    for (const [table, member] of Object.entries(EXPORTED)) {
+      expect(members, `${table} claims ${member}`).toContain(member);
+    }
+  });
+});
+
 // EVERY ABORTED DOWNLOAD USED TO COST A FILE DESCRIPTOR, PERMANENTLY.
 //
 // Measured before the fix: five aborted downloads left five open descriptors on
@@ -1341,12 +1614,12 @@ describe("export row memory", () => {
   // replaced: 93MB. The ceiling sits between them.
   //
   // The gap is 1.6x rather than 3x because the mutation measured holds only the
-  // ROWS; the implementation it replaced also held all nine finished buffers
-  // and yazl'''s deflated copies on top. So this bound is conservative: it fires
+  // ROWS; the implementation it replaced also held every finished buffer and
+  // yazl'''s deflated copies on top. So this bound is conservative: it fires
   // on the mildest version of the regression.
   const ROW_HEAP_CEILING_BYTES = 75 * 1024 * 1024;
 
-  /** Fill three of the nine sheets with enough text to be measurable. */
+  /** Fill three of the sheets with enough text to be measurable. */
   async function seedWideCorpus(): Promise<void> {
     const company = await createCompany(handle.db, actorId, { name: "Acme" });
     // Raw SQL rather than the services: 120,000 rows through createNote would
@@ -1368,7 +1641,7 @@ describe("export row memory", () => {
     `);
   }
 
-  it("holds one sheet at a time, not nine", async () => {
+  it("holds one sheet at a time, not all of them at once", async () => {
     await seedWideCorpus();
 
     // FORCED COLLECTION AT EVERY SAMPLE, which is the only way this reading

@@ -29,8 +29,8 @@ import type { IntakeFile, StagedMemberRef, StagedPayload } from "./intake.js";
 //
 // ========== WHAT THE EXPORT CANNOT CARRY, WHICH DECIDES THE SCOPE ==========
 //
-// THIS VERSION IMPORTS COMPANIES AND CONTACTS. It is two sheets of nine, and
-// the reason is not appetite: the other seven describe rows that CANNOT BE
+// THIS VERSION IMPORTS COMPANIES AND CONTACTS. It is two sheets of ten, and
+// the reason is not appetite: the other eight describe rows that CANNOT BE
 // INSERTED from what the export holds, and the shortfall is in the export
 // format rather than in this module. Read against db/schema.ts, sheet by sheet:
 //
@@ -60,6 +60,14 @@ import type { IntakeFile, StagedMemberRef, StagedPayload } from "./intake.js";
 //                   than an absent quote.
 //   files.csv ..... `uploader_user_id` is NOT NULL against `users`, same gap.
 //                   (The blobs themselves ARE in the archive, under files/.)
+//   time_entries.csv  `owner_user_id` is NOT NULL against `users`, the same gap
+//                   again -- and `time_entries_has_link` needs at least one of
+//                   five records, of which only two (company, contact) are
+//                   importable at all, so an entry booked to a project or a
+//                   task has nowhere to go. Importing it with the link dropped
+//                   would be worse than not importing it: an hour that lost
+//                   what it was spent on is a number in a total nobody can
+//                   explain, which is exactly what the CHECK exists to prevent.
 //
 // COMPANIES AND CONTACTS ARE THE CLOSURE THAT IS LEFT, and they are a closure
 // rather than a pair chosen for convenience: a contact points at a company,
@@ -263,7 +271,7 @@ export const IMPORT_FINDINGS = {
   extraMember: "extra-member",
   /** A sheet in the archive that this version does not import, and why. */
   sheetNotImported: "sheet-not-imported",
-  /** The headline: this reads two of the nine sheets. */
+  /** The headline: this reads two of the ten sheets. */
   partialImport: "partial-import",
   /** Rows whose id is already in this install and will be left alone. */
   alreadyPresent: "already-present",
@@ -816,6 +824,19 @@ const NOT_IMPORTED: readonly { member: string; reason: string }[] = [
     member: "files.csv",
     reason: "a stored file's uploader is a Conduit user the export does not carry; the files "
       + "themselves are in the archive and can be saved out of it by hand",
+  },
+  // ADDED IN THE SAME CHANGE THAT ADDED THE SHEET (Phase 10 Task 1), because
+  // this list is the second thing a new sheet has to be told about and nothing
+  // derives it: without an entry here, time_entries.csv would be the one sheet
+  // an operator's preview said nothing at all about -- neither imported nor
+  // explained -- which is the export's own "missed by three tasks running"
+  // failure wearing the importer's clothes.
+  {
+    member: "time_entries.csv",
+    reason: "an entry's owner is a Conduit user the export does not carry, and an entry must "
+      + "name at least one record -- of which only companies and contacts are imported, so an "
+      + "hour booked to a project, deal or task would arrive with nothing to say what it was "
+      + "spent on",
   },
 ];
 

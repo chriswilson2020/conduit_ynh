@@ -136,6 +136,7 @@ describe("GET /api/export", () => {
     expect((await readdir(root)).sort()).toEqual([
       "companies.csv", "contacts.csv", "deals.csv", "documents.csv", "files",
       "files.csv", "manifest.json", "meetings.csv", "notes.csv", "projects.csv", "tasks.csv",
+      "time_entries.csv",
     ]);
 
     // The bytes, unchanged, through the whole HTTP path.

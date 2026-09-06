@@ -1533,12 +1533,18 @@ test.describe("Settings -> import", () => {
       await expect(plan).toHaveAttribute("data-kind", "export");
 
       // THE HEADLINE, AND THEN THE SPECIFIC GAPS. A count alone would pass on
-      // seven copies of one sentence.
+      // eight copies of one sentence.
+      //
+      // `time_entries.csv` JOINED THE LIST IN PHASE 10, and this line is the
+      // FOURTH place a new export sheet has to be added by hand -- after
+      // services/export.ts's `*Sheet`, services/import-export.ts's NOT_IMPORTED,
+      // and the Settings copy that describes the archive to the operator.
+      // Nothing derives any of them from any other.
       await expect(page.getByTestId("import-finding-partial-import"))
         .toContainText("imports companies and contacts from an export");
       const findings = page.getByTestId("import-findings");
       for (const sheet of ["deals.csv", "tasks.csv", "projects.csv", "notes.csv",
-        "meetings.csv", "documents.csv", "files.csv"]) {
+        "meetings.csv", "documents.csv", "files.csv", "time_entries.csv"]) {
         await expect(findings, `no finding names ${sheet}`).toContainText(sheet);
       }
       // Each one says WHAT is missing rather than only that it is skipped.
