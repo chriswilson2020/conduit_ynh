@@ -170,7 +170,23 @@ test.describe.serial("CRM journey", () => {
 
     await page.getByPlaceholder("Add a note...").fill(noteText);
     await page.getByTestId("add-note").click();
-    await expect(page.getByTestId("notes")).toContainText(noteText);
+
+    // THE ROW, NOT THE TAB, and the line this replaces was vacuous rather than
+    // merely loose: `expect(getByTestId("notes")).toContainText(noteText)` was
+    // ALREADY TRUE BEFORE THE CLICK. `[data-testid="notes"]` is the whole tab
+    // and the composer <Textarea> is inside it; React writes a controlled
+    // textarea's value into `node.defaultValue`, which IS its child text node,
+    // so the tab contained the text from the moment it was typed. Measured on
+    // the dev server by asserting it between the fill and the click: it
+    // passed, with `[data-testid="note-row"]` filtered by the same text still
+    // at zero. So this test proved the note reached the list only by way of
+    // the Timeline check below -- the Notes half proved the reader could type.
+    //
+    // Nothing here ever went red for it and nothing would have: toContainText
+    // reads the container's whole text, so unlike the same mistake in
+    // e2e/rail-live.spec.ts it cannot even resolve to two elements and throw.
+    // A vacuous assertion that cannot fail is the one kind that stays vacuous.
+    await expect(page.locator('[data-testid="note-row"]').filter({ hasText: noteText })).toBeVisible();
 
     await page.getByRole("tab", { name: "Timeline" }).click();
     await expect(page.getByTestId("timeline-entry").filter({ hasText: noteText })).toBeVisible();
