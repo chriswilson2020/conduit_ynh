@@ -5,12 +5,15 @@ import {
   useContact,
   useCreateMeeting,
   useCreateMeetingTask,
+  useIssueMeetingSummary,
   useMeeting,
   useMeetings,
+  useMeetingSummaries,
   useProject,
   useUnarchiveMeeting,
   useUsers,
 } from "../../queries";
+import { apiUrl } from "../../api";
 import { EntityPicker } from "../entity-picker";
 import {
   advanceCursorPages, cursorForKey, emptyCursorPages, flattenCursorPages, identityKey,
@@ -801,7 +804,97 @@ function MeetingBody({ detail }: { detail: MeetingDetail }) {
           ))}
         </ul>
       </section>
+
+      <SummarySection meetingId={meeting.id} archived={archived} />
     </>
+  );
+}
+
+/**
+ * The meeting's generated summaries, and the one button that makes another.
+ *
+ * THERE IS NO FORM, WHICH IS THE POINT OF THIS TYPE. Everything a summary
+ * prints -- the title, the date, the attendees, the notes -- is on the meeting
+ * already, and the reader can see all four a few lines up this same panel. So
+ * the control is a button and not a dialog, and there is nothing to validate
+ * before it is pressed.
+ *
+ * THE BUTTON SAYS "Generate summary" EVERY TIME, not "Regenerate" once one
+ * exists. A summary is not frozen, producing another is ordinary, and each one
+ * is its own document with its own PDF -- so the second press does the same
+ * thing as the first, and a label that changed would suggest it did not.
+ *
+ * A PLAIN LINK PER SUMMARY, to the existing GET /api/files/:id/download. The
+ * PDF is an ordinary `files` row (that is Phase 7's design and the reason there
+ * is no second download path), and this is the deal Documents section's link
+ * reproduced -- see deal-detail.tsx, which explains why it is a bare underlined
+ * anchor rather than a button.
+ */
+function SummarySection({ meetingId, archived }: { meetingId: string; archived: boolean }) {
+  const { data: summaries = [], isLoading, error } = useMeetingSummaries(meetingId);
+  const issueSummary = useIssueMeetingSummary();
+  const [banner, setBanner] = useState<string | null>(null);
+
+  return (
+    <section data-testid="meeting-summaries" className="flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-medium text-slate-500">Summary</span>
+        <Button
+          variant="outline"
+          className="px-2 py-1 text-xs"
+          data-testid="meeting-generate-summary"
+          // An archived meeting is refused by the service (issueMeetingSummary
+          // throws ArchivedError before anything spawns), so the button is
+          // disabled rather than left to produce a 409 the reader has to read.
+          disabled={archived || issueSummary.isPending}
+          onClick={() => {
+            setBanner(null);
+            issueSummary.mutate(meetingId, {
+              onError: (err) => setBanner(meetingErrorMessage(err)),
+            });
+          }}
+        >
+          {issueSummary.isPending ? "Generating..." : "Generate summary"}
+        </Button>
+      </div>
+      {archived && (
+        <p className="text-xs text-slate-500">
+          Unarchive this meeting to generate a summary.
+        </p>
+      )}
+      {banner !== null && (
+        <p role="alert" data-testid="meeting-summary-error" className="text-xs text-red-600">{banner}</p>
+      )}
+      {error !== null && (
+        <p role="alert" className="text-xs text-red-600">
+          Could not load summaries: {meetingErrorMessage(error)}
+        </p>
+      )}
+      {isLoading && <p className="text-xs text-slate-400">Loading...</p>}
+      {!isLoading && error === null && summaries.length === 0 && (
+        <p data-testid="meeting-summaries-empty" className="text-xs text-slate-400">
+          No summary yet
+        </p>
+      )}
+      <ul className="flex flex-col gap-1">
+        {summaries.map((summary) => (
+          <li
+            key={summary.id}
+            data-testid={`meeting-summary-${summary.id}`}
+            className="flex items-center justify-between gap-2 rounded-md border border-slate-200 bg-white px-3 py-2"
+          >
+            <span className="text-xs text-slate-500">{`Issued ${summary.issueDate}`}</span>
+            <a
+              className="text-xs text-blue-600 underline"
+              href={apiUrl(`/files/${summary.fileId}/download`)}
+              data-testid={`meeting-summary-download-${summary.id}`}
+            >
+              Download PDF
+            </a>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

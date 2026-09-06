@@ -32,6 +32,7 @@ import {
   meResponseSchema,
   meetingDetailSchema,
   meetingSchema,
+  meetingSummarySchema,
   midpoint,
   noteSchema,
   orgProfileSchema,
@@ -87,6 +88,7 @@ import {
   type MarkThreadReadResponse,
   type Meeting,
   type MeetingCreateInput,
+  type MeetingSummaryRecord,
   type MeetingTaskCreateInput,
   type OrgProfile,
   type OrgProfileInput,
@@ -2101,6 +2103,60 @@ export function useIssueQuote() {
       parseWith(documentSchema, await postJson<unknown>(`/deals/${dealId}/documents`, input), "document"),
     onSuccess: (_document: DocumentRecord, { dealId }) => {
       void queryClient.invalidateQueries({ queryKey: ["documents", dealId] });
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+    },
+  });
+}
+
+const meetingSummaryListSchema = meetingSummarySchema.array();
+
+/**
+ * The summaries produced for one meeting, newest first.
+ *
+ * A SEPARATE KEY FROM `["documents", dealId]`, and a separate hook, because the
+ * two routes return different shapes: a deal's documents are quotes, with money
+ * and lines, and a meeting's are summaries, which have neither. Pooling them
+ * under one key would mean one cache entry holding two shapes and a parse that
+ * had to guess which.
+ */
+export function useMeetingSummaries(meetingId: string) {
+  return useQuery({
+    queryKey: ["meeting-documents", meetingId],
+    queryFn: async () => parseWith(
+      meetingSummaryListSchema,
+      await getJson<unknown>(`/meetings/${meetingId}/documents`),
+      "meeting summaries",
+    ),
+    enabled: meetingId !== "",
+  });
+}
+
+/**
+ * Produce the summary of a meeting. NO INPUT: everything printed is on the
+ * meeting, so the mutation takes the id and nothing else -- which is what makes
+ * this the type with no form.
+ *
+ * INVALIDATES FILES AND EVENTS FOR useIssueQuote's REASON: a summary writes a
+ * `files` row against the meeting and stamps a `file_attached` entry on the
+ * timelines the meeting is on, so both are stale the instant this returns.
+ *
+ * UNLIKE useIssueQuote THERE IS NOTHING STOPPING A SECOND CALL, and that is the
+ * per-type freezing rule showing through: a summary is not frozen, so producing
+ * one again is ordinary. It appends a second document with its own PDF rather
+ * than replacing the first -- see services/documents.ts's issueMeetingSummary
+ * for why appending, and not editing, is what Task 2 builds.
+ */
+export function useIssueMeetingSummary() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (meetingId: string) => parseWith(
+      meetingSummarySchema,
+      await postJson<unknown>(`/meetings/${meetingId}/documents`, {}),
+      "meeting summary",
+    ),
+    onSuccess: (_document: MeetingSummaryRecord, meetingId) => {
+      void queryClient.invalidateQueries({ queryKey: ["meeting-documents", meetingId] });
       void queryClient.invalidateQueries({ queryKey: ["files"] });
       void queryClient.invalidateQueries({ queryKey: ["events"] });
     },

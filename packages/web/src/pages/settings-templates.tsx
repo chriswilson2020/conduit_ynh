@@ -1,23 +1,54 @@
 import { useEffect, useState } from "react";
-import { MAX_TEMPLATE_BYTES } from "@conduit/shared";
+import { documentTypeSchema, MAX_TEMPLATE_BYTES, type DocumentType } from "@conduit/shared";
 import { useDocumentTemplate, useSaveDocumentTemplate } from "../queries";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
 import { Textarea } from "../components/ui/textarea";
 
 /**
- * Settings -> Templates: the quote template, and nothing else.
+ * Settings -> Templates: one editor per document type.
  *
  * It carried the MAIL templates too until v1.2.2, when that feature was removed
  * outright -- Chris: "I don't think we should ever be templating emails, that's
  * messy and ends up with things like dear first name last name emails!" The route
  * keeps its path and its tab label, because the QUOTE template is what anybody
  * actually opens this page for.
+ *
+ * IT BECAME PLURAL IN PHASE 9, and it had to: `document_templates` has always been
+ * keyed by type and the API has always been `/api/document-templates/:type`, so a
+ * page hard-coded to "quote" meant shipping a document type whose template only a
+ * `curl` could edit -- while the quote's sits behind a button. The list is derived
+ * from `documentTypeSchema` and the labels below are a Record over the union, so a
+ * type added in Task 3 or 4 is a BUILD error here rather than a tab nobody added.
  */
 export function SettingsTemplatesPage() {
+  const [type, setType] = useState<DocumentType>("quote");
   return (
     <SettingsLayout title="Templates">
-      <DocumentTemplateEditor />
+      <div className="flex flex-col gap-3">
+        <div className="flex gap-2" role="tablist" aria-label="Document type">
+          {documentTypeSchema.options.map((option) => (
+            <Button
+              key={option}
+              role="tab"
+              aria-selected={option === type}
+              variant={option === type ? "default" : "outline"}
+              className="px-3 py-1 text-xs"
+              data-testid={`document-template-tab-${option}`}
+              onClick={() => setType(option)}
+            >
+              {TEMPLATE_HELP[option].label}
+            </Button>
+          ))}
+        </div>
+        {/*
+          KEYED BY TYPE, so switching tabs REMOUNTS the editor. Its `bodyHtml` is
+          seeded once from the server and then owned locally (see the effect
+          below); without the remount, switching would leave the previous type's
+          body in the box and the next Save would write it to the wrong row.
+        */}
+        <DocumentTemplateEditor key={type} type={type} />
+      </div>
     </SettingsLayout>
   );
 }
@@ -25,12 +56,26 @@ export function SettingsTemplatesPage() {
 /**
  * THE MERGE FIELDS, DOCUMENTED ON THE PAGE RATHER THAN IN A WIKI NOBODY OPENS.
  *
- * These are exactly the keys `buildContext` supplies. A field it does not
- * supply is not an error and never throws -- an unknown path renders as an
+ * These are exactly the keys the type's context builder supplies. A field it does
+ * not supply is not an error and never throws -- an unknown path renders as an
  * empty string -- which is precisely why the list has to be here: a typo in a
  * template is an invisible blank on a printed page, discovered by a customer.
+ *
+ * A `Record` OVER THE UNION rather than a lookup with a fallback, and for
+ * `documentTypeFreezes`'s reason exactly: a type added without an entry is a
+ * compile error, where a fallback would quietly show a reader the wrong field list
+ * -- which is a page printed with blanks on it.
  */
-const ROOT_FIELDS: readonly [string, string][] = [
+interface TemplateHelp {
+  label: string;
+  /** What this template is, in the sentence under the heading. */
+  blurb: string;
+  fields: readonly [string, string][];
+  /** The repeated block this type has, if it has one. */
+  collection?: { title: string; note: string; fields: readonly [string, string][] };
+}
+
+const ORG_FIELDS: readonly [string, string][] = [
   ["org.name", "Your organisation's name"],
   ["org.addressLines", "Your address, line breaks kept"],
   ["org.email", "Your email address"],
@@ -40,27 +85,61 @@ const ROOT_FIELDS: readonly [string, string][] = [
   ["org.registrationNumber", "Your registration number"],
   ["org.bankDetails", "Your bank details, line breaks kept"],
   ["org.logoDataUri", "Your logo, as an image source"],
-  ["document.number", "The allocated number, e.g. QUO-2026-0001"],
-  ["document.issueDate", "The issue date"],
-  ["document.validUntilDate", "The valid-until date, or empty"],
-  ["document.recipientName", "Who the quote is for"],
-  ["document.recipientContactName", "The named contact, or empty"],
-  ["document.recipientSalutation", "How that contact is addressed, or empty"],
-  ["document.recipientAddress", "Their address, line breaks kept"],
-  ["document.subtotal", "The subtotal, formatted"],
-  ["document.tax", "The tax, formatted"],
-  ["document.total", "The total, formatted"],
-  ["document.notes", "The notes typed on the quote"],
-  ["document.terms", "The terms typed on the quote"],
 ];
 
-const LINE_FIELDS: readonly [string, string][] = [
-  ["description", "The line's description"],
-  ["qty", "Its quantity"],
-  ["unitPrice", "Its unit price, formatted"],
-  ["taxRate", "Its tax rate, e.g. 21%"],
-  ["lineTotal", "Its total, formatted"],
-];
+const TEMPLATE_HELP: Record<DocumentType, TemplateHelp> = {
+  quote: {
+    label: "Quote",
+    blurb: "The HTML a quote is rendered from.",
+    fields: [
+      ...ORG_FIELDS,
+      ["document.number", "The allocated number, e.g. QUO-2026-0001"],
+      ["document.issueDate", "The issue date"],
+      ["document.validUntilDate", "The valid-until date, or empty"],
+      ["document.recipientName", "Who the quote is for"],
+      ["document.recipientContactName", "The named contact, or empty"],
+      ["document.recipientSalutation", "How that contact is addressed, or empty"],
+      ["document.recipientAddress", "Their address, line breaks kept"],
+      ["document.subtotal", "The subtotal, formatted"],
+      ["document.tax", "The tax, formatted"],
+      ["document.total", "The total, formatted"],
+      ["document.notes", "The notes typed on the quote"],
+      ["document.terms", "The terms typed on the quote"],
+    ],
+    collection: {
+      title: "Inside a line block",
+      note: "Wrap a row in {{#lines}} ... {{/lines}} and it repeats once per line item.",
+      fields: [
+        ["description", "The line's description"],
+        ["qty", "Its quantity"],
+        ["unitPrice", "Its unit price, formatted"],
+        ["taxRate", "Its tax rate, e.g. 21%"],
+        ["lineTotal", "Its total, formatted"],
+      ],
+    },
+  },
+  meeting_summary: {
+    label: "Meeting summary",
+    blurb: "The HTML a meeting summary is rendered from. Everything on it comes from"
+      + " the meeting itself; there is no form to fill in.",
+    fields: [
+      ...ORG_FIELDS,
+      ["document.title", "The meeting's title"],
+      ["document.meetingWhen", "When it happened, with the time zone named"],
+      ["document.duration", "How long it took, or empty"],
+      ["document.issueDate", "The day the summary was produced"],
+      // NAMED AS THE ONE EXCEPTION, because it is the one field on this page
+      // whose value is markup rather than text, and somebody editing the template
+      // needs to know it will bring its own paragraphs and lists with it.
+      ["document.notes", "The meeting's notes. Rich text: it arrives as formatted HTML, not plain text"],
+    ],
+    collection: {
+      title: "Inside an attendee block",
+      note: "Wrap a row in {{#attendees}} ... {{/attendees}} and it repeats once per attendee.",
+      fields: [["name", "The attendee's name"]],
+    },
+  },
+};
 
 function FieldList({ title, fields, note }: {
   title: string;
@@ -118,8 +197,9 @@ function FieldList({ title, fields, note }: {
  * from the operator's machine. The server sanitises on write and the PDF is the
  * preview.
  */
-function DocumentTemplateEditor() {
-  const { data: template, isLoading, error } = useDocumentTemplate("quote");
+function DocumentTemplateEditor({ type }: { type: DocumentType }) {
+  const help = TEMPLATE_HELP[type];
+  const { data: template, isLoading, error } = useDocumentTemplate(type);
   const save = useSaveDocumentTemplate();
   const [bodyHtml, setBodyHtml] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -143,10 +223,10 @@ function DocumentTemplateEditor() {
 
   return (
     <div data-testid="document-template-settings" className="flex flex-col gap-3">
-      <h2 className="text-sm font-semibold text-slate-900">Quote template</h2>
+      <h2 className="text-sm font-semibold text-slate-900">{`${help.label} template`}</h2>
       <p className="text-xs text-slate-500">
-        The HTML a quote is rendered from. It is saved sanitised, which is what a quote
-        will use; there is no preview here, because the PDF is the preview.
+        {`${help.blurb} It is saved sanitised, which is what a document will use;`}
+        {" there is no preview here, because the PDF is the preview."}
       </p>
 
       {isLoading && <p className="text-sm text-slate-400">Loading...</p>}
@@ -159,7 +239,7 @@ function DocumentTemplateEditor() {
         rows={18}
         spellCheck={false}
         disabled={pending || isLoading}
-        aria-label="Quote template body"
+        aria-label={`${help.label} template body`}
         data-testid="document-template-body"
         onChange={(event) => { setSaved(false); setBodyHtml(event.target.value); }}
         className="font-mono text-xs"
@@ -207,7 +287,7 @@ function DocumentTemplateEditor() {
             setSaved(false);
             // The value is sent EXACTLY as held: no trim, no normalisation.
             // That is the whole of what keeps GET then PUT byte-identical.
-            save.mutate({ type: "quote", input: { bodyHtml: value } }, { onSuccess: () => setSaved(true) });
+            save.mutate({ type, input: { bodyHtml: value } }, { onSuccess: () => setSaved(true) });
           }}
         >
           {pending ? "Saving..." : "Save template"}
@@ -215,12 +295,14 @@ function DocumentTemplateEditor() {
       </div>
 
       <div className="flex flex-col gap-4 rounded-md border border-slate-200 p-4">
-        <FieldList title="Fields" fields={ROOT_FIELDS} />
-        <FieldList
-          title="Inside a line block"
-          fields={LINE_FIELDS}
-          note={"Wrap a row in {{#lines}} ... {{/lines}} and it repeats once per line item."}
-        />
+        <FieldList title="Fields" fields={help.fields} />
+        {help.collection !== undefined && (
+          <FieldList
+            title={help.collection.title}
+            fields={help.collection.fields}
+            note={help.collection.note}
+          />
+        )}
         <p className="text-xs text-slate-400">
           A field nobody supplies renders as nothing rather than failing, so a typo is a
           blank on the page. Wrapping a field in {"{{#path}} ... {{/path}}"} shows that part

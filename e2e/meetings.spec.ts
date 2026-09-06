@@ -302,6 +302,58 @@ test.describe.serial("Meetings journey", () => {
     await expect(page.getByTestId("meeting-notes-body")).toContainText(notesText);
   });
 
+  /**
+   * PHASE 9'S TYPE WITH NO FORM, END TO END. Everything the summary prints is
+   * already on this meeting -- the title, the date, the attendees and the notes
+   * this journey typed in -- so the whole interaction is one button, and the
+   * assertion worth making at this level is that the button really produces a PDF
+   * the browser can fetch.
+   *
+   * THE PDF IS FETCHED WITH page.request RATHER THAN AS A DOWNLOAD EVENT. It is
+   * an ordinary `files` row behind the route that already existed, so a GET is a
+   * complete statement of the claim -- and it avoids the download-event handling
+   * that has nothing to do with what is under test.
+   */
+  test("generates a summary of the meeting and serves it as a PDF", async () => {
+    await page.goto(`/companies/${companyId}`);
+    await openMeetingsTab();
+    await openMeeting(meetingTitle);
+
+    const section = page.getByTestId("meeting-summaries");
+    await expect(section.getByTestId("meeting-summaries-empty")).toBeVisible();
+
+    // The render is a real WeasyPrint subprocess on the server, so the wait is
+    // generous: the button disables itself while the mutation is in flight and
+    // the row is what says it finished.
+    await section.getByTestId("meeting-generate-summary").click();
+    // `li[...]` and not a bare attribute match: the download anchor inside each
+    // row carries `meeting-summary-download-<id>`, which shares the prefix, so an
+    // unscoped selector would count every row twice.
+    const row = section.locator("li[data-testid^='meeting-summary-']").first();
+    await expect(row).toBeVisible({ timeout: 30_000 });
+    await expect(section.getByTestId("meeting-summaries-empty")).toHaveCount(0);
+
+    const link = row.locator("a");
+    const href = await link.getAttribute("href");
+    expect(href, "the summary row links at the existing download route").toMatch(
+      /\/api\/files\/[0-9a-f-]{36}\/download$/,
+    );
+    const pdf = await page.request.get(href!);
+    expect(pdf.ok(), "downloading the generated summary").toBe(true);
+    expect(pdf.headers()["content-type"]).toContain("application/pdf");
+    expect((await pdf.body()).subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    // The filename carries the meeting's title, which is what tells two summaries
+    // of two meetings apart in a Downloads folder.
+    expect(pdf.headers()["content-disposition"]).toContain("Meeting summary");
+
+    // NOT FROZEN MEANS A SECOND ONE IS ORDINARY, and it appends rather than
+    // replacing -- which is the per-type freezing rule visible from the outside.
+    await section.getByTestId("meeting-generate-summary").click();
+    await expect(section.locator("li[data-testid^='meeting-summary-']")).toHaveCount(2, {
+      timeout: 30_000,
+    });
+  });
+
   test("adds a follow-up task from the meeting, with the meeting's links inherited", async () => {
     await page.goto(`/companies/${companyId}`);
     await openMeetingsTab();
