@@ -296,6 +296,187 @@ one real regression and it is worth recording: `rail-live.spec.ts` stubs
 `fileMetaSchema` — the widened shape made `parseWith` throw and the Files tab
 render nothing, which presented as two tests finding zero file rows.
 
+## Task 2.5: The organisation's timezone — Chris's instruction, 6 Sep
+
+Not in the original plan. Task 2's finding 5 reported that **Conduit stores no timezone
+anywhere**, so a meeting summary printed `1 September 2026 at 13:30 UTC` for a meeting the
+operator held at half past three in Amsterdam. Chris asked for local time, and asked for it
+**before** Tasks 3 and 4 rather than after, because those add three more types that print dates.
+Numbered 2.5 so Tasks 3 and 4 keep the numbers everything else refers to them by.
+
+### As built — v1.8.0, migration 0018
+
+`org_profile.time_zone`, a `text NOT NULL DEFAULT 'UTC'` with a shape CHECK; a
+`packages/shared/src/time-zone.ts` holding `DEFAULT_TIME_ZONE`, `timeZoneProblem`,
+`usableTimeZone`, `todayInZone` and `timeZoneLabel`; `formatDocumentInstant(iso, timeZone)`
+with the zone **required**; a `<select>` in Settings → Organisation built from the browser's
+own `Intl.supportedValuesOf("timeZone")`; and both of the summary's dates reading the new
+column.
+
+**THE DEFAULT IS UTC, AND IT IS THE ONLY ONE THAT CHANGES NOTHING.** With this zone
+`formatDocumentInstant` emits the v1.7.x string byte for byte — trailing `UTC` included,
+because en-GB's short zone name for UTC is exactly `UTC` — so re-rendering a summary issued
+before the upgrade produces the same page. Rejected: reading the server's zone at migration
+time, which is Etc/UTC on the YunoHost box (no better) and elsewhere is the zone of a machine
+in a datacentre, which is not evidence about where the operator sits.
+
+**THE ZONE IS STILL NAMED ON THE PAGE**, and the label now moves with the season: `CET` in
+January, `CEST` in July, off one stored zone. Chris's argument for dropping it (a document
+handed to somebody in the same office does not need `CEST`) is real and was rejected on two
+grounds. These documents are PDFs that get downloaded and emailed, which is the whole point of
+Phase 9, and the reader who needs the label is the one not in the room. And the label is what
+makes the unresolvable-zone fallback honest rather than silent: the render falls back to UTC,
+the page says UTC, and the printed time and the printed label agree. Drop the label and that
+failure path needs an announcement mechanism of its own, on the one path nothing exercises.
+
+**WHAT A RENDER DOES WITH A ZONE THAT NO LONGER RESOLVES**: formats in UTC, names UTC, never
+throws. Refusing to issue the document was rejected — the zone is fixable in ten seconds in
+Settings, and turning "your times print in UTC and say so" into "you cannot produce the
+document your customer is waiting for" trades a cosmetic degradation for an outage. The
+operator's copy of the warning is on the Settings page, which shows the stored value with
+`timeZoneProblem`'s sentence under it.
+
+### What the brief for this task got wrong
+
+1. **"A free-text field that lets someone type `CET` produces a runtime throw at render time"
+   is FALSE.** Measured on Node 24.19 (the server) and 24.15 (here):
+   `new Intl.DateTimeFormat("en-GB", { timeZone: "CET" })` does not throw. `CET` is a real
+   tzdata identifier, links to Europe/Brussels, and carries the right transitions. **The
+   dangerous values are the ones `Intl` ACCEPTS**, which is the opposite failure mode and
+   drove the whole design: `+02:00` is accepted and is a constant, so it prints an hour out
+   for half the year with a plausible `GMT+2` beside it. That is the value the validator
+   refuses, and it is the only refusal here that is a judgement rather than a fact.
+2. **"The platform can answer 'is this a real zone' on its own" is true, and the obvious
+   platform answer is the wrong one.** `Intl.supportedValuesOf("timeZone")` returns 418
+   `Area/Location` names and contains **no `UTC`**, no `GMT` and nothing under `Etc/` — so a
+   membership gate would have refused this column's own default. It also reports the
+   PRE-rename primaries on this engine (`Asia/Calcutta`, `Europe/Kiev`) while a newer browser
+   hands the form `Asia/Kolkata` and `Europe/Kyiv`, so a membership gate would refuse values
+   the operator's own browser had just offered them. The gate is therefore "does
+   `Intl.DateTimeFormat` accept it, and is it not an offset"; the LIST is used for the picker,
+   where being incomplete costs nothing.
+3. **"IANA renames zones" is the one mechanism that CANNOT break a stored zone.** A rename
+   leaves the old name as a link, indefinitely — measured: `Asia/Calcutta`, `Europe/Kiev`,
+   `America/Godthab` and `Pacific/Enderbury` all still resolve on Node 24, and this engine's
+   `supportedValuesOf` still reports them as the primaries. Even `US/Pacific-New`, dropped
+   from tzdata's `backward` file in 2020b, still resolves here, because ICU keeps more than
+   IANA ships. What CAN leave an unresolvable value in the column is narrower: a name coined
+   after this Node's tzdata (a form filled in from a newer browser), a restore or import from
+   an install with different tzdata, and a hand-written API call. The requirement stands —
+   nothing may throw mid-render — but the likelihood is much lower than the brief implies,
+   which is why the answer is a fallback plus a Settings warning and not machinery.
+4. **"One field and one argument" was one field and TWO dates.** The summary also prints
+   `{{document.issueDate}}` and puts it in the PDF's filename, and that came from
+   `scheduling.ts`'s `todayDateOnly()` — the server's UTC calendar day. A summary issued at
+   00:30 in Amsterdam was dated the day before, in type, on a page sent to the people who were
+   in the room. `todayInZone` is that second call site. `todayDateOnly` is untouched: its
+   documented ±2h caveat is right for the Gantt clamp it was written for.
+5. **The QUOTE's issue date is deliberately NOT changed.** It is client-supplied on a form
+   (`documentDateSchema`), so it is the operator's own choice in the operator's own browser,
+   and the organisation's zone is not a better answer than what they typed.
+
+### The migration trap fired a third time
+
+`drizzle-kit generate` stamped 0018's journal `when` as **1788674737914**, which falls between
+0013's 1788600000000 and 0014's 1788700000000 — so 0018 would have been skipped, silently, on
+every install already carrying 0014. Identical to 0016's and 0017's. Hand-set to 1789100000000;
+Task 1's journal test catches it, and so does the 0018 drill (0017's `when` is above the
+generated one, so the column never arrives). **The SQL itself was correct this time** — an
+`ADD COLUMN ... DEFAULT 'UTC' NOT NULL` and a CHECK, in that order — which is the first of the
+three that did not also need rewriting; only the tag and the `when` were changed, and the file
+gained its header.
+
+### One thing that went red and was not this task's code
+
+`schema.test.ts`'s **0010** drill seeds `org_profile` with `insert(orgProfile)` against a
+database migrated only to 0009. A drizzle insert spells out every column schema.ts knows about
+— `time_zone` included, as `default` — so it failed with `column "time_zone" does not exist`.
+This is the standing hazard the 0011 and 0017 drills already record in comments; it reached the
+0010 drill now because `org_profile` had not gained a column since. Fixed with raw SQL, the
+same way.
+
+### Mutation evidence
+
+**44 mutations. 37 killed by tests, 2 by typecheck, 5 green — one by design, one proved
+equivalent, two redundant by design, and one a real and general gap that is reported rather
+than closed.** Run against `shared`, `settings-org-lib`, `org-profile`, `documents-summary`,
+`documents`, `schema` and `routes` — 662 tests — on an isolated remote directory and database.
+
+**The harness was calibrated in both directions before any of it counted.** M00 changes only a
+comment and must report GREEN; it did (373 passed, 0 failed). M01 makes `formatDocumentInstant`
+return `""` unconditionally and must report RED; it did, naming 13 tests.
+
+| mutation | caught by |
+|---|---|
+| `DEFAULT_TIME_ZONE` becomes Europe/Amsterdam | 15 |
+| the fixed-offset refusal deleted | 6 |
+| ...narrowed to a leading `+` only | the `-05:00` case |
+| `resolveZone` swallows the RangeError and answers UTC | 10 |
+| `MAX_TIME_ZONE_LENGTH` narrowed to 8 | 27 |
+| `usableTimeZone` never falls back / always falls back | 5 / 8 |
+| `timeZoneProblem` always answers null (every gate and the render fallback at once) | 14 |
+| `todayInZone` ignores the zone it was given | the two-zone summary test, and todayInZone's own |
+| `timeZoneLabel` asks for `shortGeneric` / for `long` | 12 / 13 |
+| ...reads a fixed instant rather than the document's | 5 |
+| ...stops falling back for a zone that is not one | its own direct test (see below) |
+| the offset message stops naming the failure | the offset refusal test |
+| `formatDocumentInstant` drops `timeZone` (falls to the process zone) | 5 |
+| ...ignores its argument and formats in UTC | 5 |
+| ...stops naming the zone / hard-codes `UTC` as the label | 12 / 5 |
+| ...formats with the raw stored zone, so a render can throw | 3 |
+| ...prints a numeric date | 13 |
+| `toOrgProfile` repairs a broken stored zone on the way out | 23 |
+| `emptyProfile` disagrees with the column default | 3, across three files |
+| the summary context hard-codes UTC | "prints the organisation's wall clock once a zone is set" |
+| the issue date goes back to the server's UTC calendar day | "dates the summary by the organisation's calendar" |
+| the summary context reads the issue date as the meeting's moment | 3 |
+| **the migration adds the column with no default** | 9, the 0018 drill among them |
+| **the migration backfills the server's guess instead of UTC** | the 0018 drill, and 2 more |
+| **the journal `when` put back to what drizzle-kit generated** | the journal test, and the 0018 drill |
+| the migration's CHECK admits a leading sign / narrows to 20 / is never added | 3 / 1 / 3 |
+| `timeZoneOptions` stops prepending the default | 4 |
+| ...drops a stored zone the platform does not list | 3 |
+| ...stops sorting | 1 |
+| `supportedTimeZones` answers nothing | 2 |
+| `orgProfileSchema` loses the field / `formatDocumentInstant` loses its parameter | **typecheck** |
+
+**TWO SURVIVED THE FIRST PASS AND BOTH ARE NOW CLOSED.**
+
+| survivor | why it survived | what closed it |
+|---|---|---|
+| `timeZoneProblem` drops its `value === ""` branch | `Intl` throws on `""` as readily as on `Factory`, so the value stayed refused and only the WORDS changed — and nothing read the words | an assertion that the two sentences differ: `""` gets told which value to send instead, `Factory` gets told this server does not know it |
+| `timeZoneLabel` drops its own `usableTimeZone` call | its only caller had already resolved the zone before handing it over, so the guard was unreachable — true of today's caller, not of the function | a `describe` block for `timeZoneLabel` itself: the season, what en-GB gives outside Europe, the default, and the fallback. Four more mutations were run against it once it had one |
+
+**THREE ARE GREEN AND STAY GREEN, WITH REASONS.**
+
+1. **`todayInZone`'s `month: "2-digit"` swapped for `"numeric"` is an EQUIVALENT MUTANT, and
+   it was measured rather than assumed.** ICU's en-GB numeric date pattern is `dd/MM/y`, so
+   both options pad: `2026-01-02` either way, in every zone tried. `2-digit` stays because it
+   is the spec-guaranteed request rather than a property of one locale's CLDR data, and the
+   assertion is on the OUTPUT, so a future CLDR that stopped padding fails there rather than
+   writing `2026-1-2` into a `date` column.
+2. **Removing the zone check from `orgProfileInputSchema` alone, or from `saveOrgProfile`
+   alone, is green — and that is what "the gate and the backstop" means.** It is the same
+   pairing `logoDataUriProblem` already has and it is deliberately redundant, so removing
+   either half leaves the other one answering. The pair is not collectively dead: M23 removes
+   the predicate they both call and 14 tests fail.
+3. **`schema.ts` declaring a different `.default()` from the migration is GREEN, and this is a
+   real gap that is general rather than this column's.** The test database is built by running
+   the migrations, so once a migration exists, `schema.ts`'s `.default()` is documentation:
+   nothing in the suite compares the two. The catalogue test added here pins the MIGRATION's
+   default against `DEFAULT_TIME_ZONE`, which is the pairing that decides what a row gets —
+   but a `schema.ts` that drifts from `drizzle/` is invisible for every column in the file.
+   Closing it properly is one test that runs `drizzle-kit generate` and asserts it emits
+   nothing, which is its own piece of work and is **flagged for whoever takes Task 3.**
+
+### Counts
+
+Unit suite **3990 passed / 48 skipped in 100 files**, against **3944 / 48 in 98** at Task 2's
+tip: **+46 tests, +2 files** (`shared/src/time-zone.test.ts`,
+`web/src/pages/settings-org-lib.test.ts`). `npm run typecheck` clean. Run on an isolated
+remote directory and database, both removed afterwards — `/home/chris/conduit` is shared and
+the suite's advisory lock is cluster-wide.
+
 ## Task 3: The letter, and the NDA pair
 
 - [ ] **Letter**: a company or contact, plus a rich-text body the user types. Reuses the composer
