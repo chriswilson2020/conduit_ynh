@@ -9,13 +9,17 @@ import {
   errorResponseSchema, listResponseSchema, searchResultsSchema,
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
-  meetingSchema, meetingDetailSchema, documentSchema, orgProfileSchema,
-  documentTemplateSchema, CONTACT_FIELD_CAPS, DOCUMENT_MAX_DESCRIPTION_CHARS,
-  DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
+  meetingSchema, meetingDetailSchema, meetingSummarySchema, documentSchema, orgProfileSchema,
+  agreementSchema, letterSchema, recordDocumentSchema, statusReportSchema,
+  documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
+  DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
-import { seededQuoteTemplate } from "../test/seed-template.js";
+import {
+  seededAgreementTemplate, seededLetterTemplate, seededMeetingSummaryTemplate, seededQuoteTemplate,
+  seededStatusReportTemplate,
+} from "../test/seed-template.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
 import { listFiles } from "../services/files.js";
 import { listEvents } from "../services/timeline.js";
@@ -2201,7 +2205,11 @@ describe("documents routes", () => {
     const a = await app();
     const empty = await a.inject({ method: "GET", url: "/api/org-profile", headers: authHeaders });
     expect(empty.statusCode).toBe(200);
-    expect(orgProfileSchema.parse(empty.json())).toMatchObject({ name: "", logoDataUri: "" });
+    // THE ZONE IS THE ONE FIELD THAT IS NOT "" ON AN UNTOUCHED INSTALL, and it
+    // has to arrive on the wire from the very first GET or the Settings form
+    // opens with an empty select.
+    expect(orgProfileSchema.parse(empty.json()))
+      .toMatchObject({ name: "", logoDataUri: "", timeZone: DEFAULT_TIME_ZONE });
 
     const saved = await a.inject({
       method: "PUT", url: "/api/org-profile", headers: authHeaders,
@@ -2210,7 +2218,7 @@ describe("documents routes", () => {
         vatNumber: "NL001234567B01", registrationNumber: "12345678",
         email: "hello@listerdale.test", phone: "+31 20 123 4567",
         website: "listerdale.test", bankDetails: "NL00 BANK 0123 4567 89",
-        logoDataUri: "",
+        logoDataUri: "", timeZone: "Europe/Amsterdam",
       },
     });
     expect(saved.statusCode).toBe(200);
@@ -2218,11 +2226,32 @@ describe("documents routes", () => {
 
     const reread = await a.inject({ method: "GET", url: "/api/org-profile", headers: authHeaders });
     expect(orgProfileSchema.parse(reread.json()).vatNumber).toBe("NL001234567B01");
+    expect(orgProfileSchema.parse(reread.json()).timeZone).toBe("Europe/Amsterdam");
 
     const invalid = await a.inject({
       method: "PUT", url: "/api/org-profile", headers: authHeaders, payload: { name: "Only a name" },
     });
     expect(invalid.statusCode).toBe(400);
+
+    // A COMPLETE FORM WITH ONE BAD FIELD, which is a different refusal from the
+    // incomplete body above: the shape is right and the VALUE is not a zone, and
+    // it has to come back as something the person in Settings can act on rather
+    // than as a 500 out of Intl or a 23514 out of the column.
+    const badZone = await a.inject({
+      method: "PUT", url: "/api/org-profile", headers: authHeaders,
+      payload: {
+        name: "Listerdale Life Sciences", addressLines: "1 High St",
+        vatNumber: "", registrationNumber: "", email: "", phone: "",
+        website: "", bankDetails: "", logoDataUri: "", timeZone: "+02:00",
+      },
+    });
+    expect(badZone.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(badZone.json()).message).toContain("fixed offset");
+    // ...and the refusal did not overwrite what was there.
+    const afterRefusal = await a.inject({
+      method: "GET", url: "/api/org-profile", headers: authHeaders,
+    });
+    expect(orgProfileSchema.parse(afterRefusal.json()).timeZone).toBe("Europe/Amsterdam");
     await a.close();
   });
 
@@ -2427,15 +2456,484 @@ describe("documents routes", () => {
     await a.close();
   });
 
+  /**
+   * THE MEETING SUMMARY'S PAIR: the type with no form, at the HTTP layer.
+   *
+   * The POST carries NO BODY, which is the whole point -- everything printed is on
+   * the meeting and the URL says which one. So there is no input schema to reject
+   * and no 400 to test; what is worth testing is that the empty request really is
+   * accepted, that the PDF comes back through the route that already existed, and
+   * that the type's own rules survive the round trip.
+   */
+  async function makeMeeting(a: Awaited<ReturnType<typeof app>>): Promise<{ id: string }> {
+    const company = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    const created = await a.inject({
+      method: "POST", url: "/api/meetings", headers: authHeaders,
+      payload: {
+        title: "Kickoff with Acme", occurredAt: "2026-09-01T13:30:00.000Z",
+        notes: "<p>Agreed to ship on the 3rd.</p>",
+        companyId: (company.json() as { id: string }).id,
+        attendees: [{ guestName: "Their lawyer" }],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    return created.json() as { id: string };
+  }
+
+  it("generates a meeting summary with no body at all, lists it, and serves its PDF", async () => {
+    await handle.db.insert(documentTemplates)
+      .values({ type: "meeting_summary", bodyHtml: seededMeetingSummaryTemplate() });
+    const a = await app();
+    const meeting = await makeMeeting(a);
+
+    const created = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/meetings/${meeting.id}/documents`, headers: authHeaders,
+      }));
+    expect(created.statusCode).toBe(201);
+    const summary = meetingSummarySchema.parse(created.json());
+    expect(summary).toMatchObject({ type: "meeting_summary", meetingId: meeting.id, frozen: false });
+    // The wire shape has no `number`, which is the type's decision made visible at
+    // the boundary rather than only in the row.
+    expect(created.json()).not.toHaveProperty("number");
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/meetings/${meeting.id}/documents`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(meetingSummarySchema).parse(listed.json())).toEqual([summary]);
+
+    // NO SECOND DOWNLOAD PATH, exactly as for a quote: the PDF is an ordinary
+    // files row -- on the MEETING, since Phase 9 -- and comes back through the
+    // route that already existed.
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${summary.fileId}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.headers["content-type"]).toContain("application/pdf");
+    expect(download.rawPayload.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(download.headers["content-disposition"]).toContain("Meeting summary");
+    await a.close();
+  });
+
+  it("answers 404 for a meeting that does not exist and 409 with no template", async () => {
+    const a = await app();
+
+    // 409 BEFORE 404 IN THIS TEST'S ORDER, deliberately: with no template row at
+    // all, a real meeting is the only way to reach the template read, and an
+    // install whose seeded row was deleted must get a message an operator can act
+    // on rather than a 500.
+    const meeting = await makeMeeting(a);
+    const noTemplate = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/meetings/${meeting.id}/documents`, headers: authHeaders,
+      }));
+    expect(noTemplate.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(noTemplate.json()).error).toBe("template_missing");
+
+    const missing = await a.inject({
+      method: "POST", url: `/api/meetings/${unknownId}/documents`, headers: authHeaders,
+    });
+    expect(missing.statusCode).toBe(404);
+
+    // An unparseable id is the uniform 400 rather than a 500 out of the driver.
+    const bad = await a.inject({
+      method: "GET", url: "/api/meetings/not-a-uuid/documents", headers: authHeaders,
+    });
+    expect(bad.statusCode).toBe(400);
+    await a.close();
+  });
+
+  /* ---------------------------------------------------------------------- *
+   *  PHASE 9 TASK 4: the project status report
+   * ---------------------------------------------------------------------- */
+
+  /**
+   * **THE SECOND PAIR OF DOCUMENT ROUTES WITH NO REQUEST BODY**, and unlike the
+   * meeting summary's that is a finding rather than a given: the spec gave this
+   * type "possibly a date range" and it turned out to need nothing at all. What
+   * this test is really checking at the boundary is that a POST with no payload
+   * produces a document -- there is no schema to reject a body, so an empty one
+   * has to be the whole contract.
+   */
+  it("generates a project status report with no body at all, lists it, and serves its PDF", async () => {
+    await handle.db.insert(documentTemplates)
+      .values({ type: "project_status_report", bodyHtml: seededStatusReportTemplate() });
+    const a = await app();
+    const project = await makeProject(a, { startDate: "2026-08-01", dueDate: "2026-12-31" });
+    await makeTask(a, { title: "Groundwork", projectId: project.id });
+
+    const created = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/projects/${project.id}/documents`, headers: authHeaders,
+      }));
+    expect(created.statusCode).toBe(201);
+    const report = statusReportSchema.parse(created.json());
+    expect(report).toMatchObject({
+      type: "project_status_report", projectId: project.id, frozen: false,
+    });
+    // The wire shape has no `number`, which is the type's decision made visible at
+    // the boundary rather than only in the row.
+    expect(created.json()).not.toHaveProperty("number");
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/projects/${project.id}/documents`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(statusReportSchema).parse(listed.json())).toEqual([report]);
+
+    // NO SECOND DOWNLOAD PATH, exactly as for a quote and a summary: the PDF is
+    // an ordinary files row -- on the PROJECT, which `files_exactly_one_entity`
+    // has admitted since Phase 3 -- and comes back through the route that already
+    // existed.
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${report.fileId}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.headers["content-type"]).toContain("application/pdf");
+    expect(download.headers["content-disposition"]).toContain("Status report");
+    await a.close();
+  });
+
+  it("answers 404 for a project that does not exist, 409 with no template, and 400 for a bad id", async () => {
+    const a = await app();
+
+    // 409 BEFORE 404, for the meeting summary's reason: with no template row a
+    // real project is the only way to reach the template read, and an install
+    // whose seeded row was deleted must get a message an operator can act on.
+    const project = await makeProject(a);
+    const noTemplate = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/projects/${project.id}/documents`, headers: authHeaders,
+      }));
+    expect(noTemplate.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(noTemplate.json()).error).toBe("template_missing");
+
+    const missing = await a.inject({
+      method: "POST", url: `/api/projects/${unknownId}/documents`, headers: authHeaders,
+    });
+    expect(missing.statusCode).toBe(404);
+
+    const bad = await a.inject({
+      method: "GET", url: "/api/projects/not-a-uuid/documents", headers: authHeaders,
+    });
+    expect(bad.statusCode).toBe(400);
+    await a.close();
+  });
+
+  /**
+   * **A REPORT IS NOT REDRAFTABLE, AND THE REFUSAL SAYS SO RATHER THAN SAYING IT
+   * IS FROZEN.** It is NOT frozen -- `documentTypeFreezes` answers false -- so a
+   * 409 `frozen` here would be wrong twice over: wrong about the row, and wrong
+   * about what the operator should do next. `redraftLetter`'s type check is what
+   * answers, exactly as it does for a meeting summary, and this is the second
+   * type to inherit that refusal without needing anything written for it.
+   */
+  it("refuses to redraft a status report as NOT A LETTER rather than as frozen", async () => {
+    await handle.db.insert(documentTemplates)
+      .values({ type: "project_status_report", bodyHtml: seededStatusReportTemplate() });
+    const a = await app();
+    const project = await makeProject(a);
+    const created = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/projects/${project.id}/documents`, headers: authHeaders,
+      }));
+    const report = statusReportSchema.parse(created.json());
+
+    const redraft = await a.inject({
+      method: "PUT", url: `/api/documents/${report.id}`, headers: authHeaders,
+      payload: {
+        issueDate: "2026-09-06", recipientName: "Acme", bodyHtml: "<p>Nope</p>",
+      },
+    });
+    expect(redraft.statusCode).toBe(400);
+    const body = errorResponseSchema.parse(redraft.json());
+    expect(body.error).toBe("validation");
+    expect(body.message).toContain("is a project_status_report, not a letter");
+    await a.close();
+  });
+
+  /* ---------------------------------------------------------------------- *
+   *  PHASE 9 TASK 3: the letter, the agreements, and the redraft
+   * ---------------------------------------------------------------------- */
+
+  /** Its own rather than the meetings block's, which is scoped to that describe. */
+  async function makeCompany(a: Awaited<ReturnType<typeof app>>) {
+    const response = await a.inject({
+      method: "POST", url: "/api/companies", headers: authHeaders, payload: { name: "Acme" },
+    });
+    return companySchema.parse(response.json());
+  }
+
+  /** truncateAll empties document_templates, so the three new types seed their own. */
+  async function seedTask3Templates(): Promise<void> {
+    await handle.db.insert(documentTemplates).values([
+      { type: "letter", bodyHtml: seededLetterTemplate() },
+      { type: "nda", bodyHtml: seededAgreementTemplate("nda") },
+      { type: "mutual_nda", bodyHtml: seededAgreementTemplate("mutual_nda") },
+    ]);
+  }
+
+  const letterPayload = (overrides: Record<string, unknown> = {}) => ({
+    type: "letter",
+    issueDate: "2026-09-06",
+    subject: "Renewal",
+    recipientName: "Acme Manufacturing BV",
+    recipientContactName: "Jane Smith",
+    recipientSalutation: "Ms Smith",
+    recipientAddress: "1 Industrieweg",
+    bodyHtml: "<p>Thank you for your time.</p>",
+    ...overrides,
+  });
+
+  const ndaPayload = (overrides: Record<string, unknown> = {}) => ({
+    type: "nda",
+    issueDate: "2026-09-06", effectiveDate: "2026-09-01", termMonths: 36,
+    jurisdiction: "the Netherlands", partyName: "Acme Manufacturing BV",
+    partyContactName: "Jane Smith", partyAddress: "1 Industrieweg",
+    ...overrides,
+  });
+
+  it("writes a letter on a company, lists it beside an NDA, and serves both PDFs", async () => {
+    await seedTask3Templates();
+    const a = await app();
+    const company = await makeCompany(a);
+
+    const withStub = async (payload: Record<string, unknown>) =>
+      await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+        await a.inject({
+          method: "POST", url: `/api/companies/${company.id}/documents`,
+          headers: authHeaders, payload,
+        }));
+
+    const letterResponse = await withStub(letterPayload());
+    expect(letterResponse.statusCode).toBe(201);
+    const letter = letterSchema.parse(letterResponse.json());
+    expect(letter).toMatchObject({ type: "letter", companyId: company.id, frozen: false });
+
+    const ndaResponse = await withStub(ndaPayload());
+    expect(ndaResponse.statusCode).toBe(201);
+    const nda = agreementSchema.parse(ndaResponse.json());
+    expect(nda).toMatchObject({ type: "nda", number: "NDA-2026-0001", frozen: true });
+
+    // **THE MIXED LIST**, parsed with the discriminated union rather than with one
+    // member -- which is the whole point of it being a union.
+    const listed = await a.inject({
+      method: "GET", url: `/api/companies/${company.id}/documents`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(recordDocumentSchema).parse(listed.json())).toEqual([nda, letter]);
+
+    // NO SECOND DOWNLOAD PATH, as for every other type.
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${nda.fileId}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.headers["content-disposition"]).toContain("NDA-2026-0001.pdf");
+    await a.close();
+  });
+
+  it("writes a letter on a contact, which the company's list does not show", async () => {
+    await seedTask3Templates();
+    const a = await app();
+    const company = await makeCompany(a);
+    const created = await a.inject({
+      method: "POST", url: "/api/contacts", headers: authHeaders,
+      payload: { firstName: "Jane", lastName: "Smith", companyId: company.id },
+    });
+    const contactId = (created.json() as { id: string }).id;
+
+    const response = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/contacts/${contactId}/documents`,
+        headers: authHeaders, payload: letterPayload(),
+      }));
+    expect(response.statusCode).toBe(201);
+    expect(letterSchema.parse(response.json())).toMatchObject({ companyId: null, contactId });
+
+    // **CHRIS'S "EXACTLY ONE" DECISION, VISIBLE AT THE HTTP SURFACE.** A letter to
+    // Jane at Acme is on JANE, so Acme's own list is empty -- which is the
+    // consequence of the decision and the thing to look at before deciding whether
+    // it was the right one.
+    const onCompany = await a.inject({
+      method: "GET", url: `/api/companies/${company.id}/documents`, headers: authHeaders,
+    });
+    expect(onCompany.json()).toEqual([]);
+
+    /*
+     * **AND `?includeContacts=true` IS THE ANSWER TASK 3 RECOMMENDED, ADDED BY
+     * TASK 4 AS A VIEW AND NOT AS A SECOND OWNER.** The assertion above is
+     * unchanged, so the decision is still visible; this one is the other view of
+     * the same row. The letter comes back with `contactId` set and `companyId`
+     * null, which is the row as written -- nothing about "exactly one" moved.
+     */
+    const rolled = await a.inject({
+      method: "GET", url: `/api/companies/${company.id}/documents?includeContacts=true`,
+      headers: authHeaders,
+    });
+    expect(rolled.statusCode).toBe(200);
+    const rolledUp = z.array(recordDocumentSchema).parse(rolled.json());
+    expect(rolledUp).toHaveLength(1);
+    expect(rolledUp[0]).toMatchObject({ contactId, companyId: null });
+
+    // ANYTHING THAT IS NOT THE LITERAL "true" IS OFF, AND NOTHING IS REFUSED OVER
+    // IT. `z.coerce.boolean()` would answer TRUE for the string "false", which is
+    // exactly the value a client sends when it means the opposite -- so the route
+    // tests the string instead, and this is the assertion that says so.
+    for (const value of ["false", "1", "yes", ""]) {
+      const off = await a.inject({
+        method: "GET",
+        url: `/api/companies/${company.id}/documents?includeContacts=${value}`,
+        headers: authHeaders,
+      });
+      expect(off.statusCode, value).toBe(200);
+      expect(off.json(), value).toEqual([]);
+    }
+    await a.close();
+  });
+
+  it("redrafts a letter in place and refuses to redraft a quote or an NDA", async () => {
+    await seedTemplate();
+    await seedTask3Templates();
+    const a = await app();
+    const company = await makeCompany(a);
+    const stub = async (fn: () => Promise<unknown>) =>
+      await withPythonStub(writePythonStub(dataDir, VARYING_PDF), fn);
+
+    const letter = letterSchema.parse((await stub(async () => await a.inject({
+      method: "POST", url: `/api/companies/${company.id}/documents`,
+      headers: authHeaders, payload: letterPayload(),
+    })) as { json: () => unknown }).json());
+
+    const redrafted = await stub(async () => await a.inject({
+      method: "PUT", url: `/api/documents/${letter.id}`, headers: authHeaders,
+      // NO `type` IN THE BODY: the redraft schema is the issue schema minus its
+      // discriminator, because the document already knows what it is.
+      payload: {
+        issueDate: "2026-09-07", subject: "Second thoughts",
+        recipientName: "Acme Manufacturing BV", recipientContactName: "",
+        recipientSalutation: "", recipientAddress: "",
+        bodyHtml: "<p>Rewritten.</p>",
+      },
+    })) as { statusCode: number; json: () => unknown };
+    expect(redrafted.statusCode).toBe(200);
+    expect(letterSchema.parse(redrafted.json()))
+      .toMatchObject({ id: letter.id, subject: "Second thoughts", bodyHtml: "<p>Rewritten.</p>" });
+
+    // ONE DOCUMENT, EDITED. Not two.
+    const listed = await a.inject({
+      method: "GET", url: `/api/companies/${company.id}/documents`, headers: authHeaders,
+    });
+    expect(z.array(recordDocumentSchema).parse(listed.json())).toHaveLength(1);
+
+    // **AND THE TWO REFUSALS THAT MATTER.** A quote and an NDA are frozen, so a
+    // PUT at either is a 409 with a sentence rather than a silent edit.
+    const nda = agreementSchema.parse((await stub(async () => await a.inject({
+      method: "POST", url: `/api/companies/${company.id}/documents`,
+      headers: authHeaders, payload: ndaPayload(),
+    })) as { json: () => unknown }).json());
+
+    const deal = await makeQuotableDeal(a);
+    const quote = documentSchema.parse((await stub(async () => await a.inject({
+      method: "POST", url: `/api/deals/${deal.id}/documents`,
+      headers: authHeaders, payload: quotePayload(),
+    })) as { json: () => unknown }).json());
+
+    for (const [id, noun] of [[quote.id, "quote"], [nda.id, "nda"]] as const) {
+      const refused = await stub(async () => await a.inject({
+        method: "PUT", url: `/api/documents/${id}`, headers: authHeaders,
+        payload: {
+          issueDate: "2026-09-07", recipientName: "Acme", bodyHtml: "<p>x</p>",
+          subject: "", recipientContactName: "", recipientSalutation: "", recipientAddress: "",
+        },
+      })) as { statusCode: number; json: () => unknown };
+      expect(refused.statusCode).toBe(409);
+      const body = errorResponseSchema.parse(refused.json());
+      expect(body.error).toBe("frozen");
+      expect(body.message).toBe(`an issued ${noun.replace("_", " ")} cannot be changed`);
+    }
+
+    // ...and the quote is exactly what it was, which is the claim rather than the
+    // status code.
+    const quoteAfter = await a.inject({
+      method: "GET", url: `/api/deals/${deal.id}/documents`, headers: authHeaders,
+    });
+    expect(z.array(documentSchema).parse(quoteAfter.json())).toEqual([quote]);
+    await a.close();
+  });
+
+  it("answers 404 for an unknown record and 409 for an archived one", async () => {
+    await seedTask3Templates();
+    const a = await app();
+    const company = await makeCompany(a);
+
+    const unknown = await a.inject({
+      method: "POST", url: `/api/companies/${unknownId}/documents`,
+      headers: authHeaders, payload: letterPayload(),
+    });
+    expect(unknown.statusCode).toBe(404);
+
+    await a.inject({
+      method: "POST", url: `/api/companies/${company.id}/archive`, headers: authHeaders,
+    });
+    const archived = await a.inject({
+      method: "POST", url: `/api/companies/${company.id}/documents`,
+      headers: authHeaders, payload: letterPayload(),
+    });
+    expect(archived.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(archived.json()).error).toBe("archived");
+    await a.close();
+  });
+
+  it("refuses a body whose type is not one of the two this route can produce", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    for (const payload of [
+      // A type that exists but does not attach to a company.
+      letterPayload({ type: "meeting_summary" }),
+      // A type that does not exist at all.
+      letterPayload({ type: "invoice" }),
+      // The right type with a missing required field.
+      letterPayload({ recipientName: "" }),
+      // An agreement with a term outside the bound.
+      ndaPayload({ termMonths: 0 }),
+    ]) {
+      const response = await a.inject({
+        method: "POST", url: `/api/companies/${company.id}/documents`,
+        headers: authHeaders, payload,
+      });
+      expect(response.statusCode).toBe(400);
+    }
+    await a.close();
+  });
+
   it("returns 401 without an identity header on every documents route", async () => {
     const a = await app();
     const calls = [
       { method: "GET" as const, url: `/api/deals/${unknownId}/documents` },
       { method: "POST" as const, url: `/api/deals/${unknownId}/documents` },
+      { method: "GET" as const, url: `/api/meetings/${unknownId}/documents` },
+      { method: "POST" as const, url: `/api/meetings/${unknownId}/documents` },
+      { method: "GET" as const, url: `/api/companies/${unknownId}/documents` },
+      { method: "POST" as const, url: `/api/companies/${unknownId}/documents` },
+      { method: "GET" as const, url: `/api/contacts/${unknownId}/documents` },
+      { method: "POST" as const, url: `/api/contacts/${unknownId}/documents` },
+      { method: "GET" as const, url: `/api/projects/${unknownId}/documents` },
+      { method: "POST" as const, url: `/api/projects/${unknownId}/documents` },
+      { method: "PUT" as const, url: `/api/documents/${unknownId}` },
       { method: "GET" as const, url: "/api/org-profile" },
       { method: "PUT" as const, url: "/api/org-profile" },
       { method: "GET" as const, url: "/api/document-templates/quote" },
       { method: "PUT" as const, url: "/api/document-templates/quote" },
+      { method: "GET" as const, url: "/api/document-templates/meeting_summary" },
+      { method: "PUT" as const, url: "/api/document-templates/meeting_summary" },
+      { method: "GET" as const, url: "/api/document-templates/letter" },
+      { method: "PUT" as const, url: "/api/document-templates/nda" },
+      { method: "GET" as const, url: "/api/document-templates/mutual_nda" },
+      { method: "GET" as const, url: "/api/document-templates/project_status_report" },
+      { method: "PUT" as const, url: "/api/document-templates/project_status_report" },
     ];
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });

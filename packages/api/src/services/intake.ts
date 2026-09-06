@@ -801,8 +801,17 @@ export function stagedPathProblem(destination: string, resolved: string): string
   return null;
 }
 
-/** Run 7z with the passphrase on its stdin and nowhere else. */
-async function runSevenZip(
+/**
+ * Run 7z with the passphrase on its stdin and nowhere else.
+ *
+ * EXPORTED SO THE stdin GUARD BELOW IS AN INSTRUMENT RATHER THAN A HOPE, the
+ * same reason stagedPathProblem above is exported. stageArchive applies
+ * passphraseProblem BEFORE it reaches here, so nothing outside this module can
+ * hand it a payload big enough to make the write fail -- which means a test
+ * driven through stageArchive would pass with the guard deleted. This is the
+ * only door to it.
+ */
+export async function runSevenZip(
   args: readonly string[], passphrase: string | null,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return await new Promise((resolve, reject) => {
@@ -828,6 +837,20 @@ async function runSevenZip(
         stderr: Buffer.concat(stderrChunks).toString("utf8").slice(0, STDERR_CAP_BYTES),
       });
     });
+    // Registered before the write. A stream 'error' with no listener is an
+    // uncaught exception and packages/api/src installs no process-level handler,
+    // so it would end the API server rather than the upload -- and `close` is
+    // what says what was actually wrong with the archive. services/restore.ts's
+    // proveArchiveOpens carries the measurement, including why a 256-character
+    // passphrase cannot reach it and why the line is here regardless.
+    //
+    // THIS IS THE SITE WHERE THE CHILD REALLY DOES EXIT WITHOUT READING: `7z l`
+    // on 4096 bytes that are not an archive answers "Is not archive", exit 2,
+    // in all 30 runs of it -- and that it consumed nothing on the way is what
+    // the EPIPE at 256 KiB and above says, since a reader would have drained it.
+    // An ordinary wrong upload rather than a rare corruption; the only thing
+    // that makes it survivable is the size of what this writes.
+    child.stdin.on("error", () => { /* see above */ });
     // NO TRAILING NEWLINE, and it is not superstition: 7z reads one line, so a
     // newline here would be read as the end of the passphrase either way -- but
     // writing exactly the bytes the operator typed keeps this side of the pipe

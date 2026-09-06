@@ -1389,9 +1389,18 @@ async function runSevenZip(
       }
       resolve();
     });
-    // Registered before the write: a 7z that fails immediately closes its
-    // stdin while this write is in flight, and the EPIPE that follows must not
-    // become an unhandled 'error' event. `close` reports the real reason.
+    // Registered before the write, so an EPIPE never becomes an unhandled
+    // 'error' event; `close` reports the real reason.
+    //
+    // WHAT USED TO STAND HERE was "a 7z that fails immediately closes its stdin
+    // while this write is in flight", and that mechanism is not the one. libuv
+    // gives a child's stdin a socketpair whose send buffer took 128 KiB whole on
+    // the deploy target, so a passphrase-sized write completes into the kernel
+    // whatever the child does -- 0 EPIPE in 70 runs at 28 bytes against a 7z
+    // that read nothing at all, 30 in 30 at 256 KiB. No race to lose at this
+    // size.
+    // services/restore.ts's proveArchiveOpens carries the full table and the
+    // argument for keeping the line regardless.
     child.stdin.on("error", () => { /* see above */ });
     // NO TRAILING NEWLINE. 7z strips one if it is there (measured), so adding
     // one would be harmless -- but "harmless because the tool trims it" is a

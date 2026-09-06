@@ -759,10 +759,26 @@ export async function listTasks(db: Database, opts: ListTasksOptions): Promise<T
   if (opts.assigneeId) where.push(eq(tasks.assigneeUserId, opts.assigneeId));
   if (opts.status) where.push(eq(tasks.status, opts.status));
   if (opts.dated) where.push(isNotNull(tasks.startDate));
-  // Ordered (parent group, position): Postgres's default NULLS LAST on an
-  // ascending sort groups every top-level task (parent_task_id NULL)
-  // together, then each parent's children together, each group internally
-  // ordered by its fractional position.
+  // Ordered (parent group, position): every task sharing a parent_task_id stays
+  // contiguous, each group internally ordered by its fractional position. That
+  // is all this ordering promises, and it is all any caller uses -- the board
+  // and the drawer regroup by parent themselves.
+  //
+  // **THE SENTENCE THIS REPLACES HAD THE DIRECTION BACKWARDS**, and it was
+  // measured rather than re-reasoned (Phase 9 Task 4, on the dev server:
+  // `SELECT x FROM (VALUES (2),(NULL),(1)) t(x) ORDER BY x ASC` gives 1, 2,
+  // NULL). It claimed NULLS LAST "groups every top-level task (parent_task_id
+  // NULL) together, THEN each parent's children together" -- i.e. roots first.
+  // NULLS LAST puts them LAST: the CHILDREN come first, grouped by parent, and
+  // every root task follows them. Nothing depends on which way round it is, and
+  // tasks.test.ts's own ordering test carefully asserts only contiguity -- but a
+  // comment that describes the opposite of what the query does is worse than no
+  // comment, and Task 4 rejected this ordering for the status report's printed
+  // table on exactly the property it got wrong (a parent separated from its own
+  // children by the whole rest of the project). See `taskOutlineOrder` in
+  // scheduling.ts for the ordering that does put a root in front of its
+  // children, and services/documents.ts's `loadReportTasks` for why a printed
+  // table needs it.
   const rows = await db.select().from(tasks).where(and(...where))
     .orderBy(tasks.parentTaskId, tasks.position);
   return rows.map(toTask);

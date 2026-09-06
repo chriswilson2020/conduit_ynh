@@ -768,9 +768,17 @@ async function spawnRender(
       resolve(pdf);
     });
 
-    // Registered before the write, because a child that fails fast closes its stdin
-    // while this write is still in flight and the EPIPE that follows must not be an
-    // unhandled 'error' event. `close` reports the real reason.
+    // Registered before the write, so the EPIPE from a renderer that exits without
+    // draining is not an unhandled 'error' event. `close` reports the real reason.
+    //
+    // AND OF THE FOUR SPAWN SITES IN THIS PACKAGE THIS IS THE ONE WHERE IT IS
+    // LOAD-BEARING RATHER THAN DEFENSIVE, because `html` is the only payload with
+    // no cap on it. The measured threshold is the socketpair's send buffer -- 128
+    // KiB through, 256 KiB EPIPEs 30 times in 30 on the deploy target -- and a document with
+    // an inlined image passes that without trying. The three 7z sites write a
+    // passphrase capped at 256 characters and cannot reach it; see
+    // services/restore.ts's proveArchiveOpens for the table and for why they carry
+    // the line anyway.
     child.stdin.on("error", () => { /* see above */ });
     child.stdin.end(html, "utf8");
   });

@@ -17,6 +17,24 @@ export type { LineInput, DocumentTotals } from "./money.js";
 export {
   decimalFromCents, formatMoneyCents, formatQtyMilli, formatTaxRateBp, MONEY_LOCALE,
 } from "./money-format.js";
+// ...and imported as well as re-exported, because `formatDocumentInstant` below
+// formats a date in the same locale the money figures beside it use. A re-export
+// does not put the name in this module's scope, which is why the line above is
+// not enough on its own.
+import { MONEY_LOCALE } from "./money-format.js";
+// v1.8.0's organisation timezone, reaching web and api the same way the money
+// helpers do and for the same reason: the Settings form refuses a zone before it
+// is sent, saveOrgProfile refuses one that arrives anyway, and the renderer has
+// to make the same judgement about a stored one. Three readings of "is this a
+// zone" that agree today would not stay agreed.
+export {
+  DEFAULT_TIME_ZONE, MAX_TIME_ZONE_LENGTH, timeZoneLabel, timeZoneProblem, todayInZone,
+  usableTimeZone,
+} from "./time-zone.js";
+// ...and imported as well as re-exported, for the reason MONEY_LOCALE is:
+// `formatDocumentInstant` below needs the names in scope, and a re-export does
+// not put them there.
+import { timeZoneLabel, timeZoneProblem, usableTimeZone } from "./time-zone.js";
 // 7.6's backup passphrase rule, reaching web the same way and for the same
 // reason the money helpers do: the Settings page refuses a passphrase before it
 // is sent and services/backup.ts refuses one that arrives anyway, and those two
@@ -228,6 +246,16 @@ export const fileMetaSchema = z.object({
   uploaderUserId: z.uuid(),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
   projectId: z.uuid().nullable(),
+  // A FIFTH PARENT ON THE READ SHAPE AND NOT ON `createNoteInputSchema`'s
+  // `exactlyOneEntity` ABOVE, and the asymmetry is deliberate (Phase 9 Task 2).
+  // `files_exactly_one_entity` gained meeting_id so that a RENDERED DOCUMENT can
+  // live on the record it is a document OF -- documents.meeting_id and
+  // files.meeting_id have to agree about what the artifact belongs to, or the
+  // download route hands you a PDF filed under a deal that the document says is a
+  // meeting's. Nothing UPLOADS a file to a meeting: POST /api/files still takes
+  // the four, because "attach this PDF to a meeting" is a feature nobody has asked
+  // for and the Files rail has no meeting scope to show it in.
+  meetingId: z.uuid().nullable(),
   createdAt: z.iso.datetime(),
 });
 export type FileMeta = z.infer<typeof fileMetaSchema>;
@@ -439,6 +467,23 @@ export type FunnelRow = z.infer<typeof funnelRowSchema>;
 export const projectStatusSchema = z.enum(["active", "completed"]);
 export type ProjectStatus = z.infer<typeof projectStatusSchema>;
 
+/**
+ * How a project's status is WORDED, wherever it is shown to a person.
+ *
+ * **HERE SINCE PHASE 9 TASK 4, BECAUSE THE SECOND RENDERER IS A PDF.** It lived
+ * in `pages/project-detail.tsx` while the browser was the only thing that showed
+ * it. The project status report prints it too, from the server, and a third
+ * spelling of "Active" is exactly the drift `task-board.tsx`'s own comment
+ * warned against for the task labels ("a status/type's wording only ever lives in
+ * one place"). It is in @conduit/shared rather than duplicated because the
+ * package already owns the other cross-renderer formatting decisions --
+ * MONEY_LOCALE, `formatDocumentInstant` -- for the same reason: the product
+ * decides the wording, not whichever process happens to be doing the rendering.
+ */
+export const PROJECT_STATUS_LABEL: Record<ProjectStatus, string> = {
+  active: "Active", completed: "Completed",
+};
+
 const hexColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/, "color must be a 6-digit hex code (e.g. #1a2b3c)");
 
 export const projectSchema = z.object({
@@ -476,6 +521,22 @@ export const taskTypeSchema = z.enum(["task", "call", "meeting", "email", "deadl
 export type TaskType = z.infer<typeof taskTypeSchema>;
 export const taskStatusSchema = z.enum(["todo", "in_progress", "blocked", "done"]);
 export type TaskStatus = z.infer<typeof taskStatusSchema>;
+
+/**
+ * How a task's status is WORDED, wherever it is shown to a person.
+ *
+ * **MOVED HERE FROM `pages/task-board.tsx` BY PHASE 9 TASK 4**, which is the file
+ * that had already made the argument: "Exported: the task drawer and My Tasks
+ * reuse these same labels rather than redefining them, so a status/type's wording
+ * only ever lives in one place." The project status report is the fourth reader
+ * and the first that is not in a browser -- it prints these words into a PDF from
+ * the server -- so "one place" had to stop meaning "one place in packages/web".
+ * `task-board.tsx` re-exports this under its old name, so nothing that imported
+ * `STATUS_LABEL` had to change.
+ */
+export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
+  todo: "To do", in_progress: "In progress", blocked: "Blocked", done: "Done",
+};
 
 export const taskSchema = z.object({
   id: z.uuid(), title: z.string().min(1), description: nullableString,
@@ -2326,9 +2387,326 @@ function documentText(max: number, min = 0) {
   });
 }
 
-/** The one document type v1.0.0 ships. `documents_type_valid` CHECKs the same set. */
-export const documentTypeSchema = z.enum(["quote"]);
+/**
+ * The document types Conduit can produce. `documents_type_valid` CHECKs the same
+ * set, and `document_templates_type_valid` with it -- every type here has an
+ * editable template and a row seeded by the migration that added the type.
+ *
+ * `meeting_summary` is Phase 9 Task 2's, and it is the type that has no form: its
+ * whole content is a `meetings` row, so nothing about it is submitted.
+ * `letter`, `nda` and `mutual_nda` are Task 3's.
+ *
+ * **`project_status_report` IS TASK 4'S, AND IT IS THE SECOND TYPE WITH NO FORM.**
+ * That was not expected: the spec's table gives it "possibly a date range" as its
+ * extra input and the plan asked for the question to be settled before a form was
+ * built for it. It was settled NO -- the argument is at `issueStatusReport` in
+ * services/documents.ts -- and with the range gone there is no other field, so the
+ * whole content is the `projects` row, its tasks and their dependencies. The
+ * phase's real count is therefore FIVE templates and THREE forms: the quote's, the
+ * letter's and the agreements'. (The spec says "four templates, four forms", which
+ * Task 2 corrected to four and three; both halves were wrong by one.)
+ */
+export const documentTypeSchema = z.enum([
+  "quote", "meeting_summary", "letter", "nda", "mutual_nda", "project_status_report",
+]);
 export type DocumentType = z.infer<typeof documentTypeSchema>;
+
+/**
+ * WHETHER A DOCUMENT OF THIS TYPE MAY STILL CHANGE ONCE IT HAS BEEN ISSUED.
+ *
+ * Chris's decision, 6 Sep: **freezing is per type, not universal.** Phase 7 made
+ * an issued document immutable, and that is right for a quote -- you sent
+ * somebody a price and must be able to prove what you sent -- but treating it as
+ * a property of documents in general makes three of the four new types annoying
+ * to use. A quote and an NDA are handed to someone else, and an agreement you
+ * can silently edit after sending is a different kind of document from one you
+ * cannot. A meeting summary, a status report and a letter are not: a stale
+ * status report is worse than an edited one, and a letter wants redrafting
+ * before it goes.
+ *
+ * A `switch` OVER THE UNION RATHER THAN A `Set` OR A LOOKUP OBJECT, and the
+ * difference is the only compile-time help available here. TypeScript's
+ * exhaustiveness check makes a type added to `documentTypeSchema` without an
+ * answer a build error; a `Set<string>.has()` would silently answer `false` --
+ * "editable" -- for a type nobody had considered, which is the wrong way round
+ * for a rule whose failure mode is an editable quote.
+ *
+ * THE DATABASE SAYS THE SAME THING, in `documents_frozen_matches_type`, and
+ * db/schema.test.ts asserts the two spellings agree for every member of the
+ * enum. Two places state this rule because they answer different questions: this
+ * one tells a writer what to store, and the CHECK stops a writer that got it
+ * wrong -- including a writer that is a psql session.
+ */
+export function documentTypeFreezes(type: DocumentType): boolean {
+  switch (type) {
+    case "quote":
+      return true;
+    // Chris's decision, 6 Sep, and the first `false` this function has ever
+    // returned. It is also why 0016 dropped `frozen`'s DEFAULT rather than
+    // leaving `true` standing: with a type whose answer is false, "the writer
+    // forgot" and "the writer meant frozen" had to stop being the same row.
+    case "meeting_summary":
+      return false;
+    // A LETTER IS REDRAFTED, WHICH IS THE ONLY REASON THE UPDATE PATH IN
+    // services/documents.ts EXISTS AT ALL. Until Task 3 nothing in Conduit
+    // could modify an issued document; this is the type that needed to, and
+    // therefore the type that made `frozen` a column anybody reads.
+    case "letter":
+      return false;
+    // BOTH AGREEMENTS FREEZE, and this is the widening 0016's comment said
+    // would come ("the list widens for the NDA, which is Task 3's"). The
+    // argument is Chris's and is the sharpest one in the spec: an agreement you
+    // can silently edit after sending is a different kind of document from one
+    // you cannot. A signed NDA that the CRM can rewrite is not evidence of
+    // anything.
+    case "nda":
+    case "mutual_nda":
+      return true;
+    // **NOT FROZEN, AND IT IS THE ONLY ONE OF THE SIX WHOSE REASON IS ABOUT TIME
+    // RATHER THAN ABOUT WHO HOLDS IT.** A quote and an agreement freeze because
+    // somebody else has a copy and the copy must stay provable. A status report
+    // is not evidence of anything anybody agreed to; it is an answer to "where
+    // is this project", and the answer is wrong a week later. Chris, 6 Sep, via
+    // the plan: "you regenerate it next month, and a stale report is worse than
+    // an edited one."
+    //
+    // WHAT "NOT FROZEN" BUYS THIS TYPE IS NOT AN EDIT PATH. There is none --
+    // `redraftLetter` refuses anything that is not a letter, and issuing a
+    // report again appends a second one, exactly as the summary does. What it
+    // buys is that `conduit_document_frozen_guard` never fires on these rows, so
+    // a future correction path can exist without a migration.
+    case "project_status_report":
+      return false;
+  }
+}
+
+/**
+ * WHETHER A DOCUMENT OF THIS TYPE IS GIVEN A NUMBER AT ALL.
+ *
+ * **A MEETING SUMMARY IS NOT, AND THAT IS PHASE 9 TASK 2'S DECISION.** The spec
+ * left it open ("whether an NDA or a letter wants a sequence at all is a per-type
+ * decision... a meeting summary almost certainly does not"); this is the answer
+ * and the reasons it was given for, because "QUO-2026-0001 suits this not at all"
+ * is an aesthetic judgement and three of these are not.
+ *
+ * 1. **A NUMBER IS AN EXTERNAL HANDLE.** `documents.number` exists so that the
+ *    person you sent the document to can quote it back at you, and so that a
+ *    commercial document belongs to a gapless sequence somebody can audit. A
+ *    meeting summary is identified by the meeting it is of -- its title and its
+ *    date, both printed on it -- and there is nobody on the other end holding a
+ *    reference.
+ * 2. **NUMBERING SERIALISES ISSUING, MEASURABLY.** `allocateNumber` takes a row
+ *    lock on (type, year) held to commit, and the render happens inside it
+ *    (~600-700ms for a one-page document on the server's WeasyPrint). For a quote
+ *    that is the behaviour you want -- consecutive numbers are consecutive. For a
+ *    summary it would make every summary of a given year queue behind every other
+ *    one, to buy a string nobody reads.
+ * 3. **A SUMMARY IS NOT FROZEN, SO IT CAN BE PRODUCED AGAIN**, and a numbered
+ *    thing that can be produced again has to choose between spending a second
+ *    number (a sequence full of near-duplicates) and reusing the first (a number
+ *    that is no longer unique). Neither is better than having none.
+ *
+ * THE SAME `switch`-OVER-THE-UNION SHAPE AS documentTypeFreezes ABOVE, for the
+ * same reason: a type added without an answer is a build error rather than a
+ * silent `false`. It is a separate function and not a second field on one lookup
+ * table because the two rules are independent -- an NDA is frozen AND numbered, a
+ * letter is neither -- and a shared table would invite the belief that they move
+ * together.
+ *
+ * THE DATABASE SAYS THE SAME THING, in `documents_number_matches_type` (migration
+ * 0017), which is an equality in both directions: a quote with no number is
+ * refused, and a summary that somehow acquired one is refused too. db/schema.test.ts
+ * asserts the two spellings agree for every member of the enum. A third place
+ * agrees by omission: `document_number_sequences_type_valid` still names only
+ * 'quote', so a writer that called `allocateNumber` for a summary fails on the
+ * INSERT instead of minting `DOC-2026-0001`.
+ */
+export function documentTypeNumbered(type: DocumentType): boolean {
+  switch (type) {
+    case "quote":
+      return true;
+    case "meeting_summary":
+      return false;
+    /*
+     * **A LETTER TAKES NO NUMBER**, and the three reasons above are worth
+     * re-reading against it rather than assumed to carry over.
+     *
+     * 1. THE EXTERNAL HANDLE IS NOT MISSING, IT IS ALREADY TAKEN. A letter's
+     *    reference is the operator's own convention -- `Our ref:`, a project
+     *    code, a case number -- typed into the body or the subject, in whatever
+     *    scheme the correspondence already uses. `LET-2026-0001` would sit
+     *    beside it meaning nothing outside this database, and a document with
+     *    two references has none.
+     * 2. THE LOCK IS THE SAME LOCK. allocateNumber holds a `(type, year)` row
+     *    lock to commit with the render inside it (~600-700ms), so every letter
+     *    of a year would queue behind every other one. A quote pays that
+     *    willingly because consecutive numbers are the product; a letter would
+     *    pay it for a string nobody quotes back.
+     * 3. THE THIRD REASON IS THE SUMMARY'S, SHARPENED. A summary can be
+     *    produced AGAIN; a letter is REDRAFTED, which is worse for a number
+     *    rather than better. Producing again at least leaves each number
+     *    attached to one immutable page. A redraft rewrites the page UNDER the
+     *    number, so `LET-2026-0001` would name different content on Tuesday
+     *    from the content it named on Monday -- which is precisely the property
+     *    a document number exists to deny.
+     */
+    case "letter":
+      return false;
+    /*
+     * **BOTH AGREEMENTS ARE NUMBERED**, and this is the first `true` since the
+     * quote. Every one of the three reasons runs the other way:
+     *
+     * 1. THE HANDLE HAS SOMEBODY HOLDING IT. An NDA is handed to a
+     *    counterparty who files it and refers back to it, often through their
+     *    own legal team and often years later. "The NDA dated 6 September" is
+     *    ambiguous the moment there are two; `NDA-2026-0001` is not.
+     * 2. THE SEQUENCE IS A QUESTION WITH AN ANSWER. "Which agreements did we
+     *    sign in 2026, and are there gaps" is exactly the audit a gapless
+     *    per-year sequence exists for -- the same question a quote sequence
+     *    answers. "Which summaries did we generate" is not a question anybody
+     *    asks.
+     * 3. AND THE PATHOLOGY THAT RULES A NUMBER OUT ABOVE CANNOT ARISE HERE,
+     *    because an agreement is FROZEN. The number is allocated once, printed
+     *    once, and names bytes that can never change. There is no second
+     *    number to spend and no first one to reuse.
+     *
+     * TWO TYPES, TWO SEQUENCES, TWO PREFIXES -- `NDA-` and `MNDA-`, per
+     * documents-number.ts's PREFIX. `document_number_sequences` is keyed by
+     * (type, year), so they were always going to be separate series; what had
+     * to be checked is that the prefixes do not collide, because
+     * `documents_number_unique` is GLOBAL and a collision would show up as a
+     * refused document at issue. QUO, NDA and MNDA share no prefix.
+     *
+     * **AT SIX TYPES THIS FUNCTION AND documentTypeFreezes STILL ANSWER
+     * IDENTICALLY, AND THE ARGUMENT FOR KEEPING THEM APART HAS TO BE MADE
+     * WITHOUT THE COUNTEREXAMPLE THAT USED TO CARRY IT.** This paragraph said,
+     * at five types, that the two rules were independent and that "the
+     * counterexamples are ordinary: Task 4's status report is neither, and a
+     * credit note would be frozen and numbered while a delivery note is numbered
+     * and freely reprinted."
+     *
+     * **THE FIRST OF THOSE IS NOT A COUNTEREXAMPLE AND NEVER WAS.** "Neither" is
+     * AGREEMENT -- both functions answer false -- so the status report, which
+     * has now arrived and is indeed neither, made the coincidence six for six
+     * rather than breaking it. A prediction that a type would disagree was
+     * written down, the type was built, and it agreed. That is worth recording
+     * as a wrong prediction rather than quietly restating.
+     *
+     * What survives is the part that was never about the existing types: the two
+     * rules answer different questions. Freezing is "may these bytes change";
+     * numbering is "does somebody outside hold a handle to them". A credit note
+     * would be frozen and numbered; a delivery note is numbered and freely
+     * reprinted; a signed-and-scanned agreement would be frozen and take its
+     * counterparty's reference rather than one of ours. None of those exists
+     * here, so the honest statement is that the two sets have coincided for
+     * every type built so far and the reasons for each membership are disjoint.
+     * db/schema.test.ts asserts them as two independent literals for exactly
+     * this reason -- `expect(frozen).toEqual(numbered)` would read as an
+     * invariant, and six for six is precisely when that spelling becomes
+     * tempting.
+     */
+    case "nda":
+    case "mutual_nda":
+      return true;
+    /*
+     * **A STATUS REPORT TAKES NO NUMBER, AND THE LETTER'S THIRD REASON DOES NOT
+     * CARRY OVER UNCHANGED -- IT CHANGES SHAPE.** Each of the three, re-checked:
+     *
+     * 1. THE HANDLE IS THE PROJECT AND THE DATE, AND BOTH ARE PRINTED. A report
+     *    goes to whoever is paying for the project, who refers to it as "the
+     *    September report on Rye Lane" -- a phrase that already identifies it,
+     *    out of two facts on the page. `PSR-2026-0007` would identify it only
+     *    inside this database, and unlike an NDA there is no counterparty filing
+     *    it against a reference of their own.
+     * 2. THE LOCK IS THE SAME LOCK. `allocateNumber` holds a `(type, year)` row
+     *    lock to commit with the render inside it, so every report of a year
+     *    would queue behind every other one -- and this is the type most likely
+     *    to be produced in a batch, because "run this month's reports" is a
+     *    sentence about every active project at once.
+     * 3. **THE THIRD REASON IS THE LETTER'S, TURNED INSIDE OUT, AND SAYING SO IS
+     *    THE POINT.** The letter's argument is that a REDRAFT rewrites the page
+     *    under a fixed number, so `LET-2026-0001` would name different content
+     *    on Tuesday from Monday. A report is not redrafted -- regenerating one
+     *    appends a SECOND document with its own PDF, exactly as the summary does
+     *    -- so that failure cannot occur here. What occurs instead is the other
+     *    one the summary named: the sequence fills with near-duplicates. Twelve
+     *    monthly reports on one project are twelve numbers, and the audit a
+     *    gapless per-year sequence exists for ("which did we issue, and are
+     *    there gaps") answers nothing, because two adjacent numbers are the same
+     *    report of the same project a month apart. A sequence is worth having
+     *    when its members are distinct commitments. Successive answers to one
+     *    standing question are not.
+     */
+    case "project_status_report":
+      return false;
+  }
+}
+
+/**
+ * An instant, as a document prints it: `8 September 2026 at 16:00 CEST`.
+ *
+ * **THE ZONE IS AN ARGUMENT SINCE v1.8.0, AND IT IS REQUIRED.** Until then this
+ * function hard-coded UTC, because nothing in Conduit stored a zone at all:
+ * `meetings.occurred_at` is a `timestamptz` built in the browser from what the
+ * operator typed in their own zone (`localInputToIso` in web's meetings-lib.ts),
+ * `org_profile` had no timezone column, `users` had none, and no request carried
+ * one -- so the server could not reproduce the wall clock the operator saw and
+ * printed UTC instead, naming it so the page was at least honest. Phase 9 Task 2
+ * reported that; `org_profile.time_zone` is the answer, and this is where it
+ * lands.
+ *
+ * REQUIRED RATHER THAN DEFAULTED TO UTC, deliberately. Tasks 3 and 4 add three
+ * more types that print dates, and a defaulted parameter is a thing each of them
+ * could forget in a way that compiles, ships, and reads as a two-hour error on a
+ * page. Missing it is a build error instead. (`documentTypeFreezes`' `switch` is
+ * the same trick against the same class of omission.)
+ *
+ * **THE ZONE IS STILL NAMED, AND THAT IS THE DECISION MOST WORTH ARGUING.** The
+ * case for dropping the label is real -- a summary handed to somebody in the same
+ * office does not need `CEST` on it -- and it was rejected for two reasons. The
+ * first is what these documents ARE: a PDF, content-addressed, downloaded and
+ * emailed, which is the entire point of Phase 9; the reader who needs the label
+ * is the one who is not in the room, and there is no way to print a different
+ * page for them. The second is the failure path below. When the stored zone does
+ * not resolve, the fallback is UTC -- and the ONLY thing separating that from
+ * "silently reverting to UTC", which is how a document acquires the wrong time,
+ * is that the page says UTC. Drop the label and the fallback needs its own
+ * announcement mechanism, on the one path that is never exercised. Four
+ * characters buy both.
+ *
+ * THE LABEL IS COMPUTED AT THE INSTANT, so a January meeting reads `CET` and a
+ * July one `CEST` off the same stored zone. See timeZoneLabel for what en-GB
+ * actually produces for zones outside Europe, which is `GMT-5` rather than `EST`
+ * and is the better answer.
+ *
+ * **UTC IS UNCHANGED, BYTE FOR BYTE.** The default zone formats to the string
+ * v1.7.x printed -- `1 September 2026 at 13:30 UTC` -- because en-GB's short name
+ * for the UTC zone is exactly `UTC`. That is what makes UTC the only defensible
+ * backfill for an install that already has documents.
+ *
+ * MONEY_LOCALE's locale, deliberately, and for MONEY_LOCALE's own reason: the
+ * package owns the formatting rather than the viewer, or the same meeting reads
+ * `8 September 2026` in one place and `9/8/2026` in another. `dateStyle: "long"`
+ * so the month is a word -- `08/09/2026` is the one format that means two
+ * different days on two sides of the Atlantic, which is exactly the ambiguity a
+ * document must not carry.
+ *
+ * IT NEVER THROWS, matching every formatter in money-format.ts and for the same
+ * reason. There are now two ways it could: an unparseable instant makes
+ * `Intl.DateTimeFormat.format` throw a RangeError, and an unresolvable zone makes
+ * the CONSTRUCTOR throw one -- which is the worse of the two, because it fires
+ * half way through building a page rather than on a value nothing storable can
+ * produce. `usableTimeZone` takes that one.
+ */
+export function formatDocumentInstant(iso: string, timeZone: string): string {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return "";
+  const zone = usableTimeZone(timeZone);
+  const formatted = new Intl.DateTimeFormat(MONEY_LOCALE, {
+    dateStyle: "long", timeStyle: "short", timeZone: zone,
+  }).format(at);
+  return `${formatted} ${timeZoneLabel(zone, at)}`;
+}
 
 /**
  * The UTF-8 cost of a value once it has been merged into a document, escaping
@@ -2930,6 +3308,23 @@ export const orgProfileSchema = z.object({
   website: z.string(),
   bankDetails: z.string(),
   logoDataUri: z.string(),
+  /**
+   * THE ORGANISATION'S CLOCK, and the one field here that is never "". Every
+   * other value on this profile is optional on a printed page, so the empty
+   * string is a legitimate absence; a zone is not optional, because there is no
+   * such thing as formatting an instant in no zone. `DEFAULT_TIME_ZONE` is what
+   * an install has until it says otherwise, including one that has never opened
+   * Settings -- see getOrgProfile's emptyProfile.
+   *
+   * NOT VALIDATED ON THE WAY OUT. This schema is what the API RETURNS, and a row
+   * whose zone has stopped resolving -- a name coined after this server's tzdata,
+   * or a restore from an install with different tzdata -- still has to be
+   * readable: refusing to hand back the profile would take Settings, the one page
+   * that can fix it, down with the value that is wrong.
+   * `usableTimeZone` decides what a render does with such a value and
+   * `timeZoneProblem` is what the form shows about it.
+   */
+  timeZone: z.string(),
   updatedAt: z.iso.datetime(),
 });
 export type OrgProfile = z.infer<typeof orgProfileSchema>;
@@ -2966,9 +3361,26 @@ export const orgProfileInputSchema = z.object({
   website: documentText(ORG_PROFILE_FIELD_CAPS.website),
   bankDetails: documentText(ORG_PROFILE_FIELD_CAPS.bankDetails),
   logoDataUri: z.string(),
+  /**
+   * REQUIRED ON THE WIRE, not optional with a default. This body is a whole-form
+   * replacement, so an omitted field is indistinguishable from a cleared one --
+   * and a `.default(DEFAULT_TIME_ZONE)` here would let a client that had never
+   * heard of this field silently reset an operator's zone to UTC on every save.
+   * The form always sends it; a direct API caller gets told.
+   */
+  timeZone: z.string(),
 }).superRefine((value, ctx) => {
   const problem = logoDataUriProblem(value.logoDataUri);
   if (problem !== null) ctx.addIssue({ code: "custom", path: ["logoDataUri"], message: problem });
+  // THE GATE, with the column's CHECK as the backstop -- orgProfileInputSchema's
+  // standing split, and the reason the CHECK cannot be the only answer is that
+  // PostgreSQL has no tzdata opinion a `text` column can consult: it can refuse a
+  // shape and nothing more. Whether a name is a REAL zone is a question only the
+  // engine that will format with it can answer.
+  const zoneProblem = timeZoneProblem(value.timeZone);
+  if (zoneProblem !== null) {
+    ctx.addIssue({ code: "custom", path: ["timeZone"], message: zoneProblem });
+  }
   // THE RESERVE HAS TO BE ENFORCED SOMEWHERE OR IT IS A WISH. A quote's markup budget
   // is the render's markup cap minus a template allowance minus what an issuer's text
   // may cost, and nothing bounded the issuer at all: 3,400 characters of ASCII is
@@ -3013,11 +3425,28 @@ export type DocumentLineItem = z.infer<typeof documentLineItemSchema>;
  *
  * There is no update shape anywhere below, and that is the phase's central claim
  * rather than an omission: an issued quote never changes.
+ *
+ * **THIS IS THE QUOTE'S RECORD, AND SINCE PHASE 9 THE `type` SAYS SO.** It was
+ * `documentTypeSchema` when that enum had one member; now that it has two, leaving
+ * it would let a payload claim `meeting_summary` beside a currency and three money
+ * fields -- exactly the shape the table split exists to make unspellable. The
+ * literal is what makes `DocumentRecord["type"]` mean something at the cast in
+ * services/documents.ts.
+ *
+ * **AND IT IS STILL NOT A DISCRIMINATED UNION**, which Task 1 predicted would
+ * arrive with the second type. It has not, because nothing yet RECEIVES both
+ * shapes: a deal's Documents section reads quotes (`GET /api/deals/:id/documents`)
+ * and a meeting's reads summaries (`GET /api/meetings/:id/documents`), so a union
+ * here would be a type every one of its consumers narrows on the first line and
+ * nobody ever holds. The reader that genuinely mixes types is the phase's
+ * record-level Documents tab, which needs three types to be designed against
+ * rather than two; the union is that reader's, and building it early is how the
+ * common table became a quote table in the first place.
  */
 export const documentSchema = z.object({
   id: z.uuid(),
   number: z.string().min(1),
-  type: documentTypeSchema,
+  type: z.literal("quote"),
   dealId: z.uuid(),
   fileId: z.uuid(),
   currency: currencyCodeSchema,
@@ -3039,6 +3468,84 @@ export const documentSchema = z.object({
   lines: z.array(documentLineItemSchema),
 });
 export type DocumentRecord = z.infer<typeof documentSchema>;
+
+/**
+ * A generated meeting summary, as `GET`/`POST /api/meetings/:id/documents` return it.
+ *
+ * **NO `number` FIELD, AND ITS ABSENCE IS THE DESIGN** -- see `documentTypeNumbered`
+ * for the three reasons. Spelled as an absent field rather than `number: null`
+ * because a summary does not have a number that happens to be unset: nothing
+ * allocates one, `document_number_sequences` has no row for this type and could not
+ * accept one, and a nullable field here would put a "no number yet" state into a
+ * client that would then have to render it.
+ *
+ * **NO CONTENT FIELDS EITHER, AND THAT IS THE TYPE WITH NO FORM SHOWING THROUGH.**
+ * The title, the date, the attendees and the notes are all on the `meetings` row
+ * this points at, so copying them here would be a second, staler copy of a record
+ * the client already has open -- and unlike a quote's recipient they were never
+ * snapshot at issue: a summary is not frozen, so there is nothing to preserve
+ * against a later edit. What is snapshot is the PDF, and `fileId` is how you read
+ * it.
+ *
+ * `frozen` is on the wire because the client has to know whether the thing it is
+ * looking at can be produced again, and deriving it from `type` in the client
+ * would be a fourth copy of a rule that already lives in two places.
+ *
+ * `z.boolean()` AND NOT `z.literal(false)`, which was the first spelling and is
+ * the wrong one. A summary is never frozen -- but the thing that guarantees it is
+ * `documents_frozen_matches_type`, in the database, where a violation is a refused
+ * INSERT. A literal here would move the noticing to the CLIENT's `parseWith`,
+ * which throws, i.e. a row the database accepted would blank a page in the browser
+ * instead of being caught where it was written. The column is reported, not
+ * asserted.
+ */
+export const meetingSummarySchema = z.object({
+  id: z.uuid(),
+  type: z.literal("meeting_summary"),
+  meetingId: z.uuid(),
+  fileId: z.uuid(),
+  issueDate: z.iso.date(),
+  frozen: z.boolean(),
+  issuedByUserId: z.uuid(),
+  createdAt: z.iso.datetime(),
+});
+export type MeetingSummaryRecord = z.infer<typeof meetingSummarySchema>;
+
+/**
+ * A project status report, as `GET`/`POST /api/projects/:id/documents` return it.
+ *
+ * **THE SUMMARY'S SHAPE WITH A DIFFERENT RECORD ID, AND THAT SIMILARITY IS THE
+ * FINDING RATHER THAN A SHORTCUT.** The spec calls the status report the broadest
+ * source in the phase and the plan says it is "the one most likely to be larger
+ * than it looks". Its breadth is entirely on the READ side -- a project, every
+ * task on it, their dependencies, six counts and an overdue rule -- and none of
+ * that reaches the wire, for the summary's reason exactly: it is all live rows
+ * the client that opened the project already has. What is snapshot is the PDF,
+ * and `fileId` is how you read it.
+ *
+ * **NO CONTENT FIELDS, NO `number`, AND NO DATE RANGE.** The range was the one
+ * thing the spec said this type might submit; it does not (see `issueStatusReport`
+ * in the API's services/documents.ts for why, and for what a range would have had
+ * to decide about undated tasks). With it gone there is no input at all, so there
+ * is nothing for a DTO to echo back.
+ *
+ * `frozen` IS `z.boolean()` for `meetingSummarySchema`'s reason: the guarantee
+ * lives in `documents_frozen_matches_type`, where a violation is a refused INSERT,
+ * and a `z.literal(false)` here would move the noticing to the client's
+ * `parseWith`, which throws -- a row the database accepted would blank a page in
+ * the browser instead of being caught where it was written.
+ */
+export const statusReportSchema = z.object({
+  id: z.uuid(),
+  type: z.literal("project_status_report"),
+  projectId: z.uuid(),
+  fileId: z.uuid(),
+  issueDate: z.iso.date(),
+  frozen: z.boolean(),
+  issuedByUserId: z.uuid(),
+  createdAt: z.iso.datetime(),
+});
+export type StatusReportRecord = z.infer<typeof statusReportSchema>;
 
 /**
  * THE RENDER BUDGET. Every number below was MEASURED against the shipped template,
@@ -3617,6 +4124,359 @@ export const issueQuoteInputSchema = z.object({
   }
 });
 export type IssueQuoteInput = z.infer<typeof issueQuoteInputSchema>;
+
+/* ========================================================================== *
+ *  PHASE 9 TASK 3 -- THE LETTER AND THE NDA PAIR
+ * ========================================================================== */
+
+/**
+ * THE PARTY FIELDS, AND WHY THEY ARE SPELLED THREE TIMES RATHER THAN SHARED.
+ *
+ * Task 1 moved the quote's four recipient columns to `document_quotes` and left a
+ * note: "Tasks 3 and 4 have the two further types that would have to agree with
+ * it; if they do, a common `document_parties` is a migration they can make with
+ * three examples in front of them instead of one." This task has the three
+ * examples and did NOT make that migration. The argument is at `document_letters`
+ * in the API's db/schema.ts, where the tables are; the short version is that the
+ * four columns do not actually agree (an agreement has no salutation, because it
+ * has no greeting), that "recipient" is the quote's noun and an agreement has
+ * PARTIES, and that extracting them means a second migration over Chris's live
+ * quote rows in one release, for a refactor rather than a feature.
+ *
+ * WHAT IS SHARED IS THE CAPS, because the failure they exist to stop is the one
+ * Task 5 already had: a form spelling `maxLength={200}` beside a schema that says
+ * something else, agreeing today and silently disagreeing after the next edit.
+ * Sharing a number costs nothing and shares no shape.
+ */
+export const DOCUMENT_PARTY_CAPS = {
+  name: DOCUMENT_FIELD_CAPS.recipientName,
+  contactName: DOCUMENT_FIELD_CAPS.recipientContactName,
+  address: DOCUMENT_FIELD_CAPS.recipientAddress,
+} as const;
+
+export const LETTER_FIELD_CAPS = {
+  ...DOCUMENT_PARTY_CAPS,
+  salutation: DOCUMENT_FIELD_CAPS.recipientSalutation,
+  subject: 200,
+  /**
+   * THE BODY IS MARKUP, SO THIS CAP IS IN CHARACTERS OF HTML AND NOT OF PROSE.
+   * A TipTap paragraph costs seven characters before a word is typed, so 16,000
+   * is roughly eight to ten pages of ordinary correspondence -- far more letter
+   * than anybody writes, and chosen against the render budget rather than by
+   * feel: 16,000 characters is at most 48,000 UTF-8 bytes, which leaves the
+   * party fields and the subject inside DOCUMENT_CONTENT_BUDGET_BYTES even when
+   * every one of them is at its own cap and every character costs three bytes.
+   * `letterContentBytes` is what actually decides, and this is the bound that
+   * keeps the two from being able to disagree by much.
+   */
+  bodyHtml: 16_000,
+} as const;
+
+export const AGREEMENT_FIELD_CAPS = {
+  ...DOCUMENT_PARTY_CAPS,
+  /** Long enough for "the courts of Amsterdam, the Netherlands" and a clause
+   * naming an arbitration body, and short enough not to be a second body. */
+  jurisdiction: 200,
+} as const;
+
+/**
+ * The longest term an agreement may declare, in months: a hundred years.
+ *
+ * A BOUND RATHER THAN A JUDGEMENT ABOUT WHAT IS SENSIBLE. Perpetual
+ * confidentiality clauses are ordinary and five years is typical, so this is not
+ * trying to say what a good term is; it is stopping `termMonths` from being a
+ * number that prints as a paragraph. `integer` and the storable range would let
+ * a form submit 2,147,483,647, which renders as "2147483647 months" on a legal
+ * document.
+ */
+export const AGREEMENT_MAX_TERM_MONTHS = 1200;
+
+/**
+ * What a letter will cost the renderer, by the same measure as a quote's.
+ *
+ * **THE BODY IS COUNTED RAW AND EVERYTHING ELSE ESCAPED, AND THAT ASYMMETRY IS
+ * THE POINT.** `document.body` reaches the merge as a `MergeHtml` (see the API's
+ * documents-template.ts), so its `<` and `&` are emitted as themselves and cost
+ * one byte each; the subject and the party fields are ordinary escaped values and
+ * a `&` in one of them costs five. Charging the body the escaped rate would
+ * over-count a letter by roughly its tag count and refuse letters that render
+ * perfectly well.
+ *
+ * IT IS STILL A PREDICTION AND STILL NOT THE AUTHORITY. `renderAndStore` measures
+ * the merged page, for the four reasons DocumentTooLargeError lists. This is the
+ * gate that lets the refusal name a field while somebody is still looking at the
+ * form.
+ */
+export function letterContentBytes(input: {
+  subject?: string;
+  recipientName?: string;
+  recipientContactName?: string;
+  recipientSalutation?: string;
+  recipientAddress?: string;
+  bodyHtml?: string;
+}): number {
+  return escapedBytes(input.subject ?? "")
+    + escapedBytes(input.recipientName ?? "")
+    + escapedBytes(input.recipientContactName ?? "")
+    + escapedBytes(input.recipientSalutation ?? "")
+    + escapedBytes(input.recipientAddress ?? "")
+    + new TextEncoder().encode(input.bodyHtml ?? "").length;
+}
+
+/**
+ * What an agreement will cost the renderer.
+ *
+ * NO RAW FIELD AT ALL, which is what makes this the shorter of the two: an NDA's
+ * whole variable content is a party, three terms and a date, every one of them
+ * plain text in a plain input. The body of an NDA is the TEMPLATE, and templates
+ * are charged against MAX_TEMPLATE_BYTES rather than against this.
+ */
+export function agreementContentBytes(input: {
+  partyName?: string;
+  partyContactName?: string;
+  partyAddress?: string;
+  jurisdiction?: string;
+}): number {
+  return escapedBytes(input.partyName ?? "")
+    + escapedBytes(input.partyContactName ?? "")
+    + escapedBytes(input.partyAddress ?? "")
+    + escapedBytes(input.jurisdiction ?? "");
+}
+
+/**
+ * Everything a letter carries that a person types. Shared by the two things that
+ * can happen to a letter -- issuing one, and redrafting it -- because they are
+ * the SAME form: a redraft is not a patch, it is the letter written again.
+ *
+ * A PUT-SHAPED UPDATE RATHER THAN A PATCH, deliberately and for org-profile's
+ * reason: it is one form with seven fields and no concurrent editors, so sending
+ * the whole thing is both the simplest contract and the only one in which
+ * clearing a field is expressible. It also means the redraft path and the issue
+ * path cannot drift into validating different things.
+ *
+ * `recipientName` IS THE ONLY REQUIRED PARTY FIELD, matching the quote exactly. A
+ * letter to a company with no named contact, no salutation and no address on file
+ * is ordinary; a letter addressed to nobody is not.
+ */
+const letterDraftFields = {
+  issueDate: documentDateSchema,
+  subject: documentText(LETTER_FIELD_CAPS.subject).optional(),
+  recipientName: documentText(LETTER_FIELD_CAPS.name, 1),
+  recipientContactName: documentText(LETTER_FIELD_CAPS.contactName).optional(),
+  recipientSalutation: documentText(LETTER_FIELD_CAPS.salutation).optional(),
+  recipientAddress: documentText(LETTER_FIELD_CAPS.address).optional(),
+  /**
+   * TipTap HTML, as the meeting's notes already are. `.min(1)` because a letter
+   * with no body is a letterhead, and the operator has one of those already --
+   * and because the sanitiser can empty it, which the service refuses separately
+   * with a message saying so. Two different failures, two different sentences.
+   */
+  bodyHtml: documentText(LETTER_FIELD_CAPS.bodyHtml, 1),
+};
+
+/** The budget check both letter schemas need, factored out so issuing and
+ * redrafting cannot come to different answers about whether a letter fits. */
+function refineLetterBudget(
+  value: { subject?: string; recipientName: string; bodyHtml: string },
+  ctx: z.RefinementCtx,
+): void {
+  const bytes = letterContentBytes(value);
+  if (bytes > DOCUMENT_CONTENT_BUDGET_BYTES) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["bodyHtml"],
+      message: `this letter needs ${String(bytes)} bytes of the `
+        + `${String(DOCUMENT_CONTENT_BUDGET_BYTES)} a document may use; shorten the body`,
+    });
+  }
+}
+
+export const redraftLetterInputSchema = z.object(letterDraftFields).superRefine(refineLetterBudget);
+export type RedraftLetterInput = z.infer<typeof redraftLetterInputSchema>;
+
+export const issueLetterInputSchema = z.object({
+  type: z.literal("letter"),
+  ...letterDraftFields,
+}).superRefine(refineLetterBudget);
+export type IssueLetterInput = z.infer<typeof issueLetterInputSchema>;
+
+/**
+ * The three things an NDA needs that the CRM does not already hold, plus the
+ * party it is with.
+ *
+ * **`termMonths` IS AN INTEGER NUMBER OF MONTHS AND THE PAGE PRINTS IT AS ONE**
+ * -- "36 months", not "three (3) years". That is formatDurationMinutes' decision
+ * repeated, and for its reason: converting to years needs a rule for 18 months, a
+ * convention for "1 year 0 months", and a pluralisation, all of them invented
+ * formatting for a field the operator typed as a number of months. The label
+ * beside it says Term.
+ *
+ * **AN INTEGER RATHER THAN FREE TEXT**, which was the other option and is the
+ * tempting one for a legal field. Rejected because free text cannot be compared:
+ * "which agreements expire this year" is a question about a date computed from
+ * this number and the effective date, and `"3 yrs (auto-renewing)"` answers it
+ * for nobody. Anything genuinely bespoke belongs in the template, which is
+ * editable, and not in a column that pretends to be structured.
+ *
+ * **THE EFFECTIVE DATE IS SEPARATE FROM THE ISSUE DATE, and neither is derivable
+ * from the other.** An NDA is routinely effective from a date already past (the
+ * conversation started before the paperwork) or from a date in the future (a
+ * project that begins next month). The issue date is when this PDF was produced.
+ * Nothing here relates the two, deliberately: an ordering CHECK would refuse the
+ * backdated case, which is the common one.
+ */
+const agreementFields = {
+  issueDate: documentDateSchema,
+  effectiveDate: documentDateSchema,
+  termMonths: z.number().int().min(1).max(AGREEMENT_MAX_TERM_MONTHS),
+  jurisdiction: documentText(AGREEMENT_FIELD_CAPS.jurisdiction, 1),
+  partyName: documentText(AGREEMENT_FIELD_CAPS.name, 1),
+  /**
+   * **THIS IS WHERE CHRIS'S "EXACTLY ONE" DECISION IS CASHED.** The spec: an NDA
+   * naming a contact at a company "attaches to the company and names the contact
+   * in its content". This field IS that content. It is optional because an NDA
+   * with an individual attaches to the contact and the party IS the person, so
+   * there is no second name to carry.
+   */
+  partyContactName: documentText(AGREEMENT_FIELD_CAPS.contactName).optional(),
+  partyAddress: documentText(AGREEMENT_FIELD_CAPS.address).optional(),
+};
+
+export const issueAgreementInputSchema = z.object({
+  // TWO TYPES ON ONE SHAPE, because an NDA and a mutual NDA differ in what they
+  // OBLIGE and not in what they need: both are with one party, from one date, for
+  // one term, under one law. The difference is entirely in the template, which is
+  // where a difference of wording belongs. Two members rather than one field
+  // called `mutual`, so `documents.type` stays the single discriminator that
+  // `documents_type_valid`, `documents_frozen_matches_type` and
+  // `document_templates_type_valid` all key off.
+  type: z.enum(["nda", "mutual_nda"]),
+  ...agreementFields,
+});
+export type IssueAgreementInput = z.infer<typeof issueAgreementInputSchema>;
+
+/**
+ * The body of `POST /api/companies/:id/documents` and its contact twin.
+ *
+ * DISCRIMINATED ON `type`, WHICH IS THE COLUMN. One route per record rather than
+ * one route per type, because what a caller is doing is "add a document to this
+ * company" and the type is a choice inside that, not a different endpoint; and
+ * because the alternative -- `/companies/:id/letters`, `/companies/:id/ndas` --
+ * grows a route pair per type for ever and makes the record's own document list
+ * a union of N reads.
+ */
+export const recordDocumentInputSchema = z.discriminatedUnion("type", [
+  issueLetterInputSchema,
+  issueAgreementInputSchema,
+]);
+export type RecordDocumentInput = z.infer<typeof recordDocumentInputSchema>;
+
+/**
+ * A letter, as the record's document list and `POST`/`PUT` return it.
+ *
+ * **IT CARRIES ITS BODY, WHERE A MEETING SUMMARY CARRIES NO CONTENT AT ALL**, and
+ * the difference is exactly the difference between the two types. A summary's
+ * content is on the `meetings` row the client already has open, so copying it
+ * into the DTO would be a staler second copy. A letter's body exists NOWHERE
+ * else: the operator typed it into this document. It has to come back, or a
+ * redraft would start from a blank editor.
+ *
+ * **BOTH RECORD IDS ARE ON THE WIRE, WHERE `MeetingSummaryRecord` TAKES ITS
+ * `meetingId` FROM THE CALLER.** That is not inconsistency: a summary is always
+ * of a meeting, so the nullability of `documents.meeting_id` is a fact about the
+ * TABLE and not about the record, and passing it in makes the narrowing true
+ * rather than asserted. A letter is genuinely of a company OR a contact -- two
+ * possibilities, decided per row -- so a reader that wants to say who it is
+ * addressed to has to be told which, and a caller-supplied `target` would be the
+ * same two nullable fields with a longer route to them.
+ *
+ * `number` IS ABSENT RATHER THAN NULL, as the summary's is, and for
+ * documentTypeNumbered's three reasons.
+ */
+export const letterSchema = z.object({
+  id: z.uuid(),
+  type: z.literal("letter"),
+  companyId: z.uuid().nullable(),
+  contactId: z.uuid().nullable(),
+  fileId: z.uuid(),
+  issueDate: z.iso.date(),
+  frozen: z.boolean(),
+  subject: z.string(),
+  recipientName: z.string(),
+  recipientContactName: z.string(),
+  recipientSalutation: z.string(),
+  recipientAddress: z.string(),
+  bodyHtml: z.string(),
+  issuedByUserId: z.uuid(),
+  createdAt: z.iso.datetime(),
+});
+export type LetterRecord = z.infer<typeof letterSchema>;
+
+/**
+ * An NDA or a mutual NDA.
+ *
+ * `frozen` IS `z.boolean()` AND NOT `z.literal(true)`, which is the summary's
+ * lesson taken the other way round. An agreement is always frozen -- but the
+ * thing that guarantees it is `documents_frozen_matches_type`, in the database,
+ * where a violation is a refused INSERT. A literal here would move the noticing
+ * to the client's `parseWith`, which throws: a row the database accepted would
+ * blank a page in the browser instead of being caught where it was written.
+ */
+export const agreementSchema = z.object({
+  id: z.uuid(),
+  type: z.enum(["nda", "mutual_nda"]),
+  number: z.string().min(1),
+  companyId: z.uuid().nullable(),
+  contactId: z.uuid().nullable(),
+  fileId: z.uuid(),
+  issueDate: z.iso.date(),
+  frozen: z.boolean(),
+  effectiveDate: z.iso.date(),
+  termMonths: z.number().int(),
+  jurisdiction: z.string(),
+  partyName: z.string(),
+  partyContactName: z.string(),
+  partyAddress: z.string(),
+  issuedByUserId: z.uuid(),
+  createdAt: z.iso.datetime(),
+});
+export type AgreementRecord = z.infer<typeof agreementSchema>;
+
+/**
+ * **THE DISCRIMINATED UNION `documentSchema`'s COMMENT PREDICTED, ARRIVING AT THE
+ * READER IT SAID IT WOULD ARRIVE AT.** Task 1 expected it with the second type
+ * and Task 2 explained why it had not come: nothing yet RECEIVED both shapes, so
+ * a union would have been a type every consumer narrows on its first line and
+ * nobody ever holds. "The reader that genuinely mixes types is the phase's
+ * record-level Documents list, which needs three types to be designed against
+ * rather than two."
+ *
+ * That reader is here. A company's Documents section shows its letters and its
+ * agreements together, in one list, ordered by when they were issued, and it
+ * cannot know in advance which it will get.
+ *
+ * **THE QUOTE, THE SUMMARY AND THE STATUS REPORT ARE DELIBERATELY NOT MEMBERS.**
+ * A quote is of a DEAL, a summary is of a MEETING and a report is of a PROJECT,
+ * and none of the three can be carried by a company or a contact -- so admitting
+ * them here would widen the type of a value no route can produce, and the first
+ * thing every consumer would do is handle cases that cannot occur.
+ *
+ * **THE SENTENCE THIS REPLACES WAS WRONG, AND IT WAS WRONG ABOUT THIS TASK.** It
+ * read: "If Task 4's status report attaches to a project, it joins this union."
+ * It attaches to a project and it does NOT join, because this union is the
+ * COMPANY-AND-CONTACT reader and a project is neither -- the same reasoning the
+ * rest of the paragraph applies to the quote and the summary, contradicted in its
+ * own last sentence. The rule the paragraph meant is its second half and it holds
+ * unchanged: a record that starts carrying more than one type grows a union for
+ * its OWN reader, rather than this one widening to cover a fourth record. The
+ * project's reader returns `StatusReportRecord[]`, and it will become a union of
+ * its own on the day a project carries a second type.
+ */
+export const recordDocumentSchema = z.discriminatedUnion("type", [
+  letterSchema,
+  agreementSchema,
+]);
+export type RecordDocument = z.infer<typeof recordDocumentSchema>;
 
 /**
  * One editable template per document type, as Settings reads and writes it.

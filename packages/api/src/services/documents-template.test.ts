@@ -4,6 +4,7 @@ import { renderPdf, weasyprintAvailable } from "./documents-render.js";
 import {
   documentTemplateErrors,
   documentTemplateWarnings,
+  MergeHtml,
   MERGE_MAX_DEPTH,
   MERGE_MAX_OUTPUT_CHARS,
   MERGE_MAX_STEPS,
@@ -455,9 +456,144 @@ const CONTEXT: MergeContext = {
 };
 
 /** CONTEXT with `patch` merged into its `document` bag. */
-function withDocument(patch: Record<string, string>): MergeContext {
+function withDocument(patch: Record<string, string | MergeHtml>): MergeContext {
   return { ...CONTEXT, document: { ...CONTEXT.document, ...patch } };
 }
+
+/**
+ * THE RAW-HTML VALUE, WHICH IS THE ONE THING PHASE 9 ADDED TO THIS MODULE.
+ *
+ * The meeting summary's notes are TipTap rich text, so they have to survive the
+ * merge as markup rather than as the characters `<p>`. What makes that safe is
+ * that the decision belongs to the CONTEXT and not to the template -- there is no
+ * triple brace -- so these tests are about exactly that: a wrapped value emits
+ * raw, an unwrapped one beside it does not, and nothing a template can write
+ * changes which is which.
+ */
+describe("mergeTemplate emits a MergeHtml value unescaped, and only that", () => {
+  const NOTES = "<p>Agreed to <strong>ship</strong> on the 3rd &amp; review</p>";
+
+  it("emits the markup of a wrapped value", () => {
+    expect(mergeTemplate("{{document.notes}}", withDocument({ notes: new MergeHtml(NOTES) })))
+      .toBe(NOTES);
+  });
+
+  it("still escapes every unwrapped value in the same context", () => {
+    // THE PAIR IS THE TEST. A change that unescaped everything would pass the
+    // case above on its own; this is the half that says the two values in one
+    // bag are treated differently.
+    const out = mergeTemplate(
+      "[{{document.notes}}][{{document.recipientName}}]",
+      withDocument({ notes: new MergeHtml("<b>x</b>"), recipientName: "<b>x</b>" }),
+    );
+    expect(out).toBe("[<b>x</b>][&lt;b&gt;x&lt;/b&gt;]");
+  });
+
+  it("gives a template no way to ask for raw output", () => {
+    // The triple brace is Mustache's escape hatch and this language does not
+    // have it. It does not merely escape the value: the inner path would have to
+    // start with `{`, which TAG refuses, so the whole thing is ORDINARY TEXT and
+    // prints its own braces. Recorded as the measured behaviour rather than the
+    // guessed one -- the first version of this test expected `{&lt;b&gt;x...}`.
+    expect(mergeTemplate("{{{document.recipientName}}}", withDocument({ recipientName: "<b>x</b>" })))
+      .toBe("{{{document.recipientName}}}");
+  });
+
+  it("escapes the string reachable through the wrapper's own property", () => {
+    // `{{document.notes.html}}` resolves to the raw string, which is harmless
+    // precisely because it then takes the ordinary escaping path. Asserted so
+    // that a future `lookup` change cannot make it the back door.
+    expect(mergeTemplate("{{document.notes.html}}", withDocument({ notes: new MergeHtml("<b>x</b>") })))
+      .toBe("&lt;b&gt;x&lt;/b&gt;");
+  });
+
+  it("treats a wrapped value as a scalar in a block, not as a scope", () => {
+    // The summary template's own shape.
+    expect(mergeTemplate(
+      "{{#document.notes}}<h2>Notes</h2>{{document.notes}}{{/document.notes}}",
+      withDocument({ notes: new MergeHtml("<p>hi</p>") }),
+    )).toBe("<h2>Notes</h2><p>hi</p>");
+  });
+
+  /**
+   * **THE ASSERTION THAT MAKES THE SCALAR ARM LOAD-BEARING, AND IT WAS FOUND BY
+   * MUTATION RATHER THAN BY READING.** Replacing that arm with the scope-pushing
+   * one beside it was GREEN across this whole file: `lookup` walks the scope
+   * stack outward and the wrapper has no `document` key, so the case above
+   * resolves correctly either way and the arm looked like redundancy.
+   *
+   * What it really prevents is this: with the wrapper pushed as a scope, `{{html}}`
+   * inside the block resolves to the wrapper's own property and prints the raw
+   * markup, escaped, into the middle of the page. The block's scope is the
+   * DOCUMENT's, and a template naming an internal field of the merge machinery
+   * must get a blank like any other unknown path.
+   */
+  it("does not put the wrapper's own property in scope inside its block", () => {
+    expect(mergeTemplate(
+      "{{#document.notes}}[{{html}}]{{/document.notes}}",
+      withDocument({ notes: new MergeHtml("<b>x</b>") }),
+    )).toBe("[]");
+  });
+
+  it("counts an empty rich-text value as empty, tags and all", () => {
+    // `<p></p>` is what an emptied TipTap editor stores: markup, and nothing.
+    for (const empty of ["", "   ", "<p></p>", "<p><br></p>", "<div>\n</div>"]) {
+      const context = withDocument({ notes: new MergeHtml(empty) });
+      expect(mergeTemplate("{{#document.notes}}Notes{{/document.notes}}", context)).toBe("");
+      expect(mergeTemplate("{{^document.notes}}none{{/document.notes}}", context)).toBe("none");
+    }
+    // ...and a value with text in it is not empty, or the two blocks above
+    // would both pass against a function that always answered "empty".
+    const real = withDocument({ notes: new MergeHtml("<p>hi</p>") });
+    expect(mergeTemplate("{{#document.notes}}Notes{{/document.notes}}", real)).toBe("Notes");
+    expect(mergeTemplate("{{^document.notes}}none{{/document.notes}}", real)).toBe("");
+  });
+
+  it("sanitises the merged page, which is what closes a fragment's open tags", () => {
+    // THE CONTROL THAT MAKES RAW EMISSION SAFE. The fragment carries a script
+    // (which the mail profile that stored it would also have dropped, but this
+    // is the document profile's own pass) and an unclosed <b> that would
+    // otherwise embolden the rest of the page.
+    const html = prepareDocumentHtml(
+      "<div>{{document.notes}}</div><p>after</p>",
+      withDocument({ notes: new MergeHtml('<b>bold<script>alert(1)</script>') }),
+    );
+    expect(html).not.toContain("script");
+    expect(html).toContain("<b>bold</b>");
+    expect(html).toContain("<p>after</p>");
+  });
+});
+
+describe("mergeTemplate repeats any collection, not only lines", () => {
+  const WITH_ATTENDEES: MergeContext = {
+    ...CONTEXT,
+    attendees: [{ name: "Jane Smith" }, { name: "Bob & Co" }],
+  };
+
+  it("repeats an attendees block and escapes each name", () => {
+    expect(mergeTemplate("{{#attendees}}<li>{{name}}</li>{{/attendees}}", WITH_ATTENDEES))
+      .toBe("<li>Jane Smith</li><li>Bob &amp; Co</li>");
+  });
+
+  it("renders the inverted block when the collection is absent or empty", () => {
+    // ABSENT AND EMPTY BOTH, because they are different states in the context
+    // and must not be in the page: a quote's context has no `attendees` key at
+    // all, and a meeting with nobody recorded has an empty array.
+    for (const context of [CONTEXT, { ...CONTEXT, attendees: [] }]) {
+      expect(mergeTemplate("{{#attendees}}x{{/attendees}}", context)).toBe("");
+      expect(mergeTemplate("{{^attendees}}nobody{{/attendees}}", context)).toBe("nobody");
+    }
+  });
+
+  it("keeps two collections' scopes apart", () => {
+    // `{{description}}` is a line's field and `{{name}}` an attendee's; each
+    // must be blank in the other's block, or the walker's stack is not a stack.
+    expect(mergeTemplate(
+      "{{#lines}}[{{description}}{{name}}]{{/lines}}{{#attendees}}({{name}}{{description}}){{/attendees}}",
+      WITH_ATTENDEES,
+    )).toBe("[Widget](Jane Smith)(Bob &amp; Co)");
+  });
+});
 
 describe("mergeTemplate substitutes scalars", () => {
   it("substitutes a scalar field", () => {

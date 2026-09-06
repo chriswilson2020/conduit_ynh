@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import {
-  MAX_LOGO_BYTES, MAX_LOGO_PIXELS, ORG_PROFILE_FIELD_CAPS,
-  ORG_PROFILE_TEXT_RESERVE_BYTES, logoDataUriProblem, orgProfileTextBytes,
+  DEFAULT_TIME_ZONE, MAX_LOGO_BYTES, MAX_LOGO_PIXELS, ORG_PROFILE_FIELD_CAPS,
+  ORG_PROFILE_TEXT_RESERVE_BYTES, formatDocumentInstant, logoDataUriProblem,
+  orgProfileTextBytes, timeZoneProblem,
 } from "@conduit/shared";
 import type { OrgProfileInput } from "@conduit/shared";
+import { supportedTimeZones, timeZoneOptions } from "./settings-org-lib";
 import { useOrgProfile, useSaveOrgProfile } from "../queries";
 import { SettingsLayout } from "../components/settings-layout";
 import { Button } from "../components/ui/button";
@@ -27,6 +29,11 @@ import { Textarea } from "../components/ui/textarea";
 const EMPTY: OrgProfileInput = {
   name: "", addressLines: "", vatNumber: "", registrationNumber: "",
   email: "", phone: "", website: "", bankDetails: "", logoDataUri: "",
+  // NOT "", unlike every field beside it. This value is only on screen for the
+  // moment before the query resolves, but a `<select>` whose value matches no
+  // option renders EMPTY and submits its first option, so "" here would be a
+  // control that silently means Africa/Abidjan.
+  timeZone: DEFAULT_TIME_ZONE,
 };
 
 /**
@@ -94,6 +101,7 @@ export function SettingsOrgPage() {
       name: profile.name, addressLines: profile.addressLines, vatNumber: profile.vatNumber,
       registrationNumber: profile.registrationNumber, email: profile.email, phone: profile.phone,
       website: profile.website, bankDetails: profile.bankDetails, logoDataUri: profile.logoDataUri,
+      timeZone: profile.timeZone,
     });
   }, [profile]);
 
@@ -147,6 +155,20 @@ export function SettingsOrgPage() {
   const used = orgProfileTextBytes(form);
   const over = used > ORG_PROFILE_TEXT_RESERVE_BYTES;
   const pending = save.isPending;
+
+  // The platform's list is stable for the life of the page; the OPTIONS are not,
+  // because an unrecognised stored zone has to stay selectable -- see the lib.
+  const supported = useMemo(() => supportedTimeZones(), []);
+  const zoneOptions = useMemo(
+    () => timeZoneOptions(form.timeZone, supported), [form.timeZone, supported],
+  );
+  const zoneProblem = timeZoneProblem(form.timeZone);
+  // WHAT A DOCUMENT WOULD SAY, RIGHT NOW, in the zone currently selected. This is
+  // the one control on the form whose effect is invisible until a PDF exists, and
+  // it calls the same function the renderer does -- so it is the preview rather
+  // than a description of one. It also shows the FALLBACK: choose a zone that no
+  // longer resolves and this reads UTC, which is exactly what would be printed.
+  const zonePreview = formatDocumentInstant(new Date().toISOString(), form.timeZone);
 
   return (
     <SettingsLayout title="Organisation">
@@ -251,6 +273,52 @@ export function SettingsOrgPage() {
             data-testid="org-bank"
             onChange={(event) => patch({ bankDetails: event.target.value })}
           />
+        </label>
+
+        <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+          Timezone
+          {/*
+            A SELECT RATHER THAN A TEXT FIELD, and that is the control decision.
+            Free text cannot be made safe by a message beside it: `CET` is a real
+            tzdata name and would be accepted, `+02:00` is accepted by Intl and is
+            an hour wrong for half the year, and an ordinary typo is not discovered
+            until a document prints. A list the platform itself supplies can
+            express none of those.
+          */}
+          <select
+            value={form.timeZone}
+            disabled={pending}
+            data-testid="org-timezone"
+            onChange={(event) => patch({ timeZone: event.target.value })}
+            className="min-h-11 rounded-md border border-slate-300 px-3 py-2 text-sm font-normal text-slate-900"
+          >
+            {zoneOptions.map((zone) => <option key={zone} value={zone}>{zone}</option>)}
+          </select>
+          <span data-testid="org-timezone-preview" className="text-xs font-normal text-slate-400">
+            Dates on documents print in this zone, and name it. A document issued
+            now would say {zonePreview}.
+          </span>
+          {zoneProblem !== null && (
+            /*
+              THE STORED ZONE HAS STOPPED BEING ONE -- a name coined after this
+              server's tzdata, or a restore from an install with different tzdata.
+              Documents keep rendering, in UTC and saying UTC, and this is where the
+              operator finds out why rather than by holding a PDF against a calendar.
+
+              A `<span>` and not a `<p>`, which is the only reason this differs from
+              every other refusal on the page: `<label>` takes phrasing content, and
+              a block element inside one is markup a browser repairs by closing the
+              label early -- which would detach the select from its own caption.
+              `role="alert"` carries the announcement either way.
+            */
+            <span
+              role="alert"
+              data-testid="org-timezone-problem"
+              className="text-sm font-normal text-red-600"
+            >
+              {zoneProblem}
+            </span>
+          )}
         </label>
 
         <div className="flex flex-col gap-2 rounded-md border border-slate-200 p-4">

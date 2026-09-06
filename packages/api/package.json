@@ -1,13 +1,13 @@
 {
   "name": "@conduit/api",
-  "version": "1.7.2",
+  "version": "1.8.0",
   "private": true,
   "type": "module",
   "main": "./dist/server.js",
   "scripts": {
     "build": "tsc -b",
     "dev": "node --watch --experimental-strip-types src/server.ts",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate && node src/db/journal-stamp.ts"
   },
   "dependencies": {
     "@conduit/shared": "*",

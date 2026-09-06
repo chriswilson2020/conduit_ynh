@@ -217,7 +217,13 @@ function wireFile(seed: Seed, companyId: string) {
     sizeBytes: 1024,
     sha256: "0".repeat(64),
     uploaderUserId: ACTOR_ID,
-    companyId, contactId: null, dealId: null, projectId: null,
+    // FIVE PARENTS SINCE PHASE 9, not four: `files_exactly_one_entity` gained
+    // meeting_id so a rendered meeting summary can live on its meeting, and
+    // `fileMetaSchema` gained the field with it. This stub IS the wire shape, so
+    // omitting it makes `parseWith` throw and the Files tab render nothing --
+    // which is exactly how CI reported the widening, as two rail-live tests
+    // finding zero file rows.
+    companyId, contactId: null, dealId: null, projectId: null, meetingId: null,
     createdAt: seed.at,
   };
 }
@@ -724,37 +730,67 @@ test("shows a note the reader writes themselves, at once", async ({ page }, info
   // NO HINT IS SENT (stub.live is still empty) and nothing polls, so the only
   // thing that can put this note on screen is the write being recognised as
   // the reader's own.
-  await expect(page.getByTestId("notes").getByText("Written by the reader")).toBeVisible();
+  //
+  // THE BASE IS A ROW, AND THAT IS THE ASSERTION RATHER THAN A TIDIER SPELLING
+  // OF IT. It used to be `[data-testid="notes"]`, which is the WHOLE TAB --
+  // the composer <Textarea> included. React writes a controlled textarea's
+  // value into `node.defaultValue`, and a textarea's defaultValue IS its child
+  // text node, so "Written by the reader" was inside that container the
+  // instant it was typed and getByText found it there. Measured on the dev
+  // server: with the tab as the base this line was already satisfied BEFORE
+  // the write was sent, 15 times out of 15; the element it resolved to was the
+  // TEXTAREA; and `[data-testid="note-row"]` still held nothing but the three
+  // seeded notes. It read as "the note is on screen" and proved "the string is
+  // somewhere in the tab".
+  //
+  // AND IT WAS ONE MUTATION AWAY FROM BEING AN INTERMITTENT, which is the half
+  // that is easy to get wrong and was got wrong here first. With the tab as
+  // the base, a draft still present when the row lands matches TWICE --
+  // measured, `["TEXTAREA", "P"]` -- and toBeVisible then throws "resolved to
+  // 2 elements". The obvious account of why that never happened is that
+  // handleAdd's mutate-level onSuccess (notes.tsx, at the `mutate` call, NOT
+  // in useCreateNote) clears the draft before the row can arrive, the row
+  // needing a whole refetch to be answered first. THAT ORDERING IS REAL AND IS
+  // NOT WHAT WAS DOING THE WORK: with the draft-clearing taken out altogether,
+  // the old gate still PASSED 37 times in 40 and threw the strict-mode
+  // violation only 3. What actually held the hazard off is the DEFECT ITSELF
+  // -- the draft satisfied the gate so early that the row had usually not
+  // landed yet, leaving only one element to resolve. Two locks, and the one
+  // nobody names is the one that mostly holds.
+  //
+  // So the tab-based gate was not merely misleading: it was a ~7% strict-mode
+  // intermittent waiting for the next person to touch the composer, which is
+  // the exact failure class this file exists to hunt. A row base makes the
+  // composer unmatchable BY CONSTRUCTION -- nothing has to be true about any
+  // ordering for this line to mean what it says, and no change to handleAdd
+  // can bring the hazard back.
+  await expect(
+    page.locator('[data-testid="note-row"]').filter({ hasText: "Written by the reader" }),
+  ).toBeVisible();
 
   // POLLED, AND THE ONE-SHOT READ THIS REPLACES WAS A REAL DEFECT -- but NOT
   // the one 48cf351 closed in pipeline.spec.ts, and the difference is the
   // whole reason this was measured rather than pattern-matched. There the gate
   // was one React commit EARLY: dnd-kit announces the drop in the same batch
   // as the drop, and the optimistic reorder is a commit later. Here the gate
-  // is not early. It is satisfied by the wrong element.
+  // was not early. It was satisfied by the wrong element -- so it returned
+  // while the list was still the three seeded notes, and what the one-shot
+  // read got was `Note body 00` at the head: the untouched fixture, which is
+  // the same signature every read of a list that has not settled produces.
+  // REPRODUCED, NOT REASONED ABOUT: 2 times in 10 with the stub answering at
+  // once, and 15 times out of 15 with POST /api/notes held for 400 ms. Holding
+  // the WRITE is what moved the failure, which is what made that gate causally
+  // the draft rather than the note -- and the same journey gated on the note
+  // row was 0 out of 15 under that identical 400 ms hold, which is the gate
+  // above.
   //
-  // THE LINE ABOVE IS SATISFIED BY THE COMPOSER. `[data-testid="notes"]` is
-  // the whole tab, and the <Textarea> the reader has just typed into is inside
-  // it. React writes a controlled textarea's value into `node.defaultValue`,
-  // and a textarea's defaultValue IS its child text node -- so "Written by the
-  // reader" is inside the container the instant it is typed, and getByText
-  // finds it there. Measured on the dev server on 5 Sep: that locator resolved
-  // to ONE element before the write had even been sent, 15 times out of 15,
-  // with no note row on screen at all. (It resolves to one rather than two
-  // because `createNote`'s mutate-level onSuccess clears the draft before the
-  // own-write nonce fires the re-snapshot that puts the row there; the two are
-  // never on screen together, which is why this has never thrown a strict-mode
-  // violation instead.)
-  //
-  // So the gate returns while the list is still the three seeded notes, and
-  // what the one-shot read got was `Note body 00` at the head -- the untouched
-  // fixture, which is the same signature every read of a list that has not
-  // settled produces. REPRODUCED, NOT REASONED ABOUT: 2 times in 10 with the
-  // stub answering at once, and 15 times out of 15 with POST /api/notes held
-  // for 400 ms. Holding the WRITE is what moves the failure, which is what
-  // makes the gate causally the draft rather than the note -- and the same
-  // journey gated on the note row instead of on the text was 0 out of 15 under
-  // that identical 400 ms hold.
+  // THE GATE AND THIS POLL ARE NOT ONE CLAIM SAID TWICE, which is why the gate
+  // was scoped rather than deleted once the poll carried the real work. The
+  // gate says the note ARRIVED AT ALL -- the own-write path, with no hint to
+  // help it. This says it arrived AT THE HEAD -- the re-snapshot's ordering.
+  // Different mutations break them (below), and folding them into one would
+  // report a dead own-write signal as a wrong-looking head, which is the one
+  // reading this file has already paid for once.
   //
   // THE OTHER NINE one-shot result reads in this file were measured the same
   // way and are sound, so they are deliberately left as they are -- 48cf351's
@@ -775,21 +811,47 @@ test("shows a note the reader writes themselves, at once", async ({ page }, info
   // -- so polling one would not harden it, it would make it unfalsifiable.
   // They stay one-shot, after the wait that gives them their meaning.
   //
-  // The expected value is untouched, so this keeps its teeth -- proved with
-  // the mutation that breaks what THIS line guards, which is the ORDER rather
-  // than the arrival. Change notes.tsx's `resnapshot` to the "keep every seen
-  // row where it is and append arrivals at the bottom" design its own header
-  // rejects: the note is then on screen, so the gate above still passes, and
-  // this poll fails for its whole 5 s timeout on
-  // `Received string: "...Note body 00"` -- the same head the too-early read
-  // produced, which is exactly why an intermittent here would have been
-  // indistinguishable from a real regression. Taking the own-write effect out
-  // instead is NOT that proof: the note never appears at all, so the gate
-  // above fails first and this line is never reached.
+  // THREE ASSERTIONS, THREE MUTATIONS, AND EACH ONE FAILS ALONE. That is the
+  // test that the gate is not this poll wearing a different locator.
+  //
+  //   `resnapshot` changed to the "keep every seen row where it is and append
+  //   arrivals at the bottom" design notes.tsx's own header rejects: the note
+  //   IS on screen, so the gate passes; this poll fails for its whole 5 s
+  //   timeout on `Received string: "...Note body 00"` -- the same head the
+  //   too-early read used to produce, which is exactly why an intermittent
+  //   here would have been indistinguishable from a real regression.
+  //
+  //   The own-write effect taken out: the note never appears, the GATE fails
+  //   and this line is never reached. Which is why that mutation cannot be
+  //   used to prove the poll, and why deleting the gate would have left this
+  //   failure reading as a wrong head rather than as a missing note.
+  //
+  //   handleAdd's `{ onSuccess: () => setDraft("") }` taken out: gate and poll
+  //   both pass -- the note is on screen and at the head -- and only the
+  //   composer read at the foot fails, on `unexpected value "Written by the
+  //   reader"`. Under the OLD tab-based gate the same mutation gave that
+  //   sentence 37 times in 40 and a strict-mode violation at the GATE the
+  //   other 3, blaming the wrong line in a run that was otherwise green: an
+  //   intermittent whose message named neither the composer nor the note.
   await expect
     .poll(async () => (await noteTexts(page))[0] ?? "")
     .toContain("Written by the reader");
   await expect(page.getByTestId("notes-new-show")).toHaveCount(0);
+
+  // THE COMPOSER IS EMPTY, and this is a STATE read at an instant the poll
+  // above has already pinned -- not an ordering claim, which in a browser is
+  // either a race or unfalsifiable.
+  //
+  // HERE ON ITS OWN MERITS, AND NOT AS THE GATE'S GUARD. "The draft is gone
+  // once the note is sent" is what stops a reader typing over a note they have
+  // already written, or sending it twice, and nothing else in this suite says
+  // it -- e2e/crm.spec.ts walks the same composer and asserts nothing about it
+  // afterwards. It is deliberately NOT here to pin the draft-before-row
+  // ordering for the gate's sake: the measurement above is that that ordering
+  // was never what kept the gate safe, and the gate no longer needs it to be
+  // true at all. This asserts the ordering's one VISIBLE consequence, which a
+  // reader would notice losing.
+  await expect(page.getByPlaceholder("Add a note...")).toHaveValue("");
 });
 
 test("shows the first note on a record rather than offering to", async ({ page }, info) => {

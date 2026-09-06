@@ -44,12 +44,73 @@ export function pdfText(pdf: Buffer): string {
   return parts.join("\n");
 }
 
-/** Pages, from the page tree's own count rather than by counting page objects. */
+/**
+ * Pages, from the page tree's own count rather than by counting page objects.
+ *
+ * **`/Count` IS NOT ONLY A PAGE-TREE KEY, AND THIS FUNCTION USED TO ASSUME IT
+ * WAS.** It took the largest `/Count` anywhere in the file, on the reasoning that
+ * an intermediate node carries its subtree's count so the root's is the largest.
+ * That is true of the page tree and says nothing about the rest of the document:
+ * WeasyPrint also writes PDF BOOKMARKS, derived from the headings on the page, and
+ * an `/Outlines` dictionary carries a `/Count` of its own.
+ *
+ * MEASURED, ON THE DOCUMENT THAT FOUND IT. The Phase 9 meeting summary has one
+ * `<h1>` and two `<h2>`, so its outline count is 3 -- and this function answered
+ * 3 for a PDF whose page tree says 1, whose `/Type /Page` objects number 1, and
+ * whose own printed footer reads "Page 1 of 1". The quote template has a single
+ * `<h1>`, so its outline count is 1 and coincided with its page count, which is
+ * why a year of green runs never showed it.
+ *
+ * THE FIX IS TO ASK THE RIGHT DICTIONARY. Only a `/Count` inside a dictionary that
+ * also says `/Type /Pages` is a page count; the max across those is still the root
+ * for the reason above. `enclosingDictionary` does the balanced scan, because
+ * proximity is not containment: `/Type /Pages` and an unrelated `/Count` can be
+ * fifty bytes apart in a compressed object stream where objects abut.
+ */
 export function pageCount(pdf: Buffer): number {
-  const counts = (pdfText(pdf).match(/\/Count\s+(\d+)/g) ?? []).map((m) => Number(/\d+/.exec(m)![0]));
-  // An intermediate node carries its own subtree's count, so the root's is the
-  // largest -- true whatever shape the producer gives the tree.
-  return counts.length === 0 ? 0 : Math.max(...counts);
+  const text = pdfText(pdf);
+  let largest = 0;
+  for (const match of text.matchAll(/\/Type\s*\/Pages\b/g)) {
+    const dictionary = enclosingDictionary(text, match.index);
+    if (dictionary === null) continue;
+    const count = /\/Count\s+(\d+)/.exec(dictionary);
+    if (count !== null) largest = Math.max(largest, Number(count[1]));
+  }
+  return largest;
+}
+
+/**
+ * The `<< ... >>` that contains `at`, balanced.
+ *
+ * WHAT IT DOES NOT DO: honour string literals. A `(` string containing `<<` would
+ * confuse the scan. No dictionary near a page tree contains one -- a `/Type
+ * /Pages` node holds `/Kids`, `/Count` and `/Parent`, all names and numbers -- and
+ * a full lexer for a test helper is the trade this module's header already refuses
+ * elsewhere. Said out loud so a future failure is recognisable rather than
+ * mysterious.
+ */
+function enclosingDictionary(text: string, at: number): string | null {
+  let depth = 0;
+  let start = -1;
+  for (let i = at; i >= 1; i -= 1) {
+    if (text[i - 1] === ">" && text[i] === ">") { depth += 1; i -= 1; continue; }
+    if (text[i - 1] === "<" && text[i] === "<") {
+      if (depth === 0) { start = i - 1; break; }
+      depth -= 1;
+      i -= 1;
+    }
+  }
+  if (start === -1) return null;
+  depth = 0;
+  for (let i = start; i < text.length - 1; i += 1) {
+    if (text[i] === "<" && text[i + 1] === "<") { depth += 1; i += 1; continue; }
+    if (text[i] === ">" && text[i + 1] === ">") {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 2);
+      i += 1;
+    }
+  }
+  return null;
 }
 
 /** An image XObject: what a `data:` logo becomes, and what an absent one does not. */

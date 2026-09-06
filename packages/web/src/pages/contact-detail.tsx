@@ -15,6 +15,7 @@ import { PRONOUN_PRESETS, SALUTATION_PRESETS } from "../components/contact-field
 import { FieldCard, type FieldCardField } from "../components/field-card";
 import { OwnerSelect } from "../components/owner-select";
 import { Rail } from "../components/rail/rail";
+import { RecordDocumentsSection } from "../components/record-documents";
 import { Button } from "../components/ui/button";
 
 function splitList(value: string): string[] {
@@ -264,6 +265,33 @@ export function ContactDetailPage() {
             <OwnerSelect value={contact.ownerUserId} onChange={handleOwnerChange} disabled={archived} />
           </div>
         </div>
+
+        {/*
+          THE CONTACT'S LETTERS AND AGREEMENTS -- Phase 9 Task 3, the company
+          page's section on the other record it can attach to.
+
+          THE DEFAULTS ARE RICHER HERE THAN ON THE COMPANY and that is not
+          asymmetry for its own sake. A letter to a PERSON is addressed to them,
+          so the addressee is their name and the greeting is their own
+          salutation -- the field this page edits three rows up, and the same
+          snapshot-at-issue value a quote takes. The company page leaves both
+          blank because a company may have twenty contacts and choosing one for
+          the operator would be a guess printed on a letter.
+
+          THE ADDRESS COMES FROM THE LINKED COMPANY, because `contacts` has no
+          address column of its own -- a person is reached at their
+          organisation. `linkedCompany` may still be on the wire, in which case
+          the field starts empty and the operator types it; that is a default,
+          not data, so a half-loaded one costs nothing.
+        */}
+        <RecordDocumentsSection
+          target={{ contactId }}
+          archived={archived}
+          defaultRecipientName={fullName}
+          defaultRecipientContactName=""
+          defaultRecipientSalutation={contact.salutation ?? ""}
+          defaultRecipientAddress={linkedCompany?.address ?? ""}
+        />
       </div>
       <aside className="min-w-0 lg:w-1/3">
         <Rail contactId={contactId} />

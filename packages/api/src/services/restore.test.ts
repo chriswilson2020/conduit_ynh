@@ -701,6 +701,91 @@ describe("proving an archive opens", () => {
       await truncate(archive, Math.floor(size / 2));
       expect((await proveArchiveOpens(archive, PASSPHRASE)).code).not.toBe(0);
     });
+
+  /**
+   * AND IT LEAVES NO UNHANDLED 'error' BEHIND IT, which is a separate claim from
+   * the exit codes above and invisible to them: the promise resolves on `close`
+   * either way, so every assertion in the case above passes whether or not the
+   * write to 7z's stdin blew up.
+   *
+   * A stream 'error' with no listener is an uncaught exception, and NOTHING IN
+   * packages/api/src INSTALLS A process.on('uncaughtException') -- so in the API
+   * server node's default applies and the process EXITS. That is what is being
+   * bought off, not a noisy test. mail-integration.test.ts makes the same
+   * argument for imapflow's client 'error' and is the precedent for the capture
+   * below.
+   *
+   * WHY THE PASSPHRASE IS 256 KiB, AND WHAT THAT DOES AND DOES NOT PROVE.
+   * MEASURED ON THE DEPLOY TARGET (7-Zip 26.02 via p7zip 16.02, node 24.19),
+   * 10 runs per cell, against a 7z that writes nothing to stdin before exiting:
+   *
+   *                                28 bytes   128 KiB   256 KiB   1 MiB
+   *     `t` on a truncated .7z        0/30      0/20     10/10    10/10
+   *     `l` on a non-archive          0/30      0/20     10/10    10/10
+   *     `l` on an unencrypted .7z     0/10        --     10/10    10/10
+   *
+   * (The uneven denominators are the run counts as they were actually taken --
+   * the 128 KiB column came from an earlier pass over two of the three cases,
+   * before the threshold was known to be above it.)
+   *
+   * libuv gives a child's stdin a socketpair, not a pipe, and its send buffer
+   * took 128 KiB whole -- so a write SMALLER than the buffer completes into the
+   * kernel however fast the child goes, and there is no race to lose.
+   *
+   * So this is a REGRESSION TEST FOR THE GUARD, not a reproduction of anything
+   * production can reach today: MAX_PASSPHRASE_LENGTH is 256 CHARACTERS, three
+   * orders of magnitude under the threshold. It is written anyway because that
+   * cap is applied by passphraseProblem() in routes/restore.ts while this
+   * function takes an uncapped `string` -- see proveArchiveOpens for the rest of
+   * that argument.
+   */
+  it7z("leaves no unhandled stdin error when 7z exits without reading it", async () => {
+    const dir = await scratchDir("prove-epipe");
+    await writeFile(path.join(dir, "a.txt"), "hello");
+    const archive = path.join(dir, "out.7z");
+    await pack(dir, archive);
+    await truncate(archive, Math.floor((await stat(archive)).size / 2));
+
+    // A character passphraseProblem() would accept, so nothing here turns on the
+    // payload's content -- only on its length.
+    const oversized = "x".repeat(256 * 1024);
+
+    // THE CONTROL, FIRST, AND IT IS THE HALF THAT CAN ROT. The assertion below
+    // is that nothing escaped, which passes for free the day this arrangement
+    // stops provoking an EPIPE at all -- a bigger socket buffer, a 7z that
+    // drains stdin before it exits, a different libuv. So the same spawn is made
+    // here with a listener of its own and asserted to SEE one. Watched failing:
+    // with `oversized` cut to the real passphrase this line reports
+    // `expected [] to deeply equal [ 'EPIPE' ]`.
+    const observed = await new Promise<string[]>((resolve) => {
+      const child = spawn("7z", ["t", "-bd", "-y", "--", archive], {
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      const codes: string[] = [];
+      child.stdin.on("error", (error: NodeJS.ErrnoException) => { codes.push(error.code ?? "?"); });
+      child.on("error", () => { resolve(["spawn failed"]); });
+      child.on("close", () => { setTimeout(() => { resolve(codes); }, 250); });
+      child.stdin.write(oversized);
+      child.stdin.end();
+    });
+    expect(observed).toEqual(["EPIPE"]);
+
+    // ...and now the same thing through the real function, with nothing of its
+    // own attached. `process.on`, not removeAllListeners: vitest's own listener
+    // stays, so a regression is a failed assertion here AND a red run rather
+    // than either one alone.
+    const escaped: unknown[] = [];
+    const capture = (error: unknown): void => { escaped.push(error); };
+    process.on("uncaughtException", capture);
+    try {
+      expect((await proveArchiveOpens(archive, oversized)).code).not.toBe(0);
+      // The 'error' arrives on its own turn, and `close` does not order it.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      process.off("uncaughtException", capture);
+    }
+    expect(escaped).toEqual([]);
+  });
 });
 
 // ===========================================================================

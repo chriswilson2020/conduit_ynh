@@ -2,7 +2,9 @@ import { describe, it, expect } from "vitest";
 import { randomUUID } from "node:crypto";
 import {
   CSV_IMPORT_FIELDS,
+  DEFAULT_TIME_ZONE,
   csvImportFieldSchema,
+  formatDocumentInstant,
   userSchema,
   meResponseSchema,
   healthResponseSchema,
@@ -2575,6 +2577,156 @@ describe("csvImportFieldSchema", () => {
     }
     for (const bad of ["company.vat", "contact.email ", "COMPANY.NAME", "", "email"]) {
       expect(csvImportFieldSchema.safeParse(bad).success, bad).toBe(false);
+    }
+  });
+});
+
+/**
+ * THE ZONE IS AN ARGUMENT SINCE v1.8.0, AND IT IS STILL NAMED ON THE PAGE. Task 2
+ * reported that Conduit stored no zone anywhere, so the server could not reproduce
+ * the wall clock the operator saw and printed UTC instead; `org_profile.time_zone`
+ * is the answer. The label stays because these documents get emailed, and because
+ * it is the whole of what separates the unresolvable-zone fallback from silently
+ * printing UTC and claiming otherwise. See the function.
+ */
+describe("formatDocumentInstant", () => {
+  it("prints a long-form date, a 24-hour time, and the zone", () => {
+    expect(formatDocumentInstant("2026-09-01T13:30:00.000Z", "UTC"))
+      .toBe("1 September 2026 at 13:30 UTC");
+  });
+
+  /**
+   * **THE BACKFILL'S WHOLE JUSTIFICATION IS THIS EQUALITY.** 0018 gives every
+   * existing row `UTC`, and the defence of that choice is that re-rendering a
+   * document issued before v1.8.0 produces the same page. The string above is
+   * verbatim what v1.7.2 printed -- assertion and all, it is the line this
+   * describe block opened with before the argument existed -- so if the zone
+   * label, the locale or the styles ever change, this is where the claim breaks
+   * rather than a paragraph quietly becoming untrue.
+   */
+  it("prints exactly what v1.7.2 printed when the zone is the default", () => {
+    expect(formatDocumentInstant("2026-09-01T13:30:00.000Z", DEFAULT_TIME_ZONE))
+      .toBe("1 September 2026 at 13:30 UTC");
+  });
+
+  it("converts an offset rather than printing its local wall clock", () => {
+    // The same instant, written three ways. All three must print one time, or the
+    // function is reading the string instead of the moment.
+    for (const iso of [
+      "2026-09-01T13:30:00.000Z", "2026-09-01T15:30:00.000+02:00", "2026-09-01T08:30:00.000-05:00",
+    ]) {
+      expect(formatDocumentInstant(iso, "UTC"), iso).toBe("1 September 2026 at 13:30 UTC");
+    }
+  });
+
+  /**
+   * THE POINT OF THE WHOLE FIELD: the operator typed 15:30 into a meeting form in
+   * Amsterdam and the page now says 15:30 rather than 13:30.
+   */
+  it("prints the organisation's wall clock, not UTC's", () => {
+    expect(formatDocumentInstant("2026-09-01T13:30:00.000Z", "Europe/Amsterdam"))
+      .toBe("1 September 2026 at 15:30 CEST");
+    expect(formatDocumentInstant("2026-09-01T13:30:00.000Z", "America/New_York"))
+      .toBe("1 September 2026 at 09:30 GMT-4");
+  });
+
+  /**
+   * **A ZONE AND AN OFFSET ARE DIFFERENT THINGS, AND THIS IS THE ASSERTION THAT
+   * CAN TELL.** Every other case here is in September, where Europe/Amsterdam and
+   * a hard-coded +02:00 agree exactly -- so a summer-only suite would be green
+   * against an implementation that had thrown the tzdata away. January is where
+   * they part: 13:00 CET against 14:00 at +02:00. It is also where the LABEL has
+   * to move, and a label pinned to a constant would give itself away here too.
+   */
+  it("follows daylight saving in both directions, which a fixed offset could not", () => {
+    expect(formatDocumentInstant("2026-01-15T12:00:00.000Z", "Europe/Amsterdam"))
+      .toBe("15 January 2026 at 13:00 CET");
+    expect(formatDocumentInstant("2026-07-15T12:00:00.000Z", "Europe/Amsterdam"))
+      .toBe("15 July 2026 at 14:00 CEST");
+  });
+
+  /** The zone can move the DAY, not merely the hour. */
+  it("prints the local calendar day, which is not always UTC's", () => {
+    expect(formatDocumentInstant("2026-09-01T23:30:00.000Z", "Europe/Amsterdam"))
+      .toBe("2 September 2026 at 01:30 CEST");
+    expect(formatDocumentInstant("2026-09-01T01:30:00.000Z", "America/New_York"))
+      .toBe("31 August 2026 at 21:30 GMT-4");
+  });
+
+  /**
+   * **WHAT HAPPENS WHEN THE STORED ZONE STOPS RESOLVING.** ICU retires names, a
+   * restore can carry a zone this engine never had, and an older Node ships older
+   * tzdata. The two unacceptable answers are a RangeError out of `Intl` half way
+   * through a render, and a quiet switch to UTC on a page that goes on claiming a
+   * local time. This is the third: UTC, and the page says UTC, so the printed time
+   * and the printed label agree and a reader is never misled.
+   */
+  it("falls back to UTC for a zone it cannot resolve, and says UTC on the page", () => {
+    for (const broken of ["Factory", "not/a/zone", "", "Mars/Olympus_Mons"]) {
+      expect(formatDocumentInstant("2026-01-15T12:00:00.000Z", broken), broken)
+        .toBe("15 January 2026 at 12:00 UTC");
+    }
+  });
+
+  /**
+   * A FIXED OFFSET TAKES THE SAME FALLBACK, and it is the case that would
+   * otherwise be invisible: `Intl` accepts `+02:00` happily, so without the gate
+   * this would print `14:00` in January -- an hour wrong, with a plausible-looking
+   * `GMT+2` beside it. The refusal has to reach the RENDER and not only the form,
+   * because the value could have arrived before the gate existed.
+   */
+  it("refuses a fixed offset at render time too, not only at the form", () => {
+    expect(formatDocumentInstant("2026-01-15T12:00:00.000Z", "+02:00"))
+      .toBe("15 January 2026 at 12:00 UTC");
+  });
+
+  /**
+   * **THIS TEST EXISTS BECAUSE THE OBVIOUS ONE CANNOT WORK, AND A MUTATION PROVED
+   * IT.** Deleting `timeZone` from the formatter was GREEN against an assertion
+   * that merely read the output, for the reason that ought to have been obvious:
+   * CI, the dev server and every developer machine here run at Etc/UTC, where
+   * "formatted in UTC" and "formatted in the process's zone" are the same string.
+   * The zone has to be moved for the two to be distinguishable.
+   *
+   * IT STILL EARNS ITS PLACE WITH THE ARGUMENT IN. A formatter built without the
+   * `timeZone` option now falls back to the PROCESS's zone rather than to the
+   * argument, so this is the case that separates "reads its parameter" from
+   * "reads the environment and happened to agree".
+   *
+   * `process.env.TZ` IS RE-READ BY A FORMATTER CONSTRUCTED AFTERWARDS on Node 24,
+   * which is what CI and the server both run. Restored in a `finally`, because
+   * leaving it set would silently change how every later test in this file reads
+   * a date.
+   */
+  it("is not the running process's timezone, even when that is not UTC", () => {
+    const original = process.env.TZ;
+    try {
+      process.env.TZ = "America/New_York";
+      expect(formatDocumentInstant("2026-09-02T02:30:00.000Z", "UTC"))
+        .toBe("2 September 2026 at 02:30 UTC");
+      expect(formatDocumentInstant("2026-09-02T02:30:00.000Z", "Europe/Amsterdam"))
+        .toBe("2 September 2026 at 04:30 CEST");
+    } finally {
+      if (original === undefined) delete process.env.TZ;
+      else process.env.TZ = original;
+    }
+  });
+
+  it("spells the month as a word, because 08/09 means two different days", () => {
+    expect(formatDocumentInstant("2026-09-08T00:00:00.000Z", "UTC")).toContain("September");
+  });
+
+  /**
+   * NEVER THROWS, matching every formatter in money-format.ts and for the same
+   * reason: these are display functions with no error boundary above them. Both
+   * arguments, because there are now two ways in -- and an unresolvable zone is
+   * the worse one, since it throws from the CONSTRUCTOR rather than from a value
+   * a `timestamptz` could never hold.
+   */
+  it("returns an empty string for something that is not an instant", () => {
+    for (const bad of ["", "not a date", "2026-13-45T99:99:99Z"]) {
+      expect(formatDocumentInstant(bad, "UTC"), bad).toBe("");
+      expect(formatDocumentInstant(bad, "Factory"), bad).toBe("");
     }
   });
 });

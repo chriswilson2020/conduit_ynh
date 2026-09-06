@@ -980,6 +980,23 @@ async function runPsqlLoad(options: {
     };
 
     child.on("close", (code) => { closed = { code: code ?? -1 }; finish(); });
+    // NO `stdin.on("error")` HERE, AND THE ABSENCE IS DELIBERATE -- the four
+    // other spawn sites in this package have one, so the next person auditing
+    // for a missing handler needs the answer at the line rather than a fifth
+    // copy of it. `pipeline` below attaches its own 'error' listener to stdin,
+    // synchronously on this same tick, and a socket reports a failed write
+    // asynchronously -- so it is registered before anything this write can emit.
+    // MEASURED with this exact shape against a child that exits without reading
+    // and a payload past the socketpair's send buffer: with the pipeline the
+    // EPIPE arrives as `streamError` and `uncaughtException` stays empty; with
+    // `stdin.end()` in its place, the same run raises an uncaught `write EPIPE`.
+    //
+    // A listener here would be REDUNDANT rather than harmful, and that half was
+    // measured too rather than reasoned: the first draft of this comment said it
+    // would swallow the pipeline's rejection, and it does not -- both listeners
+    // fire and `streamError` is still EPIPE. It is left out because the guard
+    // this site has is `pipeline`, and a second one would let a reader believe
+    // the bare write is what is protected rather than the whole stream.
     child.stdin.write(options.preamble);
     // BOTH HALVES ARE WAITED FOR, and the stream's outcome is KEPT. A psql that
     // exits early makes this reject with EPIPE -- that one is not interesting,
@@ -1037,6 +1054,10 @@ export async function proveArchiveOpens(
       errorBytes += chunk.length;
       errors.push(chunk);
     });
+    // A SPAWN THAT NEVER STARTED, which is a different event from the one below
+    // and does not cover it: this one is the CHILD's, and a stream has its own.
+    // Measured by deleting the stdin listener: the case below goes red with this
+    // line untouched.
     child.on("error", () => { reject(new RestoreToolMissingError("7z", SEVEN_ZIP_PACKAGE)); });
     child.on("close", (code) => {
       resolve({
@@ -1044,6 +1065,38 @@ export async function proveArchiveOpens(
         stderr: Buffer.concat(errors).toString("utf8").slice(0, STDERR_CAP_BYTES),
       });
     });
+    // THE STDIN 'error', REGISTERED BEFORE THE WRITE, AND THE MEASUREMENT THAT
+    // SAYS WHEN IT FIRES. This is the canonical note; services/intake.ts and
+    // services/backup.ts point at it rather than restating it.
+    //
+    // A stream 'error' with no listener is an uncaught exception. Nothing in
+    // packages/api/src installs a process.on('uncaughtException'), so in the API
+    // server node's default applies and the PROCESS EXITS -- an archive an
+    // operator uploaded taking the server down, with `close` never reaching the
+    // caller to say what was actually wrong with it.
+    //
+    // WHEN THE WRITE CAN FAIL, MEASURED ON THE DEPLOY TARGET (7-Zip 26.02 via
+    // p7zip 16.02, node 24.19). 7z reads NOTHING from stdin in any of these
+    // three before exiting -- `t` on a truncated .7z, `l` on a file that is not
+    // an archive, `l` on an unencrypted one:
+    //
+    //     28 bytes .. EPIPE  0/70    256 KiB .. EPIPE 30/30
+    //     128 KiB ... EPIPE  0/40    1 MiB .... EPIPE 30/30
+    //
+    // (Totals across those three cases; the 128 KiB row covers two of them.)
+    //
+    // libuv gives a child's stdin a SOCKETPAIR, not a pipe, and its send buffer
+    // took 128 KiB whole. A write smaller than that buffer completes into the
+    // kernel however fast the child goes, so "the child won the race" is not the
+    // mechanism -- SIZE is, and the threshold is between 128 and 256 KiB there.
+    //
+    // WHICH MEANS THIS LINE IS NOT REACHABLE THROUGH THE ROUTES TODAY, and it is
+    // still not decoration. MAX_PASSPHRASE_LENGTH is 256 CHARACTERS, three
+    // orders of magnitude under the threshold -- but that cap is applied by
+    // passphraseProblem() over in routes/restore.ts, and this function takes an
+    // uncapped `string`. A guarantee that lives two modules away is one refactor
+    // from not existing, and it is invisible from here.
+    child.stdin.on("error", () => { /* see above */ });
     // No trailing newline: 7z reads one line, on this side exactly as on the
     // writing side. See services/intake.ts's sevenZipExtractArgs.
     child.stdin.write(passphrase);

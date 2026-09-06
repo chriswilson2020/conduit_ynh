@@ -32,6 +32,7 @@ import {
   meResponseSchema,
   meetingDetailSchema,
   meetingSchema,
+  meetingSummarySchema,
   midpoint,
   noteSchema,
   orgProfileSchema,
@@ -44,6 +45,7 @@ import {
   searchResultsSchema,
   shiftResultSchema,
   stageSchema,
+  statusReportSchema,
   taskDependencySchema,
   taskSchema,
   usersResponseSchema,
@@ -66,6 +68,12 @@ import {
   type DocumentTemplateInput,
   type DocumentType,
   type IssueQuoteInput,
+  letterSchema,
+  type LetterRecord,
+  recordDocumentSchema,
+  type RecordDocument,
+  type RecordDocumentInput,
+  type RedraftLetterInput,
   type FolderPatchInput,
   folderRenameResultSchema,
   folderDeleteResultSchema,
@@ -87,6 +95,7 @@ import {
   type MarkThreadReadResponse,
   type Meeting,
   type MeetingCreateInput,
+  type MeetingSummaryRecord,
   type MeetingTaskCreateInput,
   type OrgProfile,
   type OrgProfileInput,
@@ -98,6 +107,7 @@ import {
   type SendMailInput,
   type ShiftResult,
   type Stage,
+  type StatusReportRecord,
   type Task,
   type TaskStatus,
   type UpdateCompanyInput,
@@ -2101,6 +2111,225 @@ export function useIssueQuote() {
       parseWith(documentSchema, await postJson<unknown>(`/deals/${dealId}/documents`, input), "document"),
     onSuccess: (_document: DocumentRecord, { dealId }) => {
       void queryClient.invalidateQueries({ queryKey: ["documents", dealId] });
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+    },
+  });
+}
+
+const meetingSummaryListSchema = meetingSummarySchema.array();
+
+/**
+ * The summaries produced for one meeting, newest first.
+ *
+ * A SEPARATE KEY FROM `["documents", dealId]`, and a separate hook, because the
+ * two routes return different shapes: a deal's documents are quotes, with money
+ * and lines, and a meeting's are summaries, which have neither. Pooling them
+ * under one key would mean one cache entry holding two shapes and a parse that
+ * had to guess which.
+ */
+export function useMeetingSummaries(meetingId: string) {
+  return useQuery({
+    queryKey: ["meeting-documents", meetingId],
+    queryFn: async () => parseWith(
+      meetingSummaryListSchema,
+      await getJson<unknown>(`/meetings/${meetingId}/documents`),
+      "meeting summaries",
+    ),
+    enabled: meetingId !== "",
+  });
+}
+
+/**
+ * Produce the summary of a meeting. NO INPUT: everything printed is on the
+ * meeting, so the mutation takes the id and nothing else -- which is what makes
+ * this the type with no form.
+ *
+ * INVALIDATES FILES AND EVENTS FOR useIssueQuote's REASON: a summary writes a
+ * `files` row against the meeting and stamps a `file_attached` entry on the
+ * timelines the meeting is on, so both are stale the instant this returns.
+ *
+ * UNLIKE useIssueQuote THERE IS NOTHING STOPPING A SECOND CALL, and that is the
+ * per-type freezing rule showing through: a summary is not frozen, so producing
+ * one again is ordinary. It appends a second document with its own PDF rather
+ * than replacing the first -- see services/documents.ts's issueMeetingSummary
+ * for why appending, and not editing, is what Task 2 builds.
+ */
+export function useIssueMeetingSummary() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (meetingId: string) => parseWith(
+      meetingSummarySchema,
+      await postJson<unknown>(`/meetings/${meetingId}/documents`, {}),
+      "meeting summary",
+    ),
+    onSuccess: (_document: MeetingSummaryRecord, meetingId) => {
+      void queryClient.invalidateQueries({ queryKey: ["meeting-documents", meetingId] });
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+    },
+  });
+}
+
+const statusReportListSchema = statusReportSchema.array();
+
+/**
+ * The status reports produced for one project, newest first.
+ *
+ * `useMeetingSummaries`' twin, and a third key rather than a widening of either
+ * of the other two for its reason: the route returns a shape of its own -- no
+ * money, no lines, no letter body -- so pooling it under an existing key would
+ * put two shapes in one cache entry and leave the parse guessing which.
+ */
+export function useProjectDocuments(projectId: string) {
+  return useQuery({
+    queryKey: ["project-documents", projectId],
+    queryFn: async () => parseWith(
+      statusReportListSchema,
+      await getJson<unknown>(`/projects/${projectId}/documents`),
+      "status reports",
+    ),
+    enabled: projectId !== "",
+  });
+}
+
+/**
+ * Produce the status report of a project. NO INPUT, for `useIssueMeetingSummary`'s
+ * reason and one more of its own: everything printed is on the project and its
+ * tasks, and the date range the spec floated turned out not to be a thing this
+ * type can usefully have (see the API's `issueStatusReport`).
+ *
+ * INVALIDATES FILES AND EVENTS FOR useIssueQuote's REASON: a report writes a
+ * `files` row against the project and stamps a `file_attached` entry, so the
+ * rail's Files and Timeline tabs are stale the instant this returns.
+ *
+ * NOTHING STOPS A SECOND CALL, which is the per-type freezing rule showing
+ * through again -- and for this type regenerating is not merely permitted, it is
+ * the intended use.
+ */
+export function useIssueStatusReport() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (projectId: string) => parseWith(
+      statusReportSchema,
+      await postJson<unknown>(`/projects/${projectId}/documents`, {}),
+      "status report",
+    ),
+    onSuccess: (_document: StatusReportRecord, projectId) => {
+      void queryClient.invalidateQueries({ queryKey: ["project-documents", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+    },
+  });
+}
+
+const recordDocumentListSchema = recordDocumentSchema.array();
+
+/**
+ * Which record a documents list belongs to. Exactly one, as a union rather than
+ * two optional keys, so "neither" is unspellable -- the service's `RecordTarget`
+ * for the same reason.
+ */
+export type DocumentRecordTarget = { companyId: string } | { contactId: string };
+
+function targetPath(target: DocumentRecordTarget, includeContacts = false): string {
+  if ("contactId" in target) return `/contacts/${target.contactId}/documents`;
+  // THE ROLLUP IS A QUERY PARAMETER AND IT IS ONLY EVER SENT WHEN IT IS ON, so
+  // the ordinary request is byte for byte the one this route has always
+  // received. See the API route for why the server tests for the literal
+  // "true" rather than coercing.
+  const base = `/companies/${target.companyId}/documents`;
+  return includeContacts ? `${base}?includeContacts=true` : base;
+}
+
+function targetKey(target: DocumentRecordTarget): string {
+  return "companyId" in target ? target.companyId : target.contactId;
+}
+
+/**
+ * A company's or a contact's documents -- its letters and its agreements
+ * together, newest first.
+ *
+ * **ONE KEY AND ONE HOOK FOR BOTH RECORDS AND BOTH SHAPES**, which is the
+ * opposite of the split between `useDealDocuments` and `useMeetingSummaries` and
+ * is not an inconsistency. Those two are separate because they return DIFFERENT
+ * shapes from different routes -- a quote with money and lines, a summary with
+ * neither -- so pooling them would put two shapes under one cache entry and a
+ * parse that had to guess. This one returns a DISCRIMINATED UNION from a route
+ * that already mixes them, so the guessing is `type`'s job and the parser does
+ * it.
+ */
+export function useRecordDocuments(target: DocumentRecordTarget, includeContacts = false) {
+  const id = targetKey(target);
+  return useQuery({
+    // **THE FLAG IS PART OF THE KEY, WHICH IS NOT OPTIONAL.** The two requests
+    // return different lists from the same route, so a shared key would serve
+    // the rolled-up list to the plain view and back again on every toggle --
+    // with the wrong one showing until the refetch landed. It also means
+    // flipping the switch twice is instant rather than two more round trips.
+    //
+    // The INVALIDATION key stays `["record-documents", id]`, which is a prefix
+    // of both, so a new document still refreshes whichever view is open.
+    queryKey: ["record-documents", id, includeContacts],
+    queryFn: async () => parseWith(
+      recordDocumentListSchema,
+      await getJson<unknown>(targetPath(target, includeContacts)),
+      "documents list",
+    ),
+    enabled: id !== "",
+  });
+}
+
+/**
+ * Write a letter or raise an agreement against a company or a contact.
+ *
+ * INVALIDATES FILES AND EVENTS FOR useIssueQuote's REASON: the PDF is an
+ * ordinary `files` row on the same record and it stamps a `file_attached` entry,
+ * so the rail's Files and Timeline tabs are stale the instant this returns.
+ */
+export function useIssueRecordDocument() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ target, input }: {
+      target: DocumentRecordTarget; input: RecordDocumentInput;
+    }) => parseWith(
+      recordDocumentSchema, await postJson<unknown>(targetPath(target), input), "document",
+    ),
+    onSuccess: (_document: RecordDocument, { target }) => {
+      void queryClient.invalidateQueries({ queryKey: ["record-documents", targetKey(target)] });
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+    },
+  });
+}
+
+/**
+ * **REDRAFT A LETTER. THE ONLY MUTATION IN THIS FILE THAT CHANGES AN ISSUED
+ * DOCUMENT**, and the reason `useIssueQuote`'s "there is deliberately no update
+ * or delete hook beside this one" is now a statement about the QUOTE rather than
+ * about documents.
+ *
+ * IT EXISTS FOR EXACTLY ONE TYPE AND THE SERVER IS WHAT SAYS SO. There is no
+ * client-side check that the document is a letter or that it is unfrozen: the
+ * service refuses a frozen document with a 409 and a sentence, and
+ * `conduit_document_frozen_guard` refuses it again in the database. A guard here
+ * as well would be a third copy of a rule, in the one place it can be bypassed
+ * with a developer console.
+ *
+ * THE WHOLE FORM, NOT A PATCH -- `RedraftLetterInput` is the issue schema minus
+ * its `type`, so a redraft cannot validate differently from the letter it
+ * replaces.
+ */
+export function useRedraftLetter() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ documentId, input }: {
+      documentId: string; target: DocumentRecordTarget; input: RedraftLetterInput;
+    }) => parseWith(
+      letterSchema, await putJson<unknown>(`/documents/${documentId}`, input), "letter",
+    ),
+    onSuccess: (_letter: LetterRecord, { target }) => {
+      void queryClient.invalidateQueries({ queryKey: ["record-documents", targetKey(target)] });
       void queryClient.invalidateQueries({ queryKey: ["files"] });
       void queryClient.invalidateQueries({ queryKey: ["events"] });
     },
