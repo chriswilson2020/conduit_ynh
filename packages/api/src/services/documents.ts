@@ -1,19 +1,23 @@
 import { Readable } from "node:stream";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import {
-  documentTemplateInputSchema, documentTotals, documentTypeFreezes, formatDocumentInstant,
-  formatMoneyCents, formatQtyMilli,
-  documentContentBytes, formatTaxRateBp, issueQuoteInputSchema, lineTotalCents,
-  MAX_TEMPLATE_BYTES, renderInputCost, RENDER_IMAGE_CAP_BYTES, RENDER_IMAGE_PIXEL_CAP,
-  RENDER_MARKUP_CAP_BYTES, todayInZone,
-  type DocumentRecord, type DocumentTemplate, type DocumentTemplateInput,
-  type IssueQuoteInput, type MeetingSummaryRecord, type OrgProfile,
+  agreementContentBytes, documentTemplateInputSchema, documentTotals, documentTypeFreezes,
+  formatDocumentInstant, formatMoneyCents, formatQtyMilli,
+  documentContentBytes, formatTaxRateBp, issueAgreementInputSchema, issueLetterInputSchema,
+  issueQuoteInputSchema, lineTotalCents,
+  MAX_TEMPLATE_BYTES, redraftLetterInputSchema, renderInputCost, RENDER_IMAGE_CAP_BYTES,
+  RENDER_IMAGE_PIXEL_CAP, RENDER_MARKUP_CAP_BYTES, todayInZone,
+  type AgreementRecord, type DocumentRecord, type DocumentTemplate, type DocumentTemplateInput,
+  type IssueAgreementInput, type IssueLetterInput, type IssueQuoteInput, type LetterRecord,
+  type MeetingSummaryRecord, type OrgProfile, type RecordDocument, type RedraftLetterInput,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
-  contacts, deals, documentLineItems, documentQuotes, documents, documentTemplates,
+  companies, contacts, deals, documentAgreements, documentLetters, documentLineItems,
+  documentQuotes, documents, documentTemplates,
   meetingAttendees, meetings, users,
-  type DocumentLineItemRow, type DocumentQuoteRow, type DocumentRow,
+  type DocumentAgreementRow, type DocumentLetterRow, type DocumentLineItemRow,
+  type DocumentQuoteRow, type DocumentRow,
 } from "../db/schema.js";
 import { allocateNumber } from "./documents-number.js";
 import { renderPdf } from "./documents-render.js";
@@ -74,6 +78,27 @@ export class DocumentTooLargeError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DocumentTooLargeError";
+  }
+}
+
+/**
+ * Raised when somebody asks to change a document that is frozen.
+ *
+ * **THE ERROR THAT MAKES `documents.frozen` MEAN SOMETHING.** Task 1 added the
+ * column and recorded that nothing read it; Task 2 added the first type that
+ * answers `false` and still wrote no update path. This is Task 3's, and the
+ * spec's fourth risk is what it is for: "the rule that an issued document never
+ * changes is currently unconditional; making it conditional is where a mistake
+ * would let a quote be edited."
+ *
+ * IT NAMES THE TYPE, NOT JUST THE ID. "This document is frozen" invites the
+ * question "why is THIS one frozen"; "an issued quote cannot be changed" answers
+ * it, and the answer is a product rule rather than a database state.
+ */
+export class DocumentFrozenError extends Error {
+  constructor(readonly documentId: string, readonly type: string) {
+    super(`an issued ${type.replace(/_/g, " ")} cannot be changed`);
+    this.name = "DocumentFrozenError";
   }
 }
 
@@ -281,8 +306,17 @@ interface RenderAndStoreInput {
   provenance: string;
   /** `files.original_name`, which is what a download is called. */
   originalName: string;
-  /** Exactly one, matching the `documents` row this file is about to belong to. */
-  target: { dealId?: string; meetingId?: string };
+  /**
+   * Exactly one, matching the `documents` row this file is about to belong to.
+   *
+   * FOUR OF THE FIVE SINCE TASK 3, and the missing one is `projectId`, which is
+   * Task 4's. Spelled as four optional keys rather than as a union because
+   * `attachFile` takes exactly this shape and does its own "which one is set"
+   * walk over it; a union here would be narrowed once and widened straight back.
+   * The thing that makes "exactly one" true is `documents_exactly_one_entity`
+   * and `files_exactly_one_entity`, in the database, on both rows.
+   */
+  target: { companyId?: string; contactId?: string; dealId?: string; meetingId?: string };
 }
 
 /**
@@ -947,4 +981,684 @@ export async function listMeetingSummaries(
     .where(and(eq(documents.meetingId, meetingId), eq(documents.type, "meeting_summary")))
     .orderBy(desc(documents.createdAt), desc(documents.id));
   return rows.map((row) => toMeetingSummaryRecord(row, meetingId));
+}
+
+/* ========================================================================== *
+ *  THE LETTER AND THE NDA PAIR -- THE TYPES A COMPANY OR A CONTACT CARRIES
+ * ========================================================================== */
+
+/**
+ * Which record a document is being raised against: a company or a contact,
+ * exactly one.
+ *
+ * A UNION AND NOT TWO OPTIONAL KEYS, which is the opposite of `RenderAndStore`'s
+ * `target` a few hundred lines up and is deliberate. That one exists to be handed
+ * to `attachFile`, which walks optional keys; this one is what every function
+ * below branches on, and a union makes "neither was supplied" unspellable instead
+ * of a runtime check nobody would write. Chris's decision of 6 Sep -- a document
+ * belongs to EXACTLY ONE thing -- is enforced three times over: here at compile
+ * time, by `documents_exactly_one_entity` on the row, and by
+ * `files_exactly_one_entity` on the PDF.
+ */
+export type RecordTarget = { companyId: string } | { contactId: string };
+
+/** The record a target names, for a message and for a query. */
+function targetNoun(target: RecordTarget): "company" | "contact" {
+  return "companyId" in target ? "company" : "contact";
+}
+
+function targetId(target: RecordTarget): string {
+  return "companyId" in target ? target.companyId : target.contactId;
+}
+
+/**
+ * The record exists and is not archived, refused BEFORE anything spawns.
+ *
+ * `attachFile` re-checks this a moment later from inside the same transaction --
+ * that is what `assertFileTargetActive` is -- so this call is not what makes the
+ * rule true. It is what makes the refusal arrive before a subprocess has run and
+ * a blob has been written, which is issueQuote's own reason for reading the deal
+ * before it reads anything else.
+ */
+async function assertRecordIssuable(tx: Database, target: RecordTarget): Promise<void> {
+  const id = targetId(target);
+  if ("companyId" in target) {
+    const [row] = await tx.select({ archivedAt: companies.archivedAt })
+      .from(companies).where(eq(companies.id, id));
+    if (row === undefined) throw new NotFoundError("company", id);
+    if (row.archivedAt !== null) throw new ArchivedError("company", id);
+    return;
+  }
+  const [row] = await tx.select({ archivedAt: contacts.archivedAt })
+    .from(contacts).where(eq(contacts.id, id));
+  if (row === undefined) throw new NotFoundError("contact", id);
+  if (row.archivedAt !== null) throw new ArchivedError("contact", id);
+}
+
+/**
+ * How long an agreement lasts, as the page says it.
+ *
+ * PLAIN MONTHS, AND `formatDurationMinutes` A FEW HUNDRED LINES UP MADE THE SAME
+ * DECISION FOR THE SAME REASON. "36 months" rather than "three (3) years" is a
+ * choice and not laziness: converting needs a rule for 18 months, a convention
+ * for "1 year 0 months" and a pluralisation, all of them formatting invented for
+ * a field the operator typed as a number of months. The label beside it says
+ * Term.
+ *
+ * THE SINGULAR IS NOT DECORATION. `documentTypeSchema`'s suite learned this the
+ * hard way on the summary's duration: `toContain("1 month")` is satisfied by
+ * "1 months", so the assertion has to close round the whole cell.
+ */
+function formatAgreementTerm(months: number): string {
+  return `${String(months)} ${months === 1 ? "month" : "months"}`;
+}
+
+/** Everything the letter template is allowed to print. */
+export interface LetterContextInput {
+  org: OrgProfile;
+  issueDate: string;
+  subject: string;
+  recipientName: string;
+  recipientContactName: string;
+  recipientSalutation: string;
+  recipientAddress: string;
+  /** The letter's body, ALREADY SANITISED WITH THE DOCUMENT PROFILE. */
+  bodyHtml: string;
+}
+
+/**
+ * The merge context for one letter.
+ *
+ * **`body` IS THE SECOND `MergeHtml` IN CONDUIT, AND THE FIRST THAT SOMEBODY
+ * TYPED INTO A DOCUMENT FORM.** The summary's notes are rich text borrowed from a
+ * `meetings` row; this is rich text whose only reason for existing is this
+ * document. Everything MergeHtml's own comment says applies unchanged -- the
+ * context decides what is raw and the template cannot ask, because templates are
+ * edited in Settings by any authenticated user and a triple-brace escape hatch
+ * would turn any CRM text field into markup injected into a subprocess.
+ *
+ * **IT IS NAMED `body` AND NOT `bodyHtml`.** Merge paths are what an operator
+ * types into a template, and `{{document.bodyHtml}}` puts an implementation
+ * detail on a page they are editing; the field list in Settings is where it says
+ * that this one arrives as formatted HTML. Nothing else in any context carries a
+ * type suffix either.
+ *
+ * THE SUBJECT AND THE ADDRESSEE ARE NOT RAW. They are plain text in plain inputs,
+ * so a recipient called `<b>Acme</b>` prints as itself rather than restructuring
+ * the page -- the summary's title, exactly.
+ *
+ * NO `number` KEY, so a template naming one prints a blank, which is right for a
+ * type that has none (`documentTypeNumbered`).
+ */
+export function buildLetterContext(input: LetterContextInput): MergeContext {
+  return {
+    org: orgContext(input.org),
+    document: {
+      issueDate: input.issueDate,
+      subject: input.subject,
+      recipientName: input.recipientName,
+      recipientContactName: input.recipientContactName,
+      recipientSalutation: input.recipientSalutation,
+      recipientAddress: input.recipientAddress,
+      body: new MergeHtml(input.bodyHtml),
+    },
+    // A letter has no priced lines, so `{{#lines}}` renders nothing. Empty rather
+    // than absent for buildMeetingSummaryContext's reason: MergeContext requires
+    // it, and requiring it is what keeps every quote context honest.
+    lines: [],
+  };
+}
+
+/** Everything the NDA and mutual NDA templates are allowed to print. */
+export interface AgreementContextInput {
+  org: OrgProfile;
+  number: string;
+  issueDate: string;
+  effectiveDate: string;
+  termMonths: number;
+  jurisdiction: string;
+  partyName: string;
+  partyContactName: string;
+  partyAddress: string;
+}
+
+/**
+ * The merge context for an NDA or a mutual NDA.
+ *
+ * ONE BUILDER FOR BOTH TYPES, because the two documents need the same values and
+ * differ only in what their templates say about them. Two builders would be two
+ * copies of one key set, and the key set is the contract this file's suite checks
+ * against the tokens read out of each seeded template -- so the second copy's
+ * failure to gain a field somebody added to the first is a blank on a signed
+ * page.
+ *
+ * **NOTHING HERE IS RAW.** An agreement has no rich-text field at all: its whole
+ * variable content is a party, three terms and two dates, every one of them plain
+ * text in a plain input. The document's prose is the TEMPLATE, which is the
+ * correct place for it -- editable in Settings, reviewable by whoever is
+ * responsible for the wording, and not smuggled through a form.
+ *
+ * `term` IS FORMATTED HERE AND `termMonths` IS NOT EXPOSED, so a template cannot
+ * print a bare `36` beside its own word for months and get "36 months months".
+ */
+export function buildAgreementContext(input: AgreementContextInput): MergeContext {
+  return {
+    org: orgContext(input.org),
+    document: {
+      number: input.number,
+      issueDate: input.issueDate,
+      effectiveDate: input.effectiveDate,
+      term: formatAgreementTerm(input.termMonths),
+      jurisdiction: input.jurisdiction,
+      partyName: input.partyName,
+      partyContactName: input.partyContactName,
+      partyAddress: input.partyAddress,
+    },
+    lines: [],
+  };
+}
+
+/** `documents` + `document_letters` -> the wire shape. */
+function toLetterRecord(row: DocumentRow, letter: DocumentLetterRow): LetterRecord {
+  return {
+    id: row.id,
+    type: "letter",
+    // READ OFF THE ROW, WHERE toMeetingSummaryRecord TAKES ITS ID FROM THE
+    // CALLER, and the difference is real rather than an inconsistency. A summary
+    // is always of a meeting, so `documents.meeting_id`'s nullability is a fact
+    // about the table; a letter is genuinely of a company OR a contact, decided
+    // per row, and a reader that wants to say who it is addressed to has to be
+    // told which. Both columns are on the wire and exactly one is non-null,
+    // which `documents_exactly_one_entity` guarantees.
+    companyId: row.companyId,
+    contactId: row.contactId,
+    fileId: row.fileId,
+    issueDate: row.issueDate,
+    frozen: row.frozen,
+    subject: letter.subject,
+    recipientName: letter.recipientName,
+    recipientContactName: letter.recipientContactName,
+    recipientSalutation: letter.recipientSalutation,
+    recipientAddress: letter.recipientAddress,
+    bodyHtml: letter.bodyHtml,
+    issuedByUserId: row.issuedByUserId,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+/** `documents` + `document_agreements` -> the wire shape. */
+function toAgreementRecord(row: DocumentRow, agreement: DocumentAgreementRow): AgreementRecord {
+  // Cannot fire: this function is reached only for a row that HAS a
+  // `document_agreements` row, and `documents_number_matches_type` says an
+  // agreement has a number. Thrown rather than `?? ""` for toDocumentRecord's
+  // reason -- an agreement whose number vanished is a broken record, and an empty
+  // string on a document list is a broken record nobody notices.
+  if (row.number === null) {
+    throw new Error(`document ${row.id} is an agreement with no number, which two CHECKs forbid`);
+  }
+  return {
+    id: row.id,
+    type: agreement.type as AgreementRecord["type"],
+    number: row.number,
+    companyId: row.companyId,
+    contactId: row.contactId,
+    fileId: row.fileId,
+    issueDate: row.issueDate,
+    frozen: row.frozen,
+    effectiveDate: agreement.effectiveDate,
+    termMonths: agreement.termMonths,
+    jurisdiction: agreement.jurisdiction,
+    partyName: agreement.partyName,
+    partyContactName: agreement.partyContactName,
+    partyAddress: agreement.partyAddress,
+    issuedByUserId: row.issuedByUserId,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+/**
+ * The PDF's filename, for a type whose documents are told apart by what they say
+ * rather than by a number.
+ *
+ * `summaryFileName`'s twin and it shares its two arguments: the text is not
+ * sanitised here (three places already have an opinion about what a filename is,
+ * and a fourth would be a fourth opinion), and the DATE is in it because this
+ * type can be produced again -- two letters to the same company landing in a
+ * downloads folder as `Letter - Acme.pdf` and `Letter - Acme (1).pdf` say nothing
+ * about which is which.
+ *
+ * THE SUBJECT IS PREFERRED TO THE RECIPIENT AND THE RECIPIENT IS THE FALLBACK.
+ * A subject is what distinguishes two letters to the same company, which is the
+ * collision this function exists to break; the recipient distinguishes nothing
+ * when both letters are to them. The subject is optional, so the fallback is not
+ * decoration.
+ */
+const LETTER_TITLE_CHARS = 80;
+function letterFileName(subject: string, recipientName: string, issueDate: string): string {
+  const chosen = subject.trim() === "" ? recipientName.trim() : subject.trim();
+  const trimmed = chosen.slice(0, LETTER_TITLE_CHARS);
+  return `Letter - ${trimmed === "" ? "untitled" : trimmed} - ${issueDate}.pdf`;
+}
+
+/**
+ * A letter's own content, sanitised and checked for having survived it.
+ *
+ * **TWO FAILURES, TWO SENTENCES, AND THIS IS THE SECOND.** `bodyHtml.min(1)` in
+ * @conduit/shared refuses an empty submission; this refuses a submission that was
+ * not empty and becomes empty once the document profile has had it -- a paste of
+ * `<script>...</script>`, a lone comment, markup made entirely of tags the
+ * profile drops. Left ungated that renders a letterhead with a greeting and a
+ * sign-off and nothing between them, which is a document somebody posts.
+ *
+ * SANITISED WITH THE DOCUMENT PROFILE AND NOT THE MAIL ONE, exactly as the
+ * summary's notes are, and for the reason the summary records: the two profiles
+ * differ in both directions -- mail strips the page-layout CSS a document is made
+ * of, and a document allows `<style>`, which mail does not. What is about to be
+ * emitted unescaped is measured against the profile of the document it is going
+ * into.
+ */
+function sanitizeLetterBody(bodyHtml: string): string {
+  const clean = sanitizeDocumentHtml(bodyHtml);
+  if (clean.trim() === "") {
+    throw new DocumentInputError(
+      "the letter is empty once sanitised; it contained no markup a document keeps",
+    );
+  }
+  return clean;
+}
+
+/** The merged size gate's third term, which differs per type. */
+function letterProvenance(templateHtml: string, org: OrgProfile, bodyHtml: string): string {
+  return `Its template is ${String(Buffer.byteLength(templateHtml, "utf8"))} bytes, its logo `
+    + `${String(org.logoDataUri.length)}, and its body `
+    + `${String(Buffer.byteLength(bodyHtml, "utf8"))}`;
+}
+
+/**
+ * Write a letter. ONE TRANSACTION, and it is `issueMeetingSummary`'s order rather
+ * than `issueQuote`'s: read the record, read the template, read the issuer
+ * profile, merge, check the caps, render, write the blob, insert the file, insert
+ * the two rows.
+ *
+ * **NO NUMBER AND THEREFORE NO ROW LOCK AND THEREFORE NO `SET LOCAL
+ * lock_timeout`** -- the summary's arrangement exactly, and @conduit/shared's
+ * `documentTypeNumbered` has the three reasons a letter has none. Two letters
+ * render side by side, bounded by renderPdf's own concurrency cap and nothing
+ * else.
+ *
+ * **NOT FROZEN**, which is what makes `redraftLetter` below possible and is the
+ * whole reason this task exists. `frozen` is written rather than defaulted, for
+ * the reason 0016 dropped the DEFAULT: a writer that forgets must fail loudly
+ * rather than inherit "frozen".
+ */
+export async function issueLetter(
+  db: Database,
+  deps: IssueQuoteDeps,
+  actorId: string,
+  target: RecordTarget,
+  input: IssueLetterInput,
+): Promise<LetterRecord> {
+  const parsed = issueLetterInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new DocumentInputError(parsed.error.issues[0]?.message ?? "invalid letter");
+  }
+  const letter = parsed.data;
+
+  const record = await db.transaction(async (tx) => {
+    await assertRecordIssuable(tx, target);
+    const templateHtml = await loadTemplateBody(tx, "letter");
+    const org = await getOrgProfile(tx);
+    const bodyHtml = sanitizeLetterBody(letter.bodyHtml);
+    const values = {
+      subject: letter.subject ?? "",
+      recipientName: letter.recipientName,
+      recipientContactName: letter.recipientContactName ?? "",
+      recipientSalutation: letter.recipientSalutation ?? "",
+      recipientAddress: letter.recipientAddress ?? "",
+      bodyHtml,
+    };
+
+    const file = await renderAndStore(tx, deps, actorId, {
+      noun: "letter",
+      templateHtml,
+      context: buildLetterContext({ org, issueDate: letter.issueDate, ...values }),
+      provenance: letterProvenance(templateHtml, org, bodyHtml),
+      originalName: letterFileName(values.subject, values.recipientName, letter.issueDate),
+      target,
+    });
+
+    const [row] = await tx.insert(documents).values({
+      // SPELLED OUT RATHER THAN OMITTED, as the summary's is. `number` is
+      // nullable, so leaving it off would insert the same NULL -- but this is
+      // where a reader finds out that a letter has none.
+      number: null,
+      type: "letter",
+      ...target,
+      fileId: file.id,
+      issueDate: letter.issueDate,
+      frozen: documentTypeFreezes("letter"),
+      issuedByUserId: actorId,
+    }).returning();
+    if (row === undefined) throw new Error("document insert returned no row");
+
+    const [letterRow] = await tx.insert(documentLetters)
+      .values({ documentId: row.id, ...values }).returning();
+    if (letterRow === undefined) throw new Error("document_letters insert returned no row");
+
+    return toLetterRecord(row, letterRow);
+  });
+
+  publish({ keys: [["record-documents", targetId(target)], ["files"], ["events"]] });
+  return record;
+}
+
+/**
+ * **REDRAFT A LETTER -- THE ONLY WRITE IN CONDUIT THAT MODIFIES AN ISSUED
+ * DOCUMENT, AND THEREFORE THE ONE THE GUARD IS ABOUT.**
+ *
+ * Chris, 6 Sep: a letter "wants redrafting before it goes". Until this function
+ * there was no update path at all -- Phase 7 built none, and Task 2 deliberately
+ * declined to build one for the summary precisely because "an edit-in-place path
+ * here would be the one place in the codebase that mutated an issued document
+ * with no guard anywhere".
+ *
+ * ============================== THE GUARD ==================================
+ *
+ * **THE REFUSAL IS SAID TWICE IN THIS FUNCTION, AND MUTATION TESTING SETTLED
+ * WHICH HALF IS LOAD-BEARING.** The SELECT below refuses a frozen document before
+ * anything spawns; the UPDATE then carries `AND frozen = false`, so the test and
+ * the write are ONE statement with no window between them. Measured: removing the
+ * SELECT's check is caught by three tests, and removing the UPDATE's clause ALONE
+ * is green -- because nothing can change `frozen` under a live row, so the two
+ * can never disagree. The clause stays because what makes it unobservable is two
+ * other guards holding, and a guard that leans on another guard should still
+ * state its own condition.
+ *
+ * **AND NEITHER OF THEM IS THE THING THAT MAKES THE RULE TRUE.** 0019 puts
+ * `conduit_document_frozen_guard` on `documents` and on all three detail tables,
+ * BEFORE UPDATE OR DELETE. Delete the `frozen` clause below and this function
+ * still cannot edit a quote: the trigger refuses it, from the database, for every
+ * writer including a psql session. That is the layering the spec's fourth risk
+ * asks for -- the rule that a quote cannot be edited must not depend on this
+ * function being written correctly, because the next type's author will write a
+ * different function.
+ *
+ * **WHY IT READS `frozen` AND NOT `documentTypeFreezes(row.type)`.** They agree --
+ * `documents_frozen_matches_type` is an equality and db/schema.test.ts pins the
+ * two spellings for every member of the enum. The column is used anyway because
+ * db/schema.ts's own comment on it says why: "a guard that re-derives policy from
+ * the type at each call site is a guard that can be written wrong once per call
+ * site; one that reads a fact off the row cannot." Re-deriving would also make
+ * the guard unspellable in SQL, which is where it has to be for the two
+ * statements to be one.
+ *
+ * ============================ WHAT A REDRAFT IS ============================
+ *
+ * THE WHOLE FORM, NOT A PATCH. `redraftLetterInputSchema` is the issue schema
+ * minus its `type`, so the two paths cannot come to different answers about what
+ * a valid letter is, and clearing a field is expressible. Same reasoning as PUT
+ * /api/org-profile.
+ *
+ * **A NEW `files` ROW EACH TIME, AND THE OLD PDF STAYS.** The alternative --
+ * rewriting the existing row's sha256, size and name in place -- was rejected on
+ * two grounds. It would be the first thing in Conduit ever to mutate a `files`
+ * row, on the table the download route, the rail's Files tab, the export and the
+ * backup all read; and it would go around `attachFile`, which is the one place a
+ * `files` row is created, which re-checks that the record is still active, and
+ * which stamps the `file_attached` entry that is the only record anywhere of WHEN
+ * a redraft happened. The cost is a superseded PDF on the record's Files tab, and
+ * that is honest rather than untidy: those bytes existed, and may have been sent.
+ *
+ * NO `updated_at` COLUMN, and its absence is a decision. The `documents` row
+ * still says only what it always said; when a letter was last redrafted is the
+ * `created_at` of the `files` row it now points at, which is a fact the system
+ * already keeps rather than a second copy of one.
+ */
+export async function redraftLetter(
+  db: Database,
+  deps: IssueQuoteDeps,
+  actorId: string,
+  documentId: string,
+  input: RedraftLetterInput,
+): Promise<LetterRecord> {
+  const parsed = redraftLetterInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new DocumentInputError(parsed.error.issues[0]?.message ?? "invalid letter");
+  }
+  const letter = parsed.data;
+
+  const { record, target } = await db.transaction(async (tx) => {
+    // READ FIRST, TO REFUSE EARLY AND TO SAY WHY -- and this read IS what stops a
+    // frozen document today, which is not what a first draft of this comment
+    // claimed. It said the UPDATE below was "the guard" and this was merely an
+    // early refusal; **mutation testing said otherwise.** Removing this line is
+    // caught by three tests (a frozen document must be refused before anything
+    // spawns, with a renderer that fails if it runs at all), while removing the
+    // UPDATE's `AND frozen = false` on its own is GREEN -- because `frozen` cannot
+    // change under a live row, so the two statements can never disagree.
+    //
+    // THE `AND frozen = false` STAYS ANYWAY, and its being unobservable is the
+    // point rather than an argument against it: what makes it unobservable is
+    // that `documents_frozen_matches_type` and the trigger between them make
+    // `frozen` immutable, and a guard that depends on another guard holding is
+    // exactly the kind that should also state its own condition. Removing BOTH is
+    // red, and what kills it is the DATABASE -- see the header.
+    const [existing] = await tx.select({
+      type: documents.type, frozen: documents.frozen,
+      companyId: documents.companyId, contactId: documents.contactId,
+    }).from(documents).where(eq(documents.id, documentId));
+    if (existing === undefined) throw new NotFoundError("document", documentId);
+    if (existing.frozen) throw new DocumentFrozenError(documentId, existing.type);
+    // A DIFFERENT REFUSAL FROM THE FROZEN ONE, and it is not redundant with it.
+    // A meeting summary is not frozen either, and it has no `document_letters`
+    // row to rewrite -- so without this, redrafting one would fail on a missing
+    // detail row with a 500 instead of saying that this is not a letter. The
+    // rule "which types have a redraft path" is not the rule "which types are
+    // frozen", and conflating them is how the next unfrozen type gets a broken
+    // one for free.
+    if (existing.type !== "letter") {
+      throw new DocumentInputError(`document ${documentId} is a ${existing.type}, not a letter`);
+    }
+    // SPELLED OUT RATHER THAN `existing.contactId!`, AND THE `!` IT REPLACES WAS
+    // COVERING A REAL GAP. `documents_exactly_one_entity` says exactly one of
+    // FIVE; it does not say WHICH one for a given type, so nothing in the
+    // database stops a letter carrying a `deal_id` -- only the writers do. That
+    // has been true since Task 2 (a summary could carry a deal) and this task
+    // made it true for three more types. The CHECK that would close it is at
+    // "which entity, per type" in the plan, and it is deliberately not in 0019
+    // because it is a rule about all five types and two of them are Task 4's.
+    // Until it exists, this branch is reachable by a psql session, and it says so
+    // loudly rather than dereferencing a null.
+    const target: RecordTarget | null = existing.companyId !== null
+      ? { companyId: existing.companyId }
+      : existing.contactId !== null ? { contactId: existing.contactId } : null;
+    if (target === null) {
+      throw new Error(
+        `letter ${documentId} is attached to neither a company nor a contact, `
+        + "which no writer can produce",
+      );
+    }
+
+    await assertRecordIssuable(tx, target);
+    const templateHtml = await loadTemplateBody(tx, "letter");
+    const org = await getOrgProfile(tx);
+    const bodyHtml = sanitizeLetterBody(letter.bodyHtml);
+    const values = {
+      subject: letter.subject ?? "",
+      recipientName: letter.recipientName,
+      recipientContactName: letter.recipientContactName ?? "",
+      recipientSalutation: letter.recipientSalutation ?? "",
+      recipientAddress: letter.recipientAddress ?? "",
+      bodyHtml,
+    };
+
+    const file = await renderAndStore(tx, deps, actorId, {
+      noun: "letter",
+      templateHtml,
+      context: buildLetterContext({ org, issueDate: letter.issueDate, ...values }),
+      provenance: letterProvenance(templateHtml, org, bodyHtml),
+      originalName: letterFileName(values.subject, values.recipientName, letter.issueDate),
+      target,
+    });
+
+    // ============================ THE GUARD ================================
+    // `frozen = false` is part of the statement that writes, not a check that
+    // ran before it. See this function's header.
+    const [row] = await tx.update(documents)
+      .set({ fileId: file.id, issueDate: letter.issueDate })
+      .where(and(eq(documents.id, documentId), eq(documents.frozen, false)))
+      .returning();
+    if (row === undefined) throw new DocumentFrozenError(documentId, existing.type);
+
+    const [letterRow] = await tx.update(documentLetters)
+      .set(values).where(eq(documentLetters.documentId, documentId)).returning();
+    if (letterRow === undefined) throw new Error("document_letters update returned no row");
+
+    return { record: toLetterRecord(row, letterRow), target };
+  });
+
+  publish({ keys: [["record-documents", targetId(target)], ["files"], ["events"]] });
+  return record;
+}
+
+/**
+ * Raise an NDA or a mutual NDA. `issueQuote`'s shape, because this is the second
+ * numbered type and numbering is what gives that function its order.
+ *
+ * **THE NUMBER IS ALLOCATED BEFORE THE RENDER AND THE TRANSACTION IS WHAT MAKES
+ * THAT SAFE**, for issueQuote's reason exactly: the number is PRINTED on the page,
+ * and a render that then fails must not spend it -- an agreement sequence with
+ * holes invites the question of what was in the hole, and for a contract that is
+ * a worse question than it is for a quote. `nextval()` cannot help; a table row
+ * rolls back.
+ *
+ * **AND THE `SET LOCAL lock_timeout` COMES WITH IT.** `allocateNumber`'s ON
+ * CONFLICT takes a row lock on (type, year) held to commit, so two NDAs of the
+ * same year serialise from there to the end of the transaction with a render
+ * inside. Without the timeout a pile-up occupies pooled connections
+ * indefinitely; 45s is one full worst-case hold plus slack, which is issueQuote's
+ * figure and its argument, unchanged. `nda` and `mutual_nda` are separate rows in
+ * `document_number_sequences`, so the two types do not queue behind each other.
+ *
+ * **FROZEN ON ISSUE**, which is Chris's decision and the sharpest one in the
+ * spec. From the moment this transaction commits, `conduit_document_frozen_guard`
+ * refuses every UPDATE and DELETE against this row and its detail row, from every
+ * writer.
+ */
+export async function issueAgreement(
+  db: Database,
+  deps: IssueQuoteDeps,
+  actorId: string,
+  target: RecordTarget,
+  input: IssueAgreementInput,
+): Promise<AgreementRecord> {
+  const parsed = issueAgreementInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new DocumentInputError(parsed.error.issues[0]?.message ?? "invalid agreement");
+  }
+  const agreement = parsed.data;
+  const year = Number(agreement.issueDate.slice(0, 4));
+
+  const record = await db.transaction(async (tx) => {
+    await tx.execute(sql`SET LOCAL lock_timeout = '45s'`);
+    await assertRecordIssuable(tx, target);
+    const templateHtml = await loadTemplateBody(tx, agreement.type);
+    const org = await getOrgProfile(tx);
+    const values = {
+      type: agreement.type,
+      effectiveDate: agreement.effectiveDate,
+      termMonths: agreement.termMonths,
+      jurisdiction: agreement.jurisdiction,
+      partyName: agreement.partyName,
+      partyContactName: agreement.partyContactName ?? "",
+      partyAddress: agreement.partyAddress ?? "",
+    };
+
+    const number = await allocateNumber(tx, agreement.type, year);
+    const file = await renderAndStore(tx, deps, actorId, {
+      // "nda" and "mutual NDA" read badly in a sentence; the size refusals say
+      // "agreement", which is what both of them are and what the message is
+      // about. The quote's three refusals are untouched, which is what keeps the
+      // route suite's assertions about their wording meaningful.
+      noun: "agreement",
+      templateHtml,
+      context: buildAgreementContext({ org, number, issueDate: agreement.issueDate, ...values }),
+      // NAMES THE JURISDICTION AND THE PARTY, because those are the only parts of
+      // this document an operator can shorten: there is no body to trim (the
+      // prose is the template) and no notes.
+      provenance: `Its template is ${String(Buffer.byteLength(templateHtml, "utf8"))} bytes, `
+        + `its logo ${String(org.logoDataUri.length)}, and its party and jurisdiction `
+        + `${String(agreementContentBytes(agreement))}`,
+      originalName: `${number}.pdf`,
+      target,
+    });
+
+    const [row] = await tx.insert(documents).values({
+      number, type: agreement.type, ...target, fileId: file.id,
+      issueDate: agreement.issueDate,
+      frozen: documentTypeFreezes(agreement.type),
+      issuedByUserId: actorId,
+    }).returning();
+    if (row === undefined) throw new Error("document insert returned no row");
+
+    const [agreementRow] = await tx.insert(documentAgreements)
+      .values({ documentId: row.id, ...values }).returning();
+    if (agreementRow === undefined) throw new Error("document_agreements insert returned no row");
+
+    return toAgreementRecord(row, agreementRow);
+  });
+
+  publish({ keys: [["record-documents", targetId(target)], ["files"], ["events"]] });
+  return record;
+}
+
+/**
+ * Every document attached to one company or one contact, newest first.
+ *
+ * **THE READER THAT MIXES TYPES, WHICH IS WHAT THE DISCRIMINATED UNION IN
+ * @conduit/shared WAS WAITING FOR.** Task 1 expected the union with the second
+ * type; Task 2 explained why it had not arrived (nothing yet RECEIVED both
+ * shapes) and named the reader that would need it. This is that reader.
+ *
+ * **TWO LEFT JOINS AND ONE PASS, NOT TWO QUERIES.** A union of `listLetters` and
+ * `listAgreements` would be two round trips whose results have to be merged and
+ * re-sorted in TypeScript -- and the merge has to reproduce the ORDER BY, in a
+ * second place, by hand. One query orders once, in the database, over the column
+ * the order is about.
+ *
+ * LEFT AND NOT INNER, WHICH IS THE OPPOSITE OF `listDocuments`' CHOICE AND FOR
+ * THE SAME REASON. That one INNER JOINs `document_quotes` because it means "the
+ * documents on this deal THAT ARE QUOTES". This one means "every document on this
+ * record", so a join that dropped a row would drop a document -- which is exactly
+ * the failure Task 2 found in the export's `documentsSheet`, from an INNER JOIN
+ * written when one type existed.
+ *
+ * A ROW WITH NEITHER DETAIL IS AN ERROR AND NOT A SKIP. It cannot occur -- both
+ * detail rows are written in the same transaction as their parent, both are keyed
+ * by the primary key, and `documents_type_valid` admits nothing else that can
+ * attach to a company or a contact -- so a `continue` here would be an unreachable
+ * branch that quietly hides the one thing it could ever mean, which is a document
+ * whose content is missing.
+ */
+export async function listRecordDocuments(
+  db: Database, target: RecordTarget,
+): Promise<RecordDocument[]> {
+  const rows = await db.select({
+    document: documents, letter: documentLetters, agreement: documentAgreements,
+  })
+    .from(documents)
+    .leftJoin(documentLetters, eq(documentLetters.documentId, documents.id))
+    .leftJoin(documentAgreements, eq(documentAgreements.documentId, documents.id))
+    .where("companyId" in target
+      ? eq(documents.companyId, target.companyId)
+      : eq(documents.contactId, target.contactId))
+    .orderBy(desc(documents.createdAt), desc(documents.id));
+  return rows.map((row) => {
+    if (row.letter !== null) return toLetterRecord(row.document, row.letter);
+    if (row.agreement !== null) return toAgreementRecord(row.document, row.agreement);
+    throw new Error(
+      `document ${row.document.id} is a ${row.document.type} on a ${targetNoun(target)} `
+      + "with no detail row, which no writer can produce",
+    );
+  });
 }

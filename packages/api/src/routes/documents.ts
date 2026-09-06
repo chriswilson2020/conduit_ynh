@@ -2,15 +2,17 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import {
   documentTemplateInputSchema, documentTypeSchema, issueQuoteInputSchema, orgProfileInputSchema,
+  recordDocumentInputSchema, redraftLetterInputSchema,
 } from "@conduit/shared";
 import type { CrmRouteDeps } from "./index.js";
 import { requireUser, mapDomainError, parseOrReject, idParamSchema } from "./helpers.js";
 import { RenderBusyError, RenderError } from "../services/documents-render.js";
 import { TemplateError } from "../services/documents-template.js";
 import {
-  DocumentInputError, DocumentTemplateMissingError, DocumentTooLargeError,
-  getDocumentTemplate, issueMeetingSummary, issueQuote, listDocuments,
-  listMeetingSummaries, saveDocumentTemplate,
+  DocumentFrozenError, DocumentInputError, DocumentTemplateMissingError, DocumentTooLargeError,
+  getDocumentTemplate, issueAgreement, issueLetter, issueMeetingSummary, issueQuote,
+  listDocuments, listMeetingSummaries, listRecordDocuments, redraftLetter, saveDocumentTemplate,
+  type RecordTarget,
 } from "../services/documents.js";
 import { getOrgProfile, OrgProfileInputError, saveOrgProfile } from "../services/org-profile.js";
 
@@ -53,12 +55,50 @@ function isPostgresError(error: unknown, code: string): boolean {
     && (error as { cause?: { code?: unknown } }).cause?.code === code;
 }
 
+/**
+ * The driver's own message for a failed query, which is NOT `error.message`.
+ *
+ * drizzle wraps a query failure in a `DrizzleQueryError` whose message is
+ * "Failed query: UPDATE ..." with the SQL in it; what PostgreSQL actually said is
+ * on the `cause`, beside the `code` above. A first draft of the frozen-trigger
+ * arm below read `error.message` and would have matched the SQL text rather than
+ * the refusal -- true for any statement mentioning the constraint by name, false
+ * for the one that violates it.
+ */
+function postgresMessage(error: unknown): string {
+  if (typeof error !== "object" || error === null) return "";
+  const message = (error as { cause?: { message?: unknown } }).cause?.message;
+  return typeof message === "string" ? message : "";
+}
+
 export function mapDocumentError(reply: FastifyReply, error: unknown): void {
   // The input gates, quote and profile alike. The route already parsed the same
   // schema, so these are the services refusing a caller that reached them another
   // way -- but the shape a client sees has to be the same either way.
   if (error instanceof DocumentInputError || error instanceof OrgProfileInputError) {
     void reply.code(400).send({ error: "validation", message: error.message });
+    return;
+  }
+  /*
+   * **409, AND THE ARM EXISTS SO THIS IS NEVER A 500.** A frozen document is a
+   * conflict with the state of the resource, which is what 409 means, and it is
+   * exactly what `PUT /api/documents/:id` answers when somebody points a redraft
+   * at a quote or an NDA.
+   *
+   * ITS OWN CODE, NOT `validation`. Nothing was wrong with the submission -- the
+   * same body would have been accepted against a letter -- so a 400 would send
+   * the person editing it looking at their fields. `frozen` says what changed:
+   * the document, not the input.
+   *
+   * IT IS ALSO WHAT MAPS `conduit_document_frozen_guard`'s REFUSAL, though
+   * nothing reachable should ever produce one: the service's UPDATE carries
+   * `AND frozen = false` and answers this error itself. If the trigger ever
+   * fires through a route it is a bug, and a 500 is what a bug deserves -- but
+   * an operator watching a spinner deserves the sentence rather than the
+   * stack, so the message is the same either way. See the 23514 arm below.
+   */
+  if (error instanceof DocumentFrozenError) {
+    void reply.code(409).send({ error: "frozen", message: error.message });
     return;
   }
   // 409 rather than 500: the seeded template was deleted, which an operator fixes in
@@ -95,6 +135,32 @@ export function mapDocumentError(reply: FastifyReply, error: unknown): void {
   // rather than occupying a pooled connection indefinitely. Retrying is exactly right,
   // which is what 503 says; nothing was spent, because the timeout fires before the
   // number is allocated.
+  /*
+   * **THE TRIGGER'S OWN REFUSAL, WHICH NOTHING REACHABLE SHOULD PRODUCE.**
+   * `conduit_document_frozen_guard` (migration 0019) raises 23514 with its name
+   * in the message. Every route that could reach it goes through a service that
+   * has already refused with DocumentFrozenError above, so arriving here means a
+   * write path nobody has written yet -- Task 4's, say -- got past the service.
+   *
+   * MATCHED ON THE NAME AND NOT ON 23514 ALONE, which is the whole reason this
+   * arm is three lines rather than one. Every CHECK in the schema raises 23514:
+   * a negative quantity, a malformed currency, an over-long timezone. Mapping
+   * the code would turn all of them into "an issued quote cannot be changed".
+   *
+   * WHY MAP IT AT ALL RATHER THAN LET IT 500. The 500 would be honest about
+   * there being a bug, and useless to the operator holding the mouse. This gives
+   * them the same sentence the service would have given them, and the server log
+   * still has the trigger's message with the constraint name in it, which is
+   * what says a guard fired that should not have had to.
+   */
+  if (isPostgresError(error, "23514")
+    && postgresMessage(error).includes("documents_frozen_is_immutable")) {
+    void reply.code(409).send({
+      error: "frozen",
+      message: "an issued document cannot be changed",
+    });
+    return;
+  }
   if (isPostgresError(error, "55P03")) {
     void reply.code(503).send({
       error: "busy",
@@ -175,6 +241,101 @@ export function registerDocumentRoutes(app: FastifyInstance, { db, dataDir }: Cr
     try {
       const document = await issueMeetingSummary(db, { dataDir }, user.id, params.id);
       return await reply.code(201).send(document);
+    } catch (error) {
+      mapDocumentError(reply, error);
+    }
+  });
+
+  /*
+   * THE COMPANY'S AND THE CONTACT'S DOCUMENTS -- Phase 9 Task 3.
+   *
+   * TWO RECORDS, ONE PAIR OF HANDLERS EACH, AND ONE BODY SCHEMA. The type is in
+   * the BODY and not in the path (`recordDocumentInputSchema` discriminates on
+   * it), because what a caller is doing is "add a document to this company" and
+   * which kind is a choice inside that. The alternative --
+   * `/companies/:id/letters`, `/companies/:id/ndas`, and the same again for
+   * contacts -- grows a route pair per type per record for ever, and makes the
+   * record's own document list a union of N reads instead of one.
+   *
+   * `:id` AGAIN, for the reason the deal's routes have it: find-my-way refuses
+   * two different parameter names in the same path position, and
+   * `/api/companies/:id`, `/archive` and `/unarchive` already exist.
+   *
+   * THE PDF STILL DOWNLOADS THROUGH GET /api/files/:id/download and there is
+   * still no download route here. That is Phase 7's design and Task 2 kept it;
+   * a letter's page is an ordinary `files` row on the same record.
+   */
+  const recordDocumentRoutes = (
+    path: "companies" | "contacts",
+    toTarget: (id: string) => RecordTarget,
+  ): void => {
+    app.get(`/api/${path}/:id/documents`, async (request, reply) => {
+      if (requireUser(request, reply) === null) return;
+      const params = parseOrReject(idParamSchema, request.params, reply);
+      if (params === undefined) return;
+      // Unbounded, like the deal's documents and the meeting's summaries: a
+      // company's documents stay countable, and there is no cursor to page with.
+      return await listRecordDocuments(db, toTarget(params.id));
+    });
+
+    app.post(`/api/${path}/:id/documents`, async (request, reply) => {
+      const user = requireUser(request, reply);
+      if (user === null) return;
+      const params = parseOrReject(idParamSchema, request.params, reply);
+      if (params === undefined) return;
+      const input = parseOrReject(recordDocumentInputSchema, request.body, reply);
+      if (input === undefined) return;
+      try {
+        const target = toTarget(params.id);
+        // THE ONE BRANCH ON THE DISCRIMINATOR, and it is here rather than inside
+        // a single service function because the two produce different DTOs and
+        // take different paths through the database -- an agreement allocates a
+        // number under a row lock and a letter does not. A service that took the
+        // union would open with this same `if` and then have two bodies.
+        const document = input.type === "letter"
+          ? await issueLetter(db, { dataDir }, user.id, target, input)
+          : await issueAgreement(db, { dataDir }, user.id, target, input);
+        return await reply.code(201).send(document);
+      } catch (error) {
+        mapDocumentError(reply, error);
+      }
+    });
+  };
+  recordDocumentRoutes("companies", (id) => ({ companyId: id }));
+  recordDocumentRoutes("contacts", (id) => ({ contactId: id }));
+
+  /*
+   * **REDRAFT A LETTER. THE ONLY ROUTE IN CONDUIT THAT MODIFIES AN ISSUED
+   * DOCUMENT**, and the reason the sentence at the top of this file -- "there is
+   * no update or delete, which is the phase's central claim" -- is now true of
+   * the QUOTE rather than of documents in general.
+   *
+   * A PUT AND NOT A PATCH, matching PUT /api/org-profile and for its reason: it
+   * is one form with seven fields and no concurrent editors, so sending the whole
+   * thing is both the simplest contract and the only one in which clearing a
+   * field is expressible. `redraftLetterInputSchema` is the issue schema minus
+   * its `type`, so the two cannot validate different things.
+   *
+   * ON /api/documents/:id RATHER THAN UNDER THE RECORD, because a redraft does
+   * not need to know which record the letter is on -- the document does, and
+   * putting it in the path would let a caller name a company the letter is not
+   * attached to and get either a 404 or, worse, a silent write to the wrong
+   * record's timeline. The service reads the target off the row.
+   *
+   * THERE IS STILL NO DELETE, ANYWHERE. A letter that should not have been
+   * written is a letter that was written; nothing in this product deletes a
+   * record, and `conduit_document_frozen_guard` refuses a DELETE of a frozen one
+   * outright.
+   */
+  app.put("/api/documents/:id", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    const input = parseOrReject(redraftLetterInputSchema, request.body, reply);
+    if (input === undefined) return;
+    try {
+      return await redraftLetter(db, { dataDir }, user.id, params.id, input);
     } catch (error) {
       mapDocumentError(reply, error);
     }
