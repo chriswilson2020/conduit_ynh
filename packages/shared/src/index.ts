@@ -22,6 +22,19 @@ export {
 // does not put the name in this module's scope, which is why the line above is
 // not enough on its own.
 import { MONEY_LOCALE } from "./money-format.js";
+// v1.8.0's organisation timezone, reaching web and api the same way the money
+// helpers do and for the same reason: the Settings form refuses a zone before it
+// is sent, saveOrgProfile refuses one that arrives anyway, and the renderer has
+// to make the same judgement about a stored one. Three readings of "is this a
+// zone" that agree today would not stay agreed.
+export {
+  DEFAULT_TIME_ZONE, MAX_TIME_ZONE_LENGTH, timeZoneLabel, timeZoneProblem, todayInZone,
+  usableTimeZone,
+} from "./time-zone.js";
+// ...and imported as well as re-exported, for the reason MONEY_LOCALE is:
+// `formatDocumentInstant` below needs the names in scope, and a re-export does
+// not put them there.
+import { timeZoneLabel, timeZoneProblem, usableTimeZone } from "./time-zone.js";
 // 7.6's backup passphrase rule, reaching web the same way and for the same
 // reason the money helpers do: the Settings page refuses a passphrase before it
 // is sent and services/backup.ts refuses one that arrives anyway, and those two
@@ -2445,22 +2458,46 @@ export function documentTypeNumbered(type: DocumentType): boolean {
 }
 
 /**
- * An instant, as a document prints it: `8 September 2026 at 14:00 UTC`.
+ * An instant, as a document prints it: `8 September 2026 at 16:00 CEST`.
  *
- * **THE ZONE IS NAMED BECAUSE CONDUIT DOES NOT KNOW THE RIGHT ONE, AND THIS IS A
- * FINDING RATHER THAN A PREFERENCE.** `meetings.occurred_at` is a `timestamptz`
- * built in the browser from what the operator typed in their own zone
- * (`localInputToIso` in web's meetings-lib.ts), and nothing anywhere stores that
- * zone: `org_profile` has no timezone column, `users` has none, and no request
- * carries one. So a document rendered on the server cannot reproduce the wall
- * clock the operator saw. The rail shows `toLocaleString()` -- the VIEWER's zone,
- * which is right for a screen -- and this prints UTC and says so, which is right
- * for a page that gets downloaded and sent: a reader can convert an instant that
- * names its zone and cannot even detect one that does not. Two hours' difference
- * between the rail and the PDF, admitted, beats the same two hours concealed.
+ * **THE ZONE IS AN ARGUMENT SINCE v1.8.0, AND IT IS REQUIRED.** Until then this
+ * function hard-coded UTC, because nothing in Conduit stored a zone at all:
+ * `meetings.occurred_at` is a `timestamptz` built in the browser from what the
+ * operator typed in their own zone (`localInputToIso` in web's meetings-lib.ts),
+ * `org_profile` had no timezone column, `users` had none, and no request carried
+ * one -- so the server could not reproduce the wall clock the operator saw and
+ * printed UTC instead, naming it so the page was at least honest. Phase 9 Task 2
+ * reported that; `org_profile.time_zone` is the answer, and this is where it
+ * lands.
  *
- * If that is not the trade Chris wants, the fix is an org-profile timezone and
- * this function taking it -- a Settings field and one argument, not a redesign.
+ * REQUIRED RATHER THAN DEFAULTED TO UTC, deliberately. Tasks 3 and 4 add three
+ * more types that print dates, and a defaulted parameter is a thing each of them
+ * could forget in a way that compiles, ships, and reads as a two-hour error on a
+ * page. Missing it is a build error instead. (`documentTypeFreezes`' `switch` is
+ * the same trick against the same class of omission.)
+ *
+ * **THE ZONE IS STILL NAMED, AND THAT IS THE DECISION MOST WORTH ARGUING.** The
+ * case for dropping the label is real -- a summary handed to somebody in the same
+ * office does not need `CEST` on it -- and it was rejected for two reasons. The
+ * first is what these documents ARE: a PDF, content-addressed, downloaded and
+ * emailed, which is the entire point of Phase 9; the reader who needs the label
+ * is the one who is not in the room, and there is no way to print a different
+ * page for them. The second is the failure path below. When the stored zone does
+ * not resolve, the fallback is UTC -- and the ONLY thing separating that from
+ * "silently reverting to UTC", which is how a document acquires the wrong time,
+ * is that the page says UTC. Drop the label and the fallback needs its own
+ * announcement mechanism, on the one path that is never exercised. Four
+ * characters buy both.
+ *
+ * THE LABEL IS COMPUTED AT THE INSTANT, so a January meeting reads `CET` and a
+ * July one `CEST` off the same stored zone. See timeZoneLabel for what en-GB
+ * actually produces for zones outside Europe, which is `GMT-5` rather than `EST`
+ * and is the better answer.
+ *
+ * **UTC IS UNCHANGED, BYTE FOR BYTE.** The default zone formats to the string
+ * v1.7.x printed -- `1 September 2026 at 13:30 UTC` -- because en-GB's short name
+ * for the UTC zone is exactly `UTC`. That is what makes UTC the only defensible
+ * backfill for an install that already has documents.
  *
  * MONEY_LOCALE's locale, deliberately, and for MONEY_LOCALE's own reason: the
  * package owns the formatting rather than the viewer, or the same meeting reads
@@ -2470,17 +2507,20 @@ export function documentTypeNumbered(type: DocumentType): boolean {
  * document must not carry.
  *
  * IT NEVER THROWS, matching every formatter in money-format.ts and for the same
- * reason. An unparseable instant would make `Intl.DateTimeFormat.format` throw a
- * RangeError; nothing storable in a `timestamptz` can produce one, and the guard
- * is what keeps that true for a caller this function does not know about.
+ * reason. There are now two ways it could: an unparseable instant makes
+ * `Intl.DateTimeFormat.format` throw a RangeError, and an unresolvable zone makes
+ * the CONSTRUCTOR throw one -- which is the worse of the two, because it fires
+ * half way through building a page rather than on a value nothing storable can
+ * produce. `usableTimeZone` takes that one.
  */
-export function formatDocumentInstant(iso: string): string {
+export function formatDocumentInstant(iso: string, timeZone: string): string {
   const at = new Date(iso);
   if (Number.isNaN(at.getTime())) return "";
+  const zone = usableTimeZone(timeZone);
   const formatted = new Intl.DateTimeFormat(MONEY_LOCALE, {
-    dateStyle: "long", timeStyle: "short", timeZone: "UTC",
+    dateStyle: "long", timeStyle: "short", timeZone: zone,
   }).format(at);
-  return `${formatted} UTC`;
+  return `${formatted} ${timeZoneLabel(zone, at)}`;
 }
 
 /**
@@ -3083,6 +3123,23 @@ export const orgProfileSchema = z.object({
   website: z.string(),
   bankDetails: z.string(),
   logoDataUri: z.string(),
+  /**
+   * THE ORGANISATION'S CLOCK, and the one field here that is never "". Every
+   * other value on this profile is optional on a printed page, so the empty
+   * string is a legitimate absence; a zone is not optional, because there is no
+   * such thing as formatting an instant in no zone. `DEFAULT_TIME_ZONE` is what
+   * an install has until it says otherwise, including one that has never opened
+   * Settings -- see getOrgProfile's emptyProfile.
+   *
+   * NOT VALIDATED ON THE WAY OUT. This schema is what the API RETURNS, and a row
+   * whose zone has stopped resolving -- a name coined after this server's tzdata,
+   * or a restore from an install with different tzdata -- still has to be
+   * readable: refusing to hand back the profile would take Settings, the one page
+   * that can fix it, down with the value that is wrong.
+   * `usableTimeZone` decides what a render does with such a value and
+   * `timeZoneProblem` is what the form shows about it.
+   */
+  timeZone: z.string(),
   updatedAt: z.iso.datetime(),
 });
 export type OrgProfile = z.infer<typeof orgProfileSchema>;
@@ -3119,9 +3176,26 @@ export const orgProfileInputSchema = z.object({
   website: documentText(ORG_PROFILE_FIELD_CAPS.website),
   bankDetails: documentText(ORG_PROFILE_FIELD_CAPS.bankDetails),
   logoDataUri: z.string(),
+  /**
+   * REQUIRED ON THE WIRE, not optional with a default. This body is a whole-form
+   * replacement, so an omitted field is indistinguishable from a cleared one --
+   * and a `.default(DEFAULT_TIME_ZONE)` here would let a client that had never
+   * heard of this field silently reset an operator's zone to UTC on every save.
+   * The form always sends it; a direct API caller gets told.
+   */
+  timeZone: z.string(),
 }).superRefine((value, ctx) => {
   const problem = logoDataUriProblem(value.logoDataUri);
   if (problem !== null) ctx.addIssue({ code: "custom", path: ["logoDataUri"], message: problem });
+  // THE GATE, with the column's CHECK as the backstop -- orgProfileInputSchema's
+  // standing split, and the reason the CHECK cannot be the only answer is that
+  // PostgreSQL has no tzdata opinion a `text` column can consult: it can refuse a
+  // shape and nothing more. Whether a name is a REAL zone is a question only the
+  // engine that will format with it can answer.
+  const zoneProblem = timeZoneProblem(value.timeZone);
+  if (zoneProblem !== null) {
+    ctx.addIssue({ code: "custom", path: ["timeZone"], message: zoneProblem });
+  }
   // THE RESERVE HAS TO BE ENFORCED SOMEWHERE OR IT IS A WISH. A quote's markup budget
   // is the render's markup cap minus a template allowance minus what an issuer's text
   // may cost, and nothing bounded the issuer at all: 3,400 characters of ASCII is
