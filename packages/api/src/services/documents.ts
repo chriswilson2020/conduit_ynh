@@ -5,7 +5,7 @@ import {
   formatMoneyCents, formatQtyMilli,
   documentContentBytes, formatTaxRateBp, issueQuoteInputSchema, lineTotalCents,
   MAX_TEMPLATE_BYTES, renderInputCost, RENDER_IMAGE_CAP_BYTES, RENDER_IMAGE_PIXEL_CAP,
-  RENDER_MARKUP_CAP_BYTES,
+  RENDER_MARKUP_CAP_BYTES, todayInZone,
   type DocumentRecord, type DocumentTemplate, type DocumentTemplateInput,
   type IssueQuoteInput, type MeetingSummaryRecord, type OrgProfile,
 } from "@conduit/shared";
@@ -24,7 +24,6 @@ import {
 import { getOrgProfile } from "./org-profile.js";
 import { saveBlob } from "./blobs.js";
 import { attachFile } from "./files.js";
-import { todayDateOnly } from "./scheduling.js";
 import { ArchivedError, NotFoundError } from "./errors.js";
 import { publish } from "./sse.js";
 
@@ -565,7 +564,12 @@ export function buildMeetingSummaryContext(input: MeetingSummaryContextInput): M
     org: orgContext(input.org),
     document: {
       title: input.title,
-      meetingWhen: formatDocumentInstant(input.occurredAt),
+      // THE ORGANISATION'S CLOCK, off the profile that is already in this context
+      // for the letterhead. Not a separate argument to this builder: the zone is a
+      // property of the issuer exactly as the address and the VAT number are, and
+      // a second parameter would be a second place for Tasks 3 and 4 to disagree
+      // about where it comes from.
+      meetingWhen: formatDocumentInstant(input.occurredAt, input.org.timeZone),
       duration: input.durationMinutes === null ? "" : formatDurationMinutes(input.durationMinutes),
       issueDate: input.issueDate,
       notes: new MergeHtml(input.notesHtml),
@@ -692,11 +696,20 @@ export async function issueMeetingSummary(
     const org = await getOrgProfile(tx);
     const attendees = await loadAttendeeNames(tx, meetingId);
 
-    // SERVER-AUTHORITATIVE, AND UTC, which is scheduling.ts's `todayDateOnly` and
-    // its documented +/-2h caveat. There is no input to take an issue date from --
-    // that is what "the type with no form" means -- and a client-supplied one would
-    // be a field on a form that does not exist.
-    const issueDate = todayDateOnly();
+    // SERVER-AUTHORITATIVE, AND IN THE ORGANISATION'S ZONE. There is no input to
+    // take an issue date from -- that is what "the type with no form" means -- and a
+    // client-supplied one would be a field on a form that does not exist.
+    //
+    // NOT `scheduling.ts`'s `todayDateOnly` ANY MORE, and this line is the second
+    // half of v1.8.0's timezone field. That function reads the server clock in UTC
+    // and documents a +/-2h caveat which is exactly right for the Gantt clamp it was
+    // written for and wrong here: a summary issued at 00:30 in Amsterdam was dated
+    // the day before, in type, on a page sent to the people who were in the room --
+    // and it also named the PDF, so the file on disk carried the wrong day too. The
+    // caveat was harmless where it was written and is not harmless on a document, so
+    // documents got their own answer rather than scheduling's being changed under
+    // its own callers.
+    const issueDate = todayInZone(org.timeZone);
     // SANITISED WITH THE DOCUMENT PROFILE BEFORE IT IS RAW. The stored value went
     // through the MAIL profile on write (services/meetings.ts's sanitizeNotes), and
     // the two profiles differ in both directions -- mail strips the page-layout CSS

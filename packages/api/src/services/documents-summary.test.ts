@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   documentTypeFreezes, documentTypeNumbered, RENDER_MARKUP_CAP_BYTES,
 } from "@conduit/shared";
@@ -117,6 +117,17 @@ async function mergedHtml(): Promise<string> {
   const [file] = await handle.db.select().from(files).where(eq(files.id, summary.fileId));
   return (await readFile(blobPath(dataDir, file!.sha256), "utf8")).replace(/^%PDF-1\.7 /, "");
 }
+
+/**
+ * A profile with nothing filled in, so a test that is about ONE field can set that
+ * field and nothing else. `saveOrgProfile` takes the whole form (it is a PUT, not a
+ * PATCH), so without this every timezone test would restate nine irrelevant values.
+ */
+const BLANK_PROFILE = {
+  name: "", addressLines: "", vatNumber: "", registrationNumber: "",
+  email: "", phone: "", website: "", bankDetails: "", logoDataUri: "",
+  timeZone: "UTC",
+};
 
 /** How many blobs the store holds. Zero before the first save, which is not an error. */
 function blobCount(): number {
@@ -463,13 +474,70 @@ describe("the summary's content is the meeting, and the notes are markup", () =>
   });
 
   /**
-   * THE ZONE IS PRINTED BECAUSE CONDUIT DOES NOT KNOW THE RIGHT ONE -- see
-   * formatDocumentInstant. A reader can convert an instant that names its zone
-   * and cannot even detect one that does not, and this is a page that gets sent.
+   * THE ZONE IS PRINTED, AND ON AN INSTALL THAT HAS NOT SET ONE IT IS UTC. No
+   * org_profile row exists in this suite unless a test writes one, so this is the
+   * `emptyProfile` path -- and it prints exactly what v1.7.2 printed, which is the
+   * property that makes UTC the defensible backfill for an existing install.
    */
   it("prints the meeting's moment in a zone it names", async () => {
     const html = await mergedHtml();
     expect(html).toContain("1 September 2026 at 13:30 UTC");
+  });
+
+  /**
+   * **AND WITH A ZONE SET, IT PRINTS THE CLOCK THE OPERATOR ACTUALLY SAW.** The
+   * meeting was entered as 15:30 in Amsterdam (the browser sent 13:30Z), and until
+   * v1.8.0 the page said 13:30 because nothing stored where the operator was.
+   */
+  it("prints the organisation's wall clock once a zone is set", async () => {
+    await saveOrgProfile(handle.db, { ...BLANK_PROFILE, timeZone: "Europe/Amsterdam" });
+    const html = await mergedHtml();
+    expect(html).toContain("1 September 2026 at 15:30 CEST");
+    expect(html).not.toContain("13:30");
+  });
+
+  /**
+   * A ZONE THAT NO LONGER RESOLVES STILL PRODUCES A DOCUMENT, and the document
+   * says which clock it used. Written straight to the column, because the service
+   * refuses this value -- which is the point: the row can hold it after an ICU
+   * retires a name or a backup arrives from an install with different tzdata, and
+   * the render is downstream of every gate.
+   */
+  it("still renders when the stored zone has stopped being one, in UTC and saying UTC", async () => {
+    await handle.db.execute(
+      sql`INSERT INTO org_profile (id, name, time_zone) VALUES (1, 'Listerdale', 'Factory')`,
+    );
+    const html = await mergedHtml();
+    expect(html).toContain("1 September 2026 at 13:30 UTC");
+  });
+
+  /**
+   * **THE ISSUE DATE IS A DATE THE DOCUMENT PRINTS, AND IT MOVED TOO.** The
+   * summary's `{{document.issueDate}}` and its download filename both came from
+   * `todayDateOnly()`, which is the server's UTC calendar day -- so a summary
+   * issued at 00:30 in Amsterdam was dated the day before, in type, on a page sent
+   * to the people who were in the room.
+   *
+   * TWO ZONES 25 HOURS APART RATHER THAN A FAKE CLOCK. Pacific/Kiritimati is
+   * UTC+14 and Pacific/Niue is UTC-11, so their calendar days can never be equal
+   * at any instant, and at least one of them can never equal UTC's. That makes
+   * this assertion true whatever time the suite runs at -- where a frozen clock
+   * would have to be threaded through a live postgres connection's own timers.
+   */
+  it("dates the summary by the organisation's calendar, not the server's UTC one", async () => {
+    await saveOrgProfile(handle.db, { ...BLANK_PROFILE, timeZone: "Pacific/Kiritimati" });
+    const east = await issueWithStub();
+    await saveOrgProfile(handle.db, { ...BLANK_PROFILE, timeZone: "Pacific/Niue" });
+    const west = await issueWithStub();
+
+    expect(east.issueDate).not.toBe(west.issueDate);
+    const utcDay = new Date().toISOString().slice(0, 10);
+    expect([east.issueDate, west.issueDate]).not.toEqual([utcDay, utcDay]);
+
+    // The filename carries the same day, so the file in the operator's Downloads
+    // folder cannot disagree with the page inside it.
+    const [file] = await handle.db.select().from(files).where(eq(files.id, east.fileId));
+    expect(file?.originalName).toContain(east.issueDate);
   });
 
   it("leaves no merge token unresolved on a fully populated meeting", async () => {
@@ -477,6 +545,7 @@ describe("the summary's content is the meeting, and the notes are markup", () =>
       name: "Listerdale", addressLines: "1 High St\n1234 AB Amsterdam",
       email: "hello@listerdale.nl", phone: "+31 20 000 0000", website: "listerdale.nl",
       bankDetails: "", vatNumber: "", registrationNumber: "", logoDataUri: "",
+      timeZone: "UTC",
     });
     const html = await mergedHtml();
     expect(html).not.toContain("{{");
@@ -508,7 +577,7 @@ describe("buildMeetingSummaryContext supplies what the seeded template names", (
       org: {
         name: "Listerdale", addressLines: "", email: "", phone: "", website: "",
         bankDetails: "", vatNumber: "", registrationNumber: "", logoDataUri: "",
-        updatedAt: "2026-09-06T00:00:00.000Z",
+        timeZone: "UTC", updatedAt: "2026-09-06T00:00:00.000Z",
       },
       issueDate: "2026-09-06",
       title: "Kickoff", occurredAt: "2026-09-01T13:30:00.000Z", durationMinutes: 45,
@@ -530,7 +599,7 @@ describe("buildMeetingSummaryContext supplies what the seeded template names", (
       org: {
         name: "", addressLines: "", email: "", phone: "", website: "",
         bankDetails: "", vatNumber: "", registrationNumber: "", logoDataUri: "",
-        updatedAt: "2026-09-06T00:00:00.000Z",
+        timeZone: "UTC", updatedAt: "2026-09-06T00:00:00.000Z",
       },
       issueDate: "2026-09-06", title: "Kickoff", occurredAt: "2026-09-01T13:30:00.000Z",
       durationMinutes: null, notesHtml: "", attendees: [],
@@ -617,7 +686,7 @@ describe("the real renderer", () => {
     await saveOrgProfile(handle.db, {
       name: "Listerdale", addressLines: "1 High St\n1234 AB Amsterdam",
       email: "hello@listerdale.nl", phone: "", website: "", bankDetails: "",
-      vatNumber: "", registrationNumber: "", logoDataUri: "",
+      vatNumber: "", registrationNumber: "", logoDataUri: "", timeZone: "UTC",
     });
     const withPeople = await createMeeting(handle.db, actorId, {
       title: "Kickoff with Acme", occurredAt: "2026-09-01T13:30:00.000Z",

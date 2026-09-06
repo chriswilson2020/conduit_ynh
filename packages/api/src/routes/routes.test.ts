@@ -10,8 +10,8 @@ import {
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, meetingSummarySchema, documentSchema, orgProfileSchema,
-  documentTemplateSchema, CONTACT_FIELD_CAPS, DOCUMENT_MAX_DESCRIPTION_CHARS,
-  DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
+  documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
+  DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
@@ -2201,7 +2201,11 @@ describe("documents routes", () => {
     const a = await app();
     const empty = await a.inject({ method: "GET", url: "/api/org-profile", headers: authHeaders });
     expect(empty.statusCode).toBe(200);
-    expect(orgProfileSchema.parse(empty.json())).toMatchObject({ name: "", logoDataUri: "" });
+    // THE ZONE IS THE ONE FIELD THAT IS NOT "" ON AN UNTOUCHED INSTALL, and it
+    // has to arrive on the wire from the very first GET or the Settings form
+    // opens with an empty select.
+    expect(orgProfileSchema.parse(empty.json()))
+      .toMatchObject({ name: "", logoDataUri: "", timeZone: DEFAULT_TIME_ZONE });
 
     const saved = await a.inject({
       method: "PUT", url: "/api/org-profile", headers: authHeaders,
@@ -2210,7 +2214,7 @@ describe("documents routes", () => {
         vatNumber: "NL001234567B01", registrationNumber: "12345678",
         email: "hello@listerdale.test", phone: "+31 20 123 4567",
         website: "listerdale.test", bankDetails: "NL00 BANK 0123 4567 89",
-        logoDataUri: "",
+        logoDataUri: "", timeZone: "Europe/Amsterdam",
       },
     });
     expect(saved.statusCode).toBe(200);
@@ -2218,11 +2222,32 @@ describe("documents routes", () => {
 
     const reread = await a.inject({ method: "GET", url: "/api/org-profile", headers: authHeaders });
     expect(orgProfileSchema.parse(reread.json()).vatNumber).toBe("NL001234567B01");
+    expect(orgProfileSchema.parse(reread.json()).timeZone).toBe("Europe/Amsterdam");
 
     const invalid = await a.inject({
       method: "PUT", url: "/api/org-profile", headers: authHeaders, payload: { name: "Only a name" },
     });
     expect(invalid.statusCode).toBe(400);
+
+    // A COMPLETE FORM WITH ONE BAD FIELD, which is a different refusal from the
+    // incomplete body above: the shape is right and the VALUE is not a zone, and
+    // it has to come back as something the person in Settings can act on rather
+    // than as a 500 out of Intl or a 23514 out of the column.
+    const badZone = await a.inject({
+      method: "PUT", url: "/api/org-profile", headers: authHeaders,
+      payload: {
+        name: "Listerdale Life Sciences", addressLines: "1 High St",
+        vatNumber: "", registrationNumber: "", email: "", phone: "",
+        website: "", bankDetails: "", logoDataUri: "", timeZone: "+02:00",
+      },
+    });
+    expect(badZone.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(badZone.json()).message).toContain("fixed offset");
+    // ...and the refusal did not overwrite what was there.
+    const afterRefusal = await a.inject({
+      method: "GET", url: "/api/org-profile", headers: authHeaders,
+    });
+    expect(orgProfileSchema.parse(afterRefusal.json()).timeZone).toBe("Europe/Amsterdam");
     await a.close();
   });
 

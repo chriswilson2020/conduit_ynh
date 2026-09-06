@@ -222,9 +222,10 @@ export function registerDocumentRoutes(app: FastifyInstance, { db, dataDir }: Cr
     const input = parseOrReject(orgProfileInputSchema, request.body, reply);
     if (input === undefined) return;
     try {
-      // PUT rather than PATCH: it is one form with nine fields and no concurrent
-      // editors, so sending the whole form is both the simplest contract and the one
-      // in which clearing a field is expressible.
+      // PUT rather than PATCH: it is one form with ten fields (nine until v1.8.0
+      // added the timezone) and no concurrent editors, so sending the whole form is
+      // both the simplest contract and the one in which clearing a field is
+      // expressible.
       return await saveOrgProfile(db, input);
     } catch (error) {
       mapDocumentError(reply, error);

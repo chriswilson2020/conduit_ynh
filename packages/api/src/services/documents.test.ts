@@ -768,7 +768,7 @@ function sampleContextInput(overrides: Partial<QuoteContextInput> = {}): QuoteCo
       vatNumber: "NL001234567B01", registrationNumber: "12345678",
       email: "hello@listerdale.test", phone: "+31 20 123 4567",
       website: "listerdale.test", bankDetails: "NL00 BANK 0123 4567 89",
-      logoDataUri: "", updatedAt: new Date(0).toISOString(),
+      logoDataUri: "", timeZone: "UTC", updatedAt: new Date(0).toISOString(),
     },
     currency: "EUR",
     number: "QUO-2026-0001",
@@ -898,6 +898,10 @@ describe("buildContext", () => {
         name: "N".repeat(200), addressLines: "A".repeat(2000), vatNumber: "V".repeat(100),
         registrationNumber: "R".repeat(100), email: "E".repeat(200), phone: "P".repeat(100),
         website: "W".repeat(200), bankDetails: "B".repeat(500),
+        // The zone is not merged into the page, so it is not part of the worst
+        // case -- the longest name this column takes is 64 bytes and none of them
+        // reach the template.
+        timeZone: "Pacific/Chatham",
         logoDataUri: maxedLogo, updatedAt: new Date(0).toISOString(),
       },
       recipientName: "\u00e9".repeat(200),
@@ -1041,6 +1045,7 @@ describe("an issued quote never changes", () => {
       name: "Listerdale Life Sciences", addressLines: "1 High St", vatNumber: "NL001234567B01",
       registrationNumber: "12345678", email: "hello@listerdale.test", phone: "+31 20 123 4567",
       website: "listerdale.test", bankDetails: "NL00 BANK 0123 4567 89", logoDataUri: "",
+      timeZone: "UTC",
     });
     const before = await issueWithStub();
     const pdfBefore = await readStoredPdf(before.fileId);
@@ -1049,7 +1054,7 @@ describe("an issued quote never changes", () => {
     await saveOrgProfile(handle.db, {
       name: "Someone Else BV", addressLines: "9 Other Road", vatNumber: "NL999999999B99",
       registrationNumber: "99999999", email: "no@example.test", phone: "",
-      website: "", bankDetails: "", logoDataUri: LOGO_DATA_URI,
+      website: "", bankDetails: "", logoDataUri: LOGO_DATA_URI, timeZone: "UTC",
     });
     expect((await getOrgProfile(handle.db)).name).toBe("Someone Else BV");
 
@@ -1127,7 +1132,7 @@ describe("issueQuote against the real WeasyPrint", () => {
       vatNumber: "NL001234567B01", registrationNumber: "12345678",
       email: "hello@listerdale.test", phone: "+31 20 123 4567",
       website: "listerdale.test", bankDetails: "NL00 BANK 0123 4567 89",
-      logoDataUri: LOGO_DATA_URI,
+      logoDataUri: LOGO_DATA_URI, timeZone: "UTC",
     });
 
     const doc = await issueQuote(handle.db, { dataDir }, actorId, dealId, quoteInput({

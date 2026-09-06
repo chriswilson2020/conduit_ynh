@@ -1,8 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
-  MAX_LOGO_BYTES, MAX_LOGO_DATA_URI_CHARS, MAX_LOGO_PIXELS,
-  ORG_PROFILE_TEXT_RESERVE_BYTES, orgProfileTextBytes,
+  DEFAULT_TIME_ZONE, MAX_LOGO_BYTES, MAX_LOGO_DATA_URI_CHARS, MAX_LOGO_PIXELS,
+  ORG_PROFILE_TEXT_RESERVE_BYTES, orgProfileTextBytes, timeZoneProblem,
   type OrgProfileInput,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -87,20 +87,131 @@ function profileInput(overrides: Partial<OrgProfileInput> = {}): OrgProfileInput
     website: "listerdale.test",
     bankDetails: "NL00 BANK 0123 4567 89",
     logoDataUri: "",
+    timeZone: "Europe/Amsterdam",
     ...overrides,
   };
 }
 
 describe("getOrgProfile", () => {
   it("answers an empty profile before anyone has opened Settings", async () => {
-    // Not a 404 and not null: every column is NOT NULL DEFAULT '' and every field is
-    // optional on the printed page, so "no row yet" and "a row filled in with
-    // nothing" are the same document. A caller branching on which one it got would
-    // be branching on nothing.
+    // Not a 404 and not null: every column is NOT NULL with a default and every
+    // field is optional on the printed page, so "no row yet" and "a row filled in
+    // with nothing" are the same document. A caller branching on which one it got
+    // would be branching on nothing.
     expect(await getOrgProfile(handle.db)).toMatchObject({
       name: "", addressLines: "", vatNumber: "", registrationNumber: "",
       email: "", phone: "", website: "", bankDetails: "", logoDataUri: "",
     });
+  });
+
+  /**
+   * **"EMPTY" IS NOT "" FOR THE ZONE, AND THE TWO ROUTES INTO IT MUST AGREE.**
+   * There is no such thing as formatting an instant in no zone, so this field's
+   * absence is a real value -- and there are two ways to arrive at it: no row
+   * (this function's `emptyProfile`) and a row nobody has set the zone on (the
+   * column's DEFAULT). If those two ever differed, the first document an install
+   * produced after its first save would silently move by hours.
+   *
+   * A THIRD ROUTE, `usableTimeZone`'s fallback, is pinned to the same constant in
+   * the shared suite. All three are UTC.
+   */
+  it("gives an install with no row the same zone the column's default gives one with a row", async () => {
+    expect((await getOrgProfile(handle.db)).timeZone).toBe(DEFAULT_TIME_ZONE);
+
+    // The row arrives WITHOUT the column named, so only the DEFAULT can have
+    // filled it -- the same distinction 0014's drill makes about ALTER vs INSERT.
+    await handle.db.execute(sql`INSERT INTO org_profile (id, name) VALUES (1, 'Listerdale')`);
+    expect((await getOrgProfile(handle.db)).timeZone).toBe(DEFAULT_TIME_ZONE);
+  });
+
+  /**
+   * HANDED BACK AS STORED, not repaired on the way out. A zone that has stopped
+   * resolving has to reach Settings as the string in the row, or the one page that
+   * can fix it shows UTC and saves UTC over the evidence. The substitution belongs
+   * where the FORMATTING is, and only there.
+   */
+  it("returns a zone that no longer resolves rather than quietly correcting it", async () => {
+    await handle.db.execute(
+      sql`INSERT INTO org_profile (id, name, time_zone) VALUES (1, 'Listerdale', 'Factory')`,
+    );
+    expect((await getOrgProfile(handle.db)).timeZone).toBe("Factory");
+    expect(timeZoneProblem("Factory")).not.toBeNull();
+  });
+});
+
+describe("the organisation's timezone", () => {
+  it("stores an IANA zone and hands it straight back", async () => {
+    const saved = await saveOrgProfile(handle.db, profileInput({ timeZone: "Europe/Amsterdam" }));
+    expect(saved.timeZone).toBe("Europe/Amsterdam");
+    expect((await getOrgProfile(handle.db)).timeZone).toBe("Europe/Amsterdam");
+  });
+
+  it("replaces the zone like any other field, because the form is the record", async () => {
+    await saveOrgProfile(handle.db, profileInput({ timeZone: "Europe/Amsterdam" }));
+    const moved = await saveOrgProfile(handle.db, profileInput({ timeZone: "Asia/Tokyo" }));
+    expect(moved.timeZone).toBe("Asia/Tokyo");
+  });
+
+  /**
+   * **THE REFUSALS THAT MATTER ARE THE VALUES `Intl` ACCEPTS.** `Factory` bounces
+   * out of the formatter and would have been caught by almost any implementation;
+   * `+02:00` does not, and is the one that would print an hour out for half the
+   * year with a plausible `GMT+2` beside it. Both are refused with a sentence
+   * rather than a 23514 from the column, and neither leaves a row behind.
+   */
+  it("refuses a value that is not a zone, and a fixed offset that pretends to be one", async () => {
+    for (const bad of ["", "Factory", "not/a/zone", "+02:00", "Europe/Amsterdam "]) {
+      await expect(saveOrgProfile(handle.db, profileInput({ timeZone: bad })), bad)
+        .rejects.toBeInstanceOf(OrgProfileInputError);
+    }
+    expect(await handle.db.select().from(orgProfile)).toHaveLength(0);
+  });
+
+  it("says which of the two refusals it was, because they have different remedies", async () => {
+    const offset = await saveOrgProfile(handle.db, profileInput({ timeZone: "+02:00" }))
+      .catch((e: unknown) => e);
+    expect((offset as Error).message).toContain("fixed offset");
+    const nonsense = await saveOrgProfile(handle.db, profileInput({ timeZone: "Factory" }))
+      .catch((e: unknown) => e);
+    expect((nonsense as Error).message).toContain("not a timezone this server knows");
+  });
+
+  /**
+   * A REFUSAL MUST NOT LAND HALF WAY. The zone is checked before the upsert, so a
+   * form submitted with a good name and a bad zone changes nothing at all -- the
+   * alternative being a profile whose name moved and whose zone did not, with an
+   * error message that says nothing about either.
+   */
+  it("leaves an existing profile untouched when the zone is refused", async () => {
+    await saveOrgProfile(handle.db, profileInput({ name: "Listerdale BV", timeZone: "Asia/Tokyo" }));
+    await expect(saveOrgProfile(handle.db, profileInput({ name: "Renamed", timeZone: "Factory" })))
+      .rejects.toBeInstanceOf(OrgProfileInputError);
+    const kept = await getOrgProfile(handle.db);
+    expect(kept.name).toBe("Listerdale BV");
+    expect(kept.timeZone).toBe("Asia/Tokyo");
+  });
+
+  /**
+   * THE COLUMN IS THE BACKSTOP AND IT IS REACHABLE ONLY BY GOING ROUND THE GATE.
+   * `org_profile_time_zone_shape` cannot know what a zone IS -- PostgreSQL has no
+   * tzdata a `text` column can consult -- so it refuses the two shapes that are
+   * wrong by inspection, and this is the assertion that it is really there rather
+   * than merely declared in schema.ts.
+   */
+  it("has a column CHECK that refuses an empty zone and an offset, whatever the service does", async () => {
+    for (const bad of ["", "+02:00", "-05:00", "x".repeat(65)]) {
+      await expect(handle.db.execute(
+        sql`INSERT INTO org_profile (id, name, time_zone) VALUES (1, 'X', ${bad})`,
+      ), bad).rejects.toMatchObject({ cause: { constraint_name: "org_profile_time_zone_shape" } });
+    }
+    // ...and it admits every zone the gate does, or the two would disagree about a
+    // value the form had already accepted.
+    for (const good of ["UTC", "Europe/Amsterdam", "America/Argentina/Rio_Gallegos"]) {
+      await handle.db.execute(
+        sql`INSERT INTO org_profile (id, name, time_zone) VALUES (1, 'X', ${good})
+            ON CONFLICT (id) DO UPDATE SET time_zone = ${good}`,
+      );
+    }
   });
 });
 
