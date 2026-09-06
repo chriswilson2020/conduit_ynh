@@ -19,9 +19,9 @@ import {
   Dialog, DialogContent, DialogTitle, DialogDescription,
 } from "../components/ui/dialog";
 import {
-  EMPTY_BACKUP_FORM, EMPTY_RESTORE_FORM, applyKeptThePreview, backupFormProblem,
-  canPreviewRestore, canSubmitBackup, downloadProblem, formatBytes, formatDuration,
-  planCountLabel, preflightSeverity, preflightWarning, restoreConfirmBlocked,
+  EMPTY_BACKUP_FORM, EMPTY_RESTORE_FORM, EXPORT_ARCHIVE_SUMMARY, applyKeptThePreview,
+  backupFormProblem, canPreviewRestore, canSubmitBackup, downloadProblem, formatBytes,
+  formatDuration, planCountLabel, preflightSeverity, preflightWarning, restoreConfirmBlocked,
   restoreFormProblem, restorePreviewBlocked, restoreProblem,
 } from "./settings-data-lib";
 import type { BackupFormState, RestoreFormState } from "./settings-data-lib";
@@ -681,18 +681,20 @@ function ExportCard(
 ) {
   return (
     <Card title="Export -- the readable half" testId="export-card">
-      {/* THE THIRD HAND-WRITTEN LIST OF SHEETS, found by Phase 10 Task 1 while
-          adding a tenth. services/export.ts has one `*Sheet` function per entity,
-          services/import-export.ts has one NOT_IMPORTED entry per sheet, and this
-          sentence is the only one a USER ever reads -- so a sheet missing here is
-          an operator who does not know their timesheet is in the file. Nothing
-          derives any of the three from the others; adding a sheet means editing
-          all three, and this is the one with no test behind it. */}
-      <p className="text-sm text-slate-600">
-        A ZIP holding one CSV per record type -- companies, contacts, deals, projects,
-        tasks, notes, meetings, time entries and documents -- plus every file you have
-        uploaded and every quote PDF you have issued. The CSVs open in Excel, Numbers
-        or LibreOffice, accented names intact.
+      {/* THIS SENTENCE IS NOT WRITTEN HERE ANY MORE, and that is the whole of
+          v1.9.0's export change from this page's side. It used to be one of ten
+          hand-written lists of the same ten sheets -- three of them in the
+          product, after services/export.ts's `*Sheet` functions and
+          services/import-export.ts's NOT_IMPORTED -- and the only one of the
+          ten a USER ever reads, with nothing testing it.
+          Phase 10 Task 1 found it while adding a tenth sheet: reverting it to
+          its nine-sheet version was a mutation that survived the entire suite,
+          and what it produces is an operator who does not know their timesheet
+          is in the file. It now comes from @conduit/shared's EXPORT_MEMBERS, the
+          same list the archive is written from; settings-data-lib.ts composes
+          it, and its test refuses a card that types a record type out again. */}
+      <p data-testid="export-summary" className="text-sm text-slate-600">
+        {EXPORT_ARCHIVE_SUMMARY}
       </p>
       <Limitation testId="export-limitation" headline="It cannot be restored into Conduit.">
         There is no database dump in it, no mail, and no passwords, so nothing can rebuild

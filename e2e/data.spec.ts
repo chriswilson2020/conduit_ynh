@@ -11,6 +11,11 @@ import type { Page } from "@playwright/test";
 // that must render exactly what the server sent, a fixture free to drift from
 // that shape is the one uncoupled pair on the branch.
 import type { PlanView } from "@conduit/shared";
+// AND THE EXPORT'S MEMBER LIST AS A VALUE, for the same reason: what the
+// archive contains, what the import preview says about each sheet and what the
+// Settings page tells the operator are one declaration since v1.9.0, and a
+// journey that walked its own copy of it would be the eleventh copy.
+import { EXPORT_MEMBERS, NOT_IMPORTED_MEMBERS } from "@conduit/shared";
 
 const execFileAsync = promisify(execFile);
 
@@ -86,6 +91,19 @@ test.describe("Settings -> Export and backup", () => {
     await expect(exportCard.getByTestId("export-limitation"))
       .toContainText("cannot be restored into Conduit");
     await expect(exportCard.getByTestId("export-download")).toBeVisible();
+
+    // AND WHAT IS ACTUALLY IN THE ARCHIVE, NAMED SHEET BY SHEET. This is the
+    // ONLY description of the export a user ever reads, and until v1.9.0 it was
+    // typed out by hand with nothing testing it at all -- so it would have gone
+    // on listing eight record types while the file held nine, and an operator
+    // would not have known their timesheet was in there. The nouns come from
+    // @conduit/shared's EXPORT_MEMBERS, which is also what the archive itself is
+    // written from: a sheet added there and not named here is a red journey.
+    const summary = exportCard.getByTestId("export-summary");
+    for (const member of EXPORT_MEMBERS) {
+      await expect(summary, `the page does not tell the operator about ${member.member}`)
+        .toContainText(member.noun);
+    }
 
     const backupCard = page.getByTestId("backup-card");
     await expect(backupCard.getByTestId("backup-limitation"))
@@ -1535,17 +1553,19 @@ test.describe("Settings -> import", () => {
       // THE HEADLINE, AND THEN THE SPECIFIC GAPS. A count alone would pass on
       // eight copies of one sentence.
       //
-      // `time_entries.csv` JOINED THE LIST IN PHASE 10, and this line is the
-      // FOURTH place a new export sheet has to be added by hand -- after
-      // services/export.ts's `*Sheet`, services/import-export.ts's NOT_IMPORTED,
-      // and the Settings copy that describes the archive to the operator.
-      // Nothing derives any of them from any other.
+      // THE LIST OF SHEETS IS @conduit/shared's SINCE v1.9.0. It used to be
+      // written out here, one of TEN hand-written copies of the same ten member
+      // names -- three of them in the product: services/export.ts's `*Sheet`
+      // functions, services/import-export.ts's NOT_IMPORTED and the Settings
+      // copy that describes the archive to the operator, none of which derived
+      // from any other. What this walks is still the REAL preview of a REAL
+      // export of this install, so a member declared unimported that produces
+      // no finding is red here even though both sides read one list.
       await expect(page.getByTestId("import-finding-partial-import"))
         .toContainText("imports companies and contacts from an export");
       const findings = page.getByTestId("import-findings");
-      for (const sheet of ["deals.csv", "tasks.csv", "projects.csv", "notes.csv",
-        "meetings.csv", "documents.csv", "files.csv", "time_entries.csv"]) {
-        await expect(findings, `no finding names ${sheet}`).toContainText(sheet);
+      for (const { member } of NOT_IMPORTED_MEMBERS) {
+        await expect(findings, `no finding names ${member}`).toContainText(member);
       }
       // Each one says WHAT is missing rather than only that it is skipped.
       await expect(findings).toContainText("position");
