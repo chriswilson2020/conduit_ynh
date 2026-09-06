@@ -1021,6 +1021,12 @@ export const documents = pgTable("documents", {
   // table and the only half the backlog had noticed. Every row that existed
   // before 0016 is a quote and still carries it.
   dealId: uuid("deal_id").references(() => deals.id),
+  // THE LAST OF THE FIVE TO GET A READER, WHICH IS WHY IT IS ALSO THE LAST TO GET
+  // AN INDEX (0020's `documents_project_idx`). 0016 added all five columns and
+  // indexed none of them, on the grounds that nothing selected documents by any
+  // of them; each index has since been built by the migration that added the
+  // first SELECT that needed it -- meeting in 0017, company and contact in 0019,
+  // this one in 0020 for `listProjectDocuments`.
   projectId: uuid("project_id").references(() => projects.id),
   meetingId: uuid("meeting_id").references(() => meetings.id),
   // The rendered PDF, stored as an ordinary files row against the same record,
@@ -1093,7 +1099,7 @@ export const documents = pgTable("documents", {
   unique("documents_id_type_unique").on(t.id, t.type),
   check(
     "documents_type_valid",
-    sql`type IN ('quote','meeting_summary','letter','nda','mutual_nda')`,
+    sql`type IN ('quote','meeting_summary','letter','nda','mutual_nda','project_status_report')`,
   ),
   // WHETHER THIS TYPE IS NUMBERED, IN THE DATABASE, so `documents.number` and
   // @conduit/shared's documentTypeNumbered() cannot drift apart -- the same
@@ -1113,6 +1119,13 @@ export const documents = pgTable("documents", {
   // auditable per-year sequence, and no way for the number to come loose from
   // its content because an agreement is frozen. The letter is deliberately not
   // in the list.
+  //
+  // **0020 DID NOT TOUCH IT, AND THAT IS THE EQUALITY EARNING ITS KEEP AGAIN.**
+  // The status report is unnumbered, so it belongs on the FALSE side and there
+  // is nothing to widen -- the row reads `false = false`. An implication would
+  // have left a numbered report legal in silence, which
+  // `formatDocumentNumber`'s `?? "DOC"` fallback would have minted as
+  // `DOC-2026-0001` the first time anybody called `allocateNumber` for one.
   check(
     "documents_number_matches_type",
     sql`(number IS NOT NULL) = (type IN ('quote','nda','mutual_nda'))`,
@@ -1121,6 +1134,51 @@ export const documents = pgTable("documents", {
   check(
     "documents_exactly_one_entity",
     sql`num_nonnulls(company_id, contact_id, deal_id, project_id, meeting_id) = 1`,
+  ),
+  // **WHICH ONE OF THE FIVE, PER TYPE -- THE OTHER HALF OF THE RULE ABOVE, AND IT
+  // TOOK UNTIL 0020 TO BE WRITABLE.** `documents_exactly_one_entity` says how
+  // MANY records a document names. It has never said WHICH, so until this
+  // constraint existed nothing in the database stopped a letter carrying a
+  // `deal_id` or a quote carrying a `meeting_id` -- only the writers did. Task 3
+  // found that (its `redraftLetter` still carries the branch it needed for a
+  // letter attached to neither a company nor a contact, a row it produced by
+  // hand) and deliberately left the CHECK unwritten, because it is a rule about
+  // ALL the types and two of them did not exist yet. Writing it then would have
+  // been 0016's mistake again: generalising from the types that happened to have
+  // been built.
+  //
+  // THE TWO CHECKS ARE A PAIR AND NEITHER IS SUFFICIENT ALONE. Read by itself,
+  // the first arm here permits a quote naming a deal AND a company; the count
+  // above is what forbids that. Spelling `num_nonnulls(...) = 1` into all four
+  // arms would state one rule five times and make the next type's author edit
+  // two constraints to change one thing.
+  //
+  // **EVERY ARM SAYS ONLY WHICH COLUMN, NEVER HOW MANY, AND THE LETTER FAMILY'S
+  // IS WHERE THAT MATTERS.** The plan sketched it as
+  // `num_nonnulls(company_id, contact_id) = 1`, which admits exactly the same
+  // rows once the count CHECK is standing beside it -- and costs the one thing
+  // this schema keeps paying to protect. A letter naming BOTH a company and a
+  // contact would then violate two constraints at once, so PostgreSQL would name
+  // whichever it reached first and `documents_exactly_one_entity` -- Chris's
+  // decision of 6 Sep, the one this pair exists to enforce -- could no longer be
+  // probed by name for the case it is most about. `IS NOT NULL OR IS NOT NULL`
+  // says "the record is one of these two" and leaves the counting where the
+  // counting lives.
+  //
+  // WHAT STILL OVERLAPS, unavoidably, is an UNKNOWN type: it satisfies no arm
+  // here and also breaks `documents_type_valid`, so those two can only be told
+  // apart from the catalogue. db/schema.test.ts does that instead.
+  //
+  // EVERY ROW THAT EXISTS SATISFIES IT, so 0020 adds it validated with no
+  // backfill -- which is what made it, in Task 3's words, "a free migration
+  // whenever it is taken".
+  check(
+    "documents_entity_matches_type",
+    sql`(type = 'quote' AND deal_id IS NOT NULL)
+      OR (type = 'meeting_summary' AND meeting_id IS NOT NULL)
+      OR (type = 'project_status_report' AND project_id IS NOT NULL)
+      OR (type IN ('letter','nda','mutual_nda')
+          AND (company_id IS NOT NULL OR contact_id IS NOT NULL))`,
   ),
   // THE PER-TYPE FREEZING RULE, IN THE DATABASE, so the column and
   // @conduit/shared's documentTypeFreezes() cannot drift apart -- the same
@@ -1142,6 +1200,13 @@ export const documents = pgTable("documents", {
   // **IT WIDENED IN 0019, WHICH IS WHERE THE PREVIOUS SENTENCE SAID IT WOULD.**
   // The letter joins the summary on the FALSE side; the NDA and the mutual NDA
   // are the second and third TRUE members this column has ever had.
+  //
+  // **AND IT DID NOT WIDEN IN 0020.** The status report joins the summary and
+  // the letter on the FALSE side -- a stale report is worse than an edited one
+  // -- so at six types the TRUE side is still the three commercial documents
+  // somebody else holds a copy of. That is now the shape of the rule rather than
+  // an accident of which types exist: freezing is for a document whose bytes
+  // somebody outside this database is relying on.
   check("documents_frozen_matches_type", sql`frozen = (type IN ('quote','nda','mutual_nda'))`),
 ]);
 export type DocumentRow = typeof documents.$inferSelect;
@@ -1555,7 +1620,7 @@ export const documentTemplates = pgTable("document_templates", {
   // `documentTypeSchema` the right parser for the :type route param.
   check(
     "document_templates_type_valid",
-    sql`type IN ('quote','meeting_summary','letter','nda','mutual_nda')`,
+    sql`type IN ('quote','meeting_summary','letter','nda','mutual_nda','project_status_report')`,
   ),
 ]);
 export type DocumentTemplateRow = typeof documentTemplates.$inferSelect;

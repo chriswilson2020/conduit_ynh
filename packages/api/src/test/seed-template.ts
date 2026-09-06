@@ -33,6 +33,7 @@ const TEMPLATE_MIGRATIONS: Record<string, string[]> = {
   letter: ["0019_letter_and_agreements.sql"],
   nda: ["0019_letter_and_agreements.sql"],
   mutual_nda: ["0019_letter_and_agreements.sql"],
+  project_status_report: ["0020_project_status_report.sql"],
 };
 
 /**
@@ -179,6 +180,11 @@ export function seededAgreementTemplate(type: "nda" | "mutual_nda"): string {
   return seededTemplate(type);
 }
 
+/** The status report template a fresh install has (Phase 9 Task 4, 0020). */
+export function seededStatusReportTemplate(): string {
+  return seededTemplate("project_status_report");
+}
+
 /**
  * Every merge path the seeded template names, SPLIT BY THE SCOPE IT IS RESOLVED IN.
  *
@@ -267,4 +273,26 @@ export interface SummaryTemplatePaths {
 export function seededSummaryTemplatePaths(): SummaryTemplatePaths {
   const paths = templateMergePaths(seededMeetingSummaryTemplate(), ["lines", "attendees"]);
   return { root: paths.root, attendee: paths.inside.get("attendees") ?? [] };
+}
+
+export interface StatusReportTemplatePaths {
+  root: string[];
+  /** Resolved against one task, inside `{{#tasks}}`. */
+  task: string[];
+}
+
+/**
+ * **THE FIRST CALLER WHOSE COLLECTION ITEMS CARRY A BLOCK OF THEIR OWN**, and it
+ * is what `templateMergePaths`' stack (rather than a depth counter) was written
+ * for. `{{#after}}` opens inside `{{#tasks}}` and `after` is not a collection, so
+ * it is classified as a task-scope path and never pushed; its closer therefore
+ * does not pop `tasks`, and the fields after it stay task-scoped. A counter would
+ * have closed the task scope at `{{/after}}` and reported `status`, `startDate`
+ * and the rest as ROOT paths -- which would then have demanded
+ * `buildStatusReportContext` supply them at the top level, where they would print
+ * as blanks.
+ */
+export function seededStatusReportTemplatePaths(): StatusReportTemplatePaths {
+  const paths = templateMergePaths(seededStatusReportTemplate(), ["lines", "tasks"]);
+  return { root: paths.root, task: paths.inside.get("tasks") ?? [] };
 }
