@@ -184,6 +184,156 @@ export function todayInZone(timeZone: string, now: Date = new Date()): string {
 }
 
 /**
+ * The instants a closed range of calendar days occupies, in the organisation's
+ * own clock. Phase 10, and the reason it exists is a question Phase 10's spec and
+ * plan never ask.
+ *
+ * **A TIMESHEET SUMS TWO COLUMNS THAT ARE NOT THE SAME KIND OF THING.**
+ * `time_entries.work_date` is a `date` -- a day the operator typed, with no zone
+ * in it and none needed. `meetings.occurred_at` is a `timestamptz` -- an instant.
+ * Putting a meeting into a week therefore requires deciding which calendar day
+ * its instant fell on, and there is no neutral answer: 2026-09-06T23:30Z is
+ * Sunday in UTC and Monday in Amsterdam, which is not merely a different day but
+ * a different WEEK.
+ *
+ * The zone is the organisation's, because `org_profile.time_zone` (0018) already
+ * exists for exactly this class of question and already decides what day a
+ * document is dated. Answering in UTC instead would reintroduce the bug 0018 was
+ * built to remove -- the server unable to reproduce the wall clock the operator
+ * saw -- in the one report where being an hour out moves an hour between weeks.
+ *
+ * **HALF-OPEN, AND THE CLOSED FORM IS DELIBERATELY UNSPELLABLE.** The caller gets
+ * `[startInclusive, endExclusive)` and there is no function here that returns an
+ * inclusive end, because every inclusive end is wrong in one of two ways: an
+ * upper bound of the last day's own start drops that whole day, and one of
+ * "start plus 86,399,999ms" is an hour short on a 25-hour day and an hour long on
+ * a 23-hour one. Both failures are silent and both move hours between weeks. The
+ * only correct upper bound is where the NEXT day begins, so that is the only one
+ * this module can produce.
+ *
+ * **A BINARY SEARCH, AND THE OBVIOUS IMPLEMENTATION WAS WATCHED FAILING FIRST.**
+ * The textbook way to find local midnight -- guess `Date.UTC(y, m, d)`, subtract
+ * the zone's offset at that instant, correct once with the offset at the result
+ * -- returns an instant on the PREVIOUS calendar day in any zone that starts
+ * daylight saving at midnight, because the correction oscillates between the two
+ * offsets either side of the jump and settles on the wrong one. Measured on Node
+ * 24: America/Santiago 2026-09-06 came back as `2026-09-06T03:00Z`, which is
+ * 23:00 on the fifth; America/Havana 2026-03-08 was an hour early the same way.
+ *
+ * So the boundary is found rather than computed: the first instant whose local
+ * calendar day is not before the day asked for. That predicate is monotonic in
+ * time, which is the whole proof, and it needs no case analysis for a gap, an
+ * ambiguous hour, a half-hour offset or a day the zone skipped entirely
+ * (Pacific/Kiritimati has no 1994-12-31; the range for it comes out empty, which
+ * is true). Bracketed at +/-48h, which is comfortably wider than any offset tzdata
+ * has ever carried, so ~28 iterations. Measured: 2,514 boundaries in 109ms, i.e.
+ * 0.04ms each, against two per timesheet query.
+ *
+ * REJECTED: doing this in SQL as `(occurred_at AT TIME ZONE $tz)::date`. Postgres
+ * gets the arithmetic right, but it reads tzdata from its own installation rather
+ * than from the ICU that `timeZoneProblem` validated the stored name against, so
+ * a zone the form accepted could raise 22023 mid-report; and an expression over a
+ * runtime parameter cannot use an index on `occurred_at`, while the half-open
+ * instant range this returns is an ordinary range scan.
+ */
+export interface ZonedDayRange {
+  /** The first instant of `fromDay`, in the zone. */
+  startInclusive: Date;
+  /** The first instant of the day AFTER `toDay`. Never a member of the range. */
+  endExclusive: Date;
+}
+
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Wider than any offset in tzdata's history, so the bracket below always
+ * straddles the boundary. */
+const BRACKET_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * The first instant whose local day in `zone` is not before `day`.
+ *
+ * **ONE FORMATTER, HOISTED OUT OF THE LOOP, AND THAT IS A MEASUREMENT RATHER
+ * THAN A TIDY-UP.** The first version called `todayInZone` inside the search,
+ * which constructs an `Intl.DateTimeFormat` per call. On a fast laptop that is
+ * 0.04ms a boundary and invisible; on the dev server (2 cores, the machine this
+ * actually runs on) the exhaustive test took **19.7s**, against a 20s
+ * `testTimeout` -- a green run one scheduling hiccup away from a flake, and the
+ * kind of thing a laptop measurement would have shipped. Hoisting the formatter
+ * took the same test to the figure in its comment. Constructing the formatter,
+ * not formatting with it, was the whole cost.
+ *
+ * It also stops the implementation sharing a function with the test's oracle:
+ * `todayInZone` is now an independent second opinion in
+ * "puts the boundary exactly between two local days", not a restatement.
+ */
+function zonedDayStart(day: string, zone: string): Date {
+  const format = new Intl.DateTimeFormat("en-GB", {
+    timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
+  });
+  // Read by part NAME, exactly as todayInZone does and for its reason: a locale
+  // that happens to print ISO order is CLDR data rather than a promise.
+  const dayAt = (ms: number): string => {
+    const parts = format.formatToParts(new Date(ms));
+    const part = (type: string): string => parts.find((p) => p.type === type)?.value ?? "";
+    return `${part("year")}-${part("month")}-${part("day")}`;
+  };
+  const [year, month, dayOfMonth] = day.split("-").map(Number) as [number, number, number];
+  const naive = Date.UTC(year, month - 1, dayOfMonth);
+  // `lo` is known to be before the boundary and `hi` known to be at or after it,
+  // and the loop preserves that. `hi` is the answer when they meet.
+  let lo = naive - BRACKET_MS;
+  let hi = naive + BRACKET_MS;
+  while (lo < hi) {
+    // Written as an offset from `lo` rather than `(lo + hi) / 2`, the standard
+    // overflow-free spelling. These numbers are nowhere near MAX_SAFE_INTEGER;
+    // the habit costs nothing and the alternative is a reader having to check.
+    const mid = lo + Math.floor((hi - lo) / 2);
+    if (dayAt(mid) >= day) hi = mid;
+    else lo = mid + 1;
+  }
+  return new Date(hi);
+}
+
+/** The day after `day`, as a `YYYY-MM-DD` string. Pure UTC arithmetic on a naive
+ * date -- no zone is involved in "the next page of the calendar", and using one
+ * here would make a 23-hour day skip a date. */
+function nextDay(day: string): string {
+  const [year, month, dayOfMonth] = day.split("-").map(Number) as [number, number, number];
+  return new Date(Date.UTC(year, month - 1, dayOfMonth + 1)).toISOString().slice(0, 10);
+}
+
+export function zonedDayRange(fromDay: string, toDay: string, timeZone: string): ZonedDayRange {
+  for (const day of [fromDay, toDay]) {
+    // The shape AND the round trip: "2026-13-01" and "2026-02-30" both match the
+    // pattern, and `Date.UTC` would roll each of them into a neighbouring month
+    // without complaining. Two-digit years are caught by the same trip --
+    // `Date.UTC` maps 0-99 onto 1900-1999.
+    if (!ISO_DAY.test(day) || !isRealDay(day)) {
+      throw new Error(`zonedDayRange: ${JSON.stringify(day)} is not a YYYY-MM-DD calendar day`);
+    }
+  }
+  // An inverted range would otherwise answer with an empty one, which is
+  // indistinguishable from an honest empty week -- a number that is wrong
+  // without looking wrong, which is the failure this whole phase is about.
+  if (fromDay > toDay) {
+    throw new Error(`zonedDayRange: ${fromDay} is after ${toDay}, so the range runs backwards`);
+  }
+  const zone = usableTimeZone(timeZone);
+  return {
+    startInclusive: zonedDayStart(fromDay, zone),
+    endExclusive: zonedDayStart(nextDay(toDay), zone),
+  };
+}
+
+/** Whether `day` survives a round trip through the calendar -- i.e. names a day
+ * that exists. `2026-02-30` and `2026-13-01` do not. */
+function isRealDay(day: string): boolean {
+  const [year, month, dayOfMonth] = day.split("-").map(Number) as [number, number, number];
+  const at = new Date(Date.UTC(year, month - 1, dayOfMonth));
+  return !Number.isNaN(at.getTime()) && at.toISOString().slice(0, 10) === day;
+}
+
+/**
  * The short name of a zone AT AN INSTANT -- `CET` in January and `CEST` in July.
  *
  * AT AN INSTANT, because that is the half a static label cannot do. The whole

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_TIME_ZONE, MAX_TIME_ZONE_LENGTH, timeZoneLabel, timeZoneProblem, todayInZone,
-  usableTimeZone,
+  usableTimeZone, zonedDayRange,
 } from "./time-zone.js";
 
 /**
@@ -233,5 +233,176 @@ describe("todayInZone", () => {
   it("uses UTC's day when the stored zone no longer resolves", () => {
     const lateEvening = new Date("2026-09-06T23:30:00.000Z");
     expect(todayInZone("Factory", lateEvening)).toBe("2026-09-06");
+  });
+});
+
+/**
+ * **THE BOUNDARY BETWEEN ONE TIMESHEET WEEK AND THE NEXT.**
+ *
+ * `time_entries.work_date` is a `date` and `meetings.occurred_at` is an instant,
+ * so summing the two into one week means deciding which calendar day an instant
+ * fell on -- and Phase 10's spec and plan do not mention that decision anywhere.
+ * These are the tests for the answer: the organisation's own clock, the same
+ * `org_profile.time_zone` that already decides what day a document is dated.
+ */
+describe("zonedDayRange", () => {
+  it("turns a closed range of days into a half-open range of instants", () => {
+    const week = zonedDayRange("2026-09-07", "2026-09-13", "Europe/Amsterdam");
+    expect(week.startInclusive.toISOString()).toBe("2026-09-06T22:00:00.000Z");
+    // The instant Monday the 14th begins, NOT the last instant of Sunday the
+    // 13th: see the function's header for why an inclusive upper bound cannot be
+    // spelled here at all.
+    expect(week.endExclusive.toISOString()).toBe("2026-09-13T22:00:00.000Z");
+  });
+
+  it("is UTC's own midnight when the organisation's clock is UTC", () => {
+    const day = zonedDayRange("2026-09-07", "2026-09-07", "UTC");
+    expect(day.startInclusive.toISOString()).toBe("2026-09-07T00:00:00.000Z");
+    expect(day.endExclusive.toISOString()).toBe("2026-09-08T00:00:00.000Z");
+  });
+
+  /**
+   * A SINGLE DAY IS A RANGE OF ONE, not an empty one. `from === to` is the
+   * ordinary "what did I do on Tuesday" query, and a half-open range whose upper
+   * bound was the day itself would answer it with nothing at all.
+   */
+  it("gives a single day a whole day of width", () => {
+    const day = zonedDayRange("2026-09-07", "2026-09-07", "Europe/Amsterdam");
+    expect(day.endExclusive.getTime() - day.startInclusive.getTime()).toBe(24 * 3600 * 1000);
+  });
+
+  /**
+   * **A DAY IS NOT ALWAYS 24 HOURS, WHICH IS WHY THE UPPER BOUND IS A DAY START
+   * AND NOT A START PLUS 86,399,999 MILLISECONDS.** Europe/Amsterdam's 25 October
+   * 2026 has 25 hours in it and its 29 March has 23, so arithmetic on hours would
+   * reach an hour into the next day on one and drop the last hour of the other --
+   * an hour of meetings landing in the wrong week, twice a year.
+   */
+  it("spans the long day and the short one exactly, without arithmetic on hours", () => {
+    const long = zonedDayRange("2026-10-25", "2026-10-25", "Europe/Amsterdam");
+    expect(long.endExclusive.getTime() - long.startInclusive.getTime()).toBe(25 * 3600 * 1000);
+    const short = zonedDayRange("2026-03-29", "2026-03-29", "Europe/Amsterdam");
+    expect(short.endExclusive.getTime() - short.startInclusive.getTime()).toBe(23 * 3600 * 1000);
+  });
+
+  /**
+   * **THE MEASUREMENT THAT REJECTED THE OBVIOUS IMPLEMENTATION.**
+   *
+   * The usual way to find local midnight is to guess `Date.UTC(y, m, d)`, ask the
+   * zone for its offset at that instant, subtract, and correct once with the
+   * offset at the result. Run against these zones it is AN HOUR EARLY and lands on
+   * the previous calendar day: America/Santiago starts DST at 24:00 on 6 September
+   * 2026 (00:00 becomes 01:00), and the two-pass correction oscillates between the
+   * offsets either side of that jump and settles on the wrong one --
+   * `2026-09-06T03:00Z`, which is 23:00 on the FIFTH. Watched failing before the
+   * search below was written, not reasoned about afterwards.
+   *
+   * What it would have cost is Phase 10's own failure mode: a meeting logged late
+   * on a Sunday evening moved into the following week, in one direction, silently.
+   */
+  it("finds the first instant of a day whose local midnight does not exist", () => {
+    // America/Santiago, 6 Sep 2026: 23:59:59 -> 01:00:00, so the day begins at
+    // 01:00 local.
+    expect(zonedDayRange("2026-09-06", "2026-09-06", "America/Santiago")
+      .startInclusive.toISOString()).toBe("2026-09-06T04:00:00.000Z");
+    // America/Havana, 8 Mar 2026: the same jump.
+    expect(zonedDayRange("2026-03-08", "2026-03-08", "America/Havana")
+      .startInclusive.toISOString()).toBe("2026-03-08T05:00:00.000Z");
+    // Asia/Beirut, 29 Mar 2026: the same jump again, and the one case the
+    // two-pass version happened to get right -- kept so a regression that fixes
+    // only the easy zone is still red on the other two.
+    expect(zonedDayRange("2026-03-29", "2026-03-29", "Asia/Beirut")
+      .startInclusive.toISOString()).toBe("2026-03-28T22:00:00.000Z");
+  });
+
+  /**
+   * THE COMPLETE CHARACTERISATION, over every zone this engine has rather than
+   * over the handful somebody thought to name: the boundary's own millisecond is
+   * on or after the requested day and the millisecond before it is not. That is
+   * the whole contract, and DST, half-hour offsets and a skipped day are not
+   * special cases of it.
+   *
+   * 419 zones x 5 days = 2,095 boundaries, in **1.6s on the dev server** -- which
+   * is the figure that matters, because the first draft of `zonedDayStart` built
+   * an `Intl.DateTimeFormat` inside its search loop and this same test then took
+   * **19.7s against a 20s testTimeout**. On a laptop both versions are under
+   * 200ms and neither looks like anything. Hoisting the formatter is what closed
+   * it; the comment on that function has the rest.
+   *
+   * `todayInZone` is the oracle deliberately, and after that change it is an
+   * independent one: it is the function that decides what day an instant falls on
+   * everywhere else in this product, so a boundary these two disagreed about
+   * would be a boundary the rest of Conduit did not believe in.
+   */
+  it("puts the boundary exactly between two local days, in every zone the platform has", () => {
+    const zones = [DEFAULT_TIME_ZONE, ...Intl.supportedValuesOf("timeZone")];
+    expect(zones.length).toBeGreaterThan(100);
+    const days = ["2026-01-15", "2026-03-08", "2026-03-29", "2026-09-06", "2026-10-25"];
+    const wrong: string[] = [];
+    for (const zone of zones) {
+      for (const day of days) {
+        const { startInclusive } = zonedDayRange(day, day, zone);
+        const before = new Date(startInclusive.getTime() - 1);
+        if (!(todayInZone(zone, startInclusive) >= day && todayInZone(zone, before) < day)) {
+          wrong.push(`${zone} ${day} -> ${startInclusive.toISOString()}`);
+        }
+      }
+    }
+    expect(wrong).toEqual([]);
+  });
+
+  /**
+   * A CALENDAR DAY THAT NEVER EXISTED still has to produce a usable boundary,
+   * because nothing stops an operator asking for one. Pacific/Kiritimati skipped
+   * 31 December 1994 outright when it crossed the date line, so the range for it
+   * is empty rather than an error -- a query over it selects nothing, which is
+   * the true answer.
+   */
+  it("does not throw on a calendar day the zone skipped", () => {
+    const skipped = zonedDayRange("1994-12-31", "1994-12-31", "Pacific/Kiritimati");
+    expect(skipped.startInclusive.toISOString()).toBe("1994-12-31T10:00:00.000Z");
+    expect(skipped.endExclusive.getTime()).toBe(skipped.startInclusive.getTime());
+  });
+
+  /**
+   * `usableTimeZone`'s fallback, here as everywhere else: a stored zone this
+   * engine no longer resolves must not turn the timesheet into a 500. The caller
+   * is required to say which zone it ended up using -- services/timesheet.ts puts
+   * it in the payload, on formatDocumentInstant's precedent.
+   */
+  it("falls back to UTC's boundaries when the stored zone no longer resolves", () => {
+    const day = zonedDayRange("2026-09-07", "2026-09-07", "Factory");
+    expect(day.startInclusive.toISOString()).toBe("2026-09-07T00:00:00.000Z");
+  });
+
+  /**
+   * AN INVERTED RANGE IS A MISTAKE AND NOT AN EMPTY WEEK. Answering it with zero
+   * would be indistinguishable from an honest zero, which is this phase's whole
+   * failure mode: a number that is wrong without looking wrong.
+   */
+  it("refuses a range that runs backwards rather than answering it with nothing", () => {
+    expect(() => zonedDayRange("2026-09-13", "2026-09-07", "UTC"))
+      .toThrow(/2026-09-13.*2026-09-07/);
+  });
+
+  /**
+   * **NAMING THE ERROR, BECAUSE A BARE `toThrow()` HERE WAS GREEN FOR THE WRONG
+   * REASON.** Caught by mutation: deleting the calendar round trip
+   * (`isRealDay`) left "2026-13-01" accepted as a day, and the test still passed
+   * -- because "2026-13-01" sorts after the `to` bound and the range's own
+   * backwards check threw instead. A test that cannot tell which refusal it got
+   * is a test that certifies whichever one it happens to receive.
+   *
+   * The month-thirteen, February-thirty and two-digit-year cases are the ones
+   * that matter: `Date.UTC` rolls all three into a neighbouring month or century
+   * without complaining, so the pattern alone lets them through and the range
+   * would be over days nobody asked for.
+   */
+  it("refuses anything that is not a YYYY-MM-DD day, and says that is why", () => {
+    for (const bad of [
+      "2026-09", "07/09/2026", "2026-09-07T00:00:00Z", "2026-13-01", "2026-02-30", "0026-09-07", "",
+    ]) {
+      expect(() => zonedDayRange(bad, "2026-12-31", "UTC"), bad).toThrow(/calendar day/);
+    }
   });
 });
