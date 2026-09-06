@@ -720,9 +720,13 @@ describe("proving an archive opens", () => {
    * 10 runs per cell, against a 7z that writes nothing to stdin before exiting:
    *
    *                                28 bytes   128 KiB   256 KiB   1 MiB
-   *     `t` on a truncated .7z        0/10      0/10     10/10    10/10
-   *     `l` on a non-archive          0/10      0/10     10/10    10/10
-   *     `l` on an unencrypted .7z     0/10      0/10     10/10    10/10
+   *     `t` on a truncated .7z        0/30      0/20     10/10    10/10
+   *     `l` on a non-archive          0/30      0/20     10/10    10/10
+   *     `l` on an unencrypted .7z     0/10        --     10/10    10/10
+   *
+   * (The uneven denominators are the run counts as they were actually taken --
+   * the 128 KiB column came from an earlier pass over two of the three cases,
+   * before the threshold was known to be above it.)
    *
    * libuv gives a child's stdin a socketpair, not a pipe, and its send buffer
    * took 128 KiB whole -- so a write SMALLER than the buffer completes into the

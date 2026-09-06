@@ -1080,8 +1080,10 @@ export async function proveArchiveOpens(
     // any of these three before exiting -- `t` on a truncated .7z, `l` on a file
     // that is not an archive, `l` on an unencrypted one:
     //
-    //     28 bytes .. EPIPE 0/10     256 KiB .. EPIPE 10/10
-    //     128 KiB ... EPIPE 0/10     1 MiB ---- EPIPE 10/10
+    //     28 bytes .. EPIPE  0/70    256 KiB .. EPIPE 30/30
+    //     128 KiB ... EPIPE  0/40    1 MiB .... EPIPE 30/30
+    //
+    // (Totals across those three cases; the 128 KiB row covers two of them.)
     //
     // libuv gives a child's stdin a SOCKETPAIR, not a pipe, and its send buffer
     // took 128 KiB whole. A write smaller than that buffer completes into the

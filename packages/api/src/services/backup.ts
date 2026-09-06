@@ -1396,8 +1396,9 @@ async function runSevenZip(
     // while this write is in flight", and that mechanism is not the one. libuv
     // gives a child's stdin a socketpair whose send buffer took 128 KiB whole on
     // the deploy target, so a passphrase-sized write completes into the kernel
-    // whatever the child does -- 0/10 EPIPE at 28 bytes against a 7z that read
-    // nothing at all, 10/10 at 256 KiB. There is no race to lose at this size.
+    // whatever the child does -- 0 EPIPE in 70 runs at 28 bytes against a 7z
+    // that read nothing at all, 30 in 30 at 256 KiB. No race to lose at this
+    // size.
     // services/restore.ts's proveArchiveOpens carries the full table and the
     // argument for keeping the line regardless.
     child.stdin.on("error", () => { /* see above */ });

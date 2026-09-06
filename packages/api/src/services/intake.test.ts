@@ -360,16 +360,18 @@ describe("the 7z argument lists", () => {
    * AND THE WRITE TO 7z's stdin LEAVES NOTHING UNCAUGHT BEHIND IT.
    *
    * This is the site where the child provably exits WITHOUT READING A BYTE:
-   * `7z l` on a file that is not an archive answers "Is not archive" and exit 2,
-   * measured 10/10 on the deploy target, and that is an ordinary wrong upload
-   * rather than a rare corruption. A stream 'error' with no listener is an
-   * uncaught exception, and packages/api/src installs no process-level handler,
-   * so it would end the API server instead of the upload.
+   * `7z l` on a file that is not an archive answers "Is not archive" and exit 2
+   * in all 30 runs of it on the deploy target, and that is an ordinary wrong
+   * upload rather than a rare corruption. A stream 'error' with no listener is
+   * an uncaught exception, and packages/api/src installs no process-level
+   * handler, so it would end the API server instead of the upload.
    *
    * WHAT MAKES IT SURVIVABLE TODAY IS SIZE, NOT LUCK, and that is also why this
    * test writes 256 KiB rather than a passphrase. libuv gives a child's stdin a
-   * socketpair whose send buffer took 128 KiB whole on that box; 256 KiB EPIPEs
-   * 10/10 and 28 bytes 0/10. stageArchive applies passphraseProblem (256
+   * socketpair whose send buffer took 128 KiB whole on that box; over the three
+   * cases measured, 256 KiB and above EPIPEd 30 times out of 30 and a
+   * passphrase-sized write 0 times out of 70. stageArchive applies
+   * passphraseProblem (256
    * CHARACTERS) before it ever reaches here, which is exactly why the test has
    * to call runSevenZip directly -- driven through stageArchive it would pass
    * with the guard deleted.

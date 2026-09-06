@@ -846,9 +846,10 @@ export async function runSevenZip(
     //
     // THIS IS THE SITE WHERE THE CHILD REALLY DOES EXIT WITHOUT READING: `7z l`
     // on 4096 bytes that are not an archive answers "Is not archive", exit 2,
-    // and writes nothing to stdin first -- measured 10/10. That is an ordinary
-    // wrong upload rather than a rare corruption, and the only thing that makes
-    // it survivable is the size of what this writes.
+    // in all 30 runs of it -- and that it consumed nothing on the way is what
+    // the EPIPE at 256 KiB and above says, since a reader would have drained it.
+    // An ordinary wrong upload rather than a rare corruption; the only thing
+    // that makes it survivable is the size of what this writes.
     child.stdin.on("error", () => { /* see above */ });
     // NO TRAILING NEWLINE, and it is not superstition: 7z reads one line, so a
     // newline here would be read as the end of the passphrase either way -- but

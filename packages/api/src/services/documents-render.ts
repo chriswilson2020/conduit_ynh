@@ -774,7 +774,7 @@ async function spawnRender(
     // AND OF THE FOUR SPAWN SITES IN THIS PACKAGE THIS IS THE ONE WHERE IT IS
     // LOAD-BEARING RATHER THAN DEFENSIVE, because `html` is the only payload with
     // no cap on it. The measured threshold is the socketpair's send buffer -- 128
-    // KiB through, 256 KiB EPIPEs 10/10 on the deploy target -- and a document with
+    // KiB through, 256 KiB EPIPEs 30 times in 30 on the deploy target -- and a document with
     // an inlined image passes that without trying. The three 7z sites write a
     // passphrase capped at 256 characters and cannot reach it; see
     // services/restore.ts's proveArchiveOpens for the table and for why they carry
