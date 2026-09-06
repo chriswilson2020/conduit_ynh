@@ -467,6 +467,23 @@ export type FunnelRow = z.infer<typeof funnelRowSchema>;
 export const projectStatusSchema = z.enum(["active", "completed"]);
 export type ProjectStatus = z.infer<typeof projectStatusSchema>;
 
+/**
+ * How a project's status is WORDED, wherever it is shown to a person.
+ *
+ * **HERE SINCE PHASE 9 TASK 4, BECAUSE THE SECOND RENDERER IS A PDF.** It lived
+ * in `pages/project-detail.tsx` while the browser was the only thing that showed
+ * it. The project status report prints it too, from the server, and a third
+ * spelling of "Active" is exactly the drift `task-board.tsx`'s own comment
+ * warned against for the task labels ("a status/type's wording only ever lives in
+ * one place"). It is in @conduit/shared rather than duplicated because the
+ * package already owns the other cross-renderer formatting decisions --
+ * MONEY_LOCALE, `formatDocumentInstant` -- for the same reason: the product
+ * decides the wording, not whichever process happens to be doing the rendering.
+ */
+export const PROJECT_STATUS_LABEL: Record<ProjectStatus, string> = {
+  active: "Active", completed: "Completed",
+};
+
 const hexColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/, "color must be a 6-digit hex code (e.g. #1a2b3c)");
 
 export const projectSchema = z.object({
@@ -504,6 +521,22 @@ export const taskTypeSchema = z.enum(["task", "call", "meeting", "email", "deadl
 export type TaskType = z.infer<typeof taskTypeSchema>;
 export const taskStatusSchema = z.enum(["todo", "in_progress", "blocked", "done"]);
 export type TaskStatus = z.infer<typeof taskStatusSchema>;
+
+/**
+ * How a task's status is WORDED, wherever it is shown to a person.
+ *
+ * **MOVED HERE FROM `pages/task-board.tsx` BY PHASE 9 TASK 4**, which is the file
+ * that had already made the argument: "Exported: the task drawer and My Tasks
+ * reuse these same labels rather than redefining them, so a status/type's wording
+ * only ever lives in one place." The project status report is the fourth reader
+ * and the first that is not in a browser -- it prints these words into a PDF from
+ * the server -- so "one place" had to stop meaning "one place in packages/web".
+ * `task-board.tsx` re-exports this under its old name, so nothing that imported
+ * `STATUS_LABEL` had to change.
+ */
+export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
+  todo: "To do", in_progress: "In progress", blocked: "Blocked", done: "Done",
+};
 
 export const taskSchema = z.object({
   id: z.uuid(), title: z.string().min(1), description: nullableString,
@@ -2361,15 +2394,20 @@ function documentText(max: number, min = 0) {
  *
  * `meeting_summary` is Phase 9 Task 2's, and it is the type that has no form: its
  * whole content is a `meetings` row, so nothing about it is submitted.
- * `letter`, `nda` and `mutual_nda` are Task 3's. `project_status_report` is Task
- * 4's and is deliberately absent -- a member here with no template row and no
- * writer is a type an operator can select and nothing can produce. (The sentence
- * this replaces said "the other three... letter, nda, mutual_nda,
- * project_status_report", which is four; the spec's own "four templates, four
- * forms" miscount, already recorded by Task 2, had reached this comment.)
+ * `letter`, `nda` and `mutual_nda` are Task 3's.
+ *
+ * **`project_status_report` IS TASK 4'S, AND IT IS THE SECOND TYPE WITH NO FORM.**
+ * That was not expected: the spec's table gives it "possibly a date range" as its
+ * extra input and the plan asked for the question to be settled before a form was
+ * built for it. It was settled NO -- the argument is at `issueStatusReport` in
+ * services/documents.ts -- and with the range gone there is no other field, so the
+ * whole content is the `projects` row, its tasks and their dependencies. The
+ * phase's real count is therefore FIVE templates and THREE forms: the quote's, the
+ * letter's and the agreements'. (The spec says "four templates, four forms", which
+ * Task 2 corrected to four and three; both halves were wrong by one.)
  */
 export const documentTypeSchema = z.enum([
-  "quote", "meeting_summary", "letter", "nda", "mutual_nda",
+  "quote", "meeting_summary", "letter", "nda", "mutual_nda", "project_status_report",
 ]);
 export type DocumentType = z.infer<typeof documentTypeSchema>;
 
@@ -2424,6 +2462,21 @@ export function documentTypeFreezes(type: DocumentType): boolean {
     case "nda":
     case "mutual_nda":
       return true;
+    // **NOT FROZEN, AND IT IS THE ONLY ONE OF THE SIX WHOSE REASON IS ABOUT TIME
+    // RATHER THAN ABOUT WHO HOLDS IT.** A quote and an agreement freeze because
+    // somebody else has a copy and the copy must stay provable. A status report
+    // is not evidence of anything anybody agreed to; it is an answer to "where
+    // is this project", and the answer is wrong a week later. Chris, 6 Sep, via
+    // the plan: "you regenerate it next month, and a stale report is worse than
+    // an edited one."
+    //
+    // WHAT "NOT FROZEN" BUYS THIS TYPE IS NOT AN EDIT PATH. There is none --
+    // `redraftLetter` refuses anything that is not a letter, and issuing a
+    // report again appends a second one, exactly as the summary does. What it
+    // buys is that `conduit_document_frozen_guard` never fires on these rows, so
+    // a future correction path can exist without a migration.
+    case "project_status_report":
+      return false;
   }
 }
 
@@ -2524,21 +2577,68 @@ export function documentTypeNumbered(type: DocumentType): boolean {
      * `documents_number_unique` is GLOBAL and a collision would show up as a
      * refused document at issue. QUO, NDA and MNDA share no prefix.
      *
-     * **AT FIVE TYPES THIS FUNCTION AND documentTypeFreezes NOW ANSWER
-     * IDENTICALLY, AND THAT IS A COINCIDENCE THAT MUST NOT BE COLLAPSED.** The
-     * comment above predicted the pairing that would arrive ("an NDA is frozen
-     * AND numbered, a letter is neither") and it did -- but it arrived as
-     * agreement on all five members, which is a stronger-looking coincidence
-     * than the prediction and a more tempting one to refactor away. The two
-     * rules are still independent and the counterexamples are ordinary: Task
-     * 4's status report is neither, and a credit note would be frozen and
-     * numbered while a delivery note is numbered and freely reprinted. Merging
-     * them into one lookup table would make the next type's author answer one
-     * question where there are two.
+     * **AT SIX TYPES THIS FUNCTION AND documentTypeFreezes STILL ANSWER
+     * IDENTICALLY, AND THE ARGUMENT FOR KEEPING THEM APART HAS TO BE MADE
+     * WITHOUT THE COUNTEREXAMPLE THAT USED TO CARRY IT.** This paragraph said,
+     * at five types, that the two rules were independent and that "the
+     * counterexamples are ordinary: Task 4's status report is neither, and a
+     * credit note would be frozen and numbered while a delivery note is numbered
+     * and freely reprinted."
+     *
+     * **THE FIRST OF THOSE IS NOT A COUNTEREXAMPLE AND NEVER WAS.** "Neither" is
+     * AGREEMENT -- both functions answer false -- so the status report, which
+     * has now arrived and is indeed neither, made the coincidence six for six
+     * rather than breaking it. A prediction that a type would disagree was
+     * written down, the type was built, and it agreed. That is worth recording
+     * as a wrong prediction rather than quietly restating.
+     *
+     * What survives is the part that was never about the existing types: the two
+     * rules answer different questions. Freezing is "may these bytes change";
+     * numbering is "does somebody outside hold a handle to them". A credit note
+     * would be frozen and numbered; a delivery note is numbered and freely
+     * reprinted; a signed-and-scanned agreement would be frozen and take its
+     * counterparty's reference rather than one of ours. None of those exists
+     * here, so the honest statement is that the two sets have coincided for
+     * every type built so far and the reasons for each membership are disjoint.
+     * db/schema.test.ts asserts them as two independent literals for exactly
+     * this reason -- `expect(frozen).toEqual(numbered)` would read as an
+     * invariant, and six for six is precisely when that spelling becomes
+     * tempting.
      */
     case "nda":
     case "mutual_nda":
       return true;
+    /*
+     * **A STATUS REPORT TAKES NO NUMBER, AND THE LETTER'S THIRD REASON DOES NOT
+     * CARRY OVER UNCHANGED -- IT CHANGES SHAPE.** Each of the three, re-checked:
+     *
+     * 1. THE HANDLE IS THE PROJECT AND THE DATE, AND BOTH ARE PRINTED. A report
+     *    goes to whoever is paying for the project, who refers to it as "the
+     *    September report on Rye Lane" -- a phrase that already identifies it,
+     *    out of two facts on the page. `PSR-2026-0007` would identify it only
+     *    inside this database, and unlike an NDA there is no counterparty filing
+     *    it against a reference of their own.
+     * 2. THE LOCK IS THE SAME LOCK. `allocateNumber` holds a `(type, year)` row
+     *    lock to commit with the render inside it, so every report of a year
+     *    would queue behind every other one -- and this is the type most likely
+     *    to be produced in a batch, because "run this month's reports" is a
+     *    sentence about every active project at once.
+     * 3. **THE THIRD REASON IS THE LETTER'S, TURNED INSIDE OUT, AND SAYING SO IS
+     *    THE POINT.** The letter's argument is that a REDRAFT rewrites the page
+     *    under a fixed number, so `LET-2026-0001` would name different content
+     *    on Tuesday from Monday. A report is not redrafted -- regenerating one
+     *    appends a SECOND document with its own PDF, exactly as the summary does
+     *    -- so that failure cannot occur here. What occurs instead is the other
+     *    one the summary named: the sequence fills with near-duplicates. Twelve
+     *    monthly reports on one project are twelve numbers, and the audit a
+     *    gapless per-year sequence exists for ("which did we issue, and are
+     *    there gaps") answers nothing, because two adjacent numbers are the same
+     *    report of the same project a month apart. A sequence is worth having
+     *    when its members are distinct commitments. Successive answers to one
+     *    standing question are not.
+     */
+    case "project_status_report":
+      return false;
   }
 }
 
@@ -3410,6 +3510,42 @@ export const meetingSummarySchema = z.object({
   createdAt: z.iso.datetime(),
 });
 export type MeetingSummaryRecord = z.infer<typeof meetingSummarySchema>;
+
+/**
+ * A project status report, as `GET`/`POST /api/projects/:id/documents` return it.
+ *
+ * **THE SUMMARY'S SHAPE WITH A DIFFERENT RECORD ID, AND THAT SIMILARITY IS THE
+ * FINDING RATHER THAN A SHORTCUT.** The spec calls the status report the broadest
+ * source in the phase and the plan says it is "the one most likely to be larger
+ * than it looks". Its breadth is entirely on the READ side -- a project, every
+ * task on it, their dependencies, six counts and an overdue rule -- and none of
+ * that reaches the wire, for the summary's reason exactly: it is all live rows
+ * the client that opened the project already has. What is snapshot is the PDF,
+ * and `fileId` is how you read it.
+ *
+ * **NO CONTENT FIELDS, NO `number`, AND NO DATE RANGE.** The range was the one
+ * thing the spec said this type might submit; it does not (see `issueStatusReport`
+ * in the API's services/documents.ts for why, and for what a range would have had
+ * to decide about undated tasks). With it gone there is no input at all, so there
+ * is nothing for a DTO to echo back.
+ *
+ * `frozen` IS `z.boolean()` for `meetingSummarySchema`'s reason: the guarantee
+ * lives in `documents_frozen_matches_type`, where a violation is a refused INSERT,
+ * and a `z.literal(false)` here would move the noticing to the client's
+ * `parseWith`, which throws -- a row the database accepted would blank a page in
+ * the browser instead of being caught where it was written.
+ */
+export const statusReportSchema = z.object({
+  id: z.uuid(),
+  type: z.literal("project_status_report"),
+  projectId: z.uuid(),
+  fileId: z.uuid(),
+  issueDate: z.iso.date(),
+  frozen: z.boolean(),
+  issuedByUserId: z.uuid(),
+  createdAt: z.iso.datetime(),
+});
+export type StatusReportRecord = z.infer<typeof statusReportSchema>;
 
 /**
  * THE RENDER BUDGET. Every number below was MEASURED against the shipped template,
@@ -4319,13 +4455,22 @@ export type AgreementRecord = z.infer<typeof agreementSchema>;
  * agreements together, in one list, ordered by when they were issued, and it
  * cannot know in advance which it will get.
  *
- * **THE QUOTE AND THE SUMMARY ARE DELIBERATELY NOT MEMBERS.** A quote is of a
- * DEAL and a summary is of a MEETING, and neither a company nor a contact can
- * carry one -- so admitting them here would widen the type of a value no route
- * can produce, and the first thing every consumer would do is handle two cases
- * that cannot occur. If Task 4's status report attaches to a project, it joins
- * this union; if a later type attaches to a deal, the deal's own reader becomes
- * a union of its own rather than this one widening to cover a fourth record.
+ * **THE QUOTE, THE SUMMARY AND THE STATUS REPORT ARE DELIBERATELY NOT MEMBERS.**
+ * A quote is of a DEAL, a summary is of a MEETING and a report is of a PROJECT,
+ * and none of the three can be carried by a company or a contact -- so admitting
+ * them here would widen the type of a value no route can produce, and the first
+ * thing every consumer would do is handle cases that cannot occur.
+ *
+ * **THE SENTENCE THIS REPLACES WAS WRONG, AND IT WAS WRONG ABOUT THIS TASK.** It
+ * read: "If Task 4's status report attaches to a project, it joins this union."
+ * It attaches to a project and it does NOT join, because this union is the
+ * COMPANY-AND-CONTACT reader and a project is neither -- the same reasoning the
+ * rest of the paragraph applies to the quote and the summary, contradicted in its
+ * own last sentence. The rule the paragraph meant is its second half and it holds
+ * unchanged: a record that starts carrying more than one type grows a union for
+ * its OWN reader, rather than this one widening to cover a fourth record. The
+ * project's reader returns `StatusReportRecord[]`, and it will become a union of
+ * its own on the day a project carries a second type.
  */
 export const recordDocumentSchema = z.discriminatedUnion("type", [
   letterSchema,
